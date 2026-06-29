@@ -21,7 +21,7 @@ const UPPER_MASK: u32 = 0x8000_0000;
 const LOWER_MASK: u32 = 0x7fff_ffff;
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -43,7 +43,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 fn random_type() -> Rc<TypeObject> {
     use crate::builtin_types::builtin_types;
     let bt = builtin_types();
-    let mut td = DictData::new();
+    let mut td = DictData::default();
     for (name, fn_) in [
         (
             "__init__",

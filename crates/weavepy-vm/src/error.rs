@@ -212,6 +212,15 @@ pub fn set_exception_attr(err: &RuntimeError, key: &'static str, value: Object) 
 }
 
 pub fn type_error(message: impl Into<String>) -> RuntimeError {
+    let message = message.into();
+    if let Some(needle) = std::env::var_os("WEAVEPY_TE_BT") {
+        if message.contains(needle.to_string_lossy().as_ref()) {
+            eprintln!(
+                "[TE_BT] TypeError({message})\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+    }
     RuntimeError::PyException(PyException::from_builtin("TypeError", message))
 }
 
@@ -302,6 +311,21 @@ pub fn unicode_encode_error(
 ) -> RuntimeError {
     RuntimeError::PyException(PyException::new(
         crate::builtin_types::make_unicode_encode_error(encoding, object, start, end, reason),
+    ))
+}
+
+/// [`unicode_encode_error`] with the failing text as an [`Object`], so a
+/// surrogate-carrying `WStr` reaches the exception intact (see
+/// [`crate::builtin_types::make_unicode_encode_error_obj`]).
+pub fn unicode_encode_error_obj(
+    encoding: &str,
+    object: Object,
+    start: usize,
+    end: usize,
+    reason: &str,
+) -> RuntimeError {
+    RuntimeError::PyException(PyException::new(
+        crate::builtin_types::make_unicode_encode_error_obj(encoding, object, start, end, reason),
     ))
 }
 

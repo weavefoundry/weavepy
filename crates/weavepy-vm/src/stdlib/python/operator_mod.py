@@ -433,6 +433,21 @@ except ImportError:
 else:
     from _operator import __doc__
 
+# WeavePy: CPython's `attrgetter`/`itemgetter`/`methodcaller` are C types,
+# so calling one adds no Python frame to the stack. Splice in the native
+# `__call__`s to match — pandas' `find_stack_level()` counts the frames
+# between a `warnings.warn` site and the user's call site, and an extra
+# `<frozen operator>` frame misattributes the warning.
+try:
+    from _operator import _attrgetter_call, _itemgetter_call, _methodcaller_call
+
+    attrgetter.__call__ = _attrgetter_call
+    itemgetter.__call__ = _itemgetter_call
+    methodcaller.__call__ = _methodcaller_call
+    del _attrgetter_call, _itemgetter_call, _methodcaller_call
+except ImportError:
+    pass
+
 # All of these "__func__ = func" assignments have to happen after importing
 # from _operator to make sure they're set to the right function
 __lt__ = lt

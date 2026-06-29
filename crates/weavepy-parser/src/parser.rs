@@ -26,6 +26,21 @@ pub(crate) fn parse(source: &str, tokens: Vec<Token>) -> Result<Module, ParseErr
     Ok(module)
 }
 
+/// Parse with CPython's `eval` start rule: `expressions NEWLINE* ENDMARKER`.
+///
+/// The expression grammar simply has no production for statement syntax,
+/// so `eval("x = 1")` / `eval("del x")` fail with a *bare* "invalid
+/// syntax" anchored at the first token the rule can't accept (the `=`,
+/// the `del`, …) — never with statement-level diagnostics like "cannot
+/// assign to f-string expression" (`test_fstring` asserts exactly this).
+/// Expression-*internal* diagnostics (a missing `else`, an unclosed
+/// bracket, f-string field errors, …) still surface unchanged.
+pub(crate) fn parse_eval(source: &str, tokens: Vec<Token>) -> Result<Module, ParseError> {
+    let mut p = Parser::new(source, tokens);
+    let module = p.parse_eval_module()?;
+    Ok(module)
+}
+
 struct Parser<'src> {
     source: &'src str,
     tokens: Vec<Token>,
@@ -128,6 +143,92 @@ impl<'src> Parser<'src> {
         matches!(self.peek(), TokenKind::Keyword(k) if *k == kw)
     }
 
+    /// CPython's parse-time assignment-target validation (the PEG
+    /// grammar's `invalid_assignment` rules): only Name / Attribute /
+    /// Subscript / Starred / Tuple / List can be assigned to; container
+    /// targets are validated element-wise. Returns the offending
+    /// sub-expression and whether it sat *nested* inside a container
+    /// (nested offenders get the bare diagnostic, top-level ones the
+    /// "Maybe you meant '=='" hint).
+    fn find_invalid_target(e: &Expr, nested: bool) -> Option<(&Expr, bool)> {
+        match &e.kind {
+            ExprKind::Name(_) | ExprKind::Attribute { .. } | ExprKind::Subscript { .. } => None,
+            // The starred wrapper itself is fine (`*a, = xs`); its inner
+            // expression is a nested target ( `*f(x), = xs` → bare msg).
+            ExprKind::Starred(inner) => Self::find_invalid_target(inner, true),
+            ExprKind::Tuple(items) | ExprKind::List(items) => items
+                .iter()
+                .find_map(|it| Self::find_invalid_target(it, true)),
+            _ => Some((e, nested)),
+        }
+    }
+
+    /// Build CPython's "cannot assign to X" `SyntaxError` for an invalid
+    /// assignment target found by [`Parser::find_invalid_target`].
+    fn assign_target_error(&self, offender: &Expr, nested: bool) -> ParseError {
+        // A *bare* top-level yield target (`yield = 1`, `x = yield = 1`)
+        // has its own diagnostic in CPython's grammar
+        // (`invalid_assignment`'s `yield_expr '='` alternative). A
+        // parenthesized `(yield) = 1` instead falls through to the
+        // generic "cannot assign to X here. Maybe you meant '=='" hint —
+        // the parens make it an ordinary primary. Our AST keeps the
+        // *inner* span for parenthesized expressions, so peek at the
+        // preceding non-space character to tell the two apart.
+        if !nested && matches!(&offender.kind, ExprKind::Yield(_) | ExprKind::YieldFrom(_)) {
+            let parenthesized = self.source[..offender.span.start.0 as usize]
+                .trim_end()
+                .ends_with('(');
+            if !parenthesized {
+                return ParseError::Unexpected {
+                    span: offender.span,
+                    message: "assignment to yield expression not possible".to_owned(),
+                };
+            }
+        }
+        let name = crate::ast::expr_name(offender);
+        // The "Maybe you meant '==' instead of '='?" hint appears only on
+        // top-level offenders, and CPython's grammar carves out a handful
+        // of forms that keep the bare message even there (keyword
+        // constants, conditionals, lambdas, generator expressions,
+        // comparisons, and `not`/`and`/`or` operations).
+        let bare = nested
+            || matches!(
+                &offender.kind,
+                ExprKind::Constant(Constant::None)
+                    | ExprKind::Constant(Constant::Bool(_))
+                    | ExprKind::IfExp { .. }
+                    | ExprKind::Lambda { .. }
+                    | ExprKind::GeneratorExp { .. }
+                    | ExprKind::Compare { .. }
+                    | ExprKind::BoolOp { .. }
+            )
+            || matches!(
+                &offender.kind,
+                ExprKind::UnaryOp {
+                    op: UnaryOp::Not,
+                    ..
+                }
+            );
+        let message = if bare {
+            format!("cannot assign to {name}")
+        } else {
+            format!("cannot assign to {name} here. Maybe you meant '==' instead of '='?")
+        };
+        ParseError::Unexpected {
+            span: offender.span,
+            message,
+        }
+    }
+
+    /// Validate one statement-level assignment target, erroring exactly
+    /// as CPython's parser does.
+    fn check_assign_target(&self, target: &Expr) -> Result<(), ParseError> {
+        match Self::find_invalid_target(target, false) {
+            Some((offender, nested)) => Err(self.assign_target_error(offender, nested)),
+            None => Ok(()),
+        }
+    }
+
     /// Expect the `:` between a dict key and value. A `=` here gets
     /// CPython's "cannot assign to X here. Maybe you meant '==' instead
     /// of '='?", anchored at the key.
@@ -199,6 +300,83 @@ impl<'src> Parser<'src> {
             self.skip_trivia_and_newlines();
         }
         Ok(Module { body })
+    }
+
+    /// CPython's `eval` start rule: `expressions NEWLINE* ENDMARKER`.
+    /// See [`parse_eval`] for why this bypasses the statement grammar.
+    fn parse_eval_module(&mut self) -> Result<Module, ParseError> {
+        self.skip_trivia_and_newlines();
+        if matches!(self.peek(), TokenKind::Indent) {
+            return Err(ParseError::Indentation {
+                span: self.peek_token().span,
+                message: "unexpected indent".to_owned(),
+            });
+        }
+        let first = self.parse_eval_element()?;
+        let start_span = first.span;
+        let expr = if self.check(&TokenKind::Comma) {
+            let mut items = vec![first];
+            while self.eat(&TokenKind::Comma) {
+                if matches!(self.peek(), TokenKind::Newline | TokenKind::Endmarker) {
+                    break;
+                }
+                items.push(self.parse_eval_element()?);
+            }
+            let end_span = items.last().expect("nonempty").span;
+            Expr {
+                kind: ExprKind::Tuple(items),
+                span: start_span.merge(end_span),
+            }
+        } else {
+            first
+        };
+        self.skip_trivia_and_newlines();
+        if !matches!(self.peek(), TokenKind::Endmarker) {
+            // The first token the eval rule can't accept: the `=` of an
+            // assignment, a `;`, a stray second expression, … — always
+            // pegen's bare "invalid syntax", anchored at that token.
+            return Err(ParseError::Unexpected {
+                span: self.peek_token().span,
+                message: "invalid syntax".to_owned(),
+            });
+        }
+        let span = expr.span;
+        Ok(Module {
+            body: vec![Stmt {
+                kind: StmtKind::Expr(expr),
+                span,
+            }],
+        })
+    }
+
+    /// One element of the eval rule's `expressions` list — CPython's
+    /// `expression`: a ternary or lambda, with no starred form, no
+    /// `yield`, and no top-level walrus.
+    fn parse_eval_element(&mut self) -> Result<Expr, ParseError> {
+        // `yield`/`*` have no `expression` production; statement keywords
+        // (`del`, `import`, `pass`, …) can't start an expression at all.
+        // All get pegen's bare "invalid syntax" at the offending token.
+        if matches!(self.peek(), TokenKind::Star)
+            || self.at_keyword(Keyword::Yield)
+            || !self.at_expression_start()
+        {
+            return Err(ParseError::Unexpected {
+                span: self.peek_token().span,
+                message: "invalid syntax".to_owned(),
+            });
+        }
+        // No walrus either: consume just the name so the caller's
+        // terminator check reports "invalid syntax" at the `:=` itself.
+        if matches!(self.peek(), TokenKind::Name)
+            && matches!(self.peek_at(1), Some(TokenKind::ColonEqual))
+        {
+            let tok = self.bump();
+            return Ok(Expr {
+                kind: ExprKind::Name(self.ident(tok.span)),
+                span: tok.span,
+            });
+        }
+        self.parse_ternary()
     }
 
     fn parse_statement(&mut self) -> Result<Stmt, ParseError> {
@@ -521,6 +699,21 @@ impl<'src> Parser<'src> {
 
         // Augmented assignment.
         if let Some(op) = self.try_aug_op() {
+            // CPython (`invalid_augmented_assignment`): only a single
+            // Name / Attribute / Subscript may be augmented — container
+            // targets are illegal here too.
+            if !matches!(
+                &first.kind,
+                ExprKind::Name(_) | ExprKind::Attribute { .. } | ExprKind::Subscript { .. }
+            ) {
+                return Err(ParseError::Unexpected {
+                    span: first.span,
+                    message: format!(
+                        "'{}' is an illegal expression for augmented assignment",
+                        crate::ast::expr_name(&first)
+                    ),
+                });
+            }
             let value = self.parse_expression_list(true)?;
             let end = self.prev_token_span();
             self.consume_stmt_end()?;
@@ -536,6 +729,30 @@ impl<'src> Parser<'src> {
 
         // Annotated assignment: `target: annotation = value` (or just `target: annotation`).
         if self.check(&TokenKind::Colon) {
+            // CPython (`invalid_ann_assign_target`): a single Name /
+            // Attribute / Subscript only; tuples and lists get their own
+            // message, everything else is an illegal annotation target.
+            match &first.kind {
+                ExprKind::Name(_) | ExprKind::Attribute { .. } | ExprKind::Subscript { .. } => {}
+                ExprKind::Tuple(_) => {
+                    return Err(ParseError::Unexpected {
+                        span: first.span,
+                        message: "only single target (not tuple) can be annotated".to_owned(),
+                    });
+                }
+                ExprKind::List(_) => {
+                    return Err(ParseError::Unexpected {
+                        span: first.span,
+                        message: "only single target (not list) can be annotated".to_owned(),
+                    });
+                }
+                _ => {
+                    return Err(ParseError::Unexpected {
+                        span: first.span,
+                        message: "illegal target for annotation".to_owned(),
+                    });
+                }
+            }
             self.bump();
             let annotation = self.parse_expression(false)?;
             let value = if self.eat(&TokenKind::Equal) {
@@ -559,6 +776,12 @@ impl<'src> Parser<'src> {
         if self.check(&TokenKind::Equal) {
             let mut targets = vec![first];
             while self.eat(&TokenKind::Equal) {
+                // Every completed target must be assignable — CPython
+                // validates this in the grammar, so `ast.parse` (no
+                // compile step) rejects `f(x) = 1` too.
+                if let Some(t) = targets.last() {
+                    self.check_assign_target(t)?;
+                }
                 // Peek-parse the right-hand side as expression list;
                 // re-classify if another `=` follows.
                 let next = self.parse_expression_list(true)?;
@@ -955,7 +1178,13 @@ impl<'src> Parser<'src> {
         let context_expr = self.parse_expression(false)?;
         let optional_vars = if self.at_keyword(Keyword::As) {
             self.bump();
-            Some(self.parse_unary()?)
+            let target = self.parse_unary()?;
+            // CPython (`invalid_with_item`): the `as` target is validated
+            // at parse time with the bare "cannot assign to X" message.
+            if let Some((offender, _)) = Self::find_invalid_target(&target, false) {
+                return Err(self.assign_target_error(offender, true));
+            }
+            Some(target)
         } else {
             None
         };
@@ -1189,6 +1418,11 @@ impl<'src> Parser<'src> {
         // `for i in xs` is mis-read as `for (i in xs)`. Use the
         // sub-comparison level.
         let target = self.parse_target_list_no_tuple()?;
+        // CPython (`invalid_for_target`): the loop target is validated at
+        // parse time, always with the bare "cannot assign to X" message.
+        if let Some((offender, _)) = Self::find_invalid_target(&target, false) {
+            return Err(self.assign_target_error(offender, true));
+        }
         if !self.at_keyword(Keyword::In) {
             return Err(ParseError::Unexpected {
                 span: self.peek_token().span,
@@ -1377,6 +1611,32 @@ impl<'src> Parser<'src> {
                 break;
             }
             targets.push(self.parse_ternary()?);
+        }
+        // CPython (`invalid_del_stmt`): del targets are validated at parse
+        // time — "cannot delete X" for anything but a name / attribute /
+        // subscript / container of those. Unlike assignment, a starred
+        // element is *never* deletable ("cannot delete starred").
+        fn find_undeletable(e: &Expr) -> Option<&Expr> {
+            match &e.kind {
+                ExprKind::Name(_) | ExprKind::Attribute { .. } | ExprKind::Subscript { .. } => None,
+                ExprKind::Tuple(items) | ExprKind::List(items) => {
+                    items.iter().find_map(find_undeletable)
+                }
+                _ => Some(e),
+            }
+        }
+        for t in &targets {
+            if let Some(offender) = find_undeletable(t) {
+                let name = if matches!(&offender.kind, ExprKind::Starred(_)) {
+                    "starred"
+                } else {
+                    crate::ast::expr_name(offender)
+                };
+                return Err(ParseError::Unexpected {
+                    span: offender.span,
+                    message: format!("cannot delete {name}"),
+                });
+            }
         }
         let end = self.prev_token_span();
         self.consume_stmt_end()?;
@@ -3165,6 +3425,12 @@ impl<'src> Parser<'src> {
             };
             self.bump();
             let target = self.parse_target_list_no_tuple()?;
+            // CPython (`invalid_comprehension` / `invalid_for_target`):
+            // comprehension targets get the same parse-time validation as
+            // statement `for` targets (bare message).
+            if let Some((offender, _)) = Self::find_invalid_target(&target, false) {
+                return Err(self.assign_target_error(offender, true));
+            }
             if !self.at_keyword(Keyword::In) {
                 return Err(ParseError::Unexpected {
                     span: self.peek_token().span,

@@ -14,6 +14,7 @@
 //! host, so CI on a bare machine still passes.
 
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard};
 
 use weavepy_capi::loader::load_extension_module;
 use weavepy_vm::object::Object;
@@ -38,7 +39,21 @@ fn lookup(module: &Object, key: &str) -> Option<Object> {
     None
 }
 
-fn load() -> Option<(Interpreter, Object)> {
+/// Serialize the tests in this binary. Each test constructs its own
+/// `Interpreter`, but the C-API bridge keeps *process-global* state (the
+/// `LAST_INTERPRETER` fallback pointer, the shared dlopen'd extension's
+/// static state), so libtest's default parallel execution can route a
+/// re-entrant C-API call into a different test's interpreter mid-run. The
+/// guard is returned by the loader and held for the whole test.
+fn serialize() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    // A poisoned lock only means another test's assertion failed while
+    // holding it — the serialization itself is still valid.
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn load() -> Option<(MutexGuard<'static, ()>, Interpreter, Object)> {
+    let guard = serialize();
     let path = extension_path()?;
     if !path.is_file() {
         eprintln!(
@@ -51,7 +66,7 @@ fn load() -> Option<(Interpreter, Object)> {
     let mut interp = Interpreter::default();
     let interp_ptr: *mut Interpreter = &raw mut interp;
     match load_extension_module(interp_ptr, &path, "_stockabi") {
-        Ok(m) => Some((interp, m)),
+        Ok(m) => Some((guard, interp, m)),
         Err(err) => {
             eprintln!("dlopen of stock-ABI extension failed (treating as skip): {err}");
             None
@@ -75,7 +90,7 @@ fn stockabi_skipped_when_extension_missing() {
 
 #[test]
 fn stockabi_module_loads_with_constants() {
-    let Some((_interp, module)) = load() else {
+    let Some((_lock, _interp, module)) = load() else {
         return;
     };
     match lookup(&module, "ANSWER") {
@@ -93,7 +108,7 @@ fn stockabi_module_loads_with_constants() {
 /// float mirror.
 #[test]
 fn stockabi_inlined_float_read() {
-    let Some((mut interp, module)) = load() else {
+    let Some((_lock, mut interp, module)) = load() else {
         return;
     };
     match call(&mut interp, &module, "double_it", &[Object::Float(2.5)]) {
@@ -105,7 +120,7 @@ fn stockabi_inlined_float_read() {
 /// Inlined `Py_SIZE` reads `ob_size` off a faithful tuple mirror.
 #[test]
 fn stockabi_inlined_size_read() {
-    let Some((mut interp, module)) = load() else {
+    let Some((_lock, mut interp, module)) = load() else {
         return;
     };
     let t = Object::new_tuple(vec![Object::Int(1), Object::Int(2), Object::Int(3)]);
@@ -118,7 +133,7 @@ fn stockabi_inlined_size_read() {
 /// Inlined `PyTuple_GET_ITEM` reads the faithful `ob_item[]` tail.
 #[test]
 fn stockabi_inlined_tuple_item_read() {
-    let Some((mut interp, module)) = load() else {
+    let Some((_lock, mut interp, module)) = load() else {
         return;
     };
     let t = Object::new_tuple(vec![Object::Int(10), Object::Int(20)]);
@@ -141,7 +156,7 @@ fn stockabi_inlined_tuple_item_read() {
 /// `Py_TYPE(o) == &PyFloat_Type` / `&PyLong_Type` across the boundary.
 #[test]
 fn stockabi_type_identity() {
-    let Some((mut interp, module)) = load() else {
+    let Some((_lock, mut interp, module)) = load() else {
         return;
     };
     assert!(matches!(
@@ -165,7 +180,7 @@ fn stockabi_type_identity() {
 /// Head-poke `Py_INCREF` + ownership transfer (`roundtrip`).
 #[test]
 fn stockabi_roundtrip_incref() {
-    let Some((mut interp, module)) = load() else {
+    let Some((_lock, mut interp, module)) = load() else {
         return;
     };
     match call(&mut interp, &module, "roundtrip", &[Object::Int(99)]) {
@@ -177,7 +192,7 @@ fn stockabi_roundtrip_incref() {
 /// Function-API constructors / arg parsing / `Py_BuildValue`.
 #[test]
 fn stockabi_function_api() {
-    let Some((mut interp, module)) = load() else {
+    let Some((_lock, mut interp, module)) = load() else {
         return;
     };
     match call(
@@ -231,7 +246,7 @@ fn stockabi_function_api() {
 /// calls `_Py_Dealloc` → `tp_dealloc` (offset 48) → frees the mirror.
 #[test]
 fn stockabi_c_side_dealloc() {
-    let Some((mut interp, module)) = load() else {
+    let Some((_lock, mut interp, module)) = load() else {
         return;
     };
     match call(&mut interp, &module, "alloc_free_cycle", &[]) {

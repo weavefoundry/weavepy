@@ -61,10 +61,10 @@ def test_skip_xfail_markers():
     def _xfailed():
         raise AssertionError('expected fail')
 
-    # Markers are stored in `_pytest_marks` for the runner to consume;
+    # Markers are stored in `pytestmark` for the runner to consume;
     # asserting they're attached is enough.
-    assert_true(any(m.name == 'skip' for m in _skipped._pytest_marks))
-    assert_true(any(m.name == 'xfail' for m in _xfailed._pytest_marks))
+    assert_true(any(m.name == 'skip' for m in _skipped.pytestmark))
+    assert_true(any(m.name == 'xfail' for m in _xfailed.pytestmark))
 
 
 def test_fixture_decorator():

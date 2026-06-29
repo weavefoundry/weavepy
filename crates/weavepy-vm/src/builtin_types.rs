@@ -357,7 +357,7 @@ impl BuiltinTypes {
         }
         install_field_defaults(&attribute_error, &["name", "obj"]);
         install_field_defaults(&name_error, &["name"]);
-        install_field_defaults(&import_error, &["name", "path", "name_from"]);
+        install_field_defaults(&import_error, &["msg", "name", "path", "name_from"]);
         install_import_error_init(&import_error);
         let os_error = exc("OSError", exception.clone());
         install_os_error_init(&os_error);
@@ -456,7 +456,7 @@ impl BuiltinTypes {
         let exception_group = TypeObject::new_with_flags(
             "ExceptionGroup",
             vec![base_exception_group.clone(), exception.clone()],
-            DictData::new(),
+            DictData::default(),
             crate::types::TypeFlags {
                 is_exception: true,
                 is_builtin: true,
@@ -652,6 +652,10 @@ impl BuiltinTypes {
             pair!(name_error, "NameError"),
             pair!(not_implemented_error, "NotImplementedError"),
             pair!(os_error, "OSError"),
+            // `IOError` and `EnvironmentError` are the same object as `OSError`
+            // in Python 3 (`IOError is OSError`), kept as builtin aliases.
+            pair!(os_error, "IOError"),
+            pair!(os_error, "EnvironmentError"),
             pair!(overflow_error, "OverflowError"),
             pair!(floating_point_error, "FloatingPointError"),
             pair!(runtime_error, "RuntimeError"),
@@ -750,7 +754,7 @@ impl BuiltinTypes {
             "LookupError" => Some(self.lookup_error.clone()),
             "NameError" => Some(self.name_error.clone()),
             "NotImplementedError" => Some(self.not_implemented_error.clone()),
-            "OSError" => Some(self.os_error.clone()),
+            "OSError" | "IOError" | "EnvironmentError" => Some(self.os_error.clone()),
             "OverflowError" => Some(self.overflow_error.clone()),
             "FloatingPointError" => Some(self.floating_point_error.clone()),
             "RuntimeError" => Some(self.runtime_error.clone()),
@@ -826,7 +830,7 @@ pub fn property_class() -> Rc<TypeObject> {
             return c.clone();
         }
         let bt = builtin_types();
-        let cls = TypeObject::new_user("property", vec![bt.object_.clone()], DictData::new())
+        let cls = TypeObject::new_user("property", vec![bt.object_.clone()], DictData::default())
             .expect("property type");
         *slot.borrow_mut() = Some(cls.clone());
         cls
@@ -960,6 +964,21 @@ pub fn make_unicode_encode_error(
     end: usize,
     reason: &str,
 ) -> Object {
+    make_unicode_encode_error_obj(encoding, Object::from_str(object), start, end, reason)
+}
+
+/// [`make_unicode_encode_error`] with the failing text as an `Object`, so a
+/// surrogate-carrying [`Object::WStr`] survives into the exception's
+/// `.object` attribute (a Rust `&str` cannot hold a lone surrogate) and the
+/// rendered message names the real offending code point (`'\udac0'`, not the
+/// `'\ufffd'` a lossy conversion would show).
+pub fn make_unicode_encode_error_obj(
+    encoding: &str,
+    object: Object,
+    start: usize,
+    end: usize,
+    reason: &str,
+) -> Object {
     use crate::types::PyInstance;
     let bt = builtin_types();
     let class = bt
@@ -967,7 +986,7 @@ pub fn make_unicode_encode_error(
         .unwrap_or_else(|| bt.value_error.clone());
     let inst = PyInstance::new(class);
     let enc = Object::from_str(encoding);
-    let obj = Object::from_str(object);
+    let obj = object;
     let start_o = Object::Int(start as i64);
     let end_o = Object::Int(end as i64);
     let reason_o = Object::from_str(reason);
@@ -1069,7 +1088,7 @@ fn concrete_elements(obj: &Object) -> Option<Vec<Object>> {
                 .collect(),
         ),
         // A subclass instance wrapping a concrete native container.
-        Object::Instance(inst) => inst.native.as_ref().and_then(concrete_elements),
+        Object::Instance(inst) => inst.native.get().and_then(concrete_elements),
         _ => None,
     }
 }
@@ -1178,7 +1197,7 @@ fn native_seed_for_new(cls: &Rc<TypeObject>, value: Option<&Object>) -> Option<O
         return Some(Object::new_set_from(Vec::<Object>::new()));
     }
     if is_strict(&bt.dict_) {
-        return Some(Object::Dict(Rc::new(RefCell::new(DictData::new()))));
+        return Some(Object::Dict(Rc::new(RefCell::new(DictData::default()))));
     }
     None
 }
@@ -1672,7 +1691,7 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
                 // CPython's tp_new/tp_init for those types aren't
                 // `object_new`/`object_init`, so the strict arity
                 // policy doesn't apply.
-                if inst.native.is_none() {
+                if inst.native.get().is_none() {
                     if overrides_dunder_init(cls) {
                         // An overriding `__init__` delegated here
                         // (`super().__init__(*args)`) — blame object.__init__.
@@ -2578,12 +2597,16 @@ fn install_unicode_error_dunders(ty: &Rc<TypeObject>, kind: UnicodeErrorKind) {
 
         let msg = match kind {
             UnicodeErrorKind::Encode => {
-                let s: Vec<char> = match &obj {
-                    Object::Str(s) => s.chars().collect(),
+                let s: Vec<u32> = match &obj {
+                    Object::Str(s) => s.chars().map(|c| c as u32).collect(),
+                    // A WStr carries the lone surrogate the encode
+                    // rejected; the message must show it verbatim
+                    // (CPython: "can't encode character '\udac0'").
+                    Object::WStr(cps) => cps.to_vec(),
                     _ => Vec::new(),
                 };
                 if start >= 0 && (start as usize) < s.len() && end == start + 1 {
-                    let c = s[start as usize] as u32;
+                    let c = s[start as usize];
                     format!(
                         "'{encoding}' codec can't encode character '{}' in position {start}: {reason}",
                         escape(c)
@@ -2872,10 +2895,16 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
                     [single] => {
                         if is_key_error {
                             Object::from_str(single.repr())
-                        } else if matches!(single, Object::Instance(_)) {
-                            // A nested exception (or other instance) needs
-                            // its own __str__ dispatched: CPython's
-                            // BaseException.__str__ is `str(args[0])`.
+                        } else if matches!(single, Object::Instance(_) | Object::Foreign(_)) {
+                            // A nested exception, other instance, or a
+                            // *foreign* extension object (e.g. a numpy
+                            // scalar) needs its own `__str__`/`tp_str`
+                            // dispatched: CPython's `BaseException.__str__`
+                            // is `str(args[0])`, not `repr`. Without this a
+                            // `OutOfBoundsTimedelta(np.timedelta64(...))`
+                            // stringified to its repr
+                            // (`np.timedelta64(...,'h')`) instead of
+                            // `"... hours"`.
                             Object::from_str(
                                 crate::builtins::str_reentrant(single)
                                     .unwrap_or_else(|| single.to_str()),
@@ -3055,7 +3084,7 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
         // GH-103352: AttributeError deliberately drops `obj` from its
         // pickled state (it may be huge or unpicklable).
         let skip_obj = is_subclass_by_name(&cls, "AttributeError");
-        let mut state = crate::object::DictData::new();
+        let mut state = crate::object::DictData::default();
         for (k, v) in dict.iter() {
             if let Object::Str(s) = &k.0 {
                 if SKIP.contains(&s.as_ref()) || (skip_obj && s.as_ref() == "obj") {
@@ -3147,6 +3176,7 @@ pub fn make_exception_with_class(class: Rc<TypeObject>, message: impl Into<Strin
     let is_os = is_subclass_by_name(&class, "OSError");
     let is_syntax = is_subclass_by_name(&class, "SyntaxError");
     let is_stop_iteration = is_subclass_by_name(&class, "StopIteration");
+    let is_import = is_subclass_by_name(&class, "ImportError");
     let inst = PyInstance::new(class);
     let msg = Object::from_str(message);
     // A messageless raise (`StopIteration()`, `GeneratorExit()`, …)
@@ -3191,6 +3221,18 @@ pub fn make_exception_with_class(class: Rc<TypeObject>, message: impl Into<Strin
             for name in ["errno", "strerror", "filename", "winerror", "filename2"] {
                 dict.insert(DictKey(Object::from_static(name)), Object::None);
             }
+        }
+        if is_import {
+            // ImportError/ModuleNotFoundError expose `msg` (the message
+            // string). CPython always defines the slot; a Rust-raised
+            // ImportError must answer `.msg` so consumers (e.g. numpy's
+            // `_core/__init__` error handling, which reads `exc.msg`) don't
+            // AttributeError. `name`/`path`/`name_from` are intentionally
+            // *not* pre-set on the instance here so the import machinery's
+            // `set_exception_attr` (which skips already-present keys) can
+            // still populate the real module name; their type-level
+            // defaults keep attribute access from raising in the meantime.
+            dict.insert(DictKey(Object::from_static("msg")), msg.clone());
         }
         if is_syntax {
             // SyntaxError exposes `msg` plus a location payload. CPython
@@ -3905,7 +3947,7 @@ fn install_mutable_container_init(bt: &BuiltinTypes) {
     fn self_payload(args: &[Object]) -> Result<Object, RuntimeError> {
         match args.first() {
             Some(o @ (Object::Dict(_) | Object::List(_) | Object::Set(_))) => Ok(o.clone()),
-            Some(Object::Instance(inst)) => match &inst.native {
+            Some(Object::Instance(inst)) => match inst.native.get() {
                 Some(n @ (Object::Dict(_) | Object::List(_) | Object::Set(_))) => Ok(n.clone()),
                 _ => Err(crate::error::type_error(
                     "descriptor '__init__' requires a container instance".to_owned(),
@@ -4117,8 +4159,26 @@ fn install_numeric_class_methods(bt: &BuiltinTypes) {
             .borrow_mut()
             .insert(DictKey(Object::from_static(name)), cm);
     }
+    // Same, but for a classmethod that accepts keyword arguments
+    // (`int.from_bytes(b, byteorder='big', *, signed=False)`).
+    fn install_kw(
+        ty: &Rc<TypeObject>,
+        name: &'static str,
+        f: fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError>,
+    ) {
+        let builtin = Object::Builtin(Rc::new(BuiltinFn {
+            name,
+            binds_instance: true,
+            call: Box::new(move |args| f(args, &[])),
+            call_kw: Some(Box::new(f)),
+        }));
+        let cm = Object::ClassMethod(MethodWrapper::new(builtin));
+        ty.dict
+            .borrow_mut()
+            .insert(DictKey(Object::from_static(name)), cm);
+    }
 
-    install(
+    install_kw(
         &bt.int_,
         "from_bytes",
         crate::builtins::b_int_from_bytes_cls,
@@ -4149,7 +4209,7 @@ fn install_numeric_class_methods(bt: &BuiltinTypes) {
             // Unwrap an int/str/… subclass instance to the primitive it wraps
             // so the hash is computed on the value, bypassing the override.
             let target = match obj {
-                Object::Instance(inst) => inst.native.as_ref().unwrap_or(obj),
+                Object::Instance(inst) => inst.native.get().unwrap_or(obj),
                 other => other,
             };
             crate::builtins::hash_object(target)
@@ -4224,7 +4284,38 @@ fn install_numeric_class_methods(bt: &BuiltinTypes) {
             ))),
         }
     }
+    // CPython's `float.__int__` truncates toward zero, raising on non-finite
+    // values (`ValueError` for NaN, `OverflowError` for ±inf). Faithful via a
+    // bigint so magnitudes past the i64 range convert exactly.
+    fn float_as_int(args: &[Object]) -> Result<Object, RuntimeError> {
+        let o = args
+            .first()
+            .ok_or_else(|| crate::error::type_error("__int__ requires an argument"))?;
+        let native = o.native_value();
+        match native.as_ref().unwrap_or(o) {
+            Object::Float(f) => {
+                if f.is_nan() {
+                    return Err(crate::error::value_error(
+                        "cannot convert float NaN to integer",
+                    ));
+                }
+                if f.is_infinite() {
+                    return Err(crate::error::overflow_error(
+                        "cannot convert float infinity to integer",
+                    ));
+                }
+                Ok(Object::int_from_bigint(
+                    crate::object::bigint_from_f64_trunc(f.trunc()),
+                ))
+            }
+            other => Err(crate::error::type_error(format!(
+                "descriptor '__int__' requires a 'float' object but received a '{}'",
+                other.type_name()
+            ))),
+        }
+    }
     install_method(&bt.int_, "__int__", self_as_int);
     install_method(&bt.int_, "__index__", self_as_int);
     install_method(&bt.float_, "__float__", self_as_float);
+    install_method(&bt.float_, "__int__", float_as_int);
 }

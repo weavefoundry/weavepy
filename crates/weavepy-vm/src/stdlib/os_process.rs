@@ -1556,7 +1556,7 @@ fn os_device_encoding(_args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn environb_snapshot() -> Object {
-    let mut d = DictData::new();
+    let mut d = DictData::default();
     for (k, v) in std::env::vars_os() {
         let kb = os_str_bytes(&k);
         let vb = os_str_bytes(&v);

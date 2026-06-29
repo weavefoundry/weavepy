@@ -22,7 +22,7 @@ use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
 use crate::types::{PyInstance, TypeFlags, TypeObject};
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -309,7 +309,7 @@ fn compressor_class() -> Rc<TypeObject> {
     static CLS: OnceLock<Rc<TypeObject>> = OnceLock::new();
     CLS.get_or_init(|| {
         let bt = crate::builtin_types::builtin_types();
-        let mut dict = DictData::new();
+        let mut dict = DictData::default();
         class_method_kw(&mut dict, "__init__", compressor_init);
         class_method(&mut dict, "compress", compressor_compress);
         class_method(&mut dict, "flush", compressor_flush);
@@ -334,7 +334,7 @@ fn decompressor_class() -> Rc<TypeObject> {
     static CLS: OnceLock<Rc<TypeObject>> = OnceLock::new();
     CLS.get_or_init(|| {
         let bt = crate::builtin_types::builtin_types();
-        let mut dict = DictData::new();
+        let mut dict = DictData::default();
         class_method_kw(&mut dict, "__init__", decompressor_init);
         class_method_kw(&mut dict, "decompress", decompressor_decompress);
         class_method(&mut dict, "__reduce__", bz_no_pickle);

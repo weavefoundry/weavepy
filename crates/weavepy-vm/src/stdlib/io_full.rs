@@ -182,7 +182,7 @@ fn install_closed_getset(ty: &Rc<TypeObject>) {
 // protocol-only class stays a one-liner.
 #[allow(dead_code)]
 fn make_protocol(name: &'static str, bases: Vec<Rc<TypeObject>>) -> Rc<TypeObject> {
-    let mut td = DictData::new();
+    let mut td = DictData::default();
     // Default abstract methods — concrete impls supply real bodies.
     for stub_name in [
         "read",

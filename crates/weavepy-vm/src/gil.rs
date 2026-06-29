@@ -488,6 +488,12 @@ pub fn is_main_thread() -> bool {
     main == 0 || main == current_thread_id()
 }
 
+/// The recorded main-thread OS id (0 if never marked). The main
+/// thread's public ident (`threading.get_ident()`) is this value.
+pub fn main_thread_id() -> u64 {
+    MAIN_THREAD_ID.load(Ordering::Acquire)
+}
+
 // RFC 0025: a thread-local stack of `GilGuard`s, owned per-OS-thread.
 // Both the C-API's `PyGILState_Ensure` / `PyEval_SaveThread` and the
 // VM's worker-thread entry pre-push their guard here so any Rust
@@ -710,6 +716,18 @@ fn maybe_yield_gil() {
     if no_yield_active() {
         return;
     }
+    // RFC 0047 (wave 5): the general form of the same inversion. Any
+    // live `GilCell` borrow on this thread (a Rust frame holding a
+    // container's cell mutex while re-entering the eval loop — repr,
+    // a dunder dispatched from `Object::len`, mirror seeding, …) must
+    // block the hand-off: the next GIL holder can touch the same cell
+    // and park on its mutex forever while we park waiting for the GIL
+    // (pandas' multi-thread `read_csv` wedge). At the *outermost*
+    // checkpoint no borrows are live, so normal preemption is
+    // unaffected.
+    if crate::sync::cell_guards_live() {
+        return;
+    }
     let gil = global_gil();
     if gil.breaker.waiter_count() == 0 {
         return;
@@ -797,6 +815,57 @@ pub fn current_thread_id() -> u64 {
         std::thread::current().id().hash(&mut h);
         h.finish()
     }
+}
+
+// ---------------------------------------------------------------------------
+// PyThreadState_SetAsyncExc — cross-thread asynchronous exceptions.
+//
+// The C API's async-exc gimmick (used by test_threading via
+// ctypes.pythonapi): schedule an exception *class* to be raised in
+// another thread's eval loop at its next safe point. The store maps
+// the public thread ident (`threading.get_ident()`'s value — the
+// synthetic worker id, or the native id for the main thread) to the
+// pending exception object. The dispatch loop probes
+// [`async_exc_pending`] (one relaxed load) every instruction and only
+// takes the map lock when something is scheduled somewhere.
+// ---------------------------------------------------------------------------
+
+static ASYNC_EXC_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn async_exc_map() -> &'static Mutex<std::collections::HashMap<u64, crate::object::Object>> {
+    static MAP: std::sync::OnceLock<Mutex<std::collections::HashMap<u64, crate::object::Object>>> =
+        std::sync::OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Schedule (`Some`) or clear (`None`) a pending async exception for
+/// the thread with public ident `ident`. Mirrors CPython's
+/// "replace any previously pending exception" semantics.
+pub fn set_async_exc(ident: u64, exc: Option<crate::object::Object>) {
+    let mut m = async_exc_map().lock();
+    if m.remove(&ident).is_some() {
+        ASYNC_EXC_COUNT.fetch_sub(1, Ordering::AcqRel);
+    }
+    if let Some(e) = exc {
+        m.insert(ident, e);
+        ASYNC_EXC_COUNT.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Hot-path probe: is *any* async exception scheduled process-wide?
+#[inline]
+pub fn async_exc_pending() -> bool {
+    ASYNC_EXC_COUNT.load(Ordering::Relaxed) != 0
+}
+
+/// Remove and return the pending async exception for `ident`, if any.
+pub fn take_async_exc(ident: u64) -> Option<crate::object::Object> {
+    let mut m = async_exc_map().lock();
+    let v = m.remove(&ident);
+    if v.is_some() {
+        ASYNC_EXC_COUNT.fetch_sub(1, Ordering::AcqRel);
+    }
+    v
 }
 
 /// Alias for [`current_thread_id`]. Reserved name so RFC 0025

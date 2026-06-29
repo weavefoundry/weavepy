@@ -29,7 +29,7 @@ use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -169,10 +169,16 @@ fn arg_codec_name(args: &[Object], idx: usize, name: &str) -> Result<String, Run
 }
 
 fn arg_bytes(args: &[Object], idx: usize, name: &str) -> Result<Vec<u8>, RuntimeError> {
+    let _ = name;
     match args.get(idx) {
-        Some(o) => o
-            .as_bytes_view()
-            .ok_or_else(|| type_error(format!("{name}() argument {} must be bytes-like", idx + 1))),
+        // Argument-clinic `Py_buffer` converter wording (`codecs.utf_8_decode("x")`
+        // → "a bytes-like object is required, not 'str'").
+        Some(o) => o.as_bytes_view().ok_or_else(|| {
+            type_error(format!(
+                "a bytes-like object is required, not '{}'",
+                o.type_name()
+            ))
+        }),
         None => Err(type_error(format!("{name}() missing argument {}", idx + 1))),
     }
 }
@@ -562,14 +568,16 @@ fn encode_utf32_codepoints(
 }
 
 /// `UnicodeEncodeError` for a lone surrogate at `pos` in a code-point sequence.
-/// The `.object` attribute uses a lossy text view (a Rust `String` cannot hold
-/// the surrogate); the type/positions/reason match CPython.
+/// The `.object` attribute keeps the surrogate-bearing `WStr` so the message
+/// names the real offending code point; type/positions/reason match CPython.
 fn surrogate_encode_error(encoding: &str, cps: &[u32], pos: usize) -> RuntimeError {
-    let lossy: String = cps
-        .iter()
-        .map(|&c| char::from_u32(c).unwrap_or('\u{FFFD}'))
-        .collect();
-    crate::error::unicode_encode_error(encoding, &lossy, pos, pos + 1, "surrogates not allowed")
+    crate::error::unicode_encode_error_obj(
+        encoding,
+        Object::WStr(cps.into()),
+        pos,
+        pos + 1,
+        "surrogates not allowed",
+    )
 }
 
 /// Decode bytes to a string `Object`, producing a surrogate-bearing [`WStr`]
@@ -1029,6 +1037,7 @@ fn encode_special(s: &str, encoding: &str, errors: &str) -> Result<Option<Vec<u8
         "rawunicodeescape" => Some(encode_raw_unicode_escape(s)),
         "unicodeescape" => Some(encode_unicode_escape(s)),
         "cp437" | "437" | "ibm437" => Some(encode_cp437(s, errors)?),
+        "cp1252" | "windows1252" | "1252" => Some(encode_cp1252(s, errors)?),
         "utf7" => Some(encode_utf7(s)),
         _ => None,
     })
@@ -1058,6 +1067,7 @@ fn decode_special(
         "rawunicodeescape" => Some(decode_raw_unicode_escape(bytes)?),
         "unicodeescape" => Some(decode_unicode_escape(bytes)?),
         "cp437" | "437" | "ibm437" => Some(decode_cp437(bytes)),
+        "cp1252" | "windows1252" | "1252" => Some(decode_cp1252(bytes, errors)?),
         "utf7" => Some(decode_utf7(bytes, errors)?),
         _ => None,
     })
@@ -1110,6 +1120,219 @@ fn encode_cp437(s: &str, errors: &str) -> Result<Vec<u8>, RuntimeError> {
             match errors {
                 "ignore" => {}
                 "replace" => out.push(b'?'),
+                _ => {
+                    return Err(crate::error::unicode_encode_error(
+                        "charmap",
+                        s,
+                        i,
+                        i + 1,
+                        "character maps to <undefined>",
+                    ))
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+// ---------- cp1252 (Windows-1252, strict charmap) ----------
+//
+// `encoding_rs` implements the *WHATWG* windows-1252 index, which fills the five
+// positions CPython leaves undefined (0x81, 0x8D, 0x8F, 0x90, 0x9D) with the C1
+// control code points — so `'\x9d'.encode('cp1252')` there silently round-trips
+// instead of raising. CPython's `Lib/encodings/cp1252.py` is a strict charmap
+// with those five slots unmapped; reproduce it exactly (both directions, with
+// the built-in error handlers) so `Series.str.encode/decode('cp1252', errors=…)`
+// matches. The codec name in the raised error is `'charmap'`, like CPython.
+
+/// Upper half (0x80..=0xFF) of Windows code page 1252, from CPython's
+/// `Lib/encodings/cp1252.py` decoding table. `None` marks the five
+/// positions (0x81, 0x8D, 0x8F, 0x90, 0x9D) that CPython leaves undefined
+/// (WHATWG windows-1252, used by `encoding_rs`, wrongly maps them to the
+/// C1 controls, so `'\x9d'.encode('cp1252')` must not silently round-trip).
+const CP1252_HIGH: [Option<char>; 128] = [
+    Some('\u{20AC}'),
+    None,
+    Some('\u{201A}'),
+    Some('\u{0192}'),
+    Some('\u{201E}'),
+    Some('\u{2026}'),
+    Some('\u{2020}'),
+    Some('\u{2021}'),
+    Some('\u{02C6}'),
+    Some('\u{2030}'),
+    Some('\u{0160}'),
+    Some('\u{2039}'),
+    Some('\u{0152}'),
+    None,
+    Some('\u{017D}'),
+    None,
+    None,
+    Some('\u{2018}'),
+    Some('\u{2019}'),
+    Some('\u{201C}'),
+    Some('\u{201D}'),
+    Some('\u{2022}'),
+    Some('\u{2013}'),
+    Some('\u{2014}'),
+    Some('\u{02DC}'),
+    Some('\u{2122}'),
+    Some('\u{0161}'),
+    Some('\u{203A}'),
+    Some('\u{0153}'),
+    None,
+    Some('\u{017E}'),
+    Some('\u{0178}'),
+    Some('\u{00A0}'),
+    Some('\u{00A1}'),
+    Some('\u{00A2}'),
+    Some('\u{00A3}'),
+    Some('\u{00A4}'),
+    Some('\u{00A5}'),
+    Some('\u{00A6}'),
+    Some('\u{00A7}'),
+    Some('\u{00A8}'),
+    Some('\u{00A9}'),
+    Some('\u{00AA}'),
+    Some('\u{00AB}'),
+    Some('\u{00AC}'),
+    Some('\u{00AD}'),
+    Some('\u{00AE}'),
+    Some('\u{00AF}'),
+    Some('\u{00B0}'),
+    Some('\u{00B1}'),
+    Some('\u{00B2}'),
+    Some('\u{00B3}'),
+    Some('\u{00B4}'),
+    Some('\u{00B5}'),
+    Some('\u{00B6}'),
+    Some('\u{00B7}'),
+    Some('\u{00B8}'),
+    Some('\u{00B9}'),
+    Some('\u{00BA}'),
+    Some('\u{00BB}'),
+    Some('\u{00BC}'),
+    Some('\u{00BD}'),
+    Some('\u{00BE}'),
+    Some('\u{00BF}'),
+    Some('\u{00C0}'),
+    Some('\u{00C1}'),
+    Some('\u{00C2}'),
+    Some('\u{00C3}'),
+    Some('\u{00C4}'),
+    Some('\u{00C5}'),
+    Some('\u{00C6}'),
+    Some('\u{00C7}'),
+    Some('\u{00C8}'),
+    Some('\u{00C9}'),
+    Some('\u{00CA}'),
+    Some('\u{00CB}'),
+    Some('\u{00CC}'),
+    Some('\u{00CD}'),
+    Some('\u{00CE}'),
+    Some('\u{00CF}'),
+    Some('\u{00D0}'),
+    Some('\u{00D1}'),
+    Some('\u{00D2}'),
+    Some('\u{00D3}'),
+    Some('\u{00D4}'),
+    Some('\u{00D5}'),
+    Some('\u{00D6}'),
+    Some('\u{00D7}'),
+    Some('\u{00D8}'),
+    Some('\u{00D9}'),
+    Some('\u{00DA}'),
+    Some('\u{00DB}'),
+    Some('\u{00DC}'),
+    Some('\u{00DD}'),
+    Some('\u{00DE}'),
+    Some('\u{00DF}'),
+    Some('\u{00E0}'),
+    Some('\u{00E1}'),
+    Some('\u{00E2}'),
+    Some('\u{00E3}'),
+    Some('\u{00E4}'),
+    Some('\u{00E5}'),
+    Some('\u{00E6}'),
+    Some('\u{00E7}'),
+    Some('\u{00E8}'),
+    Some('\u{00E9}'),
+    Some('\u{00EA}'),
+    Some('\u{00EB}'),
+    Some('\u{00EC}'),
+    Some('\u{00ED}'),
+    Some('\u{00EE}'),
+    Some('\u{00EF}'),
+    Some('\u{00F0}'),
+    Some('\u{00F1}'),
+    Some('\u{00F2}'),
+    Some('\u{00F3}'),
+    Some('\u{00F4}'),
+    Some('\u{00F5}'),
+    Some('\u{00F6}'),
+    Some('\u{00F7}'),
+    Some('\u{00F8}'),
+    Some('\u{00F9}'),
+    Some('\u{00FA}'),
+    Some('\u{00FB}'),
+    Some('\u{00FC}'),
+    Some('\u{00FD}'),
+    Some('\u{00FE}'),
+    Some('\u{00FF}'),
+];
+
+fn decode_cp1252(bytes: &[u8], errors: &str) -> Result<String, RuntimeError> {
+    let mut out = String::with_capacity(bytes.len());
+    for (i, &b) in bytes.iter().enumerate() {
+        let mapped = if b < 0x80 {
+            Some(b as char)
+        } else {
+            CP1252_HIGH[(b - 0x80) as usize]
+        };
+        match mapped {
+            Some(c) => out.push(c),
+            None => match errors {
+                "ignore" => {}
+                "replace" => out.push('\u{FFFD}'),
+                "backslashreplace" => out.push_str(&format!("\\x{b:02x}")),
+                _ => {
+                    return Err(crate::error::unicode_decode_error(
+                        "charmap",
+                        bytes,
+                        i,
+                        i + 1,
+                        "character maps to <undefined>",
+                    ))
+                }
+            },
+        }
+    }
+    Ok(out)
+}
+
+fn encode_cp1252(s: &str, errors: &str) -> Result<Vec<u8>, RuntimeError> {
+    let mut out = Vec::with_capacity(s.len());
+    for (i, c) in s.chars().enumerate() {
+        let cp = c as u32;
+        if cp < 0x80 {
+            out.push(cp as u8);
+        } else if let Some(pos) = CP1252_HIGH.iter().position(|&h| h == Some(c)) {
+            out.push(0x80 + pos as u8);
+        } else {
+            match errors {
+                "ignore" => {}
+                "replace" => out.push(b'?'),
+                "backslashreplace" => {
+                    let esc = if cp < 0x100 {
+                        format!("\\x{cp:02x}")
+                    } else if cp < 0x10000 {
+                        format!("\\u{cp:04x}")
+                    } else {
+                        format!("\\U{cp:08x}")
+                    };
+                    out.extend_from_slice(esc.as_bytes());
+                }
+                "xmlcharrefreplace" => out.extend_from_slice(format!("&#{cp};").as_bytes()),
                 _ => {
                     return Err(crate::error::unicode_encode_error(
                         "charmap",
@@ -1519,6 +1742,30 @@ fn encoding_key(s: &str) -> String {
         | "iso885911987" => "latin1".to_owned(),
         _ => normalised,
     }
+}
+
+/// Codecs whose encoded byte stream can embed the newline bytes `0x0A`/`0x0D`
+/// *inside* a multi-byte code unit (or encode a newline as several bytes),
+/// making raw byte-level newline scanning invalid. These are exactly the
+/// UTF-16 and UTF-32 families: a byte-backed text stream opened with one of
+/// them must find line boundaries in the *decoded* text via the incremental
+/// decoder, precisely like CPython's `TextIOWrapper`. (UTF-8, UTF-8-sig and
+/// UTF-7 are newline-*safe* — the newline bytes never appear as a
+/// continuation byte — so they keep the fast byte-scanning read path.)
+pub fn codec_is_newline_unsafe(encoding: &str) -> bool {
+    matches!(
+        encoding_key(encoding).as_str(),
+        "utf16"
+            | "utf16le"
+            | "utf16be"
+            | "u16"
+            | "unicodebigunmarked"
+            | "unicodelittleunmarked"
+            | "utf32"
+            | "utf32le"
+            | "utf32be"
+            | "u32"
+    )
 }
 
 // ---------- UTF-8 ----------

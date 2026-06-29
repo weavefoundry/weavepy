@@ -232,8 +232,21 @@ fixture-proven:
   lifecycle interaction, a foreign double-free, foreign subscript dispatch,
   and foreign `repr`/`str` slot dispatch). See RFC 0046 for the design and
   measured outcome.
-- **Wave 5.** pandas / Cython-generated extensions (the full-API,
-  heavily-macro'd Cython surface) and the manylinux/macos wheel matrix.
+- **Wave 5** (detailed in **RFC 0047**, *The Cython-generated extension
+  surface (pandas), faithful `inherit_slots`, and the manylinux/macOS/
+  musllinux wheel matrix*). The full-API, heavily-macro'd **Cython** idiom
+  pandas (and most of the wheel ecosystem) is built on, whose defining move
+  is reading type slots **directly off the C struct**
+  (`Py_TYPE(self)->tp_as_number->nb_add`) on subclasses it defines. Landed
+  as: faithful **`inherit_slots`** baked into `PyType_Ready` (the wave-4
+  deferred item - every inherited `tp_*` slot and method-suite entry copied
+  down into the subtype's faithful struct + decoded table), the discovered
+  Cython C-API leaf tail (`wave5.rs`), a real vectorcall
+  `PY_VECTORCALL_ARGUMENTS_OFFSET` decoder fix every Cython method-call
+  shim exposed, and the **musllinux** + binary-wheel **provenance** wheel
+  matrix. Fixture-proven by `_stockcython` (an extension that subclasses an
+  extension-defined base and reads the inherited slots off `Py_TYPE(self)`).
+  See RFC 0047 for the design and measured outcome.
 
 ## Detailed design (wave 1)
 

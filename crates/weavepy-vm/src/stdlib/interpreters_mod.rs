@@ -96,7 +96,7 @@ fn shareable_error(name: &str) -> RuntimeError {
 }
 
 pub fn build(_cache: &crate::import::ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(

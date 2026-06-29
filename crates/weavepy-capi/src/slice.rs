@@ -73,7 +73,32 @@ pub unsafe extern "C" fn PySlice_Unpack(
             Object::Int(i) => Some(*i as PySsizeT),
             Object::Long(big) => big.to_isize(),
             Object::Bool(b) => Some(if *b { 1 } else { 0 }),
-            _ => None,
+            // CPython's `_PyEval_SliceIndex` accepts any object exposing
+            // `__index__` — a numpy `int64`/`intp` scalar, a pandas block
+            // placement — not just a native `int`. Coerce it through
+            // `PyNumber_Index`; on failure clear the error it set so the
+            // caller reports the slice-specific message. (pandas' `melt`,
+            // groupby `apply`, and MultiIndex `loc` all slice with np ints.)
+            other => {
+                let p = crate::object::into_owned(other.clone());
+                if p.is_null() {
+                    return None;
+                }
+                let idx = unsafe { crate::abstract_::PyNumber_Index(p) };
+                unsafe { crate::object::Py_DecRef(p) };
+                if idx.is_null() {
+                    crate::errors::clear_thread_local();
+                    return None;
+                }
+                let v = match unsafe { crate::object::clone_object(idx) } {
+                    Object::Int(i) => Some(i as PySsizeT),
+                    Object::Long(big) => big.to_isize(),
+                    Object::Bool(b) => Some(if b { 1 } else { 0 }),
+                    _ => None,
+                };
+                unsafe { crate::object::Py_DecRef(idx) };
+                v
+            }
         }
     };
     let step_v = match resolve(&s.step, 1) {
@@ -83,7 +108,14 @@ pub unsafe extern "C" fn PySlice_Unpack(
         }
         Some(v) => v,
         None => {
-            crate::errors::set_type_error("slice step must be an integer");
+            // CPython's `PySlice_Unpack` reports one uniform message for a
+            // non-integer / no-`__index__` component (via `_PyEval_SliceIndex`),
+            // *not* a per-component "slice step/start/stop must be an integer".
+            // numpy's `insert`/`delete` slice with the user value and pandas
+            // asserts on this exact string (`test_insert_out_of_bounds`).
+            crate::errors::set_type_error(
+                "slice indices must be integers or None or have an __index__ method",
+            );
             return -1;
         }
     };
@@ -96,14 +128,18 @@ pub unsafe extern "C" fn PySlice_Unpack(
     let start_v = match resolve(&s.start, big_default_start) {
         Some(v) => v,
         None => {
-            crate::errors::set_type_error("slice start must be an integer");
+            crate::errors::set_type_error(
+                "slice indices must be integers or None or have an __index__ method",
+            );
             return -1;
         }
     };
     let stop_v = match resolve(&s.stop, big_default_stop) {
         Some(v) => v,
         None => {
-            crate::errors::set_type_error("slice stop must be an integer");
+            crate::errors::set_type_error(
+                "slice indices must be integers or None or have an __index__ method",
+            );
             return -1;
         }
     };

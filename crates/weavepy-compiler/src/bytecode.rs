@@ -637,21 +637,40 @@ pub enum InlineCache {
     CompareOpFloat,
     CompareOpStr,
 
-    // LOAD_ATTR family — fingerprint + dict slot index.
+    // LOAD_ATTR family — fingerprint + dict slot index + the class's
+    // attribute-resolution version (`TypeObject::attr_version`) observed
+    // at specialisation time. A class-dict or MRO mutation bumps the
+    // version, deopting stale sites (CPython's `tp_version_tag` role).
     LoadAttrInstance {
         type_id: u64,
         key_idx: u32,
+        ver: u32,
     },
     LoadAttrModule {
         module_id: u64,
         key_idx: u32,
     },
+    /// Attribute backed by a `__slots__` member descriptor: the value
+    /// lives in the instance's slot side table, keyed by the attr name.
     LoadAttrSlot {
         type_id: u64,
-        slot_idx: u32,
+        ver: u32,
     },
     LoadAttrType {
         type_id: u64,
+        key_idx: u32,
+        ver: u32,
+    },
+    /// Method load (`obj.m` resolving to a plain Python function on the
+    /// class MRO, about to be bound). `mro_idx` locates the defining
+    /// class inside the receiver-type's MRO and `key_idx` the slot in
+    /// that class's dict — so a hit skips the MRO walk and the name
+    /// allocation, going straight to bind. Guarded by `ver`
+    /// (`TypeObject::attr_version`) plus a name check on the slot.
+    LoadAttrMethod {
+        type_id: u64,
+        ver: u32,
+        mro_idx: u16,
         key_idx: u32,
     },
 
@@ -665,14 +684,29 @@ pub enum InlineCache {
         key_idx: u32,
     },
 
-    // STORE_ATTR family — fingerprint + dict slot index.
+    // STORE_ATTR family — fingerprint + dict slot index + resolution
+    // version (see the LOAD_ATTR family note).
     StoreAttrInstance {
         type_id: u64,
         key_idx: u32,
+        ver: u32,
     },
+    /// Store to a `__slots__` member: writes the instance's slot side
+    /// table directly (the class was validated at specialisation time to
+    /// have the stock `__setattr__` and a genuine slot descriptor).
     StoreAttrSlot {
         type_id: u64,
-        slot_idx: u32,
+        ver: u32,
+    },
+    /// First store of a not-yet-present attribute on a plain instance —
+    /// the constructor pattern (`self.x = …` on a fresh object). One
+    /// hash probe decides insert vs overwrite; the class was validated
+    /// at specialisation time (stock `__setattr__`, no data descriptor
+    /// for the name, instances carry a `__dict__`) and `ver` guards
+    /// against class mutations since.
+    StoreAttrNewKey {
+        type_id: u64,
+        ver: u32,
     },
 
     // FOR_ITER family.

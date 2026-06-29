@@ -34,7 +34,7 @@ use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -85,7 +85,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 }
 
 fn build_inner_ucd() -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(

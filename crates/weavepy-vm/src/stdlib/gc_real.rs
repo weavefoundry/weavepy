@@ -39,7 +39,7 @@ use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
 use crate::weakref_registry::id_of;
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -353,7 +353,7 @@ fn get_stats(_args: &[Object]) -> Result<Object, RuntimeError> {
     let stats = gc_trace::with_state(|s| *s.stats.borrow());
     let mut entries = Vec::new();
     for s in stats.iter() {
-        let mut d = DictData::new();
+        let mut d = DictData::default();
         d.insert(
             DictKey(Object::from_static("collections")),
             Object::Int(s.collections as i64),

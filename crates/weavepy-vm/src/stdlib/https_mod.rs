@@ -19,7 +19,7 @@ use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -223,7 +223,7 @@ fn parse_response(buf: &[u8]) -> (u16, Object, Vec<u8>) {
         .nth(1)
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(0);
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         for line in lines {

@@ -13,7 +13,7 @@ use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, FileBackend, Object, PyFile, PyModule};
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -270,7 +270,7 @@ pub(crate) fn make_text_io_wrapper(
     base: Rc<crate::types::TypeObject>,
 ) -> Rc<crate::types::TypeObject> {
     use crate::types::{TypeFlags, TypeObject};
-    let mut dict = DictData::new();
+    let mut dict = DictData::default();
     let mut method = |name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>| {
         dict.insert(
             DictKey(Object::from_static(name)),
@@ -442,7 +442,51 @@ fn bytesio_file(args: &[Object], kwargs: &[(String, Object)]) -> Result<Rc<PyFil
 
 /// Construct the backing in-memory `PyFile` for a `StringIO`, reading the
 /// optional initial value from positionals/`initial_value=`.
+/// Parse and validate `StringIO`'s `newline=` argument (positional index 2 of
+/// the `(cls/self, initial_value, newline)` layout, or keyword). Returns
+/// `Ok(None)` for Python `None` (universal mode) and `Ok(Some(nl))` for one of
+/// the four legal explicit values; an absent argument is the `'\n'` default.
+fn stringio_newline_arg(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Option<String>, RuntimeError> {
+    let arg = args.get(2).cloned().or_else(|| kw_get(kwargs, "newline"));
+    match arg {
+        None => Ok(Some("\n".to_owned())),
+        Some(Object::None) => Ok(None),
+        Some(Object::Str(s)) => {
+            let v = s.to_string();
+            if !matches!(v.as_str(), "" | "\n" | "\r" | "\r\n") {
+                return Err(crate::error::value_error(format!(
+                    "illegal newline value: '{}'",
+                    v.escape_default()
+                )));
+            }
+            Ok(Some(v))
+        }
+        Some(o) => Err(type_error(format!(
+            "newline must be str or None, not {}",
+            o.type_name()
+        ))),
+    }
+}
+
+/// The write-time newline translation `StringIO` applies to incoming text
+/// (CPython `_io.StringIO.write`): universal mode (`newline=None`) collapses
+/// `\r\n`/`\r` to `\n`; `'\r'`/`'\r\n'` rewrite `\n`; `''`/`'\n'` pass through.
+/// The buffer therefore always stores the *translated* text, which is exactly
+/// what `read`/`getvalue` return.
+fn stringio_translate(data: String, newline: Option<&str>) -> String {
+    match newline {
+        None if data.as_bytes().contains(&b'\r') => data.replace("\r\n", "\n").replace('\r', "\n"),
+        Some("\r") => data.replace('\n', "\r"),
+        Some("\r\n") => data.replace('\n', "\r\n"),
+        _ => data,
+    }
+}
+
 fn stringio_file(args: &[Object], kwargs: &[(String, Object)]) -> Result<Rc<PyFile>, RuntimeError> {
+    let newline = stringio_newline_arg(args, kwargs)?;
     let initial = args
         .get(1)
         .cloned()
@@ -455,7 +499,11 @@ fn stringio_file(args: &[Object], kwargs: &[(String, Object)]) -> Result<Rc<PyFi
         Some(Object::None) | None => String::new(),
         Some(_) => return Err(type_error("initial_value must be str or None, not int")),
     };
+    // The initial value takes the same write-path translation as `write()`
+    // (CPython routes it through `self.write(initial_value)`).
+    let data = stringio_translate(data, newline.as_deref());
     let f = PyFile::new("<string>", "r+", FileBackend::MemText { data, pos: 0 });
+    f.set_newline(newline.as_deref());
     f.no_name.set(true);
     Ok(Rc::new(f))
 }
@@ -508,14 +556,18 @@ fn stringio_new(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
     let file = if cls.flags.is_builtin {
         stringio_file(args, kwargs)?
     } else {
-        empty_mem_file(
+        let f = empty_mem_file(
             "<string>",
             "r+",
             FileBackend::MemText {
                 data: String::new(),
                 pos: 0,
             },
-        )
+        );
+        // The `'\n'` default means *no* translation; `stringio_init` (run
+        // next, with the real arguments) overrides it when `newline=` given.
+        f.set_newline(Some("\n"));
+        f
     };
     file.set_io_kind(crate::object::IoKind::StringIO);
     Ok(wrap_memory_stream(&cls, file))
@@ -648,7 +700,7 @@ fn fileio_open_raw(
 fn fileio_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let f = match args.first() {
         Some(Object::File(f)) => f.clone(),
-        Some(Object::Instance(i)) => match &i.native {
+        Some(Object::Instance(i)) => match i.native.get() {
             Some(Object::File(f)) => f.clone(),
             _ => return Err(type_error("FileIO.__init__() requires a FileIO instance")),
         },
@@ -780,8 +832,14 @@ fn bytesio_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
 }
 
 /// `StringIO.__init__(self, initial_value='', newline='\n')`. See
-/// `bytesio_init`; `newline` translation is handled by the backing text file.
+/// `bytesio_init`; the `newline=` policy is installed on the backing text
+/// file *before* the initial value is written, so the write applies the
+/// right translation.
 fn stringio_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let newline = stringio_newline_arg(args, kwargs)?;
+    if let Ok(f) = crate::builtins::file_self(args) {
+        f.set_newline(newline.as_deref());
+    }
     let initial = args
         .get(1)
         .cloned()
@@ -996,7 +1054,7 @@ fn make_memory_stream(
 ) -> Rc<crate::types::TypeObject> {
     use crate::object::MethodWrapper;
     use crate::types::{TypeFlags, TypeObject};
-    let mut dict = DictData::new();
+    let mut dict = DictData::default();
     let mut method = |n: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>| {
         dict.insert(
             DictKey(Object::from_static(n)),
@@ -1362,7 +1420,7 @@ pub(crate) fn make_incremental_newline_decoder() -> Rc<crate::types::TypeObject>
     use crate::object::MethodWrapper;
     use crate::types::{TypeFlags, TypeObject};
     let bt = crate::builtin_types::builtin_types();
-    let mut dict = DictData::new();
+    let mut dict = DictData::default();
     let mut method = |n: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>| {
         dict.insert(
             DictKey(Object::from_static(n)),
@@ -1452,7 +1510,7 @@ fn tw_self(args: &[Object]) -> Result<Rc<crate::types::PyInstance>, RuntimeError
 fn tw_get(inst: &crate::types::PyInstance, name: &str) -> Option<Object> {
     inst.dict
         .borrow()
-        .get(&DictKey(Object::from_str(name)))
+        .get(&crate::object::StrKey(name))
         .cloned()
 }
 
@@ -1572,17 +1630,30 @@ pub(crate) struct IoFamily {
 /// native stream against `io.BufferedIOBase`/`TextIOBase` (the `pathlib`/`io`
 /// suites) compares against these exact objects.
 pub(crate) fn build_iobase_family() -> IoFamily {
-    thread_local! {
-        static IO_FAMILY: RefCell<Option<IoFamily>> = const { RefCell::new(None) };
+    // Process-global, not per-thread (RFC 0047, wave 5): a `BytesIO`
+    // minted on a `threading.Thread` must be an `isinstance` of the
+    // `io.BufferedIOBase` the main thread imported — pandas'
+    // multi-thread `read_csv` routes every worker's handle through
+    // that check. A per-thread family gave each thread its own class
+    // objects, so cross-thread `isinstance` silently failed.
+    //
+    // Plain `Mutex<Option<…>>` rather than `OnceLock::get_or_init` so a
+    // re-entrant call during construction (class_of on a stream built
+    // inside the family constructor) degrades to building a transient
+    // extra family — the first one stored still wins — instead of
+    // deadlocking.
+    static IO_FAMILY: std::sync::Mutex<Option<IoFamily>> = std::sync::Mutex::new(None);
+    if let Some(f) = IO_FAMILY.lock().ok().and_then(|g| g.clone()) {
+        return f;
     }
-    IO_FAMILY.with(|slot| {
-        if let Some(f) = slot.borrow().as_ref() {
-            return f.clone();
+    let fam = build_iobase_family_inner();
+    if let Ok(mut g) = IO_FAMILY.lock() {
+        if let Some(existing) = g.as_ref() {
+            return existing.clone();
         }
-        let fam = build_iobase_family_inner();
-        *slot.borrow_mut() = Some(fam.clone());
-        fam
-    })
+        *g = Some(fam.clone());
+    }
+    fam
 }
 
 /// Whether a native [`PyFile`] should be considered an instance of one of the
@@ -1629,7 +1700,7 @@ fn build_iobase_family_inner() -> IoFamily {
     use crate::object::MethodWrapper;
     use crate::types::{TypeFlags, TypeObject};
     let bt = crate::builtin_types::builtin_types();
-    let mut dict = DictData::new();
+    let mut dict = DictData::default();
     install_iobase_mixins(&mut dict);
     // `io.IOBase.register(...)` — ABC virtual-subclass registration.
     dict.insert(
@@ -1649,7 +1720,7 @@ fn build_iobase_family_inner() -> IoFamily {
         .expect("IOBase must linearise");
     install_closed_property(&iobase);
     let child = |name: &'static str, base: &Rc<TypeObject>| {
-        TypeObject::new_with_flags(name, vec![base.clone()], DictData::new(), flags())
+        TypeObject::new_with_flags(name, vec![base.clone()], DictData::default(), flags())
             .expect("io child type must linearise")
     };
     // `RawIOBase` carries the default `read`/`readall` that delegate to the
@@ -1658,7 +1729,7 @@ fn build_iobase_family_inner() -> IoFamily {
     // `read()`/`readall()` — and the layered `_pyio.BufferedReader` can call
     // `raw.readall()` on such a raw.
     let raw = {
-        let mut rd = DictData::new();
+        let mut rd = DictData::default();
         iobase_method(&mut rd, "read", rawiobase_read);
         iobase_method(&mut rd, "readall", rawiobase_readall);
         TypeObject::new_with_flags("RawIOBase", vec![iobase.clone()], rd, flags())
@@ -1669,7 +1740,7 @@ fn build_iobase_family_inner() -> IoFamily {
     // pure-Python subclass that only implements `read`/`read1` still supports
     // `readinto`.
     let buffered = {
-        let mut bd = DictData::new();
+        let mut bd = DictData::default();
         iobase_method(&mut bd, "readinto", bufferediobase_readinto);
         iobase_method(&mut bd, "readinto1", bufferediobase_readinto1);
         // The abstract `read`/`read1`/`write`/`detach` (CPython
@@ -2256,7 +2327,7 @@ pub fn unsupported_operation_class() -> Rc<crate::types::TypeObject> {
         let ty = crate::types::TypeObject::new_with_flags(
             "UnsupportedOperation",
             vec![bt.os_error.clone(), bt.value_error.clone()],
-            DictData::new(),
+            DictData::default(),
             crate::types::TypeFlags {
                 is_exception: true,
                 is_builtin: true,
@@ -2690,9 +2761,13 @@ fn tw_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runti
     // BOM-once bookkeeping: a fresh stream emits the BOM on the first write,
     // but an encoder constructed over a buffer already positioned past byte 0
     // (append mode, or `r+` after a prior write) must not (CPython's
-    // `encoding_start_of_stream`).
+    // `encoding_start_of_stream`). A *non-seekable* buffer (`tell` is
+    // unavailable) never gets the BOM either — CPython only sets
+    // `encoding_start_of_stream` for seekable buffers, which is why bz2/xz
+    // compressed utf-16/32 files come out BOM-less (pandas GH 35681 warns
+    // about exactly this).
     let start_of_stream = if bom_continuation(&encoding).is_some() {
-        tw_buffer_tell(&inst).map(|p| p == 0).unwrap_or(true)
+        tw_buffer_tell(&inst).map(|p| p == 0).unwrap_or(false)
     } else {
         true
     };
@@ -3081,6 +3156,7 @@ fn tw_ensure_decoded(inst: &Rc<crate::types::PyInstance>) -> Result<(), RuntimeE
     };
     let encoding = tw_encoding(inst);
     let errors = tw_errors(inst);
+    tw_check_bom(&encoding, &raw)?;
     // Decode to an `Object` so lone surrogates from `surrogateescape`/
     // `surrogatepass` survive as a `WStr` (PEP 383). The snapshot itself is
     // stored as a Rust `String` with surrogates *bridged* into the PUA window
@@ -3097,6 +3173,39 @@ fn tw_ensure_decoded(inst: &Rc<crate::types::PyInstance>) -> Result<(), RuntimeE
     tw_set(inst, "_dec_start", Object::Int(start));
     tw_set(inst, "_dec_done", Object::Bool(true));
     Ok(())
+}
+
+/// CPython's `encodings.utf_16`/`utf_32` incremental decoders (the ones
+/// `TextIOWrapper` drives) *require* a byte order mark when the encoding
+/// doesn't name an endianness: a stream of two or more bytes that doesn't
+/// open with the BOM raises `UnicodeError("UTF-16 stream does not start
+/// with BOM")`. The one-shot `bytes.decode("utf-16")` falls back to native
+/// order instead — so this check lives in the text-wrapper read path only
+/// (pandas warns that bz2/xz never write the BOM and asserts the read
+/// fails, GH 35681).
+fn tw_check_bom(encoding: &str, raw: &[u8]) -> Result<(), RuntimeError> {
+    let key = encoding_key_for(encoding);
+    let (label, bom_len) = match key.as_str() {
+        "utf16" => ("UTF-16", 2),
+        "utf32" => ("UTF-32", 4),
+        _ => return Ok(()),
+    };
+    if raw.len() < bom_len {
+        return Ok(());
+    }
+    let has_bom = match bom_len {
+        2 => raw[..2] == [0xFF, 0xFE] || raw[..2] == [0xFE, 0xFF],
+        _ => raw[..4] == [0xFF, 0xFE, 0x00, 0x00] || raw[..4] == [0x00, 0x00, 0xFE, 0xFF],
+    };
+    if has_bom {
+        return Ok(());
+    }
+    Err(RuntimeError::PyException(
+        crate::error::PyException::from_builtin(
+            "UnicodeError",
+            format!("{label} stream does not start with BOM"),
+        ),
+    ))
 }
 
 /// `True` once the decode snapshot is in incremental/streaming mode (the
@@ -3481,6 +3590,15 @@ fn tw_writeflush(inst: &crate::types::PyInstance) -> Result<(), RuntimeError> {
     tw_pending_set(inst, Vec::new());
     match tw_buffer_target(inst)? {
         RawTarget::Native(file) => {
+            // CPython's `TextIOWrapper` calls `self.buffer.write(bytes)`
+            // virtually — a *text* buffer underneath (`TextIOWrapper(
+            // StringIO())`, reachable via pandas `to_csv(StringIO(),
+            // mode="wb")`) rejects the encoded bytes exactly as
+            // `StringIO.write(b"…")` does. Writing into the MemText backend
+            // directly would silently decode and accept them.
+            if !file.binary {
+                return Err(type_error("string argument expected, got 'bytes'"));
+            }
             file.write_bytes(&pending)?;
         }
         RawTarget::Py(buffer) => {
@@ -4057,7 +4175,7 @@ pub(crate) fn make_buffered(
     base: Rc<crate::types::TypeObject>,
 ) -> Rc<crate::types::TypeObject> {
     use crate::types::{TypeFlags, TypeObject};
-    let mut dict = DictData::new();
+    let mut dict = DictData::default();
     let mut method = |n: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>| {
         dict.insert(
             DictKey(Object::from_static(n)),

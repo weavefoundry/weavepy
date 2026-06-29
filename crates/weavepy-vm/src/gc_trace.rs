@@ -254,8 +254,11 @@ pub struct GcState {
     /// plus the frozen set). Keeps `track` dedupe, `find_handle`, and
     /// `is_tracked` O(1) — the linear scans they replace made
     /// allocation-heavy workloads quadratic once the tracked
-    /// population grew past a few thousand.
-    index: RefCell<std::collections::HashMap<ObjectId, Arc<TrackedHandle>>>,
+    /// population grew past a few thousand. Keyed by object *address*,
+    /// so the internal fast hasher applies (consulted on every object
+    /// drop via the prompt reaper — SipHash here was a top-ten CPU
+    /// consumer under pandas).
+    index: RefCell<crate::fasthash::FxHashMap<ObjectId, Arc<TrackedHandle>>>,
     /// Re-entrancy guard: a collection can indirectly allocate (e.g.
     /// queued finalizers running Python at the next safe point may
     /// re-enter `track`), and a nested collection would see torn
@@ -371,7 +374,7 @@ impl GcState {
     pub fn new() -> Self {
         Self {
             generations: RefCell::new(Default::default()),
-            index: RefCell::new(std::collections::HashMap::new()),
+            index: RefCell::new(crate::fasthash::FxHashMap::default()),
             collecting: AtomicBool::new(false),
             thresholds: RefCell::new(DEFAULT_THRESHOLDS),
             counts: RefCell::new([0; N_GENERATIONS]),
@@ -602,6 +605,11 @@ impl GcState {
                     None => false,
                 };
                 if still_dead {
+                    if std::env::var_os("WEAVEPY_REAP_TRACE").is_some() {
+                        if let Some(h) = self.index.borrow().get(&id) {
+                            eprintln!("[ACYCLIC-REAP] {}", h.object.type_name_owned());
+                        }
+                    }
                     self.untrack_id(id);
                     reclaimed += 1;
                 }
@@ -968,6 +976,29 @@ impl GcState {
     fn collect_impl(&self, upto: usize, exact: bool) -> usize {
         if self.collecting.load(Ordering::Acquire) {
             return 0;
+        }
+        // Drop this thread's parked C-dropped clones (RFC 0047, wave 5)
+        // before seeding reachability. Each queue entry is a strong
+        // `Object` clone awaiting the eval loop's prompt-reap safe point —
+        // but when C code runs without returning to the eval loop (a
+        // C-driven embedding, or the collector's own traverse/clear boxes
+        // freed mid-pass) the queue never drains, and every entry inflates
+        // its object's `Rc::strong_count`. The mark phase seeds `gc_refs`
+        // from exactly that count, so a queued clone makes its object —
+        // and everything reachable from it — look externally rooted,
+        // pinning dead cycles forever. A collection is itself a safe
+        // point: anything that dies when these clones drop is either
+        // reaped below (acyclic) or found unreachable by the mark phase,
+        // with weakrefs/finalizers handled by the normal collection path.
+        //
+        // Guarded on no extension frame being live on this thread: while
+        // one is (`gc.collect()` invoked *from* C), a queued clone may be
+        // the last count backing a body pointer that C still borrows
+        // across its call, and dropping it here would free the body under
+        // C's feet — the exact UAF the queue exists to prevent. The clones
+        // then simply wait for the eval-loop drain, as designed.
+        if !crate::vm_singletons::cext_call_active() {
+            drop(crate::vm_singletons::drain_pending_cext_drops());
         }
         if exact {
             // Reap dead *acyclic* garbage first. CPython frees these by refcount
@@ -1713,7 +1744,7 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
             // the collector sees cycles routed through subclass storage and
             // prompt reclamation can follow such a chain (a leaf `native`
             // like an `int`/`str` subclass simply has no children).
-            if let Some(native) = &i.native {
+            if let Some(native) = i.native.get() {
                 traverse_object(native, visit);
             }
             // A C extension type (RFC 0044) may hold child references in
@@ -1856,12 +1887,28 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
 /// Sync` and lives in a `OnceLock`. Each thread sees the same
 /// table — registrations are a global, additive operation.
 fn run_external_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
-    let table = TRAVERSE_TABLE.get_or_init(|| parking_lot::Mutex::new(Vec::new()));
-    let entries = table.lock();
-    for entry in entries.iter() {
-        if (entry.matches)(obj) {
-            (entry.traverse)(obj, visit);
-        }
+    let Some(table) = TRAVERSE_TABLE.get() else {
+        return;
+    };
+    // Snapshot the matching traverse fns, then *release* the table lock
+    // before invoking them. A C extension's `tp_traverse` calls our
+    // visitproc, which recurses back through the collector
+    // (`exc_has_finalizable` → `traverse_object`) and can re-enter
+    // `run_external_traverse` for a *nested* foreign object on the same
+    // thread — e.g. collecting a cycle through pandas' `BaseOffset`.
+    // `parking_lot::Mutex` is not reentrant, so holding the lock across the
+    // callback self-deadlocks. The table is registration-only and its
+    // entries are plain `fn` pointers, so a cheap snapshot is sound.
+    let matched: Vec<fn(&Object, &mut dyn FnMut(&Object))> = {
+        let entries = table.lock();
+        entries
+            .iter()
+            .filter(|e| (e.matches)(obj))
+            .map(|e| e.traverse)
+            .collect()
+    };
+    for traverse in matched {
+        traverse(obj, visit);
     }
 }
 
@@ -1901,11 +1948,20 @@ fn run_external_clear(obj: &Object) {
     let Some(table) = CLEAR_TABLE.get() else {
         return;
     };
-    let entries = table.lock();
-    for entry in entries.iter() {
-        if (entry.matches)(obj) {
-            (entry.clear)(obj);
-        }
+    // Snapshot then release the lock before invoking, mirroring
+    // `run_external_traverse`: a C extension's `tp_clear` can re-enter the
+    // collector and thus this function for a nested foreign object on the
+    // same thread, which would self-deadlock on the non-reentrant mutex.
+    let matched: Vec<fn(&Object)> = {
+        let entries = table.lock();
+        entries
+            .iter()
+            .filter(|e| (e.matches)(obj))
+            .map(|e| e.clear)
+            .collect()
+    };
+    for clear in matched {
+        clear(obj);
     }
 }
 
@@ -2057,6 +2113,14 @@ pub fn with_state<R>(f: impl FnOnce(&GcState) -> R) -> R {
 /// Convenience: track `obj` in the shared, process-global GC.
 pub fn track(obj: Object) {
     with_state(|s| s.track(obj));
+}
+
+/// True while a collection (mark/sweep or weakref-only pass) is in
+/// flight on the process-global collector. Used by the capi boundary to
+/// suppress side-effectful bookkeeping (e.g. the C-drop reap queue) for
+/// objects the collector itself marshals through transient C boxes.
+pub fn collector_active() -> bool {
+    with_state(|s| s.collecting.load(Ordering::Acquire))
 }
 
 /// Convenience: stop tracking `obj` (by identity) in the shared,
@@ -2321,7 +2385,7 @@ mod tests {
     #[test]
     fn track_and_untrack() {
         let s = GcState::new();
-        let d = Object::Dict(Rc::new(RefCell::new(DictData::new())));
+        let d = Object::Dict(Rc::new(RefCell::new(DictData::default())));
         s.track(d.clone());
         assert!(s.is_tracked(id_of(&d)));
         s.untrack_id(id_of(&d));
@@ -2331,7 +2395,7 @@ mod tests {
     #[test]
     fn collect_clears_simple_cycle() {
         let s = GcState::new();
-        let dict = Rc::new(RefCell::new(DictData::new()));
+        let dict = Rc::new(RefCell::new(DictData::default()));
         let outer = Object::Dict(dict.clone());
         s.track(outer.clone());
         // The dict references itself: a 1-cycle.
@@ -2354,7 +2418,7 @@ mod tests {
     #[test]
     fn freeze_unfreeze_round_trip() {
         let s = GcState::new();
-        let d = Object::Dict(Rc::new(RefCell::new(DictData::new())));
+        let d = Object::Dict(Rc::new(RefCell::new(DictData::default())));
         s.track(d.clone());
         s.freeze_all();
         assert_eq!(s.freeze_count(), 1);

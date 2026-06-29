@@ -52,12 +52,19 @@ def _escape(s):
     )
 
 
-def _iterfind(elem, path):
+def _iterfind(elem, path, namespaces=None):
     """A small subset of ElementPath sufficient for the bundled stdlib.
 
     Supports ``.`` (self), a leading ``./``, the ``*`` child wildcard, exact
     tag steps, ``/``-separated multi-step paths, and the ``//`` descendant
     axis (e.g. ``.//tag``). Predicates (``[...]``) are not implemented.
+
+    ``namespaces`` (a ``{prefix: uri}`` map) is accepted for API parity with
+    CPython — pandas' ``read_xml`` etree path passes it. WeavePy's parser is
+    namespace-naive (it keeps raw ``prefix:local`` tags rather than
+    ``{uri}local``), so a ``prefix:local`` step already matches the raw stored
+    tag whenever the document and the XPath share the prefix (the usual case);
+    the argument is otherwise advisory.
     """
     if not path:
         return
@@ -137,19 +144,25 @@ class Element:
     def items(self):
         return list(self.attrib.items())
 
-    def find(self, path):
-        for c in _iterfind(self, path):
+    def clear(self):
+        self.attrib.clear()
+        self.text = None
+        self.tail = None
+        self._children = []
+
+    def find(self, path, namespaces=None):
+        for c in _iterfind(self, path, namespaces):
             return c
         return None
 
-    def findall(self, path):
-        return list(_iterfind(self, path))
+    def findall(self, path, namespaces=None):
+        return list(_iterfind(self, path, namespaces))
 
-    def iterfind(self, path):
-        return _iterfind(self, path)
+    def iterfind(self, path, namespaces=None):
+        return _iterfind(self, path, namespaces)
 
-    def findtext(self, path, default=None):
-        c = self.find(path)
+    def findtext(self, path, default=None, namespaces=None):
+        c = self.find(path, namespaces)
         if c is None:
             return default
         return c.text or ""
@@ -320,11 +333,27 @@ def _parse_text(text):
     return root
 
 
+class XMLParser:
+    """Minimal stand-in for :class:`xml.etree.ElementTree.XMLParser`.
+
+    weavepy's ElementTree parses via the built-in recursive ``_parse_text``
+    rather than an expat feed loop, so this class exists chiefly so callers
+    that *construct a parser explicitly* and pass it to ``parse(...)`` work —
+    pandas' ``read_xml`` does ``parse(data, parser=XMLParser(encoding=...))``.
+    The ``encoding`` is consulted by ``parse``/``ElementTree.parse`` when the
+    source yields bytes.
+    """
+
+    def __init__(self, *, encoding=None, target=None):
+        self.encoding = encoding
+        self.target = target
+
+
 class ElementTree:
-    def __init__(self, element=None, file=None):
+    def __init__(self, element=None, file=None, parser=None):
         self._root = element
         if file is not None:
-            self.parse(file)
+            self.parse(file, parser)
 
     def getroot(self):
         return self._root
@@ -336,7 +365,8 @@ class ElementTree:
             with open(source, "rb") as f:
                 text = f.read()
         if isinstance(text, (bytes, bytearray)):
-            text = text.decode("utf-8")
+            enc = getattr(parser, "encoding", None) or "utf-8"
+            text = text.decode(enc)
         self._root = _parse_text(text)
         return self._root
 
@@ -354,14 +384,16 @@ class ElementTree:
             with open(file, mode) as f:
                 f.write(data)
 
-    def find(self, path):
-        return self._root.find(path) if self._root is not None else None
+    def find(self, path, namespaces=None):
+        return self._root.find(path, namespaces) if self._root is not None else None
 
-    def findall(self, path):
-        return self._root.findall(path) if self._root is not None else []
+    def findall(self, path, namespaces=None):
+        return self._root.findall(path, namespaces) if self._root is not None else []
 
-    def findtext(self, path, default=None):
-        return self._root.findtext(path, default) if self._root is not None else default
+    def findtext(self, path, default=None, namespaces=None):
+        if self._root is None:
+            return default
+        return self._root.findtext(path, default, namespaces)
 
     def iter(self, tag=None):
         if self._root is None:
@@ -370,7 +402,7 @@ class ElementTree:
 
 
 def parse(source, parser=None):
-    return ElementTree(file=source)
+    return ElementTree(file=source, parser=parser)
 
 
 def iterparse(source, events=None):
@@ -396,5 +428,5 @@ def dump(elem):
 __all__ = [
     "Element", "SubElement", "Comment", "ProcessingInstruction", "PI", "CDATA",
     "ElementTree", "ParseError", "tostring", "fromstring", "parse", "iterparse",
-    "register_namespace", "dump",
+    "register_namespace", "dump", "XMLParser",
 ]

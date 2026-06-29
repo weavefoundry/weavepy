@@ -131,27 +131,78 @@ pub fn attempt_specialize_load_attr(obj: &Object, name: &str) -> InlineCache {
             // Only cache when the type doesn't customize lookup.
             // If the class has __getattr__ / __getattribute__ /
             // descriptors, the slow path is mandatory.
-            if type_has_attr_override(&inst.cls()) {
+            let cls = inst.cls();
+            if type_has_attr_override(&cls) {
                 return InlineCache::Cooldown(COOLDOWN);
+            }
+            let ver = cls.attr_version.get();
+            // A data descriptor on the class (property, `__slots__`
+            // member, user `__set__` descriptor) takes priority over the
+            // instance dict, so it must be classified *before* the
+            // dict-index shape.
+            match cls.lookup(name) {
+                Some(Object::SlotDescriptor(sd)) => {
+                    // Only a genuine slot member on this very lookup path;
+                    // `__weakref__`/`__dict__` pseudo-slots read
+                    // differently.
+                    if sd.name == name && !matches!(name, "__weakref__" | "__dict__") {
+                        return InlineCache::LoadAttrSlot {
+                            type_id: rc_id(&cls),
+                            ver,
+                        };
+                    }
+                    return InlineCache::Cooldown(COOLDOWN);
+                }
+                Some(Object::Property(_)) => return InlineCache::Cooldown(COOLDOWN),
+                Some(Object::Instance(desc))
+                    if desc.cls().lookup("__set__").is_some()
+                        || desc.cls().lookup("__delete__").is_some() =>
+                {
+                    return InlineCache::Cooldown(COOLDOWN);
+                }
+                _ => {}
             }
             // First check the instance dict — that's the
             // `LoadAttrInstance` shape.
             let dict = inst.dict.borrow();
             if let Some(idx) = dict.index_of_key_str(name) {
                 return InlineCache::LoadAttrInstance {
-                    type_id: rc_id(&inst.cls()),
+                    type_id: rc_id(&cls),
                     key_idx: idx,
+                    ver,
                 };
             }
             drop(dict);
+            // Not on the instance: resolve through the MRO. A plain
+            // Python function anywhere on it is the *method* shape —
+            // cache the defining class's position and the dict slot so a
+            // hit binds without walking or hashing. A non-function on
+            // the receiver's own class dict stays the `LoadAttrType`
+            // shape.
+            if let Some((Object::Function(_), owner)) = cls.lookup_with_owner(name) {
+                let mro = cls.mro.borrow();
+                if let Some(mro_idx) = mro.iter().position(|t| Rc::ptr_eq(t, &owner)) {
+                    if let Some(key_idx) = owner.dict.borrow().index_of_key_str(name) {
+                        if let (Ok(mro_idx), key_idx) = (u16::try_from(mro_idx), key_idx) {
+                            return InlineCache::LoadAttrMethod {
+                                type_id: rc_id(&cls),
+                                ver,
+                                mro_idx,
+                                key_idx,
+                            };
+                        }
+                    }
+                }
+                return InlineCache::Cooldown(COOLDOWN);
+            }
             // Otherwise look in the type's dict — the
             // `LoadAttrType` shape (descriptor or class attribute).
-            let cls = inst.cls();
             let class_dict = cls.dict.borrow();
             if let Some(idx) = class_dict.index_of_key_str(name) {
                 return InlineCache::LoadAttrType {
                     type_id: rc_id(&cls),
                     key_idx: idx,
+                    ver,
                 };
             }
             InlineCache::Cooldown(COOLDOWN)
@@ -215,20 +266,49 @@ pub fn attempt_specialize_store_attr(obj: &Object, name: &str) -> InlineCache {
             if type_has_attr_override(&cls) {
                 return InlineCache::Cooldown(COOLDOWN);
             }
-            // Never specialize a name that resolves to a class-level data
-            // descriptor — a `__slots__` member, a `property`, or any
-            // object exposing `__set__`/`__delete__`. Those writes must
-            // route through the generic `STORE_ATTR` so the slot side
-            // table / property setter fires; the dict-index fast path can
-            // only service *plain* instance-dict attributes. (CPython does
-            // the same: it uses a distinct `STORE_ATTR_SLOT` for slots and
-            // refuses `STORE_ATTR_INSTANCE_VALUE` when a data descriptor
-            // shadows the name.) Without this guard a `__slots__` class
-            // whose attribute happens to share an index with the dict
-            // layout (e.g. `operator.itemgetter` built during interpreter
-            // bootstrap) silently writes slot values into `__dict__`,
-            // stranding them where the slot descriptor can't read them.
-            if name_is_data_descriptor(&cls, name) {
+            let ver = cls.attr_version.get();
+            // A class-level data descriptor — a `__slots__` member, a
+            // `property`, or any object exposing `__set__`/`__delete__` —
+            // owns the write. A *plain slot member* gets its own fast
+            // shape (`StoreAttrSlot`, mirroring CPython's
+            // `STORE_ATTR_SLOT`); everything else must route through the
+            // generic `STORE_ATTR` so the property setter / user
+            // `__set__` fires. Without this classification a `__slots__`
+            // class whose attribute happens to share an index with the
+            // dict layout (e.g. `operator.itemgetter` built during
+            // interpreter bootstrap) silently writes slot values into
+            // `__dict__`, stranding them where the slot descriptor can't
+            // read them.
+            match cls.lookup(name) {
+                Some(Object::SlotDescriptor(sd)) => {
+                    if sd.name == name && !matches!(name, "__weakref__" | "__dict__") {
+                        return InlineCache::StoreAttrSlot {
+                            type_id: rc_id(&cls),
+                            ver,
+                        };
+                    }
+                    return InlineCache::Cooldown(COOLDOWN);
+                }
+                Some(Object::Property(_)) => return InlineCache::Cooldown(COOLDOWN),
+                Some(Object::Instance(desc)) => {
+                    let dcls = desc.cls();
+                    if dcls.lookup("__set__").is_some() || dcls.lookup("__delete__").is_some() {
+                        return InlineCache::Cooldown(COOLDOWN);
+                    }
+                }
+                _ => {}
+            }
+            // Names intercepted by `generic_setattr_instance` before the
+            // plain dict write: `__class__` / `__dict__` assignment and
+            // BaseException's `args` / `__traceback__` / `__cause__` /
+            // `__context__` coercions. Both cache shapes would silently
+            // skip the interception (e.g. `e.args = [1]` must coerce to a
+            // tuple on every store, warmed cache or not), so never
+            // specialize these.
+            if matches!(
+                name,
+                "__class__" | "__dict__" | "args" | "__traceback__" | "__cause__" | "__context__"
+            ) {
                 return InlineCache::Cooldown(COOLDOWN);
             }
             let dict = inst.dict.borrow();
@@ -236,27 +316,23 @@ pub fn attempt_specialize_store_attr(obj: &Object, name: &str) -> InlineCache {
                 return InlineCache::StoreAttrInstance {
                     type_id: rc_id(&cls),
                     key_idx: idx,
+                    ver,
+                };
+            }
+            drop(dict);
+            // Key not present: the constructor pattern (`self.x = …` on a
+            // fresh instance). Specialize to a single-probe insert when
+            // instances carry a `__dict__` (a `__slots__`-only class routes
+            // through the slow path's read-only / no-__dict__ errors).
+            if !cls.forbids_dict {
+                return InlineCache::StoreAttrNewKey {
+                    type_id: rc_id(&cls),
+                    ver,
                 };
             }
             InlineCache::Cooldown(COOLDOWN)
         }
         _ => InlineCache::Cooldown(COOLDOWN),
-    }
-}
-
-/// True when `name` resolves to a class-level *data descriptor* on
-/// `ty`'s MRO: a `__slots__` member, a `property`, or any user
-/// descriptor exposing `__set__`/`__delete__`. Such names own their
-/// storage (slot side table / setter) and must not be serviced by the
-/// instance-dict-index `STORE_ATTR` fast path.
-fn name_is_data_descriptor(ty: &Rc<TypeObject>, name: &str) -> bool {
-    match ty.lookup(name) {
-        Some(Object::SlotDescriptor(_) | Object::Property(_)) => true,
-        Some(Object::Instance(desc)) => {
-            let dcls = desc.cls();
-            dcls.lookup("__set__").is_some() || dcls.lookup("__delete__").is_some()
-        }
-        _ => false,
     }
 }
 
@@ -362,10 +438,11 @@ fn type_has_attr_override(ty: &Rc<TypeObject>) -> bool {
         Some(_) => return true,
         None => {}
     }
-    if ty.lookup("__setattr__").is_some() {
-        return true;
-    }
-    false
+    // Same story for `__setattr__`: `object.__setattr__` is the stock
+    // default every class inherits — a bare `is_some()` disabled the
+    // LOAD_ATTR/STORE_ATTR fast paths for *every class in the program*.
+    // Only a genuine user override disqualifies the type.
+    !ty.setattr_is_default()
 }
 
 // ---------- per-opcode dispatch stats (`WEAVEPY_VM_STATS=1`) ----------
@@ -539,8 +616,7 @@ trait DictDataExt {
 
 impl DictDataExt for DictData {
     fn index_of_key_str(&self, key_str: &str) -> Option<u32> {
-        let key = crate::object::DictKey(Object::from_str(key_str));
-        self.get_full(&key)
+        self.get_full(&crate::object::StrKey(key_str))
             .map(|(idx, _, _)| u32::try_from(idx).unwrap_or(u32::MAX))
     }
 }

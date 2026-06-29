@@ -87,10 +87,41 @@ pub unsafe extern "C" fn PyCallable_Check(o: *mut PyObject) -> c_int {
     if o.is_null() {
         return 0;
     }
-    // `callable(x)` is `type(x)` having `__call__`; querying the object
-    // resolves the slot through its type, which covers functions,
-    // methods, builtins, types, and instances of `__call__`-defining
-    // classes.
+    // CPython's `PyCallable_Check` is `Py_TYPE(o)->tp_call != NULL` — a *type*
+    // property, not an instance `__call__` attribute lookup. WeavePy's
+    // intrinsically-callable object kinds (plain/lambda functions, builtins,
+    // types, and bound/class/static methods) carry no `__call__` entry in a
+    // type dict, so the old `PyObject_HasAttrString(o, "__call__")` probe
+    // returned 0 for them through the C-API — even though the VM's `callable()`
+    // reports true. Cython compiles `callable(x)` to this function, so pandas'
+    // C parser (`parsers.pyx`: `not callable(self.usecols)` → `len(usecols)`,
+    // `not callable(self.skiprows)` → `for _ in skiprows`) then treated a
+    // callable `usecols`/`skiprows` as a sequence and raised
+    // "object of type 'function' has no len()". Recognise the callable kinds
+    // directly, matching `tp_call`.
+    let obj = unsafe { crate::object::clone_object(o) };
+    match &obj {
+        Object::Function(_)
+        | Object::Builtin(_)
+        | Object::Type(_)
+        | Object::BoundMethod(_)
+        | Object::ClassMethod(_)
+        | Object::StaticMethod(_) => return 1,
+        // A pure-Python instance is callable iff its class defines `__call__`.
+        Object::Instance(inst) => {
+            return c_int::from(inst.cls().lookup("__call__").is_some());
+        }
+        // A foreign extension object is callable iff its type installs a
+        // `tp_call` slot (numpy ufuncs, `functools.partial` bridged in, …).
+        Object::Foreign(_) => {
+            let tp = unsafe { (*o).ob_type };
+            if !tp.is_null() && !unsafe { (*tp).tp_call }.is_null() {
+                return 1;
+            }
+        }
+        _ => {}
+    }
+    // Fallback for anything else: a `__call__` on the type still means callable.
     unsafe { crate::abstract_::PyObject_HasAttrString(o, b"__call__\0".as_ptr() as *const c_char) }
 }
 
@@ -156,22 +187,50 @@ pub extern "C" fn PyErr_CheckSignals() -> c_int {
     0
 }
 
-/// tracemalloc is not wired into the C allocator domain; tracking is a
-/// no-op (CPython behaves identically when tracemalloc is stopped).
+/// `PyTraceMalloc_Track(domain, ptr, size)` — record a C-allocated block
+/// in the given tracemalloc domain (RFC 0047, wave 5). pandas' khash
+/// allocator tracks every hashtable buffer this way (domain 472) and its
+/// test suite asserts exact byte accounting through
+/// `Snapshot.filter_traces((DomainFilter(True, domain),))`. Returns 0 on
+/// success, -2 when tracing is disabled (CPython's contract).
 #[no_mangle]
-pub extern "C" fn PyTraceMalloc_Track(_domain: c_uint, _ptr: usize, _size: usize) -> c_int {
-    0
+pub extern "C" fn PyTraceMalloc_Track(domain: c_uint, ptr: usize, size: usize) -> c_int {
+    if weavepy_vm::stdlib::tracemalloc_real::track_domain(domain, ptr, size as u64) {
+        0
+    } else {
+        -2
+    }
 }
 
 #[no_mangle]
-pub extern "C" fn PyTraceMalloc_Untrack(_domain: c_uint, _ptr: usize) -> c_int {
-    0
+pub extern "C" fn PyTraceMalloc_Untrack(domain: c_uint, ptr: usize) -> c_int {
+    if weavepy_vm::stdlib::tracemalloc_real::untrack_domain(domain, ptr) {
+        0
+    } else {
+        -2
+    }
 }
 
-/// WeavePy does not maintain CPython's per-type attribute-cache version
-/// tag, so an explicit invalidation is a no-op.
+/// `PyType_Modified(type)` — the documented contract for C code that
+/// mutated `tp_dict` directly (bypassing `type.__setattr__`). The VM keeps
+/// per-type caches that such surgery can invalidate: the attribute
+/// resolution version (`TypeObject::attr_version`, guarding specialized
+/// LOAD_ATTR/STORE_ATTR sites), the `__getattribute__`/`__setattr__`
+/// classification, the `__del__` finalizer classification, and the
+/// `_PyType_Lookup` borrowed-pointer memo. Flush them all for the type and
+/// (transitively, where the walk is built in) its subclasses.
 #[no_mangle]
-pub extern "C" fn PyType_Modified(_ty: *mut PyObject) {}
+pub extern "C" fn PyType_Modified(ty: *mut PyObject) {
+    if ty.is_null() {
+        return;
+    }
+    if let Object::Type(t) = unsafe { crate::object::clone_object(ty) } {
+        t.bump_attr_version();
+        t.invalidate_getattribute_cache();
+        t.invalidate_finalizer_cache();
+    }
+    crate::wave5::flush_type_lookup_cache();
+}
 
 /// `PyMutex` is uncontended under WeavePy's GIL-serialised execution.
 #[no_mangle]
@@ -385,10 +444,12 @@ unsafe fn call_module_attr(
 
 #[no_mangle]
 pub unsafe extern "C" fn PyComplex_AsCComplex(op: *mut PyObject) -> crate::layout::PyComplexValue {
-    crate::layout::PyComplexValue {
-        real: unsafe { crate::numbers::PyComplex_RealAsDouble(op) },
-        imag: unsafe { crate::numbers::PyComplex_ImagAsDouble(op) },
-    }
+    // Single conversion pass: computing real and imag with two independent
+    // `PyComplex_RealAsDouble`/`PyComplex_ImagAsDouble` calls let the imag
+    // call's `__complex__` probe clear the `TypeError` the real call had set
+    // for an unconvertible object, so numpy's object→complex cast stored
+    // garbage instead of raising (see `numbers::complex_as_ccomplex`).
+    unsafe { crate::numbers::complex_as_ccomplex(op) }
 }
 
 #[no_mangle]
@@ -416,8 +477,22 @@ pub unsafe extern "C" fn _PyLong_Sign(v: *mut PyObject) -> c_int {
 
 /// Hash a `double` consistently with WeavePy's own `float` hashing (so a
 /// numpy scalar and the equal Python `float` land in the same dict slot).
+///
+/// CPython 3.10+ (gh-43475) hashes a NaN by the *instance's* identity
+/// (`PyObject_GenericHash(inst)`), so two distinct NaN-valued scalars —
+/// numpy's `float64.tp_hash` calls this with the scalar itself — hash apart
+/// while the same object hashes stably. Mirror that with the same
+/// pointer-rotate CPython uses; a NULL `inst` (pandas' `_Pandas_HashDouble`
+/// passes NULL, though it filters NaN itself) falls back to 0.
 #[no_mangle]
-pub unsafe extern "C" fn _Py_HashDouble(_inst: *mut PyObject, v: c_double) -> isize {
+pub unsafe extern "C" fn _Py_HashDouble(inst: *mut PyObject, v: c_double) -> isize {
+    if v.is_nan() {
+        if inst.is_null() {
+            return 0;
+        }
+        let h = (inst as usize).rotate_right(4) as isize;
+        return if h == -1 { -2 } else { h };
+    }
     let f = unsafe { crate::numbers::PyFloat_FromDouble(v) };
     if f.is_null() {
         return 0;
@@ -438,7 +513,7 @@ pub unsafe extern "C" fn PyLong_FromUnicodeObject(u: *mut PyObject, base: c_int)
 
 #[no_mangle]
 pub unsafe extern "C" fn PyFloat_FromString(s: *mut PyObject) -> *mut PyObject {
-    let text = match unsafe { crate::object::clone_object(s) } {
+    let text = match unsafe { crate::object::clone_object_value(s) } {
         Object::Str(t) => t.to_string(),
         Object::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
         _ => {
@@ -447,6 +522,7 @@ pub unsafe extern "C" fn PyFloat_FromString(s: *mut PyObject) -> *mut PyObject {
         }
     };
     match text.trim().parse::<f64>() {
+        // `PyFloat_FromDouble` gives a NaN a fresh identity tag.
         Ok(v) => unsafe { crate::numbers::PyFloat_FromDouble(v) },
         Err(_) => {
             crate::errors::set_value_error(format!("could not convert string to float: '{text}'"));
@@ -466,7 +542,7 @@ pub unsafe extern "C" fn PyUnicode_AsUCS4(
     buflen: isize,
     copy_null: c_int,
 ) -> *mut u32 {
-    let text = match unsafe { crate::object::clone_object(u) } {
+    let text = match unsafe { crate::object::clone_object_value(u) } {
         Object::Str(t) => t.to_string(),
         _ => {
             crate::errors::set_type_error("PyUnicode_AsUCS4: argument must be str");
@@ -475,6 +551,12 @@ pub unsafe extern "C" fn PyUnicode_AsUCS4(
     };
     let chars: Vec<u32> = text.chars().map(|c| c as u32).collect();
     let need = chars.len() + if copy_null != 0 { 1 } else { 0 };
+    if std::env::var_os("WEAVEPY_TRACE_UCS4").is_some() {
+        eprintln!(
+            "[UCS4] AsUCS4({u:p}, buf={buffer:p}, buflen={buflen}, copy_null={copy_null}) value={text:?} nchars={}",
+            chars.len()
+        );
+    }
     if buflen < need as isize {
         crate::errors::set_value_error("PyUnicode_AsUCS4: buffer too small");
         return ptr::null_mut();
@@ -492,7 +574,7 @@ pub unsafe extern "C" fn PyUnicode_AsUCS4(
 
 #[no_mangle]
 pub unsafe extern "C" fn PyUnicode_AsUCS4Copy(u: *mut PyObject) -> *mut u32 {
-    let text = match unsafe { crate::object::clone_object(u) } {
+    let text = match unsafe { crate::object::clone_object_value(u) } {
         Object::Str(t) => t.to_string(),
         _ => {
             crate::errors::set_type_error("PyUnicode_AsUCS4Copy: argument must be str");
@@ -538,9 +620,12 @@ macro_rules! ucs4_classifier {
 
 ucs4_classifier! {
     _PyUnicode_IsAlpha => |c: char| c.is_alphabetic();
-    _PyUnicode_IsDecimalDigit => |c: char| c.is_ascii_digit();
-    _PyUnicode_IsDigit => |c: char| c.is_ascii_digit();
-    _PyUnicode_IsNumeric => |c: char| c.is_numeric();
+    // `Numeric_Type`-faithful predicates (shared with `str.isdecimal/isdigit/isnumeric`);
+    // Rust's `is_ascii_digit`/`is_numeric` diverge from CPython on non-ASCII digits,
+    // superscripts, fractions, and CJK numerals.
+    _PyUnicode_IsDecimalDigit => |c: char| weavepy_vm::unicode_numeric::is_decimal_char(c);
+    _PyUnicode_IsDigit => |c: char| weavepy_vm::unicode_numeric::is_digit_char(c);
+    _PyUnicode_IsNumeric => |c: char| weavepy_vm::unicode_numeric::is_numeric_char(c);
     _PyUnicode_IsLowercase => |c: char| c.is_lowercase();
     _PyUnicode_IsUppercase => |c: char| c.is_uppercase();
     _PyUnicode_IsTitlecase => |c: char| c.is_uppercase() && !c.is_lowercase() && c.is_alphabetic() && false;

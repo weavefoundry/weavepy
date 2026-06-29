@@ -27,7 +27,7 @@ use std::ptr;
 use std::sync::Mutex;
 use weavepy_vm::sync::Rc;
 
-use weavepy_vm::object::{DictData, DictKey, Object};
+use weavepy_vm::object::{BoundMethod, DictData, DictKey, Object};
 use weavepy_vm::types::TypeObject;
 
 use crate::object::{PyObject, PySsizeT, IMMORTAL_REFCNT};
@@ -321,6 +321,14 @@ decl_static_type! {
     pub PyGen_Type;
     pub PyCoro_Type;
     pub PyAsyncGen_Type;
+    // RFC 0047 (wave 5): the umbrella type for WeavePy's native iterators
+    // (`Object::Iter` — list/tuple/range/dict/set/... iterators). Macro-heavy
+    // Cython reads `Py_TYPE(it)->tp_iternext` *directly* in its `for` loop and
+    // `next()` codegen; without a non-NULL slot a compiled `for x in range(n)`
+    // (numpy.random's `SeedSequence.generate_state`) jumps to its error label
+    // with no exception set. The type carries `tp_iter` (return self) +
+    // `tp_iternext` (→ `PyIter_Next`).
+    pub PySeqIter_Type;
     // RFC 0046 (wave 4): types numpy's `_multiarray_umath` references by
     // address (`Py_TYPE(x) == &PyMemoryView_Type`, descriptor/proxy slots).
     pub PyMemoryView_Type;
@@ -328,6 +336,10 @@ decl_static_type! {
     pub PyGetSetDescr_Type;
     pub PyMemberDescr_Type;
     pub PyMethodDescr_Type;
+    // RFC 0047 (wave 5): `wrapper_descriptor` (slot wrappers like
+    // `object.__init__`); numpy.random / pandas reference the type by
+    // address. A synthetic minimal type satisfies symbol + identity.
+    pub PyWrapperDescr_Type;
     // RFC 0046 (wave 4): tags a `PyModuleDef` returned by
     // `PyModuleDef_Init`, so the loader can recognise a multi-phase
     // (PEP 489) extension and run its create/exec slots.
@@ -388,10 +400,18 @@ pub fn init_static_types() {
         bt.async_generator_.clone(),
     );
 
-    // The complex/NotImplemented/Ellipsis/Capsule/CFunction/Slice/Method
-    // types don't correspond directly to BuiltinTypes entries;
-    // we synthesise minimal native types so `type(Py_None) is _PyNone_Type`
-    // (and friends) round-trips correctly.
+    // `complex` bridges to the VM's real builtin `complex` (like `float`),
+    // so `PyComplex_Type`'s bridged type is *identity-equal* to the VM
+    // `complex`. numpy's `complex128` dual-inherits from it
+    // (`tp_bases == (complexfloating, complex)`), and
+    // `isinstance(np.complex128(z), complex)` / `issubclass(...)` only hold
+    // when the MRO's `complex` entry *is* the builtin one.
+    install(&PyComplex_Type, b"complex\0", bt.complex_.clone());
+
+    // The NotImplemented/Ellipsis/Capsule/CFunction/Slice/Method types
+    // don't correspond directly to BuiltinTypes entries; we synthesise
+    // minimal native types so `type(Py_None) is _PyNone_Type` (and
+    // friends) round-trips correctly.
     fn install_synth(slot: &StaticType, name: &'static [u8], display: &str) {
         let rc = TypeObject::new_builtin(
             display,
@@ -400,7 +420,6 @@ pub fn init_static_types() {
         .expect("synthetic builtin type must linearise");
         install(slot, name, rc);
     }
-    install_synth(&PyComplex_Type, b"complex\0", "complex");
     install_synth(
         &_PyNotImplemented_Type,
         b"NotImplementedType\0",
@@ -434,7 +453,53 @@ pub fn init_static_types() {
         b"method_descriptor\0",
         "method_descriptor",
     );
+    install_synth(
+        &PyWrapperDescr_Type,
+        b"wrapper_descriptor\0",
+        "wrapper_descriptor",
+    );
     install_synth(&PyModuleDef_Type, b"moduledef\0", "moduledef");
+    install_synth(&PySeqIter_Type, b"iterator\0", "iterator");
+
+    // RFC 0047 (wave 5): wire the iteration protocol (`tp_iter` → self,
+    // `tp_iternext` → `PyIter_Next`) onto the iterator umbrella type and the
+    // generator type. Stock Cython reads these slots off `Py_TYPE(it)`
+    // directly when compiling `for`/`next()`, so a WeavePy iterator handed to
+    // a C extension must advertise them or the loop silently errors.
+    unsafe {
+        crate::builtin_slots::install_iterator(&PySeqIter_Type);
+        crate::builtin_slots::install_iterator(&PyGen_Type);
+    }
+
+    // RFC 0047 (wave 5): wire the descriptor `tp_descr_get` onto the
+    // callable types so a WeavePy function / instance-binding builtin method
+    // found via `_PyType_Lookup` *binds* to the instance. Stock Cython's
+    // special-method protocol (`with`, `for`, operator dunders) reads this
+    // slot directly off `Py_TYPE(descr)`; without it a bound special method
+    // (a `threading.Lock`'s `__exit__`) was used unbound and called with no
+    // `self`, failing inside extension module init.
+    unsafe {
+        (*PyFunction_Type.as_ptr()).tp_descr_get = callable_descr_get as *mut c_void;
+        (*PyCFunction_Type.as_ptr()).tp_descr_get = callable_descr_get as *mut c_void;
+        (*PyMethodDescr_Type.as_ptr()).tp_descr_get = callable_descr_get as *mut c_void;
+    }
+
+    // RFC 0047 (wave 5): advertise `tp_call` on the callable built-in types.
+    // CPython sets `tp_call` on `function`/`builtin_function_or_method`/
+    // `method`; stock Cython reads `Py_TYPE(f)->tp_call` *directly* both to
+    // implement `callable(f)` (inlined `PyCallable_Check`) and to invoke `f`
+    // (`__Pyx_PyObject_Call`). Left NULL, a WeavePy function handed to a C
+    // extension looked "not callable": pandas' C parser
+    // (`parsers.pyx`: `not callable(self.usecols)` → `len(usecols)`,
+    // `not callable(self.skiprows)` → `for _ in skiprows`) then treated a
+    // callable `usecols`/`skiprows` as a sequence, raising
+    // "object of type 'function' has no len()". `synth_tp_call` forwards to
+    // the abstract `PyObject_Call`, which dispatches on the Rust `Object`.
+    unsafe {
+        (*PyFunction_Type.as_ptr()).tp_call = synth_tp_call as *mut c_void;
+        (*PyCFunction_Type.as_ptr()).tp_call = synth_tp_call as *mut c_void;
+        (*PyMethod_Type.as_ptr()).tp_call = synth_tp_call as *mut c_void;
+    }
 
     // Set the `Py_TPFLAGS_*_SUBCLASS` fast-subclass bits (and a
     // baseline `Py_TPFLAGS_DEFAULT`) on the built-in static types.
@@ -470,6 +535,46 @@ pub fn init_static_types() {
         add_flags(&PyByteArray_Type, tpflags::BASETYPE);
         add_flags(&PySet_Type, tpflags::BASETYPE);
         add_flags(&PyFrozenSet_Type, 0);
+        // The iterator umbrella type needs the baseline DEFAULT feature bit so
+        // `PyType_HasFeature`/`PyIter_Check` behave; no fast-subclass bit.
+        add_flags(&PySeqIter_Type, 0);
+    }
+
+    // RFC 0047 (wave 5): faithful `tp_basicsize` / `tp_itemsize` for the
+    // static built-ins. A Cython extension imports a builtin and validates
+    // it with `__Pyx_ImportType`, which reads `Py_TYPE(builtins.X)->
+    // tp_basicsize` and raises `ValueError("X size changed, may indicate
+    // binary incompatibility. Expected N from C header, got M from
+    // PyObject")` when the live value is smaller than the `sizeof(...)` its
+    // stock CPython 3.13 headers baked in (numpy.random's `bit_generator`
+    // checks `builtins.type` == `sizeof(PyHeapTypeObject)` = 928, and a
+    // zero tripped it). WeavePy stores these objects as managed
+    // `PyObjectBox` mirrors, so the field is **reporting-only**: it never
+    // diverts allocation, which is gated by the separate `INLINE_TYPES`
+    // registry these are never entered into. The values mirror stock
+    // CPython 3.13 (`<type>.__basicsize__` / `.__itemsize__`) byte-for-byte.
+    unsafe fn set_size(slot: &StaticType, basicsize: PySsizeT, itemsize: PySsizeT) {
+        unsafe {
+            let ty = &mut *slot.as_ptr();
+            ty.tp_basicsize = basicsize;
+            ty.tp_itemsize = itemsize;
+        }
+    }
+    unsafe {
+        set_size(&PyType_Type, 928, 40);
+        set_size(&PyBaseObject_Type, 16, 0);
+        set_size(&PyLong_Type, 24, 4);
+        set_size(&PyFloat_Type, 24, 0);
+        set_size(&PyBool_Type, 24, 4);
+        set_size(&PyComplex_Type, 32, 0);
+        set_size(&PyUnicode_Type, 64, 0);
+        set_size(&PyBytes_Type, 33, 1);
+        set_size(&PyByteArray_Type, 56, 0);
+        set_size(&PyTuple_Type, 24, 8);
+        set_size(&PyList_Type, 40, 0);
+        set_size(&PyDict_Type, 48, 0);
+        set_size(&PySet_Type, 200, 0);
+        set_size(&PyFrozenSet_Type, 200, 0);
     }
 
     // RFC 0046 (wave 4): give the exported value built-ins a faithful
@@ -478,6 +583,75 @@ pub fn init_static_types() {
     // directly call the base's `tp_new`; a NULL slot is a jump through
     // address 0 (`np.float64(1.0)` and numpy's import self-checks crash).
     crate::builtin_new::install_builtin_constructors();
+
+    // RFC 0047 (wave 5): populate the C-level protocol suites
+    // (`tp_as_sequence`/`tp_as_mapping`/`tp_iter`) on the built-in
+    // containers. Macro-heavy Cython reads these slots directly off the
+    // type struct (`__Pyx_PyObject_GetItem` → `tp_as_mapping->mp_subscript`),
+    // so without them a WeavePy list/tuple/dict appears "not subscriptable"
+    // to an extension even though the VM handles the operation.
+    crate::builtin_slots::install();
+
+    // RFC 0047 (wave 5): populate `tp_as_number` on the exported numeric
+    // built-ins (`int`/`float`/`bool`/`complex`). Macro-heavy Cython casts a
+    // scalar to a C integer/double by reading `Py_TYPE(x)->tp_as_number->nb_int`
+    // (`__Pyx_PyNumber_IntOrLong`) / `nb_float` directly; a NULL suite made
+    // `<int64_t>(some_float)` raise "an integer is required" — the exact break
+    // in pandas' `Timedelta("1 day")` string parser (`cast_from_unit`).
+    crate::builtin_slots::install_numbers();
+
+    // RFC 0047 (wave 5): wire `tp_repr` / `tp_str` / `tp_hash` on every
+    // exported built-in static type. Stock Cython/C code reaches the
+    // stringify + hash slots *directly* off `Py_TYPE(o)` — e.g. pandas'
+    // `lib.ensure_string_array` compiles `f"{val}"` on an `int`/`float`
+    // element to `Py_TYPE(val)->tp_repr(val)` (via `PyObject_Format` →
+    // `object.__format__` → `PyObject_Str` → `tp_str`/`tp_repr`), and dict
+    // /set keying reads `Py_TYPE(key)->tp_hash`. A NULL slot is a jump
+    // through address 0 (`s.astype(str)` on an int64 Series crashed with
+    // `pc=0x0` inside `ensure_string_array.cold`). The `synth_*` bridges
+    // forward to `PyObject_Repr` / `PyObject_Str` / `PyObject_Hash`, which
+    // dispatch on the runtime `Object` enum and never re-read these C slots,
+    // so the forward is recursion-safe. Only fill a slot left NULL so a
+    // faithful per-type slot (datetime, `PyType_FromSpec`) is untouched;
+    // `list`/`dict`/`set` get the hash bridge too, which raises
+    // `unhashable type` via the VM exactly as CPython's
+    // `PyObject_HashNotImplemented` does.
+    // `object.__hash__` / `type.__hash__` are CPython's identity hash
+    // (`_Py_HashPointer`), **not** the VM-forwarding `synth_tp_hash` bridge.
+    // A stock extension reads `PyBaseObject_Type->tp_hash` straight off the
+    // struct and calls it directly (numpy's `datetime`/`timedelta` scalar hash
+    // does this for a `NaT`); the forwarding bridge would ping-pong `object
+    // slot → PyObject_Hash → py_hash_value(Foreign) → fwd_hash → numpy slot →
+    // object slot` and overflow the stack. Set them before the NULL-fill loop
+    // so the loop leaves them untouched. See [`object_generic_hash`].
+    unsafe {
+        (*PyBaseObject_Type.as_ptr()).tp_hash = object_generic_hash as *mut c_void;
+        (*PyType_Type.as_ptr()).tp_hash = object_generic_hash as *mut c_void;
+        // `str.__hash__` / `bytes.__hash__` are CPython's value hashes,
+        // self-contained like the identity hash above: a subtype (numpy's
+        // `str_`/`bytes_`) inherits these slots via `inherit_slots` and the
+        // VM resolves such an instance's `__hash__` back to them, so a
+        // VM-forwarding bridge here would recurse `VM → C → VM`.
+        (*PyUnicode_Type.as_ptr()).tp_hash = unicode_value_hash as *mut c_void;
+        (*PyBytes_Type.as_ptr()).tp_hash = bytes_value_hash as *mut c_void;
+    }
+    unsafe {
+        for slot in STATIC_TYPE_TABLE {
+            let ty = &mut *slot.as_ptr();
+            if ty.tp_repr.is_null() {
+                ty.tp_repr = synth_tp_repr as *mut c_void;
+            }
+            if ty.tp_str.is_null() {
+                ty.tp_str = synth_tp_str as *mut c_void;
+            }
+            if ty.tp_hash.is_null() {
+                ty.tp_hash = synth_tp_hash as *mut c_void;
+            }
+        }
+    }
+    // The static bridges wired above are registry events for the
+    // negative `find_type_ptr` cache.
+    bump_type_registry_gen();
 }
 
 /// Map a runtime [`Object`] to the static [`PyTypeObject`] pointer
@@ -492,6 +666,12 @@ pub fn type_for_object(o: &Object) -> *mut PyTypeObject {
         O::Float(_) => PyFloat_Type.as_ptr(),
         O::Complex(_) => PyComplex_Type.as_ptr(),
         O::Str(_) => PyUnicode_Type.as_ptr(),
+        // A surrogate-bearing string is still a `str` to C: the compiled
+        // `PyUnicode_Check` macro reads `ob_type->tp_flags` directly, so a
+        // `WStr` crossing with any other type pointer silently demotes it to
+        // a "generic object" (pandas' ujson then encoded `"'\udac0'"` as `{}`
+        // instead of raising UnicodeEncodeError).
+        O::WStr(_) => PyUnicode_Type.as_ptr(),
         O::Bytes(_) => PyBytes_Type.as_ptr(),
         O::ByteArray(_) => PyByteArray_Type.as_ptr(),
         O::Tuple(_) => PyTuple_Type.as_ptr(),
@@ -500,17 +680,31 @@ pub fn type_for_object(o: &Object) -> *mut PyTypeObject {
         O::Set(_) => PySet_Type.as_ptr(),
         O::FrozenSet(_) => PyFrozenSet_Type.as_ptr(),
         O::Range(_) => PyRange_Type.as_ptr(),
+        O::MemoryView(_) => PyMemoryView_Type.as_ptr(),
         O::Module(_) => PyModule_Type.as_ptr(),
         O::Function(_) => PyFunction_Type.as_ptr(),
         O::Builtin(_) => PyCFunction_Type.as_ptr(),
         O::BoundMethod(_) => PyMethod_Type.as_ptr(),
         O::Generator(_) => PyGen_Type.as_ptr(),
+        O::Iter(_) => PySeqIter_Type.as_ptr(),
         O::Coroutine(_) => PyCoro_Type.as_ptr(),
         O::AsyncGenerator(_) => PyAsyncGen_Type.as_ptr(),
         O::Slice(_) => PySlice_Type.as_ptr(),
         O::Type(t) => find_type_ptr(t).unwrap_or_else(|| PyType_Type.as_ptr()),
         O::Instance(inst) => {
-            find_type_ptr(&inst.cls()).unwrap_or_else(|| PyBaseObject_Type.as_ptr())
+            let cls = inst.cls();
+            // RFC 0029 (wave 5): an instance crosses wearing its *real* type,
+            // not a bare `object`. A pure-Python subclass of a faithful C base
+            // — pytz's `UTC ← BaseTzInfo ← datetime.tzinfo`, consumed by
+            // pandas' `cdef tzinfo utc_pytz = pytz.utc` (a Cython
+            // `__Pyx_TypeTest(obj, datetime.tzinfo)`) — only passes the C-side
+            // subtype check if `Py_TYPE(obj)`'s `tp_base` chain reaches the
+            // `tzinfo` shell. `install_user_type` builds that chain (minting
+            // intermediate bases), so use it as the final fallback rather than
+            // collapsing every unregistered instance to `object`.
+            find_type_ptr(&cls)
+                .or_else(|| synth_type_for_class(&cls))
+                .unwrap_or_else(|| install_user_type(&cls))
         }
         // RFC 0045 (wave 3): capsules round-trip as their retained box in
         // `into_owned`, but report the faithful `PyCapsule_Type` for any
@@ -520,11 +714,108 @@ pub fn type_for_object(o: &Object) -> *mut PyTypeObject {
     }
 }
 
+/// Positive-result cache for [`find_type_ptr`]: `Rc<TypeObject>`
+/// address → resolved `PyTypeObject *`. The linear registry scans
+/// below made this — which runs on *every* instance crossing into C —
+/// O(registered types); under pandas (hundreds of readied/heap types,
+/// millions of crossings) it dominated whole test files. Safe to cache
+/// because a resolved mapping never changes: registered type structs
+/// are immortal, a `bridge` is written once (never re-pointed at a
+/// different class), and the scan order is deterministic. Negative
+/// results are *not* cached — a bridge can be wired lazily after the
+/// type registers (e.g. the datetime shells), so a miss must re-scan.
+static TYPE_PTR_CACHE: Mutex<Option<weavepy_vm::fasthash::FxHashMap<usize, usize>>> =
+    Mutex::new(None);
+
+/// Monotonic stamp of the C-type registry: bumped whenever an event
+/// occurs that could make a previously-unresolvable class resolvable
+/// (a heap/readied type registers, a static bridge is wired). Guards
+/// the *negative* cache below: a cached miss is only trusted while the
+/// registry is unchanged since the miss was recorded.
+static TYPE_REGISTRY_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Negative-result cache for [`find_type_ptr`]: class address → the
+/// registry generation at which the full scan came up empty. Pure
+/// Python classes (the overwhelmingly common case on the GC traverse /
+/// crossing paths) otherwise pay the whole linear scan on *every*
+/// lookup, since only positive results are memoised. Cleared on every
+/// generation bump so entries never outlive the scan they summarise.
+/// `datetime`-named classes are excluded: their resolution runs through
+/// [`crate::datetime_api::faithful_type_for_class`], which mints shells
+/// and wires bridges outside the generation counter's view.
+static NEG_TYPE_PTR_CACHE: Mutex<Option<weavepy_vm::fasthash::FxHashMap<usize, u64>>> =
+    Mutex::new(None);
+
+/// Note a registry event that could change [`find_type_ptr`] results:
+/// invalidate the negative cache and advance the generation.
+pub(crate) fn bump_type_registry_gen() {
+    TYPE_REGISTRY_GEN.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    if let Ok(mut g) = NEG_TYPE_PTR_CACHE.lock() {
+        if let Some(m) = g.as_mut() {
+            m.clear();
+        }
+    }
+}
+
 /// Walk the static type registry plus the heap-type registry
 /// looking for a slot whose bridge matches `t`. Used by
 /// [`type_for_object`]. Linear in the number of registered types
-/// (small static set + however many `PyType_FromSpec` produced).
+/// (small static set + however many `PyType_FromSpec` produced),
+/// memoised per class through [`TYPE_PTR_CACHE`] (hits) and
+/// [`NEG_TYPE_PTR_CACHE`] (generation-stamped misses).
 fn find_type_ptr(t: &Rc<TypeObject>) -> Option<*mut PyTypeObject> {
+    let target = Rc::as_ptr(t);
+    if let Some(p) = TYPE_PTR_CACHE
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|m| m.get(&(target as usize)).copied()))
+    {
+        return Some(p as *mut PyTypeObject);
+    }
+    // A miss recorded at the current generation is authoritative — the
+    // registry hasn't changed since the last full scan for this class.
+    // Safe against address reuse: a class allocated over a dead one's
+    // address can only *gain* a C type through a registry event, and
+    // every such event clears this cache.
+    let neg_cacheable = !crate::datetime_api::is_datetime_class_name(&t.name);
+    let gen = TYPE_REGISTRY_GEN.load(std::sync::atomic::Ordering::Acquire);
+    if neg_cacheable
+        && NEG_TYPE_PTR_CACHE
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().and_then(|m| m.get(&(target as usize)).copied()))
+            == Some(gen)
+    {
+        return None;
+    }
+    match find_type_ptr_uncached(t) {
+        Some(found) => {
+            if let Ok(mut g) = TYPE_PTR_CACHE.lock() {
+                g.get_or_insert_with(weavepy_vm::fasthash::FxHashMap::default)
+                    .insert(target as usize, found as usize);
+            }
+            Some(found)
+        }
+        None => {
+            if neg_cacheable {
+                if let Ok(mut g) = NEG_TYPE_PTR_CACHE.lock() {
+                    g.get_or_insert_with(weavepy_vm::fasthash::FxHashMap::default)
+                        .insert(target as usize, gen);
+                }
+            }
+            None
+        }
+    }
+}
+
+fn find_type_ptr_uncached(t: &Rc<TypeObject>) -> Option<*mut PyTypeObject> {
+    // RFC 0029 (wave 5): the `datetime` module's classes resolve to the
+    // faithful, size-correct C types (minted on first use). Authoritative
+    // and identity-checked, so it runs *before* the generic registry scan
+    // and never collides with a coincidentally-named user class.
+    if let Some(p) = crate::datetime_api::faithful_type_for_class(t) {
+        return Some(p);
+    }
     let target = Rc::as_ptr(t);
     for slot in STATIC_TYPE_TABLE {
         let p = slot.as_ptr();
@@ -552,14 +843,13 @@ fn find_type_ptr(t: &Rc<TypeObject>) -> Option<*mut PyTypeObject> {
     }
     // Readied stock types (RFC 0044): match on the bridge and return
     // the extension's own pointer so instances carry its `ob_type`.
-    READIED_TYPES.with(|cell| {
-        for rt in cell.borrow().iter() {
-            if Rc::as_ptr(&rt.bridge) == target {
-                return Some(rt.ext_ptr);
-            }
+    let readied = READIED_TYPES.lock().ok()?;
+    for rt in readied.iter() {
+        if Rc::as_ptr(&rt.bridge) == target {
+            return Some(rt.ext_ptr);
         }
-        None
-    })
+    }
+    None
 }
 
 /// Registry of heap-allocated `PyTypeObject *` produced by
@@ -584,6 +874,11 @@ fn find_type_ptr(t: &Rc<TypeObject>) -> Option<*mut PyTypeObject> {
 /// runs single-threaded under the GIL, so the mutex is uncontended.
 static HEAP_TYPES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
+/// O(1) membership companion to [`HEAP_TYPES`] (which stays a `Vec`
+/// for its deterministic scan order). [`is_weavepy_owned_type`] runs on
+/// hot free/crossing paths; a `Vec::contains` scan there was O(types).
+static HEAP_TYPE_SET: Mutex<Option<weavepy_vm::fasthash::FxHashSet<usize>>> = Mutex::new(None);
+
 /// Register a heap-allocated type pointer so subsequent
 /// `Object::Instance` boxes get the extension's declared
 /// `ob_type` instead of falling back to `PyBaseObject_Type`.
@@ -591,11 +886,850 @@ pub fn register_heap_type(p: *mut PyTypeObject) {
     if p.is_null() {
         return;
     }
-    if let Ok(mut g) = HEAP_TYPES.lock() {
-        if !g.contains(&(p as usize)) {
+    let fresh = HEAP_TYPE_SET
+        .lock()
+        .map(|mut g| {
+            g.get_or_insert_with(weavepy_vm::fasthash::FxHashSet::default)
+                .insert(p as usize)
+        })
+        .unwrap_or(false);
+    if fresh {
+        if let Ok(mut g) = HEAP_TYPES.lock() {
             g.push(p as usize);
         }
+        bump_type_registry_gen();
     }
+}
+
+// ---------------------------------------------------------------------------
+// RFC 0047 (wave 5): synthesize a faithful C `PyTypeObject` for a *Python*
+// class that crosses into a C extension.
+//
+// WeavePy classes (incl. stdlib ones written in Python like
+// `itertools.cycle`) have no `PyType_FromSpec`-registered C type, so a
+// bare `Object::Instance` previously crossed into C wearing
+// `PyBaseObject_Type`. Macro-heavy Cython then reads protocol slots
+// (`Py_TYPE(it)->tp_iternext`, `->tp_call`, …) straight off that struct,
+// finds them NULL, and silently errors (`numpy.random.SeedSequence.
+// generate_state` iterates `cycle(self.pool)`).
+//
+// We mint one immortal type per class, populated from the class's dunders
+// with bridges that forward to the recursion-safe abstract C-API (which
+// dispatches on the Rust `Object`, never re-reading these slots). Scoped
+// to iterables/iterators to keep the blast radius small: every other
+// instance keeps the historic `PyBaseObject_Type` crossing.
+
+unsafe extern "C" fn synth_tp_iter(o: *mut PyObject) -> *mut PyObject {
+    unsafe { crate::abstract_::PyObject_GetIter(o) }
+}
+unsafe extern "C" fn synth_tp_iternext(o: *mut PyObject) -> *mut PyObject {
+    unsafe { crate::abstract_::PyIter_Next(o) }
+}
+unsafe extern "C" fn synth_tp_call(
+    o: *mut PyObject,
+    a: *mut PyObject,
+    k: *mut PyObject,
+) -> *mut PyObject {
+    unsafe { crate::abstract_::PyObject_Call(o, a, k) }
+}
+unsafe extern "C" fn synth_tp_repr(o: *mut PyObject) -> *mut PyObject {
+    unsafe { crate::abstract_::PyObject_Repr(o) }
+}
+unsafe extern "C" fn synth_tp_str(o: *mut PyObject) -> *mut PyObject {
+    unsafe { crate::abstract_::PyObject_Str(o) }
+}
+
+/// True when `slot` is one of the VM-forwarding repr/str bridges above.
+/// `foreign_repr_or_str` consults this to break the `foreign tp_repr →
+/// synth bridge → PyObject_Repr → foreign tp_repr` cycle.
+pub(crate) fn is_synth_repr_str_slot(slot: *mut c_void) -> bool {
+    slot == synth_tp_repr as *mut c_void || slot == synth_tp_str as *mut c_void
+}
+unsafe extern "C" fn synth_tp_hash(o: *mut PyObject) -> crate::object::PyHashT {
+    unsafe { crate::abstract_::PyObject_Hash(o) }
+}
+
+// ---------------------------------------------------------------------------
+// Synthesized number suite (RFC 0047, wave 5) — CPython's `slot_nb_*`.
+//
+// CPython's `fixup_slot_dispatchers` wires every class-dict numeric dunder
+// into `tp_as_number` via shared `slot_nb_*` trampolines, so C code that
+// dispatches through the slot protocol (`binary_op1`, Cython's inlined
+// `PyNumber_*` calls) reaches Python-level `__add__`/`__rmod__`/… methods.
+// WeavePy's synthesized types previously left the whole suite NULL: a
+// binary op between a *foreign* operand and a VM instance
+// (`np.timedelta64 % pandas.Timedelta`, evaluated **inside** Cython's
+// `__rmod__ → __rdivmod__ → PyNumber_FloorDivide`) found no slot on either
+// side and raised "unsupported operand type" even though the VM class
+// defines the dunder.
+//
+// Each trampoline mirrors CPython's `SLOT1BIN` exactly: it computes
+// whether each operand's type *owns* this very trampoline for the slot
+// (the `SLOTNAME == TESTFUNC` test, emulated with a `tp_base` walk since
+// WeavePy types aren't flattened), then runs only the Python-level dunder
+// pair through the VM — never the full dispatch protocol, which would
+// recurse back into these slots.
+
+/// Shared `SLOT1BIN` body. `me` is the calling trampoline's own address;
+/// `getter` projects this trampoline's slot out of a `PyNumberMethods`.
+unsafe fn synth_nb_binop(
+    x: *mut PyObject,
+    y: *mut PyObject,
+    dunder: &'static str,
+    rdunder: &'static str,
+    getter: fn(*mut crate::layout::PyNumberMethods) -> *mut c_void,
+    me: *mut c_void,
+) -> *mut PyObject {
+    let resolve = |o: *mut PyObject| -> *mut c_void {
+        let mut ty = unsafe { (*o).ob_type } as *mut crate::layout::PyTypeObjectFull;
+        let mut guard = 0;
+        while !ty.is_null() && guard < 100 {
+            let nb = unsafe { (*ty).tp_as_number };
+            if !nb.is_null() {
+                let s = getter(nb);
+                if !s.is_null() {
+                    return s;
+                }
+            }
+            ty = unsafe { (*ty).tp_base };
+            guard += 1;
+        }
+        ptr::null_mut()
+    };
+    let a_owns = resolve(x) == me;
+    let b_owns = resolve(y) == me;
+    let same_type = unsafe { (*x).ob_type == (*y).ob_type };
+    let ox = unsafe { crate::object::clone_object(x) };
+    let oy = unsafe { crate::object::clone_object(y) };
+    match crate::interp::ensure_active(|| {
+        crate::interp::with_interp_mut(|interp| {
+            interp.slot_nb_binop_public(&ox, &oy, dunder, rdunder, a_owns, b_owns, same_type)
+        })
+    }) {
+        Some(Ok(v)) => crate::object::into_owned(v),
+        Some(Err(e)) => {
+            crate::errors::set_pending_from_runtime(e);
+            ptr::null_mut()
+        }
+        None => {
+            let ni = crate::singletons::not_implemented_ptr();
+            unsafe { crate::object::Py_IncRef(ni) };
+            ni
+        }
+    }
+}
+
+macro_rules! synth_nb_binary {
+    ($fname:ident, $field:ident, $dunder:literal, $rdunder:literal) => {
+        unsafe extern "C" fn $fname(x: *mut PyObject, y: *mut PyObject) -> *mut PyObject {
+            unsafe {
+                synth_nb_binop(
+                    x,
+                    y,
+                    $dunder,
+                    $rdunder,
+                    |nb| unsafe { (*nb).$field },
+                    $fname as *mut c_void,
+                )
+            }
+        }
+    };
+}
+
+synth_nb_binary!(synth_nb_add, nb_add, "__add__", "__radd__");
+synth_nb_binary!(synth_nb_subtract, nb_subtract, "__sub__", "__rsub__");
+synth_nb_binary!(synth_nb_multiply, nb_multiply, "__mul__", "__rmul__");
+synth_nb_binary!(synth_nb_remainder, nb_remainder, "__mod__", "__rmod__");
+synth_nb_binary!(synth_nb_divmod, nb_divmod, "__divmod__", "__rdivmod__");
+synth_nb_binary!(synth_nb_lshift, nb_lshift, "__lshift__", "__rlshift__");
+synth_nb_binary!(synth_nb_rshift, nb_rshift, "__rshift__", "__rrshift__");
+synth_nb_binary!(synth_nb_and, nb_and, "__and__", "__rand__");
+synth_nb_binary!(synth_nb_xor, nb_xor, "__xor__", "__rxor__");
+synth_nb_binary!(synth_nb_or, nb_or, "__or__", "__ror__");
+synth_nb_binary!(
+    synth_nb_floor_divide,
+    nb_floor_divide,
+    "__floordiv__",
+    "__rfloordiv__"
+);
+synth_nb_binary!(
+    synth_nb_true_divide,
+    nb_true_divide,
+    "__truediv__",
+    "__rtruediv__"
+);
+synth_nb_binary!(
+    synth_nb_matrix_multiply,
+    nb_matrix_multiply,
+    "__matmul__",
+    "__rmatmul__"
+);
+
+/// `slot_nb_power`: the binary dance for a `None` modulus, else only
+/// `x.__pow__(y, m)` (CPython consults no reflected form with a modulus).
+unsafe extern "C" fn synth_nb_power(
+    x: *mut PyObject,
+    y: *mut PyObject,
+    m: *mut PyObject,
+) -> *mut PyObject {
+    if m.is_null() || m == crate::singletons::none_ptr() {
+        return unsafe {
+            synth_nb_binop(
+                x,
+                y,
+                "__pow__",
+                "__rpow__",
+                |nb| unsafe { (*nb).nb_power },
+                synth_nb_power as *mut c_void,
+            )
+        };
+    }
+    let ox = unsafe { crate::object::clone_object(x) };
+    let oy = unsafe { crate::object::clone_object(y) };
+    let om = unsafe { crate::object::clone_object(m) };
+    match crate::interp::ensure_active(|| {
+        crate::interp::with_interp_mut(|interp| interp.slot_nb_pow3_public(&ox, &oy, &om))
+    }) {
+        Some(Ok(v)) => crate::object::into_owned(v),
+        Some(Err(e)) => {
+            crate::errors::set_pending_from_runtime(e);
+            ptr::null_mut()
+        }
+        None => {
+            let ni = crate::singletons::not_implemented_ptr();
+            unsafe { crate::object::Py_IncRef(ni) };
+            ni
+        }
+    }
+}
+
+macro_rules! synth_nb_inplace {
+    ($fname:ident, $dunder:literal) => {
+        unsafe extern "C" fn $fname(x: *mut PyObject, y: *mut PyObject) -> *mut PyObject {
+            let ox = unsafe { crate::object::clone_object(x) };
+            let oy = unsafe { crate::object::clone_object(y) };
+            match crate::interp::ensure_active(|| {
+                crate::interp::with_interp_mut(|interp| {
+                    interp.slot_nb_inplace_public(&ox, &oy, $dunder)
+                })
+            }) {
+                Some(Ok(v)) => crate::object::into_owned(v),
+                Some(Err(e)) => {
+                    crate::errors::set_pending_from_runtime(e);
+                    ptr::null_mut()
+                }
+                None => {
+                    let ni = crate::singletons::not_implemented_ptr();
+                    unsafe { crate::object::Py_IncRef(ni) };
+                    ni
+                }
+            }
+        }
+    };
+}
+
+synth_nb_inplace!(synth_nb_inplace_add, "__iadd__");
+synth_nb_inplace!(synth_nb_inplace_subtract, "__isub__");
+synth_nb_inplace!(synth_nb_inplace_multiply, "__imul__");
+synth_nb_inplace!(synth_nb_inplace_remainder, "__imod__");
+synth_nb_inplace!(synth_nb_inplace_lshift, "__ilshift__");
+synth_nb_inplace!(synth_nb_inplace_rshift, "__irshift__");
+synth_nb_inplace!(synth_nb_inplace_and, "__iand__");
+synth_nb_inplace!(synth_nb_inplace_xor, "__ixor__");
+synth_nb_inplace!(synth_nb_inplace_or, "__ior__");
+synth_nb_inplace!(synth_nb_inplace_floor_divide, "__ifloordiv__");
+synth_nb_inplace!(synth_nb_inplace_true_divide, "__itruediv__");
+synth_nb_inplace!(synth_nb_inplace_matrix_multiply, "__imatmul__");
+
+macro_rules! synth_nb_unary {
+    ($fname:ident, $dunder:literal) => {
+        unsafe extern "C" fn $fname(o: *mut PyObject) -> *mut PyObject {
+            let oo = unsafe { crate::object::clone_object(o) };
+            match crate::interp::ensure_active(|| {
+                crate::interp::with_interp_mut(|interp| interp.slot_nb_unary_public(&oo, $dunder))
+            }) {
+                Some(Ok(v)) => crate::object::into_owned(v),
+                Some(Err(e)) => {
+                    crate::errors::set_pending_from_runtime(e);
+                    ptr::null_mut()
+                }
+                None => {
+                    crate::errors::set_type_error("no active interpreter for unary slot");
+                    ptr::null_mut()
+                }
+            }
+        }
+    };
+}
+
+synth_nb_unary!(synth_nb_negative, "__neg__");
+synth_nb_unary!(synth_nb_positive, "__pos__");
+synth_nb_unary!(synth_nb_absolute, "__abs__");
+synth_nb_unary!(synth_nb_invert, "__invert__");
+synth_nb_unary!(synth_nb_int, "__int__");
+synth_nb_unary!(synth_nb_float, "__float__");
+synth_nb_unary!(synth_nb_index, "__index__");
+
+/// `slot_nb_bool` (an `inquiry`): call `__bool__`, demanding a `bool`
+/// result exactly as CPython does.
+unsafe extern "C" fn synth_nb_bool(o: *mut PyObject) -> c_int {
+    let oo = unsafe { crate::object::clone_object(o) };
+    match crate::interp::ensure_active(|| {
+        crate::interp::with_interp_mut(|interp| interp.slot_nb_unary_public(&oo, "__bool__"))
+    }) {
+        Some(Ok(Object::Bool(b))) => c_int::from(b),
+        Some(Ok(other)) => {
+            crate::errors::set_type_error(format!(
+                "__bool__ should return bool, returned {}",
+                other.type_name()
+            ));
+            -1
+        }
+        Some(Err(e)) => {
+            crate::errors::set_pending_from_runtime(e);
+            -1
+        }
+        None => -1,
+    }
+}
+
+/// CPython's `slot_tp_richcompare` analogue: dispatch a rich comparison
+/// through the VM so a Python-level `__eq__`/`__lt__`/… override on a
+/// VM-defined class wins over any C `tp_richcompare` inherited from a
+/// readied extension base. Installed by [`synth_protocol_slots`] only when
+/// the class (or a VM ancestor below `object`) defines a rich-compare
+/// dunder in its own class dict, so `inherit_slots` keeps the base's C
+/// slot for pure pass-through subclasses. Must **not** route through
+/// `PyObject_RichCompare` (which reads this very slot — instant
+/// recursion); `richcompare_via_vm` enters the VM protocol directly.
+unsafe extern "C" fn synth_tp_richcompare(
+    a: *mut PyObject,
+    b: *mut PyObject,
+    op: std::os::raw::c_int,
+) -> *mut PyObject {
+    // Slot semantics (CPython `slot_tp_richcompare`): dispatch only the
+    // receiver's own dunder and *decline* with `NotImplemented` otherwise.
+    // The calling protocol (`do_richcompare`) owns the reflected leg and
+    // the final unsupported-ordering `TypeError` — running the VM's full
+    // compare protocol here raised that error from the reflected slot call
+    // with swapped operands/operator.
+    if let Some(r) = unsafe { crate::abstract_::richcompare_slot_via_vm(a, b, op) } {
+        return r;
+    }
+    // No interpreter active: decline so the caller's protocol continues.
+    let ni = crate::singletons::not_implemented_ptr();
+    unsafe { crate::object::Py_IncRef(ni) };
+    ni
+}
+
+/// `object.__hash__` — CPython's `_Py_HashPointer` identity hash, used for
+/// `PyBaseObject_Type.tp_hash`.
+///
+/// This must be **self-contained** (no re-entry into the VM), because stock C
+/// extensions read `PyBaseObject_Type->tp_hash` *directly off the struct* and
+/// call it — numpy's `datetime_arrtype_hash`/`timedelta_arrtype_hash` do
+/// exactly this for a `NaT` scalar (`Py_TYPE == object`'s slot, hash by
+/// identity). Routing that through the VM-forwarding `synth_tp_hash` would
+/// re-enter `PyObject_Hash → py_hash_value(Foreign) → fwd_hash → the numpy
+/// slot → object.tp_hash` and recurse until the stack overflows.
+///
+/// The rotate-right-by-4 of the object address matches both CPython's
+/// `_Py_HashPointer` and WeavePy's VM-side [`weavepy_vm::object::identity_hash`]
+/// for a foreign object (keyed on the same `PyObject*`), so a value hashed
+/// through this C slot agrees bit-for-bit with the VM's identity hash of the
+/// same object — dict/set keying stays consistent across the C↔VM boundary.
+pub(crate) unsafe extern "C" fn object_generic_hash(o: *mut PyObject) -> crate::object::PyHashT {
+    let u = o as usize as u64;
+    let v = u.rotate_right(4) as crate::object::PyHashT;
+    if v == -1 {
+        -2
+    } else {
+        v
+    }
+}
+
+/// `str.__hash__` — CPython's `unicode_hash`, which reads the string value
+/// straight off the object and hashes it. Like [`object_generic_hash`] this
+/// must be **self-contained** (no re-entry into generic VM hash dispatch): a
+/// `str` *subtype* (numpy's `str_`) inherits this slot via `inherit_slots`,
+/// and the VM resolves such an instance's `__hash__` back to this very slot —
+/// forwarding to `PyObject_Hash` would ping-pong `VM → C → VM` forever.
+/// Reads, in order: the native `Str`/`WStr` box, an instance's wrapped
+/// native payload (a faithful C-built subtype body seeds it on first
+/// crossing), and the faithful unicode body itself.
+pub(crate) unsafe extern "C" fn unicode_value_hash(o: *mut PyObject) -> crate::object::PyHashT {
+    let norm = |v: i64| {
+        if v == -1 {
+            -2isize as crate::object::PyHashT
+        } else {
+            v as crate::object::PyHashT
+        }
+    };
+    match unsafe { crate::object::clone_object(o) } {
+        Object::Str(s) => norm(weavepy_vm::object::py_str_hash(&s)),
+        Object::WStr(cps) => norm(weavepy_vm::object::py_wstr_hash(&cps)),
+        Object::Instance(inst) => match inst.native.get() {
+            Some(Object::Str(s)) => norm(weavepy_vm::object::py_str_hash(s)),
+            Some(Object::WStr(cps)) => norm(weavepy_vm::object::py_wstr_hash(cps)),
+            _ => match unsafe { crate::mirror::read_unicode_value(o) } {
+                Some(s) => norm(weavepy_vm::object::py_str_hash(&s)),
+                None => {
+                    crate::errors::set_type_error("unhashable type: expected str value");
+                    -1
+                }
+            },
+        },
+        _ => match unsafe { crate::mirror::read_unicode_value(o) } {
+            Some(s) => norm(weavepy_vm::object::py_str_hash(&s)),
+            None => {
+                crate::errors::set_type_error("descriptor '__hash__' requires a 'str' object");
+                -1
+            }
+        },
+    }
+}
+
+/// `bytes.__hash__` — CPython's `bytes_hash`; the `bytes` counterpart of
+/// [`unicode_value_hash`], with the same self-containment requirement
+/// (numpy's `bytes_` inherits it).
+pub(crate) unsafe extern "C" fn bytes_value_hash(o: *mut PyObject) -> crate::object::PyHashT {
+    let norm = |v: i64| {
+        if v == -1 {
+            -2isize as crate::object::PyHashT
+        } else {
+            v as crate::object::PyHashT
+        }
+    };
+    match unsafe { crate::object::clone_object(o) } {
+        Object::Bytes(b) => norm(weavepy_vm::object::py_bytes_hash(&b)),
+        Object::Instance(inst) => match inst.native.get() {
+            Some(Object::Bytes(b)) => norm(weavepy_vm::object::py_bytes_hash(b)),
+            _ => match unsafe { crate::mirror::read_bytes_value(o) } {
+                Some(b) => norm(weavepy_vm::object::py_bytes_hash(&b)),
+                None => {
+                    crate::errors::set_type_error("unhashable type: expected bytes value");
+                    -1
+                }
+            },
+        },
+        _ => match unsafe { crate::mirror::read_bytes_value(o) } {
+            Some(b) => norm(weavepy_vm::object::py_bytes_hash(&b)),
+            None => {
+                crate::errors::set_type_error("descriptor '__hash__' requires a 'bytes' object");
+                -1
+            }
+        },
+    }
+}
+
+/// Address of the VM-forwarding `tp_hash` bridge. `hash_via_slot` uses it to
+/// short-circuit the shim for a *foreign* object: such an object's VM hash
+/// (`py_hash_value` → `foreign::hash` → `fwd_hash` → `hash_via_slot`) would
+/// otherwise re-enter this bridge (`synth_tp_hash` → `PyObject_Hash` →
+/// `hash_public` → `py_hash_value`) and ping-pong `VM → C → VM` until the
+/// stack overflows. The bridge adds nothing over the VM's own dispatch for a
+/// foreign value, so it must be treated as "no native slot".
+pub(crate) fn synth_tp_hash_addr() -> *mut c_void {
+    synth_tp_hash as *mut c_void
+}
+
+/// Address of the VM-forwarding `tp_richcompare` bridge — the rich-compare
+/// counterpart of [`synth_tp_hash_addr`]. `fwd_compare` (the VM→C compare
+/// hook) must treat this slot as absent: the VM's `rich_compare_obj` routes
+/// a foreign-operand comparison to the C slots, and if the *other* operand
+/// is a VM class wearing this bridge (pandas `CategoricalDtype`, whose
+/// Python `__eq__` installs it), invoking it re-enters `rich_compare_obj`
+/// for the same pair — `fwd_compare → synth_tp_richcompare →
+/// richcompare_via_vm → rich_compare_obj → fwd_compare` until the native
+/// stack overflows (seen with `Series.astype("category")` comparing
+/// `CategoricalDtype == numpy.dtypes.ObjectDType`).
+pub(crate) fn synth_tp_richcompare_addr() -> *mut c_void {
+    synth_tp_richcompare as *mut c_void
+}
+unsafe extern "C" fn synth_length(o: *mut PyObject) -> PySsizeT {
+    unsafe { crate::abstract_::PyObject_Length(o) }
+}
+unsafe extern "C" fn synth_subscript(o: *mut PyObject, k: *mut PyObject) -> *mut PyObject {
+    unsafe { crate::abstract_::PyObject_GetItem(o, k) }
+}
+unsafe extern "C" fn synth_ass_subscript(
+    o: *mut PyObject,
+    k: *mut PyObject,
+    v: *mut PyObject,
+) -> c_int {
+    unsafe { crate::abstract_::PyObject_SetItem(o, k, v) }
+}
+
+/// `tp_descr_get` for WeavePy callables (plain functions, instance-binding
+/// builtin methods, method descriptors) that cross into a C extension as a
+/// type-dict entry.
+///
+/// CPython's special-method protocol — the one Cython emits for `with`,
+/// `for`, operators (`__Pyx_PyObject_LookupSpecial`) — does
+/// `res = _PyType_Lookup(tp, name); f = Py_TYPE(res)->tp_descr_get; res =
+/// f(res, obj, tp);` to **bind** the found descriptor to the instance. With
+/// no `tp_descr_get` wired on the function/method types the descriptor was
+/// taken *unbound*, so a bound special method (e.g. a lock's `__exit__`) was
+/// then called with `self` missing — surfacing as `AttributeError`/`TypeError`
+/// deep inside an extension's module init. This mirrors CPython's
+/// `func_descr_get` / `method_get`: bind to `obj` (yielding a `method`), or
+/// return the descriptor unchanged for class access (`obj == NULL`/`None`) and
+/// for a non-instance-binding builtin (a static/module function).
+unsafe extern "C" fn callable_descr_get(
+    descr: *mut PyObject,
+    obj: *mut PyObject,
+    _type: *mut PyObject,
+) -> *mut PyObject {
+    if std::env::var_os("WEAVEPY_TRACE_CTOR").is_some() {
+        let dty = if descr.is_null() {
+            ptr::null_mut()
+        } else {
+            unsafe { (*descr).ob_type }
+        };
+        eprintln!("[DESCRGET] descr={descr:p} descr.ob_type={dty:p} obj={obj:p} type={_type:p}");
+    }
+    let trace = std::env::var_os("WEAVEPY_TRACE_CTOR").is_some();
+    if descr.is_null() {
+        return ptr::null_mut();
+    }
+    // Class access (`Type.method`) yields the descriptor unchanged.
+    if obj.is_null() {
+        unsafe { crate::object::Py_IncRef(descr) };
+        return descr;
+    }
+    if trace {
+        eprintln!("[DESCRGET] step=clone_obj");
+    }
+    let receiver = unsafe { crate::object::clone_object(obj) };
+    if trace {
+        eprintln!(
+            "[DESCRGET] step=clone_obj_done recv={}",
+            receiver.type_name()
+        );
+    }
+    if matches!(receiver, Object::None) {
+        unsafe { crate::object::Py_IncRef(descr) };
+        return descr;
+    }
+    if trace {
+        eprintln!("[DESCRGET] step=clone_descr");
+    }
+    let d = unsafe { crate::object::clone_object(descr) };
+    if trace {
+        eprintln!("[DESCRGET] step=clone_descr_done d={}", d.type_name());
+    }
+    let bind = match &d {
+        Object::Function(_) => true,
+        Object::Builtin(b) => b.binds_instance,
+        _ => false,
+    };
+    if !bind {
+        unsafe { crate::object::Py_IncRef(descr) };
+        return descr;
+    }
+    if trace {
+        eprintln!("[DESCRGET] step=make_bound");
+    }
+    let bound = Object::BoundMethod(Rc::new(BoundMethod::new(receiver, d)));
+    if trace {
+        eprintln!("[DESCRGET] step=into_owned");
+    }
+    let r = crate::object::into_owned(bound);
+    if trace {
+        eprintln!("[DESCRGET] step=done r={r:p}");
+    }
+    r
+}
+
+/// Serialises synth-type creation so a class crossing concurrently mints
+/// exactly one type.
+static SYNTH_LOCK: Mutex<()> = Mutex::new(());
+
+/// True when `cls` (or any base) defines `name` as a non-`None` attribute.
+fn class_has_dunder(cls: &Rc<TypeObject>, name: &str) -> bool {
+    !matches!(cls.lookup(name), None | Some(Object::None))
+}
+
+/// Populate a synthesised mirror's C-level protocol slots from `cls`'s
+/// Python dunder methods. Macro-heavy extension code (Cython's
+/// `__Pyx_PyObject_GetItem` → `Py_TYPE(o)->tp_as_mapping->mp_subscript`,
+/// `__Pyx_PyObject_Call` → `tp_call`, the `for`/`with` slot reads) consults
+/// these slots *directly* off `Py_TYPE(obj)`, bypassing the abstract API. A
+/// mirror that leaves them NULL therefore looks e.g. "not subscriptable" /
+/// "not callable" to an extension even though the VM implements the operation
+/// (pandas' `lib.pyx` does `Literal[_NoDefault.no_default]` — a `__getitem__`
+/// on the frozen `typing._SpecialForm` — during single-pass module exec).
+/// Shared by [`synth_type_for_class`] and [`install_user_type`] so every
+/// Python-class crossing exposes a faithful slot table regardless of which
+/// mirror-minting path built it. Each `synth_*` bridge forwards back into the
+/// VM's dispatch.
+fn synth_protocol_slots(ty: &mut PyTypeObject, cls: &Rc<TypeObject>) {
+    if class_has_dunder(cls, "__iter__") {
+        ty.tp_iter = synth_tp_iter as *mut c_void;
+    }
+    if class_has_dunder(cls, "__next__") {
+        ty.tp_iternext = synth_tp_iternext as *mut c_void;
+        // CPython iterators answer `iter(it) is it`; advertise tp_iter too.
+        if ty.tp_iter.is_null() {
+            ty.tp_iter = synth_tp_iter as *mut c_void;
+        }
+    }
+    if class_has_dunder(cls, "__call__") {
+        ty.tp_call = synth_tp_call as *mut c_void;
+    }
+    if class_has_dunder(cls, "__repr__") {
+        ty.tp_repr = synth_tp_repr as *mut c_void;
+    }
+    if class_has_dunder(cls, "__str__") {
+        ty.tp_str = synth_tp_str as *mut c_void;
+    }
+    if class_has_dunder(cls, "__hash__") {
+        ty.tp_hash = synth_tp_hash as *mut c_void;
+    }
+    // Rich comparison: when the class — or a VM ancestor below `object` —
+    // defines any rich-compare dunder in its *own* class dict, mirror
+    // CPython's `type_new`, which gives such a type `slot_tp_richcompare`.
+    // The synthesised slot dispatches through the VM so the Python
+    // override wins; without it, `inherit_slots` copies the readied
+    // extension base's C `tp_richcompare` down and a Cython
+    // `PyObject_RichCompareBool` call (pandas `_libs.ops.scalar_compare`
+    // on an object array) runs the *base*'s comparison — pandas'
+    // `PeriodDtype.__eq__("Period[D]")` (a Python override of the cdef
+    // `PeriodDtypeBase.__eq__`) compared False through the C path while
+    // the direct `==` compared True. The MRO walk is intentionally
+    // *own-dict* based (unlike [`class_has_dunder`]'s MRO-wide lookup):
+    // a class inheriting only `object`'s identity comparison keeps a NULL
+    // slot exactly as CPython leaves `tp_richcompare` inherited.
+    {
+        const RICHCMP_DUNDERS: [&str; 6] =
+            ["__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__"];
+        let defines_richcmp = cls.mro.borrow().iter().any(|t| {
+            if t.name == "object" {
+                return false;
+            }
+            let d = t.dict.borrow();
+            RICHCMP_DUNDERS
+                .iter()
+                .any(|n| d.contains_key(&DictKey(Object::from_static(n))))
+        });
+        if defines_richcmp {
+            ty.tp_richcompare = synth_tp_richcompare as *mut c_void;
+        }
+    }
+    let has_len = class_has_dunder(cls, "__len__");
+    let has_getitem = class_has_dunder(cls, "__getitem__");
+    let has_setitem = class_has_dunder(cls, "__setitem__") || class_has_dunder(cls, "__delitem__");
+    if has_len || has_getitem || has_setitem {
+        let mut mm: crate::layout::PyMappingMethods = unsafe { std::mem::zeroed() };
+        if has_len {
+            mm.mp_length = synth_length as *mut c_void;
+        }
+        if has_getitem {
+            mm.mp_subscript = synth_subscript as *mut c_void;
+        }
+        if has_setitem {
+            mm.mp_ass_subscript = synth_ass_subscript as *mut c_void;
+        }
+        ty.tp_as_mapping = Box::into_raw(Box::new(mm)) as *mut c_void;
+        if has_len {
+            let mut sm: crate::layout::PySequenceMethods = unsafe { std::mem::zeroed() };
+            sm.sq_length = synth_length as *mut c_void;
+            ty.tp_as_sequence = Box::into_raw(Box::new(sm)) as *mut c_void;
+        }
+    }
+    // Number suite — CPython's `fixup_slot_dispatchers` wires class-dict
+    // numeric dunders into `tp_as_number` `slot_nb_*` trampolines; without
+    // them a slot-protocol dispatch (`binary_op1` with a foreign partner,
+    // Cython's inlined `PyNumber_*` calls) never reaches the VM dunder
+    // (`np.timedelta64 % pandas.Timedelta` inside Cython's
+    // `__rmod__ → __rdivmod__` raised "unsupported operand type"). A
+    // slotdef pairs the forward and reflected names on the *same* slot, so
+    // either one present wires the shared trampoline (its `SLOT1BIN` body
+    // sorts out direction at call time).
+    {
+        let mut nb: crate::layout::PyNumberMethods = unsafe { std::mem::zeroed() };
+        let mut any = false;
+        macro_rules! wire {
+            ($field:ident, $tramp:ident, $($d:literal),+) => {
+                if $(class_has_dunder(cls, $d))||+ {
+                    nb.$field = $tramp as *mut c_void;
+                    any = true;
+                }
+            };
+        }
+        wire!(nb_add, synth_nb_add, "__add__", "__radd__");
+        wire!(nb_subtract, synth_nb_subtract, "__sub__", "__rsub__");
+        wire!(nb_multiply, synth_nb_multiply, "__mul__", "__rmul__");
+        wire!(nb_remainder, synth_nb_remainder, "__mod__", "__rmod__");
+        wire!(nb_divmod, synth_nb_divmod, "__divmod__", "__rdivmod__");
+        wire!(nb_power, synth_nb_power, "__pow__", "__rpow__");
+        wire!(nb_lshift, synth_nb_lshift, "__lshift__", "__rlshift__");
+        wire!(nb_rshift, synth_nb_rshift, "__rshift__", "__rrshift__");
+        wire!(nb_and, synth_nb_and, "__and__", "__rand__");
+        wire!(nb_xor, synth_nb_xor, "__xor__", "__rxor__");
+        wire!(nb_or, synth_nb_or, "__or__", "__ror__");
+        wire!(
+            nb_floor_divide,
+            synth_nb_floor_divide,
+            "__floordiv__",
+            "__rfloordiv__"
+        );
+        wire!(
+            nb_true_divide,
+            synth_nb_true_divide,
+            "__truediv__",
+            "__rtruediv__"
+        );
+        wire!(
+            nb_matrix_multiply,
+            synth_nb_matrix_multiply,
+            "__matmul__",
+            "__rmatmul__"
+        );
+        wire!(nb_inplace_add, synth_nb_inplace_add, "__iadd__");
+        wire!(nb_inplace_subtract, synth_nb_inplace_subtract, "__isub__");
+        wire!(nb_inplace_multiply, synth_nb_inplace_multiply, "__imul__");
+        wire!(nb_inplace_remainder, synth_nb_inplace_remainder, "__imod__");
+        wire!(nb_inplace_lshift, synth_nb_inplace_lshift, "__ilshift__");
+        wire!(nb_inplace_rshift, synth_nb_inplace_rshift, "__irshift__");
+        wire!(nb_inplace_and, synth_nb_inplace_and, "__iand__");
+        wire!(nb_inplace_xor, synth_nb_inplace_xor, "__ixor__");
+        wire!(nb_inplace_or, synth_nb_inplace_or, "__ior__");
+        wire!(
+            nb_inplace_floor_divide,
+            synth_nb_inplace_floor_divide,
+            "__ifloordiv__"
+        );
+        wire!(
+            nb_inplace_true_divide,
+            synth_nb_inplace_true_divide,
+            "__itruediv__"
+        );
+        wire!(
+            nb_inplace_matrix_multiply,
+            synth_nb_inplace_matrix_multiply,
+            "__imatmul__"
+        );
+        wire!(nb_negative, synth_nb_negative, "__neg__");
+        wire!(nb_positive, synth_nb_positive, "__pos__");
+        wire!(nb_absolute, synth_nb_absolute, "__abs__");
+        wire!(nb_invert, synth_nb_invert, "__invert__");
+        wire!(nb_int, synth_nb_int, "__int__");
+        wire!(nb_float, synth_nb_float, "__float__");
+        wire!(nb_index, synth_nb_index, "__index__");
+        wire!(nb_bool, synth_nb_bool, "__bool__");
+        if any {
+            ty.tp_as_number = Box::into_raw(Box::new(nb)) as *mut c_void;
+        }
+    }
+}
+
+/// Mint (or return the cached) faithful C type for a Python class whose
+/// instances drive a C-level protocol Cython reads off `Py_TYPE(obj)`:
+/// iteration (`__iter__`/`__next__`) or the context-manager protocol
+/// (`__enter__`/`__exit__`, looked up via `_PyType_Lookup` for `with`).
+/// Returns `None` for every other class, leaving the historic
+/// `PyBaseObject_Type` crossing in place to keep the blast radius small.
+pub(crate) fn synth_type_for_class(cls: &Rc<TypeObject>) -> Option<*mut PyTypeObject> {
+    let is_iter = class_has_dunder(cls, "__iter__") || class_has_dunder(cls, "__next__");
+    let is_ctx = class_has_dunder(cls, "__enter__") || class_has_dunder(cls, "__exit__");
+    if !is_iter && !is_ctx {
+        return None;
+    }
+    let _guard = SYNTH_LOCK.lock().ok()?;
+    // Another thread may have minted + registered it between our caller's
+    // `find_type_ptr` miss and acquiring the lock.
+    if let Some(p) = find_type_ptr(cls) {
+        return Some(p);
+    }
+
+    let meta = metaclass_ptr(cls);
+    // RFC 0045 (wave 5): a synthesised shell can itself subclass an inline C
+    // type — numpy's `class MaskedArray(ndarray)` is iterable, so it reaches
+    // *this* path (not `install_user_type`) yet must still get a faithful
+    // `tp_basicsize`-wide body. Without inheriting the base's inline layout
+    // its instances were plain 16-byte boxes; numpy's `PyArray_NewFromDescr`
+    // then wrote the `PyArrayObject` fields over the Rust `obj` payload and a
+    // later `clone_object` dereferenced the clobbered pointer (a SIGBUS in
+    // `numpy.ma.core`'s `array_view → __array_finalize__`).
+    let (inline_base_ptr, base_inline, basicsize) = inherit_inline_base_layout(cls, 16);
+    let owned_name = format!("{}\0", cls.name).into_bytes();
+    let mut ty = PyTypeObject::new_zeroed();
+    ty.head.ob_refcnt = IMMORTAL_REFCNT;
+    ty.head.ob_type = meta;
+    ty.tp_name = owned_name.as_ptr() as *const c_char;
+    ty.tp_basicsize = basicsize;
+    ty.tp_dealloc = Some(crate::object::_PyWeavePy_Dealloc);
+    // Mirror CPython's `PyType_Ready` `tp_alloc`/`tp_free` defaults so a
+    // foreign C `tp_new` subclassing this synthesised type can allocate
+    // through its `tp_alloc` slot (see `install_user_type`).
+    {
+        let alloc_fp: unsafe extern "C" fn(*mut PyTypeObject, PySsizeT) -> *mut PyObject =
+            crate::genericalloc::PyType_GenericAlloc;
+        let new_fp: unsafe extern "C" fn(
+            *mut PyTypeObject,
+            *mut PyObject,
+            *mut PyObject,
+        ) -> *mut PyObject = crate::genericalloc::PyType_GenericNew;
+        let free_fp: unsafe extern "C" fn(*mut c_void) = crate::memory::PyObject_Free;
+        ty.tp_alloc = alloc_fp as *mut c_void;
+        // Inherit the solid (best_base) inline base's faithful `tp_new` so
+        // its `cdef object` fields are initialised (see the matching note in
+        // `install_user_type`). Non-inline shells keep the generic allocator.
+        ty.tp_new = if base_inline {
+            let inherited = inline_base_ptr
+                .filter(|bp| !bp.is_null())
+                .map(|bp| unsafe { (*bp).tp_new })
+                .unwrap_or(ptr::null_mut());
+            if inherited.is_null() {
+                new_fp as *mut c_void
+            } else {
+                inherited
+            }
+        } else {
+            new_fp as *mut c_void
+        };
+        ty.tp_free = free_fp as *mut c_void;
+    }
+    // RFC 0047 (wave 5): `HEAPTYPE` — a `class` statement mints a heap type
+    // on CPython, and Cython's cpdef override dispatch gates on the bit
+    // (see the matching note in [`install_user_type`]). The box below is a
+    // genuine `PyTypeObjectBox`, so `slot_table_for`'s HEAPTYPE-guarded
+    // embedded-table read stays sound.
+    ty.tp_flags = crate::layout::tpflags::DEFAULT
+        | crate::layout::tpflags::BASETYPE
+        | crate::layout::tpflags::READY
+        | crate::layout::tpflags::HEAPTYPE
+        | fast_subclass_flags(cls);
+    // Point `tp_base` at the faithful inline base (so `PyType_IsSubtype`
+    // and numpy's `PyArray_Check` walk to `ndarray`); a non-inline shell
+    // keeps the historic bare-`object` base to bound the blast radius.
+    ty.tp_base = if base_inline {
+        inline_base_ptr.unwrap_or_else(|| PyBaseObject_Type.as_ptr())
+    } else {
+        PyBaseObject_Type.as_ptr()
+    };
+    ty.bridge = Box::into_raw(Box::new(cls.clone()));
+
+    synth_protocol_slots(&mut ty, cls);
+
+    let bx = Box::new(PyTypeObjectBox {
+        head: ty,
+        owned_name,
+        slot_table: SlotTable::empty(),
+    });
+    let leaked = Box::leak(bx);
+    let p = &mut leaked.head as *mut PyTypeObject;
+    register_heap_type(p);
+    // Mirror the inline base: instances need the same faithful inline body
+    // (RFC 0045) so fixed-offset field reads/writes land on real
+    // CPython-shaped memory rather than the Rust `obj` payload.
+    if base_inline {
+        maybe_register_inline_type(p);
+    } else {
+        maybe_register_container_body_type(p);
+    }
+    Some(p)
 }
 
 /// Static table used by [`find_type_ptr`]. Listed once so we don't
@@ -628,6 +1762,7 @@ static STATIC_TYPE_TABLE: &[&StaticType] = &[
     &PyGen_Type,
     &PyCoro_Type,
     &PyAsyncGen_Type,
+    &PySeqIter_Type,
 ];
 
 /// Borrow the bridged native type from a [`PyTypeObject`].
@@ -687,6 +1822,142 @@ pub unsafe fn bridge_or_ready(ty: *mut PyTypeObject) -> Option<Rc<TypeObject>> {
     unsafe { bridge_type(ty) }
 }
 
+/// Mirror CPython's `inherit_special` fast-subclass bit assignment
+/// (`Objects/typeobject.c`): a finalised type carries exactly one
+/// `Py_TPFLAGS_*_SUBCLASS` bit, for the most-derived builtin in its
+/// ancestry, so a stock extension's inlined `PyX_Check`
+/// (`Py_TYPE(o)->tp_flags & Py_TPFLAGS_X_SUBCLASS`) classifies it without
+/// an MRO walk. The else-if order matches CPython exactly. In particular
+/// Cython's `__Pyx_ImportType` rejects `numpy.dtype` ("is not a type
+/// object") unless its metaclass `numpy._DTypeMeta` — a `type` subclass —
+/// carries `Py_TPFLAGS_TYPE_SUBCLASS`, and `__Pyx_Raise` rejects a
+/// `cdef`-raised exception unless its class carries
+/// `Py_TPFLAGS_BASE_EXC_SUBCLASS`.
+fn fast_subclass_flags(t: &Rc<TypeObject>) -> u64 {
+    use crate::layout::tpflags;
+    let bt = weavepy_vm::builtin_types::builtin_types();
+    if t.is_subclass_of(&bt.base_exception) {
+        tpflags::BASE_EXC_SUBCLASS
+    } else if t.is_subclass_of(&bt.type_) {
+        tpflags::TYPE_SUBCLASS
+    } else if t.is_subclass_of(&bt.int_) {
+        tpflags::LONG_SUBCLASS
+    } else if t.is_subclass_of(&bt.bytes_) {
+        tpflags::BYTES_SUBCLASS
+    } else if t.is_subclass_of(&bt.str_) {
+        tpflags::UNICODE_SUBCLASS
+    } else if t.is_subclass_of(&bt.tuple_) {
+        tpflags::TUPLE_SUBCLASS
+    } else if t.is_subclass_of(&bt.list_) {
+        tpflags::LIST_SUBCLASS
+    } else if t.is_subclass_of(&bt.dict_) {
+        tpflags::DICT_SUBCLASS
+    } else {
+        0
+    }
+}
+
+/// The canonical C `PyTypeObject*` for `t`'s **metaclass**, used as a
+/// type mirror's `ob_type`.
+///
+/// CPython code (and Cython-generated code in particular) reads a class's
+/// metaclass straight off `Py_TYPE(cls)`: `type(Enum)` must be `EnumType`,
+/// `type(np.dtype)` must be `numpy._DTypeMeta`, and so on. Historically
+/// every WeavePy type mirror hard-coded `ob_type = PyType_Type` (bare
+/// `type`), so `__Pyx_CalculateMetaclass((Enum,))` resolved to `type`,
+/// `type.__prepare__` returned a plain dict instead of `EnumType`'s
+/// `_EnumDict`, and a Cython module defining a Python `class X(Enum)`
+/// failed its multi-phase init with
+/// `AttributeError: 'dict' object has no attribute '_member_names'`.
+///
+/// The metaclass mirror is minted on demand. Recursion bottoms out at the
+/// static `PyType_Type`: `type`'s own metaclass is `type`, and every
+/// well-formed metaclass chain terminates there.
+fn metaclass_ptr(t: &Rc<TypeObject>) -> *mut PyTypeObject {
+    let mc = t.metaclass_or_type();
+    let bt = weavepy_vm::builtin_types::builtin_types();
+    if Rc::ptr_eq(&mc, &bt.type_) || Rc::ptr_eq(&mc, t) {
+        return PyType_Type.as_ptr();
+    }
+    if let Some(p) = find_type_ptr(&mc) {
+        return p;
+    }
+    install_user_type(&mc)
+}
+
+/// Resolve `t`'s first base to its canonical C `PyTypeObject*` and decide
+/// whether `t` inherits that base's **inline `tp_basicsize` storage**.
+///
+/// A pure-Python (VM) class can subclass an *inline* C extension type —
+/// pandas' `class NaTType(_NaT)` (the `_NaT ← datetime` shell) or numpy's
+/// `class MaskedArray(ndarray)`. CPython inherits `tp_basicsize`, so the
+/// subclass instance carries the base's faithful C layout: a stock
+/// `tp_new` packs fields at fixed offsets and the extension reads
+/// `((BaseObject *)self)->field` directly. The mirror must therefore get a
+/// faithful inline body, not a `PyObjectBox` (whose Rust payload sits
+/// exactly where the extension expects `self->field`, so those writes
+/// corrupt it — RFC 0045 / 0029).
+///
+/// Returns `(base_ptr, base_inline, basicsize)`. When the base is inline,
+/// `basicsize` is the base's `tp_basicsize`; otherwise it is
+/// `non_inline_default`. An unregistered pure-Python intermediate base
+/// (pytz `UTC ← BaseTzInfo ← tzinfo`) is minted via `install_user_type`
+/// so the `tp_base` chain reaches the faithful root; the `object` root
+/// (no bases) yields `None`. Shared by [`install_user_type`] and
+/// [`synth_type_for_class`] so a VM subclass of an inline C type gets a
+/// faithful body regardless of which mirror-minting path it takes.
+fn inherit_inline_base_layout(
+    t: &Rc<TypeObject>,
+    non_inline_default: PySsizeT,
+) -> (Option<*mut PyTypeObject>, bool, PySsizeT) {
+    // Resolve a direct base to its canonical C `PyTypeObject*`, minting a
+    // mirror for a pure-Python intermediate base (one that itself has
+    // bases) so the layout probe reaches the faithful root; the `object`
+    // root (no bases) yields `None`.
+    let resolve = |b: &Rc<TypeObject>| -> Option<*mut PyTypeObject> {
+        type_ptr_for_class(b).or_else(|| {
+            if b.bases.borrow().is_empty() {
+                None
+            } else {
+                Some(install_user_type(b))
+            }
+        })
+    };
+
+    let bases = t.bases.borrow();
+    let first_ptr = bases.first().and_then(&resolve);
+
+    // CPython's `best_base()`: the "solid base" is the base with the widest
+    // instance layout (`tp_basicsize`), scanned across *all* bases — not
+    // just the first. A VM class that lists an inline C extension type
+    // anywhere in its bases must inherit that faithful inline body. pandas'
+    // `class Block(PandasObject, libinternals.Block)` puts its inline
+    // Cython base *second* (the first base is the pure-Python
+    // `PandasObject`); probing only `bases.first()` left `Block` — and its
+    // subclasses `NumpyBlock`/`NumericBlock`/`ObjectBlock` — on a 16-byte
+    // `PyObjectBox`, so Cython's fixed-offset field writes (`_mgr_locs`,
+    // `values`, `refs`) clobbered the Rust `obj` payload and the later free
+    // dereferenced the garbage (SIGBUS).
+    let mut solid: Option<*mut PyTypeObject> = None;
+    let mut solid_size: PySsizeT = 0;
+    for b in bases.iter() {
+        if let Some(bp) = resolve(b) {
+            if is_inline_instance_type(bp) {
+                let sz = unsafe { (*bp).tp_basicsize };
+                if solid.is_none() || sz > solid_size {
+                    solid = Some(bp);
+                    solid_size = sz;
+                }
+            }
+        }
+    }
+
+    match solid {
+        Some(sp) => (Some(sp), true, solid_size),
+        None => (first_ptr, false, non_inline_default),
+    }
+}
+
 /// Find the static [`PyTypeObject`] pointer that bridges to `t`,
 /// installing one on demand for user-defined classes (e.g. heap
 /// types created without `PyType_FromSpec` — usually never; this is
@@ -695,16 +1966,115 @@ pub fn install_user_type(t: &Rc<TypeObject>) -> *mut PyTypeObject {
     if let Some(p) = find_type_ptr(t) {
         return p;
     }
+    // Resolve (minting if needed) the metaclass mirror *before* building
+    // this type's box so `Py_TYPE(t)` reports the real metaclass.
+    let meta = metaclass_ptr(t);
     let owned_name = format!("{}\0", t.name).into_bytes();
+    // Stock extensions read `tp_flags` directly to classify a type. In
+    // particular Cython's `__Pyx_Raise` gates `raise exc` on
+    // `PyExceptionInstance_Check(x)` ≡ `Py_TYPE(x)->tp_flags &
+    // Py_TPFLAGS_BASE_EXC_SUBCLASS`, so a WeavePy exception type published
+    // here with `tp_flags == 0` makes every `raise RuntimeError(...)` from
+    // a `cdef` method fail with "exception class must be a subclass of
+    // BaseException". Mirror CPython: every readied type carries
+    // DEFAULT | BASETYPE | READY, and an exception subclass also carries
+    // the BASE_EXC_SUBCLASS fast-subclass bit.
+    //
+    // RFC 0047 (wave 5): also `Py_TPFLAGS_HEAPTYPE`. Every class a `class`
+    // statement creates is a *heap type* on CPython (the VM's own
+    // `type.__flags__` — `flags_bits` — already reports the bit), and
+    // Cython's cpdef override dispatch gates on exactly this:
+    //
+    //   if (Py_TYPE(self)->tp_dictoffset != 0 ||
+    //       PyType_HasFeature(Py_TYPE(self), IS_ABSTRACT | HEAPTYPE)) {
+    //       meth = getattr(self, name); if not same-C-function: call meth
+    //   }
+    //   /* else: call the native cdef body directly */
+    //
+    // Without the bit a VM subclass of a `cdef class` (pandas'
+    // `ExtensionBlock(EABackedBlock ← … ← libinternals.Block)`) never had
+    // its Python override consulted: `BlockManager._slice_mgr_rows` called
+    // the native `Block.slice_block_rows` (`values[..., slicer]`) instead of
+    // `ExtensionBlock.slice_block_rows` (`values[slicer]`), handing 1-D
+    // ExtensionArrays a 2-D `(Ellipsis, slice)` key
+    // (`test_common.test_ellipsis_index`).
+    use crate::layout::tpflags;
+    let flags = tpflags::DEFAULT
+        | tpflags::BASETYPE
+        | tpflags::READY
+        | tpflags::HEAPTYPE
+        | fast_subclass_flags(t);
+    // RFC 0029 / 0045 (wave 5): inherit an *inline* C base's `tp_basicsize`
+    // and inline-storage status (see [`inherit_inline_base_layout`]) so a VM
+    // subclass of e.g. the `datetime` shell (pandas `NaTType`) or
+    // `numpy.ndarray` gets a faithful body, not a `PyObjectBox` the base's
+    // fixed-offset field writes would corrupt. A non-inline base keeps the
+    // identity-box size.
+    let (base_ptr, base_inline, basicsize) = inherit_inline_base_layout(
+        t,
+        std::mem::size_of::<crate::object::PyObjectBox>() as PySsizeT,
+    );
+    // RFC 0046 (wave 4/5): mirror CPython's `PyType_Ready` defaults for
+    // `tp_alloc`/`tp_free` (inherited from `object`). A *foreign* C `tp_new`
+    // that subclasses this VM type allocates through `subtype->tp_alloc(
+    // subtype, 0)` directly — pandas' `class NAType(C_NAType)` runs the cdef
+    // base's `C_NAType.__pyx_tp_new`, which calls `NAType->tp_alloc`. With a
+    // NULL slot that is a jump through address 0 (SIGSEGV). `PyType_GenericAlloc`
+    // mints a faithful instance body bound to this type's bridged class.
+    let alloc_fp: unsafe extern "C" fn(*mut PyTypeObject, PySsizeT) -> *mut PyObject =
+        crate::genericalloc::PyType_GenericAlloc;
+    let new_fp: unsafe extern "C" fn(
+        *mut PyTypeObject,
+        *mut PyObject,
+        *mut PyObject,
+    ) -> *mut PyObject = crate::genericalloc::PyType_GenericNew;
+    let free_fp: unsafe extern "C" fn(*mut c_void) = crate::memory::PyObject_Free;
+    // RFC 0047 (wave 5): mirror CPython's `tp_new` inheritance. CPython's
+    // `type_ready_inherit`/`inherit_special` copies `tp_new` down from
+    // `tp_base` — which for a multiply-inheriting class is the *solid base*
+    // (`best_base`), i.e. the base that owns the widest inline instance
+    // layout, **not** the first base on the MRO. `inherit_inline_base_layout`
+    // already resolved that solid base into `base_ptr`; adopt its faithful
+    // `tp_new` so the C struct fields it declares are initialised
+    // (Cython's `__pyx_tp_new` zeroes every `cdef object` field to `None`).
+    //
+    // This is the fix for pandas' `class MultiIndexUIntEngine(
+    // BaseMultiIndexCodesEngine, UInt64Engine)`: the first MRO base
+    // (`BaseMultiIndexCodesEngine`, no inline fields) has a `tp_new` that
+    // leaves the inherited `IndexEngine` fields (`values`/`mask`/`mapping`)
+    // NULL, so `IndexEngine.__init__`'s plain `__Pyx_DECREF(self->values)`
+    // dereferenced NULL. The solid base (`UInt64Engine ← IndexEngine`) owns
+    // those fields and its `tp_new` sets them to `None`. Only inline bases
+    // carry a faithful C `tp_new` worth inheriting; a non-inline base keeps
+    // the generic allocator (the shim still forwards to the base's captured
+    // slot for those, unchanged).
+    let tp_new_slot: *mut c_void = if base_inline {
+        let inherited = base_ptr
+            .filter(|bp| !bp.is_null())
+            .map(|bp| unsafe { (*bp).tp_new })
+            .unwrap_or(ptr::null_mut());
+        if inherited.is_null() {
+            new_fp as *mut c_void
+        } else {
+            inherited
+        }
+    } else {
+        new_fp as *mut c_void
+    };
     let bx = Box::new(PyTypeObjectBox {
         head: PyTypeObject {
             head: PyObject {
                 ob_refcnt: IMMORTAL_REFCNT,
-                ob_type: PyType_Type.as_ptr(),
+                ob_type: meta,
             },
             tp_name: owned_name.as_ptr() as *const c_char,
-            tp_basicsize: std::mem::size_of::<crate::object::PyObjectBox>() as PySsizeT,
+            tp_basicsize: basicsize,
+            tp_base: base_ptr.unwrap_or(ptr::null_mut()),
             tp_dealloc: Some(crate::object::_PyWeavePy_Dealloc),
+            tp_alloc: alloc_fp as *mut c_void,
+            tp_new: tp_new_slot,
+            tp_free: free_fp as *mut c_void,
+            tp_flags: flags,
             bridge: Box::into_raw(Box::new(t.clone())),
             ..PyTypeObject::new_zeroed()
         },
@@ -712,12 +2082,46 @@ pub fn install_user_type(t: &Rc<TypeObject>) -> *mut PyTypeObject {
         slot_table: SlotTable::empty(),
     });
     let p = Box::leak(bx);
+    // Derive the C-level protocol slots (`tp_as_mapping`/`mp_subscript`,
+    // `tp_call`, `tp_iter`, …) from the class's dunders so an extension that
+    // reads them straight off `Py_TYPE(obj)` (Cython's inlined subscript /
+    // call / iteration helpers) sees a faithful table — not the NULL suite a
+    // bare mirror would carry. Without this a frozen Python class crossing
+    // here (e.g. `typing._SpecialForm`, which only defines `__getitem__` and
+    // so misses the iter/ctx gate in `synth_type_for_class`) is "not
+    // subscriptable" to a wheel's module-init code.
+    synth_protocol_slots(&mut p.head, t);
     let ty_ptr = &mut p.head as *mut PyTypeObject;
+    // RFC 0047 (wave 5): faithful `inherit_slots`, exactly as `PyType_Ready`
+    // does. `synth_protocol_slots` above installs only the subtype's *own*
+    // mapping/call/iter dunders; every function slot and method suite it
+    // leaves NULL — most importantly the numeric suite `tp_as_number`
+    // (`nb_add`/`nb_subtract`/…) and `tp_richcompare` — must be copied down
+    // from the base so a Cython extension's *inlined*
+    // `Py_TYPE(self)->tp_as_number->nb_add` read (with no MRO walk) resolves.
+    // Without this, a VM subclass of a readied Cython `cdef class`
+    // (pandas' `Timestamp(_Timestamp)`, `Timedelta(_Timedelta)`,
+    // `Period(_Period)`) crossed into C with a NULL number suite: the C-API
+    // `PyNumber_Add`/`PyNumber_Subtract` slot dispatch skipped the base's
+    // `__add__`/`__sub__` and fell through to the *other* operand's slot
+    // (numpy's `timedelta64`), which for nanosecond resolution coerces to a
+    // Python `int` and trips pandas' `integer_op_not_supported` guard —
+    // `Timestamp - np.timedelta64(n, "ns")` raised spuriously.
+    let base_for_inherit = p.head.tp_base;
+    unsafe { crate::inherit::inherit_slots(ty_ptr, &mut p.slot_table, base_for_inherit) };
     // Cache so subsequent calls with the same native `Rc` return the
     // same pointer instead of leaking a fresh box every time
     // (`PyExc_*` aliases — e.g. `SystemError` → `runtime_error` —
     // would otherwise install distinct slots for the same type).
     register_heap_type(ty_ptr);
+    // Mirror the inline base: instances of this subclass need the same
+    // faithful inline body (RFC 0045) so fixed-offset field reads/writes
+    // land on real CPython-shaped memory.
+    if base_inline {
+        maybe_register_inline_type(ty_ptr);
+    } else {
+        maybe_register_container_body_type(ty_ptr);
+    }
     ty_ptr
 }
 
@@ -726,6 +2130,13 @@ pub fn install_user_type(t: &Rc<TypeObject>) -> *mut PyTypeObject {
 // ----------------------------------------------------------------
 
 pub const PY_TPFLAGS_HEAPTYPE: u32 = 1 << 9;
+/// `Py_TPFLAGS_IS_ABSTRACT` — set on abstract base classes. Used
+/// transiently by [`crate::instance`] to neutralise a Cython
+/// `@cython.freelist` `tp_dealloc`: the freelist stash is guarded by
+/// `!HasFeature(Py_TPFLAGS_IS_ABSTRACT)` in **both** Cython codegen
+/// variants (classic and type-specs), so temporarily setting it forces
+/// the release (`tp_free`) branch instead of the raw-pointer stash.
+pub const PY_TPFLAGS_IS_ABSTRACT: u32 = 1 << 20;
 pub const PY_TPFLAGS_BASETYPE: u32 = 1 << 10;
 pub const PY_TPFLAGS_HAVE_GC: u32 = 1 << 14;
 pub const PY_TPFLAGS_DEFAULT: u32 = 1 << 18;
@@ -748,7 +2159,7 @@ fn assemble_type_dict(
     member_pairs: Vec<(String, Object)>,
     doc: Option<&str>,
 ) -> DictData {
-    let mut dict = DictData::new();
+    let mut dict = DictData::default();
     if let Some(d) = doc {
         dict.insert(
             DictKey(Object::from_static("__doc__")),
@@ -799,10 +2210,13 @@ fn assemble_type_dict(
 //
 // Entries are `Box::leak`'d (readied types live for the process
 // lifetime), so the `&'static` borrows handed out by `bridge_type` /
-// `slot_table_for` stay valid. The map itself is thread-local: a stock
-// extension readies its types and uses them on the same thread, so
-// (unlike the cross-thread `PyExc_*` statics in the now-global
-// `HEAP_TYPES`) no cross-thread visibility is required here.
+// `slot_table_for` stay valid. The maps are **process-global** (RFC
+// 0047, wave 5): a type readied during import on the main thread is
+// used from every `threading.Thread` worker (pandas' multi-thread
+// `read_csv` tests), so per-thread registries would make a worker
+// mis-classify readied/inline types and route instance memory through
+// the wrong free path. All access happens under the VM's GIL-or-cell
+// locking discipline; the `Mutex` here guards the map structure itself.
 // ----------------------------------------------------------------
 
 /// WeavePy-owned data backing a readied stock type.
@@ -818,28 +2232,23 @@ pub struct ReadiedType {
 unsafe impl Send for ReadiedType {}
 unsafe impl Sync for ReadiedType {}
 
-thread_local! {
-    /// Map from an extension type pointer to its readied data.
-    static READIED_BY_PTR: std::cell::RefCell<std::collections::HashMap<usize, &'static ReadiedType>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
-    /// Insertion-ordered list for the `Rc<TypeObject>` → pointer scan.
-    static READIED_TYPES: std::cell::RefCell<Vec<&'static ReadiedType>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
+/// Map from an extension type pointer to its readied data.
+static READIED_BY_PTR: Mutex<Option<std::collections::HashMap<usize, &'static ReadiedType>>> =
+    Mutex::new(None);
+/// Insertion-ordered list for the `Rc<TypeObject>` → pointer scan.
+static READIED_TYPES: Mutex<Vec<&'static ReadiedType>> = Mutex::new(Vec::new());
 
-thread_local! {
-    /// Types whose instances get a faithful **inline `tp_basicsize`
-    /// body** (RFC 0045, wave 3): C-extension types finalised by
-    /// `PyType_FromSpec` / `PyType_Ready` that declare storage beyond the
-    /// object head. Membership is the opt-in gate that
-    /// [`crate::object::into_owned`] and
-    /// [`crate::genericalloc::PyType_GenericAlloc`] consult; a type absent
-    /// from this set keeps the wave-1/2 `PyObjectBox` instance shape, so
-    /// the change is purely additive (pure-Python classes and every
-    /// dict-backed fixture are unaffected).
-    static INLINE_TYPES: std::cell::RefCell<std::collections::HashSet<usize>> =
-        std::cell::RefCell::new(std::collections::HashSet::new());
-}
+/// Types whose instances get a faithful **inline `tp_basicsize`
+/// body** (RFC 0045, wave 3): C-extension types finalised by
+/// `PyType_FromSpec` / `PyType_Ready` that declare storage beyond the
+/// object head. Membership is the opt-in gate that
+/// [`crate::object::into_owned`] and
+/// [`crate::genericalloc::PyType_GenericAlloc`] consult; a type absent
+/// from this set keeps the wave-1/2 `PyObjectBox` instance shape, so
+/// the change is purely additive (pure-Python classes and every
+/// dict-backed fixture are unaffected). Process-global for the same
+/// reason as [`READIED_BY_PTR`]: instances cross threads.
+static INLINE_TYPES: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
 
 /// Register `ty` as an inline-instance type iff it declares storage
 /// beyond `PyObject_HEAD` (`tp_basicsize > sizeof(PyObject)`) — i.e. it
@@ -853,9 +2262,35 @@ pub fn maybe_register_inline_type(ty: *mut PyTypeObject) {
         return;
     }
     let basicsize = unsafe { (*ty).tp_basicsize } as usize;
-    if basicsize > std::mem::size_of::<PyObject>() {
-        INLINE_TYPES.with(|s| s.borrow_mut().insert(ty as usize));
+    let registered = basicsize > std::mem::size_of::<PyObject>();
+    if registered {
+        if let Ok(mut g) = INLINE_TYPES.lock() {
+            g.get_or_insert_with(std::collections::HashSet::new)
+                .insert(ty as usize);
+        }
     }
+    if std::env::var_os("WEAVEPY_TRACE_CTOR").is_some() {
+        eprintln!(
+            "[CTOR] register_inline name={} ty={:p} basicsize={} sizeof_pyobj={} registered={}",
+            ctor_trace_name(ty),
+            ty,
+            basicsize,
+            std::mem::size_of::<PyObject>(),
+            registered
+        );
+    }
+}
+
+/// Best-effort `tp_name` for constructor tracing (`WEAVEPY_TRACE_CTOR`).
+pub fn ctor_trace_name(ty: *mut PyTypeObject) -> String {
+    if ty.is_null() {
+        return "<null>".to_owned();
+    }
+    let n = unsafe { (*ty).tp_name };
+    if n.is_null() {
+        return "<noname>".to_owned();
+    }
+    unsafe { CStr::from_ptr(n) }.to_string_lossy().into_owned()
 }
 
 /// True if instances of `ty` use a faithful inline `tp_basicsize` body
@@ -865,7 +2300,72 @@ pub fn is_inline_instance_type(ty: *mut PyTypeObject) -> bool {
     if ty.is_null() {
         return false;
     }
-    INLINE_TYPES.with(|s| s.borrow().contains(&(ty as usize)))
+    INLINE_TYPES
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|s| s.contains(&(ty as usize))))
+        .unwrap_or(false)
+}
+
+/// Bridged VM types whose instances cross into C as faithful **container
+/// bodies** (RFC 0047, wave 5): a pure-Python `class C(list)` /
+/// `class C(tuple)` (pandas' `FrozenList`, every `namedtuple`). CPython
+/// lays such an instance out as a real `PyListObject`/`PyTupleObject`
+/// with the subclass in `ob_type`, and stock extensions classify with
+/// `PyList_Check` (a `tp_flags` bit test) then poke the layout with the
+/// `PyList_GET_ITEM`/`Py_SIZE` macros — no function call we could
+/// interpose. A plain `PyObjectBox` (Rust payload where C expects
+/// `ob_item`) read that way is garbage: pandas' ujson serializer walked
+/// `FrozenList`'s payload bytes as a pointer array and crashed on
+/// `to_json(orient="table")`.
+static CONTAINER_BODY_TYPES: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+static CONTAINER_BODY_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Register a bridged VM type whose instances need a faithful container
+/// body iff it is a list/tuple subclass (decided by the fast-subclass
+/// `tp_flags` bits already stamped on `ty`). Called at bridge time
+/// ([`install_user_type`] / [`synth_type_for_class`]) for non-inline
+/// types — an inline C base owns the layout instead.
+pub(crate) fn maybe_register_container_body_type(ty: *mut PyTypeObject) {
+    if ty.is_null() {
+        return;
+    }
+    use crate::layout::tpflags;
+    let flags = unsafe { (*ty).tp_flags };
+    if flags & (tpflags::LIST_SUBCLASS | tpflags::TUPLE_SUBCLASS) == 0 {
+        return;
+    }
+    if let Ok(mut g) = CONTAINER_BODY_TYPES.lock() {
+        if g.get_or_insert_with(std::collections::HashSet::new)
+            .insert(ty as usize)
+        {
+            CONTAINER_BODY_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// True if instances of `ty` cross as faithful container bodies (list /
+/// tuple subclass of a VM class). Gated on an atomic count so programs
+/// that never bridge such a class pay one relaxed load.
+pub fn is_container_body_type(ty: *mut PyTypeObject) -> bool {
+    if ty.is_null() || CONTAINER_BODY_COUNT.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return false;
+    }
+    CONTAINER_BODY_TYPES
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|s| s.contains(&(ty as usize))))
+        .unwrap_or(false)
+}
+
+/// True iff the inline-instance type registry is still reachable (see
+/// [`crate::containers::caches_alive`]). The registry is a process
+/// `static` now (RFC 0047: cross-thread instances), so it never dies;
+/// this only reports a poisoned mutex, which would mean a panic already
+/// aborted a registry mutation mid-flight.
+pub(crate) fn inline_types_alive() -> bool {
+    INLINE_TYPES.lock().is_ok()
 }
 
 /// Look up the readied-type data for an extension type pointer.
@@ -873,7 +2373,10 @@ fn readied_for(ty: *mut PyTypeObject) -> Option<&'static ReadiedType> {
     if ty.is_null() {
         return None;
     }
-    READIED_BY_PTR.with(|m| m.borrow().get(&(ty as usize)).copied())
+    READIED_BY_PTR
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|m| m.get(&(ty as usize)).copied()))
 }
 
 /// The decoded slot table for a readied stock type, or `None` if `ty`
@@ -907,6 +2410,89 @@ pub fn readied_bridge(ty: *mut PyTypeObject) -> Option<Rc<TypeObject>> {
 /// pure-Python class (no C `PyTypeObject` exists to consult).
 pub fn type_ptr_for_class(cls: &Rc<TypeObject>) -> Option<*mut PyTypeObject> {
     find_type_ptr(cls)
+}
+
+/// Build a faithful C-level tuple of the canonical `PyTypeObject*` for
+/// each class in `types`. Used to publish `tp_bases` / `tp_mro` on a
+/// readied / spec-built type so Cython-generated code can walk them via
+/// the `PyTuple_GET_SIZE` / `PyTuple_GET_ITEM` macros (direct struct
+/// reads, no function call). Each entry must already have a registered
+/// canonical pointer (built after the type itself is registered so its
+/// own `tp_mro[0]` slot resolves). Returns NULL on allocation failure.
+unsafe fn build_type_ptr_tuple(types: &[Rc<TypeObject>]) -> *mut PyObject {
+    let tup = unsafe { crate::containers::PyTuple_New(types.len() as PySsizeT) };
+    if tup.is_null() {
+        return ptr::null_mut();
+    }
+    for (i, cls) in types.iter().enumerate() {
+        // `into_owned(Object::Type)` resolves to the canonical
+        // `PyTypeObject*` (static / heap / readied) and hands back an
+        // owned reference, which `PyTuple_SetItem` then steals.
+        let p = crate::object::into_owned(Object::Type(cls.clone()));
+        unsafe { crate::containers::PyTuple_SetItem(tup, i as PySsizeT, p) };
+    }
+    tup
+}
+
+/// Gate for [`publish_static_type_hierarchy`] (run-once).
+static STATIC_HIERARCHY_PUBLISHED: Mutex<bool> = Mutex::new(false);
+
+/// Publish faithful C-level `tp_bases` / `tp_mro` tuples on every static
+/// builtin type (`object`, `int`, `str`, …).
+///
+/// This is deliberately *deferred* out of [`init_static_types`]: building
+/// the tuples calls [`crate::containers::PyTuple_New`] / `into_owned`,
+/// which need a live interpreter + allocator context. `init_static_types`
+/// runs at the very first C-API touch (possibly before any `ActiveContext`
+/// is established), so we publish at the first VM→C transition
+/// ([`crate::interp::ensure_active`]) instead, where the context is
+/// guaranteed. Idempotent and re-entrancy-safe (claims the flag before
+/// building, so a nested build call is a no-op rather than a deadlock).
+///
+/// Without this, each static builtin crosses into C with `tp_mro == NULL`.
+/// numpy's `_descr_from_subtype` resolves a 0-d array's scalar descr by
+/// reading `Py_TYPE(sc)->tp_mro->ob_size` (`maybe_convert_objects` →
+/// `PyArray_DescrFromScalar` on the `object` type) and dereferences the
+/// NULL `tp_mro` (fault at `0x10`, the `PyTupleObject::ob_size` offset).
+/// CPython walks a valid 1-element MRO and returns `dtype('O')`.
+pub fn publish_static_type_hierarchy() {
+    {
+        let mut done = match STATIC_HIERARCHY_PUBLISHED.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if *done {
+            return;
+        }
+        // Claim before building and release the lock, so a re-entrant
+        // `ensure_active` triggered while constructing the tuples sees the
+        // flag set and returns immediately instead of deadlocking.
+        *done = true;
+    }
+    unsafe {
+        for slot in STATIC_TYPE_TABLE {
+            let ty = &mut *slot.as_ptr();
+            let bridge = ty.bridge;
+            if bridge.is_null() {
+                continue;
+            }
+            let rc: &Rc<TypeObject> = &*bridge;
+            if ty.tp_mro.is_null() {
+                let mro = rc.mro.borrow().clone();
+                let tup = build_type_ptr_tuple(&mro);
+                if !tup.is_null() {
+                    ty.tp_mro = tup;
+                }
+            }
+            if ty.tp_bases.is_null() {
+                let bases = rc.bases.borrow().clone();
+                let tup = build_type_ptr_tuple(&bases);
+                if !tup.is_null() {
+                    ty.tp_bases = tup;
+                }
+            }
+        }
+    }
 }
 
 #[no_mangle]
@@ -1106,12 +2692,38 @@ pub unsafe extern "C" fn PyType_FromMetaclass(
 
     let ty = match TypeObject::new_user(&bare, bases_resolved, dict) {
         Ok(ty) => ty,
-        Err(_) => {
-            crate::errors::set_runtime_error("could not linearise base classes");
+        Err(e) => {
+            crate::errors::set_pending_from_runtime(e);
             return ptr::null_mut();
         }
     };
+    // CPython's `tp_name`-based error text prints the spec's full dotted
+    // name; remember it on the bridge for `type_name_owned`.
+    if qualified != bare {
+        ty.c_tp_name
+            .set(Some(Box::leak(qualified.clone().into_boxed_str())));
+    }
+    // RFC 0047 (wave 5): record a real C `sq_item` on the bridge so the
+    // VM's `make_iter` can replicate `PyObject_GetIter`'s `PySeqIter`
+    // fallback for a sequence type with no `tp_iter`.
+    if !slot_table.get(crate::slottable::Py_sq_item).is_null() {
+        ty.c_sq_item.set(true);
+    }
     let owned_name = format!("{qualified}\0").into_bytes();
+    // RFC 0047 (wave 5): publish the C-level `tp_dict` backed by the
+    // bridge's shared `DictData` (see the `PyType_Ready` path for the full
+    // rationale — Cython's `__Pyx_SetVtable`/`__Pyx_GetVtable` read and
+    // write `type->tp_dict` directly).
+    let tp_dict_box = crate::object::into_owned(Object::Dict(ty.dict.clone()));
+    // Snapshot the MRO / bases before `ty` is moved into the box; the
+    // faithful C-level `tp_bases` / `tp_mro` are built after the type is
+    // registered (so its own pointer resolves for the `tp_mro[0]` slot).
+    let mro_for_c: Vec<Rc<TypeObject>> = ty.mro.borrow().clone();
+    let bases_for_c: Vec<Rc<TypeObject>> = ty.bases.borrow().clone();
+    // RFC 0047 (wave 5): stamp the `inherit_special` fast-subclass bit (see
+    // `fast_subclass_flags`) so a spec-built metaclass / builtin subclass is
+    // classified correctly by an extension's inlined `tp_flags` reads.
+    let subclass_flags = fast_subclass_flags(&ty);
     let bx = Box::new(PyTypeObjectBox {
         head: PyTypeObject {
             head: PyObject {
@@ -1121,9 +2733,10 @@ pub unsafe extern "C" fn PyType_FromMetaclass(
             tp_name: owned_name.as_ptr() as *const c_char,
             tp_basicsize: spec_ref.basicsize as PySsizeT,
             tp_itemsize: spec_ref.itemsize as PySsizeT,
-            tp_flags: (spec_ref.flags | PY_TPFLAGS_HEAPTYPE) as u64,
+            tp_flags: (spec_ref.flags | PY_TPFLAGS_HEAPTYPE) as u64 | subclass_flags,
             tp_dealloc: Some(crate::object::_PyWeavePy_Dealloc),
             tp_slots: spec_ref.slots,
+            tp_dict: tp_dict_box,
             bridge: Box::into_raw(Box::new(ty)),
             ..PyTypeObject::new_zeroed()
         },
@@ -1136,6 +2749,22 @@ pub unsafe extern "C" fn PyType_FromMetaclass(
     // RFC 0045 (wave 3): a heap type that declares inline fields beyond
     // the object head gets faithful `tp_basicsize` instance storage.
     maybe_register_inline_type(ty_ptr);
+    // RFC 0047 (wave 5): publish faithful C-level `tp_base` / `tp_bases` /
+    // `tp_mro` (CPython's `PyType_FromMetaclass` sets all three). Cython
+    // and other extensions read them directly off the struct.
+    unsafe {
+        if let Some(bp) = bases_for_c.first().and_then(type_ptr_for_class) {
+            (*ty_ptr).tp_base = bp;
+        }
+        let tp_bases_box = build_type_ptr_tuple(&bases_for_c);
+        if !tp_bases_box.is_null() {
+            (*ty_ptr).tp_bases = tp_bases_box;
+        }
+        let tp_mro_box = build_type_ptr_tuple(&mro_for_c);
+        if !tp_mro_box.is_null() {
+            (*ty_ptr).tp_mro = tp_mro_box;
+        }
+    }
     ty_ptr as *mut PyObject
 }
 
@@ -1210,9 +2839,9 @@ pub(crate) fn is_weavepy_owned_type(ty: *mut PyTypeObject) -> bool {
             return true;
         }
     }
-    HEAP_TYPES
+    HEAP_TYPE_SET
         .lock()
-        .map(|g| g.contains(&(ty as usize)))
+        .map(|g| g.as_ref().is_some_and(|set| set.contains(&(ty as usize))))
         .unwrap_or(false)
 }
 
@@ -1416,6 +3045,43 @@ unsafe fn harvest_faithful(ty: *mut PyTypeObject) -> Harvested {
     }
 }
 
+/// Resolve a stock type's full `tp_bases` tuple into bridged VM types.
+///
+/// CPython's `PyType_Ready` linearises the MRO from **all** of a type's
+/// bases, not just `tp_base`. NumPy's numeric scalars use *dual
+/// inheritance* (`Objects/typeobject.c`-style `tp_bases`): e.g.
+/// `numpy.float64.tp_base == numpy.floating` but
+/// `numpy.float64.tp_bases == (numpy.floating, float)`, and likewise
+/// `complex128 → (complexfloating, complex)`, `str_ → (str, character)`.
+/// Following only `tp_base` truncates the MRO and — critically — drops the
+/// Python parent, so `isinstance(np.float64(x), float)` and CPython's
+/// `round()` (which requires a `float` subclass) both fail.
+///
+/// Returns the resolved bases in `tp_bases` order (each readied on
+/// demand), or an empty vec when `tp_bases` is absent/unreadable so the
+/// caller falls back to the single-`tp_base` path.
+unsafe fn harvest_bases(ty: *mut PyTypeObject) -> Vec<Rc<TypeObject>> {
+    let tp_bases = unsafe { (*ty).tp_bases };
+    if tp_bases.is_null() {
+        return Vec::new();
+    }
+    let n = unsafe { crate::containers::PyTuple_Size(tp_bases) };
+    if n <= 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        let item = unsafe { crate::containers::PyTuple_GetItem(tp_bases, i) };
+        if item.is_null() {
+            continue;
+        }
+        if let Some(cls) = unsafe { bridge_or_ready(item as *mut PyTypeObject) } {
+            out.push(cls);
+        }
+    }
+    out
+}
+
 /// `PyType_Ready(t)` — finalise a type object.
 ///
 /// For WeavePy's own types (static built-ins, `PyType_FromSpec` heap
@@ -1438,7 +3104,7 @@ pub unsafe extern "C" fn PyType_Ready(t: *mut PyTypeObject) -> c_int {
         return 0;
     }
 
-    let h = unsafe { harvest_faithful(t) };
+    let mut h = unsafe { harvest_faithful(t) };
 
     // Resolve name (qualified + bare) from tp_name.
     let raw_name = unsafe { (*t).tp_name };
@@ -1455,10 +3121,16 @@ pub unsafe extern "C" fn PyType_Ready(t: *mut PyTypeObject) -> c_int {
         .unwrap_or(&qualified)
         .to_owned();
 
-    let bases = vec![h
+    // MRO bases: prefer the full `tp_bases` when the type declares more
+    // than one (numpy's dual-inherited scalars — `float64`, `complex128`,
+    // `str_`, `bytes_`), so the Python parent lands in the linearised MRO
+    // (`isinstance(np.float64(x), float)`, `round(...)`, …). Single-base
+    // types keep the historical `tp_base`-only path.
+    let multi_bases = unsafe { harvest_bases(t) };
+    let single_base = h
         .base
         .clone()
-        .unwrap_or_else(|| weavepy_vm::builtin_types::builtin_types().object_.clone())];
+        .unwrap_or_else(|| weavepy_vm::builtin_types::builtin_types().object_.clone());
 
     let dict = assemble_type_dict(
         &qualified,
@@ -1470,25 +3142,112 @@ pub unsafe extern "C" fn PyType_Ready(t: *mut PyTypeObject) -> c_int {
         h.doc.as_deref(),
     );
 
-    let ty = match TypeObject::new_user(&bare, bases, dict) {
-        Ok(ty) => ty,
-        Err(_) => {
-            crate::errors::set_runtime_error("PyType_Ready: could not linearise bases");
-            return -1;
+    let ty = if multi_bases.len() >= 2 {
+        // Retry with only the primary `tp_base` if the full dual-inheritance
+        // set has no consistent C3 linearisation — never worse than the
+        // historical single-base MRO. `dict` is cloned for the retry.
+        match TypeObject::new_user(&bare, multi_bases, dict.clone()) {
+            Ok(ty) => ty,
+            Err(_) => match TypeObject::new_user(&bare, vec![single_base], dict) {
+                Ok(ty) => ty,
+                Err(e) => {
+                    crate::errors::set_pending_from_runtime(e);
+                    return -1;
+                }
+            },
+        }
+    } else {
+        match TypeObject::new_user(&bare, vec![single_base], dict) {
+            Ok(ty) => ty,
+            Err(e) => {
+                crate::errors::set_pending_from_runtime(e);
+                return -1;
+            }
         }
     };
+    // CPython's `tp_name`-based error text prints the full dotted name
+    // (`'numpy.ndarray'`) even though `__name__` is bare; remember it on
+    // the bridge for `type_name_owned`.
+    if qualified != bare {
+        ty.c_tp_name
+            .set(Some(Box::leak(qualified.clone().into_boxed_str())));
+    }
+
+    // RFC 0047 (wave 5): publish the C-level `tp_dict`. Cython-generated
+    // module init writes into `type->tp_dict` *directly*
+    // (`__Pyx_SetVtable` does `PyDict_SetItem(type->tp_dict,
+    // "__pyx_vtable__", capsule)`) and reads it back through
+    // `__Pyx_GetVtable` for cpdef dispatch. We back it with a dict box
+    // sharing the bridge's `DictData`, so a direct `tp_dict` mutation and
+    // the VM's MRO lookup observe the same storage. The type is immortal,
+    // so the box (refcount 1) lives for the process, matching CPython
+    // where the type owns its `tp_dict`.
+    let tp_dict_box = crate::object::into_owned(Object::Dict(ty.dict.clone()));
+
+    // RFC 0047 (wave 5): faithful `inherit_slots`. The type dict above
+    // carries only the subtype's *own* dunders (inherited behaviour is
+    // reached through the MRO, exactly as CPython). But a Cython-generated
+    // extension reads `Py_TYPE(self)->tp_*` and `…->tp_as_number->nb_add`
+    // **directly off the C struct**, with no MRO walk, so the inherited
+    // slots must be baked into both the decoded table (for direct-table
+    // dispatch) and the faithful struct (for inlined reads). The base was
+    // already readied + flattened during harvest, so one level of copy
+    // carries the whole ancestor chain.
+    let base_ptr = unsafe { (*t).tp_base };
+    unsafe { crate::inherit::inherit_slots(t, &mut h.slot_table, base_ptr) };
+
+    // RFC 0047 (wave 5): record a real C `sq_item` on the bridge (after
+    // `inherit_slots`, so an inherited sequence protocol counts too) so the
+    // VM's `make_iter` can replicate `PyObject_GetIter`'s `PySeqIter`
+    // fallback for a sequence type with no `tp_iter` (numpy's
+    // `_array_converter`).
+    if !h.slot_table.get(crate::slottable::Py_sq_item).is_null() {
+        ty.c_sq_item.set(true);
+    }
 
     let readied: &'static ReadiedType = Box::leak(Box::new(ReadiedType {
         ext_ptr: t,
         bridge: ty,
         slot_table: h.slot_table,
     }));
-    READIED_BY_PTR.with(|m| m.borrow_mut().insert(t as usize, readied));
-    READIED_TYPES.with(|v| v.borrow_mut().push(readied));
+    if std::env::var_os("WEAVEPY_TRACE_TYPEPTR").is_some() {
+        eprintln!(
+            "[READY] name={:?} ext_ptr={:p} bridge={:p}",
+            bare,
+            t,
+            Rc::as_ptr(&readied.bridge)
+        );
+    }
+    if let Ok(mut g) = READIED_BY_PTR.lock() {
+        g.get_or_insert_with(std::collections::HashMap::new)
+            .insert(t as usize, readied);
+    }
+    if let Ok(mut g) = READIED_TYPES.lock() {
+        g.push(readied);
+    }
+    bump_type_registry_gen();
     // RFC 0045 (wave 3): a readied static type that declares inline
     // fields beyond the object head gets faithful `tp_basicsize`
     // instance storage (the `PyArrayObject` shape).
     maybe_register_inline_type(t);
+
+    // RFC 0047 (wave 5): publish faithful C-level `tp_base` / `tp_bases` /
+    // `tp_mro`. Cython's `__Pyx_MergeVtables` reads `type->tp_base` and
+    // indexes `type->tp_bases` through the `PyTuple_GET_SIZE` /
+    // `PyTuple_GET_ITEM` macros (direct struct access), and
+    // `__Pyx_setup_reduce` walks `tp_mro` — leaving any of them NULL
+    // segfaults. Built *after* the type is registered so its own pointer
+    // resolves for the `tp_mro[0]` self entry.
+    let base_for_c: Option<*mut PyTypeObject> = readied
+        .bridge
+        .bases
+        .borrow()
+        .first()
+        .and_then(type_ptr_for_class);
+    let bases_for_c: Vec<Rc<TypeObject>> = readied.bridge.bases.borrow().clone();
+    let mro_for_c: Vec<Rc<TypeObject>> = readied.bridge.mro.borrow().clone();
+    let tp_bases_box = unsafe { build_type_ptr_tuple(&bases_for_c) };
+    let tp_mro_box = unsafe { build_type_ptr_tuple(&mro_for_c) };
 
     // Write-back into the caller's struct — both offsets live inside
     // the faithful 416-byte CPython prefix, so a stock static type is
@@ -1509,6 +3268,34 @@ pub unsafe extern "C" fn PyType_Ready(t: *mut PyTypeObject) -> c_int {
         }
         (*t).head.ob_refcnt = IMMORTAL_REFCNT;
         (*t).tp_flags |= PY_TPFLAGS_READY;
+        // RFC 0047 (wave 5): mirror CPython's `inherit_special` and stamp
+        // the fast-subclass bit for the most-derived builtin in this type's
+        // ancestry. A stock extension reads these directly off `tp_flags`
+        // (`PyType_Check`, `PyExceptionInstance_Check`, …); without them
+        // numpy.random's Cython rejects `numpy.dtype` whose metaclass
+        // `_DTypeMeta` is a `type` subclass that here would carry no
+        // `Py_TPFLAGS_TYPE_SUBCLASS`.
+        (*t).tp_flags |= fast_subclass_flags(&readied.bridge);
+        if (*t).tp_dict.is_null() {
+            (*t).tp_dict = tp_dict_box;
+        } else {
+            crate::object::Py_DecRef(tp_dict_box);
+        }
+        if (*t).tp_base.is_null() {
+            if let Some(bp) = base_for_c {
+                (*t).tp_base = bp;
+            }
+        }
+        if (*t).tp_bases.is_null() {
+            (*t).tp_bases = tp_bases_box;
+        } else if !tp_bases_box.is_null() {
+            crate::object::Py_DecRef(tp_bases_box);
+        }
+        if (*t).tp_mro.is_null() {
+            (*t).tp_mro = tp_mro_box;
+        } else if !tp_mro_box.is_null() {
+            crate::object::Py_DecRef(tp_mro_box);
+        }
         if (*t).tp_dealloc.is_none() {
             (*t).tp_dealloc = Some(crate::object::_PyWeavePy_Dealloc);
         }
@@ -1564,14 +3351,68 @@ pub unsafe extern "C" fn PyType_Ready(t: *mut PyTypeObject) -> c_int {
 
 #[no_mangle]
 pub unsafe extern "C" fn PyType_IsSubtype(a: *mut PyTypeObject, b: *mut PyTypeObject) -> c_int {
+    if a.is_null() || b.is_null() {
+        return 0;
+    }
+    // CPython walks `a->tp_mro` FIRST — the only walk that sees *multiple*
+    // inheritance. numpy's `complex128` reaches `complex` solely through its
+    // MRO (`tp_bases == (complexfloating, complex)`, but `tp_base` points at
+    // `complexfloating` only), and pandas' `is_complex_object` — the inline
+    // `PyComplex_Check` → `PyType_IsSubtype` — depends on it: a base-chain
+    // walk misses `complex` and `maybe_convert_objects` then coerces the
+    // scalar through the float path, silently dropping the imaginary part.
+    let mro = unsafe { (*(a as *mut crate::layout::PyTypeObjectFull)).tp_mro };
+    if !mro.is_null() {
+        let n = unsafe { crate::containers::PyTuple_Size(mro) };
+        for i in 0..n {
+            let item = unsafe { crate::containers::PyTuple_GetItem(mro, i) };
+            if std::ptr::eq(item as *mut PyTypeObject, b) {
+                return 1;
+            }
+        }
+        // CPython returns 0 here — the MRO is authoritative. We keep
+        // falling through instead: a WeavePy-bridged type's C `tp_mro`
+        // mirror may be stale or partial (only faithful mirrors publish
+        // one), so the bridged comparison below stays the source of truth
+        // for VM-minted types.
+    }
+    // `a` not completely initialized (no MRO yet): `b` is a subtype if it
+    // is reachable through the `tp_base` chain. A pure pointer walk —
+    // correct no matter which interpreter minted either type, and never an
+    // out-of-bounds read (every `PyTypeObject`, stock or ours, carries
+    // `tp_base` at the standard offset). This is what makes the
+    // process-global datetime shells (RFC 0029) answer
+    // `PyDate_Check(datetime_instance)` correctly via their
+    // `datetime → date → object` chain, where a bridge-identity
+    // comparison would fail across the test harness's per-case
+    // interpreters.
+    if unsafe { c_base_chain_contains(a, b) } {
+        return 1;
+    }
+    // Fall back to the bridged-MRO comparison for types whose faithful C
+    // base chain is not populated (the common WeavePy bridged type).
     let (Some(a), Some(b)) = (unsafe { bridge_type(a) }, unsafe { bridge_type(b) }) else {
         return 0;
     };
-    if a.is_subclass_of(&b) {
-        1
-    } else {
-        0
+    c_int::from(a.is_subclass_of(&b))
+}
+
+/// Walk `a`'s `tp_base` ancestry looking for `b` — the pointer-only core
+/// of CPython's `PyType_IsSubtype`. Returns `false` (not "unknown") when
+/// the chain runs out, so callers fall back to the bridged comparison.
+///
+/// # Safety
+/// `a` must be null or a valid `PyTypeObject*`; the chain is acyclic and
+/// terminates at a type whose `tp_base` is null (`object`).
+unsafe fn c_base_chain_contains(a: *mut PyTypeObject, b: *mut PyTypeObject) -> bool {
+    let mut cur = a;
+    while !cur.is_null() {
+        if std::ptr::eq(cur, b) {
+            return true;
+        }
+        cur = unsafe { (*cur).tp_base };
     }
+    false
 }
 
 #[no_mangle]
@@ -1583,13 +3424,11 @@ pub unsafe extern "C" fn PyObject_TypeCheck(o: *mut PyObject, ty: *mut PyTypeObj
     if std::ptr::eq(head.ob_type, ty) {
         return 1;
     }
-    let Some(other) = (unsafe { bridge_type(head.ob_type) }) else {
-        return 0;
-    };
-    let Some(t) = (unsafe { bridge_type(ty) }) else {
-        return 0;
-    };
-    c_int::from(other.is_subclass_of(&t))
+    // Same subtype semantics as the inline CPython header
+    // (`Py_IS_TYPE || PyType_IsSubtype`), including the C `tp_mro` walk
+    // that multiple-inheritance extension types (numpy's scalar lattice)
+    // need.
+    unsafe { PyType_IsSubtype(head.ob_type, ty) }
 }
 
 #[no_mangle]

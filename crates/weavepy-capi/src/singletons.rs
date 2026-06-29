@@ -39,14 +39,61 @@ impl Singleton {
     }
 }
 
+/// `Py_True`/`Py_False` are faithful `PyLongObject` singletons.
+///
+/// CPython's `bool` is an `int` subclass and `_Py_TrueStruct` /
+/// `_Py_FalseStruct` are `struct _longobject` (a `PyLongObject`), not bare
+/// `PyObject`s. RFC 0043/0047: macro-heavy Cython converts a Python bool to a
+/// C integer by reading the `PyLongObject` digits and sign tag *directly* off
+/// the struct (`__Pyx_PyLong_IsCompact` / `__Pyx_PyLong_CompactValue` under
+/// `CYTHON_USE_PYLONG_INTERNALS`) rather than calling `PyLong_AsLong`. pandas'
+/// `lib.maybe_convert_objects` stores each bool into an `ndarray[uint8]`
+/// (`bools[i] = val`), which compiles to exactly that inline read; a bare
+/// 16-byte `PyObject` left the `lv_tag`/`ob_digit` slots reading past the
+/// allocation, so `False` decoded as a "negative value" and the store raised
+/// `OverflowError: can't convert negative value to npy_uint8`. Backing the
+/// singletons with a real `_PyLongValue` makes the inline decode read `0`/`1`.
+#[repr(transparent)]
+pub struct BoolSingleton(UnsafeCell<crate::layout::PyLongObject>);
+
+unsafe impl Sync for BoolSingleton {}
+
+impl BoolSingleton {
+    /// `value` is `0` (False) or `1` (True).
+    pub const fn new(value: crate::layout::digit) -> Self {
+        // `lv_tag = (ndigits << NON_SIZE_BITS) | sign`. False is the canonical
+        // zero (0 digits, SIGN_ZERO); True is one positive digit.
+        let lv_tag = if value == 0 {
+            crate::layout::PYLONG_SIGN_ZERO
+        } else {
+            (1usize << crate::layout::PYLONG_NON_SIZE_BITS) | crate::layout::PYLONG_SIGN_POSITIVE
+        };
+        Self(UnsafeCell::new(crate::layout::PyLongObject {
+            ob_base: PyObject {
+                ob_refcnt: IMMORTAL_REFCNT,
+                ob_type: std::ptr::null_mut(),
+            },
+            long_value: crate::layout::PyLongValue {
+                lv_tag,
+                ob_digit: [value],
+            },
+        }))
+    }
+
+    /// Return a stable raw `PyObject*` (the embedded `ob_base`).
+    pub fn as_ptr(&self) -> *mut PyObject {
+        self.0.get() as *mut PyObject
+    }
+}
+
 #[no_mangle]
 pub static _Py_NoneStruct: Singleton = Singleton::new();
 
 #[no_mangle]
-pub static _Py_TrueStruct: Singleton = Singleton::new();
+pub static _Py_TrueStruct: BoolSingleton = BoolSingleton::new(1);
 
 #[no_mangle]
-pub static _Py_FalseStruct: Singleton = Singleton::new();
+pub static _Py_FalseStruct: BoolSingleton = BoolSingleton::new(0);
 
 #[no_mangle]
 pub static _Py_NotImplementedStruct: Singleton = Singleton::new();

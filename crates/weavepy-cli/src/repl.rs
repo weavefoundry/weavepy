@@ -229,7 +229,7 @@ impl Repl {
 }
 
 fn build_main_module(interpreter: &Interpreter) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     let module = Rc::new(PyModule {
         name: "__main__".to_owned(),
         filename: None,

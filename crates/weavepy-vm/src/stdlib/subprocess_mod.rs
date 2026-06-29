@@ -30,7 +30,7 @@ use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, FileBackend, Object, PyFile, PyModule};
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -299,7 +299,7 @@ fn spawn_call(args: &[Object]) -> Result<Object, RuntimeError> {
     let child_rc: Rc<RefCell<Option<std::process::Child>>> = Rc::new(RefCell::new(Some(child)));
     let returncode: Rc<RefCell<Option<i64>>> = Rc::new(RefCell::new(None));
 
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(DictKey(Object::from_static("pid")), Object::Int(pid));

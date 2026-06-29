@@ -26,11 +26,34 @@
 //!   raises events must not infinitely recurse. We disable hook
 //!   firing for the duration of any hook callout.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::object::Object;
 use crate::sync::RefCell;
+
+/// Process-wide count of registered observers (per-thread trace/profile
+/// hooks, the all-threads fallbacks, and monitoring tools with a
+/// non-empty event mask). Zero ⇒ definitely no observer anywhere, which
+/// lets [`any_observers_active`] — called every bytecode step — bail on
+/// a single relaxed load instead of three thread-local borrows. Every
+/// registration path routes through the setters below, which keep the
+/// count in sync on None↔Some transitions.
+static OBSERVER_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Adjust [`OBSERVER_COUNT`] for a slot transitioning between empty and
+/// occupied.
+fn observer_transition(was: bool, is: bool) {
+    match (was, is) {
+        (false, true) => {
+            OBSERVER_COUNT.fetch_add(1, Ordering::AcqRel);
+        }
+        (true, false) => {
+            OBSERVER_COUNT.fetch_sub(1, Ordering::AcqRel);
+        }
+        _ => {}
+    }
+}
 
 thread_local! {
     static TRACE_HOOK: RefCell<Option<Object>> = const { RefCell::new(None) };
@@ -107,10 +130,13 @@ pub enum HookKind {
 
 pub fn set_trace_hook(hook: Object) {
     TRACE_HOOK.with(|cell| {
-        *cell.borrow_mut() = match hook {
+        let mut slot = cell.borrow_mut();
+        let was = slot.is_some();
+        *slot = match hook {
             Object::None => None,
             other => Some(other),
         };
+        observer_transition(was, slot.is_some());
     });
 }
 
@@ -133,17 +159,26 @@ pub fn set_trace_all_threads(hook: Object) {
         Object::None => None,
         other => Some(other),
     };
-    ALL_TRACE_SET.store(opt.is_some(), Ordering::Release);
+    let was = ALL_TRACE_SET.swap(opt.is_some(), Ordering::AcqRel);
+    observer_transition(was, opt.is_some());
     *ALL_TRACE_HOOK.lock().unwrap() = opt.clone();
-    TRACE_HOOK.with(|cell| *cell.borrow_mut() = opt);
+    TRACE_HOOK.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let was = slot.is_some();
+        observer_transition(was, opt.is_some());
+        *slot = opt;
+    });
 }
 
 pub fn set_profile_hook(hook: Object) {
     PROFILE_HOOK.with(|cell| {
-        *cell.borrow_mut() = match hook {
+        let mut slot = cell.borrow_mut();
+        let was = slot.is_some();
+        *slot = match hook {
             Object::None => None,
             other => Some(other),
         };
+        observer_transition(was, slot.is_some());
     });
 }
 
@@ -163,13 +198,25 @@ pub fn set_profile_all_threads(hook: Object) {
         Object::None => None,
         other => Some(other),
     };
-    ALL_PROFILE_SET.store(opt.is_some(), Ordering::Release);
+    let was = ALL_PROFILE_SET.swap(opt.is_some(), Ordering::AcqRel);
+    observer_transition(was, opt.is_some());
     *ALL_PROFILE_HOOK.lock().unwrap() = opt.clone();
-    PROFILE_HOOK.with(|cell| *cell.borrow_mut() = opt);
+    PROFILE_HOOK.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let was = slot.is_some();
+        observer_transition(was, opt.is_some());
+        *slot = opt;
+    });
 }
 
 pub fn with_monitoring<R>(f: impl FnOnce(&mut MonitoringTools) -> R) -> R {
-    MONITORING_TOOLS.with(|cell| f(&mut cell.borrow_mut()))
+    MONITORING_TOOLS.with(|cell| {
+        let mut tools = cell.borrow_mut();
+        let was = tools.union_mask() != 0;
+        let r = f(&mut tools);
+        observer_transition(was, tools.union_mask() != 0);
+        r
+    })
 }
 
 /// Add an audit hook (PEP 578). Hooks fire in the order they were
@@ -190,8 +237,17 @@ pub fn audit_hooks() -> Vec<Object> {
 /// True when any observer (trace / profile / monitoring tool /
 /// audit hook) is registered. The dispatch loop uses this as a
 /// fast bail-out so the no-observer path stays free.
+///
+/// The common no-observer case is a single relaxed load of
+/// [`OBSERVER_COUNT`]; the per-thread re-check below only runs once
+/// some thread has registered something. (The count is a process-wide
+/// over-approximation — a hook on thread A makes thread B take the slow
+/// re-check — but observers are vanishingly rare outside debuggers.)
 #[inline]
 pub fn any_observers_active() -> bool {
+    if OBSERVER_COUNT.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
     TRACE_HOOK.with(|cell| cell.borrow().is_some())
         || PROFILE_HOOK.with(|cell| cell.borrow().is_some())
         || ALL_TRACE_SET.load(Ordering::Acquire)

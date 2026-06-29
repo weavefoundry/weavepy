@@ -305,7 +305,148 @@ The following implementation-specific options are available:
 -X int_max_str_digits  : set sys.int_info.str_digits_check_threshold.
 ";
 
+// Opt-in native crash diagnostics (`WEAVEPY_SEGV_BT`): macOS-only, because
+// the raw `siginfo_t`/`ucontext_t` byte offsets below are the Darwin layouts.
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn signal(signum: i32, handler: usize) -> usize;
+    fn sigaction(signum: i32, act: *const SigActionC, old: *mut SigActionC) -> i32;
+    fn backtrace(array: *mut *mut std::ffi::c_void, size: i32) -> i32;
+    fn backtrace_symbols_fd(array: *const *mut std::ffi::c_void, size: i32, fd: i32);
+}
+
+/// `struct sigaction` (macOS/BSD layout): an 8-byte handler pointer union,
+/// a 4-byte `sigset_t` mask, and a 4-byte flags word.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct SigActionC {
+    sa_sigaction: usize,
+    sa_mask: u32,
+    sa_flags: i32,
+}
+
+/// `SA_SIGINFO` — deliver the 3-argument handler so we can read `si_addr`.
+#[cfg(target_os = "macos")]
+const SA_SIGINFO: i32 = 0x0040;
+/// Byte offset of `si_addr` within macOS `siginfo_t`
+/// (`si_signo,si_errno,si_code,si_pid,si_uid,si_status` = 24 bytes precede it).
+#[cfg(target_os = "macos")]
+const SIGINFO_SI_ADDR_OFFSET: usize = 24;
+
+/// Byte offset of the `mcontext_t` pointer within macOS `ucontext_t`
+/// (`uc_onstack,uc_sigmask,uc_stack,uc_link,uc_mcsize` precede it).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const UCONTEXT_MCONTEXT_OFFSET: usize = 48;
+/// Byte offset of `__ss` (the ARM thread state) within macOS `mcontext64`
+/// — it follows the 16-byte `__es` (ARM exception state).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const MCONTEXT_SS_OFFSET: usize = 16;
+/// Byte offset of `tp_name` (a `const char *`) within `PyTypeObject`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PYTYPEOBJECT_TP_NAME_OFFSET: usize = 0x18;
+
+/// Read the C string at `p` (best-effort, capped) for signal-handler
+/// diagnostics. Returns a lossy `String`; bails on an obviously-bad pointer
+/// so we don't double-fault while already handling a crash.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn read_c_str_lossy(p: *const u8, cap: usize) -> String {
+    if (p as usize) < 0x1000 {
+        return String::from("<bad ptr>");
+    }
+    let mut bytes = Vec::new();
+    for i in 0..cap {
+        let b = unsafe { p.add(i).read() };
+        if b == 0 {
+            break;
+        }
+        bytes.push(b);
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn weavepy_segv_backtrace(sig: i32, info: *const u8, ctx: *mut std::ffi::c_void) {
+    // `ctx` (the interrupted-thread register file) is only decoded on arm64,
+    // where the `mcontext64` layout below applies.
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = ctx;
+    // The faulting memory address (`si_addr`) is the single most useful clue
+    // for a native crash in a dlopen'd extension: a small value (`0x0`, `0x8`,
+    // …) is a NULL-based field deref, a huge value a wild pointer. Printing it
+    // turns an opaque `PyArray_*` frame into an actionable diagnosis.
+    if !info.is_null() {
+        let si_addr = unsafe {
+            info.add(SIGINFO_SI_ADDR_OFFSET)
+                .cast::<usize>()
+                .read_unaligned()
+        };
+        eprintln!("\n=== WEAVEPY signal {sig} faulting address = 0x{si_addr:x} ===");
+    }
+    // Faulting register file (arm64): `pc` pinpoints the exact instruction and
+    // `x0` is usually the receiver of a `Py_TYPE(x)->tp_field` chain. When the
+    // crash is a NULL `tp_mro`/`tp_dict`/… deref, `x0` is still the live type
+    // pointer, so decoding `x0->tp_name` names the offending type directly.
+    #[cfg(target_arch = "aarch64")]
+    if !ctx.is_null() {
+        unsafe {
+            let mctx = ctx
+                .cast::<u8>()
+                .add(UCONTEXT_MCONTEXT_OFFSET)
+                .cast::<*const u8>()
+                .read_unaligned();
+            if !mctx.is_null() {
+                let ss = mctx.add(MCONTEXT_SS_OFFSET);
+                let x = |n: usize| ss.add(n * 8).cast::<u64>().read_unaligned();
+                let pc = ss.add(256).cast::<u64>().read_unaligned();
+                eprintln!(
+                    "=== registers: pc=0x{pc:x} x0=0x{:x} x1=0x{:x} x8=0x{:x} x19=0x{:x} x20=0x{:x} ===",
+                    x(0), x(1), x(8), x(19), x(20)
+                );
+                // Heuristic: for a `tp_*` NULL-field crash the type pointer is
+                // in x0 (and often mirrored in x19/x20). Decode each as a
+                // candidate `PyTypeObject*` and print its `tp_name`.
+                for (reg, val) in [("x0", x(0)), ("x19", x(19)), ("x20", x(20))] {
+                    let name_pp = (val as usize + PYTYPEOBJECT_TP_NAME_OFFSET) as *const *const u8;
+                    if (val as usize) > 0x1000 {
+                        let name = read_c_str_lossy(name_pp.read(), 64);
+                        eprintln!("===   {reg} as PyTypeObject* -> tp_name = {name:?} ===");
+                    }
+                }
+            }
+        }
+    }
+    // Native (dladdr-based) backtrace first: it resolves frames inside a
+    // dlopen'd `.so` (e.g. a Cython extension's static helpers) to their
+    // real `module + symbol + offset`, which Rust's `std::backtrace`
+    // mis-attributes to the nearest exported libsystem symbol.
+    let mut frames: [*mut std::ffi::c_void; 96] = [std::ptr::null_mut(); 96];
+    let n = unsafe { backtrace(frames.as_mut_ptr(), 96) };
+    eprintln!("=== WEAVEPY signal {sig} native backtrace ===");
+    unsafe { backtrace_symbols_fd(frames.as_ptr(), n, 2) };
+    eprintln!("=== end native backtrace ===");
+    let bt = std::backtrace::Backtrace::force_capture();
+    eprintln!("=== WEAVEPY signal {sig} rust backtrace ===\n{bt}\n=== end backtrace ===");
+    unsafe {
+        signal(sig, 0);
+    }
+    std::process::abort();
+}
+
 fn main() -> ExitCode {
+    #[cfg(target_os = "macos")]
+    if std::env::var_os("WEAVEPY_SEGV_BT").is_some() {
+        // `SA_SIGINFO` so the handler receives `siginfo_t` and can report the
+        // faulting address; `signal()` alone would only pass the signal number.
+        let act = SigActionC {
+            sa_sigaction: weavepy_segv_backtrace as *const () as usize,
+            sa_mask: 0,
+            sa_flags: SA_SIGINFO,
+        };
+        unsafe {
+            sigaction(11, &raw const act, std::ptr::null_mut()); // SIGSEGV
+            sigaction(10, &raw const act, std::ptr::null_mut()); // SIGBUS
+        }
+    }
     // Undo Rust's pre-`main` `sanitize_standard_fds` (which re-opens any closed
     // std fd onto `/dev/null`) so an inherited-closed stdin/stdout/stderr stays
     // closed, matching CPython (`test_posix.test_close_file`). Must run before
@@ -340,6 +481,15 @@ fn run_on_large_stack(entry: fn() -> ExitCode) -> ExitCode {
     weavepy::vm::stdlib::signal_mod::block_async_signals_current_thread();
 
     let vm_entry = move || -> ExitCode {
+        // Opt-in (`WEAVEPY_CRASH_BT`): register the native crash handler +
+        // per-thread sigaltstack on the VM thread itself so a stack-overflow
+        // SIGSEGV can be caught and reported (no-op stub on Windows).
+        if std::env::var_os("WEAVEPY_CRASH_BT").is_some() {
+            extern "C" {
+                fn weavepy_install_crash_handler();
+            }
+            unsafe { weavepy_install_crash_handler() };
+        }
         weavepy::vm::stdlib::signal_mod::unblock_async_signals_current_thread();
         // Arm SIGINT -> KeyboardInterrupt at startup (CPython does this during
         // interpreter init), so even scripts that never `import signal` raise

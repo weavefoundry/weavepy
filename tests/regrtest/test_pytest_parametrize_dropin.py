@@ -37,7 +37,7 @@ def test_parametrize_single_dim():
         nodeid = '<test>'
         parent = None
 
-    items = pytest._expand_parametrize('t', FakeParent(), t, t._pytest_marks)
+    items = pytest._expand_parametrize('t', FakeParent(), t, t.pytestmark)
     assert_eq(len(items), 3, '3 items from 3 values')
     for it in items:
         it.runtest()
@@ -56,7 +56,7 @@ def test_parametrize_cartesian_matrix():
         nodeid = '<test>'
         parent = None
 
-    items = pytest._expand_parametrize('t', FakeParent(), t, t._pytest_marks)
+    items = pytest._expand_parametrize('t', FakeParent(), t, t.pytestmark)
     assert_eq(len(items), 4, 'cartesian matrix is 2*2 = 4')
     for it in items:
         it.runtest()
@@ -79,7 +79,7 @@ def test_parametrize_tuple_unpacking():
         nodeid = '<test>'
         parent = None
 
-    items = pytest._expand_parametrize('t', FakeParent(), t, t._pytest_marks)
+    items = pytest._expand_parametrize('t', FakeParent(), t, t.pytestmark)
     assert_eq(len(items), 3)
     for it in items:
         it.runtest()
@@ -99,7 +99,7 @@ def test_parametrize_param_helper_with_id():
         nodeid = '<test>'
         parent = None
 
-    items = pytest._expand_parametrize('t', FakeParent(), t, t._pytest_marks)
+    items = pytest._expand_parametrize('t', FakeParent(), t, t.pytestmark)
     ids = [it._param_id for it in items]
     assert_eq(ids, ['one', 'two', 'three'])
 

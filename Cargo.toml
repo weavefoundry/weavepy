@@ -98,7 +98,7 @@ encoding_rs = "0.8"
 bzip2       = { version = "0.4", features = ["static"] }
 xz2         = "0.1"
 lzma-sys    = "0.1"
-rusqlite    = { version = "0.31", features = ["bundled"] }
+rusqlite    = { version = "0.31", features = ["bundled", "column_decltype"] }
 rust_decimal = "1.36"
 
 # RFC 0040 WS5 — `pyexpat`: a real streaming XML parser behind the native

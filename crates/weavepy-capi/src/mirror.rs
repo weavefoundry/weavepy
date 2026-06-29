@@ -37,6 +37,151 @@ use crate::layout::{self, ustate};
 use crate::object::{PyObject, PySsizeT};
 use crate::types::{self, PyTypeObject};
 
+/// Diagnostic: gate faithful instance-body alloc/free tracing on
+/// `WEAVEPY_BODY_TRACE` (RFC 0045 debugging of body-address reuse).
+pub fn body_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WEAVEPY_BODY_TRACE").is_some())
+}
+
+/// Cached `WEAVEPY_TRACE_LISTSYNC` gate — checked on every seeded-list
+/// flush (i.e. every bridged C call), so it must not `getenv` each time.
+pub(crate) fn listsync_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WEAVEPY_TRACE_LISTSYNC").is_some())
+}
+
+/// Cached `WEAVEPY_NO_LISTSYNC` kill-switch (same hot path as above).
+pub(crate) fn listsync_disabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WEAVEPY_NO_LISTSYNC").is_some())
+}
+
+fn body_trace_interesting(tn: &str) -> bool {
+    tn.contains("Engine")
+        || tn.contains("ndarray")
+        || tn.contains("Index")
+        || tn.contains("BlockManager")
+        || tn.contains("Block")
+        || tn.contains("internals")
+}
+
+thread_local! {
+    /// Diagnostic (WEAVEPY_BODY_TRACE): the type name most recently freed
+    /// at each instance-body address, so a subsequent allocation reusing
+    /// that address can flag a body-address reuse across types.
+    static FREED_BODY_TYPES: RefCell<std::collections::HashMap<usize, String>> =
+        RefCell::new(std::collections::HashMap::new());
+    /// Diagnostic (WEAVEPY_WATCH_BLOCKS): addresses of blocks tuples to
+    /// trace refcount ops on, to find a premature-free / over-decref.
+    static WATCHED: RefCell<std::collections::HashSet<usize>> =
+        RefCell::new(std::collections::HashSet::new());
+    /// Diagnostic (WEAVEPY_WATCH_BLOCKS): free-site history (type + short
+    /// backtrace) for each mirror address, so a later stale read can print
+    /// the full reuse chain that led to the confusion.
+    static FREE_BT: RefCell<std::collections::HashMap<usize, Vec<(String, String)>>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// Record the free-site of a mirror at `p` (WEAVEPY_WATCH_BLOCKS), keyed
+/// by address, so a later stale read of the same address can report who
+/// freed it.
+pub unsafe fn record_mirror_free(p: *mut PyObject) {
+    if !watch_enabled() {
+        return;
+    }
+    // Only faithful tuples/lists — the shapes a `blocks` field points at —
+    // to keep backtrace capture rare enough not to perturb timing.
+    if !unsafe { is_faithful_tuple(p) } && !unsafe { is_faithful_list(p) } {
+        return;
+    }
+    let tn = unsafe { crate::object::debug_type_name(p) };
+    // Keep only the last ~4 interior frames to make the chain readable.
+    let full = std::backtrace::Backtrace::force_capture().to_string();
+    let short: String = full
+        .lines()
+        .filter(|l| {
+            l.contains("free_mirror")
+                || l.contains("free_box")
+                || l.contains("DecRef")
+                || l.contains("Dealloc")
+                || l.contains("install_new")
+                || l.contains("VectorcallMethod")
+                || l.contains("reap")
+                || l.contains("tp_clear")
+                || l.contains("GC_")
+                || l.contains("clear")
+        })
+        .take(8)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    FREE_BT.with(|m| {
+        m.borrow_mut()
+            .entry(p as usize)
+            .or_default()
+            .push((tn, short));
+    });
+}
+
+/// Look up the free-site history recorded for `addr` (WEAVEPY_WATCH_BLOCKS).
+pub fn lookup_free_bt(addr: usize) -> Option<Vec<(String, String)>> {
+    if !watch_enabled() {
+        return None;
+    }
+    FREE_BT.with(|m| m.borrow().get(&addr).cloned())
+}
+
+use std::cell::RefCell;
+
+pub fn watch_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WEAVEPY_WATCH_BLOCKS").is_some())
+}
+
+pub fn watch_ptr(p: usize) {
+    if watch_enabled() {
+        WATCHED.with(|s| s.borrow_mut().insert(p));
+    }
+}
+
+pub fn is_watched(p: usize) -> bool {
+    watch_enabled() && WATCHED.with(|s| s.borrow().contains(&p))
+}
+
+pub fn unwatch_ptr(p: usize) {
+    if watch_enabled() {
+        WATCHED.with(|s| s.borrow_mut().remove(&p));
+    }
+}
+
+fn note_body_freed(addr: usize, tyname: String) {
+    if !body_trace_enabled() {
+        return;
+    }
+    FREED_BODY_TYPES.with(|m| {
+        m.borrow_mut().insert(addr, tyname);
+    });
+}
+
+fn check_body_reuse(addr: usize, new_ty: &str) {
+    if !body_trace_enabled() {
+        return;
+    }
+    let prev = FREED_BODY_TYPES.with(|m| m.borrow_mut().remove(&addr));
+    if let Some(old) = prev {
+        if body_trace_interesting(&old) || body_trace_interesting(new_ty) {
+            eprintln!(
+                "[BODY-REUSE] addr=0x{:x} old_type={} new_type={}",
+                addr, old, new_ty
+            );
+        }
+    }
+}
+
 /// WeavePy bookkeeping placed immediately before the faithful body. The
 /// public `*mut PyObject` is `prefix as *mut u8 + PREFIX_SIZE`, so the
 /// prefix is recovered by subtracting [`PREFIX_SIZE`].
@@ -71,6 +216,40 @@ pub struct MirrorPrefix {
     pub aux_ptr: *mut u8,
     /// Byte length of [`aux_ptr`]'s allocation.
     pub aux_size: usize,
+    /// True iff this mirror is a faithful, **buffer-authoritative** unicode
+    /// string built by [`new_unicode_mirror`] (the target of
+    /// `PyUnicode_New`/`PyUnicode_Resize`, RFC 0047, wave 5). A stock
+    /// extension writes such a string's character buffer *directly* — the
+    /// inlined `PyUnicode_WRITE` macro after `PyUnicode_New`, or
+    /// `PyUnicode_CopyCharacters` after `PyUnicode_Resize` — so the C body,
+    /// not the prefix's staged [`obj`](Self::obj), is authoritative on
+    /// read-back ([`native_of`] reconstructs via [`read_str`]). A normal
+    /// str mirror (minted by [`mirror_out`]) leaves this `false` and stays
+    /// prefix-authoritative: its bytes are never mutated in place.
+    pub str_buffer: bool,
+    /// True once a faithful **list** mirror's prefix [`obj`](Self::obj) has
+    /// been seeded from the authoritative inline `ob_item` buffer (RFC 0047,
+    /// wave 5). A list mints with `false`; the first [`native_of`] read-back
+    /// reconstructs the prefix list from `ob_item` — capturing a C-built list
+    /// (`PyList_New` + the `PyList_SET_ITEM` macro, e.g. numpy's
+    /// `__cpu_dispatch__`) — and flips this `true`. Thereafter the prefix list
+    /// is the shared, identity-stable source of truth, so a Python-side
+    /// mutation of a C-resident `cdef public list` (pandas'
+    /// `BlockManager.axes[0] = new_axis`) persists across crossings instead of
+    /// landing on a throwaway per-read reconstruction. (Always `false` for
+    /// non-list mirrors.)
+    pub list_synced: bool,
+    /// True iff this mirror is a **canonical pinned scalar box** (RFC 0047,
+    /// wave 5): a Float/Int/Str/Bytes/Long/Complex/Tuple minted while
+    /// marshaling VM arguments into a C call and registered in
+    /// [`SCALAR_PIN_CACHE`]. CPython extensions may store such an argument
+    /// pointer *borrowed* (pandas' khash `PyObjectHashTable.set_item` keeps
+    /// the raw `PyObject*` with no incref, relying on the caller's reference
+    /// to keep it alive). WeavePy's VM references don't pin C boxes, so a
+    /// pinned box is **not freed when its C refcount reaches zero** — it
+    /// stays alive (and identity-stable for later crossings of the same
+    /// value) until evicted by [`sweep_scalar_pins`].
+    pub scalar_pinned: bool,
     /// A small magic so debugging tools (and assertions) can recognise
     /// a mirror prefix.
     pub magic: u64,
@@ -126,7 +305,7 @@ pub unsafe fn is_mirror(p: *mut PyObject) -> bool {
         return false;
     }
     let ty = unsafe { (*p).ob_type };
-    type_is_faithful(ty) || types::is_inline_instance_type(ty)
+    type_is_faithful(ty) || types::is_inline_instance_type(ty) || types::is_container_body_type(ty)
 }
 
 /// The set of built-in types whose instances are minted as faithful
@@ -144,12 +323,61 @@ pub fn type_is_faithful(ty: *mut PyTypeObject) -> bool {
         || ty == types::PyUnicode_Type.as_ptr()
         || ty == types::PyTuple_Type.as_ptr()
         || ty == types::PyList_Type.as_ptr()
+        // RFC 0047 (wave 5): `dict`. Macro-heavy Cython reads
+        // `((PyDictObject*)d)->ma_used` straight off the struct (the
+        // `PyDict_GET_SIZE` macro and the keyword-argument fast path
+        // `__Pyx_PyVectorcall_FastCallDict_kw`), so a dict crossing into C
+        // must be a faithful `PyDictObject` header. WeavePy mints *every*
+        // `Object::Dict` through this path (`type_for_object(Dict)` is the
+        // sole writer of `PyDict_Type`), so the type-keyed discriminator is
+        // sound.
+        || ty == types::PyDict_Type.as_ptr()
+        // RFC 0047 (wave 5): `set` / `frozenset`. Macro-heavy Cython reads
+        // `((PySetObject*)s)->used` straight off the struct — `PySet_GET_SIZE`
+        // / `PyFrozenSet_GET_SIZE`, which Cython emits for both `len(s)` and
+        // the truthiness test `if s:` on a set-typed value (pandas'
+        // `Timedelta.__new__` keyword guard). WeavePy mints *every*
+        // `Object::Set`/`FrozenSet` through `type_for_object` (the sole writer
+        // of these two type pointers), so the type-keyed discriminator is
+        // sound: no foreign object carries `PySet_Type`/`PyFrozenSet_Type`.
+        || ty == types::PySet_Type.as_ptr()
+        || ty == types::PyFrozenSet_Type.as_ptr()
         // RFC 0046 (wave 4): `builtin_function_or_method`. WeavePy mints
         // *every* `PyCFunction` (we expose no `PyCFunction_NewEx`, and
         // `type_for_object(Builtin)` is the sole writer of this type), so a
         // type-keyed discriminator is sound: no foreign object ever carries
         // `PyCFunction_Type`.
         || ty == types::PyCFunction_Type.as_ptr()
+        // RFC 0047 (wave 5): `method` (a bound method). WeavePy mints *every*
+        // `PyMethod_Type` object — `PyMethod_New` routes through the VM and
+        // `type_for_object(BoundMethod)` is the sole writer — so the
+        // type-keyed discriminator is sound: no foreign object carries
+        // `PyMethod_Type`. A faithful body is mandatory because Cython's
+        // `with`/`for`/call fast paths unpack a bound method by reading
+        // `im_func`/`im_self` straight off the C struct (see
+        // `layout::PyMethodObject`).
+        || ty == types::PyMethod_Type.as_ptr()
+        // RFC 0047 (wave 5): `slice`. WeavePy mints *every* `Object::Slice`
+        // through `type_for_object(Slice)` (the sole writer of `PySlice_Type`),
+        // so the type-keyed discriminator is sound. A faithful body is
+        // mandatory because Cython reads `start`/`stop`/`step` straight off the
+        // `PySliceObject` struct (pandas' `internals.slice_canonize`; see
+        // `layout::PySliceObject`).
+        || ty == types::PySlice_Type.as_ptr()
+        // RFC 0047 (wave 5): `memoryview`. WeavePy mints *every*
+        // `Object::MemoryView` through `type_for_object(MemoryView)` (the sole
+        // writer of `PyMemoryView_Type`; `PyMemoryView_FromObject` and friends
+        // all route through it), so the type-keyed discriminator is sound — and
+        // the `is_weavepy_owned` guard in `free_box`/`clone_object` runs first,
+        // so a (hypothetical) foreign object carrying `PyMemoryView_Type` is
+        // never mis-claimed. A faithful `PyMemoryViewObject` body is mandatory
+        // because `PyMemoryView_GET_BUFFER` is a macro (`&mv->view`) that
+        // Cython's fused-type dispatch reads straight off the struct (pandas'
+        // `lib.map_infer_mask`; see `layout::PyMemoryViewObject`). Without this
+        // entry `is_mirror` is false for a memoryview mirror, so `free_box`
+        // drops its prefix-offset body as a `PyObjectBox`
+        // (`POINTER_BEING_FREED_WAS_NOT_ALLOCATED`).
+        || ty == types::PyMemoryView_Type.as_ptr()
 }
 
 /// True if a native [`Object`] is mirrored with a faithful body (rather
@@ -165,9 +393,16 @@ pub fn obj_is_faithful(obj: &Object) -> bool {
             | Object::Bytes(_)
             | Object::ByteArray(_)
             | Object::Str(_)
+            | Object::WStr(_)
             | Object::Tuple(_)
             | Object::List(_)
+            | Object::Dict(_)
+            | Object::Set(_)
+            | Object::FrozenSet(_)
             | Object::Builtin(_)
+            | Object::BoundMethod(_)
+            | Object::Slice(_)
+            | Object::MemoryView(_)
     )
 }
 
@@ -182,6 +417,103 @@ pub fn mirror_out(obj: Object) -> *mut PyObject {
 /// pointer. Used for the tuple-staging case (`PyTuple_New` advertises
 /// `PyTuple_Type` while staging a mutable `List`).
 pub fn mirror_out_with_type(obj: Object, ty: *mut PyTypeObject) -> *mut PyObject {
+    // A bool crosses as the immortal, layout-faithful `Py_True`/`Py_False`
+    // singleton — never a freshly-minted box. CPython hands out exactly these
+    // two `PyLongObject`s, and C code relies both on pointer identity
+    // (`x == Py_True`, `Py_RETURN_TRUE`) and on the inline digit/sign decode
+    // (`maybe_convert_objects`'s `bools[i] = val`). The generic-body fallback
+    // would have produced a 16-byte `PyObject` with no `_PyLongValue`.
+    if let Object::Bool(b) = &obj {
+        return if *b {
+            crate::singletons::true_ptr()
+        } else {
+            crate::singletons::false_ptr()
+        };
+    }
+    // RFC 0047 (wave 5): a `set`/`frozenset` crosses as a single canonical
+    // box (see [`SET_BOX_CACHE`]). Reuse the live one whenever the same
+    // native set is already mirrored so a C-cached `PyObject*` stays
+    // coherent across a VM-routed mutation (`difference_update`, `|=`, …).
+    if let Some(key) = set_rc_key(&obj) {
+        if let Some(p) = cached_set_box(key) {
+            return p;
+        }
+        let p = mirror_out_fresh(obj, ty);
+        register_set_box(key, p);
+        return p;
+    }
+    // RFC 0047 (wave 5): a plain `list` likewise crosses as a single
+    // canonical box per native `Rc` (see [`LIST_BOX_CACHE`]). Cython's
+    // `__Pyx_PyList_Append` fast path appends through the raw
+    // `PyList_SET_ITEM` + `__Pyx_SET_SIZE` macros — a direct `ob_item`
+    // write on whichever box it happens to hold, invisible to WeavePy
+    // until that same box is next touched. When every crossing minted a
+    // fresh box (pandas' `IndexEngine.get_indexer_non_unique` re-fetches
+    // `d[val]` with a fresh `np.int64` key each iteration, so the
+    // borrowed-box cache missed every time), the macro-written elements
+    // were stranded on abandoned boxes and roughly half the duplicate
+    // positions vanished. One canonical box per native list makes every
+    // fetch, macro write, and reconcile land on the same memory.
+    // `PyTuple_New`'s staging list (advertised as `PyTuple_Type`) is
+    // excluded: canonicalising it would hand a tuple-typed box to later
+    // list crossings.
+    if std::ptr::eq(ty, types::PyList_Type.as_ptr()) {
+        if let Some(key) = list_rc_key(&obj) {
+            if let Some(p) = cached_list_box(key) {
+                // The cached box's `ob_item` may lag the shared `Rc` (a VM
+                // mutation since the last VM→C flush); re-publish so a
+                // stock macro read sees the live contents.
+                unsafe { sync_list_ob_item(p) };
+                return p;
+            }
+            let p = mirror_out_fresh(obj, ty);
+            register_list_box(key, p);
+            return p;
+        }
+    }
+    // A `builtin_function_or_method` crosses as a single canonical box (see
+    // [`BUILTIN_BOX_CACHE`]) so pointer-identity tests (`op is operator.eq`,
+    // as in `pandas._libs.ops.vec_compare`) hold across the boundary. Reuse
+    // the live one whenever the same native builtin is already mirrored.
+    if let Some(key) = builtin_rc_key(&obj) {
+        if let Some(p) = cached_builtin_box(key) {
+            return p;
+        }
+        let p = mirror_out_fresh(obj, ty);
+        register_builtin_box(key, p);
+        return p;
+    }
+    // RFC 0047 (wave 5): while marshaling VM arguments into a C call,
+    // immutable hashable scalars mint through the canonical pin cache so a
+    // callee that stores the pointer *borrowed* (pandas' khash hashtables)
+    // reads valid memory for as long as the value stays reachable — see
+    // [`ScalarPinKey`].
+    if arg_pin_active() {
+        if let Some(key) = scalar_pin_key(&obj) {
+            if let Some(p) = cached_scalar_pin(key, ty) {
+                return p;
+            }
+            let p = mirror_out_fresh(obj, ty);
+            register_scalar_pin(key, p);
+            return p;
+        }
+    }
+    mirror_out_fresh(obj, ty)
+}
+
+/// Mint a fresh faithful mirror block for `obj` (no canonical-box cache
+/// consultation). Every mirror is born here; [`mirror_out_with_type`]
+/// layers the set cache on top.
+fn mirror_out_fresh(obj: Object, ty: *mut PyTypeObject) -> *mut PyObject {
+    if listsync_trace_enabled() {
+        if let Object::List(rc) = &obj {
+            eprintln!(
+                "[LISTSYNC] mint-list rc=0x{:x} len={}",
+                weavepy_vm::sync::Rc::as_ptr(rc) as usize,
+                rc.borrow().len()
+            );
+        }
+    }
     let plan = BodyPlan::for_object(&obj);
     let total = PREFIX_SIZE + plan.body_size;
     let layout = Layout::from_size_align(total, BODY_ALIGN).expect("mirror layout");
@@ -218,6 +550,9 @@ pub fn mirror_out_with_type(obj: Object, ty: *mut PyTypeObject) -> *mut PyObject
                 alloc_size: total,
                 aux_ptr,
                 aux_size,
+                str_buffer: false,
+                list_synced: false,
+                scalar_pinned: false,
                 magic: MIRROR_MAGIC,
             },
         );
@@ -250,6 +585,13 @@ pub fn alloc_instance_body(
     unsafe { ptr::write_bytes(raw, 0, total) };
 
     let body = unsafe { raw.add(PREFIX_SIZE) } as *mut PyObject;
+    if body_trace_enabled() && crate::object::is_weavepy_owned(body) {
+        let tn = unsafe { crate::object::debug_type_name(body) };
+        eprintln!(
+            "[DOUBLE-ALLOC] alloc returned live minted body=0x{:x} prev-type={}",
+            body as usize, tn
+        );
+    }
     unsafe {
         (*body).ob_refcnt = 1;
         (*body).ob_type = ty;
@@ -266,11 +608,28 @@ pub fn alloc_instance_body(
                 alloc_size: total,
                 aux_ptr: ptr::null_mut(),
                 aux_size: 0,
+                str_buffer: false,
+                list_synced: false,
+                scalar_pinned: false,
                 magic: MIRROR_MAGIC,
             },
         );
     }
     crate::object::register_minted(body);
+    if body_trace_enabled() {
+        let tn = unsafe { crate::object::debug_type_name(body) };
+        check_body_reuse(body as usize, &tn);
+        if body_trace_interesting(&tn) {
+            let inst_ptr = unsafe { (*pre).inst.as_ref() }
+                .and_then(|w| w.upgrade())
+                .map(|rc| weavepy_vm::sync::Rc::as_ptr(&rc) as usize)
+                .unwrap_or(0);
+            eprintln!(
+                "[BALLOC] body=0x{:x} inst=0x{:x} type={}",
+                body as usize, inst_ptr, tn
+            );
+        }
+    }
     body
 }
 
@@ -282,16 +641,24 @@ pub fn alloc_instance_body(
 /// [`crate::memory::PyObject_Free`] to *absorb* a stock `tp_dealloc`'s
 /// `tp_free(self)` on a body the owning instance still owns.
 ///
-/// The magic check is what makes this sound to call on an *arbitrary*
-/// pointer (e.g. a scratch buffer handed to `PyObject_Free`): a
-/// non-mirror's bytes would have to both name a registered inline type
-/// at `ob_type` *and* carry the 8-byte sentinel at the prefix offset,
-/// which does not happen in practice.
+/// The minted-registry check is what makes this sound to call on an
+/// *arbitrary* pointer (e.g. a scratch buffer or a foreign object handed
+/// to `PyObject_Free`): only a pointer WeavePy itself minted can carry
+/// our negative-offset prefix, so the prefix bytes are only read for
+/// those. A foreign block whose `ob_type` bytes happen to name a
+/// registered inline type (an extension's `PyObject_Malloc` +
+/// `PyObject_Init` object, a Cython freelist slot) previously reached
+/// the prefix read — and when the block sat at the very start of an
+/// mmap'd region, `p - PREFIX_SIZE` crossed into an unmapped page and
+/// SIGBUS'd (pandas `get_indexer_non_unique` under `test_loc.py`).
 ///
 /// # Safety
-/// `p` must be non-null and readable for `[prefix .. head + 8]`.
+/// `p` must be non-null and point at a valid object head.
 pub unsafe fn is_instance_body(p: *mut PyObject) -> bool {
     if !unsafe { is_mirror(p) } {
+        return false;
+    }
+    if !crate::object::is_weavepy_owned(p) {
         return false;
     }
     let pre = unsafe { prefix_of(p) };
@@ -307,17 +674,156 @@ pub unsafe fn is_instance_body(p: *mut PyObject) -> bool {
 /// `p` must be an instance body ([`is_instance_body`]) that the owning
 /// instance is releasing; it must not be used afterwards.
 pub unsafe fn free_instance_body(p: *mut PyObject) {
+    if body_trace_enabled() {
+        let tn = unsafe { crate::object::debug_type_name(p) };
+        note_body_freed(p as usize, tn.clone());
+        if body_trace_interesting(&tn) {
+            let rc = unsafe { (*p).ob_refcnt };
+            eprintln!("[BFREE] body=0x{:x} type={} refcnt={}", p as usize, tn, rc);
+            if tn.contains("Engine") || tn.contains("BlockManager") {
+                eprintln!("{}", std::backtrace::Backtrace::force_capture());
+            }
+        }
+    }
     crate::object::unregister_minted(p);
     let pre = unsafe { prefix_of(p) };
     if let Some(d) = unsafe { (*pre).destructor } {
         unsafe { d(p) };
     }
     let alloc_size = unsafe { (*pre).alloc_size };
+    let aux_ptr = unsafe { (*pre).aux_ptr };
+    let aux_size = unsafe { (*pre).aux_size };
+    // RFC 0047 (wave 5): a **container body** (list/tuple-subclass
+    // instance) owns one reference per element — a list body's occupants
+    // live in the out-of-line aux `ob_item` buffer, a tuple body's in the
+    // inline array. Ordinary instance bodies have neither (aux is null,
+    // both predicates false), so this is dead code for them.
+    if unsafe { is_faithful_list(p) } {
+        unregister_seeded_list(p);
+        if !aux_ptr.is_null() && aux_size > 0 {
+            let n = (aux_size / std::mem::size_of::<*mut PyObject>()) as isize;
+            let slots = aux_ptr as *mut *mut PyObject;
+            for i in 0..n {
+                let elem = unsafe { *slots.offset(i) };
+                if !elem.is_null() {
+                    unsafe { crate::object::Py_DecRef(elem) };
+                }
+            }
+        }
+    } else if unsafe { is_faithful_tuple(p) } {
+        let vo = p as *const layout::PyVarObject;
+        let n = unsafe { (*vo).ob_size };
+        if n > 0 {
+            let to = p as *mut layout::PyTupleObject;
+            let base = ptr::addr_of_mut!((*to).ob_item) as *mut *mut PyObject;
+            for i in 0..n as usize {
+                let elem = unsafe { *base.add(i) };
+                if !elem.is_null() {
+                    unsafe { crate::object::Py_DecRef(elem) };
+                }
+            }
+        }
+    }
     // Drop the prefix in place (`obj` is None; the `Weak` back-reference
     // decrements the instance's weak count) before releasing the block.
     unsafe { ptr::drop_in_place(pre) };
+    if !aux_ptr.is_null() && aux_size > 0 {
+        let aux_layout = Layout::from_size_align(aux_size, BODY_ALIGN).expect("aux layout");
+        unsafe { dealloc(aux_ptr, aux_layout) };
+    }
     let layout = Layout::from_size_align(alloc_size, BODY_ALIGN).expect("instance body layout");
     unsafe { dealloc(pre as *mut u8, layout) };
+}
+
+/// Pack a faithful `PyListObject` layout into a freshly-allocated
+/// **list-subclass container body** (RFC 0047, wave 5): fill an
+/// out-of-line `ob_item` buffer with owned references to the owning
+/// instance's native list payload, mark the body seeded, and register it
+/// for VM↔C list syncing (a Python-side `.append()` must be visible to a
+/// later C macro read, and vice versa).
+///
+/// # Safety
+/// `body` must be a zeroed instance body of at least
+/// `sizeof(PyListObject)` bytes whose prefix `inst` back-reference is set.
+pub(crate) unsafe fn pack_list_subclass_body(body: *mut PyObject) {
+    let rc = match unsafe { list_rc_of(body) } {
+        Some(rc) => rc,
+        // No native list payload (e.g. `object.__new__(C)`): the zeroed
+        // body already reads as a safe empty list.
+        None => return,
+    };
+    let items: Vec<Object> = rc.borrow().clone();
+    let n = items.len();
+    let vo = body as *mut layout::PyVarObject;
+    unsafe { (*vo).ob_size = n as PySsizeT };
+    let lo = body as *mut layout::PyListObject;
+    if n == 0 {
+        unsafe {
+            (*lo).ob_item = ptr::null_mut();
+            (*lo).allocated = 0;
+        }
+    } else {
+        let bytes = n * std::mem::size_of::<*mut PyObject>();
+        let buf_layout = Layout::from_size_align(bytes, BODY_ALIGN).expect("ob_item layout");
+        let buf = unsafe { alloc(buf_layout) };
+        assert!(!buf.is_null(), "ob_item allocation failed");
+        unsafe { ptr::write_bytes(buf, 0, bytes) };
+        let slots = buf as *mut *mut PyObject;
+        for (i, elem) in items.iter().enumerate() {
+            let ep = match elem {
+                Object::None => crate::singletons::none_ptr(),
+                Object::Bool(true) => crate::singletons::true_ptr(),
+                Object::Bool(false) => crate::singletons::false_ptr(),
+                _ => crate::object::into_owned(elem.clone()),
+            };
+            unsafe { *slots.add(i) = ep };
+        }
+        let pre = unsafe { prefix_of(body) };
+        unsafe {
+            (*lo).ob_item = slots;
+            (*lo).allocated = n as PySsizeT;
+            (*pre).aux_ptr = buf;
+            (*pre).aux_size = bytes;
+        }
+    }
+    let pre = unsafe { prefix_of(body) };
+    unsafe { (*pre).list_synced = true };
+    register_seeded_list(body);
+}
+
+/// Pack a faithful `PyTupleObject` layout into a freshly-allocated
+/// **tuple-subclass container body** (RFC 0047, wave 5 — every
+/// `namedtuple`): fill the inline `ob_item` array with owned references
+/// to the owning instance's native tuple payload. Tuples are immutable,
+/// so this is pack-once with no sync registration.
+///
+/// # Safety
+/// `body` must be a zeroed instance body of at least
+/// `sizeof(PyVarObject) + n * sizeof(PyObject*)` bytes whose prefix
+/// `inst` back-reference is set.
+pub(crate) unsafe fn pack_tuple_subclass_body(body: *mut PyObject) {
+    let pre = unsafe { prefix_of(body) };
+    let items: Vec<Object> = match unsafe { (*pre).inst.as_ref() }.and_then(|w| w.upgrade()) {
+        Some(inst) => match inst.native.get() {
+            Some(Object::Tuple(t)) => t.iter().cloned().collect(),
+            _ => return,
+        },
+        None => return,
+    };
+    let n = items.len();
+    let vo = body as *mut layout::PyVarObject;
+    unsafe { (*vo).ob_size = n as PySsizeT };
+    let to = body as *mut layout::PyTupleObject;
+    let base = ptr::addr_of_mut!((*to).ob_item) as *mut *mut PyObject;
+    for (i, elem) in items.iter().enumerate() {
+        let ep = match elem {
+            Object::None => crate::singletons::none_ptr(),
+            Object::Bool(true) => crate::singletons::true_ptr(),
+            Object::Bool(false) => crate::singletons::false_ptr(),
+            _ => crate::object::into_owned(elem.clone()),
+        };
+        unsafe { *base.add(i) = ep };
+    }
 }
 
 /// Clone the native object out of a mirror without touching the C-side
@@ -333,23 +839,143 @@ pub unsafe fn native_of(p: *mut PyObject) -> Object {
     // thus the same `__dict__`, identity, and inline body). The `Weak`
     // still upgrades here — the body is alive, so the instance is too.
     if let Some(weak) = unsafe { (*pre).inst.as_ref() } {
-        return match weak.upgrade() {
-            Some(inst) => Object::Instance(inst),
-            None => Object::None,
+        let inst = match weak.upgrade() {
+            Some(inst) => inst,
+            None => return Object::None,
         };
+        // RFC 0046 (wave 5): a faithful **str-subtype** body (numpy's
+        // `str_`, built by `builtin_new::str_new`) had its unicode value
+        // stamped into the inline body by the extension's `tp_new` chain
+        // *after* allocation, so the `PyInstance` minted at alloc time
+        // carries no VM-native payload yet. Seed `native` from the body on
+        // the first crossing — the VM's string operations (`+`, f-strings,
+        // comparison, hashing) unwrap it exactly like a `class S(str)`
+        // subclass — while the instance keeps its real type (CPython
+        // parity: `type(np.str_('x')) is np.str_`). Gated on the cheap
+        // `tp_base`-chain subtype test, so an ordinary faithful instance
+        // (numpy `ndarray`, pandas block, …) is unaffected.
+        let head = unsafe { &*p };
+        if inst.native.get().is_none()
+            && !head.ob_type.is_null()
+            && !std::ptr::eq(head.ob_type, types::PyUnicode_Type.as_ptr())
+            && unsafe {
+                crate::types::PyType_IsSubtype(head.ob_type, types::PyUnicode_Type.as_ptr())
+            } != 0
+        {
+            if let Some(s) = unsafe { read_unicode_value(p) } {
+                let _ = inst.native.set(Object::from_str(s));
+            }
+        }
+        // Same for a faithful **bytes-subtype** body (numpy's `bytes_`):
+        // its value lives in the inline `ob_sval` array; seed `native` so
+        // the VM's `bytes` operations see it while `type()` stays faithful.
+        if inst.native.get().is_none()
+            && !head.ob_type.is_null()
+            && !std::ptr::eq(head.ob_type, types::PyBytes_Type.as_ptr())
+            && unsafe { crate::types::PyType_IsSubtype(head.ob_type, types::PyBytes_Type.as_ptr()) }
+                != 0
+        {
+            if let Some(b) = unsafe { read_bytes_value(p) } {
+                let rc: weavepy_vm::sync::Rc<[u8]> = b.into();
+                let _ = inst.native.set(Object::Bytes(rc));
+            }
+        }
+        // RFC 0047 (wave 5): a **list-subclass container body** can carry
+        // direct C macro writes (`PyList_SET_ITEM` + `__Pyx_SET_SIZE`, the
+        // Cython append fast path); adopt them into the instance's native
+        // list payload before handing the instance back. `list_synced` is
+        // only ever set on a packed list body, so ordinary instance bodies
+        // skip this entirely.
+        if unsafe { (*pre).list_synced } {
+            unsafe { reconcile_list_from_c(p) };
+        }
+        return Object::Instance(inst);
     }
-    // RFC 0046 (wave 4): a faithful tuple's inline `ob_item` is the source
-    // of truth (a stock `PyTuple_SET_ITEM` writes it directly, bypassing
-    // our functions), so reconstruct from the C body rather than the
-    // staged prefix object.
+    // RFC 0046 (wave 4) / RFC 0047 (wave 5): a faithful tuple's inline
+    // `ob_item` is the source of truth (a stock `PyTuple_SET_ITEM` writes it
+    // directly, bypassing our functions) — but rebuilding a fresh
+    // `Object::Tuple` on *every* crossing broke pointer identity: the same
+    // C-held `PyObject*` read back twice compared `is`-different, and a
+    // VM-minted tuple stored into a C container (a numpy object array) came
+    // back as a copy (pandas' `test_np_max_nested_tuples` asserts
+    // `arr.max() is arr[2]`). CPython has no boundary, so identity always
+    // holds there. Restore it with a slot-pointer snapshot (the aux buffer,
+    // written at mint by `fill_body` and refreshed after each rebuild): when
+    // the live `ob_item` matches the snapshot, no `PyTuple_SET_ITEM` has
+    // rewired the tuple since the prefix object was captured, so hand back
+    // the shared prefix `Object::Tuple` — the original `Rc` for a VM-minted
+    // tuple, the seeded rebuild for a C-built one (`PyTuple_New` + macro
+    // fills, which happen before the tuple is first exposed). A mismatch —
+    // the placeholder-filled `PyTuple_New` staging tuple on its first
+    // crossing, or an (illegal-on-shared-tuples, but observed) late store —
+    // rebuilds once and re-snapshots, so identity is stable from then on.
     if unsafe { is_faithful_tuple(p) } {
-        return unsafe { read_tuple(p) };
+        return unsafe { tuple_native_shared(p) };
     }
-    // RFC 0046 (wave 4): likewise a faithful list's `ob_item` buffer is the
-    // source of truth (a stock `PyList_SET_ITEM` writes it directly), so
-    // reconstruct from the C body rather than the staged prefix object.
+    // RFC 0047 (wave 5): a faithful list is **seed-once, then prefix-
+    // authoritative**. A stock `PyList_New` + `PyList_SET_ITEM` build writes
+    // the inline `ob_item` directly (numpy's `__cpu_dispatch__`), so the first
+    // read-back reconstructs the prefix list from that buffer. Thereafter the
+    // prefix's `Object::List` is the shared, identity-stable source of truth:
+    // every crossing of the same mirror yields the *same* `Rc`, so a Python
+    // mutation of a C-resident `cdef public list` persists. pandas'
+    // `BlockManager.insert` does `self.axes[0] = new_axis` on the list its
+    // Cython getter returns; reconstruct-on-*every*-read handed each crossing
+    // a throwaway copy, so the store vanished and `df["c"] = …` silently
+    // dropped the column (`KeyError: 'c'`).
     if unsafe { is_faithful_list(p) } {
-        return unsafe { read_list(p) };
+        let pre = unsafe { prefix_of(p) };
+        if !unsafe { (*pre).list_synced } {
+            // Seed **in place**: refill the existing prefix `Rc` from the
+            // buffer rather than replacing it with a fresh `Object::List`.
+            // A VM-minted mirror (`into_owned` of a list a dict/instance
+            // still holds) *shares* that `Rc`; swapping in a new one would
+            // disconnect the mirror from its VM holder, so a C-side append
+            // through this box would never reach the dict's value (pandas'
+            // `IndexEngine.get_indexer_non_unique` built its position dict
+            // with `d[val].append(i)` — each fresh `np.int64` key minted a
+            // new box, the reseed cut it loose, and every third duplicate
+            // position vanished). For a C-built list (`PyList_New` + macro
+            // fills) the mint `Rc` is unshared and the refill is the same
+            // seeding as before.
+            if let Object::List(rc) = unsafe { &(*pre).obj } {
+                let cur = unsafe { read_list_vec(p) };
+                *rc.borrow_mut() = cur;
+            } else {
+                let seeded = unsafe { read_list(p) };
+                unsafe {
+                    (*pre).obj = seeded;
+                }
+            }
+            unsafe {
+                (*pre).list_synced = true;
+            }
+            // Now VM-shared: a Python-side mutation of this list must be
+            // re-published to `ob_item` before C reads it back through the
+            // `PyList_GET_ITEM` macro (see [`flush_seeded_lists`]).
+            register_seeded_list(p);
+        } else {
+            // Adopt any *direct* C-side macro write to `ob_item` (RFC 0047,
+            // wave 5) — e.g. Cython's `__Pyx_ListComp_Append` building
+            // `memoryview.shape` — back into the shared prefix `Rc` before
+            // handing it to the VM. A VM-only mutation is left untouched.
+            unsafe { reconcile_list_from_c(p) };
+            // A macro write to a *nested* seeded list leaves this list's own
+            // slot pointers unchanged, so the reconcile above misses it (pandas
+            // `to_csv`'s reused `rows` buffer). Descend to adopt those too.
+            unsafe { reconcile_nested_lists(p, 0) };
+        }
+        return unsafe { (*pre).obj.clone() };
+    }
+    // RFC 0047 (wave 5): a **buffer-authoritative** unicode mirror (the
+    // result of `PyUnicode_New`/`PyUnicode_Resize`) has its character data
+    // written directly by the extension (the inlined `PyUnicode_WRITE`
+    // macro, `PyUnicode_CopyCharacters`), so reconstruct from the C buffer
+    // rather than the staged prefix object, which would be stale. A normal
+    // str mirror (`str_buffer == false`) is never mutated in place, so its
+    // prefix object stays authoritative (and avoids a per-crossing rebuild).
+    if unsafe { (*pre).str_buffer } {
+        return unsafe { read_str(p) };
     }
     unsafe { (*pre).obj.clone() }
 }
@@ -368,7 +994,125 @@ pub unsafe fn is_faithful_tuple(p: *mut PyObject) -> bool {
         return false;
     }
     let head = unsafe { &*p };
-    !head.ob_type.is_null() && std::ptr::eq(head.ob_type, crate::types::PyTuple_Type.as_ptr())
+    let ty = head.ob_type;
+    if ty.is_null() {
+        return false;
+    }
+    if std::ptr::eq(ty, crate::types::PyTuple_Type.as_ptr()) {
+        return true;
+    }
+    // RFC 0047 (wave 5): a VM tuple-subclass instance (every `namedtuple`)
+    // crosses as a faithful `PyTupleObject`-shaped container body, so the
+    // inlined `PyTuple_Check` → `PyTuple_GET_ITEM`/`Py_SIZE` macro sequence
+    // reads real slots.
+    types::is_container_body_type(ty)
+        && unsafe { (*ty).tp_flags } & layout::tpflags::TUPLE_SUBCLASS != 0
+}
+
+/// True if `p` is a faithful `dict` mirror.
+///
+/// # Safety
+/// `p` must be non-null with a readable `ob_type`.
+pub unsafe fn is_faithful_dict(p: *mut PyObject) -> bool {
+    if !unsafe { is_mirror(p) } {
+        return false;
+    }
+    let head = unsafe { &*p };
+    !head.ob_type.is_null() && std::ptr::eq(head.ob_type, crate::types::PyDict_Type.as_ptr())
+}
+
+/// Refresh a faithful dict mirror's `ma_used` from its prefix's native
+/// dict after a C-side mutation changed the entry count. CPython exposes
+/// the live count straight off the struct (`PyDict_GET_SIZE`), so every
+/// WeavePy dict mutator that crosses the C boundary must re-publish it
+/// here. No-op for any pointer that isn't a faithful dict mirror.
+///
+/// # Safety
+/// `p` must be non-null with a readable `ob_type`.
+pub unsafe fn sync_dict_ma_used(p: *mut PyObject) {
+    if !unsafe { is_faithful_dict(p) } {
+        return;
+    }
+    let pre = unsafe { prefix_of(p) };
+    if let Object::Dict(rc) = unsafe { &(*pre).obj } {
+        let used = rc.borrow().len() as PySsizeT;
+        let d = p as *mut layout::PyDictObject;
+        unsafe {
+            (*d).ma_used = used;
+        }
+    }
+}
+
+/// True if `p` is a faithful `set` **or** `frozenset` mirror.
+///
+/// # Safety
+/// `p` must be non-null with a readable `ob_type`.
+pub unsafe fn is_faithful_set(p: *mut PyObject) -> bool {
+    if !unsafe { is_mirror(p) } {
+        return false;
+    }
+    let head = unsafe { &*p };
+    if head.ob_type.is_null() {
+        return false;
+    }
+    std::ptr::eq(head.ob_type, crate::types::PySet_Type.as_ptr())
+        || std::ptr::eq(head.ob_type, crate::types::PyFrozenSet_Type.as_ptr())
+}
+
+/// Refresh a faithful set mirror's `fill`/`used` from its prefix's native
+/// set after an in-place mutation changed the element count. CPython
+/// exposes the live count straight off the struct (`PySet_GET_SIZE` is
+/// `((PySetObject*)so)->used`), and Cython lowers `len(s)` / `if s:` on a
+/// set-typed value to that macro — so every mutation that reaches the set
+/// through the C boundary (a `PySet_Add`, or an unbound-method call like
+/// `set.difference_update(s, other)` routed through `PyObject_Call`) must
+/// re-publish the size here. No-op for any pointer that isn't a faithful
+/// set mirror.
+///
+/// # Safety
+/// `p` must be non-null with a readable `ob_type`.
+pub unsafe fn sync_set_used(p: *mut PyObject) {
+    if !unsafe { is_faithful_set(p) } {
+        return;
+    }
+    let pre = unsafe { prefix_of(p) };
+    let n = match unsafe { &(*pre).obj } {
+        Object::Set(rc) => rc.borrow().len() as PySsizeT,
+        Object::FrozenSet(fs) => fs.len() as PySsizeT,
+        _ => return,
+    };
+    let so = p as *mut layout::PySetObject;
+    if std::env::var_os("WEAVEPY_TRACE_SETSEED").is_some() {
+        eprintln!(
+            "[SYNC_SET_USED] p={:p} old_used={} new={}",
+            p,
+            unsafe { (*so).used },
+            n
+        );
+    }
+    unsafe {
+        (*so).fill = n;
+        (*so).used = n;
+    }
+}
+
+/// Re-publish the macro-visible size of a dict/set mirror after it may
+/// have been mutated in place through the C boundary. A cheap no-op for
+/// any pointer that isn't one of those two faithful mirrors (the
+/// [`is_mirror`] magic check gates the type comparison), so it is safe to
+/// sprinkle over the generic call path.
+///
+/// # Safety
+/// `p` may be null; if non-null it must have a readable `ob_type`.
+pub unsafe fn sync_container_size(p: *mut PyObject) {
+    if p.is_null() || !unsafe { is_mirror(p) } {
+        return;
+    }
+    if unsafe { is_faithful_dict(p) } {
+        unsafe { sync_dict_ma_used(p) };
+    } else if unsafe { is_faithful_set(p) } {
+        unsafe { sync_set_used(p) };
+    }
 }
 
 /// Reconstruct an [`Object::Tuple`] by reading a faithful tuple mirror's
@@ -409,6 +1153,60 @@ pub unsafe fn read_tuple(p: *mut PyObject) -> Object {
     Object::new_tuple(out)
 }
 
+/// Identity-stable read-back of a faithful tuple mirror (see the
+/// [`native_of`] tuple arm for the full rationale). Returns the shared
+/// prefix `Object::Tuple` while the live `ob_item` slots still match the
+/// aux snapshot; otherwise rebuilds from the slots once, re-snapshots, and
+/// shares the rebuild thereafter.
+///
+/// # Safety
+/// `p` must satisfy [`is_faithful_tuple`].
+unsafe fn tuple_native_shared(p: *mut PyObject) -> Object {
+    let pre = unsafe { prefix_of(p) };
+    let vo = p as *const layout::PyVarObject;
+    let n = unsafe { (*vo).ob_size };
+    let n = if n < 0 { 0 } else { n as usize };
+    // An empty tuple has no slots to rewire; the prefix object (staged by
+    // `mirror_out_fresh` or `PyTuple_New(0)`) is authoritative forever.
+    if n == 0 {
+        if matches!(unsafe { &(*pre).obj }, Object::Tuple(_)) {
+            return unsafe { (*pre).obj.clone() };
+        }
+        return Object::new_tuple(Vec::new());
+    }
+    let to = p as *const layout::PyTupleObject;
+    let base = ptr::addr_of!((*to).ob_item) as *const *mut PyObject;
+    let want = n * std::mem::size_of::<*mut PyObject>();
+    let snap = unsafe { (*pre).aux_ptr } as *const *mut PyObject;
+    if !snap.is_null()
+        && unsafe { (*pre).aux_size } == want
+        && matches!(unsafe { &(*pre).obj }, Object::Tuple(_))
+        && unsafe { std::slice::from_raw_parts(base, n) == std::slice::from_raw_parts(snap, n) }
+    {
+        return unsafe { (*pre).obj.clone() };
+    }
+    // Slots changed (or never snapshotted): adopt the authoritative inline
+    // array into the shared prefix object and refresh the snapshot.
+    let rebuilt = unsafe { read_tuple(p) };
+    unsafe {
+        (*pre).obj = rebuilt.clone();
+        if (*pre).aux_ptr.is_null() || (*pre).aux_size != want {
+            if !(*pre).aux_ptr.is_null() && (*pre).aux_size > 0 {
+                let old_layout =
+                    Layout::from_size_align((*pre).aux_size, BODY_ALIGN).expect("aux layout");
+                dealloc((*pre).aux_ptr, old_layout);
+            }
+            let buf_layout = Layout::from_size_align(want, BODY_ALIGN).expect("tuple seed layout");
+            let buf = alloc(buf_layout);
+            assert!(!buf.is_null(), "tuple seed allocation failed");
+            (*pre).aux_ptr = buf;
+            (*pre).aux_size = want;
+        }
+        ptr::copy_nonoverlapping(base as *const u8, (*pre).aux_ptr, want);
+    }
+    rebuilt
+}
+
 /// True iff `p` is a faithful **list** mirror — a mirror whose advertised
 /// type is `PyList_Type` and whose `ob_item` buffer holds the elements
 /// (RFC 0046, wave 4). A stock extension fills such a list with the
@@ -424,7 +1222,52 @@ pub unsafe fn is_faithful_list(p: *mut PyObject) -> bool {
         return false;
     }
     let head = unsafe { &*p };
-    !head.ob_type.is_null() && std::ptr::eq(head.ob_type, crate::types::PyList_Type.as_ptr())
+    let ty = head.ob_type;
+    if ty.is_null() {
+        return false;
+    }
+    if std::ptr::eq(ty, crate::types::PyList_Type.as_ptr()) {
+        return true;
+    }
+    // RFC 0047 (wave 5): a VM list-subclass instance (pandas' `FrozenList`)
+    // crosses as a faithful `PyListObject`-shaped container body, so the
+    // inlined `PyList_Check` → `PyList_GET_ITEM`/`Py_SIZE` macro sequence
+    // (pandas' ujson serializer) reads real slots.
+    types::is_container_body_type(ty)
+        && unsafe { (*ty).tp_flags } & layout::tpflags::LIST_SUBCLASS != 0
+}
+
+/// True iff `p` is a faithful **bound method** mirror — a mirror whose
+/// advertised type is `PyMethod_Type` and whose `im_func`/`im_self`
+/// fields are owned references (RFC 0047, wave 5). Unlike a tuple/list,
+/// a method body is never mutated through a `SET` macro, so the prefix's
+/// staged [`Object::BoundMethod`] stays authoritative for read-back
+/// ([`native_of`]); this predicate is used only to release the two extra
+/// owned refs in [`free_mirror`].
+///
+/// # Safety
+/// `p` must be non-null and readable for `[prefix .. head + 16]`.
+pub unsafe fn is_faithful_method(p: *mut PyObject) -> bool {
+    if !unsafe { is_mirror(p) } {
+        return false;
+    }
+    let head = unsafe { &*p };
+    !head.ob_type.is_null() && std::ptr::eq(head.ob_type, crate::types::PyMethod_Type.as_ptr())
+}
+
+/// True iff `p` is a faithful **slice** mirror — a mirror whose advertised
+/// type is `PySlice_Type` and whose `start`/`stop`/`step` fields hold owned
+/// `PyObject*`s (RFC 0047, wave 5). Cython reads those fields straight off
+/// the `PySliceObject` struct (pandas' `internals.slice_canonize`).
+///
+/// # Safety
+/// `p` must be non-null and readable for `[prefix .. head + 16]`.
+pub unsafe fn is_faithful_slice(p: *mut PyObject) -> bool {
+    if !unsafe { is_mirror(p) } {
+        return false;
+    }
+    let head = unsafe { &*p };
+    !head.ob_type.is_null() && std::ptr::eq(head.ob_type, crate::types::PySlice_Type.as_ptr())
 }
 
 /// Reconstruct an [`Object::List`] by reading a faithful list mirror's
@@ -437,6 +1280,17 @@ pub unsafe fn is_faithful_list(p: *mut PyObject) -> bool {
 /// # Safety
 /// `p` must satisfy [`is_faithful_list`].
 pub unsafe fn read_list(p: *mut PyObject) -> Object {
+    Object::new_list(unsafe { read_list_vec(p) })
+}
+
+/// Read a faithful list mirror's `ob_item` buffer into a plain `Vec`
+/// (the element resolution used by [`read_list`], without the
+/// `Object::List` wrapper). Used by the write-through path to refill an
+/// existing prefix `Rc` in place, preserving its identity.
+///
+/// # Safety
+/// `p` must satisfy [`is_faithful_list`].
+unsafe fn read_list_vec(p: *mut PyObject) -> Vec<Object> {
     let vo = p as *const layout::PyVarObject;
     let n = unsafe { (*vo).ob_size };
     let n = if n < 0 { 0 } else { n as usize };
@@ -453,7 +1307,1486 @@ pub unsafe fn read_list(p: *mut PyObject) -> Object {
             });
         }
     }
-    Object::new_list(out)
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Faithful-list write-through coherence (RFC 0047, wave 5).
+//
+// A faithful list is *seed-once, then prefix-authoritative*: after the first
+// read-back its prefix `Object::List` (a shared, identity-stable `Rc`) is the
+// source of truth, so a Python-side mutation of a C-resident `cdef public
+// list` persists. But a stock extension reads such a list back through the
+// `PyList_GET_ITEM` **macro** — `((PyListObject*)op)->ob_item[i]`, compiled
+// inline into the extension, which WeavePy cannot interpose. The macro reads
+// the C `ob_item` buffer, *not* the prefix `Rc`, so a VM mutation leaves the
+// two divergent: pandas' `BlockManager.insert` does `self.axes[0] = new_axis`
+// (a VM `list.__setitem__`) and then `internals.pyx`'s `get_slice` reads
+// `self.axes[0]` via the macro — seeing the stale pre-insert column and so
+// `df.head()` / `iloc[:n]` silently drop the inserted column.
+//
+// There is no WeavePy code on the path between the VM store and the inlined
+// macro read, so the buffer must be re-published *before* control re-enters
+// C. Every seeded list mirror is registered here; [`flush_seeded_lists`]
+// (called at the VM→C boundary) re-syncs each one's `ob_item` from its prefix
+// `Rc`. The atomic gate keeps the common case (no list ever crossed to C) at
+// a single relaxed load.
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+use weavepy_vm::fasthash::FxHashMap;
+
+/// Per-seeded-list coherence state, keyed by `PyObject*`.
+///
+/// A faithful list has *two* authorities that must be reconciled: the VM's
+/// shared prefix `Rc` and the C `ob_item` buffer. `rc_fp` lets the VM→C
+/// flush ([`sync_list_ob_item`]) skip an unmutated list; `c_ptrs` lets the
+/// C→VM read-back ([`native_of`] → [`reconcile_list_from_c`]) detect a
+/// *direct* C-side macro write — `PyList_SET_ITEM` + `__Pyx_SET_SIZE`, taken
+/// by Cython's `__Pyx_ListComp_Append` fast path (e.g. building
+/// `memoryview.shape`) and numpy's list builders — that never passed through
+/// a WeavePy mutator, so the buffer must be adopted back into the `Rc`.
+/// Both sides are stored as a *combined* `(chained-FNV hash, length)`
+/// digest rather than per-slot vectors: the flush runs at **every**
+/// outermost VM→C transition over **every** seeded list, so the per-list
+/// state must be comparable and replaceable without allocating. (Per-slot
+/// vectors allocated two `Vec`s per list per C call and dominated whole
+/// pandas test files.) A 64-bit chained FNV over the slot values keeps
+/// order sensitivity; a collision — one in 2⁶⁴ — costs a missed
+/// republish, the same failure mode the fingerprint scheme already
+/// accepted per-slot.
+#[derive(Default)]
+struct ListSync {
+    /// Digest of the prefix `Rc` elements last published to `ob_item`
+    /// (`None` until the first flush — forces the initial sync). See
+    /// [`sync_list_ob_item`].
+    rc_fp: Option<(u64, usize)>,
+    /// Digest of the raw `ob_item` pointers at the last agreement point
+    /// (seed, publish, write-through, or adopt). A later read that finds a
+    /// different buffer knows C wrote it directly. See
+    /// [`reconcile_list_from_c`].
+    c_ptrs: (u64, usize),
+}
+
+/// Chained-FNV accumulator for the digests in [`ListSync`].
+#[inline]
+fn digest_fold(h: u64, v: u64) -> u64 {
+    let mut h = h ^ v;
+    // FNV-1a style multiply; chaining keeps the digest order-sensitive.
+    h = h.wrapping_mul(0x0000_0100_0000_01B3);
+    h ^= h >> 29;
+    h
+}
+
+const DIGEST_SEED: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// Seeded faithful list mirrors keyed by `PyObject*`.
+static SEEDED_LISTS: Mutex<Option<FxHashMap<usize, ListSync>>> = Mutex::new(None);
+static SEEDED_LIST_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Canonical faithful `set`/`frozenset` boxes keyed by native `Rc`
+/// identity (RFC 0047, wave 5): `Rc-payload-pointer → PyObject*`.
+///
+/// A stock/Cython extension caches a `PyObject*` and later reads the
+/// element count straight off the struct — `PySet_GET_SIZE(so)` is
+/// `((PySetObject*)so)->used`, which Cython emits for *both* `len(s)` and
+/// the truthiness test `if s:` on a set-typed value. If every crossing
+/// minted a *fresh* mirror, that cached box would be a stale snapshot: an
+/// unbound-method mutation like `set.difference_update(s, other)` routed
+/// through `PyObject_Call` empties the shared native store but the count
+/// re-publish ([`sync_set_used`]) lands on the ephemeral *argument* box,
+/// never the one the extension cached. pandas' `Timedelta.__new__`
+/// keyword guard (`set(kwargs)` → `difference_update(_req_kwargs)` →
+/// `if unsupported_kwargs:`) then reads the pre-mutation `used` and raises
+/// a spurious `ValueError`. Handing out **one** canonical box per native
+/// set makes the cached pointer and the mutated/synced pointer the *same*
+/// memory, so the guard sees the emptied set.
+static SET_BOX_CACHE: Mutex<Option<FxHashMap<usize, usize>>> = Mutex::new(None);
+static SET_BOX_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Native `Rc` identity key for a `set`/`frozenset` (its `Arc` payload
+/// pointer), or `None` for any other object. Two `Object` clones of the
+/// same set share one `Rc`, so this is a stable per-set identity for as
+/// long as any clone (e.g. a live mirror's prefix) keeps it alive.
+fn set_rc_key(obj: &Object) -> Option<usize> {
+    match obj {
+        Object::Set(rc) => Some(weavepy_vm::sync::Rc::as_ptr(rc) as usize),
+        Object::FrozenSet(rc) => Some(weavepy_vm::sync::Rc::as_ptr(rc) as usize),
+        _ => None,
+    }
+}
+
+/// Return the live canonical box for native-set identity `key`, handing
+/// back a *fresh* C reference (matching `into_owned`'s "+1" contract).
+/// `None` if no box is currently cached.
+fn cached_set_box(key: usize) -> Option<*mut PyObject> {
+    let g = SET_BOX_CACHE.lock().ok()?;
+    let map = g.as_ref()?;
+    let bp = *map.get(&key)?;
+    let p = bp as *mut PyObject;
+    unsafe { crate::object::Py_IncRef(p) };
+    Some(p)
+}
+
+/// Record `p` as the canonical box for native-set identity `key`.
+fn register_set_box(key: usize, p: *mut PyObject) {
+    if let Ok(mut g) = SET_BOX_CACHE.lock() {
+        if g.get_or_insert_with(FxHashMap::default)
+            .insert(key, p as usize)
+            .is_none()
+        {
+            SET_BOX_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Evict a faithful set mirror from the canonical cache when its storage
+/// is released — called from [`free_mirror`] *before* the prefix's native
+/// `Object` (and thus its `Rc`) is dropped. Only removes the entry when it
+/// still points at `p`, so a stale box that lost a cache race can never
+/// clobber the live canonical one.
+///
+/// # Safety
+/// `p` must be a faithful set mirror ([`is_faithful_set`]) whose prefix is
+/// still intact.
+pub unsafe fn unregister_set_box(p: *mut PyObject) {
+    let pre = unsafe { prefix_of(p) };
+    let key = match set_rc_key(unsafe { &(*pre).obj }) {
+        Some(k) => k,
+        None => return,
+    };
+    if let Ok(mut g) = SET_BOX_CACHE.lock() {
+        if let Some(map) = g.as_mut() {
+            if map.get(&key) == Some(&(p as usize)) {
+                map.remove(&key);
+                SET_BOX_COUNT.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Canonical faithful `list` boxes keyed by native `Rc` identity
+/// (RFC 0047, wave 5): `Rc-payload-pointer → PyObject*`. See the long
+/// comment at the `list_rc_key` call site in [`mirror_out_with_type`]:
+/// Cython's inlined append macros write whichever box they hold, so box
+/// identity per native list is load-bearing for coherence.
+static LIST_BOX_CACHE: Mutex<Option<FxHashMap<usize, usize>>> = Mutex::new(None);
+static LIST_BOX_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Native `Rc` identity key for a plain `list`, or `None` for any other
+/// object.
+fn list_rc_key(obj: &Object) -> Option<usize> {
+    match obj {
+        Object::List(rc) => Some(weavepy_vm::sync::Rc::as_ptr(rc) as usize),
+        _ => None,
+    }
+}
+
+/// Return the live canonical box for native-list identity `key`, handing
+/// back a *fresh* C reference (matching `into_owned`'s "+1" contract).
+fn cached_list_box(key: usize) -> Option<*mut PyObject> {
+    if LIST_BOX_COUNT.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    let g = LIST_BOX_CACHE.lock().ok()?;
+    let map = g.as_ref()?;
+    let bp = *map.get(&key)?;
+    let p = bp as *mut PyObject;
+    unsafe { crate::object::Py_IncRef(p) };
+    Some(p)
+}
+
+/// Record `p` as the canonical box for native-list identity `key`.
+fn register_list_box(key: usize, p: *mut PyObject) {
+    if let Ok(mut g) = LIST_BOX_CACHE.lock() {
+        if g.get_or_insert_with(FxHashMap::default)
+            .insert(key, p as usize)
+            .is_none()
+        {
+            LIST_BOX_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Evict a faithful list mirror from the canonical cache when its storage
+/// is released — called from [`free_mirror`] *before* the prefix's native
+/// `Object` (and thus its `Rc`) is dropped. Only removes the entry when it
+/// still points at `p` so a stale box can never clobber the live one.
+///
+/// # Safety
+/// `p` must be a faithful list mirror whose prefix is still intact.
+pub unsafe fn unregister_list_box(p: *mut PyObject) {
+    if LIST_BOX_COUNT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let pre = unsafe { prefix_of(p) };
+    let key = match list_rc_key(unsafe { &(*pre).obj }) {
+        Some(k) => k,
+        None => return,
+    };
+    if let Ok(mut g) = LIST_BOX_CACHE.lock() {
+        if let Some(map) = g.as_mut() {
+            if map.get(&key) == Some(&(p as usize)) {
+                map.remove(&key);
+                LIST_BOX_COUNT.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Canonical-box cache for `Object::Builtin` (`builtin_function_or_method`),
+/// keyed by the native `Rc<BuiltinFn>` payload pointer.
+///
+/// A builtin such as `operator.eq` is a faithful mirror (see
+/// [`obj_is_faithful`]), so absent a cache every crossing mints a *fresh*
+/// `PyCFunction` box via [`mirror_out_fresh`] and hands C a different
+/// pointer each time. That breaks the pointer-identity contract stock
+/// Cython relies on: pandas' `pandas._libs.ops.vec_compare` /
+/// `scalar_compare` select the comparison with a chain of `op is
+/// operator.lt` / `elif op is operator.eq: …` tests (Cython lowers `is` to
+/// a raw C `==`), and the analogous `Timedelta` / `Timestamp` reductions do
+/// the same. When the argument box (`op`, marshaled at the call) and the box
+/// Cython fetches with `PyObject_GetAttr(operator, "eq")` differ, *every*
+/// branch is false and the function raises `ValueError("Unrecognized
+/// operator")`. Handing out **one** canonical box per native builtin makes
+/// the marshaled argument and the module-attribute lookup the *same* memory,
+/// so the identity chain resolves exactly as under CPython.
+static BUILTIN_BOX_CACHE: Mutex<Option<FxHashMap<usize, usize>>> = Mutex::new(None);
+static BUILTIN_BOX_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Native `Rc` identity key for an `Object::Builtin` (its `BuiltinFn`
+/// payload pointer), or `None` for any other object. Two `Object` clones of
+/// the same builtin share one `Rc`, so this is a stable per-builtin identity
+/// for as long as any clone (e.g. a live mirror's prefix, or the value held
+/// in the owning module dict) keeps it alive.
+fn builtin_rc_key(obj: &Object) -> Option<usize> {
+    match obj {
+        Object::Builtin(rc) => Some(weavepy_vm::sync::Rc::as_ptr(rc) as usize),
+        _ => None,
+    }
+}
+
+/// True iff `p` is a faithful `builtin_function_or_method` mirror — a mirror
+/// whose advertised type is `PyCFunction_Type`. Used only as a cheap guard in
+/// [`free_mirror`] before evicting from [`BUILTIN_BOX_CACHE`].
+///
+/// # Safety
+/// `p` must be non-null and readable for `[prefix .. head + 16]`.
+pub unsafe fn is_faithful_builtin(p: *mut PyObject) -> bool {
+    if !unsafe { is_mirror(p) } {
+        return false;
+    }
+    let head = unsafe { &*p };
+    !head.ob_type.is_null() && std::ptr::eq(head.ob_type, crate::types::PyCFunction_Type.as_ptr())
+}
+
+/// Return the live canonical box for native-builtin identity `key`, handing
+/// back a *fresh* C reference (matching the mint path's "+1" contract).
+/// `None` if no box is currently cached.
+fn cached_builtin_box(key: usize) -> Option<*mut PyObject> {
+    let g = BUILTIN_BOX_CACHE.lock().ok()?;
+    let map = g.as_ref()?;
+    let bp = *map.get(&key)?;
+    let p = bp as *mut PyObject;
+    unsafe { crate::object::Py_IncRef(p) };
+    if std::env::var_os("WEAVEPY_BOXDBG").is_some() {
+        eprintln!(
+            "[BOXDBG] builtin cache HIT key=0x{key:x} -> box=0x{:x}",
+            p as usize
+        );
+    }
+    Some(p)
+}
+
+/// Record `p` as the canonical box for native-builtin identity `key`.
+fn register_builtin_box(key: usize, p: *mut PyObject) {
+    if std::env::var_os("WEAVEPY_BOXDBG").is_some() {
+        eprintln!(
+            "[BOXDBG] builtin cache MISS key=0x{key:x} minted box=0x{:x}",
+            p as usize
+        );
+    }
+    if let Ok(mut g) = BUILTIN_BOX_CACHE.lock() {
+        if g.get_or_insert_with(FxHashMap::default)
+            .insert(key, p as usize)
+            .is_none()
+        {
+            BUILTIN_BOX_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Evict a faithful builtin mirror from the canonical cache when its storage
+/// is released — called from [`free_mirror`] *before* the prefix's native
+/// `Object` (and thus its `Rc`) is dropped. Only removes the entry when it
+/// still points at `p`, so a stale box that lost a cache race can never
+/// clobber the live canonical one.
+///
+/// # Safety
+/// `p` must be a faithful builtin mirror ([`is_faithful_builtin`]) whose
+/// prefix is still intact.
+pub unsafe fn unregister_builtin_box(p: *mut PyObject) {
+    let pre = unsafe { prefix_of(p) };
+    let key = match builtin_rc_key(unsafe { &(*pre).obj }) {
+        Some(k) => k,
+        None => return,
+    };
+    if let Ok(mut g) = BUILTIN_BOX_CACHE.lock() {
+        if let Some(map) = g.as_mut() {
+            if map.get(&key) == Some(&(p as usize)) {
+                map.remove(&key);
+                BUILTIN_BOX_COUNT.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Canonical pinned scalar boxes (RFC 0047, wave 5).
+// ---------------------------------------------------------------------------
+
+/// CPython extensions may keep an argument's `PyObject*` **borrowed** —
+/// pandas' khash `PyObjectHashTable.set_item(key, val)` stores the raw
+/// key pointer with *no* incref, relying on the Python caller's reference
+/// to keep the object alive (`get_item`/rehash later reads it back through
+/// `kh_python_hash_equal`). Under CPython that contract holds because the
+/// pointer *is* the object. Under WeavePy a fresh box is minted per
+/// crossing and dies with the call, leaving khash dangling — every direct
+/// scalar key round-trip (`t.set_item(3.5, 1); t.get_item(3.5)`) failed.
+///
+/// Fix: while marshaling VM **arguments** into a C call (the
+/// [`enter_arg_pin`] guard, set by `foreign::fwd_call`), immutable
+/// hashable scalars are minted through this canonical cache. The box is
+/// flagged [`MirrorPrefix::scalar_pinned`] and **survives its C refcount
+/// reaching zero** — `free_box` skips it — so a borrowed pointer stored by
+/// the callee stays valid, and a later crossing of the same value returns
+/// the *same pointer* (which also turns khash probes into identity hits,
+/// exactly like CPython where the caller passes the same object).
+///
+/// Keys: `Int`/`Float` by value (the VM's value semantics make equal
+/// scalars indistinguishable — consistent with the VM, where `3.5 is 3.5`
+/// is `True`); `Long`/`Complex`/`Str`/`Bytes`/`Tuple` by `Rc` data-pointer
+/// identity (the pinned box's prefix clone keeps the `Rc` alive, so the
+/// key can never dangle or be reused while the entry exists).
+///
+/// Memory is bounded by [`SCALAR_PIN_HWM`]: registering past the
+/// high-water mark sweeps entries whose C refcount is zero (freeing the
+/// boxes). A borrowed store older than a full sweep window can still
+/// dangle in theory, but that window (64Ki distinct marshaled scalars
+/// while the consumer stays alive) dwarfs every observed workload.
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+enum ScalarPinKey {
+    Int(i64),
+    FloatBits(u64),
+    /// `(type tag, Rc data pointer)` — the tag keeps zero-sized payloads
+    /// of different types (empty str vs empty bytes) from colliding.
+    Rc(u8, usize),
+}
+
+static SCALAR_PIN_CACHE: Mutex<Option<FxHashMap<ScalarPinKey, usize>>> = Mutex::new(None);
+/// Eviction sweep threshold (entries).
+const SCALAR_PIN_HWM: usize = 1 << 16;
+
+thread_local! {
+    /// Non-zero while marshaling VM arguments into a C call on this thread.
+    static ARG_PIN_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII guard for one argument-marshaling region; see [`enter_arg_pin`].
+pub struct ArgPinGuard(());
+
+impl Drop for ArgPinGuard {
+    fn drop(&mut self) {
+        let _ = ARG_PIN_DEPTH.try_with(|c| c.set(c.get().saturating_sub(1)));
+    }
+}
+
+/// Mark the current thread as marshaling VM arguments into a C call:
+/// scalar mints inside the region route through the canonical pin cache.
+pub fn enter_arg_pin() -> ArgPinGuard {
+    let _ = ARG_PIN_DEPTH.try_with(|c| c.set(c.get() + 1));
+    ArgPinGuard(())
+}
+
+fn arg_pin_active() -> bool {
+    ARG_PIN_DEPTH.try_with(|c| c.get() > 0).unwrap_or(false)
+}
+
+/// The canonical-cache key for `obj`, or `None` when the value kind is not
+/// pinned (mutable containers, instances, foreigns, …).
+fn scalar_pin_key(obj: &Object) -> Option<ScalarPinKey> {
+    use weavepy_vm::sync::Rc as VmRc;
+    Some(match obj {
+        Object::Int(i) => ScalarPinKey::Int(*i),
+        Object::Float(f) => ScalarPinKey::FloatBits(f.to_bits()),
+        Object::Long(rc) => ScalarPinKey::Rc(1, VmRc::as_ptr(rc) as usize),
+        Object::Complex(rc) => ScalarPinKey::Rc(2, VmRc::as_ptr(rc) as usize),
+        Object::Str(rc) => ScalarPinKey::Rc(3, VmRc::as_ptr(rc) as *const u8 as usize),
+        Object::Bytes(rc) => ScalarPinKey::Rc(5, VmRc::as_ptr(rc) as *const u8 as usize),
+        Object::Tuple(rc) => ScalarPinKey::Rc(6, VmRc::as_ptr(rc) as *const Object as usize),
+        _ => return None,
+    })
+}
+
+/// Return a fresh C reference to the live canonical pinned box for `key`,
+/// or `None` when no box is cached (or the cached one wears a different
+/// type — e.g. the same value crossing under a staging type).
+fn cached_scalar_pin(key: ScalarPinKey, ty: *mut PyTypeObject) -> Option<*mut PyObject> {
+    let g = SCALAR_PIN_CACHE.lock().ok()?;
+    let map = g.as_ref()?;
+    let bp = *map.get(&key)?;
+    let p = bp as *mut PyObject;
+    if unsafe { (*p).ob_type } != ty {
+        return None;
+    }
+    unsafe { crate::object::Py_IncRef(p) };
+    Some(p)
+}
+
+/// Record `p` as the canonical pinned box for `key`, sweeping the cache
+/// first when it is past the high-water mark. A displaced previous entry
+/// is unpinned (and freed at once if C no longer references it).
+fn register_scalar_pin(key: ScalarPinKey, p: *mut PyObject) {
+    unsafe { (*prefix_of(p)).scalar_pinned = true };
+    let displaced = {
+        let mut g = match SCALAR_PIN_CACHE.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let map = g.get_or_insert_with(FxHashMap::default);
+        if map.len() >= SCALAR_PIN_HWM {
+            sweep_scalar_pins_locked(map);
+        }
+        map.insert(key, p as usize)
+    };
+    if let Some(old) = displaced {
+        if old != p as usize {
+            unsafe { unpin_scalar_box(old as *mut PyObject) };
+        }
+    }
+}
+
+/// Clear a box's pin flag; free it immediately when C holds no reference.
+///
+/// # Safety
+/// `p` must be a live pinned mirror.
+unsafe fn unpin_scalar_box(p: *mut PyObject) {
+    unsafe { (*prefix_of(p)).scalar_pinned = false };
+    if unsafe { (*p).ob_refcnt } <= 0 {
+        unsafe { free_mirror(p) };
+    }
+}
+
+/// Drop every entry whose box C no longer references (refcount zero),
+/// freeing the boxes. Entries C still holds stay registered (identity
+/// remains stable for future crossings).
+fn sweep_scalar_pins_locked(map: &mut FxHashMap<ScalarPinKey, usize>) {
+    let dead: Vec<(ScalarPinKey, usize)> = map
+        .iter()
+        .filter(|(_, &bp)| unsafe { (*(bp as *mut PyObject)).ob_refcnt } <= 0)
+        .map(|(k, &bp)| (*k, bp))
+        .collect();
+    for (k, bp) in dead {
+        map.remove(&k);
+        let p = bp as *mut PyObject;
+        unsafe {
+            (*prefix_of(p)).scalar_pinned = false;
+            free_mirror(p);
+        }
+    }
+}
+
+/// True iff `p` is a canonical pinned scalar box whose storage must
+/// outlive a zero C refcount. Checked (deref-free beyond the prefix flag)
+/// by `free_box` before dispatching to [`free_mirror`].
+///
+/// # Safety
+/// `p` must satisfy [`is_mirror`].
+pub unsafe fn is_scalar_pinned(p: *mut PyObject) -> bool {
+    unsafe { (*prefix_of(p)).scalar_pinned }
+}
+
+/// Mint the **args tuple** for a VM→C call: the outer tuple itself is a
+/// per-call temporary (fresh `Rc`, never re-marshaled) so it mints
+/// *unpinned*, while its elements — boxed inside `fill_body` with the
+/// [`enter_arg_pin`] flag live — route through the canonical pin cache.
+/// See [`ScalarPinKey`] for why argument scalars must outlive the call.
+pub fn args_tuple_out(obj: Object) -> *mut PyObject {
+    let _pin = enter_arg_pin();
+    let ty = types::type_for_object(&obj);
+    mirror_out_fresh(obj, ty)
+}
+
+/// Digest a faithful list mirror's raw `ob_item` pointers. Cheap — no
+/// allocation, no minting, no refcount change — so a read can tell whether
+/// C wrote the buffer since the last agreement without reconstructing
+/// objects.
+///
+/// # Safety
+/// `p` must satisfy [`is_faithful_list`].
+unsafe fn list_ptr_snapshot(p: *mut PyObject) -> (u64, usize) {
+    let n = unsafe { list_size(p) }.max(0) as usize;
+    let lo = p as *const layout::PyListObject;
+    let base = unsafe { (*lo).ob_item };
+    let mut h = DIGEST_SEED;
+    if !base.is_null() {
+        for i in 0..n {
+            h = digest_fold(h, unsafe { *base.add(i) } as usize as u64);
+        }
+    }
+    (h, n)
+}
+
+/// Record the current `ob_item` as the agreed C state for a seeded list, so
+/// a subsequent read does not mistake a WeavePy write-through for a foreign
+/// C macro write (which would needlessly rebuild, or — after a further VM
+/// mutation — clobber it). Called by the write-through mutators; a no-op for
+/// a list that was never seeded/registered.
+///
+/// # Safety
+/// `p` must satisfy [`is_faithful_list`].
+unsafe fn note_c_agreement(p: *mut PyObject) {
+    if SEEDED_LIST_COUNT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let cur = unsafe { list_ptr_snapshot(p) };
+    if let Ok(mut g) = SEEDED_LISTS.lock() {
+        if let Some(map) = g.as_mut() {
+            if let Some(slot) = map.get_mut(&(p as usize)) {
+                slot.c_ptrs = cur;
+            }
+        }
+    }
+}
+
+/// The authoritative VM list `Rc` behind a faithful list mirror: the
+/// prefix's own `Object::List` for a builtin `list` mirror, or the owning
+/// instance's native payload for a **list-subclass container body**
+/// (RFC 0047, wave 5 — pandas' `FrozenList`). All list read/sync/mutate
+/// paths resolve through this so both shapes stay coherent.
+///
+/// # Safety
+/// `p` must satisfy [`is_faithful_list`].
+unsafe fn list_rc_of(
+    p: *mut PyObject,
+) -> Option<weavepy_vm::sync::Rc<weavepy_vm::sync::RefCell<Vec<Object>>>> {
+    let pre = unsafe { prefix_of(p) };
+    if let Object::List(rc) = unsafe { &(*pre).obj } {
+        return Some(rc.clone());
+    }
+    if let Some(w) = unsafe { (*pre).inst.as_ref() } {
+        if let Some(inst) = w.upgrade() {
+            if let Some(Object::List(rc)) = inst.native.get() {
+                return Some(rc.clone());
+            }
+        }
+    }
+    None
+}
+
+/// The C→VM half of faithful-list coherence (RFC 0047, wave 5): adopt a
+/// *direct* C-side write to a seeded list's `ob_item` back into the shared
+/// prefix `Rc`.
+///
+/// A stock extension can grow or overwrite a seeded list through the
+/// `PyList_SET_ITEM` + `__Pyx_SET_SIZE` macros — Cython's
+/// `__Pyx_ListComp_Append` fast path takes exactly this route when it builds
+/// `tuple([length for length in self.view.shape[:self.view.ndim]])` for
+/// `memoryview.shape`, so a 2-D buffer's shape read back as a 1-tuple and
+/// pandas' groupby allocated 1-D internals (`Buffer has wrong number of
+/// dimensions`). Such a write never passes through a WeavePy mutator, so the
+/// prefix `Rc` is left stale. When the current `ob_item` differs from the
+/// snapshot taken at the last agreement, the buffer is authoritative:
+/// refill the `Rc` in place (identity preserved). A VM-only mutation leaves
+/// `ob_item` untouched (snapshot matches) and so is never clobbered.
+///
+/// # Safety
+/// `p` must satisfy [`is_faithful_list`].
+unsafe fn reconcile_list_from_c(p: *mut PyObject) {
+    if SEEDED_LIST_COUNT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let cur = unsafe { list_ptr_snapshot(p) };
+    // Cheap gate: an unchanged buffer means C wrote nothing; the `Rc`
+    // (possibly ahead with un-flushed VM mutations) stays authoritative.
+    // A missing entry ⇒ leave the `Rc` alone (never clobber VM state).
+    let changed = match SEEDED_LISTS.lock() {
+        Ok(g) => g
+            .as_ref()
+            .and_then(|m| m.get(&(p as usize)))
+            .map(|st| st.c_ptrs != cur)
+            .unwrap_or(false),
+        Err(_) => return,
+    };
+    if !changed {
+        return;
+    }
+    let rc = match unsafe { list_rc_of(p) } {
+        Some(rc) => rc,
+        None => return,
+    };
+    let adopted = unsafe { read_list_vec(p) };
+    let fp = digest_objects(adopted.iter());
+    let n = cur.1;
+    *rc.borrow_mut() = adopted;
+    if let Ok(mut g) = SEEDED_LISTS.lock() {
+        if let Some(map) = g.as_mut() {
+            if let Some(slot) = map.get_mut(&(p as usize)) {
+                slot.rc_fp = Some(fp);
+                slot.c_ptrs = cur;
+            }
+        }
+    }
+    if listsync_trace_enabled() {
+        eprintln!("[LISTSYNC] adopt {p:p} ob_size={n}");
+    }
+}
+
+/// Combined digest of a sequence of elements ([`fingerprint`] folded
+/// through [`digest_fold`]) — the allocation-free replacement for the
+/// per-slot fingerprint vectors.
+fn digest_objects<'a>(items: impl Iterator<Item = &'a Object>) -> (u64, usize) {
+    let mut h = DIGEST_SEED;
+    let mut n = 0usize;
+    for it in items {
+        h = digest_fold(h, fingerprint(it));
+        n += 1;
+    }
+    (h, n)
+}
+
+/// Allocation-free identity for an `Rc`/`Arc` (sized or unsized): the data
+/// pointer, stable for the lifetime of the allocation.
+#[inline]
+fn rc_id<T: ?Sized>(rc: &weavepy_vm::sync::Rc<T>) -> u64 {
+    weavepy_vm::sync::Rc::as_ptr(rc) as *const () as u64
+}
+
+/// A 64-bit fingerprint of a list element that changes iff the element's
+/// *identity or value* changes, computed without minting any C object. For
+/// an `Rc`-backed value the stable allocation pointer is used; for an inline
+/// scalar the value itself. This lets [`sync_list_ob_item`] detect an
+/// unmutated list and leave its `ob_item` untouched (no refcount churn, no
+/// dangling of a pointer C may still borrow), which is what makes flushing
+/// at *every* VM→C boundary affordable.
+fn fingerprint(o: &Object) -> u64 {
+    #[inline]
+    fn mix(tag: u8, payload: u64) -> u64 {
+        // FNV-1a over the tag byte then the eight payload bytes.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        h ^= tag as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        let mut p = payload;
+        for _ in 0..8 {
+            h ^= p & 0xff;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            p >>= 8;
+        }
+        h
+    }
+    #[allow(clippy::enum_glob_use)]
+    use Object::*;
+    match o {
+        None => mix(0, 0),
+        Unbound => mix(1, 0),
+        Bool(b) => mix(2, *b as u64),
+        Int(i) => mix(3, *i as u64),
+        Float(f) => mix(4, f.to_bits()),
+        Long(rc) => mix(5, rc_id(rc)),
+        Complex(rc) => mix(6, rc_id(rc)),
+        Str(rc) => mix(7, rc_id(rc)),
+        WStr(rc) => mix(8, rc_id(rc)),
+        Tuple(rc) => mix(9, rc_id(rc)),
+        List(rc) => mix(10, rc_id(rc)),
+        Dict(rc) => mix(11, rc_id(rc)),
+        Range(rc) => mix(12, rc_id(rc)),
+        Function(rc) => mix(13, rc_id(rc)),
+        Builtin(rc) => mix(14, rc_id(rc)),
+        BoundMethod(rc) => mix(15, rc_id(rc)),
+        Code(rc) => mix(16, rc_id(rc)),
+        Cell(rc) => mix(17, rc_id(rc)),
+        Iter(rc) => mix(18, rc_id(rc)),
+        Slice(rc) => mix(19, rc_id(rc)),
+        Type(rc) => mix(20, rc_id(rc)),
+        Instance(rc) => mix(21, rc_id(rc)),
+        Module(rc) => mix(22, rc_id(rc)),
+        Generator(rc) => mix(23, rc_id(rc)),
+        Coroutine(rc) => mix(24, rc_id(rc)),
+        AsyncGenerator(rc) => mix(25, rc_id(rc)),
+        AsyncGenAwait(rc) => mix(26, rc_id(rc)),
+        Bytes(rc) => mix(27, rc_id(rc)),
+        ByteArray(rc) => mix(28, rc_id(rc)),
+        Set(rc) => mix(29, rc_id(rc)),
+        FrozenSet(rc) => mix(30, rc_id(rc)),
+        File(rc) => mix(31, rc_id(rc)),
+        Property(rc) => mix(32, rc_id(rc)),
+        StaticMethod(rc) => mix(33, rc_id(rc)),
+        ClassMethod(rc) => mix(34, rc_id(rc)),
+        SlotDescriptor(rc) => mix(35, rc_id(rc)),
+        Frame(rc) => mix(36, rc_id(rc)),
+        Traceback(rc) => mix(37, rc_id(rc)),
+        MemoryView(rc) => mix(38, rc_id(rc)),
+        MappingProxy(rc) => mix(39, rc_id(rc)),
+        DictView(rc) => mix(40, rc_id(rc)),
+        SimpleNamespace(rc) => mix(41, rc_id(rc)),
+        LazyIter(rc) => mix(42, rc_id(rc)),
+        Capsule(rc) => mix(43, rc_id(rc)),
+        Foreign(rc) => mix(44, rc_id(rc)),
+    }
+}
+
+thread_local! {
+    /// Set while [`flush_seeded_lists`] is running. A slot decref during a
+    /// sync can free an object whose drop re-enters the VM→C boundary (and
+    /// thus `ensure_active` → `flush_seeded_lists`); the guard makes that
+    /// nested call a no-op so the outer flush keeps a consistent snapshot.
+    static FLUSHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct FlushGuard;
+impl Drop for FlushGuard {
+    fn drop(&mut self) {
+        FLUSHING.with(|f| f.set(false));
+    }
+}
+
+/// Record a faithful list mirror as VM-shared (seeded) so its `ob_item`
+/// is re-synced from the prefix `Rc` at the next VM→C boundary.
+pub fn register_seeded_list(p: *mut PyObject) {
+    if p.is_null() {
+        return;
+    }
+    // The mirror was just seeded (its prefix `Rc` == `ob_item`), so capture
+    // the buffer snapshot now; a later read only adopts a *genuine* C write.
+    let c_ptrs = unsafe { list_ptr_snapshot(p) };
+    if let Ok(mut g) = SEEDED_LISTS.lock() {
+        // `rc_fp: None` forces the first flush to do a real sync.
+        if g.get_or_insert_with(FxHashMap::default)
+            .insert(
+                p as usize,
+                ListSync {
+                    rc_fp: None,
+                    c_ptrs,
+                },
+            )
+            .is_none()
+        {
+            SEEDED_LIST_COUNT.fetch_add(1, Ordering::Relaxed);
+            if listsync_trace_enabled() {
+                let n = unsafe { list_size(p) };
+                eprintln!("[LISTSYNC] register {p:p} ob_size={n}");
+            }
+        }
+    }
+}
+
+/// Drop a faithful list mirror from the seeded set (its storage is being
+/// released).
+pub fn unregister_seeded_list(p: *mut PyObject) {
+    if p.is_null() {
+        return;
+    }
+    if let Ok(mut g) = SEEDED_LISTS.lock() {
+        if let Some(map) = g.as_mut() {
+            if map.remove(&(p as usize)).is_some() {
+                SEEDED_LIST_COUNT.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Re-publish a seeded faithful list mirror's `ob_item` buffer from its
+/// prefix `Object::List` so a stock `PyList_GET_ITEM` macro sees the VM's
+/// latest mutations. A slot whose desired occupant already lives there
+/// (a stable identity — a cached instance box, a foreign pointer, a
+/// singleton) is left untouched, so an unchanged list churns no refcounts
+/// and never dangles a pointer C may still hold.
+///
+/// # Safety
+/// `p` must be a live pointer.
+pub unsafe fn sync_list_ob_item(p: *mut PyObject) {
+    if !unsafe { is_faithful_list(p) } {
+        return;
+    }
+    let pre = unsafe { prefix_of(p) };
+    // Never seeded ⇒ the C buffer is authoritative (a `PyList_New` +
+    // `PyList_SET_ITEM` build the VM has not yet read back); leave it.
+    if !unsafe { (*pre).list_synced } {
+        return;
+    }
+    // Adopt any *direct* C-side write first (RFC 0047, wave 5). Cython's
+    // `__Pyx_ListComp_Append` fast path grows a seeded list straight through
+    // the `PyList_SET_ITEM` + `__Pyx_SET_SIZE` macros (e.g. `[np.dtype(x)
+    // for x in ...]` building `TextReader.dtype_cast_order`), so the inline
+    // `ob_item`/`ob_size` can be *ahead* of the prefix `Rc` without any
+    // read-back having reconciled it. Publishing the stale `Rc` here would
+    // clobber those elements — pandas' C parser saw `dtype_cast_order`
+    // shrink to `[int64]` and gave up after the first (failed) cast, so
+    // every float/str/bool column read as an un-upcast `NoneType` na_count.
+    // Reconciling C→VM before the VM→C publish makes the flush symmetric:
+    // a genuine C write is adopted (the fingerprint then matches and the
+    // publish is skipped), a VM mutation is untouched and still published.
+    unsafe { reconcile_list_from_c(p) };
+    let rc = match unsafe { list_rc_of(p) } {
+        Some(rc) => rc,
+        None => return,
+    };
+    // Fingerprint the VM-shared list (allocation-free). If it matches what we
+    // last published to `ob_item`, the list is unmutated since the previous
+    // flush and the buffer is already coherent — leave it untouched (no
+    // allocation, no refcount churn). This is what keeps a flush at *every*
+    // VM→C boundary affordable; only a genuinely mutated list pays to rebuild.
+    let fp = digest_objects(rc.borrow().iter());
+    if let Ok(g) = SEEDED_LISTS.lock() {
+        if let Some(map) = g.as_ref() {
+            if let Some(st) = map.get(&(p as usize)) {
+                if st.rc_fp == Some(fp) {
+                    return;
+                }
+            }
+        }
+    }
+    let items: Vec<Object> = rc.borrow().clone();
+    let n = items.len();
+    let old_n = unsafe { list_size(p) }.max(0) as usize;
+    if listsync_trace_enabled() {
+        eprintln!("[LISTSYNC] sync {p:p} prefix_len={n} old_ob_size={old_n}");
+    }
+    if n > 0 {
+        unsafe { list_reserve(p, n) };
+    }
+    let lo = p as *mut layout::PyListObject;
+    let base = unsafe { (*lo).ob_item };
+    if base.is_null() && n > 0 {
+        return;
+    }
+    for (i, it) in items.iter().enumerate() {
+        let slot = unsafe { base.add(i) };
+        let old = unsafe { *slot };
+        let new = crate::object::into_owned(it.clone());
+        if listsync_trace_enabled() && n <= 3 {
+            eprintln!(
+                "[LISTSYNC]   slot {i}: old={old:p} new={new:p} {}",
+                if new == old { "SKIP" } else { "REPLACE" }
+            );
+        }
+        if new == old {
+            // Stable identity: `into_owned` handed back a fresh reference
+            // to the very pointer already in the slot. Release it and keep
+            // the slot as-is (no churn, no dangling pointer).
+            if !new.is_null() {
+                unsafe { crate::object::Py_DecRef(new) };
+            }
+            continue;
+        }
+        unsafe { *slot = new };
+        if !old.is_null() {
+            unsafe { crate::object::Py_DecRef(old) };
+        }
+    }
+    // A shrink (pop/remove/slice-delete) leaves stale tail occupants; drop
+    // their references and clear the slots.
+    if old_n > n && !base.is_null() {
+        for i in n..old_n {
+            let slot = unsafe { base.add(i) };
+            let old = unsafe { *slot };
+            unsafe { *slot = ptr::null_mut() };
+            if !old.is_null() {
+                unsafe { crate::object::Py_DecRef(old) };
+            }
+        }
+    }
+    let vo = p as *mut layout::PyVarObject;
+    unsafe { (*vo).ob_size = n as PySsizeT };
+    // Record the published fingerprint (so the next flush can skip an
+    // unmutated list) and the resulting `ob_item` snapshot (so a read-back
+    // does not mistake this publish for a foreign C write). `get_mut` (not
+    // `insert`) avoids resurrecting an entry an interleaved
+    // decref→`unregister_seeded_list` may have removed.
+    let c_ptrs = unsafe { list_ptr_snapshot(p) };
+    if let Ok(mut g) = SEEDED_LISTS.lock() {
+        if let Some(map) = g.as_mut() {
+            if let Some(slot) = map.get_mut(&(p as usize)) {
+                slot.rc_fp = Some(fp);
+                slot.c_ptrs = c_ptrs;
+            }
+        }
+    }
+}
+
+/// Re-sync every seeded faithful list mirror's `ob_item` from its prefix
+/// `Rc`. Called at the VM→C boundary so a stock extension's inlined
+/// `PyList_GET_ITEM` macro reads the VM's latest list mutations.
+///
+/// # Safety
+/// May only be called when no C code is mid-read of a seeded list's
+/// `ob_item` (i.e. at a VM→C transition).
+pub unsafe fn flush_seeded_lists() {
+    if listsync_disabled() {
+        return;
+    }
+    let c = SEEDED_LIST_COUNT.load(Ordering::Relaxed);
+    if c == 0 {
+        return;
+    }
+    // A decref inside a sync can free an object whose drop re-enters here;
+    // skip the nested call rather than re-snapshotting mid-flush.
+    if FLUSHING.with(|f| f.replace(true)) {
+        return;
+    }
+    let _guard = FlushGuard;
+    if listsync_trace_enabled() {
+        eprintln!("[LISTSYNC] flush count={c}");
+    }
+    // One pass under a single lock acquisition classifies every seeded
+    // list as clean (the overwhelmingly common case — both digests match)
+    // or dirty. Only dirty lists take the full per-list sync afterwards,
+    // *outside* the lock (a slot decref may free an object and re-enter
+    // this module). The classification is read-only — raw `ob_item` reads
+    // plus a shared borrow of the prefix `Rc` — so holding the map lock
+    // across it is safe (no `Py_DecRef`, no minting, no VM re-entry).
+    let dirty: Vec<usize> = match SEEDED_LISTS.lock() {
+        Ok(g) => match g.as_ref() {
+            Some(m) => m
+                .iter()
+                .filter(|(&pu, st)| {
+                    let p = pu as *mut PyObject;
+                    if !unsafe { is_faithful_list(p) } {
+                        return false;
+                    }
+                    let pre = unsafe { prefix_of(p) };
+                    if !unsafe { (*pre).list_synced } {
+                        return false;
+                    }
+                    // Dirty when C wrote the buffer directly (`c_ptrs`
+                    // digest moved) or the VM mutated the prefix `Rc`
+                    // (`rc_fp` digest moved).
+                    if st.c_ptrs != unsafe { list_ptr_snapshot(p) } {
+                        return true;
+                    }
+                    let rc = match unsafe { list_rc_of(p) } {
+                        Some(rc) => rc,
+                        None => return false,
+                    };
+                    let dirty = match rc.try_borrow() {
+                        Ok(items) => st.rc_fp != Some(digest_objects(items.iter())),
+                        // Mid-mutation borrow: treat as dirty, the full
+                        // sync re-checks outside the lock.
+                        Err(_) => true,
+                    };
+                    dirty
+                })
+                .map(|(&pu, _)| pu)
+                .collect(),
+            None => return,
+        },
+        Err(_) => return,
+    };
+    for pu in dirty {
+        unsafe { sync_list_ob_item(pu as *mut PyObject) };
+    }
+}
+
+/// Adopt direct `PyList_SET_ITEM`-macro writes made to the **nested** seeded
+/// faithful lists reachable from `p`'s `ob_item` slots (RFC 0047, wave 5).
+///
+/// [`reconcile_list_from_c`] already adopts a macro write to a list's *own*
+/// `ob_item` when that list is read back — its slot pointers changed, so the
+/// gate fires. But a stock extension frequently mutates a **child** list's
+/// cells while leaving the parent's slot (the child *pointer*) unchanged, so
+/// the parent's read-back short-circuits and never descends. pandas' `to_csv`
+/// is the canonical case: its Cython `write_csv_rows` reuses one
+/// `rows = [[None] * ncols for _ in range(100)]` buffer, overwrites each inner
+/// row's cells through `__Pyx_SetItemInt_Fast` → the `PyList_SET_ITEM` macro
+/// (the index is a C `Py_ssize_t` and the runtime `PyList_CheckExact`
+/// succeeds), then re-hands the *same* `rows` object to `writer.writerows`.
+/// The outer slots never change, so without this the inner rows' stale prefix
+/// `Rc`s (seeded from the first 100-row batch) were replayed for every later
+/// batch — every row `>= 100` wrote the data of row `i % 100`.
+///
+/// Descending reconciles each child directly: its own slot pointers *did*
+/// change (fresh cell objects), so [`reconcile_list_from_c`] refills its `Rc`
+/// in place — and because the parent's prefix shares that very `Rc`, the
+/// parent observes the fresh cells. A child with only a pending *VM* mutation
+/// (its `ob_item` unchanged) is left untouched, so VM state is never clobbered.
+///
+/// Cost is bounded by the size of the crossed list (the same O(n) as the
+/// pointer snapshot [`reconcile_list_from_c`] already takes), not the global
+/// seeded set — so it stays on the hot C→VM path only for the data actually
+/// being read. `depth` caps recursion so a self-referential list cannot loop.
+///
+/// # Safety
+/// `p` must satisfy [`is_faithful_list`]; called at a C→VM transition.
+pub(crate) unsafe fn reconcile_nested_lists(p: *mut PyObject, depth: u32) {
+    // pandas' nesting (list-of-rows) is shallow; a small cap defends against a
+    // cyclic list without a visited-set allocation on this hot path.
+    const MAX_DEPTH: u32 = 6;
+    if depth >= MAX_DEPTH || SEEDED_LIST_COUNT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let n = unsafe { list_size(p) };
+    if n <= 0 {
+        return;
+    }
+    let lo = p as *const layout::PyListObject;
+    let base = unsafe { (*lo).ob_item };
+    if base.is_null() {
+        return;
+    }
+    for i in 0..n as usize {
+        let slot = unsafe { *base.add(i) };
+        // Only faithful-list children can carry a macro write we would miss;
+        // guard against a direct self-reference before recursing.
+        if !slot.is_null() && slot != p && unsafe { is_faithful_list(slot) } {
+            unsafe { reconcile_list_from_c(slot) };
+            unsafe { reconcile_nested_lists(slot, depth + 1) };
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Faithful mutable unicode (RFC 0047, wave 5).
+//
+// WeavePy's native string is an immutable `Rc<str>`, but macro-heavy
+// Cython mutates a string's character buffer *in place*: the f-string /
+// `repr` codegen builds a result by `PyUnicode_New(n, maxchar)` followed by
+// the inlined `PyUnicode_WRITE` macro (a direct store at `PyUnicode_DATA(o)
+// + i*kind`), and concatenation takes an in-place fast path —
+// `PyUnicode_Resize(&left, left_len+right_len)` then
+// `PyUnicode_CopyCharacters(left, left_len, right, 0, right_len)` — when
+// `left` is uniquely owned and not interned. To satisfy a stock reader the
+// buffer must be a real, writable PEP 393 body, and any in-place mutation
+// must be visible when the string crosses back. We therefore mint such
+// strings as **buffer-authoritative** mirrors ([`MirrorPrefix::str_buffer`])
+// whose C body — not the staged prefix object — is read by [`native_of`].
+// ---------------------------------------------------------------------------
+
+/// The PEP 393 compact form for a string whose largest code point is
+/// `maxchar`: `(kind, ascii, data_offset, char_width)`. The data offset is
+/// where the inlined `PyUnicode_DATA` macro looks: just past
+/// `PyASCIIObject` for a compact-ASCII string, else past
+/// `PyCompactUnicodeObject` (which carries the UTF-8 cache fields).
+fn unicode_form(maxchar: u32) -> (u32, bool, usize, usize) {
+    let ascii_head = std::mem::size_of::<layout::PyASCIIObject>();
+    let compact_head = std::mem::size_of::<layout::PyCompactUnicodeObject>();
+    if maxchar < 0x80 {
+        (ustate::KIND_1BYTE, true, ascii_head, 1)
+    } else if maxchar < 0x100 {
+        (ustate::KIND_1BYTE, false, compact_head, 1)
+    } else if maxchar < 0x1_0000 {
+        (ustate::KIND_2BYTE, false, compact_head, 2)
+    } else {
+        (ustate::KIND_4BYTE, false, compact_head, 4)
+    }
+}
+
+/// The maximum code point a `kind`/`ascii` body may hold. A compact-ASCII
+/// body is capped at `0x7F` (CPython's `PyUnicode_MAX_CHAR_VALUE`), so
+/// writing a Latin-1 char into it is rejected, matching CPython.
+#[inline]
+fn kind_maxchar(kind: u32, ascii: bool) -> u32 {
+    match kind {
+        1 => {
+            if ascii {
+                0x7f
+            } else {
+                0xff
+            }
+        }
+        2 => 0xffff,
+        _ => 0x10_ffff,
+    }
+}
+
+/// Store one code point into a PEP 393 buffer of the given `kind`.
+///
+/// # Safety
+/// `data` must point at a writable buffer with room for `i + 1` units of
+/// `kind` bytes each.
+#[inline]
+unsafe fn write_codepoint(data: *mut u8, kind: u32, i: usize, cp: u32) {
+    match kind {
+        1 => unsafe { *data.add(i) = cp as u8 },
+        2 => unsafe { *(data as *mut u16).add(i) = cp as u16 },
+        _ => unsafe { *(data as *mut u32).add(i) = cp },
+    }
+}
+
+/// Load one code point from a PEP 393 buffer of the given `kind`.
+///
+/// # Safety
+/// `data` must point at a readable buffer with at least `i + 1` units.
+#[inline]
+unsafe fn read_codepoint(data: *const u8, kind: u32, i: usize) -> u32 {
+    match kind {
+        1 => unsafe { *data.add(i) as u32 },
+        2 => unsafe { *(data as *const u16).add(i) as u32 },
+        _ => unsafe { *(data as *const u32).add(i) },
+    }
+}
+
+/// True iff `p` is a **buffer-authoritative** unicode mirror — a string
+/// built by [`new_unicode_mirror`] whose C buffer is the source of truth
+/// and is safe to mutate through [`unicode_write_char`] /
+/// [`unicode_copy_characters`]. A normal str mirror or a foreign string
+/// returns `false`.
+///
+/// # Safety
+/// `p` must be non-null and point at a valid object head.
+pub unsafe fn is_str_buffer(p: *mut PyObject) -> bool {
+    if !unsafe { is_mirror(p) } {
+        return false;
+    }
+    let head = unsafe { &*p };
+    if head.ob_type.is_null() || !std::ptr::eq(head.ob_type, types::PyUnicode_Type.as_ptr()) {
+        return false;
+    }
+    unsafe { (*prefix_of(p)).str_buffer }
+}
+
+/// `(kind, ascii, length, data)` for a unicode mirror that carries a
+/// faithful PEP 393 body (a buffer-authoritative string, or a normal
+/// `fill_str` mirror). `data` points at the writable character buffer.
+///
+/// # Safety
+/// `p` must be a unicode mirror with a faithful body (its allocation is at
+/// least `size_of::<PyASCIIObject>()`).
+unsafe fn str_buffer_info(p: *mut PyObject) -> (u32, bool, usize, *mut u8) {
+    let ao = p as *mut layout::PyASCIIObject;
+    let len = {
+        let l = unsafe { (*ao).length };
+        if l < 0 {
+            0
+        } else {
+            l as usize
+        }
+    };
+    let state = unsafe { (*ao).state };
+    let kind = (state >> ustate::KIND_SHIFT) & 0x7;
+    let ascii = (state >> ustate::ASCII_SHIFT) & 0x1 != 0;
+    let off = if ascii {
+        std::mem::size_of::<layout::PyASCIIObject>()
+    } else {
+        std::mem::size_of::<layout::PyCompactUnicodeObject>()
+    };
+    let data = unsafe { (p as *mut u8).add(off) };
+    (kind, ascii, len, data)
+}
+
+/// The largest code point representable by a unicode mirror's body
+/// (`0x7F`/`0xFF`/`0xFFFF`/`0x10FFFF`), or `None` if `p` is not a unicode
+/// mirror with a faithful body. Used by [`resize_unicode`] to preserve the
+/// source string's kind across a resize (CPython never narrows the kind).
+///
+/// # Safety
+/// `p` must be non-null and point at a valid object head.
+unsafe fn mirror_str_maxchar(p: *mut PyObject) -> Option<u32> {
+    if !unsafe { is_mirror(p) } {
+        return None;
+    }
+    let head = unsafe { &*p };
+    if head.ob_type.is_null() || !std::ptr::eq(head.ob_type, types::PyUnicode_Type.as_ptr()) {
+        return None;
+    }
+    let pre = unsafe { prefix_of(p) };
+    let body_size = unsafe { (*pre).alloc_size }.saturating_sub(PREFIX_SIZE);
+    if body_size < std::mem::size_of::<layout::PyASCIIObject>() {
+        // Defensive: any WeavePy-minted string now carries a faithful PEP 393
+        // body (all kinds), so this only guards a degenerate head-only body;
+        // its value would live in the prefix, so fall back to a content scan.
+        return None;
+    }
+    let (kind, ascii, _len, _data) = unsafe { str_buffer_info(p) };
+    Some(kind_maxchar(kind, ascii))
+}
+
+/// Reconstruct an [`Object::Str`] from a unicode mirror's faithful PEP 393
+/// buffer (length, `kind`, and character data). Used by [`native_of`] for a
+/// buffer-authoritative string so a direct `PyUnicode_WRITE` /
+/// `PyUnicode_CopyCharacters` mutation is visible on read-back.
+///
+/// # Safety
+/// `p` must be a unicode mirror with a faithful body
+/// ([`is_str_buffer`], or a normal `fill_str` mirror).
+pub unsafe fn read_str(p: *mut PyObject) -> Object {
+    let (kind, _ascii, len, data) = unsafe { str_buffer_info(p) };
+    if kind == 0 {
+        // No PEP 393 kind: not a faithful buffer — defer to the prefix.
+        return unsafe { (*prefix_of(p)).obj.clone() };
+    }
+    let mut cps = Vec::with_capacity(len);
+    for i in 0..len {
+        cps.push(unsafe { read_codepoint(data, kind, i) });
+    }
+    // Canonicalises to `Str` (no surrogates) or `WStr` (some) — a C-side
+    // `PyUnicode_WRITE` of a lone surrogate must survive the round trip,
+    // not collapse to U+FFFD.
+    Object::str_from_codepoints(cps)
+}
+
+/// Decode any faithful `PyUnicodeObject` body — **compact** (inline data,
+/// the `PyUnicode_New` form) or **legacy / non-compact** (out-of-line
+/// `data.any`, the `unicode_subtype_new` form numpy's `str_` uses) — into a
+/// Rust [`String`]. Returns `None` if the body has no valid PEP 393 kind
+/// (so the caller can fall back). Mirrors the inlined `PyUnicode_KIND` /
+/// `PyUnicode_DATA` reader macros.
+///
+/// # Safety
+/// `p` must point at a readable object head whose body is at least
+/// `size_of::<PyASCIIObject>()` (compact) or `size_of::<PyUnicodeObject>()`
+/// (non-compact) bytes.
+pub unsafe fn read_unicode_value(p: *mut PyObject) -> Option<String> {
+    let ao = p as *const layout::PyASCIIObject;
+    let length = {
+        let l = unsafe { (*ao).length };
+        if l < 0 {
+            return None;
+        }
+        l as usize
+    };
+    let state = unsafe { (*ao).state };
+    let kind = (state >> ustate::KIND_SHIFT) & 0x7;
+    if kind == 0 {
+        return None;
+    }
+    let ascii = (state >> ustate::ASCII_SHIFT) & 0x1 != 0;
+    let compact = (state >> ustate::COMPACT_SHIFT) & 0x1 != 0;
+    let data: *const u8 = if compact {
+        let off = if ascii {
+            std::mem::size_of::<layout::PyASCIIObject>()
+        } else {
+            std::mem::size_of::<layout::PyCompactUnicodeObject>()
+        };
+        unsafe { (p as *const u8).add(off) }
+    } else {
+        let uo = p as *const layout::PyUnicodeObject;
+        unsafe { (*uo).data as *const u8 }
+    };
+    if data.is_null() {
+        return None;
+    }
+    let mut s = String::with_capacity(length);
+    for i in 0..length {
+        let cp = unsafe { read_codepoint(data, kind, i) };
+        s.push(char::from_u32(cp).unwrap_or('\u{fffd}'));
+    }
+    Some(s)
+}
+
+/// Read the value of a faithful **bytes-subtype** body (numpy's `bytes_`)
+/// from its inline `PyBytesObject` fields: `ob_size` (offset 16) and the
+/// inline `ob_sval` char array (offset 32). Returns `None` for a negative
+/// (uninitialised) size. Mirror of [`read_unicode_value`] for `bytes`.
+///
+/// # Safety
+/// `p` must be a faithful instance body whose type is a `bytes` subtype.
+pub unsafe fn read_bytes_value(p: *mut PyObject) -> Option<Vec<u8>> {
+    let bo = p as *const layout::PyBytesObject;
+    let n = unsafe { (*bo).ob_base.ob_size };
+    if n < 0 {
+        return None;
+    }
+    let data = unsafe { (*bo).ob_sval.as_ptr() as *const u8 };
+    if data.is_null() {
+        return None;
+    }
+    Some(unsafe { std::slice::from_raw_parts(data, n as usize).to_vec() })
+}
+
+/// Mint a faithful, writable unicode mirror of `len` code points at the
+/// PEP 393 kind implied by `maxchar`, with a zero-filled buffer (and a NUL
+/// terminator unit). The caller owns one reference. This is the body of
+/// `PyUnicode_New`: a stock extension fills it with the inlined
+/// `PyUnicode_WRITE` macro and reads it with `PyUnicode_READ`, both of
+/// which address `PyUnicode_DATA(o) + i*kind` — so the body must be a real
+/// compact string at the exact offsets [`unicode_form`] computes.
+pub fn new_unicode_mirror(len: usize, maxchar: u32) -> *mut PyObject {
+    let (kind, ascii, data_off, width) = unicode_form(maxchar);
+    // Overflow-safe size computation. A stock extension (e.g. Cython's
+    // inlined `str.join`, which sizes the result by summing
+    // `PyUnicode_GET_LENGTH` over the parts) can hand us a bogus or huge
+    // length; CPython's `PyUnicode_New` returns NULL + raises MemoryError in
+    // that case rather than aborting, so we must not panic here.
+    let raw_body = match len
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(width))
+        .and_then(|n| n.checked_add(data_off))
+    {
+        Some(n) if n <= isize::MAX as usize => n,
+        _ => {
+            if std::env::var_os("WEAVEPY_USTR_DBG").is_some() {
+                eprintln!(
+                    "[USTR] new_unicode_mirror oversize len={len} maxchar={maxchar:#x} width={width}\n{}",
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
+            return ptr::null_mut();
+        }
+    };
+    let body_size = round_up(raw_body, 8);
+    let total = match body_size.checked_add(PREFIX_SIZE) {
+        Some(t) if t <= isize::MAX as usize => t,
+        _ => return ptr::null_mut(),
+    };
+    let layout = match Layout::from_size_align(total, BODY_ALIGN) {
+        Ok(l) => l,
+        Err(_) => return ptr::null_mut(),
+    };
+    let raw = unsafe { alloc(layout) };
+    if raw.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe { ptr::write_bytes(raw, 0, total) };
+
+    let body = unsafe { raw.add(PREFIX_SIZE) } as *mut PyObject;
+    let ty = types::PyUnicode_Type.as_ptr();
+    unsafe {
+        (*body).ob_refcnt = 1;
+        (*body).ob_type = ty;
+        let ao = body as *mut layout::PyASCIIObject;
+        (*ao).length = len as PySsizeT;
+        (*ao).hash = -1;
+        (*ao).state = ustate::pack(0, kind, true, ascii, false);
+        // utf8/utf8_length (compact non-ASCII) stay zeroed by the wipe.
+    }
+
+    let pre = raw as *mut MirrorPrefix;
+    unsafe {
+        ptr::write(
+            pre,
+            MirrorPrefix {
+                obj: Object::None,
+                inst: None,
+                user_data: ptr::null_mut(),
+                destructor: None,
+                alloc_size: total,
+                aux_ptr: ptr::null_mut(),
+                aux_size: 0,
+                str_buffer: true,
+                list_synced: false,
+                scalar_pinned: false,
+                magic: MIRROR_MAGIC,
+            },
+        );
+    }
+    crate::object::register_minted(body);
+    body
+}
+
+/// Resize the buffer-authoritative (or normal) unicode mirror `p` to
+/// `newlen` code points, preserving the leading `min(oldlen, newlen)`
+/// characters and the source kind. Returns a freshly minted mirror (the
+/// caller publishes it and releases the old reference); the result's tail
+/// `[oldlen, newlen)` is zero-filled, ready for `PyUnicode_CopyCharacters`.
+/// Returns null if `p` is not a unicode object.
+///
+/// # Safety
+/// `p` must be non-null and point at a valid object head.
+pub unsafe fn resize_unicode(p: *mut PyObject, newlen: usize) -> *mut PyObject {
+    // Snapshot the existing content (works for a buffer-authoritative body,
+    // a normal `fill_str` mirror, or a head-only non-Latin-1 string).
+    let content = unsafe { native_of(p) };
+    let s = match content {
+        Object::Str(s) => s,
+        // PyUnicode_Resize only targets strings under construction; if `p`
+        // is not a str, refuse rather than corrupt memory.
+        _ => return ptr::null_mut(),
+    };
+    let maxchar = unsafe { mirror_str_maxchar(p) }
+        .unwrap_or_else(|| s.chars().map(|c| c as u32).max().unwrap_or(0));
+    let np = new_unicode_mirror(newlen, maxchar);
+    if np.is_null() {
+        return ptr::null_mut();
+    }
+    let (kind, _ascii, _nlen, data) = unsafe { str_buffer_info(np) };
+    for (i, ch) in s.chars().take(newlen).enumerate() {
+        unsafe { write_codepoint(data, kind, i, ch as u32) };
+    }
+    np
+}
+
+/// Write one code point into a buffer-authoritative unicode mirror at
+/// `idx` (the body of `PyUnicode_WriteChar`). Returns an error string for
+/// an out-of-range index, a code point too wide for the body's kind, or a
+/// non-writable target.
+///
+/// # Safety
+/// `o` must be non-null and point at a valid object head.
+pub unsafe fn unicode_write_char(o: *mut PyObject, idx: usize, ch: u32) -> Result<(), String> {
+    if !unsafe { is_str_buffer(o) } {
+        return Err("PyUnicode_WriteChar: target is not a writable unicode buffer".to_owned());
+    }
+    let (kind, ascii, len, data) = unsafe { str_buffer_info(o) };
+    if idx >= len {
+        return Err("string index out of range".to_owned());
+    }
+    if ch > kind_maxchar(kind, ascii) {
+        return Err("character does not fit in the string's storage".to_owned());
+    }
+    unsafe { write_codepoint(data, kind, idx, ch) };
+    Ok(())
+}
+
+/// Copy `how_many` code points from `from[from_start..]` into the
+/// buffer-authoritative mirror `to` at `to_start` (the body of
+/// `PyUnicode_CopyCharacters`). `from` may be any string (read through
+/// [`native_of`]); the source is snapshotted first, so an overlapping
+/// `from == to` copy is well-defined. Returns the number copied, or an
+/// error string.
+///
+/// # Safety
+/// `to` and `from` must be non-null and point at valid object heads.
+pub unsafe fn unicode_copy_characters(
+    to: *mut PyObject,
+    to_start: usize,
+    from: *mut PyObject,
+    from_start: usize,
+    how_many: usize,
+) -> Result<usize, String> {
+    if !unsafe { is_str_buffer(to) } {
+        return Err("PyUnicode_CopyCharacters: target is not a writable unicode buffer".to_owned());
+    }
+    let (to_kind, to_ascii, to_len, to_data) = unsafe { str_buffer_info(to) };
+    if to_start > to_len || how_many > to_len - to_start {
+        return Err("PyUnicode_CopyCharacters: target index out of range".to_owned());
+    }
+    let from_obj = unsafe { native_of(from) };
+    let from_s = match from_obj {
+        Object::Str(s) => s,
+        _ => return Err("PyUnicode_CopyCharacters: source is not a str".to_owned()),
+    };
+    let from_chars: Vec<u32> = from_s.chars().map(|c| c as u32).collect();
+    if from_start > from_chars.len() || how_many > from_chars.len() - from_start {
+        return Err("PyUnicode_CopyCharacters: source index out of range".to_owned());
+    }
+    let cap = kind_maxchar(to_kind, to_ascii);
+    for k in 0..how_many {
+        let cp = from_chars[from_start + k];
+        if cp > cap {
+            return Err(
+                "PyUnicode_CopyCharacters: character does not fit in target storage".to_owned(),
+            );
+        }
+        unsafe { write_codepoint(to_data, to_kind, to_start + k, cp) };
+    }
+    Ok(how_many)
+}
+
+/// Read one code point from a buffer-authoritative unicode mirror at
+/// `idx`, or `None` for an out-of-range index / non-buffer target.
+///
+/// # Safety
+/// `o` must be non-null and point at a valid object head.
+pub unsafe fn unicode_read_char(o: *mut PyObject, idx: usize) -> Option<u32> {
+    if !unsafe { is_str_buffer(o) } {
+        return None;
+    }
+    let (kind, _ascii, len, data) = unsafe { str_buffer_info(o) };
+    if idx >= len {
+        return None;
+    }
+    Some(unsafe { read_codepoint(data, kind, idx) })
 }
 
 /// Borrow the `pos`-th inline `ob_item` slot of a faithful tuple mirror
@@ -573,21 +2906,88 @@ unsafe fn list_reserve(p: *mut PyObject, min_cap: usize) -> *mut *mut PyObject {
     new_buf
 }
 
+/// Bring a faithful list mirror's shared prefix `Object::List` *contents*
+/// into line with its current C `ob_item` buffer — once, **in place** so
+/// the `Rc` identity (and any VM alias that observes it, e.g. a
+/// `defaultdict[k]` entry) is preserved — then mark the mirror
+/// prefix-authoritative and register it for VM→C re-sync. A no-op once
+/// already synced.
+///
+/// This is the C→VM half of faithful-list coherence (RFC 0047, wave 5):
+/// a stock `PyList_Append`/`PyList_SetItem` writes only the inline
+/// `ob_item`, but Cython routinely holds the *same* list in the VM (a
+/// dict entry, a `cdef` attribute) and reads it back there. Without this
+/// the mutation vanished — a `cdef defaultdict group_dict` built with
+/// `group_dict[k].append(...)` (pandas' `internals.get_blkno_indexers`)
+/// yielded empty lists.
+///
+/// For a VM-originated list the prefix `Rc` and `ob_item` already agree,
+/// so the one-time refill is a cheap no-op copy; for a C-built list
+/// (`PyList_New` + `PyList_SET_ITEM` macro) it captures the
+/// macro-written elements before the targeted mutation is applied.
+///
+/// # Safety
+/// `p` must satisfy [`is_faithful_list`].
+unsafe fn list_prefix_seed_once(p: *mut PyObject) {
+    let pre = unsafe { prefix_of(p) };
+    if unsafe { (*pre).list_synced } {
+        return;
+    }
+    let rc = match unsafe { list_rc_of(p) } {
+        Some(rc) => rc,
+        None => return,
+    };
+    let cur = unsafe { read_list_vec(p) };
+    *rc.borrow_mut() = cur;
+    unsafe { (*pre).list_synced = true };
+    register_seeded_list(p);
+}
+
 /// Append `item` to a faithful list mirror, taking a new strong
 /// reference (CPython `PyList_Append` semantics — the caller keeps its
-/// own reference). Writes the inline `ob_item` buffer, the source of
-/// truth for every read-back.
+/// own reference). Writes the inline `ob_item` buffer *and* the shared
+/// prefix `Object::List` `Rc` (the VM-visible view), keeping the two
+/// coherent so a VM holder of the same list sees the append.
 ///
 /// # Safety
 /// `p` must satisfy [`is_faithful_list`]; `item` must be a live,
 /// non-null `PyObject*`.
 pub unsafe fn list_append(p: *mut PyObject, item: *mut PyObject) {
+    if listsync_trace_enabled() {
+        let rcp = unsafe { list_rc_of(p) }
+            .map(|rc| weavepy_vm::sync::Rc::as_ptr(&rc) as usize)
+            .unwrap_or(0);
+        eprintln!(
+            "[LISTSYNC] append p={p:p} rc=0x{rcp:x} synced={} ob_size={}",
+            unsafe { (*prefix_of(p)).list_synced },
+            unsafe { list_size(p) },
+        );
+    }
+    unsafe { list_prefix_seed_once(p) };
+    // Adopt any *direct* C macro write first (RFC 0047, wave 5). Cython's
+    // `__Pyx_PyList_Append` inlines the append — `PyList_SET_ITEM` +
+    // `__Pyx_SET_SIZE`, no call into us — whenever the list has spare
+    // capacity and is more than half full, falling back to `PyList_Append`
+    // only on the grow step. Those macro-written elements exist solely in
+    // `ob_item`; pushing onto the stale prefix `Rc` here and then stamping
+    // the buffer as agreed would orphan them from the VM view forever
+    // (pandas' `get_blkno_indexers` built [0,1,2,3,7] out of 8 appends —
+    // `AssertionError: Gaps in blk ref_locs`).
+    unsafe { reconcile_list_from_c(p) };
     let n = unsafe { list_size(p) } as usize;
     let base = unsafe { list_reserve(p, n + 1) };
     unsafe { crate::object::Py_IncRef(item) };
     unsafe { *base.add(n) = item };
     let vo = p as *mut layout::PyVarObject;
     unsafe { (*vo).ob_size = (n + 1) as PySsizeT };
+    // Write-through to the shared prefix `Rc` (identity preserved) so a VM
+    // alias — a `defaultdict[k]` list a Cython `.append(...)` mutated —
+    // observes the append (RFC 0047, wave 5).
+    if let Some(rc) = unsafe { list_rc_of(p) } {
+        rc.borrow_mut()
+            .push(unsafe { crate::object::clone_object(item) });
+    }
+    unsafe { note_c_agreement(p) };
 }
 
 /// Insert `item` before `pos` (clamped to `[0, len]`) in a faithful list
@@ -597,6 +2997,10 @@ pub unsafe fn list_append(p: *mut PyObject, item: *mut PyObject) {
 /// `p` must satisfy [`is_faithful_list`]; `item` must be a live,
 /// non-null `PyObject*`.
 pub unsafe fn list_insert(p: *mut PyObject, pos: PySsizeT, item: *mut PyObject) {
+    unsafe { list_prefix_seed_once(p) };
+    // Adopt macro-written elements before the targeted `Rc` mutation (see
+    // [`list_append`]) — a stale prefix would misplace the insert.
+    unsafe { reconcile_list_from_c(p) };
     let n = unsafe { list_size(p) } as usize;
     let base = unsafe { list_reserve(p, n + 1) };
     let at = pos.clamp(0, n as PySsizeT) as usize;
@@ -607,6 +3011,13 @@ pub unsafe fn list_insert(p: *mut PyObject, pos: PySsizeT, item: *mut PyObject) 
     unsafe { *base.add(at) = item };
     let vo = p as *mut layout::PyVarObject;
     unsafe { (*vo).ob_size = (n + 1) as PySsizeT };
+    // Mirror the insert into the shared prefix `Rc` (RFC 0047, wave 5).
+    if let Some(rc) = unsafe { list_rc_of(p) } {
+        let mut v = rc.borrow_mut();
+        let at = at.min(v.len());
+        v.insert(at, unsafe { crate::object::clone_object(item) });
+    }
+    unsafe { note_c_agreement(p) };
 }
 
 /// Overwrite the `pos`-th slot of a faithful list mirror, **stealing**
@@ -622,6 +3033,11 @@ pub unsafe fn list_store(p: *mut PyObject, pos: PySsizeT, item: *mut PyObject) -
     if pos < 0 || pos >= n {
         return false;
     }
+    unsafe { list_prefix_seed_once(p) };
+    // Adopt macro-written elements before the targeted `Rc` mutation (see
+    // [`list_append`]) — on a stale (short) prefix the index could fall
+    // past `v.len()` and the store would vanish from the VM view.
+    unsafe { reconcile_list_from_c(p) };
     let lo = p as *mut layout::PyListObject;
     let base = unsafe { (*lo).ob_item };
     let slot = unsafe { base.add(pos as usize) };
@@ -630,6 +3046,15 @@ pub unsafe fn list_store(p: *mut PyObject, pos: PySsizeT, item: *mut PyObject) -
     if !prev.is_null() {
         unsafe { crate::object::Py_DecRef(prev) };
     }
+    // Mirror the store into the shared prefix `Rc` (RFC 0047, wave 5).
+    if let Some(rc) = unsafe { list_rc_of(p) } {
+        let mut v = rc.borrow_mut();
+        let idx = pos as usize;
+        if idx < v.len() {
+            v[idx] = unsafe { crate::object::clone_object(item) };
+        }
+    }
+    unsafe { note_c_agreement(p) };
     true
 }
 
@@ -666,6 +3091,18 @@ pub unsafe fn list_permute(p: *mut PyObject, ptrs: &[*mut PyObject]) {
     for (i, &pp) in ptrs.iter().enumerate() {
         unsafe { *base.add(i) = pp };
     }
+    // Re-publish the reordering into the shared prefix `Rc`, in place so a
+    // VM alias observes it (RFC 0047, wave 5).
+    let pre = unsafe { prefix_of(p) };
+    if let Some(rc) = unsafe { list_rc_of(p) } {
+        let cur = unsafe { read_list_vec(p) };
+        *rc.borrow_mut() = cur;
+        if !unsafe { (*pre).list_synced } {
+            unsafe { (*pre).list_synced = true };
+            register_seeded_list(p);
+        }
+    }
+    unsafe { note_c_agreement(p) };
 }
 
 /// Borrow the C-side state pointer stored in the prefix.
@@ -684,7 +3121,32 @@ pub unsafe fn user_data(p: *mut PyObject) -> *mut c_void {
 /// `p` must satisfy [`is_mirror`] and have a zero (or about-to-be-zero)
 /// refcount; it must not be used afterwards.
 pub unsafe fn free_mirror(p: *mut PyObject) {
+    unsafe { record_mirror_free(p) };
     crate::object::unregister_minted(p);
+    // Release any argument references `PyArg_ParseTuple` tethered to this
+    // owner's lifetime (RFC 0047, wave 5); no-op unless tethers exist.
+    crate::argparse::drop_tethered(p);
+    // Drop a seeded list mirror from the write-through set. Gated on the
+    // atomic so an ordinary mirror free (float/int/…) never takes the lock.
+    if SEEDED_LIST_COUNT.load(Ordering::Relaxed) > 0 && unsafe { is_faithful_list(p) } {
+        unregister_seeded_list(p);
+    }
+    // RFC 0047 (wave 5): drop this box from the canonical list cache before
+    // its prefix (and the native `Rc` the key is derived from) is dropped.
+    if unsafe { is_faithful_list(p) } {
+        unsafe { unregister_list_box(p) };
+    }
+    // RFC 0047 (wave 5): drop this box from the canonical set cache before
+    // its prefix (and the native `Rc` the key is derived from) is dropped.
+    if SET_BOX_COUNT.load(Ordering::Relaxed) > 0 && unsafe { is_faithful_set(p) } {
+        unsafe { unregister_set_box(p) };
+    }
+    // Likewise drop this box from the canonical builtin cache (`operator.eq`
+    // &c.) before its prefix `Rc` is dropped, so the next crossing of the
+    // same native builtin mints (and re-registers) a fresh canonical box.
+    if BUILTIN_BOX_COUNT.load(Ordering::Relaxed) > 0 && unsafe { is_faithful_builtin(p) } {
+        unsafe { unregister_builtin_box(p) };
+    }
     let pre = unsafe { prefix_of(p) };
     let destructor = unsafe { (*pre).destructor };
     if let Some(d) = destructor {
@@ -694,11 +3156,14 @@ pub unsafe fn free_mirror(p: *mut PyObject) {
     let aux_ptr = unsafe { (*pre).aux_ptr };
     let aux_size = unsafe { (*pre).aux_size };
 
-    // A non-null aux buffer is a list's out-of-line `ob_item` (RFC 0046,
-    // wave 4); the list owns one reference to each element (including any
-    // a stock `PyList_SET_ITEM` stored directly), so release them before
-    // freeing the buffer. Immortal singletons (None/bool) no-op.
-    if !aux_ptr.is_null() && aux_size > 0 {
+    // A list's out-of-line `ob_item` (RFC 0046, wave 4) holds one owned
+    // reference per element (including any a stock `PyList_SET_ITEM` stored
+    // directly), so release them before freeing the buffer. Immortal
+    // singletons (None/bool) no-op. Gated on `is_faithful_list`: a faithful
+    // **memoryview** mirror (RFC 0047, wave 5) also carries an aux buffer,
+    // but its bytes are packed `shape`/`strides`/data/format — *not*
+    // `PyObject*` slots — and must never be decref'd here.
+    if !aux_ptr.is_null() && aux_size > 0 && unsafe { is_faithful_list(p) } {
         let n = (aux_size / std::mem::size_of::<*mut PyObject>()) as isize;
         let slots = aux_ptr as *mut *mut PyObject;
         for i in 0..n {
@@ -728,6 +3193,44 @@ pub unsafe fn free_mirror(p: *mut PyObject) {
         }
     }
 
+    // RFC 0047 (wave 5): a faithful bound method owns one reference to each
+    // of `im_func` and `im_self` (materialised in `fill_body`), so release
+    // them before the block goes away. Immortal singletons no-op.
+    if unsafe { is_faithful_method(p) } {
+        let mo = p as *mut layout::PyMethodObject;
+        let func = unsafe { (*mo).im_func };
+        let recv = unsafe { (*mo).im_self };
+        if !func.is_null() {
+            unsafe { crate::object::Py_DecRef(func) };
+        }
+        if !recv.is_null() {
+            unsafe { crate::object::Py_DecRef(recv) };
+        }
+    }
+
+    // RFC 0047 (wave 5): a faithful slice owns one reference to each of
+    // `start`/`stop`/`step` (materialised in `fill_body`), so release them
+    // before the block goes away. Immortal singletons (None/bool) no-op.
+    if unsafe { is_faithful_slice(p) } {
+        let so = p as *mut layout::PySliceObject;
+        for field in [unsafe { (*so).start }, unsafe { (*so).stop }, unsafe {
+            (*so).step
+        }] {
+            if !field.is_null() {
+                unsafe { crate::object::Py_DecRef(field) };
+            }
+        }
+    }
+
+    // RFC 0047 (wave 5): C is dropping what may be the native object's
+    // last program-visible reference (a faithful tuple/list mirror
+    // decref'd inside a Cython setter — pandas' `self.blocks = new`
+    // releasing the old `tuple[Block, ...]`). Park instance/container
+    // natives for a refcount-guarded reap at the next eval-loop safe
+    // point so members that died with the container get their weakrefs
+    // cleared with CPython's timing; anything still alive elsewhere
+    // fails the reap's deadness test untouched.
+    weavepy_vm::vm_singletons::queue_cext_dropped(unsafe { &(*pre).obj });
     // Drop the owning native object (releasing its Rc clones).
     unsafe { ptr::drop_in_place(ptr::addr_of_mut!((*pre).obj)) };
 
@@ -770,6 +3273,42 @@ enum BodyKind {
     /// write a function's docstring, so `m_ml` must point at a real,
     /// writable `PyMethodDef` (carried just past the object body).
     CFunction,
+    /// Faithful `PyMethodObject` (a bound method) with `im_func`/`im_self`
+    /// populated (RFC 0047, wave 5). Macro-heavy Cython unpacks a bound
+    /// method by reading those two fields straight off the struct
+    /// (`PyMethod_GET_FUNCTION` / `PyMethod_GET_SELF`) before calling — so
+    /// they must hold real, owned `PyObject*`s, not opaque box bytes.
+    Method,
+    /// Faithful `PyDictObject` header (RFC 0047, wave 5): `ma_used` holds
+    /// the item count so a stock `PyDict_GET_SIZE` / the Cython keyword
+    /// fast path reads the right size. The entries live in the prefix's
+    /// native dict (reached via the C-API functions), so `ma_keys` /
+    /// `ma_values` stay NULL.
+    Dict,
+    /// Faithful `PySetObject` header (RFC 0047, wave 5): `fill`/`used` hold
+    /// the element count so a stock `PySet_GET_SIZE` / `PyFrozenSet_GET_SIZE`
+    /// macro — which Cython emits for both `len(s)` and the truthiness test
+    /// `if s:` on a set-typed value — reads the right size. `table` points at
+    /// the inline (empty) `smalltable`; the entries live in the prefix's
+    /// native set (reached via `PySet_Size` / `tp_iter`).
+    Set,
+    /// Faithful `PySliceObject` (RFC 0047, wave 5) with `start`/`stop`/`step`
+    /// populated as owned references. Macro-heavy Cython reads those three
+    /// fields straight off the struct (`((PySliceObject*)s)->step`), so they
+    /// must hold real `PyObject*`s. A slice is immutable, so the prefix's
+    /// staged `Object` stays authoritative on read-back; these owned refs are
+    /// released in `free_mirror`.
+    Slice,
+    /// Faithful `PyMemoryViewObject` (RFC 0047, wave 5) with a populated
+    /// inline `Py_buffer view`. `PyMemoryView_GET_BUFFER` is a macro
+    /// (`&mv->view`), so Cython's fused-type dispatch reads `view.ndim`,
+    /// `view.itemsize` and `view.format` straight off the struct — pandas'
+    /// `lib.map_infer_mask` keys its `ndarray[object]` specialization on
+    /// `itemsize == 8`/`format == "O"`. `view.buf`/`format`/`shape`/`strides`
+    /// point into the mirror's out-of-line aux buffer (freed in
+    /// `free_mirror`); the prefix's staged `Object::MemoryView` stays
+    /// authoritative on read-back.
+    MemoryView,
     /// Head-only body; the native value lives only in the prefix.
     Generic,
 }
@@ -799,11 +3338,38 @@ impl BodyPlan {
                 // varhead(24) + ob_shash(8) + (len+1) NUL-terminated.
                 body_size: round_up(24 + 8 + b.len() + 1, 8),
             },
-            Object::Str(s) if is_ascii_or_latin1(s) => BodyPlan {
-                kind: BodyKind::Str,
-                // PyASCIIObject(40) + (len+1) bytes of 1-byte chars.
-                body_size: round_up(40 + s.chars().count() + 1, 8),
-            },
+            Object::Str(s) => {
+                // Every string — 1-, 2-, or 4-byte kind — gets a faithful
+                // PEP 393 compact body so a stock extension's inlined
+                // `PyUnicode_DATA`/`PyUnicode_KIND`/`PyUnicode_GET_LENGTH`
+                // macros (and Cython's f-string / `str.join` fast paths,
+                // which read the parts' buffers directly) address real
+                // memory. A compact-ASCII string carries its 1-byte data
+                // just past `PyASCIIObject`; a compact non-ASCII string
+                // (Latin-1, UCS-2, or UCS-4) carries it past
+                // `PyCompactUnicodeObject`, where the inlined `PyUnicode_DATA`
+                // macro reads it (keyed off the `ascii`/`kind` state bits).
+                // Size the body for whichever kind `fill_str` will write.
+                let n = s.chars().count();
+                let (_kind, _ascii, data_off, width) = unicode_form(str_maxchar(s));
+                BodyPlan {
+                    kind: BodyKind::Str,
+                    body_size: round_up(data_off + (n + 1) * width, 8),
+                }
+            }
+            Object::WStr(cps) => {
+                // A surrogate-bearing string gets the same faithful PEP 393
+                // body as a plain `str` — CPython happily stores lone
+                // surrogates in UCS-2/UCS-4 buffers, and stock readers
+                // (`PyUnicode_GET_LENGTH`, `PyUnicode_READ`) must see them.
+                let n = cps.len();
+                let maxchar = cps.iter().copied().max().unwrap_or(0);
+                let (_kind, _ascii, data_off, width) = unicode_form(maxchar);
+                BodyPlan {
+                    kind: BodyKind::Str,
+                    body_size: round_up(data_off + (n + 1) * width, 8),
+                }
+            }
             Object::Tuple(t) => BodyPlan {
                 kind: BodyKind::Tuple,
                 // varhead(24) + n pointers.
@@ -823,6 +3389,36 @@ impl BodyPlan {
                 // method def is released with the object.
                 body_size: std::mem::size_of::<layout::PyCFunctionObject>()
                     + std::mem::size_of::<layout::PyMethodDef>(),
+            },
+            Object::BoundMethod(_) => BodyPlan {
+                kind: BodyKind::Method,
+                // Exactly `PyMethodObject`; `im_func`/`im_self` are owned
+                // refs filled in `fill_body` and released in `free_mirror`.
+                body_size: std::mem::size_of::<layout::PyMethodObject>(),
+            },
+            Object::Dict(_) => BodyPlan {
+                kind: BodyKind::Dict,
+                // Exactly `PyDictObject`; only `ma_used` is populated.
+                body_size: std::mem::size_of::<layout::PyDictObject>(),
+            },
+            Object::Set(_) | Object::FrozenSet(_) => BodyPlan {
+                kind: BodyKind::Set,
+                // Exactly `PySetObject`; `fill`/`used` carry the count and
+                // `table` points at the inline (empty) `smalltable`.
+                body_size: std::mem::size_of::<layout::PySetObject>(),
+            },
+            Object::Slice(_) => BodyPlan {
+                kind: BodyKind::Slice,
+                // Exactly `PySliceObject`; `start`/`stop`/`step` are owned
+                // refs filled in `fill_body` and released in `free_mirror`.
+                body_size: std::mem::size_of::<layout::PySliceObject>(),
+            },
+            Object::MemoryView(_) => BodyPlan {
+                kind: BodyKind::MemoryView,
+                // Exactly `PyMemoryViewObject` (up to `weakreflist`); the
+                // inline `view`'s `buf`/`format`/`shape`/`strides` point at a
+                // packed out-of-line aux buffer filled in `fill_body`.
+                body_size: std::mem::size_of::<layout::PyMemoryViewObject>(),
             },
             _ => BodyPlan {
                 kind: BodyKind::Generic,
@@ -849,7 +3445,10 @@ unsafe fn fill_body(
         BodyKind::Float => {
             if let Object::Float(f) = obj {
                 let fo = body as *mut layout::PyFloatObject;
-                unsafe { (*fo).ob_fval = *f };
+                // C reads `ob_fval` via the `PyFloat_AS_DOUBLE` macro; it
+                // must hold the canonical NaN bits CPython would store, not
+                // WeavePy's identity tag (see `untag_nan`).
+                unsafe { (*fo).ob_fval = weavepy_vm::object::untag_nan(*f) };
             }
         }
         BodyKind::Complex => {
@@ -857,8 +3456,8 @@ unsafe fn fill_body(
                 let co = body as *mut layout::PyComplexObject;
                 unsafe {
                     (*co).cval = layout::PyComplexValue {
-                        real: c.real,
-                        imag: c.imag,
+                        real: weavepy_vm::object::untag_nan(c.real),
+                        imag: weavepy_vm::object::untag_nan(c.imag),
                     };
                 }
             }
@@ -912,6 +3511,31 @@ unsafe fn fill_body(
                         eprintln!("[fill_body tuple n=2] i={i} kind={k} ep={ep:p}");
                     }
                     unsafe { *base.add(i) = ep };
+                }
+                // RFC 0047 (wave 5): snapshot the freshly-written `ob_item`
+                // pointers into the (otherwise unused for tuples) aux buffer.
+                // [`native_of`]'s read-back compares the live slots against
+                // this snapshot: unchanged slots mean no stock
+                // `PyTuple_SET_ITEM` rewired the tuple, so the prefix's
+                // native `Object::Tuple` — for a VM-minted tuple, the
+                // *original* `Rc` — is returned with its identity intact
+                // (CPython parity: an object stored into and read back out
+                // of a C container `is` itself; pandas'
+                // `test_np_max_nested_tuples` asserts `arr.max() is arr[2]`).
+                // The buffer holds raw pointer values, not owned references
+                // (`free_mirror`'s decref pass is list-gated; the generic
+                // aux `dealloc` releases the block itself).
+                if !t.is_empty() {
+                    let bytes = t.len() * std::mem::size_of::<*mut PyObject>();
+                    let buf_layout =
+                        Layout::from_size_align(bytes, BODY_ALIGN).expect("tuple seed layout");
+                    let buf = unsafe { alloc(buf_layout) };
+                    assert!(!buf.is_null(), "tuple seed allocation failed");
+                    unsafe {
+                        ptr::copy_nonoverlapping(base as *const u8, buf, bytes);
+                    }
+                    *aux_ptr = buf;
+                    *aux_size = bytes;
                 }
             }
         }
@@ -983,6 +3607,207 @@ unsafe fn fill_body(
             }
             let _ = (aux_ptr, aux_size);
         }
+        BodyKind::Method => {
+            // Lay a faithful `PyMethodObject` over the body and populate
+            // `im_func`/`im_self` with owned references, so a stock
+            // `PyMethod_GET_FUNCTION(m)` / `PyMethod_GET_SELF(m)` (the
+            // macros Cython's `with`/`for`/call fast paths inline) read a
+            // real function and receiver rather than Rust enum bytes. The
+            // calling convention WeavePy applies when the *method* is
+            // invoked (prepend `receiver`, call `function`) matches what
+            // Cython does after unpacking (prepend `im_self`, call
+            // `im_func`), so both routes reach the same callee with the
+            // same `self`. `im_weakreflist`/`vectorcall` stay NULL — the
+            // method is never invoked through its own vectorcall slot (its
+            // `tp_call` is unset, so a stock `PyObject_Call` routes through
+            // the VM via the prefix's `BoundMethod`). The owning
+            // `BoundMethod` also lives in the prefix, so these two extra
+            // owned refs are released in `free_mirror`.
+            if let Object::BoundMethod(bm) = obj {
+                let mo = body as *mut layout::PyMethodObject;
+                let func = crate::object::into_owned(bm.function.clone());
+                let recv = crate::object::into_owned(bm.receiver.clone());
+                unsafe {
+                    (*mo).im_func = func;
+                    (*mo).im_self = recv;
+                    (*mo).im_weakreflist = ptr::null_mut();
+                    (*mo).vectorcall = ptr::null_mut();
+                }
+            }
+            let _ = (aux_ptr, aux_size);
+        }
+        BodyKind::Dict => {
+            // Faithful `PyDictObject` header. Only `ma_used` (the item
+            // count a stock `PyDict_GET_SIZE` reads directly) is meaningful;
+            // the entries are served from the prefix's native dict through
+            // the C-API, so `ma_keys` / `ma_values` stay NULL.
+            if let Object::Dict(rc) = obj {
+                let d = body as *mut layout::PyDictObject;
+                unsafe {
+                    (*d).ma_used = rc.borrow().len() as PySsizeT;
+                    (*d).ma_version_tag = 0;
+                    (*d).ma_keys = ptr::null_mut();
+                    (*d).ma_values = ptr::null_mut();
+                }
+            }
+            let _ = (aux_ptr, aux_size);
+        }
+        BodyKind::Set => {
+            // Faithful `PySetObject` header. `fill`/`used` are the element
+            // count a stock `PySet_GET_SIZE` reads directly; the entries are
+            // served from the prefix's native set via the C-API, so `table`
+            // just points at the (zeroed) inline `smalltable` and the set
+            // looks like a freshly-initialised — if under-populated — CPython
+            // set (`mask == PySet_MINSIZE - 1`, `hash == -1`, `finger == 0`).
+            let n = match obj {
+                Object::Set(rc) => rc.borrow().len() as PySsizeT,
+                Object::FrozenSet(fs) => fs.len() as PySsizeT,
+                _ => 0,
+            };
+            let so = body as *mut layout::PySetObject;
+            unsafe {
+                (*so).fill = n;
+                (*so).used = n;
+                (*so).mask = (layout::PYSET_MINSIZE - 1) as PySsizeT;
+                (*so).table = ptr::addr_of_mut!((*so).smalltable) as *mut core::ffi::c_void;
+                (*so).hash = -1;
+                (*so).finger = 0;
+                (*so).weakreflist = ptr::null_mut();
+            }
+            let _ = (aux_ptr, aux_size);
+        }
+        BodyKind::Slice => {
+            // Lay a faithful `PySliceObject` over the body and populate
+            // `start`/`stop`/`step` with owned references, so a stock
+            // `((PySliceObject*)s)->step` read (and the inline incref/decref
+            // Cython brackets it with) hits real `PyObject*`s. A `None`
+            // component reuses the immortal singleton so the incref/decref is a
+            // no-op. The three owned refs are released in `free_mirror`.
+            if let Object::Slice(s) = obj {
+                let so = body as *mut layout::PySliceObject;
+                let materialise = |o: &Object| -> *mut PyObject {
+                    match o {
+                        Object::None => crate::singletons::none_ptr(),
+                        Object::Bool(true) => crate::singletons::true_ptr(),
+                        Object::Bool(false) => crate::singletons::false_ptr(),
+                        _ => crate::object::into_owned(o.clone()),
+                    }
+                };
+                unsafe {
+                    (*so).start = materialise(&s.start);
+                    (*so).stop = materialise(&s.stop);
+                    (*so).step = materialise(&s.step);
+                }
+            }
+            let _ = (aux_ptr, aux_size);
+        }
+        BodyKind::MemoryView => {
+            // Lay a faithful `PyMemoryViewObject` over the body and populate
+            // its inline `Py_buffer view`, so a stock `PyMemoryView_GET_BUFFER`
+            // macro (`&mv->view`) and the `__Pyx_PyMemoryView_Get_*` reads it
+            // feeds hit real `ndim`/`itemsize`/`format`/`shape`/`strides`. The
+            // window bytes, NUL-terminated format and the `shape`/`strides`
+            // `Py_ssize_t` arrays are packed into one out-of-line aux block
+            // (`view` points into it); the prefix's staged `Object::MemoryView`
+            // stays authoritative on read-back ([`native_of`]). The aux block
+            // is freed in [`free_mirror`] (gated off the list path, so its
+            // bytes are never mistaken for `PyObject*` slots).
+            if let Object::MemoryView(mv) = obj {
+                let mo = body as *mut layout::PyMemoryViewObject;
+                let itemsize = mv.itemsize.get().max(1);
+                let nbytes = mv.len.get();
+                let shape = mv.shape_dims();
+                let strides = mv.stride_bytes();
+                let ndim = shape.len();
+                let data = if mv.released.get() {
+                    Vec::new()
+                } else {
+                    mv.to_bytes()
+                };
+                let fmt = mv.format.borrow();
+                let fmt_bytes = fmt.as_bytes();
+
+                // Pack: [shape: ndim·8][strides: ndim·8][data][format+NUL],
+                // 8-aligned arrays first so `view.shape`/`strides` are aligned.
+                let ssz = std::mem::size_of::<PySsizeT>();
+                let shape_off = 0usize;
+                let strides_off = shape_off + ndim * ssz;
+                let data_off = strides_off + ndim * ssz;
+                let fmt_off = data_off + data.len();
+                let total_aux = round_up(fmt_off + fmt_bytes.len() + 1, 8).max(8);
+                let aux_layout =
+                    Layout::from_size_align(total_aux, BODY_ALIGN).expect("mv aux layout");
+                let aux = unsafe { alloc(aux_layout) };
+                assert!(!aux.is_null(), "mv aux allocation failed");
+                unsafe { ptr::write_bytes(aux, 0, total_aux) };
+
+                let shape_ptr = unsafe { aux.add(shape_off) } as *mut PySsizeT;
+                let strides_ptr = unsafe { aux.add(strides_off) } as *mut PySsizeT;
+                let data_ptr = unsafe { aux.add(data_off) };
+                let fmt_ptr = unsafe { aux.add(fmt_off) } as *mut core::ffi::c_char;
+                for i in 0..ndim {
+                    unsafe {
+                        *shape_ptr.add(i) = shape[i] as PySsizeT;
+                        *strides_ptr.add(i) = strides[i] as PySsizeT;
+                    }
+                }
+                if !data.is_empty() {
+                    unsafe {
+                        ptr::copy_nonoverlapping(data.as_ptr(), data_ptr, data.len());
+                    }
+                }
+                unsafe {
+                    ptr::copy_nonoverlapping(fmt_bytes.as_ptr(), aux.add(fmt_off), fmt_bytes.len());
+                }
+
+                // `_Py_MEMORYVIEW_C`(1) | `_Py_MEMORYVIEW_FORTRAN`(2): a
+                // contiguous view advertises both for 1-D, matching CPython's
+                // `init_flags`. A released view advertises `_RELEASED`(16).
+                let mut flags: core::ffi::c_int = 0;
+                if mv.released.get() {
+                    flags |= 0x10;
+                } else if mv.is_c_contiguous() {
+                    flags |= 0x1;
+                    if ndim <= 1 {
+                        flags |= 0x2;
+                    }
+                }
+
+                unsafe {
+                    // `PyObject_VAR_HEAD` `ob_size` is `ndim` (CPython sizes
+                    // the `ob_array` tail off it); harmless to a reader that
+                    // uses `view.ndim`.
+                    (*mo).ob_base.ob_size = ndim as PySsizeT;
+                    (*mo).mbuf = ptr::null_mut();
+                    (*mo).hash = -1;
+                    (*mo).flags = flags;
+                    (*mo).exports = 0;
+                    (*mo).weakreflist = ptr::null_mut();
+                    // `view.obj` stays NULL: a stray `PyBuffer_Release` on the
+                    // macro-fetched view is then a no-op (no spurious decref of
+                    // the memoryview). The real buffer protocol path
+                    // (`PyObject_GetBuffer(mv, …)`) is serviced separately by
+                    // `fill_native_buffer`'s `MemoryView` branch.
+                    (*mo).view.buf = data_ptr as *mut std::ffi::c_void;
+                    (*mo).view.obj = ptr::null_mut();
+                    (*mo).view.len = nbytes as PySsizeT;
+                    (*mo).view.itemsize = itemsize as PySsizeT;
+                    (*mo).view.readonly = core::ffi::c_int::from(mv.readonly.get());
+                    (*mo).view.ndim = ndim as core::ffi::c_int;
+                    (*mo).view.format = fmt_ptr;
+                    (*mo).view.shape = if ndim > 0 { shape_ptr } else { ptr::null_mut() };
+                    (*mo).view.strides = if ndim > 0 {
+                        strides_ptr
+                    } else {
+                        ptr::null_mut()
+                    };
+                    (*mo).view.suboffsets = ptr::null_mut();
+                    (*mo).view.internal = ptr::null_mut();
+                }
+                *aux_ptr = aux;
+                *aux_size = total_aux;
+            }
+        }
         BodyKind::Generic => {
             // Head-only: nothing to fill. Suppress "unused" on a list's
             // would-be aux buffer.
@@ -1017,28 +3842,73 @@ unsafe fn fill_long(body: *mut PyObject, obj: &Object) {
     }
 }
 
-/// Fill a compact 1-byte (ASCII or Latin-1) unicode body.
+/// Fill a compact PEP 393 unicode body of the kind implied by the string's
+/// largest code point: 1-byte (compact-ASCII or Latin-1), 2-byte (UCS-2), or
+/// 4-byte (UCS-4). The data offset (and the `ascii` state bit) differ
+/// between the compact-ASCII form (data past `PyASCIIObject`) and the
+/// compact non-ASCII forms (data past `PyCompactUnicodeObject`, where the
+/// inlined `PyUnicode_DATA` macro reads it). Each code point is stored at
+/// its kind's width and the buffer is NUL-terminated with one trailing unit,
+/// so a stock reader's `PyUnicode_READ`/`PyUnicode_DATA` and Cython's
+/// `str.join`/f-string fast paths address a real, correctly-sized buffer.
 unsafe fn fill_str(body: *mut PyObject, obj: &Object) {
-    let Object::Str(s) = obj else { return };
-    let is_ascii = s.is_ascii();
-    let chars: Vec<u8> = s.chars().map(|c| c as u8).collect(); // latin-1 guaranteed by planner
-    let n = chars.len();
+    // A `WStr` (lone surrogates) fills the same faithful body; its code
+    // points are stored verbatim so a stock `PyUnicode_READ` sees the
+    // surrogate and `PyUnicode_AsUTF8*` can raise the canonical
+    // UnicodeEncodeError. The hash comes from the VM's `hash()` (dict-
+    // bucketing-consistent), like `py_str_hash` for a plain `str`.
+    let (cps, hash): (Vec<u32>, i64) = match obj {
+        Object::Str(s) => (
+            s.chars().map(|c| c as u32).collect(),
+            weavepy_vm::object::py_str_hash(s),
+        ),
+        Object::WStr(w) => {
+            let h = match weavepy_vm::builtins::hash_object(obj) {
+                Ok(Object::Int(h)) => h,
+                _ => -2,
+            };
+            (w.to_vec(), h)
+        }
+        _ => return,
+    };
+    let maxchar = cps.iter().copied().max().unwrap_or(0);
+    let (kind, ascii, data_off, width) = unicode_form(maxchar);
+    let n = cps.len();
     let ao = body as *mut layout::PyASCIIObject;
     unsafe {
         (*ao).length = n as PySsizeT;
-        (*ao).hash = -1;
+        // RFC 0047 (wave 5): publish the real hash, not CPython's
+        // "uncomputed" sentinel (-1). Macro-heavy Cython matches keyword
+        // arguments by reading `((PyASCIIObject*)key)->hash` *directly*
+        // off the struct and comparing it to each interned argname's hash
+        // (`__Pyx_MatchKeywordArg_str`); both sides are WeavePy-minted
+        // strings, so a `py_str_hash`-consistent value makes the compare
+        // agree. Leaving -1 made every Cython keyword call fail with a
+        // spurious "unexpected keyword argument".
+        (*ao).hash = hash as crate::object::PyHashT;
         (*ao).state = ustate::pack(
             0, // not interned
-            ustate::KIND_1BYTE,
-            true,     // compact
-            is_ascii, // ascii
-            false,    // not statically allocated
+            kind, true,  // compact
+            ascii, // ascii
+            false, // not statically allocated
         );
-        // Compact-ASCII data follows the PyASCIIObject inline.
-        let data = (body as *mut u8).add(std::mem::size_of::<layout::PyASCIIObject>());
-        ptr::copy_nonoverlapping(chars.as_ptr(), data, n);
-        *data.add(n) = 0;
+        let data = (body as *mut u8).add(data_off);
+        for (i, cp) in cps.iter().enumerate() {
+            write_codepoint(data, kind, i, *cp);
+        }
+        // NUL-terminate with one trailing code unit of the body's width.
+        match width {
+            1 => *data.add(n) = 0,
+            2 => *(data as *mut u16).add(n) = 0,
+            _ => *(data as *mut u32).add(n) = 0,
+        }
     }
+}
+
+/// The largest code point in `s` (0 for the empty string), for
+/// [`unicode_form`].
+fn str_maxchar(s: &str) -> u32 {
+    s.chars().map(|c| c as u32).max().unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1106,11 +3976,6 @@ fn to_base_2_30(mut mag: u128) -> Vec<layout::digit> {
     }
     out
 }
-
-fn is_ascii_or_latin1(s: &str) -> bool {
-    s.chars().all(|c| (c as u32) <= 0xFF)
-}
-
 const fn round_up(n: usize, align: usize) -> usize {
     (n + (align - 1)) & !(align - 1)
 }

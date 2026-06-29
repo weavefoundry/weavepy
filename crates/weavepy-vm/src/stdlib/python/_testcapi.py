@@ -27,6 +27,23 @@ from _testinternalcapi import (  # noqa: F401
 # behave sensibly.
 INT_MAX = 2**31 - 1
 INT_MIN = -(2**31)
+UINT_MAX = 2**32 - 1
+# C `long` is 64-bit on every LP64 Unix and 32-bit on Windows (LLP64).
+_LONG_BITS = 32 if sys.platform == "win32" else 64
+LONG_MAX = 2 ** (_LONG_BITS - 1) - 1
+LONG_MIN = -(2 ** (_LONG_BITS - 1))
+ULONG_MAX = 2**_LONG_BITS - 1
+LLONG_MAX = 2**63 - 1
+LLONG_MIN = -(2**63)
+ULLONG_MAX = 2**64 - 1
+SHRT_MAX = 2**15 - 1
+SHRT_MIN = -(2**15)
+USHRT_MAX = 2**16 - 1
+CHAR_MAX = 127
+CHAR_MIN = -128
+UCHAR_MAX = 255
+SIZEOF_TIME_T = 8
+SIZE_MAX = 2**64 - 1
 PY_SSIZE_T_MAX = sys.maxsize
 PY_SSIZE_T_MIN = -sys.maxsize - 1
 # <float.h> limits (IEEE 754 binary32 / binary64, the only layouts we

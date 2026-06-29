@@ -20,7 +20,7 @@
 //! addresses are stable keys.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use crate::object::Object;
@@ -90,6 +90,45 @@ pub fn module_of(obj: &Object) -> Option<&'static str> {
 pub fn module_of_builtin(b: &Rc<crate::object::BuiltinFn>) -> Option<&'static str> {
     let k = Rc::as_ptr(b).cast::<()>() as usize;
     BUILTIN_MODULE.read().get(&k).copied()
+}
+
+/// Pointers of the `BuiltinFn`s that back a harvested C descriptor's
+/// getter/setter (a `tp_getset` computed attribute or a `tp_members`
+/// struct field, decoded in `weavepy-capi`'s `getset` module).
+///
+/// These accessor closures are `Object::Builtin`s named after the C
+/// attribute — and that name can collide with a real `builtins` function
+/// (numpy's `dtype.str` getset getter is a `BuiltinFn { name: "str" }`).
+/// The dispatch loop's by-name builtin fast-paths key purely on
+/// `BuiltinFn::name`, so without this marker `dtype.str` would be hijacked
+/// by the `str(obj)` fast-path — which calls the dtype's `tp_str`
+/// (numpy's `_dtype.__str__`, which itself reads `dtype.str`) and spins
+/// into unbounded recursion. Descriptor invocation consults this set and
+/// calls the accessor's own closure directly, never the name fast-path.
+///
+/// PROCESS-GLOBAL for the same reason as [`BUILTIN_MODULE`]: a bridged
+/// type harvested on the import thread is shared across every interpreter
+/// thread through the module cache, and its descriptors may be read from
+/// any of them.
+static NATIVE_DESCR_ACCESSOR: LazyLock<parking_lot::RwLock<HashSet<usize>>> =
+    LazyLock::new(|| parking_lot::RwLock::new(HashSet::new()));
+
+/// Tag `obj` as the getter/setter closure of a harvested C descriptor, so
+/// [`is_native_descr_accessor`] recognizes it and the dispatch loop routes
+/// the call to its own closure instead of a same-named builtin fast-path.
+pub fn mark_native_descr_accessor(obj: &Object) {
+    if let Object::Builtin(b) = obj {
+        let k = Rc::as_ptr(b).cast::<()>() as usize;
+        NATIVE_DESCR_ACCESSOR.write().insert(k);
+    }
+}
+
+/// True when `b` backs a harvested C getset/member descriptor (tagged via
+/// [`mark_native_descr_accessor`]). Such a builtin must be invoked through
+/// its own closure, bypassing the by-name builtin fast-paths.
+pub fn is_native_descr_accessor(b: &Rc<crate::object::BuiltinFn>) -> bool {
+    let k = Rc::as_ptr(b).cast::<()>() as usize;
+    NATIVE_DESCR_ACCESSOR.read().contains(&k)
 }
 
 thread_local! {

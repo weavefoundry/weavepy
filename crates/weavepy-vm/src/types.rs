@@ -71,6 +71,23 @@ pub struct TypeObject {
     /// Invalidated (reset to `0`) for the type and its subclasses whenever
     /// `__getattribute__` is assigned to / deleted from a type's dict.
     pub getattribute_kind: Cell<u8>,
+    /// Cached classification of this type's `__setattr__` slot, same
+    /// protocol as [`Self::getattribute_kind`]: `0` = not yet computed,
+    /// `1` = default (`object.__setattr__`), `2` = a user override.
+    /// Consulted on every instance attribute store — the default routes
+    /// straight to the generic setter instead of a full builtin call
+    /// dispatch. Invalidated alongside `getattribute_kind` (same walk)
+    /// and on `__setattr__` assignment / deletion / MRO changes.
+    pub setattr_kind: Cell<u8>,
+    /// Attribute-resolution version, WeavePy's analogue of CPython's
+    /// `tp_version_tag`: bumped (for the type and every transitive
+    /// subclass) whenever the class dict or MRO changes in a way that can
+    /// alter attribute resolution — a class attribute set/delete or a
+    /// `__bases__` reshaping. LOAD_ATTR/STORE_ATTR inline caches embed
+    /// the value observed at specialisation time and deopt on mismatch,
+    /// so installing e.g. a `property` over a name that instances carry
+    /// in `__dict__` is seen by already-specialised call sites.
+    pub attr_version: Cell<u32>,
     /// Cached "do instances of this type carry a `__del__` finalizer
     /// anywhere in their MRO?" answer, so [`crate::object::PyInstance`]'s
     /// `Drop` safety net can skip an MRO walk on the hot per-instance drop
@@ -79,6 +96,80 @@ pub struct TypeObject {
     /// `__del__` is assigned to / deleted from a type's dict or the MRO is
     /// recomputed (`__bases__` assignment).
     pub has_del: Cell<u8>,
+    /// Memoised instantiation plan (`type(…)` call protocol resolution:
+    /// `__new__`/`__init__`/native-payload classification), stamped with
+    /// the [`Self::attr_version`] observed when it was built. Rebuilt
+    /// lazily whenever the version moved on. See
+    /// `Interpreter::instance_plan`.
+    pub instance_plan: RefCell<Option<(u32, Rc<InstancePlan>)>>,
+    /// The C `tp_name` of the extension type this class bridges, when it
+    /// differs from the bare [`Self::name`] (`"numpy.ndarray"` vs
+    /// `"ndarray"`). CPython's `tp_name`-based error text (the
+    /// "unsupported operand type(s)" family) prints this full dotted
+    /// string while `__name__` stays bare; set by the C-API bridge when a
+    /// stock extension type is readied. The `&'static` is a leaked copy —
+    /// bridged types are immortal.
+    pub c_tp_name: Cell<Option<&'static str>>,
+    /// The bridged C type carries a real `tp_as_sequence->sq_item` (RFC
+    /// 0047, wave 5). Set by the C-API bridge when an extension type is
+    /// readied/spec-built. `PyObject_GetIter`'s legacy fallback keys on
+    /// exactly this (`PySequence_Check`): a C type with `sq_item` but no
+    /// `tp_iter` is iterable through `PySeqIter` (numpy's
+    /// `_array_converter`), while a mapping whose `__getitem__` shim comes
+    /// from `mp_subscript` (numpy's parametric dtypes) is not. The VM's
+    /// `make_iter` consults this to replicate that distinction, which the
+    /// synthesised `__getitem__` dunder alone cannot express.
+    pub c_sq_item: Cell<bool>,
+}
+
+/// Per-class resolution of the `type.__call__` protocol, cached on the
+/// class ([`TypeObject::instance_plan`]) and invalidated by
+/// [`TypeObject::attr_version`]. Everything here is a pure function of
+/// the class dict / MRO — the *per-call* work (allocating the instance,
+/// running `__init__`) stays in `Interpreter::instantiate`.
+#[derive(Debug)]
+pub struct InstancePlan {
+    /// `Some(message)` when the class still carries unimplemented
+    /// abstract methods: instantiation fails with exactly this TypeError.
+    pub abstract_error: Option<String>,
+    /// The resolved user `__new__` (already unwrapped from its
+    /// static/classmethod wrapper, pre-bound for the classmethod form).
+    /// `None` when the default allocator (`object.__new__`) applies.
+    pub user_new: Option<Object>,
+    /// The MRO resolution of `__new__` was `object.__new__` itself.
+    pub is_object_new: bool,
+    /// Native payload classification for built-in value subclasses
+    /// (`class C(int)`, `class D(dict)`, …) and descriptor wrappers.
+    pub native: NativeKind,
+    /// The raw `__init__` MRO hit (may be a `Property` or any object; the
+    /// call-time match handles the shapes).
+    pub init_fn: Option<Object>,
+    /// That `__init__` is `object.__init__` (so the default-arity rules
+    /// apply and the call can be skipped when `__new__` is overridden).
+    pub init_from_object: bool,
+    /// Instances descend from `BaseException`: seed `.args` at allocation.
+    pub seeds_exception_args: bool,
+    /// The MRO beyond the class itself is just `object` — the strict
+    /// "takes no arguments" arity check applies when no `__init__` exists.
+    pub only_object_init: bool,
+}
+
+/// How a fresh instance's `native` payload is provisioned (see
+/// [`InstancePlan::native`]).
+#[derive(Debug, Clone)]
+pub enum NativeKind {
+    /// Plain Python instance — no native payload.
+    Plain,
+    /// Subclass of `property` — wrap a fresh property built from args.
+    Property,
+    /// Subclass of `classmethod`.
+    ClassMethod,
+    /// Subclass of `staticmethod`.
+    StaticMethod,
+    /// Subclass of a built-in value/container type: seed from the base's
+    /// constructor (`mutable` bases with a user `__init__` get an empty
+    /// payload instead — the `__init__` owns the filling).
+    Value { base: Rc<TypeObject>, mutable: bool },
 }
 
 impl std::fmt::Debug for TypeObject {
@@ -103,7 +194,7 @@ impl TypeObject {
         Self::new_with_flags(
             name,
             bases,
-            DictData::new(),
+            DictData::default(),
             TypeFlags {
                 is_exception: false,
                 is_builtin: true,
@@ -116,7 +207,7 @@ impl TypeObject {
         Self::new_with_flags(
             name,
             vec![base],
-            DictData::new(),
+            DictData::default(),
             TypeFlags {
                 is_exception: true,
                 is_builtin: true,
@@ -270,10 +361,26 @@ impl TypeObject {
         mut dict: DictData,
         flags: TypeFlags,
     ) -> Result<Rc<Self>, RuntimeError> {
-        // CPython `type_new`: `__qualname__` is removed from the class
-        // namespace and stored on the type itself.
-        let qualname = match dict.shift_remove(&DictKey(Object::from_static("__qualname__"))) {
-            Some(Object::Str(s)) => Some(s.to_string()),
+        // CPython `type_new`: a *string* `__qualname__` in the class
+        // namespace is removed and stored on the type itself.
+        //
+        // A getset/member *descriptor* named `__qualname__` is different:
+        // it describes the type's *instances* (Cython's
+        // `cython_function_or_method`, the generator/coroutine getsets, a
+        // `__slots__ = ["__qualname__"]` member) and must stay in the dict
+        // — the type's own qualname then falls back to its name, exactly as
+        // CPython does (those descriptors arrive via `tp_getset`/
+        // `tp_members`, never the `type_new` namespace). The C-API spec/
+        // ready bridge merges harvested descriptors into this same dict, so
+        // we recognise that case here rather than choking on it.
+        let qualname = match dict.get(&DictKey(Object::from_static("__qualname__"))) {
+            Some(Object::Str(_)) => {
+                match dict.shift_remove(&DictKey(Object::from_static("__qualname__"))) {
+                    Some(Object::Str(s)) => Some(s.to_string()),
+                    _ => None,
+                }
+            }
+            Some(v) if is_instance_descriptor(v) => None,
             Some(other) => {
                 return Err(type_error(format!(
                     "type __qualname__ must be a str, not {}",
@@ -282,6 +389,12 @@ impl TypeObject {
             }
             None => None,
         };
+        // Class dicts are the domain of `TypeObject::lookup`'s
+        // allocation-free fast pass; note any non-`str` namespace key so
+        // the Python-`__eq__` fallback probe knows it can be needed.
+        for k in dict.keys() {
+            crate::object::note_class_dict_key(k);
+        }
         let ty = Rc::new(TypeObject {
             name: name.to_owned(),
             qualname: RefCell::new(qualname),
@@ -295,7 +408,12 @@ impl TypeObject {
             forbids_dict: false,
             subclasses: RefCell::new(Vec::new()),
             getattribute_kind: Cell::new(0),
+            setattr_kind: Cell::new(0),
+            attr_version: Cell::new(0),
             has_del: Cell::new(0),
+            instance_plan: RefCell::new(None),
+            c_tp_name: Cell::new(None),
+            c_sq_item: Cell::new(false),
         });
         let mro = compute_c3(&ty, &bases, name)?;
         *ty.mro.borrow_mut() = mro;
@@ -560,17 +678,18 @@ impl TypeObject {
         bits
     }
 
-    /// Reset the cached `__getattribute__` classification for this type and
-    /// every (transitive) subclass. Called when `__getattribute__` is
-    /// assigned to or deleted from a type's dict, since that can change the
-    /// resolved slot for the type *and* anything inheriting from it. Class
-    /// hierarchies are acyclic, so the recursion terminates.
+    /// Reset the cached `__getattribute__` / `__setattr__` classifications
+    /// for this type and every (transitive) subclass. Called when either
+    /// dunder is assigned to or deleted from a type's dict, since that can
+    /// change the resolved slot for the type *and* anything inheriting from
+    /// it. Class hierarchies are acyclic, so the recursion terminates.
     pub fn invalidate_getattribute_cache(&self) {
         // Iterative walk with a visited set: reentrant `__bases__`
         // assignment can leave a *cycle* through the subclass registry
         // (gh-92112), which naive recursion would loop on forever.
         let mut visited: Vec<*const TypeObject> = vec![std::ptr::from_ref::<TypeObject>(self)];
         self.getattribute_kind.set(0);
+        self.setattr_kind.set(0);
         let mut queue: Vec<Rc<TypeObject>> = self.subclasses();
         while let Some(t) = queue.pop() {
             let ptr = Rc::as_ptr(&t);
@@ -579,8 +698,53 @@ impl TypeObject {
             }
             visited.push(ptr);
             t.getattribute_kind.set(0);
+            t.setattr_kind.set(0);
             queue.extend(t.subclasses());
         }
+    }
+
+    /// Advance [`Self::attr_version`] for this type and every transitive
+    /// subclass. Call after any class-dict mutation or MRO reshaping that
+    /// can change what an attribute name resolves to; specialised
+    /// LOAD_ATTR/STORE_ATTR sites guard on the version and deopt.
+    pub fn bump_attr_version(&self) {
+        let mut visited: Vec<*const TypeObject> = vec![std::ptr::from_ref::<TypeObject>(self)];
+        self.attr_version
+            .set(self.attr_version.get().wrapping_add(1));
+        let mut queue: Vec<Rc<TypeObject>> = self.subclasses();
+        while let Some(t) = queue.pop() {
+            let ptr = Rc::as_ptr(&t);
+            if visited.contains(&ptr) {
+                continue;
+            }
+            visited.push(ptr);
+            t.attr_version.set(t.attr_version.get().wrapping_add(1));
+            queue.extend(t.subclasses());
+        }
+    }
+
+    /// Classify this type's resolved `__setattr__`: `true` when it is the
+    /// stock `object.__setattr__` default (so an instance attribute store
+    /// may run the generic setter directly), `false` when any class in the
+    /// MRO overrides it. Cached in [`Self::setattr_kind`].
+    pub fn setattr_is_default(&self) -> bool {
+        match self.setattr_kind.get() {
+            1 => return true,
+            2 => return false,
+            _ => {}
+        }
+        let default = match self.lookup_with_owner("__setattr__") {
+            // The stock default: `object`'s own builtin. Owner identity —
+            // not value shape — so a user class *shadowing* the name with
+            // a copied builtin still dispatches through the full path.
+            Some((Object::Builtin(_), owner)) => {
+                Rc::ptr_eq(&owner, &crate::builtin_types::builtin_types().object_)
+            }
+            None => true,
+            Some(_) => false,
+        };
+        self.setattr_kind.set(if default { 1 } else { 2 });
+        default
     }
 
     /// Do instances of this type carry a `__del__` finalizer anywhere in
@@ -683,6 +847,21 @@ impl TypeObject {
 
     /// Look up `name` in this type's MRO.
     pub fn lookup(&self, name: &str) -> Option<Object> {
+        // Fast pass: allocation-free `StrKey` probes, walking the MRO
+        // under its borrow. Holding the borrow across the probes is
+        // safe while every class-dict key in the process is a plain
+        // `str` — the comparisons are then pure native code and can
+        // never re-enter Python to reassign `__bases__` mid-walk.
+        if !crate::object::exotic_str_keys_possible() {
+            let key = crate::object::StrKey(name);
+            let mro = self.mro.borrow();
+            for ty in mro.iter() {
+                if let Some(v) = ty.dict.borrow().get(&key).cloned() {
+                    return Some(v);
+                }
+            }
+            return None;
+        }
         let key = DictKey(Object::from_str(name));
         // Snapshot the MRO before walking it (CPython `_PyType_Lookup`
         // holds a strong reference for the same reason): a dict probe
@@ -703,6 +882,17 @@ impl TypeObject {
     /// user class* from one inherited off a built-in (e.g. `object`'s
     /// identity `__hash__`).
     pub fn lookup_with_owner(&self, name: &str) -> Option<(Object, Rc<TypeObject>)> {
+        // Fast pass — see `lookup` for the gate rationale.
+        if !crate::object::exotic_str_keys_possible() {
+            let key = crate::object::StrKey(name);
+            let mro = self.mro.borrow();
+            for ty in mro.iter() {
+                if let Some(v) = ty.dict.borrow().get(&key).cloned() {
+                    return Some((v, ty.clone()));
+                }
+            }
+            return None;
+        }
         let key = DictKey(Object::from_str(name));
         // Snapshot for reentrancy — see `lookup`.
         let mro: Vec<Rc<TypeObject>> = self.mro.borrow().clone();
@@ -739,6 +929,32 @@ impl TypeObject {
             None | Some("builtins") | Some("") => qual,
             Some(m) => format!("{m}.{qual}"),
         }
+    }
+
+    /// The name CPython's `tp_name`-based error text prints: the full
+    /// dotted C `tp_name` for a bridged/static-emulating type
+    /// (`'numpy.ndarray'`, `'re.Pattern'`), the bare `__name__` otherwise.
+    pub fn error_tp_name(&self) -> String {
+        match self.c_tp_name.get() {
+            Some(full) => full.to_owned(),
+            None => self.name.clone(),
+        }
+    }
+}
+
+/// Is `obj` a descriptor that describes a type's *instances* (rather than
+/// being a plain class attribute)? Used by [`TypeObject::new_with_flags`]
+/// to tell a getset/member `__qualname__` (which must stay in the dict)
+/// from a class-body `__qualname__` string/value.
+fn is_instance_descriptor(obj: &Object) -> bool {
+    match obj {
+        Object::Property(_) | Object::SlotDescriptor(_) => true,
+        Object::Instance(inst) => {
+            inst.cls().lookup("__get__").is_some()
+                || inst.cls().lookup("__set__").is_some()
+                || inst.cls().lookup("__delete__").is_some()
+        }
+        _ => false,
     }
 }
 
@@ -848,11 +1064,14 @@ pub struct PyInstance {
     /// (`int`, `str`, `float`, `bytes`, `tuple`, …) this holds the
     /// underlying primitive value the instance *is* — the moral
     /// equivalent of CPython storing the C-level value in the object
-    /// struct. `None` for ordinary objects. Set once at construction
-    /// (the wrapped builtins are themselves immutable) and unwrapped
-    /// by the numeric / comparison / hashing / conversion fast paths
-    /// so e.g. `class C(int)` instances behave like real ints.
-    pub native: Option<Object>,
+    /// struct. Unset for ordinary objects. Set once — normally at
+    /// construction (the wrapped builtins are themselves immutable), or
+    /// on the first C-boundary crossing for a faithful C-built subtype
+    /// body (numpy's `str_`/`bytes_`, whose value is stamped into the
+    /// inline body by the extension's `tp_new` chain after allocation).
+    /// Unwrapped by the numeric / comparison / hashing / conversion
+    /// fast paths so e.g. `class C(int)` instances behave like real ints.
+    pub native: std::sync::OnceLock<Object>,
     /// Mirrors CPython 3.13's "inline values" state observable through
     /// `_testinternalcapi.has_inline_values`: starts `true` and is
     /// permanently cleared when the instance's `__dict__` is deleted or
@@ -903,8 +1122,8 @@ impl PyInstance {
     pub fn new(class: Rc<TypeObject>) -> Self {
         Self {
             class: RefCell::new(class),
-            dict: Rc::new(RefCell::new(DictData::new())),
-            native: None,
+            dict: Rc::new(RefCell::new(DictData::default())),
+            native: std::sync::OnceLock::new(),
             inline_values: Cell::new(true),
             slots: RefCell::new(None),
             hash_cache: Cell::new(None),
@@ -918,8 +1137,8 @@ impl PyInstance {
     pub fn with_native(class: Rc<TypeObject>, native: Object) -> Self {
         Self {
             class: RefCell::new(class),
-            dict: Rc::new(RefCell::new(DictData::new())),
-            native: Some(native),
+            dict: Rc::new(RefCell::new(DictData::default())),
+            native: std::sync::OnceLock::from(native),
             inline_values: Cell::new(true),
             slots: RefCell::new(None),
             hash_cache: Cell::new(None),
@@ -940,19 +1159,26 @@ impl PyInstance {
     }
 
     /// Read slot `name` from the side table (a `__slots__` member).
+    /// Keys in the side table are always plain `Str` (only `slot_set`
+    /// writes it), so the allocation-free probe is authoritative.
     pub fn slot_get(&self, name: &str) -> Option<Object> {
         self.slots
             .borrow()
             .as_ref()
-            .and_then(|s| s.get(&DictKey(Object::from_str(name))).cloned())
+            .and_then(|s| s.get(&crate::object::StrKey(name)).cloned())
     }
 
     /// Write slot `name` into the side table.
     pub fn slot_set(&self, name: &str, value: Object) {
-        self.slots
-            .borrow_mut()
-            .get_or_insert_with(DictData::new)
-            .insert(DictKey(Object::from_str(name)), value);
+        let mut guard = self.slots.borrow_mut();
+        let table = guard.get_or_insert_with(DictData::default);
+        // Overwrite in place without re-allocating the key when the
+        // slot already exists (every write after the first).
+        if let Some(v) = table.get_mut(&crate::object::StrKey(name)) {
+            *v = value;
+        } else {
+            table.insert(DictKey(Object::from_str(name)), value);
+        }
     }
 
     /// Delete slot `name` from the side table; `false` when unset.
@@ -960,7 +1186,7 @@ impl PyInstance {
         self.slots
             .borrow_mut()
             .as_mut()
-            .map(|s| s.shift_remove(&DictKey(Object::from_str(name))).is_some())
+            .map(|s| s.shift_remove(&crate::object::StrKey(name)).is_some())
             .unwrap_or(false)
     }
 
@@ -997,6 +1223,12 @@ impl Drop for PyInstance {
     /// a shallow copy that shares the dying instance's `__dict__`/slots/native
     /// value onto the VM's pending-finalizer queue so `__del__` still runs.
     fn drop(&mut self) {
+        if std::env::var_os("WEAVEPY_REAP_TRACE").is_some() {
+            let name = self.cls().name.clone();
+            if name.contains("Block") || name.contains("DataFrame") {
+                eprintln!("[INST-DROP] {name} body={:#x}", self.c_body.get());
+            }
+        }
         // RFC 0045 (wave 3): release the faithful C inline body this
         // instance owns, if it ever crossed into a C extension that reads
         // its fields at fixed `tp_basicsize` offsets. Runs before the
@@ -1033,7 +1265,10 @@ impl Drop for PyInstance {
         let resurrected = Object::Instance(Rc::new(PyInstance {
             class: RefCell::new(self.cls()),
             dict: self.dict.clone(),
-            native: self.native.clone(),
+            native: match self.native.get() {
+                Some(v) => std::sync::OnceLock::from(v.clone()),
+                None => std::sync::OnceLock::new(),
+            },
             inline_values: Cell::new(self.inline_values.get()),
             slots: RefCell::new(self.slots.borrow().clone()),
             hash_cache: Cell::new(self.hash_cache.get()),

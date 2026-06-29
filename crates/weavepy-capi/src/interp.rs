@@ -119,10 +119,43 @@ pub fn effective_interpreter_mut() -> Option<*mut Interpreter> {
 /// [`effective_interpreter_mut`]: VM-published first (always
 /// live for the duration of the call), then `LAST_INTERPRETER`
 /// (best-effort, may be stale).
+/// Cached `WEAVEPY_TRACE_EA` gate — [`ensure_active`] wraps every
+/// bridged C invocation, so it must not `getenv` per call.
+fn ea_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WEAVEPY_TRACE_EA").is_some())
+}
+
 pub fn ensure_active<R>(body: impl FnOnce() -> R) -> R {
+    // RFC 0047 (wave 5): mark a C-extension call live on this thread for
+    // the duration of `body`. Every bridged C invocation (dunder shims,
+    // `PyCFunction`s, descriptors, tp_call, foreign hooks) funnels through
+    // here, so the VM's prompt reaper can tell "plain bytecode, no
+    // extension frame below" (`depth == 0` — reclaiming a dead escaped
+    // subgraph is as safe as CPython's own `tp_dealloc`) from "inside a C
+    // call that may hold borrowed body pointers" (`depth > 0` — defer
+    // memory reclamation to the tracing collector).
+    let _cext_guard = weavepy_vm::vm_singletons::enter_cext_call();
     if current_interpreter_mut().is_some() {
+        if ea_trace_enabled() {
+            eprintln!("[EA] nested (skip flush)");
+        }
+        // Context is already live here — a safe point to publish the static
+        // builtins' `tp_bases`/`tp_mro` (run-once; needs the allocator).
+        crate::types::publish_static_type_hierarchy();
         return body();
     }
+    if ea_trace_enabled() {
+        eprintln!("[EA] outermost (flush)");
+    }
+    // Outermost VM→C transition. Re-publish any VM-mutated faithful list
+    // mirrors into their `ob_item` buffers first, so a stock extension's
+    // inlined `PyList_GET_ITEM` macro reads the VM's latest mutations rather
+    // than the buffer that was current when the list was last seeded. This is
+    // the single choke point through which *every* bridged C call (foreign
+    // hooks, tp_call, dunder shims, descriptors) passes (RFC 0047, wave 5).
+    unsafe { crate::mirror::flush_seeded_lists() };
     let interp = if let Some(p) = weavepy_vm::vm_singletons::current_interpreter_ptr() {
         p
     } else {
@@ -137,7 +170,13 @@ pub fn ensure_active<R>(body: impl FnOnce() -> R) -> R {
         globals: None,
         current_module: None,
     };
-    with_active(ctx, body)
+    with_active(ctx, || {
+        // First VM→C transition with a fresh context: publish the static
+        // builtins' `tp_bases`/`tp_mro` (run-once) now that the allocator is
+        // reachable, before any extension C code can read those slots.
+        crate::types::publish_static_type_hierarchy();
+        body()
+    })
 }
 
 static INIT: Once = Once::new();

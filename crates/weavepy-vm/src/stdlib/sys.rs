@@ -296,7 +296,7 @@ pub fn build_with_state(
                         } else {
                             fs_cf.borrow().last().cloned()
                         };
-                        let mut d = DictData::new();
+                        let mut d = DictData::default();
                         if let Some(f) = frame {
                             // Best-effort: every thread has the
                             // same logical id 0 in the single-
@@ -408,7 +408,7 @@ pub fn build_with_state(
 }
 
 pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -628,7 +628,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         for name in ["stdout", "stderr", "stdin"] {
             let dunder = format!("__{name}__");
             let v = d
-                .get(&DictKey(Object::from_str(name)))
+                .get(&crate::object::StrKey(name))
                 .cloned()
                 .expect("stream just inserted");
             d.insert(DictKey(Object::from_str(dunder)), v);
@@ -660,7 +660,7 @@ fn implementation_value() -> Object {
     // in CPython. RFC 0023 added [`Object::SimpleNamespace`] so we
     // can match the shape exactly — attribute access via `.name`
     // / `.version` works, but the value isn't a dict.
-    let mut d = DictData::new();
+    let mut d = DictData::default();
     d.insert(
         DictKey(Object::from_static("name")),
         Object::from_static("weavepy"),
@@ -1108,7 +1108,7 @@ fn sys_flags_value() -> Object {
 }
 
 fn sys_float_info() -> Object {
-    let mut d = DictData::new();
+    let mut d = DictData::default();
     d.insert(DictKey(Object::from_static("max")), Object::Float(f64::MAX));
     d.insert(
         DictKey(Object::from_static("min")),
@@ -1136,7 +1136,7 @@ fn sys_float_info() -> Object {
 }
 
 fn sys_int_info() -> Object {
-    let mut d = DictData::new();
+    let mut d = DictData::default();
     d.insert(
         DictKey(Object::from_static("bits_per_digit")),
         Object::Int(30),
@@ -1154,7 +1154,7 @@ fn sys_int_info() -> Object {
 }
 
 fn sys_hash_info() -> Object {
-    let mut d = DictData::new();
+    let mut d = DictData::default();
     d.insert(DictKey(Object::from_static("width")), Object::Int(64));
     // `_PyHASH_MODULUS` on a 64-bit build is the Mersenne prime 2**61-1,
     // which is also the modulus `python_int_hash`/`py_hash_double` reduce
@@ -1393,7 +1393,7 @@ fn stdlib_module_names_value() -> Object {
         "random",
         "re",
     ];
-    let mut set = SetData::new();
+    let mut set = SetData::default();
     for n in names {
         set.insert(DictKey(Object::from_static(n)));
     }
@@ -1623,7 +1623,7 @@ fn sys_thread_info() -> Object {
     // attribute access (`.name`, `.lock`, `.version`); `test_os` reads
     // `sys.thread_info.version` at import. A SimpleNamespace gives us the
     // same attribute surface.
-    let mut d = DictData::new();
+    let mut d = DictData::default();
     d.insert(
         DictKey(Object::from_static("name")),
         Object::from_static("weavepy"),

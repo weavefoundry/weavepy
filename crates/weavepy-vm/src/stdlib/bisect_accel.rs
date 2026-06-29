@@ -19,7 +19,7 @@ use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
 use weavepy_compiler::CompareKind;
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(

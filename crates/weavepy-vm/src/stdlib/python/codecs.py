@@ -68,18 +68,27 @@ def _make_codec(encoding, encode_fn, decode_fn, _is_text_encoding=True):
     # Build generic incremental factories on top of the stateless
     # (encode, decode) pair so `codecs.getincremental*` work for the
     # built-in codecs without a bespoke class each. The stream
-    # reader/writer factories are intentionally left unset: a faithful
-    # `StreamReader`/`StreamWriter` is part of the deferred codecs wave,
-    # and a half-built one is worse than `None` (callers fall back).
+    # reader/writer factories wrap the same stateless pair via the generic
+    # `_FuncStreamReader`/`_FuncStreamWriter` shims so `codecs.getreader` /
+    # `codecs.getwriter` (used e.g. by `pandas.read_csv(codecs.getreader(
+    # "utf-8")(handle))`) return a real callable rather than `None`.
     def _mk_incremental_encoder(errors="strict"):
         return _FuncIncrementalEncoder(encode_fn, errors)
 
     def _mk_incremental_decoder(errors="strict"):
         return _FuncIncrementalDecoder(decode_fn, errors)
 
+    def _mk_stream_reader(stream, errors="strict"):
+        return _FuncStreamReader(decode_fn, stream, errors)
+
+    def _mk_stream_writer(stream, errors="strict"):
+        return _FuncStreamWriter(encode_fn, stream, errors)
+
     return CodecInfo(
         encode=encode_fn,
         decode=decode_fn,
+        streamreader=_mk_stream_reader,
+        streamwriter=_mk_stream_writer,
         incrementalencoder=_mk_incremental_encoder,
         incrementaldecoder=_mk_incremental_decoder,
         name=encoding,
@@ -117,8 +126,327 @@ _BUILTIN_NAMES = {
 }
 
 
+# CPython's `CodecInfo.name` for each canonical `encodings.<module>` whose
+# display name differs from the module key (each module's `getregentry()`
+# hard-codes it). Everything absent maps to itself (`cp1251` → `cp1251`,
+# `shift_jis` → `shift_jis`, …). Generated against CPython 3.13.
+_DISPLAY_NAMES = {
+    "base64_codec": "base64",
+    "bz2_codec": "bz2",
+    "hex_codec": "hex",
+    "hp_roman8": "hp-roman8",
+    "iso8859_1": "iso8859-1",
+    "iso8859_10": "iso8859-10",
+    "iso8859_11": "iso8859-11",
+    "iso8859_13": "iso8859-13",
+    "iso8859_14": "iso8859-14",
+    "iso8859_15": "iso8859-15",
+    "iso8859_16": "iso8859-16",
+    "iso8859_2": "iso8859-2",
+    "iso8859_3": "iso8859-3",
+    "iso8859_4": "iso8859-4",
+    "iso8859_5": "iso8859-5",
+    "iso8859_6": "iso8859-6",
+    "iso8859_7": "iso8859-7",
+    "iso8859_8": "iso8859-8",
+    "iso8859_9": "iso8859-9",
+    "koi8_r": "koi8-r",
+    "koi8_t": "koi8-t",
+    "koi8_u": "koi8-u",
+    "latin_1": "iso8859-1",
+    "mac_arabic": "mac-arabic",
+    "mac_croatian": "mac-croatian",
+    "mac_cyrillic": "mac-cyrillic",
+    "mac_farsi": "mac-farsi",
+    "mac_greek": "mac-greek",
+    "mac_iceland": "mac-iceland",
+    "mac_latin2": "mac-latin2",
+    "mac_roman": "mac-roman",
+    "mac_romanian": "mac-romanian",
+    "mac_turkish": "mac-turkish",
+    "quopri_codec": "quopri",
+    "raw_unicode_escape": "raw-unicode-escape",
+    "rot_13": "rot-13",
+    "tis_620": "tis-620",
+    "unicode_escape": "unicode-escape",
+    "utf_16": "utf-16",
+    "utf_16_be": "utf-16-be",
+    "utf_16_le": "utf-16-le",
+    "utf_32": "utf-32",
+    "utf_32_be": "utf-32-be",
+    "utf_32_le": "utf-32-le",
+    "utf_7": "utf-7",
+    "utf_8": "utf-8",
+    "utf_8_sig": "utf-8-sig",
+    "uu_codec": "uu",
+    "zlib_codec": "zlib",
+}
+
+
 def _normalise(name):
     return name.replace("-", "_").replace(" ", "_").lower()
+
+
+# CPython `encodings.normalize_encoding` (vendored logic): collapse runs of
+# punctuation to a single underscore, keep alphanumerics and `.`, drop
+# non-ASCII. `'UTF-16LE'` → `'UTF_16LE'`, `'latin 1'` → `'latin_1'`.
+def _cpy_normalize_encoding(encoding):
+    if isinstance(encoding, bytes):
+        encoding = str(encoding, "ascii")
+    chars = []
+    punct = False
+    for c in encoding:
+        if c.isalnum() or c == ".":
+            if punct and chars:
+                chars.append("_")
+            if c.isascii():
+                chars.append(c)
+            punct = False
+        else:
+            punct = True
+    return "".join(chars)
+
+
+_ENC_ALIASES = None
+
+
+def _alias_resolve(encoding):
+    """Resolve an encoding-name alias through CPython's `encodings.aliases`
+    registry (the first step of `encodings.search_function`). Returns the
+    canonical name or `None` when the name is not an alias."""
+    global _ENC_ALIASES
+    if _ENC_ALIASES is None:
+        try:
+            from encodings.aliases import aliases as _ENC_ALIASES
+        except ImportError:  # pragma: no cover — frozen module always present
+            _ENC_ALIASES = {}
+    norm = _cpy_normalize_encoding(encoding)
+    return _ENC_ALIASES.get(norm) or _ENC_ALIASES.get(norm.replace(".", "_"))
+
+
+# ---------- charmap codec primitives ----------
+#
+# CPython exposes `charmap_encode`/`charmap_decode`/`charmap_build` (and the
+# `make_identity_dict`/`make_encoding_map` helpers) from the C `_codecs`
+# module, pulled into `codecs` via `from _codecs import *`. The frozen
+# single-byte `encodings.*` codepage modules (cp037, cp737, …) are generated
+# by CPython's `gencodec.py` and map bytes<->Unicode through a 256-entry table
+# using exactly these. WeavePy serves the common encodings natively, so these
+# faithful pure-Python equivalents only drive the on-demand frozen codepages.
+
+
+def escape_decode(data, errors="strict"):
+    """Decode Python string-literal escapes in a bytes object.
+
+    CPython exposes this from `_codecs` (re-exported by `codecs` via its
+    star-import); `pickle` uses it to load protocol-0 STRING opcodes
+    (`test_datetime.test_compat_unpickle` round-trips Python-2 pickles
+    through it). Returns `(decoded_bytes, consumed_length)`.
+    """
+    if isinstance(data, str):
+        data = data.encode("latin-1")
+    data = bytes(data)
+    simple = {
+        0x5C: 0x5C,  # backslash
+        0x27: 0x27,  # '
+        0x22: 0x22,  # "
+        0x61: 0x07,  # \a
+        0x62: 0x08,  # \b
+        0x66: 0x0C,  # \f
+        0x6E: 0x0A,  # \n
+        0x72: 0x0D,  # \r
+        0x74: 0x09,  # \t
+        0x76: 0x0B,  # \v
+    }
+    out = bytearray()
+    i = 0
+    n = len(data)
+    while i < n:
+        c = data[i]
+        if c != 0x5C:
+            out.append(c)
+            i += 1
+            continue
+        i += 1
+        if i >= n:
+            raise ValueError("Trailing \\ in string")
+        c = data[i]
+        i += 1
+        if c == 0x0A:
+            pass  # line continuation: swallowed
+        elif c in simple:
+            out.append(simple[c])
+        elif 0x30 <= c <= 0x37:
+            # Octal escape: up to three digits.
+            v = c - 0x30
+            for _ in range(2):
+                if i < n and 0x30 <= data[i] <= 0x37:
+                    v = (v << 3) + (data[i] - 0x30)
+                    i += 1
+                else:
+                    break
+            out.append(v & 0xFF)
+        elif c == 0x78:  # \xHH
+            hexdig = b"0123456789abcdefABCDEF"
+            if i + 2 <= n and data[i] in hexdig and data[i + 1] in hexdig:
+                out.append(int(data[i:i + 2], 16))
+                i += 2
+            elif errors == "strict":
+                raise ValueError("invalid \\x escape at position %d" % (i - 2))
+            elif errors == "replace":
+                out.append(0x3F)  # '?'
+            elif errors != "ignore":
+                raise ValueError(
+                    "decoding error; unknown error handling code: %s" % errors
+                )
+        else:
+            # Unknown escape: kept verbatim (backslash included).
+            out.append(0x5C)
+            out.append(c)
+    return bytes(out), n
+
+
+def escape_encode(data, errors="strict"):
+    """Inverse of `escape_decode`: bytes → Python-literal escaped bytes."""
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError("escape_encode() argument must be bytes")
+    out = bytearray()
+    for c in bytes(data):
+        if c in (0x27, 0x5C):  # ' and backslash
+            out.append(0x5C)
+            out.append(c)
+        elif c == 0x09:
+            out += b"\\t"
+        elif c == 0x0A:
+            out += b"\\n"
+        elif c == 0x0D:
+            out += b"\\r"
+        elif c < 0x20 or c >= 0x7F:
+            out += ("\\x%02x" % c).encode("ascii")
+        else:
+            out.append(c)
+    return bytes(out), len(data)
+
+
+def make_identity_dict(rng):
+    """`{i: i for i in rng}` (CPython ``codecs.make_identity_dict``)."""
+    return {i: i for i in rng}
+
+
+def make_encoding_map(decoding_map):
+    """Invert a decoding map to an encoding map; a target reachable from more
+    than one source maps to ``None`` so the encoder rejects it as undefined
+    (CPython ``codecs.make_encoding_map``)."""
+    m = {}
+    for k, v in decoding_map.items():
+        if v not in m:
+            m[v] = k
+        else:
+            m[v] = None
+    return m
+
+
+def charmap_build(decoding_table):
+    """Build the ``{unicode-ordinal: byte}`` encode map from a 256-char decode
+    table (CPython's C ``PyUnicode_BuildEncodingMap``). ``'\\ufffe'`` marks an
+    undefined byte in the decode table and is skipped so it never becomes
+    encodable."""
+    return {ord(c): i for (i, c) in enumerate(decoding_table) if c != "\ufffe"}
+
+
+def charmap_decode(input, errors="strict", mapping=None):
+    """Decode *input* bytes via *mapping* (a 256-char decode ``str`` or an
+    ``{byte: char-or-ordinal}`` dict); ``None`` decodes as latin-1. Mirrors the
+    C ``_codecs.charmap_decode`` incl. the ``'\\ufffe'`` / missing-key
+    "character maps to <undefined>" error, routed through the error handler."""
+    data = bytes(input)
+    if mapping is None:
+        return (data.decode("latin-1", errors), len(data))
+    out = []
+    i = 0
+    n = len(data)
+    while i < n:
+        b = data[i]
+        ch = None
+        if isinstance(mapping, str):
+            if b < len(mapping):
+                m = mapping[b]
+                if m != "\ufffe":
+                    ch = m
+        elif hasattr(mapping, "get"):
+            m = mapping.get(b)
+            if isinstance(m, int):
+                ch = chr(m)
+            elif isinstance(m, str) and m != "\ufffe":
+                ch = m
+        if ch is None:
+            if errors == "ignore":
+                i += 1
+                continue
+            if errors == "replace":
+                out.append("\ufffd")
+                i += 1
+                continue
+            exc = UnicodeDecodeError(
+                "charmap", data, i, i + 1, "character maps to <undefined>"
+            )
+            if errors == "strict":
+                raise exc
+            repl, newpos = lookup_error(errors)(exc)
+            if newpos < 0:
+                newpos += n
+            out.append(repl)
+            i = newpos
+            continue
+        out.append(ch)
+        i += 1
+    return ("".join(out), len(data))
+
+
+def charmap_encode(input, errors="strict", mapping=None):
+    """Encode *input* str via *mapping* (an ``{unicode-ordinal: byte}`` dict as
+    built by :func:`charmap_build`); ``None`` encodes as latin-1. Mirrors the C
+    ``_codecs.charmap_encode`` incl. the "character maps to <undefined>" error
+    for a missing/``None`` target, routed through the error handler."""
+    if mapping is None:
+        return (input.encode("latin-1", errors), len(input))
+    out = bytearray()
+    i = 0
+    n = len(input)
+    while i < n:
+        b = mapping.get(ord(input[i])) if hasattr(mapping, "get") else None
+        if b is None:
+            if errors == "ignore":
+                i += 1
+                continue
+            if errors == "replace":
+                out.append(0x3F)  # '?'
+                i += 1
+                continue
+            exc = UnicodeEncodeError(
+                "charmap", input, i, i + 1, "character maps to <undefined>"
+            )
+            if errors == "strict":
+                raise exc
+            repl, newpos = lookup_error(errors)(exc)
+            if newpos < 0:
+                newpos += n
+            if isinstance(repl, str):
+                for rc in repl:
+                    rb = mapping.get(ord(rc))
+                    if rb is None:
+                        raise exc
+                    out.append(rb)
+            else:
+                out.extend(bytes(repl))
+            i = newpos
+            continue
+        if isinstance(b, int):
+            out.append(b)
+        else:
+            out.extend(bytes(b))
+        i += 1
+    return (bytes(out), len(input))
 
 
 def _rot13_encode(s, errors="strict"):
@@ -580,16 +908,23 @@ def lookup(encoding):
 
 
 def _lookup_uncached(encoding):
+    # CPython's `encodings.search_function` first maps spelling variants
+    # through the `encodings.aliases` registry ("utf-16le" → "utf_16_le",
+    # "windows-1251" → "cp1251", "646" → "ascii", …) and then resolves the
+    # canonical name. Do the same before consulting any codec table.
+    aliased = _alias_resolve(encoding)
+    if aliased is not None and _normalise(aliased) != _normalise(encoding):
+        return _lookup_uncached(aliased)
     norm = _normalise(encoding)
     if norm == "utf_8_sig":
-        return _utf_8_sig_codecinfo(encoding)
+        return _utf_8_sig_codecinfo()
     # The auto-BOM utf-16/utf-32 variants need a stateful incremental encoder
     # (BOM emitted once); the explicit `_le`/`_be` variants are BOM-free and use
     # the generic builtin path below.
     if norm in ("utf_16", "utf16", "u16"):
-        return _utf_16_codecinfo(encoding)
+        return _utf_16_codecinfo()
     if norm in ("utf_32", "utf32", "u32"):
-        return _utf_32_codecinfo(encoding)
+        return _utf_32_codecinfo()
     # The JIS X 0213:2004 `euc_jis_2004` CJK codec (and its aliases) — a faithful
     # port whose combining sequences make the incremental *encoder* stateful.
     # `encoding_rs` (the engine's CJK backend) doesn't carry it, so it lives in a
@@ -607,6 +942,7 @@ def _lookup_uncached(encoding):
     if norm == "punycode":
         import encodings.punycode as _punycode_mod
         return _punycode_mod.getregentry()
+    display = _DISPLAY_NAMES.get(norm, encoding)
     if encoding in _PURE_CODECS or _normalise(encoding) in _PURE_CODECS:
         key = encoding if encoding in _PURE_CODECS else _normalise(encoding)
         encode_fn, decode_fn = _PURE_CODECS[key]
@@ -614,13 +950,13 @@ def _lookup_uncached(encoding):
         # `_is_text_encoding=False`, so `io.TextIOWrapper(b, encoding="hex")`
         # raises `LookupError("… is not a text encoding")`
         # (`test_io.test_non_text_encoding_codecs_are_rejected`).
-        return _make_codec(encoding, encode_fn, decode_fn, _is_text_encoding=False)
+        return _make_codec(display, encode_fn, decode_fn, _is_text_encoding=False)
     if encoding in _BUILTIN_NAMES or _normalise(encoding) in _BUILTIN_NAMES:
         key = encoding if encoding in _BUILTIN_NAMES else _normalise(encoding)
         enc_name, dec_name = _BUILTIN_NAMES[key]
         encode_fn = getattr(_codecs, enc_name)
         decode_fn = getattr(_codecs, dec_name)
-        return _make_codec(encoding, encode_fn, decode_fn)
+        return _make_codec(display, encode_fn, decode_fn)
     # Generic fall-through via the engine's own lookup. `_codecs.lookup`
     # raises `LookupError` for an unknown name (CPython parity; some older
     # engines raised `ValueError`, so tolerate both). On a miss, defer to
@@ -637,6 +973,15 @@ def _lookup_uncached(encoding):
         # ``encoding='\udcfe'`` for the ``_pyio`` variant).
         raise
     except (LookupError, ValueError):
+        # CPython's codec registry bootstraps with `encodings.search_function`,
+        # which imports `encodings.<name>` and returns its `getregentry()`. The
+        # native `_codecs.lookup` covers the common encodings; the on-demand
+        # single-byte codepages (cp037, cp737, …) live as frozen
+        # `encodings.*` modules, resolved here before any user search func
+        # (mirroring the bootstrap search's precedence).
+        info = _frozen_encodings_lookup(_normalise(encoding))
+        if info is not None:
+            return info
         info = _search_registered(_normalise(encoding))
         if info is not None:
             return info
@@ -645,7 +990,30 @@ def _lookup_uncached(encoding):
         return _codecs.encode(s, canonical, errors)
     def decode(b, errors="strict"):
         return _codecs.decode(b, canonical, errors)
-    return _make_codec(canonical, encode, decode)
+    # CPython names a codec by its `encodings.<module>` declared name, not the
+    # engine's WHATWG label — post-alias `norm` IS the module key (e.g. a
+    # `windows-1251` request alias-resolves to `cp1251` and reports as such).
+    return _make_codec(_DISPLAY_NAMES.get(norm, norm), encode, decode)
+
+
+def _frozen_encodings_lookup(norm):
+    """Resolve a codec from a frozen ``encodings.<norm>`` module (CPython's
+    ``encodings.search_function`` bootstrap). A name that isn't a plain
+    module identifier, a missing module, or one without ``getregentry`` is a
+    miss (``None``)."""
+    if not norm or not norm.replace("_", "").isalnum():
+        return None
+    try:
+        mod = __import__("encodings." + norm, fromlist=["getregentry"])
+    except ImportError:
+        return None
+    getreg = getattr(mod, "getregentry", None)
+    if getreg is None:
+        return None
+    try:
+        return getreg()
+    except Exception:
+        return None
 
 
 def _search_registered(name):
@@ -832,6 +1200,29 @@ class StreamReader:
     def readlines(self, sizehint=-1):
         return self.stream.readlines(sizehint)
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type, value, tb):
+        self.stream.close()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        line = self.readline()
+        if line:
+            return line
+        raise StopIteration
+
+    # CPython's `StreamReader.__getattr__` forwards everything it doesn't
+    # define (`close`, `flush`, `seek`, `tell`, `seekable`, …) to the wrapped
+    # binary stream, so callers can treat the reader like the file itself.
+    def __getattr__(self, name):
+        if name in ("stream", "errors"):
+            raise AttributeError(name)
+        return getattr(self.stream, name)
+
 
 class StreamWriter:
     def __init__(self, stream, errors="strict"):
@@ -844,6 +1235,17 @@ class StreamWriter:
     def writelines(self, lines):
         for line in lines:
             self.write(line)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type, value, tb):
+        self.stream.close()
+
+    def __getattr__(self, name):
+        if name in ("stream", "errors"):
+            raise AttributeError(name)
+        return getattr(self.stream, name)
 
 
 class StreamReaderWriter:

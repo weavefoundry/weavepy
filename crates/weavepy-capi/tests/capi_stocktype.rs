@@ -21,6 +21,7 @@
 //! host, so CI on a bare machine still passes.
 
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard};
 
 use weavepy_capi::loader::load_extension_module;
 use weavepy_vm::error::RuntimeError;
@@ -29,6 +30,20 @@ use weavepy_vm::Interpreter;
 
 fn extension_path() -> Option<PathBuf> {
     option_env!("WEAVEPY_CAPI_STOCKTYPE_EXTENSION").map(PathBuf::from)
+}
+
+/// Serialize the tests in this binary. Each test constructs its own
+/// `Interpreter`, but the C-API bridge keeps *process-global* state (the
+/// `LAST_INTERPRETER` fallback pointer, the static `PyTypeObject`s of the
+/// shared dlopen'd extension and their mirror entries), so libtest's default
+/// parallel execution can route a re-entrant C-API call into a different
+/// test's interpreter mid-run. The guard is returned by [`load`] and held
+/// for the whole test.
+fn serialize() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    // A poisoned lock only means another test's assertion failed while
+    // holding it — the serialization itself is still valid.
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn lookup(module: &Object, key: &str) -> Option<Object> {
@@ -46,7 +61,8 @@ fn lookup(module: &Object, key: &str) -> Option<Object> {
     None
 }
 
-fn load() -> Option<(Interpreter, Object)> {
+fn load() -> Option<(MutexGuard<'static, ()>, Interpreter, Object)> {
+    let guard = serialize();
     let path = extension_path()?;
     if !path.is_file() {
         eprintln!(
@@ -59,7 +75,7 @@ fn load() -> Option<(Interpreter, Object)> {
     let mut interp = Interpreter::default();
     let interp_ptr: *mut Interpreter = &raw mut interp;
     match load_extension_module(interp_ptr, &path, "_stocktype") {
-        Ok(m) => Some((interp, m)),
+        Ok(m) => Some((guard, interp, m)),
         Err(err) => {
             eprintln!("dlopen of stock-type extension failed (treating as skip): {err}");
             None
@@ -133,7 +149,7 @@ fn stocktype_skipped_when_extension_missing() {
 
 #[test]
 fn stocktype_module_loads_with_types() {
-    let Some((_interp, module)) = load() else {
+    let Some((_lock, _interp, module)) = load() else {
         return;
     };
     for name in ["Vec2", "Seq", "Adder", "Const", "Aw", "Proxy", "Node"] {
@@ -152,7 +168,7 @@ fn stocktype_module_loads_with_types() {
 /// bridged class dict (proves `PyType_Ready` harvested them).
 #[test]
 fn stocktype_ready_populates_class_dict() {
-    let Some((_interp, module)) = load() else {
+    let Some((_lock, _interp, module)) = load() else {
         return;
     };
     let cls = lookup(&module, "Vec2").expect("Vec2");
@@ -182,7 +198,7 @@ fn stocktype_ready_populates_class_dict() {
 /// all dispatched through the VM's synthesised dunders.
 #[test]
 fn stocktype_number_and_richcompare() {
-    let Some((mut interp, module)) = load() else {
+    let Some((_lock, mut interp, module)) = load() else {
         return;
     };
     let vec2 = lookup(&module, "Vec2").expect("Vec2");
@@ -222,7 +238,7 @@ fn stocktype_number_and_richcompare() {
 /// `Seq` sequence + mapping + iteration slots.
 #[test]
 fn stocktype_sequence_mapping_iter() {
-    let Some((mut interp, module)) = load() else {
+    let Some((_lock, mut interp, module)) = load() else {
         return;
     };
     let seq_ty = lookup(&module, "Seq").expect("Seq");
@@ -257,7 +273,7 @@ fn stocktype_sequence_mapping_iter() {
 /// `Adder` `tp_call`: calling the instance dispatches to the C slot.
 #[test]
 fn stocktype_call_protocol() {
-    let Some((mut interp, module)) = load() else {
+    let Some((_lock, mut interp, module)) = load() else {
         return;
     };
     let adder_ty = lookup(&module, "Adder").expect("Adder");
@@ -273,7 +289,7 @@ fn stocktype_call_protocol() {
 /// and `__set__` is observed through a module-global side effect.
 #[test]
 fn stocktype_descriptor_protocol() {
-    let Some((mut interp, module)) = load() else {
+    let Some((_lock, mut interp, module)) = load() else {
         return;
     };
     let const_ty = lookup(&module, "Const").expect("Const");
@@ -309,7 +325,7 @@ fn stocktype_descriptor_protocol() {
 /// covers the nested case. (RFC 0044 hardening.)
 #[test]
 fn stocktype_call_type_object_from_c() {
-    let Some((mut interp, module)) = load() else {
+    let Some((_lock, mut interp, module)) = load() else {
         return;
     };
     let vec2 = lookup(&module, "Vec2").expect("Vec2");
@@ -349,7 +365,7 @@ fn stocktype_call_type_object_from_c() {
 /// sentinels. (RFC 0044 hardening, WS3 coverage.)
 #[test]
 fn stocktype_async_protocol() {
-    let Some((mut interp, module)) = load() else {
+    let Some((_lock, mut interp, module)) = load() else {
         return;
     };
     let aw_ty = lookup(&module, "Aw").expect("Aw");
@@ -391,7 +407,7 @@ fn stocktype_async_protocol() {
 /// and stores it so it round-trips back out. (RFC 0044 hardening.)
 #[test]
 fn stocktype_getattro_setattro() {
-    let Some((mut interp, module)) = load() else {
+    let Some((_lock, mut interp, module)) = load() else {
         return;
     };
     let proxy_ty = lookup(&module, "Proxy").expect("Proxy");
@@ -448,7 +464,7 @@ fn stocktype_getattro_setattro() {
 /// `tp_traverse` / `tp_clear` bridge (RFC 0044, WS4).
 #[test]
 fn stocktype_gc_cycle_through_c_memory() {
-    let Some((mut interp, module)) = load() else {
+    let Some((_lock, mut interp, module)) = load() else {
         return;
     };
     let node_ty = lookup(&module, "Node").expect("Node");

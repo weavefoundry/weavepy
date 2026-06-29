@@ -25,7 +25,7 @@ pub const LC_MESSAGES: i64 = 5;
 pub const CHAR_MAX: i64 = 127;
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -107,7 +107,7 @@ fn l_getlocale(_args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn l_localeconv(_args: &[Object]) -> Result<Object, RuntimeError> {
-    let mut d = DictData::new();
+    let mut d = DictData::default();
     macro_rules! ins {
         ($k:literal, $v:expr) => {
             d.insert(DictKey(Object::from_static($k)), $v);

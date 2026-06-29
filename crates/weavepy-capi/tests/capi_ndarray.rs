@@ -18,6 +18,7 @@
 //! consistent with the `capi_loader` test.
 
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard};
 
 use weavepy_capi::loader::load_extension_module;
 use weavepy_vm::error::RuntimeError;
@@ -44,7 +45,21 @@ fn lookup_module_member(module: &Object, key: &str) -> Option<Object> {
     None
 }
 
-fn load_module() -> Option<(Interpreter, Object)> {
+/// Serialize the tests in this binary. Each test constructs its own
+/// `Interpreter`, but the C-API bridge keeps *process-global* state (the
+/// `LAST_INTERPRETER` fallback pointer, the shared dlopen'd extension's
+/// static state), so libtest's default parallel execution can route a
+/// re-entrant C-API call into a different test's interpreter mid-run. The
+/// guard is returned by the loader and held for the whole test.
+fn serialize() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    // A poisoned lock only means another test's assertion failed while
+    // holding it — the serialization itself is still valid.
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn load_module() -> Option<(MutexGuard<'static, ()>, Interpreter, Object)> {
+    let guard = serialize();
     let path = extension_path()?;
     if !path.is_file() {
         eprintln!(
@@ -63,7 +78,7 @@ fn load_module() -> Option<(Interpreter, Object)> {
             return None;
         }
     };
-    Some((interp, module))
+    Some((guard, interp, module))
 }
 
 fn make_array(interp: &mut Interpreter, module: &Object, rows: i64, cols: i64) -> Object {
@@ -103,7 +118,7 @@ fn ndarray_skipped_when_extension_missing() {
 
 #[test]
 fn ndarray_module_exposes_class() {
-    let Some((_interp, module)) = load_module() else {
+    let Some((_lock, _interp, module)) = load_module() else {
         return;
     };
     assert!(lookup_module_member(&module, "NDArray").is_some());
@@ -113,7 +128,7 @@ fn ndarray_module_exposes_class() {
 
 #[test]
 fn ndarray_class_has_dunders() {
-    let Some((_interp, module)) = load_module() else {
+    let Some((_lock, _interp, module)) = load_module() else {
         return;
     };
     let cls = lookup_module_member(&module, "NDArray").expect("NDArray class missing");
@@ -139,7 +154,7 @@ fn ndarray_class_has_dunders() {
 
 #[test]
 fn ndarray_dict_inspection() {
-    let Some((mut interp, module)) = load_module() else {
+    let Some((_lock, mut interp, module)) = load_module() else {
         return;
     };
     let arr = make_array(&mut interp, &module, 2, 3);
@@ -161,7 +176,7 @@ fn ndarray_dict_inspection() {
 
 #[test]
 fn ndarray_constructor_and_repr() {
-    let Some((mut interp, module)) = load_module() else {
+    let Some((_lock, mut interp, module)) = load_module() else {
         return;
     };
     let arr = make_array(&mut interp, &module, 2, 3);
@@ -178,7 +193,7 @@ fn ndarray_constructor_and_repr() {
 
 #[test]
 fn ndarray_fill_and_sum() {
-    let Some((mut interp, module)) = load_module() else {
+    let Some((_lock, mut interp, module)) = load_module() else {
         return;
     };
     let arr = make_array(&mut interp, &module, 4, 5);
@@ -197,7 +212,7 @@ fn ndarray_fill_and_sum() {
 
 #[test]
 fn ndarray_setitem_and_subscript() {
-    let Some((mut interp, module)) = load_module() else {
+    let Some((_lock, mut interp, module)) = load_module() else {
         return;
     };
     let arr = make_array(&mut interp, &module, 3, 3);
@@ -220,7 +235,7 @@ fn ndarray_setitem_and_subscript() {
 
 #[test]
 fn ndarray_sequence_len_and_item() {
-    let Some((mut interp, module)) = load_module() else {
+    let Some((_lock, mut interp, module)) = load_module() else {
         return;
     };
     let arr = make_array(&mut interp, &module, 4, 2);
@@ -238,7 +253,7 @@ fn ndarray_sequence_len_and_item() {
 
 #[test]
 fn ndarray_iter_walks_rows() {
-    let Some((mut interp, module)) = load_module() else {
+    let Some((_lock, mut interp, module)) = load_module() else {
         return;
     };
     let arr = make_array(&mut interp, &module, 3, 2);
@@ -261,7 +276,7 @@ fn ndarray_iter_walks_rows() {
 
 #[test]
 fn ndarray_addition_via_dunder() {
-    let Some((mut interp, module)) = load_module() else {
+    let Some((_lock, mut interp, module)) = load_module() else {
         return;
     };
     let a = make_array(&mut interp, &module, 2, 2);
@@ -291,7 +306,7 @@ fn ndarray_addition_via_dunder() {
 
 #[test]
 fn ndarray_shape_property() {
-    let Some((mut interp, module)) = load_module() else {
+    let Some((_lock, mut interp, module)) = load_module() else {
         return;
     };
     let arr = make_array(&mut interp, &module, 3, 5);
@@ -333,7 +348,7 @@ fn ndarray_shape_property() {
 
 #[test]
 fn ndarray_buffer_size_function() {
-    let Some((mut interp, module)) = load_module() else {
+    let Some((_lock, mut interp, module)) = load_module() else {
         return;
     };
     let arr = make_array(&mut interp, &module, 4, 5);
@@ -358,7 +373,7 @@ fn ndarray_buffer_size_function() {
 
 #[test]
 fn ndarray_format_size_helper() {
-    let Some((mut interp, module)) = load_module() else {
+    let Some((_lock, mut interp, module)) = load_module() else {
         return;
     };
     let format_size =
@@ -376,7 +391,7 @@ fn ndarray_format_size_helper() {
 
 #[test]
 fn ndarray_to_bytes_round_trip() {
-    let Some((mut interp, module)) = load_module() else {
+    let Some((_lock, mut interp, module)) = load_module() else {
         return;
     };
     let arr = make_array(&mut interp, &module, 1, 4);

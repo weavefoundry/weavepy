@@ -21,7 +21,7 @@ thread_local! {
 }
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -115,6 +115,51 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             Object::Int(9),
         );
     }
+    // `time.tzset()` — re-read the `TZ` environment variable (CPython calls
+    // the C library's `tzset(3)`) and refresh the module's derived
+    // constants. chrono re-resolves the local zone from `TZ` on each use, so
+    // the libc call plus a constant refresh reproduces CPython's observable
+    // behaviour (pandas' `tm.set_timezone` context manager gates on
+    // `hasattr(time, "tzset")` and drives `datetime.timestamp()` through it).
+    {
+        let dict_for_tzset = dict.clone();
+        dict.borrow_mut().insert(
+            DictKey(Object::from_static("tzset")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "tzset",
+                binds_instance: false,
+                call: Box::new(move |_args| {
+                    extern "C" {
+                        fn tzset();
+                    }
+                    unsafe { tzset() };
+                    let (timezone, altzone, daylight, std_name, dst_name) = compute_timezone();
+                    let mut d = dict_for_tzset.borrow_mut();
+                    d.insert(
+                        DictKey(Object::from_static("timezone")),
+                        Object::Int(timezone),
+                    );
+                    d.insert(
+                        DictKey(Object::from_static("altzone")),
+                        Object::Int(altzone),
+                    );
+                    d.insert(
+                        DictKey(Object::from_static("daylight")),
+                        Object::Int(daylight),
+                    );
+                    d.insert(
+                        DictKey(Object::from_static("tzname")),
+                        Object::new_tuple(vec![
+                            Object::from_str(std_name),
+                            Object::from_str(dst_name),
+                        ]),
+                    );
+                    Ok(Object::None)
+                }),
+                call_kw: None,
+            })),
+        );
+    }
     Rc::new(PyModule {
         name: "time".to_owned(),
         filename: None,
@@ -129,9 +174,34 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 /// `(std, dst)` abbreviation pair. We sample January and July to find the
 /// standard (smaller east offset) and DST (larger) sides.
 fn compute_timezone() -> (i64, i64, i64, String, String) {
-    use chrono::{Datelike, Offset};
-    let year = Local::now().year();
+    // Sample the local zone through libc (`localtime_r`) so a `TZ` override
+    // applied by `time.tzset()` is reflected — `chrono::Local` caches the
+    // system zone and ignores runtime `TZ` changes.
+    #[cfg(unix)]
     let sample = |month: u32| -> Option<(i64, String)> {
+        use chrono::Datelike;
+        let year = Utc::now().year();
+        let probe = Utc
+            .with_ymd_and_hms(year, month, 1, 12, 0, 0)
+            .single()?
+            .timestamp() as libc::time_t;
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        if unsafe { libc::localtime_r(&raw const probe, &raw mut tm) }.is_null() {
+            return None;
+        }
+        let name = if tm.tm_zone.is_null() {
+            String::new()
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(tm.tm_zone) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        Some((tm.tm_gmtoff as i64, name))
+    };
+    #[cfg(not(unix))]
+    let sample = |month: u32| -> Option<(i64, String)> {
+        use chrono::{Datelike, Offset};
+        let year = Local::now().year();
         let dt = Local.with_ymd_and_hms(year, month, 1, 12, 0, 0).single()?;
         let east = i64::from(dt.offset().fix().local_minus_utc());
         Some((east, dt.format("%Z").to_string()))
@@ -251,7 +321,7 @@ fn time_get_clock_info(args: &[Object]) -> Result<Object, RuntimeError> {
         let cls = crate::types::TypeObject::new_user(
             "clock_info",
             vec![bt.object_.clone()],
-            DictData::new(),
+            DictData::default(),
         )
         .expect("clock_info class must linearise");
         *slot.borrow_mut() = Some(cls.clone());
@@ -395,17 +465,57 @@ fn tuple_to_dt(args: Option<&Object>) -> Result<DateTime<Local>, RuntimeError> {
             _ => Err(type_error("invalid struct_time")),
         }
     };
-    let dt = Local
-        .with_ymd_and_hms(
-            extract(0)?,
-            extract(1)? as u32,
-            extract(2)? as u32,
-            extract(3)? as u32,
-            extract(4)? as u32,
-            extract(5)? as u32,
-        )
-        .single()
-        .ok_or_else(|| type_error("invalid local time"))?;
+    let (y, mo, d, h, mi, s) = (
+        extract(0)?,
+        extract(1)? as u32,
+        extract(2)? as u32,
+        extract(3)? as u32,
+        extract(4)? as u32,
+        extract(5)? as u32,
+    );
+    // tm_isdst disambiguates a DST-fold wall time (1 → the DST side).
+    // Optional: a bare 6-field probe or a missing slot means "unknown".
+    let isdst = match get(8) {
+        Some(Object::Int(v)) => v as i32,
+        _ => -1,
+    };
+    let dt = match Local.with_ymd_and_hms(y, mo, d, h, mi, s) {
+        chrono::LocalResult::Single(dt) => dt,
+        chrono::LocalResult::Ambiguous(a, b) => {
+            use chrono::Offset;
+            // Fall-back fold: two instants share this wall time. libc's
+            // strftime/mktime pick by tm_isdst; the DST side is the one
+            // with the larger UTC offset (EDT -4h vs EST -5h). With
+            // tm_isdst unknown (-1) prefer the standard-time side, which
+            // is what an aware `datetime.astimezone()` timetuple denotes
+            // (`test_datetime.test_astimezone_default_eastern` formats
+            // 2012-11-04 01:30 EST, the *second* 01:30 of the morning).
+            let (dst_side, std_side) =
+                if a.offset().fix().local_minus_utc() >= b.offset().fix().local_minus_utc() {
+                    (a, b)
+                } else {
+                    (b, a)
+                };
+            if isdst > 0 {
+                dst_side
+            } else {
+                std_side
+            }
+        }
+        chrono::LocalResult::None => {
+            // Spring-forward gap: no such wall time. libc mktime
+            // normalizes by shifting across the gap; approximate with
+            // the same wall time an hour later (CPython never errors here).
+            let naive = chrono::NaiveDate::from_ymd_opt(y, mo, d)
+                .and_then(|date| date.and_hms_opt(h, mi, s))
+                .ok_or_else(|| type_error("invalid local time"))?
+                + chrono::Duration::hours(1);
+            Local
+                .from_local_datetime(&naive)
+                .earliest()
+                .ok_or_else(|| type_error("invalid local time"))?
+        }
+    };
     Ok(dt)
 }
 
@@ -522,6 +632,7 @@ fn with_tz_extras(obj: Object, gmtoff: i64, zone: &str) -> Object {
     obj
 }
 
+#[cfg(not(unix))]
 fn struct_time_from_local(dt: DateTime<Local>) -> Object {
     use chrono::Offset;
     let gmtoff = i64::from(dt.offset().fix().local_minus_utc());
@@ -559,13 +670,53 @@ fn time_localtime(args: &[Object]) -> Result<Object, RuntimeError> {
     // An out-of-range or non-finite seconds value is an `OverflowError`, not a
     // `TypeError` — `datetime.fromtimestamp(1e200)` relies on this
     // (`datetimetester.test_insane_fromtimestamp`).
-    let dt = match args.first() {
-        Some(Object::Int(i)) => local_from_timestamp(*i)?,
-        Some(Object::Float(f)) => local_from_timestamp(float_to_timestamp(*f)?)?,
-        None | Some(Object::None) => Local::now(),
+    let secs = match args.first() {
+        Some(Object::Int(i)) => *i,
+        Some(Object::Float(f)) => float_to_timestamp(*f)?,
+        None | Some(Object::None) => SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64,
         _ => return Err(type_error("localtime expects a number")),
     };
-    Ok(struct_time_from_local(dt))
+    // libc `localtime_r` — unlike `chrono::Local`, it honours a `TZ` change
+    // applied by `time.tzset()` (pandas' `tm.set_timezone` context manager
+    // wraps naive `datetime.timestamp()` in exactly that dance). Range
+    // errors (year outside `struct tm`) surface as CPython's OverflowError.
+    #[cfg(unix)]
+    {
+        let t: libc::time_t = secs as libc::time_t;
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        if unsafe { libc::localtime_r(&raw const t, &raw mut tm) }.is_null() {
+            return Err(crate::error::overflow_error(
+                "timestamp out of range for platform time_t",
+            ));
+        }
+        let zone = if tm.tm_zone.is_null() {
+            String::new()
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(tm.tm_zone) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        let base = make_struct_time(vec![
+            Object::Int(i64::from(tm.tm_year) + 1900),
+            Object::Int(i64::from(tm.tm_mon) + 1),
+            Object::Int(i64::from(tm.tm_mday)),
+            Object::Int(i64::from(tm.tm_hour)),
+            Object::Int(i64::from(tm.tm_min)),
+            Object::Int(i64::from(tm.tm_sec)),
+            // C `tm_wday` is days-since-Sunday; Python wants days-since-Monday.
+            Object::Int(i64::from((tm.tm_wday + 6) % 7)),
+            Object::Int(i64::from(tm.tm_yday) + 1),
+            Object::Int(i64::from(tm.tm_isdst)),
+        ]);
+        Ok(with_tz_extras(base, tm.tm_gmtoff as i64, &zone))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(struct_time_from_local(local_from_timestamp(secs)?))
+    }
 }
 
 fn time_gmtime(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -579,6 +730,56 @@ fn time_gmtime(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn time_mktime(args: &[Object]) -> Result<Object, RuntimeError> {
-    let dt = tuple_to_dt(args.first())?;
-    Ok(Object::Float(dt.timestamp() as f64))
+    // libc `mktime` for the same reason as `localtime` above: it must agree
+    // with a `TZ`/`tzset()` override, and it resolves `tm_isdst = -1`
+    // ambiguity the way CPython's `time.mktime` does.
+    #[cfg(unix)]
+    {
+        let get = |i: usize| -> Option<Object> {
+            match args.first() {
+                Some(Object::Tuple(t)) => t.get(i).cloned(),
+                Some(Object::List(items)) => items.borrow().get(i).cloned(),
+                Some(Object::Instance(inst)) => inst
+                    .dict
+                    .borrow()
+                    .get(&DictKey(Object::from_static(STRUCT_TIME_FIELDS[i])))
+                    .cloned(),
+                _ => None,
+            }
+        };
+        if matches!(
+            args.first(),
+            Some(Object::Tuple(_) | Object::List(_) | Object::Instance(_))
+        ) {
+            let extract = |i: usize| -> Result<i64, RuntimeError> {
+                match get(i) {
+                    Some(Object::Int(v)) => Ok(v),
+                    Some(Object::Bool(b)) => Ok(i64::from(b)),
+                    _ => Err(type_error("invalid struct_time")),
+                }
+            };
+            let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+            tm.tm_year = (extract(0)? - 1900) as _;
+            tm.tm_mon = (extract(1)? - 1) as _;
+            tm.tm_mday = extract(2)? as _;
+            tm.tm_hour = extract(3)? as _;
+            tm.tm_min = extract(4)? as _;
+            tm.tm_sec = extract(5)? as _;
+            tm.tm_isdst = extract(8).unwrap_or(-1) as _;
+            let t = unsafe { libc::mktime(&raw mut tm) };
+            if t == -1 && tm.tm_mday != 30 {
+                // -1 is both the error sentinel and a legitimate second
+                // before the epoch; CPython retries with tm_mday bumped to
+                // disambiguate. Practical inputs never hit this, so raise.
+                return Err(crate::error::overflow_error("mktime argument out of range"));
+            }
+            return Ok(Object::Float(t as f64));
+        }
+        Err(type_error("expected struct_time tuple"))
+    }
+    #[cfg(not(unix))]
+    {
+        let dt = tuple_to_dt(args.first())?;
+        Ok(Object::Float(dt.timestamp() as f64))
+    }
 }

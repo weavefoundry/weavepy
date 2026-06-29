@@ -26,7 +26,6 @@
 //!   preserve the dotted-name → import-and-fetch behaviour
 //!   numpy / scipy rely on.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
@@ -36,6 +35,34 @@ use weavepy_vm::object::{Object, PyCapsuleSoul};
 use weavepy_vm::sync::Rc;
 
 use crate::object::{PyObject, PyObjectBox};
+
+/// TEMP (RFC 0047 wave 5 capsule-UAF debug): gate for `[CAP]` tracing,
+/// enabled by `WEAVEPY_TRACE_CAPSULE`.
+pub fn cap_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WEAVEPY_TRACE_CAPSULE").is_some())
+}
+
+fn refcnt_of(p: *mut PyObject) -> i64 {
+    if p.is_null() {
+        return -999;
+    }
+    unsafe { (*p).ob_refcnt as i64 }
+}
+
+/// True if `p` is a capsule box that still has a live VM-side soul
+/// (used by `free_box` to detect a use-after-free).
+pub fn soul_alive(p: *mut PyObject) -> bool {
+    let key = p as usize;
+    CAPSULE_SOULS.lock().ok().is_some_and(|g| {
+        g.as_ref().is_some_and(|m| {
+            m.get(&key)
+                .and_then(weavepy_vm::sync::Weak::upgrade)
+                .is_some()
+        })
+    })
+}
 
 #[repr(C)]
 struct CapsuleState {
@@ -87,7 +114,30 @@ pub unsafe extern "C" fn PyCapsule_New(
     });
     let raw = Box::into_raw(bx) as *mut PyObject;
     crate::object::register_minted(raw);
+    if cap_trace_enabled() {
+        let nm = name_owned_str(unsafe { &*(raw as *const PyObjectBox) });
+        eprintln!(
+            "[CAP] New box=0x{:x} refcnt={} name={:?} dtor={}",
+            raw as usize,
+            refcnt_of(raw),
+            nm,
+            destructor.is_some(),
+        );
+    }
     raw
+}
+
+fn name_owned_str(bx: &PyObjectBox) -> String {
+    let st = bx.payload.user_data as *mut CapsuleState;
+    if st.is_null() {
+        return "<no-state>".to_string();
+    }
+    unsafe { &*st }
+        .name
+        .as_deref()
+        .and_then(|b| CStr::from_bytes_with_nul(b).ok())
+        .map(|c| c.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "<unnamed>".to_string())
 }
 
 fn capsule_state(p: *mut PyObject) -> Option<*mut CapsuleState> {
@@ -119,15 +169,18 @@ fn capsule_state(p: *mut PyObject) -> Option<*mut CapsuleState> {
 // the retain when the last soul drops (the [`capsule_soul_free`] hook).
 // ---------------------------------------------------------------------------
 
-thread_local! {
-    /// Dedup map `capsule box pointer -> Weak<soul>`. Lets a capsule that
-    /// crosses into the VM more than once resolve to the *same* soul (so
-    /// `cap is cap` holds and exactly one VM-side retain is kept). Advisory:
-    /// a missing/stale entry only costs an extra soul, never correctness —
-    /// each soul independently balances its own retain.
-    static CAPSULE_SOULS: RefCell<HashMap<usize, weavepy_vm::sync::Weak<PyCapsuleSoul>>> =
-        RefCell::new(HashMap::new());
-}
+/// Dedup map `capsule box pointer -> Weak<soul>`. Lets a capsule that
+/// crosses into the VM more than once resolve to the *same* soul (so
+/// `cap is cap` holds and exactly one VM-side retain is kept). Advisory:
+/// a missing/stale entry only costs an extra soul, never correctness —
+/// each soul independently balances its own retain.
+///
+/// Process-global (RFC 0047, wave 5): capsules registered at import time
+/// (numpy's `_ARRAY_API`) are re-resolved from worker threads; a per-thread
+/// map would mint duplicate souls and duplicate lifelong retains per thread.
+static CAPSULE_SOULS: std::sync::Mutex<
+    Option<HashMap<usize, weavepy_vm::sync::Weak<PyCapsuleSoul>>>,
+> = std::sync::Mutex::new(None);
 
 /// Install the VM hook that releases a capsule's retained box when its
 /// VM-side [`PyCapsuleSoul`] drops (RFC 0045, wave 3). Idempotent; called
@@ -150,11 +203,17 @@ pub fn is_capsule(p: *mut PyObject) -> bool {
 /// `p` must be a live capsule box ([`is_capsule`]).
 pub unsafe fn capsule_soul(p: *mut PyObject) -> Object {
     let key = p as usize;
-    if let Some(existing) = CAPSULE_SOULS.with(|m| {
-        m.borrow()
-            .get(&key)
-            .and_then(weavepy_vm::sync::Weak::upgrade)
+    if let Some(existing) = CAPSULE_SOULS.lock().ok().and_then(|g| {
+        g.as_ref()
+            .and_then(|m| m.get(&key).and_then(weavepy_vm::sync::Weak::upgrade))
     }) {
+        if cap_trace_enabled() {
+            eprintln!(
+                "[CAP] soul_in p=0x{:x} REUSE existing soul refcnt={}",
+                key,
+                refcnt_of(p),
+            );
+        }
         return Object::Capsule(existing);
     }
     // First crossing: read the name for `repr`, take the soul's lifelong
@@ -168,9 +227,21 @@ pub unsafe fn capsule_soul(p: *mut PyObject) -> Object {
             weavepy_vm::sync::Rc::<str>::from(text.as_str())
         })
     });
+    let before = refcnt_of(p);
     unsafe { crate::object::Py_IncRef(p) };
     let soul = Rc::new(PyCapsuleSoul { name, handle: key });
-    CAPSULE_SOULS.with(|m| m.borrow_mut().insert(key, Rc::downgrade(&soul)));
+    if let Ok(mut g) = CAPSULE_SOULS.lock() {
+        g.get_or_insert_with(HashMap::new)
+            .insert(key, Rc::downgrade(&soul));
+    }
+    if cap_trace_enabled() {
+        eprintln!(
+            "[CAP] soul_in p=0x{:x} NEW soul refcnt {}->{}",
+            key,
+            before,
+            refcnt_of(p),
+        );
+    }
     Object::Capsule(soul)
 }
 
@@ -179,6 +250,22 @@ pub unsafe fn capsule_soul(p: *mut PyObject) -> Object {
 /// live — the soul holds a retain on it for as long as it exists.
 pub fn capsule_box_from_soul(soul: &Rc<PyCapsuleSoul>) -> *mut PyObject {
     let p = soul.handle as *mut PyObject;
+    if cap_trace_enabled() {
+        let ok = capsule_state(p).is_some();
+        let ty = if p.is_null() {
+            0
+        } else {
+            unsafe { (*p).ob_type as usize }
+        };
+        eprintln!(
+            "[CAP] box_out handle=0x{:x} refcnt_before={} is_capsule={} ob_type=0x{:x} expected=0x{:x}",
+            p as usize,
+            refcnt_of(p),
+            ok,
+            ty,
+            crate::types::PyCapsule_Type.as_ptr() as usize,
+        );
+    }
     unsafe { crate::object::Py_IncRef(p) };
     p
 }
@@ -186,8 +273,8 @@ pub fn capsule_box_from_soul(soul: &Rc<PyCapsuleSoul>) -> *mut PyObject {
 /// VM hook (registered by [`install`]): the last [`PyCapsuleSoul`] for a
 /// capsule has dropped, so release the lifelong retain its box was holding.
 /// Drops the dedup entry first, then decrefs — the decref may reach zero and
-/// free the box (running any `PyCapsule` destructor), which must not see a
-/// borrow of [`CAPSULE_SOULS`] held.
+/// free the box (running any `PyCapsule` destructor), which must not see the
+/// [`CAPSULE_SOULS`] lock held.
 fn capsule_soul_free(handle: usize) {
     if handle == 0 {
         return;
@@ -195,9 +282,18 @@ fn capsule_soul_free(handle: usize) {
     // Best-effort dedup cleanup. Advisory only: removing the wrong entry (a
     // pathological cross-thread reuse of the same address) costs at most an
     // extra soul later, never a refcount imbalance.
-    CAPSULE_SOULS.with(|m| {
-        m.borrow_mut().remove(&handle);
-    });
+    if let Ok(mut g) = CAPSULE_SOULS.lock() {
+        if let Some(m) = g.as_mut() {
+            m.remove(&handle);
+        }
+    }
+    if cap_trace_enabled() {
+        eprintln!(
+            "[CAP] soul_free handle=0x{:x} refcnt_before_dec={}",
+            handle,
+            refcnt_of(handle as *mut PyObject),
+        );
+    }
     unsafe { crate::object::Py_DecRef(handle as *mut PyObject) };
 }
 
@@ -362,6 +458,9 @@ pub unsafe extern "C" fn PyCapsule_Import(
         crate::errors::set_value_error("PyCapsule_Import: empty name");
         return ptr::null_mut();
     }
+    if cap_trace_enabled() {
+        eprintln!("[CAP] Import ENTER name={dotted:?} parts={parts:?}");
+    }
 
     // Step 1: walk longest-prefix module loads, then fall back to
     // attribute lookups for the remainder. This matches CPython's
@@ -375,6 +474,13 @@ pub unsafe extern "C" fn PyCapsule_Import(
             Err(_) => continue,
         };
         let module = unsafe { crate::module::PyImport_ImportModule(c_prefix.as_ptr()) };
+        if cap_trace_enabled() {
+            eprintln!(
+                "[CAP] Import try-prefix i={i} prefix={:?} -> {}",
+                parts[..i].join("."),
+                if module.is_null() { "NULL" } else { "ok" },
+            );
+        }
         if !module.is_null() {
             object_ptr = module;
             consumed = i;
@@ -408,6 +514,18 @@ pub unsafe extern "C" fn PyCapsule_Import(
             }
         };
         let next = unsafe { crate::abstract_::PyObject_GetAttrString(object_ptr, c_attr.as_ptr()) };
+        if cap_trace_enabled() {
+            eprintln!(
+                "[CAP] Import getattr {:?} on 0x{:x} -> {}",
+                attr,
+                object_ptr as usize,
+                if next.is_null() {
+                    "NULL".to_string()
+                } else {
+                    format!("0x{:x} is_capsule={}", next as usize, is_capsule(next))
+                },
+            );
+        }
         if next.is_null() {
             // RFC 0029: built-in C-API capsules (e.g.
             // `datetime.datetime_CAPI`, `numpy.core.multiarray._ARRAY_API`)
@@ -436,6 +554,18 @@ pub unsafe extern "C" fn PyCapsule_Import(
         }
     };
     let p = unsafe { PyCapsule_GetPointer(object_ptr, cname.as_ptr()) };
+    if cap_trace_enabled() {
+        eprintln!(
+            "[CAP] Import FINAL GetPointer on 0x{:x} (is_capsule={}) -> {}",
+            object_ptr as usize,
+            is_capsule(object_ptr),
+            if p.is_null() {
+                "NULL".to_string()
+            } else {
+                format!("0x{:x}", p as usize)
+            },
+        );
+    }
     unsafe { crate::object::Py_DecRef(object_ptr) };
     p
 }
@@ -459,13 +589,18 @@ fn try_install_well_known_capsule(
     parent_module: *mut PyObject,
 ) -> Option<*mut PyObject> {
     if dotted == "datetime.datetime_CAPI" {
-        // Build the capsule from the static API table.
+        // RFC 0029 (wave 5): mint the faithful datetime types + dynamic
+        // capsule table (size-correct type slots) before publishing, and
+        // best-effort fill the `TimeZone_UTC` singleton. Falls back to
+        // the static table (NULL type slots) if `datetime` can't be
+        // located, which keeps the function-pointer constructors usable.
+        crate::datetime_api::ensure_datetime_bridge();
+        crate::datetime_api::fill_utc_singleton();
         let name = match CString::new("datetime.datetime_CAPI") {
             Ok(s) => s,
             Err(_) => return None,
         };
-        let payload =
-            &crate::datetime_api::PyDateTimeAPI_Instance as *const _ as *mut std::ffi::c_void;
+        let payload = crate::datetime_api::capi_table_void_ptr();
         let capsule = unsafe { PyCapsule_New(payload, name.as_ptr(), None) };
         if capsule.is_null() {
             return None;
@@ -480,11 +615,10 @@ fn try_install_well_known_capsule(
             crate::abstract_::PyObject_SetAttrString(parent_module, attr.as_ptr(), capsule)
         };
         // Also publish the global pointer for the `PyDateTimeAPI`
-        // macro in `Python.h`.
+        // macro in `Python.h` (the dynamic table when ready, else static).
         unsafe {
-            crate::datetime_api::PyDateTimeAPI = &crate::datetime_api::PyDateTimeAPI_Instance
-                as *const _
-                as *mut crate::datetime_api::PyDateTimeCAPI;
+            crate::datetime_api::PyDateTimeAPI =
+                payload as *mut crate::datetime_api::PyDateTimeCAPI;
         }
         return Some(capsule);
     }

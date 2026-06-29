@@ -9,7 +9,6 @@ use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
 use std::ptr;
 use weavepy_vm::sync::Rc;
-use weavepy_vm::sync::RefCell;
 
 use weavepy_vm::object::Object;
 
@@ -43,16 +42,58 @@ pub unsafe extern "C" fn PyUnicode_FromStringAndSize(
     } else {
         unsafe { std::slice::from_raw_parts(s as *const u8, len) }
     };
-    let str_val = std::str::from_utf8(slice).unwrap_or("");
-    crate::object::into_owned(Object::from_str(str_val))
+    match std::str::from_utf8(slice) {
+        Ok(str_val) => crate::object::into_owned(Object::from_str(str_val)),
+        // CPython decodes strictly (`PyUnicode_DecodeUTF8Stateful(u, size,
+        // NULL, NULL)`) and raises `UnicodeDecodeError` on malformed input —
+        // don't silently swallow it into an empty string.
+        Err(_) => decode_capi(slice, "utf-8", "strict"),
+    }
+}
+
+/// Decode raw bytes through the VM codec engine and hand back an owned
+/// `str` pointer — the engine honours every error handler (`surrogatepass`
+/// produces a `WStr` carrying lone surrogates) and raises the faithful
+/// `UnicodeDecodeError` on strict failures.
+fn decode_capi(slice: &[u8], encoding: &str, errors: &str) -> *mut PyObject {
+    match weavepy_vm::stdlib::codecs_mod::decode_bytes_obj(slice, encoding, errors) {
+        Ok(o) => crate::object::into_owned(o),
+        Err(e) => {
+            crate::errors::set_pending_from_runtime(e);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Non-null C string → owned `&str`-ish, with a default for NULL.
+unsafe fn cstr_or(p: *const c_char, default: &str) -> std::borrow::Cow<'_, str> {
+    if p.is_null() {
+        std::borrow::Cow::Borrowed(default)
+    } else {
+        unsafe { CStr::from_ptr(p) }.to_string_lossy()
+    }
 }
 
 // Cache of `(rc str, leaked bytes)` so that `PyUnicode_AsUTF8`
 // returns a stable pointer for the lifetime of the string. CPython
 // caches the UTF-8 representation on the str object itself; we
 // approximate by leaking a `\0`-terminated copy on first call.
-thread_local! {
-    static UTF8_CACHE: RefCell<Vec<Rc<[u8]>>> = const { RefCell::new(Vec::new()) };
+//
+// Process-global (RFC 0047, wave 5): C extensions retain the returned
+// `char*` beyond the calling thread's lifetime (numpy stashes dtype/field
+// names in statics), so a per-thread pin list would dangle every pointer
+// minted on a `threading.Thread` when that thread exits.
+static UTF8_CACHE: std::sync::Mutex<Vec<Rc<[u8]>>> = std::sync::Mutex::new(Vec::new());
+
+/// Pin `rc` for the life of the process so the raw pointer handed to C
+/// stays valid. On a poisoned lock, leak instead — never hand back a
+/// pointer that dies with `rc` at the end of the caller's scope.
+fn pin_buffer(rc: Rc<[u8]>) {
+    if let Ok(mut g) = UTF8_CACHE.lock() {
+        g.push(rc);
+    } else {
+        std::mem::forget(rc);
+    }
 }
 
 fn cache_cstr(s: &str) -> *const c_char {
@@ -60,8 +101,28 @@ fn cache_cstr(s: &str) -> *const c_char {
     bytes.push(0);
     let rc: Rc<[u8]> = bytes.into();
     let p = rc.as_ptr() as *const c_char;
-    UTF8_CACHE.with(|c| c.borrow_mut().push(rc));
+    pin_buffer(rc);
     p
+}
+
+/// Raise CPython's strict-UTF-8 `UnicodeEncodeError` for the first lone
+/// surrogate in a `WStr` (a str carrying unpaired surrogate code points):
+/// `'utf-8' codec can't encode character '\udXXX' in position N:
+/// surrogates not allowed`. All `PyUnicode_AsUTF8*` variants funnel a
+/// surrogate-carrying str through here — pandas' ujson encoder relies on
+/// the raise (`test_encode_unicode_error`).
+fn set_wstr_surrogate_error(cps: &[u32]) {
+    let pos = cps
+        .iter()
+        .position(|c| (0xD800..=0xDFFF).contains(c))
+        .unwrap_or(0);
+    crate::errors::set_pending_from_runtime(weavepy_vm::error::unicode_encode_error_obj(
+        "utf-8",
+        Object::WStr(cps.into()),
+        pos,
+        pos + 1,
+        "surrogates not allowed",
+    ));
 }
 
 #[no_mangle]
@@ -69,8 +130,12 @@ pub unsafe extern "C" fn PyUnicode_AsUTF8(o: *mut PyObject) -> *const c_char {
     if o.is_null() {
         return ptr::null();
     }
-    match unsafe { crate::object::clone_object(o) } {
+    match unsafe { crate::object::clone_object_value(o) } {
         Object::Str(s) => cache_cstr(&s),
+        Object::WStr(cps) => {
+            set_wstr_surrogate_error(&cps);
+            ptr::null()
+        }
         _ => {
             crate::errors::set_type_error("expected str");
             ptr::null()
@@ -83,13 +148,31 @@ pub unsafe extern "C" fn PyUnicode_AsUTF8AndSize(
     o: *mut PyObject,
     size: *mut PySsizeT,
 ) -> *const c_char {
-    let p = unsafe { PyUnicode_AsUTF8(o) };
-    if !size.is_null() && !p.is_null() {
-        unsafe {
-            *size = libc_strlen(p) as PySsizeT;
+    if o.is_null() {
+        return ptr::null();
+    }
+    // Resolve the VM string directly (not via `PyUnicode_AsUTF8` +
+    // `strlen`): CPython reports the *true* UTF-8 byte length, and a str
+    // with embedded NULs ("31337 \x00 1337" through pandas' ujson `s#`
+    // argument parsing) must not be silently truncated at the first NUL.
+    match unsafe { crate::object::clone_object_value(o) } {
+        Object::Str(s) => {
+            let n = s.len();
+            let p = cache_cstr(&s);
+            if !size.is_null() {
+                unsafe { *size = n as PySsizeT };
+            }
+            p
+        }
+        Object::WStr(cps) => {
+            set_wstr_surrogate_error(&cps);
+            ptr::null()
+        }
+        _ => {
+            crate::errors::set_type_error("expected str");
+            ptr::null()
         }
     }
-    p
 }
 
 fn libc_strlen(p: *const c_char) -> usize {
@@ -108,9 +191,18 @@ pub unsafe extern "C" fn PyUnicode_GetLength(o: *mut PyObject) -> PySsizeT {
     if o.is_null() {
         return -1;
     }
-    match unsafe { crate::object::clone_object(o) } {
-        Object::Str(s) => s.chars().count() as PySsizeT,
-        _ => {
+    match unsafe { crate::object::clone_object_value(o) } {
+        Object::Str(s) => {
+            let n = s.chars().count() as PySsizeT;
+            if std::env::var_os("WEAVEPY_TRACE_UCS4").is_some() {
+                eprintln!("[UCS4] GetLength({o:p}) = {n} value={s:?}");
+            }
+            n
+        }
+        other => {
+            if std::env::var_os("WEAVEPY_TRACE_UCS4").is_some() {
+                eprintln!("[UCS4] GetLength({o:p}) NOT-STR kind={}", other.type_name());
+            }
             crate::errors::set_type_error("expected str");
             -1
         }
@@ -122,8 +214,8 @@ pub unsafe extern "C" fn PyUnicode_Concat(a: *mut PyObject, b: *mut PyObject) ->
     if a.is_null() || b.is_null() {
         return ptr::null_mut();
     }
-    let (sa, sb) = match (unsafe { crate::object::clone_object(a) }, unsafe {
-        crate::object::clone_object(b)
+    let (sa, sb) = match (unsafe { crate::object::clone_object_value(a) }, unsafe {
+        crate::object::clone_object_value(b)
     }) {
         (Object::Str(sa), Object::Str(sb)) => (sa, sb),
         _ => {
@@ -142,7 +234,11 @@ pub unsafe extern "C" fn PyUnicode_Check(o: *mut PyObject) -> c_int {
     if o.is_null() {
         return 0;
     }
-    matches!(unsafe { crate::object::clone_object(o) }, Object::Str(_)).into()
+    matches!(
+        unsafe { crate::object::clone_object_value(o) },
+        Object::Str(_) | Object::WStr(_)
+    )
+    .into()
 }
 
 #[no_mangle]
@@ -154,7 +250,7 @@ pub unsafe extern "C" fn PyUnicode_CompareWithASCIIString(
         return -1;
     }
     let cmp = unsafe { CStr::from_ptr(s) }.to_bytes();
-    match unsafe { crate::object::clone_object(o) } {
+    match unsafe { crate::object::clone_object_value(o) } {
         Object::Str(rs) => match rs.as_bytes().cmp(cmp) {
             std::cmp::Ordering::Less => -1,
             std::cmp::Ordering::Equal => 0,
@@ -167,12 +263,46 @@ pub unsafe extern "C" fn PyUnicode_CompareWithASCIIString(
 #[no_mangle]
 pub unsafe extern "C" fn PyUnicode_AsEncodedString(
     o: *mut PyObject,
-    _enc: *const c_char,
-    _errors: *const c_char,
+    enc: *const c_char,
+    errors: *const c_char,
 ) -> *mut PyObject {
-    // We treat all encodings as UTF-8 for the foundation; a future
-    // RFC will add the codecs registry pass-through.
-    unsafe { PyUnicode_AsUTF8String(o) }
+    if o.is_null() {
+        return ptr::null_mut();
+    }
+    let enc_s = if enc.is_null() {
+        "utf-8".to_owned()
+    } else {
+        unsafe { CStr::from_ptr(enc) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    let errors_s = if errors.is_null() {
+        "strict".to_owned()
+    } else {
+        unsafe { CStr::from_ptr(errors) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    let obj = unsafe { crate::object::clone_object_value(o) };
+    if !matches!(obj, Object::Str(_) | Object::WStr(_)) {
+        crate::errors::set_type_error("expected str");
+        return ptr::null_mut();
+    }
+    // Route through the VM codec engine — it honours the errors handler
+    // (`surrogatepass`/`surrogateescape`/`replace`/…) and non-UTF-8 codecs,
+    // which Cython-generated `str.encode(enc, errors)` calls rely on
+    // (pandas' TextReader re-encodes text-handle reads with the user's
+    // `encoding_errors`).
+    match weavepy_vm::stdlib::codecs_mod::encode_obj(&obj, &enc_s, &errors_s) {
+        Ok(bytes) => {
+            let rc: Rc<[u8]> = bytes.into();
+            crate::object::into_owned(Object::Bytes(rc))
+        }
+        Err(e) => {
+            crate::errors::set_pending_from_runtime(e);
+            ptr::null_mut()
+        }
+    }
 }
 
 #[no_mangle]
@@ -180,10 +310,14 @@ pub unsafe extern "C" fn PyUnicode_AsUTF8String(o: *mut PyObject) -> *mut PyObje
     if o.is_null() {
         return ptr::null_mut();
     }
-    match unsafe { crate::object::clone_object(o) } {
+    match unsafe { crate::object::clone_object_value(o) } {
         Object::Str(s) => {
             let bytes: Rc<[u8]> = s.as_bytes().into();
             crate::object::into_owned(Object::Bytes(bytes))
+        }
+        Object::WStr(cps) => {
+            set_wstr_surrogate_error(&cps);
+            ptr::null_mut()
         }
         _ => {
             crate::errors::set_type_error("expected str");
@@ -223,13 +357,13 @@ pub unsafe extern "C" fn PyBytes_AsString(o: *mut PyObject) -> *mut c_char {
     if o.is_null() {
         return ptr::null_mut();
     }
-    match unsafe { crate::object::clone_object(o) } {
+    match unsafe { crate::object::clone_object_value(o) } {
         Object::Bytes(b) => {
             let mut owned = b.to_vec();
             owned.push(0);
             let rc: Rc<[u8]> = owned.into();
             let p = rc.as_ptr() as *mut c_char;
-            UTF8_CACHE.with(|c| c.borrow_mut().push(rc));
+            pin_buffer(rc);
             p
         }
         _ => {
@@ -248,7 +382,7 @@ pub unsafe extern "C" fn PyBytes_AsStringAndSize(
     if o.is_null() || buffer.is_null() {
         return -1;
     }
-    match unsafe { crate::object::clone_object(o) } {
+    match unsafe { crate::object::clone_object_value(o) } {
         Object::Bytes(b) => {
             let p = unsafe { PyBytes_AsString(o) };
             unsafe {
@@ -271,7 +405,7 @@ pub unsafe extern "C" fn PyBytes_Size(o: *mut PyObject) -> PySsizeT {
     if o.is_null() {
         return -1;
     }
-    match unsafe { crate::object::clone_object(o) } {
+    match unsafe { crate::object::clone_object_value(o) } {
         Object::Bytes(b) => b.len() as PySsizeT,
         _ => -1,
     }
@@ -282,7 +416,11 @@ pub unsafe extern "C" fn PyBytes_Check(o: *mut PyObject) -> c_int {
     if o.is_null() {
         return 0;
     }
-    matches!(unsafe { crate::object::clone_object(o) }, Object::Bytes(_)).into()
+    matches!(
+        unsafe { crate::object::clone_object_value(o) },
+        Object::Bytes(_)
+    )
+    .into()
 }
 
 // ----------------------------------------------------------------
@@ -309,13 +447,13 @@ pub unsafe extern "C" fn PyByteArray_AsString(o: *mut PyObject) -> *mut c_char {
     if o.is_null() {
         return ptr::null_mut();
     }
-    match unsafe { crate::object::clone_object(o) } {
+    match unsafe { crate::object::clone_object_value(o) } {
         Object::ByteArray(b) => {
             let mut owned = b.borrow().clone();
             owned.push(0);
             let rc: Rc<[u8]> = owned.into();
             let p = rc.as_ptr() as *mut c_char;
-            UTF8_CACHE.with(|c| c.borrow_mut().push(rc));
+            pin_buffer(rc);
             p
         }
         _ => ptr::null_mut(),
@@ -327,7 +465,7 @@ pub unsafe extern "C" fn PyByteArray_Size(o: *mut PyObject) -> PySsizeT {
     if o.is_null() {
         return -1;
     }
-    match unsafe { crate::object::clone_object(o) } {
+    match unsafe { crate::object::clone_object_value(o) } {
         Object::ByteArray(b) => b.borrow().len() as PySsizeT,
         _ => -1,
     }
@@ -339,7 +477,7 @@ pub unsafe extern "C" fn PyByteArray_Check(o: *mut PyObject) -> c_int {
         return 0;
     }
     matches!(
-        unsafe { crate::object::clone_object(o) },
+        unsafe { crate::object::clone_object_value(o) },
         Object::ByteArray(_)
     )
     .into()
@@ -374,10 +512,21 @@ pub unsafe extern "C" fn PyUnicode_FromOrdinal(ord: c_int) -> *mut PyObject {
 pub unsafe extern "C" fn PyUnicode_Decode(
     s: *const c_char,
     size: PySsizeT,
-    _encoding: *const c_char,
-    _errors: *const c_char,
+    encoding: *const c_char,
+    errors: *const c_char,
 ) -> *mut PyObject {
-    unsafe { PyUnicode_FromStringAndSize(s, size) }
+    if s.is_null() && size != 0 {
+        return ptr::null_mut();
+    }
+    let len = size.max(0) as usize;
+    let slice = if s.is_null() {
+        b""
+    } else {
+        unsafe { std::slice::from_raw_parts(s as *const u8, len) }
+    };
+    let enc = unsafe { cstr_or(encoding, "utf-8") };
+    let err = unsafe { cstr_or(errors, "strict") };
+    decode_capi(slice, &enc, &err)
 }
 
 /// `PyUnicode_DecodeUTF8(s, size, errors)`.
@@ -385,9 +534,9 @@ pub unsafe extern "C" fn PyUnicode_Decode(
 pub unsafe extern "C" fn PyUnicode_DecodeUTF8(
     s: *const c_char,
     size: PySsizeT,
-    _errors: *const c_char,
+    errors: *const c_char,
 ) -> *mut PyObject {
-    unsafe { PyUnicode_FromStringAndSize(s, size) }
+    unsafe { PyUnicode_Decode(s, size, ptr::null(), errors) }
 }
 
 /// `PyUnicode_DecodeASCII(s, size, errors)`.
@@ -395,9 +544,19 @@ pub unsafe extern "C" fn PyUnicode_DecodeUTF8(
 pub unsafe extern "C" fn PyUnicode_DecodeASCII(
     s: *const c_char,
     size: PySsizeT,
-    _errors: *const c_char,
+    errors: *const c_char,
 ) -> *mut PyObject {
-    unsafe { PyUnicode_FromStringAndSize(s, size) }
+    if s.is_null() && size != 0 {
+        return ptr::null_mut();
+    }
+    let len = size.max(0) as usize;
+    let slice = if s.is_null() {
+        b""
+    } else {
+        unsafe { std::slice::from_raw_parts(s as *const u8, len) }
+    };
+    let err = unsafe { cstr_or(errors, "strict") };
+    decode_capi(slice, "ascii", &err)
 }
 
 /// `PyUnicode_DecodeLatin1(s, size, errors)` — Latin-1 source
@@ -435,7 +594,7 @@ pub unsafe extern "C" fn PyUnicode_FromEncodedObject(
     if obj.is_null() {
         return ptr::null_mut();
     }
-    match unsafe { crate::object::clone_object(obj) } {
+    match unsafe { crate::object::clone_object_value(obj) } {
         Object::Str(_) => unsafe {
             crate::object::Py_IncRef(obj);
             obj
@@ -450,10 +609,30 @@ pub unsafe extern "C" fn PyUnicode_FromEncodedObject(
             unsafe { PyUnicode_Decode(s, buf.len() as PySsizeT, encoding, errors) }
         }
         _ => {
-            crate::errors::set_type_error(
-                "PyUnicode_FromEncodedObject: expected bytes-like object",
-            );
-            ptr::null_mut()
+            // CPython falls back to the PEP 3118 buffer protocol for any
+            // bytes-like object that isn't an exact `bytes`/`bytearray`
+            // (memoryview, array.array, mmap, and — crucially for numpy —
+            // its `bytes_`/`str_` scalars and 0-d buffer exporters that
+            // datetime64 array formatting hands to us). Mirror that instead
+            // of rejecting everything non-native.
+            let mut view = crate::buffer::Py_buffer::zeroed();
+            // PyBUF_SIMPLE == 0
+            let rc = unsafe { crate::buffer::PyObject_GetBuffer(obj, &mut view, 0) };
+            if rc != 0 {
+                // Replace the pending BufferError with the TypeError CPython
+                // raises here (clearer for "needs a bytes-like object").
+                crate::errors::set_type_error("decoding to str: need a bytes-like object");
+                return ptr::null_mut();
+            }
+            let data = view.buf as *const c_char;
+            let len = view.len;
+            let out = if data.is_null() || len == 0 {
+                unsafe { PyUnicode_Decode(b"".as_ptr() as *const c_char, 0, encoding, errors) }
+            } else {
+                unsafe { PyUnicode_Decode(data, len, encoding, errors) }
+            };
+            unsafe { crate::buffer::PyBuffer_Release(&mut view) };
+            out
         }
     }
 }
@@ -469,7 +648,7 @@ pub unsafe extern "C" fn PyUnicode_Substring(
     if o.is_null() {
         return ptr::null_mut();
     }
-    match unsafe { crate::object::clone_object(o) } {
+    match unsafe { crate::object::clone_object_value(o) } {
         Object::Str(s) => {
             let start = start.max(0) as usize;
             let end = end.max(0) as usize;
@@ -492,7 +671,14 @@ pub unsafe extern "C" fn PyUnicode_ReadChar(o: *mut PyObject, idx: PySsizeT) -> 
     if o.is_null() {
         return u32::MAX;
     }
-    match unsafe { crate::object::clone_object(o) } {
+    // Fast path: a buffer-authoritative string reads straight from its
+    // PEP 393 buffer (no per-call string rebuild).
+    if idx >= 0 {
+        if let Some(cp) = unsafe { crate::mirror::unicode_read_char(o, idx as usize) } {
+            return cp;
+        }
+    }
+    match unsafe { crate::object::clone_object_value(o) } {
         Object::Str(s) => {
             let i = idx.max(0) as usize;
             match s.chars().nth(i) {
@@ -515,8 +701,8 @@ pub unsafe extern "C" fn PyUnicode_Compare(a: *mut PyObject, b: *mut PyObject) -
     if a.is_null() || b.is_null() {
         return -1;
     }
-    match (unsafe { crate::object::clone_object(a) }, unsafe {
-        crate::object::clone_object(b)
+    match (unsafe { crate::object::clone_object_value(a) }, unsafe {
+        crate::object::clone_object_value(b)
     }) {
         (Object::Str(sa), Object::Str(sb)) => match sa.cmp(&sb) {
             std::cmp::Ordering::Less => -1,
@@ -564,7 +750,7 @@ pub unsafe extern "C" fn PyUnicode_EqualToUTF8(o: *mut PyObject, s: *const c_cha
         return 0;
     }
     let want = unsafe { CStr::from_ptr(s) }.to_string_lossy().into_owned();
-    match unsafe { crate::object::clone_object(o) } {
+    match unsafe { crate::object::clone_object_value(o) } {
         Object::Str(rs) => i32::from(&*rs == want.as_str()),
         _ => 0,
     }
@@ -581,7 +767,7 @@ pub unsafe extern "C" fn PyUnicode_EqualToUTF8AndSize(
     }
     let len = n.max(0) as usize;
     let want = unsafe { std::slice::from_raw_parts(s as *const u8, len) };
-    match unsafe { crate::object::clone_object(o) } {
+    match unsafe { crate::object::clone_object_value(o) } {
         Object::Str(rs) => i32::from(rs.as_bytes() == want),
         _ => 0,
     }
@@ -600,32 +786,71 @@ pub unsafe extern "C" fn PyUnicode_InternInPlace(_p: *mut *mut PyObject) {
     // literals.
 }
 
-/// `PyUnicode_New(size, maxchar)` — build a mutable preallocated
-/// str. We approximate by allocating a fresh empty Str; user
-/// code should write characters through
-/// `PyUnicode_WriteChar` (which we treat as a no-op since the
-/// underlying storage is immutable).
+/// `PyUnicode_New(size, maxchar)` — mint a fresh, writable, zero-filled
+/// unicode string of `size` code points at the PEP 393 kind implied by
+/// `maxchar` (RFC 0047, wave 5). The result is a **buffer-authoritative**
+/// mirror: a stock extension fills it with the inlined `PyUnicode_WRITE`
+/// macro (a direct store at `PyUnicode_DATA(o) + i*kind`) and the bytes are
+/// reconstructed when the string crosses back to the VM. This is the exact
+/// idiom Cython's f-string / integer-format codegen uses.
 #[no_mangle]
-pub unsafe extern "C" fn PyUnicode_New(_size: PySsizeT, _maxchar: u32) -> *mut PyObject {
-    crate::object::into_owned(Object::from_static(""))
+pub unsafe extern "C" fn PyUnicode_New(size: PySsizeT, maxchar: u32) -> *mut PyObject {
+    let n = if size < 0 { 0 } else { size as usize };
+    let r = crate::mirror::new_unicode_mirror(n, maxchar);
+    if r.is_null() {
+        // Match CPython: an oversize/failed allocation raises MemoryError
+        // rather than returning NULL with no exception set.
+        unsafe { crate::errors::PyErr_NoMemory() };
+    }
+    r
 }
 
+/// `PyUnicode_WriteChar(o, idx, ch)` — store one code point into a writable
+/// string built by `PyUnicode_New`. Returns 0 on success, -1 (with an
+/// exception set) for an out-of-range index, a too-wide code point, or a
+/// non-writable target.
 #[no_mangle]
-pub unsafe extern "C" fn PyUnicode_WriteChar(_o: *mut PyObject, _idx: PySsizeT, _ch: u32) -> c_int {
-    // Treated as a no-op; full unicode-buffer mutation will
-    // require a private rep we haven't introduced yet.
-    0
+pub unsafe extern "C" fn PyUnicode_WriteChar(o: *mut PyObject, idx: PySsizeT, ch: u32) -> c_int {
+    if o.is_null() || idx < 0 {
+        crate::errors::set_value_error("PyUnicode_WriteChar: invalid argument");
+        return -1;
+    }
+    match unsafe { crate::mirror::unicode_write_char(o, idx as usize, ch) } {
+        Ok(()) => 0,
+        Err(msg) => {
+            crate::errors::set_value_error(msg);
+            -1
+        }
+    }
 }
 
+/// `PyUnicode_CopyCharacters(to, to_start, from, from_start, how_many)` —
+/// copy `how_many` code points from `from` into the writable string `to`
+/// (RFC 0047, wave 5). Returns the number copied, or -1 with an exception
+/// set. Cython's in-place concatenation fast path calls this straight after
+/// `PyUnicode_Resize` to append the right operand.
 #[no_mangle]
 pub unsafe extern "C" fn PyUnicode_CopyCharacters(
-    _to: *mut PyObject,
-    _to_start: PySsizeT,
-    _from: *mut PyObject,
-    _from_start: PySsizeT,
-    _how_many: PySsizeT,
+    to: *mut PyObject,
+    to_start: PySsizeT,
+    from: *mut PyObject,
+    from_start: PySsizeT,
+    how_many: PySsizeT,
 ) -> PySsizeT {
-    -1
+    if to.is_null() || from.is_null() {
+        crate::errors::set_type_error("PyUnicode_CopyCharacters: expected str");
+        return -1;
+    }
+    let ts = to_start.max(0) as usize;
+    let fs = from_start.max(0) as usize;
+    let hm = how_many.max(0) as usize;
+    match unsafe { crate::mirror::unicode_copy_characters(to, ts, from, fs, hm) } {
+        Ok(n) => n as PySsizeT,
+        Err(msg) => {
+            crate::errors::set_value_error(msg);
+            -1
+        }
+    }
 }
 
 #[no_mangle]
@@ -636,9 +861,10 @@ pub unsafe extern "C" fn PyUnicode_Contains(
     if haystack.is_null() || needle.is_null() {
         return -1;
     }
-    match (unsafe { crate::object::clone_object(haystack) }, unsafe {
-        crate::object::clone_object(needle)
-    }) {
+    match (
+        unsafe { crate::object::clone_object_value(haystack) },
+        unsafe { crate::object::clone_object_value(needle) },
+    ) {
         (Object::Str(h), Object::Str(n)) => i32::from(h.contains(&*n)),
         _ => {
             crate::errors::set_type_error("PyUnicode_Contains: expected str");
@@ -652,7 +878,7 @@ pub unsafe extern "C" fn PyUnicode_IsIdentifier(o: *mut PyObject) -> c_int {
     if o.is_null() {
         return 0;
     }
-    match unsafe { crate::object::clone_object(o) } {
+    match unsafe { crate::object::clone_object_value(o) } {
         Object::Str(s) => {
             if s.is_empty() {
                 return 0;
@@ -687,9 +913,10 @@ pub unsafe extern "C" fn PyUnicode_Find(
     if haystack.is_null() || needle.is_null() {
         return -2;
     }
-    let (h, n) = match (unsafe { crate::object::clone_object(haystack) }, unsafe {
-        crate::object::clone_object(needle)
-    }) {
+    let (h, n) = match (
+        unsafe { crate::object::clone_object_value(haystack) },
+        unsafe { crate::object::clone_object_value(needle) },
+    ) {
         (Object::Str(h), Object::Str(n)) => (h.to_string(), n.to_string()),
         _ => {
             crate::errors::set_type_error("PyUnicode_Find: expected str");
@@ -747,8 +974,8 @@ pub unsafe extern "C" fn PyUnicode_Tailmatch(
     if o.is_null() || substr.is_null() {
         return -1;
     }
-    let (o_s, sub_s) = match (unsafe { crate::object::clone_object(o) }, unsafe {
-        crate::object::clone_object(substr)
+    let (o_s, sub_s) = match (unsafe { crate::object::clone_object_value(o) }, unsafe {
+        crate::object::clone_object_value(substr)
     }) {
         (Object::Str(o_s), Object::Str(s_s)) => (o_s.to_string(), s_s.to_string()),
         _ => return -1,
@@ -776,7 +1003,7 @@ pub unsafe extern "C" fn PyUnicode_Split(
     if s.is_null() {
         return ptr::null_mut();
     }
-    let s_str = match unsafe { crate::object::clone_object(s) } {
+    let s_str = match unsafe { crate::object::clone_object_value(s) } {
         Object::Str(s) => s.to_string(),
         _ => {
             crate::errors::set_type_error("PyUnicode_Split: expected str");
@@ -786,7 +1013,7 @@ pub unsafe extern "C" fn PyUnicode_Split(
     let sep_str = if sep.is_null() {
         None
     } else {
-        match unsafe { crate::object::clone_object(sep) } {
+        match unsafe { crate::object::clone_object_value(sep) } {
             Object::Str(s) => Some(s.to_string()),
             Object::None => None,
             _ => {
@@ -820,7 +1047,7 @@ pub unsafe extern "C" fn PyUnicode_Splitlines(s: *mut PyObject, keepends: c_int)
     if s.is_null() {
         return ptr::null_mut();
     }
-    let s_str = match unsafe { crate::object::clone_object(s) } {
+    let s_str = match unsafe { crate::object::clone_object_value(s) } {
         Object::Str(s) => s.to_string(),
         _ => {
             crate::errors::set_type_error("expected str");
@@ -853,34 +1080,65 @@ pub unsafe extern "C" fn PyUnicode_Join(
     if separator.is_null() || seq.is_null() {
         return ptr::null_mut();
     }
-    let sep_str = match unsafe { crate::object::clone_object(separator) } {
+    let sep_str = match unsafe { crate::object::clone_object_value(separator) } {
         Object::Str(s) => s.to_string(),
         _ => {
             crate::errors::set_type_error("separator must be str");
             return ptr::null_mut();
         }
     };
-    let items: Vec<String> = match unsafe { crate::object::clone_object(seq) } {
-        Object::List(rc) => rc
-            .borrow()
-            .iter()
-            .map(|o| match o {
-                Object::Str(s) => s.to_string(),
-                _ => String::new(),
-            })
-            .collect(),
-        Object::Tuple(items) => items
-            .iter()
-            .map(|o| match o {
-                Object::Str(s) => s.to_string(),
-                _ => String::new(),
-            })
-            .collect(),
+
+    // CPython's `PyUnicode_Join` runs `seq` through `PySequence_Fast`, so any
+    // iterable (list, tuple, generator, set, dict-keys, list-subclass, …) is
+    // accepted — not just the two builtin sequence types. Collect the elements
+    // into a native `Vec<Object>`: use a direct borrow for the common
+    // list/tuple fast paths and fall back to the iterator protocol otherwise.
+    let elems: Vec<Object> = match unsafe { crate::object::clone_object_value(seq) } {
+        Object::List(rc) => rc.borrow().iter().cloned().collect(),
+        Object::Tuple(items) => items.iter().cloned().collect(),
         _ => {
-            crate::errors::set_type_error("seq must be iterable");
-            return ptr::null_mut();
+            let it = unsafe { crate::abstract_::PyObject_GetIter(seq) };
+            if it.is_null() {
+                // Preserve CPython's message shape for non-iterables; the
+                // iterator protocol already set a TypeError, but be explicit.
+                if crate::errors::pending().is_none() {
+                    crate::errors::set_type_error("can only join an iterable");
+                }
+                return ptr::null_mut();
+            }
+            let mut out: Vec<Object> = Vec::new();
+            loop {
+                let item = unsafe { crate::abstract_::PyIter_Next(it) };
+                if item.is_null() {
+                    break;
+                }
+                out.push(unsafe { crate::object::clone_object_value(item) });
+                unsafe { crate::object::Py_DecRef(item) };
+            }
+            unsafe { crate::object::Py_DecRef(it) };
+            if crate::errors::pending().is_some() {
+                return ptr::null_mut();
+            }
+            out
         }
     };
+
+    // Every element must be a `str`; mirror CPython's
+    // "sequence item N: expected str instance, T found" TypeError otherwise.
+    let mut items: Vec<String> = Vec::with_capacity(elems.len());
+    for (i, o) in elems.iter().enumerate() {
+        match o {
+            Object::Str(s) => items.push(s.to_string()),
+            other => {
+                crate::errors::set_type_error(format!(
+                    "sequence item {}: expected str instance, {} found",
+                    i,
+                    other.type_name()
+                ));
+                return ptr::null_mut();
+            }
+        }
+    }
     crate::object::into_owned(Object::from_str(items.join(&sep_str)))
 }
 
@@ -895,9 +1153,9 @@ pub unsafe extern "C" fn PyUnicode_Replace(
         return ptr::null_mut();
     }
     let (s_str, n_str, r_str) = match (
-        unsafe { crate::object::clone_object(s) },
-        unsafe { crate::object::clone_object(needle) },
-        unsafe { crate::object::clone_object(replacement) },
+        unsafe { crate::object::clone_object_value(s) },
+        unsafe { crate::object::clone_object_value(needle) },
+        unsafe { crate::object::clone_object_value(replacement) },
     ) {
         (Object::Str(a), Object::Str(b), Object::Str(c)) => {
             (a.to_string(), b.to_string(), c.to_string())
@@ -927,17 +1185,47 @@ pub unsafe extern "C" fn PyUnicode_Fill(
 
 #[no_mangle]
 pub unsafe extern "C" fn PyUnicode_FromKindAndData(
-    _kind: c_int,
+    kind: c_int,
     buffer: *const std::ffi::c_void,
     size: PySsizeT,
 ) -> *mut PyObject {
-    // Treat all kinds (1, 2, 4-byte chars) as utf-8 input; the
-    // common kind in extension code is 1 (Latin-1-ish) or 4
-    // (full UCS-4). We map both to UTF-8 by best effort.
+    // PEP 393: `data` is an array of `size` code units whose width is
+    // given by `kind` (1/2/4 bytes per code point). Each code unit is a
+    // raw code point — for the 1-byte kind that means Latin-1, NOT
+    // UTF-8. numpy's UNICODE_getitem reads array elements back via
+    // `PyUnicode_FromKindAndData(PyUnicode_4BYTE_KIND, ucs4, len)`, so
+    // honoring `kind` is required to avoid truncating multi-char strings.
     let len = size.max(0) as usize;
-    let slice = unsafe { std::slice::from_raw_parts(buffer as *const u8, len) };
-    let owned = String::from_utf8_lossy(slice).into_owned();
-    crate::object::into_owned(Object::from_str(owned))
+    if buffer.is_null() || len == 0 {
+        return crate::object::into_owned(Object::from_str(String::new()));
+    }
+    let mut s = String::with_capacity(len);
+    match kind {
+        2 => {
+            let p = buffer as *const u16;
+            for i in 0..len {
+                let cp = unsafe { *p.add(i) } as u32;
+                s.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+            }
+        }
+        4 => {
+            let p = buffer as *const u32;
+            for i in 0..len {
+                let cp = unsafe { *p.add(i) };
+                s.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+            }
+        }
+        // kind == 1 (Latin-1); also the fallback for the deprecated
+        // wchar/0 kind. Each byte is a code point in 0..=255.
+        _ => {
+            let p = buffer as *const u8;
+            for i in 0..len {
+                let cp = unsafe { *p.add(i) } as u32;
+                s.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+            }
+        }
+    }
+    crate::object::into_owned(Object::from_str(s))
 }
 
 /// `PyUnicode_DecodeFSDefault` / `PyUnicode_EncodeFSDefault` —
@@ -972,7 +1260,7 @@ pub unsafe extern "C" fn PyUnicode_AsLatin1String(o: *mut PyObject) -> *mut PyOb
     if o.is_null() {
         return ptr::null_mut();
     }
-    match unsafe { crate::object::clone_object(o) } {
+    match unsafe { crate::object::clone_object_value(o) } {
         Object::Str(s) => {
             let bytes: Vec<u8> = s
                 .chars()
@@ -997,7 +1285,7 @@ pub unsafe extern "C" fn PyBytes_FromObject(o: *mut PyObject) -> *mut PyObject {
     if o.is_null() {
         return ptr::null_mut();
     }
-    match unsafe { crate::object::clone_object(o) } {
+    match unsafe { crate::object::clone_object_value(o) } {
         Object::Bytes(_) => unsafe {
             crate::object::Py_IncRef(o);
             o
@@ -1050,8 +1338,8 @@ pub unsafe extern "C" fn PyBytes_Concat(p: *mut *mut PyObject, w: *mut PyObject)
     if left.is_null() {
         return;
     }
-    match (unsafe { crate::object::clone_object(left) }, unsafe {
-        crate::object::clone_object(w)
+    match (unsafe { crate::object::clone_object_value(left) }, unsafe {
+        crate::object::clone_object_value(w)
     }) {
         (Object::Bytes(a), Object::Bytes(b)) => {
             let mut out = a.to_vec();
@@ -1073,30 +1361,11 @@ pub unsafe extern "C" fn PyBytes_ConcatAndDel(p: *mut *mut PyObject, w: *mut PyO
     unsafe { crate::object::Py_DecRef(w) };
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn PyBytes_FromFormat(
-    fmt: *const c_char,
-    arg0: *const c_char,
-) -> *mut PyObject {
-    // Minimal: %s replacement. Real CPython supports the printf
-    // family; that's a future enhancement.
-    if fmt.is_null() {
-        return ptr::null_mut();
-    }
-    let fmt_s = unsafe { CStr::from_ptr(fmt) }
-        .to_string_lossy()
-        .into_owned();
-    let arg_s = if arg0.is_null() {
-        String::new()
-    } else {
-        unsafe { CStr::from_ptr(arg0) }
-            .to_string_lossy()
-            .into_owned()
-    };
-    let out = fmt_s.replacen("%s", &arg_s, 1);
-    let rc: Rc<[u8]> = out.into_bytes().into();
-    crate::object::into_owned(Object::Bytes(rc))
-}
+// `PyBytes_FromFormat` / `PyBytes_FromFormatV` live in `varargs.c`:
+// they are genuinely variadic (stable Rust cannot receive a `va_list`),
+// and the C side implements CPython's full documented format-unit set
+// (`%c %d %u %i %x %s %p %%` with `l`/`z` length flags and `%.Ns`
+// precision — `test_bytes.test_from_format` exercises all of them).
 
 // ----------------------------------------------------------------
 // RFC 0029 — additional `PyByteArray_*` surface.
@@ -1107,7 +1376,7 @@ pub unsafe extern "C" fn PyByteArray_Resize(o: *mut PyObject, size: PySsizeT) ->
     if o.is_null() || size < 0 {
         return -1;
     }
-    match unsafe { crate::object::clone_object(o) } {
+    match unsafe { crate::object::clone_object_value(o) } {
         Object::ByteArray(b) => {
             let mut v = b.borrow_mut();
             v.resize(size as usize, 0);
@@ -1125,7 +1394,7 @@ pub unsafe extern "C" fn PyByteArray_Concat(a: *mut PyObject, b: *mut PyObject) 
     if a.is_null() || b.is_null() {
         return ptr::null_mut();
     }
-    let mut out = match unsafe { crate::object::clone_object(a) } {
+    let mut out = match unsafe { crate::object::clone_object_value(a) } {
         Object::ByteArray(rc) => rc.borrow().clone(),
         Object::Bytes(rc) => rc.to_vec(),
         _ => {
@@ -1133,7 +1402,7 @@ pub unsafe extern "C" fn PyByteArray_Concat(a: *mut PyObject, b: *mut PyObject) 
             return ptr::null_mut();
         }
     };
-    match unsafe { crate::object::clone_object(b) } {
+    match unsafe { crate::object::clone_object_value(b) } {
         Object::ByteArray(rc) => out.extend_from_slice(&rc.borrow()),
         Object::Bytes(rc) => out.extend_from_slice(&rc),
         _ => {}

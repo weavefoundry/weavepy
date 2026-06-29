@@ -65,13 +65,13 @@ pub mod time;
 pub mod tracemalloc_real;
 mod unicode_decomp_data;
 pub mod unicodedata_mod;
-pub mod uuid_mod;
 pub mod weakref_mod;
 pub mod zlib_mod;
 // RFC 0023 — drop-in stdlib parity.
 pub mod abc_mod;
 pub mod atexit_mod;
 pub mod contextvars_mod;
+pub mod ctypes_native;
 pub mod https_mod;
 pub mod io_full;
 pub mod locale_mod;
@@ -137,7 +137,10 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("_statistics", statistics_accel::build);
     cache.register_builtin("binascii", binascii_mod::build);
     cache.register_builtin("secrets", secrets_mod::build);
-    cache.register_builtin("uuid", uuid_mod::build);
+    // `uuid` is CPython's verbatim pure-Python `Lib/uuid.py` (registered as a
+    // frozen source below), NOT a native dict shim — the shim's fake UUID
+    // (a `dict`) could not carry a real `__str__`, so `str(uuid.uuid4())`
+    // returned a dict repr. See `frozen_sources()`.
     cache.register_builtin("_tempfile", tempfile_mod::build);
     cache.register_builtin("_shutil", shutil_mod::build);
     cache.register_builtin("_functools", functools_mod::build);
@@ -191,6 +194,12 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("_locale", locale_mod::build);
     cache.register_builtin("_abc", abc_mod::build);
     cache.register_builtin("_contextvars", contextvars_mod::build);
+    // RFC 0046 (wave 5): native primitive layer behind the frozen `_ctypes`
+    // reimplementation (memory peek/poke, dlopen/dlsym, platform C type
+    // sizes, libffi call bridge) that backs the verbatim CPython `ctypes`
+    // package. The host `_ctypes.*.so` is core-built (links `_PyRuntime`),
+    // so it cannot be dlopen'd like a stable-ABI wheel — we reimplement it.
+    cache.register_builtin("_ctypes_native", ctypes_native::build);
     cache.register_builtin("atexit", atexit_mod::build);
     cache.register_builtin("_https", https_mod::build);
     // RFC 0026 — POSIX-flavoured stdlib that user code (and the
@@ -215,8 +224,29 @@ pub fn register_all(cache: &ModuleCache) {
     // binary-ABI loader imports the genuine `numpy._core._multiarray_umath`
     // extension instead.
     let suppress_numpy_shim = std::env::var_os("WEAVEPY_NO_NUMPY_SHIM").is_some();
+    // Mirror of `WEAVEPY_NO_NUMPY_SHIM` for the frozen `pytest`/`pluggy`/
+    // `iniconfig` shims: suppressing them lets a real pytest installed on
+    // `sys.path` load instead (or an editable copy of our shim during
+    // development), rather than being shadowed by the frozen source.
+    let suppress_pytest_shim = std::env::var_os("WEAVEPY_NO_PYTEST_SHIM").is_some();
+    // General-purpose escape hatch (comma-separated module names) so a frozen
+    // module can be shadowed by an editable copy on `sys.path` during
+    // development — the same idea as the two shims above, but for arbitrary
+    // modules while iterating on their pure-Python source without a rebuild.
+    let suppress_list = std::env::var("WEAVEPY_SUPPRESS_FROZEN").unwrap_or_default();
+    let suppressed: std::collections::HashSet<&str> = suppress_list
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
     for src in frozen_sources() {
         if suppress_numpy_shim && matches!(src.name, "numpy" | "_numpy_pure") {
+            continue;
+        }
+        if suppress_pytest_shim && matches!(src.name, "pytest" | "pluggy" | "iniconfig") {
+            continue;
+        }
+        if suppressed.contains(src.name) {
             continue;
         }
         cache.register_frozen(*src);
@@ -228,6 +258,58 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "builtins",
             source: include_str!("python/builtins.py"),
+            is_package: false,
+        },
+        // RFC 0046 (wave 5): `ctypes`. The verbatim CPython `ctypes` package
+        // runs over our frozen `_ctypes` reimplementation (CPython's real
+        // `_ctypes` is a core-built C extension linking `_PyRuntime`, so it
+        // can't be dlopen'd like a stable-ABI wheel). `_ctypes` in turn sits
+        // on the native `_ctypes_native` primitive module (memory, dlopen,
+        // platform C type sizes, libffi). pandas imports `ctypes`
+        // unconditionally (`pandas.errors`).
+        FrozenSource {
+            name: "_ctypes",
+            source: include_str!("python/_ctypes.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "ctypes",
+            source: include_str!("python/ctypes/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "ctypes._endian",
+            source: include_str!("python/ctypes/_endian.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "ctypes.util",
+            source: include_str!("python/ctypes/util.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "ctypes.wintypes",
+            source: include_str!("python/ctypes/wintypes.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "ctypes.macholib",
+            source: include_str!("python/ctypes/macholib/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "ctypes.macholib.dyld",
+            source: include_str!("python/ctypes/macholib/dyld.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "ctypes.macholib.dylib",
+            source: include_str!("python/ctypes/macholib/dylib.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "ctypes.macholib.framework",
+            source: include_str!("python/ctypes/macholib/framework.py"),
             is_package: false,
         },
         // RFC 0040 WS1 — upgrades the native `os` module's `environ`/
@@ -274,12 +356,39 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/keyword.py"),
             is_package: false,
         },
+        // `shlex` — verbatim CPython lexical analyzer (`split`/`quote`/`join`).
+        // Pure-Python over `os`/`re`/`sys`/`collections.deque`/`io.StringIO`,
+        // all of which WeavePy provides. Without it pandas' `tests/io/conftest.py`
+        // dies at its first line (`import shlex`) and `_load_conftests` silently
+        // swallows the `ModuleNotFoundError`, dropping every io-conftest fixture
+        // (`compression_to_extension`, `tips_file`, the s3/moto fixtures, …) so
+        // dozens of io tests fail with a spurious "missing positional argument".
+        FrozenSource {
+            name: "shlex",
+            source: include_str!("python/shlex.py"),
+            is_package: false,
+        },
         // `random` — verbatim CPython distribution layer over the
         // Rust `_random` MT19937 core (RFC 0037: `random.Random(42)`
         // is stream-identical to CPython).
         FrozenSource {
             name: "random",
             source: include_str!("python/random_mod.py"),
+            is_package: false,
+        },
+        // `uuid` — verbatim CPython `Lib/uuid.py`. The full `UUID` class
+        // (immutable, `__slots__`-backed, `object.__setattr__` bypass,
+        // `__str__`/`__repr__`/`__hash__`/`__eq__`, the `bytes`/`hex`/`urn`/
+        // `version`/`fields` properties) is required by real code — pandas'
+        // `_testing.ensure_clean()` builds temp filenames from
+        // `str(uuid.uuid4())`, so a dict masquerading as a UUID produced a
+        // dict-repr filename (`{'bytes': …}`) and `ENAMETOOLONG`. `uuid4()`
+        // needs only `os.urandom`; the optional `_uuid` C ext is guarded by
+        // `try/except ImportError`, and `getnode()`'s subprocess helpers are
+        // never reached by the random/hash-based generators.
+        FrozenSource {
+            name: "uuid",
+            source: include_str!("python/uuid.py"),
             is_package: false,
         },
         // Internal: `_SeqIter`, the lazy legacy-`__getitem__` iterator
@@ -1192,6 +1301,32 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/encodings/punycode.py"),
             is_package: false,
         },
+        // CPython's alias registry (`encodings/aliases.py`, vendored verbatim).
+        // `codecs.lookup` resolves spelling variants through it exactly like
+        // CPython's `encodings.search_function` — e.g. `utf-16le` → `utf_16_le`,
+        // `windows-1251` → `cp1251` — before consulting the codec tables.
+        FrozenSource {
+            name: "encodings.aliases",
+            source: include_str!("python/encodings/aliases.py"),
+            is_package: false,
+        },
+        // On-demand single-byte codepages CPython ships as `gencodec.py`-
+        // generated `encodings.*` charmap modules (`codecs.charmap_encode`/
+        // `charmap_decode`). `encoding_rs` (the native backend) carries only
+        // the WHATWG set, so these EBCDIC/DOS pages are missing there and
+        // resolve through `codecs.lookup`'s frozen-`encodings` fallback:
+        // `cp037` (pandas `read_csv`/`to_csv` non-UTF-8 tests) and `cp737`
+        // (Greek DOS, `Series.to_csv` compression matrix).
+        FrozenSource {
+            name: "encodings.cp037",
+            source: include_str!("python/encodings/cp037.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp737",
+            source: include_str!("python/encodings/cp737.py"),
+            is_package: false,
+        },
         // RFC 0042 WS5 — application-protocol clients, vendored verbatim from
         // CPython 3.13. They ride the WS1 `socket`/`makefile()` and WS2 `ssl`
         // stacks (`*_SSL` variants, `starttls`/`stls`). `nntplib`/`telnetlib`
@@ -1216,7 +1351,12 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/smtplib.py"),
             is_package: false,
         },
-        // `xml` package and submodules — only `etree.ElementTree`.
+        // `xml` package + submodules. `etree` and `dom` are now the *verbatim*
+        // CPython implementations running over WeavePy's native `pyexpat`
+        // (namespace-aware `ParserCreate(encoding, "}")`, `_elementtree` C
+        // accelerator absent so the pure-Python path is taken). This replaces
+        // the earlier hand-rolled `xml_etree.py`, which was namespace-naive and
+        // failed pandas' `read_xml`/`to_xml` namespace + prefix round-trips.
         FrozenSource {
             name: "xml",
             source: "",
@@ -1224,12 +1364,73 @@ fn frozen_sources() -> &'static [FrozenSource] {
         },
         FrozenSource {
             name: "xml.etree",
-            source: "",
+            source: include_str!("python/xml/etree/__init__.py"),
             is_package: true,
         },
         FrozenSource {
+            name: "xml.etree.ElementPath",
+            source: include_str!("python/xml/etree/ElementPath.py"),
+            is_package: false,
+        },
+        FrozenSource {
             name: "xml.etree.ElementTree",
-            source: include_str!("python/xml_etree.py"),
+            source: include_str!("python/xml/etree/ElementTree.py"),
+            is_package: false,
+        },
+        // `xml.parsers.expat` — verbatim CPython over WeavePy's native
+        // `pyexpat`. Registering the package + this thin `from pyexpat import *`
+        // shim is what lets the verbatim `xml.dom` package below drive the
+        // native parser (`xml.parsers.expat` was otherwise unresolved even
+        // though `pyexpat` imports fine).
+        FrozenSource {
+            name: "xml.parsers",
+            source: include_str!("python/xml/parsers/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "xml.parsers.expat",
+            source: include_str!("python/xml/parsers/expat.py"),
+            is_package: false,
+        },
+        // `xml.dom` + `xml.dom.minidom` (and the builders they need) — verbatim
+        // CPython. pandas' `DataFrame.to_xml(pretty_print=True)` does
+        // `xml.dom.minidom.parseString(out_xml).toprettyxml(indent="  ")`; the
+        // verbatim `minidom` guarantees byte-identical pretty-printed output,
+        // and `expatbuilder` runs over the native `pyexpat` (non-namespace mode,
+        // qualified names verbatim — matching how the input was serialized).
+        FrozenSource {
+            name: "xml.dom",
+            source: include_str!("python/xml/dom/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "xml.dom.minicompat",
+            source: include_str!("python/xml/dom/minicompat.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "xml.dom.domreg",
+            source: include_str!("python/xml/dom/domreg.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "xml.dom.NodeFilter",
+            source: include_str!("python/xml/dom/NodeFilter.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "xml.dom.xmlbuilder",
+            source: include_str!("python/xml/dom/xmlbuilder.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "xml.dom.expatbuilder",
+            source: include_str!("python/xml/dom/expatbuilder.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "xml.dom.minidom",
+            source: include_str!("python/xml/dom/minidom.py"),
             is_package: false,
         },
         // RFC 0018 — introspection, test infrastructure, exception groups.
@@ -1590,6 +1791,11 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "pickle",
             source: include_str!("python/pickle.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_compat_pickle",
+            source: include_str!("python/_compat_pickle.py"),
             is_package: false,
         },
         FrozenSource {

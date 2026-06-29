@@ -292,7 +292,7 @@ fn hasher_class() -> Rc<TypeObject> {
             return c.clone();
         }
         let bt = crate::builtin_types::builtin_types();
-        let mut dict = DictData::new();
+        let mut dict = DictData::default();
         macro_rules! method {
             ($name:literal, $body:expr) => {
                 dict.insert(
@@ -393,7 +393,7 @@ fn hasher_copy(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -412,7 +412,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("algorithms_available")),
             algos_set(),
         );
-        let cache = Rc::new(RefCell::new(DictData::new()));
+        let cache = Rc::new(RefCell::new(DictData::default()));
         CTOR_CACHE.with(|c| *c.borrow_mut() = Some(cache.clone()));
         d.insert(
             DictKey(Object::from_static("__builtin_constructor_cache")),
@@ -588,12 +588,9 @@ fn hash_new(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runt
 /// Look a digest name up in the shared `__builtin_constructor_cache`.
 fn cache_lookup(name: &str) -> Option<Object> {
     CTOR_CACHE.with(|c| {
-        c.borrow().as_ref().and_then(|cache| {
-            cache
-                .borrow()
-                .get(&DictKey(Object::from_str(name.to_owned())))
-                .cloned()
-        })
+        c.borrow()
+            .as_ref()
+            .and_then(|cache| cache.borrow().get(&crate::object::StrKey(name)).cloned())
     })
 }
 

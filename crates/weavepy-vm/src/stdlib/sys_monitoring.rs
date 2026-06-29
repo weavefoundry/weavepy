@@ -19,7 +19,7 @@ use crate::sync::{Rc, RefCell};
 use crate::trace::with_monitoring;
 
 pub fn build() -> Object {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -123,7 +123,7 @@ fn build_events_namespace() -> Object {
         ("RERAISE", 1 << 15),
         ("STOP_ITERATION", 1 << 16),
     ];
-    let mut ns = DictData::new();
+    let mut ns = DictData::default();
     for (name, value) in names {
         ns.insert(
             DictKey(Object::from_str((*name).to_string())),

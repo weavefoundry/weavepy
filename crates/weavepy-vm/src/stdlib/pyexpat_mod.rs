@@ -87,7 +87,7 @@ fn state_of(id: i64) -> Option<Rc<RefCell<ExpatState>>> {
 // ---------------------------------------------------------------------------
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -298,7 +298,7 @@ fn error_string(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn errors_submodule() -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -306,8 +306,8 @@ fn errors_submodule() -> Rc<PyModule> {
             Object::from_static("xml.parsers.expat.errors"),
         );
         // `codes`: message -> code; `messages`: code -> message.
-        let codes = Rc::new(RefCell::new(DictData::new()));
-        let messages = Rc::new(RefCell::new(DictData::new()));
+        let codes = Rc::new(RefCell::new(DictData::default()));
+        let messages = Rc::new(RefCell::new(DictData::default()));
         {
             let mut c = codes.borrow_mut();
             let mut m = messages.borrow_mut();
@@ -340,7 +340,7 @@ fn errors_submodule() -> Rc<PyModule> {
 }
 
 fn model_submodule() -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -376,7 +376,7 @@ fn model_submodule() -> Rc<PyModule> {
 fn parser_type() -> Rc<TypeObject> {
     static CLS: OnceLock<Rc<TypeObject>> = OnceLock::new();
     CLS.get_or_init(|| {
-        let mut d = DictData::new();
+        let mut d = DictData::default();
         d.insert(
             DictKey(Object::from_static("__module__")),
             Object::from_static("pyexpat"),
@@ -538,7 +538,7 @@ fn make_parser(encoding: Option<String>, namespace_sep: Option<String>) -> Objec
         // expat builder calls `self._parser.intern.setdefault`.
         d.insert(
             DictKey(Object::from_static("intern")),
-            Object::Dict(Rc::new(RefCell::new(DictData::new()))),
+            Object::Dict(Rc::new(RefCell::new(DictData::default()))),
         );
     }
     Object::Instance(Rc::new(inst))
@@ -646,6 +646,9 @@ fn parse_method(args: &[Object]) -> Result<Object, RuntimeError> {
     // instance after creation; honour the instance attributes.
     let buffer_text = buffer_text || flag_attr(&inst, "buffer_text");
     let ordered = ordered || flag_attr(&inst, "ordered_attributes");
+    // expat's `XML_SetReturnNSTriplet`: when set, prefixed names gain a trailing
+    // `<sep>prefix` field. `minidom` (ExpatBuilderNS) turns this on.
+    let return_prefix = flag_attr(&inst, "namespace_prefixes");
 
     let line_starts = compute_line_starts(&buffer);
     {
@@ -660,6 +663,7 @@ fn parse_method(args: &[Object]) -> Result<Object, RuntimeError> {
         namespace_sep.as_deref(),
         buffer_text,
         ordered,
+        return_prefix,
     )?;
     Ok(Object::Int(1))
 }
@@ -795,6 +799,7 @@ fn run_parse(
     namespace_sep: Option<&str>,
     buffer_text: bool,
     ordered: bool,
+    return_prefix: bool,
 ) -> Result<(), RuntimeError> {
     let mut reader = Reader::from_reader(buffer);
     let config = reader.config_mut();
@@ -805,6 +810,23 @@ fn run_parse(
     let mut ns_stack: Vec<NsScope> = Vec::new();
     let mut pending_text: Option<String> = None;
     let mut buf: Vec<u8> = Vec::new();
+    // Well-formedness tracking. A conforming XML document has exactly one
+    // top-level ("document") element. expat rejects two classes of input that
+    // `quick-xml` (a lenient fragment-friendly parser) accepts silently, and
+    // pandas' `read_xml` asserts on the exact expat wording:
+    //   * no root element at all           -> "no element found"           (3)
+    //   * a second top-level element/junk  -> "junk after document element" (9)
+    // `root_seen` flips true when the first depth-0 element opens; once the
+    // root has closed (`depth` back to 0 with `root_seen`) any further element
+    // start or non-whitespace text in the epilog is junk.
+    let mut root_seen = false;
+    // Element nesting depth. Character data at depth 0 is prolog/epilog
+    // whitespace, which expat routes through the Default handler rather than
+    // `CharacterDataHandler` (CPython: the `\n` after `<?xml?>` is a `default`
+    // event, not `char`). Getting this wrong made `minidom.toprettyxml` insert
+    // blank lines between the declaration and the root element, breaking every
+    // pandas `DataFrame.to_xml(pretty_print=True)` byte-comparison.
+    let mut depth: i32 = 0;
 
     loop {
         let event_pos = reader.buffer_position() as usize;
@@ -812,7 +834,7 @@ fn run_parse(
         match ev {
             Ok(Event::Eof) => break,
             Ok(Event::Decl(e)) => {
-                flush_text(inst, &mut pending_text)?;
+                flush_text(inst, &mut pending_text, depth > 0)?;
                 let version = e
                     .version()
                     .ok()
@@ -848,7 +870,11 @@ fn run_parse(
                 )?;
             }
             Ok(Event::Start(e)) => {
-                flush_text(inst, &mut pending_text)?;
+                if depth == 0 && root_seen {
+                    let (line, col) = line_col(line_starts, event_pos);
+                    return Err(make_expat_error(inst, 9, line, col, event_pos as i64));
+                }
+                flush_text(inst, &mut pending_text, depth > 0)?;
                 update_position(inst, line_starts, event_pos);
                 handle_start(
                     inst,
@@ -856,12 +882,21 @@ fn run_parse(
                     &e,
                     namespace_sep,
                     ordered,
+                    return_prefix,
                     &mut ns_stack,
                     false,
                 )?;
+                if depth == 0 {
+                    root_seen = true;
+                }
+                depth += 1;
             }
             Ok(Event::Empty(e)) => {
-                flush_text(inst, &mut pending_text)?;
+                if depth == 0 && root_seen {
+                    let (line, col) = line_col(line_starts, event_pos);
+                    return Err(make_expat_error(inst, 9, line, col, event_pos as i64));
+                }
+                flush_text(inst, &mut pending_text, depth > 0)?;
                 update_position(inst, line_starts, event_pos);
                 handle_start(
                     inst,
@@ -869,40 +904,60 @@ fn run_parse(
                     &e,
                     namespace_sep,
                     ordered,
+                    return_prefix,
                     &mut ns_stack,
                     true,
                 )?;
+                if depth == 0 {
+                    root_seen = true;
+                }
             }
             Ok(Event::End(e)) => {
-                flush_text(inst, &mut pending_text)?;
+                flush_text(inst, &mut pending_text, depth > 0)?;
                 update_position(inst, line_starts, event_pos);
-                let name = expand_end_name(&reader, e.name().as_ref(), namespace_sep, &ns_stack)?;
+                let name = expand_end_name(
+                    &reader,
+                    e.name().as_ref(),
+                    namespace_sep,
+                    &ns_stack,
+                    return_prefix,
+                )?;
                 call_handler(inst, "EndElementHandler", &[Object::from_str(name)])?;
                 pop_ns_scope(inst, namespace_sep, &mut ns_stack)?;
+                depth -= 1;
             }
             Ok(Event::Text(e)) => {
                 let text = e
                     .unescape()
                     .map_err(|err| escape_err(inst, line_starts, event_pos, &err.to_string()))?
                     .into_owned();
-                accumulate_text(inst, &mut pending_text, text, buffer_text)?;
+                // Non-whitespace character data outside the root element is not
+                // well-formed. Once the root has closed, expat reports it as
+                // "junk after document element"; whitespace epilog is allowed.
+                if depth == 0 && root_seen && !text.trim().is_empty() {
+                    let (line, col) = line_col(line_starts, event_pos);
+                    return Err(make_expat_error(inst, 9, line, col, event_pos as i64));
+                }
+                accumulate_text(inst, &mut pending_text, text, buffer_text, depth > 0)?;
             }
             Ok(Event::CData(e)) => {
-                flush_text(inst, &mut pending_text)?;
+                flush_text(inst, &mut pending_text, depth > 0)?;
                 update_position(inst, line_starts, event_pos);
                 let text = decode_cow(&reader, e.as_ref())?;
                 call_handler(inst, "StartCdataSectionHandler", &[])?;
-                emit_char_data(inst, &text)?;
+                // CDATA is only well-formed inside the root element, so it is
+                // always reportable character data.
+                emit_char_data(inst, &text, true)?;
                 call_handler(inst, "EndCdataSectionHandler", &[])?;
             }
             Ok(Event::Comment(e)) => {
-                flush_text(inst, &mut pending_text)?;
+                flush_text(inst, &mut pending_text, depth > 0)?;
                 update_position(inst, line_starts, event_pos);
                 let text = decode_cow(&reader, e.as_ref())?;
                 call_handler(inst, "CommentHandler", &[Object::from_str(text)])?;
             }
             Ok(Event::PI(e)) => {
-                flush_text(inst, &mut pending_text)?;
+                flush_text(inst, &mut pending_text, depth > 0)?;
                 update_position(inst, line_starts, event_pos);
                 let raw = decode_cow(&reader, e.as_ref())?;
                 let (target, rest) = match raw.split_once(char::is_whitespace) {
@@ -916,7 +971,7 @@ fn run_parse(
                 )?;
             }
             Ok(Event::DocType(e)) => {
-                flush_text(inst, &mut pending_text)?;
+                flush_text(inst, &mut pending_text, depth > 0)?;
                 update_position(inst, line_starts, event_pos);
                 let text = decode_cow(&reader, e.as_ref())?;
                 let name = text.split_whitespace().next().unwrap_or("").to_owned();
@@ -941,7 +996,14 @@ fn run_parse(
         }
         buf.clear();
     }
-    flush_text(inst, &mut pending_text)?;
+    flush_text(inst, &mut pending_text, depth > 0)?;
+    // A document with no top-level element ("", whitespace-only, prolog-only)
+    // is ill-formed: expat raises "no element found" at the final position.
+    if !root_seen {
+        let end = buffer.len();
+        let (line, col) = line_col(line_starts, end);
+        return Err(make_expat_error(inst, 3, line, col, end as i64));
+    }
     Ok(())
 }
 
@@ -950,30 +1012,43 @@ fn accumulate_text(
     pending: &mut Option<String>,
     text: String,
     buffer_text: bool,
+    in_element: bool,
 ) -> Result<(), RuntimeError> {
     if buffer_text {
         pending.get_or_insert_with(String::new).push_str(&text);
         Ok(())
     } else {
-        emit_char_data(inst, &text)
+        emit_char_data(inst, &text, in_element)
     }
 }
 
-fn flush_text(inst: &Rc<PyInstance>, pending: &mut Option<String>) -> Result<(), RuntimeError> {
+fn flush_text(
+    inst: &Rc<PyInstance>,
+    pending: &mut Option<String>,
+    in_element: bool,
+) -> Result<(), RuntimeError> {
     if let Some(text) = pending.take() {
         if !text.is_empty() {
-            emit_char_data(inst, &text)?;
+            emit_char_data(inst, &text, in_element)?;
         }
     }
     Ok(())
 }
 
-fn emit_char_data(inst: &Rc<PyInstance>, text: &str) -> Result<(), RuntimeError> {
-    let fired = call_handler(
-        inst,
-        "CharacterDataHandler",
-        &[Object::from_str(text.to_owned())],
-    )?;
+fn emit_char_data(inst: &Rc<PyInstance>, text: &str, in_element: bool) -> Result<(), RuntimeError> {
+    // Only content *inside* the root element is reportable character data.
+    // Whitespace in the prolog/epilog (depth 0) is never handed to
+    // `CharacterDataHandler` by expat — it goes straight to the Default
+    // handler, exactly like any other markup with no specific handler.
+    let fired = if in_element {
+        call_handler(
+            inst,
+            "CharacterDataHandler",
+            &[Object::from_str(text.to_owned())],
+        )?
+    } else {
+        false
+    };
     if !fired {
         // expat routes unhandled data through the Default handlers.
         if handler_of(inst, "DefaultHandlerExpand").is_some() {
@@ -996,6 +1071,7 @@ fn handle_start(
     e: &quick_xml::events::BytesStart<'_>,
     namespace_sep: Option<&str>,
     ordered: bool,
+    return_prefix: bool,
     ns_stack: &mut Vec<NsScope>,
     empty: bool,
 ) -> Result<(), RuntimeError> {
@@ -1033,13 +1109,27 @@ fn handle_start(
         ns_stack.push(scope);
     }
 
-    let name = expand_name(reader, e.name().as_ref(), namespace_sep, ns_stack, true)?;
+    let name = expand_name(
+        reader,
+        e.name().as_ref(),
+        namespace_sep,
+        ns_stack,
+        true,
+        return_prefix,
+    )?;
 
     // Build the expanded attribute names.
     let mut attrs: Vec<(String, String)> = Vec::with_capacity(raw_attrs.len());
     for (k, v) in raw_attrs {
         let nk = if namespace_sep.is_some() {
-            expand_name(reader, k.as_bytes(), namespace_sep, ns_stack, false)?
+            expand_name(
+                reader,
+                k.as_bytes(),
+                namespace_sep,
+                ns_stack,
+                false,
+                return_prefix,
+            )?
         } else {
             k
         };
@@ -1054,7 +1144,7 @@ fn handle_start(
         }
         Object::List(Rc::new(RefCell::new(items)))
     } else {
-        let dict = Rc::new(RefCell::new(DictData::new()));
+        let dict = Rc::new(RefCell::new(DictData::default()));
         {
             let mut d = dict.borrow_mut();
             for (k, v) in attrs {
@@ -1112,12 +1202,22 @@ fn lookup_ns(ns_stack: &[NsScope], prefix: &str) -> Option<String> {
 /// Expand an element/attribute name in namespace mode to expat's
 /// `uri<sep>localname` form. `is_element` controls default-namespace
 /// application (attributes are not in the default namespace).
+///
+/// When `return_prefix` is set (expat's `XML_SetReturnNSTriplet`, driven by the
+/// Python-visible `namespace_prefixes` flag), a *prefixed* name additionally
+/// carries the original prefix as a third separator-delimited field
+/// (`uri<sep>local<sep>prefix`). `xml.dom.minidom` turns this on and relies on
+/// the trailing prefix to reconstruct the qualified name — without it every
+/// `doc:tag` round-tripped through `minidom.toprettyxml` collapses to `tag`,
+/// which is exactly what broke pandas' `to_xml(prefix=…, pretty_print=True)`.
+/// A default-namespace name (no prefix) stays two-field, matching expat.
 fn expand_name(
     reader: &Reader<&[u8]>,
     raw: &[u8],
     namespace_sep: Option<&str>,
     ns_stack: &[NsScope],
     is_element: bool,
+    return_prefix: bool,
 ) -> Result<String, RuntimeError> {
     let name = decode_cow(reader, raw)?;
     let Some(sep) = namespace_sep else {
@@ -1125,6 +1225,9 @@ fn expand_name(
     };
     if let Some((prefix, local)) = name.split_once(':') {
         if let Some(uri) = lookup_ns(ns_stack, prefix) {
+            if return_prefix {
+                return Ok(format!("{uri}{sep}{local}{sep}{prefix}"));
+            }
             return Ok(format!("{uri}{sep}{local}"));
         }
         return Ok(name);
@@ -1144,8 +1247,9 @@ fn expand_end_name(
     raw: &[u8],
     namespace_sep: Option<&str>,
     ns_stack: &[NsScope],
+    return_prefix: bool,
 ) -> Result<String, RuntimeError> {
-    expand_name(reader, raw, namespace_sep, ns_stack, true)
+    expand_name(reader, raw, namespace_sep, ns_stack, true, return_prefix)
 }
 
 fn decode_cow(reader: &Reader<&[u8]>, bytes: &[u8]) -> Result<String, RuntimeError> {

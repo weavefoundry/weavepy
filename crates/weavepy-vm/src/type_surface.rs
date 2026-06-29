@@ -303,19 +303,27 @@ fn install_numeric_getsets(bt: &BuiltinTypes) {
             _ => Err(type_error("descriptor requires a 'complex' object")),
         }
     }
+    // Fresh float per access (CPython allocates); a NaN part gets a fresh
+    // identity tag — see `fresh_float`.
     getset(
         &bt.complex_,
         "real",
         Member,
         Some("the real part of a complex number"),
-        |args| complex_value(args.first().unwrap_or(&Object::None)).map(|(r, _)| Object::Float(r)),
+        |args| {
+            complex_value(args.first().unwrap_or(&Object::None))
+                .map(|(r, _)| crate::object::fresh_float(r))
+        },
     );
     getset(
         &bt.complex_,
         "imag",
         Member,
         Some("the imaginary part of a complex number"),
-        |args| complex_value(args.first().unwrap_or(&Object::None)).map(|(_, i)| Object::Float(i)),
+        |args| {
+            complex_value(args.first().unwrap_or(&Object::None))
+                .map(|(_, i)| crate::object::fresh_float(i))
+        },
     );
 }
 
@@ -525,8 +533,25 @@ fn install_object_compare(bt: &BuiltinTypes) {
         }
     }
     fn obj_ne(args: &[Object]) -> Result<Object, RuntimeError> {
-        match args {
-            [a, b] if a.is_same(b) => Ok(Object::Bool(false)),
+        let (a, b) = match args {
+            [a, b] => (a, b),
+            _ => return Ok(crate::vm_singletons::not_implemented()),
+        };
+        // `object.__ne__` delegates to the forward `__eq__` and inverts it
+        // (CPython `object_richcompare`); a plain identity check is wrong when
+        // `__eq__` disagrees with identity (`Decimal("NaN")`, or any custom
+        // `__eq__` returning `False`). Do this through the interpreter so the
+        // real `__eq__` runs.
+        if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+            // SAFETY: published by an enclosing VM frame on this thread.
+            let interp = unsafe { &mut *ptr };
+            let globals = interp.builtins_dict();
+            return interp.object_default_ne(a, b, &globals);
+        }
+        // No ambient interpreter (early startup): identity is the best we can
+        // do without being able to call `__eq__`.
+        match (a, b) {
+            (a, b) if a.is_same(b) => Ok(Object::Bool(false)),
             _ => Ok(crate::vm_singletons::not_implemented()),
         }
     }
@@ -567,7 +592,7 @@ fn insert_if_absent(ty: &Rc<TypeObject>, name: &str, value: Object) {
 /// base type's methods, like CPython's C-level `self`).
 fn as_native(o: &Object) -> Object {
     if let Object::Instance(inst) = o {
-        if let Some(native) = &inst.native {
+        if let Some(native) = inst.native.get() {
             return native.clone();
         }
     }
@@ -925,7 +950,7 @@ fn set_like(model: &Object, items: Vec<DictKey>) -> Object {
     match model {
         Object::FrozenSet(_) => Object::new_frozenset_from(items.into_iter().map(|k| k.0)),
         _ => {
-            let mut out = indexmap::IndexSet::new();
+            let mut out = crate::object::SetData::default();
             for k in items {
                 out.insert(k);
             }
@@ -942,8 +967,8 @@ fn set_like(model: &Object, items: Vec<DictKey>) -> Object {
 /// the elements out under a short-lived borrow (`set_items`) and rebuild a
 /// detached `IndexSet`, so a re-entrant mutation touches a cell we are no
 /// longer borrowing instead of panicking with `BorrowMutError`.
-fn snapshot_set(o: &Object) -> indexmap::IndexSet<DictKey> {
-    let mut out = indexmap::IndexSet::new();
+fn snapshot_set(o: &Object) -> crate::object::SetData {
+    let mut out = crate::object::SetData::default();
     for k in set_items(o) {
         out.insert(k);
     }
@@ -1144,8 +1169,7 @@ macro_rules! set_iop {
             // re-enter and `clear()` the receiver (bpo-46615); because we
             // hold no borrow on `target` during that window, the re-entrant
             // mutation hits an un-borrowed cell instead of panicking.
-            let compute: fn(indexmap::IndexSet<DictKey>, &Object) -> indexmap::IndexSet<DictKey> =
-                $compute;
+            let compute: fn(crate::object::SetData, &Object) -> crate::object::SetData = $compute;
             let snapshot = target.borrow().clone();
             let result = compute(snapshot, &other);
             *target.borrow_mut() = result;
@@ -1163,7 +1187,7 @@ set_iop!(set_isub_builtin, |mut t, o| {
 });
 set_iop!(set_iand_builtin, |t, o| {
     let os = snapshot_set(o);
-    let mut out = indexmap::IndexSet::new();
+    let mut out = crate::object::SetData::default();
     for k in t {
         if os.contains(&k) {
             out.insert(k);
@@ -1256,29 +1280,17 @@ fn dict_ror_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
-fn dict_eq_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
-    let (a, b) = (
-        as_native(args.first().unwrap_or(&Object::None)),
-        as_native(args.get(1).unwrap_or(&Object::None)),
-    );
-    match (&a, &b) {
-        (Object::Dict(_), Object::Dict(_)) => Ok(Object::Bool(a.eq_value(&b))),
-        _ => Ok(crate::vm_singletons::not_implemented()),
-    }
-}
-
-fn dict_ne_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
-    match dict_eq_builtin(args)? {
-        Object::Bool(v) => Ok(Object::Bool(!v)),
-        other => Ok(other),
-    }
-}
-
 fn install_dict_operators(bt: &BuiltinTypes) {
     insert_if_absent(&bt.dict_, "__or__", builtin("__or__", dict_or_builtin));
     insert_if_absent(&bt.dict_, "__ror__", builtin("__ror__", dict_ror_builtin));
-    insert_if_absent(&bt.dict_, "__eq__", builtin("__eq__", dict_eq_builtin));
-    insert_if_absent(&bt.dict_, "__ne__", builtin("__ne__", dict_ne_builtin));
+    // `__eq__`/`__ne__` come from `install_value_richcmp`, which recurses
+    // per-value *through the interpreter* so a value's own `__eq__` is
+    // honoured (CPython's `dict_equal` calls `PyObject_RichCompareBool`).
+    // A native-only comparator here used to win the `insert_if_absent`
+    // race and made two dict *subclass* instances (pandas' `PrettyDict`
+    // from `.groups`) compare unequal whenever a value needed dunder
+    // dispatch (e.g. `Index` values, whose `==` yields an array that is
+    // then truth-tested).
 }
 
 // ---------------------------------------------------------------------------
@@ -1302,6 +1314,10 @@ fn install_class_getitem(bt: &BuiltinTypes) {
         &bt.set_,
         &bt.frozenset_,
         &bt.type_,
+        // PEP 654 groups expose `__class_getitem__` in CPython (C
+        // `Py_GenericAlias`), e.g. `BaseExceptionGroup[T]` in hypothesis.
+        &bt.base_exception_group,
+        &bt.exception_group,
     ] {
         insert_if_absent(
             ty,
@@ -1411,6 +1427,7 @@ fn install_method_tables(bt: &BuiltinTypes) {
             "__mul__",
             "__rmul__",
             "__mod__",
+            "__rmod__",
             "__len__",
             "__contains__",
         ],
@@ -1564,6 +1581,8 @@ fn install_method_tables(bt: &BuiltinTypes) {
                 "__add__",
                 "__mul__",
                 "__rmul__",
+                "__mod__",
+                "__rmod__",
                 "__len__",
                 "__contains__",
             ],
