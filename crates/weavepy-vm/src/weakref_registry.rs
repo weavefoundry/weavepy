@@ -408,6 +408,8 @@ pub fn id_of(obj: &Object) -> ObjectId {
         Object::DictView(v) => Rc::as_ptr(v) as usize as u64,
         Object::SimpleNamespace(d) => Rc::as_ptr(d) as usize as u64,
         Object::LazyIter(l) => Rc::as_ptr(l) as usize as u64,
+        Object::Capsule(c) => Rc::as_ptr(c) as usize as u64,
+        Object::Foreign(s) => s.ptr as u64,
         Object::Long(b) => Rc::as_ptr(b) as usize as u64,
         Object::Complex(c) => Rc::as_ptr(c) as usize as u64,
     }

@@ -703,7 +703,7 @@ def _expand_parametrize(name, parent, fn, marks):
     other_marks = [m for m in marks if m.name != 'parametrize']
     if not param_marks:
         return [Item(name, parent, fn, marks=other_marks)]
-    matrix = [({}, [])]  # (param-binding dict, id-fragments)
+    matrix = [({}, [], [])]  # (param-binding dict, id-fragments, per-row marks)
     for marker in reversed(param_marks):
         args = marker.args
         if len(args) < 2:
@@ -719,9 +719,11 @@ def _expand_parametrize(name, parent, fn, marks):
         for row_idx, row in enumerate(argvalues):
             # Unwrap `pytest.param(value, id=..., marks=...)` if used.
             row_id = None
+            row_marks = []
             if isinstance(row, _ParamSet):
                 row_value = row.values
                 row_id = row.id
+                row_marks = row.marks
             else:
                 row_value = row
             if len(names) > 1:
@@ -734,19 +736,33 @@ def _expand_parametrize(name, parent, fn, marks):
             else:
                 values = [row_value]
             if row_id is None and explicit_ids is not None:
-                row_id = explicit_ids[row_idx]
+                # `ids=` is either a sequence indexed by row, or a *callable*
+                # invoked per argvalue (pytest calls it once per value and
+                # falls back to the auto id when it returns None).
+                if callable(explicit_ids):
+                    parts = []
+                    for v in values:
+                        got = explicit_ids(v)
+                        parts.append(str(got) if got is not None else _id_for(v))
+                    row_id = '-'.join(parts)
+                else:
+                    row_id = explicit_ids[row_idx]
             if row_id is None:
                 row_id = '-'.join(_id_for(v) for v in values)
-            for prior_params, prior_ids in matrix:
+            for prior_params, prior_ids, prior_marks in matrix:
                 merged = dict(prior_params)
                 for nm, val in zip(names, values):
                     merged[nm] = val
-                new_matrix.append((merged, prior_ids + [row_id]))
+                new_matrix.append(
+                    (merged, prior_ids + [row_id], prior_marks + row_marks))
         matrix = new_matrix
     items = []
-    for params, id_frags in matrix:
+    for params, id_frags, row_marks in matrix:
         pid = '-'.join(id_frags) if id_frags else None
-        items.append(Item(name, parent, fn, marks=other_marks,
+        # Per-param marks (`pytest.param(v, marks=...)`) apply on top of the
+        # function-level marks so a single parametrization can be skipped or
+        # xfailed independently of its siblings.
+        items.append(Item(name, parent, fn, marks=other_marks + row_marks,
                           params=params, param_id=pid))
     return items
 
@@ -758,7 +774,15 @@ class _ParamSet:
     def __init__(self, values, id=None, marks=()):  # noqa: A002
         self.values = values
         self.id = id
-        self.marks = list(marks) if marks else []
+        # `marks=` accepts a *single* mark or a collection of them, exactly
+        # like real pytest — `pytest.param(x, marks=td.skip_if_no("scipy"))`
+        # passes one `_MarkerDecorator`, which is not iterable.
+        if not marks:
+            self.marks = []
+        elif isinstance(marks, _MarkerDecorator):
+            self.marks = [marks]
+        else:
+            self.marks = list(marks)
 
 
 def param(*values, id=None, marks=()):  # noqa: A002

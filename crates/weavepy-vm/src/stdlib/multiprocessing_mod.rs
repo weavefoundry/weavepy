@@ -518,6 +518,7 @@ fn make_semlock_instance(inner: Arc<SemInner>) -> Object {
         slots: crate::sync::RefCell::new(None),
         hash_cache: crate::sync::Cell::new(None),
         finalize_ran: crate::sync::Cell::new(false),
+        c_body: crate::types::CBody::default(),
     });
     Object::Instance(inst)
 }

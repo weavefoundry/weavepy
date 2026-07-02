@@ -1302,6 +1302,10 @@ fn install_class_getitem(bt: &BuiltinTypes) {
         &bt.set_,
         &bt.frozenset_,
         &bt.type_,
+        // PEP 654 groups expose `__class_getitem__` in CPython (C
+        // `Py_GenericAlias`), e.g. `BaseExceptionGroup[T]` in hypothesis.
+        &bt.base_exception_group,
+        &bt.exception_group,
     ] {
         insert_if_absent(
             ty,

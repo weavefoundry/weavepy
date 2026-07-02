@@ -128,6 +128,36 @@ pub fn ellipsis() -> Object {
     .clone()
 }
 
+/// `True` if `obj` is the canonical `Ellipsis` singleton — an instance of
+/// the registry `ellipsis` type. Keyed on the type identity (there is only
+/// ever one instance of it), mirroring `Object::repr`'s detection. The
+/// C-API bridge uses this to hand stock extensions the static
+/// `_Py_EllipsisObject` so code that tests `x == Py_Ellipsis` by pointer
+/// (numpy's `prepare_index`) takes the right branch rather than rejecting a
+/// freshly-boxed proxy with "only integers, slices … are valid indices".
+pub fn is_ellipsis(obj: &Object) -> bool {
+    if let Object::Instance(inst) = obj {
+        return Rc::ptr_eq(
+            &inst.cls(),
+            &crate::builtin_types::builtin_types().ellipsis_,
+        );
+    }
+    false
+}
+
+/// `True` if `obj` is the canonical `NotImplemented` singleton. The C-API
+/// bridge maps it to the static `_Py_NotImplementedStruct` so extensions
+/// that compare against `Py_NotImplemented` by pointer behave correctly.
+pub fn is_not_implemented(obj: &Object) -> bool {
+    if let Object::Instance(inst) = obj {
+        return Rc::ptr_eq(
+            &inst.cls(),
+            &crate::builtin_types::builtin_types().not_implemented_type_,
+        );
+    }
+    false
+}
+
 /// CPython's `help`/`copyright`/`license`/`credits` builtins are
 /// `_Printer` instances: `repr(copyright)` returns the body, but
 /// `copyright()` also prints it. We model them as

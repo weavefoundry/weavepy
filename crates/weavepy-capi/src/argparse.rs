@@ -84,10 +84,30 @@ pub unsafe extern "C" fn _WeavePy_Arg_Long(arg: *mut PyObject, dest: *mut i64) -
                 -1
             }
         },
-        _ => {
-            crate::errors::set_type_error("an integer is required");
-            -1
-        }
+        // CPython's integer format codes ('i'/'l'/'n'/'L'...) run the arg
+        // through `PyLong_As*`, which coerces via `__index__` — so a numpy
+        // integer scalar passed positionally is accepted. Mirror that.
+        _ => match unsafe { crate::numbers::index_to_builtin_int(arg) } {
+            Some(Object::Int(i)) => {
+                unsafe { *dest = i };
+                0
+            }
+            Some(Object::Bool(b)) => {
+                unsafe { *dest = i64::from(b) };
+                0
+            }
+            Some(Object::Long(big)) => match big.to_i64() {
+                Some(v) => {
+                    unsafe { *dest = v };
+                    0
+                }
+                None => {
+                    crate::errors::set_overflow_error("Python int too large for C long");
+                    -1
+                }
+            },
+            _ => -1,
+        },
     }
 }
 

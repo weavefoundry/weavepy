@@ -1716,6 +1716,10 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
             if let Some(native) = &i.native {
                 traverse_object(native, visit);
             }
+            // A C extension type (RFC 0044) may hold child references in
+            // C-managed memory invisible to the dict walk above; give its
+            // registered `tp_traverse` bridge a chance to surface them.
+            run_external_traverse(obj, visit);
         }
         Object::Module(m) => {
             let Ok(dict) = m.dict.try_borrow() else {
@@ -1852,12 +1856,28 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
 /// Sync` and lives in a `OnceLock`. Each thread sees the same
 /// table — registrations are a global, additive operation.
 fn run_external_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
-    let table = TRAVERSE_TABLE.get_or_init(|| parking_lot::Mutex::new(Vec::new()));
-    let entries = table.lock();
-    for entry in entries.iter() {
-        if (entry.matches)(obj) {
-            (entry.traverse)(obj, visit);
-        }
+    let Some(table) = TRAVERSE_TABLE.get() else {
+        return;
+    };
+    // Snapshot the matching traverse fns, then *release* the table lock
+    // before invoking them. A C extension's `tp_traverse` calls our
+    // visitproc, which recurses back through the collector
+    // (`exc_has_finalizable` → `traverse_object`) and can re-enter
+    // `run_external_traverse` for a *nested* foreign object on the same
+    // thread — e.g. collecting a cycle through pandas' `BaseOffset`.
+    // `parking_lot::Mutex` is not reentrant, so holding the lock across the
+    // callback self-deadlocks. The table is registration-only and its
+    // entries are plain `fn` pointers, so a cheap snapshot is sound.
+    let matched: Vec<fn(&Object, &mut dyn FnMut(&Object))> = {
+        let entries = table.lock();
+        entries
+            .iter()
+            .filter(|e| (e.matches)(obj))
+            .map(|e| e.traverse)
+            .collect()
+    };
+    for traverse in matched {
+        traverse(obj, visit);
     }
 }
 
@@ -1878,6 +1898,48 @@ pub fn register_traverse(
 ) {
     let table = TRAVERSE_TABLE.get_or_init(|| parking_lot::Mutex::new(Vec::new()));
     table.lock().push(TraverseEntry { matches, traverse });
+}
+
+#[allow(missing_debug_implementations)]
+struct ClearEntry {
+    matches: fn(&Object) -> bool,
+    clear: fn(&Object),
+}
+
+static CLEAR_TABLE: std::sync::OnceLock<parking_lot::Mutex<Vec<ClearEntry>>> =
+    std::sync::OnceLock::new();
+
+/// Called from `clear_object_fields` to let a type whose child
+/// references live in module-private (or C-managed) memory break its
+/// cycles during the collector's clear phase. The companion of
+/// [`register_traverse`] (RFC 0044, WS4).
+fn run_external_clear(obj: &Object) {
+    let Some(table) = CLEAR_TABLE.get() else {
+        return;
+    };
+    // Snapshot then release the lock before invoking, mirroring
+    // `run_external_traverse`: a C extension's `tp_clear` can re-enter the
+    // collector and thus this function for a nested foreign object on the
+    // same thread, which would self-deadlock on the non-reentrant mutex.
+    let matched: Vec<fn(&Object)> = {
+        let entries = table.lock();
+        entries
+            .iter()
+            .filter(|e| (e.matches)(obj))
+            .map(|e| e.clear)
+            .collect()
+    };
+    for clear in matched {
+        clear(obj);
+    }
+}
+
+/// Register a clear callback, mirroring [`register_traverse`]. Invoked
+/// during the collector's clear phase so a matching object can drop the
+/// child references it holds outside the VM's view.
+pub fn register_clear(matches: fn(&Object) -> bool, clear: fn(&Object)) {
+    let table = CLEAR_TABLE.get_or_init(|| parking_lot::Mutex::new(Vec::new()));
+    table.lock().push(ClearEntry { matches, clear });
 }
 
 /// Drain a container's child references in place. Used during
@@ -1904,6 +1966,13 @@ pub fn clear_object_fields(obj: &Object) {
             }
         }
         Object::Instance(i) => {
+            // Drop any C-held child references (RFC 0044) *first*: a readied
+            // extension type's `tp_clear` breaks cycles routed through
+            // C-managed memory that the dict/slots clears below can't see, and
+            // it typically reads its identity (`self._id`, …) back out of the
+            // instance dict to find its side-table slot — so it must run while
+            // that dict is still intact.
+            run_external_clear(obj);
             if let Ok(mut m) = i.dict.try_borrow_mut() {
                 m.clear();
             }
@@ -2013,6 +2082,14 @@ pub fn with_state<R>(f: impl FnOnce(&GcState) -> R) -> R {
 /// Convenience: track `obj` in the shared, process-global GC.
 pub fn track(obj: Object) {
     with_state(|s| s.track(obj));
+}
+
+/// Convenience: stop tracking `obj` (by identity) in the shared,
+/// process-global GC. The inverse of [`track`]; backs the C-API
+/// `PyObject_GC_UnTrack` (RFC 0044, WS4).
+pub fn untrack(obj: &Object) {
+    let id = crate::weakref_registry::id_of(obj);
+    with_state(|s| s.untrack_id(id));
 }
 
 /// Reinitialise the process-global cycle collector's locks in a `fork(2)`

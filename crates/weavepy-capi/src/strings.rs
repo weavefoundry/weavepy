@@ -109,8 +109,17 @@ pub unsafe extern "C" fn PyUnicode_GetLength(o: *mut PyObject) -> PySsizeT {
         return -1;
     }
     match unsafe { crate::object::clone_object(o) } {
-        Object::Str(s) => s.chars().count() as PySsizeT,
-        _ => {
+        Object::Str(s) => {
+            let n = s.chars().count() as PySsizeT;
+            if std::env::var_os("WEAVEPY_TRACE_UCS4").is_some() {
+                eprintln!("[UCS4] GetLength({o:p}) = {n} value={s:?}");
+            }
+            n
+        }
+        other => {
+            if std::env::var_os("WEAVEPY_TRACE_UCS4").is_some() {
+                eprintln!("[UCS4] GetLength({o:p}) NOT-STR kind={}", other.type_name());
+            }
             crate::errors::set_type_error("expected str");
             -1
         }
@@ -450,10 +459,34 @@ pub unsafe extern "C" fn PyUnicode_FromEncodedObject(
             unsafe { PyUnicode_Decode(s, buf.len() as PySsizeT, encoding, errors) }
         }
         _ => {
-            crate::errors::set_type_error(
-                "PyUnicode_FromEncodedObject: expected bytes-like object",
-            );
-            ptr::null_mut()
+            // CPython falls back to the PEP 3118 buffer protocol for any
+            // bytes-like object that isn't an exact `bytes`/`bytearray`
+            // (memoryview, array.array, mmap, and — crucially for numpy —
+            // its `bytes_`/`str_` scalars and 0-d buffer exporters that
+            // datetime64 array formatting hands to us). Mirror that instead
+            // of rejecting everything non-native.
+            let mut view = crate::buffer::Py_buffer::zeroed();
+            // PyBUF_SIMPLE == 0
+            let rc = unsafe { crate::buffer::PyObject_GetBuffer(obj, &mut view, 0) };
+            if rc != 0 {
+                // Replace the pending BufferError with the TypeError CPython
+                // raises here (clearer for "needs a bytes-like object").
+                crate::errors::set_type_error(
+                    "decoding to str: need a bytes-like object",
+                );
+                return ptr::null_mut();
+            }
+            let data = view.buf as *const c_char;
+            let len = view.len;
+            let out = if data.is_null() || len == 0 {
+                unsafe {
+                    PyUnicode_Decode(b"".as_ptr() as *const c_char, 0, encoding, errors)
+                }
+            } else {
+                unsafe { PyUnicode_Decode(data, len, encoding, errors) }
+            };
+            unsafe { crate::buffer::PyBuffer_Release(&mut view) };
+            out
         }
     }
 }
@@ -491,6 +524,13 @@ pub unsafe extern "C" fn PyUnicode_Substring(
 pub unsafe extern "C" fn PyUnicode_ReadChar(o: *mut PyObject, idx: PySsizeT) -> u32 {
     if o.is_null() {
         return u32::MAX;
+    }
+    // Fast path: a buffer-authoritative string reads straight from its
+    // PEP 393 buffer (no per-call string rebuild).
+    if idx >= 0 {
+        if let Some(cp) = unsafe { crate::mirror::unicode_read_char(o, idx as usize) } {
+            return cp;
+        }
     }
     match unsafe { crate::object::clone_object(o) } {
         Object::Str(s) => {
@@ -600,32 +640,65 @@ pub unsafe extern "C" fn PyUnicode_InternInPlace(_p: *mut *mut PyObject) {
     // literals.
 }
 
-/// `PyUnicode_New(size, maxchar)` — build a mutable preallocated
-/// str. We approximate by allocating a fresh empty Str; user
-/// code should write characters through
-/// `PyUnicode_WriteChar` (which we treat as a no-op since the
-/// underlying storage is immutable).
+/// `PyUnicode_New(size, maxchar)` — mint a fresh, writable, zero-filled
+/// unicode string of `size` code points at the PEP 393 kind implied by
+/// `maxchar` (RFC 0047, wave 5). The result is a **buffer-authoritative**
+/// mirror: a stock extension fills it with the inlined `PyUnicode_WRITE`
+/// macro (a direct store at `PyUnicode_DATA(o) + i*kind`) and the bytes are
+/// reconstructed when the string crosses back to the VM. This is the exact
+/// idiom Cython's f-string / integer-format codegen uses.
 #[no_mangle]
-pub unsafe extern "C" fn PyUnicode_New(_size: PySsizeT, _maxchar: u32) -> *mut PyObject {
-    crate::object::into_owned(Object::from_static(""))
+pub unsafe extern "C" fn PyUnicode_New(size: PySsizeT, maxchar: u32) -> *mut PyObject {
+    let n = if size < 0 { 0 } else { size as usize };
+    crate::mirror::new_unicode_mirror(n, maxchar)
 }
 
+/// `PyUnicode_WriteChar(o, idx, ch)` — store one code point into a writable
+/// string built by `PyUnicode_New`. Returns 0 on success, -1 (with an
+/// exception set) for an out-of-range index, a too-wide code point, or a
+/// non-writable target.
 #[no_mangle]
-pub unsafe extern "C" fn PyUnicode_WriteChar(_o: *mut PyObject, _idx: PySsizeT, _ch: u32) -> c_int {
-    // Treated as a no-op; full unicode-buffer mutation will
-    // require a private rep we haven't introduced yet.
-    0
+pub unsafe extern "C" fn PyUnicode_WriteChar(o: *mut PyObject, idx: PySsizeT, ch: u32) -> c_int {
+    if o.is_null() || idx < 0 {
+        crate::errors::set_value_error("PyUnicode_WriteChar: invalid argument");
+        return -1;
+    }
+    match unsafe { crate::mirror::unicode_write_char(o, idx as usize, ch) } {
+        Ok(()) => 0,
+        Err(msg) => {
+            crate::errors::set_value_error(msg);
+            -1
+        }
+    }
 }
 
+/// `PyUnicode_CopyCharacters(to, to_start, from, from_start, how_many)` —
+/// copy `how_many` code points from `from` into the writable string `to`
+/// (RFC 0047, wave 5). Returns the number copied, or -1 with an exception
+/// set. Cython's in-place concatenation fast path calls this straight after
+/// `PyUnicode_Resize` to append the right operand.
 #[no_mangle]
 pub unsafe extern "C" fn PyUnicode_CopyCharacters(
-    _to: *mut PyObject,
-    _to_start: PySsizeT,
-    _from: *mut PyObject,
-    _from_start: PySsizeT,
-    _how_many: PySsizeT,
+    to: *mut PyObject,
+    to_start: PySsizeT,
+    from: *mut PyObject,
+    from_start: PySsizeT,
+    how_many: PySsizeT,
 ) -> PySsizeT {
-    -1
+    if to.is_null() || from.is_null() {
+        crate::errors::set_type_error("PyUnicode_CopyCharacters: expected str");
+        return -1;
+    }
+    let ts = to_start.max(0) as usize;
+    let fs = from_start.max(0) as usize;
+    let hm = how_many.max(0) as usize;
+    match unsafe { crate::mirror::unicode_copy_characters(to, ts, from, fs, hm) } {
+        Ok(n) => n as PySsizeT,
+        Err(msg) => {
+            crate::errors::set_value_error(msg);
+            -1
+        }
+    }
 }
 
 #[no_mangle]
@@ -860,27 +933,58 @@ pub unsafe extern "C" fn PyUnicode_Join(
             return ptr::null_mut();
         }
     };
-    let items: Vec<String> = match unsafe { crate::object::clone_object(seq) } {
-        Object::List(rc) => rc
-            .borrow()
-            .iter()
-            .map(|o| match o {
-                Object::Str(s) => s.to_string(),
-                _ => String::new(),
-            })
-            .collect(),
-        Object::Tuple(items) => items
-            .iter()
-            .map(|o| match o {
-                Object::Str(s) => s.to_string(),
-                _ => String::new(),
-            })
-            .collect(),
+
+    // CPython's `PyUnicode_Join` runs `seq` through `PySequence_Fast`, so any
+    // iterable (list, tuple, generator, set, dict-keys, list-subclass, …) is
+    // accepted — not just the two builtin sequence types. Collect the elements
+    // into a native `Vec<Object>`: use a direct borrow for the common
+    // list/tuple fast paths and fall back to the iterator protocol otherwise.
+    let elems: Vec<Object> = match unsafe { crate::object::clone_object(seq) } {
+        Object::List(rc) => rc.borrow().iter().cloned().collect(),
+        Object::Tuple(items) => items.iter().cloned().collect(),
         _ => {
-            crate::errors::set_type_error("seq must be iterable");
-            return ptr::null_mut();
+            let it = unsafe { crate::abstract_::PyObject_GetIter(seq) };
+            if it.is_null() {
+                // Preserve CPython's message shape for non-iterables; the
+                // iterator protocol already set a TypeError, but be explicit.
+                if crate::errors::pending().is_none() {
+                    crate::errors::set_type_error("can only join an iterable");
+                }
+                return ptr::null_mut();
+            }
+            let mut out: Vec<Object> = Vec::new();
+            loop {
+                let item = unsafe { crate::abstract_::PyIter_Next(it) };
+                if item.is_null() {
+                    break;
+                }
+                out.push(unsafe { crate::object::clone_object(item) });
+                unsafe { crate::object::Py_DecRef(item) };
+            }
+            unsafe { crate::object::Py_DecRef(it) };
+            if crate::errors::pending().is_some() {
+                return ptr::null_mut();
+            }
+            out
         }
     };
+
+    // Every element must be a `str`; mirror CPython's
+    // "sequence item N: expected str instance, T found" TypeError otherwise.
+    let mut items: Vec<String> = Vec::with_capacity(elems.len());
+    for (i, o) in elems.iter().enumerate() {
+        match o {
+            Object::Str(s) => items.push(s.to_string()),
+            other => {
+                crate::errors::set_type_error(&format!(
+                    "sequence item {}: expected str instance, {} found",
+                    i,
+                    other.type_name()
+                ));
+                return ptr::null_mut();
+            }
+        }
+    }
     crate::object::into_owned(Object::from_str(items.join(&sep_str)))
 }
 
@@ -927,17 +1031,47 @@ pub unsafe extern "C" fn PyUnicode_Fill(
 
 #[no_mangle]
 pub unsafe extern "C" fn PyUnicode_FromKindAndData(
-    _kind: c_int,
+    kind: c_int,
     buffer: *const std::ffi::c_void,
     size: PySsizeT,
 ) -> *mut PyObject {
-    // Treat all kinds (1, 2, 4-byte chars) as utf-8 input; the
-    // common kind in extension code is 1 (Latin-1-ish) or 4
-    // (full UCS-4). We map both to UTF-8 by best effort.
+    // PEP 393: `data` is an array of `size` code units whose width is
+    // given by `kind` (1/2/4 bytes per code point). Each code unit is a
+    // raw code point — for the 1-byte kind that means Latin-1, NOT
+    // UTF-8. numpy's UNICODE_getitem reads array elements back via
+    // `PyUnicode_FromKindAndData(PyUnicode_4BYTE_KIND, ucs4, len)`, so
+    // honoring `kind` is required to avoid truncating multi-char strings.
     let len = size.max(0) as usize;
-    let slice = unsafe { std::slice::from_raw_parts(buffer as *const u8, len) };
-    let owned = String::from_utf8_lossy(slice).into_owned();
-    crate::object::into_owned(Object::from_str(owned))
+    if buffer.is_null() || len == 0 {
+        return crate::object::into_owned(Object::from_str(String::new()));
+    }
+    let mut s = String::with_capacity(len);
+    match kind {
+        2 => {
+            let p = buffer as *const u16;
+            for i in 0..len {
+                let cp = unsafe { *p.add(i) } as u32;
+                s.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+            }
+        }
+        4 => {
+            let p = buffer as *const u32;
+            for i in 0..len {
+                let cp = unsafe { *p.add(i) };
+                s.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+            }
+        }
+        // kind == 1 (Latin-1); also the fallback for the deprecated
+        // wchar/0 kind. Each byte is a code point in 0..=255.
+        _ => {
+            let p = buffer as *const u8;
+            for i in 0..len {
+                let cp = unsafe { *p.add(i) } as u32;
+                s.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+            }
+        }
+    }
+    crate::object::into_owned(Object::from_str(s))
 }
 
 /// `PyUnicode_DecodeFSDefault` / `PyUnicode_EncodeFSDefault` —

@@ -21,13 +21,40 @@ use std::process::Command;
 /// build-script flat (no globals).
 struct ExtensionBuild<'a> {
     cc: &'a str,
-    manifest_dir: &'a Path,
+    include_dir: &'a Path,
     out_dir: &'a Path,
     target_os: &'a str,
     suffix: &'a str,
     src: &'a Path,
     name: &'a str,
     env_var: &'a str,
+}
+
+/// Locate the host's stock CPython 3.13 include directory (the one
+/// containing `Python.h`) so the wave-1 binary-ABI proof can be compiled
+/// against the *real* headers. Returns `None` if no CPython 3.13 is
+/// installed or its `Python.h` is missing, in which case the proof
+/// fixture is skipped. Honours `WEAVEPY_STOCK_PYTHON` to override the
+/// interpreter used for the probe.
+fn stock_python_include() -> Option<String> {
+    println!("cargo:rerun-if-env-changed=WEAVEPY_STOCK_PYTHON");
+    let interp = env::var("WEAVEPY_STOCK_PYTHON").unwrap_or_else(|_| "python3.13".to_owned());
+    let out = Command::new(&interp)
+        .arg("-c")
+        .arg("import sysconfig; print(sysconfig.get_path('include'))")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let inc = String::from_utf8(out.stdout).ok()?.trim().to_owned();
+    if inc.is_empty() {
+        return None;
+    }
+    if !Path::new(&inc).join("Python.h").is_file() {
+        return None;
+    }
+    Some(inc)
 }
 
 fn main() {
@@ -79,7 +106,7 @@ fn main() {
     fn build_extension(opts: ExtensionBuild<'_>) {
         let ExtensionBuild {
             cc,
-            manifest_dir,
+            include_dir,
             out_dir,
             target_os,
             suffix,
@@ -98,7 +125,7 @@ fn main() {
             .arg("-fvisibility=default")
             .arg("-O0")
             .arg("-Wno-error")
-            .arg(format!("-I{}", manifest_dir.join("include").display()))
+            .arg(format!("-I{}", include_dir.display()))
             .arg(src)
             .arg("-o")
             .arg(&dylib);
@@ -120,10 +147,11 @@ fn main() {
         }
     }
 
+    let weavepy_inc = manifest_dir.join("include");
     let smalltest_src = workspace_root.join("tests/capi_ext/_smalltest.c");
     build_extension(ExtensionBuild {
         cc: &cc,
-        manifest_dir: &manifest_dir,
+        include_dir: &weavepy_inc,
         out_dir: &out_dir,
         target_os: &target_os,
         suffix,
@@ -134,7 +162,7 @@ fn main() {
     let ndarray_src = workspace_root.join("tests/capi_ext/_ndarray.c");
     build_extension(ExtensionBuild {
         cc: &cc,
-        manifest_dir: &manifest_dir,
+        include_dir: &weavepy_inc,
         out_dir: &out_dir,
         target_os: &target_os,
         suffix,
@@ -145,7 +173,7 @@ fn main() {
     let numpylike_src = workspace_root.join("tests/capi_ext/_numpylike.c");
     build_extension(ExtensionBuild {
         cc: &cc,
-        manifest_dir: &manifest_dir,
+        include_dir: &weavepy_inc,
         out_dir: &out_dir,
         target_os: &target_os,
         suffix,
@@ -153,6 +181,101 @@ fn main() {
         name: "_numpylike",
         env_var: "WEAVEPY_CAPI_NUMPYLIKE_EXTENSION",
     });
+
+    // ----------------------------------------------------------------
+    // 2b) RFC 0043 binary-ABI hermetic proofs: compile the proof
+    //     fixtures against the host's *stock* CPython 3.13 headers
+    //     (full, non-limited API → real inlined macros and the genuine
+    //     416-byte `PyTypeObject`), NOT WeavePy's `include/Python.h`.
+    //
+    //       * `_stockabi.c`  — wave 1: faithful object mirrors, inlined
+    //         head/field macros, refcount poke, `tp_dealloc`.
+    //       * `_stocktype.c` — wave 2 (RFC 0044): classic static
+    //         `PyTypeObject` + `PyType_Ready`, method suites, richcompare,
+    //         call/iter/descriptor protocols, and a `Py_TPFLAGS_HAVE_GC`
+    //         type with `tp_traverse`/`tp_clear`.
+    //       * `_stockarray.c` — wave 3 (RFC 0045): inline `tp_basicsize`
+    //         instance storage (`PyArrayObject` shape), real `tp_members`
+    //         at fixed offsets, the `__array_interface__`/`__array_struct__`
+    //         interchange protocols, and the `import_array()` array-C-API
+    //         capsule pattern.
+    //
+    //     Skipped (with a note) when CPython 3.13 dev headers aren't
+    //     present, so a bare CI host still builds and the stock proofs
+    //     self-skip.
+    // ----------------------------------------------------------------
+    match stock_python_include() {
+        Some(inc) => {
+            println!("cargo:rustc-env=WEAVEPY_STOCK_PYTHON_INCLUDE={inc}");
+            let stock_inc = PathBuf::from(&inc);
+            build_extension(ExtensionBuild {
+                cc: &cc,
+                include_dir: &stock_inc,
+                out_dir: &out_dir,
+                target_os: &target_os,
+                suffix,
+                src: &workspace_root.join("tests/capi_ext/_stockabi.c"),
+                name: "_stockabi",
+                env_var: "WEAVEPY_CAPI_STOCKABI_EXTENSION",
+            });
+            build_extension(ExtensionBuild {
+                cc: &cc,
+                include_dir: &stock_inc,
+                out_dir: &out_dir,
+                target_os: &target_os,
+                suffix,
+                src: &workspace_root.join("tests/capi_ext/_stocktype.c"),
+                name: "_stocktype",
+                env_var: "WEAVEPY_CAPI_STOCKTYPE_EXTENSION",
+            });
+            build_extension(ExtensionBuild {
+                cc: &cc,
+                include_dir: &stock_inc,
+                out_dir: &out_dir,
+                target_os: &target_os,
+                suffix,
+                src: &workspace_root.join("tests/capi_ext/_stockarray.c"),
+                name: "_stockarray",
+                env_var: "WEAVEPY_CAPI_STOCKARRAY_EXTENSION",
+            });
+            // `_stockcython.c` — wave 5 (RFC 0047): a Cython-shaped
+            // extension that subclasses an extension-defined base and
+            // reads inherited slots directly off `Py_TYPE(self)` (the
+            // `inherit_slots` proof), plus the Cython C-API runtime tail.
+            build_extension(ExtensionBuild {
+                cc: &cc,
+                include_dir: &stock_inc,
+                out_dir: &out_dir,
+                target_os: &target_os,
+                suffix,
+                src: &workspace_root.join("tests/capi_ext/_stockcython.c"),
+                name: "_stockcython",
+                env_var: "WEAVEPY_CAPI_STOCKCYTHON_EXTENSION",
+            });
+            // `_stockdatetime.c` — wave 5 (RFC 0029): a datetime consumer
+            // compiled against the real `datetime.h`, exercising
+            // `PyDateTime_IMPORT`, the inlined `PyDateTime_GET_*` accessor
+            // macros, the capsule constructors, and the `tp_basicsize`
+            // size-check — the exact ABI surface pandas' `tslibs` uses.
+            build_extension(ExtensionBuild {
+                cc: &cc,
+                include_dir: &stock_inc,
+                out_dir: &out_dir,
+                target_os: &target_os,
+                suffix,
+                src: &workspace_root.join("tests/capi_ext/_stockdatetime.c"),
+                name: "_stockdatetime",
+                env_var: "WEAVEPY_CAPI_STOCKDATETIME_EXTENSION",
+            });
+        }
+        None => {
+            println!(
+                "cargo:warning=stock CPython 3.13 headers not found; \
+                 skipping the _stockabi/_stocktype/_stockarray/_stockcython \
+                 binary-ABI proof fixtures"
+            );
+        }
+    }
 
     // Re-export the include directory so dependent crates can see
     // `Python.h` via `DEP_WEAVEPY_CAPI_INCLUDE`.

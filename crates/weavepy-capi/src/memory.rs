@@ -141,6 +141,17 @@ pub unsafe extern "C" fn PyObject_Realloc(
 
 #[no_mangle]
 pub unsafe extern "C" fn PyObject_Free(p: *mut std::ffi::c_void) {
+    // RFC 0045 (wave 3): a faithful inline *instance body* is owned by its
+    // native instance, not by C's allocator. A stock `tp_dealloc` that
+    // ends with `tp_free(self)` / `PyObject_Free(self)` must be absorbed —
+    // the block is reclaimed when the owning instance is collected, and
+    // freeing it here (it has no `PyMem` allocation header) would corrupt
+    // the heap. The check is strict (mirror magic + `Weak` back-ref), so
+    // it never mistakes a genuine `PyObject_Free` scratch buffer for one.
+    if !p.is_null() && unsafe { crate::mirror::is_instance_body(p as *mut crate::object::PyObject) }
+    {
+        return;
+    }
     unsafe { PyMem_Free(p) };
 }
 

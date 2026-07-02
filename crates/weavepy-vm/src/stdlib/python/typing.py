@@ -29,7 +29,19 @@ substitution), and bound checking on ``TypeVar``.
 # ---- sentinel singletons ----------------------------------------------------
 
 
-class _SpecialForm:
+class _Final:
+    """Mixin marking the typing special forms (CPython ``typing._Final``).
+
+    Libraries introspecting the ``typing`` module key off this base to
+    recognise special forms, e.g. hypothesis's
+    ``typing_root_type = (typing._Final, typing._GenericAlias)``. The
+    CPython mixin also prohibits subclassing; that guard is omitted here
+    since our special forms are plain singletons."""
+
+    __slots__ = ()
+
+
+class _SpecialForm(_Final):
     """Marker for special typing constructs (``Any``, ``Optional``,
     ``Union``, etc.). Subscriptable to produce
     :class:`_GenericAlias`."""
@@ -45,6 +57,10 @@ class _SpecialForm:
     def __getitem__(self, params):
         if not isinstance(params, tuple):
             params = (params,)
+        if self._name == "Concatenate":
+            # PEP 612: `Concatenate[int, P]` — a dedicated alias type so
+            # `collections.abc.Callable[Concatenate[...], R]` accepts it.
+            return _ConcatenateGenericAlias(self, params)
         if self._name == "Union":
             # CPython normalizes at construction: `None` becomes
             # `type(None)`, nested unions flatten, duplicates collapse
@@ -70,6 +86,14 @@ class _SpecialForm:
     def __call__(self, *args, **kwargs):
         raise TypeError(f"Cannot instantiate {self._name!r}")
 
+    # PEP 604: `Any | None`, `Final | int`, … — a special form participates
+    # in `X | Y` union syntax exactly like a real type does.
+    def __or__(self, other):
+        return Union[self, other]
+
+    def __ror__(self, other):
+        return Union[other, self]
+
 
 Any = _SpecialForm("Any")
 NoReturn = _SpecialForm("NoReturn")
@@ -84,6 +108,135 @@ Literal = _SpecialForm("Literal")
 # (``tuple[int]``) yields ``Unpack[self]`` exactly once, mirroring
 # CPython's ``ga_iternext`` (which lazily reaches ``typing.Unpack``).
 Unpack = _SpecialForm("Unpack")
+# PEP 655 (``Required`` / ``NotRequired`` for ``TypedDict`` items),
+# PEP 675 (``LiteralString``), PEP 647/742 (``TypeGuard`` / ``TypeIs``),
+# ``TypeAlias`` (PEP 613) and ``Concatenate`` (PEP 612). numpy's
+# ``_typing`` imports several of these at module scope.
+Required = _SpecialForm("Required")
+NotRequired = _SpecialForm("NotRequired")
+ReadOnly = _SpecialForm("ReadOnly")
+LiteralString = _SpecialForm("LiteralString")
+TypeAlias = _SpecialForm("TypeAlias")
+TypeGuard = _SpecialForm("TypeGuard")
+TypeIs = _SpecialForm("TypeIs")
+Concatenate = _SpecialForm("Concatenate")
+
+
+class ForwardRef:
+    """Internal wrapper to hold a forward reference (a string annotation).
+
+    A self-contained but faithful stand-in for CPython's
+    :class:`typing.ForwardRef`: it holds the source string, compiles it
+    eagerly (so a malformed reference raises at construction, as CPython
+    does), and evaluates it lazily against the supplied namespaces,
+    caching the result. Widely imported by type-aware libraries
+    (``hypothesis``, ``pydantic``, ``attrs``), so it must exist even when
+    only its identity / attributes are used.
+    """
+
+    __slots__ = (
+        '__forward_arg__', '__forward_code__', '__forward_evaluated__',
+        '__forward_value__', '__forward_is_argument__', '__forward_is_class__',
+        '__forward_module__',
+    )
+
+    def __init__(self, arg, is_argument=True, module=None, *, is_class=False):
+        if not isinstance(arg, str):
+            raise TypeError(f"Forward reference must be a string -- got {arg!r}")
+        try:
+            code = compile(arg, '<string>', 'eval')
+        except SyntaxError:
+            raise SyntaxError(
+                f"Forward reference must be an expression -- got {arg!r}")
+        self.__forward_arg__ = arg
+        self.__forward_code__ = code
+        self.__forward_evaluated__ = False
+        self.__forward_value__ = None
+        self.__forward_is_argument__ = is_argument
+        self.__forward_is_class__ = is_class
+        self.__forward_module__ = module
+
+    def _evaluate(self, globalns, localns, *args, **kwargs):
+        # Accept the extra positional/keyword args later CPython versions
+        # pass (`type_params`, `recursive_guard`) without depending on them.
+        if not self.__forward_evaluated__:
+            if globalns is None and localns is None:
+                globalns = localns = {}
+            elif globalns is None:
+                globalns = localns
+            elif localns is None:
+                localns = globalns
+            if self.__forward_module__ is not None:
+                import sys
+                globalns = getattr(
+                    sys.modules.get(self.__forward_module__, None),
+                    '__dict__', globalns)
+            self.__forward_value__ = eval(self.__forward_code__, globalns, localns)
+            self.__forward_evaluated__ = True
+        return self.__forward_value__
+
+    def __eq__(self, other):
+        if not isinstance(other, ForwardRef):
+            return NotImplemented
+        if self.__forward_evaluated__ and other.__forward_evaluated__:
+            return (self.__forward_arg__ == other.__forward_arg__ and
+                    self.__forward_value__ == other.__forward_value__)
+        return self.__forward_arg__ == other.__forward_arg__
+
+    def __hash__(self):
+        return hash(self.__forward_arg__)
+
+    def __or__(self, other):
+        return Union[self, other]
+
+    def __ror__(self, other):
+        return Union[other, self]
+
+    def __repr__(self):
+        if self.__forward_module__ is None:
+            module_repr = ''
+        else:
+            module_repr = f', module={self.__forward_module__!r}'
+        return f'ForwardRef({self.__forward_arg__!r}{module_repr})'
+
+
+_eval_type_sentinel = object()
+
+
+def _eval_type(t, globalns, localns, type_params=_eval_type_sentinel, *,
+               recursive_guard=frozenset()):
+    """Evaluate all forward references in the type ``t``.
+
+    Mirrors CPython's private ``typing._eval_type``: ``ForwardRef`` (and
+    bare ``str``) annotations are resolved against ``globalns``/``localns``;
+    subscripted generics have their ``__args__`` evaluated recursively. The
+    ``type_params`` parameter exists (PEP 695) for feature-detecting
+    libraries — hypothesis checks ``"type_params" in
+    inspect.signature(typing._eval_type).parameters``.
+    """
+    if isinstance(t, str):
+        t = ForwardRef(t)
+    if isinstance(t, ForwardRef):
+        return t._evaluate(globalns, localns, type_params,
+                           recursive_guard=recursive_guard)
+    args = getattr(t, "__args__", None)
+    if args:
+        ev_args = tuple(
+            _eval_type(a, globalns, localns, type_params,
+                       recursive_guard=recursive_guard)
+            for a in args
+        )
+        if ev_args == tuple(args):
+            return t
+        if isinstance(t, _GenericAlias):
+            return _GenericAlias(t.__origin__, ev_args)
+        origin = getattr(t, "__origin__", None)
+        if origin is not None:
+            try:
+                return origin[ev_args]
+            except Exception:
+                return t
+    return t
 
 
 def Optional(*params):
@@ -146,6 +299,14 @@ class TypeVar:
             prefix = "~"
         return f"{prefix}{self.__name__}"
 
+    # PEP 604: a type variable participates in `T | X` union syntax, e.g.
+    # `forced: T | None` (CPython `typevarobject.c::typevar_or`).
+    def __or__(self, other):
+        return Union[self, other]
+
+    def __ror__(self, other):
+        return Union[other, self]
+
 
 class ParamSpec(TypeVar):
     pass
@@ -160,6 +321,65 @@ class TypeVarTuple(TypeVar):
     # ``typevartuple_iter`` in ``Objects/typevarobject.c``.
     def __iter__(self):
         yield Unpack[self]
+
+
+# ---- PEP 695 type aliases ---------------------------------------------------
+
+
+class TypeAliasType:
+    """Runtime object for a PEP 695 ``type X = ...`` statement.
+
+    Mirrors CPython 3.12+'s ``typing.TypeAliasType``: the alias *body*
+    is **lazily** evaluated. The compiler wraps the body in a thunk
+    (``lambda <type-params>: body``) and the VM's
+    ``__weavepy_type_alias__`` intrinsic constructs this object, passing
+    the freshly-minted type parameters. The thunk is only invoked — with
+    those parameters bound — the first time :attr:`__value__` is read.
+
+    Deferring evaluation is what lets aliases that build unions or
+    subscript *other* aliases be defined at import time without forcing
+    the referenced machinery to exist yet, e.g. numpy's::
+
+        type _DualArrayLike[DTypeT, BuiltinT] = (
+            _SupportsArray[DTypeT] | _NestedSequence[...] | BuiltinT
+        )
+        type ArrayLike = Buffer | _DualArrayLike[np.dtype, complex]
+    """
+
+    def __init__(self, name, type_params, evaluate):
+        # No ``__slots__`` — attributes live in ``__dict__`` so the lazy
+        # cache fields don't need to be predeclared.
+        self.__name__ = name
+        self.__type_params__ = tuple(type_params)
+        self._evaluate = evaluate
+        self._evaluated = False
+        self._value = None
+
+    @property
+    def __value__(self):
+        if not self._evaluated:
+            self._value = self._evaluate(*self.__type_params__)
+            self._evaluated = True
+        return self._value
+
+    def __or__(self, other):
+        return Union[self, other]
+
+    def __ror__(self, other):
+        return Union[other, self]
+
+    def __getitem__(self, params):
+        # ``Alias[args]`` — parameterise. Matches CPython, which returns
+        # a ``typing._GenericAlias`` whose ``__origin__`` is the alias.
+        if not isinstance(params, tuple):
+            params = (params,)
+        return _GenericAlias(self, params)
+
+    def __repr__(self):
+        return self.__name__
+
+    def __call__(self, *args, **kwargs):
+        raise TypeError(f"Cannot instantiate type alias {self.__name__!r}")
 
 
 # ---- generic alias ----------------------------------------------------------
@@ -238,6 +458,17 @@ class _GenericAlias:
         )
 
 
+class _ConcatenateGenericAlias(_GenericAlias):
+    """Result of ``Concatenate[...]`` (PEP 612).
+
+    A distinct class so downstream code that pattern-matches on the type —
+    e.g. ``collections.abc._is_param_expr`` — recognises it by name
+    (``type(obj).__name__ == '_ConcatenateGenericAlias'`` and
+    ``__module__ == 'typing'``), exactly like CPython's typing."""
+
+    __slots__ = ()
+
+
 def _as_class(x):
     """Coerce a bare typing alias to the runtime class it stands in for,
     so ``issubclass``/``isinstance`` can compare against it."""
@@ -312,6 +543,55 @@ Tuple = _OriginAlias("Tuple", tuple)
 Set = _OriginAlias("Set", set)
 FrozenSet = _OriginAlias("FrozenSet", frozenset)
 Type = _OriginAlias("Type", type)
+
+
+# ---- collections.abc / collections / contextlib re-exports ------------------
+# CPython's ``typing`` re-exports the standard ABCs (and a few concrete
+# containers) as subscriptable generic aliases — ``typing.Mapping``,
+# ``typing.Iterator``, ``typing.ContextManager``, ``typing.Deque``, … . With
+# ``from __future__ import annotations`` most annotations never evaluate, but
+# the *names* must still be importable: pandas does
+# ``from typing import ContextManager`` and ``from typing import Mapping``.
+# Back each by its real runtime class so ``isinstance(x, typing.Mapping)``
+# and ``typing.Mapping[str, int]`` behave like the underlying ABC.
+import collections as _collections
+import collections.abc as _abc
+import contextlib as _contextlib
+
+Hashable = _OriginAlias("Hashable", _abc.Hashable)
+Sized = _OriginAlias("Sized", _abc.Sized)
+Container = _OriginAlias("Container", _abc.Container)
+Collection = _OriginAlias("Collection", _abc.Collection)
+Iterable = _OriginAlias("Iterable", _abc.Iterable)
+Iterator = _OriginAlias("Iterator", _abc.Iterator)
+Reversible = _OriginAlias("Reversible", _abc.Reversible)
+Generator = _OriginAlias("Generator", _abc.Generator)
+Awaitable = _OriginAlias("Awaitable", _abc.Awaitable)
+Coroutine = _OriginAlias("Coroutine", _abc.Coroutine)
+AsyncIterable = _OriginAlias("AsyncIterable", _abc.AsyncIterable)
+AsyncIterator = _OriginAlias("AsyncIterator", _abc.AsyncIterator)
+AsyncGenerator = _OriginAlias("AsyncGenerator", _abc.AsyncGenerator)
+AbstractSet = _OriginAlias("AbstractSet", _abc.Set)
+MutableSet = _OriginAlias("MutableSet", _abc.MutableSet)
+Mapping = _OriginAlias("Mapping", _abc.Mapping)
+MutableMapping = _OriginAlias("MutableMapping", _abc.MutableMapping)
+Sequence = _OriginAlias("Sequence", _abc.Sequence)
+MutableSequence = _OriginAlias("MutableSequence", _abc.MutableSequence)
+MappingView = _OriginAlias("MappingView", _abc.MappingView)
+KeysView = _OriginAlias("KeysView", _abc.KeysView)
+ItemsView = _OriginAlias("ItemsView", _abc.ItemsView)
+ValuesView = _OriginAlias("ValuesView", _abc.ValuesView)
+Deque = _OriginAlias("Deque", _collections.deque)
+DefaultDict = _OriginAlias("DefaultDict", _collections.defaultdict)
+OrderedDict = _OriginAlias("OrderedDict", _collections.OrderedDict)
+Counter = _OriginAlias("Counter", _collections.Counter)
+ChainMap = _OriginAlias("ChainMap", _collections.ChainMap)
+ContextManager = _OriginAlias("ContextManager", _contextlib.AbstractContextManager)
+AsyncContextManager = _OriginAlias(
+    "AsyncContextManager", _contextlib.AbstractAsyncContextManager
+)
+if hasattr(_abc, "ByteString"):  # removed in 3.14; present in 3.13
+    ByteString = _OriginAlias("ByteString", _abc.ByteString)
 
 
 class Callable:
@@ -616,6 +896,61 @@ def clear_overloads():
     _overload_registry.clear()
 
 
+_ASSERT_NEVER_REPR_MAX_LENGTH = 100
+
+
+def assert_never(arg, /):
+    """Statically assert that a line of code is unreachable.
+
+    At runtime this raises ``AssertionError`` (PEP 484 / 3.11+).
+    """
+    value = repr(arg)
+    if len(value) > _ASSERT_NEVER_REPR_MAX_LENGTH:
+        value = value[:_ASSERT_NEVER_REPR_MAX_LENGTH] + '...'
+    raise AssertionError(f"Expected code to be unreachable, but got: {value}")
+
+
+def assert_type(val, typ, /):
+    """Ask a static type checker to confirm *val* has type *typ*.
+
+    At runtime this is a no-op returning *val* unchanged (3.11+).
+    """
+    return val
+
+
+def reveal_type(obj, /):
+    """Reveal the inferred static type of *obj* (3.11+).
+
+    At runtime prints the runtime type to stderr and returns *obj*.
+    """
+    import sys
+    print(f"Runtime type is {type(obj).__name__!r}", file=sys.stderr)
+    return obj
+
+
+def dataclass_transform(
+    *,
+    eq_default=True,
+    order_default=False,
+    kw_only_default=False,
+    frozen_default=False,
+    field_specifiers=(),
+    **kwargs,
+):
+    """Decorator marking an object as providing dataclass-like behaviour (PEP 681)."""
+    def decorator(cls_or_fn):
+        cls_or_fn.__dataclass_transform__ = {
+            "eq_default": eq_default,
+            "order_default": order_default,
+            "kw_only_default": kw_only_default,
+            "frozen_default": frozen_default,
+            "field_specifiers": field_specifiers,
+            "kwargs": kwargs,
+        }
+        return cls_or_fn
+    return decorator
+
+
 def final(f):
     """Decorator to indicate final methods and final classes.
 
@@ -630,6 +965,60 @@ def final(f):
         # don't allow setting attributes.
         pass
     return f
+
+
+def no_type_check(arg):
+    """Decorator to indicate that annotations are not type hints.
+
+    The argument must be a class or function; if it is a class, it
+    applies recursively to all methods and classes defined in that class
+    (but not to methods defined in its superclasses or subclasses).
+    This mutates the function(s) or class(es) in place.
+
+    Faithful port of CPython's ``typing.no_type_check`` — pandas'
+    ``resample`` machinery imports it (``from typing import no_type_check``).
+    """
+    if isinstance(arg, type):
+        for key in dir(arg):
+            obj = getattr(arg, key, None)
+            if obj is None:
+                continue
+            if (
+                not hasattr(obj, "__qualname__")
+                or obj.__qualname__ != f"{arg.__qualname__}.{getattr(obj, '__name__', '')}"
+                or getattr(obj, "__module__", None) != getattr(arg, "__module__", None)
+            ):
+                # Only modify objects defined in this type directly.
+                continue
+            if isinstance(obj, (classmethod, staticmethod)):
+                obj = obj.__func__
+            if callable(obj):
+                try:
+                    obj.__no_type_check__ = True
+                except (AttributeError, TypeError):
+                    pass
+    try:
+        arg.__no_type_check__ = True
+    except TypeError:  # built-in classes
+        pass
+    return arg
+
+
+def no_type_check_decorator(decorator):
+    """Decorator to give another decorator the ``@no_type_check`` effect.
+
+    This wraps a decorator with something that wraps the decorated
+    function in ``@no_type_check``.
+    """
+    import functools
+
+    @functools.wraps(decorator)
+    def wrapped_decorator(*args, **kwds):
+        func = decorator(*args, **kwds)
+        func = no_type_check(func)
+        return func
+
+    return wrapped_decorator
 
 
 def get_type_hints(obj, globalns=None, localns=None, include_extras=False):
@@ -842,6 +1231,79 @@ def _namedtuple_mro_entries(bases):
 NamedTuple.__mro_entries__ = _namedtuple_mro_entries
 
 
+# ---- TypedDict (PEP 589 / 655) ---------------------------------------------
+
+
+class _TypedDictMeta(type):
+    """Metaclass backing ``class X(TypedDict): ...``.
+
+    At runtime a ``TypedDict`` is just a ``dict`` subclass; the metaclass
+    records ``__annotations__`` plus the ``__required_keys__`` /
+    ``__optional_keys__`` split (honouring ``total=`` and
+    ``Required[...]`` / ``NotRequired[...]`` item markers). We never
+    enforce the schema — there is no static checker — but the surface is
+    enough for libraries (numpy's ``_DTypeDict``) that subclass it for
+    annotation purposes only.
+    """
+
+    def __new__(mcls, name, bases, ns, total=True, **kwargs):
+        # Bootstrap of the ``TypedDict`` sentinel base itself, and plain
+        # ``type.__new__`` paths, carry no TypedDict base — pass through.
+        if not any(isinstance(b, _TypedDictMeta) for b in bases):
+            return super().__new__(mcls, name, bases, ns)
+
+        own = dict(ns.get("__annotations__", {}))
+        annotations = {}
+        required = set()
+        optional = set()
+        # Merge inherited TypedDict schemas first (CPython order).
+        for b in bases:
+            if isinstance(b, _TypedDictMeta):
+                annotations.update(getattr(b, "__annotations__", {}) or {})
+                required |= getattr(b, "__required_keys__", frozenset())
+                optional |= getattr(b, "__optional_keys__", frozenset())
+        for key, ann in own.items():
+            annotations[key] = ann
+            req = total
+            marker = getattr(getattr(ann, "__origin__", None), "_name", None)
+            if marker == "Required":
+                req = True
+            elif marker == "NotRequired":
+                req = False
+            required.discard(key)
+            optional.discard(key)
+            (required if req else optional).add(key)
+
+        tp_dict = super().__new__(mcls, name, (dict,), ns)
+        tp_dict.__annotations__ = annotations
+        tp_dict.__required_keys__ = frozenset(required)
+        tp_dict.__optional_keys__ = frozenset(optional)
+        tp_dict.__total__ = total
+        return tp_dict
+
+    def __call__(cls, *args, **kwargs):
+        # ``TypedDict`` values are constructed like plain dicts.
+        return dict(*args, **kwargs)
+
+
+def TypedDict(typename, fields=None, /, *, total=True, **kwargs):
+    """Functional form: ``Movie = TypedDict('Movie', {'name': str})``."""
+    if fields is None:
+        fields = kwargs
+    ns = {"__annotations__": dict(fields)}
+    return _TypedDictMeta(typename, (_TypedDict,), ns, total=total)
+
+
+_TypedDict = type.__new__(_TypedDictMeta, "TypedDict", (), {})
+
+
+def _typeddict_mro_entries(bases):
+    return (_TypedDict,)
+
+
+TypedDict.__mro_entries__ = _typeddict_mro_entries
+
+
 # ---- nominal collections wrappers (PEP 585 aliases) ------------------------
 
 # CPython 3.9+ deprecated ``typing.List`` etc. in favour of bare
@@ -885,10 +1347,17 @@ __all__ = [
     "overload",
     "get_overloads",
     "clear_overloads",
+    "assert_never",
+    "assert_type",
+    "reveal_type",
+    "dataclass_transform",
     "get_type_hints",
     "get_origin",
     "get_args",
+    "no_type_check",
+    "no_type_check_decorator",
     "NewType",
+    "ForwardRef",
     "TYPE_CHECKING",
     "Deque",
     "DefaultDict",

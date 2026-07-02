@@ -11,6 +11,87 @@ use weavepy_vm::object::{Object, PyComplex};
 
 use crate::object::PyObject;
 
+/// Read a `*const c_char` `tp_name` for diagnostics — best-effort, returns
+/// `"?"` for a NULL chain.
+unsafe fn debug_type_name(o: *mut PyObject) -> String {
+    if o.is_null() {
+        return "<null>".to_owned();
+    }
+    let ty = unsafe { (*o).ob_type };
+    if ty.is_null() {
+        return "<null-type>".to_owned();
+    }
+    let name = unsafe { (*ty).tp_name };
+    if name.is_null() {
+        return "<null-name>".to_owned();
+    }
+    unsafe { CStr::from_ptr(name) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// RFC 0046 (wave 4): invoke a no-arg numeric dunder (`__float__`,
+/// `__index__`, `__complex__`) on `o` and coerce the result to an
+/// `Object`. Returns `None` if `o` has no such attribute (the caller then
+/// tries the next protocol or raises); `Some(None)` if the call or
+/// conversion failed with an exception already set.
+///
+/// CPython's `PyFloat_AsDouble` / `PyComplex_AsCComplex` consult the
+/// number-protocol slots (`nb_float`, `nb_index`); a stock extension
+/// exposes those as the matching dunder, so a `PyObject_GetAttrString`
+/// reaches them through the type's `tp_getattro` (numpy scalars included).
+unsafe fn call_number_dunder(o: *mut PyObject, name: &str) -> Option<Option<Object>> {
+    let cname = match std::ffi::CString::new(name) {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+    let meth = unsafe { crate::abstract_::PyObject_GetAttrString(o, cname.as_ptr()) };
+    if meth.is_null() {
+        // No such attribute — clear the AttributeError and let the caller
+        // fall through to the next protocol.
+        let _ = crate::errors::take_pending();
+        return None;
+    }
+    let res = unsafe { crate::abstract_::PyObject_CallNoArgs(meth) };
+    unsafe { crate::object::Py_DecRef(meth) };
+    if res.is_null() {
+        return Some(None);
+    }
+    let obj = unsafe { crate::object::clone_object(res) };
+    unsafe { crate::object::Py_DecRef(res) };
+    Some(Some(obj))
+}
+
+/// CPython's `PyLong_As*` extractors coerce a non-`int` argument through
+/// `__index__` (`_PyNumber_Index`) before failing with a `TypeError`
+/// (see `Objects/longobject.c`). A numpy integer scalar (`np.int64`) is a
+/// *foreign* object carrying `__index__` in its C `nb_index` slot, so
+/// routing through [`crate::abstract_::PyNumber_Index`] reaches it exactly
+/// as CPython does — unblocking numpy's `timedelta64(np.int64(...), unit)`
+/// constructor and any Cython code feeding numpy scalars to `PyLong_As*`.
+///
+/// On success returns a *builtin* integer `Object` (`Int`/`Long`/`Bool`),
+/// which callers convert without re-entering this fallback. Returns `None`
+/// with a `TypeError` (or the `nb_index` slot's own exception) left pending
+/// when `o` cannot be interpreted as an integer.
+pub(crate) unsafe fn index_to_builtin_int(o: *mut PyObject) -> Option<Object> {
+    let idx = unsafe { crate::abstract_::PyNumber_Index(o) };
+    if idx.is_null() {
+        return None;
+    }
+    let obj = unsafe { crate::object::clone_object(idx) };
+    unsafe { crate::object::Py_DecRef(idx) };
+    match obj {
+        Object::Int(_) | Object::Long(_) | Object::Bool(_) => Some(obj),
+        _ => {
+            crate::errors::set_type_error(
+                "__index__ returned non-int (the object cannot be interpreted as an integer)",
+            );
+            None
+        }
+    }
+}
+
 // ---------- PyLong (Python `int`) ----------
 
 #[no_mangle]
@@ -109,15 +190,27 @@ pub unsafe extern "C" fn PyLong_AsLong(o: *mut PyObject) -> i64 {
         Object::Long(big) => match big.to_i64() {
             Some(v) => v,
             None => {
+                if std::env::var_os("WEAVEPY_TRACE_OVERFLOW").is_some() {
+                    eprintln!(
+                        "[WEAVEPY_TRACE_OVERFLOW] PyLong_AsLong overflow on value with {} bits\n{}",
+                        big.bits(),
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                }
                 crate::errors::set_overflow_error("Python int too large to convert to C long");
                 -1
             }
         },
         Object::Float(f) => f.trunc() as i64,
-        _ => {
-            crate::errors::set_type_error("an integer is required");
-            -1
-        }
+        _ => match unsafe { index_to_builtin_int(o) } {
+            Some(Object::Int(i)) => i,
+            Some(Object::Bool(b)) => i64::from(b),
+            Some(Object::Long(big)) => big.to_i64().unwrap_or_else(|| {
+                crate::errors::set_overflow_error("Python int too large to convert to C long");
+                -1
+            }),
+            _ => -1,
+        },
     }
 }
 
@@ -126,16 +219,71 @@ pub unsafe extern "C" fn PyLong_AsLongLong(o: *mut PyObject) -> i64 {
     unsafe { PyLong_AsLong(o) }
 }
 
+/// `PyLong_AsUnsignedLong(o)` — the full unsigned 64-bit range `[0, 2^64)`
+/// on LP64/LLP64 (where `unsigned long` is 64-bit). Routing through the
+/// *signed* [`PyLong_AsLong`] (as a prior version did) wrongly rejected
+/// `[2^63, 2^64)` — exactly the 64-bit seed/state words numpy's
+/// `numpy.random` feeds through `np.uint64(...)` during `mtrand` init.
 #[no_mangle]
 pub unsafe extern "C" fn PyLong_AsUnsignedLong(o: *mut PyObject) -> u64 {
-    let v = unsafe { PyLong_AsLong(o) };
-    if v < 0 {
-        if crate::errors::pending().is_none() {
-            crate::errors::set_overflow_error("can't convert negative value to unsigned int");
-        }
+    if o.is_null() {
+        crate::errors::set_type_error("PyLong_AsUnsignedLong: NULL");
         return u64::MAX;
     }
-    v as u64
+    match unsafe { crate::object::clone_object(o) } {
+        Object::Int(i) => {
+            if i < 0 {
+                crate::errors::set_overflow_error(
+                    "can't convert negative value to unsigned int",
+                );
+                u64::MAX
+            } else {
+                i as u64
+            }
+        }
+        Object::Bool(b) => u64::from(b),
+        Object::Long(big) => match big.to_u64() {
+            Some(v) => v,
+            None => {
+                if big.sign() == num_bigint::Sign::Minus {
+                    crate::errors::set_overflow_error(
+                        "can't convert negative value to unsigned int",
+                    );
+                } else {
+                    crate::errors::set_overflow_error(
+                        "Python int too large to convert to C unsigned long",
+                    );
+                }
+                u64::MAX
+            }
+        },
+        _ => match unsafe { index_to_builtin_int(o) } {
+            Some(Object::Int(i)) => {
+                if i < 0 {
+                    crate::errors::set_overflow_error(
+                        "can't convert negative value to unsigned int",
+                    );
+                    u64::MAX
+                } else {
+                    i as u64
+                }
+            }
+            Some(Object::Bool(b)) => u64::from(b),
+            Some(Object::Long(big)) => big.to_u64().unwrap_or_else(|| {
+                if big.sign() == num_bigint::Sign::Minus {
+                    crate::errors::set_overflow_error(
+                        "can't convert negative value to unsigned int",
+                    );
+                } else {
+                    crate::errors::set_overflow_error(
+                        "Python int too large to convert to C unsigned long",
+                    );
+                }
+                u64::MAX
+            }),
+            _ => u64::MAX,
+        },
+    }
 }
 
 #[no_mangle]
@@ -211,10 +359,21 @@ pub unsafe extern "C" fn PyLong_AsLongAndOverflow(o: *mut PyObject, overflow: *m
             }
         },
         Object::Float(f) => f.trunc() as i64,
-        _ => {
-            crate::errors::set_type_error("an integer is required");
-            -1
-        }
+        _ => match unsafe { index_to_builtin_int(o) } {
+            Some(Object::Int(i)) => i,
+            Some(Object::Bool(b)) => i64::from(b),
+            Some(Object::Long(big)) => big.to_i64().unwrap_or_else(|| {
+                if !overflow.is_null() {
+                    let sign = match big.sign() {
+                        num_bigint::Sign::Minus => -1,
+                        _ => 1,
+                    };
+                    unsafe { *overflow = sign };
+                }
+                -1
+            }),
+            _ => -1,
+        },
     }
 }
 
@@ -244,10 +403,12 @@ pub unsafe extern "C" fn _PyLong_AsByteArray(
         Object::Int(i) => BigInt::from(i),
         Object::Long(b) => (*b).clone(),
         Object::Bool(b) => BigInt::from(b as i64),
-        _ => {
-            crate::errors::set_type_error("an integer is required");
-            return -1;
-        }
+        _ => match unsafe { index_to_builtin_int(o) } {
+            Some(Object::Int(i)) => BigInt::from(i),
+            Some(Object::Long(b)) => (*b).clone(),
+            Some(Object::Bool(b)) => BigInt::from(b as i64),
+            _ => return -1,
+        },
     };
     let mut buf: Vec<u8> = if is_signed != 0 {
         big.to_signed_bytes_le()
@@ -345,6 +506,33 @@ pub unsafe extern "C" fn PyFloat_AsDouble(o: *mut PyObject) -> f64 {
         Object::Long(big) => big.to_f64().unwrap_or(f64::INFINITY),
         Object::Bool(b) => f64::from(b as i32),
         _ => {
+            // RFC 0046 (wave 4): consult `__float__` then `__index__`
+            // (CPython's `nb_float` / `nb_index` fallback) so a numpy scalar
+            // or user instance converts faithfully.
+            for attr in ["__float__", "__index__"] {
+                if let Some(result) = unsafe { call_number_dunder(o, attr) } {
+                    return match result {
+                        Some(Object::Float(f)) => f,
+                        Some(Object::Int(i)) => i as f64,
+                        Some(Object::Long(big)) => big.to_f64().unwrap_or(f64::INFINITY),
+                        Some(Object::Bool(b)) => f64::from(b as i32),
+                        Some(_) => {
+                            crate::errors::set_type_error("__float__ returned non-float");
+                            -1.0
+                        }
+                        None => -1.0,
+                    };
+                }
+            }
+            if std::env::var_os("WEAVEPY_TRACE_CONV").is_some() {
+                let owned = crate::object::is_weavepy_owned(o);
+                let variant = format!("{:?}", unsafe { crate::object::clone_object(o) });
+                let short: String = variant.chars().take(80).collect();
+                eprintln!(
+                    "[conv] PyFloat_AsDouble: no float protocol on {} ptr={o:p} weavepy_owned={owned} clone={short}",
+                    unsafe { debug_type_name(o) },
+                );
+            }
             crate::errors::set_type_error("a float is required");
             -1.0
         }
@@ -490,8 +678,23 @@ pub unsafe extern "C" fn PyComplex_RealAsDouble(o: *mut PyObject) -> f64 {
         Object::Int(i) => i as f64,
         Object::Long(big) => big.to_f64().unwrap_or(f64::INFINITY),
         _ => {
-            crate::errors::set_type_error("a complex is required");
-            -1.0
+            // RFC 0046 (wave 4): CPython tries `__complex__` (real part),
+            // then falls back to the float protocol (`__float__` /
+            // `__index__`, via `PyFloat_AsDouble`).
+            if let Some(result) = unsafe { call_number_dunder(o, "__complex__") } {
+                return match result {
+                    Some(Object::Complex(c)) => c.real,
+                    Some(Object::Float(f)) => f,
+                    Some(Object::Int(i)) => i as f64,
+                    Some(Object::Long(big)) => big.to_f64().unwrap_or(f64::INFINITY),
+                    Some(_) => {
+                        crate::errors::set_type_error("__complex__ returned non-complex");
+                        -1.0
+                    }
+                    None => -1.0,
+                };
+            }
+            unsafe { PyFloat_AsDouble(o) }
         }
     }
 }
@@ -503,7 +706,19 @@ pub unsafe extern "C" fn PyComplex_ImagAsDouble(o: *mut PyObject) -> f64 {
     }
     match unsafe { crate::object::clone_object(o) } {
         Object::Complex(c) => c.imag,
-        _ => 0.0,
+        Object::Float(_) | Object::Int(_) | Object::Long(_) | Object::Bool(_) => 0.0,
+        _ => {
+            // RFC 0046 (wave 4): `__complex__` carries the imaginary part; a
+            // real-only object (no `__complex__`) has imag 0.
+            if let Some(result) = unsafe { call_number_dunder(o, "__complex__") } {
+                return match result {
+                    Some(Object::Complex(c)) => c.imag,
+                    Some(_) => 0.0,
+                    None => -1.0,
+                };
+            }
+            0.0
+        }
     }
 }
 

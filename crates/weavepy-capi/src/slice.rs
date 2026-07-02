@@ -73,7 +73,32 @@ pub unsafe extern "C" fn PySlice_Unpack(
             Object::Int(i) => Some(*i as PySsizeT),
             Object::Long(big) => big.to_isize(),
             Object::Bool(b) => Some(if *b { 1 } else { 0 }),
-            _ => None,
+            // CPython's `_PyEval_SliceIndex` accepts any object exposing
+            // `__index__` — a numpy `int64`/`intp` scalar, a pandas block
+            // placement — not just a native `int`. Coerce it through
+            // `PyNumber_Index`; on failure clear the error it set so the
+            // caller reports the slice-specific message. (pandas' `melt`,
+            // groupby `apply`, and MultiIndex `loc` all slice with np ints.)
+            other => {
+                let p = crate::object::into_owned(other.clone());
+                if p.is_null() {
+                    return None;
+                }
+                let idx = unsafe { crate::abstract_::PyNumber_Index(p) };
+                unsafe { crate::object::Py_DecRef(p) };
+                if idx.is_null() {
+                    crate::errors::clear_thread_local();
+                    return None;
+                }
+                let v = match unsafe { crate::object::clone_object(idx) } {
+                    Object::Int(i) => Some(i as PySsizeT),
+                    Object::Long(big) => big.to_isize(),
+                    Object::Bool(b) => Some(if b { 1 } else { 0 }),
+                    _ => None,
+                };
+                unsafe { crate::object::Py_DecRef(idx) };
+                v
+            }
         }
     };
     let step_v = match resolve(&s.step, 1) {

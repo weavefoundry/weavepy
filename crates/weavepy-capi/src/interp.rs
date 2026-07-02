@@ -121,8 +121,21 @@ pub fn effective_interpreter_mut() -> Option<*mut Interpreter> {
 /// (best-effort, may be stale).
 pub fn ensure_active<R>(body: impl FnOnce() -> R) -> R {
     if current_interpreter_mut().is_some() {
+        if std::env::var_os("WEAVEPY_TRACE_EA").is_some() {
+            eprintln!("[EA] nested (skip flush)");
+        }
         return body();
     }
+    if std::env::var_os("WEAVEPY_TRACE_EA").is_some() {
+        eprintln!("[EA] outermost (flush)");
+    }
+    // Outermost VM→C transition. Re-publish any VM-mutated faithful list
+    // mirrors into their `ob_item` buffers first, so a stock extension's
+    // inlined `PyList_GET_ITEM` macro reads the VM's latest mutations rather
+    // than the buffer that was current when the list was last seeded. This is
+    // the single choke point through which *every* bridged C call (foreign
+    // hooks, tp_call, dunder shims, descriptors) passes (RFC 0047, wave 5).
+    unsafe { crate::mirror::flush_seeded_lists() };
     let interp = if let Some(p) = weavepy_vm::vm_singletons::current_interpreter_ptr() {
         p
     } else {
@@ -147,6 +160,14 @@ static INIT: Once = Once::new();
 /// statically-initialised exception pointers.
 pub fn ensure_initialised() {
     INIT.call_once(|| {
+        // RFC 0046 (wave 4): optional native crash backtrace for debugging
+        // faults inside a freshly-loaded extension's initialiser.
+        if std::env::var_os("WEAVEPY_CRASH_BT").is_some() {
+            extern "C" {
+                fn weavepy_install_crash_handler();
+            }
+            unsafe { weavepy_install_crash_handler() };
+        }
         crate::types::init_static_types();
         crate::singletons::init_singleton_types(
             crate::types::_PyNone_Type.as_ptr(),
@@ -155,6 +176,19 @@ pub fn ensure_initialised() {
             crate::types::PyEllipsis_Type.as_ptr(),
         );
         crate::errors::init_static_exceptions();
+        // Bridge C `tp_traverse` / `tp_clear` into the tracing collector
+        // (RFC 0044, WS4) before any extension GC type can be created.
+        crate::gc_bridge::install();
+        // Install the hook that frees an inline instance's faithful body
+        // when its native instance is collected (RFC 0045, WS1).
+        crate::instance::install();
+        // Install the hook that releases a capsule's retained box when its
+        // VM-side soul drops (RFC 0045, WS5 — the `import_array()` idiom).
+        crate::capsule::install();
+        // Install the foreign-object proxy bridge so a `PyObject` the
+        // extension minted itself (numpy ndarray/descr/ufunc) round-trips
+        // through the VM opaquely (RFC 0046, wave 4).
+        crate::foreign::install();
     });
 }
 

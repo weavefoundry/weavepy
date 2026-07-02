@@ -184,9 +184,13 @@ fn inplace(args: &[Object], op: BinOpKind, name: &str) -> Result<Object, Runtime
 
 fn compare(args: &[Object], op: CompareKind, name: &str) -> Result<Object, RuntimeError> {
     let (a, b) = two_args(args, name)?;
-    Ok(Object::Bool(with_interp(|interp| {
-        interp.op_compare(a, b, op)
-    })?))
+    // `operator.gt(a, b)` is the *expression* `a > b`, not `bool(a > b)`: it
+    // must return the raw rich-comparison result, so a foreign object (a numpy
+    // `ndarray`) yields its element-wise bool array rather than a coerced
+    // scalar. pandas' `comparison_op` dispatches `Series > x` through
+    // `operator.gt`; a scalar result there makes pandas treat the whole
+    // comparison as invalid (`invalid_comparison`) and boolean masks break.
+    with_interp(|interp| interp.rich_compare_public(a, b, op))
 }
 
 fn unary(args: &[Object], op: UnaryKind, name: &str) -> Result<Object, RuntimeError> {

@@ -128,21 +128,144 @@ pub unsafe extern "C" fn PyObject_GetBuffer(
         return -1;
     }
     unsafe { *view = Py_buffer::zeroed() };
+    let trace = std::env::var_os("WEAVEPY_TRACE_BUF").is_some();
+    if trace {
+        let tn = unsafe {
+            let ty = (*exporter).ob_type as *mut crate::layout::PyTypeObjectFull;
+            if ty.is_null() {
+                "<null>".to_owned()
+            } else {
+                let np = (*ty).tp_name;
+                if np.is_null() {
+                    "<noname>".to_owned()
+                } else {
+                    core::ffi::CStr::from_ptr(np).to_string_lossy().into_owned()
+                }
+            }
+        };
+        let has_st = unsafe { slot_table_for((*exporter).ob_type) }
+            .map(|t| !t.get(Py_bf_getbuffer).is_null())
+            .unwrap_or(false);
+        let has_fb = !unsafe { foreign_bf_getbuffer((*exporter).ob_type) }.is_null();
+        eprintln!(
+            "[WEAVEPY_TRACE_BUF] GetBuffer exporter type={tn} flags={flags:#x} slot_table_bf={has_st} foreign_bf={has_fb}"
+        );
+    }
 
-    // 1) Heap-type slot dispatch.
+    // 1) Heap-type slot dispatch (WeavePy-managed slot table — types built
+    //    through the dunder shim / `PyType_FromSpec`).
     let head = unsafe { &*exporter };
     if let Some(slot_table) = unsafe { slot_table_for(head.ob_type) } {
         let slot = slot_table.get(Py_bf_getbuffer);
         if !slot.is_null() {
             let getbuf: unsafe extern "C" fn(*mut PyObject, *mut Py_buffer, c_int) -> c_int =
                 unsafe { slot.cast() };
-            return unsafe { getbuf(exporter, view, flags) };
+            let rc = unsafe { getbuf(exporter, view, flags) };
+            if trace {
+                let fmt = unsafe {
+                    let f = (*view).format;
+                    if f.is_null() {
+                        "<null>".to_owned()
+                    } else {
+                        core::ffi::CStr::from_ptr(f).to_string_lossy().into_owned()
+                    }
+                };
+                eprintln!(
+                    "[WEAVEPY_TRACE_BUF]   slot getbuf exp={exporter:p} rc={rc} format={fmt:?} itemsize={} ndim={} len={} buf={:p}",
+                    unsafe { (*view).itemsize },
+                    unsafe { (*view).ndim },
+                    unsafe { (*view).len },
+                    unsafe { (*view).buf },
+                );
+            }
+            return rc;
         }
     }
 
-    // 2) Native fallback for built-in bytes-like types.
+    // 2) Foreign-type C-struct dispatch: a real extension type (numpy's
+    //    `ndarray`, a Cython `cdef class` with `__getbuffer__`) stores its
+    //    exporter in `tp_as_buffer->bf_getbuffer`. This is the path numpy's
+    //    `numpy.random` Cython modules take when they acquire a typed
+    //    `np.ndarray[uint32]` view (`SeedSequence.mix_entropy`). The slot
+    //    owns filling `view` (incl. `view->obj`/refcount), exactly as
+    //    CPython's `PyObject_GetBuffer` delegates.
+    let slot = unsafe { foreign_bf_getbuffer(head.ob_type) };
+    if !slot.is_null() {
+        let getbuf: unsafe extern "C" fn(*mut PyObject, *mut Py_buffer, c_int) -> c_int =
+            unsafe { std::mem::transmute(slot) };
+        let rc = unsafe { getbuf(exporter, view, flags) };
+        if trace {
+            let fmt = unsafe {
+                let f = (*view).format;
+                if f.is_null() {
+                    "<null>".to_owned()
+                } else {
+                    core::ffi::CStr::from_ptr(f).to_string_lossy().into_owned()
+                }
+            };
+            let pend = crate::errors::pending().is_some();
+            eprintln!(
+                "[WEAVEPY_TRACE_BUF]   foreign getbuf rc={rc} format={fmt:?} itemsize={} ndim={} len={} pending_err={pend}",
+                unsafe { (*view).itemsize },
+                unsafe { (*view).ndim },
+                unsafe { (*view).len },
+            );
+        }
+        return rc;
+    }
+
+    // 3) Native fallback for built-in bytes-like types.
     let obj = unsafe { crate::object::clone_object(exporter) };
-    fill_native_buffer(exporter, &obj, view, flags)
+    let rc = fill_native_buffer(exporter, &obj, view, flags);
+    if trace {
+        let fmt = unsafe {
+            let f = (*view).format;
+            if f.is_null() {
+                "<null>".to_owned()
+            } else {
+                core::ffi::CStr::from_ptr(f).to_string_lossy().into_owned()
+            }
+        };
+        eprintln!(
+            "[WEAVEPY_TRACE_BUF]   native getbuf rc={rc} format={fmt:?} itemsize={} ndim={} len={}",
+            unsafe { (*view).itemsize },
+            unsafe { (*view).ndim },
+            unsafe { (*view).len },
+        );
+    }
+    rc
+}
+
+/// Read a foreign type's `tp_as_buffer->bf_getbuffer` slot (or NULL).
+///
+/// # Safety
+/// `ty` must be a live `PyObject*`-typed type pointer or NULL.
+unsafe fn foreign_bf_getbuffer(ty: *mut crate::types::PyTypeObject) -> *mut std::ffi::c_void {
+    let tyf = ty as *mut crate::layout::PyTypeObjectFull;
+    if tyf.is_null() {
+        return ptr::null_mut();
+    }
+    let procs = unsafe { (*tyf).tp_as_buffer };
+    if procs.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe { (*procs).bf_getbuffer }
+}
+
+/// Read a foreign type's `tp_as_buffer->bf_releasebuffer` slot (or NULL).
+///
+/// # Safety
+/// `ty` must be a live `PyObject*`-typed type pointer or NULL.
+unsafe fn foreign_bf_releasebuffer(ty: *mut crate::types::PyTypeObject) -> *mut std::ffi::c_void {
+    let tyf = ty as *mut crate::layout::PyTypeObjectFull;
+    if tyf.is_null() {
+        return ptr::null_mut();
+    }
+    let procs = unsafe { (*tyf).tp_as_buffer };
+    if procs.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe { (*procs).bf_releasebuffer }
 }
 
 /// `PyBuffer_Release(view)` — release the resources backing `view`.
@@ -160,8 +283,14 @@ pub unsafe extern "C" fn PyBuffer_Release(view: *mut Py_buffer) {
     if exporter.is_null() {
         return;
     }
+    if std::env::var_os("WEAVEPY_TRACE_BUF").is_some() {
+        eprintln!(
+            "[WEAVEPY_TRACE_BUF] Release exp={exporter:p} ndim={} buf={:p}",
+            v.ndim, v.buf,
+        );
+    }
 
-    // 1) Heap-type slot dispatch.
+    // 1) Heap-type slot dispatch (WeavePy-managed slot table).
     let head = unsafe { &*exporter };
     if let Some(slot_table) = unsafe { slot_table_for(head.ob_type) } {
         let slot = slot_table.get(Py_bf_releasebuffer);
@@ -174,9 +303,32 @@ pub unsafe extern "C" fn PyBuffer_Release(view: *mut Py_buffer) {
             *v = Py_buffer::zeroed();
             return;
         }
+        // A WeavePy slot-table exporter with no release slot: still drop the
+        // get-time ref below via the native path's DecRef.
+        if !slot_table.get(Py_bf_getbuffer).is_null() {
+            unsafe { crate::object::Py_DecRef(exporter) };
+            *v = Py_buffer::zeroed();
+            return;
+        }
     }
 
-    // 2) Native release path. We allocated a `BufferInternal` on
+    // 2) Foreign-type C-struct dispatch: mirror CPython's `PyBuffer_Release`
+    //    — call `bf_releasebuffer` (if any), then drop the reference the
+    //    exporter took in `bf_getbuffer`.
+    let rel = unsafe { foreign_bf_releasebuffer(head.ob_type) };
+    let getb = unsafe { foreign_bf_getbuffer(head.ob_type) };
+    if !rel.is_null() || !getb.is_null() {
+        if !rel.is_null() {
+            let release: unsafe extern "C" fn(*mut PyObject, *mut Py_buffer) =
+                unsafe { std::mem::transmute(rel) };
+            unsafe { release(exporter, view) };
+        }
+        unsafe { crate::object::Py_DecRef(exporter) };
+        *v = Py_buffer::zeroed();
+        return;
+    }
+
+    // 3) Native release path. We allocated a `BufferInternal` on
     // the heap during `fill_native_buffer`; reclaim it now.
     if !v.internal.is_null() {
         let _ = unsafe { Box::from_raw(v.internal as *mut BufferInternal) };
@@ -200,6 +352,9 @@ pub unsafe extern "C" fn PyObject_CheckBuffer(o: *mut PyObject) -> c_int {
             return 1;
         }
     }
+    if !unsafe { foreign_bf_getbuffer(head.ob_type) }.is_null() {
+        return 1;
+    }
     matches!(
         unsafe { crate::object::clone_object(o) },
         Object::Bytes(_) | Object::ByteArray(_) | Object::MemoryView(_)
@@ -211,59 +366,140 @@ pub unsafe extern "C" fn PyObject_CheckBuffer(o: *mut PyObject) -> c_int {
 // Native fallback — handles bytes / bytearray / memoryview.
 // ----------------------------------------------------------------
 
-fn fill_native_buffer(
-    exporter: *mut PyObject,
-    obj: &Object,
-    view: *mut Py_buffer,
-    flags: c_int,
-) -> c_int {
-    let (data, len, readonly) = match obj {
-        Object::Bytes(b) => (b.to_vec(), b.len(), 1),
+/// A bytes-like exporter's buffer, fully described: raw window bytes,
+/// element size, PEP 3118 `format` (not yet NUL-terminated) and the
+/// per-dimension `shape` (elements) / `strides` (bytes). Most
+/// bytes-likes are a flat 1-D `'B'`/itemsize-1 region, but a
+/// `memoryview` re-export carries its own (possibly typed) format and
+/// itemsize so that a consumer probing it — e.g. Cython fused-type
+/// dispatch over `ndarray[object]` — observes the faithful `'O'`/8
+/// layout instead of a byte collapse.
+struct NativeExport {
+    data: Vec<u8>,
+    itemsize: usize,
+    format: Vec<u8>,
+    shape: Vec<PySsizeT>,
+    strides: Vec<PySsizeT>,
+    readonly: c_int,
+}
+
+fn describe_native_export(obj: &Object) -> Result<NativeExport, ()> {
+    let export = match obj {
+        Object::Bytes(b) => NativeExport {
+            data: b.to_vec(),
+            itemsize: 1,
+            format: b"B".to_vec(),
+            shape: vec![b.len() as PySsizeT],
+            strides: vec![1],
+            readonly: 1,
+        },
         Object::ByteArray(rc) => {
             let data = rc.borrow().clone();
             let len = data.len();
-            (data, len, 0)
+            NativeExport {
+                data,
+                itemsize: 1,
+                format: b"B".to_vec(),
+                shape: vec![len as PySsizeT],
+                strides: vec![1],
+                readonly: 0,
+            }
         }
         Object::MemoryView(mv) => {
             if mv.released.get() {
                 crate::errors::set_value_error("memoryview: released");
-                return -1;
+                return Err(());
             }
             let bytes = mv.buffer.with_read(<[u8]>::to_vec);
             let len = mv.len.get();
             let start = mv.start.get();
             let slice = bytes[start..start + len].to_vec();
-            (slice, len, c_int::from(mv.readonly.get()))
+            let itemsize = mv.itemsize.get().max(1);
+            let format = mv.format.borrow().clone().into_bytes();
+            // Element shape/stride: honour an explicit shape, else derive a
+            // 1-D `[len / itemsize]` C-contiguous layout. This is what keeps
+            // a typed view's `itemsize`/`format` self-consistent with the
+            // dimensions a consumer reads back.
+            let stored_shape = mv.shape.borrow();
+            let (shape, strides) = if stored_shape.is_empty() {
+                let n = if itemsize > 0 { len / itemsize } else { 0 };
+                (vec![n as PySsizeT], vec![itemsize as PySsizeT])
+            } else {
+                let shape: Vec<PySsizeT> =
+                    stored_shape.iter().map(|&s| s as PySsizeT).collect();
+                let stored_strides = mv.strides.borrow();
+                let strides: Vec<PySsizeT> = if stored_strides.is_empty() {
+                    let mut st = vec![0 as PySsizeT; shape.len()];
+                    let mut acc = itemsize as PySsizeT;
+                    for i in (0..shape.len()).rev() {
+                        st[i] = acc;
+                        acc *= shape[i];
+                    }
+                    st
+                } else {
+                    stored_strides.iter().map(|&s| s as PySsizeT).collect()
+                };
+                (shape, strides)
+            };
+            NativeExport {
+                data: slice,
+                itemsize,
+                format,
+                shape,
+                strides,
+                readonly: c_int::from(mv.readonly.get()),
+            }
         }
         _ => {
             crate::errors::set_buffer_error(format!(
                 "a bytes-like object is required, not '{}'",
                 type_name(obj)
             ));
-            return -1;
+            return Err(());
         }
     };
+    Ok(export)
+}
 
-    if (flags & PYBUF_WRITABLE) != 0 && readonly != 0 {
+fn fill_native_buffer(
+    exporter: *mut PyObject,
+    obj: &Object,
+    view: *mut Py_buffer,
+    flags: c_int,
+) -> c_int {
+    let export = match describe_native_export(obj) {
+        Ok(e) => e,
+        Err(()) => return -1,
+    };
+
+    if (flags & PYBUF_WRITABLE) != 0 && export.readonly != 0 {
         crate::errors::set_buffer_error("Object is not writable");
         return -1;
     }
 
-    let mut owned: Box<[u8]> = data.into_boxed_slice();
+    let len = export.data.len();
+    let mut owned: Box<[u8]> = export.data.into_boxed_slice();
     let buf_ptr = owned.as_mut_ptr() as *mut std::ffi::c_void;
 
-    let format_bytes = format_string_for(FormatKind::UInt8, ByteOrder::Native);
-    let format_storage: Box<[u8]> = format_bytes.into_boxed_slice();
+    // NUL-terminate the format for `Py_buffer::format`.
+    let mut format_vec = export.format;
+    if format_vec.is_empty() {
+        format_vec.push(b'B');
+    }
+    format_vec.push(0);
+    let format_storage: Box<[u8]> = format_vec.into_boxed_slice();
 
     let want_shape = (flags & PYBUF_ND) == PYBUF_ND;
     let want_strides = (flags & 0x0010) != 0;
+    let want_format = (flags & PYBUF_FORMAT) != 0;
+    let ndim = export.shape.len();
     let shape_box: Box<[PySsizeT]> = if want_shape {
-        Box::new([len as PySsizeT])
+        export.shape.into_boxed_slice()
     } else {
         Box::new([])
     };
     let strides_box: Box<[PySsizeT]> = if want_strides {
-        Box::new([1])
+        export.strides.into_boxed_slice()
     } else {
         Box::new([])
     };
@@ -284,10 +520,10 @@ fn fill_native_buffer(
         (*view).buf = buf_ptr;
         (*view).obj = exporter;
         (*view).len = len as PySsizeT;
-        (*view).itemsize = 1;
-        (*view).readonly = readonly;
-        (*view).ndim = if want_shape { 1 } else { 0 };
-        (*view).format = if (flags & PYBUF_FORMAT) != 0 {
+        (*view).itemsize = export.itemsize as PySsizeT;
+        (*view).readonly = export.readonly;
+        (*view).ndim = if want_shape { ndim as c_int } else { 0 };
+        (*view).format = if want_format {
             internal_ref.format.as_ptr() as *mut c_char
         } else {
             ptr::null_mut()

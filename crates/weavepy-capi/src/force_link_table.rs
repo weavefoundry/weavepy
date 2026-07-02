@@ -20,21 +20,28 @@ use crate::abstract_ as ab;
 use crate::argparse;
 use crate::buffer;
 use crate::capsule;
+use crate::code_obj;
 use crate::containers;
 use crate::datetime_api as dt;
 use crate::errors;
+use crate::gc_bridge;
 use crate::genericalloc;
 use crate::lifecycle;
 use crate::memory;
 use crate::memoryview;
 use crate::module;
+use crate::monitoring;
 use crate::numbers;
 use crate::object;
+use crate::pystate;
 use crate::singletons;
 use crate::slice;
 use crate::strings;
 use crate::types;
 use crate::vectorcall;
+use crate::wave4;
+use crate::wave5;
+use crate::wave5_pandas as w5p;
 
 // The variadic helpers live in `varargs.c` and would otherwise be
 // dead-stripped from the host binary, since nothing on the Rust
@@ -119,6 +126,19 @@ extern "C" {
         callable: *mut crate::object::PyObject,
         ...
     ) -> *mut crate::object::PyObject;
+    // RFC 0046 (wave 4): variadic tail numpy links, defined in varargs.c.
+    fn PyOS_snprintf(
+        str: *mut core::ffi::c_char,
+        size: usize,
+        fmt: *const core::ffi::c_char,
+        ...
+    ) -> core::ffi::c_int;
+    fn PyErr_WarnFormat(
+        category: *mut crate::object::PyObject,
+        stack_level: isize,
+        fmt: *const core::ffi::c_char,
+        ...
+    ) -> core::ffi::c_int;
 }
 
 macro_rules! addr {
@@ -167,6 +187,8 @@ static FORCE_LINK: &[FnPtr] = &[
     addr!(object::Py_DecRef),
     addr!(object::Py_NewRef),
     addr!(object::Py_XNewRef),
+    addr!(object::_Py_Dealloc),
+    addr!(object::_PyWeavePy_Dealloc),
     // numbers.rs
     addr!(numbers::PyLong_FromLong),
     addr!(numbers::PyLong_FromLongLong),
@@ -235,6 +257,7 @@ static FORCE_LINK: &[FnPtr] = &[
     addr!(containers::PyDict_SetItem),
     addr!(containers::PyDict_SetItemString),
     addr!(containers::PyDict_GetItem),
+    addr!(containers::_PyDict_GetItem_KnownHash),
     addr!(containers::PyDict_GetItemString),
     addr!(containers::PyDict_DelItem),
     addr!(containers::PyDict_DelItemString),
@@ -263,6 +286,7 @@ static FORCE_LINK: &[FnPtr] = &[
     addr!(ab::PyObject_SetAttrString),
     addr!(ab::PyObject_DelAttrString),
     addr!(ab::PyObject_HasAttr),
+    addr!(ab::PyObject_HasAttrWithError),
     addr!(ab::PyObject_HasAttrString),
     addr!(ab::PyObject_GetItem),
     addr!(ab::PyObject_SetItem),
@@ -463,6 +487,13 @@ static FORCE_LINK: &[FnPtr] = &[
     addr!(genericalloc::Py_HashPointer),
     addr!(genericalloc::_Py_HashBytes),
     addr!(genericalloc::Py_GenericAlias),
+    // gc_bridge.rs — GC allocation + tracking C-API (RFC 0044).
+    addr!(gc_bridge::_PyObject_GC_New),
+    addr!(gc_bridge::_PyObject_GC_NewVar),
+    addr!(gc_bridge::PyObject_GC_Track),
+    addr!(gc_bridge::PyObject_GC_UnTrack),
+    addr!(gc_bridge::PyObject_GC_IsTracked),
+    addr!(gc_bridge::PyObject_GC_Del),
     // slice.rs
     addr!(slice::PySlice_New),
     addr!(slice::PySlice_Check),
@@ -548,6 +579,28 @@ static FORCE_LINK: &[FnPtr] = &[
     addr_static!(singletons::_Py_FalseStruct),
     addr_static!(singletons::_Py_NotImplementedStruct),
     addr_static!(singletons::_Py_EllipsisObject),
+    // types.rs — the static built-in type objects. A stock extension
+    // compares `Py_TYPE(o) == &PyFloat_Type` etc., so these data
+    // symbols must be in the host's dynamic symbol table (RFC 0043).
+    addr_static!(types::PyType_Type),
+    addr_static!(types::PyBaseObject_Type),
+    addr_static!(types::PyLong_Type),
+    addr_static!(types::PyFloat_Type),
+    addr_static!(types::PyBool_Type),
+    addr_static!(types::PyComplex_Type),
+    addr_static!(types::PyUnicode_Type),
+    addr_static!(types::PyBytes_Type),
+    addr_static!(types::PyByteArray_Type),
+    addr_static!(types::PyTuple_Type),
+    addr_static!(types::PyList_Type),
+    addr_static!(types::PyDict_Type),
+    addr_static!(types::PySet_Type),
+    addr_static!(types::PyFrozenSet_Type),
+    addr_static!(types::PyRange_Type),
+    addr_static!(types::PyModule_Type),
+    addr_static!(types::PySlice_Type),
+    addr_static!(types::PyCapsule_Type),
+    addr_static!(types::PySeqIter_Type),
     // datetime_api.rs
     addr_static!(mut dt::PyDateTimeAPI),
     addr_static!(dt::PyDateTimeAPI_Instance),
@@ -616,6 +669,327 @@ static FORCE_LINK: &[FnPtr] = &[
     addr_static!(mut errors::PyExc_UnicodeWarning),
     addr_static!(mut errors::PyExc_BytesWarning),
     addr_static!(mut errors::PyExc_ResourceWarning),
+    // ----------------------------------------------------------------
+    // RFC 0046 (wave 4): the CPython 3.13 C-API tail stock numpy's
+    // `_multiarray_umath` links. New leaf implementations live in
+    // `wave4.rs`; the rest were already implemented in waves 1-3 but had
+    // never been pinned into the dynamic symbol table.
+    // ----------------------------------------------------------------
+    // wave4.rs — predicates / iteration
+    addr!(wave4::PyCallable_Check),
+    addr!(wave4::PyIndex_Check),
+    addr!(wave4::PyIter_Check),
+    addr!(wave4::PyObject_SelfIter),
+    addr!(wave4::PySeqIter_New),
+    // wave4.rs — sound no-ops
+    addr!(wave4::PyErr_CheckSignals),
+    addr!(wave4::PyTraceMalloc_Track),
+    addr!(wave4::PyTraceMalloc_Untrack),
+    addr!(wave4::PyType_Modified),
+    addr!(wave4::PyMutex_Lock),
+    addr!(wave4::PyMutex_Unlock),
+    addr!(wave4::PyObject_ClearWeakRefs),
+    addr!(wave4::PyErr_WriteUnraisable),
+    // wave4.rs — exception chaining
+    addr!(wave4::PyException_SetCause),
+    addr!(wave4::PyException_SetContext),
+    addr!(wave4::PyException_SetTraceback),
+    // wave4.rs — dict tail
+    addr!(wave4::PyDict_GetItemWithError),
+    addr!(wave4::PyDict_GetItemRef),
+    addr!(wave4::PyDict_GetItemStringRef),
+    addr!(wave4::PyDict_ContainsString),
+    addr!(wave4::PyDict_SetDefaultRef),
+    addr!(wave4::PyDictProxy_New),
+    // wave4.rs — numbers
+    addr!(wave4::PyComplex_AsCComplex),
+    addr!(wave4::PyComplex_FromCComplex),
+    addr!(wave4::_PyLong_Sign),
+    addr!(wave4::_Py_HashDouble),
+    addr!(wave4::PyLong_FromUnicodeObject),
+    addr!(wave4::PyFloat_FromString),
+    // wave4.rs — unicode tail
+    addr!(wave4::PyUnicode_AsUCS4),
+    addr!(wave4::PyUnicode_AsUCS4Copy),
+    addr!(wave4::PyUnicode_Format),
+    addr!(wave4::_PyUnicode_IsAlpha),
+    addr!(wave4::_PyUnicode_IsDecimalDigit),
+    addr!(wave4::_PyUnicode_IsDigit),
+    addr!(wave4::_PyUnicode_IsNumeric),
+    addr!(wave4::_PyUnicode_IsLowercase),
+    addr!(wave4::_PyUnicode_IsUppercase),
+    addr!(wave4::_PyUnicode_IsTitlecase),
+    addr!(wave4::_PyUnicode_IsWhitespace),
+    addr_static!(wave4::_Py_ascii_whitespace),
+    // wave4.rs — OS string parsing
+    addr!(wave4::PyOS_string_to_double),
+    addr!(wave4::PyOS_strtol),
+    addr!(wave4::PyOS_strtoul),
+    // wave4.rs — object tail
+    addr!(wave4::PyObject_AsFileDescriptor),
+    addr!(wave4::PyObject_GetOptionalAttr),
+    addr!(wave4::PyObject_Print),
+    addr!(wave4::PyMethod_New),
+    // wave4.rs — import / sys / eval
+    addr!(wave4::PyImport_Import),
+    addr!(wave4::PySys_GetObject),
+    addr!(wave4::PyEval_GetBuiltins),
+    addr!(wave4::PyInterpreterState_Main),
+    // wave4.rs — errors
+    addr!(wave4::_PyErr_BadInternalCall),
+    addr!(wave4::PyErr_SetFromErrno),
+    // wave4.rs — contextvars
+    addr!(wave4::PyContextVar_New),
+    addr!(wave4::PyContextVar_Get),
+    addr!(wave4::PyContextVar_Set),
+    // varargs.c — wave-4 variadic shims
+    addr!(PyOS_snprintf),
+    addr!(PyErr_WarnFormat),
+    // Already implemented in waves 1-3, now pinned for numpy.
+    addr!(numbers::PyLong_AsLongAndOverflow),
+    addr!(numbers::PyLong_AsLongLongAndOverflow),
+    addr!(numbers::PyLong_AsVoidPtr),
+    addr!(numbers::PyLong_FromVoidPtr),
+    addr!(ab::PyNumber_And),
+    addr!(ab::PyNumber_AsSsize_t),
+    addr!(ab::PyNumber_Divmod),
+    addr!(ab::PyNumber_Index),
+    addr!(ab::PyNumber_Invert),
+    addr!(ab::PyNumber_Lshift),
+    addr!(ab::PyNumber_Or),
+    addr!(ab::PyNumber_Rshift),
+    addr!(ab::PyNumber_Xor),
+    addr!(ab::PyObject_Bytes),
+    addr!(ab::PyObject_Format),
+    addr!(ab::PyObject_LengthHint),
+    addr!(ab::PySequence_Concat),
+    addr!(ab::PySequence_InPlaceConcat),
+    addr!(ab::PySequence_InPlaceRepeat),
+    addr!(ab::PySequence_Repeat),
+    addr!(containers::PySequence_Fast),
+    addr!(strings::PyUnicode_AsASCIIString),
+    addr!(strings::PyUnicode_AsLatin1String),
+    addr!(strings::PyUnicode_Compare),
+    addr!(strings::PyUnicode_Contains),
+    addr!(strings::PyUnicode_FromEncodedObject),
+    addr!(strings::PyUnicode_FromKindAndData),
+    addr!(strings::PyUnicode_Replace),
+    addr!(strings::PyUnicode_Substring),
+    addr!(strings::PyUnicode_FindChar),
+    addr!(strings::PyUnicode_Tailmatch),
+    addr!(ab::Py_EnterRecursiveCall),
+    addr!(ab::Py_LeaveRecursiveCall),
+    addr!(strings::PyUnicode_InternFromString),
+    // wave-4 type-object statics (numpy compares `Py_TYPE(x) == &…`).
+    addr_static!(types::PyMemoryView_Type),
+    addr_static!(types::PyDictProxy_Type),
+    addr_static!(types::PyGetSetDescr_Type),
+    addr_static!(types::PyMemberDescr_Type),
+    addr_static!(types::PyMethodDescr_Type),
+    addr_static!(types::PyWrapperDescr_Type),
+    addr_static!(types::PyModuleDef_Type),
+    // IOError alias of OSError.
+    addr_static!(mut errors::PyExc_IOError),
+    // ----------------------------------------------------------------
+    // RFC 0047 (wave 5): the CPython 3.13 C-API leaf tail that
+    // Cython-generated extensions (and pandas) link. New leaf
+    // implementations live in `wave5.rs`; each delegates onto the
+    // wave-1/2/3 surface.
+    // ----------------------------------------------------------------
+    addr!(wave5::_PyObject_GetDictPtr),
+    addr!(wave5::PyObject_GetOptionalAttrString),
+    addr!(wave5::PyMapping_GetOptionalItem),
+    addr!(wave5::PyMapping_GetOptionalItemString),
+    addr!(wave5::_PyObject_GetMethod),
+    addr!(wave5::PyObject_CallMethodOneArg),
+    addr!(wave5::_PyDict_NewPresized),
+    addr!(wave5::PyLong_AsInt),
+    addr!(wave5::PyImport_ImportModuleLevelObject),
+    // ----------------------------------------------------------------
+    // RFC 0047 (wave 5): the *real* Cython-output tail. A genuine
+    // `cythonize`d `.so` (and pandas, ~70% Cython) links a faithful
+    // code/frame/traceback surface, a real `PyThreadState` whose
+    // `current_exception` slot it drives directly
+    // (`CYTHON_FAST_THREAD_STATE`), the MRO lookup, the module/import
+    // ref helpers, and a cluster of GC/managed-dict no-ops. These were
+    // invisible to the hermetic `_stockcython.c` fixture (which created
+    // no code objects and hand-rolled its own types).
+    // ----------------------------------------------------------------
+    // code_obj.rs — code / frame / traceback facade
+    addr!(code_obj::PyUnstable_Code_NewWithPosOnlyArgs),
+    addr!(code_obj::PyUnstable_Code_New),
+    addr!(code_obj::PyCode_NewEmpty),
+    addr!(code_obj::PyFrame_New),
+    addr!(code_obj::PyTraceBack_Here),
+    addr_static!(code_obj::PyCode_Type),
+    addr_static!(code_obj::PyFrame_Type),
+    addr_static!(code_obj::PyTraceBack_Type),
+    // pystate.rs — faithful thread/interpreter state
+    addr!(pystate::PyThreadState_GetUnchecked),
+    addr!(pystate::PyInterpreterState_GetID),
+    addr!(pystate::PyGC_Enable),
+    addr!(pystate::PyGC_Disable),
+    // errors.rs — 3.12+ single-object exception API
+    addr!(errors::PyErr_GetRaisedException),
+    addr!(errors::PyErr_SetRaisedException),
+    // module.rs — import / module ref helpers
+    addr!(module::PyImport_AddModuleRef),
+    addr!(module::PyImport_GetModuleDict),
+    addr!(module::PyModule_NewObject),
+    addr!(module::PyClassMethod_New),
+    addr!(module::PyDescr_NewClassMethod),
+    // wave5.rs — MRO lookup, kwarg validation, GC/managed-dict no-ops
+    addr!(wave5::_PyType_Lookup),
+    addr!(wave5::PyArg_ValidateKeywordArguments),
+    addr!(wave5::PyObject_VisitManagedDict),
+    addr!(wave5::PyObject_ClearManagedDict),
+    addr!(wave5::PyObject_GC_IsFinalized),
+    addr!(wave5::PyObject_CallFinalizerFromDealloc),
+    addr_static!(wave5::Py_Version),
+    // ----------------------------------------------------------------
+    // RFC 0047 (wave 5): the real numpy.random + pandas leaf tail
+    // (`crate::wave5_pandas`), plus existing entry points that only an
+    // extension references and that the linker therefore dead-stripped.
+    // ----------------------------------------------------------------
+    addr!(w5p::PyThread_allocate_lock),
+    addr!(w5p::PyThread_free_lock),
+    addr!(w5p::PyThread_acquire_lock),
+    addr!(w5p::PyThread_acquire_lock_timed),
+    addr!(w5p::PyThread_release_lock),
+    addr!(w5p::PyThreadState_GetFrame),
+    addr!(w5p::PyModule_GetState),
+    addr!(w5p::PyState_FindModule),
+    addr!(w5p::PyList_SetSlice),
+    addr!(w5p::PyException_GetTraceback),
+    addr!(w5p::PyStaticMethod_New),
+    addr!(w5p::_PyLong_Copy),
+    addr!(w5p::PyUnicode_FromWideChar),
+    addr!(w5p::PyUnicode_DecodeLocale),
+    addr!(w5p::PyUnicode_EncodeLocale),
+    addr!(w5p::PyUnicode_Resize),
+    addr!(w5p::_Py_FatalErrorFunc),
+    addr!(w5p::PyCMethod_New),
+    addr_static!(w5p::_PyByteArray_empty_string),
+    addr!(module::PyCFunction_NewEx),
+    // Existing definitions referenced only by a dlopen'd extension.
+    addr!(strings::PyUnicode_FromOrdinal),
+    addr!(strings::PyUnicode_Decode),
+    addr!(strings::PyUnicode_New),
+    addr!(strings::PyUnicode_Split),
+    addr!(strings::PyUnicode_Join),
+    addr!(strings::PyUnicode_CopyCharacters),
+    addr!(strings::PyUnicode_WriteChar),
+    addr!(strings::PyUnicode_ReadChar),
+    addr!(ab::PyNumber_InPlaceRshift),
+    addr!(ab::PyNumber_InPlaceAnd),
+    addr!(containers::PySet_Pop),
+    // monitoring.rs — PEP 669 sys.monitoring C-API (no-op surface)
+    addr!(monitoring::PyMonitoring_EnterScope),
+    addr!(monitoring::PyMonitoring_ExitScope),
+    addr!(monitoring::_PyMonitoring_FirePyStartEvent),
+    addr!(monitoring::_PyMonitoring_FirePyResumeEvent),
+    addr!(monitoring::_PyMonitoring_FirePyReturnEvent),
+    addr!(monitoring::_PyMonitoring_FirePyYieldEvent),
+    addr!(monitoring::_PyMonitoring_FireCallEvent),
+    addr!(monitoring::_PyMonitoring_FireLineEvent),
+    addr!(monitoring::_PyMonitoring_FireJumpEvent),
+    addr!(monitoring::_PyMonitoring_FireBranchEvent),
+    addr!(monitoring::_PyMonitoring_FireCReturnEvent),
+    addr!(monitoring::_PyMonitoring_FirePyThrowEvent),
+    addr!(monitoring::_PyMonitoring_FireRaiseEvent),
+    addr!(monitoring::_PyMonitoring_FireReraiseEvent),
+    addr!(monitoring::_PyMonitoring_FireExceptionHandledEvent),
+    addr!(monitoring::_PyMonitoring_FireCRaiseEvent),
+    addr!(monitoring::_PyMonitoring_FirePyUnwindEvent),
+    addr!(monitoring::_PyMonitoring_FireStopIterationEvent),
+    // Already implemented in earlier waves, now pinned for real Cython.
+    addr!(containers::PyDict_Pop),
+    addr!(containers::PyDict_SetDefault),
+    addr!(strings::PyUnicode_DecodeUTF8),
+    addr!(strings::PyUnicode_InternInPlace),
+    addr_static!(types::PyCFunction_Type),
+    addr_static!(types::PyMethod_Type),
+    // ---------------------------------------------------------------
+    // Completeness sweep (RFC 0047, wave 5): every `#[no_mangle]`
+    // `extern "C"` entry point this crate *defines* must be rooted
+    // here, or the linker dead-strips it and a dlopen'd extension that
+    // calls it jumps through an unbound stub to a NULL address and
+    // segfaults — exactly how numpy's `SeedSequence` (`n //= 2**32`,
+    // i.e. `PyNumber_InPlaceFloorDivide`) crashed. The
+    // `force_link_completeness` test (tests/force_link_completeness.rs)
+    // fails the build if any defined symbol is ever missing again, so
+    // this list is no longer a best-effort guess.
+    //
+    // abstract_ — number/sequence/mapping/object protocol.
+    addr!(ab::PyNumber_InPlaceAdd),
+    addr!(ab::PyNumber_InPlaceSubtract),
+    addr!(ab::PyNumber_InPlaceMultiply),
+    addr!(ab::PyNumber_InPlaceTrueDivide),
+    addr!(ab::PyNumber_InPlaceFloorDivide),
+    addr!(ab::PyNumber_InPlaceRemainder),
+    addr!(ab::PyNumber_InPlacePower),
+    addr!(ab::PyNumber_InPlaceMatrixMultiply),
+    addr!(ab::PyNumber_InPlaceLshift),
+    addr!(ab::PyNumber_InPlaceOr),
+    addr!(ab::PyNumber_InPlaceXor),
+    addr!(ab::PyNumber_ToBase),
+    addr!(ab::PyObject_DelAttr),
+    addr!(ab::PyObject_GetAttrId),
+    addr!(ab::PySequence_Count),
+    addr!(ab::PySequence_Index),
+    addr!(ab::PySequence_GetSlice),
+    addr!(ab::PySequence_SetSlice),
+    addr!(ab::PySequence_DelSlice),
+    addr!(ab::PyMapping_DelItem),
+    addr!(ab::PyMapping_DelItemString),
+    addr!(ab::PyMapping_Keys),
+    addr!(ab::PyMapping_Values),
+    addr!(ab::PyMapping_Items),
+    addr!(ab::_PyObject_GenericGetAttrWithDict),
+    addr!(ab::_PyObject_GenericSetAttrWithDict),
+    addr!(ab::_PyObject_LookupAttr),
+    addr!(ab::_PyObject_LookupAttrId),
+    addr!(ab::_Py_CheckRecursionLimit),
+    // containers — list/tuple/set fast accessors.
+    addr!(containers::PyList_Extend),
+    addr!(containers::_PyList_Extend),
+    addr!(containers::_PyList_GET_ITEM),
+    addr!(containers::_PyList_SET_ITEM),
+    addr!(containers::_PyTuple_GET_ITEM),
+    addr!(containers::_PyTuple_SET_ITEM),
+    addr!(containers::_PyTuple_Resize),
+    addr!(containers::PySequence_Fast_GET_ITEM),
+    addr!(containers::PySequence_Fast_GET_SIZE),
+    addr!(containers::PySequence_Fast_ITEMS),
+    addr!(containers::PySet_Clear),
+    // numbers — float/long introspection + IEEE pack/unpack.
+    addr!(numbers::PyFloat_GetInfo),
+    addr!(numbers::PyFloat_GetMax),
+    addr!(numbers::PyFloat_GetMin),
+    addr!(numbers::PyLong_GetInfo),
+    addr!(numbers::_PyFloat_Pack4),
+    addr!(numbers::_PyFloat_Pack8),
+    addr!(numbers::_PyFloat_Unpack4),
+    addr!(numbers::_PyFloat_Unpack8),
+    addr!(numbers::_PyLong_AsByteArray),
+    addr!(numbers::_PyLong_FromByteArray),
+    // strings — bytes/bytearray/unicode codecs + helpers.
+    addr!(strings::PyBytes_Concat),
+    addr!(strings::PyBytes_ConcatAndDel),
+    addr!(strings::PyBytes_FromFormat),
+    addr!(strings::PyByteArray_Concat),
+    addr!(strings::PyByteArray_Resize),
+    addr!(strings::PyUnicode_DecodeASCII),
+    addr!(strings::PyUnicode_DecodeLatin1),
+    addr!(strings::PyUnicode_DecodeFSDefault),
+    addr!(strings::PyUnicode_DecodeFSDefaultAndSize),
+    addr!(strings::PyUnicode_EncodeFSDefault),
+    addr!(strings::PyUnicode_EqualToUTF8),
+    addr!(strings::PyUnicode_EqualToUTF8AndSize),
+    addr!(strings::PyUnicode_Fill),
+    addr!(strings::PyUnicode_IsIdentifier),
+    addr!(strings::PyUnicode_RichCompare),
+    addr!(strings::PyUnicode_Splitlines),
 ];
 
 /// Hand-out of the table to ensure the static is referenced from

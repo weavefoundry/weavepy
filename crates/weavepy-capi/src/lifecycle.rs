@@ -130,10 +130,12 @@ pub struct PyThreadState {
 
 #[no_mangle]
 pub unsafe extern "C" fn PyThreadState_Get() -> *mut PyThreadState {
-    // We don't yet have per-thread state objects; return a
-    // sentinel. The interpreter doesn't dereference this.
-    static mut DUMMY: u8 = 0;
-    &raw mut DUMMY as *mut PyThreadState
+    // RFC 0047 (wave 5): real Cython output dereferences the returned
+    // thread state (`tstate->interp`, and via the fast-thread-state error
+    // path `tstate->current_exception`). Hand back the faithful per-thread
+    // store from `crate::pystate` so those field accesses are sound and the
+    // pending-exception slot is shared with `crate::errors`.
+    crate::pystate::current_threadstate()
 }
 
 #[no_mangle]
