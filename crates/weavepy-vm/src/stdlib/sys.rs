@@ -500,7 +500,31 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         // `sys._base_executable` mirrors `sys.executable` outside a venv
         // (CPython sets it to the real interpreter; `test_os.PidTests` and
         // `subprocess` reach for it when re-launching the interpreter).
-        d.insert(DictKey(Object::from_static("_base_executable")), executable);
+        d.insert(
+            DictKey(Object::from_static("_base_executable")),
+            executable.clone(),
+        );
+        // Installation prefixes. CPython computes these in getpath.c;
+        // approximate with the executable's grandparent directory (the
+        // usual `<prefix>/bin/python` layout). Defined natively — not
+        // just in `site.py` — because embedders skip site initialization
+        // and module-scope stdlib code reads them at import time
+        // (`gettext._default_localedir` uses `sys.base_prefix`).
+        {
+            let prefix = std::env::current_exe()
+                .ok()
+                .and_then(|p| {
+                    p.parent()
+                        .and_then(|d| d.parent())
+                        .map(std::path::Path::to_path_buf)
+                })
+                .map_or(Object::from_static(""), |p| {
+                    Object::from_str(p.to_string_lossy().into_owned())
+                });
+            for name in ["prefix", "exec_prefix", "base_prefix", "base_exec_prefix"] {
+                d.insert(DictKey(Object::from_static(name)), prefix.clone());
+            }
+        }
         d.insert(
             DictKey(Object::from_static("implementation")),
             implementation_value(),

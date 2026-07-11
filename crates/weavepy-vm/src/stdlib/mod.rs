@@ -1503,24 +1503,92 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/contextvars.py"),
             is_package: false,
         },
+        // RFC 0048 — CPython 3.13's *verbatim* `logging` package
+        // (`LoggerAdapter`, `logging.config`, `logging.handlers`), replacing
+        // the 867-line single-file shim that gated `test_logging` and most
+        // real applications' logging setup.
         FrozenSource {
             name: "logging",
-            source: include_str!("python/logging.py"),
-            is_package: false,
-        },
-        FrozenSource {
-            name: "unittest",
-            source: include_str!("python/unittest.py"),
+            source: include_str!("python/logging/__init__.py"),
             is_package: true,
         },
         FrozenSource {
+            name: "logging.config",
+            source: include_str!("python/logging/config.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "logging.handlers",
+            source: include_str!("python/logging/handlers.py"),
+            is_package: false,
+        },
+        // RFC 0048 — CPython 3.13's *verbatim* `unittest` package (the
+        // 1,900-line shim it replaces mis-shaped the long tail:
+        // `addTypeEqualityFunc`, loader discovery, `TextTestRunner`
+        // duration reporting, `IsolatedAsyncioTestCase`, mock autospec).
+        FrozenSource {
+            name: "unittest",
+            source: include_str!("python/unittest/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "unittest.util",
+            source: include_str!("python/unittest/util.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "unittest.result",
+            source: include_str!("python/unittest/result.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "unittest.case",
+            source: include_str!("python/unittest/case.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "unittest.suite",
+            source: include_str!("python/unittest/suite.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "unittest.loader",
+            source: include_str!("python/unittest/loader.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "unittest.main",
+            source: include_str!("python/unittest/main.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "unittest.runner",
+            source: include_str!("python/unittest/runner.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "unittest.signals",
+            source: include_str!("python/unittest/signals.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "unittest.async_case",
+            source: include_str!("python/unittest/async_case.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "unittest._log",
+            source: include_str!("python/unittest/_log.py"),
+            is_package: false,
+        },
+        FrozenSource {
             name: "unittest.mock",
-            source: include_str!("python/unittest_mock.py"),
+            source: include_str!("python/unittest/mock.py"),
             is_package: false,
         },
         FrozenSource {
             name: "unittest.__main__",
-            source: include_str!("python/unittest_main.py"),
+            source: include_str!("python/unittest/__main__.py"),
             is_package: false,
         },
         // `doctest` (RFC 0034) — interactive-example testing, used by
@@ -1528,6 +1596,36 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "doctest",
             source: include_str!("python/doctest.py"),
+            is_package: false,
+        },
+        // RFC 0048 — verbatim CPython modules the verbatim `unittest` /
+        // `test.support` stack imports (plus commonly-imported gaps).
+        FrozenSource {
+            name: "difflib",
+            source: include_str!("python/difflib.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "getpass",
+            source: include_str!("python/getpass.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "fileinput",
+            source: include_str!("python/fileinput.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "pickletools",
+            source: include_str!("python/pickletools.py"),
+            is_package: false,
+        },
+        // `_opcode` — the 3.13 accelerator surface `test.support` and `dis`
+        // import (specialization gate, opcode predicates). Pure-Python over
+        // the frozen `opcode` tables.
+        FrozenSource {
+            name: "_opcode",
+            source: include_str!("python/_opcode.py"),
             is_package: false,
         },
         // RFC 0034 — the `test` package: CPython's regression-test
@@ -1539,67 +1637,99 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/test_init.py"),
             is_package: true,
         },
+        // RFC 0048 — CPython 3.13's *verbatim* `test.support` package,
+        // replacing the incremental shim. The verbatim `__init__` is what
+        // unlocks the ~10 suites that failed at import on missing helpers
+        // (`run_code`, `requires_limited_api`, `iter_builtin_types`,
+        // `load_package_tests`, `skip_if_buggy_ucrt_strfptime`, …).
         FrozenSource {
             name: "test.support",
-            source: include_str!("python/test_support_init.py"),
+            source: include_str!("python/test_support/__init__.py"),
             is_package: true,
         },
         FrozenSource {
             name: "test.support.os_helper",
-            source: include_str!("python/test_support_os_helper.py"),
+            source: include_str!("python/test_support/os_helper.py"),
             is_package: false,
         },
         FrozenSource {
             name: "test.support.import_helper",
-            source: include_str!("python/test_support_import_helper.py"),
+            source: include_str!("python/test_support/import_helper.py"),
             is_package: false,
         },
         FrozenSource {
             name: "test.support.warnings_helper",
-            source: include_str!("python/test_support_warnings_helper.py"),
+            source: include_str!("python/test_support/warnings_helper.py"),
             is_package: false,
         },
         FrozenSource {
             name: "test.support.threading_helper",
-            source: include_str!("python/test_support_threading_helper.py"),
+            source: include_str!("python/test_support/threading_helper.py"),
             is_package: false,
         },
         FrozenSource {
             name: "test.support.script_helper",
-            source: include_str!("python/test_support_script_helper.py"),
+            source: include_str!("python/test_support/script_helper.py"),
             is_package: false,
         },
         FrozenSource {
             name: "test.support.socket_helper",
-            source: include_str!("python/test_support_socket_helper.py"),
+            source: include_str!("python/test_support/socket_helper.py"),
             is_package: false,
         },
-        // `test.support.hashlib_helper` (verbatim) — `requires_hashdigest`
-        // gate used by test_hmac and friends.
         FrozenSource {
             name: "test.support.hashlib_helper",
-            source: include_str!("python/test_support_hashlib_helper.py"),
+            source: include_str!("python/test_support/hashlib_helper.py"),
             is_package: false,
         },
-        // `test.support.i18n_helper` — minimal shim (snapshot tests skip) so
-        // test_getopt/test_optparse import; their own tests still run.
         FrozenSource {
             name: "test.support.i18n_helper",
-            source: include_str!("python/test_support_i18n_helper.py"),
+            source: include_str!("python/test_support/i18n_helper.py"),
             is_package: false,
         },
-        // RFC 0036 — two more 3.13 helper submodules carried verbatim:
-        // `testcase` (ExceptionIsLikeMixin + float/complex assertions used
-        // by test_float/test_complex) and `numbers` (the numeric-tower
-        // sample values test_int/test_complex iterate over).
         FrozenSource {
             name: "test.support.testcase",
-            source: include_str!("python/test_support_testcase.py"),
+            source: include_str!("python/test_support/testcase.py"),
             is_package: false,
         },
         FrozenSource {
             name: "test.support.numbers",
-            source: include_str!("python/test_support_numbers.py"),
+            source: include_str!("python/test_support/numbers.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.support.logging_helper",
+            source: include_str!("python/test_support/logging_helper.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.support.ast_helper",
+            source: include_str!("python/test_support/ast_helper.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.support.bytecode_helper",
+            source: include_str!("python/test_support/bytecode_helper.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.support.asynchat",
+            source: include_str!("python/test_support/asynchat.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.support.asyncore",
+            source: include_str!("python/test_support/asyncore.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.support.smtpd",
+            source: include_str!("python/test_support/smtpd.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.support.refleak_helper",
+            source: include_str!("python/test_support/refleak_helper.py"),
             is_package: false,
         },
         // `test.tokenizedata`: vendored lexer/tokenizer fixtures.
@@ -2023,12 +2153,6 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "zoneinfo",
             source: include_str!("python/zoneinfo_mod.py"),
-            is_package: false,
-        },
-        FrozenSource {
-            // RFC 0039 WS7: faithful CPython async_case (persistent Runner).
-            name: "unittest.async_case",
-            source: include_str!("python/unittest_async.py"),
             is_package: false,
         },
         // RFC 0023 — fill in the small but commonly-imported stdlib

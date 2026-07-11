@@ -192,9 +192,12 @@ fn arg_errors(args: &[Object], idx: usize) -> String {
 
 /// Map a CPython-shaped encoding name to an `encoding_rs::Encoding`.
 fn lookup_encoding(name: &str) -> Option<&'static Encoding> {
+    // CPython's `encodings.normalize_encoding` keeps only ASCII
+    // alphanumerics (non-ASCII chars act as separators and are dropped), so
+    // e.g. 'utf-8”' still resolves to utf-8.
     let normalised: String = name
         .chars()
-        .filter(|c| !c.is_ascii_whitespace() && *c != '-' && *c != '_')
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '.')
         .map(|c| c.to_ascii_lowercase())
         .collect();
     match normalised.as_str() {
@@ -223,6 +226,8 @@ fn lookup_encoding(name: &str) -> Option<&'static Encoding> {
         "big5" | "csbig5" => Encoding::for_label(b"big5"),
         "euckr" | "ksc56011987" => Encoding::for_label(b"euc-kr"),
         "eucjp" | "ujis" => Encoding::for_label(b"euc-jp"),
+        // WHATWG only lists the hyphenated form, which our normaliser strips.
+        "iso2022jp" | "csiso2022jp" => Encoding::for_label(b"iso-2022-jp"),
         // KOI8 Cyrillic — `encoding_rs` knows these, but only under the
         // hyphenated WHATWG labels our normaliser strips.
         "koi8r" | "cskoi8r" => Encoding::for_label(b"koi8-r"),
@@ -393,6 +398,31 @@ pub fn encode_codepoints(
         "utf32le" => encode_utf32_codepoints(cps, false, false, errors)?,
         "utf32be" => encode_utf32_codepoints(cps, true, false, errors)?,
         "utf32" => encode_utf32_codepoints(cps, false, true, errors)?,
+        // The escape codecs operate on raw code points, so lone surrogates
+        // are representable (CPython encodes '\udfff' as the escape bytes).
+        "rawunicodeescape" => {
+            let mut out = Vec::with_capacity(cps.len());
+            for &cp in cps {
+                if cp < 0x100 {
+                    out.push(cp as u8);
+                } else if cp <= 0xFFFF {
+                    out.extend_from_slice(format!("\\u{cp:04x}").as_bytes());
+                } else {
+                    out.extend_from_slice(format!("\\U{cp:08x}").as_bytes());
+                }
+            }
+            out
+        }
+        "unicodeescape" => {
+            let mut out = Vec::new();
+            for &cp in cps {
+                match char::from_u32(cp) {
+                    Some(ch) => out.extend(encode_unicode_escape(&ch.to_string())),
+                    None => out.extend_from_slice(format!("\\u{cp:04x}").as_bytes()),
+                }
+            }
+            out
+        }
         _ => {
             // Any other codec: encode maximal scalar runs through the normal
             // string engine and resolve each lone surrogate via the error
@@ -1039,8 +1069,50 @@ fn encode_special(s: &str, encoding: &str, errors: &str) -> Result<Option<Vec<u8
         "cp437" | "437" | "ibm437" => Some(encode_cp437(s, errors)?),
         "cp1252" | "windows1252" | "1252" => Some(encode_cp1252(s, errors)?),
         "utf7" => Some(encode_utf7(s)),
+        "iso2022jp" | "csiso2022jp" => Some(encode_iso2022jp(s, errors)?),
         _ => None,
     })
+}
+
+/// ISO-2022-JP encode with CPython semantics. `encoding_rs` follows the
+/// WHATWG spec and *errors* on ESC/SO/SI in the input (anti-injection rule),
+/// but CPython's codec passes all ASCII through verbatim — `email.charset`
+/// depends on re-encoding an ASCII string that already contains raw ESC
+/// shift sequences. Pass ASCII runs through untouched and encode non-ASCII
+/// runs via `encoding_rs` (each run yields a self-contained
+/// `ESC $ B … ESC ( B` sequence, matching CPython's output).
+fn encode_iso2022jp(s: &str, errors: &str) -> Result<Vec<u8>, RuntimeError> {
+    let enc = Encoding::for_label(b"iso-2022-jp").expect("encoding_rs knows iso-2022-jp");
+    let mut out = Vec::with_capacity(s.len());
+    let mut rest = s;
+    while !rest.is_empty() {
+        let ascii_end = rest.find(|c: char| !c.is_ascii()).unwrap_or(rest.len());
+        out.extend_from_slice(&rest.as_bytes()[..ascii_end]);
+        rest = &rest[ascii_end..];
+        if rest.is_empty() {
+            break;
+        }
+        let run_end = rest.find(|c: char| c.is_ascii()).unwrap_or(rest.len());
+        let (bytes, _, has_replacements) = enc.encode(&rest[..run_end]);
+        if has_replacements {
+            match errors {
+                "ignore" => {}
+                "replace" => out.push(b'?'),
+                _ => {
+                    return Err(value_error(
+                        "'iso-2022-jp' codec can't encode input".to_owned(),
+                    ))
+                }
+            }
+            if errors == "ignore" || errors == "replace" {
+                rest = &rest[run_end..];
+                continue;
+            }
+        }
+        out.extend_from_slice(&bytes);
+        rest = &rest[run_end..];
+    }
+    Ok(out)
 }
 
 fn decode_special(
@@ -2068,7 +2140,9 @@ fn encode_raw_unicode_escape(s: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len());
     for c in s.chars() {
         let cp = c as u32;
-        if cp < 0x80 {
+        // CPython emits code points < 0x100 as raw latin-1 bytes; only
+        // higher planes get `\u`/`\U` escapes.
+        if cp < 0x100 {
             out.push(cp as u8);
         } else if cp <= 0xFFFF {
             out.extend_from_slice(format!("\\u{:04x}", cp).as_bytes());

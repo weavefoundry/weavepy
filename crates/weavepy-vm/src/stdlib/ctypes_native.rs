@@ -171,6 +171,25 @@ fn b_addressof_buffer(args: &[Object]) -> Result<Object, RuntimeError> {
             Ok(addr_obj(ptr))
         }
         Object::Bytes(b) => Ok(addr_obj(b.as_ptr() as usize)),
+        // A zero-copy `from_buffer(memoryview)` keeps the view itself as the
+        // ctypes object's backing store (see frozen `_ctypes._writable_buffer`),
+        // so `ctypes.addressof` must resolve through it. `mmap`/`shared_memory`
+        // regions have a stable pointer for their lifetime; bytearray-backed
+        // views hold a live export that pins the buffer against resizing.
+        Object::MemoryView(mv) => {
+            use crate::object::MemoryViewBuffer;
+            if mv.released.get() {
+                return Err(value_error(
+                    "addressof_buffer: operation forbidden on released memoryview object",
+                ));
+            }
+            let base = match &mv.buffer {
+                MemoryViewBuffer::Bytes(b) => b.as_ptr() as usize,
+                MemoryViewBuffer::ByteArray(rc) => rc.borrow().as_ptr() as usize,
+                MemoryViewBuffer::Shared(buf) => buf.data_ptr() as usize,
+            };
+            Ok(addr_obj(base + mv.start.get()))
+        }
         other => Err(type_error(format!(
             "addressof_buffer: expected bytearray (got '{}')",
             other.type_name()

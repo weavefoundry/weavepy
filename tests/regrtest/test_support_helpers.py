@@ -91,12 +91,24 @@ class ImplDetailTests(unittest.TestCase):
 
 
 class ResourceGateTests(unittest.TestCase):
-    def test_resource_disabled_by_default(self):
-        self.assertFalse(support.is_resource_enabled("network"))
+    def test_resources_enabled_outside_regrtest(self):
+        # CPython semantics: `use_resources is None` (not running under
+        # libregrtest `-u`) means every resource is assumed enabled.
+        saved = support.use_resources
+        support.use_resources = None
+        try:
+            self.assertTrue(support.is_resource_enabled("network"))
+        finally:
+            support.use_resources = saved
 
-    def test_requires_raises_resource_denied(self):
-        with self.assertRaises(support.ResourceDenied):
-            support.requires("network")
+    def test_requires_raises_resource_denied_when_unlisted(self):
+        saved = support.use_resources
+        support.use_resources = []
+        try:
+            with self.assertRaises(support.ResourceDenied):
+                support.requires("network")
+        finally:
+            support.use_resources = saved
 
     def test_resource_denied_is_skiptest(self):
         self.assertTrue(issubclass(support.ResourceDenied,

@@ -177,7 +177,7 @@ import array
 
 # The pure-Python implementation is selectable (datetime shim falls back to
 # _pydatetime when _datetime is unavailable).
-from test.support import import_fresh_module
+from test.support.import_helper import import_fresh_module
 _pydt = import_fresh_module("datetime", fresh=["datetime", "_pydatetime"],
                             blocked=["_datetime"])
 assert _pydt is not None

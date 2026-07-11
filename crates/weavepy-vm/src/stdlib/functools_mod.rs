@@ -309,7 +309,48 @@ fn lru_counter_bump(inst: &crate::types::PyInstance, name: &'static str) {
     lru_set(inst, name, Object::Int(next));
 }
 
+/// Per-thread nesting depth of the native wrapper, standing in for
+/// CPython's C-stack consumption. Each nesting level is charged two
+/// units against `C_RECURSION_LIMIT`: CPython's C wrapper eats several
+/// C frames per call, which is why `fib(10000)` under `lru_cache` must
+/// raise `RecursionError` even though `Py_C_RECURSION_LIMIT` is 10 000
+/// and `sys.setrecursionlimit` was raised past 20 000
+/// (test_functools `test_lru_recursion`).
+const LRU_C_STACK_UNITS: usize = 2;
+
+thread_local! {
+    static LRU_NATIVE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+struct LruDepthGuard;
+
+impl Drop for LruDepthGuard {
+    fn drop(&mut self) {
+        LRU_NATIVE_DEPTH.with(|d| d.set(d.get().saturating_sub(LRU_C_STACK_UNITS)));
+    }
+}
+
+fn lru_enter_native() -> Result<LruDepthGuard, RuntimeError> {
+    let depth = LRU_NATIVE_DEPTH.with(|d| {
+        let n = d.get() + LRU_C_STACK_UNITS;
+        d.set(n);
+        n
+    });
+    if depth > crate::recursion::C_RECURSION_LIMIT {
+        // Balance eagerly: the guard is never constructed on this path.
+        LRU_NATIVE_DEPTH.with(|d| d.set(d.get().saturating_sub(LRU_C_STACK_UNITS)));
+        return Err(RuntimeError::PyException(
+            crate::error::PyException::from_builtin(
+                "RecursionError",
+                "maximum recursion depth exceeded",
+            ),
+        ));
+    }
+    Ok(LruDepthGuard)
+}
+
 fn lru_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let _depth_guard = lru_enter_native()?;
     let inst = lru_self(args)?;
     let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() else {
         return Err(type_error("lru_cache requires a running interpreter"));

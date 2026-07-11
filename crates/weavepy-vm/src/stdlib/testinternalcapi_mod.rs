@@ -153,6 +153,71 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 call_kw: None,
             })),
         );
+        // `get_recursion_depth()` — the live Python call depth on this
+        // thread, read straight off the RFC 0037 recursion guard.
+        // `test.support.get_recursion_depth()`/`infinite_recursion()` use it
+        // to size `sys.setrecursionlimit` windows (RFC 0048).
+        d.insert(
+            DictKey(Object::from_static("get_recursion_depth")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "get_recursion_depth",
+                binds_instance: false,
+                call: Box::new(|_args| {
+                    // The builtin call itself does not hold a guard, so the
+                    // depth here is the caller's frame depth. `test.support`
+                    // subtracts one for its own frame; mirror CPython by
+                    // reporting the count including the caller.
+                    let depth = crate::recursion::current_depth().max(1);
+                    Ok(Object::Int(depth as i64))
+                }),
+                call_kw: None,
+            })),
+        );
+    }
+    {
+        let mut d = dict.borrow_mut();
+        // `get_config()` — the runtime-config dict `test.support` probes.
+        // WeavePy ships PEP 657 column positions (RFC 0033/0037), so
+        // `code_debug_ranges` is truthfully 1.
+        d.insert(
+            DictKey(Object::from_static("get_config")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "get_config",
+                binds_instance: false,
+                call: Box::new(|_args| {
+                    let cfg = Rc::new(RefCell::new(DictData::default()));
+                    {
+                        let mut c = cfg.borrow_mut();
+                        c.insert(
+                            DictKey(Object::from_static("code_debug_ranges")),
+                            Object::Int(1),
+                        );
+                    }
+                    Ok(Object::Dict(cfg))
+                }),
+                call_kw: None,
+            })),
+        );
+        // Immortalization knobs: WeavePy has no deferred-immortalization
+        // pass, so suppression is a sound no-op and nothing is deferred.
+        d.insert(
+            DictKey(Object::from_static("suppress_immortalization")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "suppress_immortalization",
+                binds_instance: false,
+                call: Box::new(|_args| Ok(Object::None)),
+                call_kw: None,
+            })),
+        );
+        d.insert(
+            DictKey(Object::from_static("get_immortalize_deferred")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "get_immortalize_deferred",
+                binds_instance: false,
+                call: Box::new(|_args| Ok(Object::Bool(false))),
+                call_kw: None,
+            })),
+        );
     }
     Rc::new(PyModule {
         name: "_testinternalcapi".to_owned(),

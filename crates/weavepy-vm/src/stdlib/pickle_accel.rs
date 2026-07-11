@@ -84,10 +84,20 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 }
 
 fn make_exc(name: &'static str, base: Rc<TypeObject>) -> Rc<TypeObject> {
+    // CPython's C `_pickle` registers these as "pickle.PickleError" etc., so
+    // `__module__` reads "pickle" — and `pickle.dumps(PicklingError)` finds
+    // the class via `pickle.PicklingError` (test_concurrent_futures
+    // `test_error_during_result_pickle_in_result_handler` round-trips the
+    // exception *class* through a worker).
+    let mut dict = DictData::default();
+    dict.insert(
+        DictKey(Object::from_static("__module__")),
+        Object::from_static("pickle"),
+    );
     TypeObject::new_with_flags(
         name,
         vec![base],
-        DictData::default(),
+        dict,
         TypeFlags {
             is_exception: true,
             is_builtin: true,

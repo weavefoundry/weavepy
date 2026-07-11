@@ -45,8 +45,8 @@ status = "skip"
 reason = "imports CPython-only internals (tokenize.tokenize, encoding cookies)"
 
 [tests."cpython/Lib/test/test_dict.py"]
-status = "fail"
-reason = "depends on dict order corner cases + leaking CPython implementation details"
+status = "pass"
+reason = "RFC 0048: all 123 tests pass (14 skips for CPython-only refcount/sizeof probes). Required: reentrancy-safe dict probes over indexmap's raw-entry API (user __hash__/__eq__ never run under a live borrow, with restart-on-mutation), key_cmp_scope error propagation through every dict operation, structural-version DictWatch + live-cursor dict iterators (RuntimeError on mutation during iteration, prompt __del__ of overwritten values), parked-repr-error re-raise so a raising element __repr__ surfaces through repr(dict), dict.fromkeys as a real classmethod descriptor (subclass construction via cls() + PyObject_SetItem semantics), PyDict_Merge source-size re-check after every insert, dictview_richcompare (keys/items views as sets, incl. orderings and mixed set operands), dict(od)/dict(subclass) honouring overridden keys/__iter__ (bpo-34320), copy() preserving GC tracking, and GC traversal treating dict views/iterators as edges to the dict (bug #3680)."
 
 [tests."cpython/Lib/test/test_list.py"]
 status = "pass"
@@ -70,7 +70,8 @@ reason = "RFC 0039 WS5: all cases pass. Builds on RFC 0037's Python `__hash__`/`
 
 [tests."cpython/Lib/test/test_threading.py"]
 status = "pass"
-reason = "RFC 0039: real OS threads with cooperative GIL hand-off, faithful Lock/RLock (subclassable `_thread.RLock`), thread-death thread-local cleanup (foreign-thread `_DummyThread` reaping), and prompt refcount reclamation of acyclic garbage — including the cross-thread `Thread.run` teardown cycle (`test_no_refcycle_through_target`) swept on `join()`. All 213 tests pass (29 skips for CPython-only knobs)."
+timeout_seconds = 180
+reason = "RFC 0039: real OS threads with cooperative GIL hand-off, faithful Lock/RLock (subclassable `_thread.RLock`), thread-death thread-local cleanup (foreign-thread `_DummyThread` reaping), and prompt refcount reclamation of acyclic garbage — including the cross-thread `Thread.run` teardown cycle (`test_no_refcycle_through_target`) swept on `join()`. All 213 tests pass (29 skips for CPython-only knobs). 180s: the suite runs ~32s standalone; with the main thread participating in GIL hand-offs it exceeds the 60s cap under 4-way parallel worker load."
 
 [tests."cpython/Lib/test/test_thread.py"]
 status = "pass"
@@ -90,6 +91,9 @@ reason = "RFC 0039 WS5: the cyclic-GC hang is gone — WeakValueDictionary/WeakK
 
 [tests."cpython/Lib/test/test_multiprocessing_main_handling.py"]
 status = "pass"
+# ~25s sequentially (39 launch shapes, each re-execing the binary), but slows
+# past the global 60s cap under parallel worker contention (-j4).
+timeout_seconds = 300
 reason = "RFC 0040 WS5: 39/39 pass — all three start-method classes run on macOS (Fork + ForkServer + Spawn, 13 launch shapes each); none are skipped here. The ForkServer class needs an AF_UNIX socket + a forked server process, so it only passes when the grader runs unsandboxed (under a syscall sandbox those 13 fail at `forkserver.ensure_running`). Drives every `__main__`/`-m`/directory/zipapp launch through `runpy` + `multiprocessing` spawn child reconstruction. Required: (1) a faithful `runpy` PEP 338 port that introspects via `importlib.util.find_spec` + `loader.get_code` without executing the target; (2) a real `zipimport` (PEP 273) over the frozen `zipfile`, registered on `sys.path_hooks`, so directory/zip `__main__` and `pkg.mod`-in-zip resolve; (3) a Rust import-loader fallback to `sys.meta_path` that builds a *native* module from the located spec's code object (so dotted-import binding / `IMPORT_FROM` see a real module, not a `types.ModuleType` instance) — this is what lets `__import__('pkg')` reach a zip; (4) `io.open_code()` forced to binary mode so `pkgutil.read_code`/`runpy` read a `.pyc`'s magic header as raw bytes; (5) a dotless `sys.implementation.cache_tag` (`weavepy-313`, was `weavepy-3.13`) so PEP 3147 `source_from_cache` recovers `<name>.py` correctly; (6) faithful `make_zip_script`/`make_legacy_pyc` test helpers. CLI `run_path` dispatches directory/zip → `runpy._run_module_as_main('__main__')` and bare `.pyc` → unmarshalled-as-`__main__`."
 
 [tests."cpython/Lib/test/test_multiprocessing_fork.py"]
@@ -195,7 +199,7 @@ reason = "RFC 0037 WS8: copyreg's pickle extension registry (add_extension/remov
 
 [tests."cpython/Lib/test/test_marshal.py"]
 status = "fail"
-reason = "marshal ships (RFC 0033) and imports cleanly; full test_marshal.py conformance (every object type + version/recursion limits) unverified pending a local Lib/test checkout"
+reason = "measured: 66 tests, ~21F/12E, no crash. Recursion-depth guard (MAX_MARSHAL_STACK_DEPTH=2000) fixed the former stack-overflow abort; test_recursion_limit + test_loads_recursion pass. Remaining gaps: marshal version arg, code-object round-trips, shared-ref (w_ref) instancing/interning semantics."
 
 [tests."cpython/Lib/test/test_re.py"]
 status = "fail"
@@ -203,6 +207,9 @@ reason = "measured: completes in ~23s sequentially with a mixed F/E run (re engi
 
 [tests."cpython/Lib/test/test_json.py"]
 status = "pass"
+# ~16s sequentially, but slows past the global 60s cap under parallel worker
+# contention (-j4); give it headroom so load spikes don't grade as timeouts.
+timeout_seconds = 180
 # RFC 0041 WS-json: `json` is now the verbatim CPython package
 # (`stdlib/python/json/`) layered over a native `_json` accelerator
 # (`json_accel.rs`, a port of `Modules/_json.c`). The C-vs-Python test pairs
@@ -282,7 +289,8 @@ reason = "measured (RFC 0040 WTF-8 arc): passes end-to-end — 94 run, 0 fail, 8
 
 [tests."cpython/Lib/test/test_pathlib.py"]
 status = "fail"
-reason = "measured (RFC 0038 WS-B): 764 pass, 10 fail, 3 error of 1036. The errors need AF_UNIX socket string addresses (`sock.bind(str(path))` → 'address must be a tuple'); the failures are 3.13 path-edge corners (walk/full_match/relative_to(walk_up)). Deferred."
+timeout_seconds = 300
+reason = "measured (RFC 0038 WS-B): 764 pass, 10 fail, 3 error of 1036. The errors need AF_UNIX socket string addresses (`sock.bind(str(path))` → 'address must be a tuple'); the failures are 3.13 path-edge corners (walk/full_match/relative_to(walk_up)). Deferred. ~40s standalone, so the suite-wide 60s cap trips under parallel worker load; the override keeps the graded outcome at 'fail' rather than a load-dependent 'timeout'."
 
 [tests."cpython/Lib/test/test_tempfile.py"]
 status = "pass"
@@ -457,8 +465,8 @@ status = "pass"
 reason = "RFC 0040 WS1/WS4: passes in the canonical subprocess mode (178 run, 0F/0E, 99 skip). Landed: os.pipe2 honouring O_NONBLOCK/O_CLOEXEC via host libc O_* values (macOS differs from Linux), signal.raise_signal delivering real signals unconditionally (setsigdef kills the child), posix_spawn setsigmask preserved by capturing+restoring the inherited signal mask on the VM thread, and a pre-main C constructor (proc_init) that re-closes any inherited-closed standard fd the Rust runtime's sanitize_standard_fds reopened to /dev/null (test_close_file)."
 
 [tests."cpython/Lib/test/test_uuid.py"]
-status = "fail"
-reason = "uuid: MAC address lookup + uuid8 namespace handling"
+status = "pass"
+reason = "measured: passes as a unit (75 run, heavy skips for the C _uuid accelerator variants). The former MAC-address-lookup and uuid8 namespace failures cleared with the RFC 0040+ stdlib waves (subprocess/os plumbing the getters rely on)."
 
 [tests."cpython/Lib/test/test_secrets.py"]
 status = "fail"

@@ -1,26 +1,11 @@
-"""``unittest.async_case`` — ``IsolatedAsyncioTestCase``.
-
-RFC 0039 (WS7): ported verbatim from CPython's ``Lib/unittest/async_case.py``
-so ``async def test_*`` / ``asyncSetUp`` / ``asyncTearDown`` / async cleanups
-all run inside a single persistent ``asyncio.Runner`` (and shared
-``contextvars`` context), exactly as upstream. The only deviation from
-upstream is the ``TestCase`` import: WeavePy's ``unittest`` is a single-file
-package whose ``__init__`` exports ``TestCase`` directly, so we import it
-absolutely rather than via ``from .case import TestCase``.
-"""
-
 import asyncio
 import contextvars
 import inspect
 import warnings
 
-from unittest import TestCase
+from .case import TestCase
 
 __unittest = True
-
-# WEAVEPY_ASYNC_CASE_MARKER_V2
-__all__ = ['IsolatedAsyncioTestCase']
-
 
 class IsolatedAsyncioTestCase(TestCase):
     # Names intentionally have a long prefix

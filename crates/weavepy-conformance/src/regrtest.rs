@@ -712,6 +712,16 @@ import sys, os
 sys.path.insert(0, {lib_dir:?})
 sys.argv = [{path:?}]
 import unittest
+# Run inside a fresh scratch working directory, like libregrtest's per-worker
+# `temp_cwd`. CPython's suite assumes a disposable cwd: `test.support.os_helper`
+# drops `@test_<pid>_tmpæ` files in it, and test_zipfile's extraction tests
+# `rmtree('target')` — which, run from the workspace root, deleted the *build
+# tree* (target/release/weavepy) mid-sweep and broke every later test that
+# re-execs sys.executable.
+import tempfile, shutil, atexit
+_scratch = tempfile.mkdtemp(prefix="weavepy_regrtest_")
+os.chdir(_scratch)
+atexit.register(shutil.rmtree, _scratch, True)
 # Enable the test-resource model the way libregrtest's `-u` flag would, so
 # `support.requires('network')` / `@requires_resource('network')` exercise the
 # loopback subset instead of raising ResourceDenied. Driven by

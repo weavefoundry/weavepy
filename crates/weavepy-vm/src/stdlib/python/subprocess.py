@@ -1311,12 +1311,20 @@ class Popen:
             # Wait for the process to terminate, to avoid zombies.
             self.wait()
 
-    def __del__(self):
+    def __del__(self, _maxsize=sys.maxsize, _warn=warnings.warn):
         if not self._child_created:
+            # We didn't get to successfully create a child process.
             return
         if self.returncode is None:
-            if _active is not None:
-                _active.append(self)
+            # Not reading subprocess exit status creates a zombie process which
+            # is only destroyed at the parent python process exit
+            _warn("subprocess %s is still running" % self.pid,
+                  ResourceWarning, source=self)
+        # In case the child hasn't been waited on, check if it's done.
+        self._internal_poll(_deadstate=_maxsize)
+        if self.returncode is None and _active is not None:
+            # Child is still running, keep us alive until we can wait on it.
+            _active.append(self)
 
     def __repr__(self):
         obj_repr = "<%s: returncode: %s args: %r>" % (

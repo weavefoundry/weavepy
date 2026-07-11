@@ -579,7 +579,14 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "clear" => Some(method("clear", dict_clear)),
             "setdefault" => Some(method("setdefault", dict_setdefault)),
             "copy" => Some(method("copy", dict_copy)),
-            "fromkeys" => Some(method("fromkeys", dict_fromkeys)),
+            // A classmethod: `{}.fromkeys('abc')` must not prepend the
+            // receiver dict (it would read as the iterable — the receiver
+            // is exact `dict`, so plain-dict construction is right anyway).
+            "fromkeys" => Some({
+                let mut f = method("fromkeys", dict_fromkeys);
+                f.binds_instance = false;
+                f
+            }),
             "popitem" => Some(method("popitem", dict_popitem)),
             // Dunders so `dict.__setitem__` / `super().__setitem__` resolve
             // for `dict` subclasses (`class C(dict)`).
@@ -594,6 +601,11 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "__contains__" => Some(method("__contains__", obj_contains)),
             "__iter__" => Some(method("__iter__", dict_iter_method)),
             "__init__" => Some(method("__init__", dict_update)),
+            // PEP 584 merge operators, reachable as explicit methods
+            // (`a.__or__(b)`, `a.__ior__(b)`) as well as via `|`/`|=`.
+            "__or__" => Some(method("__or__", dict_or)),
+            "__ror__" => Some(method("__ror__", dict_ror)),
+            "__ior__" => Some(method("__ior__", dict_ior)),
             _ => None,
         },
         Object::Tuple(_) => match name {
@@ -1038,7 +1050,9 @@ fn iter_setstate(args: &[Object]) -> Result<Object, RuntimeError> {
         PyIterator::ByteArray { data, index } => {
             *index = clamp(data.borrow().len());
         }
-        PyIterator::DictKeys { keys, index, .. } => *index = clamp(keys.len()),
+        PyIterator::DictKeys { dict, index, .. } => {
+            *index = clamp(dict.as_ref().map_or(0, |d| d.borrow().len()));
+        }
         PyIterator::Reversed { index, .. } => *index = state.max(-1),
         _ => {}
     }
@@ -2453,6 +2467,11 @@ fn b_str(args: &[Object]) -> Result<Object, RuntimeError> {
         };
         let s = crate::stdlib::codecs_mod::decode_bytes(&data, &encoding, &errors)?;
         return Ok(Object::from_str(s));
+    }
+    // Identity for strings — a `WStr` in particular must keep its lone
+    // surrogates rather than flatten to U+FFFD through `to_str()`.
+    if matches!(&args[0], Object::Str(_) | Object::WStr(_)) {
+        return Ok(args[0].clone());
     }
     Ok(Object::from_str(args[0].to_str()))
 }
@@ -4571,6 +4590,35 @@ pub(crate) fn b_bytearray_fromhex_cls(args: &[Object]) -> Result<Object, Runtime
     let s = fromhex_string_arg(args.get(1))?;
     let bytes = parse_hex_bytes(&s)?;
     fromhex_wrap_subclass(args.first(), "bytearray", Object::new_bytearray(bytes))
+}
+
+/// `float.__getformat__(typestr)` — CPython's undocumented IEEE-754 probe
+/// (`Objects/floatobject.c float_getformat`). `typestr` must be `"double"`
+/// or `"float"`; the result is `"IEEE, little-endian"` /
+/// `"IEEE, big-endian"` (Rust f32/f64 are IEEE 754 on all supported
+/// targets).
+pub(crate) fn b_float_getformat_cls(args: &[Object]) -> Result<Object, RuntimeError> {
+    let typestr = match args.get(1) {
+        Some(Object::Str(s)) => s.to_string(),
+        Some(other) => {
+            return Err(type_error(format!(
+                "__getformat__() argument must be string, not {}",
+                other.type_name()
+            )));
+        }
+        None => return Err(type_error("__getformat__() missing required argument")),
+    };
+    if typestr != "double" && typestr != "float" {
+        return Err(value_error(
+            "__getformat__() argument 1 must be 'double' or 'float'",
+        ));
+    }
+    let endian = if cfg!(target_endian = "little") {
+        "IEEE, little-endian"
+    } else {
+        "IEEE, big-endian"
+    };
+    Ok(Object::from_str(endian))
 }
 
 pub(crate) fn b_float_fromhex_cls(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8410,7 +8458,7 @@ fn str_find(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(p) => p,
         None => return Err(type_error("find() expected str")),
     };
-    let total_chars = s.chars().count() as i64;
+    let total_chars = str_char_len(s) as i64;
     let Some((start, end)) = str_search_window(args, total_chars) else {
         return Ok(Object::Int(-1));
     };
@@ -8426,14 +8474,52 @@ fn str_find(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
+/// Whether `s` is pure ASCII, memoized by buffer identity. CPython's PEP 393
+/// layout makes char↔byte offset mapping O(1); our UTF-8 `Rc<str>` needs a
+/// scan. Callers like `str.find(sub, start)`-in-a-loop (email's
+/// `_parseparam`, N=100k windows over one big header) would otherwise turn
+/// linear algorithms quadratic. A one-slot cache suffices: hot loops hammer
+/// the same haystack repeatedly.
+pub(crate) fn str_is_ascii_cached(s: &str) -> bool {
+    use std::cell::Cell;
+    thread_local! {
+        static ASCII_CACHE: Cell<(usize, usize, bool)> = const { Cell::new((0, 0, false)) };
+    }
+    let key = (s.as_ptr() as usize, s.len());
+    ASCII_CACHE.with(|c| {
+        let (p, l, v) = c.get();
+        if (p, l) == key {
+            return v;
+        }
+        let v = s.is_ascii();
+        c.set((key.0, key.1, v));
+        v
+    })
+}
+
+/// Total `len()` in code points, O(1) for (cached-)ASCII strings.
+pub(crate) fn str_char_len(s: &str) -> usize {
+    if str_is_ascii_cached(s) {
+        s.len()
+    } else {
+        s.chars().count()
+    }
+}
+
 fn char_offset_to_byte(s: &str, n: usize) -> usize {
     if n == 0 {
         return 0;
+    }
+    if str_is_ascii_cached(s) {
+        return n.min(s.len());
     }
     s.char_indices().nth(n).map(|(b, _)| b).unwrap_or(s.len())
 }
 
 fn byte_offset_to_char(s: &str, byte: usize) -> usize {
+    if str_is_ascii_cached(s) {
+        return byte;
+    }
     s[..byte].chars().count()
 }
 
@@ -8625,7 +8711,7 @@ fn str_rfind(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(p) => p,
         None => return Err(type_error("rfind() expected str")),
     };
-    let total_chars = s.chars().count() as i64;
+    let total_chars = str_char_len(s) as i64;
     let Some((start, end)) = str_search_window(args, total_chars) else {
         return Ok(Object::Int(-1));
     };
@@ -8664,7 +8750,7 @@ fn str_count(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(p) => p,
         None => return Err(type_error("count() expected str")),
     };
-    let total_chars = s.chars().count() as i64;
+    let total_chars = str_char_len(s) as i64;
     let Some((start, end)) = str_search_window(args, total_chars) else {
         return Ok(Object::Int(0));
     };
@@ -9718,13 +9804,113 @@ fn dict_get(args: &[Object]) -> Result<Object, RuntimeError> {
     let key = args
         .get(1)
         .ok_or_else(|| type_error("dict.get() expected at least 1 argument"))?;
+    ensure_hashable(key)?;
     let default = args.get(2).cloned().unwrap_or(Object::None);
-    let value = d
-        .borrow()
-        .get(&DictKey(key.clone()))
-        .cloned()
-        .unwrap_or(default);
+    let value = dict_lookup(&d, key)?.unwrap_or(default);
     Ok(value)
+}
+
+/// `d[key]` probe honouring re-entrant user `__eq__`/`__hash__`: a key whose
+/// comparison can run Python takes the borrow-free two-phase path (its
+/// `__eq__` may mutate `d` mid-lookup — gh-140551) and propagates exceptions
+/// those dunders raise; every other key uses the direct native probe.
+pub(crate) fn dict_lookup(
+    d: &Rc<RefCell<DictData>>,
+    key: &Object,
+) -> Result<Option<Object>, RuntimeError> {
+    if crate::object::dict_key_is_reentrant(key) {
+        return crate::object::dict_reentrant_get(d, key);
+    }
+    // `key_cmp_scope` re-raises an exception a Python `__hash__` (or a
+    // stored key's `__eq__`) parked during the infallible table probe
+    // (test_dict `BadHash`: `d[x]` must surface the `__hash__` error).
+    let (found, deferred) = crate::object::with_key_eq_deferred(|| {
+        crate::object::key_cmp_scope(|| d.borrow().get(&DictKey(key.clone())).cloned())
+    });
+    match found? {
+        Some(v) => Ok(Some(v)),
+        // A stored key needed a Python comparison: retry borrow-free.
+        None if deferred => crate::object::dict_reentrant_get(d, key),
+        None => Ok(None),
+    }
+}
+
+/// `d[key] = value` honouring re-entrant keys (see [`dict_lookup`]).
+/// Returns the replaced value, if any.
+pub(crate) fn dict_insert(
+    d: &Rc<RefCell<DictData>>,
+    key: Object,
+    value: Object,
+) -> Result<Option<Object>, RuntimeError> {
+    if crate::object::dict_key_is_reentrant(&key) {
+        return crate::object::dict_reentrant_insert(d, key, value);
+    }
+    let (old, deferred) = crate::object::with_key_eq_deferred(|| {
+        crate::object::key_cmp_scope(|| d.borrow_mut().insert(DictKey(key.clone()), value.clone()))
+    });
+    let old = match &old {
+        Err(_) => {
+            // The probe raised (a `__hash__`/`__eq__` error). The entry may
+            // have been appended before the error was noticed; evict it so a
+            // failed insert leaves the dict untouched (CPython aborts the
+            // whole `PyDict_SetItem`).
+            let mut m = d.borrow_mut();
+            if m.keys().next_back().is_some_and(|k| k.0.is_same(&key)) {
+                m.pop();
+            }
+            drop(m);
+            return old;
+        }
+        Ok(v) => v.clone(),
+    };
+    match old {
+        // Replaced natively — genuine equality, no Python needed.
+        Some(old) => Ok(Some(old)),
+        None if deferred => {
+            // Appended while a stored key still needed a Python comparison:
+            // undo the append (`insert` places new keys last) and redo on
+            // the borrow-free path.
+            {
+                let mut m = d.borrow_mut();
+                let popped = m.pop();
+                debug_assert!(popped.is_some_and(|(k, _)| k.0.is_same(&key)));
+            }
+            crate::object::dict_reentrant_insert(d, key, value)
+        }
+        None => {
+            // A new key landed: notify any live iterator watching `d`
+            // (the "keys changed during iteration" trip-wire). Value
+            // overwrites (the `Some` arm above) intentionally don't.
+            crate::object::dict_watch_bump(d);
+            Ok(None)
+        }
+    }
+}
+
+/// `del d[key]` / `d.pop(key)` honouring re-entrant keys (see
+/// [`dict_lookup`]). Returns the evicted `(stored key, value)` pair.
+pub(crate) fn dict_remove(
+    d: &Rc<RefCell<DictData>>,
+    key: &Object,
+) -> Result<Option<(Object, Object)>, RuntimeError> {
+    if crate::object::dict_key_is_reentrant(key) {
+        return crate::object::dict_reentrant_remove(d, key);
+    }
+    let (removed, deferred) = crate::object::with_key_eq_deferred(|| {
+        crate::object::key_cmp_scope(|| {
+            d.borrow_mut()
+                .shift_remove_entry(&DictKey(key.clone()))
+                .map(|(k, v)| (k.0, v))
+        })
+    });
+    match removed? {
+        Some(entry) => {
+            crate::object::dict_watch_bump(d);
+            Ok(Some(entry))
+        }
+        None if deferred => crate::object::dict_reentrant_remove(d, key),
+        None => Ok(None),
+    }
 }
 
 // Container dunders exposed on the type so `dict.__setitem__`,
@@ -9740,7 +9926,8 @@ fn dict_setitem(args: &[Object]) -> Result<Object, RuntimeError> {
     let val = args
         .get(2)
         .ok_or_else(|| type_error("__setitem__ expected 2 arguments"))?;
-    let old = d.borrow_mut().insert(DictKey(key.clone()), val.clone());
+    ensure_hashable(key)?;
+    let old = dict_insert(&d, key.clone(), val.clone())?;
     if let Some(old) = old {
         queue_removed(old);
     }
@@ -9752,7 +9939,8 @@ fn dict_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
     let key = args
         .get(1)
         .ok_or_else(|| type_error("__getitem__ expected 1 argument"))?;
-    let found = d.borrow().get(&DictKey(key.clone())).cloned();
+    ensure_hashable(key)?;
+    let found = dict_lookup(&d, key)?;
     // CPython's `KeyError` carries the missing key *object* as `args[0]`
     // (`e.args[0] is key`), not its repr string; `str(e)` still renders
     // `repr(key)`. A `dict` subclass's `__missing__` also receives this
@@ -9774,9 +9962,10 @@ fn dict_delitem(args: &[Object]) -> Result<Object, RuntimeError> {
     let key = args
         .get(1)
         .ok_or_else(|| type_error("__delitem__ expected 1 argument"))?;
-    let removed = d.borrow_mut().shift_remove_entry(&DictKey(key.clone()));
+    ensure_hashable(key)?;
+    let removed = dict_remove(&d, key)?;
     if let Some((k, v)) = removed {
-        queue_removed(k.0);
+        queue_removed(k);
         queue_removed(v);
         Ok(Object::None)
     } else {
@@ -9829,11 +10018,12 @@ fn dict_pop(args: &[Object]) -> Result<Object, RuntimeError> {
     let key = args
         .get(1)
         .ok_or_else(|| type_error("dict.pop() expected at least 1 argument"))?;
-    let removed = d.borrow_mut().shift_remove_entry(&DictKey(key.clone()));
+    ensure_hashable(key)?;
+    let removed = dict_remove(&d, key)?;
     if let Some((k, v)) = removed {
         // The *stored* key (equal to, but possibly distinct from, the
         // lookup key) is evicted too; the value is returned to the caller.
-        queue_removed(k.0);
+        queue_removed(k);
         Ok(v)
     } else if let Some(default) = args.get(2).cloned() {
         Ok(default)
@@ -9858,10 +10048,18 @@ fn dict_update(args: &[Object]) -> Result<Object, RuntimeError> {
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
-                let mut dst = d.borrow_mut();
+                let src_len = entries.len();
                 for (k, v) in entries {
-                    if let Some(old) = dst.insert(k, v) {
+                    if let Some(old) = dict_insert(&d, k.0, v)? {
                         queue_removed(old);
+                    }
+                    // CPython's `PyDict_Merge` re-checks the source size
+                    // *after* every insert: a key `__eq__` that mutates the
+                    // source mid-merge aborts — including on the final entry
+                    // (test_dict `test_merge_and_mutate` puts the mutating
+                    // key last).
+                    if o.borrow().len() != src_len {
+                        return Err(crate::error::runtime_error("dict mutated during update"));
                     }
                 }
             }
@@ -9886,7 +10084,11 @@ fn dict_update(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn dict_clear(args: &[Object]) -> Result<Object, RuntimeError> {
     let d = dict_self(args)?;
+    dict_view_no_args(args, "clear")?;
     let evicted: Vec<(DictKey, Object)> = d.borrow_mut().drain(..).collect();
+    if !evicted.is_empty() {
+        crate::object::dict_watch_bump(&d);
+    }
     for (k, v) in evicted {
         queue_removed(k.0);
         queue_removed(v);
@@ -9959,19 +10161,53 @@ fn dict_setdefault(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(k) => DictKey(k.clone()),
         None => return Err(type_error("setdefault() takes at least 1 argument")),
     };
+    ensure_hashable(&key.0)?;
     let default = args.get(2).cloned().unwrap_or(Object::None);
-    let mut borrowed = d.borrow_mut();
-    if let Some(v) = borrowed.get(&key).cloned() {
-        return Ok(v);
+    // One probe, one `__hash__` call (CPython's `dict_setdefault` is a
+    // single lookup; `test_setdefault_atomic` counts the dispatches).
+    if crate::object::dict_key_is_reentrant(&key.0) {
+        return crate::object::dict_reentrant_setdefault(&d, key.0, default);
     }
-    borrowed.insert(key, default.clone());
-    Ok(default)
+    let (out, deferred) = crate::object::with_key_eq_deferred(|| {
+        crate::object::key_cmp_scope(|| {
+            let mut borrowed = d.borrow_mut();
+            if let Some(v) = borrowed.get(&key).cloned() {
+                return (v, true);
+            }
+            borrowed.insert(key.clone(), default.clone());
+            (default.clone(), false)
+        })
+    });
+    let (value, existed) = out?;
+    if deferred && !existed {
+        // The native probe was inconclusive (a stored key needed a Python
+        // comparison) and appended a new entry; undo it and redo the whole
+        // operation on the borrow-free path.
+        {
+            let mut m = d.borrow_mut();
+            if m.keys().next_back().is_some_and(|k| k.0.is_same(&key.0)) {
+                m.pop();
+            }
+        }
+        return crate::object::dict_reentrant_setdefault(&d, key.0, default);
+    }
+    if !existed {
+        crate::object::dict_watch_bump(&d);
+    }
+    Ok(value)
 }
 
 fn dict_copy(args: &[Object]) -> Result<Object, RuntimeError> {
     let d = dict_self(args)?;
+    dict_view_no_args(args, "copy")?;
     let cloned = d.borrow().clone();
-    Ok(Object::Dict(Rc::new(RefCell::new(cloned))))
+    let out = Object::Dict(Rc::new(RefCell::new(cloned)));
+    // CPython's `PyDict_Copy` preserves GC tracking: the copy is tracked
+    // iff the source is (test_dict `test_copy_maintains_tracking`).
+    if crate::gc_trace::is_tracked(crate::weakref_registry::id_of(&Object::Dict(d))) {
+        crate::gc_trace::track(out.clone());
+    }
+    Ok(out)
 }
 
 fn dict_fromkeys(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -9984,26 +10220,180 @@ fn dict_fromkeys(args: &[Object]) -> Result<Object, RuntimeError> {
     // class, leaving the iterable in slot 0. Critically, the iterable may
     // *be* a dict (`dict.fromkeys(other_dict, value)` — bpo do_not_rehash),
     // so we must not mistake a dict in slot 0 for a bound receiver.
-    let (it_idx, value_idx) = match args.first() {
-        Some(Object::Type(_)) => (1usize, 2usize),
-        _ => (0usize, 1usize),
+    let (cls, it_idx) = match args.first() {
+        Some(Object::Type(t)) => (Some(t.clone()), 1usize),
+        _ => (None, 0usize),
     };
     let it = args
         .get(it_idx)
-        .ok_or_else(|| type_error("fromkeys() expects iterable"))?;
-    let value = args.get(value_idx).cloned().unwrap_or(Object::None);
-    let mut d = DictData::default();
-    let mut iter = it.make_iter()?;
-    while let Some(k) = iter.next_value() {
-        d.insert(DictKey(k), value.clone());
+        .ok_or_else(|| type_error("fromkeys expected at least 1 argument, got 0"))?;
+    let value = args.get(it_idx + 1).cloned().unwrap_or(Object::None);
+    let bt = crate::builtin_types::builtin_types();
+    let plain = cls.as_ref().is_none_or(|t| Rc::ptr_eq(t, &bt.dict_));
+    let interp_ptr = crate::vm_singletons::current_interpreter_ptr();
+    if plain {
+        // Exact `dict`: build the payload directly. Iterate through the
+        // interpreter when one is live so a user iterator that *raises*
+        // (test_dict `BadSeq`) propagates instead of reading as exhaustion.
+        let d = Rc::new(RefCell::new(DictData::default()));
+        if let Some(ptr) = interp_ptr {
+            // SAFETY: published by an enclosing VM frame still live on this
+            // thread; the GIL keeps it exclusive.
+            let interp = unsafe { &mut *ptr };
+            let globals = interp.builtins_dict();
+            let iter = interp.make_iter(it, &globals)?;
+            while let Some(k) = interp.iter_next(&iter, &globals)? {
+                ensure_hashable(&k)?;
+                dict_insert(&d, k, value.clone())?;
+            }
+        } else {
+            let mut iter = it.make_iter()?;
+            while let Some(k) = iter.next_value_checked()? {
+                ensure_hashable(&k)?;
+                dict_insert(&d, k, value.clone())?;
+            }
+        }
+        return Ok(Object::Dict(d));
     }
-    Ok(Object::Dict(Rc::new(RefCell::new(d))))
+    // A dict subclass: CPython's `dict_fromkeys` calls `cls()` — running
+    // `__new__`/`__init__`, either of which may raise or return a foreign
+    // object like `UserDict` — then `PyObject_SetItem` per key, honouring a
+    // user `__setitem__` override (test_dict `baddict1/2`, `mydict`).
+    let cls = cls.expect("subclass path requires a class");
+    let ptr = interp_ptr
+        .ok_or_else(|| type_error("fromkeys(): no interpreter available for dict subclass"))?;
+    // SAFETY: as above.
+    let interp = unsafe { &mut *ptr };
+    let globals = interp.builtins_dict();
+    let target = interp.call_object_with_globals(&Object::Type(cls), &[], &[], &globals)?;
+    let iter = interp.make_iter(it, &globals)?;
+    while let Some(k) = interp.iter_next(&iter, &globals)? {
+        interp.subscr_set_public(&target, &k, value.clone())?;
+    }
+    Ok(target)
+}
+
+/// The dict payload of `other` when it is a dict (or dict-backed
+/// subclass instance); `None` for anything else.
+fn dict_payload(other: &Object) -> Option<Rc<RefCell<DictData>>> {
+    match other {
+        Object::Dict(o) => Some(o.clone()),
+        Object::Instance(inst) => match inst.native.get() {
+            Some(Object::Dict(o)) => Some(o.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// PEP 584 `d | other`: a new dict; `NotImplemented` for a non-dict RHS.
+fn dict_or(args: &[Object]) -> Result<Object, RuntimeError> {
+    let d = dict_self(args)?;
+    let Some(other) = args.get(1).and_then(dict_payload) else {
+        return Ok(crate::vm_singletons::not_implemented());
+    };
+    let mut out = d.borrow().clone();
+    for (k, v) in other.borrow().iter() {
+        out.insert(k.clone(), v.clone());
+    }
+    let obj = Object::Dict(Rc::new(RefCell::new(out)));
+    crate::gc_trace::track(obj.clone());
+    Ok(obj)
+}
+
+/// Reflected PEP 584 merge: `other | d` with `d` supplying the overrides.
+fn dict_ror(args: &[Object]) -> Result<Object, RuntimeError> {
+    let d = dict_self(args)?;
+    let Some(other) = args.get(1).and_then(dict_payload) else {
+        return Ok(crate::vm_singletons::not_implemented());
+    };
+    let mut out = other.borrow().clone();
+    for (k, v) in d.borrow().iter() {
+        out.insert(k.clone(), v.clone());
+    }
+    let obj = Object::Dict(Rc::new(RefCell::new(out)));
+    crate::gc_trace::track(obj.clone());
+    Ok(obj)
+}
+
+/// PEP 584 `d |= other` (in place): unlike binary `|`, accepts anything
+/// `dict.update` does — a mapping, or an iterable of key/value pairs.
+fn dict_ior(args: &[Object]) -> Result<Object, RuntimeError> {
+    let d = dict_self(args)?;
+    let other = args
+        .get(1)
+        .ok_or_else(|| type_error("__ior__ expected 1 argument"))?;
+    if let Some(src) = dict_payload(other) {
+        let entries: Vec<(DictKey, Object)> = src
+            .borrow()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (k, v) in entries {
+            if let Some(old) = dict_insert(&d, k.0, v)? {
+                queue_removed(old);
+            }
+        }
+        return Ok(args[0].clone());
+    }
+    // A mapping instance (`keys()` + `__getitem__`, e.g. `UserDict`)
+    // merges key→value like `dict.update` — through the interpreter, since
+    // its mapping API is Python code (test_userdict test_mixed_ior).
+    if matches!(other, Object::Instance(_)) && crate::instance_method(other, "keys").is_some() {
+        if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+            // SAFETY: published by an enclosing VM frame on this thread;
+            // the GIL keeps it exclusive.
+            let interp = unsafe { &mut *ptr };
+            let globals = interp.builtins_dict();
+            interp.dict_merge_from(&args[0], other, &globals)?;
+            return Ok(args[0].clone());
+        }
+    }
+    // Iterable of pairs (CPython `PyDict_MergeFromSeq2`): a non-iterable
+    // RHS is a TypeError, a wrong-length element a ValueError.
+    let mut it = other.make_iter().map_err(|_| {
+        type_error(format!(
+            "unsupported operand type(s) for |=: 'dict' and '{}'",
+            other.type_name()
+        ))
+    })?;
+    let mut i = 0usize;
+    while let Some(pair) = it.next_value() {
+        let mut inner = pair.make_iter().map_err(|_| {
+            type_error(format!(
+                "cannot convert dictionary update sequence element #{i} to a sequence"
+            ))
+        })?;
+        let mut kv = Vec::with_capacity(2);
+        while let Some(v) = inner.next_value() {
+            kv.push(v);
+            if kv.len() > 2 {
+                break;
+            }
+        }
+        if kv.len() != 2 {
+            return Err(value_error(format!(
+                "dictionary update sequence element #{i} has length {}; 2 is required",
+                kv.len()
+            )));
+        }
+        let mut kv = kv.into_iter();
+        let (k, v) = (kv.next().unwrap(), kv.next().unwrap());
+        ensure_hashable(&k)?;
+        if let Some(old) = dict_insert(&d, k, v)? {
+            queue_removed(old);
+        }
+        i += 1;
+    }
+    Ok(args[0].clone())
 }
 
 fn dict_popitem(args: &[Object]) -> Result<Object, RuntimeError> {
     let d = dict_self(args)?;
-    let mut borrowed = d.borrow_mut();
-    if let Some((k, v)) = borrowed.pop() {
+    dict_view_no_args(args, "popitem")?;
+    let popped = d.borrow_mut().pop();
+    if let Some((k, v)) = popped {
+        crate::object::dict_watch_bump(&d);
         Ok(Object::new_tuple(vec![k.0, v]))
     } else {
         Err(key_error("popitem(): dictionary is empty"))
@@ -12159,8 +12549,32 @@ pub(crate) fn file_read(args: &[Object]) -> Result<Object, RuntimeError> {
         // descriptor, mirroring CPython's `BufferedReader.read()` (which can
         // return `None`); `iter(f.read, None)` relies on that sentinel
         // (`test_io.test_nonblock_pipe_write_*`).
+        let buffered = !matches!(
+            f.io_kind.get(),
+            crate::object::IoKind::Raw | crate::object::IoKind::BytesIO
+        );
         match f.read_bytes_opt(n)? {
-            Some(data) => Ok(Object::new_bytes(data)),
+            Some(mut data) => {
+                // A *buffered* size-`n` read keeps issuing raw reads until it
+                // has `n` bytes or hits EOF/would-block — a raw read cut
+                // short (a pipe delivering data in dribs, a signal handler
+                // interleaving) is not the end of the stream (CPython
+                // `BufferedReader.read`; test_io
+                // `check_interrupted_read_retry`). A raw (`FileIO`) read
+                // stays single-syscall and may return partial.
+                if buffered {
+                    if let Some(want) = n {
+                        while !data.is_empty() && data.len() < want {
+                            match f.read_bytes_opt(Some(want - data.len()))? {
+                                Some(more) if more.is_empty() => break,
+                                Some(more) => data.extend_from_slice(&more),
+                                None => break,
+                            }
+                        }
+                    }
+                }
+                Ok(Object::new_bytes(data))
+            }
             None => Ok(Object::None),
         }
     } else if f.text_incr_active_gate() {
@@ -12444,7 +12858,10 @@ pub(crate) fn file_write(args: &[Object]) -> Result<Object, RuntimeError> {
             if f.binary {
                 return Err(type_error("a bytes-like object is required, not 'str'"));
             }
-            f.write_bytes(&f.encode_text(s)?)?
+            // Text writes commit fully and report the *character* count
+            // (CPython `TextIOWrapper.write`), never a partial byte tally.
+            f.write_text_all(&f.encode_text(s)?)?;
+            s.chars().count()
         }
         // A surrogate-bearing `str`. For an in-memory `StringIO` the lone
         // surrogates ride through the PUA bridge so they round-trip; a real
@@ -12460,10 +12877,11 @@ pub(crate) fn file_write(args: &[Object]) -> Result<Object, RuntimeError> {
                 crate::object::FileBackend::MemText { .. }
             ) {
                 let bridged = bridge_encode_cps(cps);
-                f.write_bytes(&f.encode_text(&bridged)?)?
+                f.write_text_all(&f.encode_text(&bridged)?)?;
             } else {
-                f.write_bytes(&f.encode_text_codepoints(cps)?)?
+                f.write_text_all(&f.encode_text_codepoints(cps)?)?;
             }
+            cps.len()
         }
         Object::Bytes(b) => {
             if !f.binary {
@@ -12486,6 +12904,17 @@ pub(crate) fn file_write(args: &[Object]) -> Result<Object, RuntimeError> {
                 return Err(type_error("string argument expected, got 'memoryview'"));
             }
             f.write_bytes(&mv.to_bytes())?
+        }
+        // A `str`/`bytes` subclass instance writes its wrapped native
+        // payload (CPython's argument checks are `isinstance`-based).
+        Object::Instance(inst)
+            if matches!(
+                inst.native.get(),
+                Some(Object::Str(_) | Object::WStr(_) | Object::Bytes(_))
+            ) =>
+        {
+            let payload = inst.native.get().cloned().expect("checked above");
+            return file_write(&[Object::File(f.clone()), payload]);
         }
         other => {
             // A text stream only accepts `str`; a binary stream accepts any

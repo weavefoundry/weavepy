@@ -801,6 +801,15 @@ struct FinallyFrame {
     /// return/break/continue-path inline copy of this frame's body be
     /// excluded from the owning try's exception-table coverage.
     id: u32,
+    /// This frame is an `except` clause's exit cleanup (the
+    /// `e = None; del e` unbind, or an empty body for a bare
+    /// `except:`): a `return` leaving the handler must emit
+    /// `POP_EXCEPT` right after inlining it — after the unbind so the
+    /// pop's prompt-reap cascade sees the handled exception's true
+    /// refcount (CPython frees the exception at handler exit;
+    /// `pickle.load`'s `except _Stop: return stopinst.value` relies on
+    /// this to release the unpickled graph immediately).
+    pop_except_after: bool,
 }
 
 impl Compiler {
@@ -1545,6 +1554,15 @@ impl Compiler {
                         let inline_start = self.next_offset();
                         if let Err(e) = self.emit_finally_frame(frame) {
                             compiled = Err(e);
+                        }
+                        // Returning out of an `except` handler body:
+                        // discard its handled-exception state right after
+                        // the unbind ran (CPython's return-path
+                        // `e = None; del e; POP_EXCEPT` order), so the
+                        // pop's prompt-reap cascade can free the handled
+                        // exception — and everything its traceback pins.
+                        if compiled.is_ok() && frame.pop_except_after {
+                            self.emit(OpCode::PopExcept, 0);
                         }
                         hole_starts.push((frame.id, inline_start));
                         self.finally_stack.clear();
@@ -2947,6 +2965,7 @@ impl Compiler {
                 kind: FinallyKind::Stmts(finalbody.to_vec()),
                 loop_depth_at_push: self.loop_stack.len(),
                 id,
+                pop_except_after: false,
             });
         }
         // The finally frame whose return/break/continue-path inlines must
@@ -3090,6 +3109,7 @@ impl Compiler {
                         kind: FinallyKind::Stmts(stmts.clone()),
                         loop_depth_at_push: self.loop_stack.len(),
                         id,
+                        pop_except_after: false,
                     });
                 }
                 for s in &h.body {
@@ -3292,14 +3312,21 @@ impl Compiler {
                     .name
                     .as_deref()
                     .map(|n| Self::except_unbind_stmts(n, h.span));
-                let mut unbind_frame_id: Option<u32> = None;
-                if let Some(stmts) = &unbind_stmts {
+                // Always push a handler-exit frame — carrying the unbind
+                // stmts when the clause binds a name, empty for a bare
+                // `except:` — flagged `pop_except_after` so a `return`
+                // leaving the handler body emits `POP_EXCEPT` right after
+                // the inlined unbind (CPython's return-path order:
+                // `e = None; del e; POP_EXCEPT; RETURN_VALUE`).
+                let unbind_frame_id: Option<u32>;
+                {
                     let id = self.fresh_finally_id();
                     unbind_frame_id = Some(id);
                     self.finally_stack.push(FinallyFrame {
-                        kind: FinallyKind::Stmts(stmts.clone()),
+                        kind: FinallyKind::Stmts(unbind_stmts.clone().unwrap_or_default()),
                         loop_depth_at_push: self.loop_stack.len(),
                         id,
+                        pop_except_after: true,
                     });
                 }
                 let hbody_start = self.next_offset();
@@ -3309,8 +3336,8 @@ impl Compiler {
                 }
                 self.handler_depth -= 1;
                 let hbody_end = self.next_offset();
+                self.finally_stack.pop();
                 if let Some(stmts) = &unbind_stmts {
-                    self.finally_stack.pop();
                     for s in stmts {
                         self.compile_stmt(s)?;
                     }
@@ -3565,6 +3592,7 @@ impl Compiler {
             kind: FinallyKind::WithExit { exit_idx },
             loop_depth_at_push: with_loop_depth,
             id: with_frame_id,
+            pop_except_after: false,
         });
 
         let body_start = self.next_offset();
@@ -4651,6 +4679,7 @@ impl Compiler {
             },
             loop_depth_at_push: awith_loop_depth,
             id: awith_frame_id,
+            pop_except_after: false,
         });
 
         let body_start = self.next_offset();
@@ -5273,6 +5302,7 @@ fn clone_finally_frame(f: &FinallyFrame) -> FinallyFrame {
         kind,
         loop_depth_at_push: f.loop_depth_at_push,
         id: f.id,
+        pop_except_after: f.pop_except_after,
     }
 }
 

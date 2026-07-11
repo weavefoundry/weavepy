@@ -816,15 +816,25 @@ impl BuiltinTypes {
 
 thread_local! {
     static BUILTIN_TYPES: RefCell<Option<Rc<BuiltinTypes>>> = const { RefCell::new(None) };
+    static PROPERTY_CLASS: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
+}
+
+/// Drop this thread's lazily-built type registry (and the derived
+/// `property` class) *now*, while the caller still holds the GIL. A worker
+/// thread's TLS destructors would otherwise release this whole per-thread
+/// type graph after the GIL has been dropped — those unsynchronised `Rc`
+/// decrements race a peer thread's in-flight GC mark phase, which reads
+/// `Rc::strong_count` snapshots and intermittently mis-classifies the
+/// peer's *live* objects as garbage (test_threading.test_foreign_thread).
+pub fn clear_thread_type_registry() {
+    let _ = PROPERTY_CLASS.try_with(|slot| slot.borrow_mut().take());
+    let _ = BUILTIN_TYPES.try_with(|slot| slot.borrow_mut().take());
 }
 
 /// Per-thread accessor. The registry is constructed lazily on first
 /// access. Panics if construction fails — that means the C3 invariant
 /// is broken on the built-in hierarchy itself.
 pub fn property_class() -> Rc<TypeObject> {
-    thread_local! {
-        static PROPERTY_CLASS: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
-    }
     PROPERTY_CLASS.with(|slot| {
         if let Some(c) = slot.borrow().as_ref() {
             return c.clone();
@@ -4190,6 +4200,15 @@ fn install_numeric_class_methods(bt: &BuiltinTypes) {
         crate::builtins::b_bytearray_fromhex_cls,
     );
     install(&bt.float_, "fromhex", crate::builtins::b_float_fromhex_cls);
+    // `float.__getformat__` — CPython keeps this (undocumented) classmethod
+    // for `test.support` (`HAVE_IEEE_754`) and struct/float tests. Rust f64
+    // is IEEE 754 binary64 on every supported target, so the answer is
+    // constant per endianness.
+    install(
+        &bt.float_,
+        "__getformat__",
+        crate::builtins::b_float_getformat_cls,
+    );
 
     // Expose `__hash__` on the hashable value built-ins so it sits in their
     // type dict. Without this, a mixin like `class F(float, H)` would resolve

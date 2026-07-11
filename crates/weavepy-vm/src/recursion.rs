@@ -38,6 +38,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// Default `sys.getrecursionlimit()`.
 pub const DEFAULT_RECURSION_LIMIT: usize = 1000;
 
+/// Analog of CPython's `Py_C_RECURSION_LIMIT` (10 000 on macOS/Linux in
+/// 3.13; the frozen `_testcapi.Py_C_RECURSION_LIMIT` mirrors this value).
+/// Raising `sys.setrecursionlimit` past it does not lift this ceiling:
+/// native reentrant builtins (e.g. the C-flavoured `lru_cache` wrapper)
+/// must still fail with `RecursionError` once activation depth crosses it,
+/// exactly like CPython's C-stack guard
+/// (test_functools `test_lru_recursion`).
+pub const C_RECURSION_LIMIT: usize = 10_000;
+
 /// Process-wide recursion limit.
 static RECURSION_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_RECURSION_LIMIT);
 
