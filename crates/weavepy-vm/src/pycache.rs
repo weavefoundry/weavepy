@@ -71,7 +71,10 @@ pub const MAGIC: &[u8; 4] = b"\xf3\x0d\x0d\x0a";
 ///   surrogates in literals (`'\udfff'`) lossily to U+FFFD; rev 2 stores
 ///   them faithfully (`test_posixpath.test_realpath_invalid_paths`,
 ///   `test_os`/`test_tarfile` surrogate paths).
-pub const CACHE_TAG: &str = "weavepy-313-2";
+/// - rev `3`: `SETUP_ANNOTATIONS` opcode. Module/class bodies containing
+///   annotated statements now bind `__annotations__` at block entry
+///   (create-if-absent) instead of lazily at the first annotation.
+pub const CACHE_TAG: &str = "weavepy-313-3";
 
 const HEADER_LEN: usize = 16;
 

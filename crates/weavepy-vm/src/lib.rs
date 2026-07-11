@@ -5872,6 +5872,32 @@ impl Interpreter {
                     frame.push(x.clone());
                 }
             }
+            OpCode::SetupAnnotations => {
+                // CPython `SETUP_ANNOTATIONS`: create `__annotations__` in
+                // the current scope only when not already bound. The store
+                // target mirrors `StoreName`: a PEP 3115 custom class
+                // namespace observes it through `__getitem__`/`__setitem__`,
+                // a plain class body binds in its locals dict, and a module
+                // body binds in globals.
+                let key = DictKey(Object::from_static("__annotations__"));
+                if let Some(ns_obj) = frame.class_namespace_obj.clone() {
+                    let g = frame.globals.clone();
+                    let probe = self.subscr_via_protocol(
+                        &ns_obj,
+                        &Object::from_static("__annotations__"),
+                        &g,
+                    );
+                    if probe.is_err() {
+                        self.class_ns_store(&ns_obj, "__annotations__", Object::new_dict(), &g)?;
+                    }
+                } else if let Some(ns) = frame.class_namespace.clone() {
+                    if !ns.borrow().contains_key(&key) {
+                        ns.borrow_mut().insert(key, Object::new_dict());
+                    }
+                } else if !frame.globals.borrow().contains_key(&key) {
+                    frame.globals.borrow_mut().insert(key, Object::new_dict());
+                }
+            }
             OpCode::DictUpdate => {
                 // Stack: [..., dict, other] -> [..., dict (updated)].
                 let other = frame.pop()?;
@@ -7656,6 +7682,17 @@ impl Interpreter {
                         return Ok(m.filename.as_deref().map_or(Object::None, Object::from_str));
                     }
                     "__dict__" => return Ok(Object::Dict(m.dict.clone())),
+                    // CPython `module_get_annotations`: reading a module's
+                    // `__annotations__` lazily creates-and-caches an empty
+                    // dict (test_module `test_lazy_create_annotations`).
+                    "__annotations__" => {
+                        let fresh = Object::new_dict();
+                        m.dict.borrow_mut().insert(
+                            DictKey(Object::from_static("__annotations__")),
+                            fresh.clone(),
+                        );
+                        return Ok(fresh);
+                    }
                     _ => {}
                 }
                 // PEP 562: a module-level `__getattr__(name)` is consulted
@@ -8919,6 +8956,46 @@ impl Interpreter {
             // reads stay live.
             "__dict__" => return Ok(Object::MappingProxy(ty.dict.clone())),
             "__flags__" => return Ok(Object::Int(ty.flags_bits())),
+            // CPython `type_get_annotations`: reading `cls.__annotations__`
+            // consults only the class's *own* dict (no MRO inheritance —
+            // a subclass must not see its base's annotations) and lazily
+            // creates-and-caches an empty dict when absent
+            // (test_type_annotations `test_lazy_create_annotations`).
+            "__annotations__" => {
+                let key = DictKey(Object::from_static("__annotations__"));
+                if let Some(v) = ty.dict.borrow().get(&key) {
+                    return Ok(v.clone());
+                }
+                // Static (built-in) types have no writable dict to cache
+                // into — CPython raises AttributeError for
+                // `float.__annotations__` (test_annotations_getset_raises).
+                if ty.flags.is_builtin {
+                    return Err(attribute_error(format!(
+                        "type object '{}' has no attribute '__annotations__'",
+                        ty.name
+                    )));
+                }
+                let fresh = Object::new_dict();
+                ty.dict.borrow_mut().insert(key, fresh.clone());
+                return Ok(fresh);
+            }
+            // CPython `tp_basicsize`/`tp_itemsize`. Only `int` reports a
+            // nonzero itemsize among the types tests interrogate
+            // (`test_long.test___sizeof__` cross-checks it against
+            // `sys.int_info.sizeof_digit`); the generic basicsize is the
+            // `object` header. These are advisory on WeavePy (no C layout),
+            // but the invariants tests assert must hold.
+            "__itemsize__" => {
+                return Ok(Object::Int(if ty.name == "int" { 4 } else { 0 }));
+            }
+            "__basicsize__" => {
+                let size: i64 = match ty.name.as_str() {
+                    "int" => 28,
+                    "object" => 16,
+                    _ => 32,
+                };
+                return Ok(Object::Int(size));
+            }
             "__subclasses__" => {
                 // `type.__subclasses__` is a bound method; the actual
                 // work is done in `Interpreter::call` via the sentinel
@@ -9496,7 +9573,7 @@ impl Interpreter {
     fn do_str_format_map(
         &mut self,
         template: &str,
-        mapping: &Rc<RefCell<DictData>>,
+        mapping: &Object,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<String, RuntimeError> {
         let mut state = FmtState::default();
@@ -9517,7 +9594,7 @@ impl Interpreter {
         template: &str,
         positional: &[Object],
         keyword: &[(String, Object)],
-        mapping: Option<&Rc<RefCell<DictData>>>,
+        mapping: Option<&Object>,
         state: &mut FmtState,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<String, RuntimeError> {
@@ -9560,7 +9637,7 @@ impl Interpreter {
         field: &str,
         positional: &[Object],
         keyword: &[(String, Object)],
-        mapping: Option<&Rc<RefCell<DictData>>>,
+        mapping: Option<&Object>,
         state: &mut FmtState,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<String, RuntimeError> {
@@ -9609,11 +9686,17 @@ impl Interpreter {
         name: &str,
         positional: &[Object],
         keyword: &[(String, Object)],
-        mapping: Option<&Rc<RefCell<DictData>>>,
+        mapping: Option<&Object>,
         state: &mut FmtState,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
         let (base, trailers) = split_name_trailers(name);
+        // `str.format_map` forbids positional fields outright (issue #12579):
+        // `'{}'.format_map(m)` and `'{0}'.format_map(m)` raise ValueError
+        // before any lookup happens.
+        if mapping.is_some() && (base.is_empty() || base.parse::<usize>().is_ok()) {
+            return Err(value_error("Format string contains positional fields"));
+        }
         let mut value = if base.is_empty() {
             if state.manual_used {
                 return Err(value_error(
@@ -9639,11 +9722,10 @@ impl Interpreter {
                 ))
             })?
         } else if let Some(map) = mapping {
-            let key = DictKey(Object::from_str(base));
-            map.borrow()
-                .get(&key)
-                .cloned()
-                .ok_or_else(|| key_error(format!("'{base}'")))?
+            // Full mapping protocol through the interpreter (CPython's
+            // `PyObject_GetItem`): dict-subclass `__missing__`, arbitrary
+            // `__getitem__` objects, and their exceptions all surface.
+            self.binary_subscr(map, &Object::from_str(base))?
         } else {
             keyword
                 .iter()
@@ -9797,13 +9879,7 @@ impl Interpreter {
         let method = instance_method(v, "__len__").or_else(|| metaclass_method(v, "__len__"));
         if let Some(method) = method {
             let r = self.call(&method, &[], &[], globals)?;
-            return match r {
-                Object::Int(i) => Ok(Object::Int(i)),
-                other => Err(type_error(format!(
-                    "'__len__' should return int, not '{}'",
-                    other.type_name()
-                ))),
-            };
+            return coerce_len_result(r).map(Object::Int);
         }
         match v.len() {
             Ok(n) => Ok(Object::Int(n as i64)),
@@ -9818,13 +9894,7 @@ impl Interpreter {
                 // detect compound dtypes).
                 if let Ok(lenf) = self.load_attr_public(v, "__len__") {
                     let r = self.call(&lenf, &[], &[], globals)?;
-                    return match r {
-                        Object::Int(i) => Ok(Object::Int(i)),
-                        other => Err(type_error(format!(
-                            "'__len__' should return int, not '{}'",
-                            other.type_name()
-                        ))),
-                    };
+                    return coerce_len_result(r).map(Object::Int);
                 }
                 Err(e)
             }
@@ -10405,20 +10475,22 @@ impl Interpreter {
         if let Object::Instance(_) = v {
             if let Some(method) = instance_method(v, "__bool__") {
                 let r = self.call(&method, &[], &[], globals)?;
+                // CPython's `slot_nb_bool` is strict: anything but an exact
+                // bool — even an int — raises (`__bool__` returning `1` is a
+                // TypeError, test_bool `test_convert_to_bool`).
                 return match r {
                     Object::Bool(b) => Ok(b),
-                    other => match other.as_i64() {
-                        Some(i) => Ok(i != 0),
-                        None => Err(type_error(format!(
-                            "__bool__ should return bool, returned {}",
-                            other.type_name()
-                        ))),
-                    },
+                    other => Err(type_error(format!(
+                        "__bool__ should return bool, returned {}",
+                        other.type_name()
+                    ))),
                 };
             }
             if let Some(method) = instance_method(v, "__len__") {
                 let r = self.call(&method, &[], &[], globals)?;
-                return Ok(r.is_truthy());
+                // `PyObject_Size` semantics; errors must match `len()`'s
+                // exactly (test_bool `test_sane_len` compares the strings).
+                return coerce_len_result(r).map(|n| n != 0);
             }
         }
         Ok(v.is_truthy())
@@ -11281,6 +11353,12 @@ impl Interpreter {
         // must short-circuit per element without materialising a 20M-item
         // Vec (and must terminate on infinite-but-eventually-truthy input).
         let want_any = name == "any";
+        if args.len() != 1 {
+            return Err(type_error(format!(
+                "{name}() takes exactly one argument ({} given)",
+                args.len()
+            )));
+        }
         let it = self.make_iter(&args[0], globals)?;
         while let Some(x) = self.iter_next(&it, globals)? {
             // `PyObject_IsTrue` per element (a foreign multi-element array
@@ -16161,9 +16239,17 @@ impl Interpreter {
             }
         };
         let mut tried_reflected = false;
+        // Track whether each operand's *own* `__ne__` slot actually ran.
+        // `object.__ne__` (installed on every class) already derives from the
+        // forward `__eq__`, so re-deriving below would call `__eq__` a second
+        // time — observable call-order divergence (test_compare
+        // `test_ne_high_priority`/`test_ne_low_priority`).
+        let mut a_slot_ran = false;
+        let mut b_slot_ran = false;
         if reflected_first {
             tried_reflected = true;
             if b_foreign {
+                b_slot_ran = true;
                 match crate::foreign::compare(op, a, b) {
                     Ok(r) if !r.is_same(&not_impl) => return Ok(r),
                     Ok(_) => {}
@@ -16172,6 +16258,7 @@ impl Interpreter {
                 }
             }
             if let Some(method) = self.cmp_method(b, swapped, globals) {
+                b_slot_ran = true;
                 let r = self.call(&method, std::slice::from_ref(a), &[], globals)?;
                 if !r.is_same(&not_impl) {
                     return Ok(r);
@@ -16179,6 +16266,7 @@ impl Interpreter {
             }
         }
         if a_foreign {
+            a_slot_ran = true;
             match crate::foreign::compare(op, a, b) {
                 Ok(r) if !r.is_same(&not_impl) => return Ok(r),
                 Ok(_) => {}
@@ -16187,6 +16275,7 @@ impl Interpreter {
             }
         }
         if let Some(method) = self.cmp_method(a, dunder, globals) {
+            a_slot_ran = true;
             let r = self.call(&method, std::slice::from_ref(b), &[], globals)?;
             if !r.is_same(&not_impl) {
                 return Ok(r);
@@ -16194,6 +16283,7 @@ impl Interpreter {
         }
         if !tried_reflected {
             if !a_foreign && b_foreign {
+                b_slot_ran = true;
                 match crate::foreign::compare(op, a, b) {
                     Ok(r) if !r.is_same(&not_impl) => return Ok(r),
                     Ok(_) => {}
@@ -16202,6 +16292,7 @@ impl Interpreter {
                 }
             }
             if let Some(method) = self.cmp_method(b, swapped, globals) {
+                b_slot_ran = true;
                 let r = self.call(&method, std::slice::from_ref(a), &[], globals)?;
                 if !r.is_same(&not_impl) {
                     return Ok(r);
@@ -16209,22 +16300,29 @@ impl Interpreter {
             }
         }
         // CPython's default `object.__ne__` inverts `__eq__`: a class that
-        // defines only `__eq__` still compares with `!=`. When neither
-        // operand supplied a usable `__ne__` above, derive the result from
-        // `__eq__` (forward then reflected) before falling back to identity.
+        // defines only `__eq__` still compares with `!=`. Derive from
+        // `__eq__` only for an operand whose `__ne__` slot never ran above
+        // (e.g. a metaclass `__eq__` where `cmp_method` finds no usable
+        // `__ne__`): an operand whose `__ne__` ran already had its
+        // `__eq__`-derivation turn inside `object.__ne__`, and CPython's
+        // `do_richcompare` falls straight through to the identity default.
         // `object.__ne__` returns a *bool* (`not result`), so this branch is
         // intrinsically boolean even when `__eq__` returned a non-bool.
         if matches!(op, CompareKind::NotEq) {
-            if let Some(method) = self.cmp_method(a, "__eq__", globals) {
-                let r = self.call(&method, std::slice::from_ref(b), &[], globals)?;
-                if !r.is_same(&not_impl) {
-                    return Ok(Object::Bool(!r.is_truthy()));
+            if !a_slot_ran {
+                if let Some(method) = self.cmp_method(a, "__eq__", globals) {
+                    let r = self.call(&method, std::slice::from_ref(b), &[], globals)?;
+                    if !r.is_same(&not_impl) {
+                        return Ok(Object::Bool(!r.is_truthy()));
+                    }
                 }
             }
-            if let Some(method) = self.cmp_method(b, "__eq__", globals) {
-                let r = self.call(&method, std::slice::from_ref(a), &[], globals)?;
-                if !r.is_same(&not_impl) {
-                    return Ok(Object::Bool(!r.is_truthy()));
+            if !b_slot_ran {
+                if let Some(method) = self.cmp_method(b, "__eq__", globals) {
+                    let r = self.call(&method, std::slice::from_ref(a), &[], globals)?;
+                    if !r.is_same(&not_impl) {
+                        return Ok(Object::Bool(!r.is_truthy()));
+                    }
                 }
             }
         }
@@ -20407,17 +20505,30 @@ impl Interpreter {
                                 return Err(type_error("str.format_map requires a 'str' receiver"))
                             }
                         };
+                        // Any object with `__getitem__` is a valid mapping
+                        // (CPython goes through `PyObject_GetItem`); lookups
+                        // raise naturally for non-subscriptable arguments.
                         let mapping = match args.get(1) {
-                            Some(Object::Dict(d)) => d.clone(),
-                            Some(_) | None => {
-                                return Err(type_error("format_map() argument must be a mapping"))
+                            Some(m) => m.clone(),
+                            None => {
+                                return Err(type_error(
+                                    "format_map() takes exactly one argument (0 given)",
+                                ))
                             }
                         };
+                        if args.len() > 2 {
+                            return Err(type_error(format!(
+                                "format_map() takes exactly one argument ({} given)",
+                                args.len() - 1
+                            )));
+                        }
                         let bridged = matches!(recv, Some(Object::WStr(_)))
-                            || mapping
-                                .borrow()
-                                .iter()
-                                .any(|(_, v)| matches!(v, Object::WStr(_)));
+                            || match &mapping {
+                                Object::Dict(d) => {
+                                    d.borrow().iter().any(|(_, v)| matches!(v, Object::WStr(_)))
+                                }
+                                _ => false,
+                            };
                         let out = self.do_str_format_map(&template, &mapping, outer_globals)?;
                         return Ok(if bridged {
                             crate::builtins::bridge_to_object(&out)
@@ -30223,9 +30334,14 @@ fn is_super_callable(obj: &Object) -> bool {
 /// ``float.imag``, and ``complex.real`` / ``complex.imag``.
 fn numeric_data_attr(obj: &Object, name: &str) -> Option<Object> {
     match (obj, name) {
-        // int / bool
-        (Object::Int(_) | Object::Long(_) | Object::Bool(_), "real")
-        | (Object::Int(_) | Object::Long(_) | Object::Bool(_), "numerator") => Some(obj.clone()),
+        // int / bool — CPython's `int.real` / `int.numerator` getters
+        // demote a bool receiver to a plain int (`type(True.real) is int`,
+        // test_bool `test_real_and_imag`).
+        (Object::Bool(b), "real") | (Object::Bool(b), "numerator") => {
+            Some(Object::Int(i64::from(*b)))
+        }
+        (Object::Int(_) | Object::Long(_), "real")
+        | (Object::Int(_) | Object::Long(_), "numerator") => Some(obj.clone()),
         (Object::Int(_) | Object::Long(_) | Object::Bool(_), "imag") => Some(Object::Int(0)),
         (Object::Int(_) | Object::Long(_) | Object::Bool(_), "denominator") => Some(Object::Int(1)),
         // float — CPython's `float.real` getter returns the object itself
@@ -31353,18 +31469,30 @@ fn bignum_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             if y.is_negative() {
                 return Err(value_error("negative shift count"));
             }
+            // CPython `long_lshift`: `0 << anything` short-circuits to 0
+            // *before* the shift count is range-checked (issue #27870), so
+            // `0 << (1 << 1000)` succeeds where a nonzero base overflows.
+            if x.is_zero() {
+                return Ok(Object::int_from_bigint(x));
+            }
             let n = y
                 .to_usize()
-                .ok_or_else(|| value_error("shift count too large"))?;
+                .ok_or_else(|| overflow_error("too many digits in integer"))?;
             Ok(Object::int_from_bigint(x << n))
         }
         B::RShift => {
             if y.is_negative() {
                 return Err(value_error("negative shift count"));
             }
-            let n = y
-                .to_usize()
-                .ok_or_else(|| value_error("shift count too large"))?;
+            // CPython `long_rshift`: a shift count beyond `Py_ssize_t`
+            // saturates — the result is 0 for a non-negative base and -1
+            // for a negative one (`42 >> (1 << 1000) == 0`), never an error.
+            let n = match y.to_usize() {
+                Some(n) => n,
+                None => {
+                    return Ok(Object::Int(if x.is_negative() { -1 } else { 0 }));
+                }
+            };
             Ok(Object::int_from_bigint(x >> n))
         }
         B::BitOr => Ok(Object::int_from_bigint(&x | &y)),
@@ -31835,6 +31963,38 @@ fn mangle_class_private(class_name: &str, name: &str) -> Option<String> {
         return None;
     }
     Some(format!("_{stripped}{name}"))
+}
+
+/// Validate a `__len__` return value the way CPython's `PyObject_Size` /
+/// `slot_mp_length` do: the result must be index-like (TypeError names the
+/// offending type otherwise), fit a `Py_ssize_t` (OverflowError), and be
+/// non-negative (ValueError). `bool(x)` via `__len__` and `len(x)` must
+/// produce *identical* error strings (test_bool `test_sane_len`).
+pub(crate) fn coerce_len_result(r: Object) -> Result<i64, RuntimeError> {
+    match &r {
+        Object::Bool(b) => Ok(i64::from(*b)),
+        Object::Int(i) => {
+            if *i < 0 {
+                Err(value_error("__len__() should return >= 0"))
+            } else {
+                Ok(*i)
+            }
+        }
+        Object::Long(b) => {
+            use num_traits::Signed;
+            if b.is_negative() {
+                Err(value_error("__len__() should return >= 0"))
+            } else {
+                Err(overflow_error(
+                    "cannot fit 'int' into an index-sized integer",
+                ))
+            }
+        }
+        other => Err(type_error(format!(
+            "'{}' object cannot be interpreted as an integer",
+            other.type_name()
+        ))),
+    }
 }
 
 pub(crate) fn compare_op(a: &Object, b: &Object, op: CompareKind) -> Result<bool, RuntimeError> {

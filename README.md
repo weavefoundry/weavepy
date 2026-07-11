@@ -52,9 +52,23 @@ work.
 > `Lib/test/` checkout into the `regrtest` harness (`--cpython-dir`,
 > crash-isolated `--mode subprocess`, `--jobs`) and rewrites the touched
 > rows of `tests/regrtest/expectations.toml` from guesses to a **measured**
-> baseline (`unexpected 0` on a fresh sweep); the full allowlist is still
-> being worked through file by file. Expect small breaking changes
-> around the edges as the long tail catches up.
+> baseline (`unexpected 0` on a fresh sweep). `RFC 0049` (wave 5)
+> retires the curated allowlist as a scope mechanism: discovery now
+> schedules **every** vendored `test_*.py` file and `test_*/` package
+> (504 labels, up from 227), and `expectations.toml` is a measured
+> whole-suite baseline — 226 of the 427 vendored-CPython labels pass
+> under the sweep budget (plus all 77 bundled fixtures), and every red
+> row carries a measured first-failure reason. The same
+> wave landed the `SETUP_ANNOTATIONS` opcode (block-entry
+> `__annotations__`, lazy type/module getsets), CPython-strict
+> `bool()`/`__bool__`/`__len__` semantics, `str` argument-clinic arity
+> across ~30 native methods, full-mapping-protocol `str.format_map`,
+> saturating int shift semantics, code-object value equality
+> (`code_richcompare`), `Py_ReprEnter`-style recursive-repr guards on
+> dict views and the io stack (fixing two native stack overflows), a
+> CPython-shaped `codeop`, verbatim `configparser`, and the six
+> built-in `codecs` error-handler callables. Expect small breaking
+> changes around the edges as the long tail catches up.
 >
 > `RFC 0033` makes WeavePy *introspectable like CPython*. It ships a
 > CPython-faithful **code-object surface** (`co_code`, `co_linetable`
