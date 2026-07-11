@@ -115,6 +115,23 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("check_hash_based_pycs")),
             Object::from_static("default"),
         );
+        // RFC 0048 — the CPython-test-only override knobs the verbatim
+        // `test.support.import_helper` calls at module scope. WeavePy's
+        // frozen modules are always available (there is no `-X frozen_modules`
+        // toggle), so the override is accepted and ignored; the
+        // multi-interp-extensions check reports the "allow" default.
+        d.insert(
+            DictKey(Object::from_static("_override_frozen_modules_for_tests")),
+            builtin("_override_frozen_modules_for_tests", |_| Ok(Object::None)),
+        );
+        d.insert(
+            DictKey(Object::from_static(
+                "_override_multi_interp_extensions_check",
+            )),
+            builtin("_override_multi_interp_extensions_check", |_| {
+                Ok(Object::Int(0))
+            }),
+        );
     }
     Rc::new(PyModule {
         name: "_imp".to_owned(),

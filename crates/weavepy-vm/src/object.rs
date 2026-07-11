@@ -321,8 +321,8 @@ impl fmt::Debug for Object {
             Object::FrozenSet(s) => f.debug_set().entries(s.iter()).finish(),
             Object::File(file) => write!(f, "<file {:?}>", file.name),
             Object::Property(_) => write!(f, "<property>"),
-            Object::StaticMethod(inner) => write!(f, "<staticmethod {:?}>", &inner.func()),
-            Object::ClassMethod(inner) => write!(f, "<classmethod {:?}>", &inner.func()),
+            Object::StaticMethod(inner) => write!(f, "<staticmethod {:?}>", inner.func()),
+            Object::ClassMethod(inner) => write!(f, "<classmethod {:?}>", inner.func()),
             Object::SlotDescriptor(sd) => write!(f, "<slot {:?} of {:?}>", sd.name, sd.class_name),
             Object::Frame(fr) => write!(f, "<frame at 0x{:x}>", Rc::as_ptr(fr) as usize),
             Object::Traceback(tb) => write!(f, "<traceback at 0x{:x}>", Rc::as_ptr(tb) as usize),
@@ -1426,6 +1426,54 @@ fn service_pending_signals_io() -> Result<(), RuntimeError> {
     Ok(())
 }
 
+/// Blocking `read(2)` from a raw descriptor honouring PEP 475: release the
+/// GIL across the (possibly blocking) syscall, and on `EINTR` run any tripped
+/// Python signal handler and retry instead of surfacing `InterruptedError`
+/// (test_io `check_interrupted_read_retry`: a `SIGALRM` handler feeds the
+/// pipe and the interrupted read must resume and deliver those bytes). A
+/// handler that raises propagates and abandons the read. `n = None` reads to
+/// EOF. The borrow on the file's backend is *not* held here, so a handler
+/// touching the same stream can't trip a `BorrowMutError`.
+#[cfg(unix)]
+fn read_fd_intr(fd: std::os::unix::io::RawFd, n: Option<usize>) -> Result<Vec<u8>, RuntimeError> {
+    let read_once = |buf: &mut [u8]| -> Result<usize, RuntimeError> {
+        loop {
+            let r = crate::gil::allow_threads_then(|| unsafe {
+                libc::read(fd, buf.as_mut_ptr().cast(), buf.len())
+            });
+            if r >= 0 {
+                return Ok(r as usize);
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                service_pending_signals_io()?;
+                continue;
+            }
+            return Err(os_error(format!("read: {err}")));
+        }
+    };
+    match n {
+        Some(0) => Ok(Vec::new()),
+        Some(n) => {
+            let mut buf = vec![0u8; n];
+            let k = read_once(&mut buf)?;
+            buf.truncate(k);
+            Ok(buf)
+        }
+        None => {
+            let mut out = Vec::new();
+            let mut chunk = vec![0u8; 64 * 1024];
+            loop {
+                let k = read_once(&mut chunk)?;
+                if k == 0 {
+                    return Ok(out);
+                }
+                out.extend_from_slice(&chunk[..k]);
+            }
+        }
+    }
+}
+
 /// Drain `pending` to a raw descriptor, removing the written prefix in place,
 /// and honouring PEP 475: release the GIL across each (possibly blocking)
 /// `write(2)` so peers run, and on `EINTR` run any tripped Python signal
@@ -1914,6 +1962,34 @@ pub(crate) fn repr_guarded<F: FnOnce() -> String>(f: F) -> Result<String, ()> {
     }
 }
 
+thread_local! {
+    /// First exception raised by a user `__repr__` invoked from the
+    /// *infallible* native renderer ([`Object::repr`] — container reprs,
+    /// `%`-formatting, the `Debug` impl). Rust's `repr()` returns a plain
+    /// `String`, so the error can't propagate the way CPython's
+    /// `PyObject_Repr` does (returning NULL); it is parked here and the
+    /// fallible boundary (`Vm::repr_of`, `str()`) re-raises it
+    /// (test_dict `test_repr`: `repr({1: BadRepr()})` must surface `Exc`).
+    static REPR_ERROR: RefCell<Option<RuntimeError>> = const { RefCell::new(None) };
+}
+
+/// Park `err` as the pending repr error (first one wins, matching CPython
+/// aborting the whole repr on the first failing element).
+pub(crate) fn stash_repr_error(err: RuntimeError) {
+    REPR_ERROR.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(err);
+        }
+    });
+}
+
+/// Take the pending repr error, if any. Called at fallible repr/str
+/// boundaries; also used to *clear* stale state before rendering.
+pub(crate) fn take_repr_error() -> Option<RuntimeError> {
+    REPR_ERROR.with(|slot| slot.borrow_mut().take())
+}
+
 impl PartialEq for DictKey {
     fn eq(&self, other: &Self) -> bool {
         // CPython compares dict/set keys with `a is b or a == b`; the identity
@@ -1943,6 +2019,14 @@ impl PartialEq for DictKey {
         // compared via Python `==` (`pd.IntervalIndex` dedup keys `(left,
         // right)` numpy pairs in a `set`).
         if key_needs_interp_eq(&self.0) || key_needs_interp_eq(&other.0) {
+            // Deferred-dispatch probe: report the need for a Python
+            // comparison instead of running it under the table's borrow
+            // (gh-140551: that user code may mutate the very dict being
+            // walked); the caller retries on the borrow-free path.
+            if key_eq_defer_active() {
+                KEY_EQ_DEFERRED.with(|c| c.set(true));
+                return false;
+            }
             if let Some(eq) = current_interp_eq(&self.0, &other.0) {
                 return eq;
             }
@@ -1991,6 +2075,356 @@ pub(crate) fn key_cmp_scope<T>(f: impl FnOnce() -> T) -> Result<T, RuntimeError>
         Some(err) => Err(err),
         None => Ok(out),
     }
+}
+
+thread_local! {
+    /// Depth of active [`with_key_eq_deferred`] scopes.
+    static KEY_EQ_DEFER_DEPTH: Cell<usize> = const { Cell::new(0) };
+    /// Set by `DictKey::eq` when it *would have* dispatched a Python
+    /// `__eq__` inside a defer scope (see [`with_key_eq_deferred`]).
+    static KEY_EQ_DEFERRED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Run a native dict-table probe with Python `__eq__` dispatch *deferred*:
+/// inside `f`, `DictKey::eq` never re-enters the interpreter — it reports
+/// "not equal" and raises a flag instead. Returns `(result, deferred)`;
+/// a `true` flag means the probe was inconclusive (some stored key needed a
+/// Python comparison) and the caller must retry on the borrow-free
+/// [`dict_reentrant_find`] path. This is what protects the *stored*-key
+/// side of gh-140551/bpo-40489: a plain `'test' in d` probe can hit a
+/// stored `str` subclass whose `__eq__` clears the dict mid-walk.
+pub(crate) fn with_key_eq_deferred<T>(f: impl FnOnce() -> T) -> (T, bool) {
+    KEY_EQ_DEFER_DEPTH.with(|c| c.set(c.get() + 1));
+    let saved = KEY_EQ_DEFERRED.with(|c| c.replace(false));
+    let out = f();
+    let deferred = KEY_EQ_DEFERRED.with(|c| c.replace(saved));
+    KEY_EQ_DEFER_DEPTH.with(|c| c.set(c.get() - 1));
+    (out, deferred)
+}
+
+fn key_eq_defer_active() -> bool {
+    KEY_EQ_DEFER_DEPTH.with(|c| c.get() > 0)
+}
+
+/// True when a dict operation keyed by `key` can run *user Python* during
+/// the hash-table walk — its class (or a tuple element's class) supplies a
+/// non-builtin `__eq__` or `__hash__`. Such operations must take the
+/// borrow-free two-phase path ([`dict_reentrant_find`] + pinned mutation)
+/// because that user code may raise, or re-enter the interpreter and mutate
+/// the same dict (gh-140551), and because CPython invokes `__hash__`
+/// exactly once per operation (`test_setdefault_atomic`). Builtin-owned
+/// overrides (`weakref` comparing by referent) stay on the fast path: they
+/// cannot re-enter user code.
+pub(crate) fn dict_key_is_reentrant(key: &Object) -> bool {
+    match key {
+        Object::Instance(inst) => {
+            let py_dunder = |name: &str| match inst.cls().lookup_with_owner(name) {
+                Some((Object::None, _)) | None => false,
+                Some((_, owner)) => !owner.flags.is_builtin,
+            };
+            py_dunder("__eq__") || py_dunder("__hash__")
+        }
+        Object::Tuple(items) => items.iter().any(dict_key_is_reentrant),
+        _ => false,
+    }
+}
+
+/// The table-level (Fx-mixed) hash for a Python hash value, matching what
+/// `DictKey::hash` feeds the [`DictData`] hasher.
+fn dict_table_hash(py_hash: i64) -> u64 {
+    use std::hash::BuildHasher;
+    crate::fasthash::FxBuildHasher.hash_one(py_hash)
+}
+
+/// Probe result of [`dict_reentrant_probe`]: the key's table-level hash
+/// plus the equal *stored* key, if any.
+pub(crate) struct ReentrantProbe {
+    table_hash: u64,
+    stored: Option<Object>,
+}
+
+/// Borrow-free dict lookup for a key whose `__hash__`/`__eq__` can run user
+/// Python.
+///
+/// The Python hash is computed exactly once, up front, with no borrow held
+/// (CPython's `PyObject_Hash` runs before the table walk — a raising
+/// `__hash__` surfaces here, and `test_setdefault_atomic` counts one call
+/// per operation). Python `__eq__` likewise only ever runs with no borrow
+/// held on `d`; if it re-enters and mutates the dict, the walk restarts
+/// against a fresh same-hash snapshot with prior comparison results
+/// memoised — the restart CPython's `lookdict` performs when it detects a
+/// mutated table (gh-140551, dict `test_clear_at_lookup`).
+pub(crate) fn dict_reentrant_probe(
+    d: &RefCell<DictData>,
+    key: &Object,
+) -> Result<ReentrantProbe, RuntimeError> {
+    use indexmap::map::raw_entry_v1::RawEntryApiV1;
+    let kh = key_cmp_scope(|| py_hash_value(key))?.unwrap_or_else(|| identity_hash(key));
+    let table_hash = dict_table_hash(kh);
+    let mut memo: Vec<(Object, bool)> = Vec::new();
+    loop {
+        // Same-hash candidates, collected under a short borrow with a
+        // never-matching predicate (no user code runs inside it).
+        let mut cands: Vec<Object> = Vec::new();
+        {
+            let m = d.borrow();
+            let _ = m.raw_entry_v1().from_hash(table_hash, |k| {
+                cands.push(k.0.clone());
+                false
+            });
+        }
+        let mut fresh_call = false;
+        let mut found = None;
+        for stored in &cands {
+            // Identity and native-value equality never run user code.
+            if stored.is_same(key) || stored.eq_value(key) {
+                found = Some(stored.clone());
+                break;
+            }
+            if !(key_needs_interp_eq(key) || key_needs_interp_eq(stored)) {
+                continue;
+            }
+            if let Some((_, eq)) = memo.iter().find(|(o, _)| o.is_same(stored)) {
+                if *eq {
+                    found = Some(stored.clone());
+                    break;
+                }
+                continue;
+            }
+            // Python `__eq__` (stored first, CPython's argument order) with
+            // no borrow held; it may mutate `d` re-entrantly.
+            let eq = key_cmp_scope(|| current_interp_eq(stored, key))?.unwrap_or(false);
+            memo.push((stored.clone(), eq));
+            fresh_call = true;
+            break; // restart against a fresh snapshot
+        }
+        if found.is_some() || !fresh_call {
+            return Ok(ReentrantProbe {
+                table_hash,
+                stored: found,
+            });
+        }
+    }
+}
+
+/// [`dict_reentrant_probe`], reduced to the stored key (membership tests).
+pub(crate) fn dict_reentrant_find(
+    d: &RefCell<DictData>,
+    key: &Object,
+) -> Result<Option<Object>, RuntimeError> {
+    Ok(dict_reentrant_probe(d, key)?.stored)
+}
+
+/// Reentrant-safe `d[key] = value`. Returns the replaced value, if any.
+///
+/// The mutation itself is performed through the raw-entry API with an
+/// identity-only predicate and the pre-computed hash, so no user
+/// `__hash__`/`__eq__` ever runs while the table holds its borrow.
+pub(crate) fn dict_reentrant_insert(
+    d: &RefCell<DictData>,
+    key: Object,
+    value: Object,
+) -> Result<Option<Object>, RuntimeError> {
+    use indexmap::map::raw_entry_v1::{RawEntryApiV1, RawEntryMut};
+    let probe = dict_reentrant_probe(d, &key)?;
+    let target = probe.stored.as_ref().unwrap_or(&key);
+    let mut m = d.borrow_mut();
+    match m
+        .raw_entry_mut_v1()
+        .from_hash(probe.table_hash, |k| k.0.is_same(target))
+    {
+        RawEntryMut::Occupied(mut e) => Ok(Some(e.insert(value))),
+        RawEntryMut::Vacant(e) => {
+            e.insert_hashed_nocheck(probe.table_hash, DictKey(key), value);
+            drop(m);
+            dict_watch_bump(d);
+            Ok(None)
+        }
+    }
+}
+
+/// Reentrant-safe `d.setdefault(key, default)`: one probe, one `__hash__`
+/// call (`test_setdefault_atomic` counts them). Returns the stored value
+/// (existing, or the freshly inserted default).
+pub(crate) fn dict_reentrant_setdefault(
+    d: &RefCell<DictData>,
+    key: Object,
+    default: Object,
+) -> Result<Object, RuntimeError> {
+    use indexmap::map::raw_entry_v1::{RawEntryApiV1, RawEntryMut};
+    let probe = dict_reentrant_probe(d, &key)?;
+    let target = probe.stored.as_ref().unwrap_or(&key);
+    let mut m = d.borrow_mut();
+    match m
+        .raw_entry_mut_v1()
+        .from_hash(probe.table_hash, |k| k.0.is_same(target))
+    {
+        RawEntryMut::Occupied(e) => Ok(e.get().clone()),
+        RawEntryMut::Vacant(e) => {
+            e.insert_hashed_nocheck(probe.table_hash, DictKey(key), default.clone());
+            drop(m);
+            dict_watch_bump(d);
+            Ok(default)
+        }
+    }
+}
+
+/// Reentrant-safe `d[key]` read. Returns the stored value, if any.
+pub(crate) fn dict_reentrant_get(
+    d: &RefCell<DictData>,
+    key: &Object,
+) -> Result<Option<Object>, RuntimeError> {
+    use indexmap::map::raw_entry_v1::RawEntryApiV1;
+    let probe = dict_reentrant_probe(d, key)?;
+    match probe.stored {
+        Some(stored) => Ok(d
+            .borrow()
+            .raw_entry_v1()
+            .from_hash(probe.table_hash, |k| k.0.is_same(&stored))
+            .map(|(_, v)| v.clone())),
+        None => Ok(None),
+    }
+}
+
+/// Reentrant-safe `del d[key]` / `d.pop(key)`. Returns the evicted entry.
+pub(crate) fn dict_reentrant_remove(
+    d: &RefCell<DictData>,
+    key: &Object,
+) -> Result<Option<(Object, Object)>, RuntimeError> {
+    use indexmap::map::raw_entry_v1::{RawEntryApiV1, RawEntryMut};
+    let probe = dict_reentrant_probe(d, key)?;
+    match probe.stored {
+        Some(stored) => {
+            let mut m = d.borrow_mut();
+            match m
+                .raw_entry_mut_v1()
+                .from_hash(probe.table_hash, |k| k.0.is_same(&stored))
+            {
+                RawEntryMut::Occupied(e) => {
+                    let (k, v) = e.shift_remove_entry();
+                    drop(m);
+                    dict_watch_bump(d);
+                    Ok(Some((k.0, v)))
+                }
+                RawEntryMut::Vacant(_) => Ok(None),
+            }
+        }
+        None => Ok(None),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dict structural-version watches (mutation-during-iteration detection).
+//
+// CPython's compact dict detects `del d[k]; d[k] = v` during iteration —
+// same `ma_used`, so the size trip-wire stays silent — because the delete
+// leaves a tombstone and the reinsert *appends*: the iterator then finds an
+// entry beyond the `di->len` elements it expected and raises `RuntimeError:
+// dictionary keys changed during iteration`. Our `IndexMap` has no
+// tombstones (`shift_remove` compacts in place), so the layout carries no
+// trace of the churn. Instead, dict iterators register a *watch* on their
+// source dict; the centralized structural mutators (`dict_insert` on a new
+// key, `dict_remove`, `clear`, `popitem`) bump the watched dict's version,
+// and the iterator's checked `__next__` raises on a version change.
+//
+// The registry is keyed by the dict's heap address and only ever holds
+// dicts with a live watcher (the watcher holds the dict's `Rc`, so the
+// address cannot be recycled while the entry exists). `DICT_WATCH_COUNT`
+// gates the mutator-side lookup: with no active iterator it's a single
+// thread-local read, keeping `d[k] = v` hot paths unaffected.
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// dict address -> (shared structural version, live watcher count).
+    static DICT_WATCHES: std::cell::RefCell<
+        std::collections::HashMap<usize, (Rc<Cell<u64>>, usize), crate::fasthash::FxBuildHasher>,
+    > = std::cell::RefCell::new(std::collections::HashMap::default());
+    /// Number of entries in `DICT_WATCHES` (fast gate for mutators).
+    static DICT_WATCH_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A live subscription to one dict's structural version. Created by a dict
+/// iterator's first user-visible `__next__`; dropped with the iterator.
+#[derive(Debug)]
+pub struct DictWatch {
+    ptr: usize,
+    version: Rc<Cell<u64>>,
+    start: u64,
+}
+
+impl DictWatch {
+    pub(crate) fn new(d: &Rc<RefCell<DictData>>) -> DictWatch {
+        let ptr = std::ptr::from_ref::<RefCell<DictData>>(&**d) as usize;
+        let version = DICT_WATCHES.with(|w| {
+            let mut w = w.borrow_mut();
+            let entry = w.entry(ptr).or_insert_with(|| (Rc::new(Cell::new(0)), 0));
+            entry.1 += 1;
+            entry.0.clone()
+        });
+        DICT_WATCH_COUNT.with(|c| c.set(DICT_WATCHES.with(|w| w.borrow().len())));
+        let start = version.get();
+        DictWatch {
+            ptr,
+            version,
+            start,
+        }
+    }
+
+    /// True when the watched dict changed structurally (a key added or
+    /// removed) since this watch was created.
+    pub(crate) fn changed(&self) -> bool {
+        self.version.get() != self.start
+    }
+}
+
+impl Clone for DictWatch {
+    fn clone(&self) -> DictWatch {
+        // Re-register so the entry's watcher count matches the number of
+        // live handles (a cloned iterator — `__reduce__`, copy — must keep
+        // the watch alive after the original drops).
+        DICT_WATCHES.with(|w| {
+            let mut w = w.borrow_mut();
+            let entry = w
+                .entry(self.ptr)
+                .or_insert_with(|| (self.version.clone(), 0));
+            entry.1 += 1;
+        });
+        DICT_WATCH_COUNT.with(|c| c.set(DICT_WATCHES.with(|w| w.borrow().len())));
+        DictWatch {
+            ptr: self.ptr,
+            version: self.version.clone(),
+            start: self.start,
+        }
+    }
+}
+
+impl Drop for DictWatch {
+    fn drop(&mut self) {
+        DICT_WATCHES.with(|w| {
+            let mut w = w.borrow_mut();
+            if let Some(entry) = w.get_mut(&self.ptr) {
+                entry.1 = entry.1.saturating_sub(1);
+                if entry.1 == 0 {
+                    w.remove(&self.ptr);
+                }
+            }
+        });
+        DICT_WATCH_COUNT.with(|c| c.set(DICT_WATCHES.with(|w| w.borrow().len())));
+    }
+}
+
+/// Record a structural change (key added/removed) to `d`. O(1) no-op unless
+/// some iterator is watching a dict on this thread.
+pub(crate) fn dict_watch_bump(d: &RefCell<DictData>) {
+    if DICT_WATCH_COUNT.with(std::cell::Cell::get) == 0 {
+        return;
+    }
+    let ptr = std::ptr::from_ref::<RefCell<DictData>>(d) as usize;
+    DICT_WATCHES.with(|w| {
+        if let Some((version, _)) = w.borrow().get(&ptr) {
+            version.set(version.get() + 1);
+        }
+    });
 }
 
 impl Hash for DictKey {
@@ -4168,6 +4602,21 @@ impl PyFile {
         // the stream position (defensive; a pure `BufferedWriter` is not
         // readable, but keeps read-after-write coherent).
         self.flush_write_buf()?;
+        // Unix disk/pipe descriptors go through the PEP 475-aware raw read:
+        // snapshot the fd under a short borrow, then read with the backend
+        // released so a signal handler can run (and even touch this stream)
+        // mid-call.
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let raw_fd = match &*self.backend.borrow() {
+                FileBackend::Disk(f) => Some(f.as_raw_fd()),
+                _ => None,
+            };
+            if let Some(fd) = raw_fd {
+                return read_fd_intr(fd, n);
+            }
+        }
         let mut backend = self.backend.borrow_mut();
         let mut buf = Vec::new();
         match (&mut *backend, n) {
@@ -4402,6 +4851,42 @@ impl PyFile {
                 &self.decode_text(out)?,
             )))
         }
+    }
+
+    /// Write **all** of `data`, blocking as needed — the text-layer commit
+    /// path. CPython's `TextIOWrapper.write` reports the full character count
+    /// and pushes every encoded byte through the buffered layer, retrying
+    /// partial writes and `EINTR` (running tripped signal handlers between
+    /// attempts — test_io `check_interrupted_write_retry`). A raw single
+    /// `write(2)` that a signal cuts short must therefore be resumed here,
+    /// not surfaced as a short write.
+    pub fn write_text_all(&self, data: &[u8]) -> Result<(), RuntimeError> {
+        if self.is_write_buffered() {
+            self.write_bytes(data)?;
+            return Ok(());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            self.check_open()?;
+            let raw_fd = match &*self.backend.borrow() {
+                FileBackend::Disk(f) => Some(f.as_raw_fd()),
+                _ => None,
+            };
+            if let Some(fd) = raw_fd {
+                let mut pending = data.to_vec();
+                return write_drain_fd_intr(fd, &mut pending);
+            }
+        }
+        let mut off = 0;
+        while off < data.len() {
+            let k = self.write_bytes(&data[off..])?;
+            if k == 0 {
+                break;
+            }
+            off += k;
+        }
+        Ok(())
     }
 
     pub fn write_bytes(&self, data: &[u8]) -> Result<usize, RuntimeError> {
@@ -5040,18 +5525,36 @@ pub enum PyIterator {
         stop: i128,
         step: i128,
     },
+    /// Live iterator over a dict (CPython's `dictiterobject`): walks the
+    /// `IndexMap` by entry index rather than snapshotting, so it pins no
+    /// key/value `Rc`s of its own — an overwritten value is freed promptly
+    /// even mid-loop (`test_oob_indexing_dictiter_iternextitem` relies on
+    /// `d[k] = None` firing the old value's `__del__` during iteration),
+    /// and the cycle GC can trace `iter -> dict -> elements`
+    /// (`test_container_iterator`).
     DictKeys {
-        keys: Vec<DictKey>,
+        /// What each step yields: the key, the value, or a `(key, value)`
+        /// tuple — one iterator shape backs `iter(d)`, `iter(d.keys())`,
+        /// `iter(d.values())` and `iter(d.items())` so all of them share
+        /// the mutation trip-wires below.
+        kind: DictViewKind,
         index: usize,
-        /// The source dict, watched for size changes between `__next__`
-        /// calls (CPython's `dictiter_iternext` compares `di_used` to
-        /// `ma_used` and raises `RuntimeError: dictionary changed size
-        /// during iteration`). `None` for sources with no single live
-        /// dict to watch (so the trip-wire is skipped).
+        /// The live source dict. Detached (set to `None`) on exhaustion,
+        /// like CPython clearing `di_dict` on the first StopIteration, so
+        /// a later mutation can't resurrect the iterator or trip its
+        /// guards.
         dict: Option<Rc<RefCell<DictData>>>,
         /// `len()` of `dict` at iterator creation; a later mismatch trips
-        /// the "changed size during iteration" error.
+        /// the "changed size during iteration" error (CPython's
+        /// `di_used != ma_used` guard).
         len: usize,
+        /// Structural-version subscription, established lazily by the
+        /// first checked `__next__` (internal drains that use the
+        /// unchecked path never pay for it). A version change with the
+        /// *same* size — `del d[k]; d[k] = v` mid-loop — raises
+        /// `RuntimeError: dictionary keys changed during iteration`,
+        /// matching CPython's tombstone-based detection.
+        watch: Option<DictWatch>,
     },
     Bytes {
         data: Rc<[u8]>,
@@ -5191,10 +5694,32 @@ impl PyIterator {
                 *current += *step;
                 Some(int_from_i128(v))
             }
-            PyIterator::DictKeys { keys, index, .. } => {
-                let k = keys.get(*index)?.clone();
-                *index += 1;
-                Some(k.0)
+            PyIterator::DictKeys {
+                kind, index, dict, ..
+            } => {
+                let d = dict.as_ref()?;
+                let entry = d
+                    .borrow()
+                    .get_index(*index)
+                    .map(|(k, v)| (k.0.clone(), v.clone()));
+                match entry {
+                    Some((k, v)) => {
+                        *index += 1;
+                        Some(match kind {
+                            DictViewKind::Keys => k,
+                            DictViewKind::Values => v,
+                            DictViewKind::Items => Object::new_tuple(vec![k, v]),
+                        })
+                    }
+                    None => {
+                        // Exhausted: detach from the dict (CPython clears
+                        // `di_dict` on the first StopIteration) so a later
+                        // mutation can't resurrect the cursor or trip the
+                        // mutation guards.
+                        *dict = None;
+                        None
+                    }
+                }
             }
             PyIterator::Bytes { data, index } => {
                 let v = data.get(*index).copied()?;
@@ -5319,15 +5844,11 @@ impl PyIterator {
                     visit(v);
                 }
             }
-            PyIterator::DictKeys { keys, dict, .. } => {
-                // The `keys` snapshot is a private buffer of cloned key Rcs,
-                // so its elements are visited directly (transient-promotion
-                // accounts the `-> keys` edges). When a live `dict` is also
-                // held (the size trip-wire), subtract the `iter -> dict` edge
-                // too; the dict's own `tp_traverse` accounts `dict -> items`.
-                for k in keys {
-                    visit(&k.0);
-                }
+            PyIterator::DictKeys { dict, .. } => {
+                // A live cursor: the iterator holds only the *dict* (a
+                // shared `Rc`), so the cycle edge to subtract is
+                // `iter -> dict`; the dict's own `tp_traverse` accounts
+                // `dict -> items` (bug #3680's dict-iterator analogue).
                 if let Some(d) = dict {
                     visit(&Object::Dict(d.clone()));
                 }
@@ -5372,7 +5893,10 @@ impl PyIterator {
             }
         }
         if let PyIterator::DictKeys {
-            dict: Some(d), len, ..
+            dict: Some(d),
+            len,
+            watch,
+            ..
         } = self
         {
             // `dictiter_iternext`: a size change since creation is fatal,
@@ -5380,6 +5904,18 @@ impl PyIterator {
             // on the step that would otherwise raise StopIteration.
             if d.borrow().len() != *len {
                 return Err(runtime_error("dictionary changed size during iteration"));
+            }
+            // Same size but keys churned (`del d[k]; d[k] = v` between
+            // steps): CPython's iterator walks past the delete's tombstone
+            // into the appended entry and raises. We detect the same churn
+            // through the structural-version watch (value overwrites don't
+            // bump it, so `d[k] = new` over an existing key stays legal).
+            match watch {
+                Some(w) if w.changed() => {
+                    return Err(runtime_error("dictionary keys changed during iteration"));
+                }
+                None => *watch = Some(DictWatch::new(d)),
+                _ => {}
             }
         }
         if let PyIterator::File { file } = self {
@@ -5410,7 +5946,10 @@ impl PyIterator {
             PyIterator::List { items, index } => Some(items.borrow().len().saturating_sub(*index)),
             PyIterator::Tuple { items, index } => Some(items.len().saturating_sub(*index)),
             PyIterator::Str { s, index } => Some(s[(*index).min(s.len())..].chars().count()),
-            PyIterator::DictKeys { keys, index, .. } => Some(keys.len().saturating_sub(*index)),
+            PyIterator::DictKeys { dict, index, .. } => Some(
+                dict.as_ref()
+                    .map_or(0, |d| d.borrow().len().saturating_sub(*index)),
+            ),
             PyIterator::Bytes { data, index } => Some(data.len().saturating_sub(*index)),
             PyIterator::ByteArray { data, index } => {
                 Some(data.borrow().len().saturating_sub(*index))
@@ -5480,10 +6019,23 @@ impl PyIterator {
                     .map(|c| Object::Str(Rc::from(c.to_string().as_str())))
                     .collect()
             }
-            PyIterator::DictKeys { keys, index, .. } => keys
-                .get(*index..)
-                .map(|rest| rest.iter().map(|k| k.0.clone()).collect())
-                .unwrap_or_default(),
+            PyIterator::DictKeys {
+                kind, index, dict, ..
+            } => match dict {
+                Some(d) => {
+                    let d = d.borrow();
+                    let start = (*index).min(d.len());
+                    (start..d.len())
+                        .filter_map(|i| d.get_index(i))
+                        .map(|(k, v)| match kind {
+                            DictViewKind::Keys => k.0.clone(),
+                            DictViewKind::Values => v.clone(),
+                            DictViewKind::Items => Object::new_tuple(vec![k.0.clone(), v.clone()]),
+                        })
+                        .collect()
+                }
+                None => Vec::new(),
+            },
             PyIterator::Bytes { data, index } => data
                 .get(*index..)
                 .map(|rest| rest.iter().map(|b| Object::Int(i64::from(*b))).collect())
@@ -6100,7 +6652,30 @@ impl Object {
                     "'in <string>' requires string as left operand".to_owned(),
                 )),
             },
-            Object::Dict(d) => Ok(d.borrow().contains_key(&DictKey(item.clone()))),
+            Object::Dict(d) => {
+                // `unhashable in {…}` raises TypeError, exactly like a
+                // direct `d[unhashable]` lookup (CPython `PyDict_Contains`).
+                crate::builtins::ensure_hashable(item)?;
+                if dict_key_is_reentrant(item) {
+                    // A key with user `__eq__` compares through Python (which
+                    // may raise, or mutate `d` mid-probe — gh-140551).
+                    return Ok(dict_reentrant_find(d, item)?.is_some());
+                }
+                let (hit, deferred) = with_key_eq_deferred(|| {
+                    key_cmp_scope(|| d.borrow().contains_key(&DictKey(item.clone())))
+                });
+                let hit = hit?;
+                if hit {
+                    return Ok(true);
+                }
+                if deferred {
+                    // A *stored* key needed a Python comparison (bpo-40489:
+                    // `'test' in d` hitting a `str` subclass whose `__eq__`
+                    // clears `d`); retry borrow-free.
+                    return Ok(dict_reentrant_find(d, item)?.is_some());
+                }
+                Ok(false)
+            }
             // Set membership retries an unhashable `set` operand as a
             // frozenset (CPython `set_lookkey`); a `list`/etc. still raises.
             Object::Set(s) => {
@@ -6235,15 +6810,13 @@ impl Object {
                 },
             ),
             Object::Dict(d) => {
-                let (keys, len) = {
-                    let b = d.borrow();
-                    (b.keys().cloned().collect::<Vec<DictKey>>(), b.len())
-                };
+                let len = d.borrow().len();
                 Ok(PyIterator::DictKeys {
-                    keys,
+                    kind: DictViewKind::Keys,
                     index: 0,
                     dict: Some(d.clone()),
                     len,
+                    watch: None,
                 })
             }
             Object::Set(s) => {
@@ -6293,47 +6866,28 @@ impl Object {
                 })
             }
             Object::DictView(v) => {
-                let d = v.dict.borrow();
-                match v.kind {
-                    DictViewKind::Keys => {
-                        let keys: Vec<DictKey> = d.keys().cloned().collect();
-                        let len = d.len();
-                        Ok(PyIterator::DictKeys {
-                            keys,
-                            index: 0,
-                            dict: Some(v.dict.clone()),
-                            len,
-                        })
-                    }
-                    DictViewKind::Values => {
-                        let vs: Vec<Object> = d.values().cloned().collect();
-                        Ok(PyIterator::List {
-                            items: Rc::new(RefCell::new(vs)),
-                            index: 0,
-                        })
-                    }
-                    DictViewKind::Items => {
-                        let items: Vec<Object> = d
-                            .iter()
-                            .map(|(k, v)| Object::new_tuple(vec![k.0.clone(), v.clone()]))
-                            .collect();
-                        Ok(PyIterator::List {
-                            items: Rc::new(RefCell::new(items)),
-                            index: 0,
-                        })
-                    }
-                }
+                // All three view kinds iterate through the same guarded
+                // live cursor so a mid-loop structural mutation of the
+                // source dict raises RuntimeError from any of them
+                // (CPython's `dictiter_iternextvalue`/`iternextitem`
+                // share the key-iterator's trip-wires).
+                let len = v.dict.borrow().len();
+                Ok(PyIterator::DictKeys {
+                    kind: v.kind,
+                    index: 0,
+                    dict: Some(v.dict.clone()),
+                    len,
+                    watch: None,
+                })
             }
             Object::MappingProxy(d) => {
-                let (keys, len) = {
-                    let b = d.borrow();
-                    (b.keys().cloned().collect::<Vec<DictKey>>(), b.len())
-                };
+                let len = d.borrow().len();
                 Ok(PyIterator::DictKeys {
-                    keys,
+                    kind: DictViewKind::Keys,
                     index: 0,
                     dict: Some(d.clone()),
                     len,
+                    watch: None,
                 })
             }
             Object::File(file) => {
@@ -6843,10 +7397,13 @@ impl Object {
                         let interp = unsafe { &mut *ptr };
                         if let Some(method) = crate::instance_method(self, "__repr__") {
                             let globals = interp.builtins_dict();
-                            if let Ok(r) =
-                                interp.call_object_with_globals(&method, &[], &[], &globals)
-                            {
-                                return r.to_str();
+                            match interp.call_object_with_globals(&method, &[], &[], &globals) {
+                                Ok(r) => return r.to_str(),
+                                // Park the error for the fallible boundary
+                                // (`repr(d)` on a dict whose element's
+                                // `__repr__` raises must surface the
+                                // exception, not render a placeholder).
+                                Err(e) => stash_repr_error(e),
                             }
                         }
                     }

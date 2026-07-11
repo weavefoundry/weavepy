@@ -746,6 +746,25 @@ impl Interpreter {
     /// `site.main()`. Errors are intentionally swallowed — a broken
     /// `.pth` file shouldn't kill the whole interpreter.
     pub fn run_site(&mut self) -> Result<(), RuntimeError> {
+        // Startup runs bytecode too (site/.pth imports can allocate enough
+        // to trip an auto-collection), so engage the GIL here just as
+        // `run_module_as` does for the program body. The process is
+        // single-threaded at this point, so the acquire is uncontended.
+        let engaged_gil = if crate::gil::current_thread_holds_gil() {
+            false
+        } else {
+            crate::gil::push_gil_guard(crate::gil::global_gil().acquire());
+            crate::gil::note_gil_acquired();
+            true
+        };
+        let site_result = self.run_site_inner();
+        if engaged_gil {
+            drop(crate::gil::pop_gil_guard());
+        }
+        site_result
+    }
+
+    fn run_site_inner(&mut self) -> Result<(), RuntimeError> {
         // Publish this interpreter for the duration of startup so native
         // code reached *during* the site/stdlib preimport (e.g.
         // `object.__setattr__` while a frozen module builds a `__slots__`
@@ -1202,6 +1221,23 @@ impl Interpreter {
         // first caller (the real main thread) wins, so the in-process
         // conformance runner's repeated `run_module` calls don't move it.
         crate::gil::mark_main_thread();
+        // Engage the process-wide GIL for the main thread's run. Worker
+        // threads have always acquired it at spawn (`spawn_python_worker`),
+        // but without this the main thread executed bytecode *concurrently*
+        // with whichever worker held the lock — `maybe_yield_gil` and
+        // `allow_threads_then` are no-ops on an empty guard stack. That
+        // let a GC collection on one thread race live mutations on
+        // another, misclassifying reachable objects as garbage (the
+        // `_CallItem.__dict__` corruption under ProcessPoolExecutor).
+        // Guarded so re-entrant `run_module` calls (REPL lines, the
+        // in-process conformance runner) don't stack redundant guards.
+        let engaged_gil = if crate::gil::current_thread_holds_gil() {
+            false
+        } else {
+            crate::gil::push_gil_guard(crate::gil::global_gil().acquire());
+            crate::gil::note_gil_acquired();
+            true
+        };
         let _interp_guard =
             crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
         let _handles = self.activate_thread_handles();
@@ -1231,6 +1267,9 @@ impl Interpreter {
         // failure must not change the program's overall exit
         // status.
         self.run_pending_finalizers();
+        if engaged_gil {
+            drop(crate::gil::pop_gil_guard());
+        }
         result
     }
 
@@ -1281,6 +1320,22 @@ impl Interpreter {
         // `Queue` and its SemLocks until the next cyclic collection
         // (RFC 0040: resource-tracker exited nonzero on leaked semaphores).
         if let Object::BoundMethod(bm) = &dropped {
+            // A bound method that escaped into an instance attribute
+            // (`self.cb = self.handler`) was GC-tracked at store time (see
+            // `generic_setattr_instance`); merely dropping our clone would
+            // leave it pinned by its own collector handle — and, through
+            // `__self__`, its receiver too. Route it through the cascade,
+            // which untracks and frees it. pickle's `_Unpickler` is the
+            // motivating case: it stores `self.append = self.stack.append`
+            // and rebinds it on every `load`, and the displaced method
+            // otherwise pinned the previous stack list and every
+            // freshly-unpickled object on it until the next cyclic
+            // collection (test_concurrent_futures
+            // `test_ressources_gced_in_workers`).
+            if gc_trace::is_tracked(crate::weakref_registry::id_of(&dropped)) {
+                self.reap_dead_subgraph(dropped);
+                return;
+            }
             let recv = bm.receiver.clone();
             drop(dropped);
             if Self::local_needs_prompt_reap(&recv) && Self::looks_reapable_temporary(&recv) {
@@ -1310,7 +1365,31 @@ impl Interpreter {
             && !gc_trace::is_tracked(id0)
             && !Self::instance_escaped_to_c(&dropped)
         {
-            return;
+            // One more container-shaped exception to the fast path: an
+            // *untracked* container can be the sole holder of a *tracked*
+            // child, and the plain `Rc` drop below would leave that child
+            // refcount-dead but pinned by its own collector handle until
+            // the next cyclic collection. Tuples are the canonical case —
+            // they are never GC-tracked at `BuildTuple` time — and
+            // `multiprocessing`'s wire format is exactly this shape:
+            // `conn.recv()` unpickles `('#ERROR', exc)`, the manager proxy
+            // re-raises `exc`, and the handled exception must die at
+            // handler exit even with `gc.disable()` in force
+            // (test_multiprocessing_* `TestManagerExceptions.test_queue_get`,
+            // gh-106558). Route such containers through the cascade, which
+            // recurses through untracked containers to reap the tracked
+            // descendants.
+            if !(matches!(
+                dropped,
+                Object::Tuple(_)
+                    | Object::List(_)
+                    | Object::Dict(_)
+                    | Object::Set(_)
+                    | Object::FrozenSet(_)
+            ) && Self::anchors_tracked_child(&dropped, 6))
+            {
+                return;
+            }
         }
         // Is `dropped` actually dead — i.e. is this its last
         // program-visible reference? The caller still holds `dropped`
@@ -1872,7 +1951,19 @@ impl Interpreter {
     /// longer inflates its refcount.
     fn reap_call_args(&mut self, args: &mut [Object]) {
         for a in args {
-            if Self::local_needs_prompt_reap(a) && Self::looks_reapable_temporary(a) {
+            // `Function` mirrors `reap_call_receiver`'s comprehension-function
+            // arm, for a function consumed as an *argument*: the canonical
+            // case is `__build_class__(<class body fn>, name, *bases)` — the
+            // body function is GC-tracked when it captures cells (any `class`
+            // in a closure-bearing scope) and CPython frees it the instant the
+            // call returns, while a plain drop left it pinned by its own
+            // collector handle. test_descr `test_slots` observes exactly that:
+            // `len(gc.get_objects())` taken before/after a compare loop
+            // differed by the stale `G` body function dying in between.
+            // `prompt_reap_dropped` early-returns for untracked functions.
+            if (Self::local_needs_prompt_reap(a) || matches!(a, Object::Function(_)))
+                && Self::looks_reapable_temporary(a)
+            {
                 let v = std::mem::replace(a, Object::Unbound);
                 self.prompt_reap_dropped(v);
             }
@@ -1954,6 +2045,12 @@ impl Interpreter {
                 | Object::Set(_)
                 | Object::Tuple(_)
                 | Object::FrozenSet(_)
+                // A bound method anchors its receiver (`__self__`); a dead
+                // one must release it promptly — and a *stored* one
+                // (GC-tracked at attribute-store time) must shed its own
+                // collector handle. See the `BoundMethod` arm of
+                // `prompt_reap_dropped`.
+                | Object::BoundMethod(_)
         )
     }
 
@@ -2017,6 +2114,53 @@ impl Interpreter {
             return found;
         }
         false
+    }
+
+    /// Does the container subgraph rooted at `root` contain a *GC-tracked*
+    /// child within `depth` links? Used by [`Self::prompt_reap_dropped`] to
+    /// decide whether an untracked, unwatched, non-finalizable container is
+    /// still worth the cascade: a plain `Rc` drop frees the container but
+    /// leaves a tracked child it solely anchored pinned by its own
+    /// collector handle (weakrefs unclear, `__del__` deferred to the next
+    /// cyclic collection). Bounded — both in depth and in total nodes
+    /// visited — so a huge scalar container (a million-int list dying at
+    /// frame exit) costs a few dozen `is_tracked` lookups at most; hitting
+    /// the cap conservatively reports `false` (skip the prompt reap; the
+    /// tracing collector reclaims later).
+    fn anchors_tracked_child(root: &Object, depth: u8) -> bool {
+        const NODE_CAP: usize = 64;
+        fn walk(obj: &Object, depth: u8, budget: &mut usize) -> bool {
+            if depth == 0 || *budget == 0 {
+                return false;
+            }
+            let mut found = false;
+            crate::gc_trace::traverse_object(obj, &mut |c| {
+                if found || *budget == 0 {
+                    return;
+                }
+                *budget -= 1;
+                if crate::gc_trace::is_tracked(crate::weakref_registry::id_of(c)) {
+                    found = true;
+                    return;
+                }
+                if matches!(
+                    c,
+                    Object::Tuple(_)
+                        | Object::List(_)
+                        | Object::Dict(_)
+                        | Object::Set(_)
+                        | Object::FrozenSet(_)
+                        | Object::Instance(_)
+                        | Object::Cell(_)
+                ) && walk(c, depth - 1, budget)
+                {
+                    found = true;
+                }
+            });
+            found
+        }
+        let mut budget = NODE_CAP;
+        walk(root, depth, &mut budget)
     }
 
     /// Is `obj` dead in refcount terms — does the caller hold its last
@@ -3203,6 +3347,17 @@ impl Interpreter {
             // nor drops references pays only two relaxed atomic loads.
             if gc_trace::has_any_finalizable() && gc_trace::take_maybe_dead() {
                 self.drain_prompt_finalizers();
+            } else if crate::vm_singletons::has_pending_finalizers() {
+                // An *untracked* finalizable instance freed by a plain `Rc`
+                // drop (its container temporary died between bytecodes — a
+                // `for k, v in d.items()` loop rebinding its tuple, dropping
+                // the overwritten value) parks its `__del__` via
+                // `PyInstance::drop`'s resurrection net. It never appears in
+                // the finalizable index, so the gate above stays cold; run
+                // the parked finalizers here to keep CPython's refcount
+                // timing (`test_dict.test_oob_indexing_dictiter_iternextitem`
+                // clears the dict from such a `__del__` mid-iteration).
+                self.run_pending_finalizers();
             }
             // RFC 0047 (wave 5): reap objects whose last C-side reference
             // was dropped *inside* an extension call since the previous
@@ -5206,13 +5361,37 @@ impl Interpreter {
                         )))
                     }
                 };
-                let mut kw_pairs: Vec<(String, Object)> = match kwargs_obj {
+                // A `**mapping` key must be a `str` (CPython raises before
+                // the call is even attempted — `dict(**{1: 2})`).
+                let kw_from_dict =
+                    |d: &Rc<RefCell<DictData>>| -> Result<Vec<(String, Object)>, RuntimeError> {
+                        d.borrow()
+                            .iter()
+                            .map(|(k, v)| match &k.0 {
+                                Object::Str(_) | Object::WStr(_) => Ok((k.0.to_str(), v.clone())),
+                                Object::Instance(inst)
+                                    if matches!(inst.native.get(), Some(Object::Str(_))) =>
+                                {
+                                    Ok((k.0.to_str(), v.clone()))
+                                }
+                                _ => Err(crate::error::type_error("keywords must be strings")),
+                            })
+                            .collect()
+                    };
+                let mut kw_pairs: Vec<(String, Object)> = match &kwargs_obj {
                     None => Vec::new(),
-                    Some(Object::Dict(d)) => d
-                        .borrow()
-                        .iter()
-                        .map(|(k, v)| (k.0.to_str(), v.clone()))
-                        .collect(),
+                    Some(Object::Dict(d)) => kw_from_dict(d)?,
+                    // A dict subclass instance passes through its native
+                    // payload (`dict(**Custom({1: 2}))` still type-checks
+                    // the keys).
+                    Some(Object::Instance(inst))
+                        if matches!(inst.native.get(), Some(Object::Dict(_))) =>
+                    {
+                        match inst.native.get() {
+                            Some(Object::Dict(d)) => kw_from_dict(d)?,
+                            _ => unreachable!("checked above"),
+                        }
+                    }
                     Some(other) => {
                         return Err(crate::error::type_error(format!(
                             "argument after ** must be a mapping, not {}",
@@ -6117,10 +6296,24 @@ impl Interpreter {
                     // re-raise keeps its refcount above the dead threshold, and
                     // every cascade node is independently refcount-guarded, so
                     // the reap is a no-op in those cases too.
-                    let weakly_observed = crate::weakref_registry::count_for(
-                        crate::weakref_registry::id_of(&pe.instance),
-                    ) > 0;
-                    if weakly_observed || Self::exc_has_finalizable(&pe.instance, 6) {
+                    // A GC-*tracked* exception must also reap: dead, it is
+                    // otherwise pinned by its collector handle until the
+                    // next cycle collection — and through its traceback it
+                    // pins every frame (and their locals) it unwound.
+                    // `pickle.load` ends with `except _Stop: return
+                    // stopinst.value`, so a lingering `_Stop` kept the
+                    // whole `_Unpickler` (memo included, i.e. every
+                    // unpickled object) alive; `concurrent.futures`'
+                    // `_process_worker` then never finalized call-item
+                    // arguments after `del call_item`
+                    // (test_concurrent_futures
+                    // `test_ressources_gced_in_workers`).
+                    let id = crate::weakref_registry::id_of(&pe.instance);
+                    let weakly_observed = crate::weakref_registry::count_for(id) > 0;
+                    if weakly_observed
+                        || gc_trace::is_tracked(id)
+                        || Self::exc_has_finalizable(&pe.instance, 6)
+                    {
                         self.reap_dead_subgraph(pe.instance);
                     }
                 }
@@ -7182,6 +7375,14 @@ impl Interpreter {
         if name == "__new__" && !matches!(obj, Object::Instance(_) | Object::Type(_)) {
             return self.load_attr_type(&crate::builtins::class_of(obj), "__new__");
         }
+        // Dict views expose the mapping they were created from as a
+        // read-only `mappingproxy` (`d.keys().mapping`, PEP 590 era
+        // addition; `test_dict.test_views_mapping`).
+        if name == "mapping" {
+            if let Object::DictView(v) = obj {
+                return Ok(Object::MappingProxy(v.dict.clone()));
+            }
+        }
         // `cell.cell_contents` — readable (and CPython-raising when empty);
         // introspection code (`inspect.getclosurevars`, typing's
         // `_eval_type` over PEP 695 lazy cells) reads it.
@@ -8146,10 +8347,11 @@ impl Interpreter {
                     }
                 }
                 if let Some(method) = self.lookup_method(obj, name) {
-                    return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
-                        obj.clone(),
-                        method,
-                    ))));
+                    // `maybe_bind` honours `binds_instance = false`
+                    // (classmethod-like entries such as `dict.fromkeys`,
+                    // where prepending the receiver would feed it in as the
+                    // iterable).
+                    return Ok(self.maybe_bind(obj, method));
                 }
                 Err(attribute_error(format!(
                     "'{}' object has no attribute '{}'",
@@ -9260,7 +9462,22 @@ impl Interpreter {
         if matches!(v, Object::Str(_) | Object::WStr(_)) {
             return Ok(v.clone());
         }
-        Ok(Object::from_str(self.stringify(v, globals)?))
+        // A `str` subclass wrapping a surrogate-bearing payload (email's
+        // `ValueTerminal('\udcac…')`) demotes to the plain `WStr` the same
+        // way — unless the subclass overrides `__str__` itself.
+        if let Object::Instance(inst) = v {
+            if let Some(native @ Object::WStr(_)) = inst.native.get() {
+                if instance_method(v, "__str__").is_none() {
+                    return Ok(native.clone());
+                }
+            }
+        }
+        // `stringify` transports lone surrogates through the PUA bridge;
+        // re-canonicalise so a bridged result surfaces as a real `WStr`
+        // rather than leaking plane-16 PUA code points.
+        Ok(crate::builtins::bridge_to_object(
+            &self.stringify(v, globals)?,
+        ))
     }
 
     /// `str.format(*args, **kwargs)` entry point. See
@@ -10710,11 +10927,26 @@ impl Interpreter {
             return Ok(None);
         };
         // A subclass of `dict` (`class C(dict)`) wraps a native dict; copy
-        // its entries directly rather than walking keys via subscript.
+        // its entries directly rather than walking keys via subscript —
+        // but only when the subclass doesn't override the iteration order
+        // (`keys` / `__iter__`). CPython's `dict_merge` fast path is gated
+        // the same way after bpo-34320: `dict(OrderedDict(...))` (whose
+        // `keys` walks the linked list, reflecting `move_to_end`) and a
+        // subclass with reversed `keys` must go through the mapping
+        // protocol below (test_dict `test_dict_copy_order`).
         if let Some(Object::Dict(inner)) = inst.native.get() {
-            return Ok(Some(Object::Dict(Rc::new(RefCell::new(
-                inner.borrow().clone(),
-            )))));
+            let overrides_order = inst.cls().mro.borrow().iter().any(|t| {
+                !t.flags.is_builtin
+                    && (t.dict.borrow().contains_key(&crate::object::StrKey("keys"))
+                        || t.dict
+                            .borrow()
+                            .contains_key(&crate::object::StrKey("__iter__")))
+            });
+            if !overrides_order {
+                return Ok(Some(Object::Dict(Rc::new(RefCell::new(
+                    inner.borrow().clone(),
+                )))));
+            }
         }
         // Prefer the instance's own `keys` (rare), then walk the MRO.
         // `inst.cls().lookup` already handles inheritance, which is
@@ -11745,7 +11977,7 @@ impl Interpreter {
         Ok(Object::None)
     }
 
-    fn dict_merge_from(
+    pub(crate) fn dict_merge_from(
         &mut self,
         dst: &Object,
         other: &Object,
@@ -11773,8 +12005,20 @@ impl Interpreter {
             _ => None,
         };
         if let Some(entries) = native_entries {
+            let src_len = entries.len();
             for (k, v) in entries {
                 self.store_subscr(dst, &k, v, globals)?;
+                // CPython's `PyDict_Merge` re-checks the source size after
+                // every insert: a key `__eq__` that mutates the source
+                // mid-merge aborts — including on the final entry
+                // (test_dict `test_merge_and_mutate`).
+                let live_len = match other {
+                    Object::Dict(o) | Object::MappingProxy(o) => o.borrow().len(),
+                    _ => src_len,
+                };
+                if live_len != src_len {
+                    return Err(crate::error::runtime_error("dict mutated during update"));
+                }
             }
             return Ok(());
         }
@@ -12038,6 +12282,9 @@ impl Interpreter {
     fn require_str_result(r: Object, dunder: &str) -> Result<String, RuntimeError> {
         match &r {
             Object::Str(_) => Ok(r.to_str()),
+            // A surrogate-bearing result travels in the PUA-bridged `String`
+            // transport (same convention as `stringify`'s native-WStr path).
+            Object::WStr(cps) => Ok(crate::builtins::bridge_encode_cps(cps)),
             // A `str` subclass instance (`class S(str)`) carries its value in
             // `native`. `Object::to_str()` would `repr()` the instance
             // (`'' -> "''"`), so pull the underlying string out directly —
@@ -12045,6 +12292,7 @@ impl Interpreter {
             // (test_pathlib's `PurePathBase('')` round-trips a `str` subclass).
             Object::Instance(inst) => match inst.native.get() {
                 Some(Object::Str(s)) => Ok(s.to_string()),
+                Some(Object::WStr(cps)) => Ok(crate::builtins::bridge_encode_cps(cps)),
                 _ => Err(type_error(format!(
                     "{dunder} returned non-string (type {})",
                     r.type_name()
@@ -12490,6 +12738,12 @@ impl Interpreter {
                     let native = native.clone();
                     return self.stringify(&native, globals);
                 }
+                // A surrogate-bearing `str` subclass renders through the PUA
+                // bridge (the `String`-typed transport for lone surrogates);
+                // `%`-format re-canonicalises via `bridge_to_object`.
+                if let Object::WStr(cps) = native {
+                    return Ok(crate::builtins::bridge_encode_cps(cps));
+                }
             }
             return self.repr_of(v, globals);
         }
@@ -12575,11 +12829,22 @@ impl Interpreter {
         // A self-referential container renders `[...]`; one nested past
         // `sys.getrecursionlimit()` raises `RecursionError` rather than
         // overflowing the native stack (test_list.test_repr_deep).
-        crate::object::repr_guarded(|| v.repr()).map_err(|()| {
+        //
+        // Clear any stale parked repr error first (an earlier swallowed
+        // render — e.g. building an unrelated error message — must not
+        // leak into this boundary), then re-raise one parked by a user
+        // `__repr__` that failed inside the infallible native renderer
+        // (test_dict.test_repr: `repr({1: BadRepr()})` raises `Exc`).
+        let _ = crate::object::take_repr_error();
+        let rendered = crate::object::repr_guarded(|| v.repr()).map_err(|()| {
             crate::error::recursion_error(
                 "maximum recursion depth exceeded while getting the repr of an object",
             )
-        })
+        });
+        if let Some(err) = crate::object::take_repr_error() {
+            return Err(err);
+        }
+        rendered
     }
 
     /// Either build a native iterator (for built-ins) or call
@@ -12737,7 +13002,7 @@ impl Interpreter {
         }
     }
 
-    fn make_iter(
+    pub(crate) fn make_iter(
         &mut self,
         v: &Object,
         globals: &Rc<RefCell<DictData>>,
@@ -13109,7 +13374,7 @@ impl Interpreter {
 
     /// Pull the next value from `iter`. Returns `Ok(None)` on
     /// exhaustion, `Ok(Some(v))` on yield, or propagates errors.
-    fn iter_next(
+    pub(crate) fn iter_next(
         &mut self,
         iter: &Object,
         globals: &Rc<RefCell<DictData>>,
@@ -15236,6 +15501,15 @@ impl Interpreter {
                             .iter()
                             .map(|(k, v)| (k.clone(), v.clone()))
                             .collect(),
+                        // A mapping (`keys()` + `__getitem__`, e.g.
+                        // `UserDict`): `dict |= mapping` merges key→value
+                        // like `dict.update` (test_userdict test_mixed_ior),
+                        // not as an iterable of pairs (which would walk the
+                        // keys and fail on non-iterable key types).
+                        _ if instance_method(b, "keys").is_some() => {
+                            self.dict_merge_from(a, b, globals)?;
+                            return Ok(a.clone());
+                        }
                         _ => {
                             let pairs = self.collect_iterable(b, globals)?;
                             let mut out = Vec::with_capacity(pairs.len());
@@ -15954,6 +16228,14 @@ impl Interpreter {
                 }
             }
         }
+        // `dict_keys` / `dict_items` compare as sets against any
+        // set/frozenset/set-like view (CPython `dictview_richcompare`),
+        // including the orderings (`<` is proper subset). Runs through the
+        // interpreter so membership probes dispatch user `__hash__`/`__eq__`
+        // and propagate their exceptions.
+        if let Some(rv) = self.dict_view_set_compare(a, b, op, globals)? {
+            return Ok(Object::Bool(rv));
+        }
         // Container comparison must recurse *through the interpreter*
         // (not the native `Object::eq_value`/`cmp`) so that (a) per-element
         // `__eq__` is honoured for wrapper objects (e.g. mock.ANY) embedded
@@ -15974,6 +16256,129 @@ impl Interpreter {
             return Ok(Object::Bool(rv));
         }
         Ok(Object::Bool(compare_op(a, b, op)?))
+    }
+
+    /// CPython's `dictview_richcompare`: `dict_keys` / `dict_items` are
+    /// set-like and rich-compare against any set, frozenset, or set-like
+    /// view — length gates plus [`Self::all_contained_in`] (test_dict
+    /// `test_keys_contained`, `test_dictview_mixed_set_operations`,
+    /// `test_errors_in_view_containment_check`). `dict_values` is not
+    /// set-like; pairs involving it fall through (`None`).
+    fn dict_view_set_compare(
+        &mut self,
+        a: &Object,
+        b: &Object,
+        op: CompareKind,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Option<bool>, RuntimeError> {
+        fn is_setlike_view(o: &Object) -> bool {
+            matches!(o, Object::DictView(v)
+                if !matches!(v.kind, crate::object::DictViewKind::Values))
+        }
+        fn is_any_set(o: &Object) -> bool {
+            matches!(o, Object::Set(_) | Object::FrozenSet(_))
+        }
+        let (a_view, b_view) = (is_setlike_view(a), is_setlike_view(b));
+        if !((a_view && (b_view || is_any_set(b))) || (b_view && is_any_set(a))) {
+            return Ok(None);
+        }
+        fn setlike_len(o: &Object) -> usize {
+            match o {
+                Object::DictView(v) => v.dict.borrow().len(),
+                Object::Set(s) => s.borrow().len(),
+                Object::FrozenSet(s) => s.len(),
+                _ => unreachable!("gated on set-like operands"),
+            }
+        }
+        let (len_a, len_b) = (setlike_len(a), setlike_len(b));
+        let len_ok = match op {
+            CompareKind::Eq | CompareKind::NotEq => len_a == len_b,
+            CompareKind::Lt => len_a < len_b,
+            CompareKind::LtE => len_a <= len_b,
+            CompareKind::Gt => len_a > len_b,
+            CompareKind::GtE => len_a >= len_b,
+        };
+        let result = if len_ok {
+            // `>` / `>=` test superset: b ⊆ a; everything else tests a ⊆ b
+            // (for `==` the equal-length gate makes subset ⇔ equality).
+            let (x, y) = match op {
+                CompareKind::Gt | CompareKind::GtE => (b, a),
+                _ => (a, b),
+            };
+            self.all_contained_in(x, y, globals)?
+        } else {
+            false
+        };
+        Ok(Some(match op {
+            CompareKind::NotEq => !result,
+            _ => result,
+        }))
+    }
+
+    /// Every element of set-like `x` is contained in set-like `y`
+    /// (CPython's `all_contained_in`). Membership probes run through the
+    /// reentrancy-safe dict lookup / `key_cmp_scope`d set lookup, so user
+    /// `__hash__`/`__eq__` exceptions propagate.
+    fn all_contained_in(
+        &mut self,
+        x: &Object,
+        y: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<bool, RuntimeError> {
+        let elems: Vec<Object> = match x {
+            Object::DictView(_) => dict_view_set_elems(x).expect("caller gated on set-like view"),
+            Object::Set(s) => s.borrow().iter().map(|k| k.0.clone()).collect(),
+            Object::FrozenSet(s) => s.iter().map(|k| k.0.clone()).collect(),
+            _ => unreachable!("gated on set-like operands"),
+        };
+        for e in elems {
+            if !self.setlike_contains(y, &e, globals)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Membership in a set-like operand. For an items view this is
+    /// CPython's `dictitems_contains`: a non-2-tuple is simply absent;
+    /// otherwise the dict value for the key compares `==` to the tuple's
+    /// second element (identity-first), dispatching — and propagating —
+    /// a user `__eq__`.
+    fn setlike_contains(
+        &mut self,
+        y: &Object,
+        item: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<bool, RuntimeError> {
+        match y {
+            Object::DictView(v) => match v.kind {
+                crate::object::DictViewKind::Keys => {
+                    Ok(crate::builtins::dict_lookup(&v.dict, item)?.is_some())
+                }
+                crate::object::DictViewKind::Items => {
+                    let Object::Tuple(t) = item else {
+                        return Ok(false);
+                    };
+                    if t.len() != 2 {
+                        return Ok(false);
+                    }
+                    match crate::builtins::dict_lookup(&v.dict, &t[0])? {
+                        None => Ok(false),
+                        Some(found) => Ok(found.is_same(&t[1])
+                            || self.dispatch_compare_op(
+                                &found,
+                                &t[1],
+                                CompareKind::Eq,
+                                globals,
+                            )?),
+                    }
+                }
+                crate::object::DictViewKind::Values => {
+                    unreachable!("values views are not set-like")
+                }
+            },
+            _ => y.contains(item),
+        }
     }
 
     /// CPython's `object.__ne__` (`object_richcompare` with `Py_NE`): invoke
@@ -17083,6 +17488,11 @@ impl Interpreter {
                 | (Object::List(_), Object::List(_))
                 | (Object::Dict(_), Object::Dict(_))
                 | (Object::Slice(_), Object::Slice(_))
+                | (
+                    Object::MappingProxy(_),
+                    Object::Dict(_) | Object::MappingProxy(_)
+                )
+                | (Object::Dict(_), Object::MappingProxy(_))
         );
         if !is_container {
             return Ok(None);
@@ -17150,34 +17560,13 @@ impl Interpreter {
                     Ok(Some(false))
                 }
             }
-            (Object::Dict(xs), Object::Dict(ys)) => {
-                // Snapshot both mappings before recursing so a user
-                // `__eq__` that mutates a dict can't invalidate a live
-                // borrow. CPython compares two dicts as equal iff they
-                // have the same keys and each maps to an equal value.
-                let xs: Vec<(DictKey, Object)> = xs
-                    .borrow()
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                let ys = ys.borrow().clone();
-                if xs.len() != ys.len() {
-                    return Ok(Some(false));
-                }
-                for (k, v) in xs {
-                    match ys.get(&k) {
-                        Some(v2) => {
-                            let v2 = v2.clone();
-                            if !(v.is_same(&v2)
-                                || self.dispatch_compare_op(&v, &v2, CompareKind::Eq, globals)?)
-                            {
-                                return Ok(Some(false));
-                            }
-                        }
-                        None => return Ok(Some(false)),
-                    }
-                }
-                Ok(Some(true))
+            (Object::Dict(xs), Object::Dict(ys)) => Ok(Some(self.dicts_equal(xs, ys, globals)?)),
+            // A `mappingproxy` compares as the mapping it wraps
+            // (`d.keys().mapping == d`, `type.__dict__ == {...}`).
+            (Object::MappingProxy(xs), Object::Dict(ys))
+            | (Object::Dict(ys), Object::MappingProxy(xs))
+            | (Object::MappingProxy(xs), Object::MappingProxy(ys)) => {
+                Ok(Some(self.dicts_equal(xs, ys, globals)?))
             }
             // CPython's `slice_richcompare` compares the `(start, stop, step)`
             // triples through `PyObject_RichCompareBool` (identity-first).
@@ -17204,6 +17593,42 @@ impl Interpreter {
             }
             _ => Ok(None),
         }
+    }
+
+    /// `dict == dict` (CPython `dict_equal`): same length, same keys, each
+    /// key mapping to an equal value. Both mappings are snapshotted before
+    /// recursing so a user `__eq__` that mutates a dict can't invalidate a
+    /// live borrow, and a key `__eq__` raising during the lookup (test_dict
+    /// `BadCmp`) propagates.
+    fn dicts_equal(
+        &mut self,
+        xs: &Rc<RefCell<DictData>>,
+        ys: &Rc<RefCell<DictData>>,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<bool, RuntimeError> {
+        let xs: Vec<(DictKey, Object)> = xs
+            .borrow()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let ys = ys.borrow().clone();
+        if xs.len() != ys.len() {
+            return Ok(false);
+        }
+        for (k, v) in xs {
+            let found = crate::object::key_cmp_scope(|| ys.get(&k).cloned())?;
+            match found {
+                Some(v2) => {
+                    if !(v.is_same(&v2)
+                        || self.dispatch_compare_op(&v, &v2, CompareKind::Eq, globals)?)
+                    {
+                        return Ok(false);
+                    }
+                }
+                None => return Ok(false),
+            }
+        }
+        Ok(true)
     }
 
     /// Element-wise ordering (`<`, `<=`, `>`, `>=`) for `list`/`tuple`,
@@ -17633,6 +18058,12 @@ impl Interpreter {
                 // methods, so e.g. `bio.seekable = lambda: False` takes effect.
                 _ => {
                     f.set_extra_attr(name, value);
+                    // A user attribute can close a cycle through the stream
+                    // (`f.f = f`); enroll it with the collector so the cycle
+                    // is reclaimable and the drop-time "unclosed file"
+                    // `ResourceWarning` still fires
+                    // (test_io `test_garbage_collection`).
+                    gc_trace::track(obj.clone());
                     Ok(())
                 }
             },
@@ -18453,7 +18884,7 @@ impl Interpreter {
                 // missing key runs its Python `__repr__`, which may re-enter
                 // the VM and mutate this very dict (pandas' `test_replace_series`
                 // catches the KeyError and assigns into the probed mapping).
-                let found = d.borrow().get(&DictKey(key.clone())).cloned();
+                let found = crate::builtins::dict_lookup(d, key)?;
                 found.ok_or_else(|| key_error_object(key.clone()))
             }
             (Object::List(items), Object::Slice(s)) => {
@@ -18736,11 +19167,27 @@ impl Interpreter {
                 for old in &evicted {
                     crate::vm_singletons::queue_container_removed(old);
                 }
+                // The RHS was only read from — its *elements* were spliced in,
+                // and the RHS container itself is discarded right here. A
+                // literal RHS (`xs[-2:] = [obj]`) is GC-tracked the moment it
+                // holds a trackable element, so a plain drop leaves it pinned
+                // by its own collector handle, leaking one reference to every
+                // spliced element. pickle's `load_tuple2`
+                // (`stack[-2:] = [(a, b)]`) leaked every unpickled tuple this
+                // way, so a handled manager-proxy error (`('#ERROR', exc)`
+                // over `conn.recv()`) never died at handler exit
+                // (test_multiprocessing_* `TestManagerExceptions`,
+                // gh-106558). Elements stay alive through the target list;
+                // an RHS still bound elsewhere fails the deadness test
+                // untouched.
+                if Self::local_needs_prompt_reap(&value) && Self::looks_reapable_temporary(&value) {
+                    self.prompt_reap_dropped(value);
+                }
                 Ok(())
             }
             (Object::Dict(d), key) => {
                 crate::builtins::ensure_hashable(key)?;
-                let old = d.borrow_mut().insert(DictKey(key.clone()), value);
+                let old = crate::builtins::dict_insert(d, key.clone(), value)?;
                 if let Some(old) = old {
                     crate::vm_singletons::queue_container_removed(&old);
                 }
@@ -18982,11 +19429,11 @@ impl Interpreter {
             }
             (Object::Dict(d), key) => {
                 crate::builtins::ensure_hashable(key)?;
-                let removed = d.borrow_mut().shift_remove_entry(&DictKey(key.clone()));
+                let removed = crate::builtins::dict_remove(d, key)?;
                 let Some((k, v)) = removed else {
                     return Err(key_error_object(key.clone()));
                 };
-                crate::vm_singletons::queue_container_removed(&k.0);
+                crate::vm_singletons::queue_container_removed(&k);
                 crate::vm_singletons::queue_container_removed(&v);
                 Ok(())
             }
@@ -28025,6 +28472,9 @@ fn percent_args_need_bridge(b: &Object) -> bool {
         match x {
             Object::WStr(_) => true,
             Object::Int(v) => (0xD800..=0xDFFF).contains(v),
+            // A `str` subclass over a surrogate-bearing payload renders
+            // bridged (see `stringify`), so it needs the same round trip.
+            Object::Instance(inst) => matches!(inst.native.get(), Some(Object::WStr(_))),
             _ => false,
         }
     }

@@ -572,9 +572,23 @@ impl GcState {
     /// number of objects reclaimed.
     pub fn reap_dead_acyclic(&self) -> usize {
         // A collection already walks the same set; never re-enter it.
-        if self.collecting.load(Ordering::Acquire) {
+        // Atomic claim (see `collect_impl`): overlapping reaps/collections
+        // from two threads corrupt each other's refcount math.
+        if self
+            .collecting
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return 0;
         }
+        let n = self.reap_dead_acyclic_locked();
+        self.collecting.store(false, Ordering::Release);
+        n
+    }
+
+    /// [`Self::reap_dead_acyclic`] body, called with the `collecting` claim
+    /// already held (by `reap_dead_acyclic` itself or by `collect_impl`).
+    fn reap_dead_acyclic_locked(&self) -> usize {
         let mut reclaimed = 0usize;
         loop {
             let dead: Vec<ObjectId> = {
@@ -679,9 +693,24 @@ impl GcState {
     /// the finalizable index, which holds just the `__del__`/callback-weakref
     /// objects (typically a handful).
     pub fn reap_dead_finalizable(&self) -> usize {
-        if self.collecting.load(Ordering::Acquire) {
+        // Atomic claim (see `collect_impl`): the untrack path below mutates
+        // the shared index/generations, which must not overlap a
+        // collection's mark walk on another thread.
+        if self
+            .collecting
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return 0;
         }
+        let n = self.reap_dead_finalizable_locked();
+        self.collecting.store(false, Ordering::Release);
+        n
+    }
+
+    /// [`Self::reap_dead_finalizable`] body, called with the `collecting`
+    /// claim held.
+    fn reap_dead_finalizable_locked(&self) -> usize {
         // Borrow-only scan: collect just the dead handles. The common case —
         // all finalizables still reachable — allocates nothing (an empty
         // `Vec::new()` doesn't heap-allocate) and pays only a cheap
@@ -950,10 +979,16 @@ impl GcState {
     /// [`Self::collect_generation`]'s `weakref_only` discussion. The
     /// re-entrancy guard applies, so this is a no-op inside a collection.
     pub fn fire_dead_weakrefs(&self) {
-        if self.collecting.load(Ordering::Acquire) {
+        // Atomic claim (see `collect_impl`): even a mark-only pass mutates
+        // the shared `gc_refs` counters, so it must not overlap a real
+        // collection on another thread.
+        if self
+            .collecting
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return;
         }
-        self.collecting.store(true, Ordering::Release);
         self.collect_generation(N_GENERATIONS - 1, true);
         self.collecting.store(false, Ordering::Release);
     }
@@ -974,7 +1009,18 @@ impl GcState {
     ///   suite (`test_set`'s mutation stress) re-scanned the entire accumulated
     ///   tracked set several times per trigger and blew the time budget.
     fn collect_impl(&self, upto: usize, exact: bool) -> usize {
-        if self.collecting.load(Ordering::Acquire) {
+        // Atomic claim — a plain load-then-store gate let two threads both
+        // observe `false` and run *overlapping* collections over the shared
+        // heap. Each phase-3 walk then subtracted the same internal edges
+        // from the same `gc_refs` counters, so a live object with one
+        // external root went negative and was swept as garbage — observed
+        // as a peer thread's suspended generator being closed mid-`for`
+        // loop (test_threading.test_foreign_thread wait_threads_exit).
+        if self
+            .collecting
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return 0;
         }
         // Drop this thread's parked C-dropped clones (RFC 0047, wave 5)
@@ -1008,9 +1054,8 @@ impl GcState {
             // *and* out of `gc.garbage` under `DEBUG_SAVEALL` (`test_saveall`
             // asserts only the genuine cycle is saved, not an incidental dead
             // `[]` temporary).
-            self.reap_dead_acyclic();
+            self.reap_dead_acyclic_locked();
         }
-        self.collecting.store(true, Ordering::Release);
         let gen = upto.min(N_GENERATIONS - 1);
         // Iterate the mark-sweep to a fixpoint (exact only). Reachability is
         // seeded from an *approximate* outer refcount (`Rc::strong_count`), so a
@@ -1162,7 +1207,14 @@ impl GcState {
                 let parent_is_iter = matches!(&h.object, Object::Iter(_));
                 traverse_object(&h.object, &mut |child| {
                     let promote = match child {
-                        Object::Iter(_) | Object::Tuple(_) | Object::FrozenSet(_) => true,
+                        // Dict views join iterators here: they're not
+                        // persistently tracked, but a cycle can route
+                        // through one (`obj.v = container.keys()` with
+                        // `container = {obj: 1}` — test_container_iterator).
+                        Object::Iter(_)
+                        | Object::Tuple(_)
+                        | Object::FrozenSet(_)
+                        | Object::DictView(_) => true,
                         Object::List(_) => parent_is_iter,
                         _ => false,
                     };
@@ -1245,9 +1297,10 @@ impl GcState {
             .collect();
 
         if std::env::var_os("WP_REAP_DBG").is_some() {
+            let dbg_class = std::env::var("WP_REAP_DBG_CLASS").unwrap_or("Executor".into());
             for h in &candidate_set {
                 if let Object::Instance(i) = &h.object {
-                    if i.cls().name.contains("Executor") {
+                    if i.cls().name.contains(&dbg_class) {
                         let exec_id = h.id;
                         let mut referrers: Vec<String> = Vec::new();
                         for c in &scan_all {
@@ -1668,6 +1721,8 @@ pub fn strong_count_for(obj: &Object) -> usize {
         Object::Module(m) => Rc::strong_count(m),
         Object::Type(t) => Rc::strong_count(t),
         Object::Code(c) => Rc::strong_count(c),
+        // Tracked only when user attributes give it cycle-capable edges.
+        Object::File(f) => Rc::strong_count(f),
         // Leaf types — no internal refs to trace.
         _ => 1,
     }
@@ -1765,6 +1820,15 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
             let Ok(v) = c.try_borrow() else { return };
             visit(&v);
         }
+        Object::File(f) => {
+            // User attributes on a stream (`f.f = f`) are its only
+            // cycle-capable edges; the fixed fields hold no objects.
+            if let Ok(attrs) = f.extra_attrs.try_borrow() {
+                for (_, v) in attrs.iter() {
+                    visit(v);
+                }
+            }
+        }
         Object::BoundMethod(b) => {
             visit(&b.function);
             visit(&b.receiver);
@@ -1792,14 +1856,12 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
             }
         }
         Object::DictView(v) => {
-            // Dict views borrow the underlying dict — visit its
-            // entries so cycles through `dict.items()` snapshots
-            // are detectable.
-            let Ok(m) = v.dict.try_borrow() else { return };
-            for (k, val) in m.iter() {
-                visit(&k.0);
-                visit(val);
-            }
+            // A dict view holds only the *dict* (a shared `Rc`), so the
+            // cycle edge to subtract is `view -> dict`; the dict's own
+            // traversal accounts `dict -> entries` (bug #3680, test_dict
+            // `test_container_iterator`). Visiting the entries here would
+            // subtract edges the view doesn't actually hold.
+            visit(&Object::Dict(v.dict.clone()));
         }
         Object::Type(t) => {
             // Class dict + base list. Without this, classes that
@@ -2014,6 +2076,14 @@ pub fn clear_object_fields(obj: &Object) {
         Object::ByteArray(b) => {
             if let Ok(mut v) = b.try_borrow_mut() {
                 v.clear();
+            }
+        }
+        Object::File(f) => {
+            // Break `f.attr = f`-style cycles; the subsequent `Rc` drop runs
+            // `PyFile::drop`, which closes the fd and queues the unclosed-file
+            // `ResourceWarning` (test_io `test_garbage_collection`).
+            if let Ok(mut attrs) = f.extra_attrs.try_borrow_mut() {
+                attrs.clear();
             }
         }
         Object::Cell(c) => {

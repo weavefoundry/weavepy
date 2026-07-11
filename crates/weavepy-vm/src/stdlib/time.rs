@@ -46,6 +46,30 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             b("perf_counter", time_monotonic),
         );
         d.insert(
+            DictKey(Object::from_static("monotonic_ns")),
+            b("monotonic_ns", time_monotonic_ns),
+        );
+        d.insert(
+            DictKey(Object::from_static("perf_counter_ns")),
+            b("perf_counter_ns", time_monotonic_ns),
+        );
+        d.insert(
+            DictKey(Object::from_static("process_time")),
+            b("process_time", time_process_time),
+        );
+        d.insert(
+            DictKey(Object::from_static("process_time_ns")),
+            b("process_time_ns", time_process_time_ns),
+        );
+        d.insert(
+            DictKey(Object::from_static("thread_time")),
+            b("thread_time", time_thread_time),
+        );
+        d.insert(
+            DictKey(Object::from_static("thread_time_ns")),
+            b("thread_time_ns", time_thread_time_ns),
+        );
+        d.insert(
             DictKey(Object::from_static("get_clock_info")),
             b("get_clock_info", time_get_clock_info),
         );
@@ -356,6 +380,67 @@ fn time_monotonic(_args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Float(elapsed.as_secs_f64()))
 }
 
+fn time_monotonic_ns(_args: &[Object]) -> Result<Object, RuntimeError> {
+    let elapsed = EPOCH.with(|e| e.elapsed());
+    Ok(Object::Int(elapsed.as_nanos() as i64))
+}
+
+/// CPU time consumed, in nanoseconds, from the requested POSIX clock.
+/// Non-Unix targets fall back to the monotonic wall clock (the closest
+/// available upper bound; the Windows CI lane only runs the Rust tests).
+#[cfg(unix)]
+fn cpu_clock_ns(clock: libc::clockid_t) -> i64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let rc = unsafe { libc::clock_gettime(clock, &raw mut ts) };
+    if rc != 0 {
+        return 0;
+    }
+    (ts.tv_sec as i64).saturating_mul(1_000_000_000) + ts.tv_nsec as i64
+}
+
+fn process_time_ns_value() -> i64 {
+    #[cfg(unix)]
+    {
+        cpu_clock_ns(libc::CLOCK_PROCESS_CPUTIME_ID)
+    }
+    #[cfg(not(unix))]
+    {
+        EPOCH.with(|e| e.elapsed()).as_nanos() as i64
+    }
+}
+
+fn thread_time_ns_value() -> i64 {
+    #[cfg(unix)]
+    {
+        cpu_clock_ns(libc::CLOCK_THREAD_CPUTIME_ID)
+    }
+    #[cfg(not(unix))]
+    {
+        EPOCH.with(|e| e.elapsed()).as_nanos() as i64
+    }
+}
+
+/// `time.process_time()` — process-wide CPU time (user + system).
+fn time_process_time(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::Float(process_time_ns_value() as f64 / 1e9))
+}
+
+fn time_process_time_ns(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::Int(process_time_ns_value()))
+}
+
+/// `time.thread_time()` — calling-thread CPU time.
+fn time_thread_time(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::Float(thread_time_ns_value() as f64 / 1e9))
+}
+
+fn time_thread_time_ns(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::Int(thread_time_ns_value()))
+}
+
 fn time_sleep(args: &[Object]) -> Result<Object, RuntimeError> {
     let secs = match args.first() {
         Some(Object::Int(i)) => *i as f64,
@@ -574,10 +659,13 @@ fn time_asctime(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn time_ctime(args: &[Object]) -> Result<Object, RuntimeError> {
-    let dt = match args.first() {
-        None | Some(Object::None) => Local::now(),
-        Some(Object::Int(i)) => local_from_timestamp(*i)?,
-        Some(Object::Float(f)) => local_from_timestamp(float_to_timestamp(*f)?)?,
+    let secs = match args.first() {
+        None | Some(Object::None) => SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64,
+        Some(Object::Int(i)) => *i,
+        Some(Object::Float(f)) => float_to_timestamp(*f)?,
         Some(other) => {
             return Err(type_error(format!(
                 "ctime() argument must be a number, not '{}'",
@@ -585,7 +673,39 @@ fn time_ctime(args: &[Object]) -> Result<Object, RuntimeError> {
             )))
         }
     };
-    Ok(format_ctime_local(dt))
+    // libc `localtime_r` for the same reason as `localtime`/`mktime`: it
+    // tracks `TZ`/`tzset()` changes, whereas `chrono::Local` caches the zone
+    // (`datetimetester.test_more_ctime` runs after `run_with_tz` tests and
+    // requires `ctime` to agree with `mktime`).
+    #[cfg(unix)]
+    {
+        let t: libc::time_t = secs as libc::time_t;
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        if unsafe { libc::localtime_r(&raw const t, &raw mut tm) }.is_null() {
+            return Err(crate::error::overflow_error(
+                "timestamp out of range for platform time_t",
+            ));
+        }
+        const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+        const MONS: [&str; 12] = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        // The `return` is required: the `#[cfg(not(unix))]` tail below is
+        // compiled out on unix, but rustc still needs this arm to diverge.
+        #[allow(clippy::needless_return)]
+        return Ok(Object::from_str(format!(
+            "{} {} {:2} {:02}:{:02}:{:02} {}",
+            DAYS[tm.tm_wday as usize],
+            MONS[tm.tm_mon as usize],
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec,
+            i64::from(tm.tm_year) + 1900,
+        )));
+    }
+    #[cfg(not(unix))]
+    Ok(format_ctime_local(local_from_timestamp(secs)?))
 }
 
 /// Convert a float timestamp to whole seconds, raising CPython's
@@ -600,6 +720,7 @@ fn float_to_timestamp(f: f64) -> Result<i64, RuntimeError> {
     Ok(f as i64)
 }
 
+#[cfg(not(unix))]
 fn local_from_timestamp(secs: i64) -> Result<DateTime<Local>, RuntimeError> {
     Local
         .timestamp_opt(secs, 0)

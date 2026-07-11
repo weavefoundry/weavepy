@@ -303,6 +303,7 @@ pub(crate) fn make_text_io_wrapper(
     method("__enter__", tw_enter);
     method("__exit__", tw_exit);
     method("__repr__", tw_repr);
+    method("__del__", tw_del);
     // `reconfigure(*, encoding, errors, newline, line_buffering, write_through)`
     // is keyword-only in CPython — register with a `call_kw` so the kwargs form
     // (`reconfigure(newline='')`, `reconfigure(encoding='utf-8')`) works.
@@ -3460,6 +3461,14 @@ fn tw_write(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = tw_self(args)?;
     let text = match args.get(1) {
         Some(Object::Str(s)) => s.to_string(),
+        // A `str` subclass instance contributes its wrapped native payload
+        // (CPython's check is `isinstance`-based).
+        Some(Object::Instance(inst)) if matches!(inst.native.get(), Some(Object::Str(_))) => {
+            match inst.native.get() {
+                Some(Object::Str(s)) => s.to_string(),
+                _ => unreachable!("checked above"),
+            }
+        }
         Some(other) => {
             return Err(type_error(format!(
                 "write() argument must be str, not {}",
@@ -4217,6 +4226,7 @@ pub(crate) fn make_buffered(
     method("__enter__", tw_enter);
     method("__exit__", bw_exit);
     method("__repr__", bw_repr);
+    method("__del__", bw_del);
     // `__new__` only allocates (CPython `buffered_new`); `__init__` binds the
     // raw stream. Keeping them separate means `tp.__new__(tp)` yields an
     // uninitialized object whose methods raise `ValueError` (`test_uninitialized`)
@@ -5580,6 +5590,85 @@ thread_local! {
 
 /// `<_io.BufferedReader>` / `<_io.BufferedReader name='dummy'>` — mirrors
 /// CPython's `buffered_repr` (the `name` is taken from the raw stream).
+/// `Buffered*.__del__` — CPython's `iobase_finalize`: a stream reclaimed
+/// while still open emits an unclosed-file `ResourceWarning` and is closed
+/// (flushing buffered writes through to the raw layer — the
+/// `test_garbage_collection` variants assert the data reached disk).
+/// Errors are swallowed, as in any finalizer.
+fn bw_del(args: &[Object]) -> Result<Object, RuntimeError> {
+    let Ok(inst) = bw_self(args) else {
+        return Ok(Object::None);
+    };
+    if bw_check_init(&inst).is_err() {
+        return Ok(Object::None);
+    }
+    let open = matches!(bw_closed(args), Ok(c) if !c.is_truthy());
+    if open {
+        if del_raw_chain_warns(tw_get(&inst, "raw")) {
+            let repr = match bw_repr(args) {
+                Ok(Object::Str(s)) => s.to_string(),
+                _ => format!("<_io.{}>", inst.cls().name),
+            };
+            crate::vm_singletons::push_pending_resource_warning(format!("unclosed file {repr}"));
+        }
+        // Dispatch `close` *virtually* so a subclass override runs
+        // (test_override_destructor records the override call); a close
+        // error propagates and the finalizer machinery routes it through
+        // `sys.unraisablehook` (test_error_through_destructor).
+        py_call(&args[0], "close", &[])?;
+    }
+    Ok(Object::None)
+}
+
+/// `TextIOWrapper.__del__` — same contract as [`bw_del`] for the text layer.
+fn tw_del(args: &[Object]) -> Result<Object, RuntimeError> {
+    let Ok(inst) = tw_self(args) else {
+        return Ok(Object::None);
+    };
+    if tw_require_init(&inst).is_err() {
+        return Ok(Object::None);
+    }
+    let open = matches!(tw_closed(args), Ok(c) if !c.is_truthy());
+    if open {
+        if del_raw_chain_warns(tw_get(&inst, "buffer")) {
+            let repr = match tw_repr(args) {
+                Ok(Object::Str(s)) => s.to_string(),
+                _ => "<_io.TextIOWrapper>".to_owned(),
+            };
+            crate::vm_singletons::push_pending_resource_warning(format!("unclosed file {repr}"));
+        }
+        py_call(&args[0], "close", &[])?;
+    }
+    Ok(Object::None)
+}
+
+/// CPython's `_dealloc_warn` chain gate: a dying buffered/text wrapper only
+/// emits the unclosed-file `ResourceWarning` when the delegation walks down
+/// to an *open, fd-backed* `FileIO` (`fileio_dealloc_warn`; each `Buffered*`
+/// layer merely forwards). Memory-backed raws (`BytesIO`) and pure-Python
+/// raws (a mock stream, gzip's `_WriteBufferStream`) have no `_dealloc_warn`
+/// hook, so an abandoned wrapper over them dies silently — tarfile's
+/// `test_open_nonwritable_fileobj` asserts exactly that for the `GzipFile`
+/// internals discarded when opening the archive fails.
+fn del_raw_chain_warns(raw: Option<Object>) -> bool {
+    let Some(raw) = raw else {
+        return false;
+    };
+    match resolve_raw_pyfile(&raw) {
+        Ok(f) => {
+            !f.is_closed()
+                && matches!(
+                    &*f.backend.borrow(),
+                    crate::object::FileBackend::Disk(_)
+                        | crate::object::FileBackend::Stdout(_)
+                        | crate::object::FileBackend::Stderr(_)
+                        | crate::object::FileBackend::Stdin
+                )
+        }
+        Err(_) => false,
+    }
+}
+
 fn bw_repr(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = bw_self(args)?;
     let typename = format!("_io.{}", inst.cls().name);

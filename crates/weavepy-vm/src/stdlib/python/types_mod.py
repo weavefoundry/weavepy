@@ -191,14 +191,18 @@ class MappingProxyType:
         return f"mappingproxy({self._mapping!r})"
 
     def __or__(self, other):
+        # CPython's mappingproxy.__or__ is PyNumber_Or(mapping, other):
+        # delegating to `|` keeps the full binary protocol, so e.g.
+        # `proxy | UserDict(...)` reaches UserDict.__ror__ and returns a
+        # UserDict (test_userdict test_mixed_or).
         if isinstance(other, MappingProxyType):
-            return {**self._mapping, **other._mapping}
-        return {**self._mapping, **other}
+            other = other._mapping
+        return self._mapping | other
 
     def __ror__(self, other):
         if isinstance(other, MappingProxyType):
-            return {**other._mapping, **self._mapping}
-        return {**other, **self._mapping}
+            other = other._mapping
+        return other | self._mapping
 
     def get(self, key, default=None):
         return self._mapping.get(key, default)

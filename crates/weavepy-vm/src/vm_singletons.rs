@@ -76,6 +76,15 @@ pub fn drain_pending_finalizers() -> Vec<Object> {
     PENDING_FINALIZERS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
 }
 
+/// Whether any `__del__` requests are parked on this thread's queue —
+/// the eval loop's between-bytecodes gate for running them promptly.
+/// Teardown-safe (one thread-local read).
+pub fn has_pending_finalizers() -> bool {
+    PENDING_FINALIZERS
+        .try_with(|cell| cell.try_borrow().map(|q| !q.is_empty()).unwrap_or(false))
+        .unwrap_or(false)
+}
+
 /// Queue a weakref callback `(callback, weakref_obj)` for invocation at
 /// the next safe point. Teardown-safe (callable from sweep paths).
 pub fn push_pending_weakref_callback(callback: Object, weakref_obj: Object) {
@@ -260,6 +269,20 @@ pub fn install_worker_thread_id(id: u64) {
 pub fn clear_worker_thread_id() {
     let native = crate::gil::current_native_thread_id();
     worker_map().lock().remove(&native);
+}
+
+/// Drop every Python object held in this thread's TLS *now*, while the
+/// caller still holds the GIL. A worker thread's TLS destructors run after
+/// the GIL guard is gone; the `Rc` decrements they perform race a peer
+/// thread's in-flight GC mark phase (which seeds reachability from
+/// `Rc::strong_count` snapshots) and can make the peer's live objects look
+/// like garbage. Called from the worker teardown in `thread_real.rs`.
+pub fn clear_thread_python_tls() {
+    let _ = PENDING_FINALIZERS.try_with(|cell| cell.borrow_mut().clear());
+    let _ = PENDING_WEAKREF_CALLBACKS.try_with(|cell| cell.borrow_mut().clear());
+    let _ = CURRENT_THREAD_HANDLES.try_with(|cell| cell.borrow_mut().clear());
+    let _ = PENDING_CEXT_DROPS.try_with(|cell| cell.borrow_mut().clear());
+    crate::builtin_types::clear_thread_type_registry();
 }
 
 /// Look up the worker thread id for the currently-running OS thread,

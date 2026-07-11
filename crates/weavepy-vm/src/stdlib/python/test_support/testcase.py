@@ -1,5 +1,3 @@
-import types
-
 from math import copysign, isnan
 
 

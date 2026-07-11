@@ -495,6 +495,237 @@ impl ServerCertVerifier for ChainOnlyVerifier {
 }
 
 // ---------------------------------------------------------------------------
+// pinned-anchor fallback verifier
+//
+// OpenSSL treats a certificate that *is itself* a trust anchor as a complete,
+// valid chain — that is how CPython's test suite (and plenty of real code)
+// connects to self-signed servers after `load_verify_locations(server_cert)`.
+// rustls/webpki instead rejects the leaf with `CaUsedAsEndEntity`. Wrap the
+// inner verifier: if standard verification fails but the end-entity is
+// byte-identical to an *explicitly loaded* CA, accept it (exact-match pinning
+// is at least as strong as chain verification). Native/system roots do not
+// participate — only certs the context loaded by hand.
+// ---------------------------------------------------------------------------
+
+/// Minimal DER walker over an X.509 certificate: just enough to (a) detect
+/// whether a subjectAltName extension is present and (b) pull the subject
+/// commonName strings. Used only for the OpenSSL-parity CN fallback on the
+/// pinned-anchor path — webpki (correctly, per RFC 6125) refuses to match
+/// hostnames against the CN, but OpenSSL's `X509_check_host` falls back to
+/// CN when *no* SAN extension exists, and CPython inherits that behavior.
+mod der_cert {
+    /// One TLV: returns `(tag, content, rest_after_tlv)`.
+    fn tlv(buf: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+        let (&tag, rest) = buf.split_first()?;
+        let (&l0, rest) = rest.split_first()?;
+        let (len, rest) = if l0 & 0x80 == 0 {
+            (l0 as usize, rest)
+        } else {
+            let n = (l0 & 0x7f) as usize;
+            if n == 0 || n > 4 || rest.len() < n {
+                return None;
+            }
+            let mut len = 0usize;
+            for &b in &rest[..n] {
+                len = (len << 8) | b as usize;
+            }
+            (len, &rest[n..])
+        };
+        if rest.len() < len {
+            return None;
+        }
+        Some((tag, &rest[..len], &rest[len..]))
+    }
+
+    const OID_COMMON_NAME: &[u8] = &[0x55, 0x04, 0x03]; // 2.5.4.3
+    const OID_SUBJECT_ALT_NAME: &[u8] = &[0x55, 0x1d, 0x11]; // 2.5.29.17
+
+    /// Parsed subset: subject CNs + whether a SAN extension exists.
+    pub(super) struct CertNames {
+        pub(super) common_names: Vec<String>,
+        pub(super) has_san: bool,
+    }
+
+    pub(super) fn parse(cert_der: &[u8]) -> Option<CertNames> {
+        // Certificate ::= SEQUENCE { tbsCertificate, sigAlg, sigValue }
+        let Some((0x30, cert_body, _)) = tlv(cert_der) else {
+            return None;
+        };
+        let Some((0x30, tbs, _)) = tlv(cert_body) else {
+            return None;
+        };
+        // tbsCertificate ::= SEQUENCE { [0] version?, serialNumber, signature,
+        //   issuer, validity, subject, subjectPublicKeyInfo, [1]?, [2]?, [3]? }
+        let mut rest = tbs;
+        // Optional explicit version tag.
+        if let Some((0xa0, _, r)) = tlv(rest) {
+            rest = r;
+        }
+        let (_, _, r) = tlv(rest)?; // serialNumber
+        let (_, _, r) = tlv(r)?; // signature algorithm
+        let (_, _, r) = tlv(r)?; // issuer
+        let (_, _, r) = tlv(r)?; // validity
+        let Some((0x30, subject, r)) = tlv(r) else {
+            return None;
+        };
+        let (_, _, mut r) = tlv(r)?; // subjectPublicKeyInfo
+
+        // Subject Name ::= SEQUENCE OF SET OF SEQUENCE { OID, value }
+        let mut common_names = Vec::new();
+        let mut rdns = subject;
+        while let Some((0x31, set, next)) = tlv(rdns) {
+            let mut atvs = set;
+            while let Some((0x30, atv, next_atv)) = tlv(atvs) {
+                if let Some((0x06, oid, val_rest)) = tlv(atv) {
+                    if oid == OID_COMMON_NAME {
+                        if let Some((tag, val, _)) = tlv(val_rest) {
+                            // PrintableString / UTF8String / IA5String / T61.
+                            if matches!(tag, 0x0c | 0x13 | 0x14 | 0x16) {
+                                if let Ok(s) = std::str::from_utf8(val) {
+                                    common_names.push(s.to_owned());
+                                }
+                            }
+                        }
+                    }
+                }
+                atvs = next_atv;
+            }
+            rdns = next;
+        }
+
+        // Optional [1] issuerUniqueID / [2] subjectUniqueID, then
+        // [3] extensions (an explicit tag wrapping SEQUENCE OF Extension).
+        let mut has_san = false;
+        while !r.is_empty() {
+            let (tag, body, next) = tlv(r)?;
+            if tag == 0xa3 {
+                if let Some((0x30, exts, _)) = tlv(body) {
+                    let mut e = exts;
+                    while let Some((0x30, ext, next_ext)) = tlv(e) {
+                        if let Some((0x06, oid, _)) = tlv(ext) {
+                            if oid == OID_SUBJECT_ALT_NAME {
+                                has_san = true;
+                            }
+                        }
+                        e = next_ext;
+                    }
+                }
+            }
+            r = next;
+        }
+        Some(CertNames {
+            common_names,
+            has_san,
+        })
+    }
+
+    /// RFC 6125-style DNS-name match with single leftmost-label wildcard —
+    /// the same rules as `ssl.py`'s `_dnsname_match`.
+    pub(super) fn dnsname_match(pattern: &str, hostname: &str) -> bool {
+        if pattern.is_empty() {
+            return false;
+        }
+        let (pattern, hostname) = (pattern.to_ascii_lowercase(), hostname.to_ascii_lowercase());
+        if pattern == hostname {
+            return true;
+        }
+        if let Some(suffix) = pattern.strip_prefix("*.") {
+            if let Some(head) = hostname.strip_suffix(suffix) {
+                if let Some(head) = head.strip_suffix('.') {
+                    return !head.is_empty() && !head.contains('.');
+                }
+            }
+        }
+        false
+    }
+}
+
+#[derive(Debug)]
+struct PinnedAnchorVerifier {
+    inner: Arc<dyn ServerCertVerifier>,
+    pinned: Vec<CertificateDer<'static>>,
+    /// Mirror of the context's `check_hostname`: a pinned-anchor acceptance
+    /// still enforces the SAN/hostname match OpenSSL would.
+    check_hostname: bool,
+}
+
+impl ServerCertVerifier for PinnedAnchorVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        match self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        ) {
+            Ok(v) => Ok(v),
+            // Never rescue a hostname mismatch — only chain-building
+            // failures (`CaUsedAsEndEntity`, `UnknownIssuer`, …) qualify.
+            Err(rustls::Error::InvalidCertificate(ce))
+                if !is_name_mismatch(&ce)
+                    && self
+                        .pinned
+                        .iter()
+                        .any(|p| p.as_ref() == end_entity.as_ref()) =>
+            {
+                if self.check_hostname {
+                    let parsed = rustls::server::ParsedCertificate::try_from(end_entity)?;
+                    match rustls::client::verify_server_name(&parsed, server_name) {
+                        Ok(()) => {}
+                        Err(name_err) => {
+                            // OpenSSL parity: a cert with *no* SAN extension
+                            // falls back to subject-CN matching.
+                            let names = der_cert::parse(end_entity.as_ref());
+                            let cn_matches = match (&names, server_name) {
+                                (Some(n), ServerName::DnsName(dns)) if !n.has_san => n
+                                    .common_names
+                                    .iter()
+                                    .any(|cn| der_cert::dnsname_match(cn, dns.as_ref())),
+                                _ => false,
+                            };
+                            if !cn_matches {
+                                return Err(name_err);
+                            }
+                        }
+                    }
+                }
+                Ok(ServerCertVerified::assertion())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Config materialization
 // ---------------------------------------------------------------------------
 
@@ -530,21 +761,33 @@ fn build_client_config(cfg: &CtxConfig) -> Result<Arc<ClientConfig>, RuntimeErro
         for c in &cfg.extra_ca {
             let _ = roots.add(c.clone());
         }
-        if cfg.check_hostname {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let webpki = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
+            .build()
+            .map_err(|e| ssl_error_rt(format!("verifier: {e}")))?;
+        let inner: Arc<dyn ServerCertVerifier> = if cfg.check_hostname {
             // Chain + hostname (rustls' default `WebPkiServerVerifier`).
-            builder.with_root_certificates(roots)
+            webpki
         } else {
             // Chain only: validate against the trust store but ignore the
             // hostname, matching CPython's `check_hostname = False` while
             // `verify_mode` stays `CERT_REQUIRED`.
-            let provider = Arc::new(rustls::crypto::ring::default_provider());
-            let inner = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
-                .build()
-                .map_err(|e| ssl_error_rt(format!("verifier: {e}")))?;
-            builder
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(ChainOnlyVerifier { inner }))
-        }
+            Arc::new(ChainOnlyVerifier { inner: webpki })
+        };
+        // Explicitly loaded CAs double as exact-match pins (OpenSSL's
+        // self-signed-anchor-as-leaf acceptance).
+        let verifier: Arc<dyn ServerCertVerifier> = if cfg.extra_ca.is_empty() {
+            inner
+        } else {
+            Arc::new(PinnedAnchorVerifier {
+                inner,
+                pinned: cfg.extra_ca.clone(),
+                check_hostname: cfg.check_hostname,
+            })
+        };
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
     } else {
         builder
             .dangerous()
@@ -878,7 +1121,7 @@ fn read_n(id: i64, n: usize) -> Result<Vec<u8>, RuntimeError> {
                         s.conn.wants_read()
                     );
                 }
-                buf.truncate(0);
+                buf.clear();
                 return Ok(buf);
             }
             Ok(r) => {
@@ -895,7 +1138,7 @@ fn read_n(id: i64, n: usize) -> Result<Vec<u8>, RuntimeError> {
             if dbg {
                 eprintln!("[read_n id={id} nb={nonblocking}] !wants_read -> empty");
             }
-            buf.truncate(0);
+            buf.clear();
             return Ok(buf);
         }
         // Pull the *next single record* off the transport (GIL released) and
@@ -914,7 +1157,7 @@ fn read_n(id: i64, n: usize) -> Result<Vec<u8>, RuntimeError> {
                 if dbg {
                     eprintln!("[read_n id={id}] read_tls Ok(0) EOF");
                 }
-                buf.truncate(0);
+                buf.clear();
                 return Ok(buf);
             }
             Ok(k) => {
@@ -945,7 +1188,7 @@ fn read_n(id: i64, n: usize) -> Result<Vec<u8>, RuntimeError> {
                 // sees a clean close instead of crashing its event-loop thread
                 // (test_poplib STLS, where the client tears the socket down
                 // without a TLS close_notify).
-                buf.truncate(0);
+                buf.clear();
                 return Ok(buf);
             }
             Err(e) => return Err(ssl_error_rt(format!("read_tls: {e}"))),

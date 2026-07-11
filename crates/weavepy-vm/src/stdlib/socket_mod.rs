@@ -151,7 +151,18 @@ fn next_handle(state: Rc<RefCell<SocketState>>) -> i64 {
         .as_ref()
         .and_then(raw_fd_of)
         .unwrap_or_else(|| -(NEXT_HANDLE.fetch_add(1, Ordering::Relaxed) + 1));
-    registry().lock().insert(handle, state);
+    if let Some(old) = registry().lock().insert(handle, state) {
+        // A state still registered under this fd number is stale: the kernel
+        // just handed *us* the descriptor, so the old state's fd was already
+        // closed (its owner is somewhere between `close(2)` and its registry
+        // remove). Release the stale `Socket` without closing — letting it
+        // drop with `owns_fd` would issue `close(fd)` and destroy the brand
+        // new socket that now legitimately owns the number.
+        let taken = old.borrow_mut().inner.take();
+        if let Some(sock) = taken {
+            release_socket(sock);
+        }
+    }
     handle
 }
 
@@ -894,7 +905,18 @@ fn sock_enter(args: &[Object]) -> Result<Object, RuntimeError> {
 fn sock_exit(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = extract_self(args)?;
     if let Ok(handle) = extract_handle(&inst) {
-        if let Some(state) = get_state(handle) {
+        // Remove the registry entry *before* issuing `close(2)`. The registry
+        // is keyed by fd number, and the kernel recycles a closed number
+        // immediately: with close-then-remove there was a window where a peer
+        // thread's `accept()`/`socket()` received this same number and
+        // registered it under the key we were about to remove — our
+        // `remove_state` then stripped the *new* socket's entry, and dropping
+        // it closed the fresh descriptor underneath its owner (test_ftplib's
+        // dummy-server thread intermittently lost its just-accepted data
+        // connection this way, surfacing as EBADF in `create_connection` or a
+        // dead command channel).
+        let state = registry().lock().remove(&handle);
+        if let Some(state) = state {
             let (sock, owns) = {
                 let mut b = state.borrow_mut();
                 (b.inner.take(), b.owns_fd)
@@ -907,7 +929,6 @@ fn sock_exit(args: &[Object]) -> Result<Object, RuntimeError> {
                 }
             }
         }
-        remove_state(handle);
     }
     inst.dict
         .borrow_mut()
@@ -963,6 +984,58 @@ fn sock_listen(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn sock_accept(args: &[Object]) -> Result<Object, RuntimeError> {
     let state = state_of(args)?;
+    // Timeout mode must be enforced with a bounded readiness wait *before*
+    // the syscall: `SO_RCVTIMEO` (what `settimeout` arms) bounds `recv`-family
+    // calls but does **not** bound `accept(2)` on macOS/BSD, so a
+    // `settimeout(20)` listener whose client never arrives blocked forever.
+    // CPython always waits with poll/select first (`sock_call_ex` internal
+    // loop), which is why its `accept` honors timeouts on every platform.
+    // test_ftplib's `TestTimeouts.server` thread relies on this: its
+    // `accept()` must raise `TimeoutError` so the thread exits and
+    // `tearDown`'s `join()` returns (the suite intermittently hung here when
+    // an earlier failure left a test without its client connection).
+    #[cfg(unix)]
+    {
+        let timeout = state.borrow().timeout;
+        if let Some(t) = timeout {
+            if !t.is_zero() {
+                let fd = {
+                    let b = state.borrow();
+                    let sock = b.inner.as_ref().ok_or_else(closed_socket_error)?;
+                    raw_fd_of(sock).ok_or_else(|| os_error("socket has no file descriptor"))?
+                        as libc::c_int
+                };
+                let deadline = std::time::Instant::now() + t;
+                loop {
+                    let remain = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remain.is_zero() {
+                        return Err(timeout_error("timed out"));
+                    }
+                    let ms = remain.as_millis().min(i32::MAX as u128) as i32;
+                    let mut pfd = libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let r = crate::gil::allow_threads_then(|| unsafe {
+                        libc::poll(std::ptr::addr_of_mut!(pfd), 1, ms)
+                    });
+                    match r {
+                        0 => return Err(timeout_error("timed out")),
+                        n if n > 0 => break,
+                        _ => {
+                            let err = std::io::Error::last_os_error();
+                            if err.raw_os_error() == Some(libc::EINTR) {
+                                run_pending_signals_after_eintr()?;
+                                continue;
+                            }
+                            return Err(io_error_to_py(&err));
+                        }
+                    }
+                }
+            }
+        }
+    }
     // Use `accept_raw` (a bare `accept(2)`) rather than socket2's `accept`,
     // which on Apple platforms *also* runs `setsockopt(SO_NOSIGPIPE)` on the
     // freshly accepted fd. When the peer connected and then *closed* (and its
@@ -1292,34 +1365,46 @@ fn sock_sendmsg(args: &[Object]) -> Result<Object, RuntimeError> {
         std::ptr::null_mut()
     };
 
-    let sent = crate::gil::allow_threads_then(move || unsafe {
-        let mut msg: libc::msghdr = std::mem::zeroed();
-        msg.msg_iov = iov_ptr;
-        msg.msg_iovlen = iov_len as _;
-        if controllen > 0 {
-            msg.msg_control = ctrl_ptr.cast::<c_void>();
-            msg.msg_controllen = controllen as _;
-            let mut cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
-            for (level, ctype, data) in &ancdata {
-                if cmsg.is_null() {
-                    break;
+    // PEP 475: retry after EINTR (running any tripped Python signal
+    // handlers first). EINTR means nothing was committed, so a plain
+    // re-issue is safe.
+    let sent = loop {
+        let ancdata_ref = &ancdata;
+        let sent = crate::gil::allow_threads_then(move || unsafe {
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_iov = iov_ptr;
+            msg.msg_iovlen = iov_len as _;
+            if controllen > 0 {
+                msg.msg_control = ctrl_ptr.cast::<c_void>();
+                msg.msg_controllen = controllen as _;
+                let mut cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
+                for (level, ctype, data) in ancdata_ref {
+                    if cmsg.is_null() {
+                        break;
+                    }
+                    (*cmsg).cmsg_level = *level;
+                    (*cmsg).cmsg_type = *ctype;
+                    (*cmsg).cmsg_len = libc::CMSG_LEN(data.len() as u32) as _;
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr(),
+                        libc::CMSG_DATA(cmsg).cast::<u8>(),
+                        data.len(),
+                    );
+                    cmsg = libc::CMSG_NXTHDR(&raw const msg, cmsg);
                 }
-                (*cmsg).cmsg_level = *level;
-                (*cmsg).cmsg_type = *ctype;
-                (*cmsg).cmsg_len = libc::CMSG_LEN(data.len() as u32) as _;
-                std::ptr::copy_nonoverlapping(
-                    data.as_ptr(),
-                    libc::CMSG_DATA(cmsg).cast::<u8>(),
-                    data.len(),
-                );
-                cmsg = libc::CMSG_NXTHDR(&raw const msg, cmsg);
             }
+            libc::sendmsg(fd, &raw const msg, flags)
+        });
+        if sent < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                run_pending_signals_after_eintr()?;
+                continue;
+            }
+            return Err(io_error_to_py(&err));
         }
-        libc::sendmsg(fd, &raw const msg, flags)
-    });
-    if sent < 0 {
-        return Err(io_error_to_py(&std::io::Error::last_os_error()));
-    }
+        break sent;
+    };
     Ok(Object::Int(sent as i64))
 }
 
@@ -1364,20 +1449,35 @@ fn sock_recvmsg(args: &[Object]) -> Result<Object, RuntimeError> {
         std::ptr::null_mut()
     };
 
-    let (n, msg_flags, used_controllen) = crate::gil::allow_threads_then(move || unsafe {
-        let mut msg: libc::msghdr = std::mem::zeroed();
-        msg.msg_iov = iov_ptr;
-        msg.msg_iovlen = 1 as _;
-        if ancbufsize > 0 {
-            msg.msg_control = ctrl_ptr.cast::<c_void>();
-            msg.msg_controllen = ancbufsize as _;
+    // PEP 475: a signal-interrupted recvmsg (EINTR) must run pending Python
+    // signal handlers and retry rather than raising InterruptedError. The
+    // forkserver's listener loop (`multiprocessing.forkserver.main`) sits in
+    // `reduction.recvfds` and takes SIGCHLD every time a forked worker exits;
+    // surfacing EINTR there killed the whole forkserver, and every later
+    // `Pool._repopulate_pool` in the parent then died with BrokenPipeError /
+    // "did not receive acknowledgement of fd" and the pool hung.
+    let (n, msg_flags, used_controllen) = loop {
+        let res = crate::gil::allow_threads_then(move || unsafe {
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_iov = iov_ptr;
+            msg.msg_iovlen = 1 as _;
+            if ancbufsize > 0 {
+                msg.msg_control = ctrl_ptr.cast::<c_void>();
+                msg.msg_controllen = ancbufsize as _;
+            }
+            let n = libc::recvmsg(fd, &raw mut msg, flags);
+            (n, i64::from(msg.msg_flags), msg.msg_controllen as usize)
+        });
+        if res.0 < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                run_pending_signals_after_eintr()?;
+                continue;
+            }
+            return Err(io_error_to_py(&err));
         }
-        let n = libc::recvmsg(fd, &raw mut msg, flags);
-        (n, i64::from(msg.msg_flags), msg.msg_controllen as usize)
-    });
-    if n < 0 {
-        return Err(io_error_to_py(&std::io::Error::last_os_error()));
-    }
+        break res;
+    };
     databuf.truncate(n as usize);
 
     let mut ancdata_items: Vec<Object> = Vec::new();

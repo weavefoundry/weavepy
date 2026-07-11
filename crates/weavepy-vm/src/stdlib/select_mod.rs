@@ -467,6 +467,13 @@ fn poll_type() -> Rc<crate::types::TypeObject> {
             DictKey(Object::from_static("__new__")),
             b("__new__", poll_new_disallowed),
         );
+        // CPython's tp_name is "select.poll": __module__ 'select',
+        // __name__ 'poll'. `test.support.check_disallow_instantiation`
+        // recomposes the qualname from those two.
+        dict.insert(
+            DictKey(Object::from_static("__module__")),
+            Object::from_static("select"),
+        );
         let cls = crate::types::TypeObject::new_user("poll", vec![bt.object_.clone()], dict)
             .expect("poll class must linearise");
         *slot.borrow_mut() = Some(cls.clone());

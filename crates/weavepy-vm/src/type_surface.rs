@@ -86,6 +86,14 @@ fn register_descriptor_kinds(bt: &BuiltinTypes) {
                 {
                     Some((s.to_string(), v.clone()))
                 }
+                // `dict.fromkeys` is wrapped in a `classmethod` descriptor
+                // (see `install_named_methods`); register the wrapped builtin
+                // so its `__qualname__`/`__objclass__` still resolve.
+                (Object::Str(s), Object::ClassMethod(w))
+                    if matches!(w.func(), Object::Builtin(_)) =>
+                {
+                    Some((s.to_string(), w.func()))
+                }
                 _ => None,
             })
             .collect();
@@ -1367,7 +1375,19 @@ fn install_buffer_protocol(bt: &BuiltinTypes) {
 fn install_named_methods(ty: &Rc<TypeObject>, type_name: &str, names: &[&str]) {
     for name in names {
         if let Some(Object::Builtin(inner)) = crate::builtins::unbound_method(type_name, name) {
-            insert_if_absent(ty, name, unwrap_shim(inner, ty));
+            let entry = unwrap_shim(inner, ty);
+            // `dict.fromkeys` is a genuine *classmethod* descriptor in
+            // CPython: access through any class in the MRO binds that class,
+            // so `dictlike.fromkeys('a')` / `dictlike().fromkeys('a')`
+            // construct a `dictlike`, not a plain dict (test_dict
+            // test_fromkeys). The bound class arrives as the leading `Type`
+            // argument, which `dict_fromkeys` inspects.
+            let entry = if type_name == "dict" && *name == "fromkeys" {
+                Object::ClassMethod(crate::object::MethodWrapper::new(entry))
+            } else {
+                entry
+            };
+            insert_if_absent(ty, name, entry);
         }
     }
 }

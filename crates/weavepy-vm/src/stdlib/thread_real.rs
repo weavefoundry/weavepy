@@ -1285,6 +1285,19 @@ fn spawn_python_worker(
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 worker_interp.run_pending_finalizers();
             }));
+            // Release this worker's Python references *while the GIL is
+            // still held*. The interpreter snapshot pins a large shared
+            // object graph; dropping it after the GIL is gone lets its
+            // `Arc` decrements (and the prompt-reap bookkeeping they
+            // trigger) race a peer thread's in-flight mark phase — which
+            // intermittently classified the peer's *live* suspended
+            // generators as garbage and closed them mid-`for` loop
+            // (test_threading.test_foreign_thread's `wait_threads_exit`).
+            drop(worker_func);
+            drop(positional);
+            drop(kwargs_pairs);
+            drop(worker_interp);
+            crate::vm_singletons::clear_thread_python_tls();
             // Drop the guard before marking finished so the parent's
             // join (which blocks on the released join lock) sees the
             // released GIL — without this the parent could re-acquire

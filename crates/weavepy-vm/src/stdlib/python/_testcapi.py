@@ -38,6 +38,17 @@ LLONG_MIN = -(2**63)
 ULLONG_MAX = 2**64 - 1
 SHRT_MAX = 2**15 - 1
 SHRT_MIN = -(2**15)
+
+# CPython 3.13's C-stack recursion budget (`Include/cpython/pystate.h`).
+# WeavePy's tree-walking evaluator enforces `sys.setrecursionlimit` on a
+# large reserved native stack, so the CPython default is the faithful
+# answer for `test.support.get_c_recursion_limit()`-sized stress loops.
+Py_C_RECURSION_LIMIT = 10000
+
+# Allocator flags (`test.support.check_impl_detail` gates). WeavePy's
+# allocator is Rust's global allocator: neither pymalloc nor mimalloc.
+WITH_PYMALLOC = False
+WITH_MIMALLOC = False
 USHRT_MAX = 2**16 - 1
 CHAR_MAX = 127
 CHAR_MIN = -128
@@ -83,6 +94,17 @@ def run_in_subinterp(code):
     # Py_NewInterpreter + PyRun_SimpleString: execute `code` in a fresh
     # interpreter namespace; uncaught exceptions are printed to stderr
     # (PyErr_Print) and the call reports -1, matching the C helper.
+    #
+    # A real sub-interpreter starts from the default interpreter config, so
+    # config knobs the child flips must not leak back into this interpreter
+    # (test_int.test_int_max_str_digits_is_per_interpreter). WeavePy's
+    # runtime keeps these process-global; snapshot + restore around the
+    # exec gives the caller CPython's isolation semantics.
+    import threading
+
+    saved_digits = sys.get_int_max_str_digits()
+    saved_recursion = sys.getrecursionlimit()
+    before = set(threading.enumerate())
     try:
         exec(code, {"__name__": "__main__"})
     except SystemExit:
@@ -90,4 +112,14 @@ def run_in_subinterp(code):
     except BaseException:
         _traceback.print_exc()
         return -1
+    finally:
+        # Py_EndInterpreter joins the interpreter's non-daemon threads
+        # before tearing it down (issue #18808); threads the exec'd code
+        # started must have finished by the time this call returns
+        # (test_threading.SubinterpThreadingTests.test_threads_join).
+        for t in threading.enumerate():
+            if t not in before and not t.daemon:
+                t.join()
+        sys.set_int_max_str_digits(saved_digits)
+        sys.setrecursionlimit(saved_recursion)
     return 0

@@ -170,9 +170,17 @@ fn b_load(args: &[Object]) -> Result<Object, RuntimeError> {
 
 // ---------- writer ----------
 
+/// CPython `Python/marshal.c` `MAX_MARSHAL_STACK_DEPTH` (non-Windows):
+/// both directions recurse natively per nesting level, so an unbounded
+/// depth overflows the Rust stack and aborts. The guard converts a
+/// deeply nested value into the `ValueError` CPython raises
+/// (test_marshal `test_recursion_limit` / `test_loads_recursion`).
+const MAX_MARSHAL_STACK_DEPTH: usize = 2000;
+
 #[derive(Default)]
 struct MarshalWriter {
     buf: Vec<u8>,
+    depth: usize,
 }
 
 impl MarshalWriter {
@@ -194,6 +202,18 @@ impl MarshalWriter {
     }
 
     fn write_value(&mut self, value: &Object) -> Result<(), RuntimeError> {
+        // CPython `w_object`: depth-guard every value, containers included.
+        self.depth += 1;
+        if self.depth > MAX_MARSHAL_STACK_DEPTH {
+            self.depth -= 1;
+            return Err(value_error("object too deeply nested to marshal"));
+        }
+        let r = self.write_value_inner(value);
+        self.depth -= 1;
+        r
+    }
+
+    fn write_value_inner(&mut self, value: &Object) -> Result<(), RuntimeError> {
         match value {
             Object::None => self.write_byte(TYPE_NONE),
             Object::Bool(b) => self.write_byte(if *b { TYPE_TRUE } else { TYPE_FALSE }),
@@ -448,11 +468,16 @@ fn strs_to_tuple(items: &[String]) -> Object {
 struct MarshalReader<'a> {
     bytes: &'a [u8],
     pos: usize,
+    depth: usize,
 }
 
 impl<'a> MarshalReader<'a> {
     fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, pos: 0 }
+        Self {
+            bytes,
+            pos: 0,
+            depth: 0,
+        }
     }
 
     fn read_byte(&mut self) -> Result<u8, RuntimeError> {
@@ -510,6 +535,19 @@ impl<'a> MarshalReader<'a> {
     }
 
     fn read_value(&mut self) -> Result<Object, RuntimeError> {
+        // CPython `r_object`: depth-guard so malicious/deep input raises
+        // instead of overflowing the native stack (test_loads_recursion).
+        self.depth += 1;
+        if self.depth > MAX_MARSHAL_STACK_DEPTH {
+            self.depth -= 1;
+            return Err(value_error("recursion limit exceeded"));
+        }
+        let r = self.read_value_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn read_value_inner(&mut self) -> Result<Object, RuntimeError> {
         let tag = self.read_byte()?;
         let tag = tag & !FLAG_REF;
         match tag {

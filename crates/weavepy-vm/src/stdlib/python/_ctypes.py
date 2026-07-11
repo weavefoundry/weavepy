@@ -1213,7 +1213,16 @@ def _writable_buffer(source):
         if source._b_buffer is not None:
             return source._b_buffer
     if isinstance(source, memoryview) and not source.readonly:
-        return bytearray(source)  # NOTE: copy; true zero-copy needs buffer API
+        # Zero-copy: keep the view itself. Every access goes through
+        # `_read_at`/`_write_at` slice operations, which the view forwards
+        # to its exporter — so a ctypes object over `memoryview(mmap)`
+        # writes straight into the mapping. multiprocessing.sharedctypes
+        # depends on this: `Value('i', 0)` is `c_int.from_buffer(<mmap
+        # arena view>)`, and a copy here silently un-shares every
+        # `mp.Value`/`mp.Array` across processes (test_multiprocessing_*
+        # `test_waitfor` deadlocks: the child's `state.value = 0` never
+        # becomes visible to the waiting parent).
+        return source
     raise TypeError("underlying buffer is not writable")
 
 
