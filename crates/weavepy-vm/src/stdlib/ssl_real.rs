@@ -1121,7 +1121,7 @@ fn read_n(id: i64, n: usize) -> Result<Vec<u8>, RuntimeError> {
                         s.conn.wants_read()
                     );
                 }
-                buf.truncate(0);
+                buf.clear();
                 return Ok(buf);
             }
             Ok(r) => {
@@ -1138,7 +1138,7 @@ fn read_n(id: i64, n: usize) -> Result<Vec<u8>, RuntimeError> {
             if dbg {
                 eprintln!("[read_n id={id} nb={nonblocking}] !wants_read -> empty");
             }
-            buf.truncate(0);
+            buf.clear();
             return Ok(buf);
         }
         // Pull the *next single record* off the transport (GIL released) and
@@ -1157,7 +1157,7 @@ fn read_n(id: i64, n: usize) -> Result<Vec<u8>, RuntimeError> {
                 if dbg {
                     eprintln!("[read_n id={id}] read_tls Ok(0) EOF");
                 }
-                buf.truncate(0);
+                buf.clear();
                 return Ok(buf);
             }
             Ok(k) => {
@@ -1188,7 +1188,7 @@ fn read_n(id: i64, n: usize) -> Result<Vec<u8>, RuntimeError> {
                 // sees a clean close instead of crashing its event-loop thread
                 // (test_poplib STLS, where the client tears the socket down
                 // without a TLS close_notify).
-                buf.truncate(0);
+                buf.clear();
                 return Ok(buf);
             }
             Err(e) => return Err(ssl_error_rt(format!("read_tls: {e}"))),
