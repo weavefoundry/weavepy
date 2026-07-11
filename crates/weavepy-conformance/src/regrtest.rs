@@ -264,8 +264,17 @@ pub fn discover_with(
                 let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
                     continue;
                 };
-                if name.starts_with("test_") && name.to_ascii_lowercase().ends_with(".py") {
+                if !name.starts_with("test_") {
+                    continue;
+                }
+                if p.is_file() && name.to_ascii_lowercase().ends_with(".py") {
                     allowlist.insert(name.to_owned());
+                } else if p.is_dir() && p.join("__init__.py").is_file() {
+                    // Test *packages* (`test_asyncio/`, `test_json/`, …) are
+                    // scheduled under the same `<name>.py` label convention
+                    // the curated allowlist uses, so an expectations row keys
+                    // identically whether the target is a file or a package.
+                    allowlist.insert(format!("{name}.py"));
                 }
             }
         }

@@ -902,7 +902,17 @@ class _BufferedIOMixin(BufferedIOBase):
         except AttributeError:
             return "<{}.{}>".format(modname, clsname)
         else:
-            return "<{}.{} name={!r}>".format(modname, clsname, name)
+            # CPython's C implementation guards with `Py_ReprEnter`: a
+            # `name` that leads back to this object raises RuntimeError
+            # instead of recursing (test_io `test_recursive_repr`).
+            if getattr(self, "_repr_running", False):
+                raise RuntimeError(
+                    f"reentrant call inside <{modname}.{clsname}>")
+            self._repr_running = True
+            try:
+                return "<{}.{} name={!r}>".format(modname, clsname, name)
+            finally:
+                self._repr_running = False
 
     def _dealloc_warn(self, source):
         if dealloc_warn := getattr(self.raw, "_dealloc_warn", None):
@@ -1688,8 +1698,17 @@ class FileIO(RawIOBase):
             return ('<%s fd=%d mode=%r closefd=%r>' %
                     (class_name, self._fd, self.mode, self._closefd))
         else:
-            return ('<%s name=%r mode=%r closefd=%r>' %
-                    (class_name, name, self.mode, self._closefd))
+            # CPython's C `fileio_repr` guards with `Py_ReprEnter`: a
+            # `name` that leads back to this object raises RuntimeError
+            # instead of recursing (test_fileio `testRecursiveRepr`).
+            if getattr(self, "_repr_running", False):
+                raise RuntimeError(f"reentrant call inside <{class_name}>")
+            self._repr_running = True
+            try:
+                return ('<%s name=%r mode=%r closefd=%r>' %
+                        (class_name, name, self.mode, self._closefd))
+            finally:
+                self._repr_running = False
 
     def _checkReadable(self):
         if not self._readable:
@@ -2143,19 +2162,28 @@ class TextIOWrapper(TextIOBase):
     def __repr__(self):
         result = "<{}.{}".format(self.__class__.__module__,
                                  self.__class__.__qualname__)
+        # CPython's C `textiowrapper_repr` guards with `Py_ReprEnter`:
+        # a `name` leading back to this object raises RuntimeError
+        # instead of recursing (test_io `test_recursive_repr`).
+        if getattr(self, "_repr_running", False):
+            raise RuntimeError(f"reentrant call inside {result}>")
+        self._repr_running = True
         try:
-            name = self.name
-        except AttributeError:
-            pass
-        else:
-            result += " name={0!r}".format(name)
-        try:
-            mode = self.mode
-        except AttributeError:
-            pass
-        else:
-            result += " mode={0!r}".format(mode)
-        return result + " encoding={0!r}>".format(self.encoding)
+            try:
+                name = self.name
+            except AttributeError:
+                pass
+            else:
+                result += " name={0!r}".format(name)
+            try:
+                mode = self.mode
+            except AttributeError:
+                pass
+            else:
+                result += " mode={0!r}".format(mode)
+            return result + " encoding={0!r}>".format(self.encoding)
+        finally:
+            self._repr_running = False
 
     @property
     def encoding(self):

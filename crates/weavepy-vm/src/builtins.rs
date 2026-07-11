@@ -3131,10 +3131,14 @@ pub(crate) fn code_synthetic_attr(
         )),
         // First *tracked* line — synthetic preamble instructions carry
         // line 0, but CPython's co_firstlineno is 1-based (a module
-        // compiled from one line reports 1, not 0).
-        "co_firstlineno" => Some(Object::Int(i64::from(
-            c.linetable.iter().copied().find(|l| *l > 0).unwrap_or(1),
-        ))),
+        // compiled from one line reports 1, not 0). A *module* code object
+        // always reports 1 regardless of leading blank lines/comments
+        // (test_opcodes `test_setup_annotations_line`).
+        "co_firstlineno" => Some(Object::Int(if c.name == "<module>" {
+            1
+        } else {
+            i64::from(c.linetable.iter().copied().find(|l| *l > 0).unwrap_or(1))
+        })),
         "co_consts" => Some(Object::new_tuple(
             c.constants
                 .iter()
@@ -4831,6 +4835,12 @@ fn valid_float_underscores(s: &str) -> bool {
 }
 
 fn b_bool(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() > 1 {
+        return Err(type_error(format!(
+            "bool expected at most 1 argument, got {}",
+            args.len()
+        )));
+    }
     if args.is_empty() {
         return Ok(Object::Bool(false));
     }
@@ -7802,12 +7812,34 @@ fn str_result(args: &[Object], result: String) -> Object {
     }
 }
 
+/// CPython parity: enforce positional arity on native `str` methods the
+/// way the C argument clinic / `METH_NOARGS` do. `args[0]` is the
+/// receiver; `min`/`max` bound the *user-visible* argument count.
+fn str_arity(name: &str, args: &[Object], min: usize, max: usize) -> Result<(), RuntimeError> {
+    let given = args.len().saturating_sub(1);
+    if given > max {
+        return Err(type_error(if max == 0 {
+            format!("str.{name}() takes no arguments ({given} given)")
+        } else {
+            format!("{name} expected at most {max} arguments, got {given}")
+        }));
+    }
+    if given < min {
+        return Err(type_error(format!(
+            "{name} expected at least {min} arguments, got {given}"
+        )));
+    }
+    Ok(())
+}
+
 fn str_upper(args: &[Object]) -> Result<Object, RuntimeError> {
+    str_arity("upper", args, 0, 0)?;
     let up = str_self(args)?.to_uppercase();
     Ok(str_result(args, up))
 }
 
 fn str_lower(args: &[Object]) -> Result<Object, RuntimeError> {
+    str_arity("lower", args, 0, 0)?;
     let lo = str_self(args)?.to_lowercase();
     Ok(str_result(args, lo))
 }
@@ -7819,6 +7851,7 @@ fn str_lower(args: &[Object]) -> Result<Object, RuntimeError> {
 /// to `char::to_lowercase()` otherwise. Case folding is context-free
 /// (no Greek final-sigma special-casing), so a per-`char` pass is exact.
 fn str_casefold(args: &[Object]) -> Result<Object, RuntimeError> {
+    str_arity("casefold", args, 0, 0)?;
     let s = str_self(args)?;
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -8140,6 +8173,7 @@ fn casefold_char(c: char) -> Option<&'static str> {
 }
 
 fn str_strip(args: &[Object]) -> Result<Object, RuntimeError> {
+    str_arity("strip", args, 0, 1)?;
     let s = str_self(args)?;
     let out = match args.get(1) {
         None | Some(Object::None) => s.trim().to_owned(),
@@ -8197,6 +8231,7 @@ fn str_split_whitespace(s: &str, maxsplit: i64) -> Vec<Object> {
 }
 
 fn str_split(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    str_arity("split", args, 0, 2)?;
     let s = str_self(args)?;
     let sep = arg_or_kw(args, 1, kwargs, "sep");
     let maxsplit = split_maxsplit(arg_or_kw(args, 2, kwargs, "maxsplit"))?;
@@ -8277,6 +8312,7 @@ fn str_join(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn str_startswith(args: &[Object]) -> Result<Object, RuntimeError> {
+    str_arity("startswith", args, 1, 3)?;
     let s = str_self(args)?;
     // PEP 257: ``startswith`` accepts either a string *or* a tuple of strings.
     let target = match args.get(1) {
@@ -8288,6 +8324,7 @@ fn str_startswith(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn str_endswith(args: &[Object]) -> Result<Object, RuntimeError> {
+    str_arity("endswith", args, 1, 3)?;
     let s = str_self(args)?;
     let target = match args.get(1) {
         Some(obj) => obj,
@@ -8524,6 +8561,7 @@ fn byte_offset_to_char(s: &str, byte: usize) -> usize {
 }
 
 fn str_title(args: &[Object]) -> Result<Object, RuntimeError> {
+    str_arity("title", args, 0, 0)?;
     let mut out = String::new();
     let mut prev_alpha = false;
     for ch in str_self(args)?.chars() {
@@ -8543,6 +8581,7 @@ fn str_title(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn str_capitalize(args: &[Object]) -> Result<Object, RuntimeError> {
+    str_arity("capitalize", args, 0, 0)?;
     let s = str_self(args)?;
     let mut chars = s.chars();
     let out = match chars.next() {
@@ -8553,6 +8592,7 @@ fn str_capitalize(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn str_swapcase(args: &[Object]) -> Result<Object, RuntimeError> {
+    str_arity("swapcase", args, 0, 0)?;
     let mut out = String::new();
     for ch in str_self(args)?.chars() {
         if ch.is_uppercase() {
@@ -8567,6 +8607,7 @@ fn str_swapcase(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn str_lstrip(args: &[Object]) -> Result<Object, RuntimeError> {
+    str_arity("lstrip", args, 0, 1)?;
     let s = str_self(args)?;
     let out = match args.get(1) {
         None | Some(Object::None) => s.trim_start().to_owned(),
@@ -8581,6 +8622,7 @@ fn str_lstrip(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn str_rstrip(args: &[Object]) -> Result<Object, RuntimeError> {
+    str_arity("rstrip", args, 0, 1)?;
     let s = str_self(args)?;
     let out = match args.get(1) {
         None | Some(Object::None) => s.trim_end().to_owned(),
@@ -8630,6 +8672,7 @@ fn str_rsplit_whitespace(s: &str, maxsplit: i64) -> Vec<Object> {
 }
 
 fn str_rsplit(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    str_arity("rsplit", args, 0, 2)?;
     let s = str_self(args)?;
     let s = s.as_ref();
     let sep = arg_or_kw(args, 1, kwargs, "sep");
@@ -8671,6 +8714,7 @@ fn str_rsplit(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
 }
 
 fn str_splitlines(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    str_arity("splitlines", args, 0, 1)?;
     let s = str_self(args)?;
     let keepends = arg_or_kw(args, 1, kwargs, "keepends")
         .map(Object::is_truthy)
@@ -8813,6 +8857,7 @@ fn str_rpartition(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn str_isdigit(args: &[Object]) -> Result<Object, RuntimeError> {
+    str_arity("isdigit", args, 0, 0)?;
     let s = str_self(args)?;
     Ok(Object::Bool(
         !s.is_empty() && s.chars().all(crate::unicode_numeric::is_digit_char),
@@ -8820,6 +8865,7 @@ fn str_isdigit(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn str_isnumeric(args: &[Object]) -> Result<Object, RuntimeError> {
+    str_arity("isnumeric", args, 0, 0)?;
     let s = str_self(args)?;
     Ok(Object::Bool(
         !s.is_empty() && s.chars().all(crate::unicode_numeric::is_numeric_char),
@@ -8827,6 +8873,7 @@ fn str_isnumeric(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn str_isdecimal(args: &[Object]) -> Result<Object, RuntimeError> {
+    str_arity("isdecimal", args, 0, 0)?;
     let s = str_self(args)?;
     Ok(Object::Bool(
         !s.is_empty() && s.chars().all(crate::unicode_numeric::is_decimal_char),
@@ -8834,6 +8881,7 @@ fn str_isdecimal(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn str_isalpha(args: &[Object]) -> Result<Object, RuntimeError> {
+    str_arity("isalpha", args, 0, 0)?;
     let s = str_self(args)?;
     Ok(Object::Bool(
         !s.is_empty() && s.chars().all(char::is_alphabetic),
@@ -8841,6 +8889,7 @@ fn str_isalpha(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn str_isalnum(args: &[Object]) -> Result<Object, RuntimeError> {
+    str_arity("isalnum", args, 0, 0)?;
     let s = str_self(args)?;
     Ok(Object::Bool(
         !s.is_empty() && s.chars().all(char::is_alphanumeric),
@@ -8848,6 +8897,7 @@ fn str_isalnum(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn str_isspace(args: &[Object]) -> Result<Object, RuntimeError> {
+    str_arity("isspace", args, 0, 0)?;
     let s = str_self(args)?;
     Ok(Object::Bool(
         !s.is_empty() && s.chars().all(char::is_whitespace),
@@ -8855,6 +8905,7 @@ fn str_isspace(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn str_isupper(args: &[Object]) -> Result<Object, RuntimeError> {
+    str_arity("isupper", args, 0, 0)?;
     let s = str_self(args)?;
     let mut has_cased = false;
     for c in s.chars() {
@@ -8869,6 +8920,7 @@ fn str_isupper(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn str_islower(args: &[Object]) -> Result<Object, RuntimeError> {
+    str_arity("islower", args, 0, 0)?;
     let s = str_self(args)?;
     let mut has_cased = false;
     for c in s.chars() {
@@ -8888,6 +8940,7 @@ fn str_istitle(args: &[Object]) -> Result<Object, RuntimeError> {
     // (Titlecase Lt chars are treated as uppercase for the run-start test;
     // Rust's std lacks a general-category API, so uppercase covers Lu — the
     // ASCII and dominant Unicode case, matching our other `is*` helpers.)
+    str_arity("istitle", args, 0, 0)?;
     let s = str_self(args)?;
     let mut cased = false;
     let mut prev_cased = false;
@@ -8912,10 +8965,12 @@ fn str_istitle(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn str_isascii(args: &[Object]) -> Result<Object, RuntimeError> {
+    str_arity("isascii", args, 0, 0)?;
     Ok(Object::Bool(str_self(args)?.is_ascii()))
 }
 
 fn str_isidentifier(args: &[Object]) -> Result<Object, RuntimeError> {
+    str_arity("isidentifier", args, 0, 0)?;
     let s = str_self(args)?;
     let mut chars = s.chars();
     let valid = match chars.next() {
@@ -8926,6 +8981,7 @@ fn str_isidentifier(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn str_isprintable(args: &[Object]) -> Result<Object, RuntimeError> {
+    str_arity("isprintable", args, 0, 0)?;
     let s = str_self(args)?;
     Ok(Object::Bool(
         s.chars().all(crate::object::char_is_printable),
@@ -8933,6 +8989,7 @@ fn str_isprintable(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn str_zfill(args: &[Object]) -> Result<Object, RuntimeError> {
+    str_arity("zfill", args, 1, 1)?;
     let s = str_self(args)?;
     let s = s.as_ref();
     let width = match args.get(1) {
@@ -8956,10 +9013,12 @@ fn str_zfill(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn str_ljust(args: &[Object]) -> Result<Object, RuntimeError> {
+    str_arity("ljust", args, 1, 2)?;
     pad_str(args, false)
 }
 
 fn str_rjust(args: &[Object]) -> Result<Object, RuntimeError> {
+    str_arity("rjust", args, 1, 2)?;
     pad_str(args, true)
 }
 
@@ -8993,6 +9052,7 @@ fn pad_str(args: &[Object], right_align: bool) -> Result<Object, RuntimeError> {
 }
 
 fn str_center(args: &[Object]) -> Result<Object, RuntimeError> {
+    str_arity("center", args, 1, 2)?;
     let s = str_self(args)?;
     let width = match args.get(1) {
         // Negative widths are no-ops in CPython; clamp to avoid an `as usize`
@@ -9030,7 +9090,10 @@ fn str_expandtabs(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let s = str_self(args)?;
     let tabsize = match args.get(1) {
-        Some(Object::Int(i)) => *i as usize,
+        // A negative tabsize collapses tabs to zero columns in CPython
+        // (`'x\ty'.expandtabs(-1) == 'xy'`); clamp so the `as usize` cast
+        // can't wrap into a gigantic pad allocation.
+        Some(Object::Int(i)) => (*i).max(0) as usize,
         None => 8,
         _ => return Err(type_error("expandtabs() expected int")),
     };

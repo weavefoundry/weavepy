@@ -1069,15 +1069,93 @@ def register_error(name, handler):
     _ERROR_HANDLERS[name] = handler
 
 
+def strict_errors(exc):
+    """CPython built-in ``strict`` handler: re-raise."""
+    raise exc
+
+
+def ignore_errors(exc):
+    """CPython built-in ``ignore`` handler: drop the offending range."""
+    if isinstance(exc, (UnicodeEncodeError, UnicodeDecodeError,
+                        UnicodeTranslateError)):
+        return ("", exc.end)
+    raise TypeError(f"don't know how to handle {type(exc).__name__} in error callback")
+
+
+def replace_errors(exc):
+    """CPython built-in ``replace`` handler: '?' on encode, U+FFFD on decode."""
+    if isinstance(exc, UnicodeEncodeError):
+        return ("?" * (exc.end - exc.start), exc.end)
+    if isinstance(exc, (UnicodeDecodeError, UnicodeTranslateError)):
+        return ("\ufffd" * (exc.end - exc.start), exc.end)
+    raise TypeError(f"don't know how to handle {type(exc).__name__} in error callback")
+
+
+def backslashreplace_errors(exc):
+    """CPython built-in ``backslashreplace`` handler (encode *and* decode)."""
+    if isinstance(exc, UnicodeDecodeError):
+        return ("".join(f"\\x{b:02x}" for b in exc.object[exc.start:exc.end]),
+                exc.end)
+    if isinstance(exc, (UnicodeEncodeError, UnicodeTranslateError)):
+        parts = []
+        for ch in exc.object[exc.start:exc.end]:
+            cp = ord(ch)
+            if cp < 0x100:
+                parts.append(f"\\x{cp:02x}")
+            elif cp < 0x10000:
+                parts.append(f"\\u{cp:04x}")
+            else:
+                parts.append(f"\\U{cp:08x}")
+        return ("".join(parts), exc.end)
+    raise TypeError(f"don't know how to handle {type(exc).__name__} in error callback")
+
+
+def xmlcharrefreplace_errors(exc):
+    """CPython built-in ``xmlcharrefreplace`` handler (encode only)."""
+    if isinstance(exc, UnicodeEncodeError):
+        return ("".join(f"&#{ord(ch)};" for ch in exc.object[exc.start:exc.end]),
+                exc.end)
+    raise TypeError(f"don't know how to handle {type(exc).__name__} in error callback")
+
+
+def namereplace_errors(exc):
+    """CPython built-in ``namereplace`` handler (encode only)."""
+    if isinstance(exc, UnicodeEncodeError):
+        import unicodedata
+        parts = []
+        for ch in exc.object[exc.start:exc.end]:
+            try:
+                parts.append("\\N{%s}" % unicodedata.name(ch))
+            except (KeyError, ValueError):
+                cp = ord(ch)
+                if cp < 0x100:
+                    parts.append(f"\\x{cp:02x}")
+                elif cp < 0x10000:
+                    parts.append(f"\\u{cp:04x}")
+                else:
+                    parts.append(f"\\U{cp:08x}")
+        return ("".join(parts), exc.end)
+    raise TypeError(f"don't know how to handle {type(exc).__name__} in error callback")
+
+
+_BUILTIN_ERROR_HANDLERS = {
+    "strict": strict_errors,
+    "ignore": ignore_errors,
+    "replace": replace_errors,
+    "backslashreplace": backslashreplace_errors,
+    "xmlcharrefreplace": xmlcharrefreplace_errors,
+    "namereplace": namereplace_errors,
+}
+
+
 def lookup_error(name):
     if name in _ERROR_HANDLERS:
         return _ERROR_HANDLERS[name]
-    if name in {"strict", "ignore", "replace", "backslashreplace",
-                "namereplace", "xmlcharrefreplace", "surrogateescape",
-                "surrogatepass"}:
-        # Built-in handlers are implemented in `_codecs`. We hand
-        # back a passthrough sentinel since the user call-back path
-        # is only used for *explicit* lookup_error() invocations.
+    if name in _BUILTIN_ERROR_HANDLERS:
+        return _BUILTIN_ERROR_HANDLERS[name]
+    if name in {"surrogateescape", "surrogatepass"}:
+        # These need codec-internal state; the native codec paths
+        # implement them, so an explicit lookup gets a passthrough.
         def passthrough(exc):  # noqa
             raise exc
         return passthrough
@@ -1354,6 +1432,9 @@ __all__ = [
     "BOM_UTF32", "BOM_UTF32_BE", "BOM_UTF32_LE", "BOM_BE", "BOM_LE",
     "encode", "decode", "lookup", "register", "unregister",
     "register_error", "lookup_error", "CodecInfo",
+    "strict_errors", "ignore_errors", "replace_errors",
+    "backslashreplace_errors", "xmlcharrefreplace_errors",
+    "namereplace_errors",
     "getencoder", "getdecoder", "getincrementalencoder",
     "getincrementaldecoder", "getreader", "getwriter",
     "iterencode", "iterdecode",

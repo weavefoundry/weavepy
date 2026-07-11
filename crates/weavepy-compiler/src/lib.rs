@@ -1094,6 +1094,15 @@ impl Compiler {
     fn compile_module_body(&mut self, module: &Module) -> Result<(), CompileError> {
         self.analyze_scope_module(module);
         self.emit(OpCode::Resume, 0);
+        // CPython's symtable marks a module block containing any annotated
+        // statement (at the block's own level) and the compiler emits
+        // SETUP_ANNOTATIONS as its first real instruction — code preceding
+        // the first annotation can already read `__annotations__`
+        // (ann_module.py does `__annotations__[1] = 2` at module top).
+        if block_has_annotations(&module.body) {
+            self.emit(OpCode::SetupAnnotations, 0);
+            self.annotations_initialized = true;
+        }
         for stmt in &module.body {
             self.compile_stmt(stmt)?;
         }
@@ -2687,6 +2696,15 @@ impl Compiler {
             let doc_name = inner.co.intern_name("__doc__");
             inner.emit(OpCode::LoadConst, doc_const);
             inner.emit(OpCode::StoreName, doc_name);
+        }
+
+        // SETUP_ANNOTATIONS before the first body statement when the class
+        // block contains an annotated statement at its own level (CPython
+        // symtable `ste_annotations_used`), so a read of `__annotations__`
+        // preceding the first annotation sees the dict.
+        if block_has_annotations(body) {
+            inner.emit(OpCode::SetupAnnotations, 0);
+            inner.annotations_initialized = true;
         }
 
         for s in body {
@@ -6168,6 +6186,43 @@ fn collect_self_attr_stores(stmts: &[Stmt], self_name: &str, out: &mut HashSet<S
             _ => {}
         }
     }
+}
+
+/// Does this block contain an annotated statement *at its own scope level*?
+/// Mirrors CPython's symtable `ste_annotations_used`: `AnnAssign` anywhere
+/// in the block — including inside `if`/`for`/`while`/`with`/`try`/`match`
+/// bodies — counts, but nested function/class scopes do not (they set up
+/// their own annotations).
+fn block_has_annotations(body: &[Stmt]) -> bool {
+    fn stmt_has(s: &Stmt) -> bool {
+        match &s.kind {
+            StmtKind::AnnAssign { .. } => true,
+            StmtKind::If { body, orelse, .. } | StmtKind::While { body, orelse, .. } => {
+                block_has_annotations(body) || block_has_annotations(orelse)
+            }
+            StmtKind::For { body, orelse, .. } | StmtKind::AsyncFor { body, orelse, .. } => {
+                block_has_annotations(body) || block_has_annotations(orelse)
+            }
+            StmtKind::With { body, .. } | StmtKind::AsyncWith { body, .. } => {
+                block_has_annotations(body)
+            }
+            StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+                ..
+            } => {
+                block_has_annotations(body)
+                    || block_has_annotations(orelse)
+                    || block_has_annotations(finalbody)
+                    || handlers.iter().any(|h| block_has_annotations(&h.body))
+            }
+            StmtKind::Match { cases, .. } => cases.iter().any(|c| block_has_annotations(&c.body)),
+            _ => false,
+        }
+    }
+    body.iter().any(stmt_has)
 }
 
 fn collect_assigned(stmt: &Stmt, out: &mut HashSet<String>) {

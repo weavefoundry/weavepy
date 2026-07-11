@@ -318,6 +318,13 @@ pub enum OpCode {
     /// (which is left at TOS for further updates). Used for `{**d}`
     /// dict-literal spreads.
     DictUpdate,
+    /// CPython `SETUP_ANNOTATIONS`: bind `__annotations__` to a fresh
+    /// empty dict in the current scope *unless it is already bound*.
+    /// Emitted once at the top of any module/class body that contains
+    /// an annotated statement, so code preceding the first annotation
+    /// can already read `__annotations__` (ann_module.py does
+    /// `__annotations__[1] = 2` at module top).
+    SetupAnnotations,
 
     // Functions / closures
     /// Build a function object from the code object on TOS.
@@ -536,6 +543,7 @@ impl OpCode {
             OpCode::UnpackSequence => "UNPACK_SEQUENCE",
             OpCode::UnpackEx => "UNPACK_EX",
             OpCode::DictUpdate => "DICT_UPDATE",
+            OpCode::SetupAnnotations => "SETUP_ANNOTATIONS",
             OpCode::MakeFunction => "MAKE_FUNCTION",
             OpCode::BuildSlice => "BUILD_SLICE",
             OpCode::LoadBuildClass => "LOAD_BUILD_CLASS",

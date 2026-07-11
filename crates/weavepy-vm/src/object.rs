@@ -3529,10 +3529,22 @@ impl PyFile {
             IoKind::BytesIO => format!("<_io.BytesIO object at 0x{self_addr:x}>"),
             IoKind::StringIO => format!("<_io.StringIO object at 0x{self_addr:x}>"),
             kind => {
+                // CPython's `fileio_repr`/`textiowrapper_repr` guard the
+                // `name` render with `Py_ReprEnter`: a `name` that leads back
+                // to this stream raises RuntimeError instead of recursing
+                // (test_fileio `testRecursiveRepr`). Infallible context, so
+                // the error is parked for the fallible repr boundary.
+                if !repr_enter(self_addr) {
+                    stash_repr_error(crate::error::runtime_error(
+                        "reentrant call inside _io stream __repr__".to_owned(),
+                    ));
+                    return "<...>".to_owned();
+                }
                 let name = self
                     .name_obj()
                     .map(|o| o.repr())
                     .unwrap_or_else(|| format!("'{}'", self.name));
+                repr_leave();
                 match kind {
                     IoKind::Raw => format!(
                         "<_io.FileIO name={} mode='{}' closefd={}>",
@@ -6366,6 +6378,11 @@ impl Object {
             (Object::Complex(c), Object::Long(b)) | (Object::Long(b), Object::Complex(c)) => {
                 c.imag == 0.0 && bigint_eq_f64(b, c.real)
             }
+            // `complex_richcompare` folds bools through the numeric tower:
+            // `0j == False` and `1+0j == True` (test_bool `test_complex`).
+            (Object::Complex(c), Object::Bool(b)) | (Object::Bool(b), Object::Complex(c)) => {
+                c.imag == 0.0 && c.real == f64::from(u8::from(*b))
+            }
             (Object::Str(a), Object::Str(b)) => a == b,
             // Two surrogate-bearing strings compare code-point-wise. A `WStr`
             // never equals a plain `Str`: the invariant guarantees a `WStr`
@@ -6512,11 +6529,16 @@ impl Object {
                     la == 1 || a.step == b.step
                 }
             }
+            // Code objects compare *by value* in CPython (`code_richcompare`
+            // walks name/bytecode/consts/names/…): `compile(s) ==
+            // compile(s)` is True (test_codeop compares `compile_command`
+            // output against a fresh `compile`).
+            (Object::Code(a), Object::Code(b)) => Rc::ptr_eq(a, b) || code_value_eq(a, b),
             // CPython's default `tp_richcompare` (no user `__eq__`) falls
             // back to *identity*: `x == x` is True and `x == y` is False
             // for distinct objects. This covers reference types without
             // value semantics — frames, generators, tracebacks, cells,
-            // code objects, … — where `bdb`/`pdb` rely on `frame ==
+            // … — where `bdb`/`pdb` rely on `frame ==
             // self.returnframe`. Returning a flat `false` here would make
             // even `frame == frame` False.
             _ => self.is_same(other),
@@ -7435,6 +7457,13 @@ impl Object {
                 format!("mappingproxy({body})")
             }
             Object::DictView(v) => {
+                // CPython `dictview_repr` guards with `Py_ReprEnter`: a view
+                // over a dict that contains the view renders `...` instead of
+                // recursing (test_dictviews `test_recursive_repr`).
+                let id = Rc::as_ptr(v).cast::<()>() as usize;
+                if !repr_enter(id) {
+                    return "...".to_owned();
+                }
                 let d = v.dict.borrow();
                 let body: Vec<String> = match v.kind {
                     DictViewKind::Keys => d.keys().map(|k| k.0.repr()).collect(),
@@ -7444,6 +7473,7 @@ impl Object {
                         .map(|(k, v)| format!("({}, {})", k.0.repr(), v.repr()))
                         .collect(),
                 };
+                repr_leave();
                 format!("{}([{}])", v.kind.type_name(), body.join(", "))
             }
             Object::LazyIter(l) => {
@@ -7581,6 +7611,41 @@ impl Object {
 
 fn sets_equal(a: &SetData, b: &SetData) -> bool {
     a.len() == b.len() && a.iter().all(|k| b.contains(k))
+}
+
+/// CPython `code_richcompare`: two code objects are equal when their
+/// semantic surface matches — name, arities, flags-ish shape, bytecode,
+/// constants (recursively, code constants use this same comparison),
+/// and the name tables. Deliberately *excludes* line/column tables,
+/// filename, and the interior-mutable inline-cache table (CPython
+/// ignores `co_linetable` too, and warmed caches must not make an
+/// executed code object unequal to a fresh compile of the same source).
+fn code_value_eq(a: &CodeObject, b: &CodeObject) -> bool {
+    use weavepy_compiler::Constant;
+    fn const_eq(x: &Constant, y: &Constant) -> bool {
+        match (x, y) {
+            (Constant::Code(cx), Constant::Code(cy)) => code_value_eq(cx, cy),
+            _ => x == y,
+        }
+    }
+    a.name == b.name
+        && a.qualname == b.qualname
+        && a.arg_count == b.arg_count
+        && a.posonly_count == b.posonly_count
+        && a.kwonly_count == b.kwonly_count
+        && a.has_varargs == b.has_varargs
+        && a.has_varkeywords == b.has_varkeywords
+        && a.is_generator == b.is_generator
+        && a.instructions == b.instructions
+        && a.names == b.names
+        && a.varnames == b.varnames
+        && a.freevars == b.freevars
+        && a.cellvars == b.cellvars
+        && a.constants.len() == b.constants.len()
+        && a.constants
+            .iter()
+            .zip(b.constants.iter())
+            .all(|(x, y)| const_eq(x, y))
 }
 
 /// Substring test over code-point sequences (the WTF-8 analogue of

@@ -3940,11 +3940,46 @@ fn install_value_type_new(bt: &BuiltinTypes) {
         &bt.set_,
         &bt.frozenset_,
     ] {
+        // `int.__new__` carries its owner so the `tp_new_wrapper` safety
+        // check can reject `int.__new__(bool, 0)` (bool's tp_new differs
+        // from int's in CPython) while `bool.__new__(bool, 0)` still works.
+        let wrapper = if Rc::ptr_eq(ty, &bt.int_) {
+            make_owned_new("int")
+        } else {
+            make_default_new()
+        };
         ty.dict
             .borrow_mut()
-            .insert(DictKey(Object::from_static("__new__")), make_default_new());
+            .insert(DictKey(Object::from_static("__new__")), wrapper);
     }
     install_mutable_container_init(bt);
+}
+
+/// Like [`make_default_new`], but the wrapper knows which built-in type it
+/// was installed on, mirroring CPython's `tp_new_wrapper` "staticbase"
+/// check: calling `A.__new__(B, …)` when `B` overrides `A`'s `tp_new`
+/// raises "A.__new__(B) is not safe, use B.__new__()". Only the
+/// `int`/`bool` pair matters among WeavePy's built-ins (bool is the one
+/// built-in subclass with its own constructor semantics).
+fn make_owned_new(owner: &'static str) -> Object {
+    use crate::object::BuiltinFn;
+    Object::StaticMethod(MethodWrapper::new(Object::Builtin(Rc::new(BuiltinFn {
+        name: "__new__",
+        binds_instance: true,
+        call: Box::new(move |args| {
+            if owner == "int" {
+                if let Some(Object::Type(cls)) = args.first() {
+                    if cls.flags.is_builtin && cls.name == "bool" {
+                        return Err(crate::error::type_error(
+                            "int.__new__(bool) is not safe, use bool.__new__()".to_owned(),
+                        ));
+                    }
+                }
+            }
+            object_new(args)
+        }),
+        call_kw: None,
+    }))))
 }
 
 /// The mutable containers own a real `tp_init` in CPython: `dict.__init__`

@@ -87,6 +87,7 @@ pub mod op {
     pub const DELETE_GLOBAL: u8 = 66;
     pub const DELETE_NAME: u8 = 67;
     pub const DICT_UPDATE: u8 = 69;
+    pub const SETUP_ANNOTATIONS: u8 = 37;
     pub const EXTENDED_ARG: u8 = 71;
     pub const FOR_ITER: u8 = 72;
     pub const GET_AWAITABLE: u8 = 73;
@@ -304,6 +305,7 @@ fn map_to_cpython(ins: Instruction, nlocals: u32) -> MappedOp {
         O::UnpackSequence => (op::UNPACK_SEQUENCE, ins.arg),
         O::UnpackEx => (op::UNPACK_EX, ins.arg),
         O::DictUpdate => (op::DICT_UPDATE, ins.arg),
+        O::SetupAnnotations => (op::SETUP_ANNOTATIONS, 0),
         O::MakeFunction => (op::MAKE_FUNCTION, ins.arg),
         O::BuildSlice => (op::BUILD_SLICE, ins.arg),
         O::LoadBuildClass => (op::LOAD_BUILD_CLASS, 0),
@@ -493,7 +495,15 @@ pub fn encode(code: &CodeObject) -> CpythonCode {
     let mut co_code: Vec<u8> = Vec::with_capacity(starts[n] * 2);
     let mut positions: Vec<Position> = Vec::with_capacity(starts[n]);
     let mut inst_offsets: Vec<u32> = Vec::with_capacity(n);
-    let firstlineno = code.linetable.first().copied().unwrap_or(1);
+    // A module code object always reports `co_firstlineno == 1` in CPython
+    // regardless of where its first statement sits (leading blank lines,
+    // comments — test_opcodes `test_setup_annotations_line`). Other code
+    // objects start at their first instruction's line.
+    let firstlineno = if code.name == "<module>" {
+        1
+    } else {
+        code.linetable.first().copied().unwrap_or(1)
+    };
     for i in 0..n {
         let line = code.linetable.get(i).copied().unwrap_or(firstlineno) as i32;
         // PEP-657 columns, when the compiler tracked them for this
@@ -1072,6 +1082,7 @@ fn map_from_cpython(cp_op: u8, arg: u32, nlocals: u32) -> Option<(OpCode, u32)> 
         op::BUILD_TUPLE => (O::BuildTuple, arg),
         op::BUILD_SET => (O::BuildSet, arg),
         op::BUILD_MAP => (O::BuildMap, arg),
+        op::SETUP_ANNOTATIONS => (O::SetupAnnotations, 0),
         op::BUILD_STRING => (O::BuildString, arg),
         op::LIST_APPEND => (O::ListAppend, arg),
         op::SET_ADD => (O::SetAdd, arg),
