@@ -7,7 +7,13 @@
 //! reports the `LC_CTYPE` codeset. Strings coming back from libc are
 //! decoded with `mbstowcs` under the current `LC_CTYPE`, mirroring
 //! CPython's `PyUnicode_DecodeLocale`.
+//!
+//! On non-Unix hosts (Windows) the langinfo surface doesn't exist, so
+//! we fall back to the pre-RFC-0050 C-locale shim: `setlocale` accepts
+//! only `C`/`POSIX`, `localeconv` serves POSIX defaults, and the
+//! codeset is always UTF-8.
 
+#[cfg(unix)]
 use std::ffi::{CStr, CString};
 
 use crate::sync::Rc;
@@ -18,6 +24,7 @@ use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
 
 // Wide-char/multibyte libc entry points the `libc` crate doesn't bind.
+#[cfg(unix)]
 unsafe extern "C" {
     fn mbstowcs(
         dest: *mut libc::wchar_t,
@@ -34,19 +41,44 @@ unsafe extern "C" {
 
 // Category constants — the host libc's values (CPython exports these
 // verbatim from `locale.h`).
+#[cfg(unix)]
 pub const LC_ALL: i64 = libc::LC_ALL as i64;
+#[cfg(unix)]
 pub const LC_CTYPE: i64 = libc::LC_CTYPE as i64;
+#[cfg(unix)]
 pub const LC_NUMERIC: i64 = libc::LC_NUMERIC as i64;
+#[cfg(unix)]
 pub const LC_TIME: i64 = libc::LC_TIME as i64;
+#[cfg(unix)]
 pub const LC_COLLATE: i64 = libc::LC_COLLATE as i64;
+#[cfg(unix)]
 pub const LC_MONETARY: i64 = libc::LC_MONETARY as i64;
+#[cfg(unix)]
 pub const LC_MESSAGES: i64 = libc::LC_MESSAGES as i64;
+
+// Non-Unix fallback: the POSIX-ish values the pre-RFC-0050 shim used.
+#[cfg(not(unix))]
+pub const LC_ALL: i64 = 6;
+#[cfg(not(unix))]
+pub const LC_CTYPE: i64 = 0;
+#[cfg(not(unix))]
+pub const LC_NUMERIC: i64 = 1;
+#[cfg(not(unix))]
+pub const LC_TIME: i64 = 2;
+#[cfg(not(unix))]
+pub const LC_COLLATE: i64 = 3;
+#[cfg(not(unix))]
+pub const LC_MONETARY: i64 = 4;
+#[cfg(not(unix))]
+pub const LC_MESSAGES: i64 = 5;
+
 pub const CHAR_MAX: i64 = 127;
 
 /// `setlocale(LC_CTYPE, "")` — adopt the environment's `LC_CTYPE` locale,
 /// as CPython's pre-init does (`_Py_SetLocaleFromEnv`). Called once at
 /// interpreter start so `nl_langinfo(CODESET)`/`localeconv` and the
 /// `locale` module observe the user's locale rather than plain `"C"`.
+#[cfg(unix)]
 pub fn init_from_env() {
     let empty = CString::new("").expect("static");
     // SAFETY: `setlocale` with a valid category and NUL-terminated string.
@@ -54,6 +86,10 @@ pub fn init_from_env() {
         libc::setlocale(libc::LC_CTYPE, empty.as_ptr());
     }
 }
+
+/// Non-Unix: nothing to adopt — the shim always serves the C locale.
+#[cfg(not(unix))]
+pub fn init_from_env() {}
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     let dict = Rc::new(RefCell::new(DictData::default()));
@@ -76,7 +112,9 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             d.insert(DictKey(Object::from_static(name)), Object::Int(val));
         }
         // `nl_langinfo` item constants (langinfo.h). Grouped exactly like
-        // CPython's `langinfo_constants` table.
+        // CPython's `langinfo_constants` table. Windows has no langinfo.h,
+        // matching CPython's `_locale` there.
+        #[cfg(unix)]
         for &(name, val) in langinfo_constants() {
             d.insert(DictKey(Object::from_static(name)), Object::Int(val));
         }
@@ -100,6 +138,8 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("strxfrm")),
             builtin("strxfrm", l_strxfrm),
         );
+        // Windows CPython's `_locale` has no `nl_langinfo`; mirror that.
+        #[cfg(unix)]
         d.insert(
             DictKey(Object::from_static("nl_langinfo")),
             builtin("nl_langinfo", l_nl_langinfo),
@@ -128,6 +168,7 @@ fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeErro
 /// Decode a libc C string under the current `LC_CTYPE` locale, mirroring
 /// CPython's `PyUnicode_DecodeLocale`: `mbstowcs` first, with a Latin-1
 /// byte-for-byte fallback for undecodable content.
+#[cfg(unix)]
 fn decode_locale_cstr(ptr: *const libc::c_char) -> String {
     if ptr.is_null() {
         return String::new();
@@ -159,6 +200,7 @@ fn decode_locale_cstr(ptr: *const libc::c_char) -> String {
     bytes.iter().map(|&b| b as char).collect()
 }
 
+#[cfg(unix)]
 fn arg_category(args: &[Object], fname: &str) -> Result<libc::c_int, RuntimeError> {
     let cat = match args.first() {
         Some(Object::Int(n)) => *n,
@@ -183,6 +225,7 @@ fn arg_category(args: &[Object], fname: &str) -> Result<libc::c_int, RuntimeErro
     Ok(cat as libc::c_int)
 }
 
+#[cfg(unix)]
 fn l_setlocale(args: &[Object]) -> Result<Object, RuntimeError> {
     let category = arg_category(args, "setlocale")?;
     match args.get(1) {
@@ -213,6 +256,7 @@ fn l_setlocale(args: &[Object]) -> Result<Object, RuntimeError> {
 
 /// CPython's `copy_grouping`: the lconv grouping byte string becomes a list
 /// of ints, keeping a trailing `CHAR_MAX` terminator and stopping there.
+#[cfg(unix)]
 fn copy_grouping(ptr: *const libc::c_char) -> Object {
     if ptr.is_null() {
         return Object::new_list(vec![]);
@@ -229,6 +273,7 @@ fn copy_grouping(ptr: *const libc::c_char) -> Object {
     Object::new_list(out)
 }
 
+#[cfg(unix)]
 fn l_localeconv(_args: &[Object]) -> Result<Object, RuntimeError> {
     let mut d = DictData::default();
     // SAFETY: `localeconv` returns a pointer to static libc storage, valid
@@ -270,6 +315,7 @@ fn l_localeconv(_args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 /// A NUL-terminated wide-char copy of `s` for `wcscoll`/`wcsxfrm`.
+#[cfg(unix)]
 fn to_wide(s: &str) -> Vec<libc::wchar_t> {
     let mut v: Vec<libc::wchar_t> = s.chars().map(|c| c as u32 as libc::wchar_t).collect();
     v.push(0);
@@ -285,6 +331,7 @@ fn arg_str(args: &[Object], idx: usize, fname: &str) -> Result<String, RuntimeEr
     }
 }
 
+#[cfg(unix)]
 fn l_strcoll(args: &[Object]) -> Result<Object, RuntimeError> {
     let a = to_wide(&arg_str(args, 0, "strcoll")?);
     let b = to_wide(&arg_str(args, 1, "strcoll")?);
@@ -293,6 +340,7 @@ fn l_strcoll(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Int(i64::from(r)))
 }
 
+#[cfg(unix)]
 fn l_strxfrm(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = arg_str(args, 0, "strxfrm")?;
     let src = to_wide(&s);
@@ -317,6 +365,7 @@ fn l_strxfrm(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
+#[cfg(unix)]
 fn l_nl_langinfo(args: &[Object]) -> Result<Object, RuntimeError> {
     let item = match args.first() {
         Some(Object::Int(n)) => *n,
@@ -337,6 +386,7 @@ fn l_nl_langinfo(args: &[Object]) -> Result<Object, RuntimeError> {
 /// The current `LC_CTYPE` codeset (`nl_langinfo(CODESET)`), with the
 /// UTF-8 fallback CPython's `_Py_GetLocaleEncoding` applies when the
 /// codeset is empty.
+#[cfg(unix)]
 pub fn current_codeset() -> String {
     // SAFETY: CODESET is a valid langinfo item on all supported hosts.
     let ptr = unsafe { libc::nl_langinfo(libc::CODESET) };
@@ -348,6 +398,12 @@ pub fn current_codeset() -> String {
     }
 }
 
+/// Non-Unix: no langinfo — the shim's codeset is always UTF-8.
+#[cfg(not(unix))]
+pub fn current_codeset() -> String {
+    "UTF-8".to_owned()
+}
+
 /// `_locale.getencoding()` — the current `LC_CTYPE` codeset.
 fn l_getencoding(_args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::from_str(current_codeset()))
@@ -355,6 +411,7 @@ fn l_getencoding(_args: &[Object]) -> Result<Object, RuntimeError> {
 
 /// The `nl_langinfo` item constants exported on this platform, mirroring
 /// CPython's `langinfo_constants` table in `_localemodule.c`.
+#[cfg(unix)]
 fn langinfo_constants() -> &'static [(&'static str, i64)] {
     static CONSTANTS: std::sync::OnceLock<Vec<(&'static str, i64)>> = std::sync::OnceLock::new();
     CONSTANTS
@@ -418,4 +475,78 @@ fn langinfo_constants() -> &'static [(&'static str, i64)] {
             ]
         })
         .as_slice()
+}
+
+// ---------------------------------------------------------------------------
+// Non-Unix fallbacks — the pre-RFC-0050 C-locale shim, kept so the module
+// builds on hosts without POSIX locale APIs (Windows).
+// ---------------------------------------------------------------------------
+
+#[cfg(not(unix))]
+fn l_setlocale(args: &[Object]) -> Result<Object, RuntimeError> {
+    let loc = match args.get(1) {
+        Some(Object::Str(s)) => s.to_string(),
+        Some(Object::None) | None => "C".to_owned(),
+        _ => {
+            return Err(crate::error::type_error(
+                "setlocale: locale must be str or None",
+            ))
+        }
+    };
+    if loc == "C" || loc == "POSIX" || loc.is_empty() {
+        return Ok(Object::from_static("C"));
+    }
+    Err(value_error("unsupported locale setting"))
+}
+
+#[cfg(not(unix))]
+fn l_localeconv(_args: &[Object]) -> Result<Object, RuntimeError> {
+    let mut d = DictData::default();
+    let mut ins = |k: &'static str, v: Object| {
+        d.insert(DictKey(Object::from_static(k)), v);
+    };
+    for k in [
+        "thousands_sep",
+        "int_curr_symbol",
+        "currency_symbol",
+        "mon_decimal_point",
+        "mon_thousands_sep",
+        "positive_sign",
+        "negative_sign",
+    ] {
+        ins(k, Object::from_static(""));
+    }
+    ins("decimal_point", Object::from_static("."));
+    ins("grouping", Object::new_list(vec![]));
+    ins("mon_grouping", Object::new_list(vec![]));
+    for k in [
+        "int_frac_digits",
+        "frac_digits",
+        "p_cs_precedes",
+        "p_sep_by_space",
+        "n_cs_precedes",
+        "n_sep_by_space",
+        "p_sign_posn",
+        "n_sign_posn",
+    ] {
+        ins(k, Object::Int(CHAR_MAX));
+    }
+    Ok(Object::Dict(Rc::new(RefCell::new(d))))
+}
+
+#[cfg(not(unix))]
+fn l_strcoll(args: &[Object]) -> Result<Object, RuntimeError> {
+    let a = arg_str(args, 0, "strcoll")?;
+    let b = arg_str(args, 1, "strcoll")?;
+    use std::cmp::Ordering;
+    Ok(Object::Int(match a.cmp(&b) {
+        Ordering::Less => -1,
+        Ordering::Equal => 0,
+        Ordering::Greater => 1,
+    }))
+}
+
+#[cfg(not(unix))]
+fn l_strxfrm(args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::from_str(arg_str(args, 0, "strxfrm")?))
 }
