@@ -36,6 +36,7 @@ pub mod frozen_code_cache;
 pub mod gc_trace;
 pub mod gil;
 pub mod import;
+pub mod linejump;
 pub mod object;
 pub mod proc_init;
 pub mod pycache;
@@ -51,6 +52,7 @@ mod tier2;
 pub mod trace;
 pub mod type_surface;
 pub mod types;
+pub mod unicode_case;
 pub mod unicode_numeric;
 pub mod vm_singletons;
 pub mod weakref_registry;
@@ -183,6 +185,33 @@ impl Frame {
     }
 }
 
+/// Scoped marker for "this frame is dispatching trace event X" (RFC
+/// 0050): CPython's `frame_setlineno` only permits jumps from specific
+/// events, so `fire_*_event` wraps its callback invocation in one of
+/// these and the `f_lineno` setter consults `PyFrame::trace_event`.
+/// Restores the previous event on drop so nested events (a trace
+/// callback that itself triggers tracing) unwind correctly.
+struct TraceEventGuard {
+    frame: Rc<PyFrame>,
+    prev: crate::linejump::TraceEvent,
+}
+
+impl TraceEventGuard {
+    fn new(frame: &Rc<PyFrame>, event: crate::linejump::TraceEvent) -> Self {
+        let prev = frame.trace_event.replace(event);
+        Self {
+            frame: frame.clone(),
+            prev,
+        }
+    }
+}
+
+impl Drop for TraceEventGuard {
+    fn drop(&mut self) {
+        self.frame.trace_event.set(self.prev);
+    }
+}
+
 /// Cycle-GC traversal hook for generator-family objects: walk the
 /// suspended frame's locals, evaluation stack, and cells so cycles
 /// running through a generator frame (`g.send(g)`) are detectable.
@@ -300,6 +329,62 @@ pub fn jit_stats_markdown() -> Option<String> {
     }
 }
 
+/// RFC 0050 — the process argv, decoded the way CPython's
+/// `Py_DecodeLocale` does under UTF-8 mode: each `OsString` is decoded
+/// as UTF-8 with `surrogateescape`, so undecodable bytes become lone
+/// surrogates (U+DC80..U+DCFF) instead of panicking (`std::env::args()`
+/// unwraps and aborts on non-UTF-8 argv — bpo-35883's exact scenario).
+///
+/// Because the CLI plumbs argv through plain `String`s (clap, argv
+/// splitting), lone surrogates are carried in the plane-16 PUA bridge
+/// window (`builtins::BRIDGE_BASE`); [`Interpreter::set_argv`] maps
+/// them back to real surrogate code points when materialising
+/// `sys.argv`, and byte-oriented consumers (script open, `os.fsencode`)
+/// can recover the original bytes via [`bridged_arg_bytes`].
+#[must_use]
+pub fn os_args_bridged() -> Vec<String> {
+    std::env::args_os()
+        .map(|arg| match arg.into_string() {
+            Ok(s) => s,
+            Err(os) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::ffi::OsStrExt;
+                    let obj = crate::stdlib::codecs_mod::decode_bytes_obj(
+                        os.as_bytes(),
+                        "utf-8",
+                        "surrogateescape",
+                    )
+                    .unwrap_or_else(|_| Object::from_str(os.to_string_lossy().into_owned()));
+                    match obj {
+                        Object::WStr(cps) => crate::builtins::bridge_encode_cps(&cps),
+                        other => other.to_str(),
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    os.to_string_lossy().into_owned()
+                }
+            }
+        })
+        .collect()
+}
+
+/// The OS-level bytes of a (possibly PUA-bridged) argv string: the
+/// inverse of [`os_args_bridged`] for one element, used when an argv
+/// value names a real filesystem object (the script path).
+#[must_use]
+pub fn bridged_arg_bytes(arg: &str) -> Vec<u8> {
+    let obj = crate::builtins::bridge_to_object(arg);
+    match &obj {
+        Object::WStr(_) | Object::Str(_) => {
+            crate::stdlib::codecs_mod::encode_obj(&obj, "utf-8", "surrogateescape")
+                .unwrap_or_else(|_| arg.as_bytes().to_vec())
+        }
+        _ => arg.as_bytes().to_vec(),
+    }
+}
+
 // ---------- interpreter ----------
 
 /// Output sink. Either the process's stdout or a `Vec<u8>` for
@@ -340,6 +425,39 @@ pub struct InterpreterFlags {
     /// The `errors` half of `PYTHONIOENCODING`. `None` keeps each stream's
     /// default handler (`strict`).
     pub io_errors: Option<String>,
+    /// `PYTHONUTF8=0|1` (PEP 540), already filtered for `-E`/`-I` by the
+    /// CLI. `-X utf8[=0|1]` has priority; when both are absent the mode
+    /// falls back to the locale-based default (`C`/`POSIX` → on).
+    pub utf8_mode: Option<u8>,
+}
+
+/// The effective `LC_CTYPE` locale name, resolved the way `setlocale(LC_CTYPE,
+/// "")` does from the environment: `LC_ALL` beats `LC_CTYPE` beats `LANG`,
+/// and an unset/empty chain means the `C` locale.
+fn effective_ctype_locale() -> String {
+    for var in ["LC_ALL", "LC_CTYPE", "LANG"] {
+        if let Ok(v) = std::env::var(var) {
+            if !v.is_empty() {
+                return v;
+            }
+        }
+    }
+    "C".to_owned()
+}
+
+/// PEP 540: the `C`/`POSIX` locale turns UTF-8 mode on by default.
+fn posix_ctype_locale() -> bool {
+    matches!(effective_ctype_locale().as_str(), "C" | "POSIX")
+}
+
+/// PEP 538: under the C locale — or one of its UTF-8 coercion targets —
+/// CPython defaults the stdin/stdout error handler to `surrogateescape`
+/// (`config_init_stdio`), independent of `-X utf8`.
+fn coercion_target_ctype_locale() -> bool {
+    matches!(
+        effective_ctype_locale().as_str(),
+        "C" | "POSIX" | "C.UTF-8" | "C.utf8" | "UTF-8"
+    )
 }
 
 /// The top-level entry point for executing WeavePy bytecode.
@@ -372,6 +490,11 @@ pub struct Interpreter {
 
 impl Default for Interpreter {
     fn default() -> Self {
+        install_parser_unicode_hook();
+        // Adopt the environment's `LC_CTYPE` locale (CPython pre-init's
+        // `_Py_SetLocaleFromEnv`) so `_locale.getencoding()` and
+        // `locale.setlocale(..., None)` observe the user's locale.
+        crate::stdlib::locale_mod::init_from_env();
         let stdout: Stdout = Rc::new(RefCell::new(std::io::stdout()));
         let mut builtins_dict = builtins::default_builtins();
         // The `builtins` module exposes the core types/exceptions as the
@@ -540,6 +663,16 @@ impl Interpreter {
 
     /// Replace `sys.argv` with the given values. The first entry is
     /// the script name; subsequent entries are passed-through args.
+    ///
+    /// Values are passed through [`os_args_bridged`]'s PUA-bridge
+    /// convention: code points in the plane-16 bridge window are mapped
+    /// back to the lone surrogates CPython's PEP 383 argv decoding
+    /// produces (so `weavepy $'\xff'` yields `sys.argv[1] == '\udcff'`,
+    /// byte-exact under `os.fsencode`). Plain text is unaffected; the
+    /// only caveat is an embedder passing a *genuine* U+10F800..U+10FFFF
+    /// private-use character, which the bridge cannot distinguish from
+    /// an escaped surrogate (the same trade-off the `str` method bridge
+    /// in `builtins.rs` documents).
     pub fn set_argv<I, S>(&self, values: I)
     where
         I: IntoIterator<Item = S>,
@@ -548,7 +681,7 @@ impl Interpreter {
         let mut argv = self.cache.argv.borrow_mut();
         argv.clear();
         for v in values {
-            argv.push(Object::from_str(v.into()));
+            argv.push(crate::builtins::bridge_to_object(&v.into()));
         }
     }
 
@@ -587,6 +720,23 @@ impl Interpreter {
             .iter()
             .any(|x| x == "dev" || x.starts_with("dev="));
         crate::vm_singletons::set_dev_mode(dev_mode);
+        // Resolve `PYTHONIOENCODING`'s encoding half to its canonical codec
+        // name up front (CPython reports `sys.stdout.encoding` normalized:
+        // `latin1` → `iso8859-1`). Must happen before the sys-dict borrow
+        // below — the registry lookup can import frozen modules.
+        let canonical_io_encoding = flags.io_encoding.as_ref().map(|enc| {
+            let guard = if crate::vm_singletons::current_interpreter_ptr().is_none() {
+                Some(crate::vm_singletons::publish_interpreter_ptr(
+                    std::ptr::from_mut::<Self>(self),
+                ))
+            } else {
+                None
+            };
+            let name =
+                crate::stdlib::codecs_mod::canonical_codec_name(enc).unwrap_or_else(|| enc.clone());
+            drop(guard);
+            name
+        });
         if let Some(Object::Module(m)) = self
             .cache
             .modules
@@ -644,10 +794,12 @@ impl Interpreter {
                     "hash_randomization",
                     flags.hash_seed.map_or(1, |_| 0),
                 );
-                // UTF-8 mode: on by default (WeavePy str is UTF-8), but
-                // honour an explicit `-X utf8=0`/`-X utf8=1` (PEP 540) so
-                // `io.text_encoding(None)` reports "locale" vs "utf-8" and
-                // `test_io.test_text_encoding` round-trips.
+                // UTF-8 mode (PEP 540) precedence: `-X utf8[=0|1]` beats
+                // `PYTHONUTF8` (already filtered for `-E`/`-I` by the CLI),
+                // which beats the locale-based default (the `C`/`POSIX`
+                // locale enables the mode). Drives `sys.flags.utf8_mode`,
+                // `io.text_encoding(None)` ("locale" vs "utf-8"), and the
+                // stdio error-handler defaults below.
                 let utf8_mode = flags
                     .xoptions
                     .iter()
@@ -661,7 +813,8 @@ impl Interpreter {
                             None
                         }
                     })
-                    .unwrap_or(1);
+                    .or(flags.utf8_mode.map(i64::from))
+                    .unwrap_or_else(|| i64::from(posix_ctype_locale()));
                 set(&mut fld, "utf8_mode", utf8_mode);
                 crate::vm_singletons::set_utf8_mode(utf8_mode != 0);
                 // The lone bool field on CPython's `sys.flags`.
@@ -716,25 +869,38 @@ impl Interpreter {
                 crate::object::DictKey(Object::from_static("_xoptions")),
                 Object::Dict(crate::sync::Rc::new(crate::sync::RefCell::new(xopts))),
             );
-            // `PYTHONIOENCODING=encoding[:errors]` — retarget the standard
-            // streams' text codec, matching CPython's startup
-            // (`config_init_stdio`). The encoding part alone is enough to
-            // make `sys.stdout.encoding` report e.g. `ascii`, which is what
-            // codec-aware helpers (`tarfile._safe_print`,
-            // `traceback`/`print` redirection) key off. We only mutate when
-            // the env var is set so the UTF-8 default — and `-E`/`-I`
-            // isolation — are untouched.
-            if flags.io_encoding.is_some() || flags.io_errors.is_some() {
-                for name in ["stdin", "stdout", "stderr"] {
-                    if let Some(Object::File(f)) =
-                        d.get(&crate::object::DictKey(Object::from_static(name)))
-                    {
-                        if let Some(enc) = &flags.io_encoding {
-                            f.set_encoding(enc);
-                        }
-                        if let Some(errs) = &flags.io_errors {
-                            f.set_errors(errs);
-                        }
+            // Standard-stream codec + error handlers, matching CPython's
+            // startup (`config_init_stdio` + `init_sys_streams`):
+            //   encoding — `PYTHONIOENCODING`'s encoding half when given
+            //   (reported under its canonical codec name: latin1 →
+            //   iso8859-1), else the UTF-8 default.
+            //   stdin/stdout errors — `PYTHONIOENCODING`'s errors half;
+            //   else `strict` when an explicit encoding was given; else
+            //   `surrogateescape` under UTF-8 mode or a C-locale coercion
+            //   target (PEP 538/540); else `strict`.
+            //   stderr errors — always `backslashreplace`.
+            let stdio_errors: &str = match (&flags.io_errors, &flags.io_encoding) {
+                (Some(errs), _) => errs,
+                (None, Some(_)) => "strict",
+                (None, None) => {
+                    if crate::vm_singletons::utf8_mode() || coercion_target_ctype_locale() {
+                        "surrogateescape"
+                    } else {
+                        "strict"
+                    }
+                }
+            };
+            for name in ["stdin", "stdout", "stderr"] {
+                if let Some(Object::File(f)) =
+                    d.get(&crate::object::DictKey(Object::from_static(name)))
+                {
+                    if let Some(enc) = &canonical_io_encoding {
+                        f.set_encoding(enc);
+                    }
+                    if name == "stderr" {
+                        f.set_errors("backslashreplace");
+                    } else {
+                        f.set_errors(stdio_errors);
                     }
                 }
             }
@@ -3422,6 +3588,15 @@ impl Interpreter {
             // Fast path: skip the line-table read entirely when no
             // observer is active. The generator-creation bootstrap
             // (`RETURN_GENERATOR`) fires no line events either.
+            //
+            // A trace callback that *raises* must have its exception
+            // propagate inside the traced frame — catchable by this
+            // frame's own `try/except` and carrying this frame in its
+            // traceback exactly once (CPython `call_trace` failure;
+            // `test_settrace_error`). Park the error and feed it
+            // through the same arm as `step`'s `Err` below instead of
+            // `?`-escaping the whole frame.
+            let mut trace_err: Option<RuntimeError> = None;
             if crate::trace::any_observers_active() && !is_gen_bootstrap {
                 let line = py_frame.current_lineno();
                 // CPython never emits a `line` event for the
@@ -3443,15 +3618,30 @@ impl Interpreter {
                     // line bookkeeping above still advances (mirrors CPython,
                     // which keeps tracking the line for later re-enable).
                     if py_frame.trace_lines.get() {
-                        self.fire_line_event(&py_frame)?;
+                        match self.fire_line_event(&py_frame) {
+                            Ok(()) => {
+                                // The callback may have set `f_lineno` (RFC
+                                // 0050 — debugger "set next statement").
+                                // Apply the validated plan to the live frame
+                                // and restart dispatch at the target so its
+                                // line event fires.
+                                if py_frame.pending_jump.get().is_some() {
+                                    self.apply_pending_jump(frame, &py_frame);
+                                    continue;
+                                }
+                            }
+                            Err(e) => trace_err = Some(e),
+                        }
                     }
                 }
                 // A `'line'` callback may have just enabled opcode tracing
                 // (bdb's `stepinstr`); CPython then fires the `'opcode'`
                 // event for this same instruction before it runs. The
                 // frame-entry RESUME carries no opcode event.
-                if !at_resume && py_frame.trace_opcodes.get() {
-                    self.fire_opcode_event(&py_frame)?;
+                if trace_err.is_none() && !at_resume && py_frame.trace_opcodes.get() {
+                    if let Err(e) = self.fire_opcode_event(&py_frame) {
+                        trace_err = Some(e);
+                    }
                 }
             }
             // RFC 0039: service pending signals (`_thread.interrupt_main`,
@@ -3486,7 +3676,9 @@ impl Interpreter {
             } else {
                 None
             };
-            let stepped = if let Some(exc) = async_exc {
+            let stepped = if let Some(e) = trace_err {
+                Err(e)
+            } else if let Some(exc) = async_exc {
                 Err(match Self::normalize_exception(exc, None) {
                     Ok(pe) => RuntimeError::PyException(pe),
                     Err(e) => e,
@@ -3524,6 +3716,12 @@ impl Interpreter {
                 Ok(StepOutcome::Yield(v)) => {
                     if crate::trace::any_observers_active() {
                         self.fire_yield_event(&py_frame, &v)?;
+                        // A jump set from the yield's 'return' trace event
+                        // (CPython allows these) lands on the suspended
+                        // frame, taking effect if/when it resumes.
+                        if py_frame.pending_jump.get().is_some() {
+                            self.apply_pending_jump(frame, &py_frame);
+                        }
                     }
                     break Ok(FrameOutcome::Yielded(v));
                 }
@@ -3818,11 +4016,93 @@ impl Interpreter {
             trace: RefCell::new(Object::None),
             gen_owner: RefCell::new(None),
             override_lineno: Cell::new(None),
+            trace_event: Cell::new(crate::linejump::TraceEvent::None),
+            pending_jump: Cell::new(None),
             last_line: Cell::new(None),
             trace_lines: Cell::new(true),
             trace_opcodes: Cell::new(false),
             on_stack: Cell::new(0),
         })
+    }
+
+    /// Apply a pending `f_lineno` jump (validated by
+    /// [`Self::frame_set_lineno`]) to the live frame: pop the value
+    /// stack to the target depth, unwind any `except` blocks the jump
+    /// leaves, and move the program counter.
+    fn apply_pending_jump(&mut self, frame: &mut Frame, py_frame: &Rc<PyFrame>) {
+        let Some(jump) = py_frame.pending_jump.take() else {
+            return;
+        };
+        while frame.stack.len() > jump.target_depth as usize {
+            frame.stack.pop();
+        }
+        for _ in 0..jump.exc_pops {
+            frame.exc_handlers.pop();
+            self.exc_info_stack.borrow_mut().pop();
+        }
+        frame.pc = jump.target_pc;
+        py_frame.lasti.set(jump.target_pc);
+        py_frame.override_lineno.set(None);
+        // Force a fresh 'line' event at the landing site.
+        py_frame.last_line.set(None);
+    }
+
+    /// `frame.f_lineno = n` — CPython's `frame_setlineno` ("set next
+    /// statement", RFC 0050). Validates the jump against the abstract
+    /// stack analysis in [`crate::linejump`] and parks the plan on the
+    /// frame; the dispatch loop applies it after the trace callback
+    /// returns.
+    fn frame_set_lineno(&mut self, fr: &Rc<PyFrame>, new_lineno: i64) -> Result<(), RuntimeError> {
+        use crate::linejump::TraceEvent;
+        let event = fr.trace_event.get();
+        match event {
+            TraceEvent::Line | TraceEvent::Yield => {}
+            TraceEvent::None => {
+                return Err(value_error("f_lineno can only be set in a trace function"))
+            }
+            TraceEvent::Call => {
+                return Err(value_error(
+                    "can't jump from the 'call' trace event of a new frame",
+                ))
+            }
+            TraceEvent::Return | TraceEvent::Exception | TraceEvent::Opcode => {
+                return Err(value_error("can only jump from a 'line' trace event"))
+            }
+        }
+        let suspended = event == TraceEvent::Yield;
+        let (jump, resolved_line) =
+            crate::linejump::compute_jump(&fr.code, fr.lasti.get(), new_lineno, suspended)?;
+        // CPython binds `None` to any still-unbound local at the target
+        // (rather than crashing on a LOAD_FAST of a name the compiler
+        // "proved" bound), warning first so an escalating filter can
+        // veto the whole jump.
+        // Compiler-synthesized temporaries (`.with_exit0`, `.retval0`,
+        // ...) live on CPython's value stack, not in `co_varnames`;
+        // counting them would warn where CPython doesn't.
+        let synthetic = |i: usize| fr.code.varnames.get(i).is_some_and(|n| n.starts_with('.'));
+        if let Some(mirror) = fr.locals_mirror.borrow().as_ref() {
+            let unbound = mirror
+                .borrow()
+                .iter()
+                .enumerate()
+                .filter(|(i, v)| matches!(v, Object::Unbound) && !synthetic(*i))
+                .count();
+            if unbound > 0 {
+                let s = if unbound == 1 { "" } else { "s" };
+                self.warn_runtime_from_builtin(format!(
+                    "assigning None to {unbound} unbound local{s}"
+                ))?;
+                for (i, slot) in mirror.borrow_mut().iter_mut().enumerate() {
+                    if matches!(slot, Object::Unbound) && !synthetic(i) {
+                        *slot = Object::None;
+                    }
+                }
+            }
+        }
+        fr.pending_jump.set(Some(jump));
+        // Reads of `f_lineno` report the target until the jump lands.
+        fr.override_lineno.set(Some(resolved_line));
+        Ok(())
     }
 
     /// `frame.clear()` — drop the references a no-longer-executing
@@ -4111,6 +4391,7 @@ impl Interpreter {
     /// Fire the `'call'` event when a frame is entered. Installs
     /// the returned per-frame trace function (settrace contract).
     fn fire_call_event(&mut self, py_frame: &Rc<PyFrame>) -> Result<(), RuntimeError> {
+        let _event = TraceEventGuard::new(py_frame, crate::linejump::TraceEvent::Call);
         if let Some(trace) = crate::trace::trace_hook() {
             let result = self.invoke_observe_hook(
                 &trace,
@@ -4210,6 +4491,7 @@ impl Interpreter {
 
     /// Fire the `'line'` event when the source line changes.
     fn fire_line_event(&mut self, py_frame: &Rc<PyFrame>) -> Result<(), RuntimeError> {
+        let _event = TraceEventGuard::new(py_frame, crate::linejump::TraceEvent::Line);
         let frame_trace = py_frame.trace.borrow().clone();
         if !matches!(frame_trace, Object::None) {
             let result = self.invoke_observe_hook(
@@ -4233,6 +4515,7 @@ impl Interpreter {
     /// `'line'`, the callback's return value replaces the per-frame
     /// trace; `sys.monitoring` observes INSTRUCTION.
     fn fire_opcode_event(&mut self, py_frame: &Rc<PyFrame>) -> Result<(), RuntimeError> {
+        let _event = TraceEventGuard::new(py_frame, crate::linejump::TraceEvent::Opcode);
         let frame_trace = py_frame.trace.borrow().clone();
         if !matches!(frame_trace, Object::None) {
             let result = self.invoke_observe_hook(
@@ -4254,6 +4537,7 @@ impl Interpreter {
         py_frame: &Rc<PyFrame>,
         value: &Object,
     ) -> Result<(), RuntimeError> {
+        let _event = TraceEventGuard::new(py_frame, crate::linejump::TraceEvent::Return);
         let frame_trace = py_frame.trace.borrow().clone();
         if !matches!(frame_trace, Object::None) {
             let _ = self.invoke_observe_hook(
@@ -4285,6 +4569,7 @@ impl Interpreter {
         py_frame: &Rc<PyFrame>,
         value: &Object,
     ) -> Result<(), RuntimeError> {
+        let _event = TraceEventGuard::new(py_frame, crate::linejump::TraceEvent::Yield);
         let frame_trace = py_frame.trace.borrow().clone();
         if !matches!(frame_trace, Object::None) {
             let _ = self.invoke_observe_hook(
@@ -4305,6 +4590,7 @@ impl Interpreter {
         py_frame: &Rc<PyFrame>,
         exc: &PyException,
     ) -> Result<(), RuntimeError> {
+        let _event = TraceEventGuard::new(py_frame, crate::linejump::TraceEvent::Exception);
         let frame_trace = py_frame.trace.borrow().clone();
         if !matches!(frame_trace, Object::None) {
             // CPython passes a 3-tuple (type, value, traceback). We
@@ -4355,6 +4641,7 @@ impl Interpreter {
     /// unwind path, while `sys.monitoring` observes `PY_UNWIND` rather
     /// than `PY_RETURN`. Fires nothing on the fast no-observer path.
     fn fire_unwind_event(&mut self, py_frame: &Rc<PyFrame>) -> Result<(), RuntimeError> {
+        let _event = TraceEventGuard::new(py_frame, crate::linejump::TraceEvent::Return);
         let frame_trace = py_frame.trace.borrow().clone();
         if !matches!(frame_trace, Object::None) {
             let _ = self.invoke_observe_hook(
@@ -6910,6 +7197,8 @@ impl Interpreter {
                     trace: RefCell::new(Object::None),
                     gen_owner: RefCell::new(None),
                     override_lineno: Cell::new(None),
+                    trace_event: Cell::new(crate::linejump::TraceEvent::None),
+                    pending_jump: Cell::new(None),
                     last_line: Cell::new(None),
                     trace_lines: Cell::new(true),
                     trace_opcodes: Cell::new(false),
@@ -18041,13 +18330,12 @@ impl Interpreter {
                     fr.trace_opcodes.set(value.is_truthy());
                     Ok(())
                 }
-                "f_lineno" => match value {
-                    Object::Int(i) if i >= 0 => {
-                        fr.override_lineno.set(Some(i as u32));
-                        Ok(())
-                    }
-                    _ => Err(type_error("f_lineno must be a non-negative int")),
-                },
+                "f_lineno" => {
+                    let Object::Int(new_lineno) = value else {
+                        return Err(value_error("lineno must be an integer"));
+                    };
+                    self.frame_set_lineno(fr, new_lineno)
+                }
                 _ => Err(attribute_error(format!(
                     "'frame' object attribute '{}' is read-only",
                     name
@@ -25203,7 +25491,17 @@ impl Interpreter {
             }
         };
         let code_rc = match (exec_src, source) {
-            (None, Object::Code(c)) => c,
+            (None, Object::Code(c)) => {
+                // CPython rejects closure code up front (`exec` takes no
+                // closure to populate the cells): running it would hit
+                // `LOAD_DEREF` with no cell (RFC 0050 severity-1 crash).
+                if !c.freevars.is_empty() {
+                    return Err(type_error(
+                        "code object passed to exec() may not contain free variables",
+                    ));
+                }
+                c
+            }
             (Some(src), _) => {
                 // A malformed source must surface as `SyntaxError` (with a
                 // location), exactly like `compile()` — CPython's `exec`
@@ -25305,6 +25603,13 @@ impl Interpreter {
         }
         let src = match source {
             Object::Code(c) => {
+                // CPython rejects closure code up front (`eval` takes no
+                // closure to populate the cells) — see `do_exec_call`.
+                if !c.freevars.is_empty() {
+                    return Err(type_error(
+                        "code object passed to eval() may not contain free variables",
+                    ));
+                }
                 // `eval`-mode code returns its expression value (see
                 // `compile_eval_with_source`); run it in the combined
                 // namespace and hand that value straight back.
@@ -25991,8 +26296,12 @@ impl Interpreter {
         let (code, source_for_diag) = if let Some(cached) = crate::pycache::try_load(path) {
             (cached, String::new())
         } else {
-            let source = std::fs::read_to_string(path)
+            // PEP 263: imported sources go through the same BOM/coding-cookie
+            // decode as the tokenizer (a plain `read_to_string` would reject
+            // any non-UTF-8 module, e.g. `# coding: gbk`).
+            let raw = std::fs::read(path)
                 .map_err(|e| import_error(format!("failed to read '{}': {e}", path.display())))?;
+            let source = decode_source_bytes(&raw, &filename)?;
             let module = weavepy_parser::parse_module(&source)
                 .map_err(|e| parse_error_to_syntax_error(&e, &source, &filename))?;
             let code = weavepy_compiler::compile_module_with_source(&module, &source, &filename)
@@ -26233,6 +26542,30 @@ fn line_col_text(source: &str, byte: u32) -> (u32, u32, String) {
     (line, col, text)
 }
 
+/// Route the parser's `\N{NAME}` escapes through the generated UCD
+/// 15.1.0 tables (RFC 0050 WS4), honouring a poisoned
+/// `sys.modules['unicodedata']` the way CPython's tokenizer does (its
+/// escape decoder imports `unicodedata` through the live runtime).
+/// Idempotent; installed from `Interpreter::default` and from embedding
+/// entry points that parse before an interpreter exists.
+pub fn install_parser_unicode_hook() {
+    weavepy_parser::set_unicode_name_resolver(|name| {
+        use weavepy_parser::UnicodeNameResolution as R;
+        if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+            // SAFETY: published by an enclosing VM frame on this thread.
+            let interp = unsafe { &mut *ptr };
+            if matches!(interp.cache.get("unicodedata"), Some(Object::None)) {
+                return R::Unavailable;
+            }
+        }
+        // Aliases resolve (CPython's `\N{NULL}`); named sequences do not.
+        match crate::stdlib::ucd::lookup_with_aliases(name) {
+            Some(cp) => R::Code(cp),
+            None => R::Unknown,
+        }
+    });
+}
+
 /// Decode a Python source buffer per PEP 263: an optional UTF-8 BOM,
 /// then an optional `# -*- coding: NAME -*-` cookie on line 1 or 2,
 /// defaulting to strict UTF-8. Mirrors CPython's tokenizer setup —
@@ -26331,7 +26664,30 @@ fn decode_source_bytes_inner(
             }
             return Err(e);
         }
-        return crate::stdlib::codecs_mod::decode_bytes(payload, &enc, "strict").map_err(|_| {
+        let decoded =
+            crate::stdlib::codecs_mod::decode_bytes(payload, &enc, "strict").or_else(|e| {
+                // Registry-backed codecs (the frozen CJK modules, custom
+                // `codecs.register` entries) need a live interpreter, but the
+                // CLI decodes the main script before one exists. Boot a
+                // scratch interpreter just for this decode — rare (only
+                // non-native cookie encodings) and CPython's tokenizer always
+                // has the full runtime available at this point anyway.
+                if crate::vm_singletons::current_interpreter_ptr().is_none() {
+                    let mut scratch = Interpreter::default();
+                    let guard =
+                        crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<
+                            Interpreter,
+                        >(
+                            &mut scratch
+                        ));
+                    let res = crate::stdlib::codecs_mod::decode_bytes(payload, &enc, "strict");
+                    drop(guard);
+                    res
+                } else {
+                    Err(e)
+                }
+            });
+        return decoded.map_err(|_| {
             crate::error::syntax_error(format!("encoding problem for '{filename}': {enc}"))
         });
     }

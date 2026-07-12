@@ -175,6 +175,9 @@ pub struct CodeObject {
     /// coroutine. Never set by the compiler — only by the runtime
     /// marking helper and marshal round-trips.
     pub is_iterable_coroutine: bool,
+    /// Memoised [`Self::to_cpython`] encoding (never compared, resets
+    /// on clone).
+    pub cp_cache: cpython_code::CpCache,
 }
 
 /// A per-instruction source-column span (PEP-657). `col`/`end_col` are
@@ -2956,6 +2959,11 @@ impl Compiler {
             }
             return Ok(());
         }
+        // PEP 626: the `try:` line is "executed" and must fire a line
+        // event even though it compiles to nothing (CPython emits a NOP
+        // carrying the statement's location; trace consumers — and
+        // test_sys_settrace's relative-line bookkeeping — count on it).
+        self.emit(OpCode::Nop, 0);
         // PEP 654 static check, before anything else compiles so the
         // `except*` jump error wins over e.g. a `return` in a module-
         // level `finally` (matching CPython's reporting order).

@@ -87,9 +87,8 @@ def getlines(filename, module_globals=None):
             return entry[2]
     try:
         return updatecache(filename, module_globals) or []
-    except (MemoryError, KeyboardInterrupt):
-        raise
-    except Exception:
+    except MemoryError:
+        clearcache()
         return []
 
 
@@ -110,25 +109,29 @@ def checkcache(filename=None):
             continue
         try:
             stat = os.stat(name)
-        except OSError:
+        except (OSError, ValueError):
             cache.pop(f, None)
             continue
         if size != stat.st_size or mtime != stat.st_mtime:
             cache.pop(f, None)
 
 
+def _materialize_lazy(filename, entry):
+    """Realise a lazy 1-tuple entry through the loader's get_source."""
+    try:
+        data = entry[0]()
+    except (ImportError, OSError):
+        return None
+    if data is None:
+        return None
+    # CPython: every loader-sourced line gets a trailing newline appended.
+    lines = [line + "\n" for line in data.splitlines()]
+    cache[filename] = (len(data), None, lines, filename)
+    return lines
+
+
 def updatecache(filename, module_globals=None):
     entry = cache.pop(filename, None)
-    # Lazy 1-tuple — materialise through the loader's get_source.
-    if entry is not None and len(entry) == 1:
-        try:
-            data = entry[0]()
-        except (ImportError, OSError):
-            data = None
-        if data is not None:
-            lines = data.splitlines(keepends=True)
-            cache[filename] = (len(data), None, lines, filename)
-            return lines
     # WeavePy frozen stdlib modules carry `<frozen NAME>` filenames;
     # their source is recoverable through `_imp.find_frozen`.
     if filename.startswith("<frozen ") and filename.endswith(">"):
@@ -146,14 +149,23 @@ def updatecache(filename, module_globals=None):
             cache[filename] = (len(lines), None, lines, filename)
             return lines
     name = filename
-    # Try direct file system access.
+    # Try direct file system access first — like CPython, loader-based
+    # lazy entries are only consulted when the file isn't readable.
     try:
         stat = os.stat(name)
-    except OSError:
+    except (OSError, ValueError):
+        if entry is not None and len(entry) == 1:
+            lines = _materialize_lazy(filename, entry)
+            if lines is not None:
+                return lines
         # One more chance: a loader from module_globals (CPython tries
         # this when the file isn't directly readable).
         if lazycache(filename, module_globals):
-            return updatecache(filename, module_globals)
+            entry = cache.pop(filename, None)
+            if entry is not None and len(entry) == 1:
+                lines = _materialize_lazy(filename, entry)
+                if lines is not None:
+                    return lines
         return []
     try:
         with open(name, "rb") as f:
@@ -161,9 +173,14 @@ def updatecache(filename, module_globals=None):
         data = _decode_source(raw)
     except (OSError, UnicodeDecodeError, LookupError):
         return []
-    lines = data.splitlines(keepends=True)
-    if lines and not lines[-1].endswith("\n"):
-        lines[-1] += "\n"
+    # CPython reads with `tokenize.open(...).readlines()`: universal-newline
+    # translation then a split on '\n' only. `str.splitlines()` would also
+    # split on form feed / vertical tab, shifting every later line
+    # (`test_traceback.test_encoded_file` puts '\f' on the first line).
+    data = data.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line + "\n" for line in data.split("\n")]
+    if data.endswith("\n"):
+        lines.pop()
     cache[filename] = (stat.st_size, stat.st_mtime, lines, name)
     return lines
 
@@ -224,13 +241,14 @@ def lazycache(filename, module_globals):
         return len(cache[filename]) == 1
     if not filename or (filename.startswith("<") and filename.endswith(">")):
         return False
-    if module_globals is None:
+    if module_globals is None or "__name__" not in module_globals:
         return False
-    name = module_globals.get("__name__")
-    loader = module_globals.get("__loader__")
+    # CPython prefers the spec's name/loader over the module-level dunders.
     spec = module_globals.get("__spec__")
-    if loader is None and spec is not None:
-        loader = getattr(spec, "loader", None)
+    name = getattr(spec, "name", None) or module_globals["__name__"]
+    loader = getattr(spec, "loader", None)
+    if loader is None:
+        loader = module_globals.get("__loader__")
     get_source = getattr(loader, "get_source", None)
     if get_source is None:
         # WeavePy's import machinery doesn't install `__loader__` on

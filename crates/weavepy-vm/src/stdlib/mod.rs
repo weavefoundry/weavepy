@@ -19,6 +19,7 @@ pub mod ast_mod;
 pub mod binascii_mod;
 pub mod bisect_accel;
 pub mod bz2_mod;
+pub mod codecs_engine;
 pub mod codecs_mod;
 pub mod csv_mod;
 pub mod datetime_mod;
@@ -63,7 +64,7 @@ pub mod testinternalcapi_mod;
 pub mod thread;
 pub mod time;
 pub mod tracemalloc_real;
-mod unicode_decomp_data;
+pub mod ucd;
 pub mod unicodedata_mod;
 pub mod weakref_mod;
 pub mod zlib_mod;
@@ -254,7 +255,9 @@ pub fn register_all(cache: &ModuleCache) {
 }
 
 fn frozen_sources() -> &'static [FrozenSource] {
-    &[
+    // A `static`, not a promoted local: the table is far past clippy's
+    // stack-array budget (`large_stack_arrays`).
+    static SOURCES: &[FrozenSource] = &[
         FrozenSource {
             name: "builtins",
             source: include_str!("python/builtins.py"),
@@ -1327,6 +1330,387 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/encodings/cp737.py"),
             is_package: false,
         },
+        // Vendored verbatim from CPython 3.13 for code that reaches into the
+        // `encodings` package directly (`encodings.ascii.StreamReader`,
+        // `from encodings.rot_13 import rot13`, the always-raising
+        // `undefined` codec).
+        FrozenSource {
+            name: "encodings.ascii",
+            source: include_str!("python/encodings/ascii.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.utf_8",
+            source: include_str!("python/encodings/utf_8.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.rot_13",
+            source: include_str!("python/encodings/rot_13.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.undefined",
+            source: include_str!("python/encodings/undefined.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.base64_codec",
+            source: include_str!("python/encodings/base64_codec.py"),
+            is_package: false,
+        },
+        // gencodec.py charmap codepages vendored verbatim from CPython 3.13;
+        // they ride the frozen `codecs.charmap_encode`/`charmap_decode`.
+        FrozenSource {
+            name: "encodings.cp856",
+            source: include_str!("python/encodings/cp856.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp874",
+            source: include_str!("python/encodings/cp874.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp875",
+            source: include_str!("python/encodings/cp875.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp1006",
+            source: include_str!("python/encodings/cp1006.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp1125",
+            source: include_str!("python/encodings/cp1125.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp1140",
+            source: include_str!("python/encodings/cp1140.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.koi8_t",
+            source: include_str!("python/encodings/koi8_t.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.kz1048",
+            source: include_str!("python/encodings/kz1048.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.mac_arabic",
+            source: include_str!("python/encodings/mac_arabic.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.palmos",
+            source: include_str!("python/encodings/palmos.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.ptcp154",
+            source: include_str!("python/encodings/ptcp154.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.tis_620",
+            source: include_str!("python/encodings/tis_620.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.charmap",
+            source: include_str!("python/encodings/charmap.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.latin_1",
+            source: include_str!("python/encodings/latin_1.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp1026",
+            source: include_str!("python/encodings/cp1026.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp1250",
+            source: include_str!("python/encodings/cp1250.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp1251",
+            source: include_str!("python/encodings/cp1251.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp1252",
+            source: include_str!("python/encodings/cp1252.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp1253",
+            source: include_str!("python/encodings/cp1253.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp1254",
+            source: include_str!("python/encodings/cp1254.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp1255",
+            source: include_str!("python/encodings/cp1255.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp1256",
+            source: include_str!("python/encodings/cp1256.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp1257",
+            source: include_str!("python/encodings/cp1257.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp1258",
+            source: include_str!("python/encodings/cp1258.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp273",
+            source: include_str!("python/encodings/cp273.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp424",
+            source: include_str!("python/encodings/cp424.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp437",
+            source: include_str!("python/encodings/cp437.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp500",
+            source: include_str!("python/encodings/cp500.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp720",
+            source: include_str!("python/encodings/cp720.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp775",
+            source: include_str!("python/encodings/cp775.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp850",
+            source: include_str!("python/encodings/cp850.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp852",
+            source: include_str!("python/encodings/cp852.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp855",
+            source: include_str!("python/encodings/cp855.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp857",
+            source: include_str!("python/encodings/cp857.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp858",
+            source: include_str!("python/encodings/cp858.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp860",
+            source: include_str!("python/encodings/cp860.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp861",
+            source: include_str!("python/encodings/cp861.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp862",
+            source: include_str!("python/encodings/cp862.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp863",
+            source: include_str!("python/encodings/cp863.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp864",
+            source: include_str!("python/encodings/cp864.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp865",
+            source: include_str!("python/encodings/cp865.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp866",
+            source: include_str!("python/encodings/cp866.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.cp869",
+            source: include_str!("python/encodings/cp869.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.hp_roman8",
+            source: include_str!("python/encodings/hp_roman8.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.iso8859_1",
+            source: include_str!("python/encodings/iso8859_1.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.iso8859_2",
+            source: include_str!("python/encodings/iso8859_2.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.iso8859_3",
+            source: include_str!("python/encodings/iso8859_3.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.iso8859_4",
+            source: include_str!("python/encodings/iso8859_4.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.iso8859_5",
+            source: include_str!("python/encodings/iso8859_5.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.iso8859_6",
+            source: include_str!("python/encodings/iso8859_6.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.iso8859_7",
+            source: include_str!("python/encodings/iso8859_7.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.iso8859_8",
+            source: include_str!("python/encodings/iso8859_8.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.iso8859_9",
+            source: include_str!("python/encodings/iso8859_9.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.iso8859_10",
+            source: include_str!("python/encodings/iso8859_10.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.iso8859_11",
+            source: include_str!("python/encodings/iso8859_11.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.iso8859_13",
+            source: include_str!("python/encodings/iso8859_13.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.iso8859_14",
+            source: include_str!("python/encodings/iso8859_14.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.iso8859_15",
+            source: include_str!("python/encodings/iso8859_15.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.iso8859_16",
+            source: include_str!("python/encodings/iso8859_16.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.koi8_r",
+            source: include_str!("python/encodings/koi8_r.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.koi8_u",
+            source: include_str!("python/encodings/koi8_u.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.mac_croatian",
+            source: include_str!("python/encodings/mac_croatian.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.mac_cyrillic",
+            source: include_str!("python/encodings/mac_cyrillic.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.mac_farsi",
+            source: include_str!("python/encodings/mac_farsi.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.mac_greek",
+            source: include_str!("python/encodings/mac_greek.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.mac_iceland",
+            source: include_str!("python/encodings/mac_iceland.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.mac_latin2",
+            source: include_str!("python/encodings/mac_latin2.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.mac_roman",
+            source: include_str!("python/encodings/mac_roman.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.mac_romanian",
+            source: include_str!("python/encodings/mac_romanian.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.mac_turkish",
+            source: include_str!("python/encodings/mac_turkish.py"),
+            is_package: false,
+        },
         // RFC 0042 WS5 — application-protocol clients, vendored verbatim from
         // CPython 3.13. They ride the WS1 `socket`/`makefile()` and WS2 `ssl`
         // stacks (`*_SSL` variants, `starttls`/`stls`). `nntplib`/`telnetlib`
@@ -1453,6 +1837,47 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "_codec_euc_jis_2004",
             source: include_str!("python/_codec_euc_jis_2004.py"),
+            is_package: false,
+        },
+        // RFC 0050 WS3 — the stateful CJK escape codecs CPython implements in
+        // Modules/cjkcodecs (hz, iso2022_jp/_1/_2/_2004/_3/_ext, iso2022_kr,
+        // johab, shift_jis_2004, shift_jisx0213). Charsets bridge onto the
+        // euc_jp/euc_kr/gb2312 backends and the euc_jis_2004 tables; loaded
+        // lazily by `codecs._lookup_uncached`.
+        FrozenSource {
+            name: "_codec_cjk_ext",
+            source: include_str!("python/_codec_cjk_ext.py"),
+            is_package: false,
+        },
+        // RFC 0050 WS3 — the stateless CJK DBCS codecs (euc_kr, cp949,
+        // euc_jp, cp932, shift_jis, gb2312, gbk, gb18030, big5, cp950,
+        // big5hkscs) with CPython-parity mapping tables probed from CPython
+        // 3.13 itself (`tools/gen_cjk_dbcs_tables.py`). Loaded lazily by
+        // `codecs._lookup_uncached`.
+        FrozenSource {
+            name: "_cjk_tables",
+            source: include_str!("python/_cjk_tables.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_codec_cjk_dbcs",
+            source: include_str!("python/_codec_cjk_dbcs.py"),
+            is_package: false,
+        },
+        // Shared plumbing for the three frozen CJK codec modules above:
+        // multibytecodec.c's error-callback protocol, the `errors` getset,
+        // and `StreamReader.read(None)` support.
+        FrozenSource {
+            name: "_cjk_common",
+            source: include_str!("python/_cjk_common.py"),
+            is_package: false,
+        },
+        // The `_multibytecodec` module surface (CPython's C base types for
+        // the CJK codecs). WeavePy's CJK codecs are frozen Python modules,
+        // so only the module-level names matter here.
+        FrozenSource {
+            name: "_multibytecodec",
+            source: include_str!("python/_multibytecodec.py"),
             is_package: false,
         },
         FrozenSource {
@@ -2422,5 +2847,6 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/_testcapi.py"),
             is_package: false,
         },
-    ]
+    ];
+    SOURCES
 }

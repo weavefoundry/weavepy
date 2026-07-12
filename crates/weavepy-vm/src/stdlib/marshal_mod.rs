@@ -374,7 +374,7 @@ impl MarshalWriter {
         self.write_int(co.kwonly_count as i32);
         self.write_int(cp.stacksize as i32);
         self.write_int(code_flags(co) as i32);
-        self.write_value(&Object::new_bytes(cp.co_code))?;
+        self.write_value(&Object::new_bytes(cp.co_code.clone()))?;
         let consts: Vec<Object> = co
             .constants
             .iter()
@@ -384,7 +384,7 @@ impl MarshalWriter {
         self.write_value(&Object::new_tuple(consts))?;
         self.write_value(&strs_to_tuple(&co.names))?;
         self.write_value(&strs_to_tuple(&cp.localsplusnames))?;
-        self.write_value(&Object::new_bytes(cp.localspluskinds))?;
+        self.write_value(&Object::new_bytes(cp.localspluskinds.clone()))?;
         self.write_value(&Object::from_str(co.filename.clone()))?;
         self.write_value(&Object::from_str(co.name.clone()))?;
         // PEP 3155 qualified name, computed at compile time from lexical
@@ -392,8 +392,8 @@ impl MarshalWriter {
         // unmarshalled function/class keeps a faithful `__qualname__`.
         self.write_value(&Object::from_str(co.qualname.clone()))?;
         self.write_int(cp.firstlineno as i32);
-        self.write_value(&Object::new_bytes(cp.co_linetable))?;
-        self.write_value(&Object::new_bytes(cp.co_exceptiontable))?;
+        self.write_value(&Object::new_bytes(cp.co_linetable.clone()))?;
+        self.write_value(&Object::new_bytes(cp.co_exceptiontable.clone()))?;
         Ok(())
     }
 }
@@ -761,6 +761,7 @@ impl<'a> MarshalReader<'a> {
             is_coroutine: flags & CO_COROUTINE != 0,
             is_async_generator: flags & CO_ASYNC_GENERATOR != 0,
             is_iterable_coroutine: flags & CO_ITERABLE_COROUTINE != 0,
+            cp_cache: cpython_code::CpCache::default(),
         };
         Ok(Object::Code(Rc::new(co)))
     }

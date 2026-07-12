@@ -2154,12 +2154,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "unicode-properties"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7df058c713841ad818f1dc5d3fd88063241cc61f49f5fbea4b951e8cf5a8d71d"
-
-[[package]]
 name = "unicode-segmentation"
 version = "1.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2532,9 +2526,6 @@ dependencies = [
  "stacker",
  "thiserror 2.0.18",
  "tracing",
- "unicode-normalization",
- "unicode-properties",
- "unicode_names2",
  "weavepy-compiler",
  "weavepy-jit",
  "weavepy-lexer",

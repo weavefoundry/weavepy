@@ -10,6 +10,13 @@ registry match CPython for consumers that use them directly
 
 from . import aliases
 
+# CPython's search-function cache ({normalised name: CodecInfo}). WeavePy's
+# real cache lives in the frozen `codecs` module, but tests (and refleak
+# hygiene helpers) pop from `encodings._cache` directly.
+_cache = {}
+_unknown = '--unknown--'
+_MAXCACHE = 500
+
 
 def normalize_encoding(encoding):
     """Normalize an encoding name (CPython semantics).

@@ -53,9 +53,6 @@ rust_decimal     = { workspace = true }
 quick-xml        = { workspace = true }
 
 # RFC 0023 — drop-in stdlib parity + HTTPS.
-unicode-normalization = { workspace = true }
-unicode-properties    = { workspace = true }
-unicode_names2        = { workspace = true }
 memmap2               = { workspace = true }
 memchr                = { workspace = true }
 libc                  = { workspace = true }

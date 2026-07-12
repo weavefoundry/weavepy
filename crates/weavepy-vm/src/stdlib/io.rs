@@ -1555,11 +1555,10 @@ fn tw_buffer(inst: &crate::types::PyInstance) -> Result<Rc<PyFile>, RuntimeError
 /// CPython's `io.open`/`TextIOWrapper` accept the special encoding name
 /// `"locale"`, which resolves to the current locale's encoding (the result of
 /// `locale.getpreferredencoding(False)`); `codecs.lookup("locale")` itself
-/// raises. WeavePy's text layer is UTF-8, so `"locale"` maps to `"utf-8"`
-/// (`test_io.test_reconfigure_locale`).
+/// raises (`test_io.test_reconfigure_locale`).
 fn resolve_locale_encoding(name: &str) -> String {
     if name.eq_ignore_ascii_case("locale") {
-        "utf-8".to_owned()
+        crate::stdlib::locale_mod::current_codeset()
     } else {
         name.to_owned()
     }
@@ -2659,7 +2658,16 @@ fn tw_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runti
             }
             resolve_locale_encoding(s.as_ref())
         }
-        Some(Object::None) | None => "utf-8".to_owned(),
+        // `None`/missing: UTF-8 under UTF-8 mode, else the locale encoding —
+        // reported under its codeset name (`_Py_GetLocaleEncoding`; "UTF-8"
+        // on a UTF-8 host locale, `test_io.test_default_encoding`).
+        Some(Object::None) | None => {
+            if crate::vm_singletons::utf8_mode() {
+                "utf-8".to_owned()
+            } else {
+                crate::stdlib::locale_mod::current_codeset()
+            }
+        }
         // A lone-surrogate encoding name can't be UTF-8-encoded for the codec
         // lookup, so CPython raises `UnicodeEncodeError` (not `TypeError`):
         // `test_constructor`: `encoding='\udcfe'`.
@@ -3165,6 +3173,9 @@ fn tw_ensure_decoded(inst: &Rc<crate::types::PyInstance>) -> Result<(), RuntimeE
     // working; the output is un-bridged back to a `WStr` on the way out. A
     // surrogate-free decode takes the verbatim fast path (`bridge_*` is
     // identity), so non-surrogate streams are byte-for-byte unchanged.
+    // Text-model codec check happened at wrapper construction; per-read codec
+    // calls must not repeat it (`test_io.test_illegal_decoder`).
+    let _exempt = crate::stdlib::codecs_mod::io_text_exempt_guard();
     let text_obj = crate::stdlib::codecs_mod::decode_bytes_obj(&raw, &encoding, &errors)?;
     let is_wstr = matches!(text_obj, Object::WStr(_));
     let text = crate::builtins::bridge_str_of(&text_obj).unwrap_or_default();
@@ -3320,6 +3331,8 @@ fn tw_fill_chunk(inst: &Rc<crate::types::PyInstance>) -> Result<(), RuntimeError
         utf8_complete_prefix_len(&combined)
     };
     let (to_decode, leftover) = combined.split_at(safe);
+    // Text-model check happened at construction, not per read.
+    let _exempt = crate::stdlib::codecs_mod::io_text_exempt_guard();
     let text_obj = crate::stdlib::codecs_mod::decode_bytes_obj(to_decode, &encoding, &errors)?;
     let is_wstr = matches!(text_obj, Object::WStr(_));
     let text = crate::builtins::bridge_str_of(&text_obj).unwrap_or_default();
@@ -3403,6 +3416,8 @@ fn tw_byte_position(inst: &crate::types::PyInstance) -> Result<i64, RuntimeError
                 _ => 0,
             };
             let errors = tw_errors(inst);
+            // Text-model check happened at construction, not per operation.
+            let _exempt = crate::stdlib::codecs_mod::io_text_exempt_guard();
             // A bridged snapshot must be un-bridged before re-encoding so the
             // byte cookie reflects the *original* surrogate bytes, not the PUA
             // stand-ins.
@@ -3507,7 +3522,12 @@ fn tw_write(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         None => encoding.clone(),
     };
-    let bytes = crate::stdlib::codecs_mod::encode_str(&translated, &effective_encoding, &errors)?;
+    // Text-model codec check happened at wrapper construction; per-write
+    // codec calls must not repeat it (`test_io.test_illegal_encoder`).
+    let bytes = {
+        let _exempt = crate::stdlib::codecs_mod::io_text_exempt_guard();
+        crate::stdlib::codecs_mod::encode_str(&translated, &effective_encoding, &errors)?
+    };
     // Any successful write leaves the stream past its start.
     tw_set(&inst, "_start_of_stream", Object::Bool(false));
     // CPython's C `TextIOWrapper` does not push every encoded write straight to
