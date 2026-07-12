@@ -2535,6 +2535,53 @@ fn install_unicode_error_dunders(ty: &Rc<TypeObject>, kind: UnicodeErrorKind) {
                 rest.len()
             )));
         }
+        // CPython parses with `PyArg_ParseTuple("UUnnU" / "UOnnU" / "UnnU")`:
+        // wrong-typed arguments raise TypeError at construction.
+        let is_str = |o: &Object| {
+            matches!(o, Object::Str(_) | Object::WStr(_))
+                || matches!(o, Object::Instance(i)
+                    if i.cls().mro.borrow().iter().any(|t| t.name == "str"))
+        };
+        let is_index = |o: &Object| matches!(o, Object::Int(_) | Object::Bool(_));
+        let is_buffer = |o: &Object| {
+            matches!(
+                o,
+                Object::Bytes(_) | Object::ByteArray(_) | Object::MemoryView(_)
+            )
+        };
+        let check = |ok: bool, pos: usize, expect: &str, got: &Object| {
+            if ok {
+                Ok(())
+            } else {
+                Err(crate::error::type_error(format!(
+                    "argument {} must be {expect}, not {}",
+                    pos + 1,
+                    got.type_name_owned()
+                )))
+            }
+        };
+        match kind {
+            UnicodeErrorKind::Encode => {
+                check(is_str(&rest[0]), 0, "str", &rest[0])?;
+                check(is_str(&rest[1]), 1, "str", &rest[1])?;
+                check(is_index(&rest[2]), 2, "int", &rest[2])?;
+                check(is_index(&rest[3]), 3, "int", &rest[3])?;
+                check(is_str(&rest[4]), 4, "str", &rest[4])?;
+            }
+            UnicodeErrorKind::Decode => {
+                check(is_str(&rest[0]), 0, "str", &rest[0])?;
+                check(is_buffer(&rest[1]), 1, "a bytes-like object", &rest[1])?;
+                check(is_index(&rest[2]), 2, "int", &rest[2])?;
+                check(is_index(&rest[3]), 3, "int", &rest[3])?;
+                check(is_str(&rest[4]), 4, "str", &rest[4])?;
+            }
+            UnicodeErrorKind::Translate => {
+                check(is_str(&rest[0]), 0, "str", &rest[0])?;
+                check(is_index(&rest[1]), 1, "int", &rest[1])?;
+                check(is_index(&rest[2]), 2, "int", &rest[2])?;
+                check(is_str(&rest[3]), 3, "str", &rest[3])?;
+            }
+        }
         let mut dict = inst_rc.dict.borrow_mut();
         set(&mut dict, "args", Object::new_tuple(rest.to_vec()));
         let mut i = 0;

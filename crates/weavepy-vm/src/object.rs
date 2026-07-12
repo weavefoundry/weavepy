@@ -395,11 +395,21 @@ pub struct PyFrame {
     /// `frame.clear()` tear down the suspended generator like
     /// CPython's `frame_clear`.
     pub gen_owner: RefCell<Option<crate::sync::Weak<PyGenerator>>>,
-    /// Per-frame `f_lineno` override. CPython lets debuggers set
-    /// `f_lineno` to jump to a different line; we keep storage so
-    /// reads round-trip, even though writes don't actually move the
-    /// program counter.
+    /// Per-frame `f_lineno` override. Set alongside a validated
+    /// [`Self::pending_jump`] so reads report the jump target until
+    /// the dispatch loop applies it (RFC 0050); cleared on apply.
     pub override_lineno: Cell<Option<u32>>,
+    /// The trace event this frame is currently dispatching. CPython's
+    /// `frame_setlineno` gates `f_lineno` assignment on the event kind
+    /// (`'line'` and yield events allow jumps; `'call'`/`'return'`/
+    /// `'exception'`/`'opcode'` refuse). Set/cleared by the
+    /// `fire_*_event` dispatchers (RFC 0050).
+    pub trace_event: Cell<crate::linejump::TraceEvent>,
+    /// A validated pending line-jump: the `f_lineno` setter runs the
+    /// legality analysis (`linejump::compute_jump`) and parks the plan
+    /// here; the dispatch loop applies it to the live frame right
+    /// after the trace callback returns (RFC 0050).
+    pub pending_jump: Cell<Option<crate::linejump::PendingJump>>,
     /// Most recently observed source line on this frame, used by
     /// the dispatcher to know when to fire a `'line'` event. `None`
     /// means "no line event has fired on this frame yet" — the
@@ -3804,6 +3814,9 @@ impl PyFile {
             Some(cont) if !self.text_start_of_stream.get() => cont.to_owned(),
             _ => enc.clone(),
         };
+        // Text-model codec check happened at wrapper construction; per-write
+        // codec calls must not repeat it (`test_io.test_illegal_encoder`).
+        let _exempt = crate::stdlib::codecs_mod::io_text_exempt_guard();
         let out = crate::stdlib::codecs_mod::encode_str(&translated, &effective, &errors)?;
         self.text_start_of_stream.set(false);
         Ok(out)
@@ -3842,6 +3855,9 @@ impl PyFile {
             crate::stdlib::codecs_mod::decode_bytes(bytes, enc, errors)
         }
         let errors = self.errors_name();
+        // Text-model codec check happened at wrapper construction; per-read
+        // codec calls must not repeat it (`test_io.test_illegal_decoder`).
+        let _exempt = crate::stdlib::codecs_mod::io_text_exempt_guard();
         let decoded = match &*self.encoding.borrow() {
             Some(enc) => decode_or_bridge(&bytes, enc, &errors)?,
             None if errors == "strict" => {
@@ -8482,22 +8498,11 @@ fn bytes_membership(haystack: &[u8], item: &Object) -> Result<bool, RuntimeError
 /// except those in the "Other" (Cc, Cf, Cs, Co, Cn) and "Separator"
 /// (Zl, Zp, Zs) general categories, with U+0020 (space) treated as
 /// printable. Used by `repr(str)` (and `str.isprintable`).
+/// `Py_UNICODE_ISPRINTABLE`, from the generated UCD 15.1.0 tables (the
+/// `unicode_properties` crate tracks a newer UCD and drifts on newly
+/// assigned code points).
 pub(crate) fn char_is_printable(c: char) -> bool {
-    if c == ' ' {
-        return true;
-    }
-    use unicode_properties::{GeneralCategory as GC, UnicodeGeneralCategory};
-    !matches!(
-        c.general_category(),
-        GC::Control
-            | GC::Format
-            | GC::Surrogate
-            | GC::PrivateUse
-            | GC::Unassigned
-            | GC::LineSeparator
-            | GC::ParagraphSeparator
-            | GC::SpaceSeparator
-    )
+    crate::unicode_case::is_printable(c)
 }
 
 fn bytes_repr(b: &[u8]) -> String {

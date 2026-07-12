@@ -275,6 +275,9 @@ pub fn run_source_with_options(source: &str, opts: &RunOptions) -> Result<(), Er
         source
     };
     install_capi_loader();
+    // `\N{NAME}` escapes resolve through the VM's UCD tables even for this
+    // pre-interpreter parse of the main module.
+    vm::install_parser_unicode_hook();
     // Tokenizer-collected invalid-escape diagnostics (CPython's
     // `SyntaxWarning`s) are replayed through the `warnings` machinery
     // once the interpreter is up, just before the module body runs.

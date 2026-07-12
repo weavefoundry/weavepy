@@ -19,6 +19,7 @@ mod parser;
 
 pub use ast::{dump_module, Module};
 pub use error::ParseError;
+pub use parser::{set_unicode_name_resolver, UnicodeNameResolution};
 pub use weavepy_lexer::EscapeWarning;
 
 /// Parse a Python source buffer into a [`Module`].

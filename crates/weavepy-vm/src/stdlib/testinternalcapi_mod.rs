@@ -109,6 +109,103 @@ fn has_inline_values(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Bool(inline))
 }
 
+/// Pull an attribute off a `RuntimeError::PyException`'s instance dict
+/// (the Unicode error objects store `start`/`reason` there directly).
+fn exc_attr(err: &RuntimeError, name: &'static str) -> Option<Object> {
+    match err {
+        RuntimeError::PyException(pyexc) => match &pyexc.instance {
+            Object::Instance(inst) => inst
+                .dict
+                .borrow()
+                .get(&DictKey(Object::from_static(name)))
+                .cloned(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `_Py_EncodeLocaleEx`/`_Py_DecodeLocaleEx` only speak these handlers;
+/// anything else is `ValueError('unsupported error handler')`.
+fn locale_check_handler(errors: &str) -> Result<(), RuntimeError> {
+    match errors {
+        "strict" | "surrogateescape" | "surrogatepass" => Ok(()),
+        _ => Err(crate::error::value_error("unsupported error handler")),
+    }
+}
+
+/// `EncodeLocaleEx(text, current_locale, errors)` — encode with the
+/// filesystem encoding (UTF-8), reporting failures as CPython's
+/// `RuntimeError("encode error: pos=N, reason=...")`.
+fn encode_locale_ex(args: &[Object]) -> Result<Object, RuntimeError> {
+    let cps: Vec<u32> = match args.first() {
+        Some(Object::Str(s)) => s.chars().map(|c| c as u32).collect(),
+        Some(Object::WStr(w)) => w.to_vec(),
+        _ => {
+            return Err(crate::error::type_error(
+                "EncodeLocaleEx() argument 'unicode' must be str",
+            ))
+        }
+    };
+    let errors = match args.get(2) {
+        Some(Object::Str(s)) => s.to_string(),
+        None => "strict".to_owned(),
+        _ => return Err(crate::error::type_error("errors must be str")),
+    };
+    locale_check_handler(&errors)?;
+    match crate::stdlib::codecs_engine::utf8_encode(&cps, &errors) {
+        Ok(b) => Ok(Object::Bytes(Rc::from(b.into_boxed_slice()))),
+        Err(e) => {
+            let pos = match exc_attr(&e, "start") {
+                Some(Object::Int(i)) => i,
+                _ => 0,
+            };
+            let reason = match exc_attr(&e, "reason") {
+                Some(Object::Str(s)) => s.to_string(),
+                _ => "encoding error".to_owned(),
+            };
+            Err(crate::error::runtime_error(format!(
+                "encode error: pos={pos}, reason={reason}"
+            )))
+        }
+    }
+}
+
+/// `DecodeLocaleEx(encoded, current_locale, errors)` — the decode
+/// counterpart of [`encode_locale_ex`].
+fn decode_locale_ex(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = match args.first().and_then(|o| o.as_bytes_view()) {
+        Some(b) => b,
+        None => {
+            return Err(crate::error::type_error(
+                "DecodeLocaleEx() argument 'str' must be bytes",
+            ))
+        }
+    };
+    let errors = match args.get(2) {
+        Some(Object::Str(s)) => s.to_string(),
+        None => "strict".to_owned(),
+        _ => return Err(crate::error::type_error("errors must be str")),
+    };
+    locale_check_handler(&errors)?;
+    match crate::stdlib::codecs_engine::utf8_decode(&data, &errors, true) {
+        Ok((obj, _)) => Ok(obj),
+        Err(e) => {
+            let pos = match exc_attr(&e, "start") {
+                Some(Object::Int(i)) => i,
+                _ => 0,
+            };
+            let reason = match exc_attr(&e, "reason") {
+                Some(Object::Str(s)) => s.to_string(),
+                _ => "decoding error".to_owned(),
+            };
+            Err(crate::error::runtime_error(format!(
+                "decode error: pos={pos}, reason={reason}"
+            )))
+        }
+    }
+}
+
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     let dict = Rc::new(RefCell::new(DictData::default()));
     {
@@ -150,6 +247,27 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 name: "_end_spawned_pthread",
                 binds_instance: false,
                 call: Box::new(end_spawned_pthread),
+                call_kw: None,
+            })),
+        );
+        // `_Py_EncodeLocaleEx`/`_Py_DecodeLocaleEx` probes
+        // (`test_codecs.LocaleCodecTest`): the filesystem-encoding
+        // (UTF-8) coders with the locale-restricted handler set.
+        d.insert(
+            DictKey(Object::from_static("EncodeLocaleEx")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "EncodeLocaleEx",
+                binds_instance: false,
+                call: Box::new(encode_locale_ex),
+                call_kw: None,
+            })),
+        );
+        d.insert(
+            DictKey(Object::from_static("DecodeLocaleEx")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "DecodeLocaleEx",
+                binds_instance: false,
+                call: Box::new(decode_locale_ex),
                 call_kw: None,
             })),
         );

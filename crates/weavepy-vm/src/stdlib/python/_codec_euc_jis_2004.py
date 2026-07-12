@@ -19,7 +19,17 @@ from codecs import (
     CodecInfo,
     IncrementalEncoder,
     IncrementalDecoder,
-    lookup_error as _lookup_error,
+    StreamReader,
+    StreamWriter,
+)
+
+from _cjk_common import (
+    ErrorsProperty,
+    MbDecStateMixin,
+    MbEncStateMixin,
+    MbStreamReaderMixin,
+    dec_handle as _common_dec_handle,
+    enc_handle as _common_enc_handle,
 )
 
 _NAME = "euc_jis_2004"
@@ -920,41 +930,11 @@ for _c, (_c1, _c2) in _COMB.items():
     _COMB_BASES.add(_c1)
 
 
-def _backslash(ch):
-    o = ord(ch)
-    if o > 0xFFFF:
-        return "\\U%08x" % o
-    if o > 0xFF:
-        return "\\u%04x" % o
-    return "\\x%02x" % o
-
-
 def _enc_handle(errors, s, start, end):
-    """Resolve an unencodable run ``s[start:end]`` -> (bytes, new_index)."""
-    if errors == "strict":
-        raise UnicodeEncodeError(_NAME, s, start, end, _REASON)
-    if errors == "ignore":
-        return (b"", end)
-    if errors == "replace":
-        return (b"?" * (end - start), end)
-    if errors == "xmlcharrefreplace":
-        return ("".join("&#%d;" % ord(c) for c in s[start:end]).encode("ascii"), end)
-    if errors == "backslashreplace":
-        return ("".join(_backslash(c) for c in s[start:end]).encode("ascii"), end)
-    if errors == "namereplace":
-        import unicodedata
-
-        parts = []
-        for c in s[start:end]:
-            try:
-                parts.append("\\N{%s}" % unicodedata.name(c))
-            except ValueError:
-                parts.append(_backslash(c))
-        return ("".join(parts).encode("ascii"), end)
-    handler = _lookup_error(errors)
-    rep, newpos = handler(UnicodeEncodeError(_NAME, s, start, end, _REASON))
-    if newpos < 0:
-        newpos += len(s)
+    """Resolve an unencodable run ``s[start:end]`` -> (bytes, new_index).
+    Delegates to the shared multibytecodec.c protocol, then re-encodes a
+    ``str`` replacement through this codec's own map (strict)."""
+    rep, newpos = _common_enc_handle(_NAME, errors, s, start, end)
     if isinstance(rep, str):
         out = bytearray()
         for ch in rep:
@@ -968,22 +948,23 @@ def _enc_handle(errors, s, start, end):
 
 def _dec_handle(errors, data, start, end, reason):
     """Resolve an undecodable run ``data[start:end]`` -> (str, new_index)."""
-    if errors == "strict":
-        raise UnicodeDecodeError(_NAME, bytes(data), start, end, reason)
-    if errors == "ignore":
-        return ("", end)
-    if errors == "replace":
-        return ("\ufffd", end)
-    if errors == "backslashreplace":
-        return ("".join("\\x%02x" % b for b in data[start:end]), end)
-    handler = _lookup_error(errors)
-    rep, newpos = handler(UnicodeDecodeError(_NAME, bytes(data), start, end, reason))
-    if newpos < 0:
-        newpos += len(data)
-    return (rep, newpos)
+    return _common_dec_handle(_NAME, errors, data, start, end, reason)
 
 
-def _encode_core(s, errors, final):
+# JIS X 0213:2000 emulation (CPython emu_jisx0213_2000.h): `euc_jisx0213`
+# shares this engine, but characters added by the 2004 revision must be
+# rejected and U+9B1D sits in plane 2 (cell 7D3B) instead.
+_EMU2000_ENC_REJECT = frozenset(
+    (0x9B1C, 0x4FF1, 0x525D, 0x541E, 0x5653, 0x59F8, 0x5C5B, 0x5E77,
+     0x7626, 0x7E6B, 0x20B9F)
+)
+_EMU2000_DEC_REJECT_P1 = frozenset(
+    ((0x2E, 0x21), (0x2F, 0x7E), (0x4F, 0x54), (0x4F, 0x7E), (0x74, 0x27),
+     (0x7E, 0x7A), (0x7E, 0x7B), (0x7E, 0x7C), (0x7E, 0x7D), (0x7E, 0x7E))
+)
+
+
+def _encode_core(s, errors, final, y2000=False):
     """Encode ``s`` -> (bytes, pending). ``pending`` is a combinable base held
     back at a non-final chunk boundary so it can combine with a following mark."""
     out = bytearray()
@@ -993,6 +974,16 @@ def _encode_core(s, errors, final):
     while i < n:
         ch = s[i]
         o = ord(ch)
+        if y2000:
+            if o in _EMU2000_ENC_REJECT:
+                rep, newpos = _enc_handle(errors, s, i, i + 1)
+                out += rep
+                i = newpos
+                continue
+            if o == 0x9B1D:
+                out += b"\x8f\xfd\xbb"
+                i += 1
+                continue
         if o in _COMB_BASES:
             if i + 1 < n:
                 cb = _COMB_ENC.get((o, ord(s[i + 1])))
@@ -1014,7 +1005,7 @@ def _encode_core(s, errors, final):
     return (bytes(out), pending)
 
 
-def _decode_core(data, errors, final):
+def _decode_core(data, errors, final, y2000=False):
     out = []
     i = 0
     n = len(data)
@@ -1036,7 +1027,8 @@ def _decode_core(data, errors, final):
                 out.append(chr(0xFF61 + (t - 0xA1)))
                 i += 2
             else:
-                rep, i = _dec_handle(errors, data, i, i + 2, _REASON)
+                # cjkcodecs decoders flag one byte per error (`return 1`)
+                rep, i = _dec_handle(errors, data, i, i + 1, _REASON)
                 out.append(rep)
             continue
         if b == 0x8F:  # SS3 plane 2
@@ -1049,12 +1041,16 @@ def _decode_core(data, errors, final):
             lead = data[i + 1]
             trail = data[i + 2]
             if 0xA1 <= lead <= 0xFE and 0xA1 <= trail <= 0xFE:
+                if y2000 and lead == 0xFD and trail == 0xBB:
+                    out.append("\u9b1d")
+                    i += 3
+                    continue
                 v = _DEC2[(lead - 0xA1) * 94 + (trail - 0xA1)]
                 if v < 0x110000:
                     out.append(chr(v))
                     i += 3
                     continue
-            rep, i = _dec_handle(errors, data, i, i + 3, _REASON)
+            rep, i = _dec_handle(errors, data, i, i + 1, _REASON)
             out.append(rep)
             continue
         if 0xA1 <= b <= 0xFE:  # plane 1
@@ -1066,6 +1062,11 @@ def _decode_core(data, errors, final):
                 continue
             trail = data[i + 1]
             if 0xA1 <= trail <= 0xFE:
+                if y2000 and (b - 0x80, trail - 0x80) in _EMU2000_DEC_REJECT_P1:
+                    # EMULATE_JISX0213_2000_DECODE_INVALID flags both bytes
+                    rep, i = _dec_handle(errors, data, i, i + 2, _REASON)
+                    out.append(rep)
+                    continue
                 c = (b - 0xA1) * 94 + (trail - 0xA1)
                 v = _DEC1[c]
                 if v == 0xFFFFFE:
@@ -1078,7 +1079,7 @@ def _decode_core(data, errors, final):
                     out.append(chr(v))
                     i += 2
                     continue
-            rep, i = _dec_handle(errors, data, i, i + 2, _REASON)
+            rep, i = _dec_handle(errors, data, i, i + 1, _REASON)
             out.append(rep)
             continue
         rep, i = _dec_handle(errors, data, i, i + 1, _REASON)
@@ -1086,50 +1087,56 @@ def _decode_core(data, errors, final):
     return ("".join(out), i)
 
 
-def _encode(input, errors="strict"):
-    out, _pending = _encode_core(input, errors, True)
+def _encode(input, errors="strict", y2000=False):
+    out, _pending = _encode_core(input, errors, True, y2000)
     return (out, len(input))
 
 
-def _decode(input, errors="strict"):
-    return _decode_core(bytes(input), errors, True)
+def _decode(input, errors="strict", y2000=False):
+    # Buffer-protocol input only (`bytes(42)` would be 42 zero bytes).
+    if not isinstance(input, (bytes, bytearray, memoryview)):
+        raise TypeError(
+            "decode() argument 'data' must be a bytes-like object, not %s"
+            % type(input).__name__)
+    return _decode_core(bytes(input), errors, True, y2000)
 
 
-class _IncrementalEncoder(IncrementalEncoder):
+class _IncrementalEncoder(ErrorsProperty, MbEncStateMixin, IncrementalEncoder):
     """Stateful encoder: a combinable base at a non-final chunk boundary is
     buffered so it can combine with a mark arriving in the next ``encode``.
     ``setstate(0)`` (issued by ``TextIOWrapper.seek``) discards the pending
     base — matching CPython's ``_codecs_jp`` MBCS encoder."""
+
+    _y2000 = False
 
     def __init__(self, errors="strict"):
         super().__init__(errors)
         self._pending = ""
 
     def encode(self, input, final=False):
-        out, self._pending = _encode_core(self._pending + input, self.errors, final)
+        out, self._pending = _encode_core(
+            self._pending + input, self.errors, final, self._y2000)
         return out
 
     def reset(self):
         super().reset()
         self._pending = ""
 
-    def getstate(self):
-        return ord(self._pending) if self._pending else 0
 
-    def setstate(self, state):
-        self._pending = chr(state) if state else ""
-
-
-class _IncrementalDecoder(IncrementalDecoder):
+class _IncrementalDecoder(ErrorsProperty, MbDecStateMixin, IncrementalDecoder):
     """Stateful decoder buffering a trailing partial multibyte sequence."""
+
+    _y2000 = False
+    name = _NAME
 
     def __init__(self, errors="strict"):
         super().__init__(errors)
         self._buffer = b""
+        self._flags = 0
 
     def decode(self, input, final=False):
         data = self._buffer + bytes(input)
-        result, consumed = _decode_core(data, self.errors, final)
+        result, consumed = _decode_core(data, self.errors, final, self._y2000)
         self._buffer = data[consumed:]
         return result
 
@@ -1137,19 +1144,107 @@ class _IncrementalDecoder(IncrementalDecoder):
         super().reset()
         self._buffer = b""
 
-    def getstate(self):
-        return (self._buffer, 0)
 
-    def setstate(self, state):
-        self._buffer = state[0]
+class _StreamWriter(StreamWriter):
+    """Stateful writer: chunks flow through a shared incremental encoder so a
+    combinable base held at a chunk boundary survives to the next write
+    (CPython's MultibyteStreamWriter)."""
+
+    _y2000 = False
+
+    def __init__(self, stream, errors="strict"):
+        StreamWriter.__init__(self, stream, errors)
+        self._encoder = (
+            _IncrementalEncoder2000(errors) if self._y2000
+            else _IncrementalEncoder(errors)
+        )
+
+    def encode(self, input, errors="strict"):
+        self._encoder.errors = errors
+        return (self._encoder.encode(input, False), len(input))
+
+    def reset(self):
+        StreamWriter.reset(self)
+        enc = getattr(self, "_encoder", None)
+        if enc is not None:
+            try:
+                tail = enc.encode("", True)
+            except UnicodeEncodeError:
+                tail = b""
+            if tail:
+                self.stream.write(tail)
+            enc.reset()
+
+
+class _StreamReader(MbStreamReaderMixin, StreamReader):
+    _y2000 = False
+
+    def __init__(self, stream, errors="strict"):
+        StreamReader.__init__(self, stream, errors)
+        self._decoder = (
+            _IncrementalDecoder2000(errors) if self._y2000
+            else _IncrementalDecoder(errors)
+        )
+
+    def decode(self, input, errors="strict"):
+        self._decoder.errors = errors
+        text = self._decoder.decode(bytes(input), False)
+        # Unconsumed tail bytes stay buffered inside the incremental
+        # decoder (and raise from the EOF flush if the stream ends there).
+        return (text, len(input))
+
+    def reset(self):
+        StreamReader.reset(self)
+        dec = getattr(self, "_decoder", None)
+        if dec is not None:
+            dec.reset()
+
+
+class _IncrementalEncoder2000(_IncrementalEncoder):
+    _y2000 = True
+
+
+class _IncrementalDecoder2000(_IncrementalDecoder):
+    _y2000 = True
+
+
+class _StreamWriter2000(_StreamWriter):
+    _y2000 = True
+
+
+class _StreamReader2000(_StreamReader):
+    _y2000 = True
+
+
+def _encode_2000(input, errors="strict"):
+    return _encode(input, errors, True)
+
+
+def _decode_2000(input, errors="strict"):
+    return _decode(input, errors, True)
 
 
 def getregentry(name="euc_jis_2004"):
+    # CPython's `euc_jisx0213` is this same engine restricted to the JIS X
+    # 0213:2000 repertoire (emu_jisx0213_2000.h).
+    if name == "euc_jisx0213":
+        return CodecInfo(
+            encode=_encode_2000,
+            decode=_decode_2000,
+            incrementalencoder=_IncrementalEncoder2000,
+            incrementaldecoder=_IncrementalDecoder2000,
+            streamreader=_StreamReader2000,
+            streamwriter=_StreamWriter2000,
+            name=name,
+            _is_text_encoding=True,
+        )
     return CodecInfo(
         encode=_encode,
         decode=_decode,
         incrementalencoder=_IncrementalEncoder,
         incrementaldecoder=_IncrementalDecoder,
+        streamreader=_StreamReader,
+        streamwriter=_StreamWriter,
         name=name,
         _is_text_encoding=True,
     )

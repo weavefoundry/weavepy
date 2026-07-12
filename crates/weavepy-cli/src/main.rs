@@ -527,7 +527,11 @@ fn run_on_large_stack(entry: fn() -> ExitCode) -> ExitCode {
 fn main_dispatch() -> ExitCode {
     init_tracing();
 
-    let raw: Vec<String> = env::args().collect();
+    // `env::args()` panics on non-UTF-8 argv (bpo-35883's exact repro);
+    // decode PEP 383-style instead, carrying undecodable bytes in the
+    // PUA bridge window that `Interpreter::set_argv` maps back to
+    // lone surrogates (RFC 0050).
+    let raw: Vec<String> = weavepy::vm::os_args_bridged();
 
     // Multiprocessing spawn-child entry point. The parent passes
     // `--multiprocessing-fork` and an optional payload fd via
@@ -676,7 +680,7 @@ fn split_argv(raw: Vec<String>) -> (Vec<String>, Option<(&'static str, String)>,
 }
 
 fn real_main() -> Result<ExitCode> {
-    let raw: Vec<String> = env::args().collect();
+    let raw: Vec<String> = weavepy::vm::os_args_bridged();
     let (wp_argv, mode, child_argv) = split_argv(raw);
     // Re-parse the WeavePy-only slice with clap.
     let mut cli = Cli::parse_from(wp_argv);
@@ -685,7 +689,10 @@ fn real_main() -> Result<ExitCode> {
     match &mode {
         Some(("c", cmd)) => cli.command = Some(cmd.clone()),
         Some(("m", m)) => cli.module = Some(m.clone()),
-        Some(("s", path)) => cli.script = Some(PathBuf::from(path)),
+        // A script path may carry PEP 383-escaped bytes (PUA-bridged by
+        // `os_args_bridged`); recover the OS-level bytes so the file
+        // actually opens (RFC 0050).
+        Some(("s", path)) => cli.script = Some(bridged_arg_to_pathbuf(path)),
         Some(("-", _)) => cli.script = Some(PathBuf::from("-")),
         _ => {}
     }
@@ -821,6 +828,7 @@ fn build_flags(cli: &Cli, env: &EnvOverrides) -> InterpreterFlags {
         hash_seed: env.hash_seed,
         io_encoding: env.io_encoding.clone(),
         io_errors: env.io_errors.clone(),
+        utf8_mode: env.utf8_mode,
     };
     if cli.optimize == 0 && env.optimize > 0 {
         flags.optimize = env.optimize;
@@ -848,6 +856,9 @@ struct EnvOverrides {
     /// part may be empty (`:errors` sets only the handler).
     io_encoding: Option<String>,
     io_errors: Option<String>,
+    /// `PYTHONUTF8=0|1` (PEP 540). `None` when unset/empty; an invalid
+    /// value is a startup fatal error (CPython `config_init_utf8_mode`).
+    utf8_mode: Option<u8>,
 }
 
 impl EnvOverrides {
@@ -912,11 +923,44 @@ impl EnvOverrides {
                 }
             }
         }
+        // `PYTHONUTF8` (PEP 540): "1" enables UTF-8 mode, "0" disables it,
+        // empty means unset; anything else is a startup fatal error
+        // (CPython's `config_init_utf8_mode`).
+        if let Ok(v) = env::var("PYTHONUTF8") {
+            match v.as_str() {
+                "" => {}
+                "1" => o.utf8_mode = Some(1),
+                "0" => o.utf8_mode = Some(0),
+                other => {
+                    eprintln!(
+                        "Fatal Python error: init_utf8_mode: invalid PYTHONUTF8 environment \
+                         variable value '{other}'"
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
         o
     }
 
     fn ignored() -> Self {
         Self::default()
+    }
+}
+
+/// Rebuild a filesystem path from a (possibly PUA-bridged) argv string,
+/// recovering the original OS bytes for PEP 383-escaped names.
+fn bridged_arg_to_pathbuf(arg: &str) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        PathBuf::from(std::ffi::OsString::from_vec(
+            weavepy::vm::bridged_arg_bytes(arg),
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(arg)
     }
 }
 

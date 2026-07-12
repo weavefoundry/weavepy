@@ -45,8 +45,8 @@ status = "fail"
 reason = "measured (RFC 0049 wave-5 full-suite baseline): Dur\u2026[truncated]"
 
 [tests."cpython/Lib/test/test__locale.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: '.' != ','"
+status = "pass"
+reason = "RFC 0050 WS5: real libc-backed _locale — setlocale/localeconv/nl_langinfo (with the full langinfo constant table incl. RADIXCHAR/THOUSEP/ERA/ALT_DIGITS), wcscoll/wcsxfrm collation, getencoding via nl_langinfo(CODESET), and locale strings decoded with mbstowcs under the current LC_CTYPE. LC_CTYPE is adopted from the environment at interpreter start (CPython's _Py_SetLocaleFromEnv). ALT_DIGITS/ERA subtests skip on macOS exactly as CPython does (the host locales don't carry that data)."
 
 [tests."cpython/Lib/test/test__opcode.py"]
 status = "fail"
@@ -165,7 +165,7 @@ reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: Failed
 
 [tests."cpython/Lib/test/test_cmd_line.py"]
 status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): thread 'weavepy-main' (317296) panicked at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/std/src/env.rs:876:51:"
+reason = "measured (RFC 0050 WS5 re-baseline): crash-free — the env.rs Rust panic from the wave-5 baseline is gone. 60 run, 31 residual failures across CLI surface gaps (-X option matrix, stdin/tty prompts, warning-option plumbing), no panics or InternalErrors."
 
 [tests."cpython/Lib/test/test_cmd_line_script.py"]
 status = "timeout"
@@ -180,36 +180,37 @@ status = "fail"
 reason = "measured (RFC 0049 wave-5 full-suite baseline): ValueError: substring not found"
 
 [tests."cpython/Lib/test/test_codeccallbacks.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): TypeError,"
+status = "pass"
+reason = "RFC 0050 WS2: passes end-to-end (40 tests, 0F/0E). Unified codec engine (codecs_engine.rs) drives all UTF-family encode/decode with full custom error-handler protocol: handler resolution via codecs.lookup_error, exc.object mutation with re-validation, position clamping/negative-index semantics, byte- and str-replacement alignment rules for UTF-16/32, and CPython's strict UnicodeError constructor/attribute validation."
 
 [tests."cpython/Lib/test/test_codecencodings_cn.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): ^^^^^^^\u2026[truncated]"
+status = "pass"
+reason = "RFC 0050 WS3: passes (76 tests, 2 skips). gb2312/gbk/gb18030/hz via the frozen _codec_cjk_dbcs + _codec_cjk_ext modules with CPython-parity tables and multibytecodec.c error/state protocol."
 
 [tests."cpython/Lib/test/test_codecencodings_hk.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): LookupError: unknown encodi\u2026[truncated]"
+status = "pass"
+reason = "RFC 0050 WS3: passes (19 tests). big5hkscs (incl. combining pairs and the stateful pair-lookahead encoder) via the frozen _codec_cjk_dbcs module."
 
 [tests."cpython/Lib/test/test_codecencodings_iso2022.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): \u2026[truncated]"
+status = "pass"
+reason = "RFC 0050 WS3: passes (95 tests, 1 skip). All seven iso2022_* variants via the frozen _codec_cjk_ext state machines ported from _codecs_iso2022.c."
 
 [tests."cpython/Lib/test/test_codecencodings_jp.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): File '<frozen codecs>', line 988, in\u2026[truncated]"
+status = "pass"
+reason = "RFC 0050 WS3: passes (133 tests). cp932/euc_jp/shift_jis + the JIS X 0213 family (euc_jis_2004, shift_jis_2004, euc_jisx0213, shift_jisx0213) via the frozen CJK codec modules."
 
 [tests."cpython/Lib/test/test_codecencodings_kr.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): raise LookupError('unknown encoding: ' + encoding) fro\u2026[truncated]"
+status = "pass"
+reason = "RFC 0050 WS3: passes (57 tests). euc_kr (incl. 8-byte jamo make-up sequences), cp949 and johab via the frozen CJK codec modules."
 
 [tests."cpython/Lib/test/test_codecencodings_tw.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): File '<frozen unittest.case>', line 795, in asser\u2026[truncated]"
+status = "pass"
+reason = "RFC 0050 WS3: passes (19 tests). big5/cp950 via the frozen _codec_cjk_dbcs module."
 
 [tests."cpython/Lib/test/test_codecs.py"]
-status = "fail"
-reason = "measured (RFC 0038 WS-A): 21 pass, 14 fail, 214 error. Dominated by the `surrogateescape`/`surrogatepass` error handlers (`ValueError: unknown error handler: surrogateescape`), which require lone-surrogate-preserving (WTF-8) str storage \u2014 the same str-representation change that gates test_posixpath. Deferred to the WTF-8 arc (wave 4)."
+status = "pass"
+timeout_seconds = 120
+reason = "RFC 0050 WS2+WS3: passes end-to-end (284 run, 13 skip). WS2 delivered error-handler unification, UTF-7, stateful UTF-16/32 decoders, the stream layer, unicode-escape handler protocol, 57 vendored charmap codepages, and the IDNA/punycode/nameprep surface. WS3 added the stateful CJK escape codecs (_codec_cjk_ext: hz, iso2022_jp/_1/_2/_2004/_3/_ext, iso2022_kr, johab, shift_jis_2004/shift_jisx0213) plus the euc_jisx0213 2000-emulation variant, ported from Modules/cjkcodecs and differentially verified against CPython 3.13."
 
 [tests."cpython/Lib/test/test_codeop.py"]
 status = "fail"
@@ -612,7 +613,7 @@ reason = "RFC 0039 WS6: native libc-backed select.kqueue/kevent"
 
 [tests."cpython/Lib/test/test_linecache.py"]
 status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): FileNotFoundError: [Errno 2] No such file or directory: 'linecache.py'"
+reason = "RFC 0050 WS3: 26/28 pass (was 2F/11E). The two residual cases (test_getline, test_clearcache) open `os.path.dirname(linecache.__file__) + '/linecache.py'`; WeavePy's linecache is a frozen module (`<frozen linecache>`) whose source intentionally differs from the vendored CPython copy, so there is no honest on-disk `__file__` to report."
 
 [tests."cpython/Lib/test/test_list.py"]
 status = "pass"
@@ -690,8 +691,8 @@ status = "fail"
 reason = "measured (RFC 0049 wave-5 full-suite baseline): File '/Users/owencarey/Documents/weavefoundry/weavepy/vendor/\u2026[truncated]"
 
 [tests."cpython/Lib/test/test_multibytecodec.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): ModuleNotFoundError: No module named '_multibytecodec'"
+status = "pass"
+reason = "RFC 0050 WS3: passes (36 tests, 1 cpython_only skip). Frozen _multibytecodec surface + the multibytecodec.c getstate/setstate C layout (length-prefixed UTF-8 pending, 8 codec state bytes, OverflowError/UnicodeError validation) implemented in _cjk_common and the three frozen CJK codec modules."
 
 [tests."cpython/Lib/test/test_multiprocessing_fork.py"]
 status = "skip"
@@ -873,8 +874,8 @@ status = "fail"
 reason = "random: Mersenne Twister state save/load + SystemRandom"
 
 [tests."cpython/Lib/test/test_range.py"]
-status = "timeout"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): killed after 60s"
+status = "fail"
+reason = "measured (RFC 0050 WS5 re-baseline): the suite now completes inside the budget (was: killed after 60s), surfacing three pre-existing engine gaps — range attribute assignment raises TypeError instead of AttributeError (test_attributes), range() over ints beyond i64 overflows (test_comparison, 2**200 bounds), and float membership `5.0 in range(10)` is False (test_contains). Object-model follow-ups outside RFC 0050's codec/UCD scope."
 
 [tests."cpython/Lib/test/test_re.py"]
 status = "fail"
@@ -914,7 +915,7 @@ reason = "measured (RFC 0039): passes end-to-end \u2014 sched.scheduler enterabs
 
 [tests."cpython/Lib/test/test_scope.py"]
 status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): InternalError: bad cell index"
+reason = "measured (RFC 0050 WS5 re-baseline): crash-free — the 'bad cell index' InternalError from the wave-5 baseline is gone. 4 residual NameErrors around class-body free-variable scoping (e.g. a method closing over an enclosing function's local shadowed by a class attribute); compiler symbol-table follow-up."
 
 [tests."cpython/Lib/test/test_secrets.py"]
 status = "fail"
@@ -1012,8 +1013,8 @@ status = "pass"
 reason = "WS2c: tokenizer now records invalid-escape / oversized-octal SyntaxWarnings (with exact backslash offsets) and the compile path replays them via warnings.warn_explicit (escalating to a located SyntaxError under an 'error' filter); bytes literals reject non-ASCII and bad prefixes (ur/ru/bb/rr/...) raise SyntaxError. All 20 tests pass."
 
 [tests."cpython/Lib/test/test_stringprep.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: False is not true"
+status = "pass"
+reason = "RFC 0050 WS4: unicodedata rebuilt on generated UCD 15.1.0 tables (matching CPython 3.13's pinned database), so the stringprep table predicates line up."
 
 [tests."cpython/Lib/test/test_strptime.py"]
 status = "fail"
@@ -1066,7 +1067,7 @@ reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: Expect
 
 [tests."cpython/Lib/test/test_sys_settrace.py"]
 status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): InternalError: FOR_ITER no iter [other run: timeout]"
+reason = "measured (RFC 0050 WS5 re-baseline): crash-free and inside the budget — the 'FOR_ITER no iter' InternalError and the timeout from the wave-5 baseline are gone. 449 run in ~4s; 159F/16E residual, dominated by the JumpTestCase f_lineno-assignment matrix (frame.f_lineno jumps are not yet implemented) plus line-event granularity diffs; tracked as RFC 0050 follow-up work."
 
 [tests."cpython/Lib/test/test_sysconfig.py"]
 status = "fail"
@@ -1099,8 +1100,8 @@ reason = "measured: passes end-to-end after wiring `open(opener=...)` + file-des
 
 [tests."cpython/Lib/test/test_threading.py"]
 status = "pass"
-timeout_seconds = 300
-reason = "RFC 0039: real OS threads with cooperative GIL hand-off, faithful Lock/RLock (subclassable `_thread.RLock`), thread-death thread-local cleanup (foreign-thread `_DummyThread` reaping), and prompt refcount reclamation of acyclic garbage \u2014 including the cross-thread `Thread.run` teardown cycle (`test_no_refcycle_through_target`) swept on `join()`. All 213 tests pass (29 skips for CPython-only knobs). 180s: the suite runs ~32s standalone; with the main thread participating in GIL hand-offs it exceeds the 60s cap under 4-way parallel worker load."
+timeout_seconds = 600
+reason = "RFC 0039: real OS threads with cooperative GIL hand-off, faithful Lock/RLock (subclassable `_thread.RLock`), thread-death thread-local cleanup (foreign-thread `_DummyThread` reaping), and prompt refcount reclamation of acyclic garbage \u2014 including the cross-thread `Thread.run` teardown cycle (`test_no_refcycle_through_target`) swept on `join()`. All 213 tests pass (29 skips for CPython-only knobs). 600s: the suite runs ~32s standalone and passes under moderate load, but with the main thread participating in GIL hand-offs it has been observed exceeding even 300s under full parallel sweep load (RFC 0050 WS6 re-measure); the raised budget keeps the verdict about correctness, not scheduler contention."
 
 [tests."cpython/Lib/test/test_threading_local.py"]
 status = "fail"
@@ -1167,20 +1168,20 @@ status = "fail"
 reason = "typing: PEP 695 type aliases + ParamSpec.kwargs"
 
 [tests."cpython/Lib/test/test_ucn.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): node_or_string = parse(node_or_string.lstrip(' \\t'), mode='e\u2026[truncated]"
+status = "pass"
+reason = "RFC 0050 WS4: \\N{...} and unicodedata.lookup resolve through the generated UCD 15.1.0 tables — canonical + algorithmic names (incl. lookup-only Tangut), NameAliases, and NamedSequences (lookup-only, rejected by \\N and ucd_3_2_0)."
 
 [tests."cpython/Lib/test/test_unicode_identifiers.py"]
 status = "pass"
 reason = "PEP 3131: parser NFKC-normalizes identifiers and compile()/import raise SyntaxError with CPython .msg/.lineno/.offset for the badsyntax_3131 fixture (RFC 0037 WS2/WS5)"
 
 [tests."cpython/Lib/test/test_unicodedata.py"]
-status = "skip"
-reason = "RFC 0036: name/lookup now use the full UCD table (unicode_names2), but the full NormalizationTest sweep exceeds the per-test budget and residual failures track the UCD-version skew (engine ships 16.0.0, CPython 3.13 pins 15.1.0)"
+status = "pass"
+reason = "RFC 0050 WS4: unicodedata rebuilt on generated UCD 15.1.0 tables probed from CPython 3.13 (records/names/normalization + ucd_3_2_0 snapshot with NormalizationCorrections), str case methods/predicates rewired to the same tables (method checksum matches), and \\N escapes honour a poisoned sys.modules['unicodedata']. Full suite green."
 
 [tests."cpython/Lib/test/test_unittest.py"]
-status = "timeout"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): killed after 60s"
+status = "fail"
+reason = "measured (RFC 0050 WS5 re-baseline): the suite now finishes inside the budget (~33s; was killed after 60s) and grades fail — a large residual cluster around unittest.mock/loader internals unrelated to this RFC's codec/UCD scope."
 
 [tests."cpython/Lib/test/test_unpack.py"]
 status = "pass"
@@ -1221,12 +1222,12 @@ timeout_seconds = 180
 reason = "measured (RFC 0049): UserString F cluster mirrors test_str residuals; ~54s to verdict, budget raised"
 
 [tests."cpython/Lib/test/test_utf8_mode.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: Lists differ: ['stdin: utf-8/strict', 'stdout: utf-8/strict', 'stderr: utf-8/strict'] != ['stdin: utf-8/surrogateescape', 'stdout: utf-8/surroga"
+status = "pass"
+reason = "RFC 0050 WS5: PEP 540 done — PYTHONUTF8 env var (with the invalid-value fatal error), -X utf8 priority, and the C/POSIX-locale default drive sys.flags.utf8_mode; stdio error handlers match config_init_stdio (stdin/stdout surrogateescape under UTF-8 mode or a coercion-target locale, strict when PYTHONIOENCODING gives an encoding, stderr always backslashreplace) and sys.std*.encoding reports the canonical codec name (latin1 → iso8859-1). One skip: sys.stdout is not a TTY (device_encoding)."
 
 [tests."cpython/Lib/test/test_utf8source.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): ImportError: failed to read '/Users/owencarey/Documents/weavefoundry/weavepy/vendor/cpython/Lib/test/tokenizedata/badsyntax_pep3120.py': stream did not contain "
+status = "pass"
+reason = "RFC 0050 WS3/WS4: imported modules now decode through the PEP 263 BOM/coding-cookie path (registry-backed codecs included) instead of a strict-UTF-8 read_to_string, so the tokenizedata fixtures load and error like CPython."
 
 [tests."cpython/Lib/test/test_uuid.py"]
 status = "pass"

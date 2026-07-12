@@ -399,6 +399,53 @@ pub struct CpythonCode {
     pub inst_offsets: Vec<u32>,
 }
 
+/// Memoised [`CodeObject::to_cpython`] output. The encoding is pure —
+/// it depends only on the (immutable-after-compile) code object — but
+/// hot paths (`f_lasti`, `co_lines()` in trace functions) call it per
+/// event, and a full re-encode of a large code object costs
+/// milliseconds. Interior-mutable under the same GIL invariant as
+/// [`crate::bytecode::CacheSlot`] so the fill can happen through a
+/// shared `&CodeObject` (`Arc<CodeObject>` crosses thread boundaries).
+#[derive(Default)]
+pub struct CpCache {
+    inner: std::cell::UnsafeCell<Option<std::sync::Arc<CpythonCode>>>,
+}
+
+// SAFETY: all reads/writes happen under the VM's GIL invariant — see
+// `CacheSlot` in bytecode.rs for the full justification.
+unsafe impl Send for CpCache {}
+unsafe impl Sync for CpCache {}
+
+impl CpCache {
+    fn get_or_init(&self, init: impl FnOnce() -> CpythonCode) -> std::sync::Arc<CpythonCode> {
+        // SAFETY: the GIL invariant guarantees no concurrent access.
+        let slot = unsafe { &mut *self.inner.get() };
+        slot.get_or_insert_with(|| std::sync::Arc::new(init()))
+            .clone()
+    }
+}
+
+impl std::fmt::Debug for CpCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CpCache")
+    }
+}
+
+/// A clone starts cold: the copy may be mutated (e.g. `code.replace`)
+/// before it is next encoded.
+impl Clone for CpCache {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+/// The cache never affects code-object identity.
+impl PartialEq for CpCache {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
 const CO_FAST_LOCAL: u8 = 0x20;
 const CO_FAST_CELL: u8 = 0x40;
 const CO_FAST_FREE: u8 = 0x80;
@@ -1127,9 +1174,11 @@ fn map_from_cpython(cp_op: u8, arg: u32, nlocals: u32) -> Option<(OpCode, u32)> 
 
 impl CodeObject {
     /// The CPython-3.13 wire view of this code object (RFC 0033).
+    /// Encoded once per code object and memoised (the encoding is hot:
+    /// trace functions hit `f_lasti` / `co_lines()` per event).
     #[must_use]
-    pub fn to_cpython(&self) -> CpythonCode {
-        encode(self)
+    pub fn to_cpython(&self) -> std::sync::Arc<CpythonCode> {
+        self.cp_cache.get_or_init(|| encode(self))
     }
 
     /// Translate a WeavePy instruction index into the `co_code` byte offset

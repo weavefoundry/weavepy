@@ -2465,8 +2465,7 @@ fn b_str(args: &[Object]) -> Result<Object, RuntimeError> {
                 )))
             }
         };
-        let s = crate::stdlib::codecs_mod::decode_bytes(&data, &encoding, &errors)?;
-        return Ok(Object::from_str(s));
+        return crate::stdlib::codecs_mod::decode_bytes_obj(&data, &encoding, &errors);
     }
     // Identity for strings — a `WStr` in particular must keep its lone
     // surrogates rather than flatten to U+FFFD through `to_str()`.
@@ -3147,9 +3146,11 @@ pub(crate) fn code_synthetic_attr(
                 .collect(),
         )),
         // CPython-3.13 wire view (RFC 0033). Computed on demand.
-        "co_code" => Some(Object::Bytes(Rc::from(c.to_cpython().co_code))),
-        "co_linetable" => Some(Object::Bytes(Rc::from(c.to_cpython().co_linetable))),
-        "co_exceptiontable" => Some(Object::Bytes(Rc::from(c.to_cpython().co_exceptiontable))),
+        "co_code" => Some(Object::Bytes(Rc::from(c.to_cpython().co_code.clone()))),
+        "co_linetable" => Some(Object::Bytes(Rc::from(c.to_cpython().co_linetable.clone()))),
+        "co_exceptiontable" => Some(Object::Bytes(Rc::from(
+            c.to_cpython().co_exceptiontable.clone(),
+        ))),
         "co_localsplusnames" => Some(Object::new_tuple(
             c.to_cpython()
                 .localsplusnames
@@ -3157,7 +3158,9 @@ pub(crate) fn code_synthetic_attr(
                 .map(Object::from_str)
                 .collect(),
         )),
-        "co_localspluskinds" => Some(Object::Bytes(Rc::from(c.to_cpython().localspluskinds))),
+        "co_localspluskinds" => Some(Object::Bytes(Rc::from(
+            c.to_cpython().localspluskinds.clone(),
+        ))),
         "co_lines" => Some(code_method(c, "co_lines", code_co_lines)),
         "co_positions" => Some(code_method(c, "co_positions", code_co_positions)),
         "_varname_from_oparg" => Some(code_method(
@@ -4797,26 +4800,14 @@ fn transform_decimal_and_space(raw: &str) -> String {
 }
 
 /// Decimal value (0–9) of a Unicode `Nd` (Decimal_Number) character, or
-/// `None`. Each `Nd` block is exactly ten consecutive code points `0..=9`,
-/// so the block's zero is found by walking down while still in category
-/// `Nd` (bounded to nine steps).
+/// `None` — straight from the generated UCD 15.1.0 record.
 fn unicode_decimal_value(c: char) -> Option<u32> {
-    use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
     if let Some(d) = c.to_digit(10) {
         return Some(d);
     }
-    if c.general_category() != GeneralCategory::DecimalNumber {
-        return None;
-    }
-    let cp = c as u32;
-    let mut zero = cp;
-    while cp - zero < 9 {
-        match char::from_u32(zero - 1) {
-            Some(p) if p.general_category() == GeneralCategory::DecimalNumber => zero -= 1,
-            _ => break,
-        }
-    }
-    Some(cp - zero)
+    crate::stdlib::ucd::record(c as u32, false)
+        .decimal()
+        .map(u32::from)
 }
 
 /// PEP 515 underscore rule for decimal float literals: every `_` must sit
@@ -7834,349 +7825,30 @@ fn str_arity(name: &str, args: &[Object], min: usize, max: usize) -> Result<(), 
 
 fn str_upper(args: &[Object]) -> Result<Object, RuntimeError> {
     str_arity("upper", args, 0, 0)?;
-    let up = str_self(args)?.to_uppercase();
+    let up = crate::unicode_case::upper(&str_self(args)?);
     Ok(str_result(args, up))
 }
 
 fn str_lower(args: &[Object]) -> Result<Object, RuntimeError> {
     str_arity("lower", args, 0, 0)?;
-    let lo = str_self(args)?.to_lowercase();
+    let lo = crate::unicode_case::lower(&str_self(args)?);
     Ok(str_result(args, lo))
 }
 
 /// `str.casefold()` — aggressive, caseless-matching fold. Distinct from
-/// `.lower()`: e.g. `"ß".casefold() == "ss"` and `"ς".casefold() == "σ"`.
-/// Applies the per-character full case-folding mapping (`casefold_char`)
-/// where it diverges from the simple lowercase mapping, and falls back
-/// to `char::to_lowercase()` otherwise. Case folding is context-free
-/// (no Greek final-sigma special-casing), so a per-`char` pass is exact.
+/// `.lower()`: e.g. `"ß".casefold() == "ss"` and `"ς".casefold() == "σ"`,
+/// and folding is context-free (no Greek final-sigma special-casing).
 fn str_casefold(args: &[Object]) -> Result<Object, RuntimeError> {
     str_arity("casefold", args, 0, 0)?;
-    let s = str_self(args)?;
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match casefold_char(c) {
-            Some(folded) => out.push_str(folded),
-            None => out.extend(c.to_lowercase()),
-        }
-    }
+    let out = crate::unicode_case::casefold(&str_self(args)?);
     Ok(str_result(args, out))
-}
-
-/// Full Unicode case-folding overlay (`CaseFolding.txt` C+F status),
-/// covering only the code points whose fold differs from their simple
-/// `char::to_lowercase()` mapping; all others fold to their lowercase
-/// form (applied by the caller). Generated from CPython's own
-/// `str.casefold()` over the entire code-point space, so it tracks the
-/// same Unicode version CPython ships.
-fn casefold_char(c: char) -> Option<&'static str> {
-    match c {
-        '\u{b5}' => Some("\u{3bc}"),
-        '\u{df}' => Some("\u{73}\u{73}"),
-        '\u{149}' => Some("\u{2bc}\u{6e}"),
-        '\u{17f}' => Some("\u{73}"),
-        '\u{1f0}' => Some("\u{6a}\u{30c}"),
-        '\u{345}' => Some("\u{3b9}"),
-        '\u{390}' => Some("\u{3b9}\u{308}\u{301}"),
-        '\u{3b0}' => Some("\u{3c5}\u{308}\u{301}"),
-        '\u{3c2}' => Some("\u{3c3}"),
-        '\u{3d0}' => Some("\u{3b2}"),
-        '\u{3d1}' => Some("\u{3b8}"),
-        '\u{3d5}' => Some("\u{3c6}"),
-        '\u{3d6}' => Some("\u{3c0}"),
-        '\u{3f0}' => Some("\u{3ba}"),
-        '\u{3f1}' => Some("\u{3c1}"),
-        '\u{3f5}' => Some("\u{3b5}"),
-        '\u{587}' => Some("\u{565}\u{582}"),
-        '\u{13a0}' => Some("\u{13a0}"),
-        '\u{13a1}' => Some("\u{13a1}"),
-        '\u{13a2}' => Some("\u{13a2}"),
-        '\u{13a3}' => Some("\u{13a3}"),
-        '\u{13a4}' => Some("\u{13a4}"),
-        '\u{13a5}' => Some("\u{13a5}"),
-        '\u{13a6}' => Some("\u{13a6}"),
-        '\u{13a7}' => Some("\u{13a7}"),
-        '\u{13a8}' => Some("\u{13a8}"),
-        '\u{13a9}' => Some("\u{13a9}"),
-        '\u{13aa}' => Some("\u{13aa}"),
-        '\u{13ab}' => Some("\u{13ab}"),
-        '\u{13ac}' => Some("\u{13ac}"),
-        '\u{13ad}' => Some("\u{13ad}"),
-        '\u{13ae}' => Some("\u{13ae}"),
-        '\u{13af}' => Some("\u{13af}"),
-        '\u{13b0}' => Some("\u{13b0}"),
-        '\u{13b1}' => Some("\u{13b1}"),
-        '\u{13b2}' => Some("\u{13b2}"),
-        '\u{13b3}' => Some("\u{13b3}"),
-        '\u{13b4}' => Some("\u{13b4}"),
-        '\u{13b5}' => Some("\u{13b5}"),
-        '\u{13b6}' => Some("\u{13b6}"),
-        '\u{13b7}' => Some("\u{13b7}"),
-        '\u{13b8}' => Some("\u{13b8}"),
-        '\u{13b9}' => Some("\u{13b9}"),
-        '\u{13ba}' => Some("\u{13ba}"),
-        '\u{13bb}' => Some("\u{13bb}"),
-        '\u{13bc}' => Some("\u{13bc}"),
-        '\u{13bd}' => Some("\u{13bd}"),
-        '\u{13be}' => Some("\u{13be}"),
-        '\u{13bf}' => Some("\u{13bf}"),
-        '\u{13c0}' => Some("\u{13c0}"),
-        '\u{13c1}' => Some("\u{13c1}"),
-        '\u{13c2}' => Some("\u{13c2}"),
-        '\u{13c3}' => Some("\u{13c3}"),
-        '\u{13c4}' => Some("\u{13c4}"),
-        '\u{13c5}' => Some("\u{13c5}"),
-        '\u{13c6}' => Some("\u{13c6}"),
-        '\u{13c7}' => Some("\u{13c7}"),
-        '\u{13c8}' => Some("\u{13c8}"),
-        '\u{13c9}' => Some("\u{13c9}"),
-        '\u{13ca}' => Some("\u{13ca}"),
-        '\u{13cb}' => Some("\u{13cb}"),
-        '\u{13cc}' => Some("\u{13cc}"),
-        '\u{13cd}' => Some("\u{13cd}"),
-        '\u{13ce}' => Some("\u{13ce}"),
-        '\u{13cf}' => Some("\u{13cf}"),
-        '\u{13d0}' => Some("\u{13d0}"),
-        '\u{13d1}' => Some("\u{13d1}"),
-        '\u{13d2}' => Some("\u{13d2}"),
-        '\u{13d3}' => Some("\u{13d3}"),
-        '\u{13d4}' => Some("\u{13d4}"),
-        '\u{13d5}' => Some("\u{13d5}"),
-        '\u{13d6}' => Some("\u{13d6}"),
-        '\u{13d7}' => Some("\u{13d7}"),
-        '\u{13d8}' => Some("\u{13d8}"),
-        '\u{13d9}' => Some("\u{13d9}"),
-        '\u{13da}' => Some("\u{13da}"),
-        '\u{13db}' => Some("\u{13db}"),
-        '\u{13dc}' => Some("\u{13dc}"),
-        '\u{13dd}' => Some("\u{13dd}"),
-        '\u{13de}' => Some("\u{13de}"),
-        '\u{13df}' => Some("\u{13df}"),
-        '\u{13e0}' => Some("\u{13e0}"),
-        '\u{13e1}' => Some("\u{13e1}"),
-        '\u{13e2}' => Some("\u{13e2}"),
-        '\u{13e3}' => Some("\u{13e3}"),
-        '\u{13e4}' => Some("\u{13e4}"),
-        '\u{13e5}' => Some("\u{13e5}"),
-        '\u{13e6}' => Some("\u{13e6}"),
-        '\u{13e7}' => Some("\u{13e7}"),
-        '\u{13e8}' => Some("\u{13e8}"),
-        '\u{13e9}' => Some("\u{13e9}"),
-        '\u{13ea}' => Some("\u{13ea}"),
-        '\u{13eb}' => Some("\u{13eb}"),
-        '\u{13ec}' => Some("\u{13ec}"),
-        '\u{13ed}' => Some("\u{13ed}"),
-        '\u{13ee}' => Some("\u{13ee}"),
-        '\u{13ef}' => Some("\u{13ef}"),
-        '\u{13f0}' => Some("\u{13f0}"),
-        '\u{13f1}' => Some("\u{13f1}"),
-        '\u{13f2}' => Some("\u{13f2}"),
-        '\u{13f3}' => Some("\u{13f3}"),
-        '\u{13f4}' => Some("\u{13f4}"),
-        '\u{13f5}' => Some("\u{13f5}"),
-        '\u{13f8}' => Some("\u{13f0}"),
-        '\u{13f9}' => Some("\u{13f1}"),
-        '\u{13fa}' => Some("\u{13f2}"),
-        '\u{13fb}' => Some("\u{13f3}"),
-        '\u{13fc}' => Some("\u{13f4}"),
-        '\u{13fd}' => Some("\u{13f5}"),
-        '\u{1c80}' => Some("\u{432}"),
-        '\u{1c81}' => Some("\u{434}"),
-        '\u{1c82}' => Some("\u{43e}"),
-        '\u{1c83}' => Some("\u{441}"),
-        '\u{1c84}' => Some("\u{442}"),
-        '\u{1c85}' => Some("\u{442}"),
-        '\u{1c86}' => Some("\u{44a}"),
-        '\u{1c87}' => Some("\u{463}"),
-        '\u{1c88}' => Some("\u{a64b}"),
-        '\u{1e96}' => Some("\u{68}\u{331}"),
-        '\u{1e97}' => Some("\u{74}\u{308}"),
-        '\u{1e98}' => Some("\u{77}\u{30a}"),
-        '\u{1e99}' => Some("\u{79}\u{30a}"),
-        '\u{1e9a}' => Some("\u{61}\u{2be}"),
-        '\u{1e9b}' => Some("\u{1e61}"),
-        '\u{1e9e}' => Some("\u{73}\u{73}"),
-        '\u{1f50}' => Some("\u{3c5}\u{313}"),
-        '\u{1f52}' => Some("\u{3c5}\u{313}\u{300}"),
-        '\u{1f54}' => Some("\u{3c5}\u{313}\u{301}"),
-        '\u{1f56}' => Some("\u{3c5}\u{313}\u{342}"),
-        '\u{1f80}' => Some("\u{1f00}\u{3b9}"),
-        '\u{1f81}' => Some("\u{1f01}\u{3b9}"),
-        '\u{1f82}' => Some("\u{1f02}\u{3b9}"),
-        '\u{1f83}' => Some("\u{1f03}\u{3b9}"),
-        '\u{1f84}' => Some("\u{1f04}\u{3b9}"),
-        '\u{1f85}' => Some("\u{1f05}\u{3b9}"),
-        '\u{1f86}' => Some("\u{1f06}\u{3b9}"),
-        '\u{1f87}' => Some("\u{1f07}\u{3b9}"),
-        '\u{1f88}' => Some("\u{1f00}\u{3b9}"),
-        '\u{1f89}' => Some("\u{1f01}\u{3b9}"),
-        '\u{1f8a}' => Some("\u{1f02}\u{3b9}"),
-        '\u{1f8b}' => Some("\u{1f03}\u{3b9}"),
-        '\u{1f8c}' => Some("\u{1f04}\u{3b9}"),
-        '\u{1f8d}' => Some("\u{1f05}\u{3b9}"),
-        '\u{1f8e}' => Some("\u{1f06}\u{3b9}"),
-        '\u{1f8f}' => Some("\u{1f07}\u{3b9}"),
-        '\u{1f90}' => Some("\u{1f20}\u{3b9}"),
-        '\u{1f91}' => Some("\u{1f21}\u{3b9}"),
-        '\u{1f92}' => Some("\u{1f22}\u{3b9}"),
-        '\u{1f93}' => Some("\u{1f23}\u{3b9}"),
-        '\u{1f94}' => Some("\u{1f24}\u{3b9}"),
-        '\u{1f95}' => Some("\u{1f25}\u{3b9}"),
-        '\u{1f96}' => Some("\u{1f26}\u{3b9}"),
-        '\u{1f97}' => Some("\u{1f27}\u{3b9}"),
-        '\u{1f98}' => Some("\u{1f20}\u{3b9}"),
-        '\u{1f99}' => Some("\u{1f21}\u{3b9}"),
-        '\u{1f9a}' => Some("\u{1f22}\u{3b9}"),
-        '\u{1f9b}' => Some("\u{1f23}\u{3b9}"),
-        '\u{1f9c}' => Some("\u{1f24}\u{3b9}"),
-        '\u{1f9d}' => Some("\u{1f25}\u{3b9}"),
-        '\u{1f9e}' => Some("\u{1f26}\u{3b9}"),
-        '\u{1f9f}' => Some("\u{1f27}\u{3b9}"),
-        '\u{1fa0}' => Some("\u{1f60}\u{3b9}"),
-        '\u{1fa1}' => Some("\u{1f61}\u{3b9}"),
-        '\u{1fa2}' => Some("\u{1f62}\u{3b9}"),
-        '\u{1fa3}' => Some("\u{1f63}\u{3b9}"),
-        '\u{1fa4}' => Some("\u{1f64}\u{3b9}"),
-        '\u{1fa5}' => Some("\u{1f65}\u{3b9}"),
-        '\u{1fa6}' => Some("\u{1f66}\u{3b9}"),
-        '\u{1fa7}' => Some("\u{1f67}\u{3b9}"),
-        '\u{1fa8}' => Some("\u{1f60}\u{3b9}"),
-        '\u{1fa9}' => Some("\u{1f61}\u{3b9}"),
-        '\u{1faa}' => Some("\u{1f62}\u{3b9}"),
-        '\u{1fab}' => Some("\u{1f63}\u{3b9}"),
-        '\u{1fac}' => Some("\u{1f64}\u{3b9}"),
-        '\u{1fad}' => Some("\u{1f65}\u{3b9}"),
-        '\u{1fae}' => Some("\u{1f66}\u{3b9}"),
-        '\u{1faf}' => Some("\u{1f67}\u{3b9}"),
-        '\u{1fb2}' => Some("\u{1f70}\u{3b9}"),
-        '\u{1fb3}' => Some("\u{3b1}\u{3b9}"),
-        '\u{1fb4}' => Some("\u{3ac}\u{3b9}"),
-        '\u{1fb6}' => Some("\u{3b1}\u{342}"),
-        '\u{1fb7}' => Some("\u{3b1}\u{342}\u{3b9}"),
-        '\u{1fbc}' => Some("\u{3b1}\u{3b9}"),
-        '\u{1fbe}' => Some("\u{3b9}"),
-        '\u{1fc2}' => Some("\u{1f74}\u{3b9}"),
-        '\u{1fc3}' => Some("\u{3b7}\u{3b9}"),
-        '\u{1fc4}' => Some("\u{3ae}\u{3b9}"),
-        '\u{1fc6}' => Some("\u{3b7}\u{342}"),
-        '\u{1fc7}' => Some("\u{3b7}\u{342}\u{3b9}"),
-        '\u{1fcc}' => Some("\u{3b7}\u{3b9}"),
-        '\u{1fd2}' => Some("\u{3b9}\u{308}\u{300}"),
-        '\u{1fd3}' => Some("\u{3b9}\u{308}\u{301}"),
-        '\u{1fd6}' => Some("\u{3b9}\u{342}"),
-        '\u{1fd7}' => Some("\u{3b9}\u{308}\u{342}"),
-        '\u{1fe2}' => Some("\u{3c5}\u{308}\u{300}"),
-        '\u{1fe3}' => Some("\u{3c5}\u{308}\u{301}"),
-        '\u{1fe4}' => Some("\u{3c1}\u{313}"),
-        '\u{1fe6}' => Some("\u{3c5}\u{342}"),
-        '\u{1fe7}' => Some("\u{3c5}\u{308}\u{342}"),
-        '\u{1ff2}' => Some("\u{1f7c}\u{3b9}"),
-        '\u{1ff3}' => Some("\u{3c9}\u{3b9}"),
-        '\u{1ff4}' => Some("\u{3ce}\u{3b9}"),
-        '\u{1ff6}' => Some("\u{3c9}\u{342}"),
-        '\u{1ff7}' => Some("\u{3c9}\u{342}\u{3b9}"),
-        '\u{1ffc}' => Some("\u{3c9}\u{3b9}"),
-        '\u{ab70}' => Some("\u{13a0}"),
-        '\u{ab71}' => Some("\u{13a1}"),
-        '\u{ab72}' => Some("\u{13a2}"),
-        '\u{ab73}' => Some("\u{13a3}"),
-        '\u{ab74}' => Some("\u{13a4}"),
-        '\u{ab75}' => Some("\u{13a5}"),
-        '\u{ab76}' => Some("\u{13a6}"),
-        '\u{ab77}' => Some("\u{13a7}"),
-        '\u{ab78}' => Some("\u{13a8}"),
-        '\u{ab79}' => Some("\u{13a9}"),
-        '\u{ab7a}' => Some("\u{13aa}"),
-        '\u{ab7b}' => Some("\u{13ab}"),
-        '\u{ab7c}' => Some("\u{13ac}"),
-        '\u{ab7d}' => Some("\u{13ad}"),
-        '\u{ab7e}' => Some("\u{13ae}"),
-        '\u{ab7f}' => Some("\u{13af}"),
-        '\u{ab80}' => Some("\u{13b0}"),
-        '\u{ab81}' => Some("\u{13b1}"),
-        '\u{ab82}' => Some("\u{13b2}"),
-        '\u{ab83}' => Some("\u{13b3}"),
-        '\u{ab84}' => Some("\u{13b4}"),
-        '\u{ab85}' => Some("\u{13b5}"),
-        '\u{ab86}' => Some("\u{13b6}"),
-        '\u{ab87}' => Some("\u{13b7}"),
-        '\u{ab88}' => Some("\u{13b8}"),
-        '\u{ab89}' => Some("\u{13b9}"),
-        '\u{ab8a}' => Some("\u{13ba}"),
-        '\u{ab8b}' => Some("\u{13bb}"),
-        '\u{ab8c}' => Some("\u{13bc}"),
-        '\u{ab8d}' => Some("\u{13bd}"),
-        '\u{ab8e}' => Some("\u{13be}"),
-        '\u{ab8f}' => Some("\u{13bf}"),
-        '\u{ab90}' => Some("\u{13c0}"),
-        '\u{ab91}' => Some("\u{13c1}"),
-        '\u{ab92}' => Some("\u{13c2}"),
-        '\u{ab93}' => Some("\u{13c3}"),
-        '\u{ab94}' => Some("\u{13c4}"),
-        '\u{ab95}' => Some("\u{13c5}"),
-        '\u{ab96}' => Some("\u{13c6}"),
-        '\u{ab97}' => Some("\u{13c7}"),
-        '\u{ab98}' => Some("\u{13c8}"),
-        '\u{ab99}' => Some("\u{13c9}"),
-        '\u{ab9a}' => Some("\u{13ca}"),
-        '\u{ab9b}' => Some("\u{13cb}"),
-        '\u{ab9c}' => Some("\u{13cc}"),
-        '\u{ab9d}' => Some("\u{13cd}"),
-        '\u{ab9e}' => Some("\u{13ce}"),
-        '\u{ab9f}' => Some("\u{13cf}"),
-        '\u{aba0}' => Some("\u{13d0}"),
-        '\u{aba1}' => Some("\u{13d1}"),
-        '\u{aba2}' => Some("\u{13d2}"),
-        '\u{aba3}' => Some("\u{13d3}"),
-        '\u{aba4}' => Some("\u{13d4}"),
-        '\u{aba5}' => Some("\u{13d5}"),
-        '\u{aba6}' => Some("\u{13d6}"),
-        '\u{aba7}' => Some("\u{13d7}"),
-        '\u{aba8}' => Some("\u{13d8}"),
-        '\u{aba9}' => Some("\u{13d9}"),
-        '\u{abaa}' => Some("\u{13da}"),
-        '\u{abab}' => Some("\u{13db}"),
-        '\u{abac}' => Some("\u{13dc}"),
-        '\u{abad}' => Some("\u{13dd}"),
-        '\u{abae}' => Some("\u{13de}"),
-        '\u{abaf}' => Some("\u{13df}"),
-        '\u{abb0}' => Some("\u{13e0}"),
-        '\u{abb1}' => Some("\u{13e1}"),
-        '\u{abb2}' => Some("\u{13e2}"),
-        '\u{abb3}' => Some("\u{13e3}"),
-        '\u{abb4}' => Some("\u{13e4}"),
-        '\u{abb5}' => Some("\u{13e5}"),
-        '\u{abb6}' => Some("\u{13e6}"),
-        '\u{abb7}' => Some("\u{13e7}"),
-        '\u{abb8}' => Some("\u{13e8}"),
-        '\u{abb9}' => Some("\u{13e9}"),
-        '\u{abba}' => Some("\u{13ea}"),
-        '\u{abbb}' => Some("\u{13eb}"),
-        '\u{abbc}' => Some("\u{13ec}"),
-        '\u{abbd}' => Some("\u{13ed}"),
-        '\u{abbe}' => Some("\u{13ee}"),
-        '\u{abbf}' => Some("\u{13ef}"),
-        '\u{fb00}' => Some("\u{66}\u{66}"),
-        '\u{fb01}' => Some("\u{66}\u{69}"),
-        '\u{fb02}' => Some("\u{66}\u{6c}"),
-        '\u{fb03}' => Some("\u{66}\u{66}\u{69}"),
-        '\u{fb04}' => Some("\u{66}\u{66}\u{6c}"),
-        '\u{fb05}' => Some("\u{73}\u{74}"),
-        '\u{fb06}' => Some("\u{73}\u{74}"),
-        '\u{fb13}' => Some("\u{574}\u{576}"),
-        '\u{fb14}' => Some("\u{574}\u{565}"),
-        '\u{fb15}' => Some("\u{574}\u{56b}"),
-        '\u{fb16}' => Some("\u{57e}\u{576}"),
-        '\u{fb17}' => Some("\u{574}\u{56d}"),
-        _ => None,
-    }
 }
 
 fn str_strip(args: &[Object]) -> Result<Object, RuntimeError> {
     str_arity("strip", args, 0, 1)?;
     let s = str_self(args)?;
     let out = match args.get(1) {
-        None | Some(Object::None) => s.trim().to_owned(),
+        None | Some(Object::None) => s.trim_matches(crate::unicode_case::is_space).to_owned(),
         Some(arg) => {
             let chars =
                 str_arg_bridged(arg).ok_or_else(|| type_error("strip() argument must be str"))?;
@@ -8198,10 +7870,16 @@ fn split_maxsplit(o: Option<&Object>) -> Result<i64, RuntimeError> {
 
 /// `str.split` on runs of whitespace (the `sep is None` case), honouring
 /// `maxsplit`. Leading/trailing whitespace is stripped and empty fields
-/// are dropped, matching CPython.
+/// are dropped, matching CPython (Py_UNICODE_ISSPACE, which covers
+/// U+001C..U+001F unlike Rust's `char::is_whitespace`).
 fn str_split_whitespace(s: &str, maxsplit: i64) -> Vec<Object> {
+    use crate::unicode_case::is_space;
     if maxsplit < 0 {
-        return s.split_whitespace().map(Object::from_str).collect();
+        return s
+            .split(is_space)
+            .filter(|f| !f.is_empty())
+            .map(Object::from_str)
+            .collect();
     }
     let chars: Vec<(usize, char)> = s.char_indices().collect();
     let n = chars.len();
@@ -8209,7 +7887,7 @@ fn str_split_whitespace(s: &str, maxsplit: i64) -> Vec<Object> {
     let mut i = 0;
     let mut splits = 0;
     while i < n {
-        while i < n && chars[i].1.is_whitespace() {
+        while i < n && is_space(chars[i].1) {
             i += 1;
         }
         if i >= n {
@@ -8220,7 +7898,7 @@ fn str_split_whitespace(s: &str, maxsplit: i64) -> Vec<Object> {
             return out;
         }
         let start = chars[i].0;
-        while i < n && !chars[i].1.is_whitespace() {
+        while i < n && !is_space(chars[i].1) {
             i += 1;
         }
         let end = if i < n { chars[i].0 } else { s.len() };
@@ -8562,47 +8240,19 @@ fn byte_offset_to_char(s: &str, byte: usize) -> usize {
 
 fn str_title(args: &[Object]) -> Result<Object, RuntimeError> {
     str_arity("title", args, 0, 0)?;
-    let mut out = String::new();
-    let mut prev_alpha = false;
-    for ch in str_self(args)?.chars() {
-        if ch.is_alphabetic() {
-            if prev_alpha {
-                out.extend(ch.to_lowercase());
-            } else {
-                out.extend(ch.to_uppercase());
-            }
-            prev_alpha = true;
-        } else {
-            out.push(ch);
-            prev_alpha = false;
-        }
-    }
+    let out = crate::unicode_case::title(&str_self(args)?);
     Ok(str_result(args, out))
 }
 
 fn str_capitalize(args: &[Object]) -> Result<Object, RuntimeError> {
     str_arity("capitalize", args, 0, 0)?;
-    let s = str_self(args)?;
-    let mut chars = s.chars();
-    let out = match chars.next() {
-        Some(c) => c.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
-        None => String::new(),
-    };
+    let out = crate::unicode_case::capitalize(&str_self(args)?);
     Ok(str_result(args, out))
 }
 
 fn str_swapcase(args: &[Object]) -> Result<Object, RuntimeError> {
     str_arity("swapcase", args, 0, 0)?;
-    let mut out = String::new();
-    for ch in str_self(args)?.chars() {
-        if ch.is_uppercase() {
-            out.extend(ch.to_lowercase());
-        } else if ch.is_lowercase() {
-            out.extend(ch.to_uppercase());
-        } else {
-            out.push(ch);
-        }
-    }
+    let out = crate::unicode_case::swapcase(&str_self(args)?);
     Ok(str_result(args, out))
 }
 
@@ -8610,7 +8260,9 @@ fn str_lstrip(args: &[Object]) -> Result<Object, RuntimeError> {
     str_arity("lstrip", args, 0, 1)?;
     let s = str_self(args)?;
     let out = match args.get(1) {
-        None | Some(Object::None) => s.trim_start().to_owned(),
+        None | Some(Object::None) => s
+            .trim_start_matches(crate::unicode_case::is_space)
+            .to_owned(),
         Some(arg) => {
             let chars =
                 str_arg_bridged(arg).ok_or_else(|| type_error("lstrip() argument must be str"))?;
@@ -8625,7 +8277,7 @@ fn str_rstrip(args: &[Object]) -> Result<Object, RuntimeError> {
     str_arity("rstrip", args, 0, 1)?;
     let s = str_self(args)?;
     let out = match args.get(1) {
-        None | Some(Object::None) => s.trim_end().to_owned(),
+        None | Some(Object::None) => s.trim_end_matches(crate::unicode_case::is_space).to_owned(),
         Some(arg) => {
             let chars =
                 str_arg_bridged(arg).ok_or_else(|| type_error("rstrip() argument must be str"))?;
@@ -8640,8 +8292,13 @@ fn str_rstrip(args: &[Object]) -> Result<Object, RuntimeError> {
 /// right. Mirrors CPython: the *last* `maxsplit` whitespace runs split,
 /// and the left remainder keeps its internal spacing.
 fn str_rsplit_whitespace(s: &str, maxsplit: i64) -> Vec<Object> {
+    use crate::unicode_case::is_space;
     if maxsplit < 0 {
-        return s.split_whitespace().map(Object::from_str).collect();
+        return s
+            .split(is_space)
+            .filter(|f| !f.is_empty())
+            .map(Object::from_str)
+            .collect();
     }
     let chars: Vec<(usize, char)> = s.char_indices().collect();
     let n = chars.len();
@@ -8649,7 +8306,7 @@ fn str_rsplit_whitespace(s: &str, maxsplit: i64) -> Vec<Object> {
     let mut i = n;
     let mut splits = 0;
     while i > 0 {
-        while i > 0 && chars[i - 1].1.is_whitespace() {
+        while i > 0 && is_space(chars[i - 1].1) {
             i -= 1;
         }
         if i == 0 {
@@ -8660,7 +8317,7 @@ fn str_rsplit_whitespace(s: &str, maxsplit: i64) -> Vec<Object> {
             out_rev.push(s[..end_byte].to_string());
             break;
         }
-        while i > 0 && !chars[i - 1].1.is_whitespace() {
+        while i > 0 && !is_space(chars[i - 1].1) {
             i -= 1;
         }
         let start_byte = chars[i].0;
@@ -8719,16 +8376,34 @@ fn str_splitlines(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object
     let keepends = arg_or_kw(args, 1, kwargs, "keepends")
         .map(Object::is_truthy)
         .unwrap_or(false);
+    // CPython line boundaries (`str.splitlines`): LF, CR, CRLF, VT, FF,
+    // FS, GS, RS, NEL, LINE SEPARATOR, PARAGRAPH SEPARATOR.
+    let is_break = |c: char| {
+        matches!(
+            c,
+            '\n' | '\r'
+                | '\x0b'
+                | '\x0c'
+                | '\x1c'
+                | '\x1d'
+                | '\x1e'
+                | '\u{85}'
+                | '\u{2028}'
+                | '\u{2029}'
+        )
+    };
     let mut out: Vec<Object> = Vec::new();
-    let bytes = s.as_bytes();
     let mut start = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\n' || bytes[i] == b'\r' {
+    let mut iter = s.char_indices().peekable();
+    while let Some((i, c)) = iter.next() {
+        if is_break(c) {
             let end_no_eol = i;
-            let mut end = i + 1;
-            if bytes[i] == b'\r' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
-                end = i + 2;
+            let mut end = i + c.len_utf8();
+            if c == '\r' {
+                if let Some(&(j, '\n')) = iter.peek() {
+                    end = j + 1;
+                    iter.next();
+                }
             }
             let line = if keepends {
                 &s[start..end]
@@ -8737,12 +8412,9 @@ fn str_splitlines(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object
             };
             out.push(str_result(args, line.to_owned()));
             start = end;
-            i = end;
-        } else {
-            i += 1;
         }
     }
-    if start < bytes.len() {
+    if start < s.len() {
         out.push(str_result(args, s[start..].to_owned()));
     }
     Ok(Object::new_list(out))
@@ -8884,7 +8556,7 @@ fn str_isalpha(args: &[Object]) -> Result<Object, RuntimeError> {
     str_arity("isalpha", args, 0, 0)?;
     let s = str_self(args)?;
     Ok(Object::Bool(
-        !s.is_empty() && s.chars().all(char::is_alphabetic),
+        !s.is_empty() && s.chars().all(crate::unicode_case::is_alpha),
     ))
 }
 
@@ -8892,7 +8564,7 @@ fn str_isalnum(args: &[Object]) -> Result<Object, RuntimeError> {
     str_arity("isalnum", args, 0, 0)?;
     let s = str_self(args)?;
     Ok(Object::Bool(
-        !s.is_empty() && s.chars().all(char::is_alphanumeric),
+        !s.is_empty() && s.chars().all(crate::unicode_case::is_alnum),
     ))
 }
 
@@ -8900,68 +8572,29 @@ fn str_isspace(args: &[Object]) -> Result<Object, RuntimeError> {
     str_arity("isspace", args, 0, 0)?;
     let s = str_self(args)?;
     Ok(Object::Bool(
-        !s.is_empty() && s.chars().all(char::is_whitespace),
+        !s.is_empty() && s.chars().all(crate::unicode_case::is_space),
     ))
 }
 
 fn str_isupper(args: &[Object]) -> Result<Object, RuntimeError> {
     str_arity("isupper", args, 0, 0)?;
-    let s = str_self(args)?;
-    let mut has_cased = false;
-    for c in s.chars() {
-        if c.is_alphabetic() {
-            has_cased = true;
-            if !c.is_uppercase() {
-                return Ok(Object::Bool(false));
-            }
-        }
-    }
-    Ok(Object::Bool(has_cased))
+    Ok(Object::Bool(crate::unicode_case::str_isupper(&str_self(
+        args,
+    )?)))
 }
 
 fn str_islower(args: &[Object]) -> Result<Object, RuntimeError> {
     str_arity("islower", args, 0, 0)?;
-    let s = str_self(args)?;
-    let mut has_cased = false;
-    for c in s.chars() {
-        if c.is_alphabetic() {
-            has_cased = true;
-            if !c.is_lowercase() {
-                return Ok(Object::Bool(false));
-            }
-        }
-    }
-    Ok(Object::Bool(has_cased))
+    Ok(Object::Bool(crate::unicode_case::str_islower(&str_self(
+        args,
+    )?)))
 }
 
 fn str_istitle(args: &[Object]) -> Result<Object, RuntimeError> {
-    // CPython `unicode_istitle_impl`: a titlecased string has each cased run
-    // starting with an upper/titlecase char, and there is >=1 cased char.
-    // (Titlecase Lt chars are treated as uppercase for the run-start test;
-    // Rust's std lacks a general-category API, so uppercase covers Lu — the
-    // ASCII and dominant Unicode case, matching our other `is*` helpers.)
     str_arity("istitle", args, 0, 0)?;
-    let s = str_self(args)?;
-    let mut cased = false;
-    let mut prev_cased = false;
-    for c in s.chars() {
-        if c.is_uppercase() {
-            if prev_cased {
-                return Ok(Object::Bool(false));
-            }
-            prev_cased = true;
-            cased = true;
-        } else if c.is_lowercase() {
-            if !prev_cased {
-                return Ok(Object::Bool(false));
-            }
-            prev_cased = true;
-            cased = true;
-        } else {
-            prev_cased = false;
-        }
-    }
-    Ok(Object::Bool(cased))
+    Ok(Object::Bool(crate::unicode_case::str_istitle(&str_self(
+        args,
+    )?)))
 }
 
 fn str_isascii(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8974,7 +8607,9 @@ fn str_isidentifier(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
     let mut chars = s.chars();
     let valid = match chars.next() {
-        Some(c) if c == '_' || c.is_alphabetic() => chars.all(|c| c == '_' || c.is_alphanumeric()),
+        Some(c) if c == '_' || crate::unicode_case::is_xid_start(c) => {
+            chars.all(crate::unicode_case::is_xid_continue)
+        }
         _ => false,
     };
     Ok(Object::Bool(valid))
@@ -9261,16 +8896,29 @@ fn str_translate(args: &[Object]) -> Result<Object, RuntimeError> {
         };
         match entry {
             Some(Object::None) => {}
-            Some(Object::Int(i)) => push_cp(&mut out, i as u32, &mut saw_surrogate),
+            Some(Object::Int(i)) => {
+                // CPython: an out-of-range target ordinal is a ValueError.
+                if !(0..0x11_0000).contains(&i) {
+                    return Err(crate::error::value_error(
+                        "character mapping must be in range(0x110000)",
+                    ));
+                }
+                push_cp(&mut out, i as u32, &mut saw_surrogate)
+            }
             Some(Object::Str(v)) => out.push_str(&v),
             Some(Object::WStr(cps)) => {
                 saw_surrogate = true;
                 out.push_str(&bridge_encode_cps(&cps));
             }
-            // `str` subclass value, etc.: fall back to its text view.
+            // `str` subclass value: fall back to its text view. Any other
+            // type is a TypeError (CPython `charmaptranslate_lookup`).
             Some(other) => match other.native_value() {
                 Some(Object::Str(v)) => out.push_str(&v),
-                _ => out.push_str(&other.to_str()),
+                _ => {
+                    return Err(type_error(
+                        "character mapping must return integer, None or str",
+                    ))
+                }
             },
             None => out.push(c),
         }

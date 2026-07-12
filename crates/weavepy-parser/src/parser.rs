@@ -4915,6 +4915,40 @@ fn cps_to_constant(cps: Vec<u32>) -> Constant {
     }
 }
 
+/// `\N{NAME}` resolution outcome supplied by the embedding VM (RFC 0050
+/// WS4): the runtime resolves names against its generated UCD tables and
+/// honours a poisoned `sys.modules['unicodedata']` the way CPython's
+/// tokenizer does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnicodeNameResolution {
+    /// Resolved to this code point.
+    Code(u32),
+    /// No character has this name.
+    Unknown,
+    /// The unicodedata machinery can't be loaded (CPython: the import of
+    /// `unicodedata` failed, e.g. `sys.modules['unicodedata'] = None`).
+    Unavailable,
+}
+
+static UNICODE_NAME_RESOLVER: std::sync::OnceLock<fn(&str) -> UnicodeNameResolution> =
+    std::sync::OnceLock::new();
+
+/// Install the VM-side `\N{NAME}` resolver. First installation wins;
+/// standalone parser users fall back to the `unicode_names2` table.
+pub fn set_unicode_name_resolver(f: fn(&str) -> UnicodeNameResolution) {
+    let _ = UNICODE_NAME_RESOLVER.set(f);
+}
+
+fn resolve_unicode_name(name: &str) -> UnicodeNameResolution {
+    match UNICODE_NAME_RESOLVER.get() {
+        Some(f) => f(name),
+        None => match unicode_names2::character(name) {
+            Some(ch) => UnicodeNameResolution::Code(ch as u32),
+            None => UnicodeNameResolution::Unknown,
+        },
+    }
+}
+
 fn decode_str_body(s: &str, raw: bool) -> Result<Constant, String> {
     if raw {
         return Ok(Constant::Str(s.to_owned()));
@@ -5032,10 +5066,24 @@ fn decode_str_body(s: &str, raw: bool) -> Result<Constant, String> {
                 loop {
                     match chars.next() {
                         Some((i, '}')) => {
-                            let ch = unicode_names2::character(&name).ok_or_else(|| {
-                                unicode_err(bs, i + 1, "unknown Unicode character name")
-                            })?;
-                            out.push(ch as u32);
+                            match resolve_unicode_name(&name) {
+                                UnicodeNameResolution::Code(cp) => out.push(cp),
+                                UnicodeNameResolution::Unknown => {
+                                    return Err(unicode_err(
+                                        bs,
+                                        i + 1,
+                                        "unknown Unicode character name",
+                                    ))
+                                }
+                                // CPython's tokenizer message when importing
+                                // `unicodedata` fails — *not* wrapped in the
+                                // unicodeescape-codec position text.
+                                UnicodeNameResolution::Unavailable => {
+                                    return Err("(unicode error) \\N escapes not supported \
+                                                (can't load unicodedata module)"
+                                        .to_owned())
+                                }
+                            }
                             break;
                         }
                         Some((_, c)) => name.push(c),

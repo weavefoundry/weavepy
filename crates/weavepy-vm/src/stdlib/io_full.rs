@@ -420,13 +420,21 @@ fn apply_text_config(
         return Ok(());
     }
     if let Some(Object::Str(enc)) = encoding {
-        // CPython resolves the codec at construction time (via
-        // `_PyCodec_LookupTextEncoding`), so an unknown encoding raises
-        // `LookupError` from `open()`/`TextIOWrapper(...)` — not later at the
-        // first read. Validate against the live codec registry so e.g.
-        // `tempfile.TemporaryFile(encoding='bad-encoding')` fails eagerly.
-        validate_text_encoding(enc)?;
-        f.set_encoding(enc);
+        // The `"locale"` sentinel (PEP 597, produced by `io.text_encoding`
+        // outside UTF-8 mode) resolves to the locale's encoding before
+        // hitting the codec registry, which knows no codec by that name
+        // (CPython does the same in `TextIOWrapper`).
+        if enc.as_ref().eq_ignore_ascii_case("locale") {
+            f.set_encoding(&crate::stdlib::locale_mod::current_codeset());
+        } else {
+            // CPython resolves the codec at construction time (via
+            // `_PyCodec_LookupTextEncoding`), so an unknown encoding raises
+            // `LookupError` from `open()`/`TextIOWrapper(...)` — not later at
+            // the first read. Validate against the live codec registry so e.g.
+            // `tempfile.TemporaryFile(encoding='bad-encoding')` fails eagerly.
+            validate_text_encoding(enc)?;
+            f.set_encoding(enc);
+        }
     }
     if let Some(Object::Str(err)) = errors {
         // CPython's TextIOWrapper validates the error handler eagerly under
