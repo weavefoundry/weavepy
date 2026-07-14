@@ -16,6 +16,13 @@ import sys
 from enum import IntEnum, auto
 from contextlib import contextmanager, nullcontext
 
+# `compile()` control flags (CPython exposes these on `_ast`; values
+# from Include/cpython/compile.h).
+PyCF_ONLY_AST = 0x0400
+PyCF_TYPE_COMMENTS = 0x1000
+PyCF_ALLOW_TOP_LEVEL_AWAIT = 0x2000
+PyCF_OPTIMIZED_AST = 0x8000 | PyCF_ONLY_AST
+
 
 # ---------------------------------------------------------------------------
 # Base node
@@ -611,21 +618,27 @@ def _fix_contexts(tree):
     return tree
 
 
+def _from_spec(spec):
+    """Build a node tree from an `_ast` spec (used by the native
+    `compile(..., PyCF_ONLY_AST)` path — RFC 0052)."""
+    return _fix_contexts(_build(spec))
+
+
 def parse(source, filename="<unknown>", mode="exec",
           type_comments=False, feature_version=None, optimize=-1):
     """Parse source into a CPython-shaped AST (RFC 0033)."""
     if isinstance(source, (bytes, bytearray)):
         source = bytes(source).decode("utf-8")
+    if type_comments:
+        # Full PEP 484 type-comment harvesting is not implemented; we do
+        # enforce pegen's `invalid_parameters` rule that a bare `*`
+        # parameter must not carry a type comment.
+        for line in source.splitlines():
+            code, _sep, comment = line.partition("#")
+            if _sep and comment.lstrip().startswith("type:") and code.strip() in ("*", "*,"):
+                raise SyntaxError("bare * has associated type comment")
     spec = _ast.parse(source, filename, mode)
-    tree = _fix_contexts(_build(spec))
-    # Remember the original text so `compile(tree, ...)` can recompile it
-    # (WeavePy compiles from source; an unmodified `ast.parse` round-trip
-    # is by far the common case).
-    try:
-        tree._weavepy_source = source
-    except Exception:
-        pass
-    return tree
+    return _fix_contexts(_build(spec))
 
 
 # ---------------------------------------------------------------------------
@@ -2036,3 +2049,123 @@ class _Unparser(NodeVisitor):
 def unparse(ast_obj):
     unparser = _Unparser()
     return unparser.visit(ast_obj)
+
+
+# ---- PyCF_OPTIMIZED_AST (RFC 0052) ----
+#
+# CPython folds constants on the AST (Python/ast_opt.c) when
+# PyCF_OPTIMIZED_AST is passed to compile(). This is the pure-Python
+# analogue covering the same value-level folds: binary/unary operations
+# over constants and all-constant Load tuples.
+
+_FOLD_BINOP = {
+    "Add": lambda a, b: a + b,
+    "Sub": lambda a, b: a - b,
+    "Mult": lambda a, b: a * b,
+    "Div": lambda a, b: a / b,
+    "FloorDiv": lambda a, b: a // b,
+    "Mod": lambda a, b: a % b,
+    "Pow": lambda a, b: a ** b,
+    "LShift": lambda a, b: a << b,
+    "RShift": lambda a, b: a >> b,
+    "BitOr": lambda a, b: a | b,
+    "BitXor": lambda a, b: a ^ b,
+    "BitAnd": lambda a, b: a & b,
+}
+
+_FOLD_UNARYOP = {
+    "Invert": lambda v: ~v,
+    "Not": lambda v: not v,
+    "UAdd": lambda v: +v,
+    "USub": lambda v: -v,
+}
+
+
+def _fold_result_ok(v):
+    # Mirror ast_opt.c's "don't grow the code object" guards: cap folded
+    # int/str/bytes sizes; allow the other constant-able types as-is.
+    if isinstance(v, int):
+        return v.bit_length() <= 256
+    if isinstance(v, (str, bytes)):
+        return len(v) <= 4096
+    if isinstance(v, tuple):
+        return len(v) <= 256
+    return v is None or isinstance(v, (bool, float, complex, frozenset))
+
+
+def _fold_args_ok(op_name, a, b):
+    # Pre-guards so folding can't be tricked into huge computation
+    # (10 ** 10**6, 1 << 10**6, 'x' * 10**6 …).
+    if op_name in ("Pow", "LShift"):
+        return isinstance(b, (int, bool)) and abs(b) <= 512 or isinstance(b, float)
+    if op_name == "Mult":
+        if isinstance(a, (str, bytes, tuple)) and isinstance(b, int):
+            return len(a) * max(b, 0) <= 4096
+        if isinstance(b, (str, bytes, tuple)) and isinstance(a, int):
+            return len(b) * max(a, 0) <= 4096
+    return True
+
+
+class _ConstantFolder(NodeTransformer):
+    def visit_BinOp(self, node):
+        self.generic_visit(node)
+        left, right = node.left, node.right
+        if type(left) is Constant and type(right) is Constant:
+            func = _FOLD_BINOP.get(type(node.op).__name__)
+            if func is not None and _fold_args_ok(
+                    type(node.op).__name__, left.value, right.value):
+                try:
+                    value = func(left.value, right.value)
+                except Exception:
+                    return node
+                if _fold_result_ok(value):
+                    return copy_location(Constant(value), node)
+        return node
+
+    def visit_UnaryOp(self, node):
+        self.generic_visit(node)
+        operand = node.operand
+        if type(operand) is Constant:
+            func = _FOLD_UNARYOP.get(type(node.op).__name__)
+            if func is not None:
+                try:
+                    value = func(operand.value)
+                except Exception:
+                    return node
+                if _fold_result_ok(value):
+                    return copy_location(Constant(value), node)
+        return node
+
+    def visit_Tuple(self, node):
+        self.generic_visit(node)
+        if isinstance(node.ctx, Load) and all(
+                type(e) is Constant for e in node.elts):
+            value = tuple(e.value for e in node.elts)
+            if _fold_result_ok(value):
+                return copy_location(Constant(value), node)
+        return node
+
+
+def _fold_constants(tree):
+    """Apply PyCF_OPTIMIZED_AST constant folding in place; returns the tree."""
+    return _ConstantFolder().visit(tree)
+
+
+def _export_node_classes_to_native():
+    # In CPython the node classes are *defined* in the C `_ast` module and
+    # `ast.py` star-imports them. WeavePy defines them here instead, so we
+    # push them back onto `_ast` — code that does `import _ast` after `ast`
+    # (e.g. `type(tree) == _ast.Module` in test_compile) sees the same
+    # class objects.
+    for _name, _obj in list(globals().items()):
+        if isinstance(_obj, type) and issubclass(_obj, AST):
+            setattr(_ast, _name, _obj)
+    _ast.AST = AST
+    _ast.PyCF_ONLY_AST = PyCF_ONLY_AST
+    _ast.PyCF_TYPE_COMMENTS = PyCF_TYPE_COMMENTS
+    _ast.PyCF_ALLOW_TOP_LEVEL_AWAIT = PyCF_ALLOW_TOP_LEVEL_AWAIT
+    _ast.PyCF_OPTIMIZED_AST = PyCF_OPTIMIZED_AST
+
+
+_export_node_classes_to_native()
+del _export_node_classes_to_native

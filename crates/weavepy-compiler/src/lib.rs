@@ -175,6 +175,12 @@ pub struct CodeObject {
     /// coroutine. Never set by the compiler — only by the runtime
     /// marking helper and marshal round-trips.
     pub is_iterable_coroutine: bool,
+    /// `CO_FUTURE_*` bits active for this code object (the module's
+    /// own `__future__` imports merged with any inherited/compile-flag
+    /// bits). Reported through `co_flags` so `compile(...,
+    /// dont_inherit=False)` can inherit the caller's futures the way
+    /// CPython does (RFC 0052).
+    pub future_flags: u32,
     /// Memoised [`Self::to_cpython`] encoding (never compared, resets
     /// on clone).
     pub cp_cache: cpython_code::CpCache,
@@ -428,6 +434,98 @@ impl From<AstConstant> for Constant {
     }
 }
 
+// ---------- compile flags (CPython `Include/cpython/compile.h`) ----------
+
+/// CPython compiler-flag constants. The `CO_FUTURE_*` values are the
+/// exact bits `__future__.CO_*` exposes and `co_flags` carries; the
+/// `PyCF_*` values are the `compile()` control bits `ast` re-exports.
+pub mod flags {
+    pub const CO_FUTURE_DIVISION: u32 = 0x0002_0000;
+    pub const CO_FUTURE_ABSOLUTE_IMPORT: u32 = 0x0004_0000;
+    pub const CO_FUTURE_WITH_STATEMENT: u32 = 0x0008_0000;
+    pub const CO_FUTURE_PRINT_FUNCTION: u32 = 0x0010_0000;
+    pub const CO_FUTURE_UNICODE_LITERALS: u32 = 0x0020_0000;
+    pub const CO_FUTURE_BARRY_AS_BDFL: u32 = 0x0040_0000;
+    pub const CO_FUTURE_GENERATOR_STOP: u32 = 0x0080_0000;
+    pub const CO_FUTURE_ANNOTATIONS: u32 = 0x0100_0000;
+
+    /// All future-statement bits (CPython `PyCF_MASK`).
+    pub const PYCF_MASK: u32 = CO_FUTURE_DIVISION
+        | CO_FUTURE_ABSOLUTE_IMPORT
+        | CO_FUTURE_WITH_STATEMENT
+        | CO_FUTURE_PRINT_FUNCTION
+        | CO_FUTURE_UNICODE_LITERALS
+        | CO_FUTURE_BARRY_AS_BDFL
+        | CO_FUTURE_GENERATOR_STOP
+        | CO_FUTURE_ANNOTATIONS;
+    /// Formerly-meaningful bits accepted and ignored (CPython
+    /// `PyCF_MASK_OBSOLETE` — `CO_NESTED`).
+    pub const PYCF_MASK_OBSOLETE: u32 = 0x0010;
+
+    pub const PYCF_SOURCE_IS_UTF8: u32 = 0x0100;
+    pub const PYCF_DONT_IMPLY_DEDENT: u32 = 0x0200;
+    pub const PYCF_ONLY_AST: u32 = 0x0400;
+    pub const PYCF_IGNORE_COOKIE: u32 = 0x0800;
+    pub const PYCF_TYPE_COMMENTS: u32 = 0x1000;
+    pub const PYCF_ALLOW_TOP_LEVEL_AWAIT: u32 = 0x2000;
+    pub const PYCF_ALLOW_INCOMPLETE_INPUT: u32 = 0x4000;
+    pub const PYCF_OPTIMIZED_AST: u32 = 0x8000 | PYCF_ONLY_AST;
+
+    /// All non-future bits `compile()` accepts (CPython
+    /// `PyCF_COMPILE_MASK`).
+    pub const PYCF_COMPILE_MASK: u32 = PYCF_ONLY_AST
+        | PYCF_ALLOW_TOP_LEVEL_AWAIT
+        | PYCF_TYPE_COMMENTS
+        | PYCF_DONT_IMPLY_DEDENT
+        | PYCF_ALLOW_INCOMPLETE_INPUT
+        | PYCF_OPTIMIZED_AST;
+
+    /// Map a `__future__` feature name to its `CO_FUTURE_*` bit.
+    /// Returns 0 for features that predate the flag scheme entirely
+    /// (there are none — every known feature has a bit).
+    pub fn future_feature_bit(name: &str) -> Option<u32> {
+        Some(match name {
+            "division" => CO_FUTURE_DIVISION,
+            "absolute_import" => CO_FUTURE_ABSOLUTE_IMPORT,
+            "with_statement" => CO_FUTURE_WITH_STATEMENT,
+            "print_function" => CO_FUTURE_PRINT_FUNCTION,
+            "unicode_literals" => CO_FUTURE_UNICODE_LITERALS,
+            "barry_as_FLUFL" => CO_FUTURE_BARRY_AS_BDFL,
+            "generator_stop" => CO_FUTURE_GENERATOR_STOP,
+            "annotations" => CO_FUTURE_ANNOTATIONS,
+            // `nested_scopes` / `generators` are always-on features with
+            // no live bit in 3.x.
+            "nested_scopes" | "generators" => 0,
+            _ => return None,
+        })
+    }
+}
+
+/// Options threaded from `compile()` into the compiler (RFC 0052).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CompileOptions {
+    /// `CO_FUTURE_*` bits active *before* the module's own
+    /// `__future__` imports are folded in (inherited from the calling
+    /// code or passed via `compile(flags=...)`), plus any `PyCF_*`
+    /// control bits (`PyCF_ALLOW_TOP_LEVEL_AWAIT` is honoured here).
+    pub flags: u32,
+    /// Resolved optimization level (0, 1 or 2 — the caller resolves
+    /// `-1` against the interpreter default before compiling).
+    pub optimize: u8,
+}
+
+/// The per-compilation parameters shared by a top-level compiler and
+/// every nested scope it spawns.
+#[derive(Debug, Clone, Copy, Default)]
+struct CompileParams {
+    future_annotations: bool,
+    optimize: u8,
+    /// Merged `CO_FUTURE_*` bits (inherited + module's own imports),
+    /// stamped onto every produced code object.
+    future_flags: u32,
+    allow_top_level_await: bool,
+}
+
 // ---------- public entry point ----------
 
 /// PEP 563: does this module open with `from __future__ import annotations`?
@@ -440,10 +538,176 @@ fn has_future_annotations(module: &Module) -> bool {
     module.body.iter().any(|stmt| {
         matches!(
             &stmt.kind,
-            StmtKind::ImportFrom { module: Some(m), names, .. }
+            StmtKind::ImportFrom { module: Some(m), names, level: 0 }
                 if m == "__future__" && names.iter().any(|a| a.name == "annotations")
         )
     })
+}
+
+/// The module's own `__future__` feature bits (`CO_FUTURE_*`). The
+/// validator has already rejected unknown features and misplaced
+/// imports by the time this runs, so a plain scan suffices.
+fn module_future_flags(module: &Module) -> u32 {
+    let mut bits = 0u32;
+    for stmt in &module.body {
+        if let StmtKind::ImportFrom {
+            module: Some(m),
+            names,
+            level: 0,
+        } = &stmt.kind
+        {
+            if m == "__future__" {
+                for a in names {
+                    bits |= flags::future_feature_bit(&a.name).unwrap_or(0);
+                }
+            }
+        }
+    }
+    bits
+}
+
+thread_local! {
+    /// PEP 563 active for the compilation currently running on this
+    /// thread. Consulted by the free-variable scans
+    /// ([`collect_reads_stmt`]) so stringified annotations don't
+    /// contribute reads to scope analysis (no spurious cells for
+    /// `def bar(): inner: outer = 1` — test_future's
+    /// `test_annotations_symbol_table_pass`).
+    static PEP563_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn pep563_active() -> bool {
+    PEP563_ACTIVE.with(std::cell::Cell::get)
+}
+
+/// RAII guard installing the PEP 563 flag for the current compilation.
+struct Pep563Guard(bool);
+
+impl Pep563Guard {
+    fn install(active: bool) -> Self {
+        Pep563Guard(PEP563_ACTIVE.with(|c| c.replace(active)))
+    }
+}
+
+impl Drop for Pep563Guard {
+    fn drop(&mut self) {
+        PEP563_ACTIVE.with(|c| c.set(self.0));
+    }
+}
+
+/// Build the shared per-compilation parameters from caller options +
+/// the module's own `__future__` imports.
+fn make_params(module: &Module, opts: CompileOptions) -> CompileParams {
+    let future_flags = (opts.flags & flags::PYCF_MASK) | module_future_flags(module);
+    CompileParams {
+        future_annotations: has_future_annotations(module)
+            || future_flags & flags::CO_FUTURE_ANNOTATIONS != 0,
+        optimize: opts.optimize,
+        future_flags,
+        allow_top_level_await: opts.flags & flags::PYCF_ALLOW_TOP_LEVEL_AWAIT != 0,
+    }
+}
+
+/// PEP 695 `type` statements arrive first-class from the parser (so
+/// `ast.parse` and `symtable` observe the real node); rewrite each to
+/// its lazy `__weavepy_type_alias__` assignment form *before* any
+/// compiler pass (validation, mangling, scope analysis, codegen)
+/// runs, so every later pass sees the same shape the parser used to
+/// emit directly. Returns the module untouched (borrowed) when no
+/// `type` statement exists — the common case — to avoid cloning the
+/// AST.
+fn lower_type_aliases(module: &Module) -> std::borrow::Cow<'_, Module> {
+    fn block_lists(kind: &StmtKind) -> Vec<&[Stmt]> {
+        match kind {
+            StmtKind::FunctionDef { body, .. }
+            | StmtKind::AsyncFunctionDef { body, .. }
+            | StmtKind::ClassDef { body, .. }
+            | StmtKind::With { body, .. }
+            | StmtKind::AsyncWith { body, .. } => vec![body],
+            StmtKind::If { body, orelse, .. }
+            | StmtKind::While { body, orelse, .. }
+            | StmtKind::For { body, orelse, .. }
+            | StmtKind::AsyncFor { body, orelse, .. } => vec![body, orelse],
+            StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            } => {
+                let mut out: Vec<&[Stmt]> = vec![body, orelse, finalbody];
+                out.extend(handlers.iter().map(|h| h.body.as_slice()));
+                out
+            }
+            StmtKind::Match { cases, .. } => cases.iter().map(|c| c.body.as_slice()).collect(),
+            _ => Vec::new(),
+        }
+    }
+    fn contains(stmts: &[Stmt]) -> bool {
+        stmts.iter().any(|s| {
+            matches!(s.kind, StmtKind::TypeAlias { .. })
+                || block_lists(&s.kind).into_iter().any(contains)
+        })
+    }
+    fn rewrite(stmts: &mut [Stmt]) {
+        for s in stmts {
+            if matches!(s.kind, StmtKind::TypeAlias { .. }) {
+                *s = weavepy_parser::lower_type_alias_stmt(s);
+                continue;
+            }
+            match &mut s.kind {
+                StmtKind::FunctionDef { body, .. }
+                | StmtKind::AsyncFunctionDef { body, .. }
+                | StmtKind::ClassDef { body, .. }
+                | StmtKind::With { body, .. }
+                | StmtKind::AsyncWith { body, .. } => rewrite(body),
+                StmtKind::If { body, orelse, .. }
+                | StmtKind::While { body, orelse, .. }
+                | StmtKind::For { body, orelse, .. }
+                | StmtKind::AsyncFor { body, orelse, .. } => {
+                    rewrite(body);
+                    rewrite(orelse);
+                }
+                StmtKind::Try {
+                    body,
+                    handlers,
+                    orelse,
+                    finalbody,
+                } => {
+                    rewrite(body);
+                    rewrite(orelse);
+                    rewrite(finalbody);
+                    for h in handlers {
+                        rewrite(&mut h.body);
+                    }
+                }
+                StmtKind::Match { cases, .. } => {
+                    for c in cases {
+                        rewrite(&mut c.body);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if !contains(&module.body) {
+        return std::borrow::Cow::Borrowed(module);
+    }
+    let mut lowered = module.clone();
+    rewrite(&mut lowered.body);
+    std::borrow::Cow::Owned(lowered)
+}
+
+/// Run only the parse-adjacent validation pass (the symtable-stage
+/// checks CPython performs while *building* the symbol table:
+/// `global`/`nonlocal` directive conflicts, `__future__` placement,
+/// annotation-scope restrictions, …) without generating code.
+/// `_symtable.symtable()` uses this so symtable-build-time
+/// `SyntaxError`s surface with CPython's messages and locations.
+pub fn validate_module_only(module: &Module, source: &str) -> Result<(), CompileError> {
+    let module = lower_type_aliases(module);
+    let module = &*module;
+    let params = make_params(module, CompileOptions::default());
+    validate::validate_module(module, source, params.future_annotations)
 }
 
 /// Compile a parsed module into a top-level [`CodeObject`].
@@ -467,7 +731,22 @@ pub fn compile_module_with_source(
     source: &str,
     filename: &str,
 ) -> Result<CodeObject, CompileError> {
-    validate::validate_module(module, source)?;
+    compile_module_with_options(module, source, filename, CompileOptions::default())
+}
+
+/// As [`compile_module_with_source`] with explicit `compile()` options
+/// (future/`PyCF_*` flags + optimization level) — RFC 0052.
+pub fn compile_module_with_options(
+    module: &Module,
+    source: &str,
+    filename: &str,
+    opts: CompileOptions,
+) -> Result<CodeObject, CompileError> {
+    let module = lower_type_aliases(module);
+    let module = &*module;
+    let params = make_params(module, opts);
+    let _pep563 = Pep563Guard::install(params.future_annotations);
+    validate::validate_module(module, source, params.future_annotations)?;
     let line_index = LineIndex::new(source);
     let mut top = Compiler::new(
         "<module>".to_owned(),
@@ -475,7 +754,7 @@ pub fn compile_module_with_source(
         CodeKind::Module,
         Rc::new(line_index),
         Rc::from(source),
-        has_future_annotations(module),
+        params,
     );
     top.compile_module_body(module)?;
     Ok(top.finish())
@@ -491,7 +770,21 @@ pub fn compile_interactive_with_source(
     source: &str,
     filename: &str,
 ) -> Result<CodeObject, CompileError> {
-    validate::validate_module(module, source)?;
+    compile_interactive_with_options(module, source, filename, CompileOptions::default())
+}
+
+/// As [`compile_interactive_with_source`] with explicit options.
+pub fn compile_interactive_with_options(
+    module: &Module,
+    source: &str,
+    filename: &str,
+    opts: CompileOptions,
+) -> Result<CodeObject, CompileError> {
+    let module = lower_type_aliases(module);
+    let module = &*module;
+    let params = make_params(module, opts);
+    let _pep563 = Pep563Guard::install(params.future_annotations);
+    validate::validate_module(module, source, params.future_annotations)?;
     let line_index = LineIndex::new(source);
     let mut top = Compiler::new(
         "<module>".to_owned(),
@@ -499,7 +792,7 @@ pub fn compile_interactive_with_source(
         CodeKind::Module,
         Rc::new(line_index),
         Rc::from(source),
-        has_future_annotations(module),
+        params,
     );
     top.interactive = true;
     top.compile_module_body(module)?;
@@ -514,6 +807,16 @@ pub fn compile_eval_with_source(
     module: &Module,
     source: &str,
     filename: &str,
+) -> Result<CodeObject, CompileError> {
+    compile_eval_with_options(module, source, filename, CompileOptions::default())
+}
+
+/// As [`compile_eval_with_source`] with explicit options.
+pub fn compile_eval_with_options(
+    module: &Module,
+    source: &str,
+    filename: &str,
+    opts: CompileOptions,
 ) -> Result<CodeObject, CompileError> {
     // CPython's `eval` grammar only admits a single expression; any
     // statement syntax (`del x`, `x = 1`, a second statement, …) is a
@@ -546,7 +849,11 @@ pub fn compile_eval_with_source(
             span,
         ));
     }
-    validate::validate_module(module, source)?;
+    let module = lower_type_aliases(module);
+    let module = &*module;
+    let params = make_params(module, opts);
+    let _pep563 = Pep563Guard::install(params.future_annotations);
+    validate::validate_module(module, source, params.future_annotations)?;
     let line_index = LineIndex::new(source);
     let mut top = Compiler::new(
         "<module>".to_owned(),
@@ -554,7 +861,7 @@ pub fn compile_eval_with_source(
         CodeKind::Module,
         Rc::new(line_index),
         Rc::from(source),
-        has_future_annotations(module),
+        params,
     );
     top.eval_mode = true;
     top.compile_module_body(module)?;
@@ -765,6 +1072,10 @@ struct Compiler {
     /// strings rather than being evaluated at definition time. Propagated
     /// to every nested function/class scope.
     future_annotations: bool,
+    /// Per-compilation options shared with every nested scope
+    /// (optimize level, merged `CO_FUTURE_*` bits, top-level-await
+    /// permission) — RFC 0052.
+    params: CompileParams,
     /// CPython `ste_private`: the name of the innermost enclosing class,
     /// inherited by every scope textually inside it. Used to *demangle*
     /// def/class binding names back to their source spelling for
@@ -830,6 +1141,14 @@ struct LoopFrame {
     /// blocks; without this the handled exception leaks until frame
     /// exit — test_exceptions.testExceptionCleanupState).
     handler_depth_at_entry: u32,
+    /// `exc_on_stack` when the loop was entered. `break`/`continue`
+    /// from inside a `finally` body running on the *exception path*
+    /// must discard both the propagating exception object (still on
+    /// the value stack, awaiting the RERAISE we're now skipping) and
+    /// its PUSH_EXC_INFO handler state — CPython's unwind of the
+    /// EXCEPTION_HANDLER fblock (`for … try: 1/0 finally: continue`,
+    /// test_grammar.test_continue_in_finally).
+    exc_on_stack_at_entry: u32,
 }
 
 /// One pending `finally` clause. We hold the AST so `return`,
@@ -884,8 +1203,9 @@ impl Compiler {
         kind: CodeKind,
         line_index: Rc<LineIndex>,
         source: Rc<str>,
-        future_annotations: bool,
+        params: CompileParams,
     ) -> Self {
+        let future_annotations = params.future_annotations;
         let mut co = CodeObject::default();
         // Default qualname == name; nested scopes overwrite this via
         // `compute_child_qualname` once the parent context is known.
@@ -893,6 +1213,7 @@ impl Compiler {
         co.name = name;
         co.filename = filename;
         co.is_class_body = matches!(kind, CodeKind::Class);
+        co.future_flags = params.future_flags;
         Self {
             co,
             kind,
@@ -921,6 +1242,7 @@ impl Compiler {
             eval_mode: false,
             source,
             future_annotations,
+            params,
             private: None,
             pep695_qualname: None,
             pending_pep695_qualname: None,
@@ -1279,6 +1601,14 @@ impl Compiler {
 
     fn compile_module_body(&mut self, module: &Module) -> Result<(), CompileError> {
         self.analyze_scope_module(module);
+        // PyCF_ALLOW_TOP_LEVEL_AWAIT: a module body that awaits is a
+        // coroutine code object, and (like generator functions) the VM's
+        // bootstrap requires RETURN_GENERATOR as the first instruction —
+        // so this must be decided before emission starts.
+        if self.allows_top_level_await() && body_has_top_level_await(&module.body) {
+            self.co.is_coroutine = true;
+            self.emit(OpCode::ReturnGenerator, 0);
+        }
         self.emit(OpCode::Resume, 0);
         // CPython's symtable marks a module block containing any annotated
         // statement (at the block's own level) and the compiler emits
@@ -1289,7 +1619,26 @@ impl Compiler {
             self.emit(OpCode::SetupAnnotations, 0);
             self.annotations_initialized = true;
         }
-        for stmt in &module.body {
+        // CPython's compiler_body stores a module's leading string
+        // literal as `__doc__` (exec mode only — the REPL echoes it and
+        // eval mode can't contain it) and skips re-evaluating it as an
+        // expression statement. Under `-OO` (optimize >= 2) the
+        // docstring is dropped entirely.
+        let mut body: &[Stmt] = &module.body;
+        if !self.interactive && !self.eval_mode {
+            if let Some(doc) = first_stmt_docstring(&module.body) {
+                if self.params.optimize < 2 {
+                    let doc_const = self.co.intern_constant(Constant::Str(doc.to_owned()));
+                    let doc_name = self.co.intern_name("__doc__");
+                    self.set_line_from(module.body[0].span.start.0);
+                    self.set_span(module.body[0].span);
+                    self.emit(OpCode::LoadConst, doc_const);
+                    self.emit(OpCode::StoreName, doc_name);
+                }
+                body = &module.body[1..];
+            }
+        }
+        for stmt in body {
             self.compile_stmt(stmt)?;
         }
         Ok(())
@@ -1374,6 +1723,13 @@ impl Compiler {
         }
         let mut free_candidates = reads.clone();
         free_candidates.extend(needed_in_inner.iter().cloned());
+        // Iterate in sorted order: `free_candidates` is a `HashSet`, and
+        // its iteration order would otherwise leak into `free_order` (→
+        // `co_freevars`), making two compiles of the same source disagree
+        // (`test_compile_ast` asserts source-vs-AST code equality). CPython
+        // sorts these names too (`dictbytype`).
+        let mut free_candidates: Vec<String> = free_candidates.into_iter().collect();
+        free_candidates.sort_unstable();
         for name in free_candidates {
             if self.bindings.contains_key(&name) {
                 continue;
@@ -1399,6 +1755,10 @@ impl Compiler {
         // reads or declares them as free / nonlocal. We do this
         // BEFORE emission so the very first `STORE_*` for each
         // promoted name routes through the cell.
+        // Sorted for the same determinism reason as above — the promotion
+        // order becomes the `co_cellvars` order.
+        let mut needed_in_inner: Vec<String> = needed_in_inner.into_iter().collect();
+        needed_in_inner.sort_unstable();
         for name in needed_in_inner {
             if matches!(self.bindings.get(&name), Some(Binding::Local)) {
                 self.bindings.insert(name.clone(), Binding::Cell);
@@ -1432,6 +1792,13 @@ impl Compiler {
                     self.emit(OpCode::PopTop, 0);
                 }
             }
+            StmtKind::TypeAlias { .. } => {
+                // Normally rewritten at the compiler entry
+                // (`lower_type_aliases`); handled here too so a caller
+                // compiling a raw parse AST still works.
+                let lowered = weavepy_parser::lower_type_alias_stmt(stmt);
+                self.compile_stmt(&lowered)?;
+            }
             StmtKind::Pass => {}
             StmtKind::Delete(targets) => {
                 for target in targets {
@@ -1446,9 +1813,11 @@ impl Compiler {
                 //   RAISE_VARARGS 1
                 // end:
                 //
-                // We don't yet strip assertions under `-O`; the VM
-                // checks `sys.flags.optimize` at runtime if it wants
-                // to elide the AssertionError raise.
+                // Under `-O`/`-OO` (optimize >= 1) assertions compile
+                // to nothing, exactly like CPython's compiler_assert.
+                if self.params.optimize >= 1 {
+                    return Ok(());
+                }
                 self.compile_expr(test)?;
                 // The raise sequence carries the *test expression's*
                 // location (CPython compiler_assert): the traceback's
@@ -1596,6 +1965,7 @@ impl Compiler {
                     break_sites: Vec::new(),
                     is_for_loop: false,
                     handler_depth_at_entry: self.handler_depth,
+                    exc_on_stack_at_entry: self.exc_on_stack,
                 });
                 for s in body {
                     self.compile_stmt(s)?;
@@ -1660,6 +2030,7 @@ impl Compiler {
                     break_sites: Vec::new(),
                     is_for_loop: true,
                     handler_depth_at_entry: self.handler_depth,
+                    exc_on_stack_at_entry: self.exc_on_stack,
                 });
                 for s in body {
                     self.compile_stmt(s)?;
@@ -1691,10 +2062,14 @@ impl Compiler {
                 orelse,
             } => {
                 if !self.in_async_context() {
-                    return Err(CompileError::spanned(
-                        "'async for' outside async function",
-                        stmt.span,
-                    ));
+                    if self.allows_top_level_await() {
+                        self.co.is_coroutine = true;
+                    } else {
+                        return Err(CompileError::spanned(
+                            "'async for' outside async function",
+                            stmt.span,
+                        ));
+                    }
                 }
                 self.compile_async_for(target, iter, body, orelse)?;
             }
@@ -1779,10 +2154,14 @@ impl Compiler {
             }
             StmtKind::AsyncWith { items, body } => {
                 if !self.in_async_context() {
-                    return Err(CompileError::spanned(
-                        "'async with' outside async function",
-                        stmt.span,
-                    ));
+                    if self.allows_top_level_await() {
+                        self.co.is_coroutine = true;
+                    } else {
+                        return Err(CompileError::spanned(
+                            "'async with' outside async function",
+                            stmt.span,
+                        ));
+                    }
                 }
                 self.compile_async_with(items, body)?;
             }
@@ -1873,11 +2252,21 @@ impl Compiler {
                 let exc_to_pop = self
                     .handler_depth
                     .saturating_sub(frame_top.handler_depth_at_entry);
+                let exc_vals = self
+                    .exc_on_stack
+                    .saturating_sub(frame_top.exc_on_stack_at_entry);
                 // Leaving `except` handler bodies on the way out: discard
                 // their handled-exception state (CPython POP_EXCEPT
                 // during block unwind).
                 for _ in 0..exc_to_pop {
                     self.emit(OpCode::PopExcept, 0);
+                }
+                // Leaving a `finally` running on the exception path:
+                // drop the propagating exception (value stack) and its
+                // handler state — the RERAISE it awaited is skipped.
+                for _ in 0..exc_vals {
+                    self.emit(OpCode::PopExcept, 0);
+                    self.emit(OpCode::PopTop, 0);
                 }
                 // Run any `finally` clauses that lie between us and
                 // the enclosing loop, in innermost-out order.
@@ -1902,8 +2291,16 @@ impl Compiler {
                 let exc_to_pop = self
                     .handler_depth
                     .saturating_sub(frame_top.handler_depth_at_entry);
+                let exc_vals = self
+                    .exc_on_stack
+                    .saturating_sub(frame_top.exc_on_stack_at_entry);
                 for _ in 0..exc_to_pop {
                     self.emit(OpCode::PopExcept, 0);
+                }
+                // See Break: unwind exception-path `finally` state.
+                for _ in 0..exc_vals {
+                    self.emit(OpCode::PopExcept, 0);
+                    self.emit(OpCode::PopTop, 0);
                 }
                 self.inline_finally_for_loop_exit()?;
                 let site = self.emit(OpCode::JumpBackward, 0);
@@ -2802,7 +3199,7 @@ impl Compiler {
             CodeKind::Function,
             self.line_index.clone(),
             self.source.clone(),
-            self.future_annotations,
+            self.params,
         );
         inner.private = self.private.clone();
         // PEP 695: a hidden `<generic parameters of X>` scope being
@@ -2843,6 +3240,53 @@ impl Compiler {
             inner.bindings.insert("__class__".to_owned(), Binding::Free);
             inner.free_order.push("__class__".to_owned());
         }
+        // CPython symtable: every `nonlocal` must resolve to a binding
+        // in some enclosing *function* scope. Our scope analysis is
+        // chained — each scope only consults its parent — but that's
+        // sufficient: any name an outer function chain provides is
+        // already forwarded into `self.bindings` (as Local / Cell /
+        // Free) by the time this child compiles. The module scope
+        // never satisfies a nonlocal, and a class-body Local is a class
+        // attribute, not a nonlocal binding target.
+        {
+            let mut ng = HashSet::new();
+            let mut nl = HashSet::new();
+            let mut na = HashSet::new();
+            for s in body {
+                collect_decls(s, &mut ng, &mut nl, &mut na);
+            }
+            let mut nl: Vec<String> = nl.into_iter().collect();
+            nl.sort_unstable();
+            for n in nl {
+                let ok = match self.kind {
+                    CodeKind::Module => false,
+                    CodeKind::Class => matches!(
+                        self.bindings.get(&n),
+                        Some(Binding::Free | Binding::Nonlocal | Binding::ClassPassthrough)
+                    ),
+                    CodeKind::Function | CodeKind::Comprehension => matches!(
+                        self.bindings.get(&n),
+                        Some(
+                            Binding::Local
+                                | Binding::Cell
+                                | Binding::Free
+                                | Binding::Nonlocal
+                                | Binding::ClassPassthrough
+                        )
+                    ),
+                };
+                if !ok {
+                    let span = find_nonlocal_decl_span(body, &n).unwrap_or_else(|| {
+                        body.first()
+                            .map_or(weavepy_lexer::Span::new(0, 0), |s| s.span)
+                    });
+                    return Err(CompileError::spanned(
+                        format!("no binding for nonlocal '{n}' found"),
+                        span,
+                    ));
+                }
+            }
+        }
         inner.analyze_scope_function(&param_names, body, &[&self.bindings]);
         for free in &inner.free_order {
             if matches!(self.bindings.get(free), Some(Binding::Local)) {
@@ -2876,8 +3320,10 @@ impl Compiler {
         // `LoadConst`, and a `None` slot is reused by the implicit
         // `return None`.
         let doc_slot = match first_stmt_docstring(body) {
-            Some(doc) => Constant::Str(doc.to_owned()),
-            None => Constant::None,
+            // `-OO` (optimize >= 2) strips docstrings; the slot decays
+            // to the shared `None` constant like CPython's.
+            Some(doc) if self.params.optimize < 2 => Constant::Str(doc.to_owned()),
+            _ => Constant::None,
         };
         inner.co.intern_constant(doc_slot);
         for s in body {
@@ -3072,7 +3518,7 @@ impl Compiler {
             CodeKind::Class,
             self.line_index.clone(),
             self.source.clone(),
-            self.future_annotations,
+            self.params,
         );
         inner.private = Some(Rc::from(name));
         inner.co.qualname = self.compute_child_qualname(name);
@@ -3175,6 +3621,10 @@ impl Compiler {
         let mut free_candidates = reads;
         free_candidates.extend(needed_in_inner.iter().cloned());
         free_candidates.remove("__class__");
+        // Sorted so `free_order` (→ `co_freevars`) is deterministic across
+        // compiles — see the function-scope analogue above.
+        let mut free_candidates: Vec<String> = free_candidates.into_iter().collect();
+        free_candidates.sort_unstable();
         for name in free_candidates {
             if inner.bindings.contains_key(&name) {
                 continue;
@@ -3200,6 +3650,8 @@ impl Compiler {
         // forwards it (the name joins `co_freevars`) while its own
         // loads/stores keep namespace semantics — see
         // [`Binding::ClassPassthrough`].
+        let mut needed_in_inner: Vec<String> = needed_in_inner.into_iter().collect();
+        needed_in_inner.sort_unstable();
         for name in &needed_in_inner {
             if name == "__class__" || name == "__classdict__" {
                 continue;
@@ -3287,10 +3739,13 @@ impl Compiler {
         // body reserves that slot for the qualname, so it must be an
         // explicit store rather than a constant-slot convention.
         if let Some(doc) = first_stmt_docstring(body) {
-            let doc_const = inner.co.intern_constant(Constant::Str(doc.to_owned()));
-            let doc_name = inner.co.intern_name("__doc__");
-            inner.emit(OpCode::LoadConst, doc_const);
-            inner.emit(OpCode::StoreName, doc_name);
+            // `-OO` (optimize >= 2) strips class docstrings too.
+            if self.params.optimize < 2 {
+                let doc_const = inner.co.intern_constant(Constant::Str(doc.to_owned()));
+                let doc_name = inner.co.intern_name("__doc__");
+                inner.emit(OpCode::LoadConst, doc_const);
+                inner.emit(OpCode::StoreName, doc_name);
+            }
         }
 
         // SETUP_ANNOTATIONS before the first body statement when the class
@@ -4396,8 +4851,22 @@ impl Compiler {
             // which normalises quoting and whitespace — `List[list["C2"]]`
             // annotates as "List[list['C2']]". Fall back to the raw source
             // slice for nodes the unparser doesn't cover.
-            let text = weavepy_parser::unparse::unparse_expr(annotation)
+            let mut text = weavepy_parser::unparse::unparse_expr(annotation)
                 .or_else(|| self.annotation_source(annotation));
+            // The Rust AST doesn't carry `Constant.kind`, so a legacy
+            // `u'…'` prefix (which CPython's unparser preserves) is
+            // recovered from the source text.
+            if let (Some(t), ExprKind::Constant(AstConstant::Str(_))) =
+                (text.as_deref(), &annotation.kind)
+            {
+                if t.starts_with(['\'', '"'])
+                    && self
+                        .annotation_source(annotation)
+                        .is_some_and(|src| src.starts_with(['u', 'U']))
+                {
+                    text = Some(format!("u{t}"));
+                }
+            }
             if let Some(text) = text {
                 let idx = self.co.intern_constant(Constant::Str(text));
                 self.emit(OpCode::LoadConst, idx);
@@ -4490,6 +4959,10 @@ impl Compiler {
 
     fn compile_assign(&mut self, target: &Expr) -> Result<(), CompileError> {
         match &target.kind {
+            ExprKind::Name(n) if n == "__debug__" => Err(CompileError::spanned(
+                "cannot assign to __debug__",
+                target.span,
+            )),
             ExprKind::Name(n) => {
                 // CPython attributes the STORE to the Name node itself,
                 // not the enclosing statement. Only observable when the
@@ -4507,6 +4980,12 @@ impl Compiler {
                 self.current_span = saved_span;
                 Ok(())
             }
+            // `obj.__debug__ = 1` — CPython's `forbidden_name` check
+            // applies to attribute targets too.
+            ExprKind::Attribute { attr, .. } if attr == "__debug__" => Err(CompileError::spanned(
+                "cannot assign to __debug__",
+                target.span,
+            )),
             ExprKind::Attribute { value, attr } => {
                 self.compile_expr(value)?;
                 let idx = self.co.intern_name(attr);
@@ -4696,6 +5175,10 @@ impl Compiler {
 
     fn compile_delete(&mut self, target: &Expr) -> Result<(), CompileError> {
         match &target.kind {
+            ExprKind::Name(n) if n == "__debug__" => Err(CompileError::spanned(
+                "cannot delete __debug__",
+                target.span,
+            )),
             ExprKind::Name(n) => {
                 self.emit_delete_name(n);
                 Ok(())
@@ -4838,6 +5321,15 @@ impl Compiler {
     }
 
     fn emit_load_name(&mut self, name: &str) {
+        // `__debug__` is a compile-time constant in CPython: `True`
+        // at optimize 0, `False` under `-O`/`-OO` (RFC 0052).
+        if name == "__debug__" {
+            let idx = self
+                .co
+                .intern_constant(Constant::Bool(self.params.optimize == 0));
+            self.emit(OpCode::LoadConst, idx);
+            return;
+        }
         let binding = self.bindings.get(name).copied();
         // PEP 695 annotation scope inside a class body: free and
         // (implicit-)global loads consult the `__classdict__` mapping
@@ -5290,14 +5782,21 @@ impl Compiler {
             }
             ExprKind::Await(value) => {
                 if !self.in_async_context() {
-                    return Err(CompileError::spanned(
-                        if self.kind == CodeKind::Function {
-                            "'await' outside async function"
-                        } else {
-                            "'await' outside function"
-                        },
-                        e.span,
-                    ));
+                    if self.allows_top_level_await() {
+                        // PyCF_ALLOW_TOP_LEVEL_AWAIT: the module code
+                        // becomes a coroutine (CPython marks it
+                        // CO_COROUTINE) — the asyncio REPL contract.
+                        self.co.is_coroutine = true;
+                    } else {
+                        return Err(CompileError::spanned(
+                            if self.kind == CodeKind::Function {
+                                "'await' outside async function"
+                            } else {
+                                "'await' outside function"
+                            },
+                            e.span,
+                        ));
+                    }
                 }
                 self.compile_expr(value)?;
                 self.compile_await_dance(0);
@@ -5310,11 +5809,14 @@ impl Compiler {
     /// inside a comprehension scope the message names the comprehension
     /// form, otherwise it's "outside function".
     fn yield_placement_error(&self, kw: &str, span: weavepy_lexer::Span) -> CompileError {
+        // CPython's symtable always says "'yield' inside …" for the
+        // comprehension case, even for `yield from`; only the
+        // "outside function" form names `yield from` distinctly.
         let msg = match self.comp_kind {
-            Some(CompKind::List) => format!("'{kw}' inside list comprehension"),
-            Some(CompKind::Set) => format!("'{kw}' inside set comprehension"),
-            Some(CompKind::Dict) => format!("'{kw}' inside dict comprehension"),
-            Some(CompKind::Generator) => format!("'{kw}' inside generator expression"),
+            Some(CompKind::List) => "'yield' inside list comprehension".to_owned(),
+            Some(CompKind::Set) => "'yield' inside set comprehension".to_owned(),
+            Some(CompKind::Dict) => "'yield' inside dict comprehension".to_owned(),
+            Some(CompKind::Generator) => "'yield' inside generator expression".to_owned(),
             None => format!("'{kw}' outside function"),
         };
         CompileError::spanned(msg, span)
@@ -5351,6 +5853,13 @@ impl Compiler {
         self.co.is_coroutine || self.co.is_async_generator
     }
 
+    /// PyCF_ALLOW_TOP_LEVEL_AWAIT (RFC 0052): `await` / `async for` /
+    /// `async with` are legal at module top level; using one turns the
+    /// module code object into a coroutine.
+    fn allows_top_level_await(&self) -> bool {
+        self.params.allow_top_level_await && matches!(self.kind, CodeKind::Module)
+    }
+
     fn compile_async_for(
         &mut self,
         target: &Expr,
@@ -5380,6 +5889,7 @@ impl Compiler {
             break_sites: Vec::new(),
             is_for_loop: true,
             handler_depth_at_entry: self.handler_depth,
+            exc_on_stack_at_entry: self.exc_on_stack,
         });
         for s in body {
             self.compile_stmt(s)?;
@@ -5712,7 +6222,7 @@ impl Compiler {
             CodeKind::Comprehension,
             self.line_index.clone(),
             self.source.clone(),
-            self.future_annotations,
+            self.params,
         );
         inner.current_line = self.current_line;
         inner.comp_kind = Some(kind);
@@ -5829,6 +6339,8 @@ impl Compiler {
                     collect_inner_free_expr(cond, &inner.bindings, &mut needed_in_inner);
                 }
             }
+            let mut needed_in_inner: Vec<String> = needed_in_inner.into_iter().collect();
+            needed_in_inner.sort_unstable();
             for name in needed_in_inner {
                 if matches!(inner.bindings.get(&name), Some(Binding::Local)) {
                     inner.bindings.insert(name.clone(), Binding::Cell);
@@ -6368,8 +6880,50 @@ fn collect_inner_free(
 ) {
     collect_pep695_header_reads(stmt, out);
     match &stmt.kind {
-        StmtKind::FunctionDef { args, body, .. }
-        | StmtKind::AsyncFunctionDef { args, body, .. } => {
+        StmtKind::FunctionDef {
+            args,
+            body,
+            decorator_list,
+            returns,
+            ..
+        }
+        | StmtKind::AsyncFunctionDef {
+            args,
+            body,
+            decorator_list,
+            returns,
+            ..
+        } => {
+            // Decorators, default values, and annotations evaluate in the
+            // *enclosing* scope, but may themselves contain nested scopes
+            // (`@lambda f: null(f)` — PEP 614) that close over our locals.
+            for d in decorator_list {
+                collect_inner_free_expr(d, outer_bindings, out);
+            }
+            for d in args
+                .defaults
+                .iter()
+                .chain(args.kw_defaults.iter().flatten())
+            {
+                collect_inner_free_expr(d, outer_bindings, out);
+            }
+            if !pep563_active() {
+                for a in args
+                    .posonlyargs
+                    .iter()
+                    .chain(&args.args)
+                    .chain(&args.kwonlyargs)
+                    .chain(&args.vararg)
+                    .chain(&args.kwarg)
+                {
+                    if let Some(ann) = &a.annotation {
+                        collect_inner_free_expr(ann, outer_bindings, out);
+                    }
+                }
+                if let Some(r) = returns {
+                    collect_inner_free_expr(r, outer_bindings, out);
+                }
+            }
             let mut inner_locals: HashSet<String> = HashSet::new();
             for a in &args.posonlyargs {
                 inner_locals.insert(a.name.clone());
@@ -6634,6 +7188,155 @@ fn body_is_generator(body: &[Stmt]) -> bool {
     body.iter().any(stmt_contains_yield)
 }
 
+/// Pre-scan for PyCF_ALLOW_TOP_LEVEL_AWAIT (RFC 0052): does the module
+/// body use `await` / `async for` / `async with` / an inline-awaited
+/// async comprehension at its own scope level? When it does, the module
+/// code object must be a coroutine, and — like generator functions —
+/// that has to be known *before* emission so `RETURN_GENERATOR` can be
+/// the first instruction (the VM's generator bootstrap stops there).
+/// Nested `def`/`class` bodies don't count; their awaits are their own.
+fn body_has_top_level_await(body: &[Stmt]) -> bool {
+    fn expr_hit(e: &Expr) -> bool {
+        match &e.kind {
+            ExprKind::Await(_) => true,
+            // Lambda bodies are their own scope, but default values
+            // evaluate here.
+            ExprKind::Lambda { args, .. } | ExprKind::TypeParamFn { args, .. } => {
+                args.defaults.iter().any(expr_hit)
+                    || args.kw_defaults.iter().flatten().any(expr_hit)
+            }
+            // An inline-awaited async list/set/dict comprehension awaits
+            // *in this scope*; so does anything in the first `for`
+            // clause's iterable (evaluated here, passed in as `.0`) —
+            // including a nested async comprehension
+            // (`[1 for x in {y async for y in a}]`).
+            ExprKind::ListComp { elt, generators } | ExprKind::SetComp { elt, generators } => {
+                comp_clause_is_async(generators, elt, None)
+                    || generators.first().is_some_and(|g| expr_hit(&g.iter))
+            }
+            ExprKind::DictComp {
+                key,
+                value,
+                generators,
+            } => {
+                comp_clause_is_async(generators, key, Some(value))
+                    || generators.first().is_some_and(|g| expr_hit(&g.iter))
+            }
+            // An async genexp is just an async-generator object — only
+            // its first iterable evaluates here.
+            ExprKind::GeneratorExp { generators, .. } => {
+                generators.first().is_some_and(|g| expr_hit(&g.iter))
+            }
+            ExprKind::Yield(v) => v.as_deref().is_some_and(expr_hit),
+            ExprKind::YieldFrom(v) => expr_hit(v),
+            ExprKind::JoinedStr(parts) => parts.iter().any(expr_hit),
+            ExprKind::FormattedValue {
+                value, format_spec, ..
+            } => expr_hit(value) || format_spec.as_deref().is_some_and(expr_hit),
+            ExprKind::BinOp { left, right, .. } => expr_hit(left) || expr_hit(right),
+            ExprKind::BoolOp { values, .. } => values.iter().any(expr_hit),
+            ExprKind::UnaryOp { operand, .. } => expr_hit(operand),
+            ExprKind::Compare {
+                left, comparators, ..
+            } => expr_hit(left) || comparators.iter().any(expr_hit),
+            ExprKind::IfExp { test, body, orelse } => {
+                expr_hit(test) || expr_hit(body) || expr_hit(orelse)
+            }
+            ExprKind::NamedExpr { target, value } => expr_hit(target) || expr_hit(value),
+            ExprKind::Call {
+                func,
+                args,
+                keywords,
+            } => {
+                expr_hit(func)
+                    || args.iter().any(expr_hit)
+                    || keywords.iter().any(|k| expr_hit(&k.value))
+            }
+            ExprKind::Attribute { value, .. } => expr_hit(value),
+            ExprKind::Subscript { value, slice } => expr_hit(value) || expr_hit(slice),
+            ExprKind::Slice { lower, upper, step } => {
+                lower.as_deref().is_some_and(expr_hit)
+                    || upper.as_deref().is_some_and(expr_hit)
+                    || step.as_deref().is_some_and(expr_hit)
+            }
+            ExprKind::Tuple(items) | ExprKind::List(items) | ExprKind::Set(items) => {
+                items.iter().any(expr_hit)
+            }
+            ExprKind::Dict { keys, values } => {
+                keys.iter().any(|k| k.as_ref().is_some_and(expr_hit)) || values.iter().any(expr_hit)
+            }
+            ExprKind::Starred(inner) => expr_hit(inner),
+            ExprKind::Constant(_) | ExprKind::Name(_) => false,
+        }
+    }
+    fn stmt_hit(stmt: &Stmt) -> bool {
+        match &stmt.kind {
+            StmtKind::AsyncFor { .. } | StmtKind::AsyncWith { .. } => true,
+            StmtKind::FunctionDef { .. }
+            | StmtKind::AsyncFunctionDef { .. }
+            | StmtKind::ClassDef { .. } => false,
+            StmtKind::Expr(e) => expr_hit(e),
+            StmtKind::Assign { targets, value } => expr_hit(value) || targets.iter().any(expr_hit),
+            StmtKind::AugAssign { target, value, .. } => expr_hit(target) || expr_hit(value),
+            StmtKind::AnnAssign { target, value, .. } => {
+                expr_hit(target) || value.as_ref().is_some_and(expr_hit)
+            }
+            StmtKind::Return(v) => v.as_ref().is_some_and(expr_hit),
+            StmtKind::If { test, body, orelse } | StmtKind::While { test, body, orelse } => {
+                expr_hit(test) || body.iter().any(stmt_hit) || orelse.iter().any(stmt_hit)
+            }
+            StmtKind::For {
+                target,
+                iter,
+                body,
+                orelse,
+            } => {
+                expr_hit(target)
+                    || expr_hit(iter)
+                    || body.iter().any(stmt_hit)
+                    || orelse.iter().any(stmt_hit)
+            }
+            StmtKind::With { items, body } => {
+                items.iter().any(|w| {
+                    expr_hit(&w.context_expr) || w.optional_vars.as_ref().is_some_and(expr_hit)
+                }) || body.iter().any(stmt_hit)
+            }
+            StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            } => {
+                body.iter().any(stmt_hit)
+                    || handlers.iter().any(|h| h.body.iter().any(stmt_hit))
+                    || orelse.iter().any(stmt_hit)
+                    || finalbody.iter().any(stmt_hit)
+            }
+            StmtKind::Raise { exc, cause } => {
+                exc.as_ref().is_some_and(expr_hit) || cause.as_ref().is_some_and(expr_hit)
+            }
+            StmtKind::Match { subject, cases } => {
+                expr_hit(subject)
+                    || cases.iter().any(|c| {
+                        c.guard.as_ref().is_some_and(expr_hit) || c.body.iter().any(stmt_hit)
+                    })
+            }
+            StmtKind::Global(_)
+            | StmtKind::Nonlocal(_)
+            | StmtKind::Import(_)
+            | StmtKind::ImportFrom { .. }
+            | StmtKind::Pass
+            | StmtKind::Break
+            | StmtKind::Continue => false,
+            StmtKind::Delete(targets) => targets.iter().any(expr_hit),
+            StmtKind::Assert { test, msg } => expr_hit(test) || msg.as_ref().is_some_and(expr_hit),
+            // `await` is rejected inside type-alias values at parse time.
+            StmtKind::TypeAlias { .. } => false,
+        }
+    }
+    body.iter().any(stmt_hit)
+}
+
 fn stmt_contains_yield(stmt: &Stmt) -> bool {
     match &stmt.kind {
         StmtKind::FunctionDef { .. }
@@ -6713,6 +7416,8 @@ fn stmt_contains_yield(stmt: &Stmt) -> bool {
         StmtKind::Assert { test, msg } => {
             expr_contains_yield(test) || msg.as_ref().is_some_and(expr_contains_yield)
         }
+        // `yield` is rejected inside type-alias values at parse time.
+        StmtKind::TypeAlias { .. } => false,
     }
 }
 
@@ -7850,8 +8555,22 @@ fn collect_decls(
                 collect_target_names(t, assigned);
             }
         }
-        StmtKind::AugAssign { target, .. } | StmtKind::AnnAssign { target, .. } => {
+        StmtKind::AugAssign { target, .. } => {
             collect_target_names(target, assigned);
+        }
+        // CPython symtable (AnnAssign): a *simple* annotated name is
+        // DEF_LOCAL even without a value (`x: int` → UnboundLocalError
+        // on read); a parenthesized one only binds when it has a value
+        // (`(x): int` alone leaves `x` resolving globally → NameError).
+        StmtKind::AnnAssign {
+            target,
+            value,
+            simple,
+            ..
+        } => {
+            if *simple || value.is_some() {
+                collect_target_names(target, assigned);
+            }
         }
         // `del NAME` is a binding operation in CPython (`DEF_LOCAL`): the
         // name is local to this scope, and — crucially — a nested scope
@@ -7960,6 +8679,60 @@ fn collect_decls(
         }
         _ => {}
     }
+}
+
+/// Locate the `nonlocal NAME` statement declaring `name` within this
+/// scope's body (recursing into compound statements but not into nested
+/// scopes), for error anchoring.
+fn find_nonlocal_decl_span(body: &[Stmt], name: &str) -> Option<weavepy_lexer::Span> {
+    for s in body {
+        match &s.kind {
+            StmtKind::Nonlocal(ns) if ns.iter().any(|n| n == name) => return Some(s.span),
+            StmtKind::For { body, orelse, .. }
+            | StmtKind::AsyncFor { body, orelse, .. }
+            | StmtKind::While { body, orelse, .. }
+            | StmtKind::If { body, orelse, .. } => {
+                if let Some(sp) = find_nonlocal_decl_span(body, name)
+                    .or_else(|| find_nonlocal_decl_span(orelse, name))
+                {
+                    return Some(sp);
+                }
+            }
+            StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            } => {
+                if let Some(sp) = find_nonlocal_decl_span(body, name)
+                    .or_else(|| {
+                        handlers
+                            .iter()
+                            .find_map(|h| find_nonlocal_decl_span(&h.body, name))
+                    })
+                    .or_else(|| find_nonlocal_decl_span(orelse, name))
+                    .or_else(|| find_nonlocal_decl_span(finalbody, name))
+                {
+                    return Some(sp);
+                }
+            }
+            StmtKind::With { body, .. } | StmtKind::AsyncWith { body, .. } => {
+                if let Some(sp) = find_nonlocal_decl_span(body, name) {
+                    return Some(sp);
+                }
+            }
+            StmtKind::Match { cases, .. } => {
+                if let Some(sp) = cases
+                    .iter()
+                    .find_map(|c| find_nonlocal_decl_span(&c.body, name))
+                {
+                    return Some(sp);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn collect_target_names(expr: &Expr, out: &mut HashSet<String>) {
@@ -8076,7 +8849,11 @@ fn collect_reads_stmt(stmt: &Stmt, out: &mut HashSet<String>) {
             ..
         } => {
             collect_reads_expr(target, out);
-            collect_reads_expr(annotation, out);
+            // PEP 563: stringified annotations are never evaluated and
+            // must not participate in scope analysis.
+            if !pep563_active() {
+                collect_reads_expr(annotation, out);
+            }
             if let Some(v) = value {
                 collect_reads_expr(v, out);
             }
@@ -8138,20 +8915,22 @@ fn collect_reads_stmt(stmt: &Stmt, out: &mut HashSet<String>) {
             for d in args.kw_defaults.iter().flatten() {
                 collect_reads_expr(d, out);
             }
-            for a in args
-                .posonlyargs
-                .iter()
-                .chain(&args.args)
-                .chain(&args.kwonlyargs)
-                .chain(&args.vararg)
-                .chain(&args.kwarg)
-            {
-                if let Some(ann) = &a.annotation {
-                    collect_reads_expr(ann, out);
+            if !pep563_active() {
+                for a in args
+                    .posonlyargs
+                    .iter()
+                    .chain(&args.args)
+                    .chain(&args.kwonlyargs)
+                    .chain(&args.vararg)
+                    .chain(&args.kwarg)
+                {
+                    if let Some(ann) = &a.annotation {
+                        collect_reads_expr(ann, out);
+                    }
                 }
-            }
-            if let Some(r) = returns {
-                collect_reads_expr(r, out);
+                if let Some(r) = returns {
+                    collect_reads_expr(r, out);
+                }
             }
             for s in body {
                 collect_reads_stmt(s, out);

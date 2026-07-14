@@ -69,6 +69,19 @@ pub enum StmtKind {
         /// PEP 695 type parameters (`class C[T](…)`).
         type_params: Vec<TypeParam>,
     },
+    /// PEP 695 `type Name[T, …] = value`. Kept first-class in the
+    /// parse AST so `ast.parse` and `symtable` see the real node;
+    /// the compiler lowers it to the lazy `__weavepy_type_alias__`
+    /// assignment (see `parser::lower_type_alias_stmt`) before any
+    /// other pass runs.
+    TypeAlias {
+        name: String,
+        /// Span of the alias-name token (for `ast.TypeAlias.name`).
+        name_span: Span,
+        /// PEP 695 type parameters (`type X[T, U] = …`).
+        type_params: Vec<TypeParam>,
+        value: Box<Expr>,
+    },
     /// `return value`
     Return(Option<Expr>),
     /// `target = value` (and multi-target: `a = b = c = ...`)
@@ -780,6 +793,33 @@ fn dump_stmt(out: &mut String, s: &Stmt, depth: usize) {
                 None => out.push_str("None"),
             }
             out.push_str(", type_comment=None)");
+        }
+        S::TypeAlias {
+            name,
+            type_params,
+            value,
+            ..
+        } => {
+            out.push_str("TypeAlias(name=Name(id='");
+            out.push_str(name);
+            out.push_str("', ctx=Store()), type_params=[");
+            for (i, tp) in type_params.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                let ctor = match tp.kind {
+                    TypeParamKind::TypeVar { .. } => "TypeVar",
+                    TypeParamKind::TypeVarTuple => "TypeVarTuple",
+                    TypeParamKind::ParamSpec => "ParamSpec",
+                };
+                out.push_str(ctor);
+                out.push_str("(name='");
+                out.push_str(&tp.source_name);
+                out.push_str("')");
+            }
+            out.push_str("], value=");
+            dump_expr(out, value, depth);
+            out.push(')');
         }
         S::AsyncFunctionDef {
             name,

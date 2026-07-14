@@ -3663,7 +3663,10 @@ pub(crate) fn code_flags(c: &weavepy_compiler::CodeObject) -> u32 {
     if c.freevars.is_empty() && c.cellvars.is_empty() {
         f |= CO_NOFREE;
     }
-    f
+    // `CO_FUTURE_*` bits recorded at compile time (RFC 0052) — what
+    // lets `compile(..., dont_inherit=False)` inherit the caller's
+    // future statements, like CPython.
+    f | c.future_flags
 }
 
 fn attr_set(obj: &Object, name: &str, value: Object) -> Result<(), RuntimeError> {
@@ -7805,6 +7808,7 @@ fn b_mark_iterable_coroutine(args: &[Object]) -> Result<Object, RuntimeError> {
         name: f.name.clone(),
         code: RefCell::new(Rc::new(code)),
         globals: f.globals.clone(),
+        builtins: f.builtins.clone(),
         defaults: f.defaults.clone(),
         kw_defaults: f.kw_defaults.clone(),
         closure: f.closure.clone(),

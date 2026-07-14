@@ -29,7 +29,7 @@ use std::collections::{HashMap, HashSet};
 use weavepy_lexer::token::Span;
 use weavepy_parser::ast as past;
 
-use crate::error::{value_error, RuntimeError};
+use crate::error::{type_error, value_error, RuntimeError};
 use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
 
@@ -42,6 +42,9 @@ const USE: i64 = 16;
 const DEF_FREE_CLASS: i64 = 64;
 const DEF_IMPORT: i64 = 128;
 const DEF_ANNOT: i64 = 256;
+/// CPython `DEF_TYPE_PARAM` (`2<<9`): the name is a PEP 695 type
+/// parameter.
+const DEF_TYPE_PARAM: i64 = 2 << 9;
 const DEF_BOUND: i64 = DEF_LOCAL | DEF_PARAM | DEF_IMPORT; // 134
 
 const SCOPE_OFF: i64 = 12;
@@ -59,23 +62,46 @@ const CELL: i64 = 5;
 const TYPE_FUNCTION: i64 = 0;
 const TYPE_CLASS: i64 = 1;
 const TYPE_MODULE: i64 = 2;
+const TYPE_ANNOTATION: i64 = 3;
+const TYPE_TYPE_ALIAS: i64 = 4;
+const TYPE_TYPE_PARAMETERS: i64 = 5;
+const TYPE_TYPE_VARIABLE: i64 = 6;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BlockType {
     Function,
     Class,
     Module,
+    /// PEP 695 `type X = …` value scope (CPython `TypeAliasBlock`).
+    TypeAlias,
+    /// PEP 695 hidden `[T, …]` scope wrapping a generic
+    /// function/class/alias (CPython `TypeParametersBlock`).
+    TypeParameters,
+    /// PEP 695 scope for one type parameter's bound/constraints/
+    /// default expression (CPython `TypeVariableBlock`).
+    TypeVariable,
 }
 
 impl BlockType {
+    /// CPython `_PyST_IsFunctionLike`: the PEP 695 annotation scopes
+    /// resolve names like function scopes do.
     fn is_function_like(self) -> bool {
-        matches!(self, BlockType::Function)
+        matches!(
+            self,
+            BlockType::Function
+                | BlockType::TypeAlias
+                | BlockType::TypeParameters
+                | BlockType::TypeVariable
+        )
     }
     fn cpython(self) -> i64 {
         match self {
             BlockType::Function => TYPE_FUNCTION,
             BlockType::Class => TYPE_CLASS,
             BlockType::Module => TYPE_MODULE,
+            BlockType::TypeAlias => TYPE_TYPE_ALIAS,
+            BlockType::TypeParameters => TYPE_TYPE_PARAMETERS,
+            BlockType::TypeVariable => TYPE_TYPE_VARIABLE,
         }
     }
 }
@@ -85,6 +111,9 @@ struct Block {
     name: String,
     lineno: i64,
     nested: bool,
+    /// CPython `ste_can_see_class_scope`: a PEP 695 annotation scope
+    /// immediately inside a class body closes over `__classdict__`.
+    can_see_class_scope: bool,
     /// name → accumulated flag word (def bits during phase 1; the scope
     /// is OR'd into the high bits during phase 2).
     symbols: IndexMap<String, i64>,
@@ -126,12 +155,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             ("TYPE_FUNCTION", TYPE_FUNCTION),
             ("TYPE_CLASS", TYPE_CLASS),
             ("TYPE_MODULE", TYPE_MODULE),
-            // Type-parameter / type-alias blocks (PEP 695) aren't produced
-            // by WeavePy yet, but the wrapper imports the type tags.
-            ("TYPE_ANNOTATION", 3),
-            ("TYPE_TYPE_ALIAS", 4),
-            ("TYPE_TYPE_PARAMETERS", 5),
-            ("TYPE_TYPE_VARIABLE", 6),
+            ("TYPE_ANNOTATION", TYPE_ANNOTATION),
+            ("TYPE_TYPE_ALIAS", TYPE_TYPE_ALIAS),
+            ("TYPE_TYPE_PARAMETERS", TYPE_TYPE_PARAMETERS),
+            ("TYPE_TYPE_VARIABLE", TYPE_TYPE_VARIABLE),
         ];
         for (k, v) in consts {
             d.insert(DictKey(Object::from_str(*k)), Object::Int(*v));
@@ -155,14 +182,59 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 }
 
 /// `_symtable.symtable(source, filename, compile_type)` → raw block tree.
+///
+/// Argument conversion mirrors CPython's `_symtablemodule.c` clinic
+/// order: `filename` goes through `PyUnicode_FSDecoder` (str/bytes),
+/// then `compile_type` must be a `str` naming a compile mode. Parse
+/// errors and symtable-build-time errors surface as `SyntaxError`s
+/// carrying `filename`/`lineno`/`offset`/`text` like CPython's.
 pub fn symtable(args: &[Object]) -> Result<Object, RuntimeError> {
-    let source = match args.first() {
+    // `filename` — CPython's FSDecoder: str, bytes, or os.PathLike.
+    // (PathLike needs a VM re-entry for `__fspath__`; str/bytes covers
+    // every real caller, and everything else is the same TypeError.)
+    let filename = match args.get(1) {
         Some(Object::Str(s)) => s.to_string(),
         Some(Object::Bytes(b)) => String::from_utf8_lossy(b).into_owned(),
-        _ => return Err(value_error("symtable() requires a str or bytes source")),
+        Some(other) => {
+            return Err(type_error(format!(
+                "symtable() argument 'filename' must be str, bytes or os.PathLike, not {}",
+                other.type_name()
+            )))
+        }
+        None => return Err(type_error("symtable expected 3 arguments")),
+    };
+    let compile_type = match args.get(2) {
+        Some(Object::Str(s)) => s.to_string(),
+        Some(other) => {
+            return Err(type_error(format!(
+                "symtable() argument 'compile_type' must be str, not {}",
+                other.type_name()
+            )))
+        }
+        None => return Err(type_error("symtable expected 3 arguments")),
+    };
+    if !matches!(compile_type.as_str(), "exec" | "eval" | "single") {
+        return Err(value_error(
+            "symtable() arg 3 must be 'exec' or 'eval' or 'single'",
+        ));
+    }
+    let source = match args.first() {
+        Some(Object::Str(s)) => s.to_string(),
+        // Bytes decode per PEP 263 (BOM + `# -*- coding: … -*-`).
+        Some(Object::Bytes(b)) => crate::decode_compile_source_bytes(b, &filename)?,
+        _ => {
+            return Err(type_error(
+                "symtable() argument 'source' must be str or bytes",
+            ))
+        }
     };
     let module = weavepy_parser::parse_module(&source)
-        .map_err(|e| value_error(format!("invalid syntax: {e}")))?;
+        .map_err(|e| crate::parse_error_to_syntax_error(&e, &source, &filename))?;
+    // CPython's symtable build raises `SyntaxError` for directive
+    // conflicts (`global` vs. parameter, …) — run the compiler's
+    // validation pass (no codegen) to surface the same diagnostics.
+    weavepy_compiler::validate_module_only(&module, &source)
+        .map_err(|e| crate::compile_error_to_syntax_error(&e, &source, &filename))?;
 
     let mut b = Builder::new(&source);
     let root = b.run(&module);
@@ -230,6 +302,7 @@ impl Builder {
             name: name.to_owned(),
             lineno,
             nested,
+            can_see_class_scope: false,
             symbols: IndexMap::new(),
             varnames: Vec::new(),
             children: Vec::new(),
@@ -289,29 +362,102 @@ impl Builder {
         }
     }
 
-    /// Visit parameter/return annotations and defaults in the *enclosing*
-    /// scope (CPython evaluates them where the `def`/`lambda` appears).
-    fn visit_defaults_and_annotations(&mut self, args: &past::Arguments, annotations: bool) {
+    /// Visit parameter defaults in the *enclosing* scope (CPython
+    /// evaluates them where the `def`/`lambda` appears).
+    fn visit_defaults(&mut self, args: &past::Arguments) {
         for d in &args.defaults {
             self.visit_expr(d);
         }
         for d in args.kw_defaults.iter().flatten() {
             self.visit_expr(d);
         }
-        if annotations {
-            let all = args
-                .posonlyargs
-                .iter()
-                .chain(&args.args)
-                .chain(args.vararg.iter())
-                .chain(&args.kwonlyargs)
-                .chain(args.kwarg.iter());
-            for a in all {
-                if let Some(ann) = &a.annotation {
-                    self.visit_expr(ann);
-                }
+    }
+
+    /// Visit parameter and return annotations. For a generic `def`
+    /// the caller enters the hidden type-parameters block first, so
+    /// these resolve in that annotation scope (CPython
+    /// `symtable_visit_annotations`).
+    fn visit_annotations(&mut self, args: &past::Arguments, returns: Option<&past::Expr>) {
+        let all = args
+            .posonlyargs
+            .iter()
+            .chain(&args.args)
+            .chain(args.vararg.iter())
+            .chain(&args.kwonlyargs)
+            .chain(args.kwarg.iter());
+        for a in all {
+            if let Some(ann) = &a.annotation {
+                self.visit_expr(ann);
             }
         }
+        if let Some(r) = returns {
+            self.visit_expr(r);
+        }
+    }
+
+    /// CPython `symtable_enter_type_param_block`: open the hidden
+    /// `TypeParametersBlock` wrapping a generic `def`/`class`/`type`
+    /// statement.
+    fn enter_type_param_block(
+        &mut self,
+        name: &str,
+        lineno: i64,
+        is_class_def: bool,
+        has_defaults: bool,
+        has_kwdefaults: bool,
+    ) {
+        let parent_is_class = self.arena[self.cur()].ty == BlockType::Class;
+        self.enter(BlockType::TypeParameters, name, lineno);
+        if parent_is_class {
+            let cur = self.cur();
+            self.arena[cur].can_see_class_scope = true;
+            self.add_def("__classdict__", USE);
+        }
+        if is_class_def {
+            // "Set" when the type-params tuple is created, "used" when
+            // the bases are built; `.generic_base` powers the implicit
+            // `Generic[…]` base.
+            self.add_def(".type_params", DEF_LOCAL);
+            self.add_def(".type_params", USE);
+            self.add_def(".generic_base", DEF_LOCAL);
+            self.add_def(".generic_base", USE);
+        }
+        if has_defaults {
+            self.add_def(".defaults", DEF_PARAM);
+        }
+        if has_kwdefaults {
+            self.add_def(".kwdefaults", DEF_PARAM);
+        }
+    }
+
+    /// CPython `symtable_visit_type_param`: bind each parameter in
+    /// the current (type-parameters) block; bounds/constraints and
+    /// PEP 696 defaults each evaluate in their own
+    /// `TypeVariableBlock`.
+    fn visit_type_params(&mut self, type_params: &[past::TypeParam]) {
+        for tp in type_params {
+            self.add_def(&tp.name, DEF_TYPE_PARAM | DEF_LOCAL);
+            if let past::TypeParamKind::TypeVar { bound: Some(b) } = &tp.kind {
+                self.visit_type_var_block(&tp.name, b);
+            }
+            if let Some(d) = &tp.default {
+                self.visit_type_var_block(&tp.name, d);
+            }
+        }
+    }
+
+    /// One `TypeVariableBlock` holding a type parameter's bound,
+    /// constraints, or default expression.
+    fn visit_type_var_block(&mut self, name: &str, e: &past::Expr) {
+        let can_see = self.arena[self.cur()].can_see_class_scope;
+        self.enter(BlockType::TypeVariable, name, self.lineno(e.span));
+        if can_see {
+            let cur = self.cur();
+            self.arena[cur].can_see_class_scope = true;
+            self.add_def("__classdict__", USE);
+        }
+        self.visit_expr(e);
+        self.exit();
     }
 
     fn visit_stmt(&mut self, s: &past::Stmt) {
@@ -324,7 +470,7 @@ impl Builder {
                 body,
                 decorator_list,
                 returns,
-                ..
+                type_params,
             }
             | S::AsyncFunctionDef {
                 name,
@@ -332,22 +478,32 @@ impl Builder {
                 body,
                 decorator_list,
                 returns,
-                ..
+                type_params,
             } => {
                 self.add_def(name, DEF_LOCAL);
-                self.visit_defaults_and_annotations(args, true);
-                if let Some(r) = returns {
-                    self.visit_expr(r);
-                }
+                self.visit_defaults(args);
                 for d in decorator_list {
                     self.visit_expr(d);
                 }
+                let generic = !type_params.is_empty();
+                if generic {
+                    let has_defaults = !args.defaults.is_empty();
+                    let has_kwdefaults = args.kw_defaults.iter().any(Option::is_some);
+                    self.enter_type_param_block(name, lineno, false, has_defaults, has_kwdefaults);
+                    self.visit_type_params(type_params);
+                }
+                // Annotations resolve inside the hidden type-parameters
+                // block when the `def` is generic.
+                self.visit_annotations(args, returns.as_deref());
                 self.enter(BlockType::Function, name, lineno);
                 self.add_params(args);
                 for st in body {
                     self.visit_stmt(st);
                 }
                 self.exit();
+                if generic {
+                    self.exit();
+                }
             }
             S::ClassDef {
                 name,
@@ -355,23 +511,63 @@ impl Builder {
                 keywords,
                 body,
                 decorator_list,
-                ..
+                type_params,
             } => {
                 self.add_def(name, DEF_LOCAL);
+                for d in decorator_list {
+                    self.visit_expr(d);
+                }
+                let generic = !type_params.is_empty();
+                if generic {
+                    self.enter_type_param_block(name, lineno, true, false, false);
+                    self.visit_type_params(type_params);
+                }
+                // A generic class's bases/keywords evaluate inside the
+                // hidden type-parameters block.
                 for b in bases {
                     self.visit_expr(b);
                 }
                 for k in keywords {
                     self.visit_expr(&k.value);
                 }
-                for d in decorator_list {
-                    self.visit_expr(d);
-                }
                 self.enter(BlockType::Class, name, lineno);
+                if generic {
+                    self.add_def("__type_params__", DEF_LOCAL);
+                    self.add_def(".type_params", USE);
+                }
                 for st in body {
                     self.visit_stmt(st);
                 }
                 self.exit();
+                if generic {
+                    self.exit();
+                }
+            }
+            S::TypeAlias {
+                name,
+                type_params,
+                value,
+                ..
+            } => {
+                // The alias name is a Store in the enclosing scope.
+                self.add_def(name, DEF_LOCAL);
+                let is_in_class = self.arena[self.cur()].ty == BlockType::Class;
+                let generic = !type_params.is_empty();
+                if generic {
+                    self.enter_type_param_block(name, lineno, false, false, false);
+                    self.visit_type_params(type_params);
+                }
+                self.enter(BlockType::TypeAlias, name, lineno);
+                if is_in_class {
+                    let cur = self.cur();
+                    self.arena[cur].can_see_class_scope = true;
+                    self.add_def("__classdict__", USE);
+                }
+                self.visit_expr(value);
+                self.exit();
+                if generic {
+                    self.exit();
+                }
             }
             S::Return(v) => {
                 if let Some(e) = v {
@@ -607,7 +803,7 @@ impl Builder {
                 }
             }
             E::Lambda { args, body } | E::TypeParamFn { args, body } => {
-                self.visit_defaults_and_annotations(args, false);
+                self.visit_defaults(args);
                 self.enter(BlockType::Function, "lambda", self.lineno(span));
                 self.add_params(args);
                 self.visit_expr(body);
@@ -834,7 +1030,10 @@ impl Analyzer<'_> {
             newbound.extend(bound.iter().cloned());
             newglobal.extend(global.iter().cloned());
         } else {
+            // Classes provide implicit cells for `__class__` and
+            // `__classdict__` to nested scopes.
             newbound.insert("__class__".to_owned());
+            newbound.insert("__classdict__".to_owned());
         }
 
         let children = self.arena[idx].children.clone();
@@ -855,12 +1054,13 @@ impl Analyzer<'_> {
             newfree.remove("__classdict__");
         }
 
+        let classflag = is_class || self.arena[idx].can_see_class_scope;
         update_symbols(
             &mut self.arena[idx].symbols,
             &scopes,
             bound,
             &newfree,
-            is_class,
+            classflag,
         );
 
         free.extend(newfree);

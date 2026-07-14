@@ -44,6 +44,10 @@ pub(crate) struct Repl {
     main_module: Rc<PyModule>,
     history_path: Option<PathBuf>,
     quiet: bool,
+    /// `CO_FUTURE_*` bits accumulated from executed inputs, so a
+    /// `from __future__ import …` typed at one prompt affects every
+    /// later prompt (CPython's `codeop.Compile` behaviour).
+    future_flags: u32,
 }
 
 impl Repl {
@@ -73,6 +77,7 @@ impl Repl {
             main_module,
             history_path,
             quiet,
+            future_flags: 0,
         })
     }
 
@@ -184,7 +189,9 @@ impl Repl {
         // A "single expression" candidate is one parse-able as
         // `Module(body=[Expr(value=…)])`. Anything else (statements,
         // multiple expressions, blocks) bails to the suite path.
-        let module = parser::parse_module(trimmed).map_err(|_| ())?;
+        let module = parser::parse_module_with_warnings_flags(trimmed, self.flufl_active())
+            .0
+            .map_err(|_| ())?;
         if module.body.len() != 1 {
             return Err(());
         }
@@ -192,8 +199,14 @@ impl Repl {
         if !is_expr {
             return Err(());
         }
-        let code =
-            compiler::compile_module_with_source(&module, trimmed, "<stdin>").map_err(|_| ())?;
+        let code = compiler::compile_module_with_options(
+            &module,
+            trimmed,
+            "<stdin>",
+            self.compile_options(),
+        )
+        .map_err(|_| ())?;
+        self.future_flags |= code.future_flags;
         let globals = self.main_module.dict.clone();
         let result = self
             .interpreter
@@ -216,15 +229,33 @@ impl Repl {
     }
 
     fn execute_once(&mut self, source: &str, filename: String) -> Result<(), String> {
-        let module = parser::parse_module(source)
+        let module = parser::parse_module_with_warnings_flags(source, self.flufl_active())
+            .0
             .map_err(|e| weavepy::Error::Parse(e).format(source, &filename))?;
-        let code = compiler::compile_module_with_source(&module, source, &filename)
-            .map_err(|e| weavepy::Error::Compile(e).format(source, &filename))?;
+        let code = compiler::compile_module_with_options(
+            &module,
+            source,
+            &filename,
+            self.compile_options(),
+        )
+        .map_err(|e| weavepy::Error::Compile(e).format(source, &filename))?;
+        self.future_flags |= code.future_flags;
         let globals = self.main_module.dict.clone();
         self.interpreter
             .exec_module_in(&code, globals)
             .map(|_| ())
             .map_err(|e| weavepy::Error::Runtime(e).format(source, &filename))
+    }
+
+    fn flufl_active(&self) -> bool {
+        self.future_flags & compiler::flags::CO_FUTURE_BARRY_AS_BDFL != 0
+    }
+
+    fn compile_options(&self) -> compiler::CompileOptions {
+        compiler::CompileOptions {
+            flags: self.future_flags,
+            ..Default::default()
+        }
     }
 }
 
@@ -277,6 +308,7 @@ fn needs_continuation(source: &str) -> bool {
             span.end.0 as usize >= source.len().saturating_sub(1)
         }
         Err(parser::ParseError::Lex(lexer::LexError::UnterminatedString { .. })) => true,
+        Err(parser::ParseError::Lex(lexer::LexError::UnterminatedTripleString { .. })) => true,
         // An unterminated (possibly triple-quoted) f-string literal is the
         // multi-line-continuation case too — the user is still typing it.
         // (`FstringExpectingBrace`/`...OrSpec` are real errors, not these.)

@@ -22,7 +22,19 @@ use crate::ast::{
 use crate::error::ParseError;
 
 pub(crate) fn parse(source: &str, tokens: Vec<Token>) -> Result<Module, ParseError> {
+    parse_with_flufl(source, tokens, false)
+}
+
+/// [`parse`] with PEP 401 `barry_as_FLUFL` pre-activated (the
+/// `CO_FUTURE_BARRY_AS_BDFL` compile flag). The parser also flips the
+/// flag itself when it sees `from __future__ import barry_as_FLUFL`.
+pub(crate) fn parse_with_flufl(
+    source: &str,
+    tokens: Vec<Token>,
+    flufl: bool,
+) -> Result<Module, ParseError> {
     let mut p = Parser::new(source, tokens);
+    p.flufl = flufl;
     let module = p.parse_module()?;
     Ok(module)
 }
@@ -37,7 +49,17 @@ pub(crate) fn parse(source: &str, tokens: Vec<Token>) -> Result<Module, ParseErr
 /// Expression-*internal* diagnostics (a missing `else`, an unclosed
 /// bracket, f-string field errors, …) still surface unchanged.
 pub(crate) fn parse_eval(source: &str, tokens: Vec<Token>) -> Result<Module, ParseError> {
+    parse_eval_with_flufl(source, tokens, false)
+}
+
+/// [`parse_eval`] with PEP 401 `barry_as_FLUFL` pre-activated.
+pub(crate) fn parse_eval_with_flufl(
+    source: &str,
+    tokens: Vec<Token>,
+    flufl: bool,
+) -> Result<Module, ParseError> {
     let mut p = Parser::new(source, tokens);
+    p.flufl = flufl;
     let module = p.parse_eval_module()?;
     Ok(module)
 }
@@ -46,6 +68,11 @@ struct Parser<'src> {
     source: &'src str,
     tokens: Vec<Token>,
     pos: usize,
+    /// PEP 401: `from __future__ import barry_as_FLUFL` is active
+    /// (either seen while parsing, or passed as a compile flag). Under
+    /// FLUFL, `<>` is the inequality operator and `!=` is a
+    /// SyntaxError.
+    flufl: bool,
 }
 
 impl<'src> Parser<'src> {
@@ -64,6 +91,7 @@ impl<'src> Parser<'src> {
             source,
             tokens,
             pos: 0,
+            flufl: false,
         }
     }
 
@@ -133,9 +161,18 @@ impl<'src> Parser<'src> {
         if self.check(k) {
             Ok(self.bump())
         } else {
+            // CPython pegen only names the missing token when the line
+            // simply stopped short (NEWLINE / EOF): `try` ⏎ says
+            // "expected ':'". Anywhere else the generic parse failure is
+            // a bare "invalid syntax" pointing at the offending token.
+            let message = if matches!(self.peek(), TokenKind::Newline | TokenKind::Endmarker) {
+                format!("expected {}", what.replace('`', "'"))
+            } else {
+                "invalid syntax".to_owned()
+            };
             Err(ParseError::Unexpected {
                 span: self.peek_token().span,
-                message: format!("expected {what}, got {:?}", self.peek()),
+                message,
             })
         }
     }
@@ -235,16 +272,35 @@ impl<'src> Parser<'src> {
     /// of '='?", anchored at the key.
     fn expect_dict_colon(&mut self, key: &Expr) -> Result<(), ParseError> {
         if self.check(&TokenKind::Equal) {
+            return Err(Self::display_equal_error(key));
+        }
+        if !self.check(&TokenKind::Colon) {
+            // pegen `invalid_dict_key_value` ("{1:2, 3:4, 5}").
             return Err(ParseError::Unexpected {
-                span: key.span,
-                message: format!(
-                    "cannot assign to {} here. Maybe you meant '==' instead of '='?",
-                    crate::ast::expr_name(key)
-                ),
+                span: self.peek_token().span,
+                message: "':' expected after dictionary key".to_owned(),
             });
         }
-        self.expect(&TokenKind::Colon, "`:`")?;
+        self.bump();
         Ok(())
+    }
+
+    /// Parse a dict value (the expression after `key:`) with pegen's
+    /// dedicated diagnostics for a missing or starred value.
+    fn parse_dict_value(&mut self) -> Result<Expr, ParseError> {
+        if let TokenKind::Star = self.peek() {
+            return Err(ParseError::Unexpected {
+                span: self.peek_token().span,
+                message: "cannot use a starred expression in a dictionary value".to_owned(),
+            });
+        }
+        if matches!(self.peek(), TokenKind::RBrace | TokenKind::Comma) {
+            return Err(ParseError::Unexpected {
+                span: self.peek_token().span,
+                message: "expression expected after dictionary key and ':'".to_owned(),
+            });
+        }
+        self.parse_ternary()
     }
 
     /// Like [`Parser::expect`], but when the failure is two adjacent
@@ -444,7 +500,18 @@ impl<'src> Parser<'src> {
                 if self.looks_like_match_statement() {
                     self.parse_match()
                 } else {
-                    self.parse_simple_statement()
+                    // pegen tries the regular statement grammar first,
+                    // then falls back to `invalid_match_stmt`, so
+                    // `match x` ⏎ reports "expected ':'" (not the
+                    // generic failure of the expression path).
+                    let saved = self.pos;
+                    match self.parse_simple_statement() {
+                        Ok(stmt) => Ok(stmt),
+                        Err(expr_err) => {
+                            self.pos = saved;
+                            Err(self.match_stmt_fallback_error(expr_err))
+                        }
+                    }
                 }
             }
             // PEP 695 — `type Alias = T` soft keyword. Disambiguate
@@ -494,17 +561,11 @@ impl<'src> Parser<'src> {
         matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Equal))
     }
 
-    /// Compile a PEP 695 type-alias statement.
-    ///
-    /// `type Foo[T, U] = body` desugars to:
-    ///
-    /// ```python
-    /// Foo = (lambda T, U: body)(TypeVar('T'), TypeVar('U'))
-    /// ```
-    ///
-    /// so the type parameters resolve as `TypeVar` instances in the
-    /// alias body without leaking into the enclosing scope. The
-    /// bare form `type Foo = body` lowers to plain `Foo = body`.
+    /// Parse a PEP 695 type-alias statement into the first-class
+    /// [`StmtKind::TypeAlias`] node. The compiler lowers it to the
+    /// lazy `__weavepy_type_alias__` assignment via
+    /// [`lower_type_alias_stmt`] just before compilation, so
+    /// `ast.parse` and `symtable` observe the real node.
     fn parse_type_alias_stmt(&mut self) -> Result<Stmt, ParseError> {
         let type_tok = self.bump(); // `type`
         let name_tok = self.expect(&TokenKind::Name, "type alias name")?;
@@ -515,15 +576,12 @@ impl<'src> Parser<'src> {
         check_type_param_expr(&value, "a type alias")?;
         self.consume_stmt_end()?;
         let span = type_tok.span.merge(value.span);
-        let target = Expr {
-            kind: ExprKind::Name(name.clone()),
-            span: name_tok.span,
-        };
-        let rhs = build_lazy_type_alias(&name, value, &type_params, name_tok.span);
         Ok(Stmt {
-            kind: StmtKind::Assign {
-                targets: vec![target],
-                value: rhs,
+            kind: StmtKind::TypeAlias {
+                name,
+                name_span: name_tok.span,
+                type_params,
+                value: Box::new(value),
             },
             span,
         })
@@ -535,7 +593,14 @@ impl<'src> Parser<'src> {
         if !matches!(self.peek(), TokenKind::LSqb) {
             return Ok(Vec::new());
         }
-        self.bump(); // `[`
+        let lsqb = self.bump(); // `[`
+                                // pegen `invalid_type_params`.
+        if matches!(self.peek(), TokenKind::RSqb) {
+            return Err(ParseError::Unexpected {
+                span: lsqb.span.merge(self.peek_token().span),
+                message: "Type parameter list cannot be empty".to_owned(),
+            });
+        }
         let mut params: Vec<TypeParam> = Vec::new();
         let mut seen_default = false;
         loop {
@@ -718,11 +783,16 @@ impl<'src> Parser<'src> {
                     ) {
                         j += 1;
                     }
-                    // A missing INDENT is still a match statement when
-                    // `case` follows — parse_match then reports CPython's
-                    // "expected an indented block after 'match' statement".
+                    // A missing INDENT is still a match statement —
+                    // parse_match then reports CPython's "expected an
+                    // indented block after 'match' statement"
+                    // (`invalid_match_stmt`). With an INDENT present,
+                    // require `case` so `match[x]:`-style annotations
+                    // aren't misread.
                     if matches!(self.tokens.get(j).map(|t| &t.kind), Some(TokenKind::Indent)) {
                         j += 1;
+                    } else {
+                        return true;
                     }
                     while matches!(
                         self.tokens.get(j).map(|t| &t.kind),
@@ -786,6 +856,27 @@ impl<'src> Parser<'src> {
     fn parse_simple_statement(&mut self) -> Result<Stmt, ParseError> {
         let start_span = self.peek_token().span;
 
+        // pegen `yield_stmt`: a statement-level `yield`/`yield from` is
+        // an expression statement and cannot continue into assignment
+        // or tuple forms (`yield from (), 1` is invalid syntax).
+        if self.at_keyword(Keyword::Yield) {
+            let e = self.parse_yield()?;
+            // `yield = 1` — pegen `invalid_assignment`'s dedicated
+            // `yield_expr '='` alternative.
+            if self.check(&TokenKind::Equal) {
+                return Err(ParseError::Unexpected {
+                    span: e.span,
+                    message: "assignment to yield expression not possible".to_owned(),
+                });
+            }
+            let end = self.prev_token_span();
+            self.consume_stmt_end()?;
+            return Ok(Stmt {
+                kind: StmtKind::Expr(e),
+                span: start_span.merge(end),
+            });
+        }
+
         // A statement opening with `(` makes any annotation target
         // non-"simple" (CPython pegen: `('(' single_target ')' | ...) ':'`
         // sets `simple=0`), even when the inner expression is a bare Name.
@@ -812,7 +903,7 @@ impl<'src> Parser<'src> {
                     ),
                 });
             }
-            let value = self.parse_expression_list(true)?;
+            let value = self.parse_assign_rhs()?;
             let end = self.prev_token_span();
             self.consume_stmt_end()?;
             return Ok(Stmt {
@@ -854,7 +945,7 @@ impl<'src> Parser<'src> {
             self.bump();
             let annotation = self.parse_expression(false)?;
             let value = if self.eat(&TokenKind::Equal) {
-                Some(self.parse_expression_list(true)?)
+                Some(self.parse_assign_rhs()?)
             } else {
                 None
             };
@@ -884,7 +975,7 @@ impl<'src> Parser<'src> {
                 }
                 // Peek-parse the right-hand side as expression list;
                 // re-classify if another `=` follows.
-                let next = self.parse_expression_list(true)?;
+                let next = self.parse_assign_rhs()?;
                 if self.check(&TokenKind::Equal) {
                     targets.push(next);
                 } else {
@@ -960,7 +1051,16 @@ impl<'src> Parser<'src> {
         // (see `desugar_pep695_def`) so annotations referencing them
         // resolve and `f.__type_params__` is populated.
         let type_params = self.collect_pep695_type_params()?;
-        self.expect(&TokenKind::LPar, "`(`")?;
+        // pegen `invalid_def_raw` uses a *forced* token here, so the
+        // missing-paren diagnostic fires no matter what follows
+        // (`def f:` and `def f -> int:` both say "expected '('").
+        if !self.check(&TokenKind::LPar) {
+            return Err(ParseError::Unexpected {
+                span: self.peek_token().span,
+                message: "expected '('".to_owned(),
+            });
+        }
+        self.bump();
         let args = self.parse_function_arguments()?;
         self.expect(&TokenKind::RPar, "`)`")?;
         let returns = if self.eat(&TokenKind::RArrow) {
@@ -1094,6 +1194,21 @@ impl<'src> Parser<'src> {
         let type_params = self.collect_pep695_type_params()?;
         let (bases, keywords) = if self.eat(&TokenKind::LPar) {
             let (a, kw) = self.parse_call_args()?;
+            // `class C(x for x in L):` — pegen's class_def_raw only
+            // accepts `arguments`, not a bare genexp; plain "invalid
+            // syntax". A *parenthesized* genexp base is grammatically
+            // fine (it fails later at runtime instead).
+            if let [only] = a.as_slice() {
+                if matches!(only.kind, ExprKind::GeneratorExp { .. })
+                    && kw.is_empty()
+                    && self.source.as_bytes().get(only.span.start.0 as usize) != Some(&b'(')
+                {
+                    return Err(ParseError::Unexpected {
+                        span: only.span,
+                        message: "invalid syntax".to_owned(),
+                    });
+                }
+            }
             self.expect(&TokenKind::RPar, "`)`")?;
             (a, kw)
         } else {
@@ -1140,16 +1255,17 @@ impl<'src> Parser<'src> {
         while self.at_keyword(Keyword::Except) {
             let exc_tok = self.bump(); // `except`
             let is_star = matches!(self.peek(), TokenKind::Star);
+            let mut kw_span = exc_tok.span;
             if is_star {
-                self.bump();
+                kw_span = kw_span.merge(self.bump().span);
                 saw_star = true;
             } else {
                 saw_plain = true;
             }
             if saw_star && saw_plain {
                 return Err(ParseError::Unexpected {
-                    span: exc_tok.span,
-                    message: "cannot have both 'except' and 'except*' on the same try".to_owned(),
+                    span: kw_span,
+                    message: "cannot have both 'except' and 'except*' on the same 'try'".to_owned(),
                 });
             }
             let (type_, name) = if self.check(&TokenKind::Colon) {
@@ -1163,7 +1279,21 @@ impl<'src> Parser<'src> {
                 }
                 (None, None)
             } else {
+                // `except` ⏎ — pegen `invalid_except_stmt`.
+                if matches!(self.peek(), TokenKind::Newline) {
+                    return Err(ParseError::Unexpected {
+                        span: self.peek_token().span,
+                        message: "expected ':'".to_owned(),
+                    });
+                }
                 let t = self.parse_expression(false)?;
+                // `except A, B:` — pegen `invalid_except_stmt`.
+                if self.check(&TokenKind::Comma) {
+                    return Err(ParseError::Unexpected {
+                        span: t.span,
+                        message: "multiple exception types must be parenthesized".to_owned(),
+                    });
+                }
                 let n = if self.at_keyword(Keyword::As) {
                     self.bump();
                     let nt = self.expect(&TokenKind::Name, "name after `as`")?;
@@ -1174,7 +1304,14 @@ impl<'src> Parser<'src> {
                 (Some(t), n)
             };
             self.expect(&TokenKind::Colon, "`:`")?;
-            let handler_body = self.parse_block("'except' statement", exc_tok.span)?;
+            let handler_body = self.parse_block(
+                if is_star {
+                    "'except*' statement"
+                } else {
+                    "'except' statement"
+                },
+                exc_tok.span,
+            )?;
             let span_end = handler_body.last().map_or(exc_tok.span, |s| s.span);
             handlers.push(ExceptHandler {
                 type_,
@@ -1199,7 +1336,7 @@ impl<'src> Parser<'src> {
         if handlers.is_empty() && finalbody.is_empty() {
             return Err(ParseError::Unexpected {
                 span: try_tok.span,
-                message: "expected `except` or `finally` after `try`".to_owned(),
+                message: "expected 'except' or 'finally' block".to_owned(),
             });
         }
         let span_end = finalbody
@@ -1349,13 +1486,31 @@ impl<'src> Parser<'src> {
         // keyword-only argument to follow it; CPython rejects `def f(p, *)`
         // and `def f(p, *, **kw)` with "named arguments must follow bare *".
         let mut bare_star_span: Option<Span> = None;
+        // pegen `invalid_parameters` bookkeeping.
+        let mut saw_slash = false;
+        let mut saw_star = false;
+        let mut saw_kwarg = false;
         loop {
             if self.check(&TokenKind::RPar) || self.check(&TokenKind::Colon) {
                 break;
             }
+            // Nothing may follow `**kwargs` (pegen `invalid_parameters`).
+            if saw_kwarg {
+                return Err(ParseError::Unexpected {
+                    span: self.peek_token().span,
+                    message: "arguments cannot follow var-keyword argument".to_owned(),
+                });
+            }
             // `*args` or bare `*` separator.
             if self.check(&TokenKind::Star) {
                 let star_tok = self.bump();
+                if saw_star {
+                    return Err(ParseError::Unexpected {
+                        span: star_tok.span,
+                        message: "* argument may appear only once".to_owned(),
+                    });
+                }
+                saw_star = true;
                 if matches!(self.peek(), TokenKind::Name) {
                     let n = self.bump();
                     args.vararg = Some(Arg {
@@ -1363,8 +1518,22 @@ impl<'src> Parser<'src> {
                         annotation: self.try_arg_annotation(allow_annotation, true)?,
                         span: n.span,
                     });
-                } else {
+                    if self.check(&TokenKind::Equal) {
+                        return Err(ParseError::Unexpected {
+                            span: self.peek_token().span,
+                            message: "var-positional argument cannot have default value".to_owned(),
+                        });
+                    }
+                } else if matches!(
+                    self.peek(),
+                    TokenKind::Comma | TokenKind::RPar | TokenKind::Colon
+                ) {
                     bare_star_span = Some(star_tok.span);
+                } else {
+                    return Err(ParseError::Unexpected {
+                        span: self.peek_token().span,
+                        message: "invalid syntax".to_owned(),
+                    });
                 }
                 phase = 2;
                 if !self.eat(&TokenKind::Comma) {
@@ -1380,13 +1549,48 @@ impl<'src> Parser<'src> {
                     annotation: self.try_arg_annotation(allow_annotation, false)?,
                     span: n.span,
                 });
+                if self.check(&TokenKind::Equal) {
+                    return Err(ParseError::Unexpected {
+                        span: self.peek_token().span,
+                        message: "var-keyword argument cannot have default value".to_owned(),
+                    });
+                }
+                saw_kwarg = true;
                 if !self.eat(&TokenKind::Comma) {
                     break;
                 }
                 continue;
             }
             // `/` separator: everything we've collected becomes posonly.
-            if self.eat(&TokenKind::Slash) {
+            if self.check(&TokenKind::Slash) {
+                let slash_tok = self.bump();
+                // pegen `invalid_parameters` slash rules, in CPython's
+                // precedence order.
+                if saw_slash {
+                    return Err(ParseError::Unexpected {
+                        span: slash_tok.span,
+                        message: "/ may appear only once".to_owned(),
+                    });
+                }
+                if saw_star {
+                    return Err(ParseError::Unexpected {
+                        span: slash_tok.span,
+                        message: "/ must be ahead of *".to_owned(),
+                    });
+                }
+                if args.args.is_empty() {
+                    return Err(ParseError::Unexpected {
+                        span: slash_tok.span,
+                        message: "at least one argument must precede /".to_owned(),
+                    });
+                }
+                saw_slash = true;
+                if self.check(&TokenKind::Star) {
+                    return Err(ParseError::Unexpected {
+                        span: self.peek_token().span,
+                        message: "expected comma between / and *".to_owned(),
+                    });
+                }
                 args.posonlyargs = std::mem::take(&mut args.args);
                 phase = 1;
                 if !self.eat(&TokenKind::Comma) {
@@ -1395,10 +1599,31 @@ impl<'src> Parser<'src> {
                 continue;
             }
 
+            // `def f(x, (y, z)):` — pegen `invalid_parameters`.
+            if self.check(&TokenKind::LPar) {
+                return Err(ParseError::Unexpected {
+                    span: self.peek_token().span,
+                    message: if allow_annotation {
+                        "Function parameters cannot be parenthesized".to_owned()
+                    } else {
+                        "Lambda expression parameters cannot be parenthesized".to_owned()
+                    },
+                });
+            }
             let n = self.expect(&TokenKind::Name, "parameter name")?;
             let name = self.ident(n.span);
             let annotation = self.try_arg_annotation(allow_annotation, false)?;
             let default = if self.eat(&TokenKind::Equal) {
+                // `def f(a, d=, c):` — pegen `invalid_default`.
+                if matches!(
+                    self.peek(),
+                    TokenKind::Comma | TokenKind::RPar | TokenKind::Colon | TokenKind::Newline
+                ) {
+                    return Err(ParseError::Unexpected {
+                        span: self.peek_token().span,
+                        message: "expected default value expression".to_owned(),
+                    });
+                }
                 Some(self.parse_expression(false)?)
             } else {
                 None
@@ -1419,7 +1644,8 @@ impl<'src> Parser<'src> {
                 } else if had_default {
                     return Err(ParseError::Unexpected {
                         span: n.span,
-                        message: "non-default argument follows default argument".to_owned(),
+                        message: "parameter without a default follows parameter with a default"
+                            .to_owned(),
                     });
                 }
             }
@@ -1497,6 +1723,10 @@ impl<'src> Parser<'src> {
             "'if' statement"
         };
         let test = self.parse_expression(false)?;
+        // `if x = 3:` — pegen `invalid_expression`/`invalid_named_expression`.
+        if self.check(&TokenKind::Equal) {
+            return Err(Self::display_equal_error(&test));
+        }
         self.expect(&TokenKind::Colon, "`:`")?;
         let body = self.parse_block(if_what, if_tok.span)?;
         let orelse = if self.at_keyword(Keyword::Elif) {
@@ -1523,6 +1753,10 @@ impl<'src> Parser<'src> {
     fn parse_while(&mut self) -> Result<Stmt, ParseError> {
         let kw = self.bump();
         let test = self.parse_expression(false)?;
+        // `while x = 3:` — same rule as `if`.
+        if self.check(&TokenKind::Equal) {
+            return Err(Self::display_equal_error(&test));
+        }
         self.expect(&TokenKind::Colon, "`:`")?;
         let body = self.parse_block("'while' statement", kw.span)?;
         let orelse = if self.at_keyword(Keyword::Else) {
@@ -1555,9 +1789,11 @@ impl<'src> Parser<'src> {
             return Err(self.assign_target_error(offender, true));
         }
         if !self.at_keyword(Keyword::In) {
+            // pegen has no dedicated diagnostic here: `for i < ():` and
+            // `for a, b` ⏎ are both the generic failure.
             return Err(ParseError::Unexpected {
                 span: self.peek_token().span,
-                message: "expected `in` in for-loop".to_owned(),
+                message: "invalid syntax".to_owned(),
             });
         }
         self.bump();
@@ -1606,6 +1842,13 @@ impl<'src> Parser<'src> {
 
     fn parse_import(&mut self) -> Result<Stmt, ParseError> {
         let kw = self.bump();
+        // pegen `invalid_import`.
+        if matches!(self.peek(), TokenKind::Newline | TokenKind::Endmarker) {
+            return Err(ParseError::Unexpected {
+                span: kw.span,
+                message: "Expected one or more names after 'import'".to_owned(),
+            });
+        }
         let mut names = Vec::new();
         loop {
             let dotted = self.parse_dotted_name()?;
@@ -1623,6 +1866,13 @@ impl<'src> Parser<'src> {
             if !self.eat(&TokenKind::Comma) {
                 break;
             }
+        }
+        // pegen `invalid_import`: `import a from b`.
+        if self.at_keyword(Keyword::From) {
+            return Err(ParseError::Unexpected {
+                span: self.peek_token().span,
+                message: "Did you mean to use 'from ... import ...' instead?".to_owned(),
+            });
         }
         let end = self.prev_token_span();
         self.consume_stmt_end()?;
@@ -1646,8 +1896,17 @@ impl<'src> Parser<'src> {
     fn parse_import_from(&mut self) -> Result<Stmt, ParseError> {
         let kw = self.bump(); // `from`
         let mut level = 0u32;
-        while self.eat(&TokenKind::Dot) {
-            level += 1;
+        // `from ...pkg import x`: the lexer greedily tokenises `...` as
+        // a single Ellipsis token, so relative-import dots arrive as a
+        // mix of `.` and `...`.
+        loop {
+            if self.eat(&TokenKind::Dot) {
+                level += 1;
+            } else if self.eat(&TokenKind::Ellipsis) {
+                level += 3;
+            } else {
+                break;
+            }
         }
         let module = if matches!(self.peek(), TokenKind::Name) {
             Some(self.parse_dotted_name()?)
@@ -1660,13 +1919,20 @@ impl<'src> Parser<'src> {
                 message: "expected `import`".to_owned(),
             });
         }
-        self.bump();
+        let import_tok = self.bump();
         let names = if self.eat(&TokenKind::Star) {
             vec![Alias {
                 name: "*".to_owned(),
                 asname: None,
             }]
         } else {
+            // pegen `invalid_import_from_targets`.
+            if matches!(self.peek(), TokenKind::Newline | TokenKind::Endmarker) {
+                return Err(ParseError::Unexpected {
+                    span: import_tok.span,
+                    message: "Expected one or more names after 'import'".to_owned(),
+                });
+            }
             let paren = self.eat(&TokenKind::LPar);
             let mut names = Vec::new();
             loop {
@@ -1674,6 +1940,15 @@ impl<'src> Parser<'src> {
                 // `from x import (a, b,)` — common in real codebases.
                 if paren && matches!(self.peek(), TokenKind::RPar) {
                     break;
+                }
+                // pegen `invalid_import_from_targets`: an unparenthesised
+                // list may not end with a comma.
+                if !paren && matches!(self.peek(), TokenKind::Newline | TokenKind::Endmarker) {
+                    return Err(ParseError::Unexpected {
+                        span: self.peek_token().span,
+                        message: "trailing comma not allowed without surrounding parentheses"
+                            .to_owned(),
+                    });
                 }
                 let n = self.expect(&TokenKind::Name, "imported name")?;
                 let name = self.ident(n.span);
@@ -1694,6 +1969,16 @@ impl<'src> Parser<'src> {
             }
             names
         };
+        // PEP 401: the parser itself activates FLUFL mode when it sees
+        // the future import, so later tokens on the same parse are
+        // affected even without compile flags (CPython pegen does the
+        // same).
+        if level == 0
+            && module.as_deref() == Some("__future__")
+            && names.iter().any(|a| a.name == "barry_as_FLUFL")
+        {
+            self.flufl = true;
+        }
         let end = self.prev_token_span();
         self.consume_stmt_end()?;
         Ok(Stmt {
@@ -1733,7 +2018,10 @@ impl<'src> Parser<'src> {
     /// supported with no extra plumbing.
     fn parse_del(&mut self) -> Result<Stmt, ParseError> {
         let kw = self.bump();
-        let mut targets = vec![self.parse_ternary()?];
+        // Accept starred targets syntactically (`del *x`) so the
+        // dedicated "cannot delete starred" diagnostic below fires
+        // instead of a generic parse failure at the `*`.
+        let mut targets = vec![self.parse_ternary_or_starred()?];
         while self.eat(&TokenKind::Comma) {
             if matches!(
                 self.peek(),
@@ -1741,7 +2029,7 @@ impl<'src> Parser<'src> {
             ) {
                 break;
             }
-            targets.push(self.parse_ternary()?);
+            targets.push(self.parse_ternary_or_starred()?);
         }
         // CPython (`invalid_del_stmt`): del targets are validated at parse
         // time — "cannot delete X" for anything but a name / attribute /
@@ -1854,6 +2142,29 @@ impl<'src> Parser<'src> {
         })
     }
 
+    /// pegen `invalid_match_stmt`: after the ordinary statement grammar
+    /// rejected a line starting with the soft keyword `match`, retry it
+    /// as a match statement; if a subject expression parses cleanly and
+    /// a `:` doesn't follow, "expected ':'" wins over the expression
+    /// path's error. Any other shape keeps the original error.
+    fn match_stmt_fallback_error(&mut self, expr_err: ParseError) -> ParseError {
+        let saved = self.pos;
+        self.bump(); // `match`
+        let subject_ok = self.parse_match_subject().is_ok();
+        // Only a line that simply stopped short gets the named-token
+        // hint (`match x` ⏎); `match x x:` stays "invalid syntax".
+        if subject_ok && matches!(self.peek(), TokenKind::Newline | TokenKind::Endmarker) {
+            let span = self.peek_token().span;
+            self.pos = saved;
+            return ParseError::Unexpected {
+                span,
+                message: "expected ':'".to_owned(),
+            };
+        }
+        self.pos = saved;
+        expr_err
+    }
+
     /// CPython allows `match a, b:` (subject is an implicit tuple). We
     /// follow.
     fn parse_match_subject(&mut self) -> Result<Expr, ParseError> {
@@ -1932,12 +2243,19 @@ impl<'src> Parser<'src> {
         let pat = self.parse_or_pattern()?;
         if self.at_keyword(Keyword::As) {
             self.bump();
-            let n = self.expect(&TokenKind::Name, "name after `as`")?;
+            if !self.check(&TokenKind::Name) {
+                // pegen `invalid_as_pattern`.
+                return Err(ParseError::Unexpected {
+                    span: self.peek_token().span,
+                    message: "invalid pattern target".to_owned(),
+                });
+            }
+            let n = self.bump();
             let name = self.ident(n.span);
             if name == "_" {
                 return Err(ParseError::Unexpected {
                     span: n.span,
-                    message: "cannot use `_` as a capture target".to_owned(),
+                    message: "cannot use '_' as a target".to_owned(),
                 });
             }
             return Ok(Pattern::As {
@@ -2182,7 +2500,7 @@ impl<'src> Parser<'src> {
                 if saw_kw {
                     return Err(ParseError::Unexpected {
                         span: self.peek_token().span,
-                        message: "positional pattern after keyword pattern".to_owned(),
+                        message: "positional patterns follow keyword patterns".to_owned(),
                     });
                 }
                 positionals.push(self.parse_pattern()?);
@@ -2249,7 +2567,15 @@ impl<'src> Parser<'src> {
             if self.eat(&TokenKind::DoubleStar) {
                 let n = self.expect(&TokenKind::Name, "name after `**` in mapping pattern")?;
                 let name = self.ident(n.span);
-                rest = Some(if name == "_" { None } else { Some(name) });
+                if name == "_" {
+                    // PEP 634 forbids `**_` (pegen `invalid_double_star_pattern`
+                    // is a bare "invalid syntax" in 3.13).
+                    return Err(ParseError::Unexpected {
+                        span: n.span,
+                        message: "invalid syntax".to_owned(),
+                    });
+                }
+                rest = Some(Some(name));
                 if !self.eat(&TokenKind::Comma) {
                     break;
                 }
@@ -2492,12 +2818,12 @@ impl<'src> Parser<'src> {
         if self.at_keyword(Keyword::Lambda) {
             return self.parse_lambda();
         }
-        // `yield` and `yield from` are expressions in CPython's grammar.
-        // They're only legal inside function bodies; the compiler — not
-        // the parser — enforces that.
-        if self.at_keyword(Keyword::Yield) {
-            return self.parse_yield();
-        }
+        // `yield` is *not* a general expression in CPython's grammar: a
+        // `yield_expr` is only admitted as a whole statement, as the
+        // sole RHS of an (aug/ann) assignment, or parenthesized. Those
+        // call sites invoke `parse_yield` themselves; anywhere else —
+        // `f(yield 1)`, `1, yield`, `not yield` — is "invalid syntax"
+        // (the atom fallback below the keyword check reports it).
         // PEP 572 walrus `NAME := expr`. The named-expression form
         // must syntactically be exactly a name followed by `:=`; the
         // compiler enforces the rest of the PEP's restrictions
@@ -2526,13 +2852,32 @@ impl<'src> Parser<'src> {
         }
         let start = self.peek_token().span;
         let body = self.parse_or()?;
+        // `(True := 1)` — pegen `invalid_named_expression`: only plain
+        // names may be walrus targets; constants get named.
+        if self.check(&TokenKind::ColonEqual) {
+            return Err(ParseError::Unexpected {
+                span: body.span,
+                message: format!(
+                    "cannot use assignment expressions with {}",
+                    crate::ast::expr_name(&body)
+                ),
+            });
+        }
         if self.at_keyword(Keyword::If) {
             self.bump();
             let test = self.parse_or()?;
             if !self.at_keyword(Keyword::Else) {
+                // pegen `invalid_expression` requires `!(':')` here:
+                // with a colon next the generic failure wins.
+                if self.check(&TokenKind::Colon) {
+                    return Err(ParseError::Unexpected {
+                        span: self.peek_token().span,
+                        message: "invalid syntax".to_owned(),
+                    });
+                }
                 return Err(ParseError::Unexpected {
                     span: self.peek_token().span,
-                    message: "expected `else` in conditional expression".to_owned(),
+                    message: "expected 'else' after 'if' expression".to_owned(),
                 });
             }
             self.bump();
@@ -2548,6 +2893,17 @@ impl<'src> Parser<'src> {
             });
         }
         Ok(body)
+    }
+
+    /// pegen's `(yield_expr | star_expressions)` — the RHS of an
+    /// assignment / augmented assignment / annotated assignment, where
+    /// a whole `yield` expression is legal (but never as a tuple
+    /// element: `x = yield, 1` is invalid syntax).
+    fn parse_assign_rhs(&mut self) -> Result<Expr, ParseError> {
+        if self.at_keyword(Keyword::Yield) {
+            return self.parse_yield();
+        }
+        self.parse_expression_list(true)
     }
 
     fn parse_yield(&mut self) -> Result<Expr, ParseError> {
@@ -2671,7 +3027,7 @@ impl<'src> Parser<'src> {
         let left = self.parse_bit_or()?;
         let mut ops = Vec::new();
         let mut comparators = Vec::new();
-        while let Some(op) = self.try_cmp_op() {
+        while let Some(op) = self.try_cmp_op()? {
             ops.push(op);
             comparators.push(self.parse_bit_or()?);
         }
@@ -2689,37 +3045,57 @@ impl<'src> Parser<'src> {
         })
     }
 
-    fn try_cmp_op(&mut self) -> Option<CmpOp> {
+    fn try_cmp_op(&mut self) -> Result<Option<CmpOp>, ParseError> {
         let op = match self.peek() {
             TokenKind::Less => CmpOp::Lt,
             TokenKind::Greater => CmpOp::Gt,
             TokenKind::LessEqual => CmpOp::LtE,
             TokenKind::GreaterEqual => CmpOp::GtE,
             TokenKind::EqEqual => CmpOp::Eq,
-            TokenKind::NotEqual => CmpOp::NotEq,
+            TokenKind::NotEqual => {
+                // PEP 401 (`_PyPegen_check_barry_as_flufl`): the lexer
+                // produces NOTEQUAL for both spellings; exactly one is
+                // legal depending on whether `barry_as_FLUFL` is
+                // active.
+                let span = self.peek_token().span;
+                let text = self.lexeme(span);
+                if self.flufl && text != "<>" {
+                    return Err(ParseError::Unexpected {
+                        span,
+                        message: "with Barry as BDFL, use '<>' instead of '!='".to_owned(),
+                    });
+                }
+                if !self.flufl && text == "<>" {
+                    return Err(ParseError::Unexpected {
+                        span,
+                        message: "invalid syntax".to_owned(),
+                    });
+                }
+                CmpOp::NotEq
+            }
             TokenKind::Keyword(Keyword::In) => CmpOp::In,
             TokenKind::Keyword(Keyword::Is) => {
                 // Two-token `is not` handled below.
                 self.bump();
                 if self.at_keyword(Keyword::Not) {
                     self.bump();
-                    return Some(CmpOp::IsNot);
+                    return Ok(Some(CmpOp::IsNot));
                 }
-                return Some(CmpOp::Is);
+                return Ok(Some(CmpOp::Is));
             }
             TokenKind::Keyword(Keyword::Not) => {
                 // `not in`
                 if matches!(self.peek_at(1), Some(TokenKind::Keyword(Keyword::In))) {
                     self.bump();
                     self.bump();
-                    return Some(CmpOp::NotIn);
+                    return Ok(Some(CmpOp::NotIn));
                 }
-                return None;
+                return Ok(None);
             }
-            _ => return None,
+            _ => return Ok(None),
         };
         self.bump();
-        Some(op)
+        Ok(Some(op))
     }
 
     fn parse_bit_or(&mut self) -> Result<Expr, ParseError> {
@@ -2818,6 +3194,7 @@ impl<'src> Parser<'src> {
                 _ => break,
             };
             self.bump();
+            self.reject_not_operand()?;
             let right = self.parse_muldiv()?;
             let span = start.merge(self.prev_token_span());
             left = Expr {
@@ -2845,6 +3222,7 @@ impl<'src> Parser<'src> {
                 _ => break,
             };
             self.bump();
+            self.reject_not_operand()?;
             let right = self.parse_unary()?;
             let span = start.merge(self.prev_token_span());
             left = Expr {
@@ -2888,6 +3266,7 @@ impl<'src> Parser<'src> {
             _ => return self.parse_power(),
         };
         let kw = self.bump();
+        self.reject_not_operand()?;
         let operand = self.parse_unary()?;
         let span = kw.span.merge(self.prev_token_span());
         Ok(Expr {
@@ -2897,6 +3276,19 @@ impl<'src> Parser<'src> {
             },
             span,
         })
+    }
+
+    /// pegen `invalid_factor` / `invalid_arithmetic`: `not` binds looser
+    /// than arithmetic, so it can't appear as an operand (`3 + not 3`,
+    /// `- not 3`).
+    fn reject_not_operand(&self) -> Result<(), ParseError> {
+        if self.at_keyword(Keyword::Not) {
+            return Err(ParseError::Unexpected {
+                span: self.peek_token().span,
+                message: "'not' after an operator must be parenthesized".to_owned(),
+            });
+        }
+        Ok(())
     }
 
     fn parse_power(&mut self) -> Result<Expr, ParseError> {
@@ -2985,19 +3377,51 @@ impl<'src> Parser<'src> {
         // keyword argument") and a repeated keyword name (CPython:
         // "keyword argument repeated: <name>").
         let mut seen_keyword = false;
+        let mut seen_kw_unpack = false;
         let mut kw_names: Vec<String> = Vec::new();
         loop {
             let arg_start = self.peek_token().span;
             if self.eat(&TokenKind::DoubleStar) {
                 let val = self.parse_ternary()?;
+                // `f(**kwargs={...})` — pegen `invalid_kwarg`.
+                if self.check(&TokenKind::Equal) {
+                    return Err(ParseError::Unexpected {
+                        span: arg_start.merge(val.span),
+                        message: "cannot assign to keyword argument unpacking".to_owned(),
+                    });
+                }
                 seen_keyword = true;
+                seen_kw_unpack = true;
                 keywords.push(KwArg {
                     arg: None,
                     value: val,
                 });
-            } else if self.eat(&TokenKind::Star) {
-                let val = self.parse_ternary()?;
-                let span = val.span;
+            } else if self.check(&TokenKind::Star) {
+                let star_tok = self.bump();
+                // A `*` whose operand doesn't parse is pegen's
+                // `starred_expression` fallback: "Invalid star expression".
+                // This outranks the "follows keyword unpacking" diagnostic:
+                // `f(**x, *)` reports the bad star, not the ordering.
+                let val = self.parse_ternary().map_err(|_| ParseError::Unexpected {
+                    span: star_tok.span,
+                    message: "Invalid star expression".to_owned(),
+                })?;
+                // `f(**x, *y)` — pegen `invalid_arguments`.
+                if seen_kw_unpack {
+                    return Err(ParseError::Unexpected {
+                        span: star_tok.span,
+                        message: "iterable argument unpacking follows keyword argument unpacking"
+                            .to_owned(),
+                    });
+                }
+                // `f(*args=[0])` — pegen `invalid_starred_expression_unpacking`.
+                if self.check(&TokenKind::Equal) {
+                    return Err(ParseError::Unexpected {
+                        span: star_tok.span.merge(val.span),
+                        message: "cannot assign to iterable argument unpacking".to_owned(),
+                    });
+                }
+                let span = star_tok.span.merge(val.span);
                 args.push(Expr {
                     kind: ExprKind::Starred(Box::new(val)),
                     span,
@@ -3009,6 +3433,13 @@ impl<'src> Parser<'src> {
                 {
                     let nt = self.bump();
                     let name = self.ident(nt.span);
+                    // `f(__debug__=1)` — CPython `forbidden_name`.
+                    if name == "__debug__" {
+                        return Err(ParseError::Unexpected {
+                            span: nt.span,
+                            message: "cannot assign to __debug__".to_owned(),
+                        });
+                    }
                     if kw_names.contains(&name) {
                         return Err(ParseError::Unexpected {
                             span: nt.span,
@@ -3016,6 +3447,16 @@ impl<'src> Parser<'src> {
                         });
                     }
                     self.bump(); // `=`
+                                 // `f(a=)` — pegen `invalid_kwarg`.
+                    if matches!(
+                        self.peek(),
+                        TokenKind::Comma | TokenKind::RPar | TokenKind::Newline
+                    ) {
+                        return Err(ParseError::Unexpected {
+                            span: self.peek_token().span,
+                            message: "expected argument value expression".to_owned(),
+                        });
+                    }
                     let val = self.parse_ternary()?;
                     seen_keyword = true;
                     kw_names.push(name.clone());
@@ -3023,11 +3464,27 @@ impl<'src> Parser<'src> {
                         arg: Some(name),
                         value: val,
                     });
+                } else if matches!(
+                    self.peek(),
+                    TokenKind::Keyword(Keyword::True | Keyword::False | Keyword::None)
+                ) && matches!(self.peek_at(1), Some(TokenKind::Equal))
+                {
+                    // `f(True=1)` — pegen `invalid_kwarg` names the
+                    // constant.
+                    let nt = self.peek_token().clone();
+                    return Err(ParseError::Unexpected {
+                        span: nt.span,
+                        message: format!("cannot assign to {}", self.lexeme(nt.span)),
+                    });
                 } else {
                     if seen_keyword {
                         return Err(ParseError::Unexpected {
                             span: self.peek_token().span,
-                            message: "positional argument follows keyword argument".to_owned(),
+                            message: if seen_kw_unpack {
+                                "positional argument follows keyword argument unpacking".to_owned()
+                            } else {
+                                "positional argument follows keyword argument".to_owned()
+                            },
                         });
                     }
                     let e = self.parse_ternary()?;
@@ -3172,7 +3629,12 @@ impl<'src> Parser<'src> {
         if self.check(&TokenKind::Star) {
             let span = self.peek_token().span;
             self.bump();
-            let value = self.parse_ternary()?;
+            // `A[*]` / `A[*:]` / `A[*(1:2)]` — pegen's `starred_expression`
+            // fallback: "Invalid star expression".
+            let value = self.parse_ternary().map_err(|_| ParseError::Unexpected {
+                span,
+                message: "Invalid star expression".to_owned(),
+            })?;
             return Ok(Expr {
                 kind: ExprKind::Starred(Box::new(value)),
                 span,
@@ -3295,9 +3757,11 @@ impl<'src> Parser<'src> {
             TokenKind::LPar => self.parse_paren_or_tuple(),
             TokenKind::LSqb => self.parse_list_or_listcomp(),
             TokenKind::LBrace => self.parse_dict_or_set(),
-            other => Err(ParseError::Unexpected {
+            // pegen's generic parse failure: a bare "invalid syntax"
+            // pointing at the token the expression grammar rejected.
+            _ => Err(ParseError::Unexpected {
                 span: tok.span,
-                message: format!("unexpected token in expression: {other:?}"),
+                message: "invalid syntax".to_owned(),
             }),
         }
     }
@@ -3311,6 +3775,14 @@ impl<'src> Parser<'src> {
                 kind: ExprKind::Tuple(Vec::new()),
                 span: lp.span.merge(rp.span),
             });
+        }
+        // pegen `group`: `(yield ...)` admits a yield expression as the
+        // *sole* parenthesized content (`(yield, 1)` stays invalid — the
+        // `expect` below reports the comma).
+        if self.at_keyword(Keyword::Yield) {
+            let inner = self.parse_yield()?;
+            self.expect(&TokenKind::RPar, "`)`")?;
+            return Ok(inner);
         }
         let first = self.parse_ternary_or_starred()?;
         let first_starred = matches!(first.kind, ExprKind::Starred(_));
@@ -3334,6 +3806,12 @@ impl<'src> Parser<'src> {
                     break;
                 }
                 items.push(self.parse_ternary_or_starred()?);
+                // `(x, y, z=3)` — pegen `invalid_named_expression`.
+                if self.check(&TokenKind::Equal) {
+                    return Err(Self::display_equal_error(
+                        items.last().expect("just pushed"),
+                    ));
+                }
             }
             let rp = self.expect_or_forgot_comma(&TokenKind::RPar, "`)`", &items)?;
             return Ok(Expr {
@@ -3344,10 +3822,12 @@ impl<'src> Parser<'src> {
         // A bare `(*a)` with no trailing comma is a syntax error in
         // CPython — starred expressions are only legal inside a tuple/
         // call/assignment context, never as a lone parenthesized value.
-        if first_starred {
+        // Only the well-formed `(*a)` gets the dedicated message;
+        // `(*a:...)` falls through to the generic failure at the `:`.
+        if first_starred && self.check(&TokenKind::RPar) {
             return Err(ParseError::Unexpected {
                 span: first.span,
-                message: "can't use starred expression here".to_owned(),
+                message: "cannot use starred expression here".to_owned(),
             });
         }
         // Plain parenthesized expression: no wrapper node, and — exactly
@@ -3387,11 +3867,27 @@ impl<'src> Parser<'src> {
             });
         }
         let mut items = vec![first];
+        if self.check(&TokenKind::Equal) {
+            return Err(Self::display_equal_error(&items[0]));
+        }
         while self.eat(&TokenKind::Comma) {
             if self.check(&TokenKind::RSqb) {
                 break;
             }
             items.push(self.parse_ternary_or_starred()?);
+            if self.check(&TokenKind::Equal) {
+                return Err(Self::display_equal_error(
+                    items.last().expect("just pushed"),
+                ));
+            }
+        }
+        // `[x,y for x,y in ...]` — pegen `invalid_comprehension`.
+        if self.at_keyword(Keyword::For) {
+            let span = items[0].span.merge(items.last().expect("nonempty").span);
+            return Err(ParseError::Unexpected {
+                span,
+                message: "did you forget parentheses around the comprehension target?".to_owned(),
+            });
         }
         let rb = self.expect_or_forgot_comma(&TokenKind::RSqb, "`]`", &items)?;
         Ok(Expr {
@@ -3428,7 +3924,7 @@ impl<'src> Parser<'src> {
                 } else {
                     let k = self.parse_ternary()?;
                     self.expect_dict_colon(&k)?;
-                    let v = self.parse_ternary()?;
+                    let v = self.parse_dict_value()?;
                     keys.push(Some(k));
                     values.push(v);
                 }
@@ -3443,7 +3939,7 @@ impl<'src> Parser<'src> {
         let first_starred = matches!(first.kind, ExprKind::Starred(_));
         if !first_starred && self.eat(&TokenKind::Colon) {
             // Dict literal (or dict comprehension).
-            let v = self.parse_ternary()?;
+            let v = self.parse_dict_value()?;
             if self.at_keyword(Keyword::For) || self.at_keyword(Keyword::Async) {
                 let generators = self.parse_comp_for()?;
                 let rb = self.expect(&TokenKind::RBrace, "`}`")?;
@@ -3468,7 +3964,7 @@ impl<'src> Parser<'src> {
                 } else {
                     let k = self.parse_ternary()?;
                     self.expect_dict_colon(&k)?;
-                    let vv = self.parse_ternary()?;
+                    let vv = self.parse_dict_value()?;
                     keys.push(Some(k));
                     values.push(vv);
                 }
@@ -3501,13 +3997,7 @@ impl<'src> Parser<'src> {
         // "cannot assign to <expr> here. Maybe you meant '==' instead
         // of '='?", anchored at the key.
         if self.check(&TokenKind::Equal) {
-            return Err(ParseError::Unexpected {
-                span: first.span,
-                message: format!(
-                    "cannot assign to {} here. Maybe you meant '==' instead of '='?",
-                    crate::ast::expr_name(&first)
-                ),
-            });
+            return Err(Self::display_equal_error(&first));
         }
         let mut items = vec![first];
         while self.eat(&TokenKind::Comma) {
@@ -3516,21 +4006,43 @@ impl<'src> Parser<'src> {
             }
             items.push(self.parse_ternary_or_starred()?);
             if self.check(&TokenKind::Equal) {
-                let last = items.last().expect("just pushed");
-                return Err(ParseError::Unexpected {
-                    span: last.span,
-                    message: format!(
-                        "cannot assign to {} here. Maybe you meant '==' instead of '='?",
-                        crate::ast::expr_name(last)
-                    ),
-                });
+                return Err(Self::display_equal_error(
+                    items.last().expect("just pushed"),
+                ));
             }
+        }
+        // `{x,y for x,y in ...}` — pegen `invalid_comprehension`.
+        if self.at_keyword(Keyword::For) {
+            let span = items[0].span.merge(items.last().expect("nonempty").span);
+            return Err(ParseError::Unexpected {
+                span,
+                message: "did you forget parentheses around the comprehension target?".to_owned(),
+            });
         }
         let rb = self.expect_or_forgot_comma(&TokenKind::RBrace, "`}`", &items)?;
         Ok(Expr {
             kind: ExprKind::Set(items),
             span: lb.span.merge(rb.span),
         })
+    }
+
+    /// pegen `invalid_named_expression`: a stray `=` after an element of
+    /// a display/condition where assignment is impossible. Plain names
+    /// get the "==' or ':='" hint, anything else the "cannot assign"
+    /// wording.
+    fn display_equal_error(expr: &Expr) -> ParseError {
+        let message = if matches!(expr.kind, ExprKind::Name(_)) {
+            "invalid syntax. Maybe you meant '==' or ':=' instead of '='?".to_owned()
+        } else {
+            format!(
+                "cannot assign to {} here. Maybe you meant '==' instead of '='?",
+                crate::ast::expr_name(expr)
+            )
+        };
+        ParseError::Unexpected {
+            span: expr.span,
+            message,
+        }
     }
 
     fn parse_comp_for(&mut self) -> Result<Vec<Comprehension>, ParseError> {
@@ -3556,17 +4068,20 @@ impl<'src> Parser<'src> {
             };
             self.bump();
             let target = self.parse_target_list_no_tuple()?;
+            // The missing-`in` diagnostic outranks target validation:
+            // `[x for a, b, (c+1) if y]` complains about `in`, not the
+            // target (pegen `invalid_comprehension` ordering).
+            if !self.at_keyword(Keyword::In) {
+                return Err(ParseError::Unexpected {
+                    span: self.peek_token().span,
+                    message: "'in' expected after for-loop variables".to_owned(),
+                });
+            }
             // CPython (`invalid_comprehension` / `invalid_for_target`):
             // comprehension targets get the same parse-time validation as
             // statement `for` targets (bare message).
             if let Some((offender, _)) = Self::find_invalid_target(&target, false) {
                 return Err(self.assign_target_error(offender, true));
-            }
-            if !self.at_keyword(Keyword::In) {
-                return Err(ParseError::Unexpected {
-                    span: self.peek_token().span,
-                    message: "expected `in` in comprehension".to_owned(),
-                });
             }
             self.bump();
             let iter = self.parse_or()?;
@@ -3618,14 +4133,19 @@ impl<'src> Parser<'src> {
         if let TokenKind::Star = self.peek() {
             let star_tok = self.peek_token().clone();
             self.bump();
-            let inner = self.parse_unary()?;
+            let inner = self.parse_bit_or()?;
             let span = star_tok.span.merge(inner.span);
             return Ok(Expr {
                 kind: ExprKind::Starred(Box::new(inner)),
                 span,
             });
         }
-        self.parse_unary()
+        // Parse at the `bitwise_or` level, exactly like pegen's
+        // `invalid_for_target` recovery: `for x+1 in y` must consume the
+        // whole `x+1` so the "cannot assign to expression" diagnostic
+        // fires instead of a bogus missing-`in` complaint. (Comparisons
+        // stay excluded so `for i in xs` isn't mis-read as `i in xs`.)
+        self.parse_bit_or()
     }
 
     /// Handle adjacent-string concatenation, mixing plain strings,
@@ -4337,6 +4857,8 @@ impl<'src> Parser<'src> {
         // tuple form `f'{*a,}'` is fine and parses as a tuple instead.
         if !partial {
             if let ExprKind::Starred(_) = value.kind {
+                // pegen's *unparenthesized* wording ("can't", not
+                // "cannot") — the same message a bare `x = *a` gets.
                 return Err(ParseError::Unexpected {
                     span: Span::new(expr_abs, expr_abs + expr_text.len() as u32),
                     message: "can't use starred expression here".to_owned(),
@@ -4657,9 +5179,23 @@ fn map_fstring_subparse_error(
             }
         }
         ParseError::Unexpected { span, message } | ParseError::Indentation { span, message } => {
+            // The synthetic `(...)` wrapper makes a bare `f'{*x}'` look
+            // parenthesized, picking up pegen's "cannot" wording; the
+            // unparenthesized original gets "can't".
+            if message == "cannot use starred expression here" {
+                return ParseError::Unexpected {
+                    span: Span::new(map_back(span.start.0), map_back(span.end.0)),
+                    message: "can't use starred expression here".to_owned(),
+                };
+            }
             let internal = message.starts_with("expected ")
                 || message.starts_with("unexpected token")
-                || message == "trailing";
+                || message == "trailing"
+                // pegen's catch-all: inside a replacement field it
+                // becomes the field-shaped diagnostic ("expecting a
+                // valid expression after '{'" / the delimiters list),
+                // never the bare form (`f'{.}'`, `f'{lambda x:x}'`).
+                || message == "invalid syntax";
             if !internal {
                 return ParseError::Unexpected {
                     span: Span::new(map_back(span.start.0), map_back(span.end.0)),
@@ -5443,7 +5979,41 @@ fn big_to_i64(b: &num_bigint::BigInt) -> Option<i64> {
 ///         )(<ctor U>)
 ///     )(<ctor T>)
 /// ```
-fn build_lazy_type_alias(name: &str, body: Expr, params: &[TypeParam], span: Span) -> Expr {
+/// Lower a first-class [`StmtKind::TypeAlias`] statement to the
+/// runtime assignment form the compiler executes:
+/// `Name = __weavepy_type_alias__('Name', (…), <thunk>)` (see
+/// [`build_lazy_type_alias`]). Called by the compiler front-end so
+/// every later pass (mangling, scope analysis, codegen) sees the
+/// same shape the parser used to emit directly.
+///
+/// # Panics
+///
+/// Panics if `stmt` is not a [`StmtKind::TypeAlias`].
+pub fn lower_type_alias_stmt(stmt: &Stmt) -> Stmt {
+    let StmtKind::TypeAlias {
+        name,
+        name_span,
+        type_params,
+        value,
+    } = &stmt.kind
+    else {
+        panic!("lower_type_alias_stmt on non-TypeAlias statement");
+    };
+    let target = Expr {
+        kind: ExprKind::Name(name.clone()),
+        span: *name_span,
+    };
+    let rhs = build_lazy_type_alias(name, (**value).clone(), type_params, *name_span);
+    Stmt {
+        kind: StmtKind::Assign {
+            targets: vec![target],
+            value: rhs,
+        },
+        span: stmt.span,
+    }
+}
+
+pub fn build_lazy_type_alias(name: &str, body: Expr, params: &[TypeParam], span: Span) -> Expr {
     let thunk = Expr {
         kind: ExprKind::TypeParamFn {
             args: Arguments::default(),

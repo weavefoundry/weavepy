@@ -43,6 +43,11 @@ enum ScopeKind {
     /// (CPython symtable: "nonlocal binding not allowed for type
     /// parameter").
     TypeParams,
+    /// A comprehension's implicit function scope. Names read inside it
+    /// don't count as uses of the enclosing scope (the outermost
+    /// iterable is visited in the enclosing scope before this is
+    /// pushed), and walrus targets bind through it.
+    Comprehension,
 }
 
 /// One declaration recorded by a `global`/`nonlocal` statement —
@@ -64,27 +69,51 @@ struct Scope {
     /// [`ScopeKind::TypeParams`]. Consulted when resolving `nonlocal`
     /// declarations from nested scopes.
     bound: std::collections::HashSet<String>,
+    /// Names *read* so far, in source order (CPython's `USE` flag) —
+    /// a later `global`/`nonlocal` for one of these is "used prior to
+    /// … declaration".
+    used: std::collections::HashSet<String>,
+    /// Names assigned/deleted/bound so far (`DEF_LOCAL`) — a later
+    /// declaration is "assigned to before … declaration".
+    assigned: std::collections::HashSet<String>,
+    /// Names annotated so far (`DEF_ANNOT`) — can never be declared
+    /// global/nonlocal in this scope, before *or* after.
+    annotated: std::collections::HashSet<String>,
 }
 
 impl Scope {
+    fn new(kind: ScopeKind) -> Scope {
+        Scope {
+            kind,
+            params: Vec::new(),
+            directives: Vec::new(),
+            bound: std::collections::HashSet::new(),
+            used: std::collections::HashSet::new(),
+            assigned: std::collections::HashSet::new(),
+            annotated: std::collections::HashSet::new(),
+        }
+    }
+
     fn directive_for(&self, name: &str) -> Option<&Directive> {
         self.directives.iter().find(|d| d.name == name)
     }
 }
 
-pub(crate) fn validate_module(module: &Module, source: &str) -> Result<(), CompileError> {
+pub(crate) fn validate_module(
+    module: &Module,
+    source: &str,
+    future_annotations: bool,
+) -> Result<(), CompileError> {
     let mut v = Validator {
         source,
-        scopes: vec![Scope {
-            kind: ScopeKind::Module,
-            params: Vec::new(),
-            directives: Vec::new(),
-            bound: std::collections::HashSet::new(),
-        }],
+        scopes: vec![Scope::new(ScopeKind::Module)],
+        future_annotations,
     };
     // `from __future__ import …` placement / feature validation
     // (CPython `future.c`). Only a docstring, comments, and other
-    // future imports may precede one.
+    // future imports may precede one. Relative imports
+    // (`from .__future__ import x`) are ordinary imports, not future
+    // statements.
     let mut prologue = true;
     for (i, stmt) in module.body.iter().enumerate() {
         match &stmt.kind {
@@ -97,7 +126,11 @@ pub(crate) fn validate_module(module: &Module, source: &str) -> Result<(), Compi
             {
                 // Module docstring keeps the prologue open.
             }
-            StmtKind::ImportFrom { module: m, .. } if m.as_deref() == Some("__future__") => {
+            StmtKind::ImportFrom {
+                module: m,
+                level: 0,
+                ..
+            } if m.as_deref() == Some("__future__") => {
                 if !prologue {
                     return Err(CompileError::spanned(
                         "from __future__ imports must occur at the beginning of the file",
@@ -117,6 +150,11 @@ pub(crate) fn validate_module(module: &Module, source: &str) -> Result<(), Compi
 struct Validator<'src> {
     source: &'src str,
     scopes: Vec<Scope>,
+    /// PEP 563 active (module has `from __future__ import annotations`
+    /// or the caller passed `CO_FUTURE_ANNOTATIONS`): annotations are
+    /// never evaluated, so their names don't participate in scope
+    /// analysis, but yield/await/walrus inside them become errors.
+    future_annotations: bool,
 }
 
 impl Validator<'_> {
@@ -126,6 +164,56 @@ impl Validator<'_> {
 
     fn scope_mut(&mut self) -> &mut Scope {
         self.scopes.last_mut().expect("scope stack never empty")
+    }
+
+    /// Record a *read* of `name` in the current scope (CPython `USE`).
+    fn mark_use(&mut self, name: &str) {
+        self.scope_mut().used.insert(name.to_owned());
+    }
+
+    /// Record a binding of `name` (CPython `DEF_LOCAL`). Comprehension
+    /// scopes are transparent to bindings: a walrus inside one binds
+    /// in the enclosing function/class/module scope.
+    fn mark_assigned(&mut self, name: &str) {
+        let idx = self
+            .scopes
+            .iter()
+            .rposition(|s| s.kind != ScopeKind::Comprehension)
+            .expect("scope stack always has a non-comprehension scope");
+        self.scopes[idx].assigned.insert(name.to_owned());
+    }
+
+    /// Visit an annotation expression. Under PEP 563 the annotation is
+    /// never evaluated: its names don't count as uses for scope
+    /// analysis, but yield/await/named expressions inside it are
+    /// compile-time errors (CPython symtable).
+    fn visit_annotation(&mut self, ann: &Expr) -> Result<(), CompileError> {
+        if self.future_annotations {
+            check_annotation_expr(ann)
+        } else {
+            self.visit_expr(ann)
+        }
+    }
+
+    /// Visit an assignment target: bare names (and names inside
+    /// tuple/list/starred unpacking) are bindings, while
+    /// attribute/subscript targets *read* their base expression
+    /// (CPython marks `x` as `USE` in `x[0] = 1`).
+    fn visit_target(&mut self, expr: &Expr) -> Result<(), CompileError> {
+        match &expr.kind {
+            ExprKind::Name(n) => {
+                let n = n.clone();
+                self.mark_assigned(&n);
+            }
+            ExprKind::Tuple(items) | ExprKind::List(items) => {
+                for i in items {
+                    self.visit_target(i)?;
+                }
+            }
+            ExprKind::Starred(inner) => self.visit_target(inner)?,
+            _ => self.visit_expr(expr)?,
+        }
+        Ok(())
     }
 
     fn visit_body(&mut self, body: &[Stmt]) -> Result<(), CompileError> {
@@ -140,9 +228,8 @@ impl Validator<'_> {
         args: &Arguments,
         body: &[Stmt],
         decorators: &[Expr],
-        defaults_scope_ok: bool,
+        returns: Option<&Expr>,
     ) -> Result<(), CompileError> {
-        let _ = defaults_scope_ok;
         for d in decorators {
             self.visit_expr(d)?;
         }
@@ -152,6 +239,9 @@ impl Validator<'_> {
         }
         for d in args.kw_defaults.iter().flatten() {
             self.visit_expr(d)?;
+        }
+        if let Some(r) = returns {
+            self.visit_annotation(r)?;
         }
         let mut params: Vec<(&str, Span)> = Vec::new();
         for a in args
@@ -163,7 +253,7 @@ impl Validator<'_> {
             .chain(&args.kwarg)
         {
             if let Some(ann) = &a.annotation {
-                self.visit_expr(ann)?;
+                self.visit_annotation(ann)?;
             }
             if params.iter().any(|(n, _)| *n == a.name) {
                 return Err(CompileError::spanned(
@@ -189,10 +279,9 @@ impl Validator<'_> {
             bound.extend(assigned);
         }
         self.scopes.push(Scope {
-            kind: ScopeKind::Function,
             params: params.iter().map(|(n, _)| (*n).to_owned()).collect(),
-            directives: Vec::new(),
             bound,
+            ..Scope::new(ScopeKind::Function)
         });
         let result = self.visit_body(body);
         self.scopes.pop();
@@ -207,10 +296,8 @@ impl Validator<'_> {
             return false;
         }
         self.scopes.push(Scope {
-            kind: ScopeKind::TypeParams,
-            params: Vec::new(),
-            directives: Vec::new(),
             bound: type_params.iter().map(|tp| tp.name.clone()).collect(),
+            ..Scope::new(ScopeKind::TypeParams)
         });
         true
     }
@@ -218,27 +305,33 @@ impl Validator<'_> {
     fn visit_stmt(&mut self, stmt: &Stmt) -> Result<(), CompileError> {
         match &stmt.kind {
             StmtKind::FunctionDef {
+                name,
                 args,
                 body,
                 decorator_list,
                 type_params,
-                ..
+                returns,
             }
             | StmtKind::AsyncFunctionDef {
+                name,
                 args,
                 body,
                 decorator_list,
                 type_params,
-                ..
+                returns,
             } => {
+                // The def's name binds in the enclosing scope.
+                let name = name.clone();
+                self.mark_assigned(&name);
                 let pushed = self.push_type_params_scope(type_params);
-                let result = self.visit_function(args, body, decorator_list, true);
+                let result = self.visit_function(args, body, decorator_list, returns.as_deref());
                 if pushed {
                     self.scopes.pop();
                 }
                 result?;
             }
             StmtKind::ClassDef {
+                name,
                 body,
                 decorator_list,
                 bases,
@@ -246,6 +339,8 @@ impl Validator<'_> {
                 type_params,
                 ..
             } => {
+                let name = name.clone();
+                self.mark_assigned(&name);
                 for d in decorator_list {
                     self.visit_expr(d)?;
                 }
@@ -257,12 +352,7 @@ impl Validator<'_> {
                     for k in keywords {
                         self.visit_expr(&k.value)?;
                     }
-                    self.scopes.push(Scope {
-                        kind: ScopeKind::Class,
-                        params: Vec::new(),
-                        directives: Vec::new(),
-                        bound: std::collections::HashSet::new(),
-                    });
+                    self.scopes.push(Scope::new(ScopeKind::Class));
                     let result = self.visit_body(body);
                     self.scopes.pop();
                     result
@@ -276,9 +366,31 @@ impl Validator<'_> {
                 let span = stmt.span;
                 for n in names {
                     let scope = self.scope();
+                    // CPython symtable priority: PARAM, USE, ANNOT,
+                    // ASSIGN — re-checked on every declaration, so a
+                    // *duplicate* `global x` after an intervening
+                    // use/assignment still errors.
                     if scope.params.iter().any(|p| p == n) {
                         return Err(CompileError::spanned(
                             format!("name '{n}' is parameter and global"),
+                            span,
+                        ));
+                    }
+                    if scope.used.contains(n) {
+                        return Err(CompileError::spanned(
+                            format!("name '{n}' is used prior to global declaration"),
+                            span,
+                        ));
+                    }
+                    if scope.annotated.contains(n) {
+                        return Err(CompileError::spanned(
+                            format!("annotated name '{n}' can't be global"),
+                            span,
+                        ));
+                    }
+                    if scope.assigned.contains(n) {
+                        return Err(CompileError::spanned(
+                            format!("name '{n}' is assigned to before global declaration"),
                             span,
                         ));
                     }
@@ -317,6 +429,24 @@ impl Validator<'_> {
                             span,
                         ));
                     }
+                    if scope.used.contains(n) {
+                        return Err(CompileError::spanned(
+                            format!("name '{n}' is used prior to nonlocal declaration"),
+                            span,
+                        ));
+                    }
+                    if scope.annotated.contains(n) {
+                        return Err(CompileError::spanned(
+                            format!("annotated name '{n}' can't be nonlocal"),
+                            span,
+                        ));
+                    }
+                    if scope.assigned.contains(n) {
+                        return Err(CompileError::spanned(
+                            format!("name '{n}' is assigned to before nonlocal declaration"),
+                            span,
+                        ));
+                    }
                     if let Some(d) = scope.directive_for(n) {
                         if d.is_global {
                             let at = d.span;
@@ -338,7 +468,7 @@ impl Validator<'_> {
                     // rebinding is rejected (CPython symtable).
                     for s in self.scopes[..self.scopes.len() - 1].iter().rev() {
                         match s.kind {
-                            ScopeKind::Class => {}
+                            ScopeKind::Class | ScopeKind::Comprehension => {}
                             ScopeKind::TypeParams => {
                                 if s.bound.contains(n) {
                                     return Err(CompileError::spanned(
@@ -378,7 +508,7 @@ impl Validator<'_> {
                 target,
                 annotation,
                 value,
-                ..
+                simple,
             } => {
                 match &target.kind {
                     ExprKind::Tuple(_) | ExprKind::List(_) => {
@@ -388,7 +518,46 @@ impl Validator<'_> {
                             target.span,
                         ));
                     }
-                    ExprKind::Name(_) | ExprKind::Attribute { .. } | ExprKind::Subscript { .. } => {
+                    ExprKind::Name(n) if n == "__debug__" => {
+                        return Err(CompileError::spanned(
+                            "cannot assign to __debug__",
+                            target.span,
+                        ));
+                    }
+                    ExprKind::Attribute { attr, .. } if attr == "__debug__" => {
+                        return Err(CompileError::spanned(
+                            "cannot assign to __debug__",
+                            target.span,
+                        ));
+                    }
+                    ExprKind::Name(n) => {
+                        // Simple (unparenthesized) targets are
+                        // annotations (`DEF_ANNOT`): incompatible with
+                        // a global/nonlocal directive in either order.
+                        // Parenthesized ones only bind (`DEF_LOCAL`).
+                        if *simple {
+                            // CPython skips this check at module scope
+                            // (`ste_symbols == st_global`): `global x` +
+                            // `x: int` at top level is valid.
+                            if self.scope().kind != ScopeKind::Module {
+                                if let Some(d) = self.scope().directive_for(n) {
+                                    let what = if d.is_global { "global" } else { "nonlocal" };
+                                    return Err(CompileError::spanned(
+                                        format!("annotated name '{n}' can't be {what}"),
+                                        stmt.span,
+                                    ));
+                                }
+                            }
+                            let n = n.clone();
+                            self.scope_mut().annotated.insert(n.clone());
+                            self.mark_assigned(&n);
+                        } else {
+                            let n = n.clone();
+                            self.mark_assigned(&n);
+                        }
+                    }
+                    ExprKind::Attribute { .. } | ExprKind::Subscript { .. } => {
+                        self.visit_expr(target)?;
                     }
                     _ => {
                         return Err(CompileError::spanned(
@@ -397,7 +566,7 @@ impl Validator<'_> {
                         ));
                     }
                 }
-                self.visit_expr(annotation)?;
+                self.visit_annotation(annotation)?;
                 if let Some(v) = value {
                     self.visit_expr(v)?;
                 }
@@ -414,6 +583,10 @@ impl Validator<'_> {
                     if let Some(t) = &h.type_ {
                         self.visit_expr(t)?;
                     }
+                    if let Some(n) = &h.name {
+                        let n = n.clone();
+                        self.mark_assigned(&n);
+                    }
                     self.visit_body(&h.body)?;
                 }
                 self.visit_body(orelse)?;
@@ -421,12 +594,12 @@ impl Validator<'_> {
             }
             StmtKind::Assign { targets, value } => {
                 for t in targets {
-                    self.visit_expr(t)?;
+                    self.visit_target(t)?;
                 }
                 self.visit_expr(value)?;
             }
             StmtKind::AugAssign { target, value, .. } => {
-                self.visit_expr(target)?;
+                self.visit_target(target)?;
                 self.visit_expr(value)?;
             }
             StmtKind::Return(v) => {
@@ -435,8 +608,9 @@ impl Validator<'_> {
                 }
             }
             StmtKind::Delete(targets) => {
+                // `del x` binds (CPython `DEF_LOCAL`), same as assignment.
                 for t in targets {
-                    self.visit_expr(t)?;
+                    self.visit_target(t)?;
                 }
             }
             StmtKind::If { test, body, orelse } => {
@@ -461,7 +635,7 @@ impl Validator<'_> {
                 body,
                 orelse,
             } => {
-                self.visit_expr(target)?;
+                self.visit_target(target)?;
                 self.visit_expr(iter)?;
                 self.visit_body(body)?;
                 self.visit_body(orelse)?;
@@ -470,7 +644,7 @@ impl Validator<'_> {
                 for it in items {
                     self.visit_expr(&it.context_expr)?;
                     if let Some(v) = &it.optional_vars {
-                        self.visit_expr(v)?;
+                        self.visit_target(v)?;
                     }
                 }
                 self.visit_body(body)?;
@@ -504,7 +678,7 @@ impl Validator<'_> {
         if let StmtKind::ImportFrom {
             module: Some(m),
             names,
-            ..
+            level: 0,
         } = &stmt.kind
         {
             if m == "__future__" {
@@ -515,7 +689,9 @@ impl Validator<'_> {
                             self.alias_span(stmt, &a.name),
                         ));
                     }
-                    if a.name != "*" && !KNOWN_FUTURES.contains(&a.name.as_str()) {
+                    if !KNOWN_FUTURES.contains(&a.name.as_str()) {
+                        // `from __future__ import *` gets the same
+                        // "not defined" diagnostic (CPython future.c).
                         return Err(CompileError::spanned(
                             format!("future feature {} is not defined", a.name),
                             self.alias_span(stmt, &a.name),
@@ -550,17 +726,29 @@ impl Validator<'_> {
     fn visit_pattern(&mut self, pattern: &Pattern) -> Result<(), CompileError> {
         match pattern {
             Pattern::Value(e) => self.visit_expr(e)?,
+            Pattern::Capture(Some(n)) | Pattern::Star(Some(n)) => {
+                let n = n.clone();
+                self.mark_assigned(&n);
+            }
             Pattern::Sequence(items) | Pattern::Or(items) => {
                 for p in items {
                     self.visit_pattern(p)?;
                 }
             }
-            Pattern::Mapping { keys, patterns, .. } => {
+            Pattern::Mapping {
+                keys,
+                patterns,
+                rest,
+            } => {
                 for k in keys {
                     self.visit_expr(k)?;
                 }
                 for p in patterns {
                     self.visit_pattern(p)?;
+                }
+                if let Some(Some(n)) = rest {
+                    let n = n.clone();
+                    self.mark_assigned(&n);
                 }
             }
             Pattern::Class {
@@ -576,7 +764,11 @@ impl Validator<'_> {
                     self.visit_pattern(p)?;
                 }
             }
-            Pattern::As { pattern, .. } => self.visit_pattern(pattern)?,
+            Pattern::As { pattern, name } => {
+                self.visit_pattern(pattern)?;
+                let name = name.clone();
+                self.mark_assigned(&name);
+            }
             _ => {}
         }
         Ok(())
@@ -584,8 +776,12 @@ impl Validator<'_> {
 
     fn visit_expr(&mut self, expr: &Expr) -> Result<(), CompileError> {
         match &expr.kind {
+            ExprKind::Name(n) => {
+                let n = n.clone();
+                self.mark_use(&n);
+            }
             ExprKind::Lambda { args, body } => {
-                self.visit_function(args, &[], &[], true)?;
+                self.visit_function(args, &[], &[], None)?;
                 // Lambda bodies are expressions; visit inside a
                 // function scope for nested checks.
                 let mut params: Vec<String> = Vec::new();
@@ -600,10 +796,9 @@ impl Validator<'_> {
                     params.push(a.name.clone());
                 }
                 self.scopes.push(Scope {
-                    kind: ScopeKind::Function,
                     params: params.clone(),
-                    directives: Vec::new(),
                     bound: params.into_iter().collect(),
+                    ..Scope::new(ScopeKind::Function)
                 });
                 let result = self.visit_expr(body);
                 self.scopes.pop();
@@ -645,7 +840,12 @@ impl Validator<'_> {
                 self.visit_expr(orelse)?;
             }
             ExprKind::NamedExpr { target, value } => {
-                self.visit_expr(target)?;
+                if let ExprKind::Name(n) = &target.kind {
+                    let n = n.clone();
+                    self.mark_assigned(&n);
+                } else {
+                    self.visit_expr(target)?;
+                }
                 self.visit_expr(value)?;
             }
             ExprKind::Call {
@@ -715,9 +915,28 @@ impl Validator<'_> {
         generators: &[Comprehension],
         elements: &[&Expr],
     ) -> Result<(), CompileError> {
+        // The outermost iterable evaluates in the enclosing scope;
+        // everything else lives in the comprehension's implicit
+        // function scope, so reads there don't count as uses of the
+        // enclosing scope (`[x for y in q]` then `global x` is fine,
+        // `[1 for y in x]` then `global x` is not).
+        if let Some(first) = generators.first() {
+            self.visit_expr(&first.iter)?;
+        }
+        self.scopes.push(Scope::new(ScopeKind::Comprehension));
+        let result = self.visit_comprehension_inner(generators, elements);
+        self.scopes.pop();
+        result
+    }
+
+    fn visit_comprehension_inner(
+        &mut self,
+        generators: &[Comprehension],
+        elements: &[&Expr],
+    ) -> Result<(), CompileError> {
         let mut iter_vars: Vec<String> = Vec::new();
         let mut walrus_vars: Vec<String> = Vec::new();
-        for g in generators {
+        for (gi, g) in generators.iter().enumerate() {
             // Iteration target: reject names already bound by a walrus
             // earlier in this comprehension.
             let mut targets: Vec<(&str, Span)> = Vec::new();
@@ -733,8 +952,15 @@ impl Validator<'_> {
                     ));
                 }
                 iter_vars.push((*name).to_owned());
+                // Iteration variables bind in the comprehension scope
+                // itself, not the enclosing one.
+                let s = self.scope_mut();
+                s.assigned.insert((*name).to_owned());
+                s.bound.insert((*name).to_owned());
             }
-            self.visit_expr(&g.iter)?;
+            if gi > 0 {
+                self.visit_expr(&g.iter)?;
+            }
             self.check_walrus(&g.iter, &iter_vars, &mut walrus_vars)?;
             for cond in &g.ifs {
                 self.visit_expr(cond)?;
@@ -752,15 +978,19 @@ impl Validator<'_> {
     /// comprehension/lambda scopes) and reject rebinds of comprehension
     /// iteration variables.
     fn check_walrus(
-        &self,
+        &mut self,
         expr: &Expr,
         iter_vars: &[String],
         walrus_vars: &mut Vec<String>,
     ) -> Result<(), CompileError> {
-        let mut found: Vec<(&str, Span)> = Vec::new();
-        collect_walrus_targets(expr, &mut found);
+        let mut found: Vec<(String, Span)> = Vec::new();
+        {
+            let mut borrowed: Vec<(&str, Span)> = Vec::new();
+            collect_walrus_targets(expr, &mut borrowed);
+            found.extend(borrowed.into_iter().map(|(n, s)| (n.to_owned(), s)));
+        }
         for (name, span) in found {
-            if iter_vars.iter().any(|v| v == name) {
+            if iter_vars.iter().any(|v| v == &name) {
                 return Err(CompileError::spanned(
                     format!(
                         "assignment expression cannot rebind comprehension iteration \
@@ -769,7 +999,10 @@ impl Validator<'_> {
                     span,
                 ));
             }
-            walrus_vars.push(name.to_owned());
+            // Walrus targets bind through the comprehension scope into
+            // the enclosing function/class/module scope.
+            self.mark_assigned(&name);
+            walrus_vars.push(name);
         }
         Ok(())
     }
@@ -797,6 +1030,155 @@ impl Validator<'_> {
             }
         }
         stmt.span
+    }
+}
+
+/// PEP 563: yield / await / named expressions may not appear anywhere
+/// inside an annotation once `from __future__ import annotations` is
+/// active (CPython symtable's `_check_no_deferred_annotation` rules).
+/// Lambdas open a new scope, so their bodies are exempt.
+fn check_annotation_expr(expr: &Expr) -> Result<(), CompileError> {
+    match &expr.kind {
+        ExprKind::Yield(_) | ExprKind::YieldFrom(_) => {
+            return Err(CompileError::spanned(
+                "yield expression cannot be used within an annotation",
+                expr.span,
+            ));
+        }
+        ExprKind::Await(_) => {
+            return Err(CompileError::spanned(
+                "await expression cannot be used within an annotation",
+                expr.span,
+            ));
+        }
+        ExprKind::NamedExpr { target, .. } => {
+            return Err(CompileError::spanned(
+                "named expression cannot be used within an annotation",
+                target.span,
+            ));
+        }
+        ExprKind::Lambda { args, .. } => {
+            // The lambda body is a new scope, but its defaults belong
+            // to the annotation's own scope.
+            for d in args
+                .defaults
+                .iter()
+                .chain(args.kw_defaults.iter().flatten())
+            {
+                check_annotation_expr(d)?;
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+    let mut result = Ok(());
+    for_each_child_expr(expr, &mut |child| {
+        if result.is_ok() {
+            result = check_annotation_expr(child);
+        }
+    });
+    result
+}
+
+/// Call `f` on every direct child expression of `expr`.
+fn for_each_child_expr<'a>(expr: &'a Expr, f: &mut dyn FnMut(&'a Expr)) {
+    match &expr.kind {
+        ExprKind::BoolOp { values, .. } => values.iter().for_each(f),
+        ExprKind::BinOp { left, right, .. } => {
+            f(left);
+            f(right);
+        }
+        ExprKind::UnaryOp { operand, .. } => f(operand),
+        ExprKind::Lambda { args, body } => {
+            for d in &args.defaults {
+                f(d);
+            }
+            for d in args.kw_defaults.iter().flatten() {
+                f(d);
+            }
+            f(body);
+        }
+        ExprKind::IfExp { test, body, orelse } => {
+            f(test);
+            f(body);
+            f(orelse);
+        }
+        ExprKind::Dict { keys, values } => {
+            keys.iter().flatten().for_each(&mut *f);
+            values.iter().for_each(f);
+        }
+        ExprKind::ListComp { elt, generators }
+        | ExprKind::SetComp { elt, generators }
+        | ExprKind::GeneratorExp { elt, generators } => {
+            f(elt);
+            for g in generators {
+                f(&g.target);
+                f(&g.iter);
+                g.ifs.iter().for_each(&mut *f);
+            }
+        }
+        ExprKind::DictComp {
+            key,
+            value,
+            generators,
+        } => {
+            f(key);
+            f(value);
+            for g in generators {
+                f(&g.target);
+                f(&g.iter);
+                g.ifs.iter().for_each(&mut *f);
+            }
+        }
+        ExprKind::Compare {
+            left, comparators, ..
+        } => {
+            f(left);
+            comparators.iter().for_each(f);
+        }
+        ExprKind::Call {
+            func,
+            args,
+            keywords,
+        } => {
+            f(func);
+            args.iter().for_each(&mut *f);
+            for k in keywords {
+                f(&k.value);
+            }
+        }
+        ExprKind::NamedExpr { target, value } => {
+            f(target);
+            f(value);
+        }
+        ExprKind::Attribute { value, .. } => f(value),
+        ExprKind::Subscript { value, slice } => {
+            f(value);
+            f(slice);
+        }
+        ExprKind::Slice { lower, upper, step } => {
+            [lower, upper, step]
+                .into_iter()
+                .flatten()
+                .for_each(|e| f(e));
+        }
+        ExprKind::Tuple(items) | ExprKind::List(items) | ExprKind::Set(items) => {
+            items.iter().for_each(f);
+        }
+        ExprKind::Starred(inner)
+        | ExprKind::Yield(Some(inner))
+        | ExprKind::YieldFrom(inner)
+        | ExprKind::Await(inner) => f(inner),
+        ExprKind::JoinedStr(parts) => parts.iter().for_each(f),
+        ExprKind::FormattedValue {
+            value, format_spec, ..
+        } => {
+            f(value);
+            if let Some(s) = format_spec {
+                f(s);
+            }
+        }
+        _ => {}
     }
 }
 

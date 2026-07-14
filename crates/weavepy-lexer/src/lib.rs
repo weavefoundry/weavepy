@@ -313,3 +313,13 @@ mod tests {
         assert!(lex_err_msg("f'{(\"x'").starts_with("unterminated string literal"));
     }
 }
+
+#[cfg(test)]
+mod flufl_probe_tests {
+    #[test]
+    fn lexes_lessgreater_as_notequal() {
+        let toks = crate::tokenize("2 <> 3\n").unwrap();
+        let kinds: Vec<_> = toks.iter().map(|t| format!("{:?}", t.kind)).collect();
+        assert!(kinds.contains(&"NotEqual".to_string()), "{kinds:?}");
+    }
+}

@@ -189,6 +189,16 @@ fn write_expr(out: &mut String, e: &Expr, level: Level) -> Option<()> {
         } => {
             write_expr(out, func, Level::Atom)?;
             out.push('(');
+            // A sole generator-expression argument shares the call's
+            // parens: `f(x for x in a)` (CPython `append_ast_call`).
+            if keywords.is_empty() && args.len() == 1 {
+                if let ExprKind::GeneratorExp { elt, generators } = &args[0].kind {
+                    write_expr(out, elt, Level::Test)?;
+                    write_comprehensions(out, generators)?;
+                    out.push(')');
+                    return Some(());
+                }
+            }
             let mut first = true;
             for a in args {
                 if !first {
@@ -321,11 +331,71 @@ fn write_expr(out: &mut String, e: &Expr, level: Level) -> Option<()> {
             out.push_str("yield from ");
             write_expr(out, inner, Level::Test)
         }),
-        // f-strings with interpolations and compiler-internal nodes:
-        // no faithful unparse — the caller falls back to raw source.
-        ExprKind::JoinedStr(_) | ExprKind::FormattedValue { .. } | ExprKind::TypeParamFn { .. } => {
-            None
+        // CPython `append_fstring`: build the body text, then emit
+        // `f` + the body's repr. (Lossy for literal `{{`/`}}` braces,
+        // exactly as CPython's unparser is.)
+        ExprKind::JoinedStr(_) | ExprKind::FormattedValue { .. } => {
+            let mut body = String::new();
+            write_fstring_body(&mut body, e, false)?;
+            out.push('f');
+            write_str_repr(out, &body);
+            Some(())
         }
+        // Compiler-internal node: no faithful unparse — the caller
+        // falls back to raw source.
+        ExprKind::TypeParamFn { .. } => None,
+    }
+}
+
+/// CPython `build_fstring_body`: the text between the f-string quotes.
+/// Inside a format spec (`is_format_spec`), nested constants append raw.
+fn write_fstring_body(out: &mut String, e: &Expr, is_format_spec: bool) -> Option<()> {
+    match &e.kind {
+        ExprKind::JoinedStr(parts) => {
+            for p in parts {
+                write_fstring_body(out, p, is_format_spec)?;
+            }
+            Some(())
+        }
+        ExprKind::FormattedValue {
+            value,
+            conversion,
+            format_spec,
+        } => {
+            out.push('{');
+            let mut inner = String::new();
+            // `PR_TEST + 1` in CPython's `append_formattedvalue`:
+            // lambdas / conditionals / walruses get wrapped in parens.
+            write_expr(&mut inner, value, Level::Or)?;
+            // `{{` would read as an escaped literal brace: CPython
+            // inserts a space (`{ {…}`).
+            if inner.starts_with('{') {
+                out.push(' ');
+            }
+            out.push_str(&inner);
+            if *conversion >= 0 {
+                out.push('!');
+                out.push(char::from_u32(*conversion as u32)?);
+            }
+            if let Some(spec) = format_spec {
+                out.push(':');
+                write_fstring_body(out, spec, true)?;
+            }
+            out.push('}');
+            Some(())
+        }
+        ExprKind::Constant(Constant::Str(s)) => {
+            // Literal braces re-escape as `{{` / `}}` (CPython
+            // `append_fstring_unicode`).
+            for c in s.chars() {
+                out.push(c);
+                if c == '{' || c == '}' {
+                    out.push(c);
+                }
+            }
+            Some(())
+        }
+        _ => None,
     }
 }
 
@@ -485,16 +555,18 @@ fn write_constant(out: &mut String, c: &Constant) -> Option<()> {
             }
         }
         Constant::Complex(real, imag) => {
-            if *real == 0.0 {
-                out.push_str(&format!("{imag}j"));
+            let mut repr = if *real == 0.0 && real.is_sign_positive() {
+                format!("{imag}j")
             } else {
-                out.push('(');
-                out.push_str(&format!("{real}"));
-                if imag.is_sign_positive() {
-                    out.push('+');
-                }
-                out.push_str(&format!("{imag}j)"));
+                let sign = if imag.is_sign_positive() { "+" } else { "" };
+                format!("({real}{sign}{imag}j)")
+            };
+            // CPython `append_repr` swaps `inf` for an eval-able
+            // overflow literal in complex reprs.
+            if repr.contains("inf") {
+                repr = repr.replace("inf", "1e309");
             }
+            out.push_str(&repr);
         }
         Constant::Str(s) => write_str_repr(out, s),
         Constant::WStr(_) => return None,

@@ -307,6 +307,22 @@ impl<'src> Scanner<'src> {
             }
             if matches!(self.peek(), Some(b'\n')) {
                 self.pos += 1;
+                // A continuation whose next line never arrives (EOF
+                // right after the swallowed newline): CPython reports
+                // an EOF error rather than silently completing the
+                // statement — unless a bracket is open, which wins.
+                if self.peek().is_none() {
+                    if let Some(&(bracket, pos)) = self.open_brackets.first() {
+                        return Err(LexError::BracketNeverClosed {
+                            open: bracket as char,
+                            pos: pos as u32,
+                        });
+                    }
+                    return Err(LexError::UnexpectedEofParsing {
+                        pos: self.pos as u32,
+                        line_had_tokens: self.last_was_content,
+                    });
+                }
                 // Skip the newline; do not start a new logical line.
                 return Ok(None);
             }
@@ -320,10 +336,12 @@ impl<'src> Scanner<'src> {
                         pos: pos as u32,
                     });
                 }
-                // CPython anchors the error at the backslash itself when
-                // nothing follows, and at the offending character when
-                // one does.
-                return Err(LexError::StrayBackslash { pos: bs_pos as u32 });
+                // bpo-2180: a line continuation ending the input is an
+                // EOF error, anchored one column past the backslash.
+                return Err(LexError::UnexpectedEofParsing {
+                    pos: (bs_pos + 1) as u32,
+                    line_had_tokens: self.last_was_content,
+                });
             }
             return Err(LexError::StrayBackslash {
                 pos: (bs_pos + 1) as u32,
@@ -414,6 +432,41 @@ impl<'src> Scanner<'src> {
             self.at_line_start = false;
             return Ok(());
         }
+        // issue-40847: a line holding only whitespace and `\`
+        // continuations whose joined logical line is still blank is a
+        // blank line — no INDENT/DEDENT processing. Probe ahead without
+        // committing; if content ever appears, fall through to normal
+        // indent handling (the continuation is consumed by the main
+        // loop as part of the logical line).
+        if b == b'\\' {
+            let mut probe = self.pos;
+            let blank_joined = loop {
+                if self.src.get(probe) != Some(&b'\\') {
+                    break false;
+                }
+                let mut q = probe + 1;
+                if self.src.get(q) == Some(&b'\r') {
+                    q += 1;
+                }
+                if self.src.get(q) != Some(&b'\n') {
+                    break false;
+                }
+                probe = q + 1;
+                while matches!(self.src.get(probe), Some(b' ' | b'\t' | 0x0C)) {
+                    probe += 1;
+                }
+                match self.src.get(probe) {
+                    None | Some(b'\n' | b'\r' | b'#') => break true,
+                    Some(b'\\') => continue,
+                    _ => break false,
+                }
+            };
+            if blank_joined {
+                self.pos = probe;
+                self.at_line_start = false;
+                return Ok(());
+            }
+        }
 
         let tab_error = || LexError::InconsistentIndent {
             pos: line_start as u32,
@@ -421,6 +474,17 @@ impl<'src> Scanner<'src> {
         let current = *self.indents.last().expect("indent stack non-empty");
         let alt_current = *self.alt_indents.last().expect("indent stack non-empty");
         if indent > current {
+            // CPython's MAXINDENT (100): the fixed `indstack` is full
+            // when a 101st level would be pushed (E_TOODEEP).
+            if self.indents.len() >= 100 {
+                let mut line_end = self.pos;
+                while line_end < self.src.len() && self.src[line_end] != b'\n' {
+                    line_end += 1;
+                }
+                return Err(LexError::TooDeepIndent {
+                    pos: line_end as u32,
+                });
+            }
             if alt <= alt_current {
                 return Err(tab_error());
             }
@@ -588,6 +652,23 @@ impl<'src> Scanner<'src> {
                         self.pos += 1;
                         match self.peek() {
                             Some(b) if valid(b) => {}
+                            // `0b1_2`: a decimal digit invalid for the
+                            // radix keeps CPython's "invalid digit"
+                            // wording, not the bare-literal one.
+                            Some(b)
+                                if b.is_ascii_digit()
+                                    && radix_char != b'x'
+                                    && radix_char != b'X' =>
+                            {
+                                self.pos += 1;
+                                return Err(LexError::InvalidNumber {
+                                    pos: (self.pos - 1) as u32,
+                                    message: format!(
+                                        "invalid digit '{}' in {radix_name} literal",
+                                        b as char
+                                    ),
+                                });
+                            }
                             _ => {
                                 return Err(LexError::InvalidNumber {
                                     pos: (self.pos - 1) as u32,
@@ -674,19 +755,27 @@ impl<'src> Scanner<'src> {
         }
 
         if matches!(self.peek(), Some(b'e' | b'E')) {
-            // Only a real exponent: `1e3`, `1e+3`. A bare `1e` or `1e+`
-            // is "invalid decimal literal" at the last consumed byte.
-            is_float = true;
+            // Only a real exponent: `1e3`, `1e+3`. A signed exponent
+            // with no digits (`1e+`) is "invalid decimal literal", but
+            // a bare `e` not followed by sign/digit is *backed up* like
+            // CPython's tokenizer — `1.else` is the float `1.` followed
+            // by the keyword `else` (issue 21642).
+            let exp_start = self.pos;
             self.pos += 1;
-            if matches!(self.peek(), Some(b'+' | b'-')) {
+            let signed = matches!(self.peek(), Some(b'+' | b'-'));
+            if signed {
                 self.pos += 1;
             }
-            let got = consume_digit_run(self)?;
-            if !got {
+            if matches!(self.peek(), Some(b) if b.is_ascii_digit()) {
+                is_float = true;
+                consume_digit_run(self)?;
+            } else if signed {
                 return Err(LexError::InvalidNumber {
                     pos: (self.pos - 1) as u32,
                     message: "invalid decimal literal".to_owned(),
                 });
+            } else {
+                self.pos = exp_start;
             }
         }
 
@@ -712,7 +801,12 @@ impl<'src> Scanner<'src> {
             }
         }
 
-        self.verify_end_of_number("invalid decimal literal")?;
+        let end_msg = if is_imaginary {
+            "invalid imaginary literal"
+        } else {
+            "invalid decimal literal"
+        };
+        self.verify_end_of_number(end_msg)?;
         Ok(self.token(TokenKind::Number, start, self.pos))
     }
 
@@ -720,16 +814,18 @@ impl<'src> Scanner<'src> {
     /// by an identifier character is a syntax error ("invalid decimal
     /// literal" at the number's last byte) — except when the trailing
     /// identifier is a keyword that may legally follow a number
-    /// (`1if x else y`, `0in xs`, …).
+    /// (`1if x else y`, `0in xs`, …), which today only draws a
+    /// SyntaxWarning with the same message. A non-ASCII follower is
+    /// left for the main loop (it becomes "invalid character …").
     fn verify_end_of_number(&mut self, message: &str) -> Result<(), LexError> {
-        const ALLOWED: &[&str] = &["and", "else", "for", "if", "in", "is", "not", "or", "while"];
+        const ALLOWED: &[&str] = &["and", "else", "for", "if", "in", "is", "not", "or"];
         let next = match self.peek() {
             Some(b) => b,
             None => return Ok(()),
         };
         let is_ident_byte =
             |b: u8| b == b'_' || b.is_ascii_alphabetic() || b.is_ascii_digit() || b >= 0x80;
-        if !(next == b'_' || next.is_ascii_alphabetic() || next >= 0x80) {
+        if !(next == b'_' || next.is_ascii_alphabetic()) {
             return Ok(());
         }
         let mut end = self.pos;
@@ -738,6 +834,10 @@ impl<'src> Scanner<'src> {
         }
         let word = std::str::from_utf8(&self.src[self.pos..end]).unwrap_or("");
         if ALLOWED.contains(&word) {
+            self.escape_warnings.push(EscapeWarning {
+                offset: self.pos as u32,
+                message: message.to_owned(),
+            });
             return Ok(());
         }
         Err(LexError::InvalidNumber {
@@ -1196,14 +1296,14 @@ impl<'src> Scanner<'src> {
         // "expecting '}'" at) is the *opening* quote — the field's
         // expression text ends just before it.
         let quote_pos = self.pos as u32;
-        let unterminated = |pos: u32| {
+        let unterminated = |pos: u32, detected_line: u32| {
             if quote == outer_quote {
                 LexError::FstringExpectingBrace {
                     pos: quote_pos,
                     field_start,
                 }
             } else {
-                LexError::UnterminatedString { pos }
+                LexError::UnterminatedString { pos, detected_line }
             }
         };
         // Walk back over the immediately-preceding ASCII-letter run to
@@ -1234,7 +1334,7 @@ impl<'src> Scanner<'src> {
         let _ = prefix.raw;
         loop {
             let Some(b) = self.peek() else {
-                return Err(unterminated(self.pos as u32));
+                return Err(unterminated(self.pos as u32, self.line_of(self.pos)));
             };
             if b == b'\\' {
                 // A backslash escapes the next byte for tokenizing in raw
@@ -1258,7 +1358,7 @@ impl<'src> Scanner<'src> {
                 return Ok(());
             }
             if (b == b'\n' || b == b'\r') && !triple {
-                return Err(unterminated(self.pos as u32));
+                return Err(unterminated(self.pos as u32, self.line_of(self.pos)));
             }
             self.pos += 1;
         }
@@ -1272,9 +1372,30 @@ impl<'src> Scanner<'src> {
     ) -> Result<Token, LexError> {
         let raw = prefix.raw;
         let mut warned = false;
+        // When the last thing consumed before EOL/EOF was a
+        // backslash-escaped copy of the closing quote (`"blech\"`),
+        // CPython appends "; perhaps you escaped the end quote?".
+        let escaped_end_quote = |scanner: &Self| {
+            scanner.pos >= 2
+                && scanner.src[scanner.pos - 1] == quote
+                && scanner.src[scanner.pos - 2] == b'\\'
+        };
+        let unterminated = |scanner: &Self| {
+            if escaped_end_quote(scanner) {
+                LexError::UnterminatedStringEscapedQuote {
+                    pos: start as u32,
+                    detected_line: scanner.line_of(scanner.pos),
+                }
+            } else {
+                LexError::UnterminatedString {
+                    pos: start as u32,
+                    detected_line: scanner.line_of(scanner.pos),
+                }
+            }
+        };
         while let Some(b) = self.peek() {
             if b == b'\n' || b == b'\r' {
-                return Err(LexError::UnterminatedString { pos: start as u32 });
+                return Err(unterminated(self));
             }
             if b == b'\\' && !raw {
                 if !warned {
@@ -1316,7 +1437,7 @@ impl<'src> Scanner<'src> {
             }
             self.pos += 1;
         }
-        Err(LexError::UnterminatedString { pos: start as u32 })
+        Err(unterminated(self))
     }
 
     fn scan_triple_string(
@@ -1329,7 +1450,10 @@ impl<'src> Scanner<'src> {
         let mut warned = false;
         loop {
             let Some(b) = self.peek() else {
-                return Err(LexError::UnterminatedString { pos: start as u32 });
+                return Err(LexError::UnterminatedTripleString {
+                    pos: start as u32,
+                    detected_line: self.line_of(self.pos),
+                });
             };
             if b == b'\\' {
                 // Backslash escapes the next byte for tokenizing in raw
@@ -1392,6 +1516,11 @@ impl<'src> Scanner<'src> {
                 (b'>', b'>') => Some(TokenKind::RightShift),
                 (b'=', b'=') => Some(TokenKind::EqEqual),
                 (b'!', b'=') => Some(TokenKind::NotEqual),
+                // PEP 401: `<>` lexes as NOTEQUAL, like CPython's
+                // tokenizer; the parser rejects it unless
+                // `barry_as_FLUFL` is active (and rejects `!=` when it
+                // is).
+                (b'<', b'>') => Some(TokenKind::NotEqual),
                 (b'<', b'=') => Some(TokenKind::LessEqual),
                 (b'>', b'=') => Some(TokenKind::GreaterEqual),
                 (b'+', b'=') => Some(TokenKind::PlusEqual),
@@ -1421,8 +1550,7 @@ impl<'src> Scanner<'src> {
                 TokenKind::LPar
             }
             b')' => {
-                self.paren_depth = self.paren_depth.saturating_sub(1);
-                self.open_brackets.pop();
+                self.close_bracket(b')', start)?;
                 TokenKind::RPar
             }
             b'[' => {
@@ -1431,8 +1559,7 @@ impl<'src> Scanner<'src> {
                 TokenKind::LSqb
             }
             b']' => {
-                self.paren_depth = self.paren_depth.saturating_sub(1);
-                self.open_brackets.pop();
+                self.close_bracket(b']', start)?;
                 TokenKind::RSqb
             }
             b'{' => {
@@ -1441,8 +1568,7 @@ impl<'src> Scanner<'src> {
                 TokenKind::LBrace
             }
             b'}' => {
-                self.paren_depth = self.paren_depth.saturating_sub(1);
-                self.open_brackets.pop();
+                self.close_bracket(b'}', start)?;
                 TokenKind::RBrace
             }
             b',' => TokenKind::Comma,
@@ -1469,10 +1595,15 @@ impl<'src> Scanner<'src> {
                 let ch = decode_utf8(&self.src[self.pos..])
                     .map(|(c, _)| c)
                     .unwrap_or('\u{FFFD}');
-                // CPython wording: ASCII junk (`$`, `?`, `` ` ``) is a
-                // plain "invalid syntax"; only non-ASCII gets the
-                // `invalid character '€' (U+20AC)` message.
+                // CPython wording: printable ASCII junk (`$`, `?`,
+                // `` ` ``) is a plain "invalid syntax", but ASCII
+                // control characters get the non-printable diagnostic
+                // (`invalid non-printable character U+0017`). Only
+                // non-ASCII gets `invalid character '€' (U+20AC)`.
                 if ch.is_ascii() {
+                    if ch.is_control() {
+                        return Err(LexError::InvalidNonPrintable { ch, pos });
+                    }
                     return Err(LexError::InvalidToken { pos });
                 }
                 // CPython distinguishes printable junk (`invalid character
@@ -1498,6 +1629,42 @@ impl<'src> Scanner<'src> {
     }
 
     // ---------- helpers ----------
+
+    /// Pop the bracket stack for a closer, producing CPython's
+    /// "unmatched ')'" (nothing open) or "closing parenthesis ')' does
+    /// not match opening parenthesis '['" (wrong opener) diagnostics.
+    fn close_bracket(&mut self, close: u8, start: usize) -> Result<(), LexError> {
+        let Some((open, open_pos)) = self.open_brackets.pop() else {
+            return Err(LexError::UnmatchedClose {
+                close: close as char,
+                pos: start as u32,
+            });
+        };
+        let expected = match open {
+            b'(' => b')',
+            b'[' => b']',
+            _ => b'}',
+        };
+        if close != expected {
+            let open_line = self.line_of(open_pos);
+            let close_line = self.line_of(start);
+            return Err(LexError::MismatchedClose {
+                close: close as char,
+                open: open as char,
+                open_line: (open_line != close_line).then_some(open_line),
+                pos: start as u32,
+            });
+        }
+        self.paren_depth = self.paren_depth.saturating_sub(1);
+        Ok(())
+    }
+
+    /// 1-based line number containing byte `pos` — the "detected at
+    /// line N" in CPython's unterminated-string diagnostics.
+    fn line_of(&self, pos: usize) -> u32 {
+        let end = pos.min(self.src.len());
+        self.src[..end].iter().filter(|b| **b == b'\n').count() as u32 + 1
+    }
 
     fn token(&self, kind: TokenKind, start: usize, end: usize) -> Token {
         Token {

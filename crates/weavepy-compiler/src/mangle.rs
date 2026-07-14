@@ -219,6 +219,29 @@ impl Mangler {
                     sub.expr(&mut k.value);
                 }
             }
+            StmtKind::TypeAlias {
+                name,
+                type_params,
+                value,
+                ..
+            } => {
+                // Normally dead — the compiler lowers `type` statements
+                // to their assignment form before mangling — but kept
+                // faithful for safety: the binding and the type-parameter
+                // names mangle; bounds/defaults/value are ordinary
+                // expressions (matching what the lowered form produces).
+                self.name(name);
+                for tp in type_params {
+                    self.name(&mut tp.name);
+                    if let TypeParamKind::TypeVar { bound: Some(b) } = &mut tp.kind {
+                        self.expr(b);
+                    }
+                    if let Some(d) = &mut tp.default {
+                        self.expr(d);
+                    }
+                }
+                self.expr(value);
+            }
             StmtKind::Return(v) => {
                 if let Some(v) = v {
                     self.expr(v);

@@ -15,6 +15,7 @@
 
 use crate::import::{FrozenSource, ModuleCache};
 
+pub mod ast_convert;
 pub mod ast_mod;
 pub mod binascii_mod;
 pub mod bisect_accel;
@@ -63,6 +64,7 @@ pub mod tempfile_mod;
 pub mod testinternalcapi_mod;
 pub mod thread;
 pub mod time;
+pub mod tokenize_mod;
 pub mod tracemalloc_real;
 pub mod ucd;
 pub mod unicodedata_mod;
@@ -161,6 +163,9 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("_ast", ast_mod::build);
     // RFC 0033 — native symbol-table core behind the frozen `symtable` module.
     cache.register_builtin("_symtable", symtable_mod::build);
+    // RFC 0052 — native lexer core behind the frozen `_tokenize` module
+    // (the CPython 3.13 `Parser/lexer` port `tokenize.py` drives).
+    cache.register_builtin("_tokenize_core", tokenize_mod::build);
     cache.register_builtin("_gzip", gzip_mod::build);
     cache.register_builtin("_bz2", bz2_mod::build);
     cache.register_builtin("_lzma", lzma_mod::build);
@@ -258,11 +263,9 @@ fn frozen_sources() -> &'static [FrozenSource] {
     // A `static`, not a promoted local: the table is far past clippy's
     // stack-array budget (`large_stack_arrays`).
     static SOURCES: &[FrozenSource] = &[
-        FrozenSource {
-            name: "builtins",
-            source: include_str!("python/builtins.py"),
-            is_package: false,
-        },
+        // `builtins` is *not* frozen source: the module is created
+        // eagerly in `Interpreter::default()` sharing the interpreter's
+        // ambient builtins dict (RFC 0052 WS5 — patchable builtins).
         // RFC 0046 (wave 5): `ctypes`. The verbatim CPython `ctypes` package
         // runs over our frozen `_ctypes` reimplementation (CPython's real
         // `_ctypes` is a core-built C extension linking `_PyRuntime`, so it
@@ -2483,6 +2486,13 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "tokenize",
             source: include_str!("python/tokenize.py"),
+            is_package: false,
+        },
+        // RFC 0052 — `TokenizerIter` shim over the native
+        // `_tokenize_core` lexer port (CPython's `_tokenize` C module).
+        FrozenSource {
+            name: "_tokenize",
+            source: include_str!("python/_tokenize.py"),
             is_package: false,
         },
         FrozenSource {

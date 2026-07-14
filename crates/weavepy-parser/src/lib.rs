@@ -20,7 +20,9 @@ pub mod unparse;
 
 pub use ast::{dump_module, Module};
 pub use error::ParseError;
-pub use parser::{set_unicode_name_resolver, UnicodeNameResolution};
+pub use parser::{
+    build_lazy_type_alias, lower_type_alias_stmt, set_unicode_name_resolver, UnicodeNameResolution,
+};
 pub use weavepy_lexer::EscapeWarning;
 
 /// Parse a Python source buffer into a [`Module`].
@@ -39,7 +41,23 @@ pub fn parse_module(source: &str) -> Result<Module, ParseError> {
 pub fn parse_module_with_warnings(
     source: &str,
 ) -> (Result<Module, ParseError>, Vec<EscapeWarning>) {
-    parse_with_warnings(source, parser::parse)
+    parse_module_with_warnings_flags(source, false)
+}
+
+/// [`parse_module_with_warnings`] with PEP 401 `barry_as_FLUFL`
+/// pre-activated when the caller passed `CO_FUTURE_BARRY_AS_BDFL` to
+/// `compile()` (the parser also self-activates on the future import).
+pub fn parse_module_with_warnings_flags(
+    source: &str,
+    flufl: bool,
+) -> (Result<Module, ParseError>, Vec<EscapeWarning>) {
+    if flufl {
+        parse_with_warnings(source, |src, tokens| {
+            parser::parse_with_flufl(src, tokens, true)
+        })
+    } else {
+        parse_with_warnings(source, parser::parse)
+    }
 }
 
 /// Like [`parse_module_with_warnings`], but with CPython's `eval` start
@@ -48,7 +66,54 @@ pub fn parse_module_with_warnings(
 /// accept, never a statement-level diagnostic. Backs `eval(...)` and
 /// `compile(..., mode="eval")`.
 pub fn parse_eval_with_warnings(source: &str) -> (Result<Module, ParseError>, Vec<EscapeWarning>) {
-    parse_with_warnings(source, parser::parse_eval)
+    parse_eval_with_warnings_flags(source, false)
+}
+
+/// [`parse_eval_with_warnings`] with PEP 401 `barry_as_FLUFL`
+/// pre-activated.
+pub fn parse_eval_with_warnings_flags(
+    source: &str,
+    flufl: bool,
+) -> (Result<Module, ParseError>, Vec<EscapeWarning>) {
+    let (mut result, warnings) = if flufl {
+        parse_with_warnings(source, |src, tokens| {
+            parser::parse_eval_with_flufl(src, tokens, true)
+        })
+    } else {
+        parse_with_warnings(source, parser::parse_eval)
+    };
+    // Eval-mode line-continuation at hard EOF: `compile()` appends a
+    // newline in exec mode (so `"\\"` reads as continuation-then-EOF,
+    // "unexpected EOF while parsing"), but the eval grammar tokenizes
+    // the source as-is, and CPython reports the stray backslash itself
+    // ("unexpected character after line continuation character") — even
+    // when a bracket is still open (`eval("(\\")`).
+    if let Some(stripped) = source.strip_suffix('\\') {
+        let eof_shaped = matches!(
+            &result,
+            Err(ParseError::Lex(
+                weavepy_lexer::LexError::UnexpectedEofParsing { .. }
+                    | weavepy_lexer::LexError::BracketNeverClosed { .. }
+            ))
+        );
+        // The backslash only counts if it is *live* syntax (not swallowed
+        // by a comment or string). Probe by appending a junk byte: a live
+        // continuation-backslash then trips StrayBackslash right there.
+        let live_backslash = || {
+            let probe = format!("{source}x");
+            matches!(
+                weavepy_lexer::tokenize(&probe),
+                Err(weavepy_lexer::LexError::StrayBackslash { pos })
+                    if pos as usize == source.len()
+            )
+        };
+        if eof_shaped && live_backslash() {
+            result = Err(ParseError::Lex(weavepy_lexer::LexError::StrayBackslash {
+                pos: stripped.len() as u32,
+            }));
+        }
+    }
+    (result, warnings)
 }
 
 fn parse_with_warnings(

@@ -69,7 +69,8 @@ impl ParseError {
     /// otherwise.
     pub fn exception_class(&self) -> &'static str {
         match self {
-            ParseError::Indentation { .. } | ParseError::Lex(LexError::UnknownDedent { .. }) => {
+            ParseError::Indentation { .. }
+            | ParseError::Lex(LexError::UnknownDedent { .. } | LexError::TooDeepIndent { .. }) => {
                 "IndentationError"
             }
             ParseError::Lex(LexError::InconsistentIndent { .. }) => "TabError",

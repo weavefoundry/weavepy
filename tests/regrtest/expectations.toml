@@ -82,8 +82,10 @@ timeout_seconds = 180
 reason = "measured (RFC 0049): fails in ~60s idle; near-boundary under load, budget raised"
 
 [tests."cpython/Lib/test/test_ast.py"]
-status = "timeout"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): killed after 60s"
+status = "fail"
+reason = "measured (RFC 0052): suite now completes (~18s standalone, previously killed after 60s) via the compile()-from-AST path; 169 failures / 80 errors remain across full AST validation, node-construction, and position fidelity"
+# ~18s standalone but sits near the 60s budget on a loaded 8-job sweep.
+timeout_seconds = 180
 
 [tests."cpython/Lib/test/test_asyncgen.py"]
 status = "pass"
@@ -222,8 +224,8 @@ timeout_seconds = 120
 reason = "RFC 0050 WS2+WS3: passes end-to-end (284 run, 13 skip). WS2 delivered error-handler unification, UTF-7, stateful UTF-16/32 decoders, the stream layer, unicode-escape handler protocol, 57 vendored charmap codepages, and the IDNA/punycode/nameprep surface. WS3 added the stateful CJK escape codecs (_codec_cjk_ext: hz, iso2022_jp/_1/_2/_2004/_3/_ext, iso2022_kr, johab, shift_jis_2004/shift_jisx0213) plus the euc_jisx0213 2000-emulation variant, ported from Modules/cjkcodecs and differentially verified against CPython 3.13."
 
 [tests."cpython/Lib/test/test_codeop.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: 1 != 2"
+status = "pass"
+reason = "RFC 0052: compile() flags (PyCF_DONT_IMPLY_DEDENT / PyCF_ALLOW_INCOMPLETE_INPUT) + pegen-exact incomplete-input diagnostics"
 
 [tests."cpython/Lib/test/test_collections.py"]
 status = "pass"
@@ -231,6 +233,9 @@ reason = "measured: passes end-to-end in ~7s under -j8 (RFC 0037 WS8 — CPython
 
 [tests."cpython/Lib/test/test_compile.py"]
 status = "fail"
+# ~30-55s under -j8; observed >60s on a loaded host (RFC 0052
+# re-measure) — verdict is stable, raise headroom only.
+timeout_seconds = 180
 reason = "compile builtin: PyCF_* flags + AST input handling"
 
 [tests."cpython/Lib/test/test_compiler_assemble.py"]
@@ -247,7 +252,9 @@ reason = "RFC 0037 WS3: passes end-to-end (35 tests). The complex() constructor 
 
 [tests."cpython/Lib/test/test_concurrent_futures.py"]
 status = "pass"
-timeout_seconds = 300
+# ~120-250s under -j8; observed >300s on a loaded/thermally-throttled host
+# (RFC 0052 re-measure) — verdict is stable, so raise headroom only.
+timeout_seconds = 600
 reason = "RFC 0040 WS6: passes as a graded unit — 267 run, 0 fail, 0 err, 20 skip (release build). The whole `concurrent.futures` matrix is green: ThreadPool + ProcessPool (fork/forkserver/spawn) across test_init/test_future/test_as_completed/test_wait/test_thread_pool/test_process_pool/test_shutdown/test_deadlock. Two fixes landed this wave. (1) A VM deterministic-finalization bug: a comprehension's anonymous `<listcomp>`/`<setcomp>`/`<dictcomp>`/`<genexpr>` is GC-tracked when it captures cells, so when emitted by `MakeFunction` and consumed by the very next `Call` a plain `Rc` drop left it pinned by its own GC handle — leaking the captured locals until the next cycle collection. `ThreadPoolExecutor.map`'s `result_iterator` closes over the listcomp's `self`, so every `map` leaked one ref to the executor; `del executor` then never hit refcount 0, the idle-worker wakeup weakref-callback never fired, and `test_shutdown`/`test_del_shutdown` hung. `reap_call_receiver` now routes a uniquely-held call-temporary `Function` through the same prompt-reap cascade as closure-function locals (the leak also resolved the test_future 18→20 and test_as_completed 19→20 residuals). (2) Added the native `faulthandler` module: `test_deadlock` fires `faulthandler._sigsegv()` inside a pool worker to force a hard crash and assert `BrokenProcessPool` recovery; without the module `import faulthandler` raised in the worker, so the crash never happened and every recovery case errored or hung to `LONG_TIMEOUT`. The crash primitives genuinely `raise(3)` the signal, and ProcessPool broken-worker detection (verified independently for SIGSEGV/SIGABRT/os._exit) recovers promptly."
 
 [tests."cpython/Lib/test/test_configparser.py"]
@@ -360,6 +367,9 @@ reason = "measured (RFC 0049 wave-5 full-suite baseline): AttributeError: 'Dynam
 
 [tests."cpython/Lib/test/test_email.py"]
 status = "fail"
+# ~35-55s under -j8; observed >60s on a loaded host (RFC 0052
+# re-measure) — verdict is stable, raise headroom only.
+timeout_seconds = 180
 reason = "email: policy.utf8 + EmailMessage.iter_attachments"
 
 [tests."cpython/Lib/test/test_embed.py"]
@@ -379,8 +389,8 @@ status = "pass"
 reason = "measured (RFC 0051 wave-6): enumerate() accepts its documented keyword arguments (iterable=/start=) — the wave-5 first-failure. ~6-9s under -j8 (pickle matrix)."
 
 [tests."cpython/Lib/test/test_eof.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: 'unterminated string literal at byte 5 (<string>, line 1)' != 'unterminated triple-quoted string literal (detected at[23 chars]e 1)'"
+status = "pass"
+reason = "RFC 0052: CPython-exact unterminated-string / EOF SyntaxError wording ('detected at line N')"
 
 [tests."cpython/Lib/test/test_exception_group.py"]
 status = "fail"
@@ -423,8 +433,8 @@ status = "pass"
 reason = "RFC 0037 WS3: passes end-to-end (skipped=3). float()/math coercion now routes user objects through __float__/__index__ (coerce_f64_opt) and int->float raises OverflowError when the magnitude exceeds the f64 range instead of silently yielding inf; NaN orderings are unordered (Lt/LtE/Gt/GtE are all False against a NaN); float.hex/fromhex roundtrip and the unbound float methods resolve."
 
 [tests."cpython/Lib/test/test_flufl.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): SyntaxError: unexpected token in expression: Greater"
+status = "pass"
+reason = "RFC 0052: PEP 401 barry_as_FLUFL future flag — lexer `<>` toggle threaded through compile()/eval and the REPL"
 
 [tests."cpython/Lib/test/test_fnmatch.py"]
 status = "pass"
@@ -467,8 +477,8 @@ status = "pass"
 reason = "measured: passes end-to-end (RFC 0037 WS8 — partial/lru_cache/singledispatch + the classmethod(partial)/bound-method descriptor-redispatch fix) against the vendored CPython 3.13 Lib/test."
 
 [tests."cpython/Lib/test/test_future_stmt.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): SyntaxError: future feature spam is not defined"
+status = "pass"
+reason = "RFC 0052: CO_FUTURE_* threading through compile(flags=/dont_inherit=), future-feature validation, and __future__ module parity"
 
 [tests."cpython/Lib/test/test_gc.py"]
 status = "pass"
@@ -499,8 +509,8 @@ status = "fail"
 reason = "measured (RFC 0049 wave-5 full-suite baseline): FileNotFoundError: [Errno 2] No such file or directory: '/Users/owencarey/Documents/weavefoundry/weavepy/vendor/cpython/Modules/getpath.py'"
 
 [tests."cpython/Lib/test/test_gettext.py"]
-status = "fail"
-reason = "measured: `gettext` now ships (frozen verbatim) and imports — previously `ModuleNotFoundError` — so the suite runs (71/78); 7 residual errors around the C-accelerated catalog/plural-eval edges remain a follow-up."
+status = "pass"
+reason = "RFC 0052: the 7 residual catalog/plural-eval errors cleared once tokenize/compile fidelity landed (gettext's plural-form parser tokenizes the expression)"
 
 [tests."cpython/Lib/test/test_glob.py"]
 status = "pass"
@@ -508,12 +518,12 @@ timeout_seconds = 180
 reason = "correct but slow (~51s idle); budget raised for parallel-load headroom"
 
 [tests."cpython/Lib/test/test_global.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: SyntaxError not raised"
+status = "pass"
+reason = "RFC 0052: symtable-stage 'name assigned/used before global declaration' SyntaxErrors"
 
 [tests."cpython/Lib/test/test_grammar.py"]
-status = "fail"
-reason = "exercises features still in flight (top-level await, complex f-strings)"
+status = "pass"
+reason = "RFC 0052: pegen-exact diagnostics, PyCF_ALLOW_TOP_LEVEL_AWAIT, and f-string fidelity closed the remaining grammar gaps"
 
 [tests."cpython/Lib/test/test_gzip.py"]
 status = "pass"
@@ -899,6 +909,10 @@ reason = "measured (RFC 0049 wave-5 full-suite baseline): ImportError: cannot im
 
 [tests."cpython/Lib/test/test_repl.py"]
 status = "fail"
+# Spawns subprocess REPLs; sits near the 60s budget under -j8 load
+# (observed 45-70s). Raised so the stable `fail` verdict doesn't flip
+# to a spurious `timeout`.
+timeout_seconds = 180
 reason = "measured (RFC 0049 wave-5 full-suite baseline): File '/Users/owencarey/Documents/weavefoundry/weavepy/ve…[truncated]"
 
 [tests."cpython/Lib/test/test_reprlib.py"]
@@ -1062,12 +1076,12 @@ status = "fail"
 reason = "measured (RFC 0049 wave-5 full-suite baseline): EOFError: EOF when reading a line"
 
 [tests."cpython/Lib/test/test_symtable.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AttributeError: 'NoneType' object has no attribute 'get_children'"
+status = "pass"
+reason = "RFC 0052: PEP 695 block types (type alias / type parameters / type variable / annotation) in _symtable, plus compile_type + filename threading"
 
 [tests."cpython/Lib/test/test_syntax.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: SyntaxError did not contain 'invalid syntax'"
+status = "pass"
+reason = "RFC 0052: pegen-exact SyntaxError messages, spans, and exception classes across the invalid_* rule family"
 
 [tests."cpython/Lib/test/test_sys.py"]
 status = "fail"
@@ -1086,8 +1100,8 @@ status = "fail"
 reason = "measured (RFC 0049 wave-5 full-suite baseline): ImportError: cannot import name '_INSTALL_SCHEMES' from 'sysconfig'"
 
 [tests."cpython/Lib/test/test_tabnanny.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: '/var[26 chars]9tc1swkk3w0000gn/T/tmp_hhh2us3.py 3 \\'\\\\tprint('world')\\\\n\\'\\n' != '/var[26 chars]9tc1swkk3w0000gn/T/tmp_hhh2us3.py 3 \\'\\\\tprint("
+status = "pass"
+reason = "RFC 0052: CPython 3.13-faithful tokenize (token text/positions) feeds tabnanny's whitespace analysis"
 
 [tests."cpython/Lib/test/test_tarfile.py"]
 status = "pass"
@@ -1113,7 +1127,7 @@ reason = "measured: passes end-to-end after wiring `open(opener=...)` + file-des
 [tests."cpython/Lib/test/test_threading.py"]
 status = "pass"
 timeout_seconds = 600
-reason = "RFC 0039: real OS threads with cooperative GIL hand-off, faithful Lock/RLock (subclassable `_thread.RLock`), thread-death thread-local cleanup (foreign-thread `_DummyThread` reaping), and prompt refcount reclamation of acyclic garbage — including the cross-thread `Thread.run` teardown cycle (`test_no_refcycle_through_target`) swept on `join()`. All 213 tests pass (29 skips for CPython-only knobs). 600s: the suite runs ~32s standalone and passes under moderate load, but with the main thread participating in GIL hand-offs it has been observed exceeding even 300s under full parallel sweep load (RFC 0050 WS6 re-measure); the raised budget keeps the verdict about correctness, not scheduler contention."
+reason = "RFC 0039: real OS threads with cooperative GIL hand-off, faithful Lock/RLock (subclassable `_thread.RLock`), thread-death thread-local cleanup (foreign-thread `_DummyThread` reaping), and prompt refcount reclamation of acyclic garbage — including the cross-thread `Thread.run` teardown cycle (`test_no_refcycle_through_target`) swept on `join()`. All 213 tests pass (29 skips for CPython-only knobs). 600s: the suite runs ~32s standalone and passes under moderate load, but with the main thread participating in GIL hand-offs it has been observed exceeding even 300s under full parallel sweep load (RFC 0050 WS6 re-measure); the raised budget keeps the verdict about correctness, not scheduler contention. KNOWN FLAKE (pre-existing, reproduces on unmodified main): `test_no_refcycle_through_target` intermittently fails when concurrent threads race the prompt-reap deadness check at `del self._kwargs` — the kwargs dict stays pinned by its GC handle, keeping the target instance's weakref live. Deterministic repro: busy daemon threads + gc.disable() flips it to 30/30 failures on main; the suite's own daemon-thread pressure makes it ~50% under load."
 
 [tests."cpython/Lib/test/test_threading_local.py"]
 status = "fail"
@@ -1132,8 +1146,9 @@ status = "fail"
 reason = "measured (RFC 0049 wave-5 full-suite baseline): ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^…[truncated]"
 
 [tests."cpython/Lib/test/test_tokenize.py"]
-status = "skip"
-reason = "imports CPython-only internals (tokenize.tokenize, encoding cookies)"
+status = "pass"
+timeout_seconds = 600
+reason = "measured (RFC 0052): native _tokenize_core lexer port; the roundtrip sweeps over the vendored stdlib are correct but slow"
 
 [tests."cpython/Lib/test/test_tomllib.py"]
 status = "fail"

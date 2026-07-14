@@ -31,6 +31,11 @@ def _is_incomplete(exc, source):
     if "was never closed" in msg:
         return True
     if "unexpected EOF" in msg or "incomplete input" in msg:
+        # A backslash-newline at EOF already consumed the continuation:
+        # CPython treats "a = 9+ \\\n" as a hard error, while a bare
+        # trailing backslash can still be continued.
+        if source.endswith("\\\n") or source.endswith("\\\r\n"):
+            return False
         return True
     # A pending suite ("if 1:" …) is incomplete only when nothing but
     # blank lines follows the suite *header* — a dedented statement
