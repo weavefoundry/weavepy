@@ -1043,6 +1043,13 @@ class chain:
             state[0], state[1] if len(state) == 2 else None
         )
 
+    def __class_getitem__(cls, item):
+        # CPython's C `chain` exposes `__class_getitem__ = Py_GenericAlias`
+        # (test_genericalias includes `chain` in its generic_types sweep).
+        import types
+
+        return types.GenericAlias(cls, item)
+
 
 # ---------------------------------------------------------------------------
 # compress

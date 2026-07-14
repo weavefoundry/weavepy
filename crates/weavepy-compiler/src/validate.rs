@@ -38,6 +38,11 @@ enum ScopeKind {
     Module,
     Function,
     Class,
+    /// The implicit PEP 695 scope holding a generic `def`/`class`'s
+    /// type parameters. `nonlocal` may never rebind a name bound here
+    /// (CPython symtable: "nonlocal binding not allowed for type
+    /// parameter").
+    TypeParams,
 }
 
 /// One declaration recorded by a `global`/`nonlocal` statement —
@@ -54,6 +59,11 @@ struct Scope {
     /// Parameter names of a function scope.
     params: Vec<String>,
     directives: Vec<Directive>,
+    /// Names bound in this scope: parameters plus body assignments
+    /// for functions; the parameter names themselves for
+    /// [`ScopeKind::TypeParams`]. Consulted when resolving `nonlocal`
+    /// declarations from nested scopes.
+    bound: std::collections::HashSet<String>,
 }
 
 impl Scope {
@@ -69,6 +79,7 @@ pub(crate) fn validate_module(module: &Module, source: &str) -> Result<(), Compi
             kind: ScopeKind::Module,
             params: Vec::new(),
             directives: Vec::new(),
+            bound: std::collections::HashSet::new(),
         }],
     };
     // `from __future__ import …` placement / feature validation
@@ -162,14 +173,46 @@ impl Validator<'_> {
             }
             params.push((&a.name, a.span));
         }
+        // Body-level bindings (assignments, defs, imports, walrus
+        // targets) participate in `nonlocal` resolution from nested
+        // scopes.
+        let mut bound: std::collections::HashSet<String> =
+            params.iter().map(|(n, _)| (*n).to_owned()).collect();
+        {
+            let mut globals = std::collections::HashSet::new();
+            let mut nonlocals = std::collections::HashSet::new();
+            let mut assigned = std::collections::HashSet::new();
+            for s in body {
+                crate::collect_decls(s, &mut globals, &mut nonlocals, &mut assigned);
+                crate::collect_walrus_stmt(s, &mut assigned);
+            }
+            bound.extend(assigned);
+        }
         self.scopes.push(Scope {
             kind: ScopeKind::Function,
             params: params.iter().map(|(n, _)| (*n).to_owned()).collect(),
             directives: Vec::new(),
+            bound,
         });
         let result = self.visit_body(body);
         self.scopes.pop();
         result
+    }
+
+    /// Push the implicit PEP 695 scope holding a generic statement's
+    /// type parameters (the caller pops it). Returns whether a scope
+    /// was pushed.
+    fn push_type_params_scope(&mut self, type_params: &[weavepy_parser::ast::TypeParam]) -> bool {
+        if type_params.is_empty() {
+            return false;
+        }
+        self.scopes.push(Scope {
+            kind: ScopeKind::TypeParams,
+            params: Vec::new(),
+            directives: Vec::new(),
+            bound: type_params.iter().map(|tp| tp.name.clone()).collect(),
+        });
+        true
     }
 
     fn visit_stmt(&mut self, stmt: &Stmt) -> Result<(), CompileError> {
@@ -178,39 +221,55 @@ impl Validator<'_> {
                 args,
                 body,
                 decorator_list,
+                type_params,
                 ..
             }
             | StmtKind::AsyncFunctionDef {
                 args,
                 body,
                 decorator_list,
+                type_params,
                 ..
             } => {
-                self.visit_function(args, body, decorator_list, true)?;
+                let pushed = self.push_type_params_scope(type_params);
+                let result = self.visit_function(args, body, decorator_list, true);
+                if pushed {
+                    self.scopes.pop();
+                }
+                result?;
             }
             StmtKind::ClassDef {
                 body,
                 decorator_list,
                 bases,
                 keywords,
+                type_params,
                 ..
             } => {
                 for d in decorator_list {
                     self.visit_expr(d)?;
                 }
-                for b in bases {
-                    self.visit_expr(b)?;
+                let pushed = self.push_type_params_scope(type_params);
+                let result = (|| -> Result<(), CompileError> {
+                    for b in bases {
+                        self.visit_expr(b)?;
+                    }
+                    for k in keywords {
+                        self.visit_expr(&k.value)?;
+                    }
+                    self.scopes.push(Scope {
+                        kind: ScopeKind::Class,
+                        params: Vec::new(),
+                        directives: Vec::new(),
+                        bound: std::collections::HashSet::new(),
+                    });
+                    let result = self.visit_body(body);
+                    self.scopes.pop();
+                    result
+                })();
+                if pushed {
+                    self.scopes.pop();
                 }
-                for k in keywords {
-                    self.visit_expr(&k.value)?;
-                }
-                self.scopes.push(Scope {
-                    kind: ScopeKind::Class,
-                    params: Vec::new(),
-                    directives: Vec::new(),
-                });
-                let result = self.visit_body(body);
-                self.scopes.pop();
                 result?;
             }
             StmtKind::Global(names) => {
@@ -273,6 +332,31 @@ impl Validator<'_> {
                             is_global: false,
                         });
                     }
+                    // PEP 695: resolve outward (class scopes are
+                    // transparent, as for any closure). If the nearest
+                    // scope binding `n` is a type-parameter scope, the
+                    // rebinding is rejected (CPython symtable).
+                    for s in self.scopes[..self.scopes.len() - 1].iter().rev() {
+                        match s.kind {
+                            ScopeKind::Class => {}
+                            ScopeKind::TypeParams => {
+                                if s.bound.contains(n) {
+                                    return Err(CompileError::spanned(
+                                        format!(
+                                            "nonlocal binding not allowed for type parameter '{n}'"
+                                        ),
+                                        span,
+                                    ));
+                                }
+                            }
+                            ScopeKind::Function => {
+                                if s.bound.contains(n) {
+                                    break;
+                                }
+                            }
+                            ScopeKind::Module => break,
+                        }
+                    }
                 }
             }
             StmtKind::ImportFrom { names, .. }
@@ -294,6 +378,7 @@ impl Validator<'_> {
                 target,
                 annotation,
                 value,
+                ..
             } => {
                 match &target.kind {
                     ExprKind::Tuple(_) | ExprKind::List(_) => {
@@ -516,8 +601,9 @@ impl Validator<'_> {
                 }
                 self.scopes.push(Scope {
                     kind: ScopeKind::Function,
-                    params,
+                    params: params.clone(),
                     directives: Vec::new(),
+                    bound: params.into_iter().collect(),
                 });
                 let result = self.visit_expr(body);
                 self.scopes.pop();

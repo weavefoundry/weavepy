@@ -74,7 +74,12 @@ pub const MAGIC: &[u8; 4] = b"\xf3\x0d\x0d\x0a";
 /// - rev `3`: `SETUP_ANNOTATIONS` opcode. Module/class bodies containing
 ///   annotated statements now bind `__annotations__` at block entry
 ///   (create-if-absent) instead of lazily at the first annotation.
-pub const CACHE_TAG: &str = "weavepy-313-3";
+/// - rev `4`: RFC 0051 PEP 695 lowering. Type parameters now capture
+///   `*Ts`/`**P` kinds, bounds/constraints, and PEP 696 defaults via
+///   the `__weavepy_typevar__` intrinsic family and append the
+///   implicit `Generic[…]` base; pre-rev `.pyc` baked the name-only
+///   placeholder lowering.
+pub const CACHE_TAG: &str = "weavepy-313-11";
 
 const HEADER_LEN: usize = 16;
 
@@ -128,8 +133,42 @@ pub fn try_load(source_path: &Path) -> Option<CodeObject> {
     }
     let body = &bytes[HEADER_LEN..];
     match marshal_mod::load_from_bytes(body).ok()? {
-        Object::Code(c) => Some((*c).clone()),
+        Object::Code(c) => {
+            let mut code = (*c).clone();
+            // The cache may have been written under a different spelling of
+            // the same file (a symlinked `sys.path` entry — e.g. a vendored
+            // `Lib -> /opt/.../python3.13`). CPython re-imports record the
+            // *current* path in `co_filename` (each interpreter writes its
+            // own pyc from the path it used); a stale spelling here would
+            // diverge from the module's `__file__` and break consumers that
+            // bridge the two (`warnings.warn(stacklevel=)` filename checks).
+            let current = source_path.to_string_lossy();
+            if code.filename != current {
+                rewrite_filenames(&mut code, &current);
+            }
+            Some(code)
+        }
         _ => None,
+    }
+}
+
+/// Recursively stamp `filename` on a code object and every nested code
+/// constant (function/class bodies, comprehensions).
+fn rewrite_filenames(code: &mut CodeObject, filename: &str) {
+    code.filename = filename.to_owned();
+    fn walk(c: &mut weavepy_compiler::Constant, filename: &str) {
+        match c {
+            weavepy_compiler::Constant::Code(inner) => rewrite_filenames(inner, filename),
+            weavepy_compiler::Constant::Tuple(items) => {
+                for it in items {
+                    walk(it, filename);
+                }
+            }
+            _ => {}
+        }
+    }
+    for c in &mut code.constants {
+        walk(c, filename);
     }
 }
 

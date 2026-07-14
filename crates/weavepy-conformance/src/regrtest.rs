@@ -1054,8 +1054,14 @@ fn truncate_detail(msg: &str) -> String {
     if msg.len() <= LIMIT {
         msg.to_owned()
     } else {
-        let mut s = String::with_capacity(LIMIT + 16);
-        s.push_str(&msg[..LIMIT]);
+        // Back off to a char boundary — byte 1024 can land mid-UTF-8
+        // sequence (test output routinely contains non-ASCII).
+        let mut cut = LIMIT;
+        while !msg.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let mut s = String::with_capacity(cut + 16);
+        s.push_str(&msg[..cut]);
         s.push_str("…[truncated]");
         s
     }

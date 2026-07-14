@@ -5602,6 +5602,10 @@ pub enum PyIterator {
     Enumerate {
         inner: Rc<RefCell<PyIterator>>,
         count: i64,
+        /// Engaged when the counter can't ride in an `i64` — a big
+        /// `start` (`enumerate(x, sys.maxsize + 1)`) or an overflowing
+        /// increment. `count` is ignored while this is `Some`.
+        count_big: Option<Box<BigInt>>,
     },
     /// `reversed(seq)` — yields `items[index]`, `items[index-1]`, … down
     /// to `items[0]`. `items` is held in *forward* order (matching
@@ -5773,11 +5777,25 @@ impl PyIterator {
                     }
                 }
             }
-            PyIterator::Enumerate { inner, count } => {
+            PyIterator::Enumerate {
+                inner,
+                count,
+                count_big,
+            } => {
                 let v = inner.borrow_mut().next_value()?;
-                let i = *count;
-                *count += 1;
-                Some(Object::new_tuple(vec![Object::Int(i), v]))
+                let idx = if let Some(b) = count_big {
+                    let cur = (**b).clone();
+                    **b += 1;
+                    Object::Long(Rc::new(cur))
+                } else {
+                    let i = *count;
+                    match count.checked_add(1) {
+                        Some(n) => *count = n,
+                        None => *count_big = Some(Box::new(BigInt::from(i) + 1)),
+                    }
+                    Object::Int(i)
+                };
+                Some(Object::new_tuple(vec![idx, v]))
             }
             PyIterator::Shared(inner) => inner.borrow_mut().next_value(),
             // Lazy file line. The error channel is `next_value_checked`
@@ -6113,11 +6131,26 @@ impl PyIterator {
                 }
                 out
             }
-            PyIterator::Enumerate { inner, count } => {
+            PyIterator::Enumerate {
+                inner,
+                count,
+                count_big,
+            } => {
                 let rest = inner.borrow().remaining_items();
                 let mut out = Vec::with_capacity(rest.len());
-                for (i, v) in (*count..).zip(rest) {
-                    out.push(Object::new_tuple(vec![Object::Int(i), v]));
+                match count_big {
+                    Some(b) => {
+                        let mut i = (**b).clone();
+                        for v in rest {
+                            out.push(Object::new_tuple(vec![Object::Long(Rc::new(i.clone())), v]));
+                            i += 1;
+                        }
+                    }
+                    None => {
+                        for (i, v) in (*count..).zip(rest) {
+                            out.push(Object::new_tuple(vec![Object::Int(i), v]));
+                        }
+                    }
                 }
                 out
             }
@@ -6757,23 +6790,32 @@ impl Object {
                 }
             }
             Object::MappingProxy(d) => Ok(d.borrow().contains_key(&DictKey(item.clone()))),
-            Object::DictView(v) => {
-                let d = v.dict.borrow();
-                match v.kind {
-                    DictViewKind::Keys => Ok(d.contains_key(&DictKey(item.clone()))),
-                    DictViewKind::Values => Ok(d.values().any(|x| x.eq_value(item))),
-                    DictViewKind::Items => {
-                        if let Object::Tuple(t) = item {
-                            if t.len() == 2 {
-                                if let Some(v) = d.get(&DictKey(t[0].clone())) {
-                                    return Ok(v.eq_value(&t[1]));
-                                }
-                            }
+            // View membership matches the dict's own: user `__hash__`/
+            // `__eq__` dispatch through Python and their exceptions
+            // propagate (test_dictviews.test_compare_error).
+            Object::DictView(v) => match v.kind {
+                DictViewKind::Keys => Object::Dict(v.dict.clone()).contains(item),
+                DictViewKind::Values => {
+                    let snapshot: Vec<Object> = v.dict.borrow().values().cloned().collect();
+                    for x in &snapshot {
+                        if member_eq(x, item)? {
+                            return Ok(true);
                         }
-                        Ok(false)
                     }
+                    Ok(false)
                 }
-            }
+                DictViewKind::Items => {
+                    if let Object::Tuple(t) = item {
+                        if t.len() == 2 {
+                            if let Some(stored) = crate::builtins::dict_lookup(&v.dict, &t[0])? {
+                                return member_eq(&stored, &t[1]);
+                            }
+                            return Ok(false);
+                        }
+                    }
+                    Ok(false)
+                }
+            },
             Object::MemoryView(mv) => match item {
                 Object::Int(i) => Ok(*i >= 0 && *i <= 255 && mv.to_bytes().contains(&(*i as u8))),
                 _ => Err(type_error(
@@ -7012,7 +7054,14 @@ impl Object {
             Object::Builtin(_) => "builtin_function_or_method",
             Object::BoundMethod(_) => "method",
             Object::Code(_) => "code",
-            Object::Iter(_) => "iterator",
+            // `enumerate` / `reversed` objects are instances of their own
+            // real types in CPython; anything else reports the generic
+            // iterator name (`try_borrow` in case the cursor is mid-step).
+            Object::Iter(it) => match it.try_borrow().as_deref() {
+                Ok(PyIterator::Enumerate { .. }) => "enumerate",
+                Ok(PyIterator::Reversed { .. }) => "reversed",
+                _ => "iterator",
+            },
             Object::Slice(_) => "slice",
             Object::Cell(_) => "cell",
             Object::Type(_) => "type",
@@ -7512,28 +7561,116 @@ impl Object {
                 // PEP 585/604 runtime forms repr as type expressions
                 // (CPython: `repr(list[int])` is "list[int]", `repr(int |
                 // str)` is "int | str"), not as namespace literals.
-                let type_param_repr = |o: &Object| -> String {
+                let is_ellipsis = |o: &Object| {
+                    matches!(o, Object::Instance(inst)
+                        if Rc::ptr_eq(&inst.cls(), &crate::builtin_types::builtin_types().ellipsis_))
+                };
+                fn type_param_repr(o: &Object) -> String {
+                    let is_ellipsis = |o: &Object| {
+                        matches!(o, Object::Instance(inst)
+                            if Rc::ptr_eq(&inst.cls(), &crate::builtin_types::builtin_types().ellipsis_))
+                    };
                     match o {
                         Object::Type(t) => t.qualified_display_name(),
                         Object::None => "None".to_owned(),
+                        // CPython `ga_repr` renders an Ellipsis argument as
+                        // the literal `...` (`repr(tuple[int, ...])`).
+                        _ if is_ellipsis(o) => "...".to_owned(),
+                        // A list argument (a ParamSpec parameter list,
+                        // `Alias[int, [float, object]]`) reprs each element
+                        // with the same type-expression rule (CPython
+                        // `ga_repr`'s PyList special case). Indexed access
+                        // without holding the borrow: an element's user
+                        // `__repr__` may mutate the list, which CPython
+                        // surfaces as IndexError (gh-143823,
+                        // test_genericalias.test_evil_repr3).
+                        Object::List(items) => {
+                            let len = items.borrow().len();
+                            let mut parts: Vec<String> = Vec::with_capacity(len);
+                            for idx in 0..len {
+                                let item = items.borrow().get(idx).cloned();
+                                match item {
+                                    Some(it) => parts.push(type_param_repr(&it)),
+                                    None => {
+                                        stash_repr_error(crate::error::index_error(
+                                            "list index out of range".to_owned(),
+                                        ));
+                                        break;
+                                    }
+                                }
+                            }
+                            format!("[{}]", parts.join(", "))
+                        }
                         other => other.repr(),
                     }
-                };
+                }
                 let args = dict.get(&DictKey(Object::from_static("__args__"))).cloned();
                 if dict
                     .get(&DictKey(Object::from_static("__is_pep604_union__")))
                     .is_some()
                 {
                     if let Some(Object::Tuple(items)) = &args {
-                        let parts: Vec<String> = items.iter().map(type_param_repr).collect();
+                        // CPython's `union_repr` prints `NoneType` as
+                        // `None` (`repr(int | None)` == "int | None");
+                        // `GenericAlias` repr does not.
+                        let parts: Vec<String> = items
+                            .iter()
+                            .map(|o| match o {
+                                Object::Type(t) if t.name == "NoneType" => "None".to_owned(),
+                                other => type_param_repr(other),
+                            })
+                            .collect();
                         return parts.join(" | ");
                     }
                 }
                 if let (Some(origin), Some(Object::Tuple(items))) =
                     (dict.get(&DictKey(Object::from_static("__origin__"))), &args)
                 {
+                    // The PEP 646 starred form (`__unpacked__ = True`, what
+                    // `iter(tuple[str])` yields) reprs with a `*` prefix
+                    // (CPython `ga_repr`: `*tuple[str]`).
+                    let star = if matches!(
+                        dict.get(&DictKey(Object::from_static("__unpacked__"))),
+                        Some(Object::Bool(true))
+                    ) {
+                        "*"
+                    } else {
+                        ""
+                    };
+                    // `collections.abc.Callable[...]` stores its args
+                    // *flattened* `(arg1, .., argN, ret)`; the repr restores
+                    // the CPython `_CallableGenericAlias` bracket form
+                    // `Callable[[arg1, .., argN], ret]` unless the parameter
+                    // slot is `...`/a ParamSpec (which reprs bare).
+                    let is_param_expr = |o: &Object| {
+                        is_ellipsis(o)
+                            || matches!(o, Object::Instance(inst)
+                            if inst.cls().mro.borrow().iter().any(|t| matches!(
+                                t.name.as_str(),
+                                "ParamSpec" | "_ConcatenateGenericAlias"
+                            )))
+                    };
+                    if matches!(origin, Object::Type(t) if t.name == "Callable")
+                        && !items.is_empty()
+                        && !(items.len() == 2 && is_param_expr(&items[0]))
+                    {
+                        let (ret, params) = items.split_last().expect("non-empty args");
+                        let parts: Vec<String> = params.iter().map(type_param_repr).collect();
+                        return format!(
+                            "{}{}[[{}], {}]",
+                            star,
+                            type_param_repr(origin),
+                            parts.join(", "),
+                            type_param_repr(ret)
+                        );
+                    }
+                    // CPython `ga_repr` writes a literal `()` for an
+                    // empty args tuple (`repr(list[()])` == "list[()]").
+                    if items.is_empty() {
+                        return format!("{}{}[()]", star, type_param_repr(origin));
+                    }
                     let parts: Vec<String> = items.iter().map(type_param_repr).collect();
-                    return format!("{}[{}]", type_param_repr(origin), parts.join(", "));
+                    return format!("{}{}[{}]", star, type_param_repr(origin), parts.join(", "));
                 }
                 let parts: Vec<String> = dict
                     .iter()
@@ -8142,7 +8279,44 @@ pub(crate) fn identity_hash(obj: &Object) -> i64 {
         Object::Frame(r) => rot(Rc::as_ptr(r).cast()),
         Object::Traceback(r) => rot(Rc::as_ptr(r).cast()),
         Object::MemoryView(r) => rot(Rc::as_ptr(r).cast()),
-        Object::SimpleNamespace(r) => rot(Rc::as_ptr(r).cast()),
+        // A PEP 585 generic alias hashes by *value* (CPython `ga_hash`:
+        // `hash(__origin__) ^ hash(__args__)`), keeping hash consistent
+        // with `eq_value`'s content comparison so `{Callable[[int], int],
+        // Callable[[int], int]}` dedups. Plain namespaces keep identity.
+        Object::SimpleNamespace(r) => {
+            let d = r.borrow();
+            let is_union = d
+                .get(&DictKey(Object::from_static("__is_pep604_union__")))
+                .is_some();
+            let origin = d.get(&DictKey(Object::from_static("__origin__")));
+            let args = d.get(&DictKey(Object::from_static("__args__")));
+            if is_union {
+                // CPython `union_hash`: hash of the frozenset of args, so
+                // `int | str` and `str | int` collide as required by `==`.
+                let mut acc: i64 = 0;
+                if let Some(Object::Tuple(items)) = args {
+                    for it in items.iter() {
+                        acc ^= py_hash_value(it).unwrap_or_else(|| identity_hash(it));
+                    }
+                }
+                if acc == -1 {
+                    -2
+                } else {
+                    acc
+                }
+            } else if let (Some(origin), Some(args)) = (origin, args) {
+                let h1 = py_hash_value(origin).unwrap_or_else(|| identity_hash(origin));
+                let h2 = py_hash_value(args).unwrap_or_else(|| identity_hash(args));
+                let v = h1 ^ h2;
+                if v == -1 {
+                    -2
+                } else {
+                    v
+                }
+            } else {
+                rot(Rc::as_ptr(r).cast())
+            }
+        }
         Object::LazyIter(r) => rot(Rc::as_ptr(r).cast()),
         Object::Capsule(r) => rot(Rc::as_ptr(r).cast()),
         // Identity hash keyed on the foreign `PyObject*` (matches the
@@ -8233,6 +8407,16 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
         Object::Tuple(items) => {
             let lanes: Vec<i64> = items
                 .iter()
+                .map(|x| py_hash_value(x).unwrap_or_else(|| identity_hash(x)))
+                .collect();
+            Some(combine_tuple_hash(&lanes))
+        }
+        // Slices hash since 3.12 (gh-101335): CPython `slicehash` builds
+        // the `(start, stop, step)` tuple and hashes that. Unhashable
+        // members are rejected earlier by `ensure_hashable`.
+        Object::Slice(s) => {
+            let lanes: Vec<i64> = [&s.start, &s.stop, &s.step]
+                .into_iter()
                 .map(|x| py_hash_value(x).unwrap_or_else(|| identity_hash(x)))
                 .collect();
             Some(combine_tuple_hash(&lanes))

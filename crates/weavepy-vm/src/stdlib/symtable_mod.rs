@@ -394,6 +394,7 @@ impl Builder {
                 target,
                 annotation,
                 value,
+                ..
             } => {
                 if let past::ExprKind::Name(n) = &target.kind {
                     self.add_def(n, DEF_ANNOT);
@@ -605,7 +606,7 @@ impl Builder {
                     self.bind_target(target);
                 }
             }
-            E::Lambda { args, body } => {
+            E::Lambda { args, body } | E::TypeParamFn { args, body } => {
                 self.visit_defaults_and_annotations(args, false);
                 self.enter(BlockType::Function, "lambda", self.lineno(span));
                 self.add_params(args);

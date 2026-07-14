@@ -984,8 +984,20 @@ fn compute_c3(
             }
         }
         let Some(c) = chosen else {
+            // CPython `set_mro_error`: list each unmerged list's *head*
+            // by `__name__`, in first-appearance order, deduplicated.
+            let _ = name;
+            let mut seen: Vec<String> = Vec::new();
+            for list in &lists {
+                if let Some(t) = list.first() {
+                    if !seen.iter().any(|n| n == &t.name) {
+                        seen.push(t.name.clone());
+                    }
+                }
+            }
             return Err(type_error(format!(
-                "Cannot create a consistent method resolution order (MRO) for bases of '{name}'"
+                "Cannot create a consistent method resolution order (MRO) for bases {}",
+                seen.join(", ")
             )));
         };
         merged.push(c.clone());

@@ -266,6 +266,62 @@ class _EnumerateIter:
         return (enumerate, (self._it, self._index))
 
 
+class _ReversedIter:
+    """Lazy ``reversed(seq)`` over a user sequence — CPython's
+    ``reversedobject``.
+
+    Holds the *live* sequence and a descending cursor; ``__len__`` is
+    consulted once at construction and again by ``__length_hint__``
+    (test_enumerate.TestReversed.test_len relies on the second, live
+    call — a ``__len__`` that starts raising must propagate).
+    """
+
+    __slots__ = ("_seq", "_index")
+
+    def __init__(self, seq):
+        self._seq = seq
+        self._index = len(seq) - 1
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        seq = self._seq
+        index = self._index
+        if seq is None or index < 0:
+            self._seq = None
+            raise StopIteration
+        try:
+            item = seq[index]
+        except (IndexError, StopIteration):
+            # CPython's reversedobject clears it_seq on both.
+            self._seq = None
+            raise StopIteration
+        self._index = index - 1
+        return item
+
+    def __length_hint__(self):
+        # CPython `reversed___length_hint___impl`: a detached iterator
+        # hints 0; otherwise re-measure the live sequence (errors from
+        # its `__len__` propagate) and clamp to the remaining span.
+        if self._seq is None:
+            return 0
+        position = self._index + 1
+        if len(self._seq) < position:
+            return 0
+        return position
+
+    def __reduce__(self):
+        if self._seq is None:
+            return (reversed, ([],))
+        return (reversed, (self._seq,), self._index)
+
+    def __setstate__(self, state):
+        if state < -1:
+            state = -1
+        self._index = state
+
+
 def _zip_arg_range(count):
     """`argument 1` / `arguments 1-N` phrasing of zip-strict errors."""
     return "argument 1" if count == 1 else f"arguments 1-{count}"

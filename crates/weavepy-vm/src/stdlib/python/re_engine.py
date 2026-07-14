@@ -90,6 +90,11 @@ class Pattern:
     # `types.GenericAlias` (CPython exposes this on the C `Pattern` type).
     __class_getitem__ = classmethod(_GenericAlias)
 
+    # CPython's C `re.Pattern` is final (no Py_TPFLAGS_BASETYPE);
+    # subclassing must raise the canonical `best_base` TypeError.
+    def __init_subclass__(cls, /, **kwargs):
+        raise TypeError("type 're.Pattern' is not an acceptable base type")
+
     def __init__(self, handle, pattern, flags, groups, groupindex, indexgroup):
         self._handle = handle
         self.pattern = pattern
@@ -301,6 +306,11 @@ class Match:
 
     # PEP 585: `re.Match[str]` / `re.Match[bytes]` yield a `types.GenericAlias`.
     __class_getitem__ = classmethod(_GenericAlias)
+
+    # CPython's C `re.Match` is final (no Py_TPFLAGS_BASETYPE);
+    # subclassing must raise the canonical `best_base` TypeError.
+    def __init_subclass__(cls, /, **kwargs):
+        raise TypeError("type 're.Match' is not an acceptable base type")
 
     def __init__(self, pattern, string, pos, endpos, r):
         self.re = pattern

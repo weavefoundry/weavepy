@@ -822,6 +822,13 @@ def _create_array_type(element_type, length):
 
 
 class Array(_CData, metaclass=_ArrayType):
+    def __class_getitem__(cls, item):
+        # CPython's `ctypes.Array` exposes `__class_getitem__ =
+        # Py_GenericAlias` (test_genericalias generic_types sweep).
+        import types
+
+        return types.GenericAlias(cls, item)
+
     def __init__(self, *args):
         if args:
             for i, val in enumerate(args):

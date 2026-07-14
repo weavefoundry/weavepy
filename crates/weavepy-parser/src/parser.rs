@@ -16,7 +16,8 @@ use weavepy_lexer::{Keyword, Span, Token, TokenKind};
 
 use crate::ast::{
     Alias, Arg, Arguments, BinOp, BoolOp, CmpOp, Comprehension, Constant, ExceptHandler, Expr,
-    ExprKind, Keyword as KwArg, MatchCase, Module, Pattern, Stmt, StmtKind, UnaryOp, WithItem,
+    ExprKind, Keyword as KwArg, MatchCase, Module, Pattern, Stmt, StmtKind, TypeParam,
+    TypeParamKind, UnaryOp, WithItem,
 };
 use crate::error::ParseError;
 
@@ -511,6 +512,7 @@ impl<'src> Parser<'src> {
         let type_params = self.collect_pep695_type_params()?;
         self.expect(&TokenKind::Equal, "`=`")?;
         let value = self.parse_expression_list(true)?;
+        check_type_param_expr(&value, "a type alias")?;
         self.consume_stmt_end()?;
         let span = type_tok.span.merge(value.span);
         let target = Expr {
@@ -527,34 +529,125 @@ impl<'src> Parser<'src> {
         })
     }
 
-    /// Swallows a PEP 695 `[T, *Ts, **P]` type-parameter list after a
-    /// `def`/`class`/`type` name and returns the captured parameter names.
-    fn collect_pep695_type_params(&mut self) -> Result<Vec<String>, ParseError> {
+    /// Parses a PEP 695 `[T, T: bound, *Ts, **P, X = default]`
+    /// type-parameter list after a `def`/`class`/`type` name.
+    fn collect_pep695_type_params(&mut self) -> Result<Vec<TypeParam>, ParseError> {
         if !matches!(self.peek(), TokenKind::LSqb) {
             return Ok(Vec::new());
         }
         self.bump(); // `[`
-        let mut names = Vec::new();
+        let mut params: Vec<TypeParam> = Vec::new();
+        let mut seen_default = false;
         loop {
             self.skip_trivia();
-            // Allow `*Ts` and `**P` prefixes — discard the prefix.
-            while matches!(self.peek(), TokenKind::Star | TokenKind::DoubleStar) {
-                self.bump();
-            }
+            let kind_prefix = match self.peek() {
+                TokenKind::Star => {
+                    self.bump();
+                    Some(TypeParamKind::TypeVarTuple)
+                }
+                TokenKind::DoubleStar => {
+                    self.bump();
+                    Some(TypeParamKind::ParamSpec)
+                }
+                _ => None,
+            };
             if matches!(self.peek(), TokenKind::RSqb) {
+                if kind_prefix.is_some() {
+                    return Err(ParseError::Unexpected {
+                        span: self.peek_token().span,
+                        message: "invalid syntax".to_owned(),
+                    });
+                }
                 break;
             }
             let name_tok = self.expect(&TokenKind::Name, "type parameter name")?;
-            names.push(self.ident(name_tok.span));
-            // Skip optional `: bound` and `= default`.
-            if matches!(self.peek(), TokenKind::Colon) {
-                self.bump();
-                let _ = self.parse_expression(false)?;
+            let name = self.ident(name_tok.span);
+            if params.iter().any(|p| p.source_name == name) {
+                return Err(ParseError::Unexpected {
+                    span: name_tok.span,
+                    message: format!("duplicate type parameter '{name}'"),
+                });
             }
-            if matches!(self.peek(), TokenKind::Equal) {
+            // `: bound` — legal only for plain TypeVars (CPython's
+            // grammar rejects bounds on `*Ts` / `**P`).
+            let bound = if matches!(self.peek(), TokenKind::Colon) {
                 self.bump();
-                let _ = self.parse_expression(false)?;
-            }
+                let b = self.parse_expression(false)?;
+                if let Some(kind) = &kind_prefix {
+                    let what = if matches!(b.kind, ExprKind::Tuple(_)) {
+                        "constraints"
+                    } else {
+                        "bound"
+                    };
+                    let with = match kind {
+                        TypeParamKind::TypeVarTuple => "TypeVarTuple",
+                        _ => "ParamSpec",
+                    };
+                    return Err(ParseError::Unexpected {
+                        span: name_tok.span,
+                        message: format!("cannot use {what} with {with}"),
+                    });
+                }
+                let ctx = if matches!(b.kind, ExprKind::Tuple(_)) {
+                    "a TypeVar constraint"
+                } else {
+                    "a TypeVar bound"
+                };
+                check_type_param_expr(&b, ctx)?;
+                Some(Box::new(b))
+            } else {
+                None
+            };
+            // PEP 696 `= default`. A starred default (`*Ts = *tuple[int]`)
+            // is grammar for TypeVarTuple only.
+            let default = if matches!(self.peek(), TokenKind::Equal) {
+                self.bump();
+                let starred = if matches!(self.peek(), TokenKind::Star) {
+                    if !matches!(kind_prefix, Some(TypeParamKind::TypeVarTuple)) {
+                        return Err(ParseError::Unexpected {
+                            span: self.peek_token().span,
+                            message: "invalid syntax".to_owned(),
+                        });
+                    }
+                    Some(self.bump().span)
+                } else {
+                    None
+                };
+                let d = self.parse_expression(false)?;
+                let ctx = match kind_prefix {
+                    Some(TypeParamKind::TypeVarTuple) => "a TypeVarTuple default",
+                    Some(_) => "a ParamSpec default",
+                    None => "a TypeVar default",
+                };
+                check_type_param_expr(&d, ctx)?;
+                seen_default = true;
+                let d = match starred {
+                    Some(star_span) => Expr {
+                        span: star_span.merge(d.span),
+                        kind: ExprKind::Starred(Box::new(d)),
+                    },
+                    None => d,
+                };
+                Some(Box::new(d))
+            } else {
+                if seen_default {
+                    return Err(ParseError::Unexpected {
+                        span: name_tok.span,
+                        message: format!(
+                            "non-default type parameter '{name}' follows default type parameter"
+                        ),
+                    });
+                }
+                None
+            };
+            let kind = kind_prefix.unwrap_or(TypeParamKind::TypeVar { bound });
+            params.push(TypeParam {
+                source_name: name.clone(),
+                name,
+                kind,
+                default,
+                span: name_tok.span,
+            });
             if matches!(self.peek(), TokenKind::Comma) {
                 self.bump();
             } else {
@@ -562,7 +655,7 @@ impl<'src> Parser<'src> {
             }
         }
         self.expect(&TokenKind::RSqb, "`]`")?;
-        Ok(names)
+        Ok(params)
     }
 
     /// `match` is a soft keyword. The disambiguating signal is
@@ -693,6 +786,11 @@ impl<'src> Parser<'src> {
     fn parse_simple_statement(&mut self) -> Result<Stmt, ParseError> {
         let start_span = self.peek_token().span;
 
+        // A statement opening with `(` makes any annotation target
+        // non-"simple" (CPython pegen: `('(' single_target ')' | ...) ':'`
+        // sets `simple=0`), even when the inner expression is a bare Name.
+        let starts_with_lpar = matches!(self.peek(), TokenKind::LPar);
+
         // Try to parse an expression first; assignment / aug-assignment
         // / ann-assignment are disambiguated by lookahead.
         let first = self.parse_expression(true)?;
@@ -762,11 +860,13 @@ impl<'src> Parser<'src> {
             };
             let end = self.prev_token_span();
             self.consume_stmt_end()?;
+            let simple = matches!(first.kind, ExprKind::Name(_)) && !starts_with_lpar;
             return Ok(Stmt {
                 kind: StmtKind::AnnAssign {
                     target: first,
                     annotation,
                     value,
+                    simple,
                 },
                 span: start_span.merge(end),
             });
@@ -868,6 +968,26 @@ impl<'src> Parser<'src> {
         } else {
             None
         };
+        // A generic def's annotations evaluate inside the PEP 695
+        // annotation scope, where walrus/yield/await are illegal.
+        if !type_params.is_empty() {
+            let ctx = "the definition of a generic";
+            for arg in args
+                .posonlyargs
+                .iter()
+                .chain(args.args.iter())
+                .chain(args.vararg.iter())
+                .chain(args.kwonlyargs.iter())
+                .chain(args.kwarg.iter())
+            {
+                if let Some(ann) = &arg.annotation {
+                    check_type_param_expr(ann, ctx)?;
+                }
+            }
+            if let Some(r) = &returns {
+                check_type_param_expr(r, ctx)?;
+            }
+        }
         self.expect(&TokenKind::Colon, "`:`")?;
         let body = self.parse_block("function definition", def_tok.span)?;
         let span_end = body.last().map_or(def_tok.span, |s| s.span);
@@ -979,6 +1099,17 @@ impl<'src> Parser<'src> {
         } else {
             (Vec::new(), Vec::new())
         };
+        // A generic class's bases/keywords evaluate inside the PEP 695
+        // annotation scope, where walrus/yield/await are illegal.
+        if !type_params.is_empty() {
+            let ctx = "the definition of a generic";
+            for b in &bases {
+                check_type_param_expr(b, ctx)?;
+            }
+            for k in &keywords {
+                check_type_param_expr(&k.value, ctx)?;
+            }
+        }
         self.expect(&TokenKind::Colon, "`:`")?;
         let body = self.parse_block("class definition", class_tok.span)?;
         let span_end = body.last().map_or(class_tok.span, |s| s.span);
@@ -4368,7 +4499,7 @@ fn remap_expr_spans(e: &mut Expr, map: &dyn Fn(u32) -> u32) {
             remap_expr_spans(target, map);
             remap_expr_spans(value, map);
         }
-        ExprKind::Lambda { args, body } => {
+        ExprKind::Lambda { args, body } | ExprKind::TypeParamFn { args, body } => {
             remap_args(args, map);
             remap_expr_spans(body, map);
         }
@@ -5289,33 +5420,33 @@ fn big_to_i64(b: &num_bigint::BigInt) -> Option<i64> {
 /// Name = __weavepy_type_alias__('Name', (), lambda: body)
 /// ```
 ///
-/// The `__weavepy_type_alias__` intrinsic mints one `TypeVar`-shaped
-/// placeholder per name, records them as `__type_params__`, and only
-/// invokes the thunk (with those placeholders bound to the lambda's
-/// parameters) the first time `Name.__value__` is read. Deferring the
-/// body is what lets numpy's `_typing` aliases — e.g.
-/// `type ArrayLike = Buffer | _DualArrayLike[np.dtype, …]` — be defined
-/// without eagerly building unions / subscripting other aliases.
-fn build_lazy_type_alias(name: &str, body: Expr, names: &[String], span: Span) -> Expr {
-    let args = Arguments {
-        posonlyargs: Vec::new(),
-        args: names
-            .iter()
-            .map(|n| Arg {
-                name: n.clone(),
-                annotation: None,
-                span,
-            })
-            .collect(),
-        vararg: None,
-        kwonlyargs: Vec::new(),
-        kw_defaults: Vec::new(),
-        kwarg: None,
-        defaults: Vec::new(),
-    };
+/// The `__weavepy_type_alias__` intrinsic hands the tuple of real
+/// `_typing` type-parameter objects (built by each `TypeParam`'s
+/// constructor expression, RFC 0051) plus a zero-argument thunk to
+/// `_typing.TypeAliasType`, which only invokes the thunk the first
+/// time `Name.__value__` is read. Deferring the body is what lets
+/// numpy's `_typing` aliases — e.g. `type ArrayLike = Buffer |
+/// _DualArrayLike[np.dtype, …]` — be defined without eagerly building
+/// unions / subscripting other aliases.
+///
+/// A generic alias nests one immediately-invoked lambda per type
+/// parameter (CPython's hidden PEP 695 scope): a later parameter's
+/// lazy bound/default and the value thunk each *close over* the
+/// earlier parameters, so `type A[T, U: T] = X[T, U]` resolves `T` in
+/// `U`'s bound and both names in the body without leaking either into
+/// the enclosing scope:
+///
+/// ```python
+/// A = (lambda T:
+///         (lambda U:
+///             __weavepy_type_alias__('A', (T, U), lambda: X[T, U])
+///         )(<ctor U>)
+///     )(<ctor T>)
+/// ```
+fn build_lazy_type_alias(name: &str, body: Expr, params: &[TypeParam], span: Span) -> Expr {
     let thunk = Expr {
-        kind: ExprKind::Lambda {
-            args,
+        kind: ExprKind::TypeParamFn {
+            args: Arguments::default(),
             body: Box::new(body),
         },
         span,
@@ -5326,17 +5457,17 @@ fn build_lazy_type_alias(name: &str, body: Expr, names: &[String], span: Span) -
     };
     let params_tuple = Expr {
         kind: ExprKind::Tuple(
-            names
+            params
                 .iter()
-                .map(|n| Expr {
-                    kind: ExprKind::Constant(Constant::Str(n.clone())),
+                .map(|p| Expr {
+                    kind: ExprKind::Name(p.name.clone()),
                     span,
                 })
                 .collect(),
         ),
         span,
     };
-    Expr {
+    let mut acc = Expr {
         kind: ExprKind::Call {
             func: Box::new(Expr {
                 kind: ExprKind::Name("__weavepy_type_alias__".to_owned()),
@@ -5346,5 +5477,186 @@ fn build_lazy_type_alias(name: &str, body: Expr, names: &[String], span: Span) -
             keywords: Vec::new(),
         },
         span,
+    };
+    // Wrap innermost-last: each parameter's constructor runs in the
+    // scope of every parameter declared before it. PEP 696 defaults
+    // attach *inside* the binder (after the name is bound) so a
+    // default can reference the parameter itself
+    // (`type X[T = [T for T in [T]]] = T`); the `(<set default>,
+    // <rest>)[1]` tuple sequences the mutation before the inner body.
+    for p in params.iter().rev() {
+        let inner_body = if p.default.is_some() {
+            let set_default = p.apply_default_expr(Expr {
+                kind: ExprKind::Name(p.name.clone()),
+                span,
+            });
+            Expr {
+                kind: ExprKind::Subscript {
+                    value: Box::new(Expr {
+                        kind: ExprKind::Tuple(vec![set_default, acc]),
+                        span,
+                    }),
+                    slice: Box::new(Expr {
+                        kind: ExprKind::Constant(Constant::Int(1)),
+                        span,
+                    }),
+                },
+                span,
+            }
+        } else {
+            acc
+        };
+        let binder = Expr {
+            kind: ExprKind::TypeParamFn {
+                args: Arguments {
+                    args: vec![Arg {
+                        name: p.name.clone(),
+                        annotation: None,
+                        span,
+                    }],
+                    ..Arguments::default()
+                },
+                body: Box::new(inner_body),
+            },
+            span,
+        };
+        acc = Expr {
+            kind: ExprKind::Call {
+                func: Box::new(binder),
+                args: vec![p.constructor_expr()],
+                keywords: Vec::new(),
+            },
+            span,
+        };
     }
+    acc
+}
+
+/// PEP 695 annotation scopes (type-parameter bounds/constraints/
+/// defaults, `type` alias values, and the header of a generic
+/// `def`/`class`) reject `yield`, `yield from`, `await`, and the
+/// walrus operator (CPython symtable's TypeVarBound/TypeAlias/
+/// TypeParam block checks). Lambda *bodies* are ordinary function
+/// scopes and are exempt (their defaults still evaluate here).
+pub(crate) fn check_type_param_expr(e: &Expr, ctx: &str) -> Result<(), ParseError> {
+    let err = |what: &str, span: Span| -> Result<(), ParseError> {
+        Err(ParseError::Unexpected {
+            span,
+            message: format!("{what} cannot be used within {ctx}"),
+        })
+    };
+    match &e.kind {
+        ExprKind::Yield(_) | ExprKind::YieldFrom(_) => return err("yield expression", e.span),
+        ExprKind::Await(_) => return err("await expression", e.span),
+        ExprKind::NamedExpr { .. } => return err("named expression", e.span),
+        ExprKind::Lambda { args, .. } | ExprKind::TypeParamFn { args, .. } => {
+            for d in args
+                .defaults
+                .iter()
+                .chain(args.kw_defaults.iter().flatten())
+            {
+                check_type_param_expr(d, ctx)?;
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+    for child in expr_children(e) {
+        check_type_param_expr(child, ctx)?;
+    }
+    Ok(())
+}
+
+/// Immediate sub-expressions of `e`, for read-only traversal.
+fn expr_children(e: &Expr) -> Vec<&Expr> {
+    let mut out: Vec<&Expr> = Vec::new();
+    match &e.kind {
+        ExprKind::Constant(_) | ExprKind::Name(_) => {}
+        ExprKind::Attribute { value, .. } => out.push(value),
+        ExprKind::Subscript { value, slice } => {
+            out.push(value);
+            out.push(slice);
+        }
+        ExprKind::Slice { lower, upper, step } => {
+            out.extend(lower.as_deref());
+            out.extend(upper.as_deref());
+            out.extend(step.as_deref());
+        }
+        ExprKind::BinOp { left, right, .. } => {
+            out.push(left);
+            out.push(right);
+        }
+        ExprKind::BoolOp { values, .. } => out.extend(values.iter()),
+        ExprKind::UnaryOp { operand, .. } => out.push(operand),
+        ExprKind::Compare {
+            left, comparators, ..
+        } => {
+            out.push(left);
+            out.extend(comparators.iter());
+        }
+        ExprKind::IfExp { test, body, orelse } => {
+            out.push(test);
+            out.push(body);
+            out.push(orelse);
+        }
+        ExprKind::NamedExpr { target, value } => {
+            out.push(target);
+            out.push(value);
+        }
+        ExprKind::Call {
+            func,
+            args,
+            keywords,
+        } => {
+            out.push(func);
+            out.extend(args.iter());
+            out.extend(keywords.iter().map(|k| &k.value));
+        }
+        ExprKind::Lambda { args, body } | ExprKind::TypeParamFn { args, body } => {
+            out.extend(args.defaults.iter());
+            out.extend(args.kw_defaults.iter().flatten());
+            out.push(body);
+        }
+        ExprKind::Tuple(items) | ExprKind::List(items) | ExprKind::Set(items) => {
+            out.extend(items.iter());
+        }
+        ExprKind::Dict { keys, values } => {
+            out.extend(keys.iter().flatten());
+            out.extend(values.iter());
+        }
+        ExprKind::ListComp { elt, generators }
+        | ExprKind::SetComp { elt, generators }
+        | ExprKind::GeneratorExp { elt, generators } => {
+            out.push(elt);
+            for g in generators {
+                out.push(&g.target);
+                out.push(&g.iter);
+                out.extend(g.ifs.iter());
+            }
+        }
+        ExprKind::DictComp {
+            key,
+            value,
+            generators,
+        } => {
+            out.push(key);
+            out.push(value);
+            for g in generators {
+                out.push(&g.target);
+                out.push(&g.iter);
+                out.extend(g.ifs.iter());
+            }
+        }
+        ExprKind::Starred(inner) => out.push(inner),
+        ExprKind::Yield(v) => out.extend(v.as_deref()),
+        ExprKind::YieldFrom(v) | ExprKind::Await(v) => out.push(v),
+        ExprKind::JoinedStr(parts) => out.extend(parts.iter()),
+        ExprKind::FormattedValue {
+            value, format_spec, ..
+        } => {
+            out.push(value);
+            out.extend(format_spec.as_deref());
+        }
+    }
+    out
 }

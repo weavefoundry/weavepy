@@ -2973,6 +2973,24 @@ pub(crate) fn dir_entry_type() -> Rc<crate::types::TypeObject> {
                 })),
             );
         }
+        // `os.DirEntry[str]` → `types.GenericAlias` (CPython's C DirEntry
+        // exposes `__class_getitem__ = Py_GenericAlias`;
+        // test_genericalias generic_types sweep).
+        dict.insert(
+            DictKey(Object::from_static("__class_getitem__")),
+            Object::ClassMethod(crate::object::MethodWrapper::new(Object::Builtin(Rc::new(
+                crate::object::BuiltinFn {
+                    name: "__class_getitem__",
+                    binds_instance: true,
+                    call: Box::new(|args| {
+                        let origin = args.first().cloned().unwrap_or(Object::None);
+                        let params = args.get(1).cloned().unwrap_or(Object::None);
+                        Ok(crate::make_generic_alias_public(origin, params))
+                    }),
+                    call_kw: None,
+                },
+            )))),
+        );
         let cls = TypeObject::new_user("DirEntry", vec![bt.object_.clone()], dict)
             .expect("DirEntry type");
         *slot.borrow_mut() = Some(cls.clone());

@@ -52,7 +52,99 @@ pub fn install(bt: &BuiltinTypes) {
     install_value_reprs(bt);
     install_numeric_dunders(bt);
     install_immutable_getnewargs(bt);
+    install_supports_dunders(bt);
+    install_type_checks(bt);
     register_descriptor_kinds(bt);
+}
+
+/// The conversion dunders the `typing.Supports*` protocols probe for via
+/// `attr in base.__dict__` (`__bytes__`, `__complex__`, `__round__`);
+/// CPython stores them as `tp_methods` entries in the type dicts. The
+/// implementations already exist in the `lookup_method` tables.
+fn install_supports_dunders(bt: &BuiltinTypes) {
+    install_named_methods(&bt.bytes_, "bytes", &["__bytes__"]);
+    install_named_methods(&bt.complex_, "complex", &["__complex__"]);
+    install_named_methods(
+        &bt.float_,
+        "float",
+        &["__round__", "__trunc__", "__floor__", "__ceil__"],
+    );
+    install_named_methods(
+        &bt.int_,
+        "int",
+        &[
+            "__round__",
+            "__trunc__",
+            "__floor__",
+            "__ceil__",
+            "__index__",
+        ],
+    );
+}
+
+/// `type.__instancecheck__` / `type.__subclasscheck__` — the *default*
+/// slot wrappers every metaclass override chains up to
+/// (`super().__instancecheck__(obj)` in typing's `_AnyMeta`,
+/// `type.__subclasscheck__(cls, other)` in `_ProtocolMeta`). They run the
+/// plain check, never the metaclass hook (that is exactly what makes the
+/// super-call terminate).
+fn install_type_checks(bt: &BuiltinTypes) {
+    fn type_instancecheck(args: &[Object]) -> Result<Object, RuntimeError> {
+        let (cls, obj) = match args {
+            [c, o] => (c, o),
+            _ => {
+                return Err(type_error(format!(
+                    "__instancecheck__() takes exactly one argument ({} given)",
+                    args.len().saturating_sub(1)
+                )))
+            }
+        };
+        let Object::Type(ty) = cls else {
+            return Err(type_error(
+                "descriptor '__instancecheck__' requires a 'type' object".to_owned(),
+            ));
+        };
+        if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+            // SAFETY: published by an enclosing VM frame on this thread.
+            let interp = unsafe { &mut *ptr };
+            return interp.recursive_isinstance_type(obj, ty);
+        }
+        Ok(Object::Bool(
+            crate::builtins::class_of(obj).is_subclass_of(ty),
+        ))
+    }
+    fn type_subclasscheck(args: &[Object]) -> Result<Object, RuntimeError> {
+        let (cls, derived) = match args {
+            [c, d] => (c, d),
+            _ => {
+                return Err(type_error(format!(
+                    "__subclasscheck__() takes exactly one argument ({} given)",
+                    args.len().saturating_sub(1)
+                )))
+            }
+        };
+        let Object::Type(ty) = cls else {
+            return Err(type_error(
+                "descriptor '__subclasscheck__' requires a 'type' object".to_owned(),
+            ));
+        };
+        match derived {
+            Object::Type(d) => Ok(Object::Bool(d.is_subclass_of(ty))),
+            // CPython `recursive_issubclass`: a non-type first argument must
+            // still look like a class (expose `__bases__`).
+            _ => Err(type_error("issubclass() arg 1 must be a class".to_owned())),
+        }
+    }
+    insert_if_absent(
+        &bt.type_,
+        "__instancecheck__",
+        builtin("__instancecheck__", type_instancecheck),
+    );
+    insert_if_absent(
+        &bt.type_,
+        "__subclasscheck__",
+        builtin("__subclasscheck__", type_subclasscheck),
+    );
 }
 
 /// Tag every `Object::Builtin` sitting in a built-in type's own dict as a
@@ -1315,13 +1407,17 @@ fn class_getitem_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn install_class_getitem(bt: &BuiltinTypes) {
+    // `type` is deliberately absent: CPython special-cases `type[int]`
+    // inside `PyObject_GetItem` without exposing a `__class_getitem__`
+    // method — a metaclass like `class MyType(type)` must NOT inherit
+    // subscriptability (test_genericalias.test_type_subclass_generic).
+    // The VM's subscription fallback handles `type` by name.
     for ty in [
         &bt.list_,
         &bt.tuple_,
         &bt.dict_,
         &bt.set_,
         &bt.frozenset_,
-        &bt.type_,
         // PEP 654 groups expose `__class_getitem__` in CPython (C
         // `Py_GenericAlias`), e.g. `BaseExceptionGroup[T]` in hypothesis.
         &bt.base_exception_group,

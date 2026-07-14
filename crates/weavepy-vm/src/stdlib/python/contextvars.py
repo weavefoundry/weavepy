@@ -28,6 +28,8 @@ class Token:
 
     __slots__ = ("_var", "_old", "_used")
 
+    __class_getitem__ = classmethod(_GenericAlias)
+
     def __init__(self, var, old):
         self._var = var
         self._old = old

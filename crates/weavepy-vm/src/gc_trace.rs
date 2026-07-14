@@ -1214,7 +1214,8 @@ impl GcState {
                         Object::Iter(_)
                         | Object::Tuple(_)
                         | Object::FrozenSet(_)
-                        | Object::DictView(_) => true,
+                        | Object::DictView(_)
+                        | Object::Slice(_) => true,
                         Object::List(_) => parent_is_iter,
                         _ => false,
                     };
@@ -1723,6 +1724,8 @@ pub fn strong_count_for(obj: &Object) -> usize {
         Object::Code(c) => Rc::strong_count(c),
         // Tracked only when user attributes give it cycle-capable edges.
         Object::File(f) => Rc::strong_count(f),
+        // Promoted transiently when a cycle routes through one.
+        Object::Slice(s) => Rc::strong_count(s),
         // Leaf types — no internal refs to trace.
         _ => 1,
     }

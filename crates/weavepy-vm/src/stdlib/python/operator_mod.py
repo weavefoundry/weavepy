@@ -102,6 +102,20 @@ def index(a):
         raise TypeError(
             "__index__ returned non-int (type %s)" % type(result).__name__
         )
+    if type(result) is not int:
+        # CPython ``PyNumber_Index``: a strict int subclass (bool
+        # included) is accepted with a DeprecationWarning and unwrapped
+        # to a true int.
+        import warnings
+        warnings.warn(
+            "__index__ returned non-int (type %s).  "
+            "The ability to return an instance of a strict subclass of "
+            "int is deprecated, and may be removed in a future version "
+            "of Python." % type(result).__name__,
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        result = int(result)
     return result
 
 def inv(a):
