@@ -15,8 +15,11 @@
 //! are mangled against their own (innermost) class name when their own
 //! body is compiled.
 
+use std::collections::HashSet;
+
 use weavepy_parser::ast::{
     Arguments, Comprehension, ExceptHandler, Expr, ExprKind, MatchCase, Pattern, Stmt, StmtKind,
+    TypeParamKind,
 };
 
 /// Recover the source spelling of a binding that was mangled against
@@ -42,15 +45,61 @@ pub(crate) fn mangle_class_body(class_name: &str, body: &mut [Stmt]) {
     }
     let m = Mangler {
         prefix: format!("_{stripped}"),
+        skip: HashSet::new(),
+        only: None,
     };
     for s in body {
         m.stmt(s);
     }
 }
 
+/// Mangle a single identifier against `class_name` (`_Py_Mangle` for
+/// one name). Used by the PEP 695 hidden-scope lowering: a *class's*
+/// type parameters bind mangled against the class's own name
+/// (`class Foo[__T]` binds `_Foo__T`) even outside any class body.
+pub(crate) fn mangle_ident(class_name: &str, ident: &str) -> String {
+    let stripped = class_name.trim_start_matches('_');
+    if stripped.is_empty()
+        || !ident.starts_with("__")
+        || ident.ends_with("__")
+        || ident.contains('.')
+    {
+        return ident.to_owned();
+    }
+    format!("_{stripped}{ident}")
+}
+
+/// Rewrite only the identifiers in `names` within `expr`, mangling
+/// them against `class_name`. The PEP 695 hidden-scope lowering uses
+/// this on a generic class's header expressions (bases, keywords, and
+/// type-parameter bounds/defaults evaluate inside the hidden scope,
+/// where references to the class's own — mangled — type parameters
+/// must follow the binding rename).
+pub(crate) fn mangle_only_in_expr(class_name: &str, names: &HashSet<String>, expr: &mut Expr) {
+    let stripped = class_name.trim_start_matches('_');
+    if stripped.is_empty() {
+        return;
+    }
+    let m = Mangler {
+        prefix: format!("_{stripped}"),
+        skip: HashSet::new(),
+        only: Some(names.clone()),
+    };
+    m.expr(expr);
+}
+
 struct Mangler {
     /// `_ClassName` (leading underscores of the class name stripped).
     prefix: String,
+    /// Names exempt from this pass. Used for a nested generic class's
+    /// own PEP 695 type parameters: those mangle against the *nested*
+    /// class's name (CPython mangles `class Foo[__T]`'s binding to
+    /// `_Foo__T` even at module level), which the compiler's hidden-
+    /// scope lowering applies when the nested class itself compiles.
+    skip: HashSet<String>,
+    /// When set, mangle *only* these identifiers (the inverse of
+    /// `skip`) — the [`mangle_only_in_expr`] targeted-rename mode.
+    only: Option<HashSet<String>>,
 }
 
 impl Mangler {
@@ -62,6 +111,14 @@ impl Mangler {
         }
         if ident.ends_with("__") || ident.contains('.') {
             return;
+        }
+        if self.skip.contains(ident.as_str()) {
+            return;
+        }
+        if let Some(only) = &self.only {
+            if !only.contains(ident.as_str()) {
+                return;
+            }
         }
         *ident = format!("{}{}", self.prefix, ident);
     }
@@ -79,21 +136,34 @@ impl Mangler {
                 args,
                 body,
                 decorator_list,
+                type_params,
                 returns,
-                ..
             }
             | StmtKind::AsyncFunctionDef {
                 name,
                 args,
                 body,
                 decorator_list,
+                type_params,
                 returns,
-                ..
             } => {
                 // The *binding* is mangled; the compiler demangles for
                 // `__name__`/`__qualname__` (CPython keeps those
                 // unmangled — see `demangle_name`).
                 self.name(name);
+                // A *function's* PEP 695 type parameters mangle against
+                // the enclosing class (CPython binds `def meth[__U]`
+                // inside `Outer` as `_Outer__U`; the TypeVar's
+                // `__name__` is demangled back at lowering time).
+                for tp in type_params {
+                    self.name(&mut tp.name);
+                    if let TypeParamKind::TypeVar { bound: Some(b) } = &mut tp.kind {
+                        self.expr(b);
+                    }
+                    if let Some(d) = &mut tp.default {
+                        self.expr(d);
+                    }
+                }
                 self.arguments(args);
                 for d in decorator_list {
                     self.expr(d);
@@ -110,6 +180,7 @@ impl Mangler {
                 bases,
                 keywords,
                 decorator_list,
+                type_params,
                 ..
             } => {
                 // The binding is mangled (demangled again for display
@@ -117,14 +188,35 @@ impl Mangler {
                 // class's own name when its `build_class_body` runs —
                 // don't descend here.
                 self.name(name);
-                for b in bases {
-                    self.expr(b);
-                }
-                for k in keywords {
-                    self.expr(&mut k.value);
-                }
                 for d in decorator_list {
                     self.expr(d);
+                }
+                // A *class's* type parameters mangle against the class
+                // itself (CPython: `class Foo[__T]` binds `_Foo__T`
+                // even at module level) — applied by the compiler's
+                // hidden-scope lowering, so this pass must leave the
+                // parameter names (and references to them in the
+                // header, which evaluates inside the hidden scope)
+                // untouched.
+                let own: HashSet<String> = type_params.iter().map(|tp| tp.name.clone()).collect();
+                let sub = Mangler {
+                    prefix: self.prefix.clone(),
+                    skip: self.skip.union(&own).cloned().collect(),
+                    only: self.only.clone(),
+                };
+                for tp in type_params {
+                    if let TypeParamKind::TypeVar { bound: Some(b) } = &mut tp.kind {
+                        sub.expr(b);
+                    }
+                    if let Some(d) = &mut tp.default {
+                        sub.expr(d);
+                    }
+                }
+                for b in bases {
+                    sub.expr(b);
+                }
+                for k in keywords {
+                    sub.expr(&mut k.value);
                 }
             }
             StmtKind::Return(v) => {
@@ -146,6 +238,7 @@ impl Mangler {
                 target,
                 annotation,
                 value,
+                ..
             } => {
                 self.expr(target);
                 self.expr(annotation);
@@ -409,7 +502,7 @@ impl Mangler {
                 self.expr(target);
                 self.expr(value);
             }
-            ExprKind::Lambda { args, body } => {
+            ExprKind::Lambda { args, body } | ExprKind::TypeParamFn { args, body } => {
                 self.arguments(args);
                 self.expr(body);
             }

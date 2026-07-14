@@ -619,9 +619,17 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/dataclasses.py"),
             is_package: false,
         },
+        // RFC 0051: CPython's verbatim `Lib/typing.py` over the
+        // pure-Python `_typing` support module (the C accelerator
+        // surface from `Objects/typevarobject.c`, re-implemented).
         FrozenSource {
             name: "typing",
             source: include_str!("python/typing.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_typing",
+            source: include_str!("python/_typing.py"),
             is_package: false,
         },
         FrozenSource {
@@ -2341,6 +2349,28 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "copyreg",
             source: include_str!("python/copyreg.py"),
+            is_package: false,
+        },
+        // CPython 3.13 `Lib/graphlib.py`, adopted verbatim (RFC 0051):
+        // pure Python, no C accelerator, used by `test_genericalias`.
+        FrozenSource {
+            name: "graphlib",
+            source: include_str!("python/graphlib.py"),
+            is_package: false,
+        },
+        // CPython 3.13 `Lib/mailbox.py`, adopted verbatim (RFC 0051):
+        // pure Python over the already-frozen `email` package; `fcntl`
+        // is an optional import it guards itself.
+        FrozenSource {
+            name: "mailbox",
+            source: include_str!("python/mailbox.py"),
+            is_package: false,
+        },
+        // CPython 3.13 `Lib/filecmp.py`, adopted verbatim (RFC 0051):
+        // pure Python over `os`/`stat`/`itertools`.
+        FrozenSource {
+            name: "filecmp",
+            source: include_str!("python/filecmp.py"),
             is_package: false,
         },
         FrozenSource {

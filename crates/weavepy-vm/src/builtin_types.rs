@@ -47,6 +47,11 @@ pub struct BuiltinTypes {
     pub dict_values_: Rc<TypeObject>,
     pub dict_items_: Rc<TypeObject>,
     pub iterator_: Rc<TypeObject>,
+    /// `enumerate` — a real type in CPython (`type(enumerate([])) is
+    /// enumerate`, subclassable, PEP 585 generic).
+    pub enumerate_: Rc<TypeObject>,
+    /// `reversed` — likewise a real type in CPython.
+    pub reversed_: Rc<TypeObject>,
     pub none_type: Rc<TypeObject>,
     pub ellipsis_: Rc<TypeObject>,
     pub not_implemented_type_: Rc<TypeObject>,
@@ -234,10 +239,67 @@ impl BuiltinTypes {
         let dict_keys_ = mk("dict_keys", vec![object_.clone()]);
         let dict_values_ = mk("dict_values", vec![object_.clone()]);
         let dict_items_ = mk("dict_items", vec![object_.clone()]);
+        // The view types have no `tp_new` in CPython — calling
+        // `type({}.keys())(...)` raises "cannot create ... instances"
+        // (test_dictviews.test_constructors_not_callable). Same for the
+        // pickle/copy path: views are not reducible.
+        for (ty, tname) in [
+            (&dict_keys_, "dict_keys"),
+            (&dict_values_, "dict_values"),
+            (&dict_items_, "dict_items"),
+        ] {
+            use crate::object::BuiltinFn;
+            ty.dict.borrow_mut().insert(
+                DictKey(Object::from_static("__new__")),
+                Object::Builtin(Rc::new(BuiltinFn {
+                    name: "__new__",
+                    binds_instance: false,
+                    call: Box::new(move |_args| {
+                        Err(crate::error::type_error(format!(
+                            "cannot create '{tname}' instances"
+                        )))
+                    }),
+                    call_kw: None,
+                })),
+            );
+            ty.dict.borrow_mut().insert(
+                DictKey(Object::from_static("__reduce__")),
+                Object::Builtin(Rc::new(BuiltinFn {
+                    name: "__reduce__",
+                    binds_instance: true,
+                    call: Box::new(move |_args| {
+                        Err(crate::error::type_error(format!(
+                            "cannot pickle '{tname}' object"
+                        )))
+                    }),
+                    call_kw: None,
+                })),
+            );
+        }
         let iterator_ = mk("iterator", vec![object_.clone()]);
+        let enumerate_ = mk("enumerate", vec![object_.clone()]);
+        let reversed_ = mk("reversed", vec![object_.clone()]);
         let none_type = mk("NoneType", vec![object_.clone()]);
         let ellipsis_ = mk("ellipsis", vec![object_.clone()]);
         let not_implemented_type_ = mk("NotImplementedType", vec![object_.clone()]);
+        // CPython pickles the singletons by *global name*: `ellipsis`
+        // defines `__reduce__` returning "Ellipsis" (and NotImplemented
+        // likewise) — `pickle.dumps(Tuple[int, ...])` needs it.
+        for (ty, global_name) in [
+            (&ellipsis_, "Ellipsis"),
+            (&not_implemented_type_, "NotImplemented"),
+        ] {
+            use crate::object::BuiltinFn;
+            ty.dict.borrow_mut().insert(
+                DictKey(Object::from_static("__reduce__")),
+                Object::Builtin(Rc::new(BuiltinFn {
+                    name: "__reduce__",
+                    binds_instance: true,
+                    call: Box::new(move |_args| Ok(Object::from_static(global_name))),
+                    call_kw: None,
+                })),
+            );
+        }
         let simple_namespace_ = mk("SimpleNamespace", vec![object_.clone()]);
         // PEP 585 / PEP 604 runtime types. The *instances* are
         // namespace-shaped (`Object::SimpleNamespace` carrying
@@ -256,6 +318,108 @@ impl BuiltinTypes {
             d.insert(
                 crate::object::DictKey(Object::from_static("__module__")),
                 Object::from_static("types"),
+            );
+        }
+        // CPython's `ga_new`: `GenericAlias(origin, args)` — also reached
+        // through subclasses (`class SubClass(GenericAlias)`) and
+        // `super().__new__(cls, ...)`, and rejects keyword arguments
+        // (test_genericalias test_subclassing_types_genericalias).
+        {
+            use crate::object::BuiltinFn;
+            let ga_ty = generic_alias_.clone();
+            generic_alias_.dict.borrow_mut().insert(
+                DictKey(Object::from_static("__new__")),
+                Object::Builtin(Rc::new(BuiltinFn {
+                    name: "__new__",
+                    binds_instance: false,
+                    call: Box::new(move |args| {
+                        // args[0] is the class (SubClass or GenericAlias).
+                        if args.len() != 3 {
+                            return Err(crate::error::type_error(format!(
+                                "GenericAlias expected 2 arguments, got {}",
+                                args.len().saturating_sub(1)
+                            )));
+                        }
+                        let alias =
+                            crate::make_generic_alias_public(args[1].clone(), args[2].clone());
+                        // CPython `ga_new` allocates through `cls`, so a
+                        // subclass instance reports the subclass as its type
+                        // (test_dataclasses test_is_dataclass_genericalias).
+                        // Stamp the subclass; `class_of` honours it.
+                        if let (Object::Type(cls), Object::SimpleNamespace(d)) = (&args[0], &alias)
+                        {
+                            if !Rc::ptr_eq(cls, &ga_ty) {
+                                d.borrow_mut().insert(
+                                    DictKey(Object::from_static("__class__")),
+                                    args[0].clone(),
+                                );
+                            }
+                        }
+                        Ok(alias)
+                    }),
+                    call_kw: None,
+                })),
+            );
+        }
+        // CPython's `ga_reduce`: aliases pickle as `GenericAlias(origin,
+        // args)` (test_type_aliases pickles `Alias[T]` round-trip).
+        {
+            use crate::object::BuiltinFn;
+            let ga_ty = generic_alias_.clone();
+            generic_alias_.dict.borrow_mut().insert(
+                DictKey(Object::from_static("__reduce__")),
+                Object::Builtin(Rc::new(BuiltinFn {
+                    name: "__reduce__",
+                    binds_instance: true,
+                    call: Box::new(move |args| {
+                        let d = match args.first() {
+                            Some(Object::SimpleNamespace(d)) => d.borrow(),
+                            _ => {
+                                return Err(crate::error::type_error(
+                                    "__reduce__ requires a GenericAlias".to_string(),
+                                ))
+                            }
+                        };
+                        let get = |name: &'static str| {
+                            d.get(&DictKey(Object::from_static(name)))
+                                .cloned()
+                                .unwrap_or(Object::None)
+                        };
+                        Ok(Object::new_tuple(vec![
+                            Object::Type(ga_ty.clone()),
+                            Object::new_tuple(vec![get("__origin__"), get("__args__")]),
+                        ]))
+                    }),
+                    call_kw: None,
+                })),
+            );
+            // CPython `ga_mro_entries`: a PEP 585 alias used as a base
+            // resolves to its origin. typing's `_GenericAlias.
+            // __mro_entries__` also *calls* this on later bases to decide
+            // whether Generic is already contributed (`class MySeq(List[T],
+            // BaseSeq[T])` must not inject a second Generic).
+            generic_alias_.dict.borrow_mut().insert(
+                DictKey(Object::from_static("__mro_entries__")),
+                Object::Builtin(Rc::new(BuiltinFn {
+                    name: "__mro_entries__",
+                    binds_instance: true,
+                    call: Box::new(|args| {
+                        let origin = match args.first() {
+                            Some(Object::SimpleNamespace(d)) => d
+                                .borrow()
+                                .get(&DictKey(Object::from_static("__origin__")))
+                                .cloned()
+                                .unwrap_or(Object::None),
+                            _ => {
+                                return Err(crate::error::type_error(
+                                    "__mro_entries__ requires a GenericAlias".to_string(),
+                                ))
+                            }
+                        };
+                        Ok(Object::new_tuple(vec![origin]))
+                    }),
+                    call_kw: None,
+                })),
             );
         }
         let function_ = mk("function", vec![object_.clone()]);
@@ -491,6 +655,8 @@ impl BuiltinTypes {
             dict_values_,
             dict_items_,
             iterator_,
+            enumerate_,
+            reversed_,
             none_type,
             ellipsis_,
             not_implemented_type_,
@@ -634,6 +800,8 @@ impl BuiltinTypes {
             pair!(range_, "range"),
             pair!(slice_, "slice"),
             pair!(memoryview_, "memoryview"),
+            pair!(enumerate_, "enumerate"),
+            pair!(reversed_, "reversed"),
             // `super` is a real type (`super(C, obj)`, `class mysuper(super)`).
             // The `Interpreter::default` seed overrides the function-flavoured
             // `super` entry with this type; construction routes through
@@ -735,6 +903,8 @@ impl BuiltinTypes {
             "range" => Some(self.range_.clone()),
             "slice" => Some(self.slice_.clone()),
             "memoryview" => Some(self.memoryview_.clone()),
+            "enumerate" => Some(self.enumerate_.clone()),
+            "reversed" => Some(self.reversed_.clone()),
             "mappingproxy" => Some(self.mappingproxy_.clone()),
             "dict_keys" => Some(self.dict_keys_.clone()),
             "dict_values" => Some(self.dict_values_.clone()),
@@ -1260,6 +1430,17 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
         crate::gc_trace::track(inst.clone());
         return Ok(inst);
     }
+    // A `type` subclass reaching the generic allocator is a wrong-arity
+    // `type.__new__` call — the three-argument class-building form is
+    // intercepted upstream (the 4-arg `__new__` route / `Meta(name,
+    // bases, ns)`), so e.g. `type(typing.Any)()` must raise like
+    // CPython's `type_new` ("takes exactly 3 arguments (0 given)").
+    if cls.is_subclass_of(&builtin_types().type_) && args.len() != 4 {
+        return Err(crate::error::type_error(format!(
+            "type.__new__() takes exactly 3 arguments ({} given)",
+            args.len() - 1
+        )));
+    }
     if cls.flags.is_builtin && !Rc::ptr_eq(&cls, &builtin_types().object_) {
         if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
             // SAFETY: published by an enclosing VM frame still live on this
@@ -1283,10 +1464,17 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
             && !Rc::ptr_eq(&cls, &bt.generic_alias_)
             && cls.is_subclass_of(&bt.generic_alias_)
         {
-            return Ok(crate::make_generic_alias_public(
-                args[1].clone(),
-                args[2].clone(),
-            ));
+            let alias = crate::make_generic_alias_public(args[1].clone(), args[2].clone());
+            // CPython `ga_new` allocates through `cls`, so the instance
+            // reports the subclass as its type (test_dataclasses
+            // test_is_dataclass_genericalias). `class_of` honours the stamp.
+            if let Object::SimpleNamespace(d) = &alias {
+                d.borrow_mut().insert(
+                    DictKey(Object::from_static("__class__")),
+                    Object::Type(cls.clone()),
+                );
+            }
+            return Ok(alias);
         }
     }
     // CPython `object_new` arity policy (bpo-31506): excess arguments

@@ -93,6 +93,8 @@ pub(crate) fn builtin_type_constructor(name: &str) -> Option<Rc<BuiltinFn>> {
         "range" => ctor!("range", b_range),
         "slice" => ctor!("slice", b_slice),
         "memoryview" => ctor!("memoryview", b_memoryview),
+        "enumerate" => ctor!("enumerate", b_enumerate, b_enumerate_kw),
+        "reversed" => ctor!("reversed", b_reversed),
         _ => None,
     }
 }
@@ -247,21 +249,38 @@ pub fn default_builtins() -> DictData {
     reg!("pow", b_pow);
     reg!("breakpoint", b_breakpoint);
     reg!("memoryview", b_memoryview);
-    reg!("__weavepy_typevar__", b_typevar);
     reg!("__weavepy_set_tp_name__", b_set_tp_name);
-    // PEP 695 `type X = …` lowers (in the parser) to a call to this
-    // name; it's a VM intrinsic (needs interpreter access to import
-    // `typing` and mint typevars) so the real work runs in
-    // `Interpreter::do_type_alias_call`.
-    {
+    reg!("__weavepy_pep604_union__", b_pep604_union);
+    // PEP 695 intrinsics (RFC 0051). Each lowering-generated name is a
+    // VM-intercepted builtin (they need interpreter access to import
+    // the frozen `_typing` module and call its constructors), mirroring
+    // CPython's `CALL_INTRINSIC_1/2` opcodes. The real work runs in
+    // `Interpreter::do_typing_intrinsic` / `do_type_alias_call`.
+    for (public, vm_name) in [
+        ("__weavepy_type_alias__", "__vm:type_alias"),
+        ("__weavepy_typevar__", "__vm:typevar"),
+        ("__weavepy_typevar_with_bound__", "__vm:typevar_with_bound"),
+        (
+            "__weavepy_typevar_with_constraints__",
+            "__vm:typevar_with_constraints",
+        ),
+        ("__weavepy_paramspec__", "__vm:paramspec"),
+        ("__weavepy_typevartuple__", "__vm:typevartuple"),
+        ("__weavepy_typeparam_default__", "__vm:typeparam_default"),
+        (
+            "__weavepy_typeparam_default_starred__",
+            "__vm:typeparam_default_starred",
+        ),
+        ("__weavepy_generic_base__", "__vm:generic_base"),
+    ] {
         let f = BuiltinFn {
-            name: "__vm:type_alias",
+            name: vm_name,
             binds_instance: false,
             call: Box::new(b_type_alias_unsupported),
             call_kw: None,
         };
         d.insert(
-            DictKey(Object::from_static("__weavepy_type_alias__")),
+            DictKey(Object::from_static(public)),
             Object::Builtin(Rc::new(f)),
         );
     }
@@ -567,6 +586,11 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
         Object::Range(_) => match name {
             "index" => Some(method("index", range_index)),
             "count" => Some(method("count", range_count)),
+            // Slot wrapper: `range(1, 20).__getitem__(i)` with full
+            // `__index__` + slice support (test_index.RangeTestCase).
+            "__getitem__" => Some(method("__getitem__", range_getitem)),
+            "__len__" => Some(method("__len__", obj_len)),
+            "__contains__" => Some(method("__contains__", obj_contains)),
             _ => None,
         },
         Object::Dict(_) => match name {
@@ -964,6 +988,9 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "__trunc__" => Some(method("__trunc__", int_conjugate)),
             "__floor__" => Some(method("__floor__", int_conjugate)),
             "__ceil__" => Some(method("__ceil__", int_conjugate)),
+            // `int.__round__([ndigits])` — same shape as the `round()`
+            // builtin's native path (typing's SupportsRound probes for it).
+            "__round__" => Some(method("__round__", b_round)),
             _ => numeric_dunder(obj, name),
         },
         Object::Float(_) => match name {
@@ -999,6 +1026,14 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
         },
         Object::Slice(_) => match name {
             "indices" => Some(method("indices", slice_indices_method)),
+            // Hashable since 3.12 (gh-101335); the test suite calls the
+            // bound `slice(...).__hash__()` form directly.
+            "__hash__" => Some(method("__hash__", |args| {
+                hash_object(
+                    args.first()
+                        .ok_or_else(|| type_error("__hash__() missing self"))?,
+                )
+            })),
             _ => None,
         },
         // Built-in iterators expose `__length_hint__` (PEP 424) so
@@ -1174,59 +1209,79 @@ fn slice_indices_method(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Slice(s)) => s.clone(),
         _ => return Err(type_error("descriptor 'indices' requires a 'slice' object")),
     };
+    // CPython's `_PySlice_GetLongIndices`: everything is arbitrary-
+    // precision integer arithmetic — start/stop/step/length beyond
+    // `sys.maxsize` clamp exactly, never overflow (issue #14794;
+    // test_slice.test_indices sweeps `±2**100`).
+    use num_bigint::BigInt;
+    let to_big = |o: &Object| -> Result<BigInt, RuntimeError> {
+        match coerce_index_object(o)? {
+            Object::Int(i) => Ok(BigInt::from(i)),
+            Object::Long(b) => Ok((*b).clone()),
+            _ => unreachable!("coerce_index_object returns Int or Long"),
+        }
+    };
+    let big_obj = |v: BigInt| -> Object {
+        match i64::try_from(&v) {
+            Ok(i) => Object::Int(i),
+            Err(_) => Object::Long(Rc::new(v)),
+        }
+    };
     let length = match args.get(1) {
-        Some(o) => coerce_index_i64(o)?,
+        Some(o) => to_big(o)?,
         None => return Err(type_error("indices() takes exactly one argument (0 given)")),
     };
-    if length < 0 {
+    let zero = BigInt::from(0);
+    if length < zero {
         return Err(value_error("length should not be negative"));
     }
     let step = match &s.step {
-        Object::None => 1,
+        Object::None => BigInt::from(1),
         o => {
-            let st = coerce_index_i64(o)?;
-            if st == 0 {
+            let st = to_big(o)?;
+            if st == zero {
                 return Err(value_error("slice step cannot be zero"));
             }
             st
         }
     };
-    let (lower, upper) = if step < 0 {
-        (-1i64, length - 1)
+    let backwards = step < zero;
+    let (lower, upper) = if backwards {
+        (BigInt::from(-1), &length + BigInt::from(-1))
     } else {
-        (0i64, length)
+        (zero.clone(), length.clone())
     };
-    let clamp = |v: i64| -> i64 {
-        if v < 0 {
-            (v + length).max(lower)
+    let clamp = |v: BigInt| -> BigInt {
+        if v < zero {
+            (v + &length).max(lower.clone())
         } else {
-            v.min(upper)
+            v.min(upper.clone())
         }
     };
     let start = match &s.start {
         Object::None => {
-            if step < 0 {
-                upper
+            if backwards {
+                upper.clone()
             } else {
-                lower
+                lower.clone()
             }
         }
-        o => clamp(coerce_index_i64(o)?),
+        o => clamp(to_big(o)?),
     };
     let stop = match &s.stop {
         Object::None => {
-            if step < 0 {
-                lower
+            if backwards {
+                lower.clone()
             } else {
-                upper
+                upper.clone()
             }
         }
-        o => clamp(coerce_index_i64(o)?),
+        o => clamp(to_big(o)?),
     };
     Ok(Object::new_tuple(vec![
-        Object::Int(start),
-        Object::Int(stop),
-        Object::Int(step),
+        big_obj(start),
+        big_obj(stop),
+        big_obj(step),
     ]))
 }
 
@@ -1697,6 +1752,24 @@ pub fn unbound_method(type_name: &str, name: &str) -> Option<Object> {
         "iterator" => Object::Iter(Rc::new(RefCell::new(crate::object::PyIterator::Tuple {
             items: Rc::from(Vec::<Object>::new()),
             index: 0,
+        }))),
+        // `enumerate` / `reversed` are real types whose instances share
+        // the built-in iterator method table (`__length_hint__`,
+        // `__reduce__`, …); a representative empty instance routes the
+        // type-level lookup there.
+        "enumerate" => Object::Iter(Rc::new(RefCell::new(
+            crate::object::PyIterator::Enumerate {
+                inner: Rc::new(RefCell::new(crate::object::PyIterator::Tuple {
+                    items: Rc::from(Vec::<Object>::new()),
+                    index: 0,
+                })),
+                count: 0,
+                count_big: None,
+            },
+        ))),
+        "reversed" => Object::Iter(Rc::new(RefCell::new(crate::object::PyIterator::Reversed {
+            items: Rc::new(RefCell::new(Vec::new())),
+            index: -1,
         }))),
         // Descriptor types: expose their protocol slots
         // (`property.__set__`, `staticmethod.__get__`, …) for
@@ -2208,7 +2281,7 @@ pub(crate) fn coerce_index_i64(o: &Object) -> Result<i64, RuntimeError> {
 /// through `__index__` and return the resulting int *object* (Int or Long)
 /// at full width. `hex()`/`oct()`/`bin()` accept any magnitude — a
 /// `np.uint64` above `i64::MAX` must format, not raise `OverflowError`.
-fn coerce_index_object(o: &Object) -> Result<Object, RuntimeError> {
+pub(crate) fn coerce_index_object(o: &Object) -> Result<Object, RuntimeError> {
     match o {
         Object::Int(_) | Object::Long(_) => return Ok(o.clone()),
         Object::Bool(b) => return Ok(Object::Int(i64::from(*b))),
@@ -3163,6 +3236,10 @@ pub(crate) fn code_synthetic_attr(
         ))),
         "co_lines" => Some(code_method(c, "co_lines", code_co_lines)),
         "co_positions" => Some(code_method(c, "co_positions", code_co_positions)),
+        // Deprecated pre-PEP-626 line table, derived on demand from the
+        // position records exactly like CPython's `decode_linetable`
+        // (`dis.findlinestarts` fallbacks and legacy tools read it).
+        "co_lnotab" => Some(Object::Bytes(Rc::from(code_lnotab_bytes(c)))),
         "_varname_from_oparg" => Some(code_method(
             c,
             "_varname_from_oparg",
@@ -3391,13 +3468,21 @@ fn code_co_positions(args: &[Object]) -> Result<Object, RuntimeError> {
         v.filter(|_| debug_ranges)
             .map_or(Object::None, |x| Object::Int(i64::from(x)))
     };
+    let line = |v: i32| {
+        if v <= 0 {
+            Object::None
+        } else {
+            Object::Int(i64::from(v))
+        }
+    };
     let items = cp
         .positions
         .iter()
         .map(|p| {
+            // A NO_LOCATION unit (lineno 0) reports all-None (PEP 657).
             Object::new_tuple(vec![
-                Object::Int(i64::from(p.lineno)),
-                Object::Int(i64::from(p.end_lineno)),
+                line(p.lineno),
+                line(p.end_lineno),
                 col(p.col),
                 col(p.end_col),
             ])
@@ -3411,6 +3496,56 @@ fn code_co_positions(args: &[Object]) -> Result<Object, RuntimeError> {
 fn list_iter(items: Vec<Object>) -> Result<Object, RuntimeError> {
     let it = Object::new_list(items).make_iter()?;
     Ok(Object::Iter(Rc::new(RefCell::new(it))))
+}
+
+/// `code.co_lnotab` — the deprecated pre-PEP-626 `(addr_delta,
+/// line_delta)` byte-pair encoding, rebuilt from the per-unit position
+/// records (CPython `decode_linetable` + `write_lnotab`, including the
+/// unsigned-255 address chunking and the signed [-128, 127] line-delta
+/// wraparound).
+fn code_lnotab_bytes(c: &Rc<weavepy_compiler::CodeObject>) -> Vec<u8> {
+    let cp = c.to_cpython();
+    let mut out: Vec<u8> = Vec::new();
+    let write_pair = |out: &mut Vec<u8>, bdelta: i32, ldelta: i32| {
+        out.push(bdelta as u8);
+        out.push(ldelta as i8 as u8);
+    };
+    let write_lnotab = |out: &mut Vec<u8>, mut bdelta: i32, mut ldelta: i32| {
+        while bdelta > 255 {
+            write_pair(out, 255, 0);
+            bdelta -= 255;
+        }
+        while ldelta > 127 {
+            write_pair(out, bdelta, 127);
+            bdelta = 0;
+            ldelta -= 127;
+        }
+        while ldelta < -128 {
+            write_pair(out, bdelta, -128);
+            bdelta = 0;
+            ldelta += 128;
+        }
+        write_pair(out, bdelta, ldelta);
+    };
+    let mut code_offset: i32 = 0;
+    let mut line: i32 = cp.firstlineno as i32;
+    let n = cp.positions.len();
+    let mut i = 0;
+    while i < n {
+        let range_line = cp.positions[i].lineno;
+        let start = (i * 2) as i32;
+        while i < n && cp.positions[i].lineno == range_line {
+            i += 1;
+        }
+        // Location-less units (line 0 / -1) never open a new lnotab
+        // entry; they inherit the previous line, as in CPython.
+        if range_line > 0 && range_line != line {
+            write_lnotab(&mut out, start - code_offset, range_line - line);
+            code_offset = start;
+            line = range_line;
+        }
+    }
+    out
 }
 
 /// `code.co_lines()` — `(start, end, lineno)` byte ranges (PEP 626),
@@ -3430,7 +3565,13 @@ fn code_co_lines(args: &[Object]) -> Result<Object, RuntimeError> {
         out.push(Object::new_tuple(vec![
             Object::Int((start * 2) as i64),
             Object::Int((i * 2) as i64),
-            Object::Int(i64::from(line)),
+            // PEP 626: a range with no source line yields None (the
+            // 0 sentinel marks NO_LOCATION instructions).
+            if line == 0 {
+                Object::None
+            } else {
+                Object::Int(i64::from(line))
+            },
         ]));
     }
     list_iter(out)
@@ -6009,7 +6150,26 @@ fn b_sorted(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn b_reversed(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() > 1 {
+        return Err(type_error(format!(
+            "reversed expected 1 argument, got {}",
+            args.len()
+        )));
+    }
     let iterable = one(args, "reversed")?;
+    // `range.__reversed__` returns a *range iterator* — the same type
+    // `iter(range(...))` yields (CPython `range_reverse`;
+    // test_enumerate.test_range_optimization compares the two types).
+    if let Object::Range(r) = iterable {
+        let len = crate::object::range_len_i128(r);
+        let current = r.start + (len - 1).max(0) * r.step;
+        let stop = r.start - r.step;
+        return Ok(Object::Iter(Rc::new(RefCell::new(PyIterator::RangeHuge {
+            current: if len > 0 { current } else { stop },
+            stop,
+            step: -r.step,
+        }))));
+    }
     // A plain list shares its backing store with the reverse-iterator
     // (CPython `list___reversed__`): the iterator holds the *live* list and
     // a descending cursor, so co-pickling `(reversed(xs), xs)` memoizes one
@@ -6039,35 +6199,76 @@ fn b_reversed(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn b_enumerate_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
-    // `enumerate(iterable, start=N)`: fold a `start` keyword into the
-    // positional form `b_enumerate` consumes (`args[1]`).
-    let mut ctor_args = args.to_vec();
+    // `enumerate(iterable, start=0)` — both parameters are documented
+    // keywords (CPython argument clinic). Fold keywords onto the
+    // positional layout `b_enumerate` consumes.
+    let mut iterable: Option<Object> = args.first().cloned();
+    let mut start: Option<Object> = args.get(1).cloned();
+    if args.len() > 2 {
+        return Err(type_error(format!(
+            "enumerate() takes at most 2 arguments ({} given)",
+            args.len()
+        )));
+    }
     for (k, v) in kwargs {
-        if k == "start" {
-            if ctor_args.len() >= 2 {
-                return Err(type_error(
-                    "enumerate() got multiple values for argument 'start'",
-                ));
+        match k.as_str() {
+            "iterable" => {
+                if iterable.is_some() {
+                    return Err(type_error(
+                        "argument for enumerate() given by name ('iterable') and position (1)",
+                    ));
+                }
+                iterable = Some(v.clone());
             }
-            ctor_args.push(v.clone());
-        } else {
-            return Err(type_error(format!(
-                "enumerate() got an unexpected keyword argument '{k}'"
-            )));
+            "start" => {
+                if start.is_some() {
+                    return Err(type_error(
+                        "argument for enumerate() given by name ('start') and position (2)",
+                    ));
+                }
+                start = Some(v.clone());
+            }
+            other => {
+                return Err(type_error(format!(
+                    "enumerate() got an unexpected keyword argument '{other}'"
+                )))
+            }
         }
+    }
+    let Some(iterable) = iterable else {
+        return Err(type_error(
+            "enumerate() missing required argument 'iterable' (pos 1)",
+        ));
+    };
+    let mut ctor_args = vec![iterable];
+    if let Some(s) = start {
+        ctor_args.push(s);
     }
     b_enumerate(&ctor_args)
 }
 
 fn b_enumerate(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() > 2 {
+        return Err(type_error(format!(
+            "enumerate() takes at most 2 arguments ({} given)",
+            args.len()
+        )));
+    }
     let iterable = one(args, "enumerate")?;
-    let start = if args.len() >= 2 {
-        match &args[1] {
-            Object::Int(i) => *i,
-            _ => return Err(type_error("enumerate() start must be an int")),
+    // `start` goes through `PyNumber_Index` (CPython `enum_new`) and may
+    // exceed the machine-int range (`enumerate(x, sys.maxsize + 1)` —
+    // test_enumerate.TestLongStart).
+    let (start, start_big) = if args.len() >= 2 {
+        match coerce_index_object(&args[1])? {
+            Object::Int(i) => (i, None),
+            Object::Long(b) => match i64::try_from(&*b) {
+                Ok(i) => (i, None),
+                Err(_) => (0, Some(Box::new((*b).clone()))),
+            },
+            _ => unreachable!("coerce_index_object returns Int or Long"),
         }
     } else {
-        0
+        (0, None)
     };
     // CPython's `enumerate(x)` wraps `iter(x)` lazily. When `x` is already an
     // iterator, `iter(x)` returns `x` itself, so consuming the enumerate must
@@ -6081,6 +6282,7 @@ fn b_enumerate(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Iter(Rc::new(RefCell::new(PyIterator::Enumerate {
         inner,
         count: start,
+        count_big: start_big,
     }))))
 }
 
@@ -6157,9 +6359,10 @@ pub(crate) fn b_super(args: &[Object]) -> Result<Object, RuntimeError> {
     // real `super` type. Zero-arg form is handled by the VM's
     // call path (it materialises `__class__` and `self` first).
     if !matches!(args.len(), 1 | 2) {
-        return Err(type_error(
-            "super(): expected 2 arguments (zero-arg form must be called from inside a method)",
-        ));
+        return Err(type_error(format!(
+            "super expected at most 2 arguments, got {}",
+            args.len()
+        )));
     }
     let class = match &args[0] {
         Object::Type(t) => t.clone(),
@@ -6224,9 +6427,16 @@ pub(crate) fn supercheck(
     if oc.is_subclass_of(class) {
         return Ok(oc);
     }
-    Err(type_error(
-        "super(type, obj): obj must be an instance or subtype of type",
-    ))
+    // CPython `supercheck` names both sides in the failure
+    // (test_super.test_supercheck_fail matches the exact shape).
+    let (kind, obj_name) = match receiver {
+        Object::Type(t) => ("type", t.name.clone()),
+        _ => ("instance of", oc.name.clone()),
+    };
+    Err(type_error(format!(
+        "super(type, obj): obj ({kind} {obj_name}) is not an instance or subtype of type ({}).",
+        class.name
+    )))
 }
 
 /// Build a `super` proxy of concrete type `proxy_type` (`super` or a user
@@ -6519,7 +6729,16 @@ pub fn class_of(obj: &Object) -> crate::sync::Rc<crate::types::TypeObject> {
                     .get(&DictKey(Object::from_static("__args__")))
                     .is_some()
             {
-                bt.generic_alias_.clone()
+                // A GenericAlias *subclass* instance carries its class in
+                // the namespace dict (stamped by `GenericAlias.__new__`,
+                // mirroring CPython's `ga_new` allocating through `cls`).
+                if let Some(Object::Type(cls)) =
+                    dict.get(&DictKey(Object::from_static("__class__")))
+                {
+                    cls.clone()
+                } else {
+                    bt.generic_alias_.clone()
+                }
             } else {
                 bt.simple_namespace_.clone()
             }
@@ -6565,7 +6784,14 @@ pub fn class_of(obj: &Object) -> crate::sync::Rc<crate::types::TypeObject> {
         Object::ByteArray(_) => bt.bytearray_.clone(),
         Object::Set(_) => bt.set_.clone(),
         Object::FrozenSet(_) => bt.frozenset_.clone(),
-        Object::Iter(_) => bt.iterator_.clone(),
+        // `enumerate` / `reversed` objects are instances of their own
+        // real types in CPython (`type(enumerate([])) is enumerate`).
+        // `try_borrow` keeps this safe if the iterator is mid-advance.
+        Object::Iter(it) => match it.try_borrow().as_deref() {
+            Ok(crate::object::PyIterator::Enumerate { .. }) => bt.enumerate_.clone(),
+            Ok(crate::object::PyIterator::Reversed { .. }) => bt.reversed_.clone(),
+            _ => bt.iterator_.clone(),
+        },
         // Native itertools adapters share the generic iterator type for
         // now; `type(x).__name__` is "iterator" rather than CPython's
         // "islice" until they get dedicated TypeObjects.
@@ -6763,10 +6989,39 @@ pub fn ensure_hashable(obj: &Object) -> Result<(), RuntimeError> {
         Object::Dict(_) => "dict",
         Object::Set(_) => "set",
         Object::ByteArray(_) => "bytearray",
-        Object::Slice(_) => "slice",
+        // Slices are hashable since 3.12 (gh-101335) — like a tuple,
+        // hashability recurses into the members.
+        Object::Slice(s) => {
+            ensure_hashable(&s.start)?;
+            ensure_hashable(&s.stop)?;
+            ensure_hashable(&s.step)?;
+            return Ok(());
+        }
         Object::Tuple(items) => {
             for it in items.iter() {
                 ensure_hashable(it)?;
+            }
+            return Ok(());
+        }
+        // A class whose *metaclass* stores the `__hash__ = None`
+        // anti-registration marker is unhashable (`class M(type):
+        // __hash__ = None`; `hash(A)` for `A(metaclass=M)` raises).
+        Object::Type(t) => {
+            let meta = t.metaclass_or_type();
+            if !Rc::ptr_eq(&meta, &crate::builtin_types::builtin_types().type_)
+                && matches!(meta.lookup("__hash__"), Some(Object::None))
+            {
+                return Err(type_error(format!("unhashable type: '{}'", meta.name)));
+            }
+            return Ok(());
+        }
+        // A PEP 604 union hashes as a frozenset of its args (CPython
+        // `union_hash`), so an unhashable member propagates.
+        Object::SimpleNamespace(_) => {
+            if let Some(args) = crate::is_pep604_union(obj) {
+                for a in &args {
+                    ensure_hashable(a)?;
+                }
             }
             return Ok(());
         }
@@ -6912,6 +7167,33 @@ pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
                     }
                 }
             }
+            // A namespace-shaped object (PEP 585 GenericAlias,
+            // SimpleNamespace) carries per-object attributes in its dict —
+            // CPython's `ga_dir`/`object.__dir__` include them
+            // (`'__origin__' in dir(list[int])`).
+            if let Object::SimpleNamespace(d) = other {
+                for k in d.borrow().keys() {
+                    if let Object::Str(s) = &k.0 {
+                        names.insert(s.to_string());
+                    }
+                }
+                // CPython `ga_dir`: a generic alias reports `dir(origin)`
+                // plus its own attributes, so `dir(list[int])` is a
+                // superset of `dir(list)` (test_genericalias.test_dir).
+                let origin = d
+                    .borrow()
+                    .get(&crate::object::StrKey("__origin__"))
+                    .cloned();
+                if let Some(Object::Type(t)) = origin {
+                    for cls in t.mro.borrow().iter() {
+                        for k in cls.dict.borrow().keys() {
+                            if let Object::Str(s) = &k.0 {
+                                names.insert(s.to_string());
+                            }
+                        }
+                    }
+                }
+            }
             // The generator family's methods and introspection attrs are
             // synthesized in `load_attr` rather than stored in type
             // dicts; surface the same names CPython's type dicts hold.
@@ -6985,6 +7267,24 @@ pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
             for n in extra {
                 names.insert((*n).to_string());
             }
+        }
+    }
+    // `object`'s C-level surface that WeavePy synthesizes in attribute
+    // lookup rather than storing in the type dict. Every non-module
+    // `dir()` walks an MRO ending at `object`, so CPython always lists
+    // these (test_descrtut tut3 checks `dir(list)` verbatim).
+    if !matches!(obj, Object::Module(_)) {
+        for n in [
+            "__class__",
+            "__dir__",
+            "__doc__",
+            "__format__",
+            "__getstate__",
+            "__repr__",
+            "__sizeof__",
+            "__str__",
+        ] {
+            names.insert(n.to_string());
         }
     }
     Ok(Object::new_list(
@@ -7141,13 +7441,27 @@ fn b_input_unsupported(_args: &[Object]) -> Result<Object, RuntimeError> {
     Err(runtime_error("input() must be called through the VM"))
 }
 
-/// Placeholder for the `__weavepy_type_alias__` PEP 695 intrinsic; the
-/// VM intercepts it (it needs interpreter state to import `typing` and
-/// mint typevars), so reaching this body means the dispatcher missed it.
+/// Placeholder for the PEP 695 `__weavepy_*__` intrinsics; the VM
+/// intercepts them (they need interpreter state to import `_typing`
+/// and mint type parameters), so reaching this body means the
+/// dispatcher missed one.
 fn b_type_alias_unsupported(_args: &[Object]) -> Result<Object, RuntimeError> {
     Err(runtime_error(
-        "__weavepy_type_alias__() must be called through the VM",
+        "PEP 695 intrinsics must be called through the VM",
     ))
+}
+
+/// `__weavepy_pep604_union__(a, b)` — build the native PEP 604 union
+/// object from Python. `_typing.TypeAliasType.__or__` uses this to
+/// mirror CPython's `_Py_union_type_or` slot (a `types.UnionType`
+/// union, not `typing.Union`).
+fn b_pep604_union(args: &[Object]) -> Result<Object, RuntimeError> {
+    match args {
+        [a, b] => Ok(crate::make_pep604_union(a, b)),
+        _ => Err(type_error(
+            "__weavepy_pep604_union__() expects exactly 2 arguments",
+        )),
+    }
 }
 
 /// `pow(base, exp[, mod])` — modular exponentiation when `mod` is
@@ -7357,32 +7671,6 @@ fn bigint_from(o: &Object, fn_name: &str) -> Result<BigInt, RuntimeError> {
 /// to honour `sys.breakpointhook` and `PYTHONBREAKPOINT`.
 fn b_breakpoint(_args: &[Object]) -> Result<Object, RuntimeError> {
     Err(runtime_error("breakpoint() must be called through the VM"))
-}
-
-/// `__weavepy_typevar__(name)` — internal builtin that produces a
-/// lightweight `TypeVar`-shaped placeholder. Used as the implicit
-/// binding for PEP 695 type parameters in `type X[T] = ...`,
-/// `def f[T](...)`, and `class C[T]:`. Behaves enough like
-/// `typing.TypeVar` that consumers can subscript / index / repr it
-/// without importing `typing`.
-pub(crate) fn b_typevar(args: &[Object]) -> Result<Object, RuntimeError> {
-    let name = match args.first() {
-        Some(Object::Str(s)) => s.to_string(),
-        Some(other) => other.to_str(),
-        None => "T".to_owned(),
-    };
-    let mut d = crate::object::DictData::default();
-    d.insert(
-        crate::object::DictKey(Object::from_static("__name__")),
-        Object::from_str(&name),
-    );
-    d.insert(
-        crate::object::DictKey(Object::from_static("__weavepy_typevar__")),
-        Object::Bool(true),
-    );
-    Ok(Object::SimpleNamespace(Rc::new(crate::sync::RefCell::new(
-        d,
-    ))))
 }
 
 /// `__weavepy_set_tp_name__(cls, name)` — internal hook for stdlib
@@ -9186,12 +9474,17 @@ fn list_imul(args: &[Object]) -> Result<Object, RuntimeError> {
     let n = match &args[1] {
         Object::Int(i) => *i,
         Object::Bool(b) => i64::from(*b),
-        other => {
-            return Err(type_error(format!(
-                "can't multiply sequence by non-int of type '{}'",
-                other.type_name()
-            )))
-        }
+        // Sequence repetition honours `__index__` (CPython `sq_repeat`
+        // via `PyNumber_AsSsize_t` — test_index.test_inplace_repeat).
+        other => match try_coerce_index_i64(other) {
+            Some(res) => res?,
+            None => {
+                return Err(type_error(format!(
+                    "can't multiply sequence by non-int of type '{}'",
+                    other.type_name()
+                )))
+            }
+        },
     };
     let l = list_self(args)?;
     let mut data = l.borrow_mut();
@@ -9383,6 +9676,36 @@ fn int_like_to_i128(o: &Object) -> Option<i128> {
         Object::Long(b) => b.to_i128(),
         _ => None,
     }
+}
+
+/// `range.__getitem__(self, index)` — int (through `__index__`) and
+/// slice subscription, mirroring CPython's `range_subscript`.
+fn range_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
+    let r = match args.first() {
+        Some(Object::Range(r)) => r.clone(),
+        _ => {
+            return Err(type_error(
+                "descriptor '__getitem__' requires a 'range' object",
+            ))
+        }
+    };
+    let index = args
+        .get(1)
+        .ok_or_else(|| type_error("__getitem__() takes exactly one argument (0 given)"))?;
+    let len = crate::object::range_len_i128(&r);
+    if let Object::Slice(slc) = index {
+        return crate::range_slice(&r, len, slc);
+    }
+    let i = coerce_index_i64(index)?;
+    let idx = if i < 0 {
+        i128::from(i) + len
+    } else {
+        i128::from(i)
+    };
+    if idx < 0 || idx >= len {
+        return Err(crate::error::index_error("range object index out of range"));
+    }
+    Ok(crate::object::int_from_i128(r.start + idx * r.step))
 }
 
 fn range_index(args: &[Object]) -> Result<Object, RuntimeError> {

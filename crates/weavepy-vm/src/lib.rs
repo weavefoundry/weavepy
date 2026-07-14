@@ -153,6 +153,13 @@ struct Frame {
     /// first entry and re-push the same object on each resume.
     /// `None` for ordinary frames, which are only ever entered once.
     py_frame: Option<Rc<PyFrame>>,
+    /// RFC 0051 (WS4): skip the frame-entry `'call'` trace event for
+    /// the *next* activation. Set by `generator_throw`, which fires
+    /// CPython's PY_THROW (`'call'`) + RAISE (`'exception'`) pair at
+    /// the suspension point itself — before the exception handler
+    /// moves `pc` — so the generic entry event (which would see the
+    /// handler's no-line `PUSH_EXC_INFO`) must not fire again.
+    suppress_call_event: bool,
 }
 
 impl Frame {
@@ -486,6 +493,15 @@ pub struct Interpreter {
     /// errors during `__del__`). Reserved for future use.
     #[allow(dead_code)]
     pub(crate) unraisable_hook: Rc<RefCell<Object>>,
+    /// `exec`/`eval` invoked with a *dict subclass* as globals whose class
+    /// defines `__missing__` (CPython's non-exact-dict LOAD_GLOBAL slow
+    /// path routes misses through `PyMapping_GetOptionalItem`, which
+    /// honours it — `test_dynamic`, `test_type_aliases`). Keyed by the
+    /// `Rc::as_ptr` of the subclass's native `DictData`. The owner is held
+    /// strongly: a function created under such globals keeps only the
+    /// native dict alive (CPython's function keeps the mapping itself),
+    /// so a weak owner would die with the caller's last direct reference.
+    globals_missing_hooks: RefCell<Vec<(usize, Rc<PyInstance>)>>,
 }
 
 impl Default for Interpreter {
@@ -584,6 +600,7 @@ impl Default for Interpreter {
             exc_info_stack,
             excepthook,
             unraisable_hook,
+            globals_missing_hooks: RefCell::new(Vec::new()),
         };
         // RFC 0025: publish the shared parts of this interpreter
         // (builtins / module cache / stdout / hooks) so workers
@@ -652,6 +669,7 @@ impl Interpreter {
             exc_info_stack: Rc::new(RefCell::new(Vec::new())),
             excepthook: self.excepthook.clone(),
             unraisable_hook: self.unraisable_hook.clone(),
+            globals_missing_hooks: RefCell::new(Vec::new()),
         }
     }
 
@@ -3328,6 +3346,7 @@ impl Interpreter {
             pc: 0,
             py_frame: None,
             cleanup_lasti: None,
+            suppress_call_event: false,
         }
     }
 
@@ -3459,7 +3478,8 @@ impl Interpreter {
         // for subsequent line / return / exception events. The
         // generator-creation bootstrap is invisible to tracers.
         let observers_active = crate::trace::any_observers_active();
-        if observers_active && !is_gen_bootstrap {
+        let suppress_call = std::mem::take(&mut frame.suppress_call_event);
+        if observers_active && !is_gen_bootstrap && !suppress_call {
             self.fire_call_event(&py_frame)?;
             // On a resume, line tracing must continue from the line
             // where the frame suspended — CPython reports the `call`
@@ -3495,6 +3515,16 @@ impl Interpreter {
                 crate::tier2::JitEntry::Deopt | crate::tier2::JitEntry::Skip => {}
             }
         }
+        // RFC 0051 (WS4): line-event bookkeeping, mirroring CPython
+        // 3.13's monitoring model. `prev_pc` is the index of the last
+        // instruction that actually executed in this frame (CPython's
+        // `frame->instr_ptr` as seen by `INSTRUMENTED_LINE`); `None`
+        // means "frame just (re)entered" and behaves like CPython's
+        // prev-was-RESUME case — the first marked instruction fires
+        // regardless of line equality. `line_starts` is the lazily
+        // computed instrumented set (`initialize_lines` port).
+        let mut prev_pc: Option<usize> = None;
+        let mut line_starts: Option<Vec<bool>> = None;
         let result = loop {
             // RFC 0039 (WS2): cooperative GIL hand-off. Cheap
             // thread-local countdown in the common case; drops and
@@ -3597,22 +3627,37 @@ impl Interpreter {
             // through the same arm as `step`'s `Err` below instead of
             // `?`-escaping the whole frame.
             let mut trace_err: Option<RuntimeError> = None;
+            let cur_pc = frame.pc as usize;
             if crate::trace::any_observers_active() && !is_gen_bootstrap {
                 let line = py_frame.current_lineno();
-                // CPython never emits a `line` event for the
-                // frame-entry `RESUME`: the `call` event covers entry
-                // and line tracing begins at the first *real*
-                // instruction (the first body line). Firing here would
-                // inject a spurious `line` event at the `def` line,
-                // desyncing trace consumers like `bdb`/`pdb`. We skip
-                // firing *and* leave `last_line` untouched so a one-line
-                // body (`def f(): return 1`) still reports its single
-                // line event from the following instruction.
-                let at_resume = matches!(
-                    frame.code.instructions.get(frame.pc as usize).map(|i| i.op),
-                    Some(OpCode::Resume)
-                );
-                if !at_resume && line != 0 && py_frame.last_line.get() != Some(line) {
+                // RFC 0051 (WS4): CPython 3.13 line-event semantics.
+                // A `'line'` event fires when execution reaches an
+                // instruction in the instrumented set (line starts, jump
+                // targets, exception-handler entries — see
+                // `linejump::line_event_starts`) *and* the previously
+                // executed instruction was on a different line (or was
+                // the frame-entry RESUME / a fresh (re)entry, which
+                // never suppresses). Additionally, `sys.settrace` fires
+                // for every *backward* jump landing on the same line
+                // (CPython `sys_trace_jump_func`), which is what makes a
+                // one-line `while` loop re-report its line every
+                // iteration.
+                let starts = line_starts
+                    .get_or_insert_with(|| crate::linejump::line_event_starts(&frame.code));
+                let marked = starts.get(cur_pc).copied().unwrap_or(false);
+                let prev_line = prev_pc.map(|p| frame.code.linetable.get(p).copied().unwrap_or(0));
+                let prev_op = prev_pc.and_then(|p| frame.code.instructions.get(p).map(|i| i.op));
+                let head_fire = marked
+                    && match (prev_line, prev_op) {
+                        (None, _) => true,
+                        (_, Some(OpCode::Resume)) => true,
+                        (Some(pl), _) => pl != line,
+                    };
+                let jump_fire = matches!(
+                    (prev_pc, prev_op),
+                    (Some(p), Some(OpCode::JumpBackward)) if p > cur_pc
+                ) && prev_line == Some(line);
+                if line != 0 && (head_fire || jump_fire) {
                     py_frame.last_line.set(Some(line));
                     // `f_trace_lines = False` suppresses the callback but the
                     // line bookkeeping above still advances (mirrors CPython,
@@ -3623,10 +3668,14 @@ impl Interpreter {
                                 // The callback may have set `f_lineno` (RFC
                                 // 0050 — debugger "set next statement").
                                 // Apply the validated plan to the live frame
-                                // and restart dispatch at the target so its
-                                // line event fires.
+                                // and re-dispatch at the target. CPython
+                                // marks the *target* as the previously
+                                // executed instruction (`frame_setlineno`
+                                // sets `instr_ptr = dest`), so the target
+                                // itself does not fire a fresh line event.
                                 if py_frame.pending_jump.get().is_some() {
                                     self.apply_pending_jump(frame, &py_frame);
+                                    prev_pc = Some(frame.pc as usize);
                                     continue;
                                 }
                             }
@@ -3638,6 +3687,10 @@ impl Interpreter {
                 // (bdb's `stepinstr`); CPython then fires the `'opcode'`
                 // event for this same instruction before it runs. The
                 // frame-entry RESUME carries no opcode event.
+                let at_resume = matches!(
+                    frame.code.instructions.get(cur_pc).map(|i| i.op),
+                    Some(OpCode::Resume)
+                );
                 if trace_err.is_none() && !at_resume && py_frame.trace_opcodes.get() {
                     if let Err(e) = self.fire_opcode_event(&py_frame) {
                         trace_err = Some(e);
@@ -3676,21 +3729,48 @@ impl Interpreter {
             } else {
                 None
             };
+            let mut instruction_ran = false;
+            // An error injected *before* the instruction runs (raising
+            // trace callback, async exc, signal handler) is attributed to
+            // the instruction that was about to execute: advance `pc` past
+            // it so `handle_exception`'s `pc - 1` convention finds the
+            // right protected range and traceback line. Without this, an
+            // error injected at the first instruction of a `try` body
+            // escapes the `try` (test_sys_settrace
+            // no_jump_to_non_integers catches the setter's ValueError
+            // *inside* the traced frame).
             let stepped = if let Some(e) = trace_err {
+                frame.pc += 1;
                 Err(e)
             } else if let Some(exc) = async_exc {
+                frame.pc += 1;
                 Err(match Self::normalize_exception(exc, None) {
                     Ok(pe) => RuntimeError::PyException(pe),
                     Err(e) => e,
                 })
             } else if crate::stdlib::signal_mod::signals_pending() && crate::gil::is_main_thread() {
                 match self.run_pending_signals(&py_frame) {
-                    Ok(()) => self.step(frame),
-                    Err(e) => Err(e),
+                    Ok(()) => {
+                        instruction_ran = true;
+                        self.step(frame)
+                    }
+                    Err(e) => {
+                        frame.pc += 1;
+                        Err(e)
+                    }
                 }
             } else {
+                instruction_ran = true;
                 self.step(frame)
             };
+            // The instruction at `cur_pc` executed (or raised while
+            // executing): it becomes the "previously executed"
+            // instruction for line-event suppression. Errors injected
+            // *before* execution (a raising trace callback, an async
+            // exc) leave `prev_pc` untouched.
+            if instruction_ran {
+                prev_pc = Some(cur_pc);
+            }
             if watch_drops
                 && (frame.stack.len() < stack_before
                     || matches!(
@@ -3757,8 +3837,33 @@ impl Interpreter {
                             // `except` sees `e.__cause__`.
                             Self::sync_exc_attrs(&exc);
                         }
-                        if crate::trace::any_observers_active() {
-                            self.fire_exception_event(&py_frame, &exc)?;
+                        // CPython's RERAISE fires the separate RERAISE
+                        // monitoring event, which `sys.settrace` does
+                        // *not* subscribe to — only fresh raises
+                        // (RAISE_VARARGS, failing opcodes, propagating
+                        // callee exceptions) surface as `'exception'`
+                        // trace events. A compiler-generated re-raise
+                        // (unmatched `except`, end of `finally`,
+                        // non-suppressing `with` cleanup) is silent, and
+                        // so is a bare `raise` statement (RAISE_VARARGS 0
+                        // re-raising the handled exception): CPython's
+                        // `do_raise` routes it through `monitor_reraise`.
+                        let reraising = matches!(
+                            frame.code.instructions.get(cur_pc).map(|i| (i.op, i.arg)),
+                            Some((OpCode::Reraise, _)) | Some((OpCode::RaiseVarargs, 0))
+                        );
+                        if crate::trace::any_observers_active() && !reraising {
+                            // A raising `'exception'` trace callback
+                            // *replaces* the propagating exception
+                            // (CPython `call_exc_trace` drops the
+                            // original); the replacement unwinds through
+                            // this same frame's handlers.
+                            if let Err(trace_e) = self.fire_exception_event(&py_frame, &exc) {
+                                match trace_e {
+                                    RuntimeError::PyException(new_exc) => exc = new_exc,
+                                    other => break Err(other),
+                                }
+                            }
                         }
                         match self.handle_exception(frame, exc) {
                             Ok(Some(())) => continue,
@@ -4352,16 +4457,14 @@ impl Interpreter {
             arg,
         ];
         let outer = self.builtins.clone();
-        // CPython's trace/profile contract for a raised exception:
-        //
-        //   * On an `'exception'` event the exception is discarded
-        //     (`call_trace_protected` / `call_exc_trace`) so that it
-        //     doesn't clobber the exception already being propagated.
-        //   * On every other event (`'call'`, `'line'`, `'return'`,
-        //     `'opcode'`) the exception propagates into the traced
-        //     program *and* tracing is turned off (the offending
-        //     trace/profile function is cleared) so no further events
-        //     fire while the exception unwinds.
+        // CPython's trace/profile contract for a raised exception: the
+        // exception propagates into the traced program *and* tracing is
+        // turned off (the offending trace/profile function is cleared) so
+        // no further events fire while the exception unwinds. For an
+        // `'exception'` event, `call_exc_trace` drops the exception that
+        // was being propagated and lets the trace function's exception
+        // *replace* it (test_sys_settrace test_no_jump_from_exception_event
+        // sees the setter's ValueError, not the original ZeroDivisionError).
         //
         // Clearing the global hook is sufficient to silence all
         // subsequent events: the dispatcher gates every callout on the
@@ -4369,20 +4472,16 @@ impl Interpreter {
         match self.call(hook, &args, &[], &outer) {
             Ok(v) => Ok(v),
             Err(RuntimeError::PyException(exc)) => {
-                if event == "exception" {
-                    Ok(Object::None)
-                } else {
-                    match kind {
-                        crate::trace::HookKind::Trace => {
-                            crate::trace::set_trace_hook(Object::None);
-                            *py_frame.trace.borrow_mut() = Object::None;
-                        }
-                        crate::trace::HookKind::Profile => {
-                            crate::trace::set_profile_hook(Object::None);
-                        }
+                match kind {
+                    crate::trace::HookKind::Trace => {
+                        crate::trace::set_trace_hook(Object::None);
+                        *py_frame.trace.borrow_mut() = Object::None;
                     }
-                    Err(RuntimeError::PyException(exc))
+                    crate::trace::HookKind::Profile => {
+                        crate::trace::set_profile_hook(Object::None);
+                    }
                 }
+                Err(RuntimeError::PyException(exc))
             }
             Err(other) => Err(other),
         }
@@ -5176,7 +5275,10 @@ impl Interpreter {
                             &[],
                             &frame.globals.clone(),
                         )?
-                    } else if let Some(method) = ty.lookup("__class_getitem__") {
+                    } else if let Some(method) = ty
+                        .lookup("__class_getitem__")
+                        .filter(|m| !matches!(m, Object::None))
+                    {
                         let callable = match method {
                             Object::ClassMethod(inner) => inner.func(),
                             Object::StaticMethod(inner) => inner.func(),
@@ -5188,7 +5290,18 @@ impl Interpreter {
                             &[],
                             &frame.globals.clone(),
                         )?
-                    } else if ty.flags.is_builtin && !ty.flags.is_exception {
+                    } else if matches!(ty.lookup("__class_getitem__"), Some(Object::None)) {
+                        // CPython `PyObject_GetItem`: an explicit
+                        // `__class_getitem__ = None` opts the class out of
+                        // subscription with the type-flavored message.
+                        return Err(type_error(format!(
+                            "type '{}' is not subscriptable",
+                            ty.name
+                        )));
+                    } else if ty.flags.is_builtin
+                        && !ty.flags.is_exception
+                        && builtin_type_is_generic(&ty.name)
+                    {
                         // PEP 585 fallback — `list[int]`, `dict[str, int]`,
                         // etc. We build a SimpleNamespace-shaped
                         // GenericAlias with `__origin__` and `__args__`
@@ -5197,7 +5310,13 @@ impl Interpreter {
                         // and other reflective uses go through `__origin__`.
                         make_generic_alias(Object::Type(ty.clone()), i.clone())
                     } else {
-                        self.binary_subscr(&v, &i)?
+                        // CPython `PyObject_GetItem` for any other class:
+                        // "type 'X' is not subscriptable" (the *type*
+                        // flavor, naming the class, not its metaclass).
+                        return Err(type_error(format!(
+                            "type '{}' is not subscriptable",
+                            ty.name
+                        )));
                     }
                 } else if matches!(&v, Object::Foreign(_)) {
                     // A foreign extension object (e.g. numpy's `flatiter`)
@@ -5213,6 +5332,13 @@ impl Interpreter {
                         )?,
                         Err(_) => self.binary_subscr(&v, &i)?,
                     }
+                } else if is_generic_alias(&v) {
+                    // Native alias re-parameterisation may need the typing
+                    // hooks (`__typing_prepare_subst__`), which run Python.
+                    self.subscript_generic_alias_vm(&v, &i)?
+                } else if is_pep604_union(&v).is_some() {
+                    // `(list[T] | int)[str]` — CPython `union_getitem`.
+                    self.subscript_union_vm(&v, &i)?
                 } else {
                     self.binary_subscr(&v, &i)?
                 };
@@ -6390,6 +6516,46 @@ impl Interpreter {
                         }
                         v
                     }
+                };
+                frame.push(v);
+            }
+            // PEP 695 annotation-scope loads (RFC 0051): TOS is the
+            // `__classdict__` mapping (pushed by a preceding LoadDeref);
+            // try it first, then fall back to the closure cell /
+            // globals — CPython's LOAD_FROM_DICT_OR_{DEREF,GLOBALS}.
+            OpCode::LoadClassdictOrDeref => {
+                let idx = ins.arg as usize;
+                let free_offset = frame.code.cellvars.len();
+                let free_index = idx.saturating_sub(free_offset);
+                let name = frame
+                    .code
+                    .freevars
+                    .get(free_index)
+                    .cloned()
+                    .unwrap_or_default();
+                let mapping = frame.pop()?;
+                let v = match self.classdict_get(&mapping, &name)? {
+                    Some(v) => v,
+                    None => {
+                        let cell =
+                            frame.cells.get(idx).cloned().ok_or_else(|| {
+                                RuntimeError::Internal("bad cell index".to_owned())
+                            })?;
+                        let v = cell.borrow().clone();
+                        if matches!(v, Object::Unbound) {
+                            return Err(Self::unbound_deref(&frame.code, idx));
+                        }
+                        v
+                    }
+                };
+                frame.push(v);
+            }
+            OpCode::LoadClassdictOrGlobal => {
+                let name = self.name_at(&frame.code, ins.arg)?;
+                let mapping = frame.pop()?;
+                let v = match self.classdict_get(&mapping, &name)? {
+                    Some(v) => v,
+                    None => self.lookup_global_or_builtin(&frame.globals, &name)?,
                 };
                 frame.push(v);
             }
@@ -7572,7 +7738,7 @@ impl Interpreter {
     }
 
     fn lookup_global_or_builtin(
-        &self,
+        &mut self,
         globals: &Rc<RefCell<DictData>>,
         name: &str,
     ) -> Result<Object, RuntimeError> {
@@ -7580,12 +7746,56 @@ impl Interpreter {
         if let Some(v) = globals.borrow().get(&key) {
             return Ok(v.clone());
         }
+        // Dict-subclass exec/eval globals: CPython's non-exact-dict
+        // LOAD_GLOBAL slow path consults the mapping's `__missing__`
+        // *before* falling back to builtins; a KeyError from it falls
+        // through, anything else propagates. The VM's own named
+        // intrinsics (`__weavepy_*__`, CPython's CALL_INTRINSIC
+        // opcodes) are not observable names and must never route
+        // through user mappings.
+        if !name.starts_with("__weavepy_") {
+            if let Some(owner) = self.globals_missing_owner(globals) {
+                if let Some(miss) = instance_method(&owner, "__missing__") {
+                    let g = self.builtins.clone();
+                    match self.call(&miss, &[Object::from_str(name.to_owned())], &[], &g) {
+                        Ok(v) => return Ok(v),
+                        Err(RuntimeError::PyException(exc)) if exc.type_name() == "KeyError" => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+        }
         if let Some(v) = self.builtins.borrow().get(&key) {
             return Ok(v.clone());
         }
         let err = name_error(format!("name '{name}' is not defined"));
         crate::error::set_exception_attr(&err, "name", Object::from_str(name.to_owned()));
         Err(err)
+    }
+
+    /// The dict-subclass instance registered (by `exec`/`eval`) as the
+    /// owner of `globals`, if any.
+    fn globals_missing_owner(&self, globals: &Rc<RefCell<DictData>>) -> Option<Object> {
+        let hooks = self.globals_missing_hooks.borrow();
+        if hooks.is_empty() {
+            return None;
+        }
+        let want = Rc::as_ptr(globals) as usize;
+        hooks
+            .iter()
+            .find(|(ptr, _)| *ptr == want)
+            .map(|(_, inst)| Object::Instance(inst.clone()))
+    }
+
+    /// Register a dict-subclass globals owner for `__missing__` dispatch
+    /// (see `globals_missing_hooks`). Idempotent per dict identity.
+    fn register_globals_missing_hook(&self, dict: &Rc<RefCell<DictData>>, inst: &Rc<PyInstance>) {
+        let ptr = Rc::as_ptr(dict) as usize;
+        let mut hooks = self.globals_missing_hooks.borrow_mut();
+        if hooks.iter().any(|(p, _)| *p == ptr) {
+            return;
+        }
+        hooks.push((ptr, inst.clone()));
     }
 
     fn load_attr(&mut self, obj: &Object, name: &str) -> Result<Object, RuntimeError> {
@@ -7825,7 +8035,7 @@ impl Interpreter {
                 crate::foreign::getattr(s, name)
             }
             Object::Instance(inst) => self.load_attr_instance(inst, obj, name),
-            Object::Type(ty) => self.load_attr_type(ty, name),
+            Object::Type(ty) => self.load_attr_type_dispatch(&ty.clone(), obj, name),
             Object::Property(p) => match name {
                 // A tagged numeric getset/member (`float.real`,
                 // `complex.real`) reports CPython descriptor metadata.
@@ -8010,6 +8220,37 @@ impl Interpreter {
                 }
                 if name == "__dict__" {
                     return Ok(Object::Dict(d.clone()));
+                }
+                // CPython `ga_getattro`: a GenericAlias proxies attribute
+                // reads to its `__origin__` (so `dict[int, None].fromkeys`
+                // and unbound `list[int].append` work), except for the
+                // alias's own bookkeeping attributes — those miss above
+                // and must NOT resolve through the origin.
+                if is_generic_alias(obj)
+                    && is_pep604_union(obj).is_none()
+                    && !matches!(
+                        name,
+                        "__class__"
+                            | "__bases__"
+                            | "__origin__"
+                            | "__args__"
+                            | "__unpacked__"
+                            | "__parameters__"
+                            | "__typing_unpacked_tuple_args__"
+                            | "__mro_entries__"
+                            | "__reduce_ex__"
+                            | "__reduce__"
+                            | "__copy__"
+                            | "__deepcopy__"
+                    )
+                {
+                    let origin = d
+                        .borrow()
+                        .get(&crate::object::StrKey("__origin__"))
+                        .cloned();
+                    if let Some(origin) = origin {
+                        return self.load_attr(&origin, name);
+                    }
                 }
                 Err(attribute_error(format!(
                     "'SimpleNamespace' object has no attribute '{name}'"
@@ -8797,6 +9038,11 @@ impl Interpreter {
     ) -> Result<Object, RuntimeError> {
         match recv {
             Object::Instance(inst) => self.load_attr_instance_default(inst, recv, name),
+            // A class receiver must NOT re-enter the metaclass
+            // `__getattribute__` dispatch (a common override body is
+            // `return object.__getattribute__(self, attr)` — that would
+            // recurse forever); go straight to the default type lookup.
+            Object::Type(ty) => self.load_attr_type(&ty.clone(), name),
             _ => self.load_attr(recv, name),
         }
     }
@@ -8931,6 +9177,43 @@ impl Interpreter {
                             name: "__dir__",
                             binds_instance: true,
                             call: Box::new(crate::builtins::b_dir),
+                            call_kw: None,
+                        })),
+                    ),
+                )));
+            }
+            // `type.mro` is a native slot absent from `type`'s dict, so
+            // the MRO walk above can't find it. A metaclass method doing
+            // `super().mro()` (test_super.test___class___mro) must reach
+            // the default C3 recomputation bound to the receiver class.
+            if name == "mro"
+                && matches!(&receiver, Object::Type(_))
+                && obj_type
+                    .mro
+                    .borrow()
+                    .iter()
+                    .any(|t| Rc::ptr_eq(t, &builtin_types().type_))
+            {
+                return Ok(Object::BoundMethod(Rc::new(
+                    crate::object::BoundMethod::new(
+                        receiver.clone(),
+                        Object::Builtin(Rc::new(crate::object::BuiltinFn {
+                            name: "mro",
+                            binds_instance: true,
+                            call: Box::new(|args| {
+                                let recv = match args.first() {
+                                    Some(Object::Type(t)) => t.clone(),
+                                    _ => {
+                                        return Err(type_error(
+                                            "descriptor 'mro' requires a 'type' object",
+                                        ))
+                                    }
+                                };
+                                let mro = crate::types::TypeObject::recompute_c3(&recv)?;
+                                Ok(Object::new_list(
+                                    mro.into_iter().map(Object::Type).collect(),
+                                ))
+                            }),
                             call_kw: None,
                         })),
                     ),
@@ -9117,6 +9400,56 @@ impl Interpreter {
         Err(crate::error::attribute_error_named(instance_obj, name))
     }
 
+    /// Explicit attribute access on a class (`C.attr`, `getattr(C, …)`):
+    /// dispatch a *metaclass* `__getattribute__` override, and consult a
+    /// metaclass `__getattr__` on AttributeError — CPython installs
+    /// `slot_tp_getattr_hook` on the metaclass just as on ordinary
+    /// classes (typing's NamedTuple `__set_name__` error-propagation
+    /// tests hit the override path). Implicit special-method lookups
+    /// bypass this, exactly as on instances.
+    fn load_attr_type_dispatch(
+        &mut self,
+        ty: &Rc<TypeObject>,
+        obj: &Object,
+        name: &str,
+    ) -> Result<Object, RuntimeError> {
+        let meta = ty.metaclass_or_type();
+        let plain_meta = Rc::ptr_eq(&meta, &builtin_types().type_);
+        let result = if plain_meta {
+            self.load_attr_type(ty, name)
+        } else if let Some(getattribute) = self.user_getattribute(&meta) {
+            // `dispatch` so a descriptor-valued `__getattribute__` honours
+            // its `__get__`, as on the instance path.
+            let bound =
+                Object::BoundMethod(Rc::new(BoundMethod::dispatch(obj.clone(), getattribute)));
+            self.call(
+                &bound,
+                &[Object::from_str(name)],
+                &[],
+                &self.builtins.clone(),
+            )
+        } else {
+            self.load_attr_type(ty, name)
+        };
+        match result {
+            Err(e) if !plain_meta && self.is_attribute_error(&e) => {
+                if let Some(getattr) = meta.lookup("__getattr__") {
+                    let bound =
+                        Object::BoundMethod(Rc::new(BoundMethod::dispatch(obj.clone(), getattr)));
+                    self.call(
+                        &bound,
+                        &[Object::from_str(name)],
+                        &[],
+                        &self.builtins.clone(),
+                    )
+                } else {
+                    Err(e)
+                }
+            }
+            other => other,
+        }
+    }
+
     /// Attribute access on a class. Mirrors CPython's
     /// `type.__getattribute__`: the metaclass MRO contributes data
     /// descriptors that beat class-level attrs, the class itself is
@@ -9239,6 +9572,10 @@ impl Interpreter {
                 return Ok(Object::new_tuple(mro));
             }
             "__class__" => return Ok(Object::Type(meta)),
+            // PEP 695: `type.__type_params__` is a getset defaulting to
+            // `()` when the class dict has no entry (generic classes
+            // store theirs; `type.__type_params__` itself reads `()`).
+            "__type_params__" => return Ok(Object::new_tuple(vec![])),
             // CPython: `type.__dict__` is a read-only `mappingproxy`
             // (direct `cls.__dict__[k] = v` raises TypeError; mutation
             // must go through `setattr`). The proxy *shares* the dict, so
@@ -12482,6 +12819,21 @@ impl Interpreter {
                 instance_method(obj, "__len__"),
                 instance_method(obj, "__getitem__"),
             ) {
+                // Lazy, like CPython's `reversedobject`: hold the live
+                // sequence and a descending cursor. `__len__` runs once
+                // here (via the wrapper's `__init__`) and again on every
+                // `__length_hint__` — a `__len__` that starts raising
+                // must propagate from `operator.length_hint`
+                // (test_enumerate.TestReversed.test_len).
+                if let Some(it) = self.make_seqtools_iter(
+                    "_ReversedIter",
+                    std::slice::from_ref(obj),
+                    &[],
+                    globals,
+                )? {
+                    return Ok(it);
+                }
+                // Eager fallback if the frozen module is unavailable.
                 let n = self.call(&len_m, &[], &[], globals)?;
                 let n = n.as_i64().ok_or_else(|| {
                     type_error("__len__() should return an integer for reversed()")
@@ -12957,24 +13309,44 @@ impl Interpreter {
                 )));
                 return self.call(&bound, std::slice::from_ref(i), &[], &g);
             }
-            if let Some(method) = ty.lookup("__class_getitem__") {
-                let callable = match method {
-                    Object::ClassMethod(inner) => inner.func(),
-                    Object::StaticMethod(inner) => inner.func(),
-                    other => other,
-                };
-                return self.call(&callable, &[Object::Type(ty.clone()), i.clone()], &[], &g);
+            match ty.lookup("__class_getitem__") {
+                Some(Object::None) => {
+                    // CPython `PyObject_GetItem`: `__class_getitem__ = None`
+                    // opts out of subscription (type-flavored message).
+                    return Err(type_error(format!(
+                        "type '{}' is not subscriptable",
+                        ty.name
+                    )));
+                }
+                Some(method) => {
+                    let callable = match method {
+                        Object::ClassMethod(inner) => inner.func(),
+                        Object::StaticMethod(inner) => inner.func(),
+                        other => other,
+                    };
+                    return self.call(&callable, &[Object::Type(ty.clone()), i.clone()], &[], &g);
+                }
+                None => {}
             }
-            if ty.flags.is_builtin && !ty.flags.is_exception {
+            if ty.flags.is_builtin && !ty.flags.is_exception && builtin_type_is_generic(&ty.name) {
                 return Ok(make_generic_alias(Object::Type(ty.clone()), i.clone()));
             }
-            return self.binary_subscr(v, i);
+            return Err(type_error(format!(
+                "type '{}' is not subscriptable",
+                ty.name
+            )));
         }
         if matches!(v, Object::Foreign(_)) {
             return match self.load_attr(v, "__getitem__") {
                 Ok(method) => self.call(&method, std::slice::from_ref(i), &[], &g),
                 Err(_) => self.binary_subscr(v, i),
             };
+        }
+        if is_generic_alias(v) {
+            return self.subscript_generic_alias_vm(v, i);
+        }
+        if is_pep604_union(v).is_some() {
+            return self.subscript_union_vm(v, i);
         }
         self.binary_subscr(v, i)
     }
@@ -13392,6 +13764,18 @@ impl Interpreter {
                 self.call(&method, &[], &[], globals)
             }
             Object::Instance(_) => {
+                // `__iter__ = None` disables the slot (CPython's
+                // "anti-registration" convention — typing's special forms
+                // use it so `iter(Union[int, str])` raises "not iterable"
+                // rather than calling None).
+                if let Object::Instance(inst) = v {
+                    if matches!(inst.cls().lookup("__iter__"), Some(Object::None)) {
+                        return Err(type_error(format!(
+                            "'{}' object is not iterable",
+                            v.type_name_owned()
+                        )));
+                    }
+                }
                 if let Some(method) = instance_method(v, "__iter__") {
                     let result = self.call(&method, &[], &[], globals)?;
                     // CPython requires `__iter__` to return an actual
@@ -13530,46 +13914,50 @@ impl Interpreter {
     }
 
     /// `iter()` of a PEP 585 generic alias. Mirrors CPython's
-    /// `ga_iternext`, which yields `typing.Unpack[self]` exactly once
-    /// before the iterator is exhausted. The single value is wrapped in a
-    /// tuple-style iterator so the exhausted `__reduce__` collapses to the
-    /// empty-tuple form `(iter, ((),))`, matching `tupleiterator`.
+    /// `ga_iternext`, which yields the *starred* form of the alias (a
+    /// fresh `types.GenericAlias` with `__unpacked__ = True`, repr
+    /// `*tuple[str]`) exactly once before the iterator is exhausted. The
+    /// single value is wrapped in a tuple-style iterator so the exhausted
+    /// `__reduce__` collapses to the empty-tuple form `(iter, ((),))`,
+    /// matching `tupleiterator`.
     fn make_generic_alias_iter(
         &mut self,
         alias: &Object,
-        globals: &Rc<RefCell<DictData>>,
+        _globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
-        let starred = self.build_unpack_form(alias, globals)?;
+        let starred = match alias {
+            Object::SimpleNamespace(d) => {
+                let mut copy = d.borrow().clone();
+                copy.insert(
+                    DictKey(Object::from_static("__unpacked__")),
+                    Object::Bool(true),
+                );
+                // CPython `ga_typing_unpacked_tuple_args`: a starred alias
+                // whose origin is `tuple` exposes its args so typing's
+                // `_unpack_args` can splice `*tuple[int, str]` flat.
+                let is_tuple_origin = matches!(
+                    copy.get(&DictKey(Object::from_static("__origin__"))),
+                    Some(Object::Type(t)) if Rc::ptr_eq(t, &crate::builtin_types::builtin_types().tuple_)
+                );
+                if is_tuple_origin {
+                    let args = copy
+                        .get(&DictKey(Object::from_static("__args__")))
+                        .cloned()
+                        .unwrap_or_else(|| Object::new_tuple(Vec::new()));
+                    copy.insert(
+                        DictKey(Object::from_static("__typing_unpacked_tuple_args__")),
+                        args,
+                    );
+                }
+                Object::SimpleNamespace(Rc::new(RefCell::new(copy)))
+            }
+            other => other.clone(),
+        };
         let it = crate::object::PyIterator::Tuple {
             items: Rc::from(vec![starred]),
             index: 0,
         };
         Ok(Object::Iter(Rc::new(RefCell::new(it))))
-    }
-
-    /// Build `typing.Unpack[alias]` — the PEP 646 star-unpack form a
-    /// generic alias yields when iterated. CPython lazily imports `typing`
-    /// at this point too; if `typing.Unpack` is somehow unavailable we
-    /// degrade to yielding the alias itself (the value is rarely inspected,
-    /// only the exhausted-iterator `__reduce__` is observable in practice).
-    fn build_unpack_form(
-        &mut self,
-        alias: &Object,
-        globals: &Rc<RefCell<DictData>>,
-    ) -> Result<Object, RuntimeError> {
-        if let Ok(Object::Module(m)) = self.do_import("typing", &Object::None, 0, globals) {
-            let unpack = m
-                .dict
-                .borrow()
-                .get(&DictKey(Object::from_static("Unpack")))
-                .cloned();
-            if let Some(unpack) = unpack {
-                if let Some(method) = instance_method(&unpack, "__getitem__") {
-                    return self.call(&method, std::slice::from_ref(alias), &[], globals);
-                }
-            }
-        }
-        Ok(alias.clone())
     }
 
     /// Drive an awaitable into its underlying iterator (PEP 492 /
@@ -13765,7 +14153,7 @@ impl Interpreter {
                 }
                 Err(e) => Err(e),
             },
-            Object::Instance(_) => {
+            Object::Instance(inst) => {
                 if let Some(method) = instance_method(iter, "__next__") {
                     match self.call(&method, &[], &[], globals) {
                         Ok(v) => Ok(Some(v)),
@@ -13776,6 +14164,19 @@ impl Interpreter {
                         }
                         Err(e) => Err(e),
                     }
+                } else if let Some(native) = inst.native.get().filter(|n| {
+                    // A subclass of a built-in iterator type
+                    // (`class MyEnum(enumerate)`) inherits the C-level
+                    // `__next__`: advance the wrapped iterator payload
+                    // (a native iterator, or the lazy `_seqtools`
+                    // wrapper used for VM-driven sources).
+                    matches!(
+                        n,
+                        Object::Iter(_) | Object::LazyIter(_) | Object::Generator(_)
+                    ) || instance_method(n, "__next__").is_some()
+                }) {
+                    let native = native.clone();
+                    self.iter_next(&native, globals)
                 } else {
                     Err(type_error(format!(
                         "'{}' object is not an iterator",
@@ -15295,6 +15696,41 @@ impl Interpreter {
             }
         }
 
+        // RFC 0051 (WS4): CPython's `gen_throw` resumes the frame at
+        // the yield and delivers PY_THROW (legacy `'call'`) followed
+        // by RAISE (`'exception'`) *at the suspension point*, before
+        // any handler runs — so both events report the yield's line.
+        // Fire them here while `pc` still points at the resume site;
+        // the upcoming `run_until_yield_or_return` skips its own
+        // frame-entry call event (it would see the handler's no-line
+        // `PUSH_EXC_INFO` and report `f_lineno = None`).
+        if crate::trace::any_observers_active() {
+            if let Some(py) = frame.py_frame.clone() {
+                py.lasti.set(frame.pc);
+                let line = frame
+                    .code
+                    .linetable
+                    .get(frame.pc as usize)
+                    .copied()
+                    .unwrap_or(0);
+                if line != 0 {
+                    py.last_line.set(Some(line));
+                }
+                *py.back.borrow_mut() = self.frame_stack.borrow().last().cloned();
+                py.on_stack.set(py.on_stack.get() + 1);
+                self.frame_stack.borrow_mut().push(py.clone());
+                let hook_result = self
+                    .fire_call_event(&py)
+                    .and_then(|()| self.fire_exception_event(&py, &exc));
+                self.pop_py_frame();
+                if let Err(err) = hook_result {
+                    *gen.state.borrow_mut() = GeneratorState::Finished;
+                    return Err(err);
+                }
+                frame.suppress_call_event = true;
+            }
+        }
+
         // Let the suspended frame handle the exception via its own
         // exception table; if no handler claims it the error bubbles
         // out and we mark the generator finished.
@@ -16479,6 +16915,89 @@ impl Interpreter {
     /// `NormalDist.test_equality`: `nd == A()` is `10`, not `True`). Only the
     /// *fallbacks* (identity for `==`/`!=`, the `__eq__`-derived `!=`, and the
     /// container/native defaults) are intrinsically boolean.
+    /// Set-style equality of two PEP 604 unions' args (CPython
+    /// `union_richcompare` compares frozensets of args): order-insensitive,
+    /// each side's every arg must have a VM-equal counterpart.
+    fn union_args_set_eq(
+        &mut self,
+        a: &[Object],
+        b: &[Object],
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<bool, RuntimeError> {
+        let covers = |vm: &mut Self, xs: &[Object], ys: &[Object]| -> Result<bool, RuntimeError> {
+            'outer: for x in xs {
+                for y in ys {
+                    if vm.vm_eq(x, y, globals)? {
+                        continue 'outer;
+                    }
+                }
+                return Ok(false);
+            }
+            Ok(true)
+        };
+        Ok(covers(self, a, b)? && covers(self, b, a)?)
+    }
+
+    /// Equality of two namespace-shaped generic aliases (CPython
+    /// `ga_richcompare`): `__origin__` and `__args__`, both through
+    /// VM-aware equality so typing-level `__eq__` overrides apply.
+    fn generic_alias_eq(
+        &mut self,
+        a: &Object,
+        b: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<bool, RuntimeError> {
+        let field = |o: &Object, name: &'static str| -> Object {
+            match o {
+                Object::SimpleNamespace(d) => d
+                    .borrow()
+                    .get(&DictKey(Object::from_static(name)))
+                    .cloned()
+                    .unwrap_or(Object::None),
+                _ => Object::None,
+            }
+        };
+        // CPython `ga_richcompare` also compares the `starred` flag:
+        // `*tuple[int, ...] != tuple[int, ...]` (typing's `_tp_cache`
+        // would otherwise conflate them).
+        let starred = |o: &Object| matches!(field(o, "__unpacked__"), Object::Bool(true));
+        if starred(a) != starred(b) {
+            return Ok(false);
+        }
+        if !self.vm_eq(&field(a, "__origin__"), &field(b, "__origin__"), globals)? {
+            return Ok(false);
+        }
+        let (args_a, args_b) = (field(a, "__args__"), field(b, "__args__"));
+        match (&args_a, &args_b) {
+            (Object::Tuple(xa), Object::Tuple(xb)) => {
+                if xa.len() != xb.len() {
+                    return Ok(false);
+                }
+                for (x, y) in xa.iter().zip(xb.iter()) {
+                    if !self.vm_eq(x, y, globals)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            _ => self.vm_eq(&args_a, &args_b, globals),
+        }
+    }
+
+    /// VM-aware `a == b` reduced to a bool (identity fast path first).
+    fn vm_eq(
+        &mut self,
+        a: &Object,
+        b: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<bool, RuntimeError> {
+        if a.is_same(b) {
+            return Ok(true);
+        }
+        let r = self.rich_compare_obj(a, b, CompareKind::Eq, globals)?;
+        Ok(r.is_truthy())
+    }
+
     fn rich_compare_obj(
         &mut self,
         a: &Object,
@@ -16486,6 +17005,38 @@ impl Interpreter {
         op: CompareKind,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
+        // PEP 585 aliases compare per CPython `ga_richcompare`:
+        // `__origin__` and `__args__` element-wise through *full* rich
+        // equality — args may hold typing-level instances whose `__eq__`
+        // is Python (two distinct `Unpack[tuple[int, ...]]` objects are
+        // equal), which the native namespace `eq_value` (identity for
+        // instances) cannot see.
+        if matches!(op, CompareKind::Eq | CompareKind::NotEq)
+            && is_generic_alias(a)
+            && is_generic_alias(b)
+        {
+            let eq = self.generic_alias_eq(a, b, globals)?;
+            let res = if matches!(op, CompareKind::Eq) {
+                eq
+            } else {
+                !eq
+            };
+            return Ok(Object::Bool(res));
+        }
+        // PEP 604 unions compare as *sets* of args through full rich
+        // equality (CPython `union_richcompare` builds frozensets) — args
+        // may be nested aliases whose equality needs the VM.
+        if matches!(op, CompareKind::Eq | CompareKind::NotEq) {
+            if let (Some(args_a), Some(args_b)) = (is_pep604_union(a), is_pep604_union(b)) {
+                let eq = self.union_args_set_eq(&args_a, &args_b, globals)?;
+                let res = if matches!(op, CompareKind::Eq) {
+                    eq
+                } else {
+                    !eq
+                };
+                return Ok(Object::Bool(res));
+            }
+        }
         let (dunder, swapped) = cmp_dunder(op);
         // A reflected/forward dunder may decline by returning
         // `NotImplemented`; treating that sentinel as a truthy result is
@@ -17133,7 +17684,7 @@ impl Interpreter {
     /// Deopt a `LOAD_GLOBAL` cache and run the generic lookup.
     #[inline]
     fn deopt_load_global_slow(
-        &self,
+        &mut self,
         frame: &Frame,
         cache_pc: u32,
         name_idx: u32,
@@ -18253,6 +18804,17 @@ impl Interpreter {
                 self.set_type_attr_direct(ty, name, value)
             }
             Object::Module(m) => {
+                // The `builtins` module's attributes are the ambient
+                // builtins namespace in CPython (same dict object);
+                // WeavePy's module is a re-exposure, so writes mirror
+                // into the live lookup dict (`test_dynamic`'s
+                // `swap_attr(builtins, "len", …)` must affect every
+                // frame's name resolution immediately).
+                if m.name == "builtins" {
+                    self.builtins
+                        .borrow_mut()
+                        .insert(DictKey(Object::from_str(name)), value.clone());
+                }
                 m.dict
                     .borrow_mut()
                     .insert(DictKey(Object::from_str(name)), value);
@@ -18884,6 +19446,13 @@ impl Interpreter {
             // `del module.attr` removes the name from the module dict
             // (CPython `module_setattro` with a NULL value).
             Object::Module(m) => {
+                // Mirror of the `store_attr` special case: deleting a
+                // `builtins` attribute unhooks it from live name lookup.
+                if m.name == "builtins" {
+                    self.builtins
+                        .borrow_mut()
+                        .shift_remove(&DictKey(Object::from_str(name)));
+                }
                 let removed = m
                     .dict
                     .borrow_mut()
@@ -19206,6 +19775,12 @@ impl Interpreter {
         // `__index__` code runs.
         let coerced_index;
         let index = match index {
+            // A range slices at full integer width (CPython's
+            // `compute_slice` works on PyLongs — `range(2**100)[:2**100]`
+            // must not saturate); `range_slice` runs `__index__` itself
+            // and ranges are immutable, so the borrow-safety pre-pass is
+            // unnecessary.
+            Object::Slice(_) if matches!(container, Object::Range(_)) => index,
             Object::Slice(s) if is_sequence && slice_needs_resolution(s) => {
                 coerced_index = Object::Slice(Rc::new(resolve_slice_ints(s)?));
                 &coerced_index
@@ -19309,7 +19884,11 @@ impl Interpreter {
                 ))
             }
             (Object::Range(r), Object::Slice(slc)) => {
-                let len = container.len()? as i64;
+                // Full-width length: `range(2**100)[s]` must slice
+                // exactly (`len()` would truncate/overflow — CPython's
+                // `compute_slice` works on PyLongs; test_slice
+                // test_indices sweeps ±2**100).
+                let len = crate::object::range_len_i128(r);
                 range_slice(r, len, slc)
             }
             (Object::Bytes(buf), Object::Int(i)) => {
@@ -20365,6 +20944,22 @@ impl Interpreter {
                     if b.name == "__vm:type_alias" {
                         return self.do_type_alias_call(args, outer_globals);
                     }
+                    if let Some(kind) = b.name.strip_prefix("__vm:").filter(|k| {
+                        matches!(
+                            *k,
+                            "typevar"
+                                | "typevar_with_bound"
+                                | "typevar_with_constraints"
+                                | "paramspec"
+                                | "typevartuple"
+                                | "typeparam_default"
+                                | "typeparam_default_starred"
+                                | "generic_base"
+                        )
+                    }) {
+                        let kind = kind.to_owned();
+                        return self.do_typing_intrinsic(&kind, args, outer_globals);
+                    }
                     if b.name == "__vm:__import__" {
                         // ``__import__(name, globals=None, locals=None,
                         //              fromlist=(), level=0)`` — mirror
@@ -21147,6 +21742,15 @@ impl Interpreter {
                 let meta = ty.metaclass_or_type();
                 if !Rc::ptr_eq(&meta, &bt.type_) {
                     if let Some(call_method) = meta.lookup("__call__") {
+                        // CPython's `lookup_maybe_method`: a non-descriptor
+                        // `__call__` (e.g. typing's `_TypedDictMeta.__call__
+                        // = dict`) is invoked as-is, with no self injected —
+                        // `TD(x=1)` must mean `dict(x=1)`, not `dict(TD)`.
+                        if let Object::Type(target) = &call_method {
+                            if target.metaclass_or_type().lookup("__get__").is_none() {
+                                return self.call(&call_method, args, kwargs, outer_globals);
+                            }
+                        }
                         let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
                             Object::Type(ty.clone()),
                             call_method,
@@ -21196,7 +21800,18 @@ impl Interpreter {
                     .get(&DictKey(Object::from_static("__origin__")))
                     .cloned()
                     .expect("checked above");
-                self.call(&origin, args, kwargs, outer_globals)
+                let result = self.call(&origin, args, kwargs, outer_globals)?;
+                // CPython `ga_call` stamps `__orig_class__` on the fresh
+                // instance (typing's type-erasure tests read it back),
+                // swallowing AttributeError/TypeError from slots-only or
+                // immutable instances.
+                match self.store_attr(&result, "__orig_class__", callable.clone()) {
+                    Ok(()) => {}
+                    Err(RuntimeError::PyException(exc))
+                        if matches!(exc.type_name().as_str(), "TypeError" | "AttributeError") => {}
+                    Err(e) => return Err(e),
+                }
+                Ok(result)
             }
             _ => Err(type_error(format!(
                 "'{}' object is not callable",
@@ -21389,6 +22004,39 @@ impl Interpreter {
     /// wrapped native dict directly; `None` means "not bound here" so the
     /// caller falls through to globals/builtins (matching CPython's
     /// `LOAD_NAME`).
+    /// PEP 695 `LOAD_FROM_DICT_OR_*`: probe the `__classdict__`
+    /// mapping for `name`. Plain dicts (the overwhelmingly common
+    /// case) get a direct probe; a custom `__prepare__` mapping goes
+    /// through the full mapping protocol, with `KeyError` as a miss.
+    fn classdict_get(
+        &mut self,
+        mapping: &Object,
+        name: &str,
+    ) -> Result<Option<Object>, RuntimeError> {
+        if let Object::Dict(d) = mapping {
+            return Ok(d.borrow().get(&crate::object::StrKey(name)).cloned());
+        }
+        // Custom `__prepare__` mapping: go through the full mapping
+        // protocol — `__getitem__` (and dict's `__missing__` hook) must
+        // observe the probe (test_broken_class_namespace's
+        // `WeirdMapping.__missing__` raises RuntimeError on purpose).
+        let key = Object::from_str(name.to_owned());
+        let result = match instance_method(mapping, "__getitem__") {
+            Some(method) => self.call(
+                &method,
+                std::slice::from_ref(&key),
+                &[],
+                &Rc::new(RefCell::new(DictData::default())),
+            ),
+            None => self.binary_subscr(mapping, &key),
+        };
+        match result {
+            Ok(v) => Ok(Some(v)),
+            Err(RuntimeError::PyException(exc)) if exc.type_name() == "KeyError" => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     fn class_ns_load(&self, ns_obj: &Object, name: &str) -> Option<Object> {
         let key = DictKey(Object::from_str(name));
         match ns_obj {
@@ -21468,12 +22116,15 @@ impl Interpreter {
             Some(p) => p,
             None => return Ok(None),
         };
-        // `__prepare__` is conventionally a classmethod; bind the metaclass
-        // as the implicit first argument when needed.
+        // `__prepare__` is conventionally a classmethod (bound to the
+        // metaclass), but CPython fetches it with plain `getattr`: a
+        // bare `def __prepare__(name, bases)` in the metaclass body is
+        // called *unbound* with just `(name, bases, **kwds)`
+        // (test_broken_class_namespace).
         let (callable, prefix): (Object, Vec<Object>) = match &prep {
             Object::ClassMethod(inner) => (inner.func(), vec![Object::Type(metaclass.clone())]),
             Object::StaticMethod(inner) => (inner.func(), Vec::new()),
-            other => (other.clone(), vec![Object::Type(metaclass.clone())]),
+            other => (other.clone(), Vec::new()),
         };
         let bases_tuple = bases_tuple.clone();
         let mut call_args = prefix;
@@ -21630,12 +22281,13 @@ impl Interpreter {
             Some(Object::Type(t)) => Some(t.clone()),
             Some(other) => {
                 // Non-type metaclass: no winner computation, call it
-                // with the raw bases after the body runs.
+                // with the resolved bases after the body runs.
                 return self.build_class_with_callable_meta(
                     other.clone(),
                     &body_fn,
                     &name,
                     &resolved_bases,
+                    bases_replaced.then_some(orig_bases.as_slice()),
                     &subclass_kwargs,
                 );
             }
@@ -21684,6 +22336,7 @@ impl Interpreter {
                     &body_fn,
                     &name,
                     &resolved_bases,
+                    bases_replaced.then_some(orig_bases.as_slice()),
                     &subclass_kwargs,
                 );
             }
@@ -21693,12 +22346,10 @@ impl Interpreter {
         for b in &resolved_bases {
             match b {
                 Object::Type(t) => bases.push(t.clone()),
-                other => {
-                    return Err(type_error(format!(
-                        "base of class '{}' must be a class, got '{}'",
-                        name,
-                        other.type_name()
-                    )));
+                _ => {
+                    // CPython `type_new_impl`'s wording (test_typing's
+                    // `__mro_entries__`-returns-non-type case matches on it).
+                    return Err(type_error("bases must be types".to_owned()));
                 }
             }
         }
@@ -21789,6 +22440,25 @@ impl Interpreter {
         } else {
             frame.class_namespace = Some(class_ns.clone());
         }
+        // PEP 695 (RFC 0051): annotation scopes created in this class
+        // body (type-param bounds/defaults, `type` alias thunks, the
+        // hidden scopes of generic defs) close over a `__classdict__`
+        // cell holding the live namespace mapping — seed it before the
+        // body runs.
+        if let Some(i) = frame
+            .code
+            .cellvars
+            .iter()
+            .position(|c| c == "__classdict__")
+        {
+            if let Some(cell) = frame.cells.get(i) {
+                let mapping = match &ns_obj {
+                    Some(obj) => obj.clone(),
+                    None => Object::Dict(class_ns.clone()),
+                };
+                *cell.borrow_mut() = mapping;
+            }
+        }
         let _ = self.run_frame(&mut frame)?;
 
         // PEP 3135: when the body created a `__class__` cell (a method
@@ -21831,7 +22501,22 @@ impl Interpreter {
         {
             let mut ns = class_ns.borrow_mut();
             let key = DictKey(Object::from_static("__doc__"));
-            if ns.get(&key).is_none() {
+            // …unless `__slots__` names `__doc__` (CPython's `typing.py`
+            // does this): the injected class variable would then trip
+            // the "conflicts with class variable" slots check, which
+            // CPython only applies to *explicit* class-body bindings.
+            let slots_declare_doc = match ns.get(&DictKey(Object::from_static("__slots__"))) {
+                Some(Object::Str(s)) => s.as_ref() == "__doc__",
+                Some(Object::Tuple(t)) => t
+                    .iter()
+                    .any(|x| matches!(x, Object::Str(s) if s.as_ref() == "__doc__")),
+                Some(Object::List(l)) => l
+                    .borrow()
+                    .iter()
+                    .any(|x| matches!(x, Object::Str(s) if s.as_ref() == "__doc__")),
+                _ => false,
+            };
+            if ns.get(&key).is_none() && !slots_declare_doc {
                 ns.insert(key, Object::None);
             }
         }
@@ -21929,16 +22614,12 @@ impl Interpreter {
                 // `__init__` is skipped. (`__set_name__` /
                 // `__init_subclass__` already ran inside the real
                 // `type.__new__` via `dynamic_type_call_with_meta`.)
-                other => {
-                    for (i, cell_name) in body_fn.code().cellvars.iter().enumerate() {
-                        if cell_name == "__class__" {
-                            if let Some(cell) = frame.cells.get(i) {
-                                *cell.borrow_mut() = other.clone();
-                            }
-                        }
-                    }
-                    return Ok(other);
-                }
+                // CPython's `__build_class__` only audits the
+                // `__classcell__` when the metaclass returned an actual
+                // type (`PyType_Check(cls)` guards the check) — a
+                // metaclass returning e.g. `None` leaves the cell unset
+                // without complaint (test___class___delayed).
+                other => return Ok(other),
             };
             // Run `__init__` if a user `__new__` was used (the
             // dynamic_type_call_with_meta path already invokes
@@ -21974,15 +22655,62 @@ impl Interpreter {
         };
 
         // If the body produced a `__class__` cell (because a method
-        // references super or __class__), point it at the new type.
+        // references super or __class__), verify `type.__new__` pointed it
+        // at the class we're returning. CPython's `__build_class__` does
+        // NOT fill the cell itself — a metaclass that passes `type.__new__`
+        // a namespace *copy* (dropping `__classcell__`) leaves it unset
+        // (RuntimeError), and one that creates a second class from the
+        // same namespace re-points it (TypeError) — test_super
+        // test___classcell___missing / test___classcell___wrong_cell.
+        Self::check_classcell_propagated(&frame, &body_fn, &name, &Object::Type(ty.clone()))?;
         for (i, cell_name) in body_fn.code().cellvars.iter().enumerate() {
-            if cell_name == "__class__" {
+            // PEP 695: re-point `__classdict__` at the *type's* dict
+            // (CPython `type_new` via `__classdictcell__`), so lazy
+            // bounds/aliases see post-creation mutations like
+            // `X.T = float` (test_modified_later).
+            if cell_name == "__classdict__" {
                 if let Some(cell) = frame.cells.get(i) {
-                    *cell.borrow_mut() = Object::Type(ty.clone());
+                    *cell.borrow_mut() = Object::Dict(ty.dict.clone());
                 }
             }
         }
         Ok(Object::Type(ty))
+    }
+
+    /// CPython `__build_class__`'s final `__classcell__` audit: if the
+    /// class body minted a `__class__` cell, it must now hold exactly the
+    /// object being returned as the class.
+    fn check_classcell_propagated(
+        frame: &Frame,
+        body_fn: &Rc<PyFunction>,
+        name: &str,
+        cls: &Object,
+    ) -> Result<(), RuntimeError> {
+        for (i, cell_name) in body_fn.code().cellvars.iter().enumerate() {
+            if cell_name != "__class__" {
+                continue;
+            }
+            let Some(cell) = frame.cells.get(i) else {
+                continue;
+            };
+            let current = cell.borrow().clone();
+            if current.is_same(cls) {
+                continue;
+            }
+            if matches!(current, Object::Unbound) {
+                return Err(crate::error::runtime_error(format!(
+                    "__class__ not set defining {name:?} as {}. \
+                     Was __classcell__ propagated to type.__new__?",
+                    cls.repr()
+                )));
+            }
+            return Err(type_error(format!(
+                "__class__ set to {} defining {name:?} as {}",
+                current.repr(),
+                cls.repr()
+            )));
+        }
+        Ok(())
     }
 
     /// `__build_class__` tail for a metaclass that is not a subclass of
@@ -21997,6 +22725,7 @@ impl Interpreter {
         body_fn: &Rc<PyFunction>,
         name: &str,
         bases: &[Object],
+        orig_bases: Option<&[Object]>,
         subclass_kwargs: &[(String, Object)],
     ) -> Result<Object, RuntimeError> {
         let class_ns = Rc::new(RefCell::new(DictData::default()));
@@ -22039,7 +22768,30 @@ impl Interpreter {
             false,
         );
         frame.class_namespace = Some(class_ns.clone());
+        // PEP 695: seed any `__classdict__` cell (see the main build path).
+        if let Some(i) = frame
+            .code
+            .cellvars
+            .iter()
+            .position(|c| c == "__classdict__")
+        {
+            if let Some(cell) = frame.cells.get(i) {
+                *cell.borrow_mut() = Object::Dict(class_ns.clone());
+            }
+        }
         let _ = self.run_frame(&mut frame)?;
+
+        // PEP 560: when `__mro_entries__` rewrote the bases, expose the
+        // originals — CPython's `__build_class__` stamps
+        // `ns["__orig_bases__"]` after the body runs, before calling
+        // the metaclass (typing's `_generic_init_subclass` relies on
+        // it to tell `Generic[T]` from plain `Generic`).
+        if let Some(ob) = orig_bases {
+            class_ns.borrow_mut().insert(
+                DictKey(Object::from_static("__orig_bases__")),
+                Object::new_tuple(ob.to_vec()),
+            );
+        }
 
         let call_args = vec![
             Object::from_str(name),
@@ -22154,35 +22906,31 @@ impl Interpreter {
             _ => return Err(type_error("type() arg 1 must be str")),
         };
         let bases: Vec<Rc<TypeObject>> = match &args[1] {
-            Object::Tuple(items) => items
-                .iter()
-                .map(|b| match b {
-                    Object::Type(t) => Ok(t.clone()),
-                    other => Err(type_error(format!(
-                        "type() arg 2 entry must be a class, got '{}'",
-                        other.type_name()
-                    ))),
-                })
-                .collect::<Result<_, _>>()?,
+            Object::Tuple(items) => {
+                let mut resolved = Vec::with_capacity(items.len());
+                for b in items.iter() {
+                    match b {
+                        Object::Type(t) => resolved.push(t.clone()),
+                        other => {
+                            // CPython `type_new_get_bases`: a direct
+                            // `type()` call never resolves PEP 560
+                            // `__mro_entries__`; a base that carries the
+                            // hook gets the pointed redirect instead of
+                            // the generic message.
+                            if self.load_attr(other, "__mro_entries__").is_ok() {
+                                return Err(type_error(
+                                    "type() doesn't support MRO entry resolution; \
+                                     use types.new_class()",
+                                ));
+                            }
+                            return Err(type_error("bases must be types".to_owned()));
+                        }
+                    }
+                }
+                resolved
+            }
             _ => return Err(type_error("type() arg 2 must be tuple of bases")),
         };
-        if std::env::var_os("WEAVEPY_TRACE_SUPER").is_some() && name == "TimeRE" {
-            let bn: Vec<String> = bases
-                .iter()
-                .map(|b| {
-                    format!(
-                        "{}({:?})",
-                        b.name,
-                        b.mro
-                            .borrow()
-                            .iter()
-                            .map(|t| t.name.clone())
-                            .collect::<Vec<_>>()
-                    )
-                })
-                .collect();
-            eprintln!("[MKCLASS] name={name} bases={bn:?}");
-        }
         let ns_dict_obj = args[2].clone();
         let mut ns = match &args[2] {
             Object::Dict(d) => d.borrow().clone(),
@@ -22238,13 +22986,6 @@ impl Interpreter {
             }
         }
         let ty = TypeObject::new_user(&name, effective_bases.clone(), ns)?;
-        if std::env::var_os("WEAVEPY_TRACE_SUPER").is_some() && name == "TimeRE" {
-            let m: Vec<String> = ty.mro.borrow().iter().map(|t| t.name.clone()).collect();
-            eprintln!(
-                "[MKCLASS2] created TimeRE ptr={:p} mro={m:?}",
-                Rc::as_ptr(&ty)
-            );
-        }
         ty.set_metaclass(metaclass.clone());
         if let Some(Object::Cell(cell)) = classcell {
             *cell.borrow_mut() = Object::Type(ty.clone());
@@ -22858,9 +23599,10 @@ impl Interpreter {
                     receiver_class,
                 ))
             }
-            _ => Err(type_error(
-                "super(): expected 2 arguments (zero-arg form must be called from inside a method)",
-            )),
+            // Argument-clinic shape (test_super.test_super_argcount).
+            n => Err(type_error(format!(
+                "super expected at most 2 arguments, got {n}"
+            ))),
         }
     }
 
@@ -22891,9 +23633,16 @@ impl Interpreter {
                 }
             }
         }
-        Err(type_error(
-            "super(type, obj): obj must be an instance or subtype of type",
-        ))
+        // CPython `supercheck` names both sides in the failure
+        // (test_super.test_supercheck_fail matches the exact shape).
+        let (kind, obj_name) = match receiver {
+            Object::Type(t) => ("type", t.name.clone()),
+            _ => ("instance of", oc.name.clone()),
+        };
+        Err(type_error(format!(
+            "super(type, obj): obj ({kind} {obj_name}) is not an instance or subtype of type ({}).",
+            class.name
+        )))
     }
 
     fn invoke_init_subclass(
@@ -23161,6 +23910,19 @@ impl Interpreter {
                 base: bt.dict_.clone(),
                 mutable: true,
             }
+        } else if is_strict(&bt.enumerate_) {
+            // `class MyEnum(enumerate)` — the payload is the underlying
+            // enumerate iterator built by the base constructor
+            // (test_enumerate.SubclassTestCase).
+            NativeKind::Value {
+                base: bt.enumerate_.clone(),
+                mutable: false,
+            }
+        } else if is_strict(&bt.reversed_) {
+            NativeKind::Value {
+                base: bt.reversed_.clone(),
+                mutable: false,
+            }
         } else {
             NativeKind::Plain
         };
@@ -23345,6 +24107,42 @@ impl Interpreter {
                     return self.build_super(cls.clone(), args);
                 }
                 _ => {}
+            }
+            // `enumerate` is lazy in CPython — a VM-driven source (a
+            // generator, or a user `__iter__`) can't be materialised up
+            // front (`enumerate(itertools.count())` would hang). Route
+            // those to the frozen `_seqtools._EnumerateIter`, exactly as
+            // the builtin-function call path does.
+            if cls.name == "enumerate" && args.first().is_some_and(object_needs_vm_iter) {
+                let mut ctor_args = args.to_vec();
+                for (k, v) in kwargs {
+                    if k == "start" && ctor_args.len() == 1 {
+                        ctor_args.push(v.clone());
+                    } else if k == "iterable" {
+                        return Err(type_error(
+                            "argument for enumerate() given by name ('iterable') and position (1)",
+                        ));
+                    } else {
+                        return Err(type_error(format!(
+                            "enumerate() got an unexpected keyword argument '{k}'"
+                        )));
+                    }
+                }
+                let global_dummy = Rc::new(RefCell::new(DictData::default()));
+                if let Some(it) =
+                    self.make_seqtools_iter("_EnumerateIter", &ctor_args, &[], &global_dummy)?
+                {
+                    return Ok(it);
+                }
+            }
+            // `reversed(x)` on a user instance must honour `__reversed__`
+            // / `__getitem__`+`__len__` through the interpreter.
+            if cls.name == "reversed"
+                && kwargs.is_empty()
+                && args.first().is_some_and(object_needs_vm_iter)
+            {
+                let global_dummy = Rc::new(RefCell::new(DictData::default()));
+                return self.do_reversed_call(args, &global_dummy);
             }
             // Special-case `list(it)` / `tuple(it)` so generators flow
             // through the VM-aware collector.
@@ -23568,6 +24366,19 @@ impl Interpreter {
             return Err(type_error(msg.clone()));
         }
 
+        // A `type` subclass without its own `__new__` (typing's
+        // `_AnyMeta`, a bare `class M(type)`) inherits `type.__new__`,
+        // whose only valid call shape here is the three-argument
+        // class-building form — that was already intercepted by
+        // `type_call_default`, so any other arity raises like CPython's
+        // `type_new` (`type(Any)()`, test_typing test_cannot_instantiate).
+        if plan.user_new.is_none() && cls.is_subclass_of(&builtin_types().type_) {
+            return Err(type_error(format!(
+                "type.__new__() takes exactly 3 arguments ({} given)",
+                args.len()
+            )));
+        }
+
         let is_object_new = plan.is_object_new;
         let instance = match &plan.user_new {
             // User-defined `__new__` (the first MRO hit other than the
@@ -23753,7 +24564,19 @@ impl Interpreter {
                     Object::Instance(i)
                         if matches!(i.native.get(), Some(Object::Set(_) | Object::FrozenSet(_)))
                 );
-                let drop_init_kwargs = !is_object_new
+                // An iterator-payload subclass (`class MyEnum(enumerate)`)
+                // has no overriding `__new__` in WeavePy's model — the
+                // payload seeding consumed the constructor keywords
+                // (`MyEnum(iterable=..., start=...)`), so the inherited
+                // no-keyword `__init__` must ignore them, exactly as
+                // CPython's `enum_new`-consumed kwargs never reach
+                // `object.__init__`'s check.
+                let recv_native_iter = matches!(
+                    &instance,
+                    Object::Instance(i)
+                        if matches!(i.native.get(), Some(Object::Iter(_)))
+                );
+                let drop_init_kwargs = (!is_object_new || recv_native_iter)
                     && !recv_is_set
                     && matches!(
                         &init,
@@ -24387,47 +25210,55 @@ impl Interpreter {
         let callable = frame.pop()?;
         // Zero-arg super(): inject __class__ and `self`. Never matches a
         // pinned-function cache, so it always takes the generic path.
+        // Mirrors CPython `super_init_without_args`'s error ladder — every
+        // failure is a RuntimeError (test_super.test_obscure_super_errors).
         if args.is_empty() && is_super_callable(&callable) {
-            if let Some(class_cell) = find_cell(frame, "__class__") {
-                let class_obj = class_cell.borrow().clone();
-                if !matches!(class_obj, Object::None) {
-                    let mut self_obj = frame
-                        .locals
-                        .borrow()
-                        .first()
-                        .cloned()
-                        .unwrap_or(Object::None);
-                    // The first argument may have been *promoted to a cell*
-                    // (captured by an inner closure/genexpr — pandas'
-                    // `DatetimeTZDtype._get_common_dtype` does
-                    // `all(... == self.tz for t in dtypes)` before calling
-                    // `super()`), which moves the value out of the fast
-                    // slot. CPython's zero-arg `super` reads through the
-                    // cell in that case (`CO_FAST_CELL` on arg 0).
-                    if matches!(self_obj, Object::Unbound) {
-                        if let Some(cell) = frame
-                            .code
-                            .varnames
-                            .first()
-                            .and_then(|n| find_cell(frame, n))
-                        {
-                            self_obj = cell.borrow().clone();
-                        }
-                    }
-                    if matches!(self_obj, Object::Unbound) {
-                        // CPython: the first argument was deleted (or its
-                        // cell cleared) before `super()` ran.
-                        return Err(RuntimeError::PyException(
-                            crate::error::PyException::from_builtin(
-                                "RuntimeError",
-                                "super(): arg[0] deleted",
-                            ),
-                        ));
-                    }
-                    args.push(class_obj);
-                    args.push(self_obj);
+            let runtime_err = |msg: &str| {
+                RuntimeError::PyException(crate::error::PyException::from_builtin(
+                    "RuntimeError",
+                    msg,
+                ))
+            };
+            if frame.code.arg_count == 0 {
+                return Err(runtime_err("super(): no arguments"));
+            }
+            let mut self_obj = frame
+                .locals
+                .borrow()
+                .first()
+                .cloned()
+                .unwrap_or(Object::None);
+            // The first argument may have been *promoted to a cell*
+            // (captured by an inner closure/genexpr — pandas'
+            // `DatetimeTZDtype._get_common_dtype` does
+            // `all(... == self.tz for t in dtypes)` before calling
+            // `super()`), which moves the value out of the fast
+            // slot. CPython's zero-arg `super` reads through the
+            // cell in that case (`CO_FAST_CELL` on arg 0).
+            if matches!(self_obj, Object::Unbound) {
+                if let Some(cell) = frame
+                    .code
+                    .varnames
+                    .first()
+                    .and_then(|n| find_cell(frame, n))
+                {
+                    self_obj = cell.borrow().clone();
                 }
             }
+            if matches!(self_obj, Object::Unbound) {
+                // CPython: the first argument was deleted (or its
+                // cell cleared) before `super()` ran.
+                return Err(runtime_err("super(): arg[0] deleted"));
+            }
+            let Some(class_cell) = find_cell(frame, "__class__") else {
+                return Err(runtime_err("super(): __class__ cell not found"));
+            };
+            let class_obj = class_cell.borrow().clone();
+            if matches!(class_obj, Object::None | Object::Unbound) {
+                return Err(runtime_err("super(): empty __class__ cell"));
+            }
+            args.push(class_obj);
+            args.push(self_obj);
         }
         // RFC 0047 — a *method call on a Python function* transfers
         // ownership: the receiver and arguments move into the callee's
@@ -24634,6 +25465,7 @@ impl Interpreter {
             pc: 0,
             py_frame: None,
             cleanup_lasti: None,
+            suppress_call_event: false,
         };
         self.run_frame(&mut frame)
     }
@@ -24736,16 +25568,19 @@ impl Interpreter {
         }
     }
 
-    /// PEP 695 `type Name[T, U] = body` runtime constructor.
+    /// PEP 695 `type Name[T, U] = body` runtime constructor (RFC 0051).
     ///
     /// The parser lowers the statement to
-    /// `__weavepy_type_alias__('Name', ('T', 'U'), lambda T, U: body)`.
-    /// We mint one TypeVar-shaped placeholder per declared parameter and
-    /// build a lazy `typing.TypeAliasType`, so the body thunk runs only
-    /// when `Name.__value__` is first read — matching CPython, and
-    /// crucially letting numpy's `_typing` aliases (`type ArrayLike =
-    /// Buffer | _DualArrayLike[np.dtype, …]`) be *defined* without
-    /// eagerly building unions or subscripting sibling aliases.
+    /// `__weavepy_type_alias__('Name', (<T ctor>, <U ctor>), lambda T, U: body)`
+    /// where each `<ctor>` is itself a `__weavepy_typevar__`-family
+    /// intrinsic call, so by the time we run, `args[1]` holds the real
+    /// `_typing` type-parameter objects. We hand everything to
+    /// `_typing._weavepy_make_typealias`, which builds a lazy
+    /// `TypeAliasType` — the body thunk runs only when
+    /// `Name.__value__` is first read (matching CPython's
+    /// `_Py_make_typealias`), which is what lets numpy's `_typing`
+    /// aliases be *defined* without eagerly building unions or
+    /// subscripting sibling aliases.
     fn do_type_alias_call(
         &mut self,
         args: &[Object],
@@ -24756,9 +25591,9 @@ impl Interpreter {
             Some(other) => Object::from_str(other.to_str()),
             None => return Err(type_error("__weavepy_type_alias__() missing name")),
         };
-        let param_names: Vec<Object> = match args.get(1) {
-            Some(Object::Tuple(t)) => t.iter().cloned().collect(),
-            Some(Object::None) | None => Vec::new(),
+        let type_params = match args.get(1) {
+            Some(t @ Object::Tuple(_)) => t.clone(),
+            Some(Object::None) | None => Object::new_tuple(Vec::new()),
             Some(other) => {
                 return Err(type_error(format!(
                     "__weavepy_type_alias__() type-params must be a tuple, not '{}'",
@@ -24774,24 +25609,55 @@ impl Interpreter {
                 ))
             }
         };
-        let mut typevars: Vec<Object> = Vec::with_capacity(param_names.len());
-        for pn in &param_names {
-            typevars.push(crate::builtins::b_typevar(std::slice::from_ref(pn))?);
-        }
-        // The lazy (thunk-carrying) constructor: the public
-        // `TypeAliasType(name, value)` signature takes an eager value
-        // (CPython 3.12+), so PEP 695 statements go through the dedicated
-        // classmethod that defers the body.
-        let ty = self.module_attr("typing", "TypeAliasType").ok_or_else(|| {
-            runtime_error("typing.TypeAliasType unavailable for PEP 695 `type` alias")
+        let ctor = self
+            .module_attr("_typing", "_weavepy_make_typealias")
+            .ok_or_else(|| runtime_error("_typing unavailable for PEP 695 `type` alias"))?;
+        self.call(&ctor, &[name, type_params, thunk], &[], outer_globals)
+    }
+
+    /// PEP 695/696 type-parameter intrinsics (RFC 0051): the
+    /// `__weavepy_typevar__` lowering family, funneled to the frozen
+    /// `_typing` module's constructors — WeavePy's analogue of
+    /// CPython's `CALL_INTRINSIC_1/2` dispatch into
+    /// `Objects/typevarobject.c`.
+    fn do_typing_intrinsic(
+        &mut self,
+        kind: &str,
+        args: &[Object],
+        outer_globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        let (func_name, forwarded): (&str, Vec<Object>) = match kind {
+            "typevar" => ("_weavepy_make_typevar", args.to_vec()),
+            // (name, bound_thunk) → evaluate_bound
+            "typevar_with_bound" => ("_weavepy_make_typevar", args.to_vec()),
+            // (name, constraints_thunk) → evaluate_constraints; slot 2
+            "typevar_with_constraints" => {
+                let v = vec![
+                    args.first().cloned().unwrap_or(Object::None),
+                    Object::None,
+                    args.get(1).cloned().unwrap_or(Object::None),
+                ];
+                ("_weavepy_make_typevar", v)
+            }
+            "paramspec" => ("_weavepy_make_paramspec", args.to_vec()),
+            "typevartuple" => ("_weavepy_make_typevartuple", args.to_vec()),
+            "typeparam_default" => ("_weavepy_set_typeparam_default", args.to_vec()),
+            "typeparam_default_starred" => {
+                ("_weavepy_set_typeparam_default_starred", args.to_vec())
+            }
+            "generic_base" => ("_weavepy_subscript_generic", args.to_vec()),
+            other => {
+                return Err(runtime_error(format!(
+                    "unknown PEP 695 intrinsic '{other}'"
+                )))
+            }
+        };
+        let func = self.module_attr("_typing", func_name).ok_or_else(|| {
+            runtime_error(format!(
+                "_typing.{func_name} unavailable for PEP 695 lowering"
+            ))
         })?;
-        let ctor = self.load_attr_public(&ty, "_weavepy_lazy")?;
-        self.call(
-            &ctor,
-            &[name, Object::new_tuple(typevars), thunk],
-            &[],
-            outer_globals,
-        )
+        self.call(&func, &forwarded, &[], outer_globals)
     }
 
     /// Parse `source`, replaying any tokenizer-collected invalid-escape
@@ -24910,6 +25776,80 @@ impl Interpreter {
         None
     }
 
+    /// `alias[index]` for a native (namespace-shaped) generic alias.
+    ///
+    /// When `__parameters__` carry typing-level type variables — real
+    /// `TypeVar`/`ParamSpec`/`TypeVarTuple` instances with
+    /// `__typing_prepare_subst__`/`__typing_subst__` hooks — the
+    /// substitution must run through Python (CPython's
+    /// `_Py_subs_parameters` calls those hooks for PEP 646/612
+    /// splicing, argument checks, and PEP 696 defaults). Plain sentinel
+    /// parameters keep the pure-Rust fast path.
+    fn subscript_generic_alias_vm(
+        &mut self,
+        alias: &Object,
+        index: &Object,
+    ) -> Result<Object, RuntimeError> {
+        let needs_python = match alias {
+            Object::SimpleNamespace(d) => matches!(
+                d.borrow().get(&DictKey(Object::from_static("__parameters__"))),
+                Some(Object::Tuple(params)) if params.iter().any(|p| matches!(p, Object::Instance(_)))
+            ),
+            _ => false,
+        };
+        if needs_python {
+            if let Some(helper) = self.module_attr("_typing", "_weavepy_ga_subs_parameters") {
+                let (origin, starred) = match alias {
+                    Object::SimpleNamespace(d) => {
+                        let dict = d.borrow();
+                        (
+                            dict.get(&DictKey(Object::from_static("__origin__")))
+                                .cloned(),
+                            matches!(
+                                dict.get(&DictKey(Object::from_static("__unpacked__"))),
+                                Some(Object::Bool(true))
+                            ),
+                        )
+                    }
+                    _ => (None, false),
+                };
+                let g = self.builtins.clone();
+                let new_args = self.call(&helper, &[alias.clone(), index.clone()], &[], &g)?;
+                if let Some(origin) = origin {
+                    let res = make_generic_alias(origin, new_args);
+                    // CPython `ga_getitem` copies the `starred` flag.
+                    if starred {
+                        mark_alias_starred(&res);
+                    }
+                    return Ok(res);
+                }
+            }
+        }
+        subscript_generic_alias(alias, index)
+    }
+
+    /// `union[index]` for a PEP 604 union namespace. CPython's
+    /// `union_getitem` runs the same `_Py_subs_parameters` substitution
+    /// as generic aliases and folds the result back through
+    /// `_Py_union_from_tuple` (`(list[T] | int)[str]` → `list[str] | int`).
+    fn subscript_union_vm(&mut self, un: &Object, index: &Object) -> Result<Object, RuntimeError> {
+        let Some(helper) = self.module_attr("_typing", "_weavepy_ga_subs_parameters") else {
+            return Err(type_error(format!(
+                "'{}' object is not subscriptable",
+                un.type_name()
+            )));
+        };
+        let g = self.builtins.clone();
+        let new_args = self.call(&helper, &[un.clone(), index.clone()], &[], &g)?;
+        let items: Vec<Object> = match new_args {
+            Object::Tuple(t) => t.iter().cloned().collect(),
+            other => vec![other],
+        };
+        let mut it = items.into_iter();
+        let first = it.next().unwrap_or(Object::None);
+        Ok(it.fold(first, |acc, x| make_pep604_union(&acc, &x)))
+    }
+
     /// `object.__reduce_ex__(self, protocol)`. Honours a user-defined
     /// `__reduce__` override (CPython semantics) and otherwise produces the
     /// default `copyreg`-based reduction so `copy`/`pickle` can rebuild the
@@ -24920,6 +25860,37 @@ impl Interpreter {
         proto: i64,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
+        // A *starred* PEP 646 alias (`*tuple[int, ...]`) must keep its
+        // unpacked flag across pickle/copy. CPython's `ga_reduce` emits
+        // `next(iter(plain_alias))`; WeavePy reduces through the named
+        // `_typing` helper that rebuilds exactly that, so the callable
+        // pickles by global name at every protocol
+        // (test_genericalias test_pickle/test_copy on _UNPACKED_TUPLES).
+        if let Object::SimpleNamespace(d) = recv {
+            let starred = is_generic_alias(recv)
+                && matches!(
+                    d.borrow()
+                        .get(&DictKey(Object::from_static("__unpacked__"))),
+                    Some(Object::Bool(true))
+                );
+            if starred {
+                if let Some(helper) = self.module_attr("_typing", "_weavepy_make_starred_alias") {
+                    let (origin, args) = {
+                        let dict = d.borrow();
+                        let get = |name: &'static str| {
+                            dict.get(&DictKey(Object::from_static(name)))
+                                .cloned()
+                                .unwrap_or(Object::None)
+                        };
+                        (get("__origin__"), get("__args__"))
+                    };
+                    return Ok(Object::new_tuple(vec![
+                        helper,
+                        Object::new_tuple(vec![origin, args]),
+                    ]));
+                }
+            }
+        }
         let cls = crate::builtins::class_of(recv);
         if let Some(reduce) = cls.lookup("__reduce__") {
             let is_default = matches!(&reduce, Object::Builtin(b) if b.name == ".object_reduce");
@@ -24950,6 +25921,37 @@ impl Interpreter {
         // default (which would try to pickle the unexposed iterator type).
         if matches!(recv, Object::Iter(_)) {
             return self.iter_reduce(recv, globals);
+        }
+        // An `enumerate`/`reversed` *subclass* instance wraps the real
+        // iterator as its native payload; reduce that payload and swap in
+        // the instance's own class (CPython's `enum_reduce` uses
+        // `Py_TYPE(self)`, so `MyEnum(...)` unpickles as `MyEnum`).
+        if let Object::Instance(inst) = recv {
+            if let Some(native @ Object::Iter(it)) = inst.native.get() {
+                let swap = matches!(
+                    &*it.borrow(),
+                    crate::object::PyIterator::Enumerate { .. }
+                        | crate::object::PyIterator::Reversed { .. }
+                );
+                if swap {
+                    let native = native.clone();
+                    let reduced = self.iter_reduce(&native, globals)?;
+                    if let Object::Tuple(items) = &reduced {
+                        let mut v: Vec<Object> = items.to_vec();
+                        if !v.is_empty() {
+                            v[0] = Object::Type(inst.cls());
+                        }
+                        return Ok(Object::new_tuple(v));
+                    }
+                    return Ok(reduced);
+                }
+            }
+        }
+        // Code objects are unpicklable in CPython — `copyreg.__reduce_ex__`
+        // raises the canonical TypeError (pickling a `typing.ForwardRef`,
+        // whose `__dict__` holds `__forward_code__`, depends on it).
+        if matches!(recv, Object::Code(_)) {
+            return Err(type_error("cannot pickle code objects".to_owned()));
         }
         // `range` and `slice` carry their state in the constructor args, not
         // in `__new__`; CPython's `range_reduce`/`slice_reduce` return
@@ -25156,7 +26158,14 @@ impl Interpreter {
         // the builtin lookup below may run arbitrary `__eq__` that re-enters
         // and mutates (e.g. exhausts) this very iterator.
         let is_reversed = matches!(&*it.borrow(), crate::object::PyIterator::Reversed { .. });
-        let builtin_name = if is_reversed { "reversed" } else { "iter" };
+        let is_enumerate = matches!(&*it.borrow(), crate::object::PyIterator::Enumerate { .. });
+        let builtin_name = if is_reversed {
+            "reversed"
+        } else if is_enumerate {
+            "enumerate"
+        } else {
+            "iter"
+        };
         // CPython fetches the builtin via `_PyEval_GetBuiltin`, which reads the
         // live `builtins` *module* dict — a namespace user code can mutate.
         // Resolve there first (not the VM's private fast-path map) so a
@@ -25219,6 +26228,25 @@ impl Interpreter {
                 builtin,
                 Object::new_tuple(vec![Object::List(items.clone())]),
                 Object::Int(*index as i64),
+            ]));
+        }
+        // An enumerate object reduces to `(enumerate, (inner_iter, count))`
+        // — CPython `enum_reduce`. The inner iterator pickles through its
+        // own `__reduce__`, and re-calling `enumerate(it, count)` shares
+        // the handle, reproducing the cursor exactly.
+        if let crate::object::PyIterator::Enumerate {
+            inner,
+            count,
+            count_big,
+        } = &*it.borrow()
+        {
+            let idx = match count_big {
+                Some(b) => Object::Long(Rc::new((**b).clone())),
+                None => Object::Int(*count),
+            };
+            return Ok(Object::new_tuple(vec![
+                builtin,
+                Object::new_tuple(vec![Object::Iter(inner.clone()), idx]),
             ]));
         }
         // A reverse iterator reduces to `(reversed, (forward_list,), index)`
@@ -25441,6 +26469,16 @@ impl Interpreter {
         let globals_dict = match args.get(1) {
             Some(Object::Dict(d)) => d.clone(),
             Some(Object::None) | None => outer_globals.clone(),
+            // A dict *subclass* is a legal globals mapping (CPython
+            // `PyDict_Check`); its `__missing__`, when defined, serves
+            // global-name misses (see `globals_missing_hooks`).
+            Some(Object::Instance(inst)) => match inst.native.get() {
+                Some(Object::Dict(d)) => {
+                    self.register_globals_missing_hook(d, inst);
+                    d.clone()
+                }
+                _ => return Err(type_error("exec() globals must be a dict")),
+            },
             _ => return Err(type_error("exec() globals must be a dict")),
         };
         // The optional third argument is the *locals* namespace. When a
@@ -25457,7 +26495,7 @@ impl Interpreter {
             // that function's locals). At module level locals *are*
             // globals, so no distinct mapping is installed.
             Some(Object::None) | None => {
-                if matches!(args.get(1), Some(Object::Dict(_))) {
+                if matches!(args.get(1), Some(Object::Dict(_) | Object::Instance(_))) {
                     // Explicit globals without locals: locals default to
                     // the same dict (CPython), i.e. no distinct mapping.
                     None
@@ -25552,6 +26590,14 @@ impl Interpreter {
         let globals_dict = match args.get(1) {
             Some(Object::Dict(d)) => d.clone(),
             Some(Object::None) | None => outer_globals.clone(),
+            // Dict subclasses are legal globals, as in `exec` above.
+            Some(Object::Instance(inst)) => match inst.native.get() {
+                Some(Object::Dict(d)) => {
+                    self.register_globals_missing_hook(d, inst);
+                    d.clone()
+                }
+                _ => return Err(type_error("eval() globals must be a dict")),
+            },
             _ => return Err(type_error("eval() globals must be a dict")),
         };
         // Resolve the locals namespace. CPython: an explicit mapping is
@@ -25561,14 +26607,21 @@ impl Interpreter {
         let locals_dict: Option<Rc<RefCell<DictData>>> = match args.get(2) {
             Some(Object::Dict(d)) => Some(d.clone()),
             Some(Object::None) | None => {
-                let caller = self.frame_stack.borrow().last().cloned();
-                caller.and_then(|f| {
-                    f.invalidate_locals();
-                    match f.locals() {
-                        Object::Dict(d) => Some(d),
-                        _ => None,
-                    }
-                })
+                if matches!(args.get(1), Some(Object::Dict(_) | Object::Instance(_))) {
+                    // Explicit globals without locals: locals default to
+                    // the globals mapping itself (CPython), never the
+                    // caller's frame.
+                    None
+                } else {
+                    let caller = self.frame_stack.borrow().last().cloned();
+                    caller.and_then(|f| {
+                        f.invalidate_locals();
+                        match f.locals() {
+                            Object::Dict(d) => Some(d),
+                            _ => None,
+                        }
+                    })
+                }
             }
             _ => return Err(type_error("eval() locals must be a mapping")),
         };
@@ -27158,11 +28211,69 @@ fn adjust_slice(len: i64, s: &PySlice) -> Result<(i64, i64, i64, i64), RuntimeEr
 }
 
 /// `range(...)[slice]` → a new range, mirroring CPython `compute_slice`.
-fn range_slice(r: &crate::object::Range, len: i64, s: &PySlice) -> Result<Object, RuntimeError> {
-    let (start, _stop, step, slicelen) = adjust_slice(len, s)?;
-    let new_start = r.start + i128::from(start) * r.step;
-    let new_step = r.step * i128::from(step);
-    let new_stop = new_start + i128::from(slicelen) * new_step;
+/// Full-width (`i128`) arithmetic throughout: the range length and the
+/// slice bounds may exceed `i64` (`range(2**100)[:2**100]`), and CPython
+/// computes this on PyLongs without overflow.
+pub(crate) fn range_slice(
+    r: &crate::object::Range,
+    len: i128,
+    s: &PySlice,
+) -> Result<Object, RuntimeError> {
+    // A slice bound too large for `i128` clamps: bounds only ever clamp
+    // to `[-1, len]`, so any value beyond the type's range behaves as
+    // its sign's extreme.
+    let member = |o: &Object, default: i128| -> Result<i128, RuntimeError> {
+        match o {
+            Object::None => Ok(default),
+            other => match crate::builtins::coerce_index_object(other)? {
+                Object::Int(i) => Ok(i128::from(i)),
+                Object::Long(b) => Ok(i128::try_from(&*b).unwrap_or_else(|_| {
+                    use num_bigint::Sign;
+                    if b.sign() == Sign::Minus {
+                        i128::MIN / 2
+                    } else {
+                        i128::MAX / 2
+                    }
+                })),
+                _ => unreachable!("coerce_index_object returns Int or Long"),
+            },
+        }
+    };
+    let step = member(&s.step, 1)?;
+    if step == 0 {
+        return Err(value_error("slice step cannot be zero"));
+    }
+    let backwards = step < 0;
+    let (lower, upper) = if backwards { (-1, len - 1) } else { (0, len) };
+    // Defaults apply *directly*; only explicit bounds go through the
+    // negative-index wrap + clamp (CPython `_PySlice_GetLongIndices`).
+    let resolve = |o: &Object, default: i128| -> Result<i128, RuntimeError> {
+        if matches!(o, Object::None) {
+            return Ok(default);
+        }
+        let v = member(o, default)?;
+        Ok(if v < 0 {
+            v.saturating_add(len).max(lower)
+        } else {
+            v.min(upper)
+        })
+    };
+    let start = resolve(&s.start, if backwards { upper } else { lower })?;
+    let stop = resolve(&s.stop, if backwards { lower } else { upper })?;
+    let slicelen = if backwards {
+        if stop < start {
+            (start - stop - 1) / (-step) + 1
+        } else {
+            0
+        }
+    } else if start < stop {
+        (stop - start - 1) / step + 1
+    } else {
+        0
+    };
+    let new_start = r.start.saturating_add(start.saturating_mul(r.step));
+    let new_step = r.step.saturating_mul(step);
+    let new_stop = new_start.saturating_add(slicelen.saturating_mul(new_step));
     Ok(Object::Range(Rc::new(crate::object::Range {
         start: new_start,
         stop: new_stop,
@@ -31515,9 +32626,17 @@ pub fn make_pep604_union(a: &Object, b: &Object) -> Object {
         DictKey(Object::from_static("__args__")),
         Object::new_tuple(args.clone()),
     );
+    // CPython `union_getitem`/`union_parameters`: a union carries the type
+    // parameters found anywhere in its args (`(list[T] | float).
+    // __parameters__ == (T,)`), which typing's `_collect_parameters`
+    // reads when the union is nested in a subscription.
+    let mut params: Vec<Object> = Vec::new();
+    for a in &args {
+        collect_type_parameters(a, &mut params);
+    }
     dict.insert(
         DictKey(Object::from_static("__parameters__")),
-        Object::new_tuple(Vec::new()),
+        Object::new_tuple(params),
     );
     // Surface a `__class__` string so `repr` / type introspection
     // sees something reasonable; we don't have a real
@@ -32028,18 +33147,35 @@ fn make_generic_alias(origin: Object, params: Object) -> Object {
     d.insert(DictKey(Object::from_static("__origin__")), origin);
     d.insert(DictKey(Object::from_static("__args__")), args_tuple);
     d.insert(DictKey(Object::from_static("__parameters__")), params_tuple);
+    // CPython's `types.GenericAlias` exposes `__unpacked__` (True only
+    // for `*list[int]`-style unpacked aliases); typing's `_eval_type`
+    // reads it unconditionally on every GenericAlias.
+    d.insert(
+        DictKey(Object::from_static("__unpacked__")),
+        Object::Bool(false),
+    );
     Object::SimpleNamespace(Rc::new(RefCell::new(d)))
 }
 
 /// True if `o` is a runtime type variable: an instance of a class whose
-/// MRO carries `TypeVar` (typing's `TypeVar` / `ParamSpec` /
-/// `TypeVarTuple`), or the PEP 695 `SimpleNamespace` placeholder.
+/// MRO carries `TypeVar` / `ParamSpec` / `TypeVarTuple` (the three
+/// typing classes exposing `__typing_subst__`-family hooks — CPython's
+/// `_collect_type_parameters` keys on that attribute), or the PEP 695
+/// `SimpleNamespace` placeholder.
 fn is_typevar_object(o: &Object) -> bool {
     if is_typevar_like(o) {
         return true;
     }
+    // CPython `_collect_parameters` duck-types: *any* non-type object
+    // exposing `__typing_subst__` counts as a type variable
+    // (test_return_non_tuple_while_unpacking's EvilTypeVar).
     matches!(o, Object::Instance(inst)
-        if inst.cls().mro.borrow().iter().any(|t| t.name == "TypeVar"))
+        if inst.cls().lookup("__typing_subst__").is_some()
+            || inst
+                .dict
+                .borrow()
+                .get(&crate::object::StrKey("__typing_subst__"))
+                .is_some())
 }
 
 /// The `__args__` tuple of an alias-shaped object: a PEP 585 namespace
@@ -32071,6 +33207,26 @@ fn collect_type_parameters(x: &Object, out: &mut Vec<Object>) {
         for a in &args {
             collect_type_parameters(a, out);
         }
+        return;
+    }
+    // Duck-typing (CPython `_collect_parameters`): a non-type argument
+    // exposing `__parameters__` contributes those parameters —
+    // `list[A()].__parameters__ == (T,)` for any object whose
+    // `__parameters__` is `(T,)` (test_parameter_detection).
+    if let Object::Instance(inst) = x {
+        let params = inst
+            .dict
+            .borrow()
+            .get(&crate::object::StrKey("__parameters__"))
+            .cloned()
+            .or_else(|| inst.cls().lookup("__parameters__"));
+        if let Some(Object::Tuple(items)) = params {
+            for p in items.iter() {
+                if !out.iter().any(|o| o.is_same(p)) {
+                    out.push(p.clone());
+                }
+            }
+        }
     }
 }
 
@@ -32084,11 +33240,15 @@ fn substitute_type_parameters(t: &Object, tvars: &[Object], values: &[Object]) -
         }
     }
     if let Object::SimpleNamespace(d) = t {
-        let (is_union, origin, items) = {
+        let (is_union, is_starred, origin, items) = {
             let dict = d.borrow();
             (
                 dict.get(&DictKey(Object::from_static("__is_pep604_union__")))
                     .is_some(),
+                matches!(
+                    dict.get(&DictKey(Object::from_static("__unpacked__"))),
+                    Some(Object::Bool(true))
+                ),
                 dict.get(&DictKey(Object::from_static("__origin__")))
                     .cloned(),
                 match dict.get(&DictKey(Object::from_static("__args__"))) {
@@ -32111,11 +33271,47 @@ fn substitute_type_parameters(t: &Object, tvars: &[Object], values: &[Object]) -
                 return it.fold(first, |acc, x| make_pep604_union(&acc, &x));
             }
             if let Some(origin) = origin {
-                return make_generic_alias(origin, Object::new_tuple(new_args));
+                let rebuilt = make_generic_alias(origin, Object::new_tuple(new_args));
+                // A starred nested alias (`*tuple[T, ...]` inside
+                // `tuple[T1, *tuple[T2, ...]]`) stays starred after
+                // substitution (CPython rebuilds via `Py_GenericAlias`
+                // + `setattr` of the flag through `ga_new`).
+                if is_starred {
+                    mark_alias_starred(&rebuilt);
+                }
+                return rebuilt;
             }
         }
     }
     t.clone()
+}
+
+/// Flip a fresh namespace alias into its PEP 646 starred form:
+/// `__unpacked__ = True`, plus `__typing_unpacked_tuple_args__` when the
+/// origin is `tuple` (CPython `ga_typing_unpacked_tuple_args`).
+fn mark_alias_starred(alias: &Object) {
+    let Object::SimpleNamespace(d) = alias else {
+        return;
+    };
+    let mut dict = d.borrow_mut();
+    dict.insert(
+        DictKey(Object::from_static("__unpacked__")),
+        Object::Bool(true),
+    );
+    let is_tuple_origin = matches!(
+        dict.get(&DictKey(Object::from_static("__origin__"))),
+        Some(Object::Type(t)) if Rc::ptr_eq(t, &crate::builtin_types::builtin_types().tuple_)
+    );
+    if is_tuple_origin {
+        let args = dict
+            .get(&DictKey(Object::from_static("__args__")))
+            .cloned()
+            .unwrap_or_else(|| Object::new_tuple(Vec::new()));
+        dict.insert(
+            DictKey(Object::from_static("__typing_unpacked_tuple_args__")),
+            args,
+        );
+    }
 }
 
 /// `alias[index]` for a PEP 585 namespace alias — positional TypeVar
@@ -32144,7 +33340,7 @@ fn subscript_generic_alias(alias: &Object, index: &Object) -> Result<Object, Run
     }
     if tvars.is_empty() {
         return Err(type_error(format!(
-            "There are no type variables left in {}",
+            "{} is not a generic class",
             alias.repr()
         )));
     }
@@ -32169,7 +33365,17 @@ fn subscript_generic_alias(alias: &Object, index: &Object) -> Result<Object, Run
         .iter()
         .map(|a| substitute_type_parameters(a, &tvars, &values))
         .collect();
-    Ok(make_generic_alias(origin, Object::new_tuple(new_args)))
+    let res = make_generic_alias(origin, Object::new_tuple(new_args));
+    // CPython `ga_getitem` copies the receiver's `starred` flag onto the
+    // substituted alias (`(*tuple[T, ...])[int]` stays starred).
+    if matches!(
+        d.borrow()
+            .get(&DictKey(Object::from_static("__unpacked__"))),
+        Some(Object::Bool(true))
+    ) {
+        mark_alias_starred(&res);
+    }
+    Ok(res)
 }
 
 /// True if `info` is a PEP 585 generic alias (a `SimpleNamespace`-shaped
@@ -32179,6 +33385,40 @@ fn subscript_generic_alias(alias: &Object, index: &Object) -> Result<Object, Run
 fn is_generic_alias(info: &Object) -> bool {
     matches!(info, Object::SimpleNamespace(d)
         if d.borrow().get(&DictKey(Object::from_static("__origin__"))).is_some())
+}
+
+/// The Rust-side builtin types whose CPython 3.13 counterparts expose
+/// `__class_getitem__` (C `Py_GenericAlias`). Subscripting any *other*
+/// builtin type must raise `type 'X' is not subscriptable`
+/// (`test_genericalias.test_unsubscriptable`: `int[int]`, `str[int]`, …).
+/// `type` itself is included — CPython special-cases `type[int]` in
+/// `PyObject_GetItem` rather than exposing a method, but the observable
+/// result is the same alias. Python-level stdlib classes define their own
+/// `__class_getitem__` and never reach this fallback.
+fn builtin_type_is_generic(name: &str) -> bool {
+    matches!(
+        name,
+        "type"
+            | "tuple"
+            | "list"
+            | "dict"
+            | "set"
+            | "frozenset"
+            | "enumerate"
+            | "mappingproxy"
+            | "dict_keys"
+            | "dict_values"
+            | "dict_items"
+            | "generator"
+            | "coroutine"
+            | "async_generator"
+            | "weakref"
+            | "ReferenceType"
+            | "ContextVar"
+            | "Token"
+            | "array"
+            | "chain"
+    )
 }
 
 /// A `Long` whose magnitude exceeds what a C double can represent.

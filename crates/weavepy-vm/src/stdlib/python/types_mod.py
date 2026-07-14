@@ -40,6 +40,7 @@ __all__ = [
     "new_class",
     "prepare_class",
     "resolve_bases",
+    "get_original_bases",
     "DynamicClassAttribute",
 ]
 
@@ -153,6 +154,11 @@ class MappingProxyType:
     """Read-only view over a mapping. Mirrors :class:`types.MappingProxyType`."""
 
     __slots__ = ("_mapping",)
+
+    def __class_getitem__(cls, item):
+        # CPython's C mappingproxy exposes `__class_getitem__ =
+        # Py_GenericAlias` (test_genericalias generic_types sweep).
+        return GenericAlias(cls, item)
 
     def __init__(self, mapping):
         # CPython's check is `PyMapping_Check`: the *type* must supply
@@ -443,6 +449,34 @@ def new_class(name, bases=(), kwds=None, exec_body=None):
     if resolved is not bases:
         ns["__orig_bases__"] = bases
     return meta(name, resolved, ns, **kwds)
+
+
+def get_original_bases(cls, /):
+    """Return the class's "original" bases prior to modification by `__mro_entries__`.
+
+    Examples::
+
+        from typing import TypeVar, Generic, NamedTuple, TypedDict
+
+        T = TypeVar("T")
+        class Foo(Generic[T]): ...
+        class Bar(Foo[int], float): ...
+        class Baz(list[str]): ...
+        Eggs = NamedTuple("Eggs", [("a", int), ("b", str)])
+        Spam = TypedDict("Spam", {"a": int, "b": str})
+
+        assert get_original_bases(Bar) == (Foo[int], float)
+        assert get_original_bases(Baz) == (list[str],)
+        assert get_original_bases(Eggs) == (NamedTuple,)
+        assert get_original_bases(Spam) == (TypedDict,)
+        assert get_original_bases(int) == (object,)
+    """
+    try:
+        return cls.__dict__.get("__orig_bases__", cls.__bases__)
+    except AttributeError:
+        raise TypeError(
+            f"Expected an instance of type, not {type(cls).__name__!r}"
+        ) from None
 
 
 def _cell_factory():

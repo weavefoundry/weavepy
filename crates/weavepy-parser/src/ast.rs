@@ -41,8 +41,8 @@ pub enum StmtKind {
         args: Arguments,
         body: Vec<Stmt>,
         decorator_list: Vec<Expr>,
-        /// PEP 695 type-parameter names (`def f[T, U](…)`).
-        type_params: Vec<String>,
+        /// PEP 695 type parameters (`def f[T, U](…)`).
+        type_params: Vec<TypeParam>,
         /// `-> annotation`, evaluated at definition time.
         returns: Option<Box<Expr>>,
     },
@@ -54,8 +54,8 @@ pub enum StmtKind {
         args: Arguments,
         body: Vec<Stmt>,
         decorator_list: Vec<Expr>,
-        /// PEP 695 type-parameter names.
-        type_params: Vec<String>,
+        /// PEP 695 type parameters.
+        type_params: Vec<TypeParam>,
         /// `-> annotation`, evaluated at definition time.
         returns: Option<Box<Expr>>,
     },
@@ -66,8 +66,8 @@ pub enum StmtKind {
         keywords: Vec<Keyword>,
         body: Vec<Stmt>,
         decorator_list: Vec<Expr>,
-        /// PEP 695 type-parameter names (`class C[T](…)`).
-        type_params: Vec<String>,
+        /// PEP 695 type parameters (`class C[T](…)`).
+        type_params: Vec<TypeParam>,
     },
     /// `return value`
     Return(Option<Expr>),
@@ -88,6 +88,11 @@ pub enum StmtKind {
         target: Expr,
         annotation: Expr,
         value: Option<Expr>,
+        /// CPython's `simple` flag: a bare (unparenthesized) `Name`
+        /// target. Only simple targets are recorded in
+        /// `__annotations__` (`(pars): bool = True` binds but does not
+        /// annotate).
+        simple: bool,
     },
     /// `if test: body [else: orelse]` with elif chains folded into `orelse`.
     If {
@@ -172,6 +177,140 @@ pub enum StmtKind {
         test: Expr,
         msg: Option<Expr>,
     },
+}
+
+/// One PEP 695 type parameter (`T`, `T: bound`, `T: (c1, c2)`,
+/// `*Ts`, `**P`), optionally with a PEP 696 `= default`.
+///
+/// Mirrors CPython's `ast.TypeVar` / `ast.TypeVarTuple` /
+/// `ast.ParamSpec` nodes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeParam {
+    pub name: String,
+    /// The verbatim source spelling, for the runtime object's
+    /// `__name__`. Stays fixed when private-name mangling rewrites
+    /// `name` (and when the source literally spells a mangled-looking
+    /// name like `_ClassA__A`, which must *not* be demangled).
+    pub source_name: String,
+    pub kind: TypeParamKind,
+    /// PEP 696 `= default` expression (lazily evaluated at runtime).
+    /// For a `TypeVarTuple`, a starred default (`*Ts = *tuple[int]`)
+    /// is stored as `Starred(...)` and unpacks at evaluation time.
+    pub default: Option<Box<Expr>>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypeParamKind {
+    /// `T` or `T: bound`. A parenthesized tuple bound
+    /// (`T: (int, str)`) means *constraints*, per PEP 695; the
+    /// compiler keys off `ExprKind::Tuple`.
+    TypeVar { bound: Option<Box<Expr>> },
+    /// `*Ts`.
+    TypeVarTuple,
+    /// `**P`.
+    ParamSpec,
+}
+
+impl TypeParam {
+    /// Synthesize the runtime-constructor call expression for this
+    /// type parameter — the WeavePy analogue of CPython's
+    /// `CALL_INTRINSIC_1 INTRINSIC_TYPEVAR{_WITH_BOUND,…}` lowering.
+    ///
+    /// - `T`            → `__weavepy_typevar__('T')`
+    /// - `T: int`       → `__weavepy_typevar_with_bound__('T', <thunk> int)`
+    /// - `T: (a, b)`    → `__weavepy_typevar_with_constraints__('T', <thunk> (a, b))`
+    /// - `*Ts`          → `__weavepy_typevartuple__('Ts')`
+    /// - `**P`          → `__weavepy_paramspec__('P')`
+    ///
+    /// Bounds compile as zero-argument [`ExprKind::TypeParamFn`]
+    /// thunks so their evaluation is deferred to first attribute
+    /// access (PEP 695 lazy semantics). A PEP 696 `= default` is *not*
+    /// part of the constructor: it must be attached only after the
+    /// parameter's name is bound, because the default expression can
+    /// reference the parameter itself (see
+    /// [`Self::apply_default_expr`]).
+    ///
+    /// The `__name__` string constant uses [`Self::source_name`], not
+    /// the (possibly mangled) binding name.
+    pub fn constructor_expr(&self) -> Expr {
+        let span = self.span;
+        let name_str = Expr {
+            kind: ExprKind::Constant(Constant::Str(self.source_name.clone())),
+            span,
+        };
+        let lazy_thunk = |body: Expr| Expr {
+            kind: ExprKind::TypeParamFn {
+                args: Arguments::default(),
+                body: Box::new(body),
+            },
+            span,
+        };
+        let call = |func: &str, args: Vec<Expr>| Expr {
+            kind: ExprKind::Call {
+                func: Box::new(Expr {
+                    kind: ExprKind::Name(func.to_owned()),
+                    span,
+                }),
+                args,
+                keywords: Vec::new(),
+            },
+            span,
+        };
+        match &self.kind {
+            TypeParamKind::TypeVar { bound: None } => call("__weavepy_typevar__", vec![name_str]),
+            TypeParamKind::TypeVar { bound: Some(b) } => {
+                // A parenthesized tuple bound is a constraints list.
+                let intrinsic = if matches!(b.kind, ExprKind::Tuple(_)) {
+                    "__weavepy_typevar_with_constraints__"
+                } else {
+                    "__weavepy_typevar_with_bound__"
+                };
+                call(intrinsic, vec![name_str, lazy_thunk((**b).clone())])
+            }
+            TypeParamKind::TypeVarTuple => call("__weavepy_typevartuple__", vec![name_str]),
+            TypeParamKind::ParamSpec => call("__weavepy_paramspec__", vec![name_str]),
+        }
+    }
+
+    /// `__weavepy_typeparam_default__(<param>, <thunk> default)` — the
+    /// PEP 696 default application (CPython's
+    /// `INTRINSIC_SET_TYPEPARAM_DEFAULT`). Emitted *after* the
+    /// parameter's binding is live so the thunk can close over the
+    /// parameter itself (`type X[T = [T for T in [T]]] = T`).
+    pub fn apply_default_expr(&self, param: Expr) -> Expr {
+        let span = self.span;
+        let Some(d) = &self.default else {
+            return param;
+        };
+        // A starred TypeVarTuple default (`*Ts = *tuple[int]`) lazily
+        // evaluates to the *unpacked* form — CPython's
+        // `next(iter(value))` on the evaluated operand.
+        let (intrinsic, body) = match &d.kind {
+            ExprKind::Starred(inner) => {
+                ("__weavepy_typeparam_default_starred__", (**inner).clone())
+            }
+            _ => ("__weavepy_typeparam_default__", (**d).clone()),
+        };
+        let thunk = Expr {
+            kind: ExprKind::TypeParamFn {
+                args: Arguments::default(),
+                body: Box::new(body),
+            },
+            span,
+        };
+        Expr {
+            kind: ExprKind::Call {
+                func: Box::new(Expr {
+                    kind: ExprKind::Name(intrinsic.to_owned()),
+                    span,
+                }),
+                args: vec![param, thunk],
+                keywords: Vec::new(),
+            },
+            span,
+        }
+    }
 }
 
 /// One `case` clause inside a `match` statement (RFC 0009).
@@ -333,6 +472,17 @@ pub enum ExprKind {
         args: Arguments,
         body: Box<Expr>,
     },
+    /// A compiler-generated PEP 695 *annotation scope* function — never
+    /// produced by user syntax. Shaped like a lambda, but the compiler
+    /// gives it CPython's lazy-evaluation scoping: inside a class body
+    /// its free names resolve through the live class dict first
+    /// (`LOAD_FROM_DICT_OR_DEREF` / `__classdict__`). Used for
+    /// TypeVar bounds/constraints/defaults, `type X = …` alias values,
+    /// and the per-parameter binder lambdas of a generic alias.
+    TypeParamFn {
+        args: Arguments,
+        body: Box<Expr>,
+    },
     Call {
         func: Box<Expr>,
         args: Vec<Expr>,
@@ -406,7 +556,7 @@ pub fn expr_name(expr: &Expr) -> &'static str {
         ExprKind::List(_) => "list",
         ExprKind::Dict { .. } => "dict literal",
         ExprKind::Set(_) => "set display",
-        ExprKind::Lambda { .. } => "lambda",
+        ExprKind::Lambda { .. } | ExprKind::TypeParamFn { .. } => "lambda",
         ExprKind::Call { .. } => "function call",
         ExprKind::BoolOp { .. } | ExprKind::BinOp { .. } | ExprKind::UnaryOp { .. } => "expression",
         ExprKind::GeneratorExp { .. } => "generator expression",
@@ -827,6 +977,7 @@ fn dump_stmt(out: &mut String, s: &Stmt, depth: usize) {
             target,
             annotation,
             value,
+            simple,
         } => {
             out.push_str("AnnAssign(target=");
             dump_expr(out, target, depth);
@@ -838,7 +989,11 @@ fn dump_stmt(out: &mut String, s: &Stmt, depth: usize) {
             } else {
                 out.push_str("None");
             }
-            out.push_str(", simple=1)");
+            out.push_str(if *simple {
+                ", simple=1)"
+            } else {
+                ", simple=0)"
+            });
         }
         S::If { test, body, orelse } => {
             out.push_str("If(test=");
@@ -1324,7 +1479,7 @@ fn dump_expr(out: &mut String, e: &Expr, depth: usize) {
             dump_expr(out, value, depth);
             out.push(')');
         }
-        E::Lambda { args, body } => {
+        E::Lambda { args, body } | E::TypeParamFn { args, body } => {
             out.push_str("Lambda(args=");
             dump_arguments(out, args, depth + 2);
             out.push_str(", body=");

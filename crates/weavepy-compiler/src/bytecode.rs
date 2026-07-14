@@ -340,6 +340,17 @@ pub enum OpCode {
     /// Class-scope deref: like `LOAD_DEREF` but first tries the active
     /// class namespace (for forward references inside a class body).
     LoadClassderef,
+    /// PEP 695 lazy-scope deref (CPython `LOAD_FROM_DICT_OR_DEREF`):
+    /// pops a mapping (the `__classdict__` cell's contents) and pushes
+    /// `mapping[name]` if present, else falls back to the cell at
+    /// `arg` (like `LoadClassderef`'s cell path). Emitted for free-
+    /// variable loads inside annotation scopes that can see a class
+    /// namespace.
+    LoadClassdictOrDeref,
+    /// PEP 695 lazy-scope global (CPython `LOAD_FROM_DICT_OR_GLOBALS`):
+    /// pops a mapping and pushes `mapping[name]` if present, else
+    /// resolves `names[arg]` through globals → builtins.
+    LoadClassdictOrGlobal,
 
     // Exceptions
     /// Pop TOS as the exception to raise. `arg` is the raise form:
@@ -548,6 +559,8 @@ impl OpCode {
             OpCode::BuildSlice => "BUILD_SLICE",
             OpCode::LoadBuildClass => "LOAD_BUILD_CLASS",
             OpCode::LoadClassderef => "LOAD_CLASSDEREF",
+            OpCode::LoadClassdictOrDeref => "LOAD_FROM_DICT_OR_DEREF",
+            OpCode::LoadClassdictOrGlobal => "LOAD_FROM_DICT_OR_GLOBALS",
             OpCode::RaiseVarargs => "RAISE_VARARGS",
             OpCode::CheckExcMatch => "CHECK_EXC_MATCH",
             OpCode::CheckEGMatch => "CHECK_EG_MATCH",

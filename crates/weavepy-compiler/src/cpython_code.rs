@@ -102,6 +102,14 @@ pub mod op {
     pub const LOAD_DEREF: u8 = 84;
     pub const LOAD_FAST: u8 = 85;
     pub const LOAD_FROM_DICT_OR_DEREF: u8 = 89;
+    pub const LOAD_FROM_DICT_OR_GLOBALS: u8 = 90;
+    /// WeavePy-private (no 3.13 equivalent): CPython lowers a class
+    /// body's free-variable load to `LOAD_LOCALS` +
+    /// `LOAD_FROM_DICT_OR_DEREF`, but our `LoadClassderef` is a single
+    /// instruction, so it needs its own number to round-trip — it must
+    /// not collide with `LoadClassdictOrDeref`'s encoding (which pops
+    /// an explicit mapping; `LoadClassderef` does not).
+    pub const LOAD_CLASSDEREF_WEAVEPY: u8 = 147;
     pub const LOAD_GLOBAL: u8 = 91;
     pub const LOAD_NAME: u8 = 92;
     pub const MAKE_CELL: u8 = 94;
@@ -309,7 +317,9 @@ fn map_to_cpython(ins: Instruction, nlocals: u32) -> MappedOp {
         O::MakeFunction => (op::MAKE_FUNCTION, ins.arg),
         O::BuildSlice => (op::BUILD_SLICE, ins.arg),
         O::LoadBuildClass => (op::LOAD_BUILD_CLASS, 0),
-        O::LoadClassderef => (op::LOAD_FROM_DICT_OR_DEREF, ins.arg + nlocals),
+        O::LoadClassderef => (op::LOAD_CLASSDEREF_WEAVEPY, ins.arg + nlocals),
+        O::LoadClassdictOrDeref => (op::LOAD_FROM_DICT_OR_DEREF, ins.arg + nlocals),
+        O::LoadClassdictOrGlobal => (op::LOAD_FROM_DICT_OR_GLOBALS, ins.arg),
         O::RaiseVarargs => (op::RAISE_VARARGS, ins.arg),
         O::CheckExcMatch => (op::CHECK_EXC_MATCH, 0),
         O::CheckEGMatch => (op::CHECK_EG_MATCH, 0),
@@ -650,6 +660,7 @@ fn encode_linetable(
     firstlineno: u32,
 ) -> Vec<u8> {
     const CODE_NO_COLUMNS: u8 = 13;
+    const CODE_NO_LOCATION: u8 = 15;
     let mut out = Vec::new();
     let mut prev_line = firstlineno as i32;
     for i in 0..code.instructions.len() {
@@ -657,6 +668,16 @@ fn encode_linetable(
         let units = ext[i] + 1 + cache_entries(mapped[i].cp_op);
         // Each location entry covers 1..=8 code units; split if longer.
         let mut remaining = units;
+        // Line 0 is WeavePy's NO_LOCATION sentinel — the entry form 15
+        // carries no line delta and doesn't advance the running line.
+        if line == 0 {
+            while remaining > 0 {
+                let chunk = remaining.min(8);
+                out.push(0x80 | (CODE_NO_LOCATION << 3) | ((chunk - 1) as u8));
+                remaining -= chunk;
+            }
+            continue;
+        }
         let mut delta = line - prev_line;
         while remaining > 0 {
             let chunk = remaining.min(8);
@@ -980,8 +1001,13 @@ fn decode_linetable(table: &[u8], raws: &[DecodedRaw], firstlineno: u32) -> Vec<
         }
         let code = (first >> 3) & 0x0F;
         let length = ((first & 0x07) as usize) + 1;
+        if code == 15 {
+            // NONE — no location. Units decode to the 0 sentinel and
+            // the running line is unchanged.
+            unit_lines.extend(std::iter::repeat_n(0, length));
+            continue;
+        }
         let delta = match code {
-            15 => 0,                                 // NONE — no location
             13 => read_loc_svarint(table, &mut pos), // no columns
             14 => {
                 let d = read_loc_svarint(table, &mut pos);
@@ -1140,7 +1166,9 @@ fn map_from_cpython(cp_op: u8, arg: u32, nlocals: u32) -> Option<(OpCode, u32)> 
         op::MAKE_FUNCTION => (O::MakeFunction, arg),
         op::BUILD_SLICE => (O::BuildSlice, arg),
         op::LOAD_BUILD_CLASS => (O::LoadBuildClass, 0),
-        op::LOAD_FROM_DICT_OR_DEREF => (O::LoadClassderef, arg.saturating_sub(nlocals)),
+        op::LOAD_CLASSDEREF_WEAVEPY => (O::LoadClassderef, arg.saturating_sub(nlocals)),
+        op::LOAD_FROM_DICT_OR_DEREF => (O::LoadClassdictOrDeref, arg.saturating_sub(nlocals)),
+        op::LOAD_FROM_DICT_OR_GLOBALS => (O::LoadClassdictOrGlobal, arg),
         op::RAISE_VARARGS => (O::RaiseVarargs, arg),
         op::CHECK_EXC_MATCH => (O::CheckExcMatch, 0),
         op::CHECK_EG_MATCH => (O::CheckEGMatch, 0),

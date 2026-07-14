@@ -176,18 +176,135 @@ struct Marked {
     exc_depths: Vec<i32>,
 }
 
+/// Must-be-bound analysis for the synthetic `.with_exit`/`.aexit` fast
+/// locals. CPython keeps a `with` block's bound `__exit__` on the value
+/// stack, so its `mark_stacks` alone rejects jumps into a `with` body
+/// (deeper target stack → "incompatible stacks"). WeavePy stashes the
+/// exit in a synthetic local instead, which the kind-stack analysis
+/// can't see — this parallel forward dataflow (bit per exit slot,
+/// merge = intersection) recovers the same legality judgement: a jump
+/// whose target requires an exit slot the source hasn't bound is the
+/// CPython "incompatible stacks" case.
+fn mark_bound_exits(code: &CodeObject) -> Option<Vec<u64>> {
+    use OpCode as O;
+    let mut slot_bits = vec![0u64; code.varnames.len()];
+    let mut any = false;
+    let mut next_bit = 0u32;
+    for (i, name) in code.varnames.iter().enumerate() {
+        if name.starts_with(".with_exit") || name.starts_with(".aexit") {
+            if next_bit >= 64 {
+                return None; // absurd nesting — skip the refinement
+            }
+            slot_bits[i] = 1 << next_bit;
+            next_bit += 1;
+            any = true;
+        }
+    }
+    if !any {
+        return None;
+    }
+    let n = code.instructions.len();
+    const TOP: u64 = u64::MAX; // unreached
+    let mut bound = vec![TOP; n + 1];
+    bound[0] = 0;
+    let mut todo = true;
+    while todo {
+        todo = false;
+        let meet = |bound: &mut Vec<u64>, idx: usize, v: u64| {
+            if idx < bound.len() {
+                let merged = bound[idx] & v;
+                if merged != bound[idx] {
+                    bound[idx] = merged;
+                    return true;
+                }
+            }
+            false
+        };
+        for i in 0..n {
+            let cur = bound[i];
+            if cur == TOP {
+                continue;
+            }
+            let ins = code.instructions[i];
+            let arg = ins.arg as usize;
+            let next_i = i + 1;
+            match ins.op {
+                O::StoreFast => {
+                    let v = cur | slot_bits.get(arg).copied().unwrap_or(0);
+                    todo |= meet(&mut bound, next_i, v);
+                }
+                O::DeleteFast => {
+                    let v = cur & !slot_bits.get(arg).copied().unwrap_or(0);
+                    todo |= meet(&mut bound, next_i, v);
+                }
+                O::PopJumpIfFalse | O::PopJumpIfTrue | O::ForIter | O::Send => {
+                    todo |= meet(&mut bound, next_i + arg, cur);
+                    todo |= meet(&mut bound, next_i, cur);
+                }
+                O::JumpForward => {
+                    todo |= meet(&mut bound, next_i + arg, cur);
+                }
+                O::JumpBackward => {
+                    todo |= meet(&mut bound, next_i.saturating_sub(arg), cur);
+                }
+                O::ReturnValue | O::RaiseVarargs | O::Reraise => {}
+                _ => {
+                    todo |= meet(&mut bound, next_i, cur);
+                }
+            }
+        }
+        for h in &code.exception_table {
+            let handler = h.handler as usize;
+            for i in (h.start as usize)..(h.end as usize).min(n) {
+                let cur = bound[i];
+                if cur == TOP {
+                    continue;
+                }
+                if handler < bound.len() {
+                    let merged = bound[handler] & cur;
+                    if merged != bound[handler] {
+                        bound[handler] = merged;
+                        todo = true;
+                    }
+                }
+            }
+        }
+    }
+    Some(bound)
+}
+
 /// First offsets of each line: `linestarts[i] = line` when instruction
 /// `i` starts a new line (mirrors CPython's `marklines`), else -1.
 fn marklines(code: &CodeObject) -> Vec<i64> {
     let n = code.instructions.len();
     let mut out = vec![-1i64; n];
     let mut last_line: i64 = -1;
-    for (i, slot) in out.iter_mut().enumerate() {
+    #[allow(clippy::needless_range_loop)] // `i` also indexes the neighbours
+    for i in 0..n {
         let line = i64::from(code.linetable.get(i).copied().unwrap_or(0));
-        if line != last_line && line != 0 {
-            *slot = line;
-            last_line = line;
-        } else if line != 0 {
+        // The duplicated per-path implicit-return stubs
+        // (`Compiler::finish`) sit after the primary epilogue, each
+        // stamped with its jump site's line. CPython's equivalent
+        // RETURN_CONST copies are *inline* in their predecessor blocks —
+        // contiguous with the line run they end — so they never mark a
+        // line start. Left in, a stub becomes a bogus jump candidate:
+        // jumping "into" a bare `except` body would land on its `return
+        // None` and silently end the function instead of raising
+        // (test_no_jump_into_bare_except_block).
+        let is_return_stub = i > 0
+            && matches!(code.instructions[i].op, OpCode::LoadConst)
+            && matches!(
+                code.instructions.get(i + 1).map(|x| x.op),
+                Some(OpCode::ReturnValue)
+            )
+            && matches!(
+                code.instructions[i - 1].op,
+                OpCode::ReturnValue | OpCode::Reraise
+            );
+        if line != 0 {
+            if line != last_line && !is_return_stub {
+                out[i] = line;
+            }
             last_line = line;
         }
     }
@@ -236,6 +353,7 @@ fn plain_effect(code: &CodeObject, i: usize, ins: Instruction) -> Option<(u32, u
         | O::LoadBuildClass
         | O::LoadAssertionError => (0, 1),
         O::StoreFast | O::StoreGlobal | O::StoreName | O::StoreDeref => (1, 0),
+        O::LoadClassdictOrDeref | O::LoadClassdictOrGlobal => (1, 1),
         O::LoadAttr | O::UnaryOp => (1, 1),
         O::StoreAttr => (2, 0),
         O::DeleteAttr => (1, 0),
@@ -257,7 +375,10 @@ fn plain_effect(code: &CodeObject, i: usize, ins: Instruction) -> Option<(u32, u
         O::UnpackEx => (1, (arg >> 8) + 1 + (arg & 0xFF)),
         O::MakeFunction => (1 + (arg & 0xF).count_ones(), 1),
         O::BuildSlice => (3, 1),
-        O::CheckExcMatch => (1, 1),
+        // Consumes both the `CopyTop`ed exc and the type, pushes the
+        // match bool (see the VM opcode; CPython's version peeks the exc
+        // instead, so its effect differs).
+        O::CheckExcMatch => (2, 1),
         O::CheckEGMatch => (2, 2),
         O::PrepReraiseStar => (2, 1),
         O::ImportName => (2, 1),
@@ -387,9 +508,14 @@ fn mark_stacks(code: &CodeObject) -> Marked {
                     todo |= merge(&mut stacks, &mut exc_depths, next_i, cur, (exc - 1).max(0));
                 }
                 O::WithExceptStart => {
-                    // [.., __exit__(O), exc(E)] -> [.., exc(E), result(O)]
-                    let below = pop_kind(pop_kind(cur));
-                    let after = push_kind(push_kind(below, Kind::Except), Kind::Object);
+                    // Push-only, like the VM opcode: reads `exc` (TOS) and
+                    // `__exit__` (TOS1) in place and pushes the call
+                    // result: [.., __exit__, exc] -> [.., __exit__, exc,
+                    // result]. Modelling it as pop-2/push-2 dropped the
+                    // `__exit__` slot and desynced every offset after a
+                    // `with` cleanup (test_jump_out_of_with_block_within_
+                    // for_block saw "stack to deep to analyze").
+                    let after = push_kind(cur, Kind::Object);
                     todo |= merge(&mut stacks, &mut exc_depths, next_i, after, exc);
                 }
                 O::ReturnValue | O::RaiseVarargs | O::Reraise => {
@@ -439,6 +565,85 @@ fn kind_of(raw: i64) -> Kind {
     }
 }
 
+/// Which instructions carry a `'line'` trace event — a port of
+/// CPython 3.13's `initialize_lines` (instrumentation.c), which decides
+/// where `INSTRUMENTED_LINE` is placed when `sys.settrace` /
+/// `sys.monitoring` LINE events are enabled:
+///
+///   1. every instruction that *starts a line* (its line differs from
+///      the previous instruction's, walking the stream in order), except
+///      `RESUME` / `END_FOR` / `END_SEND` / `END_ASYNC_FOR`;
+///   2. every jump target with a real line (a conditional branch or loop
+///      edge can land mid-line — think `if x: a; b` — and the landing
+///      must still be traceable);
+///   3. every exception-table handler entry with a real line.
+///
+/// The dispatch loop then fires a `'line'` event when execution reaches
+/// a marked instruction *and* the previously executed instruction was on
+/// a different line (see `_Py_call_instrumentation_line`).
+pub(crate) fn line_event_starts(code: &CodeObject) -> Vec<bool> {
+    use OpCode as O;
+    let n = code.instructions.len();
+    let mut out = vec![false; n];
+    let line_at = |i: usize| code.linetable.get(i).copied().unwrap_or(0);
+    // Pass 1: line starts. `current_line` tracks the previous
+    // instruction's line; 0 ("no line", e.g. a handler-entry
+    // PUSH_EXC_INFO) resets it so the next real-line instruction starts
+    // a run even if it repeats the pre-gap line — exactly CPython's
+    // NO_LINE behaviour.
+    let mut current_line: u32 = u32::MAX;
+    for (i, slot) in out.iter_mut().enumerate() {
+        match code.instructions[i].op {
+            // Never carry line events: RESUME is needed for
+            // instrumentation bookkeeping, END_FOR/END_SEND are skipped
+            // over by FOR_ITER/SEND, END_ASYNC_FOR merely closes an
+            // `async for`. These also don't advance `current_line`.
+            O::Resume | O::EndFor | O::EndSend | O::EndAsyncFor => {}
+            _ => {
+                let line = line_at(i);
+                if line != 0 && line != current_line {
+                    *slot = true;
+                }
+                current_line = line;
+            }
+        }
+    }
+    // Pass 2: jump targets (branch landings can be mid-line).
+    for i in 0..n {
+        let ins = code.instructions[i];
+        let arg = ins.arg as usize;
+        let target = match ins.op {
+            O::PopJumpIfFalse | O::PopJumpIfTrue | O::JumpForward | O::ForIter | O::Send => {
+                i + 1 + arg
+            }
+            O::JumpBackward => (i + 1).saturating_sub(arg),
+            _ => continue,
+        };
+        // CPython's FOR_ITER/SEND targets skip over END_FOR/END_SEND;
+        // WeavePy's exhaustion target *is* the END_FOR, so hop past it.
+        let mut t = target;
+        while t < n
+            && matches!(
+                code.instructions[t].op,
+                O::EndFor | O::EndSend | O::EndAsyncFor
+            )
+        {
+            t += 1;
+        }
+        if t < n && line_at(t) != 0 {
+            out[t] = true;
+        }
+    }
+    // Pass 3: exception-handler entries.
+    for h in &code.exception_table {
+        let t = h.handler as usize;
+        if t < n && line_at(t) != 0 && !matches!(code.instructions[t].op, O::EndAsyncFor) {
+            out[t] = true;
+        }
+    }
+    out
+}
+
 /// Validate a `f_lineno` assignment and compute the jump plan.
 ///
 /// `cur_pc` is the frame's current instruction index; `suspended` is
@@ -451,7 +656,15 @@ pub fn compute_jump(
     new_lineno: i64,
     suspended: bool,
 ) -> Result<(PendingJump, u32), RuntimeError> {
-    let first_lineno = i64::from(code.linetable.iter().copied().find(|l| *l > 0).unwrap_or(1));
+    // Same convention as `co_firstlineno`: a module code object reports
+    // 1 no matter how many blank/comment lines precede the first
+    // statement, so pdb can jump to line 1 of exec'd module code
+    // (test_sys_settrace test_jump_to_firstlineno).
+    let first_lineno = if code.name == "<module>" {
+        1
+    } else {
+        i64::from(code.linetable.iter().copied().find(|l| *l > 0).unwrap_or(1))
+    };
     if new_lineno < first_lineno {
         return Err(value_error(format!(
             "line {new_lineno} comes before the current code block"
@@ -459,11 +672,16 @@ pub fn compute_jump(
     }
     let n = code.instructions.len();
     let lines = marklines(code);
+    let marked = mark_stacks(code);
     // First line at-or-after the requested one that actually starts an
-    // instruction run (CPython `first_line_not_before`).
+    // instruction run (CPython `first_line_not_before`). Unreachable
+    // instructions don't count: CPython's compiler deletes dead code, so
+    // a line that only exists in unreachable instructions (our compiler
+    // keeps them) is "after the current code block" there, not a
+    // handler-entry mismatch (test_no_jump_infinite_while_loop).
     let mut resolved = i64::MAX;
-    for &l in &lines {
-        if l >= new_lineno && l < resolved {
+    for (i, &l) in lines.iter().enumerate() {
+        if l >= new_lineno && l < resolved && marked.stacks[i] != UNINITIALIZED {
             resolved = l;
         }
     }
@@ -472,7 +690,11 @@ pub fn compute_jump(
             "line {new_lineno} comes after the current code block"
         )));
     }
-    let marked = mark_stacks(code);
+    let bound_exits = mark_bound_exits(code);
+    let start_bound = bound_exits
+        .as_ref()
+        .and_then(|b| b.get(cur_pc as usize).copied())
+        .unwrap_or(0);
     let mut start_stack = *marked.stacks.get(cur_pc as usize).unwrap_or(&UNINITIALIZED);
     let start_exc = marked
         .exc_depths
@@ -488,11 +710,25 @@ pub fn compute_jump(
     let mut best_addr: Option<usize> = None;
     let mut err_msg: Option<&'static str> = None;
     for (i, &l) in lines.iter().enumerate().take(n) {
-        if l != resolved {
+        if l != resolved || marked.stacks[i] == UNINITIALIZED {
             continue;
         }
         let target_stack = marked.stacks[i];
         let target_exc = marked.exc_depths[i].max(0);
+        // The target must not rely on a `.with_exit`/`.aexit` slot the
+        // source hasn't bound — the WeavePy face of CPython's "the
+        // target's stack holds a with-block `__exit__` the source
+        // doesn't" incompatibility (see `mark_bound_exits`).
+        let exits_ok = bound_exits
+            .as_ref()
+            .and_then(|b| b.get(i).copied())
+            .is_none_or(|tb| tb == u64::MAX || tb & !start_bound == 0);
+        if !exits_ok {
+            if err_msg.is_none() {
+                err_msg = Some("incompatible stacks");
+            }
+            continue;
+        }
         if target_exc <= start_exc && compatible_stack(start_stack, target_stack) {
             if best_addr.is_none() || target_stack > best_stack {
                 best_stack = target_stack;

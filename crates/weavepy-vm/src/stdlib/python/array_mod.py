@@ -45,6 +45,13 @@ _TYPECODES = {
 
 
 class array:
+    def __class_getitem__(cls, item):
+        # CPython's C `array.array` exposes `__class_getitem__ =
+        # Py_GenericAlias` (test_genericalias generic_types sweep).
+        import types
+
+        return types.GenericAlias(cls, item)
+
     def __init__(self, typecode, initializer=None):
         if not isinstance(typecode, str) or typecode not in _TYPECODES:
             raise ValueError(

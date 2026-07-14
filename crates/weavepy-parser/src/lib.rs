@@ -16,6 +16,7 @@
 pub mod ast;
 pub mod error;
 mod parser;
+pub mod unparse;
 
 pub use ast::{dump_module, Module};
 pub use error::ParseError;

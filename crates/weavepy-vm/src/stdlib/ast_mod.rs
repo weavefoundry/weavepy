@@ -303,13 +303,14 @@ impl Builder<'_> {
                 target,
                 annotation,
                 value,
+                simple,
             } => node(
                 "AnnAssign",
                 vec![
                     ("target", self.expr(target)),
                     ("annotation", self.expr(annotation)),
                     ("value", self.opt_expr(value.as_ref())),
-                    ("simple", Object::Int(1)),
+                    ("simple", Object::Int(i64::from(*simple))),
                 ],
                 sp,
                 self.lm,
@@ -585,7 +586,10 @@ impl Builder<'_> {
                 sp,
                 self.lm,
             ),
-            E::Lambda { args, body } => node(
+            // `TypeParamFn` is compiler-generated (PEP 695 lowering)
+            // and never reaches user-visible ASTs, but render it as
+            // the lambda it is shaped like just in case.
+            E::Lambda { args, body } | E::TypeParamFn { args, body } => node(
                 "Lambda",
                 vec![("args", self.arguments(args)), ("body", self.expr(body))],
                 sp,
