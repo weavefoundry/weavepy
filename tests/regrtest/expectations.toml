@@ -73,8 +73,8 @@ status = "fail"
 reason = "measured (RFC 0049 wave-5 full-suite baseline): TypeError: slot descriptor requires an instance"
 
 [tests."cpython/Lib/test/test_argparse.py"]
-status = "fail"
-reason = "measured (RFC 0038 WS-C): runs to completion with 1022 pass and only 2 errors remaining, both architectural: (1) `open(argparse.__file__)` fails because frozen stdlib modules report `__file__='<frozen argparse>'`; (2) TestFileTypeOpenArgs relies on `mock.patch('builtins.open')`, which WeavePy's LOAD_GLOBAL builtins fast-path bypasses. Deferred (frozen-__file__ + patchable-builtins arcs)."
+status = "pass"
+reason = "measured (RFC 0053): the two architectural blockers fell — the materialized stdlib tree gives frozen modules a real on-disk `__file__` (so `open(argparse.__file__)` works), and the patchable-builtins work lets `mock.patch('builtins.open')` take effect."
 
 [tests."cpython/Lib/test/test_array.py"]
 status = "fail"
@@ -170,8 +170,8 @@ status = "fail"
 reason = "measured (RFC 0049 wave-5 full-suite baseline): AttributeError: 'int' object has no attribute '__float__'. Did you mean: '__format__'?"
 
 [tests."cpython/Lib/test/test_cmd.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: Failed doctest test for test.test_cmd.CmdPrintExceptionClass"
+status = "pass"
+reason = "measured (RFC 0053 WS3): verbatim `cmd.py` + the doctest-machinery fidelity work (real tracebacks through `<frozen …>`-free files) clear the CmdPrintExceptionClass doctest."
 
 [tests."cpython/Lib/test/test_cmd_line.py"]
 status = "fail"
@@ -497,8 +497,8 @@ status = "pass"
 reason = "measured (RFC 0051 wave-6): __class_getitem__ / __mro_entries__ semantics match CPython (the wave-5 first-failure was the type() arg-2 error shape for non-class MRO entries)."
 
 [tests."cpython/Lib/test/test_genexps.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: Failed doctest test for test.test_genexps.__test__.doctests"
+status = "pass"
+reason = "measured (RFC 0053 WS6): the doctest suite passes — the last diverging case (unparenthesized generator expression as a keyword argument) now raises CPython's exact SyntaxError."
 
 [tests."cpython/Lib/test/test_getopt.py"]
 status = "pass"
@@ -631,8 +631,8 @@ status = "pass"
 reason = "RFC 0039 WS6: native libc-backed select.kqueue/kevent"
 
 [tests."cpython/Lib/test/test_linecache.py"]
-status = "fail"
-reason = "RFC 0050 WS3: 26/28 pass (was 2F/11E). The two residual cases (test_getline, test_clearcache) open `os.path.dirname(linecache.__file__) + '/linecache.py'`; WeavePy's linecache is a frozen module (`<frozen linecache>`) whose source intentionally differs from the vendored CPython copy, so there is no honest on-disk `__file__` to report."
+status = "pass"
+reason = "measured (RFC 0053 WS1+WS3): verbatim `linecache.py` over the materialized stdlib tree — `linecache.__file__` is a real on-disk path whose contents match what the interpreter runs, so the source-reading cases (test_getline, test_clearcache) pass along with the module-identity ones (`__loader__`/`__spec__` in `__main__`)."
 
 [tests."cpython/Lib/test/test_list.py"]
 status = "pass"
@@ -811,8 +811,8 @@ status = "fail"
 reason = "measured (RFC 0049 wave-5 full-suite baseline): AttributeError: module 'sys' has no attribute '_git'"
 
 [tests."cpython/Lib/test/test_plistlib.py"]
-status = "timeout"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): killed after 60s"
+status = "fail"
+reason = "measured (RFC 0053): no longer a timeout — the suite completes in ~2s with 3 errors left, all in the expat shim: XML plists in utf-16-le/utf-16-be encodings, and entity-declaration rejection (plistlib installs an EntityDeclHandler the shim never invokes)."
 
 [tests."cpython/Lib/test/test_poll.py"]
 status = "pass"
@@ -848,16 +848,16 @@ status = "fail"
 reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: 0 != 2"
 
 [tests."cpython/Lib/test/test_profile.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): TypeError: Stats.__init__() got an unexpected keyword argument 'stream'"
+status = "pass"
+reason = "measured (RFC 0053 WS5): verbatim `profile.py`/`pstats.py` over the new `_lsprof`-backed profiling stack (c_call/c_return/c_exception events, CPython-exact entry labels)."
 
 [tests."cpython/Lib/test/test_property.py"]
 status = "fail"
 reason = "measured (RFC 0049 wave-5 full-suite baseline): TypeError: builtin '__init__' does not accept keyword arguments"
 
 [tests."cpython/Lib/test/test_pstats.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): ImportError: cannot import name 'SortKey' from 'pstats'"
+status = "pass"
+reason = "measured (RFC 0053 WS5): verbatim `pstats.py` (SortKey enum, `stream=` kwarg, add/dump round-trips) over the `_lsprof`/`cProfile` stack."
 
 [tests."cpython/Lib/test/test_pty.py"]
 status = "fail"
@@ -965,8 +965,8 @@ status = "fail"
 reason = "measured (RFC 0049 wave-5 full-suite baseline): TypeError: unsupported operand type(s) for -: 'NoneType' and 'int'"
 
 [tests."cpython/Lib/test/test_shelve.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AttributeError: module 'shelve' has no attribute 'Shelf'"
+status = "pass"
+reason = "measured (RFC 0053): verbatim `shelve.py` (Shelf/BsdDbShelf/DbfilenameShelf surface) over the dbm stack."
 
 [tests."cpython/Lib/test/test_shlex.py"]
 status = "fail"
@@ -1142,8 +1142,8 @@ status = "fail"
 reason = "time: timezone strings + monotonic stability under leap seconds"
 
 [tests."cpython/Lib/test/test_timeit.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^…[truncated]"
+status = "pass"
+reason = "measured (RFC 0053): verbatim `timeit.py` — the template-compilation and traceback-format cases pass with the compiler-front-end + real-`__file__` fidelity work."
 
 [tests."cpython/Lib/test/test_tokenize.py"]
 status = "pass"
@@ -1279,8 +1279,8 @@ status = "pass"
 reason = "RFC 0039 WS5: all 46 cases pass. Required keying `weakref.ref` objects by their referent inside `set`/`dict` (CPython `weakref_richcompare`/`weakref_hash`): `DictKey`'s `Hash`/`Eq` now dispatch a builtin type's overriding `__eq__`/`__hash__` (not just user classes) via `instance_has_custom_dunder`, so equal refs collide into one bucket and dedup, with `weakref_native_hash` memoising the referent hash on the hot path. Also `_weakrefset.WeakSet` imported from the frozen `_weakrefset` (was an incomplete inline copy) and `supports_weakref` narrowed to CPython's `tp_weaklistoffset` set (so `ref([])`/`ref({})` raise `TypeError`)."
 
 [tests."cpython/Lib/test/test_webbrowser.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AttributeError: module 'webbrowser' has no attribute 'Chrome'"
+status = "pass"
+reason = "measured (RFC 0053): verbatim `webbrowser.py` (full browser-class registry incl. Chrome/Chromium, CLI parsing)."
 
 [tests."cpython/Lib/test/test_with.py"]
 status = "pass"

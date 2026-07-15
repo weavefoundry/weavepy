@@ -255,6 +255,17 @@ impl Validator<'_> {
             if let Some(ann) = &a.annotation {
                 self.visit_annotation(ann)?;
             }
+            // CPython `forbidden_name`: `__debug__` is a compile-time
+            // constant, so binding it as a parameter (`def f(__debug__)`,
+            // `lambda __debug__: 0`, `*args`/`**kwargs` spelled
+            // `__debug__`, keyword-only, …) is a SyntaxError, exactly like
+            // assigning to it.
+            if a.name == "__debug__" {
+                return Err(CompileError::spanned(
+                    "cannot assign to __debug__".to_owned(),
+                    a.span,
+                ));
+            }
             if params.iter().any(|(n, _)| *n == a.name) {
                 return Err(CompileError::spanned(
                     format!("duplicate argument '{}' in function definition", a.name),

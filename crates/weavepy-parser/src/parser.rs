@@ -3458,6 +3458,18 @@ impl<'src> Parser<'src> {
                         });
                     }
                     let val = self.parse_ternary()?;
+                    // `f(a = i for i in xs)` — pegen `invalid_arguments`:
+                    // a generator expression can't be a keyword value
+                    // without parentheses; CPython points at `a = i` with
+                    // the '==' / ':=' hint.
+                    if self.at_keyword(Keyword::For) || self.at_keyword(Keyword::Async) {
+                        return Err(ParseError::Unexpected {
+                            span: nt.span.merge(val.span),
+                            message: "invalid syntax. Maybe you meant '==' or ':=' instead of \
+                                      '='?"
+                                .to_owned(),
+                        });
+                    }
                     seen_keyword = true;
                     kw_names.push(name.clone());
                     keywords.push(KwArg {

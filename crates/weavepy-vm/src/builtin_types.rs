@@ -423,6 +423,7 @@ impl BuiltinTypes {
             );
         }
         let function_ = mk("function", vec![object_.clone()]);
+        install_function_methods(&function_);
         // `types.MethodType` — the bound-method type. Distinct from
         // `function` so `type(obj.meth)` is `method` (as in CPython) and
         // `types.MethodType(func, obj)` can construct a bound method.
@@ -768,6 +769,18 @@ impl BuiltinTypes {
         // type dicts (CPython's `tp_dict` parity: `vars(list)`,
         // `bytearray.__hash__ is None`, `_check_methods`-style ABC hooks).
         crate::type_surface::install(&bt);
+        // Native callables are descriptors: `func.__get__(obj)` already
+        // binds at the instance level. Mirror the *type*-level slot so
+        // `getattr(type(descr), '__get__')` resolves too — the form
+        // `inspect._descriptor_get` uses to bind a native
+        // `__call__`/`__init__` before reading its signature. Without it
+        // an Argument-Clinic `$self`/`$module` marker is not stripped and
+        // the signature keeps a spurious leading parameter (test_operator,
+        // test_functools). Installed after `type_surface` so it lands on
+        // the final, fully-populated descriptor type dicts.
+        install_builtin_descriptor_get(&bt.method_descriptor_);
+        install_builtin_descriptor_get(&bt.wrapper_descriptor_);
+        install_builtin_descriptor_get(&bt.builtin_function_);
         bt
     }
 
@@ -1645,6 +1658,53 @@ fn install_gen_name_getsets(ty: &Rc<TypeObject>, kind: &'static str) {
 /// descriptors): `A.x.__set__(obj, v)` / `.__get__(obj)` / `.__delete__(obj)`
 /// — CPython's `member_get`/`member_set`/`member_delete`, including the
 /// receiver type check that rejects virtual (ABC-registered) instances.
+/// Expose the descriptor protocol on the `function` *type* dict so
+/// `type(func).__get__` resolves (not just the per-instance
+/// `func.__get__` fast path). CPython functions are non-data
+/// descriptors; `inspect._descriptor_get` reaches for
+/// `getattr(type(descriptor), '__get__')` to bind a class's `__init__`
+/// to the class before reading its signature (which is how the leading
+/// `self` is dropped from a constructor signature). Without the
+/// type-level slot that lookup misses and every class signature keeps a
+/// spurious `self`.
+fn install_function_methods(function_: &Rc<TypeObject>) {
+    let get = crate::builtins::function_get_builtin();
+    crate::descr_registry::register(
+        &get,
+        crate::descr_registry::DescrKind::Method,
+        function_.clone(),
+        "__get__",
+        None,
+    );
+    function_
+        .dict
+        .borrow_mut()
+        .insert(DictKey(Object::from_static("__get__")), get);
+}
+
+/// Expose `__get__` on a native-callable *type* dict (see
+/// `install_function_methods`; this is the `builtin_function_or_method`
+/// / descriptor analogue, backed by `builtin_descriptor_get`).
+fn install_builtin_descriptor_get(ty: &Rc<TypeObject>) {
+    use crate::object::BuiltinFn;
+    let get = Object::Builtin(Rc::new(BuiltinFn {
+        name: "__get__",
+        binds_instance: true,
+        call: Box::new(crate::builtins::builtin_descriptor_get),
+        call_kw: None,
+    }));
+    crate::descr_registry::register(
+        &get,
+        crate::descr_registry::DescrKind::Method,
+        ty.clone(),
+        "__get__",
+        None,
+    );
+    ty.dict
+        .borrow_mut()
+        .insert(DictKey(Object::from_static("__get__")), get);
+}
+
 fn install_member_descriptor_methods(member_: &Rc<TypeObject>) {
     use crate::object::BuiltinFn;
     fn slot_and_receiver<'a>(
@@ -2060,6 +2120,79 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
             call_kw: None,
         })),
     );
+    // `object.__class__` is a getset *in the type dict* (CPython
+    // `object_getsets`), not just an attribute-path special case.
+    // Static introspection reads it there: `inspect.getattr_static`,
+    // `classify_class_attrs` (which must report `__class__` as defined
+    // by `object`, not by whichever class it walks first — test_enum's
+    // TestStdLib), and pydoc's descriptor sweep. The attribute fast
+    // paths in `load_attr`/`setattr` still short-circuit `__class__`
+    // before descriptor dispatch, so these functions only run when the
+    // descriptor is invoked explicitly.
+    fn object_class_get(args: &[Object]) -> Result<Object, RuntimeError> {
+        let obj = args.first().ok_or_else(|| {
+            crate::error::type_error("descriptor '__class__' of 'object' needs an argument")
+        })?;
+        // A weakproxy lies about its class: CPython's proxy `tp_getattro`
+        // forwards the whole read to the referent (and a dead proxy
+        // raises ReferenceError). The proxy is an `Object::Instance`, so
+        // this data descriptor is reached through the normal MRO walk
+        // and must forward too (test_itertools.test_tee).
+        if let Some(target) = crate::stdlib::weakref_real::proxy_referent(obj) {
+            return Ok(Object::Type(crate::builtins::class_of(&target?)));
+        }
+        Ok(Object::Type(crate::builtins::class_of(obj)))
+    }
+    fn object_class_set(args: &[Object]) -> Result<Object, RuntimeError> {
+        let (Some(obj), Some(value)) = (args.first(), args.get(1)) else {
+            return Err(crate::error::type_error(
+                "descriptor '__class__' requires (instance, value)",
+            ));
+        };
+        // Route through the interpreter's setattr, which owns the
+        // layout-compatibility rules for `__class__` assignment.
+        if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+            // SAFETY: published by an enclosing VM frame still live on
+            // this thread; the GIL keeps access exclusive.
+            let interp = unsafe { &mut *ptr };
+            interp.store_attr_public(obj, "__class__", value.clone())?;
+            return Ok(Object::None);
+        }
+        Err(crate::error::type_error(
+            "__class__ assignment only supported inside a running interpreter",
+        ))
+    }
+    {
+        let getset = Object::Property(Rc::new(crate::object::PyProperty::new(
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "__class__",
+                binds_instance: true,
+                call: Box::new(object_class_get),
+                call_kw: None,
+            })),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "__class__",
+                binds_instance: true,
+                call: Box::new(object_class_set),
+                call_kw: None,
+            })),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "__class__",
+                binds_instance: true,
+                call: Box::new(object_class_set),
+                call_kw: None,
+            })),
+            Object::None,
+        )));
+        crate::descr_registry::register(
+            &getset,
+            crate::descr_registry::DescrKind::GetSet,
+            object_.clone(),
+            "__class__",
+            None,
+        );
+        dict.insert(DictKey(Object::from_static("__class__")), getset);
+    }
     // `object.__init_subclass__(cls)` and `object.__subclasshook__`
     // are no-ops by default; defining them here lets every subclass
     // chain through `super().__init_subclass__()` without raising.
@@ -2376,6 +2509,44 @@ pub fn install_type_dunders(type_: &Rc<TypeObject>) {
             "can't delete {name}.__name__"
         )))
     }
+    // `type.__mro__` / `type.__dict__` are read-only getsets on the
+    // metatype. Exposing them *in the type dict* (not just on the
+    // attribute fast path) matters because `inspect.py` (verbatim,
+    // RFC 0053) resolves them statically: `_static_getmro =
+    // type.__dict__['__mro__'].__get__`, and likewise for
+    // `__dict__` — the whole point being to bypass any metaclass
+    // `__getattribute__`.
+    fn type_mro_get(args: &[Object]) -> Result<Object, RuntimeError> {
+        let Some(Object::Type(ty)) = args.first() else {
+            return Err(crate::error::type_error(
+                "descriptor '__mro__' for 'type' objects doesn't apply to other objects",
+            ));
+        };
+        if ty.mro.borrow().is_empty() && !ty.flags.is_builtin {
+            return Ok(Object::None);
+        }
+        Ok(Object::new_tuple(
+            ty.mro
+                .borrow()
+                .iter()
+                .map(|b| Object::Type(b.clone()))
+                .collect(),
+        ))
+    }
+    fn type_mro_set(_args: &[Object]) -> Result<Object, RuntimeError> {
+        Err(crate::error::attribute_error("readonly attribute"))
+    }
+    fn type_dunder_dict_get(args: &[Object]) -> Result<Object, RuntimeError> {
+        let Some(Object::Type(ty)) = args.first() else {
+            return Err(crate::error::type_error(
+                "descriptor '__dict__' for 'type' objects doesn't apply to other objects",
+            ));
+        };
+        Ok(Object::MappingProxy(ty.dict.clone()))
+    }
+    fn type_dunder_dict_set(_args: &[Object]) -> Result<Object, RuntimeError> {
+        Err(crate::error::attribute_error("readonly attribute"))
+    }
     type GetSetFn = fn(&[Object]) -> Result<Object, RuntimeError>;
     fn mk_getset(name: &'static str, get: GetSetFn, set: GetSetFn, del: GetSetFn) -> Object {
         Object::Property(Rc::new(crate::object::PyProperty::new(
@@ -2417,6 +2588,19 @@ pub fn install_type_dunders(type_: &Rc<TypeObject>) {
         (
             "__name__",
             mk_getset("__name__", type_name_get, type_name_set, type_name_del),
+        ),
+        (
+            "__mro__",
+            mk_getset("__mro__", type_mro_get, type_mro_set, type_mro_set),
+        ),
+        (
+            "__dict__",
+            mk_getset(
+                "__dict__",
+                type_dunder_dict_get,
+                type_dunder_dict_set,
+                type_dunder_dict_set,
+            ),
         ),
     ] {
         crate::descr_registry::register(

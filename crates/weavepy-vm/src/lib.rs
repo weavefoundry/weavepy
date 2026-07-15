@@ -43,6 +43,7 @@ pub mod pycache;
 pub mod recursion;
 pub mod specialize;
 pub mod stdlib;
+pub mod stdlib_tree;
 pub mod sync;
 pub mod thread_registry;
 /// RFC 0032 — tier-2 Cranelift JIT integration. Present only under the
@@ -1495,6 +1496,21 @@ impl Interpreter {
         globals
             .borrow_mut()
             .insert(DictKey(Object::from_static("__spec__")), Object::None);
+        // CPython sets `__main__.__loader__` to a `SourceFileLoader` when
+        // the entry point is a real on-disk script (its `__spec__` stays
+        // `None`, but `linecache`/`inspect` reach the loader through
+        // `globals()['__loader__']`, a plain dict read that never trips
+        // the lazy `__spec__`/`__loader__` synthesis). Install it eagerly
+        // for that case; `-c`/`<stdin>`/`<frozen …>` entry points keep no
+        // loader, exactly as CPython.
+        if file.is_some_and(|f| !f.starts_with('<')) {
+            if let Some(loader) = self.main_source_loader(name, file) {
+                globals
+                    .borrow_mut()
+                    .entry(DictKey(Object::from_static("__loader__")))
+                    .or_insert(loader);
+            }
+        }
         // Insert the module into `sys.modules` so callers can introspect
         // `sys.modules["__main__"]` (pickle by qualified name and the
         // multiprocessing spawn helper both rely on this).
@@ -5860,7 +5876,7 @@ impl Interpreter {
                     return Ok(StepOutcome::Continue);
                 }
                 let mut kw_pairs = kw_pairs;
-                let r = self.call(&callable, &pos_args, &kw_pairs, &frame.globals)?;
+                let r = self.call_c_profiled(&callable, &pos_args, &kw_pairs, &frame.globals)?;
                 frame.push(r);
                 self.reap_call_receiver(callable);
                 self.reap_call_args(&mut pos_args);
@@ -5924,7 +5940,7 @@ impl Interpreter {
                         )))
                     }
                 };
-                let r = self.call(&callable, &pos_args, &kw_pairs, &frame.globals)?;
+                let r = self.call_c_profiled(&callable, &pos_args, &kw_pairs, &frame.globals)?;
                 frame.push(r);
                 self.reap_call_receiver(callable);
                 self.reap_call_args(&mut pos_args);
@@ -8318,6 +8334,16 @@ impl Interpreter {
                     }
                     _ => {}
                 }
+                // RFC 0053 WS2 — `__spec__`/`__loader__` synthesize lazily
+                // for modules the Rust importer built (it runs long before
+                // `importlib` is importable, so it cannot construct PEP 451
+                // specs eagerly). The pair is cached back into the module
+                // dict, so this fires at most once per module.
+                if matches!(name, "__spec__" | "__loader__") {
+                    if let Some((spec, loader)) = self.ensure_module_spec(m) {
+                        return Ok(if name == "__spec__" { spec } else { loader });
+                    }
+                }
                 // PEP 562: a module-level `__getattr__(name)` is consulted
                 // for any attribute missing from the module namespace.
                 // Used by e.g. `calendar.January` (deprecation shim) and
@@ -8662,7 +8688,24 @@ impl Interpreter {
                 "__doc__" => Ok(builtin_doc(b.name)
                     .map(Object::from_static)
                     .unwrap_or(Object::None)),
-                "__self__" => Ok(Object::None),
+                // A module-level C function's `__self__` is its defining
+                // module (CPython's `PyCFunction.m_self`); `inspect`'s
+                // `_signature_fromstr` reads it to strip the leading
+                // Argument-Clinic `$module` parameter (so
+                // `signature(functools.cmp_to_key)` is `(mycmp)`, not
+                // `(module, /, mycmp)`). Instance-bound native methods keep
+                // their receiver via `BoundMethod`, and other builtins have
+                // no `__self__`.
+                "__self__" => {
+                    if builtin_text_signature(b.name).is_some_and(|s| s.starts_with("($module")) {
+                        if let Some(module) =
+                            crate::descr_registry::module_of(obj).and_then(|m| self.cache.get(m))
+                        {
+                            return Ok(module);
+                        }
+                    }
+                    Ok(Object::None)
+                }
                 // Argument-Clinic style introspection string; `None`
                 // when the builtin doesn't publish one (CPython).
                 "__text_signature__" => Ok(builtin_text_signature(b.name)
@@ -23651,8 +23694,18 @@ impl Interpreter {
             // arbitrary attrs (i.e. every base also forbids dict),
             // mark this class as forbidding instance __dict__.
             let bases_all_forbid = ty.bases.borrow().iter().all(|b| {
-                if Rc::ptr_eq(b, &builtin_types().object_) {
-                    return true;
+                if b.flags.is_builtin {
+                    // CPython `may_add_dict`: a builtin base contributes an
+                    // instance dict only when its `tp_dictoffset != 0` —
+                    // exceptions, modules, `type`, functions. Every other
+                    // builtin (`dict`, `list`, `int`, …) keeps instance
+                    // state in its native payload, so `__slots__` on the
+                    // subclass genuinely forbids a `__dict__`
+                    // (test_descrtut's `defaultdict2(dict)`).
+                    return !b.mro.borrow().iter().any(|t| {
+                        t.flags.is_exception
+                            || matches!(t.name.as_str(), "module" | "type" | "function")
+                    });
                 }
                 b.forbids_dict
             });
@@ -25670,7 +25723,56 @@ impl Interpreter {
             let f = f.clone();
             return self.call_python_owned(&f, std::mem::take(args), Vec::new());
         }
-        self.call(callable, args, &[], globals)
+        self.call_c_profiled(callable, args, &[], globals)
+    }
+
+    /// RFC 0053 WS5 — `c_call` / `c_return` / `c_exception` profile
+    /// events around C-level callables reached from the bytecode
+    /// `CALL`/`CALL_KW` family, matching CPython's `PyTrace_C_CALL`
+    /// contract (fired for built-in functions and bound native
+    /// methods, not for classes). `_lsprof`/`cProfile` account builtin
+    /// time from exactly these events. Gated on an installed profile
+    /// hook so the common path pays one relaxed load.
+    fn call_c_profiled(
+        &mut self,
+        callable: &Object,
+        args: &[Object],
+        kwargs: &[(String, Object)],
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        if crate::trace::any_observers_active() && is_c_profiled_callable(callable) {
+            if let Some(profile) = crate::trace::profile_hook() {
+                let py_frame = self.frame_stack.borrow().last().cloned();
+                if let Some(py_frame) = py_frame {
+                    self.invoke_observe_hook(
+                        &profile,
+                        &py_frame,
+                        "c_call",
+                        callable.clone(),
+                        crate::trace::HookKind::Profile,
+                    )?;
+                    let result = self.call(callable, args, kwargs, globals);
+                    // The hook may have been uninstalled by the callee
+                    // (e.g. `profiler.disable()`) — re-read it.
+                    if let Some(profile) = crate::trace::profile_hook() {
+                        let event = if result.is_ok() {
+                            "c_return"
+                        } else {
+                            "c_exception"
+                        };
+                        self.invoke_observe_hook(
+                            &profile,
+                            &py_frame,
+                            event,
+                            callable.clone(),
+                            crate::trace::HookKind::Profile,
+                        )?;
+                    }
+                    return result;
+                }
+            }
+        }
+        self.call(callable, args, kwargs, globals)
     }
 
     /// Fast frame setup for a cell-free, exact-arity Python call: build
@@ -27459,6 +27561,128 @@ impl Interpreter {
         }
     }
 
+    /// RFC 0053 WS2 — synthesize and cache a module's PEP 451
+    /// `(__spec__, __loader__)` pair on first read. The Rust importer
+    /// cannot build specs eagerly (it runs before `importlib` is
+    /// importable), so modules it loads resolve them lazily through
+    /// the frozen `_weave_spec` helper, exactly once. Returns `None`
+    /// when synthesis is impossible right now (early bootstrap, or a
+    /// re-entrant lookup on the same module) — the caller then falls
+    /// through to the ordinary missing-attribute path, and a later
+    /// read retries.
+    fn ensure_module_spec(&mut self, module: &Rc<PyModule>) -> Option<(Object, Object)> {
+        thread_local! {
+            static IN_PROGRESS: RefCell<std::collections::HashSet<String>> =
+                RefCell::new(std::collections::HashSet::new());
+        }
+        if !IN_PROGRESS.with(|s| s.borrow_mut().insert(module.name.clone())) {
+            return None;
+        }
+        let result = self.ensure_module_spec_inner(module);
+        IN_PROGRESS.with(|s| {
+            s.borrow_mut().remove(&module.name);
+        });
+        result
+    }
+
+    /// The `SourceFileLoader` CPython installs as `__main__.__loader__`
+    /// for a directly-run script. Best-effort: `None` if `_weave_spec`
+    /// is not yet importable.
+    fn main_source_loader(&mut self, name: &str, file: Option<&str>) -> Option<Object> {
+        let helper = match self.import_path("_weave_spec") {
+            Ok(Object::Module(m)) => m,
+            _ => return None,
+        };
+        let func = helper
+            .dict
+            .borrow()
+            .get(&DictKey(Object::from_static("make_spec_and_loader")))
+            .cloned()?;
+        let helper_globals = helper.dict.clone();
+        let pair = self
+            .call(
+                &func,
+                &[
+                    Object::from_str(name),
+                    file.map_or(Object::None, Object::from_str),
+                    Object::Bool(false),
+                    Object::None,
+                ],
+                &[],
+                &helper_globals,
+            )
+            .ok()?;
+        let Object::Tuple(pair) = pair else {
+            return None;
+        };
+        match pair.get(1).cloned() {
+            Some(Object::None) | None => None,
+            Some(loader) => Some(loader),
+        }
+    }
+
+    fn ensure_module_spec_inner(&mut self, module: &Rc<PyModule>) -> Option<(Object, Object)> {
+        let helper = match self.import_path("_weave_spec") {
+            Ok(Object::Module(m)) => m,
+            _ => return None,
+        };
+        let func = helper
+            .dict
+            .borrow()
+            .get(&DictKey(Object::from_static("make_spec_and_loader")))
+            .cloned()?;
+        let filename = module
+            .filename
+            .as_deref()
+            .map_or(Object::None, Object::from_str);
+        let (is_package, locations) = {
+            let dict = module.dict.borrow();
+            match dict.get(&crate::object::StrKey("__path__")) {
+                Some(p @ Object::List(_)) => (Object::Bool(true), p.clone()),
+                Some(_) => (Object::Bool(true), Object::None),
+                None => (Object::Bool(false), Object::None),
+            }
+        };
+        let helper_globals = helper.dict.clone();
+        let pair = self
+            .call(
+                &func,
+                &[
+                    Object::from_str(&module.name),
+                    filename,
+                    is_package,
+                    locations,
+                ],
+                &[],
+                &helper_globals,
+            )
+            .ok()?;
+        let Object::Tuple(pair) = pair else {
+            return None;
+        };
+        let spec = pair.first().cloned().unwrap_or(Object::None);
+        let loader = pair.get(1).cloned().unwrap_or(Object::None);
+        {
+            let mut dict = module.dict.borrow_mut();
+            dict.entry(DictKey(Object::from_static("__spec__")))
+                .or_insert_with(|| spec.clone());
+            dict.entry(DictKey(Object::from_static("__loader__")))
+                .or_insert_with(|| loader.clone());
+        }
+        // Re-read: the module body (or a racing thread) may have set its
+        // own values between our miss and the insert above.
+        let dict = module.dict.borrow();
+        let spec = dict
+            .get(&crate::object::StrKey("__spec__"))
+            .cloned()
+            .unwrap_or(spec);
+        let loader = dict
+            .get(&crate::object::StrKey("__loader__"))
+            .cloned()
+            .unwrap_or(loader);
+        Some((spec, loader))
+    }
+
     /// Load a single fully-qualified module name. Honours the cache
     /// first, then the built-in registry, then frozen Python sources,
     /// then the filesystem.
@@ -27536,27 +27760,45 @@ impl Interpreter {
             return Ok(obj);
         }
         if let Some(frozen) = self.cache.frozen_source(full) {
-            // Distinct per-module pseudo-filenames (`<frozen contextlib>`)
-            // let tracebacks resolve source lines through `linecache`'s
-            // frozen-source hook (backed by `_imp.find_frozen`).
+            // RFC 0053 WS1 — frozen modules carry a *real* filesystem
+            // identity: `co_filename`/`__file__` point into the
+            // materialized stdlib tree (byte-identical to the embedded
+            // source, so `open(module.__file__)`, `inspect.getsource`,
+            // `linecache`, and doctest all observe the code that runs).
+            // When the tree is unavailable (read-only FS,
+            // `WEAVEPY_NO_STDLIB_TREE`) the pre-0053 pseudo-filename
+            // (`<frozen contextlib>`) stands, and tracebacks resolve
+            // source through `linecache`'s `_imp.find_frozen` hook.
             let mut display = format!("<frozen {full}>");
-            // A frozen *package* that is also present on disk (the usual case
-            // under a vendored CPython `Lib/`) should be indistinguishable from
-            // an on-disk import: compile its body with the *real* source path as
-            // `co_filename`, matching the real-path `__file__`/`__path__` that
-            // `run_frozen_compiled` sets for such packages. Otherwise the code
-            // object's frames carry `<frozen pkg>` while `__file__` points at
-            // disk, and any consumer that bridges the two breaks — notably
-            // `warnings.warn(..., skip_file_prefixes=(os.path.dirname(__file__),))`
-            // (zipfile's "Overlapped entries" warning must blame the caller, not
-            // zipfile's own frame). Real-path code is never written to the
-            // process-global frozen cache (the cache key is the `<frozen …>`
-            // shape), so we also bypass the cache fast-path here.
+            // A frozen *package* that is also present on disk *outside our
+            // own mirror* (the usual case under a vendored CPython `Lib/`)
+            // should be indistinguishable from an on-disk import: compile
+            // its body with the *real* source path as `co_filename`,
+            // matching the real-path `__file__`/`__path__` that
+            // `run_frozen_compiled` sets for such packages. Otherwise the
+            // code object's frames carry `<frozen pkg>` while `__file__`
+            // points at disk, and any consumer that bridges the two breaks
+            // — notably `warnings.warn(...,
+            // skip_file_prefixes=(os.path.dirname(__file__),))` (zipfile's
+            // "Overlapped entries" warning must blame the caller, not
+            // zipfile's own frame). Foreign-path code is never written to
+            // the process-global frozen cache (the disk copy can differ
+            // from the embedded source), so we also bypass the cache
+            // fast-path in that case. Materialized-tree paths *are*
+            // cacheable: they are process-stable labels for the embedded
+            // bytes the compiler consumed.
             let mut frozen_cacheable = true;
             if frozen.is_package {
                 if let Some((path, true)) = self.cache.find_source(full) {
+                    if !crate::stdlib_tree::contains(&path) {
+                        display = path.to_string_lossy().into_owned();
+                        frozen_cacheable = false;
+                    }
+                }
+            }
+            if frozen_cacheable {
+                if let Some(path) = crate::stdlib_tree::module_path(full, frozen.is_package) {
                     display = path.to_string_lossy().into_owned();
-                    frozen_cacheable = false;
                 }
             }
             // RFC 0021 — frozen modules pay a parse + compile cost
@@ -27828,8 +28070,13 @@ impl Interpreter {
         // *next* interpreter in this process skips parse + compile.
         // We cache only the compiled code, never the running module
         // — module *state* is interpreter-local (different
-        // `sys.modules`, different `__name__`).
-        if filename.starts_with("<frozen") {
+        // `sys.modules`, different `__name__`). Materialized-tree
+        // paths (RFC 0053) are process-stable labels for the same
+        // embedded bytes, so they are cacheable exactly like the
+        // `<frozen …>` pseudo-names.
+        if filename.starts_with("<frozen")
+            || crate::stdlib_tree::contains(std::path::Path::new(filename))
+        {
             frozen_code_cache::insert(full, &code);
         }
         self.run_frozen_compiled(full, code, is_package, filename)
@@ -27861,31 +28108,28 @@ impl Interpreter {
         // package-detection (`runpy` package → `__main__` redirect,
         // `pkgutil`, `importlib`) treats them as packages.
         if is_package {
-            // When the *same* package is also reachable on `sys.path` (the
-            // usual case under a real CPython `Lib/`), report its filesystem
-            // `__file__`/`__path__` — CPython does, and introspective code
-            // depends on it: `_test_multiprocessing._TestImportStar` globs
+            // The caller (`load_one`) already resolved the package's
+            // filesystem identity into `filename`: a foreign on-disk copy
+            // (vendored CPython `Lib/`) when one exists on `sys.path`, else
+            // the materialized-tree `__init__.py` (RFC 0053), else the bare
+            // `<frozen pkg>` pseudo-name. Real paths become
+            // `__file__`/`__path__` directly — introspective code depends
+            // on it: `_test_multiprocessing._TestImportStar` globs
             // `os.path.dirname(multiprocessing.__file__)/*.py` to enumerate
-            // submodules, and `pkgutil.iter_modules(pkg.__path__)` walks the
-            // directory. Execution still runs the frozen bytecode (the code
-            // object's `co_filename` stays `<frozen pkg>` so tracebacks and
-            // `linecache` resolve through the frozen-source hook); only the
-            // module's metadata points at disk. With no on-disk copy (a
-            // from-binary-only run) fall back to the synthetic
-            // `<frozen pkg>/__init__.py` shape, whose `os.path.dirname` is
-            // still the bare `<frozen pkg>` other code keys off of (e.g.
-            // `zipfile`'s `skip_file_prefixes` overlap warning).
-            let (file_attr, path_list) = match self.cache.find_source(full) {
-                Some((init_path, true)) => {
-                    let dir = init_path
-                        .parent()
-                        .map_or_else(String::new, |p| p.to_string_lossy().into_owned());
-                    (
-                        init_path.to_string_lossy().into_owned(),
-                        vec![Object::from_str(dir)],
-                    )
-                }
-                _ => (format!("{filename}/__init__.py"), Vec::new()),
+            // submodules, and `pkgutil.iter_modules(pkg.__path__)` walks
+            // the directory. With no on-disk copy fall back to the
+            // synthetic `<frozen pkg>/__init__.py` shape, whose
+            // `os.path.dirname` is still the bare `<frozen pkg>` other
+            // code keys off of (e.g. `zipfile`'s `skip_file_prefixes`
+            // overlap warning).
+            let (file_attr, path_list) = if filename.starts_with("<frozen") {
+                (format!("{filename}/__init__.py"), Vec::new())
+            } else {
+                let init_path = std::path::Path::new(filename);
+                let dir = init_path
+                    .parent()
+                    .map_or_else(String::new, |p| p.to_string_lossy().into_owned());
+                (filename.to_owned(), vec![Object::from_str(dir)])
             };
             globals.borrow_mut().insert(
                 DictKey(Object::from_static("__path__")),
@@ -28000,6 +28244,24 @@ impl Interpreter {
         if let Err(e) = self.run_frame(&mut frame) {
             self.cache.remove(full);
             return Err(e);
+        }
+        // RFC 0053 WS2 — CPython's import machinery stores `__spec__`
+        // and `__loader__` *in the module dict* eagerly. The frozen
+        // stdlib defers this (lazy synthesis on attribute read) to keep
+        // startup cheap, but an on-disk import already paid parse +
+        // compile, so populate the pair now: consumers that read them as
+        // plain dict entries — `globals()['__loader__']` in
+        // `linecache.lazycache`, `test.support` module-identity checks —
+        // then see them without tripping the attribute fast path.
+        if let Object::Module(m) = &module_obj {
+            let has_both = {
+                let d = m.dict.borrow();
+                d.contains_key(&DictKey(Object::from_static("__spec__")))
+                    && d.contains_key(&DictKey(Object::from_static("__loader__")))
+            };
+            if !has_both {
+                let _ = self.ensure_module_spec(m);
+            }
         }
         // CPython `_load_unlocked` re-reads `sys.modules[name]` after the
         // body runs: a module may replace its own entry (e.g. `decimal.py`
@@ -31910,6 +32172,11 @@ fn format_missing_arguments(func_name: &str, kind: &str, names: &[&str]) -> Stri
 /// final dotted component — matching CPython, where `gc.collect.__name__`
 /// is `'collect'` and `str.format.__name__` is `'format'`.
 fn builtin_display_name(name: &'static str) -> &'static str {
+    // Interception sentinels (`__vm:exec`, `__vm:eval`, …) surface
+    // their Python-visible name (`exec.__name__ == 'exec'`).
+    if let Some(rest) = name.strip_prefix("__vm:") {
+        return rest;
+    }
     // Generator-family sentinels carry internal names; surface the
     // Python-visible method name.
     match name.strip_prefix(".u").unwrap_or(name) {
@@ -32988,6 +33255,19 @@ fn find_handler(table: &[ExcHandler], pc: u32) -> Option<&ExcHandler> {
     // entry before the outer one, so a forward scan finds the
     // tightest range first.
     table.iter().find(|h| pc >= h.start && pc < h.end)
+}
+
+/// RFC 0053 WS5 — whether a callable fires CPython's `c_call` /
+/// `c_return` / `c_exception` profile events: built-in functions and
+/// bound native methods (`PyCFunction_Check` in `ceval.c`). Classes,
+/// Python functions, and other callables do not.
+fn is_c_profiled_callable(obj: &Object) -> bool {
+    match obj {
+        // `super` calls are control flow, not profiled C calls.
+        Object::Builtin(b) => b.name != "super",
+        Object::BoundMethod(bm) => matches!(bm.function, Object::Builtin(_)),
+        _ => false,
+    }
 }
 
 fn is_super_callable(obj: &Object) -> bool {

@@ -1,269 +1,236 @@
-"""WeavePy `linecache` — line-by-line source cache.
+"""Cache lines from Python source files.
 
-Used by `traceback`, `inspect.getsource`, and warning machinery to
-turn (filename, lineno) into a source line for display. Mirrors
-CPython's cache model: `cache` maps filename → 4-tuple
-`(size, mtime, lines, fullname)`, with *lazy* entries stored as
-1-tuples `(get_source,)` until first use (PEP 302 loaders).
+This is intended to read lines from modules imported -- hence if a filename
+is not found, it will look down the module search path for a file by
+that name.
 """
 
-import os
-import sys
+__all__ = ["getline", "clearcache", "checkcache", "lazycache"]
 
 
-# Public, exactly like CPython — tests poke `linecache.cache` directly.
+# The cache. Maps filenames to either a thunk which will provide source code,
+# or a tuple (size, mtime, lines, fullname) once loaded.
 cache = {}
-
-
-__all__ = [
-    "getline",
-    "getlines",
-    "clearcache",
-    "checkcache",
-    "lazycache",
-    "updatecache",
-]
+_interactive_cache = {}
 
 
 def clearcache():
+    """Clear the cache entirely."""
     cache.clear()
 
 
 def getline(filename, lineno, module_globals=None):
+    """Get a line for a Python source file from the cache.
+    Update the cache if it doesn't contain an entry for this file already."""
+
     lines = getlines(filename, module_globals)
     if 1 <= lineno <= len(lines):
         return lines[lineno - 1]
-    return ""
+    return ''
 
 
-def _getline_from_code(code, lineno):
-    """Source line for a code object whose file isn't on disk
-    (e.g. `<stdin>`); CPython keeps a code-object-keyed side cache."""
-    lines = _getlines_from_code(code)
+def getlines(filename, module_globals=None):
+    """Get the lines for a Python source file from the cache.
+    Update the cache if it doesn't contain an entry for this file already."""
+
+    entry = cache.get(filename, None)
+    if entry is not None and len(entry) != 1:
+        return entry[2]
+
+    try:
+        return updatecache(filename, module_globals)
+    except MemoryError:
+        clearcache()
+        return []
+
+
+def _getline_from_code(filename, lineno):
+    lines = _getlines_from_code(filename)
     if 1 <= lineno <= len(lines):
         return lines[lineno - 1]
-    return ""
-
-
-# CPython keys this side cache by (co_filename, co_qualname,
-# co_firstlineno) rather than the code object itself: the frame being
-# rendered holds a *nested* code object (a method compiled inside the
-# registered module code), and value-keying lets registration walk
-# `co_consts` once and cover every nested function.
-_interactive_cache = {}
-
+    return ''
 
 def _make_key(code):
     return (code.co_filename, code.co_qualname, code.co_firstlineno)
 
+def _getlines_from_code(code):
+    code_id = _make_key(code)
+    entry = _interactive_cache.get(code_id, None)
+    if entry is not None and len(entry) != 1:
+        return entry[2]
+    return []
+
+
+def checkcache(filename=None):
+    """Discard cache entries that are out of date.
+    (This is not checked upon each call!)"""
+
+    if filename is None:
+        # get keys atomically
+        filenames = cache.copy().keys()
+    else:
+        filenames = [filename]
+
+    for filename in filenames:
+        entry = cache.get(filename, None)
+        if entry is None or len(entry) == 1:
+            # lazy cache entry, leave it lazy.
+            continue
+        size, mtime, lines, fullname = entry
+        if mtime is None:
+            continue   # no-op for files loaded via a __loader__
+        try:
+            # This import can fail if the interpreter is shutting down
+            import os
+        except ImportError:
+            return
+        try:
+            stat = os.stat(fullname)
+        except (OSError, ValueError):
+            cache.pop(filename, None)
+            continue
+        if size != stat.st_size or mtime != stat.st_mtime:
+            cache.pop(filename, None)
+
+
+def updatecache(filename, module_globals=None):
+    """Update a cache entry and return its list of lines.
+    If something's wrong, print a message, discard the cache entry,
+    and return an empty list."""
+
+    # These imports are not at top level because linecache is in the critical
+    # path of the interpreter startup and importing os and sys take a lot of time
+    # and slows down the startup sequence.
+    try:
+        import os
+        import sys
+        import tokenize
+    except ImportError:
+        # These import can fail if the interpreter is shutting down
+        return []
+
+    entry = cache.pop(filename, None)
+    if not filename or (filename.startswith('<') and filename.endswith('>')):
+        return []
+
+    fullname = filename
+    try:
+        stat = os.stat(fullname)
+    except OSError:
+        basename = filename
+
+        # Realise a lazy loader based lookup if there is one
+        # otherwise try to lookup right now.
+        lazy_entry = entry if entry is not None and len(entry) == 1 else None
+        if lazy_entry is None:
+            lazy_entry = _make_lazycache_entry(filename, module_globals)
+        if lazy_entry is not None:
+            try:
+                data = lazy_entry[0]()
+            except (ImportError, OSError):
+                pass
+            else:
+                if data is None:
+                    # No luck, the PEP302 loader cannot find the source
+                    # for this module.
+                    return []
+                entry = (
+                    len(data),
+                    None,
+                    [line + '\n' for line in data.splitlines()],
+                    fullname
+                )
+                cache[filename] = entry
+                return entry[2]
+
+        # Try looking through the module search path, which is only useful
+        # when handling a relative filename.
+        if os.path.isabs(filename):
+            return []
+
+        for dirname in sys.path:
+            try:
+                fullname = os.path.join(dirname, basename)
+            except (TypeError, AttributeError):
+                # Not sufficiently string-like to do anything useful with.
+                continue
+            try:
+                stat = os.stat(fullname)
+                break
+            except (OSError, ValueError):
+                pass
+        else:
+            return []
+    except ValueError:  # may be raised by os.stat()
+        return []
+    try:
+        with tokenize.open(fullname) as fp:
+            lines = fp.readlines()
+    except (OSError, UnicodeDecodeError, SyntaxError):
+        return []
+    if not lines:
+        lines = ['\n']
+    elif not lines[-1].endswith('\n'):
+        lines[-1] += '\n'
+    size, mtime = stat.st_size, stat.st_mtime
+    cache[filename] = size, mtime, lines, fullname
+    return lines
+
+
+def lazycache(filename, module_globals):
+    """Seed the cache for filename with module_globals.
+
+    The module loader will be asked for the source only when getlines is
+    called, not immediately.
+
+    If there is an entry in the cache already, it is not altered.
+
+    :return: True if a lazy load is registered in the cache,
+        otherwise False. To register such a load a module loader with a
+        get_source method must be found, the filename must be a cacheable
+        filename, and the filename must not be already cached.
+    """
+    entry = cache.get(filename, None)
+    if entry is not None:
+        return len(entry) == 1
+
+    lazy_entry = _make_lazycache_entry(filename, module_globals)
+    if lazy_entry is not None:
+        cache[filename] = lazy_entry
+        return True
+    return False
+
+
+def _make_lazycache_entry(filename, module_globals):
+    if not filename or (filename.startswith('<') and filename.endswith('>')):
+        return None
+    # Try for a __loader__, if available
+    if module_globals and '__name__' in module_globals:
+        spec = module_globals.get('__spec__')
+        name = getattr(spec, 'name', None) or module_globals['__name__']
+        loader = getattr(spec, 'loader', None)
+        if loader is None:
+            loader = module_globals.get('__loader__')
+        get_source = getattr(loader, 'get_source', None)
+
+        if name and get_source:
+            def get_lines(name=name, *args, **kwargs):
+                return get_source(name, *args, **kwargs)
+            return (get_lines,)
+    return None
+
+
 
 def _register_code(code, string, name):
-    entry = (
-        len(string),
-        None,
-        [line + "\n" for line in string.splitlines()],
-        name,
-    )
+    entry = (len(string),
+             None,
+             [line + '\n' for line in string.splitlines()],
+             name)
     stack = [code]
     while stack:
         code = stack.pop()
         for const in code.co_consts:
             if isinstance(const, type(code)):
                 stack.append(const)
-        _interactive_cache[_make_key(code)] = entry
-
-
-def _getlines_from_code(code):
-    entry = _interactive_cache.get(_make_key(code))
-    if entry is not None and len(entry) != 1:
-        return entry[2]
-    return []
-
-
-def getlines(filename, module_globals=None):
-    if filename in cache:
-        entry = cache[filename]
-        if len(entry) != 1:
-            return entry[2]
-    try:
-        return updatecache(filename, module_globals) or []
-    except MemoryError:
-        clearcache()
-        return []
-
-
-def checkcache(filename=None):
-    if filename is None:
-        filenames = list(cache.keys())
-    elif filename in cache:
-        filenames = [filename]
-    else:
-        return
-    for f in filenames:
-        entry = cache.get(f)
-        if entry is None or len(entry) == 1:
-            # Lazy entries have no stat to validate.
-            continue
-        size, mtime, lines, name = entry
-        if mtime is None:
-            continue
-        try:
-            stat = os.stat(name)
-        except (OSError, ValueError):
-            cache.pop(f, None)
-            continue
-        if size != stat.st_size or mtime != stat.st_mtime:
-            cache.pop(f, None)
-
-
-def _materialize_lazy(filename, entry):
-    """Realise a lazy 1-tuple entry through the loader's get_source."""
-    try:
-        data = entry[0]()
-    except (ImportError, OSError):
-        return None
-    if data is None:
-        return None
-    # CPython: every loader-sourced line gets a trailing newline appended.
-    lines = [line + "\n" for line in data.splitlines()]
-    cache[filename] = (len(data), None, lines, filename)
-    return lines
-
-
-def updatecache(filename, module_globals=None):
-    entry = cache.pop(filename, None)
-    # WeavePy frozen stdlib modules carry `<frozen NAME>` filenames;
-    # their source is recoverable through `_imp.find_frozen`.
-    if filename.startswith("<frozen ") and filename.endswith(">"):
-        modname = filename[8:-1]
-        try:
-            import _imp
-            found = _imp.find_frozen(modname)
-        except Exception:
-            found = None
-        if found is not None:
-            src = found[0]
-            if isinstance(src, bytes):
-                src = src.decode("utf-8", "replace")
-            lines = src.splitlines(keepends=True)
-            cache[filename] = (len(lines), None, lines, filename)
-            return lines
-    name = filename
-    # Try direct file system access first — like CPython, loader-based
-    # lazy entries are only consulted when the file isn't readable.
-    try:
-        stat = os.stat(name)
-    except (OSError, ValueError):
-        if entry is not None and len(entry) == 1:
-            lines = _materialize_lazy(filename, entry)
-            if lines is not None:
-                return lines
-        # One more chance: a loader from module_globals (CPython tries
-        # this when the file isn't directly readable).
-        if lazycache(filename, module_globals):
-            entry = cache.pop(filename, None)
-            if entry is not None and len(entry) == 1:
-                lines = _materialize_lazy(filename, entry)
-                if lines is not None:
-                    return lines
-        return []
-    try:
-        with open(name, "rb") as f:
-            raw = f.read()
-        data = _decode_source(raw)
-    except (OSError, UnicodeDecodeError, LookupError):
-        return []
-    # CPython reads with `tokenize.open(...).readlines()`: universal-newline
-    # translation then a split on '\n' only. `str.splitlines()` would also
-    # split on form feed / vertical tab, shifting every later line
-    # (`test_traceback.test_encoded_file` puts '\f' on the first line).
-    data = data.replace("\r\n", "\n").replace("\r", "\n")
-    lines = [line + "\n" for line in data.split("\n")]
-    if data.endswith("\n"):
-        lines.pop()
-    cache[filename] = (stat.st_size, stat.st_mtime, lines, name)
-    return lines
-
-
-def _coding_cookie(line):
-    """PEP 263 cookie in a comment line (bytes), or None.
-
-    Hand-rolled equivalent of tokenize's
-    `^[ \\t\\f]*#.*?coding[:=][ \\t]*([-_.a-zA-Z0-9]+)` so linecache
-    doesn't have to import `re` mid-traceback.
-    """
-    i = 0
-    while i < len(line) and line[i : i + 1] in (b" ", b"\t", b"\x0c"):
-        i += 1
-    if line[i : i + 1] != b"#":
-        return None
-    pos = line.find(b"coding", i)
-    if pos < 0:
-        return None
-    j = pos + 6
-    if line[j : j + 1] not in (b":", b"="):
-        return None
-    j += 1
-    while line[j : j + 1] in (b" ", b"\t"):
-        j += 1
-    start = j
-    while j < len(line) and chr(line[j]) in (
-        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
-    ):
-        j += 1
-    if j == start:
-        return None
-    return line[start:j].decode("ascii")
-
-
-def _decode_source(raw):
-    """Decode source bytes the way `tokenize.open` would: UTF-8 BOM,
-    then a PEP 263 coding cookie on line 1 or 2, defaulting to UTF-8."""
-    if raw.startswith(b"\xef\xbb\xbf"):
-        return raw[3:].decode("utf-8")
-    for line in raw.split(b"\n", 2)[:2]:
-        encoding = _coding_cookie(line)
-        if encoding is not None:
-            return raw.decode(encoding)
-        # A cookie on line 2 only counts if line 1 is blank or a comment.
-        stripped = line.strip(b" \t\x0c\r")
-        if stripped and not stripped.startswith(b"#"):
-            break
-    return raw.decode("utf-8")
-
-
-def lazycache(filename, module_globals):
-    """Seed the cache with a deferred get_source for `filename`.
-
-    Returns True if a lazy entry was (or already is) installed.
-    """
-    if filename in cache:
-        return len(cache[filename]) == 1
-    if not filename or (filename.startswith("<") and filename.endswith(">")):
-        return False
-    if module_globals is None or "__name__" not in module_globals:
-        return False
-    # CPython prefers the spec's name/loader over the module-level dunders.
-    spec = module_globals.get("__spec__")
-    name = getattr(spec, "name", None) or module_globals["__name__"]
-    loader = getattr(spec, "loader", None)
-    if loader is None:
-        loader = module_globals.get("__loader__")
-    get_source = getattr(loader, "get_source", None)
-    if get_source is None:
-        # WeavePy's import machinery doesn't install `__loader__` on
-        # disk-loaded modules yet; synthesize the loader CPython would
-        # have used from `__file__`.
-        file = module_globals.get("__file__")
-        if name and file:
-            try:
-                from importlib.machinery import SourceFileLoader
-            except ImportError:
-                return False
-            get_source = SourceFileLoader(name, file).get_source
-    if name and get_source:
-        def get_lines(name=name, *args, **kwargs):
-            return get_source(name, *args, **kwargs)
-        cache[filename] = (get_lines,)
-        return True
-    return False
+        key = _make_key(code)
+        _interactive_cache[key] = entry
