@@ -259,7 +259,7 @@ pub fn register_all(cache: &ModuleCache) {
     }
 }
 
-fn frozen_sources() -> &'static [FrozenSource] {
+pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
     // A `static`, not a promoted local: the table is far past clippy's
     // stack-array budget (`large_stack_arrays`).
     static SOURCES: &[FrozenSource] = &[
@@ -325,6 +325,14 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "_weave_envinit",
             source: include_str!("python/_weave_envinit.py"),
+            is_package: false,
+        },
+        // RFC 0053 WS2 — builds PEP 451 (spec, loader) pairs lazily for
+        // modules the Rust importer loaded natively. See the module
+        // `__spec__`/`__loader__` fallback in `Interpreter::load_attr`.
+        FrozenSource {
+            name: "_weave_spec",
+            source: include_str!("python/_weave_spec.py"),
             is_package: false,
         },
         // RFC 0040 WS7 — CPython's pure-Python `io` reference implementation.
@@ -2495,9 +2503,41 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/_tokenize.py"),
             is_package: false,
         },
+        // RFC 0053 WS4 — verbatim CPython `sysconfig` package over a
+        // WeavePy-generated `_sysconfigdata` (CPython generates that
+        // module during its autoconf build; ours computes the same
+        // variables from the running interpreter). Registered under
+        // the platform-derived names `_get_sysconfigdata_name()`
+        // produces with `sys.abiflags == ''` and no
+        // `sys.implementation._multiarch`.
         FrozenSource {
             name: "sysconfig",
-            source: include_str!("python/sysconfig.py"),
+            source: include_str!("python/sysconfig/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "sysconfig.__main__",
+            source: include_str!("python/sysconfig/__main__.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_sysconfigdata__darwin_weavepy-x86_64",
+            source: include_str!("python/_weave_sysconfigdata.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_sysconfigdata__linux_weavepy-x86_64",
+            source: include_str!("python/_weave_sysconfigdata.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_sitebuiltins",
+            source: include_str!("python/_sitebuiltins.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_osx_support",
+            source: include_str!("python/_osx_support.py"),
             is_package: false,
         },
         FrozenSource {
@@ -2583,16 +2623,23 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/timeit_mod.py"),
             is_package: false,
         },
+        // RFC 0053 WS5 — the full CPython profiling stack: verbatim
+        // `profile`/`cProfile`/`pstats` over a `_lsprof` core that
+        // aggregates the VM's profile events (incl. the new
+        // c_call/c_return/c_exception family).
         FrozenSource {
             name: "profile",
             source: include_str!("python/profile_mod.py"),
             is_package: false,
         },
-        // `cProfile` is an alias for `profile` in WeavePy — we don't
-        // (yet) ship a C-accelerated profiler.
         FrozenSource {
             name: "cProfile",
-            source: include_str!("python/profile_mod.py"),
+            source: include_str!("python/cprofile_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_lsprof",
+            source: include_str!("python/_lsprof.py"),
             is_package: false,
         },
         FrozenSource {

@@ -13063,6 +13063,16 @@ pub(crate) fn file_seek(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let offset = match args.get(1) {
         Some(Object::Int(i)) => *i as isize,
+        Some(Object::Bool(b)) => isize::from(*b),
+        // A Python int beyond i64 is a distinct `Object::Long`; CPython's
+        // argument clinic raises OverflowError converting it to
+        // Py_ssize_t, and callers rely on catching exactly that
+        // (plistlib treats it as a corrupt binary plist).
+        Some(Object::Long(_)) => {
+            return Err(crate::error::overflow_error(
+                "Python int too large to convert to C ssize_t",
+            ));
+        }
         _ => return Err(type_error("seek() expected int")),
     };
     // A text stream (CPython's `TextIOWrapper`) only supports absolute seeks to

@@ -505,18 +505,25 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             executable.clone(),
         );
         // Installation prefixes. CPython computes these in getpath.c;
-        // approximate with the executable's grandparent directory (the
-        // usual `<prefix>/bin/python` layout). Defined natively — not
-        // just in `site.py` — because embedders skip site initialization
-        // and module-scope stdlib code reads them at import time
-        // (`gettext._default_localedir` uses `sys.base_prefix`).
+        // RFC 0053 anchors them on the materialized stdlib tree
+        // (`{prefix}/lib/weavepy3.13`), so `sysconfig`'s
+        // `{installed_base}`-relative schemes and `site.getsitepackages`
+        // resolve inside a real, existing installation. When the tree is
+        // unavailable, approximate with the executable's grandparent
+        // directory (the usual `<prefix>/bin/python` layout). Defined
+        // natively — not just in `site.py` — because embedders skip site
+        // initialization and module-scope stdlib code reads them at
+        // import time (`gettext._default_localedir` uses
+        // `sys.base_prefix`).
         {
-            let prefix = std::env::current_exe()
-                .ok()
-                .and_then(|p| {
-                    p.parent()
-                        .and_then(|d| d.parent())
-                        .map(std::path::Path::to_path_buf)
+            let prefix = crate::stdlib_tree::prefix()
+                .map(std::path::Path::to_path_buf)
+                .or_else(|| {
+                    std::env::current_exe().ok().and_then(|p| {
+                        p.parent()
+                            .and_then(|d| d.parent())
+                            .map(std::path::Path::to_path_buf)
+                    })
                 })
                 .map_or(Object::from_static(""), |p| {
                     Object::from_str(p.to_string_lossy().into_owned())
@@ -525,6 +532,29 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
                 d.insert(DictKey(Object::from_static(name)), prefix.clone());
             }
         }
+        // RFC 0053 WS4 — a release build carries no ABI flags; the
+        // verbatim `sysconfig` derives `_sysconfigdata_*` names from it.
+        d.insert(
+            DictKey(Object::from_static("abiflags")),
+            Object::from_static(""),
+        );
+        // The verbatim `site.setcopyright()` builds the interactive
+        // `copyright` object from this (CPython's is assembled in
+        // `getcopyright.c`).
+        d.insert(
+            DictKey(Object::from_static("copyright")),
+            Object::from_static(
+                "Copyright (c) 2001-2024 Python Software Foundation.\nAll Rights Reserved.",
+            ),
+        );
+        // RFC 0053 — the materialized stdlib directory (CPython 3.11+'s
+        // `sys._stdlib_dir`). `None` when the tree is unavailable.
+        d.insert(
+            DictKey(Object::from_static("_stdlib_dir")),
+            crate::stdlib_tree::stdlib_dir().map_or(Object::None, |p| {
+                Object::from_str(p.to_string_lossy().into_owned())
+            }),
+        );
         d.insert(
             DictKey(Object::from_static("implementation")),
             implementation_value(),
