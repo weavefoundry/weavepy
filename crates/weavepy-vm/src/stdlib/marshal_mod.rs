@@ -425,7 +425,9 @@ fn code_flags(co: &CodeObject) -> u32 {
     if co.is_async_generator {
         f |= CO_ASYNC_GENERATOR;
     }
-    f
+    // Persist active `__future__` bits so an unmarshalled code object
+    // still reports them on `co_flags` (RFC 0052).
+    f | co.future_flags
 }
 
 /// Pack a `BigInt` into CPython's marshal digit form: a signed count of
@@ -761,6 +763,7 @@ impl<'a> MarshalReader<'a> {
             is_coroutine: flags & CO_COROUTINE != 0,
             is_async_generator: flags & CO_ASYNC_GENERATOR != 0,
             is_iterable_coroutine: flags & CO_ITERABLE_COROUTINE != 0,
+            future_flags: flags & weavepy_compiler::flags::PYCF_MASK,
             cp_cache: cpython_code::CpCache::default(),
         };
         Ok(Object::Code(Rc::new(co)))

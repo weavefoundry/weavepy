@@ -37,6 +37,11 @@ class _RawTable:
         self.varnames = d["varnames"]
         self.children = [_RawTable(c) for c in d["children"]]
 
+    def __repr__(self):
+        # CPython's PySTEntry repr: "<symtable entry top(140…), line 0>".
+        return "<symtable entry {0}({1}), line {2}>".format(
+            self.name, self.id, self.lineno)
+
 
 def symtable(code, filename, compile_type):
     """ Return the toplevel *SymbolTable* for the source code.
@@ -275,13 +280,29 @@ class Class(SymbolTable):
             for st in self._table.children:
                 # pick the function-like symbols that are local identifiers
                 if is_local_symbol(st.name):
-                    if st.type == _symtable.TYPE_FUNCTION:
-                        # generators are of type TYPE_FUNCTION with a ".0"
-                        # parameter as a first parameter (which makes them
-                        # distinguishable from a function named 'genexpr')
-                        if st.name == 'genexpr' and '.0' in st.varnames:
-                            continue
-                        d[st.name] = 1
+                    match st.type:
+                        case _symtable.TYPE_FUNCTION:
+                            # generators are of type TYPE_FUNCTION with a ".0"
+                            # parameter as a first parameter (which makes them
+                            # distinguishable from a function named 'genexpr')
+                            if st.name == 'genexpr' and '.0' in st.varnames:
+                                continue
+                            d[st.name] = 1
+                        case _symtable.TYPE_TYPE_PARAMETERS:
+                            # Get the function-def block in the annotation
+                            # scope 'st' with the same identifier, if any.
+                            scope_name = st.name
+                            for c in st.children:
+                                if c.name == scope_name and c.type == _symtable.TYPE_FUNCTION:
+                                    # A generic generator of type TYPE_FUNCTION
+                                    # cannot be a direct child of 'st' (but it
+                                    # can be a descendant), e.g.:
+                                    #
+                                    # class A:
+                                    #   type genexpr[genexpr] = (x for x in [])
+                                    assert scope_name != 'genexpr' or '.0' not in c.varnames
+                                    d[scope_name] = 1
+                                    break
             self.__methods = tuple(d)
         return self.__methods
 

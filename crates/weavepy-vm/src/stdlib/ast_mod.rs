@@ -54,6 +54,20 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("parse")),
             Object::Builtin(Rc::new(bf)),
         );
+        // `compile()` control flags (CPython `_ast` exposes these;
+        // `ast.py` re-exports them) — RFC 0052.
+        use weavepy_compiler::flags as cf;
+        for (name, value) in [
+            ("PyCF_ONLY_AST", cf::PYCF_ONLY_AST),
+            ("PyCF_TYPE_COMMENTS", cf::PYCF_TYPE_COMMENTS),
+            ("PyCF_ALLOW_TOP_LEVEL_AWAIT", cf::PYCF_ALLOW_TOP_LEVEL_AWAIT),
+            ("PyCF_OPTIMIZED_AST", cf::PYCF_OPTIMIZED_AST),
+        ] {
+            d.insert(
+                DictKey(Object::from_static(name)),
+                Object::Int(i64::from(value)),
+            );
+        }
     }
     Rc::new(PyModule {
         name: "_ast".to_owned(),
@@ -211,7 +225,7 @@ impl Builder<'_> {
                 body,
                 decorator_list,
                 returns,
-                ..
+                type_params,
             } => node(
                 "FunctionDef",
                 vec![
@@ -224,7 +238,7 @@ impl Builder<'_> {
                         returns.as_deref().map_or(Object::None, |r| self.expr(r)),
                     ),
                     ("type_comment", Object::None),
-                    ("type_params", Object::new_list(vec![])),
+                    ("type_params", self.type_params(type_params)),
                 ],
                 sp,
                 self.lm,
@@ -235,7 +249,7 @@ impl Builder<'_> {
                 body,
                 decorator_list,
                 returns,
-                ..
+                type_params,
             } => node(
                 "AsyncFunctionDef",
                 vec![
@@ -248,7 +262,7 @@ impl Builder<'_> {
                         returns.as_deref().map_or(Object::None, |r| self.expr(r)),
                     ),
                     ("type_comment", Object::None),
-                    ("type_params", Object::new_list(vec![])),
+                    ("type_params", self.type_params(type_params)),
                 ],
                 sp,
                 self.lm,
@@ -259,7 +273,7 @@ impl Builder<'_> {
                 keywords,
                 body,
                 decorator_list,
-                ..
+                type_params,
             } => node(
                 "ClassDef",
                 vec![
@@ -268,7 +282,30 @@ impl Builder<'_> {
                     ("keywords", list_of(keywords, |k| self.keyword(k))),
                     ("body", list_of(body, |x| self.stmt(x))),
                     ("decorator_list", list_of(decorator_list, |x| self.expr(x))),
-                    ("type_params", Object::new_list(vec![])),
+                    ("type_params", self.type_params(type_params)),
+                ],
+                sp,
+                self.lm,
+            ),
+            S::TypeAlias {
+                name,
+                name_span,
+                type_params,
+                value,
+            } => node(
+                "TypeAlias",
+                vec![
+                    (
+                        "name",
+                        node(
+                            "Name",
+                            vec![("id", ident(name)), ("ctx", singleton("Store"))],
+                            *name_span,
+                            self.lm,
+                        ),
+                    ),
+                    ("type_params", self.type_params(type_params)),
+                    ("value", self.expr(value)),
                 ],
                 sp,
                 self.lm,
@@ -744,6 +781,34 @@ impl Builder<'_> {
                 ("value", self.expr(&k.value)),
             ],
         )
+    }
+
+    /// PEP 695 type-parameter list → `[ast.TypeVar | ast.TypeVarTuple |
+    /// ast.ParamSpec, …]` (with PEP 696 `default_value`).
+    fn type_params(&self, tps: &[past::TypeParam]) -> Object {
+        list_of(tps, |tp| {
+            let default_value = tp.default.as_deref().map_or(Object::None, |d| self.expr(d));
+            let fields = match &tp.kind {
+                past::TypeParamKind::TypeVar { bound } => vec![
+                    ("name", ident(&tp.source_name)),
+                    (
+                        "bound",
+                        bound.as_deref().map_or(Object::None, |b| self.expr(b)),
+                    ),
+                    ("default_value", default_value),
+                ],
+                past::TypeParamKind::TypeVarTuple | past::TypeParamKind::ParamSpec => vec![
+                    ("name", ident(&tp.source_name)),
+                    ("default_value", default_value),
+                ],
+            };
+            let ty = match &tp.kind {
+                past::TypeParamKind::TypeVar { .. } => "TypeVar",
+                past::TypeParamKind::TypeVarTuple => "TypeVarTuple",
+                past::TypeParamKind::ParamSpec => "ParamSpec",
+            };
+            node(ty, fields, tp.span, self.lm)
+        })
     }
 
     fn comprehension(&self, c: &past::Comprehension) -> Object {

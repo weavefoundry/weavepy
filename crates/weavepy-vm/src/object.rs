@@ -2473,6 +2473,13 @@ pub struct PyFunction {
     pub code: RefCell<Rc<CodeObject>>,
     /// Module-level globals shared with the defining module.
     pub globals: Rc<RefCell<DictData>>,
+    /// CPython `func_builtins`: the builtins mapping this function's
+    /// frames resolve names against. Resolved from
+    /// `globals['__builtins__']` once, at function creation, and never
+    /// re-read — rebinding `globals()['__builtins__']` between calls
+    /// must not change resolution (test_dynamic's
+    /// `test_cannot_replace_builtins_dict_between_calls`).
+    pub builtins: Rc<RefCell<DictData>>,
     pub defaults: Vec<Object>,
     pub kw_defaults: Vec<(String, Object)>,
     /// Closure cells matching `code.freevars` in order.

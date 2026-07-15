@@ -137,11 +137,17 @@ class SingleModeEchoTests(unittest.TestCase):
         import io
         import contextlib
         buf = io.StringIO()
-        code = compile("1 + 1\n'hi'\nNone\n", "<t>", "single")
+        # "single" mode accepts one statement at a time (a multi-statement
+        # source is a SyntaxError, matching CPython) — compile each
+        # example the way doctest does.
+        ns = {}
         with contextlib.redirect_stdout(buf):
-            exec(code, {})
+            for src in ("1 + 1\n", "'hi'\n", "None\n"):
+                exec(compile(src, "<t>", "single"), ns)
         # 1+1 -> "2", 'hi' -> "'hi'", None is suppressed by displayhook.
         self.assertEqual(buf.getvalue(), "2\n'hi'\n")
+        with self.assertRaises(SyntaxError):
+            compile("1 + 1\n'hi'\nNone\n", "<t>", "single")
 
 
 class BridgeTests(unittest.TestCase):

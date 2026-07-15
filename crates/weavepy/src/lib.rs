@@ -283,7 +283,17 @@ pub fn run_source_with_options(source: &str, opts: &RunOptions) -> Result<(), Er
     // once the interpreter is up, just before the module body runs.
     let (module_res, escape_warnings) = parser::parse_module_with_warnings(source_ref);
     let module = module_res?;
-    let code = compiler::compile_module_with_source(&module, source_ref, &opts.filename)?;
+    // `-O`/`-OO` applies to the main module too (assert/docstring
+    // stripping, `__debug__` folding) — RFC 0052.
+    let code = compiler::compile_module_with_options(
+        &module,
+        source_ref,
+        &opts.filename,
+        compiler::CompileOptions {
+            flags: 0,
+            optimize: opts.flags.optimize,
+        },
+    )?;
     let mut interpreter = vm::Interpreter::default();
     interpreter.apply_run_options(&opts.flags);
     if !opts.flags.safe_path {
@@ -477,6 +487,23 @@ fn format_compile_error(source: &str, filename: &str, err: &compiler::CompileErr
 }
 
 fn format_lex_error(source: &str, filename: &str, err: &lexer::LexError) -> String {
+    // A line continuation at EOF with nothing before it on the line:
+    // CPython's *file* tokenizer reports column 0 for this, and the
+    // C-level error printer then omits the caret line entirely
+    // (test_eof's bpo-2180 from-file cases assert on that shape).
+    if let lexer::LexError::UnexpectedEofParsing {
+        pos,
+        line_had_tokens: false,
+    } = err
+    {
+        let loc = SourceLocation::from_byte(source, *pos);
+        let rtext = loc.line_text.trim_end_matches('\n');
+        let ltext = rtext.trim_start_matches([' ', '\n', '\x0c']);
+        return format!(
+            "  File \"{filename}\", line {}\n    {ltext}\nSyntaxError: {err}\n",
+            loc.line
+        );
+    }
     let byte = err.byte_offset();
     format_syntax_error_span(source, filename, byte, byte, &err.to_string())
 }
