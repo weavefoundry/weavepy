@@ -85,6 +85,22 @@ work.
 > `__pycache__` using CPython's `b"\xf3\r\r\n"` magic + PEP 552 header
 > (kept collision-safe by a distinct `weavepy-3.13` cache tag). Six
 > bundled regrtests cross-check the whole surface against CPython 3.13.
+>
+> `RFC 0054` lands the **async wave**: a native `_asyncio` C-accelerator
+> (the real `Future`/`Task` state machines, `current_task`/`all_tasks`,
+> eager task factories, cancellation bookkeeping) that CPython's frozen
+> `asyncio` adopts via its normal import hook, plus an OpenSSL-shaped
+> `_ssl` over rustls — full `getpeercert()` X.509→dict parsing, SNI
+> servername callbacks via a two-phase `rustls::server::Acceptor`
+> handshake, server-side ALPN, session stats, options/verify_flags
+> bitmasks (`VERIFY_X509_STRICT`, CRL checks), dual RSA/ECC certificate
+> slots, encrypted PKCS#8 keys with password callbacks, per-message
+> handshake callbacks, and TLS 1.3 post-handshake-auth emulation. The
+> vendored `test_asyncio` package now grades as 31 per-submodule rows —
+> **all 31 pass** over real loopback sockets, real subprocess transports,
+> and rustls TLS — and the network tail graduates to measured `pass`
+> rows: `test_ssl` (191 tests), `test_urllib2`, `test_poplib`, joining
+> the already-green httplib/imaplib/ftplib/smtplib/socketserver family.
 
 ## Repository layout
 

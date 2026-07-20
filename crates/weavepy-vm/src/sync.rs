@@ -1191,6 +1191,13 @@ impl GilLock {
     pub fn try_lock(&self) -> Option<parking_lot::ReentrantMutexGuard<'_, ()>> {
         self.0.try_lock()
     }
+
+    pub fn try_lock_for(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Option<parking_lot::ReentrantMutexGuard<'_, ()>> {
+        self.0.try_lock_for(timeout)
+    }
 }
 
 /// A typed Arc alias for the threading primitives. Each `Object`

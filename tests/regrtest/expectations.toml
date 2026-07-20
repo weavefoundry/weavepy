@@ -74,6 +74,9 @@ reason = "measured (RFC 0049 wave-5 full-suite baseline): TypeError: slot descri
 
 [tests."cpython/Lib/test/test_argparse.py"]
 status = "pass"
+# ~27s idle; observed >60s under -j4 sweep contention (RFC 0054
+# re-measure) — verdict is stable, raise headroom only.
+timeout_seconds = 180
 reason = "measured (RFC 0053): the two architectural blockers fell — the materialized stdlib tree gives frozen modules a real on-disk `__file__` (so `open(argparse.__file__)` works), and the patchable-builtins work lets `mock.patch('builtins.open')` take effect."
 
 [tests."cpython/Lib/test/test_array.py"]
@@ -91,9 +94,50 @@ timeout_seconds = 180
 status = "pass"
 reason = "measured (RFC 0037 WS7): passes end-to-end. PEP 525 finalization hooks (sys.set_asyncgen_hooks / firstiter+finalizer), aclose()/athrow() semantics incl. GeneratorExit propagation, asyncio.sleep(0) yield points, and shutdown_asyncgens."
 
-[tests."cpython/Lib/test/test_asyncio.py"]
-status = "skip"
-reason = "RFC 0039 WS6/WS7: the native selector backends (select/poll/kqueue) and a real SelectorEventLoop shipped (test_selectors passes). But the harness grades the whole 31-submodule `test_asyncio` package, which includes test_subprocess/test_ssl/test_sendfile/test_sock_lowlevel/test_unix_events — live network + real subprocess transports unavailable in the CI sandbox — so it can't be graded green as a unit. Deferred with the live-network test harness (RFC future work)."
+# test_asyncio (RFC 0054 WS4): the package now expands to one graded row per
+# submodule (31 rows) instead of a single package-level row, so one slow or
+# hanging file can't poison 30 green siblings. All 31 submodules pass
+# end-to-end on the native `_asyncio` accelerator + SelectorEventLoop over
+# real loopback sockets, real subprocess transports, and rustls TLS
+# (test_ssl/test_sslproto included). Per the file convention, only the
+# correct-but-slow rows are listed below — each carries budget headroom for
+# a loaded parallel sweep; every unlisted submodule is expected to pass.
+
+[tests."cpython/Lib/test/test_asyncio/test_base_events.py"]
+status = "pass"
+timeout_seconds = 180
+
+[tests."cpython/Lib/test/test_asyncio/test_eager_task_factory.py"]
+status = "pass"
+timeout_seconds = 180
+
+[tests."cpython/Lib/test/test_asyncio/test_events.py"]
+status = "pass"
+timeout_seconds = 180
+
+[tests."cpython/Lib/test/test_asyncio/test_selector_events.py"]
+status = "pass"
+timeout_seconds = 180
+
+[tests."cpython/Lib/test/test_asyncio/test_sendfile.py"]
+status = "pass"
+timeout_seconds = 180
+
+[tests."cpython/Lib/test/test_asyncio/test_ssl.py"]
+status = "pass"
+timeout_seconds = 180
+
+[tests."cpython/Lib/test/test_asyncio/test_subprocess.py"]
+status = "pass"
+timeout_seconds = 180
+
+[tests."cpython/Lib/test/test_asyncio/test_taskgroups.py"]
+status = "pass"
+timeout_seconds = 180
+
+[tests."cpython/Lib/test/test_asyncio/test_tasks.py"]
+status = "pass"
+timeout_seconds = 180
 
 [tests."cpython/Lib/test/test_atexit.py"]
 status = "fail"
@@ -203,11 +247,14 @@ reason = "RFC 0050 WS3: passes (19 tests). big5hkscs (incl. combining pairs and 
 
 [tests."cpython/Lib/test/test_codecencodings_iso2022.py"]
 status = "pass"
-timeout_seconds = 180
-reason = "RFC 0050 WS3: passes (95 tests, 1 skip). All seven iso2022_* variants via the frozen _codec_cjk_ext state machines ported from _codecs_iso2022.c. RFC 0051: ~22s standalone but observed hitting the 60s budget under -j8 contention; budget raised so the verdict stays about correctness."
+timeout_seconds = 360
+reason = "RFC 0050 WS3: passes (95 tests, 1 skip). All seven iso2022_* variants via the frozen _codec_cjk_ext state machines ported from _codecs_iso2022.c. RFC 0054 re-measure: ~123s idle (round-trip stress dominates), exceeded the previous 180s budget under -j4 contention; budget raised so the verdict stays about correctness."
 
 [tests."cpython/Lib/test/test_codecencodings_jp.py"]
 status = "pass"
+# ~47s idle (RFC 0054 re-measure) — too close to the 60s default under
+# sweep contention; raise headroom only.
+timeout_seconds = 180
 reason = "RFC 0050 WS3: passes (133 tests). cp932/euc_jp/shift_jis + the JIS X 0213 family (euc_jis_2004, shift_jis_2004, euc_jisx0213, shift_jisx0213) via the frozen CJK codec modules."
 
 [tests."cpython/Lib/test/test_codecencodings_kr.py"]
@@ -233,9 +280,9 @@ reason = "measured: passes end-to-end in ~7s under -j8 (RFC 0037 WS8 — CPython
 
 [tests."cpython/Lib/test/test_compile.py"]
 status = "fail"
-# ~30-55s under -j8; observed >60s on a loaded host (RFC 0052
-# re-measure) — verdict is stable, raise headroom only.
-timeout_seconds = 180
+# ~119s idle (RFC 0054 re-measure); exceeded 300s under -j8 sweep
+# contention — verdict is stable, raise headroom only.
+timeout_seconds = 600
 reason = "compile builtin: PyCF_* flags + AST input handling"
 
 [tests."cpython/Lib/test/test_compiler_assemble.py"]
@@ -303,6 +350,9 @@ reason = "measured: passes end-to-end (RFC 0037 WS6 — __init_subclass__/__set_
 
 [tests."cpython/Lib/test/test_datetime.py"]
 status = "pass"
+# ~57s idle (RFC 0054 re-measure) — sits on the 60s default; raise
+# headroom only.
+timeout_seconds = 180
 reason = "measured (RFC 0041 WS-datetime): 518 run, OK (48 skipped). Re-split datetime into a verbatim pure-Python `_pydatetime` plus the `Lib/datetime.py` shim (`from _datetime import *` with the `from _pydatetime import *` fallback), so `load_tests`' `import_fresh_module('datetime', blocked=['_datetime'])` dual-module probe runs the `_Pure` suite (the native `_datetime` accelerator is deferred, so its `_Fast` classes skip cleanly). Required native edges, all CPython-faithful: `time.strftime` accepts a `WStr` format and round-trips lone surrogates through the PUA bridge (`'%y\\ud800%m'`, surrogate tznames in `%Z`); the `%c` printf code accepts an int code point in the surrogate range and a one-codepoint `WStr` (un-bridged at the `%` boundary); `time.ctime`/`time.asctime` (libc asctime layout, space-padded day); `struct_time` carries the hidden `tm_gmtoff`/`tm_zone` extras read by `_pydatetime._local_timezone` without leaking them into the 9-element sequence view; `time.localtime`/`gmtime` raise `OverflowError` (not `TypeError`) for out-of-range/non-finite timestamps; `array.byteswap()` for tzfile parsing; and `pickle`'s Python-2 `BINSTRING`/`SHORT_BINSTRING` opcodes plus `_assertNotWarns` for the test harness."
 
 [tests."cpython/Lib/test/test_dbm_sqlite3.py"]
@@ -620,7 +670,9 @@ reason = "correct but slow (~37s idle); budget raised for parallel-load headroom
 
 [tests."cpython/Lib/test/test_json.py"]
 status = "pass"
-timeout_seconds = 180
+# ~79s idle (RFC 0054 re-measure); exceeded 180s under -j4 sweep
+# contention — verdict is stable, raise headroom only.
+timeout_seconds = 300
 
 [tests."cpython/Lib/test/test_keywordonlyarg.py"]
 status = "pass"
@@ -660,8 +712,8 @@ status = "pass"
 reason = "full lzma (1 skip): LZMAFile + LZMACompressor/Decompressor with check-id parsing & arg validation, FORMAT_RAW filter chains and _en/_decode_filter_properties via lzma-sys raw FFI (workspace vendors lzma-sys with all BCJ filters enabled)"
 
 [tests."cpython/Lib/test/test_mailbox.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: 'policy' unexpectedly found in {'_subdir': 'new', '_info': '', '_date': 1783758217.887461, 'policy': Compat32(), '_headers': [('Return-Path', '<"
+status = "pass"
+reason = "measured (RFC 0054 sweep): now passes end-to-end (~8s; 3 skips). The previous failure — message metadata ('policy') leaking into Maildir info dicts — fell out of the email/copy fidelity work; both full-sweep cross-checks agree."
 
 [tests."cpython/Lib/test/test_marshal.py"]
 status = "fail"
@@ -669,8 +721,8 @@ reason = "measured: 66 tests, ~21F/12E, no crash. Recursion-depth guard (MAX_MAR
 
 [tests."cpython/Lib/test/test_math.py"]
 status = "pass"
-timeout_seconds = 300
-reason = "RFC 0041 WS-math (C-accelerator numeric/data tower): passes end-to-end (86 ran, OK, 4 skipped) in ~13s. The math module was rebuilt as a faithful port of CPython 3.13 mathmodule.c: added math.fma/sumprod, rewrote gamma/lgamma (g=6.024 Lanczos + m_sinpi reflection), erf/erfc (series + continued fraction), pow/fmod/frexp/modf/ldexp/remainder/nextafter(steps=)/ulp with exact IEEE-754 domain+overflow semantics, fsum (Shewchuk msum) and hypot/dist (vector_norm with double-length compensated arithmetic), and comb/perm/factorial/gcd/lcm on arbitrary-precision BigInt; loghelper handles huge-int logs via bigint frexp. ceil/floor/trunc dispatch __ceil__/__floor__/__trunc__, gcd/lcm/isqrt and friends coerce via __index__, and hypot/dist accept __float__ elements (iterating tuple subclasses/generators through the VM). Also fixed three core-arithmetic gaps the suite depends on: builtin sum() now accumulates through the interpreter so reflected __radd__ fires (int + Fraction/Decimal), rejects str/bytes/bytearray start, and takes start= as a keyword; float coercion of an over-range int raises OverflowError instead of yielding inf; and 0 ** -negative raises ZeroDivisionError (plus an i64::MIN % -1 remainder-overflow guard)."
+timeout_seconds = 600
+reason = "RFC 0041 WS-math (C-accelerator numeric/data tower): passes end-to-end (86 ran, OK, 3 skipped) in ~6.5min — test_sumprod_stress alone sweeps ~9 pools x size<=3 cross products against a naive-baseline oracle. RFC 0054 follow-up: sumprod's float path now uses CPython's TripleLength (Algorithm 5.10 SumKVert K=3 over 2Prod/2Sum error-free transforms) and its int path is a machine-word accumulator that finalizes on overflow, reproducing CPython's exact flush ordering (int-overflow pairs spill to the float path, e.g. sumprod((10,-5,2**31),(2**80,1.5,1.5)) == 1.2089258196146296e+25). The math module was rebuilt as a faithful port of CPython 3.13 mathmodule.c: added math.fma/sumprod, rewrote gamma/lgamma (g=6.024 Lanczos + m_sinpi reflection), erf/erfc (series + continued fraction), pow/fmod/frexp/modf/ldexp/remainder/nextafter(steps=)/ulp with exact IEEE-754 domain+overflow semantics, fsum (Shewchuk msum) and hypot/dist (vector_norm with double-length compensated arithmetic), and comb/perm/factorial/gcd/lcm on arbitrary-precision BigInt; loghelper handles huge-int logs via bigint frexp. ceil/floor/trunc dispatch __ceil__/__floor__/__trunc__, gcd/lcm/isqrt and friends coerce via __index__, and hypot/dist accept __float__ elements (iterating tuple subclasses/generators through the VM). Also fixed three core-arithmetic gaps the suite depends on: builtin sum() now accumulates through the interpreter so reflected __radd__ fires (int + Fraction/Decimal), rejects str/bytes/bytearray start, and takes start= as a keyword; float coercion of an over-range int raises OverflowError instead of yielding inf; and 0 ** -negative raises ZeroDivisionError (plus an i64::MIN % -1 remainder-overflow guard)."
 
 [tests."cpython/Lib/test/test_memoryio.py"]
 status = "fail"
@@ -762,6 +814,9 @@ reason = "measured (RFC 0049 wave-5 full-suite baseline): File '/Users/owencarey
 
 [tests."cpython/Lib/test/test_os.py"]
 status = "pass"
+# ~5s idle; exceeded the 60s default under full-sweep host contention —
+# verdict is stable, raise headroom only.
+timeout_seconds = 180
 reason = "measured (RFC 0040 WS1 + WTF-8 arc): passes end-to-end — 338 run, 0F/0E, 129 skip (was 1F/3E). The 3 `Pep383Tests` (undecodable/lone-surrogate filenames) closed with the WTF-8 `str` arc: the `os.*` path converter accepts a lone-surrogate `str` (`Object::WStr`) and fsencodes it (`surrogateescape`) — round-tripping undecodable filenames as real surrogates and raising `UnicodeEncodeError` for non-escapable ones — instead of rejecting it with `TypeError`/lossy U+FFFD. The last residual, `ForkTests.test_fork_warns_when_non_python_thread_exists`, closed this wave: a native `_testcapi._spawn_pthread_waiter`/`_end_spawned_pthread` raw-`pthread` spawner (`_testinternalcapi`) plus mach `task_threads` OS-thread counting and a startup thread baseline let `os.fork()` detect a live non-Python thread and emit the multi-threaded-fork `DeprecationWarning` parent-side, exactly like CPython's `warn_about_fork_with_threads`. The `dir_fd`/fd surface (landed earlier) stands: `os.{open,stat,lstat,unlink,rmdir,mkdir}(dir_fd=)` via `*at(2)`, `os.scandir(fd)`/`listdir(fd)` via `fdopendir`+`rewinddir`, populated `os.supports_dir_fd`/`supports_fd`, fd-free `os.urandom` over `getentropy`/`getrandom`. Note: `SpawnTests.test_spawnve_bytes` can flake (exit-code mismatch) only when the grader is starved by a heavy concurrent run sharing the host; it is deterministically green in isolation (`os.spawnve` with bytes args/env works, verified directly)."
 
 [tests."cpython/Lib/test/test_pathlib.py"]
@@ -819,8 +874,8 @@ status = "pass"
 reason = "RFC 0039 WS6: native libc-backed select.poll"
 
 [tests."cpython/Lib/test/test_poplib.py"]
-status = "skip"
-reason = "flaky under parallel load: local-socket race (passes idle, failed one loaded sweep); revisit in wave 6"
+status = "pass"
+reason = "measured (RFC 0054 WS3): passes end-to-end — 71 run, 0 fail / 0 error, 0 skip. The earlier parallel-load flake was a real bug: the asyncore mock POP3 server calls send() on a `wrap_socket(do_handshake_on_connect=False)` socket before the handshake, and the native layer raised `ValueError: closed connection` instead of SSLWantReadError. The two-phase server handshake now reports WANT_READ for pending sessions and `SSLSocket.read`/`write` drive the deferred handshake transparently (OpenSSL semantics), so the STLS/POP3_SSL legs round-trip over loopback."
 
 [tests."cpython/Lib/test/test_positional_only_arg.py"]
 status = "fail"
@@ -874,6 +929,9 @@ reason = "measured (RFC 0049 wave-5 full-suite baseline): AttributeError: module
 [tests."cpython/Lib/test/test_pydoc.py"]
 status = "fail"
 reason = "measured (RFC 0049 wave-5 full-suite baseline): KeyError: '__doc__'"
+# Fast fail idle; exceeded the 60s default under full-sweep host
+# contention — verdict is stable, raise headroom only.
+timeout_seconds = 180
 
 [tests."cpython/Lib/test/test_pyexpat.py"]
 status = "fail"
@@ -1013,8 +1071,9 @@ status = "fail"
 reason = "measured: the package __init__ does 'from test.support import load_package_tests' at import, which WeavePy's test.support shim doesn't provide (same gap as test_zoneinfo; test_inspect only references it lazily)."
 
 [tests."cpython/Lib/test/test_ssl.py"]
-status = "skip"
-reason = "measured (RFC 0042 WS2): the TLS deliverable is implemented and proven, but the full test_ssl suite asserts OpenSSL/_ssl internals that are explicit RFC non-goals (rustls-not-OpenSSL), so the row is deferred. Implemented + green: real client+server `wrap_socket` over an *existing* fd (the five protocol-client suites — test_ftplib/imaplib/poplib/smtplib + test_httplib — all round-trip over loopback TLS) and the socketless `MemoryBIO`/`SSLObject` path over rustls' native memory BIO (MemoryBIOTests 5/5 + SSLObjectTests 2/2: read/write/eof/pending/buffer-types incl. the non-contiguous BufferError, the no-public-constructor guard, and the bidirectional close_notify `unwrap`). Bundled in-process proof: tests/regrtest/test_net_tls_roundtrip.py (fd wrapping, client+server) and test_net_bio_roundtrip.py (MemoryBIO/SSLObject). Deferred surfaces (Non-goals): `getpeercert()`'s full X.509→dict parse (test_connect/test_getpeercert/test_parse_cert*), the OpenSSL cipher-string grammar (get_ciphers/set_ciphers/test_ciphers), exact options/verify_flags bitmasks, SNI servername callbacks, session_stats, set_ecdh_curve, load_dh_params, and `_ssl._SSLSocket.owner`-style introspection (test_bio_handshake). A background ThreadedEchoServer teardown join also hangs after the cert-parse FAIL, so the row stays `skip` (not run) rather than `timeout`."
+status = "pass"
+reason = "measured (RFC 0054 WS3): passes end-to-end — 191 run, 0 fail / 0 error, 25 skip. The rustls-backed `_ssl` now covers the OpenSSL-shaped surface the suite asserts: full `getpeercert()` X.509→dict parsing (x509-parser), cipher-suite listing/filtering (`set_ciphers`/`shared_ciphers`, NO_SHARED_CIPHER alerts), options/verify_flags bitmasks (OP_NO_TLSv1_2/1_3, VERIFY_X509_STRICT AKI checks, VERIFY_CRL_CHECK_LEAF), SNI servername callbacks via a two-phase rustls Acceptor handshake (incl. alert propagation and dead-reference unraisable reporting), server-side ALPN intersection, session_stats + session-reuse bookkeeping, set_ecdh_curve group pinning, dual RSA/ECC certificate slots, encrypted PKCS#8 keys with password callbacks (pkcs8 crate), per-message handshake `_msg_callback` replay from a captured transcript, and TLS 1.3 post-handshake-auth emulation. The 25 skips are CPython's own gates (TLS 1.0/1.1 legacy protocols rustls intentionally drops, missing-feature probes, and the walltime-gated IPv6 internet test). ~18s standalone; the generous budget absorbs 8-way sweep contention (observed >10x inflation under full parallel load)."
+timeout_seconds = 600
 
 [tests."cpython/Lib/test/test_stat.py"]
 status = "pass"
@@ -1127,7 +1186,7 @@ reason = "measured: passes end-to-end after wiring `open(opener=...)` + file-des
 [tests."cpython/Lib/test/test_threading.py"]
 status = "pass"
 timeout_seconds = 600
-reason = "RFC 0039: real OS threads with cooperative GIL hand-off, faithful Lock/RLock (subclassable `_thread.RLock`), thread-death thread-local cleanup (foreign-thread `_DummyThread` reaping), and prompt refcount reclamation of acyclic garbage — including the cross-thread `Thread.run` teardown cycle (`test_no_refcycle_through_target`) swept on `join()`. All 213 tests pass (29 skips for CPython-only knobs). 600s: the suite runs ~32s standalone and passes under moderate load, but with the main thread participating in GIL hand-offs it has been observed exceeding even 300s under full parallel sweep load (RFC 0050 WS6 re-measure); the raised budget keeps the verdict about correctness, not scheduler contention. KNOWN FLAKE (pre-existing, reproduces on unmodified main): `test_no_refcycle_through_target` intermittently fails when concurrent threads race the prompt-reap deadness check at `del self._kwargs` — the kwargs dict stays pinned by its GC handle, keeping the target instance's weakref live. Deterministic repro: busy daemon threads + gc.disable() flips it to 30/30 failures on main; the suite's own daemon-thread pressure makes it ~50% under load."
+reason = "RFC 0039: real OS threads with cooperative GIL hand-off, faithful Lock/RLock (subclassable `_thread.RLock`), thread-death thread-local cleanup (foreign-thread `_DummyThread` reaping), and prompt refcount reclamation of acyclic garbage — including the cross-thread `Thread.run` teardown cycle (`test_no_refcycle_through_target`) swept on `join()`. All 213 tests pass (29 skips for CPython-only knobs). RFC 0054: fixed the fork-child GIL wedge in `test_3_join_in_forked_from_thread` (~30% flake) — the GIL's parking_lot primitives are now re-boxed at fresh addresses after fork (the parking table is keyed by address, so in-place rebuilds inherited ghost waiters) and blocking acquires use timed-wait loops like CPython's `take_gil`, so a lost wakeup self-heals; 1000 fork-loop iterations + 15 suite runs clean. 600s: the suite runs ~32s standalone and passes under moderate load, but with the main thread participating in GIL hand-offs it has been observed exceeding even 300s under full parallel sweep load (RFC 0050 WS6 re-measure); the raised budget keeps the verdict about correctness, not scheduler contention. RFC 0054 follow-up: fixed the `test_no_refcycle_through_target` flake (~50% under load) at its root — every `f(**d)` call leaked one GC-tracked kwargs-temporary dict (the compiler's `BuildMap 0` + `dict.update(d)` splat lowering), refcount-dead but pinned by its own collector handle, holding a strong clone of every kwarg value until the next full collection; `Thread(kwargs={...})` pinned the target instance through it, keeping the weakref live past `join()`. `CALL_FUNCTION_EX` now runs the splat temporaries (kwargs mapping and *args sequence) through the prompt reaper, restoring CPython's refcount timing; the busy-daemon + gc.disable() repro went from 30/30 failures to 0/30, and 3 consecutive suite runs pass."
 
 [tests."cpython/Lib/test/test_threading_local.py"]
 status = "fail"
@@ -1205,6 +1264,9 @@ reason = "PEP 3131: parser NFKC-normalizes identifiers and compile()/import rais
 
 [tests."cpython/Lib/test/test_unicodedata.py"]
 status = "pass"
+# ~39s idle (RFC 0054 re-measure); observed >60s under -j4 sweep
+# contention — raise headroom only.
+timeout_seconds = 180
 reason = "RFC 0050 WS4: unicodedata rebuilt on generated UCD 15.1.0 tables probed from CPython 3.13 (records/names/normalization + ucd_3_2_0 snapshot with NormalizationCorrections), str case methods/predicates rewired to the same tables (method checksum matches), and \\N escapes honour a poisoned sys.modules['unicodedata']. Full suite green."
 
 [tests."cpython/Lib/test/test_unittest.py"]
@@ -1222,7 +1284,9 @@ reason = "starred-target unpacking with generators"
 
 [tests."cpython/Lib/test/test_unparse.py"]
 status = "fail"
-timeout_seconds = 150
+# ~99s idle (RFC 0054 re-measure); exceeded the previous 150s budget
+# under -j4 sweep contention — verdict is stable, raise headroom only.
+timeout_seconds = 300
 reason = "measured (RFC 0049): ast.unparse F/E cluster; ~35s to verdict, budget raised"
 
 [tests."cpython/Lib/test/test_urllib.py"]
@@ -1230,8 +1294,8 @@ status = "pass"
 reason = "measured (RFC 0042 WS4): passes end-to-end — 102 run, 0 fail / 0 error, 2 skip. `urllib.request`/`urllib.response`/`urllib.error` are CPython's verbatim modules (the `OpenerDirector` + `HTTPHandler`/`HTTPSHandler`/`HTTPRedirectHandler`/`HTTPErrorProcessor`/`ProxyHandler`/auth handlers/`FileHandler`/`FTPHandler`/`DataHandler` chain) over the WS3 `http.client`."
 
 [tests."cpython/Lib/test/test_urllib2.py"]
-status = "skip"
-reason = "needs network + test.support.requires_subprocess; urllib2-style handlers unverified in the sandbox"
+status = "pass"
+reason = "measured (RFC 0054 WS3): passes end-to-end — 76 run, 0 fail / 0 error, 1 skip. The handler/opener matrix (Basic/Digest auth, redirects, proxies, cookies, file: URLs) runs over the harness loopback resource set; the earlier failures were `gethostname()` returning 'localhost' and `gethostbyname('localhost')` resolving to IPv6 in the native socket layer, both fixed. The 1 skip is CPython's own gate (an OS-specific case)."
 
 [tests."cpython/Lib/test/test_urllib2_localnet.py"]
 status = "fail"

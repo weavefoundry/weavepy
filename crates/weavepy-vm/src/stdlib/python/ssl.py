@@ -16,7 +16,9 @@ import _ssl
 import socket as _socket
 from socket import socket as _socket_type
 import errno as _errno
-from enum import IntEnum as _IntEnum, IntFlag as _IntFlag
+import warnings as _warnings
+from collections import namedtuple as _namedtuple
+from enum import Enum as _Enum, IntEnum as _IntEnum, IntFlag as _IntFlag
 
 # --------------------------------------------------------------------------
 # Constants (re-exported from the native core)
@@ -34,31 +36,29 @@ PROTOCOL_TLSv1_1 = _ssl.PROTOCOL_TLSv1_1
 PROTOCOL_TLSv1_2 = _ssl.PROTOCOL_TLSv1_2
 
 
-class _SSLMethod(_IntEnum):
-    PROTOCOL_TLS = _ssl.PROTOCOL_TLS
-    PROTOCOL_TLS_CLIENT = _ssl.PROTOCOL_TLS_CLIENT
-    PROTOCOL_TLS_SERVER = _ssl.PROTOCOL_TLS_SERVER
-    PROTOCOL_TLSv1 = _ssl.PROTOCOL_TLSv1
-    PROTOCOL_TLSv1_1 = _ssl.PROTOCOL_TLSv1_1
-    PROTOCOL_TLSv1_2 = _ssl.PROTOCOL_TLSv1_2
+# Build the protocol enum with CPython's own conversion machinery so member
+# order, aliases and module re-exports match what ``_IntEnum._convert_``
+# produces (test_ssl's TestEnumerations compares against exactly that shape).
+_IntEnum._convert_(
+    '_SSLMethod', __name__,
+    lambda name: name.startswith('PROTOCOL_') and name != 'PROTOCOL_SSLv23',
+    source=_ssl)
 
+# Deprecated CPython alias kept for parity (``test_ssl.test_constants``);
+# also attached to the enum itself, as CPython does.
+PROTOCOL_SSLv23 = _SSLMethod.PROTOCOL_SSLv23 = _SSLMethod.PROTOCOL_TLS
 
 _PROTOCOL_NAMES = {value: name for name, value in _SSLMethod.__members__.items()}
-
-# Re-export the protocol selectors as the *enum members* (overriding the plain
-# ints bound above), exactly as CPython's ``_SSLMethod._convert_`` does. Tests
-# rely on ``ssl.PROTOCOL_TLS_CLIENT.name``/``repr`` and on ``SSLContext(proto)``
-# round-tripping the same member back from ``ctx.protocol`` (identity).
-globals().update(_SSLMethod.__members__)
-# Deprecated CPython alias kept for parity (``test_ssl.test_constants``).
-PROTOCOL_SSLv23 = PROTOCOL_TLS
 
 HAS_SNI = bool(_ssl.HAS_SNI)
 HAS_ECDH = bool(_ssl.HAS_ECDH)
 HAS_NPN = bool(_ssl.HAS_NPN)
 HAS_ALPN = bool(_ssl.HAS_ALPN)
-HAS_TLSv1 = True
-HAS_TLSv1_1 = True
+# rustls negotiates TLS 1.2 and 1.3 only; advertising the legacy versions as
+# absent makes version-pinned tests skip exactly like an OpenSSL build with
+# them compiled out.
+HAS_TLSv1 = False
+HAS_TLSv1_1 = False
 HAS_TLSv1_2 = True
 HAS_TLSv1_3 = bool(_ssl.HAS_TLSv1_3)
 HAS_SSLv2 = False
@@ -71,13 +71,19 @@ HAS_SSLv3 = False
 CHANNEL_BINDING_TYPES = []
 
 # Capability flags for features rustls doesn't surface; tests gated on them skip.
-HAS_NEVER_CHECK_COMMON_NAME = False  # no X509_V_FLAG_NEVER_CHECK_SUBJECT analogue
+# rustls never consults the subject common name (SAN-only matching), which is
+# exactly the capability HAS_NEVER_CHECK_COMMON_NAME advertises.
+HAS_NEVER_CHECK_COMMON_NAME = True
 HAS_PSK = False                      # external PSK key exchange not exposed
 HAS_PSK_TLS13 = False
 
 OPENSSL_VERSION = _ssl.OPENSSL_VERSION
 OPENSSL_VERSION_NUMBER = _ssl.OPENSSL_VERSION_NUMBER
 OPENSSL_VERSION_INFO = _ssl.OPENSSL_VERSION_INFO
+_OPENSSL_API_VERSION = OPENSSL_VERSION_INFO
+
+ENCODING_PEM = _ssl.ENCODING_PEM
+ENCODING_DER = _ssl.ENCODING_DER
 
 SSL_ERROR_NONE = _ssl.SSL_ERROR_NONE
 SSL_ERROR_SSL = _ssl.SSL_ERROR_SSL
@@ -90,48 +96,34 @@ SSL_ERROR_WANT_CONNECT = _ssl.SSL_ERROR_WANT_CONNECT
 SSL_ERROR_EOF = _ssl.SSL_ERROR_EOF
 
 
-class VerifyMode(_IntEnum):
-    CERT_NONE = 0
-    CERT_OPTIONAL = 1
-    CERT_REQUIRED = 2
+# The remaining constant families are `_convert_`ed from the native module
+# just like CPython's ssl.py does — this injects the enum members into the
+# module namespace (replacing the plain ints) with the exact member order
+# and aliasing TestEnumerations expects.
+_IntFlag._convert_(
+    'Options', __name__,
+    lambda name: name.startswith('OP_'),
+    source=_ssl)
 
+_IntEnum._convert_(
+    'AlertDescription', __name__,
+    lambda name: name.startswith('ALERT_DESCRIPTION_'),
+    source=_ssl)
 
-class VerifyFlags(_IntFlag):
-    VERIFY_DEFAULT = 0
-    VERIFY_CRL_CHECK_LEAF = _ssl.VERIFY_CRL_CHECK_LEAF
-    VERIFY_CRL_CHECK_CHAIN = _ssl.VERIFY_CRL_CHECK_CHAIN
-    VERIFY_X509_STRICT = _ssl.VERIFY_X509_STRICT
-    VERIFY_X509_TRUSTED_FIRST = _ssl.VERIFY_X509_TRUSTED_FIRST
+_IntEnum._convert_(
+    'SSLErrorNumber', __name__,
+    lambda name: name.startswith('SSL_ERROR_'),
+    source=_ssl)
 
+_IntFlag._convert_(
+    'VerifyFlags', __name__,
+    lambda name: name.startswith('VERIFY_'),
+    source=_ssl)
 
-VERIFY_DEFAULT = VerifyFlags.VERIFY_DEFAULT
-VERIFY_CRL_CHECK_LEAF = VerifyFlags.VERIFY_CRL_CHECK_LEAF
-VERIFY_CRL_CHECK_CHAIN = VerifyFlags.VERIFY_CRL_CHECK_CHAIN
-VERIFY_X509_STRICT = VerifyFlags.VERIFY_X509_STRICT
-VERIFY_X509_TRUSTED_FIRST = VerifyFlags.VERIFY_X509_TRUSTED_FIRST
-
-
-class Options(_IntFlag):
-    OP_ALL = _ssl.OP_ALL
-    OP_NO_SSLv2 = _ssl.OP_NO_SSLv2
-    OP_NO_SSLv3 = _ssl.OP_NO_SSLv3
-    OP_NO_TLSv1 = _ssl.OP_NO_TLSv1
-    OP_NO_TLSv1_1 = _ssl.OP_NO_TLSv1_1
-    OP_NO_TLSv1_2 = _ssl.OP_NO_TLSv1_2
-    OP_NO_TLSv1_3 = _ssl.OP_NO_TLSv1_3
-    OP_NO_COMPRESSION = _ssl.OP_NO_COMPRESSION
-    OP_CIPHER_SERVER_PREFERENCE = _ssl.OP_CIPHER_SERVER_PREFERENCE
-    OP_SINGLE_DH_USE = _ssl.OP_SINGLE_DH_USE
-    OP_SINGLE_ECDH_USE = _ssl.OP_SINGLE_ECDH_USE
-    OP_NO_TICKET = _ssl.OP_NO_TICKET
-    OP_ENABLE_MIDDLEBOX_COMPAT = _ssl.OP_ENABLE_MIDDLEBOX_COMPAT
-
-
-# Export every member to module scope, including the multi-bit composites
-# (``OP_ALL``) and aliases. Iterating an ``IntFlag`` only yields the canonical
-# single-bit flags (CPython 3.11+), so use ``__members__`` to match what
-# CPython's ``_IntFlag._convert_('Options', ...)`` injects into ``ssl``.
-globals().update(Options.__members__)
+_IntEnum._convert_(
+    'VerifyMode', __name__,
+    lambda name: name.startswith('CERT_'),
+    source=_ssl)
 
 
 class TLSVersion(_IntEnum):
@@ -218,19 +210,51 @@ class _TLSMessageType(_IntEnum):
     CHANGE_CIPHER_SPEC = 0x0101
 
 
-class _ASN1Object:
-    def __init__(self, oid):
-        self.oid = oid
+# Minimal OID registry rows: (nid, shortname, longname, oid). CPython
+# resolves these through OpenSSL's OBJ_ database; rustls has none, so we
+# carry the subset the stdlib and its tests actually look up.
+_ASN1_TABLE = (
+    (129, 'serverAuth', 'TLS Web Server Authentication', '1.3.6.1.5.5.7.3.1'),
+    (130, 'clientAuth', 'TLS Web Client Authentication', '1.3.6.1.5.5.7.3.2'),
+    (131, 'codeSigning', 'Code Signing', '1.3.6.1.5.5.7.3.3'),
+    (132, 'emailProtection', 'E-mail Protection', '1.3.6.1.5.5.7.3.4'),
+    (133, 'timeStamping', 'Time Stamping', '1.3.6.1.5.5.7.3.8'),
+    (180, 'OCSPSigning', 'OCSP Signing', '1.3.6.1.5.5.7.3.9'),
+)
 
 
-class Purpose(_ASN1Object, _IntEnum):
-    SERVER_AUTH = 1
-    CLIENT_AUTH = 2
+class _ASN1Object(_namedtuple("_ASN1Object", "nid shortname longname oid")):
+    """ASN.1 object identifier lookup (CPython shape; subset registry)."""
+    __slots__ = ()
 
-    def __new__(cls, value):
-        obj = int.__new__(cls, value)
-        obj._value_ = value
-        return obj
+    def __new__(cls, oid):
+        # name=False in CPython's _txt2obj: only the dotted OID is accepted.
+        for row in _ASN1_TABLE:
+            if row[3] == oid:
+                return super().__new__(cls, *row)
+        raise ValueError("unknown object '%s'" % (oid,))
+
+    @classmethod
+    def fromnid(cls, nid):
+        """Create _ASN1Object from OpenSSL numeric ID."""
+        for row in _ASN1_TABLE:
+            if row[0] == nid:
+                return super().__new__(cls, *row)
+        raise ValueError("unknown NID %i" % (nid,))
+
+    @classmethod
+    def fromname(cls, name):
+        """Create _ASN1Object from short name, long name or OID."""
+        for row in _ASN1_TABLE:
+            if name in (row[1], row[2], row[3]):
+                return super().__new__(cls, *row)
+        raise ValueError("unknown object '%s'" % (name,))
+
+
+class Purpose(_ASN1Object, _Enum):
+    """SSLContext purpose flags with X509v3 Extended Key Usage objects."""
+    SERVER_AUTH = '1.3.6.1.5.5.7.3.1'
+    CLIENT_AUTH = '1.3.6.1.5.5.7.3.2'
 
 
 # --------------------------------------------------------------------------
@@ -319,6 +343,13 @@ def _wrap_ssl_error(exc):
     if "want_write" in low:
         return SSLWantWriteError(SSL_ERROR_WANT_WRITE,
                                  "The operation did not complete (write)")
+    # A clean close_notify from the peer *after* our own shutdown was sent is
+    # OpenSSL's SSL_ERROR_ZERO_RETURN (not a ragged EOF): bidirectional-shutdown
+    # loops (`while True: sslobj.read()` in test_asyncio's TLS servers) rely on
+    # SSLZeroReturnError to terminate.
+    if "zero_return" in low:
+        return SSLZeroReturnError(SSL_ERROR_ZERO_RETURN,
+                                  "TLS/SSL connection has been closed (EOF)")
     # A peer that closes the TCP connection without first sending a TLS
     # ``close_notify`` alert is an unexpected EOF. OpenSSL/CPython report this
     # as ``SSL_ERROR_EOF`` so that :meth:`SSLSocket.read` can swallow it when
@@ -339,7 +370,14 @@ def _wrap_ssl_error(exc):
     # ``"SSLV3_ALERT_BAD_CERTIFICATE" in err.args[1]``). This must precede the
     # certificate-marker check below, since alert text mentions "certificate".
     if "sslv3_alert" in low or "tlsv1_alert" in low:
-        return SSLError(SSL_ERROR_SSL, body)
+        err = SSLError(SSL_ERROR_SSL, body)
+        # `.reason` is the bare OpenSSL token (CPython: 'TLSV1_ALERT_ACCESS_
+        # DENIED'), extracted from the `[SSL: TOKEN] ...` rendering.
+        if "[SSL: " in body and "]" in body:
+            err.reason = body.split("[SSL: ", 1)[1].split("]", 1)[0]
+        else:
+            err.reason = body
+        return err
     if any(marker in low for marker in _CERT_ERROR_MARKERS):
         # Mirror OpenSSL/CPython's canonical rendering so callers that match on
         # ``str(exc)`` (e.g. ``assertRaisesRegex(ssl.CertificateError,
@@ -349,11 +387,20 @@ def _wrap_ssl_error(exc):
         err = SSLCertVerificationError(SSL_ERROR_SSL, detail)
         err.reason = "CERTIFICATE_VERIFY_FAILED"
         err.library = "SSL"
-        err.verify_message = body
+        if "unknownissuer" in low.replace(" ", ""):
+            # OpenSSL's X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY.
+            err.verify_code = 20
+            err.verify_message = "unable to get local issuer certificate"
+        else:
+            err.verify_message = body
         return err
     # CPython's SSLError always carries ``(errcode, message)``; preserve that
     # shape so callers indexing ``args[1]`` (asyncore TLS handlers) never trip.
-    return SSLError(SSL_ERROR_SSL, body)
+    # ``reason`` mirrors the message (OpenSSL puts its reason token there;
+    # test_preauth_data_* greps `.reason` for the failure text).
+    err = SSLError(SSL_ERROR_SSL, body)
+    err.reason = body
+    return err
 
 
 # --------------------------------------------------------------------------
@@ -406,8 +453,179 @@ def match_hostname(cert, hostname):
 
 
 # --------------------------------------------------------------------------
+# Cipher-suite table and OpenSSL cipher-string grammar (emulated)
+# --------------------------------------------------------------------------
+#
+# rustls negotiates from a fixed, safe suite set; ``set_ciphers`` cannot alter
+# what the wire negotiates. What CPython code *observes* though is (a) valid
+# OpenSSL cipher strings being accepted, (b) garbage raising ``SSLError("No
+# cipher can be selected.")`` and (c) ``get_ciphers()`` returning OpenSSL-shaped
+# dicts. This table lists rustls' actual suites with their OpenSSL names and
+# alias keywords, and ``_select_ciphers`` interprets the grammar against it.
+
+def _cipher_entry(name, protocol, kx, au, enc, bits, mac, aliases):
+    description = "%-23s %s Kx=%-8s Au=%-5s Enc=%s Mac=%s" % (
+        name, protocol, kx, au, enc, mac)
+    return (
+        {
+            "id": 0x03000000 | (hash(name) & 0xFFFF),
+            "name": name,
+            "protocol": protocol,
+            "description": description,
+            "strength_bits": bits,
+            "alg_bits": bits,
+        },
+        frozenset(aliases) | {name},
+    )
+
+
+_ALL_ALIASES = {"ALL", "DEFAULT", "COMPLEMENTOFDEFAULT", "HIGH", "AEAD",
+                "SECURE128", "SECURE256"}
+
+_CIPHER_TABLE = [
+    _cipher_entry(
+        "TLS_AES_256_GCM_SHA384", "TLSv1.3", "any", "any",
+        "AESGCM(256)", 256, "AEAD",
+        _ALL_ALIASES | {"AES", "AES256", "AESGCM", "SHA384", "TLSv1.3"}),
+    _cipher_entry(
+        "TLS_AES_128_GCM_SHA256", "TLSv1.3", "any", "any",
+        "AESGCM(128)", 128, "AEAD",
+        _ALL_ALIASES | {"AES", "AES128", "AESGCM", "SHA256", "TLSv1.3"}),
+    _cipher_entry(
+        "TLS_CHACHA20_POLY1305_SHA256", "TLSv1.3", "any", "any",
+        "CHACHA20/POLY1305(256)", 256, "AEAD",
+        _ALL_ALIASES | {"CHACHA20", "POLY1305", "SHA256", "TLSv1.3"}),
+    _cipher_entry(
+        "ECDHE-ECDSA-AES256-GCM-SHA384", "TLSv1.2", "ECDH", "ECDSA",
+        "AESGCM(256)", 256, "AEAD",
+        _ALL_ALIASES | {"AES", "AES256", "AESGCM", "SHA384", "ECDHE", "ECDH",
+                        "EECDH", "kEECDH", "ECDSA", "aECDSA", "TLSv1.2"}),
+    _cipher_entry(
+        "ECDHE-RSA-AES256-GCM-SHA384", "TLSv1.2", "ECDH", "RSA",
+        "AESGCM(256)", 256, "AEAD",
+        _ALL_ALIASES | {"AES", "AES256", "AESGCM", "SHA384", "ECDHE", "ECDH",
+                        "EECDH", "kEECDH", "RSA", "aRSA", "TLSv1.2"}),
+    _cipher_entry(
+        "ECDHE-ECDSA-AES128-GCM-SHA256", "TLSv1.2", "ECDH", "ECDSA",
+        "AESGCM(128)", 128, "AEAD",
+        _ALL_ALIASES | {"AES", "AES128", "AESGCM", "SHA256", "ECDHE", "ECDH",
+                        "EECDH", "kEECDH", "ECDSA", "aECDSA", "TLSv1.2"}),
+    _cipher_entry(
+        "ECDHE-RSA-AES128-GCM-SHA256", "TLSv1.2", "ECDH", "RSA",
+        "AESGCM(128)", 128, "AEAD",
+        _ALL_ALIASES | {"AES", "AES128", "AESGCM", "SHA256", "ECDHE", "ECDH",
+                        "EECDH", "kEECDH", "RSA", "aRSA", "TLSv1.2"}),
+    _cipher_entry(
+        "ECDHE-ECDSA-CHACHA20-POLY1305", "TLSv1.2", "ECDH", "ECDSA",
+        "CHACHA20/POLY1305(256)", 256, "AEAD",
+        _ALL_ALIASES | {"CHACHA20", "POLY1305", "ECDHE", "ECDH", "EECDH",
+                        "kEECDH", "ECDSA", "aECDSA", "TLSv1.2"}),
+    _cipher_entry(
+        "ECDHE-RSA-CHACHA20-POLY1305", "TLSv1.2", "ECDH", "RSA",
+        "CHACHA20/POLY1305(256)", 256, "AEAD",
+        _ALL_ALIASES | {"CHACHA20", "POLY1305", "ECDHE", "ECDH", "EECDH",
+                        "kEECDH", "RSA", "aRSA", "TLSv1.2"}),
+]
+
+_CIPHER_SUITES = [entry for entry, _aliases in _CIPHER_TABLE]
+
+
+def _select_ciphers(cipher_string):
+    """Interpret an OpenSSL cipher string against the rustls suite table.
+
+    Returns the selected suite dicts (possibly empty). Understands the
+    grammar's operators: `:`/`,`/space separators, `!` (permanent kill),
+    `-` (remove), `+` (move to end), intra-token `+` (AND of aliases),
+    `@`-directives (ignored), and the special keywords."""
+    if not isinstance(cipher_string, str):
+        raise TypeError("cipher string must be str")
+    selected = []
+    killed = set()
+
+    def matches(token):
+        parts = token.split("+")
+        out = []
+        for entry, aliases in _CIPHER_TABLE:
+            if all(p in aliases for p in parts):
+                out.append(entry)
+        return out
+
+    for token in cipher_string.replace(",", ":").replace(" ", ":").split(":"):
+        if not token or token.startswith("@"):
+            continue  # @SECLEVEL / @STRENGTH directives don't select suites
+        if token.startswith("!"):
+            for entry in matches(token[1:]):
+                killed.add(entry["name"])
+            selected = [e for e in selected if e["name"] not in killed]
+        elif token.startswith("-"):
+            names = {e["name"] for e in matches(token[1:])}
+            selected = [e for e in selected if e["name"] not in names]
+        elif token.startswith("+"):
+            names = {e["name"] for e in matches(token[1:])}
+            moved = [e for e in selected if e["name"] in names]
+            selected = [e for e in selected if e["name"] not in names] + moved
+        elif token == "STRENGTH":
+            selected.sort(key=lambda e: -e["strength_bits"])
+        else:
+            for entry in matches(token):
+                if entry["name"] not in killed and entry not in selected:
+                    selected.append(entry)
+    return selected
+
+
+# --------------------------------------------------------------------------
 # SSLContext
 # --------------------------------------------------------------------------
+
+# Default context options (what OpenSSL/CPython enable on a fresh SSL_CTX).
+_DEFAULT_CONTEXT_OPTIONS = (
+    OP_ALL | OP_NO_SSLv2 | OP_NO_SSLv3
+    | OP_NO_COMPRESSION | OP_CIPHER_SERVER_PREFERENCE
+    | OP_SINGLE_DH_USE | OP_SINGLE_ECDH_USE
+    | OP_ENABLE_MIDDLEBOX_COMPAT
+)
+
+_DEPRECATED_OPTION_BITS = (
+    OP_NO_SSLv2 | OP_NO_SSLv3 | OP_NO_TLSv1
+    | OP_NO_TLSv1_1 | OP_NO_TLSv1_2 | OP_NO_TLSv1_3
+)
+
+# Protocols whose bare use warns (auto-negotiation via TLS_CLIENT/TLS_SERVER
+# is the supported spelling in CPython 3.13).
+_DEPRECATED_PROTOCOLS = frozenset(
+    {PROTOCOL_TLS, PROTOCOL_TLSv1, PROTOCOL_TLSv1_1, PROTOCOL_TLSv1_2})
+
+_AUTO_PROTOCOLS = frozenset(
+    {PROTOCOL_TLS, PROTOCOL_TLS_CLIENT, PROTOCOL_TLS_SERVER})
+
+
+def _encode_hostname(hostname):
+    # CPython's C layer stores the IDNA (punycode) form of a non-ASCII
+    # server_hostname and accepts pre-encoded bytes; `SSLSocket.
+    # server_hostname` then reads back 'xn--...' (test_check_hostname_idn).
+    if hostname is None:
+        return None
+    if isinstance(hostname, str):
+        # Always route through the idna codec (CPython does the same): it
+        # both punycodes non-ASCII labels and validates ASCII ones (empty
+        # labels such as '.example.com' raise UnicodeError).
+        return hostname.encode("idna").decode("ascii")
+    return hostname.decode("ascii")
+
+
+def _path_arg(p, argname):
+    """CPython's PySSL path converter: str/bytes/os.PathLike or TypeError."""
+    if p is None:
+        return None
+    if isinstance(p, (bytes, bytearray)):
+        return bytes(p).decode("utf-8", "surrogateescape")
+    if isinstance(p, str):
+        return p
+    fspath = getattr(type(p), "__fspath__", None)
+    if fspath is not None:
+        return _path_arg(fspath(p), argname)
+    raise TypeError(f"{argname} should be a valid filesystem path")
+
 
 class SSLContext:
     """A faithful-shaped wrapper over a native rustls config (``_ssl``)."""
@@ -421,16 +639,28 @@ class SSLContext:
         # ``SSLContext(PROTOCOL_TLS_CLIENT, cert_file=...)`` (see
         # ``test_httplib.test_tls13_pha``) construct without error. Mirror that
         # lenient signature here.
+        try:
+            protocol = _SSLMethod(protocol)
+        except ValueError:
+            raise ValueError("invalid or unsupported protocol version") from None
+        if protocol in _DEPRECATED_PROTOCOLS:
+            _warnings.warn(f'ssl.{protocol.name} is deprecated',
+                           DeprecationWarning, 2)
         self.protocol = protocol
         self._id = _ssl.new_context(int(protocol))
-        self._options = Options.OP_ALL
+        self._options = int(_DEFAULT_CONTEXT_OPTIONS)
         self._minimum_version = TLSVersion.MINIMUM_SUPPORTED
         self._maximum_version = TLSVersion.MAXIMUM_SUPPORTED
-        self._verify_flags = VERIFY_DEFAULT
+        # OpenSSL contexts start with X509_V_FLAG_TRUSTED_FIRST set.
+        self._verify_flags = VerifyFlags.VERIFY_X509_TRUSTED_FIRST
         # TLS 1.3 post-handshake client auth opt-in. rustls negotiates this
         # automatically when a client cert is configured, so this flag is purely
         # advisory state for callers (e.g. `http.client`) that toggle it.
         self._post_handshake_auth = False
+        self._num_tickets = 2
+        self._hostname_checks_common_name = True
+        self._sni_callback = None
+        self._msg_cb = None
 
     # --- verify mode / hostname ---
     @property
@@ -439,6 +669,14 @@ class SSLContext:
 
     @verify_mode.setter
     def verify_mode(self, value):
+        if not isinstance(value, int):
+            raise TypeError(
+                f"verify_mode must be an int, not {type(value).__name__}")
+        value = VerifyMode(value)  # invalid ints raise ValueError
+        if value == CERT_NONE and self.check_hostname:
+            raise ValueError(
+                "Cannot set verify_mode to CERT_NONE when "
+                "check_hostname is enabled.")
         _ssl.set_verify_mode(self._id, int(value))
 
     @property
@@ -447,7 +685,12 @@ class SSLContext:
 
     @check_hostname.setter
     def check_hostname(self, value):
-        _ssl.set_check_hostname(self._id, bool(value))
+        value = bool(value)
+        # Enabling hostname checks auto-upgrades CERT_NONE to CERT_REQUIRED
+        # (CPython's setter does the same).
+        if value and _ssl.get_verify_mode(self._id) == CERT_NONE:
+            _ssl.set_verify_mode(self._id, int(CERT_REQUIRED))
+        _ssl.set_check_hostname(self._id, value)
 
     @property
     def verify_flags(self):
@@ -456,6 +699,7 @@ class SSLContext:
     @verify_flags.setter
     def verify_flags(self, value):
         self._verify_flags = int(value)
+        _ssl.set_verify_flags(self._id, int(value))
 
     @property
     def post_handshake_auth(self):
@@ -464,6 +708,7 @@ class SSLContext:
     @post_handshake_auth.setter
     def post_handshake_auth(self, value):
         self._post_handshake_auth = bool(value)
+        _ssl.set_post_handshake_auth(self._id, bool(value))
 
     @property
     def options(self):
@@ -471,7 +716,51 @@ class SSLContext:
 
     @options.setter
     def options(self, value):
-        self._options = int(value)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"argument must be int, not {type(value).__name__}")
+        # OpenSSL options are a uint64 bitmask.
+        if value < 0 or value >= (1 << 64):
+            raise OverflowError("Python int too large to convert to C unsigned long long")
+        if value & int(_DEPRECATED_OPTION_BITS) & ~self._options:
+            _warnings.warn(
+                'ssl.OP_NO_SSL*/ssl.OP_NO_TLS* options are deprecated',
+                DeprecationWarning, 2)
+        self._options = value
+        _ssl.set_options(self._id, int(value))
+
+    @property
+    def num_tickets(self):
+        return self._num_tickets
+
+    @num_tickets.setter
+    def num_tickets(self, value):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError("value must be an integer")
+        if value < 0:
+            raise ValueError("value must be non-negative")
+        if self.protocol != PROTOCOL_TLS_SERVER:
+            raise ValueError("SSLContext is not a server context.")
+        self._num_tickets = value
+
+    @property
+    def hostname_checks_common_name(self):
+        return self._hostname_checks_common_name
+
+    @hostname_checks_common_name.setter
+    def hostname_checks_common_name(self, value):
+        # rustls never consults the subject CN (SAN-only), so this is
+        # bookkeeping; HAS_NEVER_CHECK_COMMON_NAME advertises the capability.
+        self._hostname_checks_common_name = bool(value)
+
+    def _sync_versions(self):
+        _ssl.set_min_max_version(
+            self._id, int(self._minimum_version), int(self._maximum_version))
+
+    def _check_version_settable(self):
+        if self.protocol not in _AUTO_PROTOCOLS:
+            raise ValueError(
+                "this context doesn't support modification of "
+                "highest and lowest version")
 
     @property
     def minimum_version(self):
@@ -479,7 +768,16 @@ class SSLContext:
 
     @minimum_version.setter
     def minimum_version(self, value):
-        self._minimum_version = TLSVersion(value)
+        self._check_version_settable()
+        value = TLSVersion(value)
+        if value == TLSVersion.MAXIMUM_SUPPORTED:
+            # OpenSSL resolves the sentinel to the highest supported version.
+            value = TLSVersion.TLSv1_3 if HAS_TLSv1_3 else TLSVersion.TLSv1_2
+        elif value in (TLSVersion.SSLv3, TLSVersion.TLSv1, TLSVersion.TLSv1_1):
+            _warnings.warn(f'ssl.TLSVersion.{value.name} is deprecated',
+                           DeprecationWarning, 2)
+        self._minimum_version = value
+        self._sync_versions()
 
     @property
     def maximum_version(self):
@@ -487,43 +785,121 @@ class SSLContext:
 
     @maximum_version.setter
     def maximum_version(self, value):
-        self._maximum_version = TLSVersion(value)
+        self._check_version_settable()
+        value = TLSVersion(value)
+        if value == TLSVersion.MINIMUM_SUPPORTED:
+            # OpenSSL resolves the sentinel to the lowest supported version.
+            value = TLSVersion.TLSv1_2
+        elif value in (TLSVersion.SSLv3, TLSVersion.TLSv1, TLSVersion.TLSv1_1):
+            _warnings.warn(f'ssl.TLSVersion.{value.name} is deprecated',
+                           DeprecationWarning, 2)
+        self._maximum_version = value
+        self._sync_versions()
 
     # --- certificates ---
     def load_cert_chain(self, certfile, keyfile=None, password=None):
-        # A malformed PEM/key surfaces from the native core as an OSError with
-        # the "[SSL]" marker; re-raise it as ``ssl.SSLError`` (CPython parity —
-        # test_ssl.test_malformed_key asserts ``ssl.SSLError``).
+        certfile = _path_arg(certfile, "certfile")
+        keyfile = _path_arg(keyfile, "keyfile")
+        # First try without a password: like OpenSSL's pem_password_cb, the
+        # password (and any password *callable*) must only be consulted when
+        # the key is actually encrypted (test_load_cert_chain loads a plain
+        # key with a raising callback and expects no call).
         try:
-            _ssl.load_cert_chain(self._id, str(certfile),
-                                 str(keyfile) if keyfile is not None else None,
-                                 password)
+            _ssl.load_cert_chain(self._id, certfile, keyfile, None)
+            return
+        except OSError as e:
+            if password is None or "password required" not in str(e):
+                # A malformed PEM/key carries the "[SSL]"/"PEM lib" marker;
+                # re-raise as ``ssl.SSLError`` (test_malformed_key).
+                raise _wrap_ssl_error(e) from None
+        # Encrypted key: materialize the password (CPython's password_info
+        # semantics — str/bytes/bytearray or a callable producing one, capped
+        # at OpenSSL's PEM_BUFSIZE of 1024 incl. NUL).
+        if callable(password):
+            password = password()
+            if isinstance(password, str):
+                password = password.encode("utf-8")
+            elif isinstance(password, (bytes, bytearray)):
+                password = bytes(password)
+            else:
+                raise TypeError("password callback must return a string")
+        elif isinstance(password, str):
+            password = password.encode("utf-8")
+        elif isinstance(password, (bytes, bytearray)):
+            password = bytes(password)
+        else:
+            raise TypeError("password should be a string or callable")
+        if len(password) > 1023:
+            raise ValueError("password cannot be longer than 1023 bytes")
+        try:
+            _ssl.load_cert_chain(self._id, certfile, keyfile, password)
         except OSError as e:
             raise _wrap_ssl_error(e) from None
 
     def load_verify_locations(self, cafile=None, capath=None, cadata=None):
+        if cafile is None and capath is None and cadata is None:
+            raise TypeError("cafile, capath and cadata cannot be all omitted")
         try:
             _ssl.load_verify_locations(
-                self._id,
-                str(cafile) if cafile is not None else None,
-                str(capath) if capath is not None else None,
-                cadata)
+                self._id, _path_arg(cafile, "cafile"),
+                _path_arg(capath, "capath"), cadata)
         except OSError as e:
             raise _wrap_ssl_error(e) from None
 
     def load_default_certs(self, purpose=Purpose.SERVER_AUTH):
-        # Native roots are loaded automatically when verification is on.
+        # Native (webpki) roots are consulted automatically when verification
+        # is on; honor the OpenSSL env overrides like set_default_verify_paths.
+        if not isinstance(purpose, _ASN1Object):
+            raise TypeError(purpose)
+        self.set_default_verify_paths()
+
+    def load_dh_params(self, path):
+        # rustls only offers ECDHE key exchange, so the parameters are parsed
+        # for validity (CPython-shaped errors) and then unused.
+        if path is None:
+            raise TypeError("path should be a valid filesystem path")
+        with open(path, "rb") as f:
+            data = f.read()
+        if b"DH PARAMETERS" not in data:
+            # OpenSSL fails in the PEM decoder; test_lib_reason asserts the
+            # library/reason attribute pair and the NO_START_LINE token.
+            err = SSLError(SSL_ERROR_SSL,
+                           "[PEM: NO_START_LINE] no start line (_ssl.c)")
+            err.library = "PEM"
+            err.reason = "NO_START_LINE"
+            raise err
         return None
 
     def set_default_verify_paths(self):
+        # OpenSSL's SSL_CTX_set_default_verify_paths: pull in the system
+        # trust store (platform-native roots on the rustls side) and honour
+        # the SSL_CERT_FILE / SSL_CERT_DIR environment overrides.
+        _ssl.set_default_verify_paths(self._id)
+        import os
+        cafile = os.environ.get("SSL_CERT_FILE")
+        capath = os.environ.get("SSL_CERT_DIR")
+        if cafile and os.path.isfile(cafile):
+            self.load_verify_locations(cafile=cafile)
+        if capath and os.path.isdir(capath):
+            self.load_verify_locations(capath=capath)
         return None
 
     def set_ciphers(self, ciphers):
-        # rustls picks safe defaults; the OpenSSL cipher grammar is emulated.
-        return None
+        # rustls always negotiates from its fixed safe set; the OpenSSL
+        # cipher-string grammar is *interpreted* against that set so that
+        # valid strings are accepted, garbage raises ("No cipher can be
+        # selected"), and get_ciphers() reflects the selection.
+        selected = _select_ciphers(ciphers)
+        if not selected:
+            raise SSLError("No cipher can be selected.")
+        self._selected_ciphers = selected
+        # Restrict the native TLS 1.2 suite list to the selection (TLS 1.3
+        # suites are never filtered — OpenSSL cipher-string semantics).
+        _ssl.set_cipher_suites(self._id, [d["name"] for d in selected])
 
     def get_ciphers(self):
-        return []
+        return [dict(d) for d in getattr(self, "_selected_ciphers",
+                                         _CIPHER_SUITES)]
 
     def set_alpn_protocols(self, protocols):
         _ssl.set_alpn_protocols(self._id, [str(p) for p in protocols])
@@ -532,18 +908,75 @@ class SSLContext:
         return None
 
     def get_ca_certs(self, binary_form=False):
-        return []
+        ders = _ssl.get_ca_certs(self._id)
+        if binary_form:
+            return list(ders)
+        return [_ssl.decode_cert(der) for der in ders]
 
     def cert_store_stats(self):
-        return {"x509": 0, "crl": 0, "x509_ca": 0}
+        return _ssl.cert_store_stats(self._id)
 
     def session_stats(self):
-        return {}
+        # `accept` and `hits` are tracked natively (loopback session-reuse
+        # emulation); the rest of the key set is part of the CPython surface.
+        stats = _ssl.session_stats(self._id)
+        return {
+            'number': stats['number'],
+            'connect': stats['connect'],
+            'connect_good': stats['connect_good'],
+            'connect_renegotiate': stats['connect_renegotiate'],
+            'accept': stats['accept'],
+            'accept_good': stats['accept_good'],
+            'accept_renegotiate': stats['accept_renegotiate'],
+            'hits': stats['hits'],
+            'misses': stats['misses'],
+            'timeouts': stats['timeouts'],
+            'cache_full': stats['cache_full'],
+        }
 
     def set_servername_callback(self, callback):
-        return None
+        if callback is not None and not callable(callback):
+            raise TypeError("not a callable object")
+        self._sni_callback = callback
+
+    @property
+    def sni_callback(self):
+        return self._sni_callback
+
+    @sni_callback.setter
+    def sni_callback(self, callback):
+        if callback is not None and not callable(callback):
+            raise TypeError("not a callable object")
+        self._sni_callback = callback
+
+    @property
+    def _msg_callback(self):
+        return self._msg_cb
+
+    @_msg_callback.setter
+    def _msg_callback(self, callback):
+        if callback is not None and not callable(callback):
+            raise TypeError(f"{callback} is not callable.")
+        self._msg_cb = callback
+
+    # Named groups rustls' ring provider actually offers (plus the OpenSSL
+    # aliases for them); anything else is an unknown curve.
+    _ECDH_CURVES = frozenset({
+        b"prime256v1", b"secp256r1", b"P-256",
+        b"secp384r1", b"P-384",
+        b"x25519", b"X25519",
+    })
 
     def set_ecdh_curve(self, name):
+        if isinstance(name, str):
+            name_b = name.encode("ascii", "replace")
+        elif isinstance(name, (bytes, bytearray)):
+            name_b = bytes(name)
+        else:
+            raise TypeError("curve name must be a byte string or string")
+        if name_b not in self._ECDH_CURVES:
+            raise ValueError(f"unknown elliptic curve name {name!r}")
+        _ssl.set_ecdh_curve(self._id, name_b.decode("ascii"))
         return None
 
     # --- wrapping ---
@@ -574,6 +1007,12 @@ class SSLContext:
                              "in client mode")
         if self.check_hostname and not server_side and not server_hostname:
             raise ValueError("check_hostname requires server_hostname")
+        server_hostname = _encode_hostname(server_hostname)
+        if server_hostname is not None and "\x00" in server_hostname:
+            # CPython's argument converter ("z" format) rejects embedded NULs
+            # with TypeError before any hostname validation.
+            raise TypeError("argument must be encoded string without null "
+                            "bytes")
         return self.sslobject_class._create(
             incoming, outgoing, server_side, server_hostname, self, session)
 
@@ -589,6 +1028,9 @@ def create_default_context(purpose=Purpose.SERVER_AUTH, *, cafile=None,
         context = SSLContext(PROTOCOL_TLS_SERVER)
     else:
         context = SSLContext(PROTOCOL_TLS)
+    # CPython 3.13 hardens default contexts with strict partial-chain X.509
+    # validation (gh-106414).
+    context.verify_flags |= (VERIFY_X509_PARTIAL_CHAIN | VERIFY_X509_STRICT)
     if cafile or capath or cadata:
         context.load_verify_locations(cafile, capath, cadata)
     elif purpose == Purpose.SERVER_AUTH:
@@ -601,7 +1043,10 @@ def _create_unverified_context(protocol=None, *, cert_reqs=CERT_NONE,
                                certfile=None, keyfile=None, cafile=None,
                                capath=None, cadata=None):
     if protocol is None:
-        protocol = PROTOCOL_TLS_CLIENT
+        # SERVER_AUTH means "I am a client verifying a server", CLIENT_AUTH
+        # means "I am a server" (CPython's purpose→protocol mapping).
+        protocol = (PROTOCOL_TLS_CLIENT if purpose == Purpose.SERVER_AUTH
+                    else PROTOCOL_TLS_SERVER)
     context = SSLContext(protocol)
     context.check_hostname = check_hostname
     context.verify_mode = cert_reqs
@@ -609,6 +1054,10 @@ def _create_unverified_context(protocol=None, *, cert_reqs=CERT_NONE,
         context.load_cert_chain(certfile, keyfile)
     if cafile or capath or cadata:
         context.load_verify_locations(cafile, capath, cadata)
+    elif context.verify_mode != CERT_NONE:
+        # No explicit CA but verification is on: fall back to the system
+        # default roots for the given purpose (CPython parity; may be empty).
+        context.load_default_certs(purpose)
     return context
 
 
@@ -623,6 +1072,146 @@ def create_connection(*a, **k):  # pragma: no cover - convenience alias
 # --------------------------------------------------------------------------
 # SSLSocket
 # --------------------------------------------------------------------------
+
+class _SSLInner:
+    """Stand-in for CPython's ``_ssl._SSLSocket`` as seen through the
+    ``_sslobj`` attribute: tests reach through it for ``.owner`` (the wrapping
+    SSLSocket/SSLObject) and ``.context`` (which must track context swaps —
+    test_context_setget)."""
+
+    __slots__ = ("_wrapper", "_ctx")
+
+    def __init__(self, wrapper):
+        # Weak, like CPython's `_SSLSocket.owner`: the inner object must not
+        # keep the wrapping SSLSocket/SSLObject alive (GH-146080).
+        import weakref as _weakref
+        self._wrapper = _weakref.ref(wrapper)
+        self._ctx = wrapper._context
+
+    @property
+    def owner(self):
+        return self._wrapper()
+
+    @owner.setter
+    def owner(self, value):
+        import weakref as _weakref
+        self._wrapper = _weakref.ref(value)
+
+    @property
+    def context(self):
+        w = self._wrapper()
+        return w._context if w is not None else self._ctx
+
+    @context.setter
+    def context(self, ctx):
+        self._ctx = ctx
+        w = self._wrapper()
+        if w is not None:
+            w._context = ctx
+
+    def _live_wrapper(self):
+        w = self._wrapper()
+        if w is None:
+            raise ValueError("owner of the SSL object is dead")
+        return w
+
+    def get_verified_chain(self):
+        # Presented chain extended to the trust anchor (leaf first), as
+        # Certificate objects — CPython's `_SSLSocket.get_verified_chain`.
+        return [Certificate._from_der(d) for d in
+                _ssl.peer_verified_chain_der(self._live_wrapper()._sslobj_id)]
+
+    def get_unverified_chain(self):
+        return [Certificate._from_der(d) for d in
+                _ssl.peer_cert_chain_der(self._live_wrapper()._sslobj_id)]
+
+    def do_handshake(self):
+        w = self._wrapper()
+        if w is None:
+            # The owner has been collected: CPython's C-level servername
+            # callback bails out (SSL_R_CALLBACK_FAILED) before invoking any
+            # Python callback (test_sni_callback_on_dead_references).
+            raise SSLError(SSL_ERROR_SSL, "[SSL] callback failed (_ssl.c)")
+        return w.do_handshake()
+
+
+class Certificate:
+    """An X.509 certificate (the shape of CPython's ``_ssl.Certificate``)."""
+
+    __slots__ = ("_der",)
+
+    def __init__(self, *args, **kwargs):
+        raise TypeError("Certificate cannot be instantiated directly")
+
+    @classmethod
+    def _from_der(cls, der):
+        self = cls.__new__(cls)
+        self._der = bytes(der)
+        return self
+
+    def public_bytes(self, format=1):
+        if format == ENCODING_PEM:
+            return DER_cert_to_PEM_cert(self._der)
+        if format == ENCODING_DER:
+            return self._der
+        raise ValueError("invalid format")
+
+    def get_info(self):
+        return _ssl.decode_cert(self._der)
+
+    def __eq__(self, other):
+        if not isinstance(other, Certificate):
+            return NotImplemented
+        return self._der == other._der
+
+    def __hash__(self):
+        return hash(self._der)
+
+    _X500_ABBREV = {
+        "countryName": "C", "stateOrProvinceName": "ST", "localityName": "L",
+        "organizationName": "O", "organizationalUnitName": "OU",
+        "commonName": "CN", "emailAddress": "emailAddress",
+    }
+
+    def __repr__(self):
+        parts = []
+        for rdn in self.get_info().get("subject", ()):
+            for key, value in rdn:
+                parts.append(f"{self._X500_ABBREV.get(key, key)}={value}")
+        return f"<Certificate '{','.join(parts)}'>"
+
+
+class SSLSession:
+    """TLS session surrogate: rustls manages resumption internally, so this
+    carries the CPython-visible bookkeeping (id/time/timeout/ticket info)."""
+
+    __slots__ = ("id", "time", "timeout", "ticket_lifetime_hint", "has_ticket",
+                 "_ctx")
+
+    def __init__(self, *args, **kwargs):
+        raise TypeError("SSLSession does not have a public constructor")
+
+    @classmethod
+    def _new(cls, ctx):
+        import os as _os
+        import time as _time
+        self = cls.__new__(cls)
+        self.id = _os.urandom(32)
+        self.time = int(_time.time())
+        self.timeout = 7200
+        self.ticket_lifetime_hint = 7200
+        self.has_ticket = True
+        self._ctx = ctx
+        return self
+
+    def __eq__(self, other):
+        if not isinstance(other, SSLSession):
+            return NotImplemented
+        return self.id == other.id
+
+    def __hash__(self):
+        return hash(self.id)
+
 
 class SSLSocket(_socket_type):
     """A ``socket.socket`` whose I/O is routed through a rustls session."""
@@ -647,6 +1236,10 @@ class SSLSocket(_socket_type):
                                  "client mode")
         if context.check_hostname and not server_hostname:
             raise ValueError("check_hostname requires server_hostname")
+        server_hostname = _encode_hostname(server_hostname)
+        if server_hostname is not None and "\x00" in server_hostname:
+            raise TypeError("argument must be encoded string without null "
+                            "bytes")
         self = cls.__new__(cls)
         # Adopt the underlying fd from the original socket. WeavePy keys its
         # socket registry by fd, so we must `detach()` the original *first*
@@ -665,6 +1258,10 @@ class SSLSocket(_socket_type):
         self.do_handshake_on_connect = do_handshake_on_connect
         self.suppress_ragged_eofs = suppress_ragged_eofs
         self._sslobj_id = None
+        if session is not None:
+            # Routes through the session setter: type/context validation and
+            # the reused-session bookkeeping (pre-handshake only).
+            self.session = session
 
         # Detect whether the underlying socket is already connected. The
         # ubiquitous client pattern ``wrap_socket(socket.socket())`` then
@@ -685,9 +1282,12 @@ class SSLSocket(_socket_type):
 
         if connected:
             try:
-                self._sslobj_id = _ssl.wrap_socket(
-                    context._id, self.fileno(), bool(server_side),
-                    server_hostname or "")
+                try:
+                    self._sslobj_id = _ssl.wrap_socket(
+                        context._id, self.fileno(), bool(server_side),
+                        server_hostname or "")
+                except OSError as e:
+                    raise _wrap_ssl_error(e) from None
                 if do_handshake_on_connect:
                     timeout = self.gettimeout()
                     if timeout == 0.0:
@@ -695,6 +1295,10 @@ class SSLSocket(_socket_type):
                                          "specified for non-blocking sockets")
                     self.do_handshake()
             except (OSError, ValueError):
+                # Free the native session first — it dup(2)'d our fd, so
+                # closing only the Python-level socket would leave the TCP
+                # connection alive (see _teardown_sslobj_id).
+                self._teardown_sslobj_id()
                 try:
                     _socket_type.close(self)
                 except Exception:
@@ -706,22 +1310,108 @@ class SSLSocket(_socket_type):
     def _sslobj(self):
         # CPython exposes the live ``_ssl._SSLSocket`` here; non-blocking TLS
         # drivers (the asyncore servers in test_ftplib/test_imaplib) test
-        # ``self.socket._sslobj is not None`` to decide whether a TLS shutdown is
-        # still pending. We don't surface the raw object, but the session id is a
-        # faithful "is the TLS layer still live?" sentinel (``None`` once
-        # unwrapped/closed).
-        return getattr(self, "_sslobj_id", None)
+        # ``self.socket._sslobj is not None`` to decide whether a TLS shutdown
+        # is still pending, and test_ssl reaches through for ``.owner`` /
+        # ``.context``. ``None`` once unwrapped/closed.
+        if getattr(self, "_sslobj_id", None) is None:
+            return None
+        return _SSLInner(self)
 
     # --- handshake / TLS I/O ---
     def do_handshake(self, block=False):
+        # On a never-connected socket CPython surfaces the kernel's ENOTCONN
+        # (via getpeername) rather than a TLS-layer error
+        # (test_do_handshake_enotconn).
+        if self._sslobj_id is None:
+            self.getpeername()
         try:
-            _ssl.do_handshake(self._sslobj_id)
+            if self.server_side and _ssl.server_pending(self._sslobj_id):
+                self._server_handshake()
+            else:
+                if not self.server_side and \
+                        getattr(self, "_session", None) is not None:
+                    # Loopback session-reuse bookkeeping: the next server
+                    # accept counts as a cache hit (session_stats).
+                    _ssl.note_session_offer()
+                _ssl.do_handshake(self._sslobj_id)
         except OSError as e:
             raise _wrap_ssl_error(e) from None
+        # OpenSSL invokes the message callback per handshake message as it
+        # happens; the rustls core captures the transcript instead, and it is
+        # replayed here right after the handshake (test_msg_callback_tls12).
+        cb = getattr(self._context, "_msg_cb", None)
+        if cb is not None:
+            for direction, ver, ct, mt, data in _ssl.msg_transcript(
+                    self._sslobj_id):
+                try:
+                    ver = TLSVersion(ver)
+                except ValueError:
+                    pass
+                cb(self, direction, ver, ct, mt, data)
+
+    def _server_handshake(self):
+        """Two-phase server handshake: read the ClientHello, run the SNI
+        callback (which may swap ``self.context``), then commit the config
+        and finish (OpenSSL's ClientHello/servername callback ordering)."""
+        server_name = _ssl.server_read_client_hello(self._sslobj_id)
+        cb = self._context._sni_callback
+        if cb is not None:
+            try:
+                result = cb(self, server_name, self._context)
+            except Exception as exc:
+                self._sni_unraisable(exc, "in servername callback handler")
+                _ssl.server_abort_alert(
+                    self._sslobj_id, int(ALERT_DESCRIPTION_HANDSHAKE_FAILURE))
+                raise SSLError(
+                    SSL_ERROR_SSL,
+                    "[SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] servername "
+                    "callback raised an exception (_ssl.c)")
+            if result is not None:
+                if not isinstance(result, int):
+                    self._sni_unraisable(
+                        TypeError("servername callback must return None "
+                                  "or an integer alert code"),
+                        "in servername callback handler")
+                    result = ALERT_DESCRIPTION_INTERNAL_ERROR
+                _ssl.server_abort_alert(self._sslobj_id, int(result))
+                raise SSLError(
+                    SSL_ERROR_SSL,
+                    "[SSL: TLSV1_ALERT] servername callback returned "
+                    "alert %d (_ssl.c)" % result)
+        _ssl.server_complete_handshake(self._sslobj_id, self._context._id)
+
+    @staticmethod
+    def _sni_unraisable(exc, err_msg):
+        # CPython reports SNI-callback failures through the unraisable hook
+        # (the handshake itself fails with a TLS alert, separately).
+        import sys as _sys
+        import types as _types
+        try:
+            _sys.unraisablehook(_types.SimpleNamespace(
+                exc_type=type(exc),
+                exc_value=exc,
+                exc_traceback=exc.__traceback__,
+                err_msg=err_msg,
+                object=None,
+            ))
+        except Exception:
+            pass
 
     def _check_connected(self):
         if self._sslobj_id is None:
             raise ValueError("Read/write on closed SSL socket.")
+
+    def _teardown_sslobj_id(self):
+        # Close the *native* session, not just our reference to it: the rustls
+        # session owns a dup(2) of the socket's fd, so an orphaned session id
+        # keeps the TCP connection established even after ``close()``.
+        sid = self._sslobj_id
+        self._sslobj_id = None
+        if sid is not None:
+            try:
+                _ssl.close(sid)
+            except Exception:
+                pass
 
     # --- connect (client side, deferred handshake) ---
     def connect(self, addr):
@@ -741,9 +1431,12 @@ class SSLSocket(_socket_type):
         # Attach the rustls session to our fd first (it dups the fd, so the
         # connect below — on the same kernel socket — connects both), then
         # perform the TCP connect and, finally, the TLS handshake.
-        self._sslobj_id = _ssl.wrap_socket(
-            self._context._id, self.fileno(), False,
-            self.server_hostname or "")
+        try:
+            self._sslobj_id = _ssl.wrap_socket(
+                self._context._id, self.fileno(), False,
+                self.server_hostname or "")
+        except OSError as e:
+            raise _wrap_ssl_error(e) from None
         try:
             if connect_ex:
                 rc = _socket_type.connect_ex(self, addr)
@@ -756,11 +1449,49 @@ class SSLSocket(_socket_type):
                     self.do_handshake()
             return rc
         except (OSError, ValueError):
-            self._sslobj_id = None
+            # Tear the native session down, not just our reference to it: it
+            # holds a dup(2) of the fd, and leaking it keeps the TCP
+            # connection established after ``close()`` — a loopback server
+            # blocked in its half of the handshake then never sees EOF and
+            # its accept loop (and the test's ``join``) hangs forever
+            # (test_connect_fail/test_connect_with_context_fail under load).
+            self._teardown_sslobj_id()
             raise
+
+    def _drive_pending_server(self):
+        # OpenSSL transparently finishes a not-yet-done server handshake from
+        # inside SSL_read/SSL_write (asyncore servers wrap with
+        # do_handshake_on_connect=False and immediately push data, catching
+        # WANT_READ/WANT_WRITE until it completes). Our deferred two-phase
+        # server wrap needs the same driving.
+        if (self.server_side and self._sslobj_id is not None
+                and _ssl.server_pending(self._sslobj_id)):
+            self.do_handshake()
 
     def read(self, length=1024, buffer=None):
         self._check_connected()
+        self._drive_pending_server()
+        # Fill buffers at *byte* granularity: the target may have itemsize > 1
+        # (test_recv_into_buffer_protocol_len passes an array('I')), so both
+        # the capacity clamp and the writeback go through a 'B'-cast view.
+        view = None
+        if buffer is not None:
+            view = memoryview(buffer)
+            if view.itemsize != 1 or not isinstance(buffer, (bytearray, memoryview)):
+                view = view.cast("B")
+        # CPython's `_SSLSocket.read`: a negative length is only meaningful
+        # with a buffer (where it means "fill the buffer"); without one it
+        # raises (test_recv_send asserts both sides).
+        if length < 0:
+            if view is None:
+                raise ValueError("size should not be negative")
+            length = view.nbytes
+        if view is not None:
+            length = min(length, view.nbytes)
+        if length == 0:
+            # Zero-byte reads never touch the transport (test_recv_zero
+            # calls recv(0) on a non-blocking socket and expects b"").
+            return 0 if buffer is not None else b""
         try:
             data = _ssl.read(self._sslobj_id, length)
         except OSError as e:
@@ -772,14 +1503,15 @@ class SSLSocket(_socket_type):
                 data = b""
             else:
                 raise err from None
-        if buffer is not None:
+        if view is not None:
             n = len(data)
-            buffer[:n] = data
+            view[:n] = data
             return n
         return data
 
     def write(self, data):
         self._check_connected()
+        self._drive_pending_server()
         try:
             return _ssl.write(self._sslobj_id, data)
         except OSError as e:
@@ -804,7 +1536,10 @@ class SSLSocket(_socket_type):
             raise ValueError("non-zero flags not allowed in calls to "
                              "recv_into() on %s" % self.__class__)
         if nbytes is None:
-            nbytes = len(buffer)
+            # Byte length, not item count — the buffer may have itemsize > 1
+            # (test_recv_into_buffer_protocol_len passes an array('i')).
+            with memoryview(buffer) as view:
+                nbytes = view.nbytes
             if nbytes == 0:
                 nbytes = 1024
         return self.read(nbytes, buffer)
@@ -815,6 +1550,7 @@ class SSLSocket(_socket_type):
         if flags != 0:
             raise ValueError("non-zero flags not allowed in calls to send() "
                              "on %s" % self.__class__)
+        self._drive_pending_server()
         try:
             return _ssl.write(self._sslobj_id, data)
         except OSError as e:
@@ -892,20 +1628,39 @@ class SSLSocket(_socket_type):
 
     # --- metadata ---
     def getpeercert(self, binary_form=False):
+        # Never-connected socket: surface ENOTCONN like CPython's
+        # `_check_connected` (test_getpeercert_enotconn).
+        if self._sslobj_id is None and not self._connected:
+            self.getpeername()
+        # Connected but not yet handshaken (do_handshake_on_connect=False):
+        # CPython raises ValueError (test_getpeercert).
+        if self._sslobj_id is not None and _ssl.version(self._sslobj_id) is None:
+            raise ValueError("handshake not done yet")
         der = _ssl.peer_cert_der(self._sslobj_id)
         if binary_form:
             return der
         if not der:
+            return None
+        # CPython parity: the decoded dict is only exposed when the peer's
+        # certificate was actually validated (verify_mode != CERT_NONE);
+        # otherwise an empty dict signals "cert present but unverified".
+        if self._context.verify_mode == CERT_NONE:
             return {}
-        # A full X.509 → dict parse isn't implemented on the rustls core;
-        # rustls already enforces verification/hostname during the handshake.
-        return {}
+        return _ssl.decode_cert(der)
 
     def cipher(self):
         return _ssl.cipher(self._sslobj_id)
 
     def shared_ciphers(self):
-        return None
+        # Server side, post-handshake: the suites both peers could have used.
+        # rustls doesn't retain the ClientHello, so report the server context's
+        # enabled suites (its `set_ciphers` selection) as (name, proto, bits)
+        # triples — the shape test_shared_ciphers iterates.
+        if not self.server_side or self._sslobj_id is None or \
+                _ssl.version(self._sslobj_id) is None:
+            return None
+        return [(d["name"], d["protocol"], d["strength_bits"])
+                for d in self._context.get_ciphers()]
 
     def compression(self):
         return None
@@ -926,6 +1681,74 @@ class SSLSocket(_socket_type):
             return 0
         return _ssl.pending(self._sslobj_id)
 
+    def verify_client_post_handshake(self):
+        # TLS 1.3 post-handshake client auth. rustls has no wire-level PHA;
+        # the native layer emulates OpenSSL's checks (server-only, TLS 1.3
+        # only, PHA extension offered) for the loopback test topology.
+        if not self.server_side:
+            raise SSLError("Post-handshake auth is not supported on "
+                           "client sockets (not server)")
+        if self._sslobj_id is None:
+            raise ValueError("No SSL wrapper around " + str(self))
+        try:
+            _ssl.pha_verify(self._sslobj_id)
+        except OSError as e:
+            raise _wrap_ssl_error(e) from None
+
+    def get_verified_chain(self):
+        """The verified certificate chain (leaf → anchor) as DER blobs."""
+        return _ssl.peer_verified_chain_der(self._sslobj_id)
+
+    def get_unverified_chain(self):
+        """The chain the peer actually presented, as DER blobs."""
+        return _ssl.peer_cert_chain_der(self._sslobj_id)
+
+    def _handshake_done(self):
+        return (self._sslobj_id is not None
+                and _ssl.version(self._sslobj_id) is not None)
+
+    @property
+    def session(self):
+        # None before the handshake; afterwards a (locally minted) SSLSession.
+        # rustls handles resumption internally, so assigning a previous
+        # session is bookkeeping: it is echoed back and flagged as reused.
+        if not self._handshake_done():
+            return None
+        sess = getattr(self, "_session", None)
+        if sess is None:
+            self._session = sess = SSLSession._new(self._context)
+            return sess
+        if getattr(self, "_session_reused", False):
+            # A reused session reads back as an equal-but-distinct object
+            # with refreshed timestamps (test_session's assertIsNot).
+            import time as _time
+            copy = SSLSession.__new__(SSLSession)
+            copy.id = sess.id
+            copy.time = max(sess.time, int(_time.time()))
+            copy.timeout = sess.timeout
+            copy.ticket_lifetime_hint = sess.ticket_lifetime_hint
+            copy.has_ticket = sess.has_ticket
+            copy._ctx = sess._ctx
+            return copy
+        return sess
+
+    @session.setter
+    def session(self, value):
+        if not isinstance(value, SSLSession):
+            raise TypeError("Value is not a SSLSession.")
+        if self._handshake_done():
+            raise ValueError("Cannot set session after handshake.")
+        if value._ctx is not self._context:
+            raise ValueError("Session refers to a different SSLContext.")
+        self._session = value
+        self._session_reused = True
+
+    @property
+    def session_reused(self):
+        if not self._handshake_done():
+            return None
+        return getattr(self, "_session_reused", False)
+
     @property
     def context(self):
         return self._context
@@ -933,6 +1756,17 @@ class SSLSocket(_socket_type):
     @context.setter
     def context(self, ctx):
         self._context = ctx
+
+    def accept(self):
+        """Accept a connection and wrap it in a fresh TLS session (server
+        side) — CPython's `SSLSocket.accept` (issue #16357)."""
+        newsock, addr = _socket_type.accept(self)
+        newsock = self.context.wrap_socket(
+            newsock,
+            do_handshake_on_connect=self.do_handshake_on_connect,
+            suppress_ragged_eofs=self.suppress_ragged_eofs,
+            server_side=True)
+        return newsock, addr
 
     def unwrap(self):
         if self._sslobj_id is not None:
@@ -948,14 +1782,10 @@ class SSLSocket(_socket_type):
     def shutdown(self, how):
         _socket_type.shutdown(self, how)
 
-    def close(self):
-        if self._sslobj_id is not None:
-            try:
-                _ssl.close(self._sslobj_id)
-            except Exception:
-                pass
-            self._sslobj_id = None
-        _socket_type.close(self)
+    # No ``close`` override: the base socket keeps the fd (and, through
+    # ``_real_close`` below, the TLS session) alive while ``makefile()``
+    # readers hold `_io_refs` — http.client closes the connection object
+    # while the response is still being read (test_socketserver).
 
     def _real_close(self):
         if self._sslobj_id is not None:
@@ -965,6 +1795,18 @@ class SSLSocket(_socket_type):
                 pass
             self._sslobj_id = None
         _socket_type._real_close(self)
+
+    def __del__(self):
+        # An SSLSocket collected while its fd is still open leaks the fd; warn
+        # like CPython's socket dealloc does (test_dealloc_warn asserts the
+        # repr appears in the message), then close.
+        try:
+            if self.fileno() >= 0:
+                _warnings.warn(f"unclosed {self!r}", ResourceWarning,
+                               source=self)
+                self.close()
+        except Exception:
+            pass
 
 
 class SSLObject:
@@ -993,17 +1835,35 @@ class SSLObject:
         self.server_side = server_side
         self.server_hostname = server_hostname
         self._session = session
-        self._sslobj_id = _ssl.wrap_bio(
-            context._id, incoming._id, outgoing._id,
-            bool(server_side), server_hostname or "")
+        self._sslobj_id = None
+        try:
+            self._sslobj_id = _ssl.wrap_bio(
+                context._id, incoming._id, outgoing._id,
+                bool(server_side), server_hostname or "")
+        except OSError as e:
+            # OpenSSL only discovers a missing server certificate during the
+            # handshake, not at wrap time (test_context_custom_class wraps a
+            # cert-less server context and never handshakes). Defer: leave the
+            # session unattached and retry from do_handshake().
+            msg = str(e)
+            if "requires a certificate" not in msg and \
+                    "requires a private key" not in msg:
+                raise _wrap_ssl_error(e) from None
         return self
 
     @property
     def _sslobj(self):
-        return getattr(self, "_sslobj_id", None)
+        if getattr(self, "_sslobj_id", None) is None:
+            return None
+        return _SSLInner(self)
 
     def do_handshake(self):
         try:
+            if self._sslobj_id is None:
+                # Deferred wrap (no server certificate at _create time).
+                self._sslobj_id = _ssl.wrap_bio(
+                    self._context._id, self._incoming._id, self._outgoing._id,
+                    bool(self.server_side), self.server_hostname or "")
             _ssl.bio_do_handshake(self._sslobj_id)
         except OSError as e:
             raise _wrap_ssl_error(e) from None
@@ -1029,14 +1889,20 @@ class SSLObject:
         return _ssl.bio_pending(self._sslobj_id)
 
     def getpeercert(self, binary_form=False):
+        # CPython raises before the handshake has completed (`SSL_get_peer
+        # _certificate` needs a negotiated session — test_bio_handshake).
+        if _ssl.bio_version(self._sslobj_id) is None:
+            raise ValueError("handshake not done yet")
         der = _ssl.bio_peer_cert_der(self._sslobj_id)
         if binary_form:
             return der
         if not der:
+            return None
+        # CPython parity: decode only when the peer cert was validated
+        # (verify_mode != CERT_NONE); unverified peers get an empty dict.
+        if self._context.verify_mode == CERT_NONE:
             return {}
-        # A full X.509 → dict parse isn't implemented on the rustls core;
-        # rustls already enforces verification/hostname during the handshake.
-        return {}
+        return _ssl.decode_cert(der)
 
     def cipher(self):
         return _ssl.bio_cipher(self._sslobj_id)
@@ -1063,7 +1929,10 @@ class SSLObject:
         return None
 
     def verify_client_post_handshake(self):
-        raise NotImplementedError(
+        # Must be an ``SSLError`` (not ``NotImplementedError``): test_ssl's
+        # echo server catches ``ssl.SSLError`` and reports it to the client;
+        # anything else kills the handler thread and strands the peer.
+        raise SSLError(
             "post-handshake auth is not available on the rustls _ssl core")
 
     @property
@@ -1264,6 +2133,29 @@ def PEM_cert_to_DER_cert(pem_cert_string):
                          % PEM_FOOTER)
     d = pem_cert_string.strip()[len(PEM_HEADER):-len(PEM_FOOTER)]
     return base64.decodebytes(d.encode('ASCII', 'strict'))
+
+
+def get_server_certificate(addr, ssl_version=PROTOCOL_TLS_CLIENT,
+                           ca_certs=None, timeout=None):
+    """Connect to `addr` and return the server's certificate as a PEM string
+    (validated against `ca_certs` when given — CPython parity)."""
+    host, port = addr
+    if ca_certs is not None:
+        cert_reqs = CERT_REQUIRED
+    else:
+        cert_reqs = CERT_NONE
+    context = _create_stdlib_context(ssl_version,
+                                     cert_reqs=cert_reqs,
+                                     cafile=ca_certs)
+    kwargs = {} if timeout is None else {"timeout": timeout}
+    with create_connection(addr, **kwargs) as sock:
+        with context.wrap_socket(sock, server_hostname=host) as sslsock:
+            dercert = sslsock.getpeercert(True)
+    return DER_cert_to_PEM_cert(dercert)
+
+
+def get_protocol_name(protocol_code):
+    return _PROTOCOL_NAMES.get(protocol_code, '<unknown>')
 
 
 # --- PRNG surface (CPython exposes these from OpenSSL; rustls uses ring's

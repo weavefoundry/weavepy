@@ -124,9 +124,16 @@ memchr                = "2.8"
 libc                  = "0.2"
 rustls                = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types      = "1.7"
+# PKCS#8 "ENCRYPTED PRIVATE KEY" (PBES2) decryption for password-protected
+# keys in SSLContext.load_cert_chain.
+pkcs8                 = { version = "0.10", features = ["encryption", "pem"] }
 rustls-pemfile        = "2.1"
 rustls-native-certs   = "0.7"
 webpki-roots          = "0.26"
+# `SSLSocket.getpeercert()` returns CPython's decoded-certificate dict
+# (subject/issuer RDNs, validity, SAN, AIA, CRL points); rustls treats certs
+# as opaque DER, so the decode needs a real X.509/ASN.1 parser.
+x509-parser           = "0.16"
 
 # RFC 0024 — real OS threads, GIL, cycle GC, weakrefs.
 parking_lot           = "0.12"

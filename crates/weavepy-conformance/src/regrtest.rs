@@ -288,20 +288,89 @@ pub fn discover_with(
                 continue;
             }
             // Some regression tests are *packages* (`test_dataclasses/`
-            // with an `__init__.py`); keep the `.py` label but run the
-            // package entry point.
-            let pkg_init = dir.join(name.trim_end_matches(".py")).join("__init__.py");
+            // with an `__init__.py`). When the package is a plain
+            // container of `test_*.py` submodules (RFC 0054 WS4), grade
+            // each submodule as its own labelled row —
+            // `cpython/Lib/test/test_asyncio/test_futures.py` — so one
+            // hanging/failing file no longer poisons 30 green siblings
+            // and each row gets its own timeout budget. Packages whose
+            // `load_tests` *composes* something beyond the directory scan
+            // (test_json parametrizes shared cases across C/pure
+            // variants) keep the single package label.
+            let pkg_dir = dir.join(name.trim_end_matches(".py"));
+            let pkg_init = pkg_dir.join("__init__.py");
             if pkg_init.is_file() {
-                out.push(RegrtestFile {
-                    path: pkg_init,
-                    label: format!("cpython/Lib/test/{name}"),
-                });
+                if let Some(children) = package_test_children(&pkg_dir) {
+                    let pkg = name.trim_end_matches(".py");
+                    for child in children {
+                        out.push(RegrtestFile {
+                            path: pkg_dir.join(&child),
+                            label: format!("cpython/Lib/test/{pkg}/{child}"),
+                        });
+                    }
+                } else {
+                    out.push(RegrtestFile {
+                        path: pkg_init,
+                        label: format!("cpython/Lib/test/{name}"),
+                    });
+                }
             }
         }
     }
 
     out.sort_by(|a, b| a.label.cmp(&b.label));
+    out.dedup_by(|a, b| a.label == b.label);
     out
+}
+
+/// Test packages graded one row per `test_*.py` submodule instead of as a
+/// single unit. RFC 0054 WS4 introduced this for `test_asyncio`: its ~40
+/// submodules are independent files where one hanging/failing module
+/// poisoned 30 green siblings and a single timeout budget. The list is
+/// deliberately explicit rather than shape-driven — the rest of the
+/// conformance baseline (`expectations.toml`) is expressed at package
+/// granularity, with statuses and timeout budgets measured for the package
+/// as a unit (`test_multiprocessing_spawn` passes as one 1200s row);
+/// silently expanding every `load_package_tests` delegator would orphan
+/// those rows and re-grade the submodules against default budgets. Add a
+/// package here together with its per-submodule expectations rows.
+const EXPANDED_PACKAGES: &[&str] = &["test_asyncio"];
+
+/// RFC 0054 WS4: one row per `test_*.py` submodule for the packages in
+/// [`EXPANDED_PACKAGES`]. The package must also be a plain delegation to
+/// `test.support.load_package_tests` that passes the caller's `tests`
+/// through unchanged — meaning it is nothing more than a directory of
+/// independently loadable test files.
+fn package_test_children(pkg_dir: &Path) -> Option<Vec<String>> {
+    let pkg_name = pkg_dir.file_name()?.to_str()?;
+    if !EXPANDED_PACKAGES.contains(&pkg_name) {
+        return None;
+    }
+    let init = fs::read_to_string(pkg_dir.join("__init__.py")).ok()?;
+    if !init.contains("load_package_tests") {
+        return None;
+    }
+    let delegates = init.contains("load_package_tests(os.path.dirname(__file__), *args)")
+        || init.contains("load_package_tests(pkg_dir, loader, tests, pattern)");
+    if !delegates {
+        return None;
+    }
+    let mut children: Vec<String> = fs::read_dir(pkg_dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+        .filter(|n| {
+            n.starts_with("test_")
+                && Path::new(n)
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("py"))
+        })
+        .collect();
+    if children.is_empty() {
+        return None;
+    }
+    children.sort();
+    Some(children)
 }
 
 /// Options that control how [`discover_with`] picks up CPython tests.
@@ -708,11 +777,13 @@ fn cpython_lib_dir(file: &RegrtestFile) -> Option<String> {
 }
 
 fn libregrtest_bootstrap(file: &RegrtestFile) -> Option<String> {
+    // Package submodule labels (`test_asyncio/test_futures.py`, RFC 0054
+    // WS4) import as dotted module paths: `test.test_asyncio.test_futures`.
     let name = file
         .label
         .strip_prefix("cpython/Lib/test/")?
         .trim_end_matches(".py")
-        .to_owned();
+        .replace('/', ".");
     let lib_dir = cpython_lib_dir(file)?;
     let path = file.path.display().to_string();
     Some(format!(

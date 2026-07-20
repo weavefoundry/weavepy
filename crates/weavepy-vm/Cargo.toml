@@ -58,9 +58,11 @@ memchr                = { workspace = true }
 libc                  = { workspace = true }
 rustls                = { workspace = true }
 rustls-pki-types      = { workspace = true }
+pkcs8                 = { workspace = true }
 rustls-pemfile        = { workspace = true }
 rustls-native-certs   = { workspace = true }
 webpki-roots          = { workspace = true }
+x509-parser           = { workspace = true }
 
 # RFC 0024 — real OS threads, GIL, cycle GC, weakrefs.
 parking_lot           = { workspace = true }

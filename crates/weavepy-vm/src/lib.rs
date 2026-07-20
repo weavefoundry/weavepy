@@ -284,6 +284,53 @@ fn generator_frame_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
     }
 }
 
+/// Registered with `gc_trace::register_traverse`: the object edges a
+/// Python-visible frame snapshot ([`Object::Frame`]) keeps alive. The
+/// interesting ones are the locals — a traceback frame is the *only*
+/// owner of an unwound activation's locals, and CPython decrefs those
+/// the instant the traceback dies. Deliberately skips `f_globals`
+/// (a module dict; walking it from every traceback frame would fan a
+/// prompt-reap scan out over the whole module namespace).
+fn py_frame_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
+    let Object::Frame(f) = obj else { return };
+    if let Ok(mirror) = f.locals_mirror.try_borrow() {
+        if let Some(m) = mirror.as_ref() {
+            if let Ok(vals) = m.try_borrow() {
+                for v in vals.iter() {
+                    visit(v);
+                }
+            }
+        }
+    }
+    if let Ok(cache) = f.locals_cache.try_borrow() {
+        if let Some(d) = cache.as_ref() {
+            visit(d);
+        }
+    }
+    if let Ok(back) = f.back.try_borrow() {
+        if let Some(b) = back.as_ref() {
+            visit(&Object::Frame(b.clone()));
+        }
+    }
+}
+
+/// Registered with `gc_trace::register_traverse`: a traceback's edges —
+/// its frame and the next link. Lets a prompt-reap cascade rooted at a
+/// dying exception follow `__traceback__` down to the frames' locals,
+/// the way CPython's refcounting frees an entire unwound call chain the
+/// moment the exception dies (asyncio's `create_connection` cancellation
+/// otherwise leaks its transport/SSLContext until a full collection —
+/// test_ssl.test_handshake_timeout_handler_leak).
+fn py_traceback_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
+    let Object::Traceback(tb) = obj else { return };
+    visit(&Object::Frame(tb.frame.clone()));
+    if let Ok(next) = tb.next.try_borrow() {
+        if let Some(n) = next.as_ref() {
+            visit(&Object::Traceback(n.clone()));
+        }
+    }
+}
+
 /// Snapshot the objects in a generator's suspended frame that will
 /// need finalization when the frame is dropped (instances with a
 /// `__del__`). Captured *before* `close()` tears the frame down so
@@ -607,6 +654,19 @@ impl Default for Interpreter {
             // e.g. `obj.x = iter(set_containing_obj)` is collectable
             // (`test_set.test_container_iterator`).
             crate::gc_trace::register_traverse(|o| matches!(o, Object::Iter(_)), iter_traverse);
+            // A dying exception's `__traceback__` is often the sole owner of
+            // the unwound frames — and their locals — below it; CPython's
+            // refcounting frees that whole chain the instant the exception
+            // dies. Teach the prompt-reap cascade (and anything else walking
+            // `traverse_object`) to follow traceback → frame → locals.
+            crate::gc_trace::register_traverse(
+                |o| matches!(o, Object::Traceback(_)),
+                py_traceback_traverse,
+            );
+            crate::gc_trace::register_traverse(
+                |o| matches!(o, Object::Frame(_)),
+                py_frame_traverse,
+            );
         });
         let excepthook = Rc::new(RefCell::new(Object::None));
         let unraisable_hook = Rc::new(RefCell::new(Object::None));
@@ -1685,6 +1745,16 @@ impl Interpreter {
         // hold strong clones; anything beyond that is a live binding and
         // we must leave the object to the cycle collector.
         if !Self::is_refcount_dead(&dropped, 1) {
+            // Still referenced — but possibly only by Rust-side transients
+            // that die between safe points (the same shape the cascade's
+            // child check handles via `note_suspect`, but at the *root*: a
+            // `del obj` racing another thread's in-flight teardown clones).
+            // A weakly-referenced tracked root that misses its reap here is
+            // user-visible — the weakref never clears
+            // (test_threading.test_no_refcycle_through_target under load) —
+            // so enroll borderline cases for the eval loop's re-probe.
+            // Finalizable objects stay excluded, as everywhere on the
+            // suspect path: their `__del__` must not fire from a probe.
             return;
         }
         self.reap_dead_subgraph(dropped);
@@ -1971,6 +2041,19 @@ impl Interpreter {
                             | Object::Instance(_)
                             | Object::Cell(_)
                             | Object::BoundMethod(_)
+                            // A dying exception owns its traceback, and the
+                            // traceback's frames own the unwound activations'
+                            // locals — where a cancelled asyncio call chain
+                            // keeps its transports and SSL contexts. CPython
+                            // frees all of it by refcount the moment the
+                            // exception dies; walk through so the tracked
+                            // descendants become the cascade's next links
+                            // (test_ssl.test_handshake_timeout_handler_leak).
+                            // Live frames (still on the stack / owned by a
+                            // suspended generator) survive the per-child
+                            // refcount guard below unharmed.
+                            | Object::Traceback(_)
+                            | Object::Frame(_)
                     ) && scanned.insert(cid)
                     {
                         if crate::weakref_registry::count_for(cid) > 0 {
@@ -1997,6 +2080,16 @@ impl Interpreter {
                     let sc = gc_trace::strong_count_for(&h.object);
                     if sc <= 1 + weak {
                         work.push(h.object.clone());
+                    } else if sc <= 4 + weak && !Self::object_is_finalizable(&h.object) {
+                        // Still referenced — but only just. The extra refs are
+                        // often Rust-side transients (an in-flight `PyException`
+                        // clone in the task machinery, a native call's argument)
+                        // that die between safe points, where no opcode-level
+                        // reap can see the drop. Enroll for the eval loop's
+                        // suspect re-probe so the object still dies at CPython's
+                        // refcount timing (asyncio cancellation chains:
+                        // test_ssl.test_handshake_timeout_handler_leak).
+                        gc_trace::note_suspect(h.clone());
                     }
                 }
             }
@@ -2440,6 +2533,11 @@ impl Interpreter {
                         | Object::FrozenSet(_)
                         | Object::Instance(_)
                         | Object::Cell(_)
+                        // Follow `__traceback__` → frame → locals: a dying
+                        // exception is routinely the last holder of tracked
+                        // objects that live only in the frames it unwound.
+                        | Object::Traceback(_)
+                        | Object::Frame(_)
                 ) && walk(c, depth - 1, budget)
                 {
                     found = true;
@@ -2663,6 +2761,15 @@ impl Interpreter {
             // drop the last reference to — or resurrect — other finalizables,
             // which the next pass re-evaluates.
             self.run_pending_finalizers();
+            // Cascade through *non*-finalizable tracked objects too: freeing
+            // a `__del__`-bearing object often exposes a chain of plain
+            // containers (transport → protocol → context dicts) that CPython's
+            // refcounting would free in the same instant, and whose survival
+            // would keep further finalizables/weakref targets alive past this
+            // drain (asyncio's SSL leak tests watch such a chain). Only runs
+            // on the rare "a finalizable just died" path, so the O(tracked)
+            // scan stays off the hot loop.
+            gc_trace::reap_dead_acyclic();
         }
         IN_PROMPT_FINALIZE.with(|c| c.set(false));
     }
@@ -3666,8 +3773,21 @@ impl Interpreter {
             // previous instruction must have dropped a reference (`take_maybe_
             // _dead`), so a hot loop that neither allocates `__del__` objects
             // nor drops references pays only two relaxed atomic loads.
-            if gc_trace::has_any_finalizable() && gc_trace::take_maybe_dead() {
-                self.drain_prompt_finalizers();
+            if (gc_trace::has_any_finalizable() || gc_trace::has_suspects())
+                && gc_trace::take_maybe_dead()
+            {
+                if gc_trace::has_any_finalizable() {
+                    self.drain_prompt_finalizers();
+                }
+                // Re-probe cascade-skipped suspects (see `note_suspect`): a
+                // Rust-side transient that pinned one during its cascade has
+                // typically died by now, and CPython would have freed the
+                // object (and everything it anchors) at that instant.
+                if gc_trace::has_suspects() {
+                    for obj in gc_trace::take_dead_suspects() {
+                        self.reap_dead_subgraph(obj);
+                    }
+                }
             } else if crate::vm_singletons::has_pending_finalizers() {
                 // An *untracked* finalizable instance freed by a plain `Rc`
                 // drop (its container temporary died between bytecodes — a
@@ -4523,9 +4643,22 @@ impl Interpreter {
                     None => Object::None,
                 }
             }
-            // Running: the frame is live on the interpreter call stack,
-            // not in the box. Finished: the frame has been dropped.
-            GeneratorState::Running | GeneratorState::Finished => Object::None,
+            // Running: the frame is live on the interpreter call stack, not
+            // in the box — find it by its generator backlink. CPython's
+            // `cr_frame` returns the *executing* frame here, which is what
+            // `Task.get_stack()` reads from inside the running coroutine
+            // (RFC 0054 WS2, test_tasks.test_get_stack).
+            GeneratorState::Running => {
+                for py in self.frame_stack.borrow().iter().rev() {
+                    let owner = py.gen_owner.borrow().as_ref().and_then(|w| w.upgrade());
+                    if owner.is_some_and(|o| Rc::ptr_eq(&o, g)) {
+                        return Object::Frame(py.clone());
+                    }
+                }
+                Object::None
+            }
+            // Finished: the frame has been dropped.
+            GeneratorState::Finished => Object::None,
         }
     }
 
@@ -5892,7 +6025,7 @@ impl Interpreter {
                 let kwargs_obj = if has_kwargs { Some(frame.pop()?) } else { None };
                 let args_obj = frame.pop()?;
                 let callable = frame.pop()?;
-                let mut pos_args: Vec<Object> = match args_obj {
+                let mut pos_args: Vec<Object> = match &args_obj {
                     Object::Tuple(items) => items.iter().cloned().collect(),
                     Object::List(items) => items.borrow().clone(),
                     other => {
@@ -5947,6 +6080,24 @@ impl Interpreter {
                 for (_, v) in &mut kw_pairs {
                     self.reap_call_args(std::slice::from_mut(v));
                 }
+                // The `**kwargs` mapping is (usually) a compiler temporary:
+                // `f(**d)` lowers to `BuildMap 0` + `dict.update(d)`, and
+                // populating that fresh dict GC-tracks it. Dropping it with
+                // a plain Rust drop would leave it refcount-dead but pinned
+                // by its own collector handle — holding a strong clone of
+                // every kwarg value until the next full collection. CPython
+                // frees the temporary (and everything it holds) by refcount
+                // the instant the call returns; run it through the prompt
+                // reaper so e.g. `Thread(target=..., kwargs={'x': obj})`
+                // doesn't pin `obj` past `Thread.join()`
+                // (test_threading.test_no_refcycle_through_target). The
+                // deadness guard inside leaves a still-referenced mapping
+                // untouched, so a user-held dict passed as `**d` is safe.
+                if let Some(kw) = kwargs_obj {
+                    self.prompt_reap_dropped(kw);
+                }
+                // Same for the `*args` sequence temporary.
+                self.prompt_reap_dropped(args_obj);
             }
             OpCode::ReturnValue => {
                 return Ok(StepOutcome::Return(frame.pop()?));
@@ -6882,6 +7033,26 @@ impl Interpreter {
                 // (RFC 0040 deterministic-finalization arc: `test_io` /
                 // `test_subprocess` destructor-timing cases).
                 if let Some((_, pe)) = popped {
+                    // Deconstruct the handler's `PyException` *first*: its
+                    // `context`/`cause` boxes and traceback entries hold
+                    // their own strong clones of the chained exceptions and
+                    // frames. Held across the reap below, they make the
+                    // `__context__` chain look externally referenced and the
+                    // cascade stops at the outer instance — leaving e.g. the
+                    // `CancelledError` behind asyncio's `TimeoutError` (and
+                    // every frame its traceback pins) to the next full
+                    // collection (test_ssl.test_handshake_timeout_handler_leak).
+                    let PyException {
+                        instance,
+                        traceback,
+                        context,
+                        cause,
+                        ..
+                    } = pe;
+                    drop(traceback);
+                    drop(context);
+                    drop(cause);
+                    let pe_instance = instance;
                     // A handled exception is itself an untracked,
                     // non-finalizable leaf, so it slips past the fast-path
                     // early-return in `prompt_reap_dropped`; when it anchors a
@@ -6923,13 +7094,27 @@ impl Interpreter {
                     // arguments after `del call_item`
                     // (test_concurrent_futures
                     // `test_ressources_gced_in_workers`).
-                    let id = crate::weakref_registry::id_of(&pe.instance);
+                    let id = crate::weakref_registry::id_of(&pe_instance);
                     let weakly_observed = crate::weakref_registry::count_for(id) > 0;
+                    // `anchors_tracked_child` too: an *untracked* exception
+                    // can be the last holder of a GC-tracked one — via
+                    // `__cause__`/`__context__`, or via its traceback's
+                    // frames — asyncio's `TimeoutError` raised `from` the
+                    // tracked `CancelledError` whose traceback pins the
+                    // whole cancelled call chain (frames, transports, the
+                    // SSLContext). A plain `Rc` drop frees the outer
+                    // exception but leaves the tracked descendants on their
+                    // collector handles until the next full collection
+                    // (test_ssl.test_handshake_timeout_handler_leak). Only
+                    // probed when the exception is actually about to die,
+                    // so an `except E as e: saved = e` pays nothing.
                     if weakly_observed
                         || gc_trace::is_tracked(id)
-                        || Self::exc_has_finalizable(&pe.instance, 6)
+                        || Self::exc_has_finalizable(&pe_instance, 6)
+                        || (Self::is_refcount_dead(&pe_instance, 1)
+                            && Self::anchors_tracked_child(&pe_instance, 5))
                     {
-                        self.reap_dead_subgraph(pe.instance);
+                        self.reap_dead_subgraph(pe_instance);
                     }
                 }
             }
@@ -7478,15 +7663,29 @@ impl Interpreter {
             funcname: frame.code.name.clone(),
             lineno,
         });
-        let py_frame = self
-            .frame_stack
-            .borrow()
-            .last()
-            .cloned()
+        // The Python-visible frame for this entry must be *this* frame's
+        // snapshot. Generator-family frames cache theirs (stable identity
+        // across resumes) but are not necessarily on `frame_stack` when an
+        // exception is thrown into them (`generator_throw` /
+        // `resume_outer_with_exc`), so preferring the stack top paired one
+        // frame with another frame's `lineno`/`lasti` — deriving
+        // out-of-range `tb_lasti` values that made `traceback`'s
+        // `_get_code_position` StopIterate (RFC 0054: asyncio cancellation
+        // tracebacks crashed `format_exc` with PEP 479 RuntimeError).
+        let py_frame = frame
+            .py_frame
+            .clone()
+            .or_else(|| {
+                self.frame_stack
+                    .borrow()
+                    .last()
+                    .filter(|top| Rc::ptr_eq(&top.code, &frame.code))
+                    .cloned()
+            })
             .unwrap_or_else(|| {
-                // Fall back to a synthetic snapshot if for some
-                // reason the stack is empty (shouldn't happen in
-                // normal flow but keeps the chain non-empty).
+                // Fall back to a synthetic snapshot when neither source
+                // matches (e.g. a not-yet-entered generator frame, or an
+                // empty stack) so the chain stays non-empty.
                 Rc::new(PyFrame {
                     code: frame.code.clone(),
                     globals: frame.globals.clone(),
@@ -12660,13 +12859,28 @@ impl Interpreter {
                 Some((Object::Builtin(b), owner)) if owner.flags.is_builtin => {
                     return (b.call)(std::slice::from_ref(obj));
                 }
-                // A non-function callable supplied by a *user* class
-                // (e.g. `unittest.mock` installs a `Mock` instance as
-                // `__hash__` on the per-instance subclass). CPython
-                // calls `type(obj).__hash__(obj)` — no binding, the
-                // receiver is passed explicitly.
+                // A non-function attribute supplied by a *user* class.
+                // CPython's `lookup_maybe_method`: a descriptor is bound
+                // (`descr.__get__(obj, type)` — mock's lazy `MagicProxy`
+                // materialises its child mock here) and the result is
+                // called with *no* arguments; a plain non-descriptor
+                // callable (the child mock itself, once installed on the
+                // type) is likewise called with no arguments.
                 Some((other, owner)) if !owner.flags.is_builtin => {
-                    return self.call(&other, std::slice::from_ref(obj), &[], globals);
+                    let is_descr = match &other {
+                        Object::Property(_) | Object::StaticMethod(_) | Object::ClassMethod(_) => {
+                            true
+                        }
+                        Object::Instance(d) => d.cls().lookup("__get__").is_some(),
+                        _ => false,
+                    };
+                    let target = if is_descr {
+                        let owner_ty = Object::Type(inst.cls());
+                        self.descriptor_get(&other, obj, &owner_ty)?
+                    } else {
+                        other
+                    };
+                    return self.call(&target, &[], &[], globals);
                 }
                 _ => {}
             }
@@ -16297,6 +16511,19 @@ impl Interpreter {
         // PEP 667: writes made through the suspended frame's `f_locals`
         // take effect when the generator resumes.
         Self::apply_py_frame_locals_writes(&mut frame);
+        // Tag the Python-visible frame with its owning generator *before*
+        // entering: while Running, `gi_frame`/`cr_frame` locates the live
+        // frame on the interpreter stack through this backlink (CPython
+        // returns the executing frame; `Task.get_stack()` reads it from
+        // inside the running coroutine).
+        if frame.py_frame.is_none() {
+            frame.py_frame = Some(self.build_py_frame(&frame, None));
+        }
+        if let Some(py) = &frame.py_frame {
+            if py.gen_owner.borrow().is_none() {
+                *py.gen_owner.borrow_mut() = Some(Rc::downgrade(gen));
+            }
+        }
         let sent_for_frame = if first_resume { None } else { Some(sent) };
         match self.run_until_yield_or_return(&mut frame, sent_for_frame) {
             Ok(FrameOutcome::Yielded(v)) => {
@@ -17062,6 +17289,13 @@ impl Interpreter {
                 )
                 .ok()
             }
+            // A *non-descriptor* instance stored on the type —
+            // `unittest.mock` installs the child mock itself as
+            // `type(m).__eq__` on first use. CPython's slot lookup
+            // (`lookup_maybe_method`) returns such an object as-is, so the
+            // comparison call passes only the other operand; binding would
+            // hand the mock's one-arg `__eq__` side-effect two arguments.
+            Object::Instance(_) => Some(m.clone()),
             _ => Some(Object::BoundMethod(Rc::new(BoundMethod::new(
                 Object::Instance(inst),
                 m,
@@ -20627,6 +20861,8 @@ impl Interpreter {
                     ".format"
                         | ".format_map"
                         | ".gc.collect"
+                        | ".gc.get_objects"
+                        | ".gc.get_referrers"
                         | ".object_getattribute"
                         | ".object_reduce"
                         | ".object_reduce_ex"
@@ -21214,6 +21450,27 @@ impl Interpreter {
                     // drain the queue synchronously, matching CPython
                     // semantics where `gc.collect()` returns *after*
                     // every finaliser has fired.
+                    // Heap introspection must observe CPython's *refcount*
+                    // timing, not our deferred one: an object whose last
+                    // program reference died a few instructions ago may still
+                    // sit on the suspect list (its cascade was skipped while a
+                    // Rust-side transient pinned it — see `note_suspect`).
+                    // CPython would have freed it already, so
+                    // `gc.get_objects()` / `gc.get_referrers()` must not
+                    // enumerate it — worse, the returned snapshot list would
+                    // *pin* the corpse through the caller's inspection loop,
+                    // decaying its probe budget until it is evicted and leaks
+                    // for good (test_taskgroups.test_exception_refcycles_*
+                    // call `gc.get_referrers` right after an `except*` block
+                    // and assert the handled group's ctor list is gone).
+                    // Settle the pending reaps before taking the snapshot.
+                    if matches!(b.name, ".gc.get_objects" | ".gc.get_referrers")
+                        && gc_trace::has_suspects()
+                    {
+                        for obj in gc_trace::take_dead_suspects() {
+                            self.reap_dead_subgraph(obj);
+                        }
+                    }
                     if b.name == ".gc.collect" {
                         // `generation` may be positional or the `generation=`
                         // keyword (CPython accepts both). Validate it the way
@@ -24908,27 +25165,30 @@ impl Interpreter {
             dict.insert(DictKey(Object::from_static("code")), code);
         }
         if is_os_error {
-            // CPython `oserror_init`: the named fields populate only
-            // for the 2..5-positional forms; otherwise they're None.
-            let get = |i: usize| args.get(i).cloned().unwrap_or(Object::None);
-            let populated = (2..=5).contains(&args.len());
-            dict.insert(
-                DictKey(Object::from_static("errno")),
-                if populated { get(0) } else { Object::None },
-            );
-            dict.insert(
-                DictKey(Object::from_static("strerror")),
-                if populated { get(1) } else { Object::None },
-            );
-            dict.insert(
-                DictKey(Object::from_static("filename")),
-                if populated { get(2) } else { Object::None },
-            );
-            dict.insert(DictKey(Object::from_static("winerror")), Object::None);
-            dict.insert(
-                DictKey(Object::from_static("filename2")),
-                if populated { get(4) } else { Object::None },
-            );
+            // CPython `oserror_init`: the named fields populate only for the
+            // 2..5-positional forms. Unpopulated fields stay *out* of the
+            // instance dict — CPython keeps them in C slots, so a subclass's
+            // class attribute (`class Err(OSError): errno = EINVAL`) must
+            // remain visible through ordinary attribute lookup (asyncio's
+            // add_signal_handler error tests). Type-level `None` defaults on
+            // `OSError` cover the genuinely-unset case.
+            if (2..=5).contains(&args.len()) {
+                let get = |i: usize| args.get(i).cloned().unwrap_or(Object::None);
+                for (i, name) in ["errno", "strerror", "filename", "winerror", "filename2"]
+                    .into_iter()
+                    .enumerate()
+                {
+                    // `winerror` is POSIX-None (slot ignored off Windows).
+                    let v = if name == "winerror" {
+                        Object::None
+                    } else {
+                        get(i)
+                    };
+                    if !matches!(v, Object::None) {
+                        dict.insert(DictKey(Object::from_static(name)), v);
+                    }
+                }
+            }
         }
         if mro_has("SyntaxError") {
             // `SyntaxError(msg)` / `SyntaxError(msg, (filename, lineno,

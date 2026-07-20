@@ -1074,13 +1074,17 @@ fn math_prod(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
 }
 
 /// `math.sumprod(p, q)` — sum of the elementwise products of two iterables.
-/// Faithful port of CPython's `math_sumprod_impl`: an exact big-integer
-/// fast path for int/int pairs, a float fast path for float and float/int
-/// pairs, and a general fallback using Python `*`/`+` (so `Fraction`,
-/// `Decimal`, and user types are type-preserved). The three accumulators are
-/// flushed into a single running `total` in sequence, reproducing CPython's
-/// (deliberately lossy) ordering — e.g. `sumprod((-5,-5,10), (1.5, big, big))`
-/// is `0.0`, not `-7.5`.
+/// Faithful port of CPython's `math_sumprod_impl`: a machine-word int fast
+/// path for int/int pairs (finalized on overflow, like CPython's
+/// `PyLong_AsLongAndOverflow` checks), a *correctly-rounded* float fast path for
+/// float and float/int pairs (triple-length compensated accumulation —
+/// Algorithm 5.10 `SumKVert` with K=3 over error-free `2Prod`/`2Sum`
+/// transforms, CPython's `TripleLength`/`tl_fma`), and a general fallback
+/// using Python `*`/`+` (so `Fraction`, `Decimal`, and user types are
+/// type-preserved). Naive `+=` here loses catastrophic-cancellation cases
+/// like `sumprod((-5,-5,10), (1.5, 2**62, 2**61))` — the exact answer is
+/// `-7.5`, which test_math's `test_sumprod_stress` checks against a
+/// `Fraction` oracle.
 fn math_sumprod(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() != 2 {
         return Err(type_error(format!(
@@ -1088,8 +1092,15 @@ fn math_sumprod(args: &[Object]) -> Result<Object, RuntimeError> {
             args.len()
         )));
     }
-    fn is_exact_int(o: &Object) -> bool {
-        matches!(o, Object::Int(_) | Object::Long(_))
+    /// `PyLong_AsLongAndOverflow` analogue: exact-int (bool excluded) to
+    /// machine word, `None` on overflow.
+    fn exact_int_as_i64(o: &Object) -> Option<Option<i64>> {
+        use num_traits::ToPrimitive;
+        match o {
+            Object::Int(i) => Some(Some(*i)),
+            Object::Long(b) => Some(b.to_i64()),
+            _ => None,
+        }
     }
     fn is_int_like(o: &Object) -> bool {
         matches!(o, Object::Int(_) | Object::Long(_) | Object::Bool(_))
@@ -1139,10 +1150,10 @@ fn math_sumprod(args: &[Object]) -> Result<Object, RuntimeError> {
         .map_err(|_| type_error(format!("'{}' object is not iterable", args[1].type_name())))?;
 
     let mut total = Object::Int(0);
-    let mut int_total = num_bigint::BigInt::from(0);
+    let mut int_total = 0_i64;
     let mut int_in_use = false;
     let mut int_enabled = true;
-    let mut flt_total = 0.0_f64;
+    let mut flt_total = TripleLength::ZERO;
     let mut flt_in_use = false;
     let mut flt_enabled = true;
 
@@ -1155,20 +1166,30 @@ fn math_sumprod(args: &[Object]) -> Result<Object, RuntimeError> {
         let finished = p_i.is_none();
 
         if int_enabled {
-            if !finished {
-                let (p, q) = (p_i.as_ref().unwrap(), q_i.as_ref().unwrap());
-                if is_exact_int(p) && is_exact_int(q) {
-                    int_total += p.as_bigint().unwrap() * q.as_bigint().unwrap();
-                    int_in_use = true;
-                    continue;
+            // A machine-word accumulator that finalizes on any overflow —
+            // CPython's `PyLong_AsLongAndOverflow` / `long_add_would_overflow`
+            // path. Falling out of the int path on overflow (instead of
+            // widening to a bigint) is load-bearing: a too-big int product
+            // then flows through the *float* path or the general path, which
+            // is exactly the (deliberately lossy) ordering test_sumprod_stress
+            // pins down.
+            let accumulated = (|| {
+                if finished {
+                    return None;
                 }
+                let (p, q) = (p_i.as_ref().unwrap(), q_i.as_ref().unwrap());
+                let ip = exact_int_as_i64(p)??;
+                let iq = exact_int_as_i64(q)??;
+                int_total = int_total.checked_add(ip.checked_mul(iq)?)?;
+                Some(())
+            })();
+            if accumulated.is_some() {
+                int_in_use = true;
+                continue;
             }
             int_enabled = false;
             if int_in_use {
-                let term = Object::int_from_bigint(std::mem::replace(
-                    &mut int_total,
-                    num_bigint::BigInt::from(0),
-                ));
+                let term = Object::Int(std::mem::take(&mut int_total));
                 total = interp.op_binary(&total, &term, weavepy_compiler::BinOpKind::Add)?;
                 int_in_use = false;
             }
@@ -1177,16 +1198,25 @@ fn math_sumprod(args: &[Object]) -> Result<Object, RuntimeError> {
         if flt_enabled {
             if !finished {
                 let (p, q) = (p_i.as_ref().unwrap(), q_i.as_ref().unwrap());
-                if let Some((fp, fq)) = try_float_pair(p, q)? {
-                    flt_total += fp * fq;
-                    flt_in_use = true;
-                    continue;
+                // An int too large for f64 disables the path (CPython
+                // clears the `PyLong_AsDouble` OverflowError and
+                // finalizes), it does not propagate.
+                if let Ok(Some((fp, fq))) = try_float_pair(p, q) {
+                    let new_total = flt_total.fma(fp, fq);
+                    if new_total.hi.is_finite() {
+                        flt_total = new_total;
+                        flt_in_use = true;
+                        continue;
+                    }
+                    // Non-finite: flush what we have and hand this pair
+                    // (and the rest) to the type-preserving general path,
+                    // exactly like CPython's `finalize_flt_path`.
                 }
             }
             flt_enabled = false;
             if flt_in_use {
-                let term = Object::Float(flt_total);
-                flt_total = 0.0;
+                let term = Object::Float(flt_total.to_f64());
+                flt_total = TripleLength::ZERO;
                 total = interp.op_binary(&total, &term, weavepy_compiler::BinOpKind::Add)?;
                 flt_in_use = false;
             }
@@ -1219,6 +1249,52 @@ fn dl_fast_sum(a: f64, b: f64) -> DoubleLength {
     let x = a + b;
     let y = (a - x) + b;
     DoubleLength { hi: x, lo: y }
+}
+
+/// Algorithm 3.1: error-free transformation of the sum (no magnitude
+/// precondition — Knuth's 2Sum), CPython's `dl_sum`.
+fn dl_sum(a: f64, b: f64) -> DoubleLength {
+    let x = a + b;
+    let z = x - a;
+    let y = (a - (x - z)) + (b - z);
+    DoubleLength { hi: x, lo: y }
+}
+
+/// A triple-length float accumulator `(hi, lo, tiny)` — CPython's
+/// `TripleLength`, used by `math.sumprod`'s correctly-rounded float path.
+#[derive(Clone, Copy)]
+struct TripleLength {
+    hi: f64,
+    lo: f64,
+    tiny: f64,
+}
+
+impl TripleLength {
+    const ZERO: TripleLength = TripleLength {
+        hi: 0.0,
+        lo: 0.0,
+        tiny: 0.0,
+    };
+
+    /// Algorithm 5.10 (`SumKVert` with K=3) folding in an error-free
+    /// product — CPython's `tl_fma`.
+    fn fma(self, x: f64, y: f64) -> TripleLength {
+        let pr = dl_mul(x, y);
+        let sm = dl_sum(self.hi, pr.hi);
+        let r1 = dl_sum(self.lo, pr.lo);
+        let r2 = dl_sum(r1.hi, sm.lo);
+        TripleLength {
+            hi: sm.hi,
+            lo: r2.hi,
+            tiny: self.tiny + r1.lo + r2.lo,
+        }
+    }
+
+    /// CPython's `tl_to_d`: collapse to the correctly-rounded double.
+    fn to_f64(self) -> f64 {
+        let last = dl_sum(self.lo, self.hi);
+        self.tiny + last.lo + last.hi
+    }
 }
 
 /// Algorithm 3.5: error-free product, using the hardware FMA (`mul_add`).

@@ -7081,6 +7081,34 @@ fn b_hash(args: &[Object]) -> Result<Object, RuntimeError> {
     hash_object(one(args, "hash")?)
 }
 
+/// The `co_*` surface of a code object (`code_synthetic_attr`), for
+/// `dir()` over `types.CodeType` and code instances.
+const CODE_ATTR_NAMES: &[&str] = &[
+    "co_argcount",
+    "co_cellvars",
+    "co_code",
+    "co_consts",
+    "co_exceptiontable",
+    "co_filename",
+    "co_firstlineno",
+    "co_flags",
+    "co_freevars",
+    "co_kwonlyargcount",
+    "co_lines",
+    "co_linetable",
+    "co_lnotab",
+    "co_name",
+    "co_names",
+    "co_nlocals",
+    "co_positions",
+    "co_posonlyargcount",
+    "co_qualname",
+    "co_stacksize",
+    "co_varnames",
+    "replace",
+    "_varname_from_oparg",
+];
+
 /// `dir(obj)` — return a sorted list of names available on *obj*.
 /// Mirrors CPython's "best effort" introspection: walk the class
 /// MRO, the instance dict, the module dict, or — for built-ins —
@@ -7112,6 +7140,17 @@ pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
                     if let Object::Str(s) = &k.0 {
                         names.insert(s.to_string());
                     }
+                }
+            }
+            // `types.CodeType`'s getsets are synthesized in `load_attr`
+            // (`code_synthetic_attr`), not stored in the type dict;
+            // `dir(CodeType)` must still list them — `unittest.mock`'s
+            // `AsyncMock` builds its fake `__code__` from
+            // `NonCallableMock(spec_set=CodeType)` and then sets
+            // `co_flags`/`co_argcount` on it.
+            if t.name == "code" && t.flags.is_builtin {
+                for n in CODE_ATTR_NAMES {
+                    names.insert((*n).to_string());
                 }
             }
         }
@@ -7200,6 +7239,11 @@ pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
             // The generator family's methods and introspection attrs are
             // synthesized in `load_attr` rather than stored in type
             // dicts; surface the same names CPython's type dicts hold.
+            if matches!(other, Object::Code(_)) {
+                for n in CODE_ATTR_NAMES {
+                    names.insert((*n).to_string());
+                }
+            }
             let extra: &[&str] = match other {
                 Object::Generator(_) => &[
                     "close",
