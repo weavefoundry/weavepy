@@ -1776,7 +1776,7 @@ fn sock_setsockopt(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Bool(b)) => i64::from(*b),
         _ => 0,
     };
-    let sol_socket = libc::SOL_SOCKET;
+    let sol_socket = libc_sol_socket() as i32;
     // socket2 fast paths for the SOL_SOCKET/TCP options user code reaches
     // for by name; anything else falls through to a raw `setsockopt(2)`
     // so every (level, optname) works — asyncio's dual-stack server sets
@@ -1795,8 +1795,8 @@ fn sock_setsockopt(args: &[Object]) -> Result<Object, RuntimeError> {
     } else if level == sol_socket && optname == libc_so_broadcast() as i32 {
         sock.set_broadcast(want != 0)
             .map_err(|e| io_error_to_py(&e))?;
-    } else if level == libc::IPPROTO_TCP && optname == 1 {
-        // TCP_NODELAY (level IPPROTO_TCP/SOL_TCP).
+    } else if level == 6 && optname == 1 {
+        // TCP_NODELAY (level IPPROTO_TCP/SOL_TCP — 6 on every platform).
         sock.set_nodelay(want != 0)
             .map_err(|e| io_error_to_py(&e))?;
     } else if level == sol_socket && optname == libc_so_sndbuf() as i32 {
@@ -1810,45 +1810,50 @@ fn sock_setsockopt(args: &[Object]) -> Result<Object, RuntimeError> {
         // virtualizes a few SO_* numbers (SO_ERROR/SO_TYPE/SO_*TIMEO are
         // Linux-shaped on every platform), so those must not reach libc
         // verbatim. IP/IPv6/TCP-level options are exported with real
-        // platform values and pass straight through.
-        let fd = raw_fd_of(sock).ok_or_else(closed_socket_error)? as i32;
-        let rc = match value {
-            Some(Object::Bytes(b)) => unsafe {
-                libc::setsockopt(
-                    fd,
-                    level,
-                    optname,
-                    b.as_ptr().cast(),
-                    b.len() as libc::socklen_t,
-                )
-            },
-            Some(Object::ByteArray(b)) => {
-                let buf = b.borrow();
-                unsafe {
+        // platform values and pass straight through. POSIX-only: the
+        // Windows libc crate exposes no setsockopt surface, so unknown
+        // options stay a no-op there (the pre-RFC-0054 behavior).
+        #[cfg(unix)]
+        {
+            let fd = raw_fd_of(sock).ok_or_else(closed_socket_error)? as i32;
+            let rc = match value {
+                Some(Object::Bytes(b)) => unsafe {
                     libc::setsockopt(
                         fd,
                         level,
                         optname,
-                        buf.as_ptr().cast(),
-                        buf.len() as libc::socklen_t,
+                        b.as_ptr().cast(),
+                        b.len() as libc::socklen_t,
                     )
+                },
+                Some(Object::ByteArray(b)) => {
+                    let buf = b.borrow();
+                    unsafe {
+                        libc::setsockopt(
+                            fd,
+                            level,
+                            optname,
+                            buf.as_ptr().cast(),
+                            buf.len() as libc::socklen_t,
+                        )
+                    }
                 }
-            }
-            _ => {
-                let v = want as libc::c_int;
-                unsafe {
-                    libc::setsockopt(
-                        fd,
-                        level,
-                        optname,
-                        std::ptr::addr_of!(v).cast(),
-                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                    )
+                _ => {
+                    let v = want as libc::c_int;
+                    unsafe {
+                        libc::setsockopt(
+                            fd,
+                            level,
+                            optname,
+                            std::ptr::addr_of!(v).cast(),
+                            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                        )
+                    }
                 }
+            };
+            if rc != 0 {
+                return Err(io_error_to_py(&std::io::Error::last_os_error()));
             }
-        };
-        if rc != 0 {
-            return Err(io_error_to_py(&std::io::Error::last_os_error()));
         }
     }
     Ok(Object::None)
@@ -1914,7 +1919,9 @@ fn sock_getsockopt(args: &[Object]) -> Result<Object, RuntimeError> {
     // Off-SOL_SOCKET levels (IP/IPv6/TCP options) read back through a raw
     // `getsockopt(2)` so a set/get round-trip reflects reality — asyncio's
     // dual-stack `create_server` verifies `IPV6_V6ONLY` this way.
-    if level != libc::SOL_SOCKET {
+    // POSIX-only, like the matching setsockopt passthrough above.
+    #[cfg(unix)]
+    if level != libc_sol_socket() as i32 {
         let fd = raw_fd_of(sock).ok_or_else(closed_socket_error)? as i32;
         let mut v: libc::c_int = 0;
         let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
@@ -1978,6 +1985,7 @@ fn sock_fileno(args: &[Object]) -> Result<Object, RuntimeError> {
 
 /// PEP 446 inheritability, read through `FD_CLOEXEC` (inheritable ==
 /// *not* close-on-exec), exactly like `os.get_inheritable`.
+#[cfg(unix)]
 fn sock_get_inheritable(args: &[Object]) -> Result<Object, RuntimeError> {
     let state = state_of(args)?;
     let borrow = state.borrow();
@@ -1990,6 +1998,7 @@ fn sock_get_inheritable(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Bool(flags & libc::FD_CLOEXEC == 0))
 }
 
+#[cfg(unix)]
 fn sock_set_inheritable(args: &[Object]) -> Result<Object, RuntimeError> {
     let state = state_of(args)?;
     let inheritable = args
@@ -2010,6 +2019,21 @@ fn sock_set_inheritable(args: &[Object]) -> Result<Object, RuntimeError> {
     if unsafe { libc::fcntl(fd as i32, libc::F_SETFD, new_flags) } < 0 {
         return Err(io_error_to_py(&std::io::Error::last_os_error()));
     }
+    Ok(Object::None)
+}
+
+/// Non-POSIX stub: there is no `FD_CLOEXEC` (Windows uses
+/// `HANDLE_FLAG_INHERIT`, which the libc crate does not expose). CPython
+/// creates sockets non-inheritable by default, so report that.
+#[cfg(not(unix))]
+fn sock_get_inheritable(args: &[Object]) -> Result<Object, RuntimeError> {
+    let _ = state_of(args)?;
+    Ok(Object::Bool(false))
+}
+
+#[cfg(not(unix))]
+fn sock_set_inheritable(args: &[Object]) -> Result<Object, RuntimeError> {
+    let _ = state_of(args)?;
     Ok(Object::None)
 }
 
@@ -2542,6 +2566,7 @@ fn cmsg_size_arg(arg: Option<&Object>) -> Result<u32, RuntimeError> {
 /// compares `gethostbyname(gethostname())` against the URL's host to
 /// decide "local file" — an env-var placeholder here made every
 /// non-`localhost` file URL look remote (test_urllib2.HandlerTests).
+#[cfg(unix)]
 fn mod_gethostname(_args: &[Object]) -> Result<Object, RuntimeError> {
     let mut buf = [0_u8; 1024];
     let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast::<libc::c_char>(), buf.len()) };
@@ -2551,6 +2576,16 @@ fn mod_gethostname(_args: &[Object]) -> Result<Object, RuntimeError> {
     buf[buf.len() - 1] = 0;
     let cstr = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr().cast::<libc::c_char>()) };
     Ok(Object::from_str(cstr.to_string_lossy().into_owned()))
+}
+
+/// Non-POSIX fallback (the Windows libc crate has no `gethostname`):
+/// the environment's machine name, like the pre-RFC-0054 placeholder.
+#[cfg(not(unix))]
+fn mod_gethostname(_args: &[Object]) -> Result<Object, RuntimeError> {
+    let name = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "localhost".to_string());
+    Ok(Object::from_str(name))
 }
 
 /// `gethostbyname(name)` → IPv4 dotted-quad. CPython's implementation
@@ -2797,6 +2832,7 @@ fn mod_getfqdn(args: &[Object]) -> Result<Object, RuntimeError> {
 /// `0.0.0.0` — dual-stack `create_server(host=None)`, RFC 0054 WS2),
 /// `type=0` enumerates every socktype, and `AI_CANONNAME` populates the
 /// canonical-name column.
+#[cfg(unix)]
 fn mod_getaddrinfo(args: &[Object]) -> Result<Object, RuntimeError> {
     use std::ffi::{CStr, CString};
     let nul_err = || value_error("getaddrinfo: embedded null character in argument");
@@ -2888,6 +2924,67 @@ fn mod_getaddrinfo(args: &[Object]) -> Result<Object, RuntimeError> {
         ]));
     }
     unsafe { libc::freeaddrinfo(res) };
+    Ok(Object::new_list(out))
+}
+
+/// Non-POSIX fallback resolver over `std::net::ToSocketAddrs` (the
+/// Windows libc crate exposes no `addrinfo` surface). Loses the hint
+/// fidelity of the libc path (`AI_PASSIVE` wildcards, `AI_CANONNAME`)
+/// but resolves names/ports correctly — the pre-RFC-0054 behavior.
+#[cfg(not(unix))]
+fn mod_getaddrinfo(args: &[Object]) -> Result<Object, RuntimeError> {
+    let host = match args.first() {
+        Some(Object::Str(s)) => s.to_string(),
+        Some(Object::Bytes(b)) => String::from_utf8_lossy(b).into_owned(),
+        Some(Object::None) | None => "0.0.0.0".to_string(),
+        _ => return Err(type_error("getaddrinfo: host must be str, bytes, or None")),
+    };
+    let port = match args.get(1) {
+        Some(Object::Int(n)) => *n as u16,
+        Some(Object::Str(s)) => s.parse::<u16>().unwrap_or(0),
+        Some(Object::None) | None => 0,
+        _ => return Err(type_error("getaddrinfo: port must be int, str, or None")),
+    };
+    let int_at = |i: usize| match args.get(i) {
+        Some(Object::Int(n)) => *n as i32,
+        _ => 0,
+    };
+    let (family_req, mut kind, proto) = (int_at(2), int_at(3), int_at(4));
+    if kind == 0 {
+        kind = libc_sock_stream() as i32;
+    }
+    let resolved = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|e| io_error_to_py(&e))?;
+    let mut out = Vec::new();
+    for sa in resolved {
+        let fam = match sa {
+            SocketAddr::V4(_) => libc_af_inet() as i32,
+            SocketAddr::V6(_) => libc_af_inet6() as i32,
+        };
+        if family_req != 0 && family_req != fam {
+            continue;
+        }
+        let addr_tuple = match sa {
+            SocketAddr::V4(v4) => Object::new_tuple(vec![
+                Object::from_str(v4.ip().to_string()),
+                Object::Int(i64::from(v4.port())),
+            ]),
+            SocketAddr::V6(v6) => Object::new_tuple(vec![
+                Object::from_str(v6.ip().to_string()),
+                Object::Int(i64::from(v6.port())),
+                Object::Int(i64::from(v6.flowinfo())),
+                Object::Int(i64::from(v6.scope_id())),
+            ]),
+        };
+        out.push(Object::new_tuple(vec![
+            Object::Int(i64::from(fam)),
+            Object::Int(i64::from(kind)),
+            Object::Int(i64::from(proto)),
+            Object::from_static(""),
+            addr_tuple,
+        ]));
+    }
     Ok(Object::new_list(out))
 }
 
