@@ -1541,6 +1541,13 @@ fn make_thread_handle_object(state: Arc<ThreadHandleState>, ident: Object) -> Ob
             return Err(runtime_error("thread not started"));
         }
         if join_state.done.load(Ordering::Acquire) {
+            // Already-finished fast path: still sweep — the worker's teardown
+            // (`del self._target, self._args, self._kwargs` in `Thread.run`)
+            // dropped containers that stay pinned by their cycle-GC handles
+            // until a sweep, and callers expect join() to have restored
+            // CPython's refcount timing regardless of who won the race
+            // (test_threading.test_no_refcycle_through_target).
+            crate::gc_trace::reap_dead_acyclic();
             return Ok(Object::None);
         }
         // Joining a thread from itself would deadlock; CPython's handle

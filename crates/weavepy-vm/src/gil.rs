@@ -170,13 +170,22 @@ pub type PendingCall = Box<dyn FnOnce() + Send + 'static>;
 /// whether bytecode is currently executing, plus the eval
 /// breaker that lets other contexts cooperatively request
 /// attention.
+/// The blocking primitives live behind `Box`es so that
+/// [`reinit_after_fork_in_child`] can replace them with fresh ones at
+/// *new heap addresses*. `parking_lot`'s process-global parking table
+/// is keyed by primitive address: a parent thread parked on the GIL at
+/// `fork(2)` time leaves a ghost queue entry at that address in the
+/// child, and rebuilding the lock in place would let the first
+/// eventual-fairness hand-off give the lock to the vanished thread —
+/// wedging the child forever. Fresh boxes get fresh addresses; the old
+/// boxes are leaked so the poisoned addresses are never reused.
 #[allow(missing_debug_implementations)]
 pub struct GilState {
     /// The reentrant lock guarding bytecode execution within
     /// this interpreter. Acquired at `Interpreter::run_module`
     /// entry, released before blocking I/O via
     /// `allow_threads`, re-acquired on resume.
-    pub lock: GilLock,
+    pub lock: Box<GilLock>,
     /// Eval-loop interrupt set.
     pub breaker: EvalBreaker,
     /// Native id of the OS thread currently holding the lock,
@@ -198,11 +207,11 @@ pub struct GilState {
     /// GIL for a waiter parks here until [`Self::switch_number`]
     /// advances (proving the waiter took the lock), instead of
     /// burning CPU in a `sched_yield` spin.
-    pub switch_mutex: Mutex<()>,
-    pub switch_cond: Condvar,
+    pub switch_mutex: Box<Mutex<()>>,
+    pub switch_cond: Box<Condvar>,
     /// Pending-call queue. `EvalBreaker::pending_calls` mirrors
     /// the size for the hot-path probe.
-    pub pending: Mutex<Vec<PendingCall>>,
+    pub pending: Box<Mutex<Vec<PendingCall>>>,
 }
 
 impl Default for GilState {
@@ -214,14 +223,14 @@ impl Default for GilState {
 impl GilState {
     pub fn new() -> Self {
         Self {
-            lock: GilLock::new(),
+            lock: Box::new(GilLock::new()),
             breaker: EvalBreaker::new(),
             holder: AtomicU64::new(0),
             depth: AtomicI64::new(0),
             switch_number: AtomicU64::new(0),
-            switch_mutex: Mutex::new(()),
-            switch_cond: Condvar::new(),
-            pending: Mutex::new(Vec::new()),
+            switch_mutex: Box::new(Mutex::new(())),
+            switch_cond: Box::new(Condvar::new()),
+            pending: Box::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -241,7 +250,18 @@ impl GilState {
     /// a guard that releases on drop.
     pub fn acquire(self: &Arc<Self>) -> GilGuard {
         self.breaker.add_waiter();
-        let lock_guard = self.lock.lock();
+        // Timed parked waits in a loop rather than a single untimed
+        // `lock()`, mirroring CPython's `take_gil` (`COND_TIMED_WAIT` on
+        // `gil->cond`). Untimed parking is not robust in a `fork(2)`
+        // child: a wakeup lost to the inherited parking-table state
+        // would wedge the waiter forever, whereas a timed wait re-checks
+        // the lock word each interval and self-heals
+        // (`test_threading.test_3_join_in_forked_from_thread`).
+        let lock_guard = loop {
+            if let Some(g) = self.lock.try_lock_for(Duration::from_millis(50)) {
+                break g;
+            }
+        };
         self.breaker.remove_waiter();
         self.note_acquired();
         let me = current_thread_id();
@@ -349,7 +369,12 @@ impl GilGuard {
         drop(guard);
         self.state.holder.store(0, Ordering::Release);
         let result = f();
-        let new_guard = self.state.lock.lock();
+        // Timed-wait loop for fork-child robustness — see `GilState::acquire`.
+        let new_guard = loop {
+            if let Some(g) = self.state.lock.try_lock_for(Duration::from_millis(50)) {
+                break g;
+            }
+        };
         let me = current_thread_id();
         self.state.holder.store(me, Ordering::Release);
         let static_guard: parking_lot::ReentrantMutexGuard<'static, ()> =
@@ -420,19 +445,29 @@ pub fn reinit_after_fork_in_child() {
     for g in held {
         std::mem::forget(g);
     }
-    // 2. Replace the `parking_lot` primitives in place with pristine ones.
-    //    The child is single-threaded here, so nothing races this write;
-    //    every live `Arc<GilState>` clone shares this allocation, so the
-    //    swap is observed consistently. `ptr::write` deliberately does not
-    //    drop the old (poisoned) values.
+    // 2. Replace the `parking_lot` primitives with pristine ones at *fresh
+    //    heap addresses*. `parking_lot` keys its process-global parking
+    //    table by primitive address, and the inherited table still holds
+    //    queue entries for the parent's threads that were parked on these
+    //    primitives at fork time. Rebuilding a primitive in place would
+    //    leave those ghost entries reachable at the same address: the
+    //    first eventual-fairness hand-off (`unpark_one` after ~0.5ms of
+    //    contention) would dequeue a vanished thread's `ThreadParker` and
+    //    hand the lock to nobody, wedging every real waiter forever
+    //    (`test_threading.test_3_join_in_forked_from_thread` — the child's
+    //    `Thread.start()` + the new worker's bootstrap are exactly two
+    //    contending threads). Boxing gives each replacement a new address
+    //    with no parking-table history; `ptr::write` over the box pointers
+    //    leaks the old allocations so the poisoned addresses are never
+    //    reused by another lock.
     // SAFETY: sole surviving thread post-fork; the `Arc` keeps the
     // allocation alive for the duration of the writes.
     let p = Arc::as_ptr(&gil).cast_mut();
     unsafe {
-        std::ptr::write(&raw mut (*p).lock, GilLock::new());
-        std::ptr::write(&raw mut (*p).switch_mutex, Mutex::new(()));
-        std::ptr::write(&raw mut (*p).switch_cond, Condvar::new());
-        std::ptr::write(&raw mut (*p).pending, Mutex::new(Vec::new()));
+        std::ptr::write(&raw mut (*p).lock, Box::new(GilLock::new()));
+        std::ptr::write(&raw mut (*p).switch_mutex, Box::new(Mutex::new(())));
+        std::ptr::write(&raw mut (*p).switch_cond, Box::new(Condvar::new()));
+        std::ptr::write(&raw mut (*p).pending, Box::new(Mutex::new(Vec::new())));
     }
     // 3. Reset the hand-off bookkeeping. No peers remain: no waiters, no
     //    queued pending calls, no drop request.

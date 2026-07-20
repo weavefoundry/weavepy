@@ -1,0 +1,142 @@
+"""RFC 0054 WS3 — asyncio TLS end-to-end over `sslproto` on loopback.
+
+Runs a real `asyncio.start_server(ssl=...)` echo server and an
+`asyncio.open_connection(ssl=...)` client in one event loop, both over
+the rustls-backed `_ssl` with the checked-in self-signed certificate
+(`certs/localhost.*`). On top of the echo round-trip it asserts two
+OpenSSL-shaped surfaces this RFC graduated: the `getpeercert()`
+X.509→dict parse (subject/issuer RDN tuples, serialNumber,
+notBefore/notAfter) and server-side SNI callback dispatch
+(`sni_callback` observes the client's `server_hostname`; dispatched on
+the socket `wrap_socket` path, where the rustls Acceptor two-phase
+handshake lives — asyncio's `wrap_bio` path builds its server config
+at wrap time and has no SNI hook yet).
+"""
+
+import asyncio
+import os
+import socket
+import ssl
+import threading
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CERT = os.path.join(HERE, "certs", "localhost.cert")
+KEY = os.path.join(HERE, "certs", "localhost.key")
+assert os.path.exists(CERT), CERT
+assert os.path.exists(KEY), KEY
+
+sni_seen = []
+
+
+def make_contexts():
+    sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    sctx.load_cert_chain(CERT, KEY)
+
+    cctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    # Trust exactly the fixture cert so verification succeeds and the
+    # peer certificate is exposed to getpeercert().
+    cctx.load_verify_locations(CERT)
+    cctx.check_hostname = False
+    cctx.verify_mode = ssl.CERT_REQUIRED
+    return sctx, cctx
+
+
+async def tls_echo():
+    sctx, cctx = make_contexts()
+
+    async def handle(reader, writer):
+        line = await reader.readline()
+        writer.write(b"S:" + line.upper())
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0, ssl=sctx)
+    host, port = server.sockets[0].getsockname()[:2]
+
+    reader, writer = await asyncio.open_connection(
+        host, port, ssl=cctx, server_hostname="localhost"
+    )
+    ssl_obj = writer.get_extra_info("ssl_object")
+    assert ssl_obj is not None
+
+    # getpeercert(): the verified peer cert parses into CPython's dict shape.
+    cert = ssl_obj.getpeercert()
+    assert isinstance(cert, dict), cert
+    for key in ("subject", "issuer", "serialNumber", "notBefore", "notAfter"):
+        assert key in cert, (key, sorted(cert))
+    subject = dict(pair for rdn in cert["subject"] for pair in rdn)
+    assert subject.get("commonName") == "localhost", cert["subject"]
+    assert isinstance(cert["serialNumber"], str) and cert["serialNumber"]
+
+    # The raw DER form is non-empty and consistent with the parsed dict.
+    der = ssl_obj.getpeercert(binary_form=True)
+    assert isinstance(der, bytes) and len(der) > 100
+
+    writer.write(b"ping over tls\n")
+    await writer.drain()
+    reply = await reader.readline()
+    assert reply == b"S:PING OVER TLS\n", reply
+
+    writer.close()
+    await writer.wait_closed()
+    server.close()
+    await server.wait_closed()
+
+
+async def guarded():
+    await asyncio.wait_for(tls_echo(), timeout=30)
+
+
+asyncio.run(guarded())
+
+
+# ---------------------------------------------------------------------------
+# SNI callback dispatch (socket wrap path): the server context's
+# `sni_callback` observes the client's server_hostname mid-handshake.
+# ---------------------------------------------------------------------------
+
+def sni_dispatch():
+    sctx, cctx = make_contexts()
+
+    def on_sni(sock, server_name, ctx):
+        sni_seen.append(server_name)
+        return None
+
+    sctx.sni_callback = on_sni
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    host, port = listener.getsockname()[:2]
+    server_error = []
+
+    def serve():
+        try:
+            raw, _ = listener.accept()
+            raw.settimeout(15)
+            tls = sctx.wrap_socket(raw, server_side=True)
+            tls.sendall(tls.recv(64))
+            tls.close()
+        except Exception as e:
+            server_error.append(repr(e))
+
+    t = threading.Thread(target=serve)
+    t.start()
+    try:
+        raw = socket.create_connection((host, port), timeout=15)
+        raw.settimeout(15)
+        tls = cctx.wrap_socket(raw, server_hostname="localhost")
+        tls.sendall(b"sni")
+        assert tls.recv(64) == b"sni"
+        tls.close()
+    finally:
+        t.join(timeout=15)
+        listener.close()
+    assert not server_error, server_error
+    assert sni_seen == ["localhost"], sni_seen
+
+
+sni_dispatch()
+
+print("RFC 0054 asyncio TLS echo fixture ok")

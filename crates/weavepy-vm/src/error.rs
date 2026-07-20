@@ -484,9 +484,21 @@ pub fn os_error(message: impl Into<String>) -> RuntimeError {
 /// — e.g. `asyncore`'s `_DISCONNECTED` check, `socket`/`ssl` cleanup paths
 /// — classify it correctly. Mirrors CPython's `OSError(errno, strerror)`.
 pub fn os_error_with_errno(errno: i32, strerror: impl Into<String>) -> RuntimeError {
+    oserror_subclass_with_errno("OSError", errno, strerror)
+}
+
+/// Like [`os_error_with_errno`] but for a specific `OSError` subclass
+/// (`ConnectionResetError`, `ConnectionAbortedError`, …) — CPython picks the
+/// subclass from the errno in `oserror_new`, so a native error that carries
+/// ECONNRESET must both be a `ConnectionResetError` *and* expose the errno.
+pub fn oserror_subclass_with_errno(
+    class: &'static str,
+    errno: i32,
+    strerror: impl Into<String>,
+) -> RuntimeError {
     use crate::object::{DictKey, Object};
     let strerror = strerror.into();
-    let pe = PyException::from_builtin("OSError", strerror.clone());
+    let pe = PyException::from_builtin(class, strerror.clone());
     if let Object::Instance(inst) = &pe.instance {
         let mut d = inst.dict.borrow_mut();
         d.insert(

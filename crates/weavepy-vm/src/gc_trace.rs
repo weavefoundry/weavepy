@@ -473,6 +473,15 @@ impl GcState {
             // index so the per-safe-point sweep scans only them, not the whole
             // tracked population.
             if has_finalizer(&handle.object) {
+                // Seed the clone-count cache from the registry: weakrefs
+                // created *before* tracking (asyncio's WeakValueDictionary
+                // registers a transport before its first cycle-suspect
+                // mutation tracks it) would otherwise make the fast-path
+                // filter read the object as permanently live.
+                handle.weak_clones.store(
+                    crate::weakref_registry::strong_clone_count(new_id),
+                    Ordering::Release,
+                );
                 let mut fin = self.finalizable.borrow_mut();
                 if fin.insert(new_id, handle.clone()).is_none() {
                     self.finalizable_count.fetch_add(1, Ordering::AcqRel);
@@ -500,6 +509,30 @@ impl GcState {
         let Some(handle) = self.index.borrow_mut().remove(&id) else {
             return;
         };
+        // Purge any suspect-list clone of this handle in lock-step: the
+        // suspect entry shares the same `Arc<TrackedHandle>`, so dropping
+        // the index's Arc alone would leave the handle's strong `object`
+        // reference alive in the suspect list (see `remove_suspect`).
+        remove_suspect(id);
+        // CPython's `PyObject_GC_Del` decrements the gen-0 allocation
+        // counter for every GC-tracked object freed, whatever its
+        // generation — so churn workloads whose young objects die by
+        // refcount (asyncio's per-connection task/future/handle webs)
+        // barely advance toward `threshold0` and automatic collections
+        // stay rare. Without the decrement, our prompt-reap untracks kept
+        // the gross allocation count, firing young collections an order
+        // of magnitude more often than CPython — frequently enough to
+        // land inside the window where a pending asyncio task is
+        // reachable only through its own await cycle. Collecting there is
+        // *correct* per CPython semantics (the docs tell users to hold
+        // task references; test_log_destroyed_pending_task relies on it),
+        // but CPython's cadence means its suite never observes it in e.g.
+        // test_streams.test_start_server — match the cadence, not just
+        // the semantics (RFC 0054).
+        {
+            let mut counts = self.counts.borrow_mut();
+            counts[0] = counts[0].saturating_sub(1);
+        }
         // Drop the finalizable-index entry in lock-step with the main index so
         // the cheap prompt-finalization scan never sees a reclaimed object.
         if self.finalizable.borrow_mut().remove(&id).is_some() {
@@ -716,12 +749,24 @@ impl GcState {
         // `Vec::new()` doesn't heap-allocate) and pays only a cheap
         // `strong_count` atomic load per object, skipping the per-id registry
         // lookup via the `weak_clones` fast-path filter.
+        static FIN_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let fin_trace = *FIN_TRACE.get_or_init(|| std::env::var_os("WEAVEPY_FIN_TRACE").is_some());
         let dead: Vec<Arc<TrackedHandle>> = {
             let fin = self.finalizable.borrow();
             let mut out: Vec<Arc<TrackedHandle>> = Vec::new();
             for h in fin.values() {
                 let sc = strong_count_for(&h.object);
                 let cached = h.weak_clones.load(Ordering::Acquire);
+                if fin_trace {
+                    let tn = h.object.type_name_owned();
+                    if tn.contains("Transport") || tn.contains("SSLContext") || tn == "SSLProtocol"
+                    {
+                        eprintln!(
+                            "[FIN-SCAN] {tn} sc={sc} cached={cached} clones={}",
+                            crate::weakref_registry::strong_clone_count(h.id)
+                        );
+                    }
+                }
                 // Fast reject: more strong refs than our handle plus all of its
                 // (cached, upper-bound) weakref clones ⇒ a program reference is
                 // still live. Skip without touching the registry.
@@ -731,6 +776,16 @@ impl GcState {
                 // Borderline: compute the exact live clone count and test for
                 // an effective program refcount of zero.
                 let clones = crate::weakref_registry::strong_clone_count(h.id);
+                // Refresh the cached bound with the exact value. A cleared or
+                // died weakref leaves the cache stale-high, and a stale-high
+                // bound keeps a live object "borderline" — paying this
+                // registry lookup again at *every* reference-dropping safe
+                // point. This scan runs per drop opcode while any finalizable
+                // is live, so a single stale entry costs a whole test run
+                // (statistics.kde's hot sum-loop spent ~40% of its time
+                // here). New weakrefs refresh the cache upward via
+                // `note_weakref_finalizable`, so tightening it is safe.
+                h.weak_clones.store(clones, Ordering::Release);
                 if sc.saturating_sub(1).saturating_sub(clones) == 0 {
                     out.push(h.clone());
                 }
@@ -1205,18 +1260,61 @@ impl GcState {
                 // reached directly through an iterator, so we never re-scan the
                 // whole (already tracked) list population.
                 let parent_is_iter = matches!(&h.object, Object::Iter(_));
+                let parent_is_frame = matches!(&h.object, Object::Frame(_));
                 traverse_object(&h.object, &mut |child| {
                     let promote = match child {
                         // Dict views join iterators here: they're not
                         // persistently tracked, but a cycle can route
                         // through one (`obj.v = container.keys()` with
                         // `container = {obj: 1}` — test_container_iterator).
+                        // Bound methods likewise (CPython GC-tracks
+                        // `method`): a stored `self.cb` closes the classic
+                        // callback cycle — asyncio's `future._callbacks →
+                        // task.__wakeup → task → future` (RFC 0054,
+                        // test_tasks.test_log_destroyed_pending_task).
+                        // Closure cells likewise (CPython GC-tracks `cell`):
+                        // a nested function that calls itself
+                        // (`def inner(): ... inner()`) closes the cycle
+                        // `function → cell → function`, and the cell's edge
+                        // must be subtracted or the function always looks
+                        // externally reachable (RFC 0054: asyncio's
+                        // `iter_one`-style recursive callbacks pin the async
+                        // generator they iterate, test_base_events'
+                        // asyncgen-finalization-by-gc tests).
+                        // Tracebacks and frames likewise (CPython GC-tracks
+                        // both): an exception object owns `__traceback__ →
+                        // frame → f_locals`, and a local that references the
+                        // exception again (`except* E as excs` materialises
+                        // the handled group in the frame's locals mirror)
+                        // closes a cycle whose edges live entirely in these
+                        // untracked node types (RFC 0054,
+                        // test_taskgroups.test_exception_refcycles_*).
                         Object::Iter(_)
                         | Object::Tuple(_)
                         | Object::FrozenSet(_)
                         | Object::DictView(_)
-                        | Object::Slice(_) => true,
+                        | Object::Slice(_)
+                        | Object::Cell(_)
+                        | Object::Traceback(_)
+                        | Object::Frame(_)
+                        | Object::BoundMethod(_) => true,
                         Object::List(_) => parent_is_iter,
+                        // An *exception* instance is untracked until a
+                        // mutation marks it a cycle suspect, yet `raise X
+                        // from …` inside an `except` builds the classic
+                        // `group → __context__ exc → __traceback__ → frame →
+                        // f_locals → group` loop where the chained exception
+                        // is the only instance node. Promote untracked
+                        // exceptions so their `__context__`/`__cause__`/
+                        // traceback edges are subtracted (RFC 0054,
+                        // test_taskgroups.test_exception_refcycles_*).
+                        Object::Instance(i) => i.cls().flags.is_exception,
+                        // A frame's `f_locals` cache is an internal,
+                        // untracked dict; it carries the frame's only
+                        // object-graph edges to the locals (the `eg` in the
+                        // cycle above), so it joins the walk when reached
+                        // through its frame.
+                        Object::Dict(_) => parent_is_frame,
                         _ => false,
                     };
                     if !promote {
@@ -2188,6 +2286,29 @@ pub fn track(obj: Object) {
     with_state(|s| s.track(obj));
 }
 
+/// Track `obj` *and* enroll it in the prompt-finalization index even though
+/// it has no `__del__`/weakref callback. For handle-pinned glue objects whose
+/// CPython counterpart dies by refcount with observable timing — e.g.
+/// `_asyncio.FutureIter`, whose strong ref on its Future would otherwise keep
+/// a finished Task (and its coroutine frame, and every local in it) alive
+/// until the next cyclic collection (test_ssl's weakref-based leak tests).
+/// The prompt sweep sees the object with no pending finalizer and simply
+/// untracks it the moment its last program reference drops, cascading the
+/// frees exactly like CPython's refcounting.
+pub fn track_prompt_reclaim(obj: Object) {
+    let id = crate::weakref_registry::id_of(&obj);
+    with_state(|s| {
+        s.track(obj);
+        let handle = s.index.borrow().get(&id).cloned();
+        if let Some(h) = handle {
+            let mut fin = s.finalizable.borrow_mut();
+            if fin.insert(id, h).is_none() {
+                s.finalizable_count.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    });
+}
+
 /// True while a collection (mark/sweep or weakref-only pass) is in
 /// flight on the process-global collector. Used by the capi boundary to
 /// suppress side-effectful bookkeeping (e.g. the C-drop reap queue) for
@@ -2350,6 +2471,133 @@ pub fn reap_dead_acyclic() -> usize {
 #[inline]
 pub fn has_any_finalizable() -> bool {
     with_state(GcState::has_any_finalizable)
+}
+
+/// Prompt-reap *suspects* (RFC 0054): tracked, non-finalizable objects a
+/// [`Interpreter::reap_dead_subgraph`] cascade visited but had to skip
+/// because something still referenced them — typically a Rust-side
+/// transient (an in-flight `PyException` clone, a native call's argument)
+/// that dies a few opcodes later, *between* safe points, leaving the object
+/// pinned by its own collector handle until the next full collection.
+/// CPython's refcounting frees such objects the instant the transient dies;
+/// re-probing the (tiny) suspect list at drop safe points recovers that
+/// timing. Each entry carries a probe budget so a genuinely long-lived
+/// skipped object (the event loop itself) stops costing anything after a
+/// bounded number of checks.
+///
+/// The canonical chain: asyncio's `wait_for` timeout leaves a
+/// `CancelledError` (skipped mid-cascade while the task machinery still
+/// held a clone) whose traceback pins the cancelled `create_connection`
+/// frames — and through their locals the SSL transport, protocol, and
+/// `SSLContext` that test_ssl's leak tests watch via weakref.
+const SUSPECT_CAP: usize = 256;
+const SUSPECT_BUDGET: u8 = 64;
+static SUSPECTS: parking_lot::Mutex<Vec<(Arc<TrackedHandle>, u8)>> =
+    parking_lot::Mutex::new(Vec::new());
+static SUSPECT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Enroll a cascade-skipped tracked object for later deadness re-probes.
+/// Deduplicated; silently dropped when the list is full (the next full
+/// collection reclaims it instead).
+pub fn note_suspect(h: Arc<TrackedHandle>) {
+    static NO_SUSPECTS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *NO_SUSPECTS.get_or_init(|| std::env::var_os("WEAVEPY_NO_SUSPECTS").is_some()) {
+        return;
+    }
+    let mut s = SUSPECTS.lock();
+    if s.iter().any(|(e, _)| e.id == h.id) {
+        return;
+    }
+    // Refresh the handle's cached weakref-clone upper bound once at
+    // enrollment so the re-probe loop can fast-reject live suspects with
+    // two atomic loads instead of a registry lookup per safe point (see
+    // `take_dead_suspects` — the probe runs at *every* reference-dropping
+    // opcode, and a hot loop that keeps re-enrolling a long-lived object
+    // like `statistics.kde`'s sample list would otherwise spend ~40% of
+    // its time in `strong_clone_count`).
+    h.weak_clones.store(
+        crate::weakref_registry::strong_clone_count(h.id),
+        Ordering::Release,
+    );
+    if s.len() >= SUSPECT_CAP {
+        // Full: evict the most-probed entry (lowest remaining budget) —
+        // it has had the most chances to die and is the closest to
+        // aging out anyway. Silently dropping the *new* suspect instead
+        // loses the one object whose last real reference just died
+        // (asyncio's wait_for cancellation chain arrived after ~200
+        // module-teardown stragglers and was never re-probed, pinning
+        // the Timeout→Task→frame web the test_ssl leak tests watch).
+        match s
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (_, b))| *b)
+            .map(|(i, _)| i)
+        {
+            Some(i) => {
+                s.swap_remove(i);
+            }
+            None => return,
+        }
+    }
+    s.push((h, SUSPECT_BUDGET));
+    SUSPECT_COUNT.store(s.len(), Ordering::Release);
+}
+
+/// Cheap gate for the eval loop's safe point.
+#[inline]
+pub fn has_suspects() -> bool {
+    SUSPECT_COUNT.load(Ordering::Relaxed) > 0
+}
+
+/// Drop the suspect entry for `id`, if any. Called in lock-step with
+/// `untrack_id`: a suspect's `Arc<TrackedHandle>` is a *clone of the
+/// index's handle*, so removing the object from the index alone leaves
+/// the handle — and its strong `object` reference — alive in the suspect
+/// list until the next re-probe. That stale strong clone pins an object
+/// the prompt-reap cascade just untracked and expected to free by `Rc`
+/// drop, deferring everything it anchors (`unittest`'s
+/// `_AssertRaisesContext` → stored exception → `AttributeError.obj` io
+/// temporary whose `close()` must fire at `with`-exit —
+/// `test_io.test_error_through_destructor`) to a later safe point.
+pub fn remove_suspect(id: ObjectId) {
+    if SUSPECT_COUNT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let mut s = SUSPECTS.lock();
+    s.retain(|(h, _)| h.id != id);
+    SUSPECT_COUNT.store(s.len(), Ordering::Release);
+}
+
+/// Re-probe the suspect list: return the objects that are now dead in
+/// refcount terms (nothing beyond the GC handle and weakref strong clones
+/// holds them) for the caller to run through the prompt-reap cascade, and
+/// decay the probe budget of the rest.
+pub fn take_dead_suspects() -> Vec<Object> {
+    let mut out = Vec::new();
+    let mut s = SUSPECTS.lock();
+    s.retain_mut(|(h, budget)| {
+        if !is_tracked(h.id) {
+            return false; // already reclaimed elsewhere
+        }
+        // Fast reject via the cached weakref-clone upper bound (refreshed
+        // at enrollment): more strong refs than the handle plus every
+        // possible weakref clone ⇒ a program reference is still live, no
+        // registry lookup needed. Only borderline counts pay for the
+        // exact `strong_clone_count`.
+        let sc = strong_count_for(&h.object);
+        let cached = h.weak_clones.load(Ordering::Acquire);
+        if sc <= 1 + cached {
+            let weak = crate::weakref_registry::strong_clone_count(h.id);
+            if sc <= 1 + weak {
+                out.push(h.object.clone());
+                return false;
+            }
+        }
+        *budget -= 1;
+        *budget > 0
+    });
+    SUSPECT_COUNT.store(s.len(), Ordering::Release);
+    out
 }
 
 thread_local! {

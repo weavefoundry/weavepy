@@ -585,6 +585,17 @@ fn make_ref_object(target: Object, callback: Option<Object>, kind_tag: u8) -> Ob
     // the next cyclic collection. Enroll the (tracked) referent in the cycle
     // GC's prompt-finalization index so a refcount-death between bytecodes
     // fires it — matching CPython's `tp_dealloc` weakref clear.
+    //
+    // Callback-*less* refs must clear promptly too (leak tests observe
+    // `wr()` going `None` right after the owning scope exits — test_ssl's
+    // SSLContext checks), but NOT via this index: enrolling every weakref
+    // target would leave `has_any_finalizable()` permanently true from the
+    // interpreter-boot weakrefs (`abc`/`typing` registries), turning the
+    // eval loop's drop safe point into a full index scan on every
+    // reference-dropping opcode (a 3-4x interpreter-wide slowdown, RFC 0054
+    // WS5 re-measure). They are served by the opcode-level prompt-reap
+    // cascade (`reap_dead_subgraph` clears weakrefs) plus the suspect
+    // re-probe for deaths inside Rust transients.
     if callback.is_some() {
         crate::gc_trace::note_weakref_finalizable(target_id);
     }

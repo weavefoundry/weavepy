@@ -101,11 +101,11 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         );
         d.insert(
             DictKey(Object::from_static("get_objects")),
-            bkw("get_objects", get_objects),
+            bkw(".gc.get_objects", get_objects),
         );
         d.insert(
             DictKey(Object::from_static("get_referrers")),
-            b("get_referrers", get_referrers),
+            b(".gc.get_referrers", get_referrers),
         );
         d.insert(
             DictKey(Object::from_static("get_referents")),
@@ -114,6 +114,14 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         d.insert(
             DictKey(Object::from_static("is_tracked")),
             b("is_tracked", is_tracked),
+        );
+        d.insert(
+            DictKey(Object::from_static("_strong_count")),
+            b("_strong_count", strong_count_dbg),
+        );
+        d.insert(
+            DictKey(Object::from_static("_find_paths")),
+            b("_find_paths", find_paths_dbg),
         );
         d.insert(
             DictKey(Object::from_static("is_finalized")),
@@ -303,6 +311,67 @@ fn get_referents(args: &[Object]) -> Result<Object, RuntimeError> {
         gc_trace::traverse_object(arg, &mut |child| out.push(child.clone()));
     }
     Ok(Object::new_list(out))
+}
+
+/// Debug: find reference paths from tracked roots to `target`, walking
+/// through untracked intermediates (frames, tracebacks, containers).
+/// Returns a list of "RootType -> Mid -> ... -> target" strings.
+fn find_paths_dbg(args: &[Object]) -> Result<Object, RuntimeError> {
+    let target = args
+        .first()
+        .ok_or_else(|| type_error("_find_paths() requires 1 argument"))?;
+    let target_id = id_of(target);
+    let roots = gc_trace::with_state(|s| s.snapshot(None));
+    let mut out: Vec<Object> = Vec::new();
+    for root in &roots {
+        if id_of(root) == target_id {
+            continue;
+        }
+        // DFS through untracked children only.
+        let mut stack: Vec<(Object, Vec<String>)> =
+            vec![(root.clone(), vec![root.type_name_owned()])];
+        let mut seen = std::collections::HashSet::new();
+        while let Some((node, path)) = stack.pop() {
+            if path.len() > 8 {
+                continue;
+            }
+            let mut hits = Vec::new();
+            gc_trace::traverse_object(&node, &mut |child| {
+                hits.push(child.clone());
+            });
+            for child in hits {
+                let cid = id_of(&child);
+                if cid == target_id {
+                    let mut p = path.clone();
+                    p.push("TARGET".to_owned());
+                    out.push(Object::from_str(p.join(" -> ")));
+                    continue;
+                }
+                if gc_trace::is_tracked(cid) || !seen.insert(cid) {
+                    continue;
+                }
+                let mut p = path.clone();
+                p.push(child.type_name_owned());
+                stack.push((child, p));
+            }
+        }
+        if out.len() > 40 {
+            break;
+        }
+    }
+    Ok(Object::new_list(out))
+}
+
+fn strong_count_dbg(args: &[Object]) -> Result<Object, RuntimeError> {
+    let target = args
+        .first()
+        .ok_or_else(|| type_error("_strong_count() requires 1 argument"))?;
+    let strong = gc_trace::strong_count_for(target) as i64;
+    let weak = crate::weakref_registry::strong_clone_count(id_of(target)) as i64;
+    Ok(Object::new_tuple(vec![
+        Object::Int(strong),
+        Object::Int(weak),
+    ]))
 }
 
 fn is_tracked(args: &[Object]) -> Result<Object, RuntimeError> {

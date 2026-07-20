@@ -4244,7 +4244,17 @@ impl Compiler {
             self.emit(OpCode::LoadFast, orig_idx);
             // [list, orig]
             self.emit(OpCode::PrepReraiseStar, 0);
-            // [result]
+            // [result]. The synthetic locals are dead now — clear them.
+            // CPython keeps these values on the *stack* and consumes them
+            // here; leaving them in fastlocals would pin the original group
+            // (and its `[excs]` ctor payload) for the rest of the frame's
+            // life, defeating the refcount-timed release the taskgroups
+            // refcycle tests observe (`gc.get_referrers(exc) == []` right
+            // after the `except*` block — RFC 0054).
+            for idx in [orig_idx, rem_idx, raised_idx] {
+                self.emit(OpCode::LoadConst, none_idx);
+                self.emit(OpCode::StoreFast, idx);
+            }
             self.emit(OpCode::CopyTop, 0);
             self.emit(OpCode::LoadConst, none_idx);
             self.emit(OpCode::IsOp, 0);

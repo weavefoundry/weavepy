@@ -1592,7 +1592,37 @@ fn make_default_new() -> Object {
         name: "__new__",
         binds_instance: true,
         call: Box::new(object_new),
-        call_kw: None,
+        // CPython's `object.__new__(cls, *args, **kwargs)` ignores excess
+        // arguments when `cls` overrides `__init__` but not `__new__`
+        // (`tp_new_wrapper` → `excess_args` rules): `Future.__new__(Future,
+        // loop=loop)` allocates uninitialized (RFC 0054 WS6,
+        // test_futures.test_uninitialized). Without an overridden
+        // `__init__` the excess is an error, as on CPython.
+        call_kw: Some(Box::new(|args, kwargs| {
+            if kwargs.is_empty() {
+                return object_new(args);
+            }
+            let overrides_init = match args.first() {
+                Some(Object::Type(cls)) => cls
+                    .mro
+                    .borrow()
+                    .iter()
+                    .take_while(|t| t.name != "object")
+                    .any(|t| {
+                        t.dict
+                            .borrow()
+                            .get(&DictKey(Object::from_static("__init__")))
+                            .is_some()
+                    }),
+                _ => false,
+            };
+            if !overrides_init {
+                return Err(crate::error::type_error(
+                    "object.__new__() takes exactly one argument (the type to instantiate)",
+                ));
+            }
+            object_new(&args[..args.len().min(1)])
+        })),
     }))))
 }
 
@@ -2772,11 +2802,22 @@ fn install_os_error_init(os_error: &Rc<TypeObject>) {
                     Object::None
                 }
             };
-            dict.insert(DictKey(Object::from_static("errno")), pick(0));
-            dict.insert(DictKey(Object::from_static("strerror")), pick(1));
-            dict.insert(DictKey(Object::from_static("filename")), pick(2));
-            dict.insert(DictKey(Object::from_static("winerror")), pick(3));
-            dict.insert(DictKey(Object::from_static("filename2")), pick(4));
+            // Only set fields that have real values. CPython keeps these in
+            // C slots, so a subclass's *class attribute* (`class Err(OSError):
+            // errno = EINVAL`) is what attribute lookup finds when the slot
+            // was never populated — writing `None` into the instance dict
+            // here would shadow it (asyncio's add_signal_handler tests build
+            // exactly such subclasses). The type-level `None` defaults below
+            // cover the genuinely-unset case.
+            for (i, name) in ["errno", "strerror", "filename", "winerror", "filename2"]
+                .into_iter()
+                .enumerate()
+            {
+                let v = pick(i);
+                if !matches!(v, Object::None) {
+                    dict.insert(DictKey(Object::from_static(name)), v);
+                }
+            }
         }
         Ok(Object::None)
     }
@@ -3602,7 +3643,6 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
 
 pub fn make_exception_with_class(class: Rc<TypeObject>, message: impl Into<String>) -> Object {
     use crate::types::PyInstance;
-    let is_os = is_subclass_by_name(&class, "OSError");
     let is_syntax = is_subclass_by_name(&class, "SyntaxError");
     let is_stop_iteration = is_subclass_by_name(&class, "StopIteration");
     let is_import = is_subclass_by_name(&class, "ImportError");
@@ -3642,15 +3682,13 @@ pub fn make_exception_with_class(class: Rc<TypeObject>, message: impl Into<Strin
             Object::Bool(false),
         );
         dict.insert(DictKey(Object::from_static("__traceback__")), Object::None);
-        if is_os {
-            // OSError attributes — populated to None when we raise
-            // from Rust so callers can still ask `exc.errno` without
-            // an AttributeError. Real values land here through the
-            // `OSError(errno, strerror, ...)` __init__ in Python.
-            for name in ["errno", "strerror", "filename", "winerror", "filename2"] {
-                dict.insert(DictKey(Object::from_static(name)), Object::None);
-            }
-        }
+        // OSError named fields (`errno`/`strerror`/…) are *not* seeded on
+        // the instance: the `OSError` type carries `None` defaults at the
+        // class level, and instance-dict entries here would shadow a
+        // subclass's own class attribute (`class Err(OSError): errno =
+        // EINVAL`, raised bare via `raise Err` — asyncio's
+        // add_signal_handler error tests read `exc.errno` through the
+        // class).
         if is_import {
             // ImportError/ModuleNotFoundError expose `msg` (the message
             // string). CPython always defines the slot; a Rust-raised

@@ -5019,6 +5019,30 @@ fn bw_writable_dst(
     }
 }
 
+/// Extract a writable byte destination (`bytearray`, writable `memoryview`,
+/// or PEP 688 `__buffer__` exporter) as `(storage, start, capacity)`. Shared
+/// by `readinto`-shaped consumers outside this module (`_socket.recv_into`,
+/// `_ssl` reads); `what` names the operation for the error message.
+pub(crate) fn writable_buffer_dst(
+    arg: Option<&Object>,
+    what: &str,
+) -> Result<(Rc<RefCell<Vec<u8>>>, usize, usize), RuntimeError> {
+    let err = || {
+        Err(type_error(format!(
+            "{what}() argument must be a writable bytes-like object"
+        )))
+    };
+    match arg {
+        Some(Object::ByteArray(dst)) => {
+            let cap = dst.borrow().len();
+            Ok((dst.clone(), 0, cap))
+        }
+        Some(Object::MemoryView(mv)) => memoryview_writable_buffer(mv),
+        Some(other) => instance_writable_buffer(other).unwrap_or_else(err),
+        None => err(),
+    }
+}
+
 /// Extract the backing writable `bytearray` storage from a memoryview, erroring
 /// if it is released, read-only, non-contiguous, or not bytearray-backed.
 fn memoryview_writable_buffer(

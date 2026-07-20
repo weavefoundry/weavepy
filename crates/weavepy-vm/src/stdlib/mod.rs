@@ -17,6 +17,7 @@ use crate::import::{FrozenSource, ModuleCache};
 
 pub mod ast_convert;
 pub mod ast_mod;
+pub mod asyncio_mod;
 pub mod binascii_mod;
 pub mod bisect_accel;
 pub mod bz2_mod;
@@ -111,6 +112,11 @@ pub fn register_all(cache: &ModuleCache) {
     // a pure-Python fallback, exactly like CPython, so `test_json` can build
     // its C-vs-Python test pairs (`import_fresh_module('json', blocked=['_json'])`).
     cache.register_builtin("_json", json_accel::build);
+    // RFC 0054 WS1 — the asyncio C accelerator: native `Future`/`Task`,
+    // the per-thread running-loop slot, and the task registries. The frozen
+    // `asyncio/{futures,tasks,events}.py` adoption hooks bind these exactly
+    // as CPython's do.
+    cache.register_builtin("_asyncio", asyncio_mod::build);
     cache.register_builtin("time", time::build);
     cache.register_builtin("_thread", thread_real::build);
     cache.register_builtin("errno", errno_mod::build);
@@ -1101,6 +1107,11 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "urllib.request",
             source: include_str!("python/urllib/request.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "urllib.robotparser",
+            source: include_str!("python/urllib/robotparser.py"),
             is_package: false,
         },
         // RFC 0042 WS3 — `http`, vendored verbatim from
