@@ -61,8 +61,8 @@ status = "fail"
 reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: 0 != -1"
 
 [tests."cpython/Lib/test/test__osx_support.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): % (cc…[truncated]"
+status = "pass"
+reason = "measured (RFC 0055): passes end-to-end — the sysconfig/os.environ fidelity work landed the compiler-variable customization paths."
 
 [tests."cpython/Lib/test/test_abc.py"]
 status = "pass"
@@ -218,12 +218,12 @@ status = "pass"
 reason = "measured (RFC 0053 WS3): verbatim `cmd.py` + the doctest-machinery fidelity work (real tracebacks through `<frozen …>`-free files) clear the CmdPrintExceptionClass doctest."
 
 [tests."cpython/Lib/test/test_cmd_line.py"]
-status = "fail"
-reason = "measured (RFC 0050 WS5 re-baseline): crash-free — the env.rs Rust panic from the wave-5 baseline is gone. 60 run, 31 residual failures across CLI surface gaps (-X option matrix, stdin/tty prompts, warning-option plumbing), no panics or InternalErrors."
+status = "pass"
+reason = "measured (RFC 0055 WS4): passes end-to-end — flag/env plumbing (-R/-d/-X int_max_str_digits/cpu_count/gil, PYTHONDEBUG et al.), hash randomization, unbuffered stdio, shutdown-flush exit 120, PEP 383 argv, stdlib shadowing in isolated mode, -i namespace-sharing REPL, displayhook encoding. 13 skips are CPython-implementation-detail cases."
 
 [tests."cpython/Lib/test/test_cmd_line_script.py"]
-status = "timeout"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): killed after 60s"
+status = "pass"
+reason = "measured (RFC 0055 WS4): passes end-to-end — script/dir/zip/pyc execution dunders (__cached__/__package__/__loader__/abs __file__), -m via runpy with '-m' argv0 placeholder, sys.path[0] semantics ('' for -c/stdin, post-site insertion, -I dir execution), CPython-shaped -m error messages, SystemExit(exception) str(), can't-open-file diagnostics, /dev/fd single-read, and null-byte/f-string/escape SyntaxError caret shapes."
 
 [tests."cpython/Lib/test/test_code.py"]
 status = "fail"
@@ -423,12 +423,12 @@ timeout_seconds = 180
 reason = "email: policy.utf8 + EmailMessage.iter_attachments"
 
 [tests."cpython/Lib/test/test_embed.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AttributeError: 'tuple' object has no attribute 'major'"
+status = "skip"
+reason = "principled skip (RFC 0055 WS4): exercises CPython's embedding artifacts — the `_testembed` binary built by CPython's own build system and Py_InitializeFromConfig C API shapes. Not meaningful for a Rust interpreter; same policy as the tkinter family."
 
 [tests."cpython/Lib/test/test_ensurepip.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): File '<frozen unittest.mock>', line 1…[truncated]"
+status = "pass"
+reason = "measured (RFC 0055 WS2): passes end-to-end over the verbatim ensurepip bootstrapping the bundled pip wheel."
 
 [tests."cpython/Lib/test/test_enum.py"]
 status = "pass"
@@ -555,8 +555,8 @@ status = "pass"
 reason = "measured: passes end-to-end after vendoring CPython's `getopt` verbatim (frozen module) together with the `gettext` fallback it imports for localized error messages."
 
 [tests."cpython/Lib/test/test_getpath.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): FileNotFoundError: [Errno 2] No such file or directory: '/Users/owencarey/Documents/weavefoundry/weavepy/vendor/cpython/Modules/getpath.py'"
+status = "skip"
+reason = "principled skip (RFC 0055 WS4): interprets CPython's `Modules/getpath.py` (a build artifact outside `Lib/`, absent from the vendored tree) under a mock host to test CPython's own path-computation script. WeavePy's path initialization is tested behaviorally via test_sysconfig/test_venv/test_site instead."
 
 [tests."cpython/Lib/test/test_gettext.py"]
 status = "pass"
@@ -645,6 +645,10 @@ reason = "RFC 0037 WS3/WS9: passes end-to-end (47 tests, 7 skipped). int() strin
 status = "pass"
 timeout_seconds = 600
 reason = "measured (RFC 0040 WS7 — acceptance bar met): passes end-to-end — 661 run, 0F/0E, 36 skip (up from 655/3F/3E, itself up from 330/209F/88E). The full `BufferedRandom` read/write interleaving, `bufsize=0`→`RawIOBase`, binary line-buffering, `TextIOWrapper` reconfigure/`open(fd:int)`, and the entire `tell()`/`seek()` cookie surface pass. WTF-8 + arg-coercion closed the constructor/reconfigure cluster: a lone-surrogate `encoding`/`errors` (`Object::WStr`) raises `UnicodeEncodeError`, `newline=<surrogate>` raises `ValueError`, `reconfigure(encoding='locale\\0')` truncates at NUL to `LookupError`, `reconfigure(line_buffering=2**1000)` raises `OverflowError`, and a `surrogateescape`-decoded `read()` yields real lone surrogates. The final 6 residuals all closed this wave: (1) `test_seek_and_tell` (C) — the native `TextIOWrapper` now drives an arbitrary *Python* `IncrementalDecoder` whose one-shot `decode` is `None` (the `test_decoder` codec) via the getstate/setstate cookie protocol (`PyFile::{read,tell,seek}_text_incr`, packing the decoder snapshot into a BigInt cookie); (2) `test_slow_close_from_thread` ×2 — a real cross-thread buffered-stream lock serialises a concurrent `write()` behind an in-progress `close()` then raises `ValueError`; (3) `test_abcs` (C) — the native `io.IOBase` family are now `abc.ABCMeta` instances; (4) `test_seek_with_encoder_state` ×2 (C+Py) — a faithful JIS X 0213:2004 `euc_jis_2004` CJK codec (frozen `_codec_euc_jis_2004`, validated byte-for-byte against CPython across all 196 608 code points + 18 184 byte sequences) whose 25 combining sequences make the incremental *encoder* stateful (a combinable base buffered across `encode()` calls, discarded by `setstate(0)` on seek)."
+
+[tests."cpython/Lib/test/test_ioctl.py"]
+status = "pass"
+reason = "measured (RFC 0055 WS6): os.openpty unlocked the pty-backed legs; fcntl.ioctl masks a negative code to its 32-bit pattern like CPython's bitwise unsigned-int converter."
 
 [tests."cpython/Lib/test/test_ipaddress.py"]
 status = "fail"
@@ -862,8 +866,8 @@ status = "pass"
 reason = "measured: passes end-to-end (non-target; advanced to a clean verdict on the wave-2 import/namespace-package work)."
 
 [tests."cpython/Lib/test/test_platform.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AttributeError: module 'sys' has no attribute '_git'"
+status = "pass"
+reason = "measured (RFC 0055 WS1): passes end-to-end — sys._git/_framework, structseq sys.version_info, platform identity strings."
 
 [tests."cpython/Lib/test/test_plistlib.py"]
 status = "fail"
@@ -915,16 +919,16 @@ status = "pass"
 reason = "measured (RFC 0053 WS5): verbatim `pstats.py` (SortKey enum, `stream=` kwarg, add/dump round-trips) over the `_lsprof`/`cProfile` stack."
 
 [tests."cpython/Lib/test/test_pty.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): master_fd, slave_name = _open_termina…[truncated]"
+status = "pass"
+reason = "measured (RFC 0055 WS6): native termios + os.openpty/os.login_tty — pty.fork(), spawn, and the SmallPtyTests all pass."
 
 [tests."cpython/Lib/test/test_pulldom.py"]
 status = "fail"
 reason = "measured (RFC 0049 wave-5 full-suite baseline): ----------------------------------------…[truncated]"
 
 [tests."cpython/Lib/test/test_py_compile.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AttributeError: module 'py_c…[truncated]"
+status = "pass"
+reason = "measured (RFC 0055 WS3): passes end-to-end — cache_from_source optimization levels, _classify_pyc validation, PEP 263 decode errors."
 
 [tests."cpython/Lib/test/test_pydoc.py"]
 status = "fail"
@@ -966,12 +970,12 @@ status = "fail"
 reason = "measured (RFC 0049 wave-5 full-suite baseline): ImportError: cannot import name 'TestStats' from 'test.libregrtest.result'"
 
 [tests."cpython/Lib/test/test_repl.py"]
-status = "fail"
+status = "pass"
 # Spawns subprocess REPLs; sits near the 60s budget under -j8 load
-# (observed 45-70s). Raised so the stable `fail` verdict doesn't flip
-# to a spurious `timeout`.
+# (observed 45-70s). Raised so the stable verdict doesn't flip to a
+# spurious `timeout`.
 timeout_seconds = 180
-reason = "measured (RFC 0049 wave-5 full-suite baseline): File '/Users/owencarey/Documents/weavefoundry/weavepy/ve…[truncated]"
+reason = "measured (RFC 0055 WS4): passes end-to-end — excepthook-rendered REPL tracebacks with linecache._register_code'd interactive source, CPython-shaped compound-statement continuation and EOF handling, and the `-m asyncio` REPL over `_pyrepl.console`/`_pyrepl.main` + os.openpty. 3 skips are CPython-implementation-detail cases."
 
 [tests."cpython/Lib/test/test_reprlib.py"]
 status = "fail"
@@ -986,8 +990,8 @@ status = "fail"
 reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: Lists differ: ['None.__class__()', 'None.__delattr__(', 'None.__[276 chars]k__'] != ['None.__delattr__(', 'None.__eq__(', 'None.__ge__[259 chars"
 
 [tests."cpython/Lib/test/test_runpy.py"]
-status = "fail"
-reason = "runpy: _run_module_as_main alt_argv0 + run_path with .zip"
+status = "pass"
+reason = "measured (RFC 0055 WS3/WS4): passes end-to-end — verbatim runpy (incl. the `-m runpy` __main__ block), ModuleSpec.cached/__cached__ semantics, and zip/directory run_path over the verbatim zipimport."
 
 [tests."cpython/Lib/test/test_sax.py"]
 status = "fail"
@@ -1155,8 +1159,8 @@ status = "fail"
 reason = "measured (RFC 0051 WS4): writable frame.f_lineno landed over linejump.rs — 449 run, residual down from 159F/16E to 58F/0E with only 6 jump-matrix cases left (comprehension-inlining RuntimeWarning divergences among them); the remaining failures are line-event granularity diffs, not jumps."
 
 [tests."cpython/Lib/test/test_sysconfig.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): ImportError: cannot import name '_INSTALL_SCHEMES' from 'sysconfig'"
+status = "pass"
+reason = "measured (RFC 0055 WS1): passes end-to-end over the verbatim sysconfig + native _sysconfig module (config vars, install schemes, EXT_SUFFIX/SOABI, user schemes)."
 
 [tests."cpython/Lib/test/test_tabnanny.py"]
 status = "pass"
@@ -1170,6 +1174,10 @@ reason = "correct but slow (~105s idle); budget raised for parallel-load headroo
 [tests."cpython/Lib/test/test_tempfile.py"]
 status = "pass"
 reason = "measured (RFC 0040 WS7/WS8 + deterministic-finalization arc): passes end-to-end — 118 run, 0F/0E, 8 skip. The `SpooledTemporaryFile` IO layer is faithful (native text files track `.newlines`, report their real `.encoding`/`.errors`, and `f.name` round-trips an integer fd; `unittest.mock.MagicMock` exposes settable `__enter__`/`__exit__` child mocks). The last 2 residuals (`test_del_by_finalizer`, `test_warnings_on_cleanup`) needed prompt refcount finalization of a function-local file object at *frame teardown* without an explicit `gc.collect()`. That landed in the deterministic-finalization arc: `reap_frame_locals_on_exit` now (a) reaps non-escaped closure-`Function` locals — which are GC-tracked, so a plain `Rc` drop left them (and their captured cells) pinned by the GC handle — and (b) sweeps the frame's own cell variables, reaping any uniquely-held cellvar whose contents are a dead finalizable (`test_writelines_rollover`'s `f`, captured by a throwaway generator/closure). This mirrors CPython decref'ing a frame's cells together with its closures at teardown."
+
+[tests."cpython/Lib/test/test_termios.py"]
+status = "pass"
+reason = "measured (RFC 0055 WS6): native termios builtin (tcgetattr/tcsetattr/tcdrain/tcflush/tcflow/winsize over libc) with CPython's error type and VMIN/VTIME int-vs-bytes cc semantics."
 
 [tests."cpython/Lib/test/test_textwrap.py"]
 status = "pass"
@@ -1224,6 +1232,10 @@ reason = "measured: passes end-to-end (RFC 0037 WS5 traceback module — StackSu
 [tests."cpython/Lib/test/test_tracemalloc.py"]
 status = "fail"
 reason = "measured (RFC 0049 wave-5 full-suite baseline): AttributeError: module 'tracemalloc' has no attribute 'Traceback'"
+
+[tests."cpython/Lib/test/test_tty.py"]
+status = "pass"
+reason = "measured (RFC 0055 WS6): frozen CPython tty.py over the native termios builtin — setraw/setcbreak mode surgery verified against tcgetattr round-trips."
 
 [tests."cpython/Lib/test/test_tuple.py"]
 status = "pass"
@@ -1327,8 +1339,9 @@ status = "pass"
 reason = "measured: passes as a unit (75 run, heavy skips for the C _uuid accelerator variants). The former MAC-address-lookup and uuid8 namespace failures cleared with the RFC 0040+ stdlib waves (subprocess/os plumbing the getters rely on)."
 
 [tests."cpython/Lib/test/test_venv.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AttributeError: module 'sysconfig' has no attribute '_get_python_version_abi'. Did you mean: 'get_python_version'?"
+status = "pass"
+timeout_seconds = 120
+reason = "measured (RFC 0055 WS2): passes end-to-end over the verbatim venv module — creation/upgrade, pyvenv.cfg fields, --with-pip via ensurepip over the bundled wheel, zippath from a non-installed layout."
 
 [tests."cpython/Lib/test/test_warnings.py"]
 status = "fail"
@@ -1372,8 +1385,9 @@ timeout_seconds = 180
 reason = "correct but slow (~47s idle); budget raised for parallel-load headroom"
 
 [tests."cpython/Lib/test/test_zipimport.py"]
-status = "timeout"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): killed after 60s"
+status = "pass"
+timeout_seconds = 180
+reason = "measured (RFC 0055 WS3): passes end-to-end over the verbatim zipimport (uncompressed + compressed, namespace merging, sourceless entries). Runs ~58s — the pack/unpack-heavy fixture setup dominates; budget raised accordingly."
 
 [tests."cpython/Lib/test/test_zipimport_support.py"]
 status = "fail"

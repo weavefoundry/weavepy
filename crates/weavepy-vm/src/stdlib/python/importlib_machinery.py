@@ -89,7 +89,7 @@ class ModuleSpec:
     """
 
     __slots__ = ('name', 'loader', 'origin', 'submodule_search_locations',
-                 'loader_state', 'cached', '_set_fileattr', '_initializing')
+                 'loader_state', '_cached', '_set_fileattr', '_initializing')
 
     def __init__(self, name, loader, *, origin=None, loader_state=None,
                  is_package=None):
@@ -98,9 +98,31 @@ class ModuleSpec:
         self.origin = origin
         self.loader_state = loader_state
         self.submodule_search_locations = [] if is_package else None
-        self.cached = None
+        self._cached = None
         self._set_fileattr = origin is not None
         self._initializing = False
+
+    @property
+    def cached(self):
+        # CPython computes this lazily from `origin`
+        # (`_bootstrap_external._get_cached`): the `__pycache__`
+        # artifact for a source file, the file itself for a
+        # sourceless `.pyc`. `runpy` publishes it as `__cached__`.
+        if self._cached is None and self.origin is not None and self._set_fileattr:
+            origin = self.origin
+            if origin.endswith(tuple(SOURCE_SUFFIXES)):
+                try:
+                    from importlib.util import cache_from_source
+                    self._cached = cache_from_source(origin)
+                except NotImplementedError:
+                    pass
+            elif origin.endswith(tuple(BYTECODE_SUFFIXES)):
+                self._cached = origin
+        return self._cached
+
+    @cached.setter
+    def cached(self, value):
+        self._cached = value
 
     @property
     def parent(self):
@@ -220,6 +242,17 @@ class _LoaderBase:
         code = compile(source, self.path or '<frozen>', 'exec')
         exec(code, module.__dict__)
 
+    def get_resource_reader(self, module=None):
+        # CPython defines this on FileLoader: every file-backed loader
+        # serves package resources through a FileReader
+        # (`importlib.resources.files('pkg')` resolves via this hook;
+        # without it the _adapters fallback yields an orphan
+        # CompatibilityFiles path that can't be opened).
+        if not self.path:
+            return None
+        from importlib.resources.readers import FileReader
+        return FileReader(self)
+
 
 class SourceFileLoader(_LoaderBase):
     """Load a module from a ``.py`` file on disk.
@@ -273,8 +306,13 @@ class SourcelessFileLoader(_LoaderBase):
         with open(self.path, 'rb') as f:
             data = f.read()
         if len(data) < 16 or data[:4] != MAGIC_NUMBER:
-            raise ImportError("bad magic in {!r}".format(self.path),
-                              name=self.name, path=self.path)
+            # CPython's `_classify_pyc` wording: the *module name* and the
+            # magic bytes actually seen (`python -m pkg` over an invalid
+            # `__init__.pyc` surfaces this through runpy's
+            # "Error while finding module specification" wrapper).
+            raise ImportError(
+                "bad magic number in {!r}: {!r}".format(self.name, data[:4]),
+                name=self.name, path=self.path)
         try:
             return marshal.loads(data[16:])
         except Exception as exc:
@@ -337,6 +375,55 @@ class ExtensionFileLoader(_LoaderBase):
         # canonical.
         if loaded is not None and loaded is not module:
             module.__dict__.update(loaded.__dict__)
+
+
+class NamespaceLoader:
+    """Loader for PEP 420 namespace packages (public since 3.11).
+
+    Namespace packages have no code to execute; the loader exists so
+    their specs carry a non-None ``loader`` and so tooling can
+    ``isinstance``-check it (pytest's ``_pytest.pathlib`` imports it
+    for exactly that).
+    """
+
+    def __init__(self, name, path=None, path_finder=None):
+        self.name = name
+        self._path = path if path is not None else []
+
+    def is_package(self, fullname=None):
+        return True
+
+    def get_source(self, fullname=None):
+        return ''
+
+    def get_code(self, fullname=None):
+        return compile('', '<string>', 'exec', dont_inherit=True)
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        pass
+
+    def get_filename(self, fullname=None):
+        raise ImportError('namespace packages have no file',
+                          name=self.name)
+
+    def load_module(self, fullname):
+        import importlib._bootstrap
+        return importlib._bootstrap._load_module_shim(self, fullname)
+
+    def get_resource_reader(self, module):
+        try:
+            from importlib.resources.readers import NamespaceReader
+            return NamespaceReader(self._path)
+        except Exception:
+            return None
+
+
+# CPython's private alias predates the 3.11 public name; some tools
+# (setuptools vendoring, older pytest) still reach for it.
+_NamespaceLoader = NamespaceLoader
 
 
 # ---------------------------------------------------------------------
@@ -462,52 +549,39 @@ class PathFinder:
         return None
 
     @classmethod
-    def _get_spec(cls, fullname, path, target=None):
+    def find_spec(cls, fullname, path=None, target=None):
+        """CPython's `PathFinder._get_spec` shape: walk every entry;
+        the first loader-bearing spec wins outright, while loaderless
+        (namespace) portions from *all* entries accumulate into one
+        merged namespace spec (`testMixedNamespacePackage` — a package
+        split between a zip and a real directory).
+        """
+        if path is None:
+            path = sys.path
+        namespace_path = []
         for entry in path:
             if not isinstance(entry, str):
                 continue
             finder = cls._path_importer_cache(entry)
-            if finder is None:
+            if finder is None or not hasattr(finder, 'find_spec'):
                 continue
-            if hasattr(finder, 'find_spec'):
-                try:
-                    spec = finder.find_spec(fullname, target)
-                except (OSError, ImportError):
-                    spec = None
-                if spec is not None:
-                    return spec
-        return None
-
-    @classmethod
-    def find_spec(cls, fullname, path=None, target=None):
-        if path is None:
-            path = sys.path
-        # Handle namespace packages: collect every contributing
-        # directory across `path` before returning.
-        namespace_path = []
-        spec = cls._get_spec(fullname, path, target)
-        if spec is not None:
-            if spec.loader is None and spec.submodule_search_locations:
-                # Namespace from the first match: keep walking and
-                # merge.
-                namespace_path.extend(spec.submodule_search_locations)
-                for entry in path[path.index(
-                        spec.submodule_search_locations[0])
-                        if spec.submodule_search_locations[0] in path
-                        else len(path):]:
-                    finder = cls._path_importer_cache(entry)
-                    if finder is None:
-                        continue
-                    extra = finder.find_spec(fullname, target)
-                    if extra is None:
-                        continue
-                    if extra.loader is not None:
-                        # Real loader wins.
-                        return extra
-                    namespace_path.extend(
-                        extra.submodule_search_locations or [])
-                if namespace_path:
-                    spec.submodule_search_locations = namespace_path
+            try:
+                spec = finder.find_spec(fullname, target)
+            except (OSError, ImportError):
+                spec = None
+            if spec is None:
+                continue
+            if spec.loader is not None:
+                return spec
+            portions = spec.submodule_search_locations
+            if portions:
+                namespace_path.extend(p for p in portions
+                                      if p not in namespace_path)
+        if namespace_path:
+            spec = ModuleSpec(fullname, None, is_package=True)
+            spec.submodule_search_locations = namespace_path
+            spec.origin = None
+            spec._set_fileattr = False
             return spec
         return None
 
@@ -712,6 +786,7 @@ __all__ = [
     'SourceFileLoader',
     'SourcelessFileLoader',
     'ExtensionFileLoader',
+    'NamespaceLoader',
     'FileFinder',
     'PathFinder',
     'BuiltinImporter',

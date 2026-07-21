@@ -2707,6 +2707,7 @@ name = "weavepy-capi"
 version = "0.0.0"
 dependencies = [
  "cc",
+ "libc",
  "libloading",
  "num-bigint",
  "num-traits",

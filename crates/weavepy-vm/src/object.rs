@@ -5020,14 +5020,31 @@ impl PyFile {
                 *pos = buf.len();
                 data.len()
             }
-            FileBackend::Stdout(sink) => sink
-                .borrow_mut()
-                .write(data)
-                .map_err(|e| crate::error::io_error_to_py(&e))?,
-            FileBackend::Stderr(sink) => sink
-                .borrow_mut()
-                .write(data)
-                .map_err(|e| crate::error::io_error_to_py(&e))?,
+            FileBackend::Stdout(sink) => {
+                let mut s = sink.borrow_mut();
+                let n = s
+                    .write(data)
+                    .map_err(|e| crate::error::io_error_to_py(&e))?;
+                // `-u` / `PYTHONUNBUFFERED`: every write reaches the fd
+                // immediately (Rust's stdout is otherwise line-buffered,
+                // which would lose bytes on `os._exit`).
+                if crate::vm_singletons::stdio_unbuffered() {
+                    s.flush().map_err(|e| crate::error::io_error_to_py(&e))?;
+                } else {
+                    crate::vm_singletons::note_stdout_write(&data[..n]);
+                }
+                n
+            }
+            FileBackend::Stderr(sink) => {
+                let mut s = sink.borrow_mut();
+                let n = s
+                    .write(data)
+                    .map_err(|e| crate::error::io_error_to_py(&e))?;
+                if crate::vm_singletons::stdio_unbuffered() {
+                    s.flush().map_err(|e| crate::error::io_error_to_py(&e))?;
+                }
+                n
+            }
             FileBackend::Stdin => return Err(os_error("not writable")),
         };
         Ok(n)
@@ -5040,10 +5057,23 @@ impl PyFile {
         let mut backend = self.backend.borrow_mut();
         match &mut *backend {
             FileBackend::Disk(f) => f.flush().map_err(|e| crate::error::io_error_to_py(&e))?,
-            FileBackend::Stdout(sink) => sink
-                .borrow_mut()
-                .flush()
-                .map_err(|e| crate::error::io_error_to_py(&e))?,
+            FileBackend::Stdout(sink) => {
+                sink.borrow_mut()
+                    .flush()
+                    .map_err(|e| crate::error::io_error_to_py(&e))?;
+                // Rust's stdout swallows `EBADF` (std's `handle_ebadf`), so
+                // a "successful" flush to a closed fd 1 silently dropped
+                // any buffered tail. Surface it as the `OSError` CPython
+                // raises (shutdown then reports "Exception ignored on
+                // flushing sys.stdout" and exits 120).
+                #[cfg(unix)]
+                if crate::vm_singletons::take_stdout_pending()
+                    && unsafe { libc::fcntl(1, libc::F_GETFD) } == -1
+                {
+                    let e = std::io::Error::from_raw_os_error(libc::EBADF);
+                    return Err(crate::error::io_error_to_py(&e));
+                }
+            }
             FileBackend::Stderr(sink) => sink
                 .borrow_mut()
                 .flush()
@@ -8185,12 +8215,51 @@ const PY_HASH_NONE: i64 = 0xFCA8_6420;
 /// matching), where profiling showed SipHash itself as a top-ten CPU
 /// consumer. Python-level `hash(s)` carries no cross-process stability
 /// contract, and the byte length is folded in so prefixes don't collide.
+/// Per-process `str`/`bytes` hash salt (CPython's hash randomization,
+/// PEP 456 in spirit). Initialized once, from OS entropy by default;
+/// `PYTHONHASHSEED=n` pins it (`0` disables randomization entirely —
+/// the salt is 0 and hashing is bit-identical across runs).
+static HASH_SALT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Pin the hash salt from `PYTHONHASHSEED`. Must run before the first
+/// `str`/`bytes` hash of the process (the CLI calls it first thing);
+/// a later call is a no-op, matching CPython where the seed is fixed
+/// at startup.
+pub fn set_hash_seed(seed: u32) {
+    let salt = if seed == 0 {
+        0
+    } else {
+        // SplitMix64 expansion of the 32-bit seed: deterministic per
+        // seed, well-mixed across the 64-bit salt space.
+        let mut z = u64::from(seed).wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        z
+    };
+    let _ = HASH_SALT.set(salt);
+}
+
+fn hash_salt() -> u64 {
+    *HASH_SALT.get_or_init(|| {
+        use std::hash::{BuildHasher, Hasher};
+        // `RandomState` is seeded from OS entropy once per process.
+        std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish()
+    })
+}
+
 fn py_hash_bytes_slice(bytes: &[u8]) -> i64 {
     if bytes.is_empty() {
         return 0;
     }
     use std::hash::Hasher;
     let mut h = crate::fasthash::FxHasher::default();
+    let salt = hash_salt();
+    if salt != 0 {
+        h.write_u64(salt);
+    }
     h.write(bytes);
     h.write_usize(bytes.len());
     let v = h.finish() as i64;

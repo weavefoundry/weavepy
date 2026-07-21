@@ -101,6 +101,25 @@ work.
 > and rustls TLS — and the network tail graduates to measured `pass`
 > rows: `test_ssl` (191 tests), `test_urllib2`, `test_poplib`, joining
 > the already-green httplib/imaplib/ftplib/smtplib/socketserver family.
+>
+> `RFC 0055` is the **daily-driver wave**: the acceptance bar moves from
+> "passes CPython's tests" to "runs real installed packages". A new
+> `ecosystem` conformance lane (`tests/ecosystem/`) creates a scratch
+> venv per manifest row with the WeavePy binary under test, installs
+> real PyPI packages through the in-tree pip (online or fully offline
+> via a wheel cache), runs a behaviour-asserting probe, and grades
+> against a checked-in baseline — **all nine launch rows pass**: six,
+> attrs, click, jinja2, requests, python-dateutil, typing_extensions,
+> packaging, and *real* pytest (8.4). Getting there landed the mypyc
+> C-API tail (charset_normalizer's compiled `.so` loads and runs),
+> dependency-closure resolution in `pip install --no-index
+> --find-links`, the 3.11+ `importlib.resources` package layout
+> (`.abc`, `.readers`, `NamespaceLoader`), int-subclass `SystemExit`
+> payloads (`sys.exit(pytest.ExitCode.OK)`), and site-packages
+> precedence over the bundled third-party facades — `pip install
+> packaging` (or pytest, numpy, …) now actually changes what `import
+> packaging` returns. The same wave finished the CLI/REPL residuals
+> (`test_cmd_line`, `test_repl`, `test_cmd_line_script` all pass).
 
 ## Repository layout
 
@@ -187,6 +206,13 @@ cargo run -p weavepy-conformance -- diff tokens    # one phase
 # against the measured baseline (RFC 0036).
 cargo run -p weavepy-conformance -- regrtest \
     --cpython-dir vendor/cpython/Lib/test --mode subprocess --jobs 8
+
+# Ecosystem lane: venv + pip install + probe per real PyPI package,
+# graded against tests/ecosystem/expectations.toml (RFC 0055).
+cargo run -p weavepy-conformance -- ecosystem                # online
+python3 tools/ecosystem_fetch.py --dest target/ecosystem-wheels
+cargo run -p weavepy-conformance -- ecosystem \
+    --wheels target/ecosystem-wheels                         # offline
 ```
 
 See [`docs/CONFORMANCE.md`](docs/CONFORMANCE.md) for the model, the

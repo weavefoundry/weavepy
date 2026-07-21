@@ -45,6 +45,21 @@ def cache_from_source(path, debug_override=None, *, optimization=None):
     head, tail = os.path.split(path)
     name, _ = os.path.splitext(tail)
     tag = _cache_tag()
+    # PEP 488: `optimization=''` (or None) is the plain `.pyc`;
+    # anything else is embedded as an alphanumeric `.opt-N` segment.
+    if optimization is None:
+        if debug_override is not None:
+            optimization = '' if debug_override else 1
+        else:
+            optimization = ''
+    optimization = str(optimization)
+    if optimization:
+        if not optimization.isalnum():
+            raise ValueError(
+                '{!r} is not alphanumeric'.format(optimization))
+        filename = '{}.{}.opt-{}.pyc'.format(name, tag, optimization)
+    else:
+        filename = '{}.{}.pyc'.format(name, tag)
     prefix = getattr(sys, 'pycache_prefix', None)
     if prefix:
         absbase = os.path.abspath(head)
@@ -55,7 +70,7 @@ def cache_from_source(path, debug_override=None, *, optimization=None):
         target_dir = os.path.join(prefix, absbase)
     else:
         target_dir = os.path.join(head, '__pycache__')
-    return os.path.join(target_dir, '{}.{}.pyc'.format(name, tag))
+    return os.path.join(target_dir, filename)
 
 
 def source_from_cache(path):
@@ -114,11 +129,25 @@ def decode_source(source_bytes):
     """
     if isinstance(source_bytes, str):
         return source_bytes
-    if source_bytes.startswith(b'\xef\xbb\xbf'):
-        return source_bytes[3:].decode('utf-8')
+    bom_found = source_bytes.startswith(b'\xef\xbb\xbf')
+    if bom_found:
+        source_bytes = source_bytes[3:]
     for line in source_bytes.split(b'\n', 2)[:2]:
         encoding = _coding_cookie(line)
         if encoding is not None:
+            # `tokenize.detect_encoding` semantics: an unknown cookie
+            # is a SyntaxError, and a BOM tolerates only a literal
+            # `utf-8` cookie (the interpreter rejects `utf8` + BOM —
+            # `test_py_compile.test_bad_coding`).
+            import codecs
+            try:
+                codecs.lookup(encoding)
+            except LookupError:
+                raise SyntaxError('unknown encoding: ' + encoding)
+            if bom_found:
+                if encoding.replace('_', '-').lower() != 'utf-8':
+                    raise SyntaxError('encoding problem: utf-8')
+                encoding = 'utf-8'
             return source_bytes.decode(encoding)
         # A cookie on line 2 only counts if line 1 is blank or a comment.
         stripped = line.strip(b' \t\x0c\r')
@@ -165,6 +194,16 @@ def resolve_name(name, package):
 
 
 def spec_from_loader(name, loader, *, origin=None, is_package=None):
+    # CPython: a loader with `get_filename` describes an on-disk (or
+    # in-archive) location — route through `spec_from_file_location`
+    # so `origin` and package search locations come from the loader
+    # (the verbatim `zipimport` relies on this to shape its specs).
+    if hasattr(loader, 'get_filename'):
+        if is_package is None:
+            return spec_from_file_location(name, loader=loader)
+        search = [] if is_package else None
+        return spec_from_file_location(name, loader=loader,
+                                       submodule_search_locations=search)
     if is_package is None and hasattr(loader, 'is_package'):
         try:
             is_package = bool(loader.is_package(name))
@@ -174,8 +213,13 @@ def spec_from_loader(name, loader, *, origin=None, is_package=None):
         name, loader, origin=origin, is_package=bool(is_package))
 
 
+# Sentinel: "ask the loader whether this is a package" (CPython's
+# `_bootstrap_external._POPULATE`).
+_POPULATE = object()
+
+
 def spec_from_file_location(name, location=None, *, loader=None,
-                              submodule_search_locations=None):
+                              submodule_search_locations=_POPULATE):
     """Compose a ``ModuleSpec`` directly from a file path.
 
     Picks a loader by suffix unless one is supplied. This is the
@@ -183,25 +227,45 @@ def spec_from_file_location(name, location=None, *, loader=None,
     specs by hand (``importlib.util.spec_from_file_location`` is
     the documented way to dynamically import a file).
     """
-    if loader is None and location is not None:
+    if location is None:
+        # A loader that knows its file (CPython's default handling).
+        location = '<unknown>'
+        if hasattr(loader, 'get_filename'):
+            try:
+                location = loader.get_filename(name)
+            except ImportError:
+                pass
+    else:
+        location = os.fspath(location)
+    if loader is None:
         for sfx in _machinery.EXTENSION_SUFFIXES:
             if location.endswith(sfx):
                 loader = _machinery.ExtensionFileLoader(name, location)
                 break
         else:
-            if location.endswith('.py'):
-                loader = _machinery.SourceFileLoader(name, location)
-            elif location.endswith('.pyc'):
+            if location.endswith('.pyc'):
                 loader = _machinery.SourcelessFileLoader(name, location)
             else:
                 loader = _machinery.SourceFileLoader(name, location)
-    spec = _machinery.ModuleSpec(
-        name, loader, origin=location,
-        is_package=bool(submodule_search_locations))
-    if submodule_search_locations is not None:
-        spec.submodule_search_locations = list(submodule_search_locations)
-    if location is not None:
-        spec._set_fileattr = True
+    spec = _machinery.ModuleSpec(name, loader, origin=location)
+    spec._set_fileattr = True
+    if submodule_search_locations is _POPULATE:
+        if hasattr(loader, 'is_package'):
+            try:
+                is_package = loader.is_package(name)
+            except ImportError:
+                pass
+            else:
+                if is_package:
+                    spec.submodule_search_locations = []
+    else:
+        spec.submodule_search_locations = (
+            list(submodule_search_locations)
+            if submodule_search_locations is not None else None)
+    if spec.submodule_search_locations == []:
+        if location:
+            dirname = os.path.split(location)[0]
+            spec.submodule_search_locations.append(dirname)
     return spec
 
 
@@ -281,11 +345,20 @@ def find_spec(name, package=None):
         parent_name = fullname.rpartition('.')[0]
         parent = sys.modules.get(parent_name)
         if parent is None:
-            try:
-                parent = __import__(parent_name)
-            except ImportError:
-                return None
-        parent_path = getattr(parent, '__path__', None)
+            # Propagates ImportError, exactly like CPython's
+            # `__import__(parent_name, fromlist=['__path__'])`.
+            __import__(parent_name)
+            parent = sys.modules[parent_name]
+        try:
+            parent_path = parent.__path__
+        except AttributeError as e:
+            # CPython raises here (not "return None"): asking for a
+            # submodule of a non-package is a ModuleNotFoundError —
+            # runpy turns it into `python -m builtins.x`'s
+            # "Error while finding module specification" message.
+            raise ModuleNotFoundError(
+                f"__path__ attribute not found on {parent_name!r} "
+                f"while trying to find {fullname!r}", name=fullname) from e
     for finder in sys.meta_path:
         try:
             if hasattr(finder, 'find_spec'):

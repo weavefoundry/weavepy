@@ -289,6 +289,15 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("pipe")),
             builtin("pipe", os_pipe),
         );
+        d.insert(
+            DictKey(Object::from_static("openpty")),
+            builtin("openpty", os_openpty),
+        );
+        #[cfg(unix)]
+        d.insert(
+            DictKey(Object::from_static("login_tty")),
+            builtin("login_tty", os_login_tty),
+        );
         d.insert(DictKey(Object::from_static("dup")), builtin("dup", os_dup));
         d.insert(
             DictKey(Object::from_static("dup2")),
@@ -374,6 +383,10 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         d.insert(
             DictKey(Object::from_static("waitpid")),
             builtin("waitpid", os_waitpid),
+        );
+        d.insert(
+            DictKey(Object::from_static("system")),
+            builtin("system", os_system),
         );
         d.insert(
             DictKey(Object::from_static("waitstatus_to_exitcode")),
@@ -1705,12 +1718,10 @@ fn os_close_fd(_fd: i64) -> Result<Object, RuntimeError> {
 }
 
 /// `os.open(path, flags, mode=0o777)` → raw fd. The flag bits are the
-/// module's own `O_*` constants (translated to `OpenOptions` here, so
-/// the values never reach the host libc, whose constants may differ).
+/// module's own `O_*` constants, which are the host libc's values, so
+/// they pass straight to `open(2)`/`openat(2)`.
 #[cfg(unix)]
 fn os_open_stub(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::io::IntoRawFd;
     // CPython: `os.open(path, flags, mode=0o777, *, dir_fd=None)` — every
     // parameter is also accepted by keyword (`test_os.test_open_keywords`).
     let p = path_arg_or_kw(args, 0, "path", kwargs, "open")?;
@@ -1735,35 +1746,12 @@ fn os_open_stub(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
         }
         return Ok(Object::Int(i64::from(fd)));
     }
-    // Interpret the flag bits with the *host* platform's `libc` values, matching
-    // the `O_*` constants the `os` module exposes — on macOS these differ from
-    // Linux, so hard-coding Linux numbers here mis-decoded macOS flag masks.
-    const O_WRONLY: i64 = libc::O_WRONLY as i64;
-    const O_RDWR: i64 = libc::O_RDWR as i64;
-    const O_CREAT: i64 = libc::O_CREAT as i64;
-    const O_EXCL: i64 = libc::O_EXCL as i64;
-    const O_TRUNC: i64 = libc::O_TRUNC as i64;
-    const O_APPEND: i64 = libc::O_APPEND as i64;
-    let mut oo = std::fs::OpenOptions::new();
-    match flags & i64::from(libc::O_ACCMODE) {
-        O_WRONLY => oo.write(true),
-        O_RDWR => oo.read(true).write(true),
-        _ => oo.read(true),
-    };
-    if flags & O_APPEND != 0 {
-        oo.append(true);
-    }
-    if flags & O_TRUNC != 0 {
-        oo.write(true).truncate(true);
-    }
-    if flags & O_CREAT != 0 {
-        oo.mode(mode);
-        if flags & O_EXCL != 0 {
-            oo.create_new(true);
-        } else {
-            oo.create(true);
-        }
-    }
+    // Hand the flag bits straight to the kernel. Routing through
+    // `std::fs::OpenOptions` imposed Rust's own validation on top of
+    // POSIX — notably rejecting `O_CREAT` with a read-only access mode
+    // ("creating or truncating a file requires write or append
+    // access"), which POSIX permits and `test_zipimport.
+    // testFileUnreadable` exercises (`os.open(p, os.O_CREAT, 000)`).
     // Preserve the identity of the original `path` argument (positional or the
     // `path=` keyword) as `.filename` (`test_os.test_oserror_filename`).
     let path_obj = args.first().cloned().or_else(|| {
@@ -1772,10 +1760,23 @@ fn os_open_stub(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
             .find(|(k, _)| k == "path")
             .map(|(_, v)| v.clone())
     });
-    let f = oo
-        .open(&p)
-        .map_err(|e| path_io_err(&e, path_obj.as_ref(), &p))?;
-    Ok(Object::Int(i64::from(f.into_raw_fd())))
+    let cpath =
+        std::ffi::CString::new(p.as_bytes()).map_err(|_| value_error("embedded null byte"))?;
+    // PEP 446: descriptors Python creates are non-inheritable —
+    // CPython's `os.open` ORs in `O_CLOEXEC` (as did the previous
+    // `OpenOptions`-based implementation here).
+    let fd = unsafe {
+        libc::open(
+            cpath.as_ptr(),
+            flags as libc::c_int | libc::O_CLOEXEC,
+            mode as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        let e = std::io::Error::last_os_error();
+        return Err(path_io_err(&e, path_obj.as_ref(), &p));
+    }
+    Ok(Object::Int(i64::from(fd)))
 }
 
 #[cfg(not(unix))]
@@ -3402,6 +3403,36 @@ fn os_kill(_args: &[Object]) -> Result<Object, RuntimeError> {
     ))
 }
 
+/// `os.system(command)` — run `command` through the shell via libc
+/// `system(3)`. Returns the raw `wait()`-encoded status on POSIX
+/// (callers decode with `os.waitstatus_to_exitcode`), matching
+/// CPython's `posix.system`.
+#[cfg(unix)]
+fn os_system(args: &[Object]) -> Result<Object, RuntimeError> {
+    let command = match args.first() {
+        Some(Object::Str(s)) => s.to_string(),
+        Some(Object::Bytes(b)) => String::from_utf8_lossy(b).into_owned(),
+        _ => {
+            return Err(type_error(
+                "system() argument must be str or bytes, not None",
+            ))
+        }
+    };
+    let c_command = std::ffi::CString::new(command)
+        .map_err(|_| crate::error::value_error("embedded null byte"))?;
+    // Release the GIL: the child shell can run arbitrarily long and
+    // may itself be a WeavePy re-invocation that needs the lock.
+    let status = crate::gil::allow_threads_then(|| unsafe { libc::system(c_command.as_ptr()) });
+    Ok(Object::Int(i64::from(status)))
+}
+
+#[cfg(not(unix))]
+fn os_system(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Err(crate::error::not_implemented_error(
+        "os.system() is only implemented on POSIX in WeavePy",
+    ))
+}
+
 #[cfg(unix)]
 fn os_waitpid(args: &[Object]) -> Result<Object, RuntimeError> {
     let pid = match args.first() {
@@ -3583,6 +3614,80 @@ fn os_pipe(_args: &[Object]) -> Result<Object, RuntimeError> {
             "os.pipe() is only implemented on POSIX in WeavePy",
         ))
     }
+}
+
+fn os_openpty(_args: &[Object]) -> Result<Object, RuntimeError> {
+    #[cfg(unix)]
+    {
+        let mut master: libc::c_int = -1;
+        let mut slave: libc::c_int = -1;
+        let rc = unsafe {
+            libc::openpty(
+                &raw mut master,
+                &raw mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return Err(crate::error::os_error("openpty() failed"));
+        }
+        // PEP 446: both descriptors are non-inheritable.
+        unsafe {
+            for fd in [master, slave] {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags >= 0 {
+                    libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                }
+            }
+        }
+        Ok(Object::new_tuple(vec![
+            Object::Int(i64::from(master)),
+            Object::Int(i64::from(slave)),
+        ]))
+    }
+    #[cfg(not(unix))]
+    {
+        Err(crate::error::not_implemented_error(
+            "os.openpty() is only implemented on POSIX in WeavePy",
+        ))
+    }
+}
+
+/// `os.login_tty(fd)` — make `fd` the controlling terminal and the new
+/// stdin/stdout/stderr (CPython 3.11+, `HAVE_LOGIN_TTY`). The frozen
+/// `pty.fork()` calls this in the forked child.
+#[cfg(unix)]
+#[allow(clippy::cast_lossless)] // ioctl's request type is c_ulong or c_int per libc
+fn os_login_tty(args: &[Object]) -> Result<Object, RuntimeError> {
+    let fd = match args.first() {
+        Some(Object::Int(i)) => *i as libc::c_int,
+        Some(Object::Bool(b)) => libc::c_int::from(*b),
+        _ => return Err(type_error("login_tty() arg must be int")),
+    };
+    // BSD `login_tty(3)` semantics, spelled out so we don't depend on a
+    // libutil symbol that not every libc build exports: new session, make
+    // `fd` the controlling terminal, then splat it over the stdio fds.
+    unsafe {
+        libc::setsid();
+        if libc::ioctl(fd, libc::TIOCSCTTY as _, 0 as libc::c_long) == -1 {
+            return Err(crate::error::io_error_to_py(
+                &std::io::Error::last_os_error(),
+            ));
+        }
+        for std_fd in 0..3 {
+            if libc::dup2(fd, std_fd) == -1 {
+                return Err(crate::error::io_error_to_py(
+                    &std::io::Error::last_os_error(),
+                ));
+            }
+        }
+        if fd > 2 {
+            libc::close(fd);
+        }
+    }
+    Ok(Object::None)
 }
 
 fn os_dup(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -4160,6 +4265,11 @@ fn os_get_terminal_size(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn os_cpu_count(_args: &[Object]) -> Result<Object, RuntimeError> {
+    // `-X cpu_count=N` / `PYTHON_CPU_COUNT` (gh-109595) overrides both
+    // `os.cpu_count()` and `os.process_cpu_count()`.
+    if let Some(n) = crate::vm_singletons::cpu_count_override() {
+        return Ok(Object::Int(n));
+    }
     let n = std::thread::available_parallelism()
         .map(|n| n.get() as i64)
         .unwrap_or(1);

@@ -28,6 +28,20 @@ def _wrap(fn):
 _INT_CODES = frozenset("bBhHiIlLqQnNP")
 _FLOAT_CODES = frozenset("fde")
 
+# Values the Rust core handles directly (including its own native
+# `__index__`/`__float__` coercions for numeric scalars). Only exotic
+# objects — e.g. something whose `__bool__` raises for a `?` code —
+# need the Python-level pre-coercion loop. Skipping it for all-
+# primitive calls keeps `struct.pack` off `zipfile`'s hot path.
+_PRIMITIVES = (int, float, bytes, bytearray, str, memoryview)
+
+
+def _needs_coercion(values):
+    for v in values:
+        if not isinstance(v, _PRIMITIVES):
+            return True
+    return False
+
 
 def _coerce_values(fmt, values):
     """Coerce each argument through the protocol its format code implies.
@@ -108,7 +122,8 @@ def unpack_from(fmt, buffer, offset=0):
 
 
 def pack(fmt, *values):
-    values = _coerce_values(fmt, values)
+    if _needs_coercion(values):
+        values = _coerce_values(fmt, values)
     try:
         return _impl.pack(fmt, *values)
     except ValueError as e:
@@ -151,7 +166,8 @@ def _writable(buffer):
 
 def pack_into(fmt, buffer, offset, *values):
     target = _writable(buffer)
-    values = _coerce_values(fmt, values)
+    if _needs_coercion(values):
+        values = _coerce_values(fmt, values)
     try:
         return _impl.pack_into(fmt, target, offset, *values)
     except ValueError as e:

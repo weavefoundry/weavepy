@@ -1,0 +1,51 @@
+# Ecosystem conformance matrix (RFC 0055 WS5).
+#
+# Each `[packages.<name>]` row is graded independently:
+#   requirements     — space-separated pip requirement strings
+#   probe            — smoke-probe file, relative to this directory;
+#                      exit 0 = pass. Probes assert real behaviour, not
+#                      just import.
+#   timeout_seconds  — optional per-row wall budget (venv + install +
+#                      probe); default comes from the runner (600 s).
+#
+# Run with:
+#   cargo run -p weavepy-conformance -- ecosystem
+# Offline lane (CI): populate a wheel cache first —
+#   python3 tools/ecosystem_fetch.py --dest target/ecosystem-wheels
+#   cargo run -p weavepy-conformance -- ecosystem --wheels target/ecosystem-wheels
+
+[packages.six]
+requirements = "six"
+probe = "probes/six_probe.py"
+
+[packages.attrs]
+requirements = "attrs"
+probe = "probes/attrs_probe.py"
+
+[packages.click]
+requirements = "click"
+probe = "probes/click_probe.py"
+
+[packages.jinja2]
+requirements = "jinja2 markupsafe"
+probe = "probes/jinja2_probe.py"
+
+[packages.requests]
+requirements = "requests"
+probe = "probes/requests_probe.py"
+
+[packages.dateutil]
+requirements = "python-dateutil"
+probe = "probes/dateutil_probe.py"
+
+[packages.typing_extensions]
+requirements = "typing_extensions"
+probe = "probes/typing_extensions_probe.py"
+
+[packages.packaging]
+requirements = "packaging"
+probe = "probes/packaging_probe.py"
+
+[packages.pytest]
+requirements = "pytest"
+probe = "probes/pytest_probe.py"

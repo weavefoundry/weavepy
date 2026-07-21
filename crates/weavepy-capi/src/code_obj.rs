@@ -126,6 +126,8 @@ fn ensure_types() {
             ty.tp_name = name.as_ptr() as *const c_char;
             ty.tp_flags = TPFLAGS_DEFAULT;
         }
+        (*PyFrame_Type.as_ptr()).tp_dealloc = Some(frame_dealloc);
+        (*PyFrame_Type.as_ptr()).tp_basicsize = FRAME_BODY_SIZE as crate::object::PySsizeT;
     }
 }
 
@@ -331,6 +333,31 @@ pub unsafe extern "C" fn PyCode_NewEmpty(
 /// `PyFrame_New(tstate, code, globals, locals)` — returns NULL (no error
 /// set). The caller treats this as "couldn't build a traceback frame" and
 /// preserves the pending exception.
+/// Body size for a facade frame: covers CPython 3.13's `PyFrameObject`
+/// through `f_extra_locals` plus slack. The only direct struct access a
+/// consumer performs is mypyc's `frame_obj->f_lineno = line` write
+/// (offset 40: head 16 + `f_back` 8 + `f_frame` 8 + `f_trace` 8), which
+/// lands inside this zeroed block.
+const FRAME_BODY_SIZE: usize = 128;
+
+unsafe extern "C" fn frame_dealloc(obj: *mut PyObject) {
+    if obj.is_null() {
+        return;
+    }
+    let layout = Layout::from_size_align(FRAME_BODY_SIZE, 8).expect("frame layout");
+    unsafe { alloc::dealloc(obj as *mut u8, layout) };
+}
+
+/// `PyFrame_New(tstate, code, globals, locals)` — mint a facade frame.
+///
+/// This must return a real object, not NULL: mypyc's `CPy_AddTraceback`
+/// does `PyErr_Fetch` → `PyFrame_New` → `PyErr_Restore` and, if the frame
+/// can't be created, takes an error path that *drops the fetched
+/// exception* — every failure in a mypyc-compiled module body then
+/// surfaces as "init function returned NULL" with no pending exception
+/// (RFC 0055 WS5, charset_normalizer). The frame itself is metadata-only:
+/// `PyTraceBack_Here` is a VM-side no-op and the caller decrefs it
+/// immediately.
 #[no_mangle]
 pub unsafe extern "C" fn PyFrame_New(
     _tstate: *mut PyThreadState,
@@ -338,7 +365,19 @@ pub unsafe extern "C" fn PyFrame_New(
     _globals: *mut PyObject,
     _locals: *mut PyObject,
 ) -> *mut PyObject {
-    ptr::null_mut()
+    ensure_types();
+    let layout = Layout::from_size_align(FRAME_BODY_SIZE, 8).expect("frame layout");
+    let raw = unsafe { alloc::alloc_zeroed(layout) };
+    if raw.is_null() {
+        unsafe { crate::errors::PyErr_NoMemory() };
+        return ptr::null_mut();
+    }
+    let obj = raw as *mut PyObject;
+    unsafe {
+        (*obj).ob_refcnt = 1;
+        (*obj).ob_type = PyFrame_Type.as_ptr();
+    }
+    obj
 }
 
 /// `PyTraceBack_Here(frame)` — prepend a traceback entry for `frame`.

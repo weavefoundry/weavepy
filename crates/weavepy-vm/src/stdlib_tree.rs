@@ -43,6 +43,35 @@ pub const LIB_DIR_NAME: &str = "weavepy3.13";
 
 const COMPLETE_MARKER: &str = ".weavepy-complete";
 
+/// Non-`.py` files materialized into the stdlib tree (RFC 0055 WS2):
+/// the verbatim `venv` activation scripts, found by
+/// `venv.EnvBuilder.setup_scripts` relative to `venv.__file__`.
+/// Paths are relative to the stdlib dir, `/`-separated.
+const DATA_FILES: &[(&str, &str)] = &[
+    (
+        "venv/scripts/common/activate",
+        include_str!("stdlib/python/venv/scripts/common/activate"),
+    ),
+    (
+        "venv/scripts/common/Activate.ps1",
+        include_str!("stdlib/python/venv/scripts/common/Activate.ps1"),
+    ),
+    (
+        "venv/scripts/common/activate.fish",
+        include_str!("stdlib/python/venv/scripts/common/activate.fish"),
+    ),
+    (
+        "venv/scripts/posix/activate.csh",
+        include_str!("stdlib/python/venv/scripts/posix/activate.csh"),
+    ),
+];
+
+/// The bundled pip wheel's filename. The version must agree with
+/// `ensurepip._PIP_VERSION` and the frozen pip facade's
+/// `pip.__version__` — `ensurepip` derives the resource name from its
+/// `_PIP_VERSION` and refuses to uninstall a mismatched install.
+pub const PIP_WHEEL_NAME: &str = "pip-24.0.0+weavepy-py3-none-any.whl";
+
 /// The materialized stdlib directory (`…/lib/weavepy3.13`) for this
 /// process, or `None` when disabled or unavailable. Resolved once;
 /// the warm path after first call is a pointer read.
@@ -92,7 +121,7 @@ fn rel_path(name: &str, is_package: bool) -> PathBuf {
 /// aliases, markers — anything `materialize` writes that is not an
 /// embedded source). Bump when the shape changes so existing caches
 /// keyed on unchanged sources are not mistaken for the new layout.
-const TREE_FORMAT: &str = "tree-format-2";
+const TREE_FORMAT: &str = "tree-format-3";
 
 /// FNV-1a over every frozen module's name and source, mixed with the
 /// crate version. Any change to any embedded byte lands in a new
@@ -114,7 +143,124 @@ fn build_id() -> u64 {
         eat(&[u8::from(src.is_package)]);
         eat(src.source.as_bytes());
     }
+    for (path, contents) in DATA_FILES {
+        eat(path.as_bytes());
+        eat(contents.as_bytes());
+    }
     h
+}
+
+/// Build the bundled pip wheel (RFC 0055 WS2) from the frozen pip
+/// facade source. A wheel is a zip archive; entries are stored
+/// uncompressed with a fixed 1980-01-01 DOS timestamp so the bytes
+/// are deterministic for a given build.
+fn pip_wheel_bytes() -> Vec<u8> {
+    let pip_source = crate::stdlib::frozen_sources()
+        .iter()
+        .find(|s| s.name == "_minipip")
+        .map_or("", |s| s.source);
+    let version = PIP_WHEEL_NAME
+        .trim_start_matches("pip-")
+        .split("-py3-none-any.whl")
+        .next()
+        .unwrap_or("0");
+    let dist_info = format!("pip-{version}.dist-info");
+    let metadata = format!(
+        "Metadata-Version: 2.1\n\
+         Name: pip\n\
+         Version: {version}\n\
+         Summary: WeavePy's bundled pip-compatible installer (the frozen pip facade, RFC 0030).\n\
+         License: MIT OR Apache-2.0\n\
+         Requires-Python: >=3.8\n"
+    );
+    let wheel_meta = "Wheel-Version: 1.0\n\
+         Generator: weavepy\n\
+         Root-Is-Purelib: true\n\
+         Tag: py3-none-any\n";
+    let entry_points = "[console_scripts]\n\
+         pip = pip:main\n\
+         pip3 = pip:main\n";
+
+    let mut entries: Vec<(String, Vec<u8>)> = vec![
+        ("pip.py".to_owned(), pip_source.as_bytes().to_vec()),
+        (format!("{dist_info}/METADATA"), metadata.into_bytes()),
+        (format!("{dist_info}/WHEEL"), wheel_meta.as_bytes().to_vec()),
+        (
+            format!("{dist_info}/entry_points.txt"),
+            entry_points.as_bytes().to_vec(),
+        ),
+    ];
+    // RECORD: `path,sha256=<urlsafe-b64-nopad>,<size>` per PEP 376,
+    // with the RECORD row itself left hashless.
+    let mut record = String::new();
+    for (name, data) in &entries {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+        let digest = sha2::Sha256::digest(data);
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+        record.push_str(&format!("{name},sha256={b64},{}\n", data.len()));
+    }
+    record.push_str(&format!("{dist_info}/RECORD,,\n"));
+    entries.push((format!("{dist_info}/RECORD"), record.into_bytes()));
+
+    // Minimal stored-entry zip (PKZIP appnote 4.4.x): local headers,
+    // central directory, end-of-central-directory.
+    let mut out: Vec<u8> = Vec::new();
+    let mut central: Vec<u8> = Vec::new();
+    let mut count: u16 = 0;
+    for (name, data) in &entries {
+        let crc = crc32fast::hash(data);
+        let offset = u32::try_from(out.len()).unwrap_or(u32::MAX);
+        let name_bytes = name.as_bytes();
+        let size = u32::try_from(data.len()).unwrap_or(u32::MAX);
+        // Local file header.
+        out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+        out.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        out.extend_from_slice(&0u16.to_le_bytes()); // flags
+        out.extend_from_slice(&0u16.to_le_bytes()); // method: stored
+        out.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        out.extend_from_slice(&0x21u16.to_le_bytes()); // mod date: 1980-01-01
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes()); // csize
+        out.extend_from_slice(&size.to_le_bytes()); // usize
+        out.extend_from_slice(&u16::try_from(name_bytes.len()).unwrap_or(0).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // extra len
+        out.extend_from_slice(name_bytes);
+        out.extend_from_slice(data);
+        // Central directory entry.
+        central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+        central.extend_from_slice(&20u16.to_le_bytes()); // version made by
+        central.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        central.extend_from_slice(&0u16.to_le_bytes()); // flags
+        central.extend_from_slice(&0u16.to_le_bytes()); // method
+        central.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        central.extend_from_slice(&0x21u16.to_le_bytes()); // mod date
+        central.extend_from_slice(&crc.to_le_bytes());
+        central.extend_from_slice(&size.to_le_bytes());
+        central.extend_from_slice(&size.to_le_bytes());
+        central.extend_from_slice(&u16::try_from(name_bytes.len()).unwrap_or(0).to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes()); // extra len
+        central.extend_from_slice(&0u16.to_le_bytes()); // comment len
+        central.extend_from_slice(&0u16.to_le_bytes()); // disk number
+        central.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+        central.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+        central.extend_from_slice(&offset.to_le_bytes());
+        central.extend_from_slice(name_bytes);
+        count += 1;
+    }
+    let cd_offset = u32::try_from(out.len()).unwrap_or(u32::MAX);
+    let cd_size = u32::try_from(central.len()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&central);
+    // End of central directory.
+    out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes()); // this disk
+    out.extend_from_slice(&0u16.to_le_bytes()); // cd start disk
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&cd_size.to_le_bytes());
+    out.extend_from_slice(&cd_offset.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes()); // comment len
+    out
 }
 
 fn resolve() -> Option<PathBuf> {
@@ -228,6 +374,71 @@ fn materialize(prefix: &Path) -> bool {
                 .join("lib")
                 .join(format!("python{}", &LIB_DIR_NAME["weavepy".len()..]));
             let _ = std::os::unix::fs::symlink(LIB_DIR_NAME, alias);
+        }
+        // RFC 0055 WS1 — the installation artifacts `sysconfig`
+        // points at must exist for the surface to be truthful:
+        // `get_makefile_filename()` → `{stdlib}/config-3.13-{multiarch}/
+        // Makefile` (also `srcdir`), and `get_config_h_filename()` →
+        // `{prefix}/include/python3.13/pyconfig.h`. Both carry the
+        // same variables the frozen `_weave_sysconfigdata` reports, in
+        // CPython's on-disk formats (`_parse_makefile`/`parse_config_h`
+        // can read them back).
+        {
+            let version_short = &LIB_DIR_NAME["weavepy".len()..];
+            let multiarch = crate::stdlib::sysconfig_native::MULTIARCH;
+            let config_dir_name = if multiarch.is_empty() {
+                format!("config-{version_short}")
+            } else {
+                format!("config-{version_short}-{multiarch}")
+            };
+            let config_dir = tmp_lib.join(config_dir_name);
+            std::fs::create_dir_all(&config_dir)?;
+            std::fs::write(
+                config_dir.join("Makefile"),
+                format!(
+                    "# Generated by WeavePy (RFC 0055); mirrors _sysconfigdata.\n\
+                     VERSION=\t{version_short}\n\
+                     ABIFLAGS=\t\n\
+                     SOABI=\t{soabi}\n\
+                     EXT_SUFFIX=\t{ext_suffix}\n\
+                     MULTIARCH=\t{multiarch}\n\
+                     LIBRARY=\tlibpython{version_short}.a\n\
+                     LDLIBRARY=\tlibpython{version_short}.a\n\
+                     Py_DEBUG=\t0\n\
+                     Py_GIL_DISABLED=\t0\n",
+                    soabi = crate::stdlib::sysconfig_native::SOABI,
+                    ext_suffix = crate::stdlib::sysconfig_native::EXT_SUFFIX,
+                ),
+            )?;
+            let include_dir = tmp_prefix
+                .join("include")
+                .join(format!("python{version_short}"));
+            std::fs::create_dir_all(&include_dir)?;
+            std::fs::write(
+                include_dir.join("pyconfig.h"),
+                "/* Generated by WeavePy (RFC 0055); mirrors _sysconfigdata. */\n\
+                 #define PY_VERSION_HEX 0x030d00f0\n\
+                 #define SIZEOF_VOID_P 8\n\
+                 #define WITH_DOC_STRINGS 1\n\
+                 /* #undef Py_DEBUG */\n\
+                 /* #undef Py_GIL_DISABLED */\n\
+                 /* #undef Py_TRACE_REFS */\n",
+            )?;
+        }
+        // RFC 0055 WS2 — data files (venv activation scripts) and the
+        // bundled pip wheel `importlib.resources.files('ensurepip')`
+        // resolves against.
+        for (rel, contents) in DATA_FILES {
+            let path: PathBuf = tmp_lib.join(rel.split('/').collect::<PathBuf>());
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(&path, contents)?;
+        }
+        {
+            let bundled = tmp_lib.join("ensurepip").join("_bundled");
+            std::fs::create_dir_all(&bundled)?;
+            std::fs::write(bundled.join(PIP_WHEEL_NAME), pip_wheel_bytes())?;
         }
         std::fs::write(
             tmp_lib.join(COMPLETE_MARKER),

@@ -338,17 +338,25 @@ fn imp_find_frozen(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn imp_extension_suffixes(_args: &[Object]) -> Result<Object, RuntimeError> {
+    // RFC 0055 WS1 — the first entry is the compile-target's own
+    // tagged suffix (shared with `_sysconfig.config_vars()['EXT_SUFFIX']`;
+    // `test_sysconfig` asserts they agree), followed by the untagged
+    // fallbacks CPython lists.
     let suffixes = if cfg!(target_os = "macos") {
-        vec![".cpython-313-darwin.so", ".abi3.so", ".so", ".dylib"]
+        vec![
+            crate::stdlib::sysconfig_native::EXT_SUFFIX,
+            ".abi3.so",
+            ".so",
+            ".dylib",
+        ]
     } else if cfg!(target_os = "linux") {
         vec![
-            ".cpython-313-x86_64-linux-gnu.so",
-            ".cpython-313-aarch64-linux-gnu.so",
+            crate::stdlib::sysconfig_native::EXT_SUFFIX,
             ".abi3.so",
             ".so",
         ]
     } else if cfg!(target_os = "windows") {
-        vec![".cp313-win_amd64.pyd", ".pyd", ".dll"]
+        vec![crate::stdlib::sysconfig_native::EXT_SUFFIX, ".pyd", ".dll"]
     } else {
         vec![".so"]
     };

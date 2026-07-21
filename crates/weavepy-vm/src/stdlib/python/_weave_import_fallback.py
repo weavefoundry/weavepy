@@ -102,7 +102,24 @@ def import_via_finders(name):
         return None
     loader = spec.loader
     if loader is None:
-        return None
+        # A loaderless spec is a PEP 420 namespace package. The native
+        # loader handles the on-disk flavour itself, but portions that
+        # live in archives (zip namespace packages) only surface here —
+        # build the namespace module directly (`test_zipimport.
+        # testNamespacePackage`).
+        locations = spec.submodule_search_locations
+        if locations is None:
+            return None
+        import types
+        module = sys.modules.get(name)
+        if module is None:
+            module = types.ModuleType(name)
+            module.__path__ = list(locations)
+            module.__spec__ = spec
+            module.__loader__ = None
+            module.__package__ = name
+            sys.modules[name] = module
+        return (_LIVE_MODULE, module)
     get_code = getattr(loader, "get_code", None)
     code = get_code(name) if get_code is not None else None
     if code is not None:

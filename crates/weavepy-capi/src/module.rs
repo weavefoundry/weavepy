@@ -1043,8 +1043,12 @@ pub unsafe extern "C" fn PyImport_AddModuleRef(name: *const c_char) -> *mut PyOb
 #[no_mangle]
 pub unsafe extern "C" fn PyImport_GetModuleDict() -> *mut PyObject {
     crate::interp::ensure_initialised();
-    crate::interp::with_current(|ctx| {
-        let interp = unsafe { &*ctx.interp };
+    // Use the effective interpreter (active extension context, published VM
+    // pointer, or last-seen) rather than requiring an ACTIVE context: mypyc's
+    // `CPyImport_ImportMany` reads the result with `PyTuple_GET_*` style
+    // direct access and dereferences it unconditionally, so a NULL here from
+    // a re-entrant/ctypes call path is an instant segfault.
+    crate::interp::with_interp_mut(|interp| {
         let modules = interp.module_cache().modules.clone();
         crate::object::into_owned(Object::Dict(modules))
     })

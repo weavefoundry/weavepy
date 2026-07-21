@@ -344,6 +344,14 @@ decl_static_type! {
     // `PyModuleDef_Init`, so the loader can recognise a multi-phase
     // (PEP 489) extension and run its create/exec slots.
     pub PyModuleDef_Type;
+    // RFC 0055 WS5: types the mypyc runtime (`CPy.h`) references by
+    // address — `CPyDictKeys_Check`/`Values`/`Items` compare `Py_TYPE(x)`
+    // against the view types, and `CPy_Super` *calls* `PySuper_Type`.
+    // All four bridge to the corresponding real VM types.
+    pub PyDictKeys_Type;
+    pub PyDictValues_Type;
+    pub PyDictItems_Type;
+    pub PySuper_Type;
 }
 
 /// Initialise the static type table from the running interpreter's
@@ -391,6 +399,17 @@ pub fn init_static_types() {
     install(&PyRange_Type, b"range\0", bt.range_.clone());
     install(&PyModule_Type, b"module\0", bt.module_.clone());
     install(&_PyNone_Type, b"NoneType\0", bt.none_type.clone());
+    // RFC 0055 WS5 (mypyc tail): dict views + super bridge to the real VM
+    // types, so `type(d.keys())` identity and `super(...)` construction
+    // through the C surface behave exactly like the Python-level ones.
+    install(&PyDictKeys_Type, b"dict_keys\0", bt.dict_keys_.clone());
+    install(
+        &PyDictValues_Type,
+        b"dict_values\0",
+        bt.dict_values_.clone(),
+    );
+    install(&PyDictItems_Type, b"dict_items\0", bt.dict_items_.clone());
+    install(&PySuper_Type, b"super\0", bt.super_.clone());
     install(&PyFunction_Type, b"function\0", bt.function_.clone());
     install(&PyGen_Type, b"generator\0", bt.generator_.clone());
     install(&PyCoro_Type, b"coroutine\0", bt.coroutine_.clone());
@@ -1763,6 +1782,14 @@ static STATIC_TYPE_TABLE: &[&StaticType] = &[
     &PyCoro_Type,
     &PyAsyncGen_Type,
     &PySeqIter_Type,
+    // RFC 0055 WS5 (mypyc tail): membership makes `is_weavepy_owned_type`
+    // accept these statics so `bridge_type` may read their bridge — mypyc's
+    // `_init_subclass` *vectorcalls* `&PySuper_Type` (super(cls, cls)), which
+    // otherwise proxies as a non-callable foreign 'object'.
+    &PyDictKeys_Type,
+    &PyDictValues_Type,
+    &PyDictItems_Type,
+    &PySuper_Type,
 ];
 
 /// Borrow the bridged native type from a [`PyTypeObject`].

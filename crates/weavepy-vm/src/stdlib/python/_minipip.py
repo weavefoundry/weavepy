@@ -378,7 +378,67 @@ def _install_wheel(wheel_path, *, dest=None, scheme='purelib'):
                     os.chmod(target, 0o755)
                 except OSError:
                     pass
+    # RFC 0055 WS2 — generate `[console_scripts]` launchers, the way
+    # real pip does (this is how `pip`, `pytest`, `flask`, … CLIs
+    # appear in a venv's bin dir).
+    installed.extend(_generate_console_scripts(installed, scripts_dir))
     return installed
+
+
+_SCRIPT_TEMPLATE = """\
+#!{python}
+# -*- coding: utf-8 -*-
+import re
+import sys
+from {module} import {import_name}
+if __name__ == '__main__':
+    sys.argv[0] = re.sub(r'(-script\\.pyw|\\.exe)?$', '', sys.argv[0])
+    sys.exit({call}())
+"""
+
+
+def _generate_console_scripts(installed, scripts_dir):
+    """Write launcher scripts for every ``[console_scripts]`` entry in
+    the just-installed dist-info. Returns the created paths."""
+    entry_points = [p for p in installed
+                    if p.replace(os.sep, '/').endswith('.dist-info/entry_points.txt')]
+    created = []
+    for ep_path in entry_points:
+        try:
+            with open(ep_path, 'r', encoding='utf-8') as f:
+                lines = f.read().splitlines()
+        except OSError:
+            continue
+        section = None
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith(('#', ';')):
+                continue
+            if line.startswith('[') and line.endswith(']'):
+                section = line[1:-1].strip()
+                continue
+            if section != 'console_scripts' or '=' not in line:
+                continue
+            script_name, _, spec = line.partition('=')
+            script_name = script_name.strip()
+            spec = spec.split('[', 1)[0].strip()  # drop [extras]
+            module, _, attr = spec.partition(':')
+            module = module.strip()
+            attr = attr.strip() or 'main'
+            import_name = attr.split('.', 1)[0]
+            target = os.path.join(scripts_dir, script_name)
+            body = _SCRIPT_TEMPLATE.format(
+                python=sys.executable, module=module,
+                import_name=import_name, call=attr)
+            try:
+                os.makedirs(scripts_dir, exist_ok=True)
+                with open(target, 'w', encoding='utf-8') as f:
+                    f.write(body)
+                os.chmod(target, 0o755)
+            except OSError:
+                continue
+            created.append(target)
+    return created
 
 
 def _data_prefix(zf):
@@ -399,6 +459,41 @@ def cmd_install(args):
     if not targets:
         print('ERROR: no packages specified', file=sys.stderr)
         return 1
+    dest = args.target
+    if getattr(args, 'user', False) and dest is None:
+        import site
+        dest = site.getusersitepackages()
+    if getattr(args, 'root', None):
+        # `--root` re-anchors the destination under an alternate root
+        # (ensurepip passes it for altinstall trees).
+        base = dest or _site_packages()
+        dest = os.path.join(args.root, os.path.relpath(base, os.sep))
+    if getattr(args, 'no_index', False):
+        # Offline mode: satisfy every target from `--find-links`
+        # directories (`ensurepip`'s bootstrap path). Wheels only.
+        # Requires-Dist chains are resolved against the local cache
+        # unless --no-deps: `install --no-index --find-links D requests`
+        # must pull urllib3/idna/certifi/… exactly like online pip.
+        plan = []
+        rc = 0
+        for spec in targets:
+            try:
+                plan.extend(
+                    _resolve_from_links(spec, args.find_links,
+                                        follow_deps=not args.no_deps))
+            except RuntimeError as exc:
+                print('ERROR: {}'.format(exc), file=sys.stderr)
+                rc = 1
+        seen = set()
+        for wheel in plan:
+            if wheel in seen:
+                continue
+            seen.add(wheel)
+            if not args.quiet:
+                print('Installing wheel: {}'.format(wheel))
+            _install_wheel(wheel, dest=dest)
+        return rc
+    args.target = dest
     rc = 0
     if args.no_deps:
         # Old behaviour: install each spec individually.
@@ -420,6 +515,120 @@ def cmd_install(args):
         print('ERROR: {}'.format(exc), file=sys.stderr)
         rc = 1
     return rc
+
+
+def _find_wheel_in_links(spec, link_dirs):
+    """Resolve *spec* to a wheel file inside the `--find-links` dirs.
+
+    Highest version wins; environment tags are matched with the same
+    PEP 425 matcher the index path uses.
+    """
+    if os.path.isfile(spec) and spec.endswith('.whl'):
+        return spec
+    try:
+        req = Requirement(spec)
+        name = req.name
+        specifier = req.specifier
+    except InvalidRequirement:
+        name = re.split(r'[<>=!~ ]', spec, maxsplit=1)[0].strip()
+        specifier = None
+    canonical = canonicalize_name(name)
+    best = None
+    best_key = None
+    for d in link_dirs or []:
+        try:
+            entries = os.listdir(d)
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.endswith('.whl'):
+                continue
+            try:
+                whl_name, whl_version, _build, _tags = parse_wheel_filename(entry)
+            except Exception:
+                continue
+            if canonicalize_name(whl_name) != canonical:
+                continue
+            if not wheel_is_compatible(entry):
+                continue
+            if specifier is not None and not specifier.contains(str(whl_version)):
+                continue
+            key = (Version(str(whl_version)), wheel_score(entry))
+            if best_key is None or key > best_key:
+                best = os.path.join(d, entry)
+                best_key = key
+    return best
+
+
+def _resolve_from_links(spec, link_dirs, *, follow_deps=True):
+    """Resolve *spec* (and, when *follow_deps*, its Requires-Dist
+    closure) against the ``--find-links`` directories.
+
+    Returns wheel paths in dependency-first order so imports work the
+    moment each wheel lands. Raises ``RuntimeError`` when a needed
+    wheel is missing from the cache.
+    """
+    ordered = []
+    done = set()
+
+    def visit(spec, extras, chain):
+        try:
+            req = Requirement(spec)
+            name, req_extras = req.name, set(req.extras)
+        except InvalidRequirement:
+            name = re.split(r'[<>=!~ ;]', spec, maxsplit=1)[0].strip()
+            req_extras = set()
+        key = canonicalize_name(name)
+        if key in chain:  # dependency cycle (rare but legal)
+            return
+        if key in done:
+            return
+        wheel = _find_wheel_in_links(spec, link_dirs)
+        if wheel is None:
+            raise RuntimeError(
+                'no matching wheel for {!r} in {}'.format(spec, link_dirs))
+        if follow_deps:
+            env = default_environment()
+            for raw in _wheel_requires_dist(wheel):
+                try:
+                    dep = Requirement(raw)
+                except InvalidRequirement:
+                    continue
+                if dep.marker is not None:
+                    wanted = req_extras | extras
+                    # A dep guarded by `extra == "…"` only applies when
+                    # that extra was requested.
+                    if not any(
+                        dep.marker.evaluate(dict(env, extra=e))
+                        for e in (wanted or {''})
+                    ):
+                        continue
+                visit(str(dep), set(dep.extras), chain | {key})
+        done.add(key)
+        ordered.append(wheel)
+
+    visit(spec, set(), frozenset())
+    return ordered
+
+
+def _wheel_requires_dist(wheel_path):
+    """The ``Requires-Dist:`` lines of a wheel's METADATA."""
+    try:
+        with zipfile.ZipFile(wheel_path) as zf:
+            meta_name = next(
+                (n for n in zf.namelist()
+                 if n.endswith('.dist-info/METADATA') and n.count('/') == 1),
+                None)
+            if meta_name is None:
+                return []
+            text = zf.read(meta_name).decode('utf-8', errors='replace')
+    except (OSError, zipfile.BadZipFile):
+        return []
+    out = []
+    for line in text.split('\n\n', 1)[0].splitlines():
+        if line.startswith('Requires-Dist:'):
+            out.append(line.split(':', 1)[1].strip())
+    return out
 
 
 def _read_requirements(path):
@@ -606,6 +815,10 @@ def cmd_uninstall(args):
             shutil.rmtree(info)
         except OSError:
             pass
+        # Real pip prints `Successfully uninstalled <name>-<version>`;
+        # `test_venv.do_test_with_pip` greps for the prefix.
+        dist = os.path.basename(info)[:-len('.dist-info')]
+        print('Successfully uninstalled {}'.format(dist))
     return rc
 
 
@@ -839,6 +1052,7 @@ def main(argv=None):
     install.add_argument('-r', '--requirement', action='append', default=[])
     install.add_argument('--index-url', default=DEFAULT_INDEX)
     install.add_argument('-q', '--quiet', action='store_true')
+    install.add_argument('-v', '--verbose', action='count', default=0)
     install.add_argument('--no-deps', action='store_true',
                          help="don't follow Requires-Dist chains")
     install.add_argument('--dry-run', action='store_true',
@@ -850,11 +1064,29 @@ def main(argv=None):
     install.add_argument('-e', '--editable', action='append', default=[],
                          help='install in editable mode (best-effort)')
     install.add_argument('-U', '--upgrade', action='store_true')
+    # RFC 0055 WS2 — the offline surface `ensurepip` drives
+    # (`install --no-cache-dir --no-index --find-links <dir> pip`).
+    install.add_argument('--no-index', action='store_true',
+                         help='ignore the package index; only --find-links')
+    install.add_argument('--find-links', action='append', default=[],
+                         metavar='DIR',
+                         help='look for wheel archives in DIR')
+    install.add_argument('--no-cache-dir', action='store_true',
+                         help='disable the download cache')
+    install.add_argument('--root', default=None,
+                         help='install relative to this alternate root')
+    install.add_argument('--user', action='store_true',
+                         help='install into the user site-packages')
     install.set_defaults(func=cmd_install)
 
     uninstall = subs.add_parser('uninstall', help='remove a package')
     uninstall.add_argument('packages', nargs='+')
     uninstall.add_argument('-y', '--yes', action='store_true')
+    uninstall.add_argument('-v', '--verbose', action='count', default=0)
+    # Accepted for CPython `ensurepip._uninstall` compatibility; the
+    # facade never phones home for version checks anyway.
+    uninstall.add_argument('--disable-pip-version-check',
+                           action='store_true')
     uninstall.set_defaults(func=cmd_uninstall)
 
     list_cmd = subs.add_parser('list', help='list installed packages')
@@ -900,7 +1132,12 @@ def main(argv=None):
 
     opts = parser.parse_args(argv)
     if opts.version:
-        print('pip {} (from _minipip / WeavePy)'.format(VERSION))
+        # Real pip's shape: `pip <ver> from <location> (python <X.Y>)`.
+        # `test_venv.EnsurePipTest` greps the venv path out of it.
+        location = os.path.dirname(os.path.abspath(
+            globals().get('__file__') or '.'))
+        print('pip {} from {} (python {}.{})'.format(
+            VERSION, location, *sys.version_info[:2]))
         return 0
     if not getattr(opts, 'command', None):
         parser.print_help()

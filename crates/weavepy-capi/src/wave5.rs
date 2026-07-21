@@ -431,6 +431,30 @@ pub unsafe extern "C" fn PyImport_ImportModuleLevelObject(
     module
 }
 
+/// `PyImport_ImportModuleLevel(name, globals, locals, fromlist, level)` —
+/// the `const char *name` spelling of the same entry point. mypyc-compiled
+/// wheels (charset_normalizer's `md`/`cd` speedups) call this one from
+/// their module init; on macOS the extension links with
+/// `-undefined dynamic_lookup`, so a missing export doesn't fail `dlopen`
+/// — the first call jumps to NULL and the process dies with SIGSEGV.
+#[no_mangle]
+pub unsafe extern "C" fn PyImport_ImportModuleLevel(
+    name: *const c_char,
+    globals: *mut PyObject,
+    locals: *mut PyObject,
+    fromlist: *mut PyObject,
+    level: c_int,
+) -> *mut PyObject {
+    let name_obj = unsafe { crate::strings::PyUnicode_FromString(name) };
+    if name_obj.is_null() {
+        return ptr::null_mut();
+    }
+    let module =
+        unsafe { PyImport_ImportModuleLevelObject(name_obj, globals, locals, fromlist, level) };
+    unsafe { crate::object::Py_DecRef(name_obj) };
+    module
+}
+
 // ---------------------------------------------------------------------------
 // Type MRO lookup
 // ---------------------------------------------------------------------------

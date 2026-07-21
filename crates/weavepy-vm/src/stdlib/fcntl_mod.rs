@@ -154,18 +154,23 @@ fn fcntl_with_buffer(fd: i32, op: i32, data: &[u8]) -> Result<Object, RuntimeErr
 
 fn fcntl_ioctl(args: &[Object]) -> Result<Object, RuntimeError> {
     let fd = coerce_fd(args.first())?;
-    let request = extract_int(args.get(1), "request")?;
+    // CPython's clinic converter for the code is `unsigned int` with
+    // "bitwise" semantics: a negative code (an ioctl constant that
+    // overflowed into the sign bit, e.g. TIOCSWINSZ reinterpreted via
+    // struct.unpack('i', ...)) is masked to its 32-bit pattern, not
+    // sign-extended (test_ioctl_signed_unsigned_code_param).
+    let request = (extract_int(args.get(1), "request")? as u64) & 0xFFFF_FFFF;
     // The mutable-buffer form of `ioctl` mirrors `fcntl`: copy the buffer
     // into scratch, run the syscall, return the mutated prefix.
     match args.get(2) {
-        Some(Object::Bytes(b)) => ioctl_with_buffer(fd, request as u64, &b[..]),
+        Some(Object::Bytes(b)) => ioctl_with_buffer(fd, request, &b[..]),
         Some(Object::ByteArray(b)) => {
             let data = b.borrow().clone();
-            ioctl_with_buffer(fd, request as u64, &data)
+            ioctl_with_buffer(fd, request, &data)
         }
-        Some(Object::Int(n)) => ioctl_with_int(fd, request as u64, *n),
-        Some(Object::Bool(b)) => ioctl_with_int(fd, request as u64, i64::from(*b)),
-        Some(Object::None) | None => ioctl_with_int(fd, request as u64, 0),
+        Some(Object::Int(n)) => ioctl_with_int(fd, request, *n),
+        Some(Object::Bool(b)) => ioctl_with_int(fd, request, i64::from(*b)),
+        Some(Object::None) | None => ioctl_with_int(fd, request, 0),
         Some(other) => Err(type_error(format!(
             "ioctl() argument 3 must be an integer or bytes, not '{}'",
             other.type_name()

@@ -121,6 +121,7 @@ pub mod memoryview;
 pub mod mirror;
 pub mod module;
 pub mod monitoring;
+pub mod mypyc_tail;
 pub mod numbers;
 pub mod numbers_format;
 pub mod object;

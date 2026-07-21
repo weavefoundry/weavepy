@@ -1569,6 +1569,23 @@ PyObject *PyErr_Format(PyObject *ty, const char *fmt, ...) {
     return r;
 }
 
+/* _PyErr_FormatFromCause — raise a freshly-formatted exception whose
+ * __cause__/__context__ is the previously-pending one (CPython's
+ * "raise X from err" shape, used by mypyc's import-failure paths).
+ * The detach/re-attach pair lives in Rust (mypyc_tail.rs). */
+extern PyObject *_WeavePy_FetchForCause(void);
+extern void _WeavePy_ApplyCause(PyObject *cause);
+
+PyObject *_PyErr_FormatFromCause(PyObject *ty, const char *fmt, ...) {
+    PyObject *cause = _WeavePy_FetchForCause();
+    va_list ap;
+    va_start(ap, fmt);
+    (void)PyErr_FormatV(ty, fmt, ap);
+    va_end(ap);
+    _WeavePy_ApplyCause(cause);
+    return NULL;
+}
+
 /* --------------------------------------------------------------
  * Variadic convenience callers.
  * -------------------------------------------------------------- */

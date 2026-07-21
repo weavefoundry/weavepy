@@ -20,6 +20,28 @@ _version_short = "%d.%d" % sys.version_info[:2]
 _bindir = os.path.dirname(getattr(sys, "executable", "") or "") or os.path.join(
     _prefix, "bin"
 )
+# RFC 0055 WS1 — ABI identity. WeavePy's binary ABI loads stock
+# CPython 3.13 extensions, so EXT_SUFFIX/SOABI carry CPython's tags
+# (they must equal `_imp.extension_suffixes()[0]` — asserted by
+# test_sysconfig — and they are what setuptools/packaging use to name
+# and match built extensions).
+_multiarch = getattr(sys.implementation, "_multiarch", "")
+if _multiarch:
+    _soabi = "cpython-%d%d-%s" % (*sys.version_info[:2], _multiarch)
+else:
+    _soabi = "cpython-%d%d" % sys.version_info[:2]
+_ext_suffix = "." + _soabi + ".so"
+# `{stdlib}/config-3.13-{multiarch}` — materialized by the stdlib
+# tree (RFC 0055) so `get_makefile_filename()`/`srcdir` point at real
+# files.
+_config_dir = os.path.join(
+    _prefix,
+    "lib",
+    "python" + _version_short,
+    "config-%s-%s" % (_version_short, _multiarch)
+    if _multiarch
+    else "config-" + _version_short,
+)
 
 build_time_vars = {
     "ABIFLAGS": "",
@@ -34,23 +56,24 @@ build_time_vars = {
     ),
     "CXX": "c++",
     "EXE": "",
-    "EXT_SUFFIX": ".so",
+    "EXT_SUFFIX": _ext_suffix,
     "HOST_GNU_TYPE": "",
     "INCLUDEPY": os.path.join(_prefix, "include", "python" + _version_short),
     "LDFLAGS": "",
-    "LDLIBRARY": "",
+    "LDLIBRARY": "libpython%s.a" % _version_short,
     "LDSHARED": "cc -shared",
     "LDVERSION": _version_short,
     "LIBDEST": os.path.join(_prefix, "lib", "python" + _version_short),
     "LIBDIR": os.path.join(_prefix, "lib"),
-    "LIBRARY": "",
-    "MULTIARCH": "",
+    "LIBRARY": "libpython%s.a" % _version_short,
+    "MULTIARCH": _multiarch,
     "Py_DEBUG": 0,
     "Py_ENABLE_SHARED": 0,
     "Py_GIL_DISABLED": 0,
     "SHLIB_SUFFIX": ".so",
     "SIZEOF_VOID_P": 8,
-    "SOABI": "weavepy-313",
+    "SOABI": _soabi,
+    "srcdir": _config_dir,
     "TZPATH": "/usr/share/zoneinfo:/usr/lib/zoneinfo:/usr/share/lib/zoneinfo:/etc/zoneinfo",
     "VERSION": _version_short,
     "WITH_DOC_STRINGS": 1,

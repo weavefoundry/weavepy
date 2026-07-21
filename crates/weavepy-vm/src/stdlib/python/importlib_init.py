@@ -108,16 +108,21 @@ def find_loader(name, path=None):
     return spec.loader if spec else None
 
 
-# Submodule re-exports happen lazily — they're loaded on first
-# attribute access via the import machinery, which is enough for
-# `import importlib; importlib.util.spec_from_file_location(...)`.
-def _lazy_import(name):
-    try:
-        return import_module('importlib.' + name)
-    except ImportError:
-        return None
-
-
-machinery = _lazy_import('machinery')
-util = _lazy_import('util')
-abc = _lazy_import('abc')
+# Submodule re-exports are PEP 562 lazy: CPython's importlib/__init__
+# binds *no* submodules at import time, and eagerly importing `abc`
+# here would drag in `importlib.resources` → `inspect` → `ast` on any
+# startup spec synthesis. `test_traceback.test_print_traceback_at_exit`
+# depends on `ast` NOT being in sys.modules at finalization (so the
+# caret-anchor helper's `import ast` fails and full-range carets are
+# printed). A successful `import importlib.abc` still binds the
+# attribute directly on this package, bypassing this hook thereafter.
+# (`_bootstrap`/`_bootstrap_external` are reachable the same way —
+# `test_zipimport` and packaging tools import them directly.)
+def __getattr__(name):
+    if name in ('machinery', 'util', 'abc', '_bootstrap',
+                '_bootstrap_external'):
+        module = import_module('importlib.' + name)
+        globals()[name] = module
+        return module
+    raise AttributeError(
+        "module 'importlib' has no attribute {!r}".format(name))

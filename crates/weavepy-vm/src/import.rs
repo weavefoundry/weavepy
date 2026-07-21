@@ -179,6 +179,55 @@ impl ModuleCache {
         None
     }
 
+    /// Locate a module on the `sys.path` entries that *precede* the
+    /// stdlib's position. In CPython the stdlib resolves through its
+    /// `sys.path` slot, so a `uuid.py` next to the script shadows the
+    /// standard module (`test_cmd_line.test_isolatedmode`); WeavePy's
+    /// frozen registry would otherwise always win. The stdlib position
+    /// is the `pythonXY.zip` landmark or any directory that is itself a
+    /// stdlib tree (contains `os.py` — the landmark CPython's `getpath`
+    /// uses), e.g. a vendored `Lib/`; scanning stops there.
+    pub fn find_source_shadowing_stdlib(&self, full_name: &str) -> Option<(PathBuf, bool)> {
+        let rel: PathBuf = full_name.split('.').collect();
+        for dir in self.search_dirs() {
+            let leaf = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if leaf.starts_with("python")
+                && std::path::Path::new(leaf).extension() == Some("zip".as_ref())
+            {
+                return None;
+            }
+            if dir.join("os.py").is_file() {
+                return None;
+            }
+            let module_file = dir.join(&rel).with_extension("py");
+            if module_file.is_file() {
+                return Some((module_file, false));
+            }
+            let pkg_init = dir.join(&rel).join("__init__.py");
+            if pkg_init.is_file() {
+                return Some((pkg_init, true));
+            }
+        }
+        None
+    }
+
+    /// Whether a frozen name is a bundled *third-party facade* rather
+    /// than stdlib. These are PyPI projects WeavePy freezes as a
+    /// convenience (`packaging`, `numpy`, `pytest`, …). In CPython they
+    /// are not stdlib at all, so a real installation *anywhere* on
+    /// `sys.path` — site-packages included — must win over the facade;
+    /// the frozen copy is only the fallback for bare environments.
+    /// (`pip install packaging` must actually change what `import
+    /// packaging` returns: the facade's `Version` diverges from real
+    /// packaging's — RFC 0055 WS5.)
+    pub fn is_third_party_facade(full_name: &str) -> bool {
+        let top = full_name.split('.').next().unwrap_or(full_name);
+        matches!(
+            top,
+            "packaging" | "numpy" | "pytest" | "pluggy" | "iniconfig" | "exceptiongroup" | "pip"
+        )
+    }
+
     /// Locate a PEP 420 namespace package — a directory on `sys.path`
     /// with the given name that does *not* contain an `__init__.py`.
     /// Returns the list of contributing directories (matching CPython's
@@ -188,7 +237,14 @@ impl ModuleCache {
         let mut hits = Vec::new();
         for dir in self.search_dirs() {
             let pkg_dir = dir.join(&rel);
-            if pkg_dir.is_dir() && !pkg_dir.join("__init__.py").is_file() {
+            // A directory with a sourceless `__init__.pyc` is a *regular*
+            // package (CPython's FileFinder checks both suffixes); it must
+            // reach the Python-level fallback's SourcelessFileLoader, not
+            // be swallowed as a PEP 420 namespace portion.
+            if pkg_dir.is_dir()
+                && !pkg_dir.join("__init__.py").is_file()
+                && !pkg_dir.join("__init__.pyc").is_file()
+            {
                 hits.push(pkg_dir);
             }
         }

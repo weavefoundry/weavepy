@@ -138,19 +138,19 @@ fn child_flags_from_opts(exe: &str, opt_args: &[String]) -> InterpreterFlags {
 )]
 struct Cli {
     /// Print the version and exit (`python -V` / `--version`).
-    #[arg(short = 'V', long = "version", action = ArgAction::SetTrue)]
+    #[arg(short = 'V', long = "version", action = ArgAction::SetTrue, overrides_with = "version")]
     version: bool,
 
     /// Print this help and exit.
-    #[arg(short = 'h', long = "help", action = ArgAction::SetTrue)]
+    #[arg(short = 'h', long = "help", action = ArgAction::SetTrue, overrides_with = "help")]
     help: bool,
 
     /// Print the help-env summary (which `PYTHON*` vars are honoured) and exit.
-    #[arg(long = "help-env", action = ArgAction::SetTrue)]
+    #[arg(long = "help-env", action = ArgAction::SetTrue, overrides_with = "help_env")]
     help_env: bool,
 
     /// Print the help-xoptions summary and exit.
-    #[arg(long = "help-xoptions", action = ArgAction::SetTrue)]
+    #[arg(long = "help-xoptions", action = ArgAction::SetTrue, overrides_with = "help_xoptions")]
     help_xoptions: bool,
 
     /// Optimisation level. `-O` once, `-OO` twice.
@@ -162,43 +162,49 @@ struct Cli {
     bytes_warning: u8,
 
     /// Don't write `.pyc` files.
-    #[arg(short = 'B', action = ArgAction::SetTrue)]
+    #[arg(short = 'B', action = ArgAction::SetTrue, overrides_with = "no_bytecode_write")]
     no_bytecode_write: bool,
 
-    /// Parser debug output (no-op stub today).
-    #[arg(short = 'd', action = ArgAction::SetTrue)]
-    parser_debug: bool,
+    /// Parser debug output (`sys.flags.debug`; counted like CPython's
+    /// `-d`, otherwise a no-op stub).
+    #[arg(short = 'd', action = ArgAction::Count)]
+    parser_debug: u8,
+
+    /// `-R`: turn on hash randomization (the default; overrides a
+    /// `PYTHONHASHSEED` fixed seed, like CPython).
+    #[arg(short = 'R', action = ArgAction::SetTrue, overrides_with = "hash_randomization")]
+    hash_randomization: bool,
 
     /// Ignore all `PYTHON*` environment variables.
-    #[arg(short = 'E', action = ArgAction::SetTrue)]
+    #[arg(short = 'E', action = ArgAction::SetTrue, overrides_with = "ignore_env")]
     ignore_env: bool,
 
     /// Drop into the REPL after running the script / module / command.
-    #[arg(short = 'i', action = ArgAction::SetTrue)]
+    #[arg(short = 'i', action = ArgAction::SetTrue, overrides_with = "inspect_after")]
     inspect_after: bool,
 
     /// Isolated mode: implies `-E -s` and sets `sys.flags.isolated`.
-    #[arg(short = 'I', action = ArgAction::SetTrue)]
+    #[arg(short = 'I', action = ArgAction::SetTrue, overrides_with = "isolated")]
     isolated: bool,
 
     /// Don't run `site.main()` on interpreter startup.
-    #[arg(short = 'S', action = ArgAction::SetTrue)]
+    #[arg(short = 'S', action = ArgAction::SetTrue, overrides_with = "no_site")]
     no_site: bool,
 
     /// Don't add the user site-packages to `sys.path`.
-    #[arg(short = 's', action = ArgAction::SetTrue)]
+    #[arg(short = 's', action = ArgAction::SetTrue, overrides_with = "no_user_site")]
     no_user_site: bool,
 
     /// Suppress the REPL banner.
-    #[arg(short = 'q', action = ArgAction::SetTrue)]
+    #[arg(short = 'q', action = ArgAction::SetTrue, overrides_with = "quiet")]
     quiet: bool,
 
     /// Don't prepend the script dir / cwd to `sys.path`.
-    #[arg(short = 'P', action = ArgAction::SetTrue)]
+    #[arg(short = 'P', action = ArgAction::SetTrue, overrides_with = "safe_path")]
     safe_path: bool,
 
     /// Force stdout/stderr unbuffered.
-    #[arg(short = 'u', action = ArgAction::SetTrue)]
+    #[arg(short = 'u', action = ArgAction::SetTrue, overrides_with = "unbuffered")]
     unbuffered: bool,
 
     /// Verbose imports.
@@ -206,7 +212,7 @@ struct Cli {
     verbose: u8,
 
     /// Skip the first source line (shebang trick).
-    #[arg(short = 'x', action = ArgAction::SetTrue)]
+    #[arg(short = 'x', action = ArgAction::SetTrue, overrides_with = "skip_first_line")]
     skip_first_line: bool,
 
     /// `-X key[=value]`. Forwarded to `sys._xoptions`.
@@ -256,6 +262,7 @@ Options (and corresponding environment variables):
 -OO    : do -O changes and also discard docstrings
 -P     : don't prepend a potentially unsafe path to sys.path
 -q     : don't print version and copyright messages on interactive startup
+-R     : turn on hash randomization; also PYTHONHASHSEED=random (default)
 -s     : don't add user site directory to sys.path; also PYTHONNOUSERSITE
 -S     : don't imply 'import site' on initialization
 -u     : force the stdout and stderr streams to be unbuffered
@@ -596,12 +603,16 @@ fn split_argv(raw: Vec<String>) -> (Vec<String>, Option<(&'static str, String)>,
             return (wp, None, iter.collect());
         }
         if arg == "-c" {
-            let cmd = iter.next().unwrap_or_default();
+            let Some(cmd) = iter.next() else {
+                argument_expected_error('c');
+            };
             let rest: Vec<String> = iter.collect();
             return (wp, Some(("c", cmd)), rest);
         }
         if arg == "-m" {
-            let m = iter.next().unwrap_or_default();
+            let Some(m) = iter.next() else {
+                argument_expected_error('m');
+            };
             let rest: Vec<String> = iter.collect();
             return (wp, Some(("m", m)), rest);
         }
@@ -638,7 +649,7 @@ fn split_argv(raw: Vec<String>) -> (Vec<String>, Option<(&'static str, String)>,
             let body: Vec<char> = arg[1..].chars().collect();
             if let Some(pos) = body.iter().position(|&c| c == 'c' || c == 'm') {
                 const BOOL_SHORT: &[char] = &[
-                    'O', 'b', 'B', 'd', 'E', 'i', 'I', 'S', 's', 'q', 'P', 'u', 'v', 'x',
+                    'O', 'b', 'B', 'd', 'E', 'i', 'I', 'R', 'S', 's', 'q', 'P', 'u', 'v', 'x',
                 ];
                 if body[..pos].iter().all(|c| BOOL_SHORT.contains(c)) {
                     for &c in &body[..pos] {
@@ -647,7 +658,8 @@ fn split_argv(raw: Vec<String>) -> (Vec<String>, Option<(&'static str, String)>,
                     let kind = if body[pos] == 'c' { "c" } else { "m" };
                     let after: String = body[pos + 1..].iter().collect();
                     let value = if after.is_empty() {
-                        iter.next().unwrap_or_default()
+                        iter.next()
+                            .unwrap_or_else(|| argument_expected_error(body[pos]))
                     } else {
                         after
                     };
@@ -687,7 +699,7 @@ fn real_main() -> Result<ExitCode> {
     // Stuff `mode` back into the parsed Cli so the rest of real_main
     // sees a consistent view.
     match &mode {
-        Some(("c", cmd)) => cli.command = Some(cmd.clone()),
+        Some(("c", cmd)) => cli.command = Some(decode_command_arg(cmd)),
         Some(("m", m)) => cli.module = Some(m.clone()),
         // A script path may carry PEP 383-escaped bytes (PUA-bridged by
         // `os_args_bridged`); recover the OS-level bytes so the file
@@ -751,24 +763,24 @@ fn real_main() -> Result<ExitCode> {
     if let Some(source) = cli.command.clone() {
         let mut argv = vec!["-c".to_owned()];
         argv.extend(cli.args.iter().cloned());
+        // CPython's `-c` puts the *empty string* at `sys.path[0]` (an
+        // '' entry means "current directory, resolved at import time"),
+        // not a materialized cwd path —
+        // `test_cmd_line_script.test_issue8202_dash_c_file_ignored`.
         let opts = RunOptions::new("<string>")
             .with_argv(argv)
             .with_extra_path(extra_path.drain(..))
-            .with_script_dir(env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+            .with_script_dir("")
             .with_flags(flags.clone());
+        // `-i` is handled inside `run_source_with_options`, which drops
+        // into a namespace-sharing REPL after the program body.
         run_source_with_options(&source, &opts)?;
-        if flags.inspect {
-            run_repl(flags, env.startup.as_deref(), Vec::new())?;
-        }
         return Ok(ExitCode::SUCCESS);
     }
 
     if let Some(module) = cli.module.clone() {
         let extra = cli.args.clone();
         run_module(&module, extra, &flags, &extra_path)?;
-        if flags.inspect {
-            run_repl(flags, env.startup.as_deref(), Vec::new())?;
-        }
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -777,25 +789,69 @@ fn real_main() -> Result<ExitCode> {
     match script.as_deref() {
         Some(path) if path.as_os_str() == "-" => {
             run_stdin(trailing.clone(), &flags, &extra_path)?;
-            if flags.inspect {
-                run_repl(flags, env.startup.as_deref(), Vec::new())?;
-            }
             Ok(ExitCode::SUCCESS)
         }
         Some(path) => {
             run_path(path, trailing.clone(), &flags, &extra_path)?;
-            if flags.inspect {
-                run_repl(flags, env.startup.as_deref(), Vec::new())?;
-            }
             Ok(ExitCode::SUCCESS)
         }
         None => {
-            // No script — interactive mode. Honour `-i`'s implicit
-            // "interactive after" by always going to the REPL here.
-            flags.inspect = true;
-            run_repl(flags, env.startup.as_deref(), trailing)?;
+            // No script. CPython enters the REPL only when stdin is a
+            // tty (or `-i` forces it); a piped stdin is read to EOF and
+            // run as a program named `<stdin>` (`pymain_run_stdin` —
+            // no banner, no `>>>` prompts, plain tracebacks).
+            let stdin_is_tty = std::io::IsTerminal::is_terminal(&io::stdin());
+            if stdin_is_tty || flags.inspect {
+                flags.inspect = true;
+                run_repl(flags, env.startup.as_deref(), trailing)?;
+            } else {
+                run_stdin(trailing, &flags, &extra_path)?;
+            }
             Ok(ExitCode::SUCCESS)
         }
+    }
+}
+
+/// CPython's `pymain_err_print` for an option missing its argument:
+/// diagnostics + usage line on stderr, exit status 2.
+fn argument_expected_error(opt: char) -> ! {
+    eprintln!("Argument expected for the -{opt} option");
+    eprintln!("usage: weavepy [option] ... [-c cmd | -m mod | file | -] [arg] ...");
+    eprintln!("Try `weavepy -h' for more information.");
+    std::process::exit(2);
+}
+
+/// A startup configuration error CPython reports through
+/// `Py_ExitStatusException`: `Fatal Python error: <where>: <msg>`, exit 1.
+fn config_fatal_error(whence: &str, msg: &str) -> ! {
+    eprintln!("Fatal Python error: {whence}: {msg}");
+    std::process::exit(1);
+}
+
+/// The value of the last `-X name[=value]` occurrence: `None` when the
+/// option wasn't given, `Some(None)` for the bare form, `Some(Some(v))`
+/// for `-X name=v`.
+fn xoption_value<'a>(xoptions: &'a [String], name: &str) -> Option<Option<&'a str>> {
+    xoptions.iter().rev().find_map(|x| {
+        if x == name {
+            Some(None)
+        } else {
+            x.strip_prefix(name)
+                .and_then(|rest| rest.strip_prefix('='))
+                .map(Some)
+        }
+    })
+}
+
+/// Parse + validate the PEP 0467 digit cap (`0` or `>= 640`), exiting
+/// with CPython's `config_init_int_max_str_digits` fatal error otherwise.
+fn parse_int_max_str_digits(value: &str, source: &str) -> i64 {
+    match value.parse::<i64>() {
+        Ok(n) if n == 0 || n >= 640 => n,
+        _ => config_fatal_error(
+            "config_init_int_max_str_digits",
+            &format!("{source}: invalid limit; must be >= 640 or 0 for unlimited."),
+        ),
     }
 }
 
@@ -804,11 +860,82 @@ fn real_main() -> Result<ExitCode> {
 fn build_flags(cli: &Cli, env: &EnvOverrides) -> InterpreterFlags {
     let isolated = cli.isolated;
     let ignore_env = cli.ignore_env || isolated;
-    let mut flags = InterpreterFlags {
+    // Pin the per-process str/bytes hash salt before the interpreter
+    // hashes anything (PEP 456 / `PYTHONHASHSEED`). `-R` re-enables
+    // randomization, which is also the default when the var is unset.
+    if !cli.hash_randomization {
+        if let Some(seed) = env.hash_seed {
+            weavepy::vm::object::set_hash_seed(seed);
+        }
+    }
+    // `-X pycache_prefix[=PATH]` beats `PYTHONPYCACHEPREFIX` even when
+    // given bare / with an empty value (which unsets the env prefix).
+    let pycache_prefix = match xoption_value(&cli.xoptions, "pycache_prefix") {
+        Some(v) => v.filter(|p| !p.is_empty()).map(str::to_owned),
+        None => env.pycache_prefix.clone(),
+    };
+    let int_max_str_digits = match xoption_value(&cli.xoptions, "int_max_str_digits") {
+        Some(Some(v)) => Some(parse_int_max_str_digits(v, "-X int_max_str_digits")),
+        Some(None) => config_fatal_error(
+            "config_init_int_max_str_digits",
+            "-X int_max_str_digits: invalid limit; must be >= 640 or 0 for unlimited.",
+        ),
+        None => env
+            .int_max_str_digits
+            .as_deref()
+            .map(|v| parse_int_max_str_digits(v, "PYTHONINTMAXSTRDIGITS")),
+    };
+    // `-X cpu_count=N|default` / `PYTHON_CPU_COUNT` (gh-109595).
+    let cpu_count_raw = match xoption_value(&cli.xoptions, "cpu_count") {
+        Some(Some(v)) => Some(v.to_owned()),
+        Some(None) => config_fatal_error(
+            "config_init_cpu_count",
+            "-X cpu_count=n option: n is missing or invalid",
+        ),
+        None => env.cpu_count.clone(),
+    };
+    let cpu_count = cpu_count_raw.and_then(|raw| {
+        if raw == "default" {
+            None
+        } else {
+            match raw.parse::<i64>() {
+                Ok(n) if n >= 1 => Some(n),
+                _ => config_fatal_error(
+                    "config_init_cpu_count",
+                    "-X cpu_count=n option: n is missing or invalid",
+                ),
+            }
+        }
+    });
+    // `-X gil` / `PYTHON_GIL` (PEP 703): only "1" is meaningful on a
+    // build whose GIL can't be disabled; "0" is a startup fatal error.
+    let gil = match xoption_value(&cli.xoptions, "gil") {
+        Some(v) => v.map(str::to_owned),
+        None => env.gil.clone(),
+    };
+    match gil.as_deref() {
+        None | Some("1") => {}
+        Some("0") => config_fatal_error(
+            "config_read_gil",
+            "Disabling the GIL is not supported by this build",
+        ),
+        Some(_) => config_fatal_error(
+            "config_read_gil",
+            "PYTHON_GIL / -X gil must be \"0\" or \"1\"",
+        ),
+    }
+    let mut xoptions = cli.xoptions.clone();
+    // `PYTHONDEVMODE` behaves like `-X dev` for `sys.flags.dev_mode`
+    // (though CPython does *not* mirror it into `sys._xoptions`; the
+    // duplicate key is harmless for our flag computation).
+    if env.dev_mode && xoption_value(&xoptions, "dev").is_none() {
+        xoptions.push("dev".to_owned());
+    }
+    InterpreterFlags {
         optimize: cli.optimize.max(env.optimize),
         dont_write_bytecode: cli.no_bytecode_write || env.dont_write_bytecode,
         inspect: cli.inspect_after || env.inspect,
-        verbose: cli.verbose > 0 || env.verbose,
+        verbose: cli.verbose.max(env.verbose),
         no_site: cli.no_site,
         no_user_site: cli.no_user_site || env.no_user_site || isolated,
         ignore_environment: ignore_env,
@@ -818,22 +945,27 @@ fn build_flags(cli: &Cli, env: &EnvOverrides) -> InterpreterFlags {
         skip_first_line: cli.skip_first_line,
         bytes_warning: cli.bytes_warning,
         safe_path: cli.safe_path || env.safe_path || isolated,
-        debug: cli.parser_debug,
-        xoptions: cli.xoptions.clone(),
+        debug: cli.parser_debug.max(env.debug),
+        xoptions,
         warning_filters: {
             let mut v = env.warning_filters.clone();
             v.extend(cli.warnings.iter().cloned());
             v
         },
-        hash_seed: env.hash_seed,
+        // `-R` re-enables randomization, trumping a fixed seed from
+        // `PYTHONHASHSEED`.
+        hash_seed: if cli.hash_randomization {
+            None
+        } else {
+            env.hash_seed
+        },
         io_encoding: env.io_encoding.clone(),
         io_errors: env.io_errors.clone(),
         utf8_mode: env.utf8_mode,
-    };
-    if cli.optimize == 0 && env.optimize > 0 {
-        flags.optimize = env.optimize;
+        pycache_prefix,
+        int_max_str_digits,
+        cpu_count,
     }
-    flags
 }
 
 /// Subset of `PYTHON*` environment overrides we honour. Materialised
@@ -847,9 +979,20 @@ struct EnvOverrides {
     dont_write_bytecode: bool,
     inspect: bool,
     unbuffered: bool,
-    verbose: bool,
+    verbose: u8,
+    debug: u8,
+    dev_mode: bool,
     no_user_site: bool,
     safe_path: bool,
+    /// `PYTHONPYCACHEPREFIX` (PEP 552), losing to `-X pycache_prefix`.
+    pycache_prefix: Option<String>,
+    /// `PYTHONINTMAXSTRDIGITS`, raw (validated during flag composition
+    /// so `-X int_max_str_digits` precedence applies first).
+    int_max_str_digits: Option<String>,
+    /// `PYTHON_CPU_COUNT`, raw (`"default"` or an integer ≥ 1).
+    cpu_count: Option<String>,
+    /// `PYTHON_GIL`, raw (`"0"` / `"1"`).
+    gil: Option<String>,
     warning_filters: Vec<String>,
     hash_seed: Option<u32>,
     /// `PYTHONIOENCODING=encoding[:errors]`, split into its halves. Either
@@ -875,27 +1018,31 @@ impl EnvOverrides {
                 o.startup = Some(PathBuf::from(p));
             }
         }
-        if let Ok(n) = env::var("PYTHONOPTIMIZE") {
-            o.optimize = n.parse().unwrap_or(1);
+        // CPython treats a `PYTHON*` variable set to the empty string as
+        // unset (`config_get_env` / `_Py_GetEnv`); the int-valued ones
+        // (`PYTHONOPTIMIZE`/`PYTHONVERBOSE`/`PYTHONDEBUG`) parse as an
+        // integer with any non-numeric value meaning 1
+        // (`test_cmd_line.test_sys_flags_set`).
+        let nonempty = |name: &str| env::var(name).ok().filter(|v| !v.is_empty());
+        let env_int = |name: &str| nonempty(name).map(|v| v.parse::<u8>().unwrap_or(1));
+        if let Some(n) = env_int("PYTHONOPTIMIZE") {
+            o.optimize = n;
         }
-        if env::var_os("PYTHONDONTWRITEBYTECODE").is_some() {
-            o.dont_write_bytecode = true;
-        }
-        if env::var_os("PYTHONINSPECT").is_some() {
-            o.inspect = true;
-        }
-        if env::var_os("PYTHONUNBUFFERED").is_some() {
-            o.unbuffered = true;
-        }
-        if env::var_os("PYTHONVERBOSE").is_some() {
-            o.verbose = true;
-        }
-        if env::var_os("PYTHONNOUSERSITE").is_some() {
-            o.no_user_site = true;
-        }
-        if env::var_os("PYTHONSAFEPATH").is_some() {
-            o.safe_path = true;
-        }
+        o.dont_write_bytecode = nonempty("PYTHONDONTWRITEBYTECODE").is_some();
+        o.inspect = nonempty("PYTHONINSPECT").is_some();
+        o.unbuffered = nonempty("PYTHONUNBUFFERED").is_some();
+        o.verbose = env_int("PYTHONVERBOSE").unwrap_or(0);
+        // Unlike OPTIMIZE/VERBOSE, `PYTHONDEBUG` is a plain boolean env
+        // in CPython (`config_get_env`, not the int-parsing variant):
+        // any non-empty value — including "2" — means 1.
+        o.debug = u8::from(nonempty("PYTHONDEBUG").is_some());
+        o.dev_mode = nonempty("PYTHONDEVMODE").is_some();
+        o.no_user_site = nonempty("PYTHONNOUSERSITE").is_some();
+        o.safe_path = nonempty("PYTHONSAFEPATH").is_some();
+        o.pycache_prefix = nonempty("PYTHONPYCACHEPREFIX");
+        o.int_max_str_digits = nonempty("PYTHONINTMAXSTRDIGITS");
+        o.cpu_count = nonempty("PYTHON_CPU_COUNT");
+        o.gil = nonempty("PYTHON_GIL");
         if let Ok(w) = env::var("PYTHONWARNINGS") {
             o.warning_filters = w.split(',').map(str::to_owned).collect();
         }
@@ -948,6 +1095,39 @@ impl EnvOverrides {
     }
 }
 
+/// Materialise the `-c` command text from its (possibly PUA-bridged)
+/// argv transport, the way CPython's `pymain_run_command` receives it:
+/// - clean text (the overwhelmingly common case) passes through;
+/// - undecodable bytes under the `C`/`POSIX` locale decode to their
+///   byte values (macOS/BSD `_Py_char2wchar` fallback — `test_cmd_line.
+///   test_undecodable_code` expects `ascii("\xff")` to print `'\xff'`);
+/// - otherwise the command cannot be represented and startup fails with
+///   CPython's "Unable to decode the command from the command line".
+fn decode_command_arg(cmd: &str) -> String {
+    use weavepy::vm::object::Object;
+    match weavepy::vm::argv_str_to_object(cmd) {
+        Object::WStr(cps) => {
+            let c_locale = ["LC_ALL", "LC_CTYPE", "LANG"]
+                .iter()
+                .find_map(|v| env::var(v).ok().filter(|s| !s.is_empty()))
+                .is_none_or(|loc| loc == "C" || loc == "POSIX");
+            if c_locale {
+                cps.iter()
+                    .map(|&cp| match cp {
+                        0xDC80..=0xDCFF => char::from_u32(cp - 0xDC00).unwrap_or('\u{FFFD}'),
+                        other => char::from_u32(other).unwrap_or('\u{FFFD}'),
+                    })
+                    .collect()
+            } else {
+                eprintln!("Unable to decode the command from the command line:");
+                std::process::exit(1);
+            }
+        }
+        Object::Str(s) => s.to_string(),
+        _ => cmd.to_owned(),
+    }
+}
+
 /// Rebuild a filesystem path from a (possibly PUA-bridged) argv string,
 /// recovering the original OS bytes for PEP 383-escaped names.
 fn bridged_arg_to_pathbuf(arg: &str) -> PathBuf {
@@ -989,71 +1169,28 @@ fn run_module(
     flags: &InterpreterFlags,
     extra_path: &[PathBuf],
 ) -> Result<()> {
-    // First look on the filesystem for a top-level `<name>.py`. A single-file
-    // module has no `__main__` redirect and no parent package to initialise,
-    // so we can run it directly and let the filename / `__file__` honour the
-    // host source. Packages are deliberately NOT short-circuited here: CPython's
-    // `python -m pkg` never executes `pkg/__init__.py` as `__main__`, it
-    // redirects to `pkg.__main__` (importing `pkg` first so the target's
-    // relative imports resolve). Running `__init__.py` directly breaks any
-    // `from . import ...` in the package body (e.g. `zipfile`). So packages —
-    // and everything else — fall through to the `runpy` path below, which
-    // performs that redirect faithfully and also resolves frozen modules.
-    let mut argv = vec![name.to_owned()];
+    // Every `-m` goes through CPython's own entry point,
+    // `runpy._run_module_as_main`: it imports parent packages (so the
+    // target's relative imports resolve), redirects a package to its
+    // `__main__` submodule, executes the target *in* the current
+    // `__main__` namespace (so `-i -m timeit` leaves `Timer` visible to
+    // the inspect REPL — `test_cmd_line.test_run_module_bug1764407`),
+    // and reports a missing module the way CPython does
+    // (`sys.exit("<exe>: Error while finding module specification …")`).
+    //
+    // `sys.argv[0]` starts as the literal `'-m'` — CPython's config
+    // leaves the placeholder in place so code run *during the search*
+    // (a parent package's `__init__`) sees it
+    // (`test_cmd_line_script.test_issue8202`); `_run_module_as_main`
+    // then swaps in the located file path before the target runs.
+    let mut argv = vec!["-m".to_owned()];
     argv.extend(args.iter().cloned());
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let rel: PathBuf = name.split('.').collect();
-    let mut search: Vec<PathBuf> = vec![cwd.clone()];
-    search.extend(extra_path.iter().cloned());
-    // Only a top-level, non-dotted name with a matching `<name>.py` takes the
-    // fast path; a dotted `-m pkg.mod` needs `runpy` to import the parent
-    // package first, and a package directory must redirect to `__main__`.
-    let on_disk_module = if name.contains('.') {
-        None
-    } else {
-        search.iter().find_map(|dir| {
-            let m = dir.join(&rel).with_extension("py");
-            m.is_file().then_some(m)
-        })
-    };
-    if let Some(source_path) = on_disk_module {
-        let bytes = fs::read(&source_path)
-            .with_context(|| format!("failed to read {}", source_path.display()))?;
-        let filename = source_path.display().to_string();
-        let source = decode_script_source(&bytes, &filename);
-        // CPython's `python -m mod` runs through `runpy._run_module_as_main`,
-        // which sets `sys.argv[0]` to the module's resolved *file path*, not the
-        // bare module name. Programs derive identity from it — e.g. argparse's
-        // default `prog` is `os.path.basename(sys.argv[0])`, so `-m calendar -h`
-        // must report `calendar.py`, not `calendar`. Mirror that here on the
-        // single-file fast path (the `runpy` path below already does so via
-        // `alter_sys=True`).
-        argv[0] = filename.clone();
-        let opts = RunOptions::new(filename.clone())
-            .with_argv(argv)
-            .with_extra_path(extra_path.to_vec())
-            .with_script_dir(cwd)
-            .with_flags(flags.clone());
-        return run_source_with_options(&source, &opts);
-    }
-    // Frozen / built-in module path — delegate to runpy. The
-    // bootstrap is a tiny snippet that imports runpy and asks it to
-    // run the requested module as `__main__`. We make the host argv
-    // visible up front so the loaded module's `sys.argv` matches
-    // CPython's `python -m`.
     let mut bootstrap = String::from("import runpy, sys\n");
-    bootstrap.push_str("try:\n");
     bootstrap.push_str(&format!(
-        "    runpy.run_module({}, run_name='__main__', alter_sys=True)\n",
+        "runpy._run_module_as_main({})\n",
         quote_py_string(name)
     ));
-    bootstrap.push_str("except ImportError as e:\n");
-    bootstrap.push_str(&format!(
-        "    sys.stderr.write(\"weavepy: No module named '{}': \" + str(e) + \"\\n\")\n",
-        name
-    ));
-    bootstrap.push_str("    sys.exit(1)\n");
-    let _ = args;
     let opts = RunOptions::new(format!("<runpy:{name}>"))
         .with_argv(argv)
         .with_extra_path(extra_path.to_vec())
@@ -1073,6 +1210,24 @@ fn decode_script_source(bytes: &[u8], filename: &str) -> String {
                 weavepy::vm::RuntimeError::PyException(pe) => pe.message(),
                 other => other.to_string(),
             };
+            // A NUL in the source: CPython reports the line the byte sits
+            // on and echoes that line *truncated at the NUL*, with no
+            // caret (`test_cmd_line_script.test_syntaxerror_null_bytes`).
+            if let Some(pos) = bytes.iter().position(|&b| b == 0) {
+                let line_no = bytes[..pos].iter().filter(|&&b| b == b'\n').count() + 1;
+                let line_start = bytes[..pos]
+                    .iter()
+                    .rposition(|&b| b == b'\n')
+                    .map_or(0, |i| i + 1);
+                let line_text = String::from_utf8_lossy(&bytes[line_start..pos]);
+                eprintln!("  File \"{filename}\", line {line_no}");
+                let trimmed = line_text.trim_start();
+                if !trimmed.is_empty() {
+                    eprintln!("    {trimmed}");
+                }
+                eprintln!("SyntaxError: {msg}");
+                std::process::exit(1);
+            }
             eprintln!("  File \"{filename}\", line 1");
             eprintln!("SyntaxError: {msg}");
             std::process::exit(1);
@@ -1091,21 +1246,55 @@ fn run_path(
     // `runpy._run_module_as_main("__main__")`, so `<dir>/__main__.py` (or the
     // zip's top-level `__main__`) becomes the program. (`python <dir>` /
     // `python app.zip`.)
-    if path.is_dir() || path_is_zipfile(path) {
+    if path.is_dir() {
         return run_main_module_from_path(path, extra, flags, extra_path);
     }
-    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let filename = path.display().to_string();
+    // CPython's `pymain_run_file`: an unopenable script prints
+    // `<program>: can't open file '<abspath>': [Errno N] <strerror>`
+    // (no traceback) and exits with status 2.
+    //
+    // The file is read exactly *once* and every content sniff (zip
+    // magic, pyc magic) works off those bytes: a `/dev/fd/N` script
+    // shares its seek offset with every other descriptor on the same
+    // open file description, so a probe that consumed 4 magic bytes
+    // would shear them off the program itself (GH-87235,
+    // `test_cmd_line_script.test_script_as_dev_fd`).
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+            let program = env::args().next().unwrap_or_else(|| "weavepy".to_owned());
+            let errno = e.raw_os_error().unwrap_or(2);
+            eprintln!(
+                "{program}: can't open file '{}': [Errno {errno}] {}",
+                abs.display(),
+                errno_message(errno)
+            );
+            std::process::exit(2);
+        }
+    };
+    // `python app.zip`: the zip's top-level `__main__` becomes the program.
+    if is_zip_bytes(&bytes) {
+        return run_main_module_from_path(path, extra, flags, extra_path);
+    }
     // A compiled-bytecode file (`.pyc`) given directly: CPython's
     // `pymain_run_file` detects the magic and runs the unmarshalled code
     // object as `__main__` (rather than trying to decode it as source).
     if is_pyc_bytes(&bytes) {
         return run_pyc_as_main(path, extra, flags, extra_path);
     }
+    // CPython absolutizes the script path for `__main__.__file__` /
+    // `co_filename` (getpath's `abspath(program_full_path)`), while
+    // `sys.argv[0]` keeps the exact text the user typed
+    // (`test_cmd_line_script.test_script_abspath`).
+    let filename = std::path::absolute(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string();
     let source = decode_script_source(&bytes, &filename);
-    let mut argv = vec![filename.clone()];
+    let mut argv = vec![path.display().to_string()];
     argv.extend(extra);
-    let script_dir = path
+    let script_dir = Path::new(&filename)
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
@@ -1115,6 +1304,16 @@ fn run_path(
         .with_script_dir(script_dir)
         .with_flags(flags.clone());
     run_source_with_options(&source, &opts)
+}
+
+/// The OS `strerror` text for an errno, without the " (os error N)"
+/// suffix `std::io::Error`'s Display appends.
+fn errno_message(errno: i32) -> String {
+    let s = io::Error::from_raw_os_error(errno).to_string();
+    match s.find(" (os error ") {
+        Some(i) => s[..i].to_owned(),
+        None => s,
+    }
 }
 
 /// CPython's `__pycache__`/legacy-`.pyc` magic (kept in sync with
@@ -1127,20 +1326,12 @@ fn is_pyc_bytes(bytes: &[u8]) -> bool {
     bytes.len() >= 16 && bytes[..4] == PYC_MAGIC
 }
 
-/// Whether `path` is a zip archive (local-file/empty/spanned signatures).
+/// Whether `bytes` begins with a zip signature (local-file/empty/spanned).
 /// `python app.zip` runs the zip's top-level `__main__` via `zipimport`.
-fn path_is_zipfile(path: &Path) -> bool {
-    use std::io::Read;
-    let Ok(mut f) = fs::File::open(path) else {
-        return false;
-    };
-    let mut magic = [0u8; 4];
-    if f.read_exact(&mut magic).is_err() {
-        return false;
-    }
+fn is_zip_bytes(bytes: &[u8]) -> bool {
     matches!(
-        magic,
-        [b'P', b'K', 0x03, 0x04] | [b'P', b'K', 0x05, 0x06] | [b'P', b'K', 0x07, 0x08]
+        bytes.get(..4),
+        Some([b'P', b'K', 0x03, 0x04] | [b'P', b'K', 0x05, 0x06] | [b'P', b'K', 0x07, 0x08])
     )
 }
 
@@ -1162,7 +1353,7 @@ fn run_main_module_from_path(
     let opts = RunOptions::new(path_str)
         .with_argv(argv)
         .with_extra_path(extra_path.to_vec())
-        .with_script_dir(path.to_path_buf())
+        .with_script_dir_always(path.to_path_buf())
         .with_flags(flags.clone());
     run_source_with_options(&bootstrap, &opts)
 }
@@ -1193,6 +1384,14 @@ fn run_pyc_as_main(
     bootstrap.push_str(&format!("_g['__file__'] = {quoted}\n"));
     bootstrap.push_str("_g['__cached__'] = None\n");
     bootstrap.push_str("_g['__spec__'] = None\n");
+    // CPython's `pymain_run_file` on a `.pyc` installs a
+    // `SourcelessFileLoader` as `__main__.__loader__`
+    // (`test_cmd_line_script.test_script_compiled`).
+    bootstrap.push_str("import importlib.machinery as _m\n");
+    bootstrap.push_str(&format!(
+        "_g['__loader__'] = _m.SourcelessFileLoader('__main__', {quoted})\n"
+    ));
+    bootstrap.push_str("del _m\n");
     bootstrap.push_str("del sys, marshal, _f, _data\n");
     bootstrap.push_str("exec(_code, _g)\n");
     let opts = RunOptions::new(path_str)
@@ -1210,10 +1409,12 @@ fn run_stdin(extra: Vec<String>, flags: &InterpreterFlags, extra_path: &[PathBuf
         .context("failed to read stdin")?;
     let mut argv = vec!["-".to_owned()];
     argv.extend(extra);
+    // Like `-c`: stdin programs get `''` (cwd at import time) as
+    // `sys.path[0]`, matching CPython's `pymain_run_stdin`.
     let opts = RunOptions::new("<stdin>")
         .with_argv(argv)
         .with_extra_path(extra_path.to_vec())
-        .with_script_dir(env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        .with_script_dir("")
         .with_flags(flags.clone());
     run_source_with_options(&buf, &opts)
 }
@@ -1223,6 +1424,26 @@ fn run_source_with_options(source: &str, opts: &RunOptions) -> Result<()> {
     // interpreter's `sys.excepthook` / `traceback` machinery (source
     // lines, carets, exception chains) while it is still alive.
     let opts = opts.clone().with_print_uncaught(true);
+    // `-i` / `PYTHONINSPECT`: keep the interpreter alive and drop into
+    // a REPL that shares the program's `__main__` namespace (CPython's
+    // `pymain_repl`). An uncaught `SystemExit` is *ignored* — CPython's
+    // `_Py_HandleSystemExit` says "Don't exit if -i flag was given"
+    // (so `-i -m timeit`, whose main ends in `sys.exit(...)`, still
+    // reaches the prompt); any other exception is printed first and
+    // the prompt appears anyway.
+    if opts.flags.inspect {
+        let (interpreter, result) = weavepy::run_source_keep_interpreter(source, &opts);
+        if let Err(err) = result {
+            if err.system_exit_code().is_none() && !err.already_printed() {
+                let mut stderr = io::stderr().lock();
+                let diag = err.format(source, &opts.filename);
+                let _ = stderr.write_all(diag.as_bytes());
+            }
+        }
+        // No banner in inspect mode (CPython goes straight to `>>>`).
+        let repl = repl::Repl::new(interpreter, true)?;
+        return repl.run(None);
+    }
     match weavepy::run_source_with_options(source, &opts) {
         Ok(()) => Ok(()),
         Err(err) => {
@@ -1265,6 +1486,40 @@ fn exit_with_system_exit(code: weavepy::vm::object::Object) -> ! {
         // message; WeavePy models the empty payload as an empty string,
         // which means "no error" → exit 0, not a printed message.
         Object::Str(s) if s.is_empty() => 0,
+        // An *int subclass* payload exits with its integer value —
+        // `sys.exit(pytest.ExitCode.OK)` is an `enum.IntEnum`, and
+        // CPython's `_Py_HandleSystemExit` does `PyLong_Check(value)`
+        // which is subclass-inclusive (RFC 0055 WS5).
+        Object::Instance(ref inst)
+            if matches!(
+                inst.native.get(),
+                Some(Object::Int(_) | Object::Long(_) | Object::Bool(_))
+            ) =>
+        {
+            (code.as_i64().unwrap_or(1) & 0xFF) as i32
+        }
+        // `sys.exit(SomeException('msg'))`: CPython prints `str(code)`.
+        // The interpreter is already torn down, so mirror
+        // `BaseException.__str__` from the args tuple directly
+        // (`test_cmd_line_script.test_issue20500_exit_with_exception_value`).
+        Object::Instance(inst) => {
+            let args = inst
+                .dict
+                .borrow()
+                .get(&weavepy::vm::object::DictKey(Object::from_static("args")))
+                .cloned();
+            let text = match args {
+                Some(Object::Tuple(args)) => match args.len() {
+                    0 => String::new(),
+                    1 => args[0].to_str(),
+                    _ => Object::Tuple(args).to_str(),
+                },
+                _ => Object::Instance(inst).to_str(),
+            };
+            let mut stderr = io::stderr().lock();
+            let _ = writeln!(stderr, "{text}");
+            1
+        }
         other => {
             let mut stderr = io::stderr().lock();
             let _ = writeln!(stderr, "{}", other.to_str());

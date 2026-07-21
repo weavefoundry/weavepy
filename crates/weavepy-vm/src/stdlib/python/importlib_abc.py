@@ -99,48 +99,14 @@ class SourceLoader(FileLoader):
         return decode_source(self.get_data(self.path))
 
 
-class Traversable(abc.ABC):
-    @abc.abstractmethod
-    def iterdir(self):
-        raise NotImplementedError
-
-    @abc.abstractmethod
-    def read_bytes(self):
-        raise NotImplementedError
-
-    @abc.abstractmethod
-    def read_text(self, encoding='utf-8'):
-        raise NotImplementedError
-
-    @abc.abstractmethod
-    def is_dir(self):
-        raise NotImplementedError
-
-    @abc.abstractmethod
-    def is_file(self):
-        raise NotImplementedError
-
-    @abc.abstractmethod
-    def joinpath(self, *child):
-        raise NotImplementedError
-
-    def __truediv__(self, other):
-        return self.joinpath(other)
-
-    @property
-    def name(self):
-        raise NotImplementedError
-
-    def open(self, mode='r', *args, **kwargs):
-        if mode == 'r':
-            return open(str(self), encoding=kwargs.get('encoding', 'utf-8'))
-        return open(str(self), mode)
-
-
-class TraversableResources(ResourceLoader):
-    @abc.abstractmethod
-    def files(self):
-        raise NotImplementedError
+# Canonical home since 3.11 is `importlib.resources.abc`; these names
+# are re-exports so isinstance checks agree across both import paths
+# (CPython does exactly this until the 3.14 removal).
+from importlib.resources.abc import (  # noqa: E402
+    ResourceReader,
+    Traversable,
+    TraversableResources,
+)
 
 
 __all__ = [
@@ -153,6 +119,7 @@ __all__ = [
     'ExecutionLoader',
     'FileLoader',
     'SourceLoader',
+    'ResourceReader',
     'Traversable',
     'TraversableResources',
 ]

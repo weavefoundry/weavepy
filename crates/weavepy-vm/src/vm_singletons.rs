@@ -760,6 +760,80 @@ pub fn dev_mode() -> bool {
     DEV_MODE.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// Raw OS bytes for the (astronomically rare) argv elements whose
+/// decoded text lands in the plane-16 PUA bridge window
+/// (U+10F800..U+10FFFF): a *genuine* such character is
+/// indistinguishable in the bridged-`String` transport from an escaped
+/// lone surrogate, so `os_args_bridged` records the original bytes
+/// here and `argv_str_to_object` decodes from them instead
+/// (`test_cmd_line.test_osx_android_utf8` passes a real U+10FFFF).
+static RAW_ARGS: std::sync::Mutex<Vec<(String, Vec<u8>)>> = std::sync::Mutex::new(Vec::new());
+
+pub fn register_raw_arg(transport: String, bytes: Vec<u8>) {
+    if let Ok(mut v) = RAW_ARGS.lock() {
+        if !v.iter().any(|(t, _)| *t == transport) {
+            v.push((transport, bytes));
+        }
+    }
+}
+
+pub fn raw_arg_bytes(transport: &str) -> Option<Vec<u8>> {
+    RAW_ARGS
+        .lock()
+        .ok()?
+        .iter()
+        .find(|(t, _)| t == transport)
+        .map(|(_, b)| b.clone())
+}
+
+/// `-u` / `PYTHONUNBUFFERED`: standard-stream writes are pushed to the
+/// descriptor immediately (and `sys.stdout.write_through` reports True).
+static STDIO_UNBUFFERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_stdio_unbuffered(value: bool) {
+    STDIO_UNBUFFERED.store(value, std::sync::atomic::Ordering::Release);
+}
+
+pub fn stdio_unbuffered() -> bool {
+    STDIO_UNBUFFERED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Whether the process-global stdout buffer (Rust's line-buffered
+/// `std::io::Stdout`) may be holding unflushed bytes: true after a write
+/// whose cumulative stream doesn't end in a newline. Needed because
+/// Rust's stdout deliberately *swallows* `EBADF` (`handle_ebadf` in
+/// std), so a shutdown flush to a closed fd 1 reports success while
+/// dropping data — CPython exits 120 with "Exception ignored on
+/// flushing sys.stdout" instead (`test_cmd_line.test_stdout_flush_at_shutdown`).
+static STDOUT_TAIL_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn note_stdout_write(chunk: &[u8]) {
+    if let Some(last) = chunk.last() {
+        STDOUT_TAIL_PENDING.store(*last != b'\n', std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Read-and-clear the pending flag (the caller is about to flush).
+pub fn take_stdout_pending() -> bool {
+    STDOUT_TAIL_PENDING.swap(false, std::sync::atomic::Ordering::AcqRel)
+}
+
+/// `-X cpu_count=N` / `PYTHON_CPU_COUNT` (gh-109595): overrides what
+/// `os.cpu_count()` / `os.process_cpu_count()` report. `0` = no override.
+static CPU_COUNT_OVERRIDE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+pub fn set_cpu_count_override(value: i64) {
+    CPU_COUNT_OVERRIDE.store(value, std::sync::atomic::Ordering::Release);
+}
+
+pub fn cpu_count_override() -> Option<i64> {
+    match CPU_COUNT_OVERRIDE.load(std::sync::atomic::Ordering::Acquire) {
+        0 => None,
+        n => Some(n),
+    }
+}
+
 /// PEP 540 UTF-8 mode. WeavePy stores `str` as UTF-8 so this defaults to
 /// `true`; the CLI lowers it for `-X utf8=0` (read by `io.text_encoding`).
 static UTF8_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
