@@ -649,6 +649,12 @@ pub unsafe fn clone_object(p: *mut PyObject) -> Object {
     // whose (readied) type was registered for inline storage. Proxy it
     // opaquely; it round-trips back to the same pointer via `into_owned`.
     if !crate::object::is_weavepy_owned(p) {
+        // RFC 0055 WS5: a `_PyLong_New` block is a genuine `PyLongObject`
+        // whose digits the extension wrote after allocation — decode the
+        // value rather than proxying the pointer.
+        if crate::mypyc_tail::is_raw_long(p) {
+            return unsafe { crate::mypyc_tail::decode_raw_long(p) };
+        }
         return unsafe { crate::foreign::wrap_foreign(p) };
     }
     // RFC 0045 (wave 3): a capsule carries its state in `user_data`, not in
@@ -897,6 +903,12 @@ pub(crate) unsafe fn free_box(p: *mut PyObject) {
     // dispatch to the extension's own `tp_dealloc` (numpy frees its array
     // data, etc.); with no `tp_dealloc` we leak rather than corrupt.
     if !is_weavepy_owned(p) {
+        // RFC 0055 WS5: `_PyLong_New` blocks are libc-allocated; freeing
+        // them through a type's tp_dealloc would misclassify the block.
+        if crate::mypyc_tail::take_raw_long(p) {
+            unsafe { libc::free(p as *mut core::ffi::c_void) };
+            return;
+        }
         let live = soul_count(p as usize);
         if live > 0 {
             let tyname = unsafe { debug_type_name(p) };

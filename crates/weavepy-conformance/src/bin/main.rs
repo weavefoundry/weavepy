@@ -115,6 +115,54 @@ enum Cmd {
         #[arg(long, action = clap::ArgAction::SetTrue)]
         stream: bool,
     },
+
+    /// Validate WeavePy against real PyPI packages: per manifest row,
+    /// create a scratch venv, `pip install` the requirement set, run the
+    /// smoke probe, and grade against the ecosystem baseline (RFC 0055).
+    Ecosystem {
+        /// Path to the package matrix. Defaults to
+        /// `<workspace>/tests/ecosystem/manifest.toml`.
+        #[arg(long, value_name = "FILE")]
+        manifest: Option<PathBuf>,
+
+        /// Path to the baseline. Defaults to
+        /// `<workspace>/tests/ecosystem/expectations.toml`.
+        #[arg(long, value_name = "FILE")]
+        expectations: Option<PathBuf>,
+
+        /// Only run rows whose name contains `<FILTER>` as a substring.
+        #[arg(long, value_name = "FILTER")]
+        filter: Option<String>,
+
+        /// Per-row wall budget (venv + install + probe), in seconds.
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u64>,
+
+        /// Offline mode: install from this wheel-cache directory
+        /// (`pip install --no-index --find-links <DIR>`); populate it with
+        /// `tools/ecosystem_fetch.py`. Without it installs hit PyPI.
+        #[arg(long, value_name = "DIR")]
+        wheels: Option<PathBuf>,
+
+        /// Path to the `weavepy` binary the scratch venvs are built from.
+        /// Defaults to a `weavepy` sibling of this executable, then
+        /// `<workspace>/target/release/weavepy`.
+        #[arg(long, value_name = "BIN")]
+        weavepy: Option<PathBuf>,
+
+        /// Keep the scratch venvs around for post-mortem.
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        keep_venvs: bool,
+
+        /// Exit non-zero if any row diverged from its expected status.
+        /// Defaults to true; pass `--no-check` to grade without gating.
+        #[arg(long = "check", action = clap::ArgAction::SetTrue, default_value_t = true)]
+        check: bool,
+
+        /// Disable the strict-grading exit code.
+        #[arg(long = "no-check", action = clap::ArgAction::SetTrue, conflicts_with = "check")]
+        no_check: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -215,7 +263,131 @@ fn real_main() -> Result<()> {
                 },
             )
         }
+        Cmd::Ecosystem {
+            manifest,
+            expectations,
+            filter,
+            timeout,
+            wheels,
+            weavepy,
+            keep_venvs,
+            check,
+            no_check,
+        } => cmd_ecosystem(
+            &workspace,
+            &report_dir,
+            EcosystemArgs {
+                manifest,
+                expectations,
+                filter,
+                timeout,
+                wheels,
+                weavepy,
+                keep_venvs,
+                strict: check && !no_check,
+            },
+        ),
     }
+}
+
+/// Bundle of [`cmd_ecosystem`] inputs.
+struct EcosystemArgs {
+    manifest: Option<PathBuf>,
+    expectations: Option<PathBuf>,
+    filter: Option<String>,
+    timeout: Option<u64>,
+    wheels: Option<PathBuf>,
+    weavepy: Option<PathBuf>,
+    keep_venvs: bool,
+    strict: bool,
+}
+
+fn cmd_ecosystem(workspace: &Path, report_dir: &Path, args: EcosystemArgs) -> Result<()> {
+    use weavepy_conformance::ecosystem;
+
+    let manifest_path = args
+        .manifest
+        .unwrap_or_else(|| workspace.join("tests/ecosystem/manifest.toml"));
+    let mut manifest = ecosystem::Manifest::load(&manifest_path)?;
+    if let Some(needle) = &args.filter {
+        manifest.rows.retain(|r| r.name.contains(needle.as_str()));
+    }
+    if manifest.rows.is_empty() {
+        anyhow::bail!(
+            "no ecosystem rows scheduled from {} (filter={:?})",
+            manifest_path.display(),
+            args.filter,
+        );
+    }
+
+    let exp_path = args
+        .expectations
+        .unwrap_or_else(|| workspace.join("tests/ecosystem/expectations.toml"));
+    let expectations = ecosystem::EcosystemExpectations::load(&exp_path)?;
+
+    let weavepy =
+        resolve_weavepy_binary(args.weavepy, regrtest::ExecutionMode::Subprocess, workspace)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+            "could not locate a weavepy binary — build target/release/weavepy or pass --weavepy"
+        )
+            })?;
+
+    let scratch_dir = report_dir.join("ecosystem-scratch");
+    std::fs::create_dir_all(&scratch_dir)
+        .with_context(|| format!("failed to create {}", scratch_dir.display()))?;
+
+    // Local-TLS probes (requests over HTTPS) read the bundled cert pair.
+    let mut probe_env = Vec::new();
+    let certs = workspace.join("tests/regrtest/certs");
+    if certs.is_dir() {
+        probe_env.push((
+            "WEAVEPY_ECOSYSTEM_CERTS".to_owned(),
+            certs.display().to_string(),
+        ));
+    }
+
+    let opts = ecosystem::EcosystemOptions {
+        weavepy,
+        wheels: args.wheels,
+        timeout: Duration::from_secs(args.timeout.unwrap_or(ecosystem::DEFAULT_ROW_TIMEOUT_SECS)),
+        keep_venvs: args.keep_venvs,
+        scratch_dir,
+        probe_env,
+    };
+
+    let reports = ecosystem::run_all(&manifest, &expectations, &opts);
+    let summary = ecosystem::EcosystemSummary::from_reports(&reports);
+    print!("{}", ecosystem::report_to_markdown(&reports));
+
+    std::fs::create_dir_all(report_dir)
+        .with_context(|| format!("failed to create {}", report_dir.display()))?;
+    let md_path = report_dir.join("ecosystem.md");
+    std::fs::write(&md_path, ecosystem::report_to_markdown(&reports))
+        .with_context(|| format!("failed to write {}", md_path.display()))?;
+    let json_path = report_dir.join("ecosystem.json");
+    let json = serde_json::json!({
+        "summary": summary,
+        "reports": reports,
+    });
+    std::fs::write(
+        &json_path,
+        serde_json::to_string_pretty(&json).unwrap_or_default(),
+    )
+    .with_context(|| format!("failed to write {}", json_path.display()))?;
+    eprintln!(
+        "wrote ecosystem.md and ecosystem.json to {}",
+        report_dir.display()
+    );
+
+    if args.strict && summary.unexpected > 0 {
+        anyhow::bail!(
+            "{} ecosystem regression(s) — see {}",
+            summary.unexpected,
+            md_path.display()
+        );
+    }
+    Ok(())
 }
 
 /// Bundle of [`cmd_regrtest`] inputs — keeps the call site readable now

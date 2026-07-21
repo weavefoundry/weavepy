@@ -53,9 +53,36 @@ def _normalize(name):
     return re.sub(r'[-_.]+', '-', name).lower()
 
 
+class _Metadata(dict):
+    """Case-insensitive header mapping. CPython's ``metadata()`` returns an
+    ``email.message.Message``, whose ``__getitem__`` is case-insensitive and
+    yields ``None`` for missing headers (attrs does ``metadata("attrs")
+    ["version"]`` with a lowercase key)."""
+
+    def _find(self, key):
+        if super().__contains__(key):
+            return key
+        lower = key.lower()
+        for k in self.keys():
+            if k.lower() == lower:
+                return k
+        return None
+
+    def __getitem__(self, key):
+        k = self._find(key)
+        return super().__getitem__(k) if k is not None else None
+
+    def get(self, key, default=None):
+        k = self._find(key)
+        return super().__getitem__(k) if k is not None else default
+
+    def __contains__(self, key):
+        return self._find(key) is not None
+
+
 def _parse_metadata(text):
     """Parse a ``METADATA`` / ``PKG-INFO`` file."""
-    headers = {}
+    headers = _Metadata()
     body_lines = []
     in_body = False
     current_key = None
@@ -214,12 +241,16 @@ class Distribution:
     @classmethod
     def from_name(cls, name):
         normalized = _normalize(name)
-        for path, _kind in _iter_dist_dirs():
+        for path, kind in _iter_dist_dirs():
             base = os.path.basename(path)
-            m = _NAME_RE.match(base)
-            if not m:
-                continue
-            dist_name = _normalize(m.group(1))
+            # Strip the ".dist-info" / ".egg-info" suffix before matching;
+            # the NAME_RE version group is greedy and would otherwise
+            # swallow "…-2.34.2.dist" and never match the queried name.
+            suffix = '.dist-info' if kind == 'dist-info' else '.egg-info'
+            stem = base[: -len(suffix)] if base.endswith(suffix) else base
+            # PEP 427 escapes the project name (runs of [-_.] become "_"),
+            # so the first "-" always separates name from version.
+            dist_name = _normalize(stem.partition('-')[0])
             if dist_name == normalized:
                 return PathDistribution(path)
         raise PackageNotFoundError(name)

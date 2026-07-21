@@ -27,9 +27,13 @@ def make_spec_and_loader(name, filename, is_package, search_locations):
     )
 
     if name == "__main__":
-        loader = None
+        # A real script gets a SourceFileLoader; `-c` / `<stdin>` /
+        # the REPL get BuiltinImporter, matching CPython's
+        # `_PyImport_AddModule`-created `__main__`. Spec stays None.
         if filename and not filename.startswith("<"):
             loader = SourceFileLoader(name, filename)
+        else:
+            loader = BuiltinImporter
         return None, loader
     if filename is None:
         spec = ModuleSpec(name, BuiltinImporter, origin="built-in")

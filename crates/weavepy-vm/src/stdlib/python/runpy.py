@@ -355,3 +355,12 @@ def run_path(path_name, init_globals=None, run_name=None):
             sys.path.remove(path_name)
         except ValueError:
             pass
+
+
+if __name__ == "__main__":
+    # Run the module specified as the next command line argument
+    if len(sys.argv) < 2:
+        print("No module specified for execution", file=sys.stderr)
+    else:
+        del sys.argv[0] # Make the requested module sys.argv[0]
+        _run_module_as_main(sys.argv[0])

@@ -43,6 +43,10 @@ pub(crate) struct Repl {
     editor: Editor<(), FileHistory>,
     main_module: Rc<PyModule>,
     history_path: Option<PathBuf>,
+    /// Whether stdin is a terminal. When it isn't (piped input), lines
+    /// are read directly rather than through rustyline, so EOF
+    /// handling can match CPython's `PyOS_StdioReadline`.
+    stdin_tty: bool,
     quiet: bool,
     /// `CO_FUTURE_*` bits accumulated from executed inputs, so a
     /// `from __future__ import …` typed at one prompt affects every
@@ -67,15 +71,26 @@ impl Repl {
         if let Some(p) = history_path.as_ref() {
             let _ = editor.load_history(p);
         }
-        let main_module = build_main_module(&interpreter);
-        interpreter
-            .module_cache()
-            .insert("__main__", Object::Module(main_module.clone()));
+        // `-i` / `PYTHONINSPECT`: a program already ran and left its
+        // `__main__` behind — the REPL continues in that namespace
+        // (CPython's `pymain_repl`), so `python -i -m timeit` sees
+        // `Timer` at the prompt. Only a fresh session builds one.
+        let main_module = match interpreter.module_cache().get("__main__") {
+            Some(Object::Module(m)) => m,
+            _ => {
+                let m = build_main_module(&interpreter);
+                interpreter
+                    .module_cache()
+                    .insert("__main__", Object::Module(m.clone()));
+                m
+            }
+        };
         Ok(Self {
             interpreter,
             editor,
             main_module,
             history_path,
+            stdin_tty: std::io::IsTerminal::is_terminal(&io::stdin()),
             quiet,
             future_flags: 0,
         })
@@ -95,14 +110,18 @@ impl Repl {
     }
 
     fn print_banner(&self) {
-        let mut stdout = io::stdout().lock();
+        // CPython's interactive banner goes to *stderr* (as do the
+        // prompts): `test_cmd_line_script.interactive_python` drains
+        // stderr until the first `>>> ` while stdout must carry only
+        // program output.
+        let mut stderr = io::stderr().lock();
         let _ = writeln!(
-            stdout,
+            stderr,
             "WeavePy {VERSION} (Python 3.13 compatible) on {}",
             host_platform()
         );
         let _ = writeln!(
-            stdout,
+            stderr,
             "Type \"help\", \"copyright\", \"credits\" or \"license\" for more information."
         );
     }
@@ -126,7 +145,7 @@ impl Repl {
         let mut buffer = String::new();
         loop {
             let prompt = if buffer.is_empty() { ps1() } else { ps2() };
-            let line = match self.editor.readline(&prompt) {
+            let line = match self.read_input(&prompt) {
                 Ok(l) => l,
                 Err(ReadlineError::Interrupted) => {
                     let mut stderr = io::stderr().lock();
@@ -135,8 +154,24 @@ impl Repl {
                     continue;
                 }
                 Err(ReadlineError::Eof) => {
-                    let mut stdout = io::stdout().lock();
-                    let _ = writeln!(stdout);
+                    {
+                        // Terminates the prompt, which lives on stderr.
+                        let mut stderr = io::stderr().lock();
+                        let _ = writeln!(stderr);
+                    }
+                    // A block still being continued when EOF arrives is
+                    // compiled and run (CPython's tokenizer treats EOF
+                    // as the terminating blank line: `def f(x, x): ...`
+                    // + EOF still reports its SyntaxError —
+                    // `test_repl.test_runsource_show_syntax_error_location`).
+                    if !buffer.trim().is_empty() {
+                        let to_run = std::mem::take(&mut buffer);
+                        if let Err(e) = self.eval_input(&to_run) {
+                            let mut stderr = io::stderr().lock();
+                            let _ = stderr.write_all(e.as_bytes());
+                        }
+                        continue;
+                    }
                     if let Some(p) = self.history_path.as_ref() {
                         let _ = self.editor.save_history(p);
                     }
@@ -170,81 +205,114 @@ impl Repl {
         }
     }
 
-    /// Try to evaluate `source` as a single expression first (so the
-    /// result can be printed and bound to `_`). On `SyntaxError` fall
-    /// back to executing it as a statement / suite.
-    fn eval_input(&mut self, source: &str) -> Result<(), String> {
-        if let Ok(expr_repr) = self.try_eval_as_expression(source) {
-            if let Some(text) = expr_repr {
-                let mut stdout = io::stdout().lock();
-                let _ = writeln!(stdout, "{text}");
-            }
-            return Ok(());
+    /// One line of input. A terminal goes through rustyline (editing,
+    /// history, Ctrl-C/Ctrl-D); piped stdin reads plainly, writing the
+    /// prompt to stdout the way CPython's `PyOS_StdioReadline` does.
+    fn read_input(&mut self, prompt: &str) -> rustyline::Result<String> {
+        if self.stdin_tty {
+            return self.editor.readline(prompt);
         }
-        self.execute_once(source, "<stdin>".to_owned())
+        // Piped-stdin prompts go to *stderr*, like CPython's
+        // `PyOS_StdioReadline` (stdout must carry only program output —
+        // `test_cmd_line_script.test_repl_stdout_flush_separate_stderr`).
+        {
+            let mut out = io::stderr().lock();
+            let _ = write!(out, "{prompt}");
+            let _ = out.flush();
+        }
+        let mut line = String::new();
+        match io::stdin().read_line(&mut line) {
+            Ok(0) => Err(ReadlineError::Eof),
+            Ok(_) => {
+                if let Some(stripped) = line.strip_suffix('\n') {
+                    Ok(stripped.to_owned())
+                } else {
+                    // EOF terminated the line. CPython's tokenizer asks
+                    // for one more line — printing the continuation
+                    // prompt — and the EOF answer ends the prompt line,
+                    // so any execution output starts on a fresh line
+                    // (`test_repl.test_pythonstartup_error_reporting`
+                    // writes `1/0` with no trailing newline).
+                    let mut out = io::stderr().lock();
+                    let _ = writeln!(out, "{}", ps2());
+                    let _ = out.flush();
+                    Ok(line)
+                }
+            }
+            Err(e) => Err(ReadlineError::Io(e)),
+        }
     }
 
-    fn try_eval_as_expression(&mut self, source: &str) -> Result<Option<String>, ()> {
-        let trimmed = source.trim_end_matches('\n');
-        // A "single expression" candidate is one parse-able as
-        // `Module(body=[Expr(value=…)])`. Anything else (statements,
-        // multiple expressions, blocks) bails to the suite path.
-        let module = parser::parse_module_with_warnings_flags(trimmed, self.flufl_active())
-            .0
-            .map_err(|_| ())?;
-        if module.body.len() != 1 {
-            return Err(());
-        }
-        let is_expr = matches!(module.body[0].kind, parser::ast::StmtKind::Expr(_));
-        if !is_expr {
-            return Err(());
-        }
-        let code = compiler::compile_module_with_options(
-            &module,
-            trimmed,
-            "<stdin>",
-            self.compile_options(),
-        )
-        .map_err(|_| ())?;
-        self.future_flags |= code.future_flags;
-        let globals = self.main_module.dict.clone();
-        let result = self
-            .interpreter
-            .exec_module_in(&code, globals)
-            .map_err(|_| ())?;
-        if matches!(result, Object::None) {
-            return Ok(None);
-        }
-        // Bind `_` to the result (CPython behaviour).
-        self.main_module
-            .dict
-            .borrow_mut()
-            .insert(DictKey(Object::from_static("_")), result.clone());
-        // We re-use the high-level `repr` over the result.
-        let text = match &result {
-            Object::Str(s) => format!("{s:?}"),
-            other => format!("{other:?}"),
-        };
-        Ok(Some(text))
+    /// Run one accepted prompt input the way CPython's REPL does:
+    /// compiled in interactive ("single") mode, so a top-level
+    /// expression statement echoes its value through `sys.displayhook`
+    /// (which also binds `builtins._`) — see `OpCode::PrintExpr`.
+    fn eval_input(&mut self, source: &str) -> Result<(), String> {
+        self.execute_source(source, "<stdin>".to_owned(), true)
     }
 
     fn execute_once(&mut self, source: &str, filename: String) -> Result<(), String> {
+        self.execute_source(source, filename, false)
+    }
+
+    fn execute_source(
+        &mut self,
+        source: &str,
+        filename: String,
+        interactive: bool,
+    ) -> Result<(), String> {
         let module = parser::parse_module_with_warnings_flags(source, self.flufl_active())
             .0
             .map_err(|e| weavepy::Error::Parse(e).format(source, &filename))?;
-        let code = compiler::compile_module_with_options(
-            &module,
-            source,
-            &filename,
-            self.compile_options(),
-        )
-        .map_err(|e| weavepy::Error::Compile(e).format(source, &filename))?;
+        let compile = if interactive {
+            compiler::compile_interactive_with_options
+        } else {
+            compiler::compile_module_with_options
+        };
+        let code = compile(&module, source, &filename, self.compile_options())
+            .map_err(|e| weavepy::Error::Compile(e).format(source, &filename))?;
         self.future_flags |= code.future_flags;
+        if interactive {
+            // gh-103987: every interactive input is registered with
+            // `linecache._register_code` (keyed per contained code
+            // object), so tracebacks — possibly from a *later* prompt —
+            // render this input's source lines and `~~^~~` anchors.
+            let code_rc = Rc::new(code.clone());
+            self.interpreter
+                .register_source_with_linecache(&code_rc, source, &filename);
+        }
         let globals = self.main_module.dict.clone();
-        self.interpreter
-            .exec_module_in(&code, globals)
-            .map(|_| ())
-            .map_err(|e| weavepy::Error::Runtime(e).format(source, &filename))
+        match self.interpreter.exec_module_in(&code, globals) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                self.exit_if_system_exit(&e);
+                // CPython's REPL reports through `sys.excepthook` /
+                // the `traceback` module (source lines, anchors,
+                // chained exceptions); the plain formatter is only the
+                // fallback when that machinery is unavailable.
+                if let weavepy::vm::RuntimeError::PyException(exc) = &e {
+                    if self.interpreter.print_uncaught_exception(exc) {
+                        return Ok(());
+                    }
+                }
+                Err(weavepy::Error::Runtime(e).format(source, &filename))
+            }
+        }
+    }
+
+    /// A `SystemExit` raised at the prompt (`exit()`, `sys.exit(2)`,
+    /// `raise SystemExit`) terminates the session with CPython's
+    /// exit-code semantics instead of printing a traceback.
+    fn exit_if_system_exit(&mut self, e: &weavepy::vm::RuntimeError) {
+        if let weavepy::vm::RuntimeError::PyException(exc) = e {
+            if let Some(code) = exc.system_exit_code() {
+                if let Some(p) = self.history_path.clone() {
+                    let _ = self.editor.save_history(&p);
+                }
+                let _ = self.interpreter.flush_streams();
+                crate::exit_with_system_exit(code);
+            }
+        }
     }
 
     fn flufl_active(&self) -> bool {
@@ -291,6 +359,16 @@ fn needs_continuation(source: &str) -> bool {
     // end of input is treated as "you need more text"; everything
     // else (including a successful parse or a mid-buffer error) is
     // "done, hand it to the evaluator."
+    // CPython's interactive tokenizer only closes a *compound*
+    // statement on a blank line (`>>> def f(): ...` shows the `... `
+    // prompt until one arrives), even when the suite is already
+    // syntactically complete — and even when it is about to be a
+    // SyntaxError (`test_repl.test_runsource_show_syntax_error_location`
+    // types `def f(x, x): ...`). Lexical, like the tokenizer: it must
+    // not depend on a successful parse.
+    if starts_with_compound_keyword(source) && !ends_with_blank_line(source) {
+        return true;
+    }
     match parser::parse_module(source.trim_end_matches('\n')) {
         Ok(module) => {
             // Empty parse on a non-empty trimmed buffer means the user
@@ -300,6 +378,15 @@ fn needs_continuation(source: &str) -> bool {
             let last = source.lines().rfind(|l| !l.trim().is_empty()).unwrap_or("");
             if last.trim_end().ends_with(':') {
                 return module.body.is_empty();
+            }
+            // `match` is a soft keyword, so the lexical check above
+            // skips it; a parsed `match` *statement* is compound too.
+            if let [stmt] = module.body.as_slice() {
+                if matches!(stmt.kind, parser::ast::StmtKind::Match { .. })
+                    && !ends_with_blank_line(source)
+                {
+                    return true;
+                }
             }
             // Bracket-balance for triple-quote / parens.
             !is_balanced(source)
@@ -321,6 +408,39 @@ fn needs_continuation(source: &str) -> bool {
         Err(parser::ParseError::Lex(lexer::LexError::BracketNeverClosed { .. })) => true,
         Err(_) => false,
     }
+}
+
+/// Whether the buffer's first statement opens with a (hard) compound
+/// keyword or a decorator — CPython's interactive grammar
+/// (`statement_newline: compound_stmt NEWLINE | simple_stmts | …`)
+/// demands an extra NEWLINE, i.e. a blank line, after these.
+fn starts_with_compound_keyword(source: &str) -> bool {
+    let first = source
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim_start();
+    if first.starts_with('@') {
+        return true;
+    }
+    let word: String = first
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    matches!(
+        word.as_str(),
+        "if" | "while" | "for" | "try" | "with" | "def" | "class" | "async"
+    )
+}
+
+/// Whether the buffer's final physical line (before the trailing
+/// newline the loop appends) is blank.
+fn ends_with_blank_line(source: &str) -> bool {
+    let trimmed = source.strip_suffix('\n').unwrap_or(source);
+    trimmed
+        .rsplit('\n')
+        .next()
+        .is_some_and(|line| line.trim().is_empty())
 }
 
 /// Rough delimiter balance. Used by [`needs_continuation`] only.

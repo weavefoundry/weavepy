@@ -1,0 +1,38 @@
+# Ecosystem conformance baseline (RFC 0055 WS5).
+#
+# One row per manifest package. Statuses:
+#   pass — venv + install + probe all succeed
+#   fail — known divergence; the run reports it as "expected fail" and a
+#          flip to pass shows up as an improvement to ratchet
+#   skip — do not run (e.g. needs network features we don't emulate yet)
+#
+# `notes` is free-form context for humans. The runner exits non-zero on
+# any status that differs from this file (unless --no-check).
+
+[packages.six]
+status = "pass"
+
+[packages.attrs]
+status = "pass"
+
+[packages.click]
+status = "pass"
+
+[packages.jinja2]
+status = "pass"
+
+[packages.requests]
+status = "pass"
+notes = "charset_normalizer is mypyc-compiled; exercised via the C-API tail."
+
+[packages.dateutil]
+status = "pass"
+
+[packages.typing_extensions]
+status = "pass"
+
+[packages.packaging]
+status = "pass"
+
+[packages.pytest]
+status = "pass"

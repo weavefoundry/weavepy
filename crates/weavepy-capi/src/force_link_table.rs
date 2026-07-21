@@ -31,6 +31,7 @@ use crate::memory;
 use crate::memoryview;
 use crate::module;
 use crate::monitoring;
+use crate::mypyc_tail;
 use crate::numbers;
 use crate::object;
 use crate::pystate;
@@ -144,6 +145,13 @@ extern "C" {
         fmt: *const core::ffi::c_char,
         ...
     ) -> core::ffi::c_int;
+    // RFC 0055 WS5: variadic "raise from" formatter mypyc links,
+    // defined in varargs.c.
+    fn _PyErr_FormatFromCause(
+        ty: *mut crate::object::PyObject,
+        fmt: *const core::ffi::c_char,
+        ...
+    ) -> *mut crate::object::PyObject;
 }
 
 macro_rules! addr {
@@ -754,6 +762,7 @@ static FORCE_LINK: &[FnPtr] = &[
     // varargs.c — wave-4 variadic shims
     addr!(PyOS_snprintf),
     addr!(PyErr_WarnFormat),
+    addr!(_PyErr_FormatFromCause),
     // Already implemented in waves 1-3, now pinned for numpy.
     addr!(numbers::PyLong_AsLongAndOverflow),
     addr!(numbers::PyLong_AsLongLongAndOverflow),
@@ -814,6 +823,38 @@ static FORCE_LINK: &[FnPtr] = &[
     addr!(wave5::_PyDict_NewPresized),
     addr!(wave5::PyLong_AsInt),
     addr!(wave5::PyImport_ImportModuleLevelObject),
+    addr!(wave5::PyImport_ImportModuleLevel),
+    // mypyc_tail.rs (RFC 0055 WS5 — the mypyc-compiled-wheel tail)
+    addr!(mypyc_tail::_PyLong_New),
+    addr!(mypyc_tail::_PyLong_NumBits),
+    addr!(mypyc_tail::_PyTrash_thread_deposit_object),
+    addr!(mypyc_tail::_PyTrash_thread_destroy_chain),
+    addr!(mypyc_tail::PyErr_GetExcInfo),
+    addr!(mypyc_tail::PyErr_SetExcInfo),
+    addr!(mypyc_tail::PyErr_SetImportError),
+    addr!(mypyc_tail::_PyErr_SetKeyError),
+    addr!(mypyc_tail::_PyErr_ChainExceptions1),
+    addr!(mypyc_tail::_PyGen_FetchStopIterationValue),
+    addr!(mypyc_tail::_WeavePy_FetchForCause),
+    addr!(mypyc_tail::_WeavePy_ApplyCause),
+    addr!(mypyc_tail::PyDict_MergeFromSeq2),
+    addr!(mypyc_tail::PyList_Clear),
+    addr!(mypyc_tail::PyList_GetSlice),
+    addr!(mypyc_tail::PyFunction_GetAnnotations),
+    addr!(mypyc_tail::PyGen_GetCode),
+    addr!(mypyc_tail::PyModule_GetFilenameObject),
+    addr!(mypyc_tail::PyUnicode_Append),
+    addr!(mypyc_tail::PyUnicode_Count),
+    addr!(mypyc_tail::PyUnicode_RSplit),
+    addr!(mypyc_tail::_PyUnicode_Equal),
+    addr!(mypyc_tail::_PyBytes_Join),
+    addr_static!(mypyc_tail::_Py_ctype_table),
+    addr_static!(mypyc_tail::_Py_ctype_tolower),
+    addr_static!(mypyc_tail::_Py_ctype_toupper),
+    addr_static!(types::PyDictKeys_Type),
+    addr_static!(types::PyDictValues_Type),
+    addr_static!(types::PyDictItems_Type),
+    addr_static!(types::PySuper_Type),
     // ----------------------------------------------------------------
     // RFC 0047 (wave 5): the *real* Cython-output tail. A genuine
     // `cythonize`d `.so` (and pandas, ~70% Cython) links a faithful

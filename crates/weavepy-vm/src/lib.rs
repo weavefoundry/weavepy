@@ -406,9 +406,24 @@ pub fn jit_stats_markdown() -> Option<String> {
 /// can recover the original bytes via [`bridged_arg_bytes`].
 #[must_use]
 pub fn os_args_bridged() -> Vec<String> {
+    // An argv element containing a *genuine* U+10F800..U+10FFFF character
+    // is ambiguous in the bridged transport (the window doubles as the
+    // surrogate escape); record its raw bytes so `argv_str_to_object` /
+    // `bridged_arg_bytes` can recover the truth.
+    fn register_if_ambiguous(transport: &str, bytes: &[u8]) {
+        if transport
+            .chars()
+            .any(|ch| crate::builtins::bridge_window(ch as u32))
+        {
+            crate::vm_singletons::register_raw_arg(transport.to_owned(), bytes.to_vec());
+        }
+    }
     std::env::args_os()
         .map(|arg| match arg.into_string() {
-            Ok(s) => s,
+            Ok(s) => {
+                register_if_ambiguous(&s, s.as_bytes());
+                s
+            }
             Err(os) => {
                 #[cfg(unix)]
                 {
@@ -419,10 +434,17 @@ pub fn os_args_bridged() -> Vec<String> {
                         "surrogateescape",
                     )
                     .unwrap_or_else(|_| Object::from_str(os.to_string_lossy().into_owned()));
-                    match obj {
+                    let transport = match obj {
                         Object::WStr(cps) => crate::builtins::bridge_encode_cps(&cps),
                         other => other.to_str(),
-                    }
+                    };
+                    // A decoded lone surrogate is *expected* in the window;
+                    // only a genuine window code point (one that decoded
+                    // from a valid 4-byte sequence) makes the transport
+                    // ambiguous. Both cases land here; registering the raw
+                    // bytes is correct (and harmless) for either.
+                    register_if_ambiguous(&transport, os.as_bytes());
+                    transport
                 }
                 #[cfg(not(unix))]
                 {
@@ -433,11 +455,29 @@ pub fn os_args_bridged() -> Vec<String> {
         .collect()
 }
 
+/// Materialise one (possibly PUA-bridged) argv transport string as the
+/// Python-visible `sys.argv` object, resolving the genuine-PUA-character
+/// ambiguity through the raw-bytes table when needed.
+#[must_use]
+pub fn argv_str_to_object(arg: &str) -> Object {
+    if let Some(bytes) = crate::vm_singletons::raw_arg_bytes(arg) {
+        if let Ok(obj) =
+            crate::stdlib::codecs_mod::decode_bytes_obj(&bytes, "utf-8", "surrogateescape")
+        {
+            return obj;
+        }
+    }
+    crate::builtins::bridge_to_object(arg)
+}
+
 /// The OS-level bytes of a (possibly PUA-bridged) argv string: the
 /// inverse of [`os_args_bridged`] for one element, used when an argv
 /// value names a real filesystem object (the script path).
 #[must_use]
 pub fn bridged_arg_bytes(arg: &str) -> Vec<u8> {
+    if let Some(bytes) = crate::vm_singletons::raw_arg_bytes(arg) {
+        return bytes;
+    }
     let obj = crate::builtins::bridge_to_object(arg);
     match &obj {
         Object::WStr(_) | Object::Str(_) => {
@@ -466,7 +506,8 @@ pub struct InterpreterFlags {
     pub optimize: u8,
     pub dont_write_bytecode: bool,
     pub inspect: bool,
-    pub verbose: bool,
+    /// `-v` count / `PYTHONVERBOSE` (an int on `sys.flags.verbose`).
+    pub verbose: u8,
     pub no_site: bool,
     pub no_user_site: bool,
     pub ignore_environment: bool,
@@ -476,7 +517,8 @@ pub struct InterpreterFlags {
     pub skip_first_line: bool,
     pub bytes_warning: u8,
     pub safe_path: bool,
-    pub debug: bool,
+    /// `-d` count / `PYTHONDEBUG` (an int on `sys.flags.debug`).
+    pub debug: u8,
     pub xoptions: Vec<String>,
     pub warning_filters: Vec<String>,
     pub hash_seed: Option<u32>,
@@ -492,6 +534,18 @@ pub struct InterpreterFlags {
     /// CLI. `-X utf8[=0|1]` has priority; when both are absent the mode
     /// falls back to the locale-based default (`C`/`POSIX` → on).
     pub utf8_mode: Option<u8>,
+    /// `sys.pycache_prefix` (PEP 552 cache-tree redirect): the resolved
+    /// value of `-X pycache_prefix=PATH` over `PYTHONPYCACHEPREFIX`
+    /// (the CLI applies the precedence, including "-X present but empty
+    /// means None").
+    pub pycache_prefix: Option<String>,
+    /// PEP 0467 digit cap from `-X int_max_str_digits` /
+    /// `PYTHONINTMAXSTRDIGITS`, already validated (0 or ≥640) by the CLI.
+    pub int_max_str_digits: Option<i64>,
+    /// `-X cpu_count=N` / `PYTHON_CPU_COUNT` override for
+    /// `os.cpu_count()`/`os.process_cpu_count()` (gh-109595). `None`
+    /// means the real value (including `cpu_count=default`).
+    pub cpu_count: Option<i64>,
 }
 
 /// The effective `LC_CTYPE` locale name, resolved the way `setlocale(LC_CTYPE,
@@ -621,6 +675,14 @@ impl Default for Interpreter {
         );
         let builtins = Rc::new(RefCell::new(builtins_dict));
         let cache = ModuleCache::default();
+        // CPython's getpath seeds `sys.path` with the stdlib zip landmark
+        // (`{base_prefix}/lib/pythonXY.zip`) before `site` ever runs, and
+        // lists it whether or not the archive exists. Mirror that so
+        // `-S` runs still expose it (`test_venv.
+        // test_zippath_from_non_installed_posix` greps for it).
+        if let Some(zip) = crate::stdlib::sys::stdlib_zip_path() {
+            cache.path.borrow_mut().push(Object::from_str(zip));
+        }
         stdlib::register_all(&cache);
         // RFC 0052 WS5 — patchable builtins: the `builtins` module and
         // the interpreter's ambient lookup namespace are *one dict*.
@@ -742,19 +804,42 @@ impl Interpreter {
     /// stdout flush and any `Drop`-based flushing). First drive the
     /// Python-level `sys.stdout`/`sys.stderr` `flush()` (handles a
     /// reassigned, user-buffered stream), then flush the host sink.
-    pub fn flush_streams(&mut self) {
+    /// Returns `false` when flushing `sys.stdout` failed — CPython's
+    /// `Py_FinalizeEx` reports that with "Exception ignored on flushing
+    /// sys.stdout" on stderr and the process exits with status 120
+    /// (`test_cmd_line.test_stdout_flush_at_shutdown`).
+    pub fn flush_streams(&mut self) -> bool {
+        let mut ok = true;
         for name in ["stdout", "stderr"] {
             if let Some(stream) = self.current_sys_attr(name) {
                 if matches!(&stream, Object::None) {
                     continue;
                 }
+                // CPython's `flush_std_files` skips a stream whose
+                // `.closed` is true (`sys.stdout.close()` before exit
+                // must not provoke a flush error — issue #13444).
+                if matches!(self.load_attr(&stream, "closed"), Ok(Object::Bool(true))) {
+                    continue;
+                }
                 if let Ok(flush) = self.load_attr(&stream, "flush") {
                     let globals = self.builtins.clone();
-                    let _ = self.call(&flush, &[], &[], &globals);
+                    if let Err(RuntimeError::PyException(exc)) =
+                        self.call(&flush, &[], &[], &globals)
+                    {
+                        if name == "stdout" {
+                            eprintln!(
+                                "Exception ignored on flushing sys.stdout:\n{}: {}",
+                                exc.type_name(),
+                                exc.message()
+                            );
+                            ok = false;
+                        }
+                    }
                 }
             }
         }
         let _ = self.stdout.borrow_mut().flush();
+        ok
     }
 
     /// RFC 0025: build a worker [`Interpreter`] that shares all
@@ -818,7 +903,7 @@ impl Interpreter {
         let mut argv = self.cache.argv.borrow_mut();
         argv.clear();
         for v in values {
-            argv.push(crate::builtins::bridge_to_object(&v.into()));
+            argv.push(argv_str_to_object(&v.into()));
         }
     }
 
@@ -917,7 +1002,7 @@ impl Interpreter {
                 );
                 set(&mut fld, "inspect", i64::from(flags.inspect));
                 set(&mut fld, "interactive", i64::from(flags.inspect));
-                set(&mut fld, "verbose", i64::from(flags.verbose));
+                set(&mut fld, "verbose", flags.verbose.into());
                 set(&mut fld, "quiet", i64::from(flags.quiet));
                 set(&mut fld, "no_site", i64::from(flags.no_site));
                 set(&mut fld, "no_user_site", i64::from(flags.no_user_site));
@@ -928,12 +1013,19 @@ impl Interpreter {
                 );
                 set(&mut fld, "isolated", i64::from(flags.isolated));
                 set(&mut fld, "bytes_warning", flags.bytes_warning.into());
-                set(&mut fld, "safe_path", i64::from(flags.safe_path));
-                set(&mut fld, "debug", i64::from(flags.debug));
+                // `safe_path` is one of the two *bool* fields on
+                // CPython's `sys.flags` (with `dev_mode`).
+                fld.insert(
+                    crate::object::DictKey(Object::from_static("safe_path")),
+                    Object::Bool(flags.safe_path),
+                );
+                set(&mut fld, "debug", flags.debug.into());
+                // CPython: 0 only for `PYTHONHASHSEED=0`; a fixed nonzero
+                // seed still reports 1 (`use_hash_seed && seed != 0`).
                 set(
                     &mut fld,
                     "hash_randomization",
-                    flags.hash_seed.map_or(1, |_| 0),
+                    flags.hash_seed.map_or(1, |s| i64::from(s != 0)),
                 );
                 // UTF-8 mode (PEP 540) precedence: `-X utf8[=0|1]` beats
                 // `PYTHONUTF8` (already filtered for `-E`/`-I` by the CLI),
@@ -963,7 +1055,13 @@ impl Interpreter {
                     crate::object::DictKey(Object::from_static("dev_mode")),
                     Object::Bool(dev_mode),
                 );
-                set(&mut fld, "int_max_str_digits", 4300);
+                let digit_cap = flags.int_max_str_digits.unwrap_or(4300);
+                set(&mut fld, "int_max_str_digits", digit_cap);
+                crate::stdlib::sys::set_int_max_str_digits(digit_cap);
+                // `-X gil` / `PYTHON_GIL`: the GIL cannot be disabled in
+                // this build, so the flag is pinned at 1 (the CLI rejects
+                // `gil=0` up front, like CPython's `config_read_gil`).
+                set(&mut fld, "gil", 1);
                 // `-X warn_default_encoding` / `PYTHONWARNDEFAULTENCODING`
                 // (PEP 597): turns on the `EncodingWarning` that `open()` /
                 // `subprocess` raise when a text stream takes the default
@@ -985,6 +1083,18 @@ impl Interpreter {
                 crate::object::DictKey(Object::from_static("dont_write_bytecode")),
                 Object::Bool(flags.dont_write_bytecode),
             );
+            // PEP 552: `sys.pycache_prefix` redirects the `__pycache__`
+            // tree (consumed by the Rust bytecode-cache writer and
+            // `importlib.util.cache_from_source`).
+            d.insert(
+                crate::object::DictKey(Object::from_static("pycache_prefix")),
+                flags
+                    .pycache_prefix
+                    .as_ref()
+                    .map_or(Object::None, |p| Object::from_str(p.clone())),
+            );
+            crate::vm_singletons::set_cpu_count_override(flags.cpu_count.unwrap_or(0));
+            crate::vm_singletons::set_stdio_unbuffered(flags.unbuffered);
             d.insert(
                 crate::object::DictKey(Object::from_static("warnoptions")),
                 Object::new_list(
@@ -1549,6 +1659,14 @@ impl Interpreter {
             crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
         let _handles = self.activate_thread_handles();
         let globals = self.build_module_globals(name, file, None);
+        // CPython's `__main__` keeps `__package__ = None` for scripts, `-c`
+        // and stdin (only runpy's `-m` path fills it in): the fresh-module
+        // default is never touched because no import machinery loads
+        // `__main__`. `test_cmd_line_script`'s probe branches on
+        // `__package__ is not None`.
+        globals
+            .borrow_mut()
+            .insert(DictKey(Object::from_static("__package__")), Object::None);
         // CPython's `__main__` always carries `__spec__` (None when run as a
         // script, a real `ModuleSpec` under `-m`). `multiprocessing.spawn`'s
         // `get_preparation_data` does `getattr(main_module.__spec__, ...)`, so
@@ -1570,6 +1688,14 @@ impl Interpreter {
                     .entry(DictKey(Object::from_static("__loader__")))
                     .or_insert(loader);
             }
+            // CPython's `PyRun_SimpleFileExFlags` seeds
+            // `__main__.__cached__ = None` for a directly-run script
+            // (`-c` / `<stdin>` runs leave the name unset) —
+            // `test_cmd_line_script`'s probe prints it.
+            globals
+                .borrow_mut()
+                .entry(DictKey(Object::from_static("__cached__")))
+                .or_insert(Object::None);
         }
         // Insert the module into `sys.modules` so callers can introspect
         // `sys.modules["__main__"]` (pickle by qualified name and the
@@ -8107,9 +8233,55 @@ impl Interpreter {
         if let Some(v) = frame.builtins.borrow().get(&key) {
             return Ok(v.clone());
         }
+        // CPython seeds `__main__.__loader__ = BuiltinImporter` when the
+        // program comes from `-c` or piped stdin (the module object is
+        // created by `_PyImport_AddModule` machinery before `PyRun_*`).
+        // WeavePy defers it so a plain `-c 'pass'` never has to import
+        // `importlib.machinery`; the first read materializes it here.
+        if name == "__loader__" {
+            if let Some(loader) = self.synthesize_main_command_loader(globals) {
+                return Ok(loader);
+            }
+        }
         let err = name_error(format!("name '{name}' is not defined"));
         crate::error::set_exception_attr(&err, "name", Object::from_str(name.to_owned()));
         Err(err)
+    }
+
+    /// If `globals` is the real `__main__` module dict for a `-c` /
+    /// `<stdin>` run (no on-disk `__file__`), resolve
+    /// `importlib.machinery.BuiltinImporter`, cache it as
+    /// `__main__.__loader__`, and return it. `None` for every other
+    /// namespace, leaving the NameError to stand.
+    fn synthesize_main_command_loader(
+        &mut self,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Option<Object> {
+        let is_main = match self.cache.get("__main__") {
+            Some(Object::Module(m)) => Rc::ptr_eq(&m.dict, globals),
+            _ => false,
+        };
+        if !is_main {
+            return None;
+        }
+        if let Some(Object::Str(f)) = globals.borrow().get(&crate::object::StrKey("__file__")) {
+            if !f.starts_with('<') {
+                return None;
+            }
+        }
+        let machinery = match self.import_path("importlib.machinery") {
+            Ok(Object::Module(m)) => m,
+            _ => return None,
+        };
+        let loader = machinery
+            .dict
+            .borrow()
+            .get(&DictKey(Object::from_static("BuiltinImporter")))
+            .cloned()?;
+        globals
+            .borrow_mut()
+            .insert(DictKey(Object::from_static("__loader__")), loader.clone());
+        Some(loader)
     }
 
     /// The dict-subclass instance registered (by `exec`/`eval`) as the
@@ -8516,8 +8688,16 @@ impl Interpreter {
                 }
                 match name {
                     "__name__" => return Ok(Object::from_str(&m.name)),
+                    // CPython: `__file__` is a plain dict entry; a module
+                    // without one raises AttributeError. (mypyc's
+                    // `CPyImport_SetModuleFile` probes exactly this to decide
+                    // whether to derive `__file__` for a compiled module.)
+                    // The `filename` fallback covers Rust-importer modules
+                    // that predate the dict entry.
                     "__file__" => {
-                        return Ok(m.filename.as_deref().map_or(Object::None, Object::from_str));
+                        if let Some(f) = m.filename.as_deref() {
+                            return Ok(Object::from_str(f));
+                        }
                     }
                     "__dict__" => return Ok(Object::Dict(m.dict.clone())),
                     // CPython `module_get_annotations`: reading a module's
@@ -9170,6 +9350,34 @@ impl Interpreter {
                             // reflects the line endings seen so far.
                             if !f.binary {
                                 return Ok(f.newlines_obj());
+                            }
+                        }
+                        "line_buffering" | "write_through" => {
+                            // `TextIOWrapper` config attributes. Defaults
+                            // match CPython's stdio setup: stderr is always
+                            // line-buffered, stdout only on a tty; both are
+                            // False on ordinary text files. A value set via
+                            // `reconfigure()` (kept in `extra_attrs`) wins.
+                            if !f.binary && !f.is_memory() {
+                                if let Some(v) = f.get_extra_attr(name) {
+                                    return Ok(v);
+                                }
+                                let unbuffered = crate::vm_singletons::stdio_unbuffered();
+                                let v = match (name, &*f.backend.borrow()) {
+                                    ("line_buffering", crate::object::FileBackend::Stderr(_)) => {
+                                        !unbuffered
+                                    }
+                                    ("line_buffering", crate::object::FileBackend::Stdout(_)) => {
+                                        !unbuffered && f.isatty()
+                                    }
+                                    (
+                                        "write_through",
+                                        crate::object::FileBackend::Stdout(_)
+                                        | crate::object::FileBackend::Stderr(_),
+                                    ) => unbuffered,
+                                    _ => false,
+                                };
+                                return Ok(Object::Bool(v));
                             }
                         }
                         "_CHUNK_SIZE" => {
@@ -10467,6 +10675,7 @@ impl Interpreter {
         }
         let mut sink = self.stdout.borrow_mut();
         let _ = write!(sink, "{text}");
+        crate::vm_singletons::note_stdout_write(text.as_bytes());
         Ok(())
     }
 
@@ -10522,6 +10731,37 @@ impl Interpreter {
             Object::Str(s) => s.to_string(),
             other => other.to_str(),
         };
+        // CPython's `sys.displayhook`: the repr is written through
+        // `sys.stdout`'s codec; on `UnicodeEncodeError` it is re-encoded
+        // with `backslashreplace` and pushed to `sys.stdout.buffer`
+        // (`test_cmd_line.test_displayhook_unencodable` runs the REPL
+        // with `PYTHONIOENCODING=ascii/latin-1`).
+        if let Some(Object::File(f)) = self.current_sys_attr("stdout") {
+            if matches!(&*f.backend.borrow(), FileBackend::Stdout(_)) {
+                if let Some(enc) = f.encoding.borrow().clone() {
+                    let errors = f.errors_name();
+                    let bytes = crate::stdlib::codecs_mod::encode_str(&rendered, &enc, &errors)
+                        .or_else(|_| {
+                            crate::stdlib::codecs_mod::encode_str(
+                                &rendered,
+                                &enc,
+                                "backslashreplace",
+                            )
+                        })?;
+                    let mut sink = self.stdout.borrow_mut();
+                    let _ = sink.write_all(&bytes);
+                    let _ = writeln!(sink);
+                    crate::vm_singletons::note_stdout_write(b"\n");
+                    drop(sink);
+                    if let Some(Object::Module(m)) = self.cache.get("builtins") {
+                        m.dict
+                            .borrow_mut()
+                            .insert(DictKey(Object::from_static("_")), value);
+                    }
+                    return Ok(());
+                }
+            }
+        }
         let mut text = rendered;
         text.push('\n');
         self.write_to_stdout(&text, globals)?;
@@ -26372,13 +26612,32 @@ impl Interpreter {
                 if let RuntimeError::PyException(pe) = &e {
                     if let Object::Instance(inst) = &pe.instance {
                         if inst.cls().is_subclass_of(&syntax_warning_ty) {
-                            return Err(crate::error::syntax_error_located(
+                            let err = crate::error::syntax_error_located(
                                 w.message.clone(),
                                 Some(filename),
                                 Some(lineno),
                                 Some(offset),
                                 Some(&text),
-                            ));
+                            );
+                            // CPython's compiler marks exactly the
+                            // two-character escape (`\` + letter) —
+                            // `test_cmd_line_script.
+                            // test_syntaxerror_invalid_escape_sequence_multi_line`
+                            // expects a `^^` caret, not to-end-of-token.
+                            if let RuntimeError::PyException(pe2) = &err {
+                                if let Object::Instance(inst2) = &pe2.instance {
+                                    let mut d = inst2.dict.borrow_mut();
+                                    d.insert(
+                                        DictKey(Object::from_static("end_lineno")),
+                                        Object::Int(i64::from(lineno)),
+                                    );
+                                    d.insert(
+                                        DictKey(Object::from_static("end_offset")),
+                                        Object::Int(i64::from(offset + 2)),
+                                    );
+                                }
+                            }
+                            return Err(err);
                         }
                     }
                 }
@@ -27598,11 +27857,28 @@ impl Interpreter {
                         "code object passed to eval() may not contain free variables",
                     ));
                 }
-                // `eval`-mode code returns its expression value (see
-                // `compile_eval_with_source`); run it in the combined
-                // namespace and hand that value straight back.
+                // A code object routes exactly like `exec(code, g, l)`:
+                // the frame's globals are the real globals dict and a
+                // distinct locals mapping receives top-level binds via the
+                // class-namespace channel. (`eval` accepts *exec*-mode
+                // code objects — attrs' `_compile_and_eval` runs generated
+                // `def`s through `eval(bytecode, globs, locs)` and expects
+                // the functions to land in `locs`.) The merged-snapshot
+                // `ns` would swallow those STORE_NAMEs.
+                {
+                    let mut g = globals_dict.borrow_mut();
+                    if !g.contains_key(&DictKey(Object::from_static("__builtins__"))) {
+                        g.insert(
+                            DictKey(Object::from_static("__builtins__")),
+                            Object::Dict(self.builtins.clone()),
+                        );
+                    }
+                }
                 let mut frame =
-                    self.make_frame(c.clone(), Vec::new(), Vec::new(), ns.clone(), None);
+                    self.make_frame(c.clone(), Vec::new(), Vec::new(), globals_dict, None);
+                if let Some(l) = locals_dict.filter(|_| use_combined) {
+                    frame.class_namespace = Some(l);
+                }
                 // PyCF_ALLOW_TOP_LEVEL_AWAIT module code is a coroutine:
                 // `eval(co)` hands back the coroutine object for the
                 // caller to await (`asyncio.run(eval(co, g))`).
@@ -28019,7 +28295,23 @@ impl Interpreter {
             }
             return Ok(obj);
         }
-        if let Some(frozen) = self.cache.frozen_source(full) {
+        // A user module earlier on `sys.path` than the stdlib position
+        // shadows the frozen copy, exactly as it would shadow the
+        // on-disk stdlib in CPython (`test_cmd_line.test_isolatedmode`
+        // plants a fake `uuid.py` next to the script). Bundled
+        // *third-party facades* (`packaging`, `pytest`, …) are looser
+        // still: they aren't stdlib in CPython, so a real installation
+        // anywhere on `sys.path` — site-packages included, which sits
+        // *after* the stdlib landmark — wins over the frozen copy
+        // (RFC 0055 WS5: `pip install packaging` must actually change
+        // what `import packaging` returns).
+        let stdlib_shadowed = self.cache.frozen_source(full).is_some()
+            && if crate::import::ModuleCache::is_third_party_facade(full) {
+                self.cache.find_source(full).is_some()
+            } else {
+                self.cache.find_source_shadowing_stdlib(full).is_some()
+            };
+        if let Some(frozen) = self.cache.frozen_source(full).filter(|_| !stdlib_shadowed) {
             // RFC 0053 WS1 — frozen modules carry a *real* filesystem
             // identity: `co_filename`/`__file__` point into the
             // materialized stdlib tree (byte-identical to the embedded
@@ -28133,6 +28425,22 @@ impl Interpreter {
         // whose `__name__` is the dotted name.
         let ns_dirs = self.cache.find_namespace_package(full);
         if !ns_dirs.is_empty() {
+            // A namespace package can be split across directories *and*
+            // archives (`test_zipimport.testMixedNamespacePackage`). When
+            // any `sys.path` entry is a file (a zip candidate), let the
+            // Python `PathFinder` assemble the merged portion list first —
+            // it consults `zipimport` alongside the directory finders. The
+            // native construction below remains the fast path for the
+            // all-directories common case.
+            let has_archive_entry =
+                self.cache.path.borrow().iter().any(
+                    |entry| matches!(entry, Object::Str(s) if Path::new(s.as_ref()).is_file()),
+                );
+            if has_archive_entry {
+                if let Some(module) = self.try_meta_path_import(full)? {
+                    return Ok(module);
+                }
+            }
             let pkg_for_globals = full.rsplit_once('.').map(|(p, _)| p.to_owned());
             let globals = self.build_module_globals(full, None, pkg_for_globals.as_deref());
             {
@@ -28173,7 +28481,22 @@ impl Interpreter {
         if let Some(module) = self.try_meta_path_import(full)? {
             return Ok(module);
         }
-        let err = module_not_found_error(format!("No module named '{full}'"));
+        // CPython's `_find_and_load` appends the diagnosis when the
+        // dotted parent exists but has no `__path__`
+        // ("No module named 'builtins.x'; 'builtins' is not a package").
+        let mut msg = format!("No module named '{full}'");
+        if let Some((parent, _)) = full.rsplit_once('.') {
+            if let Some(Object::Module(pm)) = self.cache.get(parent) {
+                if !pm
+                    .dict
+                    .borrow()
+                    .contains_key(&DictKey(Object::from_static("__path__")))
+                {
+                    msg.push_str(&format!("; '{parent}' is not a package"));
+                }
+            }
+        }
+        let err = module_not_found_error(msg);
         crate::error::set_exception_attr(&err, "name", Object::from_str(full.to_owned()));
         Err(err)
     }

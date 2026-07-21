@@ -1331,7 +1331,30 @@ pub unsafe extern "C" fn PySet_Add(s: *mut PyObject, item: *mut PyObject) -> c_i
             unsafe { crate::mirror::sync_set_used(s) };
             0
         }
-        _ => -1,
+        // CPython's `PySet_Add` explicitly accepts a *frozenset* too — the
+        // documented "fill it before it's exposed" idiom. mypyc's
+        // `CPyStatics_Initialize` builds every frozenset literal with
+        // `PyFrozenSet_New(NULL)` + `PySet_Add` (RFC 0055 WS5). The
+        // payload is immutable, so rewrite the box with an extended copy.
+        Object::FrozenSet(fs) => {
+            let mut data: SetData = SetData::clone(&fs);
+            data.insert(DictKey(unsafe { crate::object::clone_object(item) }));
+            unsafe {
+                crate::object::set_payload(
+                    s,
+                    Object::FrozenSet(Rc::new(weavepy_vm::object::FrozenSetObj::new(data))),
+                );
+                crate::mirror::sync_set_used(s);
+            }
+            0
+        }
+        other => {
+            crate::errors::set_type_error(format!(
+                "PySet_Add: expected set, got {}",
+                other.type_name()
+            ));
+            -1
+        }
     }
 }
 

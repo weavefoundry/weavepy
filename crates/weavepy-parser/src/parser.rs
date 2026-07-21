@@ -4778,8 +4778,18 @@ impl<'src> Parser<'src> {
                     message: "f-string: expecting '}'".to_owned(),
                 });
             }
+            // CPython's caret sits on the *terminator character itself*
+            // (`test_cmd_line_script.test_syntaxerror_multi_line_fstring`
+            // expects a single `^` under the `}`), not the whole token.
+            let term_pos = field_abs
+                + match before {
+                    '!' => conv_start.map_or(field.len(), |c| c - 1),
+                    ':' => spec_start.map_or(field.len(), |s| s - 1),
+                    '=' => trimmed_end.len().saturating_sub(1),
+                    _ => field.len(),
+                } as u32;
             return Err(ParseError::Unexpected {
-                span: anchor,
+                span: Span::new(term_pos, term_pos + 1),
                 message: format!("f-string: valid expression required before '{before}'"),
             });
         }

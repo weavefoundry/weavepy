@@ -457,13 +457,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         );
         d.insert(
             DictKey(Object::from_static("version_info")),
-            Object::new_tuple(vec![
-                Object::Int(PY_VERSION.0),
-                Object::Int(PY_VERSION.1),
-                Object::Int(PY_VERSION.2),
-                Object::from_static("final"),
-                Object::Int(0),
-            ]),
+            version_info_value(),
         );
         d.insert(
             DictKey(Object::from_static("platform")),
@@ -475,6 +469,19 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         d.insert(
             DictKey(Object::from_static("_framework")),
             Object::from_static(""),
+        );
+        // RFC 0055 WS1 — version-control build stamp, CPython's
+        // `sys._git` 3-tuple `(project, branch, revision)`. CPython
+        // reports empty branch/revision strings when built outside a
+        // checkout; WeavePy does the same (`platform._sys_version`
+        // and its test suite read the attribute unconditionally).
+        d.insert(
+            DictKey(Object::from_static("_git")),
+            Object::new_tuple(vec![
+                Object::from_static("WeavePy"),
+                Object::from_static(""),
+                Object::from_static(""),
+            ]),
         );
         d.insert(
             DictKey(Object::from_static("byteorder")),
@@ -500,9 +507,13 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         // `sys._base_executable` mirrors `sys.executable` outside a venv
         // (CPython sets it to the real interpreter; `test_os.PidTests` and
         // `subprocess` reach for it when re-launching the interpreter).
+        // Inside a venv, CPython's getpath derives it from pyvenv.cfg's
+        // `home` key + the executable's basename (RFC 0055 WS1;
+        // `test_venv.test_sysconfig` asserts the venv python reports
+        // the *base* interpreter here).
         d.insert(
             DictKey(Object::from_static("_base_executable")),
-            executable.clone(),
+            venv_base_executable().map_or_else(|| executable.clone(), Object::from_str),
         );
         // Installation prefixes. CPython computes these in getpath.c;
         // RFC 0053 anchors them on the materialized stdlib tree
@@ -656,25 +667,45 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             Rc::new(RefCell::new(std::io::stdout()));
         let stderr_sink: Rc<RefCell<dyn std::io::Write + Send + Sync>> =
             Rc::new(RefCell::new(std::io::stderr()));
+        // CPython's `init_sys_streams`: a standard stream whose fd is
+        // closed at startup (e.g. spawned with `os.close(0)` in a
+        // preexec hook) is `None`, not a broken file object
+        // (`test_cmd_line.test_no_stdin` and friends).
+        #[cfg(unix)]
+        let fd_valid = |fd: i32| unsafe { libc::fcntl(fd, libc::F_GETFD) } != -1;
+        #[cfg(not(unix))]
+        let fd_valid = |_fd: i32| true;
         d.insert(
             DictKey(Object::from_static("stdout")),
-            Object::File(Rc::new(PyFile::new(
-                "<stdout>",
-                "w",
-                FileBackend::Stdout(stdout_sink),
-            ))),
+            if fd_valid(1) {
+                Object::File(Rc::new(PyFile::new(
+                    "<stdout>",
+                    "w",
+                    FileBackend::Stdout(stdout_sink),
+                )))
+            } else {
+                Object::None
+            },
         );
         d.insert(
             DictKey(Object::from_static("stderr")),
-            Object::File(Rc::new(PyFile::new(
-                "<stderr>",
-                "w",
-                FileBackend::Stderr(stderr_sink),
-            ))),
+            if fd_valid(2) {
+                Object::File(Rc::new(PyFile::new(
+                    "<stderr>",
+                    "w",
+                    FileBackend::Stderr(stderr_sink),
+                )))
+            } else {
+                Object::None
+            },
         );
         d.insert(
             DictKey(Object::from_static("stdin")),
-            Object::File(Rc::new(PyFile::new("<stdin>", "r", FileBackend::Stdin))),
+            if fd_valid(0) {
+                Object::File(Rc::new(PyFile::new("<stdin>", "r", FileBackend::Stdin)))
+            } else {
+                Object::None
+            },
         );
         // `sys.__stdout__` et al. record the *original* streams so code
         // that rebinds `sys.stdout` can restore them. They alias the same
@@ -721,13 +752,7 @@ fn implementation_value() -> Object {
     );
     d.insert(
         DictKey(Object::from_static("version")),
-        Object::new_tuple(vec![
-            Object::Int(PY_VERSION.0),
-            Object::Int(PY_VERSION.1),
-            Object::Int(PY_VERSION.2),
-            Object::from_static("final"),
-            Object::Int(0),
-        ]),
+        version_info_value(),
     );
     d.insert(
         DictKey(Object::from_static("hexversion")),
@@ -737,11 +762,87 @@ fn implementation_value() -> Object {
         DictKey(Object::from_static("cache_tag")),
         Object::from_static(crate::pycache::CACHE_TAG),
     );
-    d.insert(
-        DictKey(Object::from_static("_multiarch")),
-        Object::from_static("weavepy-x86_64"),
-    );
+    // RFC 0055 WS1 — CPython's multiarch tag for the compile target
+    // (`darwin`, `x86_64-linux-gnu`, …). Only present on the platforms
+    // where CPython defines it, matching `hasattr` probes in
+    // `sysconfig`/`test.support`.
+    if !crate::stdlib::sysconfig_native::MULTIARCH.is_empty() {
+        d.insert(
+            DictKey(Object::from_static("_multiarch")),
+            Object::from_static(crate::stdlib::sysconfig_native::MULTIARCH),
+        );
+    }
     Object::SimpleNamespace(Rc::new(RefCell::new(d)))
+}
+
+/// Contents of the governing `pyvenv.cfg` (next to the executable's
+/// directory or one level up), or `None` outside a virtual environment.
+fn venv_cfg_contents() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let exe_dir = exe.parent()?;
+    let cfg = [
+        exe_dir.join("pyvenv.cfg"),
+        exe_dir.parent()?.join("pyvenv.cfg"),
+    ]
+    .into_iter()
+    .find(|p| p.is_file())?;
+    std::fs::read_to_string(cfg).ok()
+}
+
+/// Case-insensitive `key = value` lookup in pyvenv.cfg contents.
+fn venv_cfg_lookup(contents: &str, wanted: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        (key.trim().eq_ignore_ascii_case(wanted)).then(|| value.trim().to_owned())
+    })
+}
+
+/// When the running executable lives inside a virtual environment,
+/// return the base interpreter path. Prefer the explicit `executable`
+/// key venv writes since 3.11; fall back to CPython getpath's
+/// `{home}/{basename(executable)}` reconstruction. `None` outside a
+/// venv.
+fn venv_base_executable() -> Option<String> {
+    let contents = venv_cfg_contents()?;
+    if let Some(executable) = venv_cfg_lookup(&contents, "executable") {
+        if std::path::Path::new(&executable).is_file() {
+            return Some(executable);
+        }
+    }
+    let home = venv_cfg_lookup(&contents, "home")?;
+    let exe = std::env::current_exe().ok()?;
+    let base = std::path::Path::new(&home).join(exe.file_name()?);
+    base.is_file().then(|| base.to_string_lossy().into_owned())
+}
+
+/// CPython getpath's stdlib-zip landmark: `{base_prefix}/{platlibdir}/
+/// python{XY}{abi_thread}.zip`. Listed on `sys.path` whether or not the
+/// archive exists (CPython does the same), and — crucially for venvs
+/// created from a non-installed build (`test_venv.
+/// test_zippath_from_non_installed_posix`) — anchored on the *base*
+/// prefix derived from pyvenv.cfg's `home` key.
+pub(crate) fn stdlib_zip_path() -> Option<String> {
+    let base_prefix: std::path::PathBuf = venv_cfg_contents()
+        .and_then(|contents| venv_cfg_lookup(&contents, "home"))
+        .map(|home| {
+            let home = std::path::PathBuf::from(home);
+            // `home` is the base executable's directory (`{base}/bin` on
+            // POSIX); the prefix is one level up.
+            match (home.file_name(), home.parent()) {
+                (Some(name), Some(parent)) if name == "bin" => parent.to_path_buf(),
+                _ => home,
+            }
+        })
+        .or_else(|| crate::stdlib_tree::prefix().map(std::path::Path::to_path_buf))
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| Some(p.parent()?.parent()?.to_path_buf()))
+        })?;
+    let zip = base_prefix
+        .join("lib")
+        .join(format!("python{}{}.zip", PY_VERSION.0, PY_VERSION.1));
+    Some(zip.to_string_lossy().into_owned())
 }
 
 fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
@@ -796,6 +897,12 @@ thread_local! {
 /// Read by the str→int / int→str conversion paths to enforce PEP 0467.
 pub fn int_max_str_digits() -> i64 {
     INT_MAX_STR_DIGITS.with(|c| c.get())
+}
+
+/// Startup override for the digit cap (`-X int_max_str_digits` /
+/// `PYTHONINTMAXSTRDIGITS`, already validated by the CLI).
+pub fn set_int_max_str_digits(n: i64) {
+    INT_MAX_STR_DIGITS.with(|c| c.set(n));
 }
 
 fn sys_get_int_max_str_digits(_args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1135,7 +1242,27 @@ pub(crate) const SYS_FLAGS_FIELDS: &[&str] = &[
     "warn_default_encoding",
     "safe_path",
     "int_max_str_digits",
+    "gil",
 ];
+
+/// `sys.version_info` (and `sys.implementation.version`) — CPython's
+/// `PyStructSequence` with named fields; `sys.version_info.major` is
+/// one of the most common introspection idioms in the ecosystem
+/// (RFC 0055 WS1: `test_venv`'s zip-path probe and `test_embed`'s
+/// first failure were both this attribute).
+const VERSION_INFO_FIELDS: &[&str] = &["major", "minor", "micro", "releaselevel", "serial"];
+
+fn version_info_value() -> Object {
+    let ty = crate::stdlib::os::struct_seq_type("version_info", "sys", VERSION_INFO_FIELDS);
+    let values = vec![
+        Object::Int(PY_VERSION.0),
+        Object::Int(PY_VERSION.1),
+        Object::Int(PY_VERSION.2),
+        Object::from_static("final"),
+        Object::Int(0),
+    ];
+    crate::stdlib::os::struct_seq_instance(ty, VERSION_INFO_FIELDS, values)
+}
 
 fn sys_flags_value() -> Object {
     // CPython exposes `sys.flags` as a real `PyStructSequence` (a `tuple`
@@ -1150,11 +1277,14 @@ fn sys_flags_value() -> Object {
             // CPython's default cap on int<->str conversion size (PEP 0467 /
             // `-X int_max_str_digits`). test_int reads this off `sys.flags`.
             "int_max_str_digits" => Object::Int(4300),
+            // 3.13's `-X gil` / `PYTHON_GIL`: on a build where the GIL
+            // can't be disabled the flag is always 1.
+            "gil" => Object::Int(1),
             // WeavePy stores `str` as UTF-8, so UTF-8 mode is on unless the
             // CLI explicitly passes `-X utf8=0` (applied in apply_run_options).
             "utf8_mode" => Object::Int(1),
-            // The lone bool field on CPython's `sys.flags`.
-            "dev_mode" => Object::Bool(false),
+            // The two bool fields on CPython's `sys.flags`.
+            "dev_mode" | "safe_path" => Object::Bool(false),
             _ => Object::Int(0),
         })
         .collect();
@@ -1303,6 +1433,7 @@ fn stdlib_module_names_value() -> Object {
         "_strptime",
         "_struct",
         "_symtable",
+        "_sysconfig",
         "_thread",
         "_threading_local",
         "_tkinter",

@@ -789,7 +789,16 @@ fn libregrtest_bootstrap(file: &RegrtestFile) -> Option<String> {
     Some(format!(
         r#"
 import sys, os
-sys.path.insert(0, {lib_dir:?})
+# The runner also exports WEAVEPY_CPYTHON_LIB, which lands the same
+# directory on the default path — keep exactly one copy, at the front
+# (a duplicate breaks test_venv's stdlib-copying walk of sys.path).
+_lib = {lib_dir:?}
+try:
+    sys.path.remove(_lib)
+except ValueError:
+    pass
+sys.path.insert(0, _lib)
+del _lib
 sys.argv = [{path:?}]
 import unittest
 # Run inside a fresh scratch working directory, like libregrtest's per-worker

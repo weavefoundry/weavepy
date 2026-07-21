@@ -18,6 +18,37 @@ from importlib.util import spec_from_loader
 from importlib.machinery import ModuleSpec
 
 
+def _verbose_message(message, *args, verbosity=1):
+    """Print *message* to stderr when `python -v` is active
+    (CPython gates on `sys.flags.verbose`)."""
+    if getattr(sys.flags, 'verbose', 0) >= verbosity:
+        if not message.startswith(('#', 'import ')):
+            message = '# ' + message
+        print(message.format(*args), file=sys.stderr)
+
+
+def _load_module_shim(self, fullname):
+    """Load the specified module into sys.modules and return it.
+
+    CPython keeps this as the compatibility shim behind every legacy
+    ``loader.load_module()`` API (zipimporter's included).
+    """
+    spec = spec_from_loader(fullname, self)
+    if fullname in sys.modules:
+        module = sys.modules[fullname]
+        try:
+            if spec.loader is not None:
+                spec.loader.exec_module(module)
+        except BaseException:
+            try:
+                del sys.modules[fullname]
+            except KeyError:
+                pass
+            raise
+        return sys.modules.get(fullname, module)
+    return _load(spec)
+
+
 def _load(spec):
     """Create, register, and execute the module described by *spec*.
 

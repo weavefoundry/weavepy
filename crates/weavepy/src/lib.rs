@@ -187,6 +187,12 @@ pub struct RunOptions {
     /// Directory to prepend to `sys.path` (typically the script's
     /// directory, mirroring CPython's `python script.py` behaviour).
     pub script_dir: Option<PathBuf>,
+    /// Prepend [`Self::script_dir`] even under `-P`/`-I`. CPython's
+    /// `pymain_run_python` adds a directory/zipfile argument
+    /// (`main_importer_path`) to `sys.path[0]` unconditionally —
+    /// `safe_path` only suppresses the *script's parent dir* — so
+    /// `python -I app/` still finds `app/__main__.py`.
+    pub script_dir_always: bool,
     /// Set of flag toggles the CLI hands the VM. The VM reflects
     /// these on `sys.flags`, `sys.dont_write_bytecode`,
     /// `sys._xoptions`, and `sys.warnoptions`.
@@ -210,6 +216,7 @@ impl RunOptions {
             argv: Vec::new(),
             extra_path: Vec::new(),
             script_dir: None,
+            script_dir_always: false,
             flags: InterpreterFlags::default(),
             print_uncaught: false,
         }
@@ -238,6 +245,14 @@ impl RunOptions {
         self
     }
 
+    /// See [`RunOptions::script_dir_always`].
+    #[must_use]
+    pub fn with_script_dir_always(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.script_dir = Some(dir.into());
+        self.script_dir_always = true;
+        self
+    }
+
     #[must_use]
     pub fn with_extra_path<I, P>(mut self, paths: I) -> Self
     where
@@ -262,6 +277,36 @@ impl RunOptions {
 /// emulate `python script.py arg1 arg2`, and tests use it for
 /// multi-file fixtures.
 pub fn run_source_with_options(source: &str, opts: &RunOptions) -> Result<(), Error> {
+    run_source_with_options_impl(source, opts, false).1
+}
+
+/// As [`run_source_with_options`], but keeps the interpreter (and its
+/// `sys.modules['__main__']` globals) alive for the caller — the `-i`
+/// / `PYTHONINSPECT` path, where the REPL that follows must share the
+/// just-run program's namespace (`python -i -m timeit` then typing
+/// `Timer` shows `__main__.Timer`). No shutdown finalizers run; the
+/// caller owns the interpreter's remaining lifecycle.
+pub fn run_source_keep_interpreter(
+    source: &str,
+    opts: &RunOptions,
+) -> (vm::Interpreter, Result<(), Error>) {
+    let (interp, result) = run_source_with_options_impl(source, opts, true);
+    let interp = interp.unwrap_or_else(|| {
+        // Parse/compile failed before an interpreter existed — hand
+        // back a configured one so the REPL can still start (CPython's
+        // `-i` drops to the prompt even after a startup SyntaxError).
+        let mut i = vm::Interpreter::default();
+        i.apply_run_options(&opts.flags);
+        i
+    });
+    (interp, result)
+}
+
+fn run_source_with_options_impl(
+    source: &str,
+    opts: &RunOptions,
+    keep_interpreter: bool,
+) -> (Option<vm::Interpreter>, Result<(), Error>) {
     // `-x`: drop the first physical line (typical use is to allow a
     // shell-style shebang to live above a self-extracting payload).
     let effective_source: String;
@@ -282,10 +327,13 @@ pub fn run_source_with_options(source: &str, opts: &RunOptions) -> Result<(), Er
     // `SyntaxWarning`s) are replayed through the `warnings` machinery
     // once the interpreter is up, just before the module body runs.
     let (module_res, escape_warnings) = parser::parse_module_with_warnings(source_ref);
-    let module = module_res?;
+    let module = match module_res {
+        Ok(m) => m,
+        Err(e) => return (None, Err(e.into())),
+    };
     // `-O`/`-OO` applies to the main module too (assert/docstring
     // stripping, `__debug__` folding) — RFC 0052.
-    let code = compiler::compile_module_with_options(
+    let code = match compiler::compile_module_with_options(
         &module,
         source_ref,
         &opts.filename,
@@ -293,14 +341,12 @@ pub fn run_source_with_options(source: &str, opts: &RunOptions) -> Result<(), Er
             flags: 0,
             optimize: opts.flags.optimize,
         },
-    )?;
+    ) {
+        Ok(c) => c,
+        Err(e) => return (None, Err(e.into())),
+    };
     let mut interpreter = vm::Interpreter::default();
     interpreter.apply_run_options(&opts.flags);
-    if !opts.flags.safe_path {
-        if let Some(dir) = &opts.script_dir {
-            interpreter.prepend_path(dir.clone());
-        }
-    }
     for p in &opts.extra_path {
         interpreter.append_path(p.clone());
     }
@@ -315,6 +361,16 @@ pub fn run_source_with_options(source: &str, opts: &RunOptions) -> Result<(), Er
         // suppressed (matching CPython's behaviour) so a botched
         // `.pth` file can't break the interpreter outright.
         let _ = interpreter.run_site();
+    }
+    // `sys.path[0]` (the script's directory, `''` for `-c`/stdin, the
+    // dir/zip argument itself) goes in *after* `site` runs — CPython's
+    // `pymain_run_python` inserts path0 post-init, which is what keeps
+    // site's `removeduppaths()` from absolutizing the `''` entry
+    // (`test_cmd_line_script.test_issue8202_dash_c_file_ignored`).
+    if !opts.flags.safe_path || opts.script_dir_always {
+        if let Some(dir) = &opts.script_dir {
+            interpreter.prepend_path(dir.clone());
+        }
     }
     // Synthetic source names are wrapped in angle brackets (`<string>`,
     // `<stdin>`, `<multiprocessing-fork>`, …) and, like CPython, must *not*
@@ -358,6 +414,13 @@ pub fn run_source_with_options(source: &str, opts: &RunOptions) -> Result<(), Er
         }
         other => other.map_err(Error::from),
     };
+    if keep_interpreter {
+        // `-i` / `PYTHONINSPECT`: the program's namespace lives on into
+        // the REPL — no shutdown, no finalizers; just make the output
+        // visible before the prompt appears.
+        let _ = interpreter.flush_streams();
+        return (Some(interpreter), result.map(|_| ()));
+    }
     // CPython's `Py_FinalizeEx` first joins non-daemon threads
     // (`threading._shutdown()`) and runs `atexit` callbacks, *then*
     // finalizes everything still alive. Do the same so a program that
@@ -375,8 +438,13 @@ pub fn run_source_with_options(source: &str, opts: &RunOptions) -> Result<(), Er
     // which skips Rust's end-of-main stdout flush, so without this an
     // output-buffering `sys.exit()` run (e.g. a redirected unittest
     // session) would lose its tail — or all of it, for sub-buffer output.
-    interpreter.flush_streams();
-    result.map(|_| ())
+    if !interpreter.flush_streams() {
+        // CPython: a failed `Py_FinalizeEx` (here: `sys.stdout` would
+        // not flush) turns the whole run into exit status 120,
+        // overriding even a `SystemExit` code.
+        std::process::exit(120);
+    }
+    (Some(interpreter), result.map(|_| ()))
 }
 
 fn script_dir_of(filename: &str) -> PathBuf {

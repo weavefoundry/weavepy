@@ -61,7 +61,10 @@ pub mod subprocess_mod;
 pub mod symtable_mod;
 pub mod sys;
 pub mod sys_monitoring;
+pub mod sysconfig_native;
 pub mod tempfile_mod;
+#[cfg(unix)]
+pub mod termios_mod;
 pub mod testinternalcapi_mod;
 pub mod thread;
 pub mod time;
@@ -169,6 +172,10 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("_ast", ast_mod::build);
     // RFC 0033 — native symbol-table core behind the frozen `symtable` module.
     cache.register_builtin("_symtable", symtable_mod::build);
+    // RFC 0055 WS1 — CPython 3.13's native build-info module (gh-103480).
+    // `sysconfig._init_non_posix` merges `config_vars()` on Windows and
+    // `test_sysconfig` imports it unconditionally.
+    cache.register_builtin("_sysconfig", sysconfig_native::build);
     // RFC 0052 — native lexer core behind the frozen `_tokenize` module
     // (the CPython 3.13 `Parser/lexer` port `tokenize.py` drives).
     cache.register_builtin("_tokenize_core", tokenize_mod::build);
@@ -218,6 +225,10 @@ pub fn register_all(cache: &ModuleCache) {
     // multiprocessing rewrite) imports unconditionally.
     cache.register_builtin("fcntl", fcntl_mod::build);
     cache.register_builtin("resource", resource_mod::build);
+    // RFC 0055 WS6 — real POSIX terminal control (CPython's termios is a
+    // core C extension; `tty`/`pty` above are pure-Python over it).
+    #[cfg(unix)]
+    cache.register_builtin("termios", termios_mod::build);
     // RFC 0031 — debugger / profiler observability is now fully
     // wired in the VM dispatch loop; the modules below expose the
     // user-visible registration / snapshot API.
@@ -622,13 +633,18 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/enum.py"),
             is_package: false,
         },
-        // `termios` — constants-only shim so pure-Python `tty` (pulled in by
-        // `test_asyncio.test_events`) imports. Real terminal control is not
-        // implemented; the tty syscalls fail cleanly on non-terminal fds and
-        // the pty-backed tests skip (no `os.openpty`).
+        // `tty` + `pty` verbatim from CPython — they run over the native
+        // `termios` builtin (RFC 0055 WS6: real terminal control, so the
+        // pty-backed legs of `test_asyncio.test_events`, `test_termios`,
+        // `test_tty`, and `test_ioctl` measure the real syscalls).
         FrozenSource {
-            name: "termios",
-            source: include_str!("python/termios_mod.py"),
+            name: "tty",
+            source: include_str!("python/tty.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "pty",
+            source: include_str!("python/pty.py"),
             is_package: false,
         },
         FrozenSource {
@@ -2228,6 +2244,15 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/test_pickletester.py"),
             is_package: false,
         },
+        // `test.test_longexp` (verbatim, 10 lines): CPython's own
+        // `test_cmd_line.test_relativedir_bug46421` runs
+        // `python -m unittest test/test_longexp.py`, which the unittest
+        // loader resolves to the *stdlib* `test.test_longexp` module.
+        FrozenSource {
+            name: "test.test_longexp",
+            source: include_str!("python/test_longexp.py"),
+            is_package: false,
+        },
         // `test.__main__` / `test.regrtest`: drive `weavepy -m test` and
         // `weavepy -m test.regrtest`. The runner itself lives in the
         // `test.libregrtest` package below.
@@ -2469,9 +2494,56 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/importlib_metadata.py"),
             is_package: false,
         },
+        // CPython's `importlib/resources/` package, frozen verbatim
+        // (RFC 0055 WS5). A *package* since 3.11: pytest's assertion
+        // rewriter imports `importlib.resources.abc` /
+        // `importlib.resources.readers` directly, and `test_zipfile`
+        // isinstance-checks `zipfile.Path` against the
+        // runtime-checkable `Traversable` Protocol.
         FrozenSource {
             name: "importlib.resources",
-            source: include_str!("python/importlib_resources.py"),
+            source: include_str!("python/importlib_resources/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "importlib.resources.abc",
+            source: include_str!("python/importlib_resources/abc.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "importlib.resources.readers",
+            source: include_str!("python/importlib_resources/readers.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "importlib.resources.simple",
+            source: include_str!("python/importlib_resources/simple.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "importlib.resources._adapters",
+            source: include_str!("python/importlib_resources/_adapters.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "importlib.resources._common",
+            source: include_str!("python/importlib_resources/_common.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "importlib.resources._functional",
+            source: include_str!("python/importlib_resources/_functional.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "importlib.resources._itertools",
+            source: include_str!("python/importlib_resources/_itertools.py"),
+            is_package: false,
+        },
+        // 3.10-era location, kept by CPython as an alias module.
+        FrozenSource {
+            name: "importlib.readers",
+            source: include_str!("python/importlib_readers.py"),
             is_package: false,
         },
         // CPython's frozen import-core modules; stdlib code (pydoc,
@@ -2479,6 +2551,18 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "importlib._bootstrap",
             source: include_str!("python/importlib_bootstrap.py"),
+            is_package: false,
+        },
+        // The `_frozen_importlib*` builtin names CPython freezes; the
+        // verbatim `zipimport` (RFC 0055 WS3) imports them directly.
+        FrozenSource {
+            name: "_frozen_importlib",
+            source: include_str!("python/importlib_bootstrap.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_frozen_importlib_external",
+            source: include_str!("python/importlib_bootstrap_external.py"),
             is_package: false,
         },
         FrozenSource {
@@ -2519,8 +2603,10 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
         // module during its autoconf build; ours computes the same
         // variables from the running interpreter). Registered under
         // the platform-derived names `_get_sysconfigdata_name()`
-        // produces with `sys.abiflags == ''` and no
-        // `sys.implementation._multiarch`.
+        // produces with `sys.abiflags == ''` and CPython's multiarch
+        // tags (RFC 0055 WS1); only the compile target's name resolves
+        // at runtime, so registering every platform's spelling is
+        // harmless.
         FrozenSource {
             name: "sysconfig",
             source: include_str!("python/sysconfig/__init__.py"),
@@ -2532,12 +2618,17 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             is_package: false,
         },
         FrozenSource {
-            name: "_sysconfigdata__darwin_weavepy-x86_64",
+            name: "_sysconfigdata__darwin_darwin",
             source: include_str!("python/_weave_sysconfigdata.py"),
             is_package: false,
         },
         FrozenSource {
-            name: "_sysconfigdata__linux_weavepy-x86_64",
+            name: "_sysconfigdata__linux_x86_64-linux-gnu",
+            source: include_str!("python/_weave_sysconfigdata.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_sysconfigdata__linux_aarch64-linux-gnu",
             source: include_str!("python/_weave_sysconfigdata.py"),
             is_package: false,
         },
@@ -2561,14 +2652,50 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/_pyrepl_pager.py"),
             is_package: false,
         },
+        // RFC 0055 WS4 — `_pyrepl.console` / `_pyrepl.main` (verbatim):
+        // `asyncio.__main__` (the `python -m asyncio` REPL) imports
+        // `InteractiveColoredConsole` and `CAN_USE_PYREPL` from them.
+        // With a non-tty stdin `CAN_USE_PYREPL` computes False and the
+        // console falls back to plain `code.InteractiveConsole.interact`.
+        FrozenSource {
+            name: "_pyrepl.console",
+            source: include_str!("python/_pyrepl_console.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.main",
+            source: include_str!("python/_pyrepl_main.py"),
+            is_package: false,
+        },
+        // RFC 0055 WS2 — verbatim CPython `venv` + `ensurepip`
+        // packages. The activation scripts and the bundled pip wheel
+        // are not `.py` sources; they materialize through the stdlib
+        // tree's data-file table (`stdlib_tree::DATA_FILES`), which is
+        // where `venv.EnvBuilder.setup_scripts` (`__file__`-relative)
+        // and `importlib.resources.files('ensurepip')` find them.
         FrozenSource {
             name: "venv",
-            source: include_str!("python/venv_mod.py"),
+            source: include_str!("python/venv/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "venv.__main__",
+            source: include_str!("python/venv/__main__.py"),
             is_package: false,
         },
         FrozenSource {
             name: "ensurepip",
-            source: include_str!("python/ensurepip.py"),
+            source: include_str!("python/ensurepip/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "ensurepip.__main__",
+            source: include_str!("python/ensurepip/__main__.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "ensurepip._uninstall",
+            source: include_str!("python/ensurepip/_uninstall.py"),
             is_package: false,
         },
         FrozenSource {
@@ -2778,10 +2905,14 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/_pep517.py"),
             is_package: false,
         },
-        // Expose the WeavePy pip under the canonical `pip` name as well.
+        // Expose the WeavePy pip under the canonical `pip` name — via
+        // the RFC 0055 WS2 dispatcher, which prefers an installed
+        // site-packages pip, honours venv --without-pip semantics
+        // (`import pip` fails there), and falls back to the embedded
+        // `_minipip` in the base environment.
         FrozenSource {
             name: "pip",
-            source: include_str!("python/_minipip.py"),
+            source: include_str!("python/pip_shim.py"),
             is_package: false,
         },
         // `packaging` is a third-party project on PyPI but extremely

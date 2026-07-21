@@ -35,8 +35,18 @@ use crate::object::PyObject;
 // CPython 3.13 `struct _ts` field offsets (machine-checked against stock
 // `cpython/pystate.h`; see the layout walk in the wave-5 work log).
 const OFF_INTERP: usize = 16; // PyInterpreterState *interp
+const OFF_C_RECURSION_REMAINING: usize = 52; // int c_recursion_remaining
 const OFF_CURRENT_EXCEPTION: usize = 112; // PyObject *current_exception
 const OFF_EXC_INFO: usize = 120; // _PyErr_StackItem *exc_info
+const OFF_DELETE_LATER: usize = 168; // PyObject *delete_later
+
+/// Initial `c_recursion_remaining`. mypyc's `Py_TRASHCAN_BEGIN` expansion
+/// reads/writes the field *directly* and deposits the object (deferring its
+/// dealloc) whenever the remaining budget is ≤ 50 — a zeroed field would
+/// push *every* dealloc through the trashcan and never drain it. CPython
+/// 3.13 initialises it to `Py_C_RECURSION_LIMIT`; the precise figure only
+/// bounds native dealloc recursion.
+const C_RECURSION_BUDGET: i32 = 4000;
 
 /// Generously sized backing body. The real 3.13 `PyThreadState` is well
 /// under this; the slack guarantees any in-struct field write Cython emits
@@ -86,6 +96,10 @@ fn store_ptr() -> *mut TStateStore {
                 let exc_info_ptr = ptr::addr_of_mut!((*store).exc_info) as *mut c_void;
                 let body = (*store).body.as_mut_ptr();
                 ptr::write_unaligned(body.add(OFF_EXC_INFO) as *mut *mut c_void, exc_info_ptr);
+                ptr::write_unaligned(
+                    body.add(OFF_C_RECURSION_REMAINING) as *mut i32,
+                    C_RECURSION_BUDGET,
+                );
             }
         }
         store
@@ -103,6 +117,23 @@ pub fn current_threadstate() -> *mut PyThreadState {
 pub fn current_exception_slot() -> *mut *mut PyObject {
     let store = store_ptr();
     unsafe { (*store).body.as_mut_ptr().add(OFF_CURRENT_EXCEPTION) as *mut *mut PyObject }
+}
+
+/// Pointer to this thread's handled-exception (`exc_info->exc_value`) slot,
+/// holding NULL or one owned reference. `PyErr_GetExcInfo`/`SetExcInfo`
+/// (mypyc's try/finally save-restore) read and write it.
+pub fn exc_info_value_slot() -> *mut *mut PyObject {
+    let store = store_ptr();
+    unsafe { ptr::addr_of_mut!((*store).exc_info.exc_value) }
+}
+
+/// Pointer to this thread's `delete_later` field. mypyc's `Py_TRASHCAN_END`
+/// expansion reads the field directly to decide whether to call
+/// `_PyTrash_thread_destroy_chain`, so the deposit/destroy pair in
+/// [`crate::mypyc_tail`] must keep it accurate.
+pub fn delete_later_slot() -> *mut *mut PyObject {
+    let store = store_ptr();
+    unsafe { (*store).body.as_mut_ptr().add(OFF_DELETE_LATER) as *mut *mut PyObject }
 }
 
 // ---------------------------------------------------------------------------

@@ -722,6 +722,13 @@ except ImportError:
 
 # Module initialization
 _processoptions(sys.warnoptions)
+# `-b` / `-bb` (CPython's config_init_warnings): a BytesWarning filter
+# in front of even the -W options ("default" for -b, "error" for -bb).
+_bytes_warning = getattr(getattr(sys, 'flags', None), 'bytes_warning', 0)
+if _bytes_warning:
+    simplefilter("error" if _bytes_warning > 1 else "default",
+                 category=BytesWarning, append=0)
+del _bytes_warning
 if not _warnings_defaults:
     # Several warning categories are ignored by default in regular builds
     if not hasattr(sys, 'gettotalrefcount'):

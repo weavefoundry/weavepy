@@ -15,6 +15,7 @@
 //! to optionally check out CPython as a submodule to widen the corpus.
 
 pub mod corpus;
+pub mod ecosystem;
 pub mod normalize;
 pub mod oracle;
 pub mod regrtest;
