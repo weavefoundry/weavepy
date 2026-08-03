@@ -575,11 +575,16 @@ class Popen:
     # -- fd wrapping --
 
     def _wrap_fd(self, fd, kind, bufsize):
-        if self.text_mode:
-            mode = kind  # 'r' / 'w'
-            return io.open(fd, mode, bufsize if bufsize >= 0 else -1,
-                           self.encoding, self.errors)
-        return io.open(fd, kind + "b", bufsize if bufsize >= 0 else -1)
+        # Match CPython's Popen: the binary layer honours bufsize (0 =
+        # unbuffered raw), and text mode wraps it in a write-through
+        # TextIOWrapper (line-buffered only when bufsize == 1).
+        binary = io.open(fd, kind + "b", bufsize if bufsize >= 0 else -1)
+        if not self.text_mode:
+            return binary
+        return io.TextIOWrapper(binary, encoding=self.encoding,
+                                errors=self.errors,
+                                line_buffering=(bufsize == 1),
+                                write_through=True)
 
     def _get_devnull(self):
         if self._devnull is None:

@@ -431,7 +431,12 @@ thread_local! {
     /// between-bytecodes safe point it uses for prompt `__del__` finalization
     /// (and `gc.collect()` drains it after a collection), giving CPython's
     /// "unclosed file" warning the right timing without the reentrancy hazard.
-    static PENDING_RESOURCE_WARNINGS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// Each entry carries the message and, when known, the dying object's
+    /// allocation address — the token `warnings.warn(..., source=)` and
+    /// `tracemalloc.get_object_traceback` use to look up the allocation
+    /// traceback after the object itself is gone.
+    static PENDING_RESOURCE_WARNINGS: RefCell<Vec<(String, Option<usize>)>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 /// Cheap "is the deferred-warning queue non-empty?" probe set whenever a
@@ -441,13 +446,25 @@ static PENDING_RW_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 
 /// Enqueue a deferred `ResourceWarning` message from a destructor. Drained by
 /// [`crate::Interpreter::drain_pending_resource_warnings`] at the next safe
-/// point. Silently dropped once shutdown has begun (the `warnings` machinery
-/// is being torn down and CPython likewise suppresses dealloc warnings then).
+/// point. Enqueueing stays open during shutdown: CPython *does* report a
+/// file leaked until `Py_FinalizeEx`'s module sweep (`<sys>:0:
+/// ResourceWarning: unclosed file …`, `test_warnings.test_late_resource_warning`)
+/// — the shutdown sequence drains the queue one last time after clearing
+/// `__main__`, and anything enqueued later simply evaporates with the process.
 pub fn push_pending_resource_warning(message: String) {
-    if is_finalizing() {
-        return;
-    }
-    PENDING_RESOURCE_WARNINGS.with(|cell| cell.borrow_mut().push(message));
+    PENDING_RESOURCE_WARNINGS.with(|cell| cell.borrow_mut().push((message, None)));
+    PENDING_RW_FLAG.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// As [`push_pending_resource_warning`], carrying the dying object's
+/// allocation address as the warning's `source` token (CPython's
+/// `PyErr_ResourceWarning(source, …)` passes the object itself; ours is
+/// already mid-drop, so the address stands in for the tracemalloc lookup).
+/// Pins the object's allocation frames first so a recycled address from
+/// `linecache.getline` during warning formatting cannot overwrite them.
+pub fn push_pending_resource_warning_with_source(message: String, source_key: usize) {
+    crate::stdlib::tracemalloc_real::pin_object_traceback(source_key);
+    PENDING_RESOURCE_WARNINGS.with(|cell| cell.borrow_mut().push((message, Some(source_key))));
     PENDING_RW_FLAG.store(true, std::sync::atomic::Ordering::Release);
 }
 
@@ -459,7 +476,7 @@ pub fn has_pending_resource_warnings() -> bool {
 
 /// Drain and return all queued deferred resource-warning messages on this
 /// thread, clearing the fast-path flag.
-pub fn take_pending_resource_warnings() -> Vec<String> {
+pub fn take_pending_resource_warnings() -> Vec<(String, Option<usize>)> {
     PENDING_RW_FLAG.store(false, std::sync::atomic::Ordering::Release);
     PENDING_RESOURCE_WARNINGS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
 }

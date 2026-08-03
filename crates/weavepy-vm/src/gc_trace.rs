@@ -1809,6 +1809,9 @@ pub fn strong_count_for(obj: &Object) -> usize {
         Object::Coroutine(g) => Rc::strong_count(g),
         Object::AsyncGenerator(g) => Rc::strong_count(g),
         Object::ByteArray(b) => Rc::strong_count(b),
+        // Not cycle-capable, but `sys.getrefcount(b"...")` parity matters
+        // to ctypes' keepalive tests (test_internals.test_c_char_p).
+        Object::Bytes(b) => Rc::strong_count(b),
         Object::Iter(i) => Rc::strong_count(i),
         Object::Frame(f) => Rc::strong_count(f),
         Object::Traceback(t) => Rc::strong_count(t),
@@ -1940,9 +1943,11 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
             visit(&s.step);
         }
         Object::Property(p) => {
-            visit(&p.fget);
-            visit(&p.fset);
-            visit(&p.fdel);
+            for member in [&p.fget, &p.fset, &p.fdel] {
+                if let Ok(v) = member.try_borrow() {
+                    visit(&v);
+                }
+            }
             if let Ok(doc) = p.doc.try_borrow() {
                 visit(&doc);
             }

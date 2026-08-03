@@ -93,7 +93,7 @@ fn call_method(interp: &mut Interpreter, instance: Object, name: &str, args: &[O
     // so the test can read e.g. `arr.shape` without going through the
     // VM's LOAD_ATTR dispatcher.
     let method = match method {
-        Object::Property(p) if args.is_empty() => p.fget.clone(),
+        Object::Property(p) if args.is_empty() => p.fget(),
         m => m,
     };
     let mut full = Vec::with_capacity(args.len() + 1);

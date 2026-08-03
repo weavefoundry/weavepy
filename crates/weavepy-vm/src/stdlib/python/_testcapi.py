@@ -90,6 +90,21 @@ def bad_get(self, obj, cls):
     return cls()
 
 
+def set_nomemory(start, stop=None):
+    # CPython's hook swaps in an allocator that fails the start..stop-th
+    # allocations (PyMem_SetAllocator). WeavePy's allocator is Rust's
+    # global allocator with no failure-injection seam, so tests that
+    # need real allocation failures (test_pyexpat's
+    # test_error_path_no_crash) skip rather than error.
+    import unittest
+
+    raise unittest.SkipTest("WeavePy cannot inject allocation failures")
+
+
+def remove_mem_hooks():
+    pass
+
+
 def run_in_subinterp(code):
     # Py_NewInterpreter + PyRun_SimpleString: execute `code` in a fresh
     # interpreter namespace; uncaught exceptions are printed to stderr

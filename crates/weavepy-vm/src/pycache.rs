@@ -79,19 +79,41 @@ pub const MAGIC: &[u8; 4] = b"\xf3\x0d\x0d\x0a";
 ///   the `__weavepy_typevar__` intrinsic family and append the
 ///   implicit `Generic[…]` base; pre-rev `.pyc` baked the name-only
 ///   placeholder lowering.
-pub const CACHE_TAG: &str = "weavepy-313-11";
+/// - rev `12`: RFC 0056 WS4 invalidation. Rev-11 artifacts in the wild
+///   were written across intermediate compiler changes (notably module
+///   `__doc__` binding) without a bump, so a stale `.pyc` could import a
+///   module with `__doc__ = None` (doctest found no module-level
+///   examples in `test_doctest2`). One bump flushes them all.
+/// - rev `13`: PEP 657 column spans in the location table (long entry
+///   form). Rev-12 `.pyc`s carried the no-column form only, so modules
+///   imported from cache lost traceback caret underlines
+///   (test_doctest's error-report examples compare them textually).
+/// - rev `14`: PEP 488 `.opt-N` variants + `source_to_code(_optimize=)`
+///   honoured. Rev-13 `.opt-1`/`.opt-2` artifacts (written by
+///   `py_compile`/`compileall`) contain *unoptimized* code under the
+///   optimized filename; one bump flushes them before the native
+///   reader starts trusting the suffix.
+pub const CACHE_TAG: &str = "weavepy-313-14";
 
 const HEADER_LEN: usize = 16;
 
-/// Resolve the `__pycache__/<name>.<tag>.pyc` companion for a source
-/// file. CPython routes the cache to `<source_dir>/__pycache__/...`
+/// Resolve the `__pycache__/<name>.<tag>[.opt-N].pyc` companion for a
+/// source file. CPython routes the cache to `<source_dir>/__pycache__/...`
 /// unless `sys.pycache_prefix` redirects elsewhere; we follow the
-/// same shape.
-pub fn cache_path_for(source: &Path) -> Option<PathBuf> {
+/// same shape. `optimize` selects the PEP 488 suffix: level 0 is
+/// untagged, `-O`/`-OO` read and write `.opt-1`/`.opt-2` variants (an
+/// import under `-O` updates exactly the `opt-1` artifact —
+/// `test_compileall.HardlinkDedupTests.test_import`).
+pub fn cache_path_for(source: &Path, optimize: u8) -> Option<PathBuf> {
     let stem = source.file_stem()?.to_string_lossy().into_owned();
     let dir = source.parent()?;
     let cache_dir = dir.join("__pycache__");
-    Some(cache_dir.join(format!("{stem}.{CACHE_TAG}.pyc")))
+    let name = if optimize == 0 {
+        format!("{stem}.{CACHE_TAG}.pyc")
+    } else {
+        format!("{stem}.{CACHE_TAG}.opt-{optimize}.pyc")
+    };
+    Some(cache_dir.join(name))
 }
 
 /// Returns true when the user has asked us not to persist `.pyc`s.
@@ -111,8 +133,8 @@ pub fn dont_write_bytecode(sys_module: &Rc<RefCell<DictData>>) -> bool {
 /// `Some(code)` on a healthy hit; returns `None` if the cache is
 /// missing, stale, or malformed (so the caller falls back to source
 /// compilation).
-pub fn try_load(source_path: &Path) -> Option<CodeObject> {
-    let cache_path = cache_path_for(source_path)?;
+pub fn try_load(source_path: &Path, optimize: u8) -> Option<CodeObject> {
+    let cache_path = cache_path_for(source_path, optimize)?;
     let src_meta = fs::metadata(source_path).ok()?;
     let src_mtime = mtime_seconds(&src_meta);
     let src_size = u32::try_from(src_meta.len()).ok()?;
@@ -175,8 +197,8 @@ fn rewrite_filenames(code: &mut CodeObject, filename: &str) {
 /// Persist the compiled code object alongside its source. Errors are
 /// silently swallowed (matching CPython): a read-only filesystem or a
 /// missing parent directory shouldn't fail the import.
-pub fn try_write(source_path: &Path, code: &CodeObject) {
-    let Some(cache_path) = cache_path_for(source_path) else {
+pub fn try_write(source_path: &Path, code: &CodeObject, optimize: u8) {
+    let Some(cache_path) = cache_path_for(source_path, optimize) else {
         return;
     };
     let Ok(meta) = fs::metadata(source_path) else {

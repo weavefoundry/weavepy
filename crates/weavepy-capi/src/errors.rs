@@ -390,6 +390,7 @@ macro_rules! exc_cell {
 
 exc_cell! {
     PyExc_BaseException;
+    PyExc_BaseExceptionGroup;
     PyExc_Exception;
     PyExc_ArithmeticError;
     PyExc_AssertionError;
@@ -483,6 +484,12 @@ pub fn init_static_exceptions() {
     };
     unsafe {
         publish(&raw mut PyExc_BaseException, bt.base_exception.clone());
+        // PEP 654 group root; PyO3's abi3 import table binds it
+        // unconditionally (pydantic-core dlopen fails without the symbol).
+        publish(
+            &raw mut PyExc_BaseExceptionGroup,
+            bt.base_exception_group.clone(),
+        );
         publish(&raw mut PyExc_Exception, bt.exception.clone());
         publish(&raw mut PyExc_ArithmeticError, bt.arithmetic_error.clone());
         publish(&raw mut PyExc_AssertionError, bt.assertion_error.clone());

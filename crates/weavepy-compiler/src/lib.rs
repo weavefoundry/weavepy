@@ -2354,12 +2354,19 @@ impl Compiler {
                     self.emit_store_name(top);
                 }
                 Some(asname) => {
-                    // `import a.b.c as x` walks the attribute chain.
+                    // `import a.b.c as x` walks the chain with IMPORT_FROM,
+                    // not plain attribute loads (bpo-30024): IMPORT_FROM
+                    // falls back to the (possibly still-initialising)
+                    // submodule in `sys.modules`, which is what makes
+                    // circular `import numpy._core.multiarray as ma`
+                    // inside `numpy._core.__init__` resolvable.
                     let mut parts = alias.name.split('.');
                     let _ = parts.next();
                     for part in parts {
                         let idx = self.co.intern_name(part);
-                        self.emit(OpCode::LoadAttr, idx);
+                        self.emit(OpCode::ImportFrom, idx);
+                        self.emit(OpCode::Swap, 2);
+                        self.emit(OpCode::PopTop, 0);
                     }
                     self.emit_store_name(asname);
                 }
@@ -3260,6 +3267,12 @@ impl Compiler {
             for n in nl {
                 let ok = match self.kind {
                     CodeKind::Module => false,
+                    // A class body always owns an implicit `__class__` cell
+                    // (created on demand for `super()`/`__class__` uses), so
+                    // `nonlocal __class__` in a method resolves against it
+                    // even though no explicit binding exists (test_super's
+                    // pathology-repair tearDown).
+                    CodeKind::Class if n == "__class__" => true,
                     CodeKind::Class => matches!(
                         self.bindings.get(&n),
                         Some(Binding::Free | Binding::Nonlocal | Binding::ClassPassthrough)
@@ -7174,7 +7187,19 @@ fn method_references_class(body: &[Stmt]) -> bool {
     for s in body {
         collect_reads_stmt(s, &mut reads);
     }
-    reads.contains("super") || reads.contains("__class__")
+    if reads.contains("super") || reads.contains("__class__") {
+        return true;
+    }
+    // `nonlocal __class__` (test_super's pathology-repair tearDown) binds
+    // the implicit class cell for *writing* without ever reading it —
+    // CPython's symtable treats the declaration itself as a use.
+    let mut globals = HashSet::new();
+    let mut nonlocals = HashSet::new();
+    let mut assigned = HashSet::new();
+    for s in body {
+        collect_decls(s, &mut globals, &mut nonlocals, &mut assigned);
+    }
+    nonlocals.contains("__class__")
 }
 
 /// The docstring of a body, per CPython's rule: the first statement is a

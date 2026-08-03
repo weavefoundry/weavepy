@@ -837,6 +837,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dea2df4cf52843e0452895c455a1a2cfbb842a1e7329671acf418fdc53ed4c59"
 
 [[package]]
+name = "expat-sys"
+version = "2.6.4"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "fallible-iterator"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1609,16 +1616,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
-]
-
-[[package]]
-name = "quick-xml"
-version = "0.36.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7649a7b4df05aed9ea7ec6f628c67c9953a43869b8bc50929569b2999d443fe"
-dependencies = [
- "encoding_rs",
- "memchr",
 ]
 
 [[package]]
@@ -2807,6 +2804,7 @@ dependencies = [
  "crossbeam-utils",
  "digest",
  "encoding_rs",
+ "expat-sys",
  "fancy-regex",
  "flate2",
  "hmac",
@@ -2823,7 +2821,6 @@ dependencies = [
  "num-traits",
  "parking_lot",
  "pkcs8",
- "quick-xml",
  "regex",
  "rusqlite",
  "rust_decimal",

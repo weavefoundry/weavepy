@@ -84,6 +84,13 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             ("RawIOBase", &raw_iobase),
             ("BufferedIOBase", &buffered_iobase),
             ("TextIOBase", &text_iobase),
+            // CPython's `_io` names the abstract bases with a leading
+            // underscore (`_io._IOBase` …); `io.py` re-exports them bare.
+            // cffi's `_cffi_backend` init imports `_io._IOBase` directly.
+            ("_IOBase", &iobase),
+            ("_RawIOBase", &raw_iobase),
+            ("_BufferedIOBase", &buffered_iobase),
+            ("_TextIOBase", &text_iobase),
             ("FileIO", &fileio),
             ("BytesIO", &bytes_io),
             ("StringIO", &string_io),
@@ -775,6 +782,10 @@ pub(crate) fn finish_open(
     newline: Option<&Object>,
     binary: bool,
 ) -> Result<Object, RuntimeError> {
+    // tracemalloc: remember where this file was opened (every `open()` /
+    // `io.open` funnels through here), so a later unclosed-file
+    // `ResourceWarning` can report the allocation site.
+    crate::stdlib::tracemalloc_real::track_object_alloc(&file);
     let result = (|| -> Result<(), RuntimeError> {
         if !binary && encoding_arg_is_default(encoding) {
             warn_open_default_encoding()?;

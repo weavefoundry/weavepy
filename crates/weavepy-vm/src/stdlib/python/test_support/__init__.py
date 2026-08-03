@@ -107,6 +107,25 @@ LONG_TIMEOUT = 5 * 60.0
 # that contains Python's regression test suite
 TEST_SUPPORT_DIR = os.path.dirname(os.path.abspath(__file__))
 TEST_HOME_DIR = os.path.dirname(TEST_SUPPORT_DIR)
+# WeavePy: `test.support` is the frozen copy living in the materialized
+# stdlib tree, but the regression suite itself usually runs from a
+# checked-out CPython `Lib/test/` (the `test` package's __init__ grafts it
+# onto `__path__`). Everything derived from TEST_HOME_DIR — fixture lookup
+# (`findfile`, test_import/data), and the STDLIB_DIR that
+# `load_package_tests` hands unittest discovery as top_level_dir ("Path
+# must be within the project") — must point at *that* tree, not at the
+# materialized one, which carries only the support layer.
+try:
+    _test_pkg = sys.modules["test"]
+    for _entry in list(getattr(_test_pkg, "__path__", [])):
+        if _entry != TEST_HOME_DIR and os.path.isfile(
+            os.path.join(_entry, "test_import", "__init__.py")
+        ):
+            TEST_HOME_DIR = _entry
+            break
+    del _test_pkg, _entry
+except (KeyError, NameError):
+    pass
 STDLIB_DIR = os.path.dirname(TEST_HOME_DIR)
 REPO_ROOT = os.path.dirname(STDLIB_DIR)
 

@@ -159,6 +159,25 @@ fn ref_type_call(args: &[Object]) -> Result<Object, RuntimeError> {
     Err(type_error("__call__() requires a weakref instance"))
 }
 
+/// C-API bridge (`PyWeakref_NewRef`): mint a plain weakref to `target`,
+/// exactly like `_weakref.ref(target, callback)`.
+pub fn c_new_ref(target: Object, callback: Option<Object>) -> Result<Object, RuntimeError> {
+    if !supports_weakref(&target) {
+        return Err(type_error(format!(
+            "cannot create weak reference to '{}' object",
+            target.type_name_owned()
+        )));
+    }
+    Ok(make_ref_object(target, callback, kind::REF))
+}
+
+/// C-API bridge (`PyWeakref_GetRef`): referent of a weakref wrapper.
+/// `Some(Some(target))` while live, `Some(None)` once dead, `None` when
+/// `obj` isn't a weakref wrapper at all.
+pub fn c_referent(obj: &Object) -> Option<Option<Object>> {
+    wrapper_referent(obj)
+}
+
 /// Referent of a ref/proxy wrapper through its per-instance deref
 /// closure. `Some(Some(target))` while live, `Some(None)` once dead,
 /// `None` when `obj` isn't a weakref wrapper at all.

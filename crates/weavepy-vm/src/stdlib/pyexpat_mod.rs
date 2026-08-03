@@ -1,76 +1,163 @@
-//! `pyexpat` — native XML parser (RFC 0040 WS5).
+//! `pyexpat` — bindings to the real (vendored) expat 2.6.4 (RFC 0056 WS3).
 //!
-//! CPython's `pyexpat` is a thin C wrapper over the bundled `expat`
-//! library. WeavePy wraps `quick-xml` (a mature pure-Rust streaming XML
-//! parser) behind the same Python-visible surface: `ParserCreate`, the
-//! `xmlparser` object with its settable `*Handler` callbacks, `Parse` /
-//! `ParseFile`, the `Error*`/`Current*` position attributes, and the
-//! `ExpatError` exception with `code`/`lineno`/`offset`.
+//! This replaces the earlier `quick-xml`-based approximation with a faithful
+//! port of CPython's `Modules/pyexpat.c` over `vendor/expat-sys`: a true push
+//! parser (incremental `Parse(data, isfinal)` chunks fire handlers as tokens
+//! complete), the full 22-slot handler table, DTD/entity/notation/attlist
+//! declaration events, namespace triplets, external-entity subparsers,
+//! character-data buffering (`buffer_text`/`buffer_size`), interning, live
+//! `Current*`/`Error*` position attributes and `GetInputContext`.
 //!
-//! This is what makes `xml.parsers.expat`, `xml.sax`, `xml.dom.minidom`
-//! and — critically for WS5 — the `xmlrpc.client` serializer that
-//! `multiprocessing.managers` uses (`serializer='xmlrpclib'`) work. The
-//! manager-server restart tests (`test_rapid_restart`, `test_remote`)
-//! cannot complete without it, and their orphaned server children are
-//! what deadlock the spawn suite during cleanup.
-//!
-//! ## Push model
-//!
-//! `expat` is a push parser: `Parse(data, isfinal)` is fed incrementally
-//! and fires handlers as tokens complete. `quick-xml` is a pull parser,
-//! so we accumulate the fed bytes and run the parse when the document is
-//! finalised (`isfinal=True`). Every real consumer here feeds a complete
-//! document and then closes (`xmlrpc`'s `loads`, `sax.parseString`,
-//! `minidom.parseString`), so the handler *sequence* and final result are
-//! faithful; only the intra-`feed` interleaving differs.
+//! Structure mirrors `_sqlite3` (`sqlite3_native`): native state lives in a
+//! process-global registry keyed by an integer handle stored on the Python
+//! instance's `_handle`; expat's C callbacks re-enter the VM through the
+//! published interpreter pointer, and Python-level exceptions raised inside a
+//! handler are parked in the state (`pending_exc`) while `XML_StopParser`
+//! aborts the C-side parse — exactly CPython's `flag_error` protocol.
 
-use crate::sync::Rc;
-use crate::sync::RefCell;
-use std::collections::HashMap;
+#![allow(unsafe_op_in_unsafe_fn)]
+
+use std::os::raw::{c_char, c_int, c_void};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Mutex, OnceLock};
 
-use quick_xml::events::Event;
-use quick_xml::reader::Reader;
+use expat_sys as ex;
+use expat_sys::XML_Parser;
 
-use crate::error::{type_error, value_error, PyException, RuntimeError};
+use crate::error::{
+    attribute_error, overflow_error, recursion_error, type_error, value_error, PyException,
+    RuntimeError,
+};
 use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
+use crate::sync::Rc;
+use crate::sync::RefCell;
 use crate::types::{PyInstance, TypeFlags, TypeObject};
 
 // ---------------------------------------------------------------------------
-// Parser state registry (mirrors the `_bz2` streaming-object pattern: native
-// state lives in a process-global registry keyed by an integer handle stored
-// on the Python instance's `_handle`).
+// Interpreter re-entry (the `_sqlite3` pattern)
 // ---------------------------------------------------------------------------
 
-struct ExpatState {
-    /// Bytes accumulated across `Parse(data, isfinal=False)` calls.
-    buffer: Vec<u8>,
-    /// Namespace separator (expat's `namespace_separator`); `None` disables
-    /// namespace processing.
-    namespace_sep: Option<String>,
-    /// Coalesce adjacent character data into a single handler call.
-    buffer_text: bool,
-    /// Report attributes as a flat `[n0, v0, n1, v1, …]` list instead of a
-    /// dict.
-    ordered_attributes: bool,
-    /// Already-finalised (a second non-empty `Parse` after `isfinal=True`
-    /// is an error in expat).
-    finished: bool,
-    /// Cached newline offsets of `buffer`, for line/column reporting.
-    line_starts: Vec<usize>,
+type Interp = crate::Interpreter;
+
+fn interp<'a>() -> Result<&'a mut Interp, RuntimeError> {
+    let ptr = crate::vm_singletons::current_interpreter_ptr()
+        .ok_or_else(|| RuntimeError::Internal("pyexpat: no running interpreter".to_owned()))?;
+    // SAFETY: published by an enclosing VM frame still live on this thread;
+    // the GIL keeps the access exclusive.
+    Ok(unsafe { &mut *ptr })
 }
 
-// All fields are `Send`; the registry `Mutex` provides the cross-thread
-// barrier (a parser object can be created on one thread and used on another,
-// as the manager-server feeder does).
+fn call(ip: &mut Interp, f: &Object, args: &[Object]) -> Result<Object, RuntimeError> {
+    let globals = ip.builtins_dict();
+    ip.call_object_with_globals(f, args, &[], &globals)
+}
 
-type ParserReg = Mutex<HashMap<i64, Rc<RefCell<ExpatState>>>>;
+// ---------------------------------------------------------------------------
+// Handler slots (CPython's handler_info table)
+// ---------------------------------------------------------------------------
 
-fn parser_reg() -> &'static ParserReg {
-    static REG: OnceLock<ParserReg> = OnceLock::new();
-    REG.get_or_init(|| Mutex::new(HashMap::new()))
+const H_START_ELEMENT: usize = 0;
+const H_END_ELEMENT: usize = 1;
+const H_PROCESSING_INSTRUCTION: usize = 2;
+const H_CHARACTER_DATA: usize = 3;
+const H_UNPARSED_ENTITY_DECL: usize = 4;
+const H_NOTATION_DECL: usize = 5;
+const H_START_NAMESPACE_DECL: usize = 6;
+const H_END_NAMESPACE_DECL: usize = 7;
+const H_COMMENT: usize = 8;
+const H_START_CDATA: usize = 9;
+const H_END_CDATA: usize = 10;
+const H_DEFAULT: usize = 11;
+const H_DEFAULT_EXPAND: usize = 12;
+const H_NOT_STANDALONE: usize = 13;
+const H_EXTERNAL_ENTITY_REF: usize = 14;
+const H_START_DOCTYPE_DECL: usize = 15;
+const H_END_DOCTYPE_DECL: usize = 16;
+const H_ENTITY_DECL: usize = 17;
+const H_XML_DECL: usize = 18;
+const H_ELEMENT_DECL: usize = 19;
+const H_ATTLIST_DECL: usize = 20;
+const H_SKIPPED_ENTITY: usize = 21;
+const N_HANDLERS: usize = 22;
+
+const HANDLER_NAMES: [&str; N_HANDLERS] = [
+    "StartElementHandler",
+    "EndElementHandler",
+    "ProcessingInstructionHandler",
+    "CharacterDataHandler",
+    "UnparsedEntityDeclHandler",
+    "NotationDeclHandler",
+    "StartNamespaceDeclHandler",
+    "EndNamespaceDeclHandler",
+    "CommentHandler",
+    "StartCdataSectionHandler",
+    "EndCdataSectionHandler",
+    "DefaultHandler",
+    "DefaultHandlerExpand",
+    "NotStandaloneHandler",
+    "ExternalEntityRefHandler",
+    "StartDoctypeDeclHandler",
+    "EndDoctypeDeclHandler",
+    "EntityDeclHandler",
+    "XmlDeclHandler",
+    "ElementDeclHandler",
+    "AttlistDeclHandler",
+    "SkippedEntityHandler",
+];
+
+fn slot_for(name: &str) -> Option<usize> {
+    HANDLER_NAMES.iter().position(|n| *n == name)
+}
+
+// ---------------------------------------------------------------------------
+// Parser state + registry
+// ---------------------------------------------------------------------------
+
+/// Default character-data buffer size (pyexpat.c `new_parser_object`).
+const DEFAULT_BUFFER_SIZE: usize = 8192;
+
+struct ExpatState {
+    /// Raw `XML_Parser`, stored as usize (Send); 0 after free.
+    parser: usize,
+    /// Python handler objects (`Object::None` when unset), by slot.
+    handlers: Vec<Object>,
+    /// The string-interning dict (always a real Python dict).
+    intern: Object,
+    /// `buffer_text`: coalesce character data until the next non-chardata
+    /// event (or the buffer fills up).
+    buffer_text: bool,
+    buffer: Vec<u8>,
+    buffer_size: usize,
+    ordered_attributes: bool,
+    specified_attributes: bool,
+    ns_prefixes: bool,
+    /// Nesting depth of Python handler callbacks (drives `GetInputContext`).
+    in_callback: u32,
+    /// Python exception raised inside a handler; the parse is aborted and
+    /// this is re-raised from `Parse`/`ParseFile`.
+    pending_exc: Option<RuntimeError>,
+    /// Tracked value for `GetReparseDeferralEnabled` (expat >= 2.6).
+    reparse_deferral: bool,
+    /// Strong ref to the parent parser instance for subparsers created by
+    /// `ExternalEntityParserCreate`: expat subparsers use their parent's
+    /// `XML_Parser` internals, so the parent must outlive them (gh-139400).
+    /// Never read — its only job is the keepalive.
+    #[allow(dead_code)]
+    parent: Object,
+}
+
+impl ExpatState {
+    fn parser(&self) -> XML_Parser {
+        self.parser as XML_Parser
+    }
+}
+
+type StateRef = Rc<RefCell<ExpatState>>;
+
+fn parser_reg() -> &'static parking_lot::Mutex<std::collections::HashMap<i64, StateRef>> {
+    static REG: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashMap<i64, StateRef>>> =
+        std::sync::OnceLock::new();
+    REG.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
 
 fn next_id() -> i64 {
@@ -78,133 +165,725 @@ fn next_id() -> i64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-fn state_of(id: i64) -> Option<Rc<RefCell<ExpatState>>> {
-    parser_reg().lock().ok()?.get(&id).cloned()
+fn state_of(id: i64) -> Option<StateRef> {
+    parser_reg().lock().get(&id).cloned()
 }
 
-// ---------------------------------------------------------------------------
-// Module construction.
-// ---------------------------------------------------------------------------
+/// Registry lookup from an expat userdata pointer (the state id).
+fn state_from_ud(ud: *mut c_void) -> Option<StateRef> {
+    state_of(ud as i64)
+}
 
-pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::default()));
-    {
-        let mut d = dict.borrow_mut();
-        d.insert(
-            DictKey(Object::from_static("__name__")),
-            Object::from_static("pyexpat"),
-        );
-        d.insert(
-            DictKey(Object::from_static("__doc__")),
-            Object::from_static("Python wrapper for Expat parser (RFC 0040 WS5)."),
-        );
-        d.insert(
-            DictKey(Object::from_static("EXPAT_VERSION")),
-            Object::from_static("expat_2.5.0"),
-        );
-        d.insert(
-            DictKey(Object::from_static("version_info")),
-            Object::new_tuple(vec![Object::Int(2), Object::Int(5), Object::Int(0)]),
-        );
-        d.insert(
-            DictKey(Object::from_static("native_encoding")),
-            Object::from_static("UTF-8"),
-        );
-        d.insert(
-            DictKey(Object::from_static("features")),
-            Object::new_tuple(vec![]),
-        );
-        d.insert(
-            DictKey(Object::from_static("XML_PARAM_ENTITY_PARSING_NEVER")),
-            Object::Int(0),
-        );
-        d.insert(
-            DictKey(Object::from_static(
-                "XML_PARAM_ENTITY_PARSING_UNLESS_STANDALONE",
-            )),
-            Object::Int(1),
-        );
-        d.insert(
-            DictKey(Object::from_static("XML_PARAM_ENTITY_PARSING_ALWAYS")),
-            Object::Int(2),
-        );
-        d.insert(
-            DictKey(Object::from_static("ParserCreate")),
-            b_kw("ParserCreate", parser_create),
-        );
-        d.insert(
-            DictKey(Object::from_static("ErrorString")),
-            b("ErrorString", error_string),
-        );
-        d.insert(
-            DictKey(Object::from_static("XMLParserType")),
-            Object::Type(parser_type()),
-        );
-        let err = expat_error_type();
-        d.insert(
-            DictKey(Object::from_static("ExpatError")),
-            Object::Type(err.clone()),
-        );
-        d.insert(DictKey(Object::from_static("error")), Object::Type(err));
-        d.insert(
-            DictKey(Object::from_static("errors")),
-            Object::Module(errors_submodule()),
-        );
-        d.insert(
-            DictKey(Object::from_static("model")),
-            Object::Module(model_submodule()),
-        );
+fn self_inst(args: &[Object]) -> Result<Rc<PyInstance>, RuntimeError> {
+    match args.first() {
+        Some(Object::Instance(i)) => Ok(i.clone()),
+        _ => Err(type_error("expected xmlparser instance")),
     }
-    Rc::new(PyModule {
-        name: "pyexpat".to_owned(),
-        filename: None,
-        dict,
-    })
 }
 
-fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
-    Object::Builtin(Rc::new(BuiltinFn {
-        name,
-        binds_instance: false,
-        call: Box::new(body),
-        call_kw: None,
-    }))
+fn state_of_args(args: &[Object]) -> Result<StateRef, RuntimeError> {
+    let inst = self_inst(args)?;
+    let handle = inst
+        .dict
+        .borrow()
+        .get(&DictKey(Object::from_static("_handle")))
+        .cloned();
+    match handle {
+        Some(Object::Int(id)) => {
+            state_of(id).ok_or_else(|| value_error("xmlparser has been freed"))
+        }
+        _ => Err(type_error("xmlparser instance missing _handle")),
+    }
 }
 
-fn b_kw(
-    name: &'static str,
-    body: fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError>,
-) -> Object {
-    Object::Builtin(Rc::new(BuiltinFn {
-        name,
-        binds_instance: false,
-        call: Box::new(move |args| body(args, &[])),
-        call_kw: Some(Box::new(body)),
-    }))
+// ---------------------------------------------------------------------------
+// C-string / interning conversions
+// ---------------------------------------------------------------------------
+
+/// Convert a NUL-terminated expat string (always valid UTF-8 in this build)
+/// to an owned Rust string.
+unsafe fn cstr(p: *const c_char) -> String {
+    if p.is_null() {
+        return String::new();
+    }
+    String::from_utf8_lossy(std::ffi::CStr::from_ptr(p).to_bytes()).into_owned()
 }
 
-fn method(
-    dict: &mut DictData,
-    name: &'static str,
-    body: fn(&[Object]) -> Result<Object, RuntimeError>,
+/// NULL-tolerant conversion: `None` for NULL (CPython `STRING_CONV_FUNC`).
+unsafe fn conv_opt(p: *const c_char) -> Object {
+    if p.is_null() {
+        Object::None
+    } else {
+        Object::from_str(cstr(p))
+    }
+}
+
+unsafe fn conv_len(s: *const c_char, len: c_int) -> Object {
+    if s.is_null() {
+        return Object::None;
+    }
+    let bytes = std::slice::from_raw_parts(s.cast::<u8>(), len as usize);
+    Object::from_str(String::from_utf8_lossy(bytes).into_owned())
+}
+
+/// `string_intern` (pyexpat.c): return the canonical `str` for `p` out of the
+/// parser's intern dict, inserting on first sight. NULL converts to `None`.
+unsafe fn intern_cstr(st: &StateRef, p: *const c_char) -> Object {
+    if p.is_null() {
+        return Object::None;
+    }
+    let s = cstr(p);
+    let dict = st.borrow().intern.clone();
+    if let Object::Dict(dd) = &dict {
+        let key = DictKey(Object::from_str(s));
+        if let Some(existing) = dd.borrow().get(&key).cloned() {
+            return existing;
+        }
+        let obj = key.0.clone();
+        dd.borrow_mut().insert(key, obj.clone());
+        return obj;
+    }
+    key_fallback(s)
+}
+
+fn key_fallback(s: String) -> Object {
+    Object::from_str(s)
+}
+
+// ---------------------------------------------------------------------------
+// Handler dispatch + character-data buffering
+// ---------------------------------------------------------------------------
+
+/// Call the Python handler in `slot`. Returns `None` if the handler is unset,
+/// an exception is already pending, or the handler raised (in which case the
+/// exception is parked and the parse aborted — CPython's `flag_error`).
+fn dispatch(st: &StateRef, slot: usize, args: Vec<Object>) -> Option<Object> {
+    let handler = {
+        let s = st.borrow();
+        if s.pending_exc.is_some() {
+            return None;
+        }
+        s.handlers[slot].clone()
+    };
+    if matches!(handler, Object::None) {
+        return None;
+    }
+    let Ok(ip) = interp() else {
+        return None;
+    };
+    st.borrow_mut().in_callback += 1;
+    let result = call(ip, &handler, &args);
+    st.borrow_mut().in_callback -= 1;
+    match result {
+        Ok(v) => Some(v),
+        Err(e) => {
+            flag_error(st, e);
+            None
+        }
+    }
+}
+
+fn flag_error(st: &StateRef, e: RuntimeError) {
+    let parser = {
+        let mut s = st.borrow_mut();
+        if s.pending_exc.is_none() {
+            s.pending_exc = Some(e);
+        }
+        s.parser()
+    };
+    // SAFETY: aborting a live parse; harmless (error return) outside one.
+    unsafe {
+        ex::XML_StopParser(parser, ex::XML_FALSE);
+    }
+}
+
+/// `flush_character_buffer`: hand accumulated character data to the
+/// CharacterDataHandler. Returns false when an exception is pending.
+fn flush_chardata(st: &StateRef) -> bool {
+    let (handler, bytes) = {
+        let mut s = st.borrow_mut();
+        if s.pending_exc.is_some() {
+            return false;
+        }
+        if s.buffer.is_empty() {
+            return true;
+        }
+        let bytes = std::mem::take(&mut s.buffer);
+        (s.handlers[H_CHARACTER_DATA].clone(), bytes)
+    };
+    if matches!(handler, Object::None) {
+        return true;
+    }
+    let text = Object::from_str(String::from_utf8_lossy(&bytes).into_owned());
+    dispatch(st, H_CHARACTER_DATA, vec![text]);
+    st.borrow().pending_exc.is_none()
+}
+
+// ---------------------------------------------------------------------------
+// expat C trampolines
+// ---------------------------------------------------------------------------
+
+macro_rules! get_state {
+    ($ud:expr) => {
+        match state_from_ud($ud) {
+            Some(st) => st,
+            None => return,
+        }
+    };
+}
+
+unsafe extern "C" fn tr_start_element(
+    ud: *mut c_void,
+    name: *const c_char,
+    atts: *mut *const c_char,
 ) {
-    dict.insert(
-        DictKey(Object::from_static(name)),
-        Object::Builtin(Rc::new(BuiltinFn {
-            name,
-            binds_instance: true,
-            call: Box::new(body),
-            call_kw: None,
-        })),
+    let st = get_state!(ud);
+    if !flush_chardata(&st) {
+        return;
+    }
+    let (ordered, specified, parser) = {
+        let s = st.borrow();
+        (s.ordered_attributes, s.specified_attributes, s.parser())
+    };
+    // Number of filled slots in atts[]; with specified_attributes only the
+    // actually-specified (non-defaulted) leading slots are reported.
+    let max = if specified {
+        ex::XML_GetSpecifiedAttributeCount(parser) as usize
+    } else {
+        let mut n = 0usize;
+        while !(*atts.add(n)).is_null() {
+            n += 2;
+        }
+        n
+    };
+    let name_obj = intern_cstr(&st, name);
+    let container = if ordered {
+        let mut items = Vec::with_capacity(max);
+        let mut i = 0usize;
+        while i < max && !(*atts.add(i)).is_null() {
+            items.push(intern_cstr(&st, *atts.add(i)));
+            items.push(conv_opt(*atts.add(i + 1)));
+            i += 2;
+        }
+        Object::List(Rc::new(RefCell::new(items)))
+    } else {
+        let dict = Rc::new(RefCell::new(DictData::default()));
+        {
+            let mut d = dict.borrow_mut();
+            let mut i = 0usize;
+            while i < max && !(*atts.add(i)).is_null() {
+                d.insert(
+                    DictKey(intern_cstr(&st, *atts.add(i))),
+                    conv_opt(*atts.add(i + 1)),
+                );
+                i += 2;
+            }
+        }
+        Object::Dict(dict)
+    };
+    dispatch(&st, H_START_ELEMENT, vec![name_obj, container]);
+}
+
+unsafe extern "C" fn tr_end_element(ud: *mut c_void, name: *const c_char) {
+    let st = get_state!(ud);
+    if !flush_chardata(&st) {
+        return;
+    }
+    let name_obj = intern_cstr(&st, name);
+    dispatch(&st, H_END_ELEMENT, vec![name_obj]);
+}
+
+unsafe extern "C" fn tr_character_data(ud: *mut c_void, s: *const c_char, len: c_int) {
+    let st = get_state!(ud);
+    let data = std::slice::from_raw_parts(s.cast::<u8>(), len as usize);
+    let (buffering, fits, oversize) = {
+        let stb = st.borrow();
+        if stb.pending_exc.is_some() {
+            return;
+        }
+        let buffering = stb.buffer_text;
+        let fits = stb.buffer.len() + data.len() <= stb.buffer_size;
+        let oversize = data.len() > stb.buffer_size;
+        (buffering, fits, oversize)
+    };
+    if !buffering {
+        let text = Object::from_str(String::from_utf8_lossy(data).into_owned());
+        dispatch(&st, H_CHARACTER_DATA, vec![text]);
+        return;
+    }
+    if !fits {
+        if !flush_chardata(&st) {
+            return;
+        }
+        // The handler may have unset itself; drop the rest on the floor then
+        // (pyexpat.c my_CharacterDataHandler).
+        if matches!(st.borrow().handlers[H_CHARACTER_DATA], Object::None) {
+            return;
+        }
+    }
+    if oversize {
+        let text = Object::from_str(String::from_utf8_lossy(data).into_owned());
+        dispatch(&st, H_CHARACTER_DATA, vec![text]);
+    } else {
+        st.borrow_mut().buffer.extend_from_slice(data);
+    }
+}
+
+unsafe extern "C" fn tr_processing_instruction(
+    ud: *mut c_void,
+    target: *const c_char,
+    data: *const c_char,
+) {
+    let st = get_state!(ud);
+    if !flush_chardata(&st) {
+        return;
+    }
+    dispatch(
+        &st,
+        H_PROCESSING_INSTRUCTION,
+        vec![conv_opt(target), conv_opt(data)],
     );
 }
 
+unsafe extern "C" fn tr_comment(ud: *mut c_void, data: *const c_char) {
+    let st = get_state!(ud);
+    if !flush_chardata(&st) {
+        return;
+    }
+    dispatch(&st, H_COMMENT, vec![conv_opt(data)]);
+}
+
+unsafe extern "C" fn tr_start_cdata(ud: *mut c_void) {
+    let st = get_state!(ud);
+    if !flush_chardata(&st) {
+        return;
+    }
+    dispatch(&st, H_START_CDATA, vec![]);
+}
+
+unsafe extern "C" fn tr_end_cdata(ud: *mut c_void) {
+    let st = get_state!(ud);
+    if !flush_chardata(&st) {
+        return;
+    }
+    dispatch(&st, H_END_CDATA, vec![]);
+}
+
+unsafe extern "C" fn tr_default(ud: *mut c_void, s: *const c_char, len: c_int) {
+    let st = get_state!(ud);
+    if !flush_chardata(&st) {
+        return;
+    }
+    dispatch(&st, H_DEFAULT, vec![conv_len(s, len)]);
+}
+
+unsafe extern "C" fn tr_default_expand(ud: *mut c_void, s: *const c_char, len: c_int) {
+    let st = get_state!(ud);
+    if !flush_chardata(&st) {
+        return;
+    }
+    dispatch(&st, H_DEFAULT_EXPAND, vec![conv_len(s, len)]);
+}
+
+/// Convert a Python handler return value to a C int result (CPython's
+/// `PyLong_AsLong` conversion in `RC_HANDLER`).
+fn int_result(st: &StateRef, rv: Option<Object>) -> c_int {
+    match rv {
+        Some(Object::Int(i)) => i as c_int,
+        Some(Object::Bool(b)) => c_int::from(b),
+        Some(other) => {
+            flag_error(
+                st,
+                type_error(format!(
+                    "'{}' object cannot be interpreted as an integer",
+                    other.type_name_owned()
+                )),
+            );
+            0
+        }
+        None => 0,
+    }
+}
+
+unsafe extern "C" fn tr_not_standalone(ud: *mut c_void) -> c_int {
+    let Some(st) = state_from_ud(ud) else {
+        return 0;
+    };
+    if !flush_chardata(&st) {
+        return 0;
+    }
+    let rv = dispatch(&st, H_NOT_STANDALONE, vec![]);
+    int_result(&st, rv)
+}
+
+unsafe extern "C" fn tr_external_entity_ref(
+    parser: XML_Parser,
+    context: *const c_char,
+    base: *const c_char,
+    system_id: *const c_char,
+    public_id: *const c_char,
+) -> c_int {
+    // This is the one handler expat passes the parser (not userdata) to.
+    let ud = ex::XML_GetUserData(parser);
+    let Some(st) = state_from_ud(ud) else {
+        return 0;
+    };
+    if !flush_chardata(&st) {
+        return 0;
+    }
+    let args = vec![
+        conv_opt(context),
+        intern_cstr(&st, base),
+        intern_cstr(&st, system_id),
+        intern_cstr(&st, public_id),
+    ];
+    let rv = dispatch(&st, H_EXTERNAL_ENTITY_REF, args);
+    int_result(&st, rv)
+}
+
+unsafe extern "C" fn tr_start_namespace_decl(
+    ud: *mut c_void,
+    prefix: *const c_char,
+    uri: *const c_char,
+) {
+    let st = get_state!(ud);
+    if !flush_chardata(&st) {
+        return;
+    }
+    dispatch(
+        &st,
+        H_START_NAMESPACE_DECL,
+        vec![conv_opt(prefix), conv_opt(uri)],
+    );
+}
+
+unsafe extern "C" fn tr_end_namespace_decl(ud: *mut c_void, prefix: *const c_char) {
+    let st = get_state!(ud);
+    if !flush_chardata(&st) {
+        return;
+    }
+    dispatch(&st, H_END_NAMESPACE_DECL, vec![conv_opt(prefix)]);
+}
+
+unsafe extern "C" fn tr_start_doctype_decl(
+    ud: *mut c_void,
+    doctype_name: *const c_char,
+    sysid: *const c_char,
+    pubid: *const c_char,
+    has_internal_subset: c_int,
+) {
+    let st = get_state!(ud);
+    if !flush_chardata(&st) {
+        return;
+    }
+    let args = vec![
+        intern_cstr(&st, doctype_name),
+        intern_cstr(&st, sysid),
+        intern_cstr(&st, pubid),
+        Object::Int(i64::from(has_internal_subset)),
+    ];
+    dispatch(&st, H_START_DOCTYPE_DECL, args);
+}
+
+unsafe extern "C" fn tr_end_doctype_decl(ud: *mut c_void) {
+    let st = get_state!(ud);
+    if !flush_chardata(&st) {
+        return;
+    }
+    dispatch(&st, H_END_DOCTYPE_DECL, vec![]);
+}
+
+unsafe extern "C" fn tr_entity_decl(
+    ud: *mut c_void,
+    entity_name: *const c_char,
+    is_parameter_entity: c_int,
+    value: *const c_char,
+    value_length: c_int,
+    base: *const c_char,
+    system_id: *const c_char,
+    public_id: *const c_char,
+    notation_name: *const c_char,
+) {
+    let st = get_state!(ud);
+    if !flush_chardata(&st) {
+        return;
+    }
+    let args = vec![
+        intern_cstr(&st, entity_name),
+        Object::Int(i64::from(is_parameter_entity)),
+        conv_len(value, value_length),
+        intern_cstr(&st, base),
+        intern_cstr(&st, system_id),
+        intern_cstr(&st, public_id),
+        intern_cstr(&st, notation_name),
+    ];
+    dispatch(&st, H_ENTITY_DECL, args);
+}
+
+unsafe extern "C" fn tr_unparsed_entity_decl(
+    ud: *mut c_void,
+    entity_name: *const c_char,
+    base: *const c_char,
+    system_id: *const c_char,
+    public_id: *const c_char,
+    notation_name: *const c_char,
+) {
+    let st = get_state!(ud);
+    if !flush_chardata(&st) {
+        return;
+    }
+    let args = vec![
+        intern_cstr(&st, entity_name),
+        intern_cstr(&st, base),
+        intern_cstr(&st, system_id),
+        intern_cstr(&st, public_id),
+        intern_cstr(&st, notation_name),
+    ];
+    dispatch(&st, H_UNPARSED_ENTITY_DECL, args);
+}
+
+unsafe extern "C" fn tr_notation_decl(
+    ud: *mut c_void,
+    notation_name: *const c_char,
+    base: *const c_char,
+    system_id: *const c_char,
+    public_id: *const c_char,
+) {
+    let st = get_state!(ud);
+    if !flush_chardata(&st) {
+        return;
+    }
+    let args = vec![
+        intern_cstr(&st, notation_name),
+        intern_cstr(&st, base),
+        intern_cstr(&st, system_id),
+        intern_cstr(&st, public_id),
+    ];
+    dispatch(&st, H_NOTATION_DECL, args);
+}
+
+unsafe extern "C" fn tr_xml_decl(
+    ud: *mut c_void,
+    version: *const c_char,
+    encoding: *const c_char,
+    standalone: c_int,
+) {
+    let st = get_state!(ud);
+    if !flush_chardata(&st) {
+        return;
+    }
+    let args = vec![
+        conv_opt(version),
+        conv_opt(encoding),
+        Object::Int(i64::from(standalone)),
+    ];
+    dispatch(&st, H_XML_DECL, args);
+}
+
+/// Recursive `XML_Content` → tuple conversion (`conv_content_model`), with a
+/// depth cap so a pathologically nested model raises `RecursionError`
+/// instead of exhausting the native stack (gh-145986).
+unsafe fn conv_content_model(
+    model: *const ex::XML_Content,
+    depth: usize,
+) -> Result<Object, RuntimeError> {
+    if depth > 5000 {
+        return Err(recursion_error(
+            "maximum recursion depth exceeded while converting expat content model",
+        ));
+    }
+    let m = &*model;
+    let mut children = Vec::with_capacity(m.numchildren as usize);
+    for i in 0..m.numchildren as usize {
+        children.push(conv_content_model(m.children.add(i), depth + 1)?);
+    }
+    Ok(Object::new_tuple(vec![
+        Object::Int(i64::from(m.type_)),
+        Object::Int(i64::from(m.quant)),
+        conv_opt(m.name),
+        Object::new_tuple(children),
+    ]))
+}
+
+unsafe extern "C" fn tr_element_decl(
+    ud: *mut c_void,
+    name: *const c_char,
+    model: *mut ex::XML_Content,
+) {
+    let st = get_state!(ud);
+    let parser = st.borrow().parser();
+    let converted = if flush_chardata(&st) {
+        conv_content_model(model, 0)
+    } else {
+        Err(RuntimeError::Internal("aborted".to_owned()))
+    };
+    // The model must be freed exactly once, whatever happened above.
+    ex::XML_FreeContentModel(parser, model);
+    match converted {
+        Ok(model_obj) => {
+            dispatch(&st, H_ELEMENT_DECL, vec![intern_cstr(&st, name), model_obj]);
+        }
+        Err(RuntimeError::Internal(_)) => {}
+        Err(e) => flag_error(&st, e),
+    }
+}
+
+unsafe extern "C" fn tr_attlist_decl(
+    ud: *mut c_void,
+    elname: *const c_char,
+    attname: *const c_char,
+    att_type: *const c_char,
+    dflt: *const c_char,
+    isrequired: c_int,
+) {
+    let st = get_state!(ud);
+    if !flush_chardata(&st) {
+        return;
+    }
+    let args = vec![
+        intern_cstr(&st, elname),
+        intern_cstr(&st, attname),
+        conv_opt(att_type),
+        conv_opt(dflt),
+        Object::Int(i64::from(isrequired)),
+    ];
+    dispatch(&st, H_ATTLIST_DECL, args);
+}
+
+unsafe extern "C" fn tr_skipped_entity(
+    ud: *mut c_void,
+    entity_name: *const c_char,
+    is_parameter_entity: c_int,
+) {
+    let st = get_state!(ud);
+    if !flush_chardata(&st) {
+        return;
+    }
+    let args = vec![
+        intern_cstr(&st, entity_name),
+        Object::Int(i64::from(is_parameter_entity)),
+    ];
+    dispatch(&st, H_SKIPPED_ENTITY, args);
+}
+
+/// `PyUnknownEncodingHandler` (pyexpat.c): resolve an encoding expat doesn't
+/// know natively by decoding bytes 0..=255 with Python's codec machinery
+/// ('replace' errors) and handing expat the byte -> codepoint map. This is
+/// what makes single-byte documents (`encoding='iso8859'` etc.) parse.
+unsafe extern "C" fn tr_unknown_encoding(
+    data: *mut c_void,
+    name: *const c_char,
+    info: *mut ex::XML_Encoding,
+) -> c_int {
+    let st = state_from_ud(data);
+    let Ok(ip) = interp() else {
+        return ex::XML_STATUS_ERROR;
+    };
+    let enc_name = cstr(name);
+    let template: Vec<u8> = (0u8..=255u8).collect();
+    let bytes = Object::new_bytes(template);
+    let decoded = ip.load_attr_public(&bytes, "decode").and_then(|d| {
+        call(
+            ip,
+            &d,
+            &[Object::from_str(enc_name), Object::from_static("replace")],
+        )
+    });
+    let decoded = match decoded {
+        Ok(v) => v,
+        Err(e) => {
+            if let Some(st) = &st {
+                flag_error(st, e);
+            }
+            return ex::XML_STATUS_ERROR;
+        }
+    };
+    let chars: Vec<u32> = match &decoded {
+        Object::Str(s) => s.chars().map(|c| c as u32).collect(),
+        Object::WStr(cps) => cps.to_vec(),
+        _ => return ex::XML_STATUS_ERROR,
+    };
+    if chars.len() != 256 {
+        if let Some(st) = &st {
+            flag_error(st, value_error("multi-byte encodings are not supported"));
+        }
+        return ex::XML_STATUS_ERROR;
+    }
+    let info = &mut *info;
+    for (i, ch) in chars.iter().enumerate() {
+        // U+FFFD marks bytes the codec couldn't map.
+        info.map[i] = if *ch == 0xFFFD { -1 } else { *ch as c_int };
+    }
+    info.data = std::ptr::null_mut();
+    info.convert = None;
+    info.release = None;
+    ex::XML_STATUS_OK
+}
+
+/// (Un)register the native trampoline for a handler slot.
+unsafe fn apply_native_handler(parser: XML_Parser, slot: usize, on: bool) {
+    match slot {
+        H_START_ELEMENT => {
+            ex::XML_SetStartElementHandler(parser, on.then_some(tr_start_element as _))
+        }
+        H_END_ELEMENT => ex::XML_SetEndElementHandler(parser, on.then_some(tr_end_element as _)),
+        H_PROCESSING_INSTRUCTION => ex::XML_SetProcessingInstructionHandler(
+            parser,
+            on.then_some(tr_processing_instruction as _),
+        ),
+        H_CHARACTER_DATA => {
+            ex::XML_SetCharacterDataHandler(parser, on.then_some(tr_character_data as _))
+        }
+        H_UNPARSED_ENTITY_DECL => {
+            ex::XML_SetUnparsedEntityDeclHandler(parser, on.then_some(tr_unparsed_entity_decl as _))
+        }
+        H_NOTATION_DECL => {
+            ex::XML_SetNotationDeclHandler(parser, on.then_some(tr_notation_decl as _))
+        }
+        H_START_NAMESPACE_DECL => {
+            ex::XML_SetStartNamespaceDeclHandler(parser, on.then_some(tr_start_namespace_decl as _))
+        }
+        H_END_NAMESPACE_DECL => {
+            ex::XML_SetEndNamespaceDeclHandler(parser, on.then_some(tr_end_namespace_decl as _))
+        }
+        H_COMMENT => ex::XML_SetCommentHandler(parser, on.then_some(tr_comment as _)),
+        H_START_CDATA => {
+            ex::XML_SetStartCdataSectionHandler(parser, on.then_some(tr_start_cdata as _))
+        }
+        H_END_CDATA => ex::XML_SetEndCdataSectionHandler(parser, on.then_some(tr_end_cdata as _)),
+        H_DEFAULT => ex::XML_SetDefaultHandler(parser, on.then_some(tr_default as _)),
+        H_DEFAULT_EXPAND => {
+            ex::XML_SetDefaultHandlerExpand(parser, on.then_some(tr_default_expand as _))
+        }
+        H_NOT_STANDALONE => {
+            ex::XML_SetNotStandaloneHandler(parser, on.then_some(tr_not_standalone as _))
+        }
+        H_EXTERNAL_ENTITY_REF => {
+            ex::XML_SetExternalEntityRefHandler(parser, on.then_some(tr_external_entity_ref as _))
+        }
+        H_START_DOCTYPE_DECL => {
+            ex::XML_SetStartDoctypeDeclHandler(parser, on.then_some(tr_start_doctype_decl as _))
+        }
+        H_END_DOCTYPE_DECL => {
+            ex::XML_SetEndDoctypeDeclHandler(parser, on.then_some(tr_end_doctype_decl as _))
+        }
+        H_ENTITY_DECL => ex::XML_SetEntityDeclHandler(parser, on.then_some(tr_entity_decl as _)),
+        H_XML_DECL => ex::XML_SetXmlDeclHandler(parser, on.then_some(tr_xml_decl as _)),
+        H_ELEMENT_DECL => ex::XML_SetElementDeclHandler(parser, on.then_some(tr_element_decl as _)),
+        H_ATTLIST_DECL => ex::XML_SetAttlistDeclHandler(parser, on.then_some(tr_attlist_decl as _)),
+        H_SKIPPED_ENTITY => {
+            ex::XML_SetSkippedEntityHandler(parser, on.then_some(tr_skipped_entity as _))
+        }
+        _ => {}
+    }
+}
+
 // ---------------------------------------------------------------------------
-// ExpatError exception + the `errors` / `model` submodules.
+// ExpatError + `errors` / `model` submodules
 // ---------------------------------------------------------------------------
 
 fn expat_error_type() -> Rc<TypeObject> {
-    static CLS: OnceLock<Rc<TypeObject>> = OnceLock::new();
+    static CLS: std::sync::OnceLock<Rc<TypeObject>> = std::sync::OnceLock::new();
     CLS.get_or_init(|| {
         let parent = crate::builtin_types::builtin_types().exception.clone();
         let cls = TypeObject::new_exception("ExpatError", parent).expect("ExpatError class");
@@ -214,88 +893,99 @@ fn expat_error_type() -> Rc<TypeObject> {
     .clone()
 }
 
-/// expat error codes (subset; the well-formedness ones the tests check).
-const ERR_CODES: &[(i64, &str, &str)] = &[
-    (1, "XML_ERROR_NO_MEMORY", "out of memory"),
-    (2, "XML_ERROR_SYNTAX", "syntax error"),
-    (3, "XML_ERROR_NO_ELEMENTS", "no element found"),
-    (
-        4,
-        "XML_ERROR_INVALID_TOKEN",
-        "not well-formed (invalid token)",
-    ),
-    (5, "XML_ERROR_UNCLOSED_TOKEN", "unclosed token"),
-    (6, "XML_ERROR_PARTIAL_CHAR", "partial character"),
-    (7, "XML_ERROR_TAG_MISMATCH", "mismatched tag"),
-    (8, "XML_ERROR_DUPLICATE_ATTRIBUTE", "duplicate attribute"),
-    (
-        9,
-        "XML_ERROR_JUNK_AFTER_DOC_ELEMENT",
-        "junk after document element",
-    ),
-    (
-        10,
-        "XML_ERROR_PARAM_ENTITY_REF",
-        "illegal parameter entity reference",
-    ),
-    (11, "XML_ERROR_UNDEFINED_ENTITY", "undefined entity"),
-    (
-        12,
-        "XML_ERROR_RECURSIVE_ENTITY_REF",
-        "recursive entity reference",
-    ),
-    (13, "XML_ERROR_ASYNC_ENTITY", "asynchronous entity"),
-    (
-        14,
-        "XML_ERROR_BAD_CHAR_REF",
-        "reference to invalid character number",
-    ),
-    (
-        15,
-        "XML_ERROR_BINARY_ENTITY_REF",
-        "reference to binary entity",
-    ),
-    (
-        16,
-        "XML_ERROR_ATTRIBUTE_EXTERNAL_ENTITY_REF",
-        "reference to external entity in attribute",
-    ),
-    (
-        17,
-        "XML_ERROR_MISPLACED_XML_PI",
-        "XML or text declaration not at start of entity",
-    ),
-    (18, "XML_ERROR_UNKNOWN_ENCODING", "unknown encoding"),
-    (
-        19,
-        "XML_ERROR_INCORRECT_ENCODING",
-        "encoding specified in XML declaration is incorrect",
-    ),
-    (
-        20,
-        "XML_ERROR_UNCLOSED_CDATA_SECTION",
-        "unclosed CDATA section",
-    ),
-    (
-        21,
-        "XML_ERROR_EXTERNAL_ENTITY_HANDLING",
-        "error in processing external entity reference",
-    ),
-    (22, "XML_ERROR_NOT_STANDALONE", "document is not standalone"),
+/// `XML_ErrorString` for `code`, or empty for out-of-range codes.
+fn error_string_for(code: c_int) -> Option<String> {
+    // SAFETY: XML_ErrorString returns a static string or NULL for any input.
+    let p = unsafe { ex::XML_ErrorString(code) };
+    if p.is_null() {
+        None
+    } else {
+        Some(unsafe { cstr(p) })
+    }
+}
+
+/// Raise `ExpatError` for the parser's current error state (`set_error`).
+fn set_error(st: &StateRef, code: c_int) -> RuntimeError {
+    let parser = st.borrow().parser();
+    // SAFETY: live parser handle.
+    let (lineno, column) = unsafe {
+        (
+            ex::XML_GetCurrentLineNumber(parser) as i64,
+            ex::XML_GetCurrentColumnNumber(parser) as i64,
+        )
+    };
+    let msg = format!(
+        "{}: line {}, column {}",
+        error_string_for(code).unwrap_or_else(|| "unknown error".to_owned()),
+        lineno,
+        column
+    );
+    let cls = expat_error_type();
+    let einst = PyInstance::new(cls);
+    {
+        let mut d = einst.dict.borrow_mut();
+        d.insert(
+            DictKey(Object::from_static("args")),
+            Object::new_tuple(vec![Object::from_str(msg)]),
+        );
+        d.insert(
+            DictKey(Object::from_static("code")),
+            Object::Int(i64::from(code)),
+        );
+        d.insert(DictKey(Object::from_static("lineno")), Object::Int(lineno));
+        d.insert(DictKey(Object::from_static("offset")), Object::Int(column));
+    }
+    RuntimeError::PyException(PyException::new(Object::Instance(Rc::new(einst))))
+}
+
+/// Error-code names in `enum XML_Error` order (expat.h); index == code.
+const ERROR_NAMES: &[&str] = &[
+    "XML_ERROR_NONE", // unused (code 0)
+    "XML_ERROR_NO_MEMORY",
+    "XML_ERROR_SYNTAX",
+    "XML_ERROR_NO_ELEMENTS",
+    "XML_ERROR_INVALID_TOKEN",
+    "XML_ERROR_UNCLOSED_TOKEN",
+    "XML_ERROR_PARTIAL_CHAR",
+    "XML_ERROR_TAG_MISMATCH",
+    "XML_ERROR_DUPLICATE_ATTRIBUTE",
+    "XML_ERROR_JUNK_AFTER_DOC_ELEMENT",
+    "XML_ERROR_PARAM_ENTITY_REF",
+    "XML_ERROR_UNDEFINED_ENTITY",
+    "XML_ERROR_RECURSIVE_ENTITY_REF",
+    "XML_ERROR_ASYNC_ENTITY",
+    "XML_ERROR_BAD_CHAR_REF",
+    "XML_ERROR_BINARY_ENTITY_REF",
+    "XML_ERROR_ATTRIBUTE_EXTERNAL_ENTITY_REF",
+    "XML_ERROR_MISPLACED_XML_PI",
+    "XML_ERROR_UNKNOWN_ENCODING",
+    "XML_ERROR_INCORRECT_ENCODING",
+    "XML_ERROR_UNCLOSED_CDATA_SECTION",
+    "XML_ERROR_EXTERNAL_ENTITY_HANDLING",
+    "XML_ERROR_NOT_STANDALONE",
+    "XML_ERROR_UNEXPECTED_STATE",
+    "XML_ERROR_ENTITY_DECLARED_IN_PE",
+    "XML_ERROR_FEATURE_REQUIRES_XML_DTD",
+    "XML_ERROR_CANT_CHANGE_FEATURE_ONCE_PARSING",
+    "XML_ERROR_UNBOUND_PREFIX",
+    "XML_ERROR_UNDECLARING_PREFIX",
+    "XML_ERROR_INCOMPLETE_PE",
+    "XML_ERROR_XML_DECL",
+    "XML_ERROR_TEXT_DECL",
+    "XML_ERROR_PUBLICID",
+    "XML_ERROR_SUSPENDED",
+    "XML_ERROR_NOT_SUSPENDED",
+    "XML_ERROR_ABORTED",
+    "XML_ERROR_FINISHED",
+    "XML_ERROR_SUSPEND_PE",
+    "XML_ERROR_RESERVED_PREFIX_XML",
+    "XML_ERROR_RESERVED_PREFIX_XMLNS",
+    "XML_ERROR_RESERVED_NAMESPACE_URI",
+    "XML_ERROR_INVALID_ARGUMENT",
+    "XML_ERROR_NO_BUFFER",
+    "XML_ERROR_AMPLIFICATION_LIMIT_BREACH",
+    "XML_ERROR_NOT_STARTED",
 ];
-
-fn error_message(code: i64) -> &'static str {
-    ERR_CODES
-        .iter()
-        .find(|(c, _, _)| *c == code)
-        .map(|(_, _, m)| *m)
-        .unwrap_or("unknown error")
-}
-
-fn error_string(args: &[Object]) -> Result<Object, RuntimeError> {
-    let code = args.first().and_then(Object::as_i64).unwrap_or(0);
-    Ok(Object::from_str(error_message(code).to_owned()))
-}
 
 fn errors_submodule() -> Rc<PyModule> {
     let dict = Rc::new(RefCell::new(DictData::default()));
@@ -305,25 +995,30 @@ fn errors_submodule() -> Rc<PyModule> {
             DictKey(Object::from_static("__name__")),
             Object::from_static("xml.parsers.expat.errors"),
         );
-        // `codes`: message -> code; `messages`: code -> message.
+        d.insert(
+            DictKey(Object::from_static("__doc__")),
+            Object::from_static("Constants used to describe error conditions."),
+        );
+        // `codes`: message -> code; `messages`: code -> message; and one
+        // module attribute per error name holding the message string.
         let codes = Rc::new(RefCell::new(DictData::default()));
         let messages = Rc::new(RefCell::new(DictData::default()));
         {
             let mut c = codes.borrow_mut();
             let mut m = messages.borrow_mut();
-            for (code, name, msg) in ERR_CODES {
+            for (code, name) in ERROR_NAMES.iter().enumerate().skip(1) {
+                let Some(msg) = error_string_for(code as c_int) else {
+                    continue;
+                };
                 d.insert(
                     DictKey(Object::from_static(name)),
-                    Object::from_str((*msg).to_owned()),
+                    Object::from_str(msg.clone()),
                 );
                 c.insert(
-                    DictKey(Object::from_str((*msg).to_owned())),
-                    Object::Int(*code),
+                    DictKey(Object::from_str(msg.clone())),
+                    Object::Int(code as i64),
                 );
-                m.insert(
-                    DictKey(Object::Int(*code)),
-                    Object::from_str((*msg).to_owned()),
-                );
+                m.insert(DictKey(Object::Int(code as i64)), Object::from_str(msg));
             }
         }
         d.insert(DictKey(Object::from_static("codes")), Object::Dict(codes));
@@ -347,19 +1042,26 @@ fn model_submodule() -> Rc<PyModule> {
             DictKey(Object::from_static("__name__")),
             Object::from_static("xml.parsers.expat.model"),
         );
+        d.insert(
+            DictKey(Object::from_static("__doc__")),
+            Object::from_static("Constants used to interpret content model information."),
+        );
         for (name, val) in [
-            ("XML_CTYPE_EMPTY", 1),
-            ("XML_CTYPE_ANY", 2),
-            ("XML_CTYPE_MIXED", 3),
-            ("XML_CTYPE_NAME", 4),
-            ("XML_CTYPE_CHOICE", 5),
-            ("XML_CTYPE_SEQ", 6),
-            ("XML_CQUANT_NONE", 0),
-            ("XML_CQUANT_OPT", 1),
-            ("XML_CQUANT_REP", 2),
-            ("XML_CQUANT_PLUS", 3),
+            ("XML_CTYPE_EMPTY", ex::XML_CTYPE_EMPTY),
+            ("XML_CTYPE_ANY", ex::XML_CTYPE_ANY),
+            ("XML_CTYPE_MIXED", ex::XML_CTYPE_MIXED),
+            ("XML_CTYPE_NAME", ex::XML_CTYPE_NAME),
+            ("XML_CTYPE_CHOICE", ex::XML_CTYPE_CHOICE),
+            ("XML_CTYPE_SEQ", ex::XML_CTYPE_SEQ),
+            ("XML_CQUANT_NONE", ex::XML_CQUANT_NONE),
+            ("XML_CQUANT_OPT", ex::XML_CQUANT_OPT),
+            ("XML_CQUANT_REP", ex::XML_CQUANT_REP),
+            ("XML_CQUANT_PLUS", ex::XML_CQUANT_PLUS),
         ] {
-            d.insert(DictKey(Object::from_static(name)), Object::Int(val));
+            d.insert(
+                DictKey(Object::from_static(name)),
+                Object::Int(i64::from(val)),
+            );
         }
     }
     Rc::new(PyModule {
@@ -370,16 +1072,50 @@ fn model_submodule() -> Rc<PyModule> {
 }
 
 // ---------------------------------------------------------------------------
-// xmlparser type + ParserCreate.
+// xmlparser type
 // ---------------------------------------------------------------------------
 
+fn method(
+    dict: &mut DictData,
+    name: &'static str,
+    body: fn(&[Object]) -> Result<Object, RuntimeError>,
+) {
+    dict.insert(
+        DictKey(Object::from_static(name)),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name,
+            binds_instance: true,
+            call: Box::new(body),
+            call_kw: None,
+        })),
+    );
+}
+
+fn getset(
+    cls: &Rc<TypeObject>,
+    name: &'static str,
+    getter: fn(&[Object]) -> Result<Object, RuntimeError>,
+) {
+    crate::stdlib::sqlite3_native::install_getset(cls, name, getter, None);
+}
+
+fn handler_get<const SLOT: usize>(args: &[Object]) -> Result<Object, RuntimeError> {
+    let st = state_of_args(args)?;
+    let h = st.borrow().handlers[SLOT].clone();
+    Ok(h)
+}
+
 fn parser_type() -> Rc<TypeObject> {
-    static CLS: OnceLock<Rc<TypeObject>> = OnceLock::new();
+    static CLS: std::sync::OnceLock<Rc<TypeObject>> = std::sync::OnceLock::new();
     CLS.get_or_init(|| {
         let mut d = DictData::default();
         d.insert(
             DictKey(Object::from_static("__module__")),
             Object::from_static("pyexpat"),
+        );
+        d.insert(
+            DictKey(Object::from_static("__doc__")),
+            Object::from_static("XML parser"),
         );
         method(&mut d, "Parse", parse_method);
         method(&mut d, "ParseFile", parse_file_method);
@@ -407,7 +1143,9 @@ fn parser_type() -> Rc<TypeObject> {
             "SetReparseDeferralEnabled",
             set_reparse_deferral_method,
         );
-        TypeObject::new_with_flags(
+        method(&mut d, "__setattr__", setattr_method);
+        method(&mut d, "__del__", del_method);
+        let cls = TypeObject::new_with_flags(
             "xmlparser",
             vec![crate::builtin_types::builtin_types().object_.clone()],
             d,
@@ -416,27 +1154,345 @@ fn parser_type() -> Rc<TypeObject> {
                 is_builtin: true,
             },
         )
-        .expect("xmlparser type")
+        .expect("xmlparser type");
+
+        // Handler attributes (read side; writes go through __setattr__).
+        getset(&cls, "StartElementHandler", handler_get::<H_START_ELEMENT>);
+        getset(&cls, "EndElementHandler", handler_get::<H_END_ELEMENT>);
+        getset(
+            &cls,
+            "ProcessingInstructionHandler",
+            handler_get::<H_PROCESSING_INSTRUCTION>,
+        );
+        getset(
+            &cls,
+            "CharacterDataHandler",
+            handler_get::<H_CHARACTER_DATA>,
+        );
+        getset(
+            &cls,
+            "UnparsedEntityDeclHandler",
+            handler_get::<H_UNPARSED_ENTITY_DECL>,
+        );
+        getset(&cls, "NotationDeclHandler", handler_get::<H_NOTATION_DECL>);
+        getset(
+            &cls,
+            "StartNamespaceDeclHandler",
+            handler_get::<H_START_NAMESPACE_DECL>,
+        );
+        getset(
+            &cls,
+            "EndNamespaceDeclHandler",
+            handler_get::<H_END_NAMESPACE_DECL>,
+        );
+        getset(&cls, "CommentHandler", handler_get::<H_COMMENT>);
+        getset(
+            &cls,
+            "StartCdataSectionHandler",
+            handler_get::<H_START_CDATA>,
+        );
+        getset(&cls, "EndCdataSectionHandler", handler_get::<H_END_CDATA>);
+        getset(&cls, "DefaultHandler", handler_get::<H_DEFAULT>);
+        getset(
+            &cls,
+            "DefaultHandlerExpand",
+            handler_get::<H_DEFAULT_EXPAND>,
+        );
+        getset(
+            &cls,
+            "NotStandaloneHandler",
+            handler_get::<H_NOT_STANDALONE>,
+        );
+        getset(
+            &cls,
+            "ExternalEntityRefHandler",
+            handler_get::<H_EXTERNAL_ENTITY_REF>,
+        );
+        getset(
+            &cls,
+            "StartDoctypeDeclHandler",
+            handler_get::<H_START_DOCTYPE_DECL>,
+        );
+        getset(
+            &cls,
+            "EndDoctypeDeclHandler",
+            handler_get::<H_END_DOCTYPE_DECL>,
+        );
+        getset(&cls, "EntityDeclHandler", handler_get::<H_ENTITY_DECL>);
+        getset(&cls, "XmlDeclHandler", handler_get::<H_XML_DECL>);
+        getset(&cls, "ElementDeclHandler", handler_get::<H_ELEMENT_DECL>);
+        getset(&cls, "AttlistDeclHandler", handler_get::<H_ATTLIST_DECL>);
+        getset(
+            &cls,
+            "SkippedEntityHandler",
+            handler_get::<H_SKIPPED_ENTITY>,
+        );
+
+        // Flags, buffering, interning.
+        getset(&cls, "buffer_text", |args| {
+            Ok(Object::Bool(state_of_args(args)?.borrow().buffer_text))
+        });
+        getset(&cls, "buffer_size", |args| {
+            Ok(Object::Int(
+                state_of_args(args)?.borrow().buffer_size as i64,
+            ))
+        });
+        getset(&cls, "buffer_used", |args| {
+            Ok(Object::Int(
+                state_of_args(args)?.borrow().buffer.len() as i64
+            ))
+        });
+        getset(&cls, "ordered_attributes", |args| {
+            Ok(Object::Bool(
+                state_of_args(args)?.borrow().ordered_attributes,
+            ))
+        });
+        getset(&cls, "specified_attributes", |args| {
+            Ok(Object::Bool(
+                state_of_args(args)?.borrow().specified_attributes,
+            ))
+        });
+        getset(&cls, "namespace_prefixes", |args| {
+            Ok(Object::Bool(state_of_args(args)?.borrow().ns_prefixes))
+        });
+        getset(&cls, "intern", |args| {
+            Ok(state_of_args(args)?.borrow().intern.clone())
+        });
+
+        // Live position / error attributes (pyexpat.c getsets).
+        getset(&cls, "CurrentLineNumber", |args| {
+            let p = state_of_args(args)?.borrow().parser();
+            Ok(Object::Int(
+                unsafe { ex::XML_GetCurrentLineNumber(p) } as i64
+            ))
+        });
+        getset(&cls, "CurrentColumnNumber", |args| {
+            let p = state_of_args(args)?.borrow().parser();
+            Ok(Object::Int(
+                unsafe { ex::XML_GetCurrentColumnNumber(p) } as i64
+            ))
+        });
+        getset(&cls, "CurrentByteIndex", |args| {
+            let p = state_of_args(args)?.borrow().parser();
+            Ok(Object::Int(unsafe { ex::XML_GetCurrentByteIndex(p) } as i64))
+        });
+        getset(&cls, "ErrorCode", |args| {
+            let p = state_of_args(args)?.borrow().parser();
+            Ok(Object::Int(i64::from(unsafe { ex::XML_GetErrorCode(p) })))
+        });
+        getset(&cls, "ErrorLineNumber", |args| {
+            let p = state_of_args(args)?.borrow().parser();
+            Ok(Object::Int(
+                unsafe { ex::XML_GetCurrentLineNumber(p) } as i64
+            ))
+        });
+        getset(&cls, "ErrorColumnNumber", |args| {
+            let p = state_of_args(args)?.borrow().parser();
+            Ok(Object::Int(
+                unsafe { ex::XML_GetCurrentColumnNumber(p) } as i64
+            ))
+        });
+        getset(&cls, "ErrorByteIndex", |args| {
+            let p = state_of_args(args)?.borrow().parser();
+            Ok(Object::Int(unsafe { ex::XML_GetCurrentByteIndex(p) } as i64))
+        });
+        cls
     })
     .clone()
 }
 
-fn opt_str(o: Option<&Object>) -> Option<String> {
-    match o {
-        Some(Object::Str(s)) => Some(s.to_string()),
-        _ => None,
+// ---------------------------------------------------------------------------
+// __setattr__ / __del__
+// ---------------------------------------------------------------------------
+
+fn setattr_method(args: &[Object]) -> Result<Object, RuntimeError> {
+    let st = state_of_args(args)?;
+    let name = match args.get(1) {
+        Some(Object::Str(s)) => s.to_string(),
+        Some(other) => {
+            return Err(type_error(format!(
+                "attribute name must be string, not '{}'",
+                other.type_name_owned()
+            )))
+        }
+        None => return Err(type_error("__setattr__ expected 2 arguments")),
+    };
+    let value = args.get(2).cloned().unwrap_or(Object::None);
+
+    if let Some(slot) = slot_for(&name) {
+        // Changing the CharacterDataHandler flushes pending data through the
+        // *old* handler first (pyexpat.c xmlparse_handler_setter).
+        if slot == H_CHARACTER_DATA && !flush_chardata(&st) {
+            let e = st.borrow_mut().pending_exc.take();
+            if let Some(e) = e {
+                return Err(e);
+            }
+        }
+        let on = !matches!(value, Object::None);
+        let parser = {
+            let mut s = st.borrow_mut();
+            s.handlers[slot] = value;
+            s.parser()
+        };
+        // SAFETY: live parser handle.
+        unsafe { apply_native_handler(parser, slot, on) };
+        return Ok(Object::None);
+    }
+
+    match name.as_str() {
+        "buffer_text" => {
+            let enable = value.is_truthy();
+            let was = st.borrow().buffer_text;
+            if was && !enable && !flush_chardata(&st) {
+                let e = st.borrow_mut().pending_exc.take();
+                if let Some(e) = e {
+                    return Err(e);
+                }
+            }
+            st.borrow_mut().buffer_text = enable;
+        }
+        "buffer_size" => {
+            let new_size = match &value {
+                Object::Int(i) => *i,
+                Object::Bool(b) => i64::from(*b),
+                Object::Long(_) => {
+                    return Err(overflow_error("Python int too large to convert to C long"))
+                }
+                _ => return Err(type_error("buffer_size must be an integer")),
+            };
+            if new_size <= 0 {
+                return Err(value_error("buffer_size must be greater than zero"));
+            }
+            let changed = st.borrow().buffer_size != new_size as usize;
+            if changed {
+                if !flush_chardata(&st) {
+                    let e = st.borrow_mut().pending_exc.take();
+                    if let Some(e) = e {
+                        return Err(e);
+                    }
+                }
+                st.borrow_mut().buffer_size = new_size as usize;
+            }
+        }
+        "ordered_attributes" => st.borrow_mut().ordered_attributes = value.is_truthy(),
+        "specified_attributes" => st.borrow_mut().specified_attributes = value.is_truthy(),
+        "namespace_prefixes" => {
+            let enable = value.is_truthy();
+            let parser = {
+                let mut s = st.borrow_mut();
+                s.ns_prefixes = enable;
+                s.parser()
+            };
+            // SAFETY: live parser handle.
+            unsafe { ex::XML_SetReturnNSTriplet(parser, c_int::from(enable)) };
+        }
+        "intern"
+        | "buffer_used"
+        | "CurrentLineNumber"
+        | "CurrentColumnNumber"
+        | "CurrentByteIndex"
+        | "ErrorCode"
+        | "ErrorLineNumber"
+        | "ErrorColumnNumber"
+        | "ErrorByteIndex" => {
+            return Err(attribute_error(format!(
+                "attribute '{name}' of 'pyexpat.xmlparser' objects is not writable"
+            )))
+        }
+        _ => {
+            return Err(attribute_error(format!(
+                "'xmlparser' object has no attribute '{name}'"
+            )))
+        }
+    }
+    Ok(Object::None)
+}
+
+fn del_method(args: &[Object]) -> Result<Object, RuntimeError> {
+    let inst = self_inst(args)?;
+    let handle = inst
+        .dict
+        .borrow()
+        .get(&DictKey(Object::from_static("_handle")))
+        .cloned();
+    if let Some(Object::Int(id)) = handle {
+        if let Some(st) = parser_reg().lock().remove(&id) {
+            let parser = st.borrow().parser();
+            if !parser.is_null() {
+                st.borrow_mut().parser = 0;
+                // SAFETY: sole owner; nobody can reach this handle anymore.
+                unsafe { ex::XML_ParserFree(parser) };
+            }
+        }
+    }
+    Ok(Object::None)
+}
+
+// ---------------------------------------------------------------------------
+// ParserCreate / ExternalEntityParserCreate
+// ---------------------------------------------------------------------------
+
+fn register_parser(
+    parser: XML_Parser,
+    intern: Object,
+    ns_prefixes: bool,
+    parent: Object,
+) -> Object {
+    let id = next_id();
+    // SAFETY: fresh live parser.
+    unsafe {
+        ex::XML_SetUserData(parser, id as *mut c_void);
+        ex::XML_SetUnknownEncodingHandler(parser, Some(tr_unknown_encoding), id as *mut c_void);
+    }
+    let state = Rc::new(RefCell::new(ExpatState {
+        parser: parser as usize,
+        handlers: vec![Object::None; N_HANDLERS],
+        intern,
+        buffer_text: false,
+        buffer: Vec::new(),
+        buffer_size: DEFAULT_BUFFER_SIZE,
+        ordered_attributes: false,
+        specified_attributes: false,
+        ns_prefixes,
+        in_callback: 0,
+        pending_exc: None,
+        reparse_deferral: expat_at_least(2, 6),
+        parent,
+    }));
+    parser_reg().lock().insert(id, state);
+    let inst = PyInstance::new(parser_type());
+    inst.dict
+        .borrow_mut()
+        .insert(DictKey(Object::from_static("_handle")), Object::Int(id));
+    Object::Instance(Rc::new(inst))
+}
+
+fn expat_at_least(major: c_int, minor: c_int) -> bool {
+    // SAFETY: pure struct-by-value query.
+    let v = unsafe { ex::XML_ExpatVersionInfo() };
+    (v.major, v.minor) >= (major, minor)
+}
+
+fn opt_str_arg(func: &str, name: &str, v: Option<&Object>) -> Result<Option<String>, RuntimeError> {
+    match v {
+        None | Some(Object::None) => Ok(None),
+        Some(Object::Str(s)) => Ok(Some(s.to_string())),
+        Some(other) => Err(type_error(format!(
+            "{func}() argument '{name}' must be str or None, not {}",
+            other.type_name_owned()
+        ))),
     }
 }
 
 fn parser_create(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
-    let mut encoding = opt_str(args.first());
-    let mut namespace_sep = opt_str(args.get(1));
-    let mut intern = args.get(2).cloned();
+    let mut encoding_arg = args.first().cloned();
+    let mut sep_arg = args.get(1).cloned();
+    let mut intern_arg = args.get(2).cloned();
     for (k, v) in kwargs {
         match k.as_str() {
-            "encoding" => encoding = opt_str(Some(v)),
-            "namespace_separator" => namespace_sep = opt_str(Some(v)),
-            "intern" => intern = Some(v.clone()),
+            "encoding" => encoding_arg = Some(v.clone()),
+            "namespace_separator" => sep_arg = Some(v.clone()),
+            "intern" => intern_arg = Some(v.clone()),
             other => {
                 return Err(type_error(format!(
                     "ParserCreate() got an unexpected keyword argument '{other}'"
@@ -444,7 +1500,17 @@ fn parser_create(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object,
             }
         }
     }
-    // expat requires the namespace separator to be a single character.
+    let encoding = opt_str_arg("ParserCreate", "encoding", encoding_arg.as_ref())?;
+    let namespace_sep = match sep_arg {
+        None | Some(Object::None) => None,
+        Some(Object::Str(s)) => Some(s.to_string()),
+        Some(other) => {
+            return Err(type_error(format!(
+                "ParserCreate() argument 'namespace_separator' must be str or None, not {}",
+                other.type_name_owned()
+            )))
+        }
+    };
     if let Some(s) = &namespace_sep {
         if s.chars().count() > 1 {
             return Err(value_error(
@@ -452,898 +1518,440 @@ fn parser_create(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object,
             ));
         }
     }
-    let parser = make_parser(encoding, namespace_sep);
-    // An explicit `intern` mapping (or `None`) overrides the default dict.
-    if let (Some(intern), Object::Instance(inst)) = (intern, &parser) {
-        inst.dict
-            .borrow_mut()
-            .insert(DictKey(Object::from_static("intern")), intern);
-    }
-    Ok(parser)
-}
-
-fn make_parser(encoding: Option<String>, namespace_sep: Option<String>) -> Object {
-    let id = next_id();
-    if let Ok(mut reg) = parser_reg().lock() {
-        reg.insert(
-            id,
-            Rc::new(RefCell::new(ExpatState {
-                buffer: Vec::new(),
-                namespace_sep,
-                buffer_text: false,
-                ordered_attributes: false,
-                finished: false,
-                line_starts: vec![0],
-            })),
-        );
-    }
-    let inst = PyInstance::new(parser_type());
-    {
-        let mut d = inst.dict.borrow_mut();
-        d.insert(DictKey(Object::from_static("_handle")), Object::Int(id));
-        d.insert(
-            DictKey(Object::from_static("buffer_text")),
-            Object::Bool(false),
-        );
-        d.insert(
-            DictKey(Object::from_static("ordered_attributes")),
-            Object::Bool(false),
-        );
-        d.insert(
-            DictKey(Object::from_static("specified_attributes")),
-            Object::Int(0),
-        );
-        d.insert(
-            DictKey(Object::from_static("namespace_prefixes")),
-            Object::Bool(false),
-        );
-        d.insert(
-            DictKey(Object::from_static("buffer_size")),
-            Object::Int(8192),
-        );
-        d.insert(DictKey(Object::from_static("buffer_used")), Object::Int(0));
-        d.insert(
-            DictKey(Object::from_static("CurrentLineNumber")),
-            Object::Int(0),
-        );
-        d.insert(
-            DictKey(Object::from_static("CurrentColumnNumber")),
-            Object::Int(0),
-        );
-        d.insert(
-            DictKey(Object::from_static("CurrentByteIndex")),
-            Object::Int(0),
-        );
-        d.insert(DictKey(Object::from_static("ErrorCode")), Object::Int(0));
-        d.insert(
-            DictKey(Object::from_static("ErrorLineNumber")),
-            Object::Int(0),
-        );
-        d.insert(
-            DictKey(Object::from_static("ErrorColumnNumber")),
-            Object::Int(0),
-        );
-        d.insert(
-            DictKey(Object::from_static("ErrorByteIndex")),
-            Object::Int(0),
-        );
-        let enc = match encoding {
-            Some(e) => Object::from_str(e),
-            None => Object::None,
-        };
-        d.insert(DictKey(Object::from_static("encoding")), enc);
-        d.insert(DictKey(Object::from_static("base")), Object::None);
-        // CPython's `xmlparser.intern` is the string-interning dict (the
-        // `intern` ctor argument; defaults to a fresh dict). `minidom`'s
-        // expat builder calls `self._parser.intern.setdefault`.
-        d.insert(
-            DictKey(Object::from_static("intern")),
-            Object::Dict(Rc::new(RefCell::new(DictData::default()))),
-        );
-    }
-    Object::Instance(Rc::new(inst))
-}
-
-fn self_inst(args: &[Object]) -> Result<Rc<PyInstance>, RuntimeError> {
-    match args.first() {
-        Some(Object::Instance(i)) => Ok(i.clone()),
-        _ => Err(type_error("expected xmlparser instance")),
-    }
-}
-
-fn handle_of(inst: &Rc<PyInstance>) -> Result<i64, RuntimeError> {
-    match inst
-        .dict
-        .borrow()
-        .get(&DictKey(Object::from_static("_handle")))
-        .cloned()
-    {
-        Some(Object::Int(v)) => Ok(v),
-        _ => Err(type_error("xmlparser missing _handle")),
-    }
-}
-
-fn flag_attr(inst: &Rc<PyInstance>, name: &'static str) -> bool {
-    matches!(
-        inst.dict
-            .borrow()
-            .get(&DictKey(Object::from_static(name)))
-            .cloned(),
-        Some(Object::Bool(true)) | Some(Object::Int(1))
-    )
-}
-
-// ---------------------------------------------------------------------------
-// Handler dispatch.
-// ---------------------------------------------------------------------------
-
-fn handler_of(inst: &Rc<PyInstance>, name: &'static str) -> Option<Object> {
-    let d = inst.dict.borrow();
-    match d.get(&DictKey(Object::from_static(name))) {
-        None | Some(Object::None) => None,
-        Some(o) => Some(o.clone()),
-    }
-}
-
-fn call_handler(
-    inst: &Rc<PyInstance>,
-    name: &'static str,
-    args: &[Object],
-) -> Result<bool, RuntimeError> {
-    let Some(h) = handler_of(inst, name) else {
-        return Ok(false);
+    let intern = match intern_arg {
+        None | Some(Object::None) => Object::Dict(Rc::new(RefCell::new(DictData::default()))),
+        Some(d @ Object::Dict(_)) => d,
+        Some(_) => return Err(type_error("intern must be a dictionary")),
     };
-    let ptr = crate::vm_singletons::current_interpreter_ptr()
-        .ok_or_else(|| value_error("no running interpreter for expat handler"))?;
-    // SAFETY: published by the enclosing VM frame on this thread.
-    let interp = unsafe { &mut *ptr };
-    interp.call_object(h, args, &[])?;
-    Ok(true)
+
+    let enc_c = encoding
+        .map(|e| std::ffi::CString::new(e).map_err(|_| value_error("embedded null character")))
+        .transpose()?;
+    let enc_ptr = enc_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+    // SAFETY: valid (or null) encoding pointer; single-byte separator.
+    let parser = unsafe {
+        match &namespace_sep {
+            Some(s) => {
+                let sep = s.as_bytes().first().copied().unwrap_or(0) as c_char;
+                ex::XML_ParserCreateNS(enc_ptr, sep)
+            }
+            None => ex::XML_ParserCreate(enc_ptr),
+        }
+    };
+    if parser.is_null() {
+        return Err(RuntimeError::PyException(PyException::from_builtin(
+            "MemoryError",
+            "",
+        )));
+    }
+    Ok(register_parser(parser, intern, false, Object::None))
 }
 
-// ---------------------------------------------------------------------------
-// Parse.
-// ---------------------------------------------------------------------------
+fn external_entity_parser_create(args: &[Object]) -> Result<Object, RuntimeError> {
+    let st = state_of_args(args)?;
+    let context = opt_str_arg("ExternalEntityParserCreate", "context", args.get(1))?;
+    let encoding = opt_str_arg("ExternalEntityParserCreate", "encoding", args.get(2))?;
 
-fn parse_method(args: &[Object]) -> Result<Object, RuntimeError> {
-    let inst = self_inst(args)?;
-    let id = handle_of(&inst)?;
-    let state = state_of(id).ok_or_else(|| value_error("stale xmlparser"))?;
+    let ctx_c = context
+        .map(|c| std::ffi::CString::new(c).map_err(|_| value_error("embedded null character")))
+        .transpose()?;
+    let enc_c = encoding
+        .map(|e| std::ffi::CString::new(e).map_err(|_| value_error("embedded null character")))
+        .transpose()?;
+    let ctx_ptr = ctx_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+    let enc_ptr = enc_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
 
-    let (data, isfinal) = parse_args(&args[1..])?;
-
-    {
-        let mut st = state.borrow_mut();
-        if st.finished {
-            return Err(make_expat_error(
-                &inst,
-                9,
-                st.line_starts.len() as i64,
-                0,
-                st.buffer.len() as i64,
-            ));
-        }
-        st.buffer.extend_from_slice(&data);
-        if !isfinal {
-            // Defer: accumulate until the document is finalised.
-            return Ok(Object::Int(1));
-        }
-        st.finished = true;
-    }
-
-    // Snapshot the buffer + flags, then release the registry lock so handler
-    // callbacks (which may touch the parser) don't deadlock.
-    let (buffer, namespace_sep, buffer_text, ordered) = {
-        let st = state.borrow();
+    let (parent_parser, handlers, intern, buffer_text, buffer_size, ordered, specified, nsp) = {
+        let s = st.borrow();
         (
-            st.buffer.clone(),
-            st.namespace_sep.clone(),
-            st.buffer_text,
-            st.ordered_attributes,
+            s.parser(),
+            s.handlers.clone(),
+            s.intern.clone(),
+            s.buffer_text,
+            s.buffer_size,
+            s.ordered_attributes,
+            s.specified_attributes,
+            s.ns_prefixes,
         )
     };
-    // The `buffer_text` / `ordered_attributes` knobs are user-settable on the
-    // instance after creation; honour the instance attributes.
-    let buffer_text = buffer_text || flag_attr(&inst, "buffer_text");
-    let ordered = ordered || flag_attr(&inst, "ordered_attributes");
-    // expat's `XML_SetReturnNSTriplet`: when set, prefixed names gain a trailing
-    // `<sep>prefix` field. `minidom` (ExpatBuilderNS) turns this on.
-    let return_prefix = flag_attr(&inst, "namespace_prefixes");
-
-    let line_starts = compute_line_starts(&buffer);
-    {
-        let mut st = state.borrow_mut();
-        st.line_starts = line_starts.clone();
+    // SAFETY: live parent parser; context/encoding pointers valid or null.
+    let child = unsafe { ex::XML_ExternalEntityParserCreate(parent_parser, ctx_ptr, enc_ptr) };
+    if child.is_null() {
+        return Err(RuntimeError::PyException(PyException::from_builtin(
+            "MemoryError",
+            "",
+        )));
     }
+    let parent_obj = args[0].clone();
+    let obj = register_parser(child, intern, nsp, parent_obj);
+    // Inherit the parent's Python-side configuration + handler table
+    // (pyexpat.c ExternalEntityParserCreate).
+    if let Object::Instance(inst) = &obj {
+        let handle = inst
+            .dict
+            .borrow()
+            .get(&DictKey(Object::from_static("_handle")))
+            .cloned();
+        if let Some(Object::Int(id)) = handle {
+            if let Some(child_st) = state_of(id) {
+                {
+                    let mut s = child_st.borrow_mut();
+                    s.buffer_text = buffer_text;
+                    s.buffer_size = buffer_size;
+                    s.ordered_attributes = ordered;
+                    s.specified_attributes = specified;
+                    s.handlers = handlers;
+                }
+                let s = child_st.borrow();
+                for (slot, h) in s.handlers.iter().enumerate() {
+                    if !matches!(h, Object::None) {
+                        // SAFETY: live child parser.
+                        unsafe { apply_native_handler(child, slot, true) };
+                    }
+                }
+                if nsp {
+                    // SAFETY: live child parser.
+                    unsafe { ex::XML_SetReturnNSTriplet(child, 1) };
+                }
+            }
+        }
+    }
+    Ok(obj)
+}
 
-    run_parse(
-        &inst,
-        &buffer,
-        &line_starts,
-        namespace_sep.as_deref(),
-        buffer_text,
-        ordered,
-        return_prefix,
-    )?;
-    Ok(Object::Int(1))
+// ---------------------------------------------------------------------------
+// Parse / ParseFile
+// ---------------------------------------------------------------------------
+
+/// Feed one chunk to expat and translate the outcome: pending Python
+/// exception > ExpatError > success (returns expat's status code, 1).
+fn feed(st: &StateRef, data: &[u8], isfinal: bool) -> Result<i64, RuntimeError> {
+    let parser = st.borrow().parser();
+    // SAFETY: live parser; `data` outlives the call.
+    let rc = unsafe {
+        ex::XML_Parse(
+            parser,
+            data.as_ptr().cast::<c_char>(),
+            data.len() as c_int,
+            c_int::from(isfinal),
+        )
+    };
+    let pending = st.borrow_mut().pending_exc.take();
+    if let Some(e) = pending {
+        return Err(e);
+    }
+    if rc == ex::XML_STATUS_ERROR {
+        let code = unsafe { ex::XML_GetErrorCode(parser) };
+        return Err(set_error(st, code));
+    }
+    Ok(i64::from(rc))
+}
+
+fn parse_data_arg(st: &StateRef, arg: Option<&Object>) -> Result<Vec<u8>, RuntimeError> {
+    match arg {
+        Some(Object::Str(s)) => {
+            // A str argument overrides any declared document encoding: the
+            // data is fed as UTF-8 (pyexpat.c Parse).
+            let parser = st.borrow().parser();
+            // SAFETY: live parser; static encoding name.
+            unsafe { ex::XML_SetEncoding(parser, c"utf-8".as_ptr()) };
+            Ok(s.as_bytes().to_vec())
+        }
+        Some(Object::WStr(_)) => Err(RuntimeError::PyException(PyException::from_builtin(
+            "UnicodeEncodeError",
+            "'utf-8' codec can't encode surrogates",
+        ))),
+        Some(Object::Bytes(b)) => Ok(b.to_vec()),
+        Some(Object::ByteArray(b)) => Ok(b.borrow().clone()),
+        Some(Object::MemoryView(mv)) => {
+            if mv.is_c_contiguous() {
+                Ok(mv.to_bytes())
+            } else {
+                Err(RuntimeError::PyException(PyException::from_builtin(
+                    "BufferError",
+                    "underlying buffer is not C-contiguous",
+                )))
+            }
+        }
+        Some(other) => Err(type_error(format!(
+            "a bytes-like object is required, not '{}'",
+            other.type_name_owned()
+        ))),
+        None => Err(type_error(
+            "Parse() missing 1 required positional argument: 'data'",
+        )),
+    }
+}
+
+fn parse_method(args: &[Object]) -> Result<Object, RuntimeError> {
+    let st = state_of_args(args)?;
+    let data = parse_data_arg(&st, args.get(1))?;
+    let isfinal = args.get(2).map(Object::is_truthy).unwrap_or(false);
+    let rc = feed(&st, &data, isfinal)?;
+    if !flush_chardata(&st) {
+        let e = st.borrow_mut().pending_exc.take();
+        if let Some(e) = e {
+            return Err(e);
+        }
+    }
+    Ok(Object::Int(rc))
 }
 
 fn parse_file_method(args: &[Object]) -> Result<Object, RuntimeError> {
-    let inst = self_inst(args)?;
-    // `ParseFile(file)` — read the whole file, then parse as a final chunk.
+    let st = state_of_args(args)?;
     let file = args
         .get(1)
         .cloned()
-        .ok_or_else(|| type_error("ParseFile() takes a file argument"))?;
-    let ptr = crate::vm_singletons::current_interpreter_ptr()
-        .ok_or_else(|| value_error("no running interpreter"))?;
-    let interp = unsafe { &mut *ptr };
-    let read = interp.load_attr_public(&file, "read")?;
-    let data = interp.call_object(read, &[], &[])?;
-    let bytes = match &data {
-        Object::Bytes(b) => b.to_vec(),
-        Object::ByteArray(b) => b.borrow().clone(),
-        Object::Str(s) => s.as_bytes().to_vec(),
-        _ => return Err(type_error("read() must return bytes")),
-    };
-    parse_method(&[
-        Object::Instance(inst),
-        Object::new_bytes(bytes),
-        Object::Bool(true),
-    ])
-}
-
-fn parse_args(rest: &[Object]) -> Result<(Vec<u8>, bool), RuntimeError> {
-    let data = match rest.first() {
-        Some(Object::Bytes(b)) => b.to_vec(),
-        Some(Object::ByteArray(b)) => b.borrow().clone(),
-        Some(Object::Str(s)) => s.as_bytes().to_vec(),
-        None => Vec::new(),
-        _ => return Err(type_error("Parse() argument must be str or bytes")),
-    };
-    let isfinal = match rest.get(1) {
-        Some(Object::Bool(b)) => *b,
-        Some(Object::Int(i)) => *i != 0,
-        _ => false,
-    };
-    Ok((data, isfinal))
-}
-
-fn compute_line_starts(buf: &[u8]) -> Vec<usize> {
-    let mut starts = vec![0usize];
-    for (i, b) in buf.iter().enumerate() {
-        if *b == b'\n' {
-            starts.push(i + 1);
-        }
-    }
-    starts
-}
-
-/// Line (0-based) and column (0-based) for `offset` — expat's
-/// `CurrentLineNumber` is 1-based, `CurrentColumnNumber` 0-based.
-fn line_col(line_starts: &[usize], offset: usize) -> (i64, i64) {
-    // Largest index whose start <= offset.
-    let idx = match line_starts.binary_search(&offset) {
-        Ok(i) => i,
-        Err(i) => i.saturating_sub(1),
-    };
-    let line = idx as i64 + 1;
-    let col = offset.saturating_sub(line_starts[idx]) as i64;
-    (line, col)
-}
-
-fn update_position(inst: &Rc<PyInstance>, line_starts: &[usize], offset: usize) {
-    let (line, col) = line_col(line_starts, offset);
-    let mut d = inst.dict.borrow_mut();
-    d.insert(
-        DictKey(Object::from_static("CurrentLineNumber")),
-        Object::Int(line),
-    );
-    d.insert(
-        DictKey(Object::from_static("CurrentColumnNumber")),
-        Object::Int(col),
-    );
-    d.insert(
-        DictKey(Object::from_static("CurrentByteIndex")),
-        Object::Int(offset as i64),
-    );
-}
-
-fn make_expat_error(
-    inst: &Rc<PyInstance>,
-    code: i64,
-    lineno: i64,
-    colno: i64,
-    byte_index: i64,
-) -> RuntimeError {
-    {
-        let mut d = inst.dict.borrow_mut();
-        d.insert(DictKey(Object::from_static("ErrorCode")), Object::Int(code));
-        d.insert(
-            DictKey(Object::from_static("ErrorLineNumber")),
-            Object::Int(lineno),
-        );
-        d.insert(
-            DictKey(Object::from_static("ErrorColumnNumber")),
-            Object::Int(colno),
-        );
-        d.insert(
-            DictKey(Object::from_static("ErrorByteIndex")),
-            Object::Int(byte_index),
-        );
-    }
-    let msg = format!("{}: line {}, column {}", error_message(code), lineno, colno);
-    let cls = expat_error_type();
-    let einst = PyInstance::new(cls);
-    {
-        let mut d = einst.dict.borrow_mut();
-        d.insert(
-            DictKey(Object::from_static("args")),
-            Object::new_tuple(vec![Object::from_str(msg.clone())]),
-        );
-        d.insert(DictKey(Object::from_static("code")), Object::Int(code));
-        d.insert(DictKey(Object::from_static("lineno")), Object::Int(lineno));
-        d.insert(DictKey(Object::from_static("offset")), Object::Int(colno));
-    }
-    RuntimeError::PyException(PyException::new(Object::Instance(Rc::new(einst))))
-}
-
-/// One namespace scope: prefix → URI. The empty prefix is the default
-/// namespace (`xmlns="…"`).
-type NsScope = HashMap<String, String>;
-
-fn run_parse(
-    inst: &Rc<PyInstance>,
-    buffer: &[u8],
-    line_starts: &[usize],
-    namespace_sep: Option<&str>,
-    buffer_text: bool,
-    ordered: bool,
-    return_prefix: bool,
-) -> Result<(), RuntimeError> {
-    let mut reader = Reader::from_reader(buffer);
-    let config = reader.config_mut();
-    config.trim_text(false);
-    config.expand_empty_elements = false;
-    config.check_end_names = true;
-
-    let mut ns_stack: Vec<NsScope> = Vec::new();
-    let mut pending_text: Option<String> = None;
-    let mut buf: Vec<u8> = Vec::new();
-    // Well-formedness tracking. A conforming XML document has exactly one
-    // top-level ("document") element. expat rejects two classes of input that
-    // `quick-xml` (a lenient fragment-friendly parser) accepts silently, and
-    // pandas' `read_xml` asserts on the exact expat wording:
-    //   * no root element at all           -> "no element found"           (3)
-    //   * a second top-level element/junk  -> "junk after document element" (9)
-    // `root_seen` flips true when the first depth-0 element opens; once the
-    // root has closed (`depth` back to 0 with `root_seen`) any further element
-    // start or non-whitespace text in the epilog is junk.
-    let mut root_seen = false;
-    // Element nesting depth. Character data at depth 0 is prolog/epilog
-    // whitespace, which expat routes through the Default handler rather than
-    // `CharacterDataHandler` (CPython: the `\n` after `<?xml?>` is a `default`
-    // event, not `char`). Getting this wrong made `minidom.toprettyxml` insert
-    // blank lines between the declaration and the root element, breaking every
-    // pandas `DataFrame.to_xml(pretty_print=True)` byte-comparison.
-    let mut depth: i32 = 0;
-
+        .ok_or_else(|| type_error("ParseFile() missing 1 required positional argument: 'file'"))?;
+    let ip = interp()?;
+    let read = ip.load_attr_public(&file, "read")?;
+    let rc;
     loop {
-        let event_pos = reader.buffer_position() as usize;
-        let ev = reader.read_event_into(&mut buf);
-        match ev {
-            Ok(Event::Eof) => break,
-            Ok(Event::Decl(e)) => {
-                flush_text(inst, &mut pending_text, depth > 0)?;
-                let version = e
-                    .version()
-                    .ok()
-                    .map(|v| decode_cow(&reader, &v))
-                    .transpose()?
-                    .unwrap_or_default();
-                let encoding = match e.encoding() {
-                    Some(Ok(enc)) => Some(decode_cow(&reader, &enc)?),
-                    _ => None,
-                };
-                let standalone = match e.standalone() {
-                    Some(Ok(sa)) => {
-                        let s = decode_cow(&reader, &sa)?;
-                        if s == "yes" {
-                            Object::Int(1)
-                        } else if s == "no" {
-                            Object::Int(0)
-                        } else {
-                            Object::Int(-1)
-                        }
-                    }
-                    _ => Object::Int(-1),
-                };
-                update_position(inst, line_starts, event_pos);
-                let enc_obj = match encoding {
-                    Some(e) => Object::from_str(e),
-                    None => Object::None,
-                };
-                call_handler(
-                    inst,
-                    "XmlDeclHandler",
-                    &[Object::from_str(version), enc_obj, standalone],
-                )?;
+        let chunk = call(ip, &read, &[Object::Int(2048)])?;
+        let bytes = match &chunk {
+            Object::Bytes(b) => b.to_vec(),
+            other => {
+                return Err(type_error(format!(
+                    "read() did not return a bytes object (type={})",
+                    other.type_name_owned()
+                )))
             }
-            Ok(Event::Start(e)) => {
-                if depth == 0 && root_seen {
-                    let (line, col) = line_col(line_starts, event_pos);
-                    return Err(make_expat_error(inst, 9, line, col, event_pos as i64));
-                }
-                flush_text(inst, &mut pending_text, depth > 0)?;
-                update_position(inst, line_starts, event_pos);
-                handle_start(
-                    inst,
-                    &reader,
-                    &e,
-                    namespace_sep,
-                    ordered,
-                    return_prefix,
-                    &mut ns_stack,
-                    false,
-                )?;
-                if depth == 0 {
-                    root_seen = true;
-                }
-                depth += 1;
-            }
-            Ok(Event::Empty(e)) => {
-                if depth == 0 && root_seen {
-                    let (line, col) = line_col(line_starts, event_pos);
-                    return Err(make_expat_error(inst, 9, line, col, event_pos as i64));
-                }
-                flush_text(inst, &mut pending_text, depth > 0)?;
-                update_position(inst, line_starts, event_pos);
-                handle_start(
-                    inst,
-                    &reader,
-                    &e,
-                    namespace_sep,
-                    ordered,
-                    return_prefix,
-                    &mut ns_stack,
-                    true,
-                )?;
-                if depth == 0 {
-                    root_seen = true;
-                }
-            }
-            Ok(Event::End(e)) => {
-                flush_text(inst, &mut pending_text, depth > 0)?;
-                update_position(inst, line_starts, event_pos);
-                let name = expand_end_name(
-                    &reader,
-                    e.name().as_ref(),
-                    namespace_sep,
-                    &ns_stack,
-                    return_prefix,
-                )?;
-                call_handler(inst, "EndElementHandler", &[Object::from_str(name)])?;
-                pop_ns_scope(inst, namespace_sep, &mut ns_stack)?;
-                depth -= 1;
-            }
-            Ok(Event::Text(e)) => {
-                let text = e
-                    .unescape()
-                    .map_err(|err| escape_err(inst, line_starts, event_pos, &err.to_string()))?
-                    .into_owned();
-                // Non-whitespace character data outside the root element is not
-                // well-formed. Once the root has closed, expat reports it as
-                // "junk after document element"; whitespace epilog is allowed.
-                if depth == 0 && root_seen && !text.trim().is_empty() {
-                    let (line, col) = line_col(line_starts, event_pos);
-                    return Err(make_expat_error(inst, 9, line, col, event_pos as i64));
-                }
-                accumulate_text(inst, &mut pending_text, text, buffer_text, depth > 0)?;
-            }
-            Ok(Event::CData(e)) => {
-                flush_text(inst, &mut pending_text, depth > 0)?;
-                update_position(inst, line_starts, event_pos);
-                let text = decode_cow(&reader, e.as_ref())?;
-                call_handler(inst, "StartCdataSectionHandler", &[])?;
-                // CDATA is only well-formed inside the root element, so it is
-                // always reportable character data.
-                emit_char_data(inst, &text, true)?;
-                call_handler(inst, "EndCdataSectionHandler", &[])?;
-            }
-            Ok(Event::Comment(e)) => {
-                flush_text(inst, &mut pending_text, depth > 0)?;
-                update_position(inst, line_starts, event_pos);
-                let text = decode_cow(&reader, e.as_ref())?;
-                call_handler(inst, "CommentHandler", &[Object::from_str(text)])?;
-            }
-            Ok(Event::PI(e)) => {
-                flush_text(inst, &mut pending_text, depth > 0)?;
-                update_position(inst, line_starts, event_pos);
-                let raw = decode_cow(&reader, e.as_ref())?;
-                let (target, rest) = match raw.split_once(char::is_whitespace) {
-                    Some((t, r)) => (t.to_owned(), r.trim_start().to_owned()),
-                    None => (raw.clone(), String::new()),
-                };
-                call_handler(
-                    inst,
-                    "ProcessingInstructionHandler",
-                    &[Object::from_str(target), Object::from_str(rest)],
-                )?;
-            }
-            Ok(Event::DocType(e)) => {
-                flush_text(inst, &mut pending_text, depth > 0)?;
-                update_position(inst, line_starts, event_pos);
-                let text = decode_cow(&reader, e.as_ref())?;
-                let name = text.split_whitespace().next().unwrap_or("").to_owned();
-                call_handler(
-                    inst,
-                    "StartDoctypeDeclHandler",
-                    &[
-                        Object::from_str(name),
-                        Object::None,
-                        Object::None,
-                        Object::Int(0),
-                    ],
-                )?;
-                call_handler(inst, "EndDoctypeDeclHandler", &[])?;
-            }
-            #[allow(unreachable_patterns)]
-            Ok(_) => {}
-            Err(err) => {
-                let (line, col) = line_col(line_starts, event_pos);
-                return Err(map_quickxml_error(inst, &err, line, col, event_pos as i64));
-            }
-        }
-        buf.clear();
-    }
-    flush_text(inst, &mut pending_text, depth > 0)?;
-    // A document with no top-level element ("", whitespace-only, prolog-only)
-    // is ill-formed: expat raises "no element found" at the final position.
-    if !root_seen {
-        let end = buffer.len();
-        let (line, col) = line_col(line_starts, end);
-        return Err(make_expat_error(inst, 3, line, col, end as i64));
-    }
-    Ok(())
-}
-
-fn accumulate_text(
-    inst: &Rc<PyInstance>,
-    pending: &mut Option<String>,
-    text: String,
-    buffer_text: bool,
-    in_element: bool,
-) -> Result<(), RuntimeError> {
-    if buffer_text {
-        pending.get_or_insert_with(String::new).push_str(&text);
-        Ok(())
-    } else {
-        emit_char_data(inst, &text, in_element)
-    }
-}
-
-fn flush_text(
-    inst: &Rc<PyInstance>,
-    pending: &mut Option<String>,
-    in_element: bool,
-) -> Result<(), RuntimeError> {
-    if let Some(text) = pending.take() {
-        if !text.is_empty() {
-            emit_char_data(inst, &text, in_element)?;
-        }
-    }
-    Ok(())
-}
-
-fn emit_char_data(inst: &Rc<PyInstance>, text: &str, in_element: bool) -> Result<(), RuntimeError> {
-    // Only content *inside* the root element is reportable character data.
-    // Whitespace in the prolog/epilog (depth 0) is never handed to
-    // `CharacterDataHandler` by expat — it goes straight to the Default
-    // handler, exactly like any other markup with no specific handler.
-    let fired = if in_element {
-        call_handler(
-            inst,
-            "CharacterDataHandler",
-            &[Object::from_str(text.to_owned())],
-        )?
-    } else {
-        false
-    };
-    if !fired {
-        // expat routes unhandled data through the Default handlers.
-        if handler_of(inst, "DefaultHandlerExpand").is_some() {
-            call_handler(
-                inst,
-                "DefaultHandlerExpand",
-                &[Object::from_str(text.to_owned())],
-            )?;
-        } else {
-            call_handler(inst, "DefaultHandler", &[Object::from_str(text.to_owned())])?;
-        }
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn handle_start(
-    inst: &Rc<PyInstance>,
-    reader: &Reader<&[u8]>,
-    e: &quick_xml::events::BytesStart<'_>,
-    namespace_sep: Option<&str>,
-    ordered: bool,
-    return_prefix: bool,
-    ns_stack: &mut Vec<NsScope>,
-    empty: bool,
-) -> Result<(), RuntimeError> {
-    // Collect attributes, separating xmlns declarations when namespace
-    // processing is on.
-    let mut scope: NsScope = HashMap::new();
-    let mut raw_attrs: Vec<(String, String)> = Vec::new();
-    for a in e.attributes() {
-        let a = a.map_err(|err| value_error(format!("expat: bad attribute: {err}")))?;
-        let key = decode_cow(reader, a.key.as_ref())?;
-        let val = decode_attr_value(reader, &a.value)?;
-        if namespace_sep.is_some() && (key == "xmlns" || key.starts_with("xmlns:")) {
-            let prefix = if key == "xmlns" {
-                String::new()
-            } else {
-                key["xmlns:".len()..].to_owned()
-            };
-            scope.insert(prefix.clone(), val.clone());
-            // expat reports namespace declarations before the start tag.
-            let prefix_obj = if prefix.is_empty() {
-                Object::None
-            } else {
-                Object::from_str(prefix.clone())
-            };
-            call_handler(
-                inst,
-                "StartNamespaceDeclHandler",
-                &[prefix_obj, Object::from_str(val)],
-            )?;
-        } else {
-            raw_attrs.push((key, val));
-        }
-    }
-    if namespace_sep.is_some() {
-        ns_stack.push(scope);
-    }
-
-    let name = expand_name(
-        reader,
-        e.name().as_ref(),
-        namespace_sep,
-        ns_stack,
-        true,
-        return_prefix,
-    )?;
-
-    // Build the expanded attribute names.
-    let mut attrs: Vec<(String, String)> = Vec::with_capacity(raw_attrs.len());
-    for (k, v) in raw_attrs {
-        let nk = if namespace_sep.is_some() {
-            expand_name(
-                reader,
-                k.as_bytes(),
-                namespace_sep,
-                ns_stack,
-                false,
-                return_prefix,
-            )?
-        } else {
-            k
         };
-        attrs.push((nk, v));
-    }
-
-    let attr_obj = if ordered {
-        let mut items = Vec::with_capacity(attrs.len() * 2);
-        for (k, v) in attrs {
-            items.push(Object::from_str(k));
-            items.push(Object::from_str(v));
-        }
-        Object::List(Rc::new(RefCell::new(items)))
-    } else {
-        let dict = Rc::new(RefCell::new(DictData::default()));
-        {
-            let mut d = dict.borrow_mut();
-            for (k, v) in attrs {
-                d.insert(DictKey(Object::from_str(k)), Object::from_str(v));
-            }
-        }
-        Object::Dict(dict)
-    };
-
-    call_handler(
-        inst,
-        "StartElementHandler",
-        &[Object::from_str(name.clone()), attr_obj],
-    )?;
-
-    if empty {
-        call_handler(inst, "EndElementHandler", &[Object::from_str(name)])?;
-        if namespace_sep.is_some() {
-            pop_ns_scope(inst, namespace_sep, ns_stack)?;
+        let isfinal = bytes.is_empty();
+        let status = feed(&st, &bytes, isfinal)?;
+        if isfinal {
+            rc = status;
+            break;
         }
     }
-    Ok(())
-}
-
-fn pop_ns_scope(
-    inst: &Rc<PyInstance>,
-    namespace_sep: Option<&str>,
-    ns_stack: &mut Vec<NsScope>,
-) -> Result<(), RuntimeError> {
-    if namespace_sep.is_none() {
-        return Ok(());
-    }
-    if let Some(scope) = ns_stack.pop() {
-        for prefix in scope.keys() {
-            let prefix_obj = if prefix.is_empty() {
-                Object::None
-            } else {
-                Object::from_str(prefix.clone())
-            };
-            call_handler(inst, "EndNamespaceDeclHandler", &[prefix_obj])?;
+    if !flush_chardata(&st) {
+        let e = st.borrow_mut().pending_exc.take();
+        if let Some(e) = e {
+            return Err(e);
         }
     }
-    Ok(())
-}
-
-fn lookup_ns(ns_stack: &[NsScope], prefix: &str) -> Option<String> {
-    for scope in ns_stack.iter().rev() {
-        if let Some(uri) = scope.get(prefix) {
-            return Some(uri.clone());
-        }
-    }
-    None
-}
-
-/// Expand an element/attribute name in namespace mode to expat's
-/// `uri<sep>localname` form. `is_element` controls default-namespace
-/// application (attributes are not in the default namespace).
-///
-/// When `return_prefix` is set (expat's `XML_SetReturnNSTriplet`, driven by the
-/// Python-visible `namespace_prefixes` flag), a *prefixed* name additionally
-/// carries the original prefix as a third separator-delimited field
-/// (`uri<sep>local<sep>prefix`). `xml.dom.minidom` turns this on and relies on
-/// the trailing prefix to reconstruct the qualified name — without it every
-/// `doc:tag` round-tripped through `minidom.toprettyxml` collapses to `tag`,
-/// which is exactly what broke pandas' `to_xml(prefix=…, pretty_print=True)`.
-/// A default-namespace name (no prefix) stays two-field, matching expat.
-fn expand_name(
-    reader: &Reader<&[u8]>,
-    raw: &[u8],
-    namespace_sep: Option<&str>,
-    ns_stack: &[NsScope],
-    is_element: bool,
-    return_prefix: bool,
-) -> Result<String, RuntimeError> {
-    let name = decode_cow(reader, raw)?;
-    let Some(sep) = namespace_sep else {
-        return Ok(name);
-    };
-    if let Some((prefix, local)) = name.split_once(':') {
-        if let Some(uri) = lookup_ns(ns_stack, prefix) {
-            if return_prefix {
-                return Ok(format!("{uri}{sep}{local}{sep}{prefix}"));
-            }
-            return Ok(format!("{uri}{sep}{local}"));
-        }
-        return Ok(name);
-    }
-    if is_element {
-        if let Some(uri) = lookup_ns(ns_stack, "") {
-            if !uri.is_empty() {
-                return Ok(format!("{uri}{sep}{name}"));
-            }
-        }
-    }
-    Ok(name)
-}
-
-fn expand_end_name(
-    reader: &Reader<&[u8]>,
-    raw: &[u8],
-    namespace_sep: Option<&str>,
-    ns_stack: &[NsScope],
-    return_prefix: bool,
-) -> Result<String, RuntimeError> {
-    expand_name(reader, raw, namespace_sep, ns_stack, true, return_prefix)
-}
-
-fn decode_cow(reader: &Reader<&[u8]>, bytes: &[u8]) -> Result<String, RuntimeError> {
-    reader
-        .decoder()
-        .decode(bytes)
-        .map(|c| c.into_owned())
-        .map_err(|e| value_error(format!("expat: decode error: {e}")))
-}
-
-fn decode_attr_value(reader: &Reader<&[u8]>, bytes: &[u8]) -> Result<String, RuntimeError> {
-    let decoded = decode_cow(reader, bytes)?;
-    quick_xml::escape::unescape(&decoded)
-        .map(|c| c.into_owned())
-        .map_err(|e| value_error(format!("expat: unescape error: {e}")))
-}
-
-fn escape_err(
-    inst: &Rc<PyInstance>,
-    line_starts: &[usize],
-    offset: usize,
-    _msg: &str,
-) -> RuntimeError {
-    let (line, col) = line_col(line_starts, offset);
-    make_expat_error(inst, 4, line, col, offset as i64)
-}
-
-fn map_quickxml_error(
-    inst: &Rc<PyInstance>,
-    err: &quick_xml::Error,
-    line: i64,
-    col: i64,
-    byte_index: i64,
-) -> RuntimeError {
-    use quick_xml::Error as E;
-    let code = match err {
-        E::IllFormed(_) => 7,
-        E::Syntax(_) => 2,
-        _ => 4,
-    };
-    make_expat_error(inst, code, line, col, byte_index)
+    Ok(Object::Int(rc))
 }
 
 // ---------------------------------------------------------------------------
-// Misc methods.
+// Remaining methods
 // ---------------------------------------------------------------------------
 
 fn set_base_method(args: &[Object]) -> Result<Object, RuntimeError> {
-    let inst = self_inst(args)?;
-    let base = args.get(1).cloned().unwrap_or(Object::None);
-    inst.dict
-        .borrow_mut()
-        .insert(DictKey(Object::from_static("base")), base);
+    let st = state_of_args(args)?;
+    let base = match args.get(1) {
+        Some(Object::Str(s)) => s.to_string(),
+        Some(other) => {
+            return Err(type_error(format!(
+                "SetBase() argument 'base' must be str, not {}",
+                other.type_name_owned()
+            )))
+        }
+        None => return Err(type_error("SetBase() missing 1 required argument: 'base'")),
+    };
+    let c = std::ffi::CString::new(base).map_err(|_| value_error("embedded null character"))?;
+    let parser = st.borrow().parser();
+    // SAFETY: live parser; expat copies the string.
+    let ok = unsafe { ex::XML_SetBase(parser, c.as_ptr()) };
+    if ok == 0 {
+        return Err(RuntimeError::PyException(PyException::from_builtin(
+            "MemoryError",
+            "",
+        )));
+    }
     Ok(Object::None)
 }
 
 fn get_base_method(args: &[Object]) -> Result<Object, RuntimeError> {
-    let inst = self_inst(args)?;
-    let base = inst
-        .dict
-        .borrow()
-        .get(&DictKey(Object::from_static("base")))
-        .cloned()
-        .unwrap_or(Object::None);
-    Ok(base)
+    let st = state_of_args(args)?;
+    let parser = st.borrow().parser();
+    // SAFETY: live parser.
+    Ok(unsafe { conv_opt(ex::XML_GetBase(parser)) })
 }
 
-fn get_input_context_method(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::None)
-}
-
-fn set_param_entity_parsing_method(_args: &[Object]) -> Result<Object, RuntimeError> {
-    // We never read external/parameter entities; report "not changed".
-    Ok(Object::Int(0))
-}
-
-fn use_foreign_dtd_method(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::None)
-}
-
-fn get_reparse_deferral_method(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::Bool(false))
-}
-
-fn set_reparse_deferral_method(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::None)
-}
-
-fn external_entity_parser_create(args: &[Object]) -> Result<Object, RuntimeError> {
-    // Return a fresh parser sharing the namespace configuration.
-    let inst = self_inst(args)?;
-    let ns = {
-        let id = handle_of(&inst)?;
-        state_of(id).and_then(|s| s.borrow().namespace_sep.clone())
+fn get_input_context_method(args: &[Object]) -> Result<Object, RuntimeError> {
+    let st = state_of_args(args)?;
+    let (parser, in_callback) = {
+        let s = st.borrow();
+        (s.parser(), s.in_callback > 0)
     };
-    Ok(make_parser(None, ns))
+    if !in_callback {
+        return Ok(Object::None);
+    }
+    let mut offset: c_int = 0;
+    let mut size: c_int = 0;
+    // SAFETY: live parser; out-params are stack locals.
+    let buf = unsafe { ex::XML_GetInputContext(parser, &raw mut offset, &raw mut size) };
+    if buf.is_null() {
+        return Ok(Object::None);
+    }
+    // SAFETY: expat guarantees `buf[offset..size]` is readable here.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            buf.add(offset as usize).cast::<u8>(),
+            (size - offset) as usize,
+        )
+    };
+    Ok(Object::new_bytes(bytes.to_vec()))
+}
+
+fn set_param_entity_parsing_method(args: &[Object]) -> Result<Object, RuntimeError> {
+    let st = state_of_args(args)?;
+    let flag = args
+        .get(1)
+        .and_then(Object::as_i64)
+        .ok_or_else(|| type_error("an integer is required"))?;
+    let parser = st.borrow().parser();
+    // SAFETY: live parser.
+    let rc = unsafe { ex::XML_SetParamEntityParsing(parser, flag as c_int) };
+    Ok(Object::Int(i64::from(rc)))
+}
+
+fn use_foreign_dtd_method(args: &[Object]) -> Result<Object, RuntimeError> {
+    let st = state_of_args(args)?;
+    let flag = args.get(1).map(Object::is_truthy).unwrap_or(true);
+    let parser = st.borrow().parser();
+    // SAFETY: live parser.
+    let rc = unsafe { ex::XML_UseForeignDTD(parser, ex::XML_Bool::from(flag)) };
+    if rc != 0 {
+        return Err(set_error(&st, rc));
+    }
+    Ok(Object::None)
+}
+
+fn get_reparse_deferral_method(args: &[Object]) -> Result<Object, RuntimeError> {
+    let st = state_of_args(args)?;
+    let v = st.borrow().reparse_deferral;
+    Ok(Object::Bool(v))
+}
+
+fn set_reparse_deferral_method(args: &[Object]) -> Result<Object, RuntimeError> {
+    let st = state_of_args(args)?;
+    let enabled = args.get(1).map(Object::is_truthy).unwrap_or(false);
+    if expat_at_least(2, 6) {
+        let parser = st.borrow().parser();
+        // SAFETY: live parser.
+        let ok = unsafe { ex::XML_SetReparseDeferralEnabled(parser, ex::XML_Bool::from(enabled)) };
+        if ok != 0 {
+            st.borrow_mut().reparse_deferral = enabled;
+        }
+    }
+    Ok(Object::None)
+}
+
+// ---------------------------------------------------------------------------
+// Module-level functions + module construction
+// ---------------------------------------------------------------------------
+
+fn error_string_fn(args: &[Object]) -> Result<Object, RuntimeError> {
+    let code = args.first().and_then(Object::as_i64).unwrap_or(0);
+    match error_string_for(code as c_int) {
+        Some(s) => Ok(Object::from_str(s)),
+        None => Ok(Object::None),
+    }
+}
+
+pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
+    let dict = Rc::new(RefCell::new(DictData::default()));
+    {
+        let mut d = dict.borrow_mut();
+        d.insert(
+            DictKey(Object::from_static("__name__")),
+            Object::from_static("pyexpat"),
+        );
+        d.insert(
+            DictKey(Object::from_static("__doc__")),
+            Object::from_static("Python wrapper for Expat parser."),
+        );
+        // SAFETY: pure static queries.
+        let (version_str, vinfo) =
+            unsafe { (cstr(ex::XML_ExpatVersion()), ex::XML_ExpatVersionInfo()) };
+        d.insert(
+            DictKey(Object::from_static("EXPAT_VERSION")),
+            Object::from_str(version_str),
+        );
+        d.insert(
+            DictKey(Object::from_static("version_info")),
+            Object::new_tuple(vec![
+                Object::Int(i64::from(vinfo.major)),
+                Object::Int(i64::from(vinfo.minor)),
+                Object::Int(i64::from(vinfo.micro)),
+            ]),
+        );
+        d.insert(
+            DictKey(Object::from_static("native_encoding")),
+            Object::from_static("UTF-8"),
+        );
+        let mut features = Vec::new();
+        // SAFETY: static feature table terminated by a NULL-named entry.
+        unsafe {
+            let mut f = ex::XML_GetFeatureList();
+            while !f.is_null() && !(*f).name.is_null() && (*f).feature != 0 {
+                features.push(Object::new_tuple(vec![
+                    Object::from_str(cstr((*f).name)),
+                    Object::Int((*f).value as i64),
+                ]));
+                f = f.add(1);
+            }
+        }
+        d.insert(
+            DictKey(Object::from_static("features")),
+            Object::List(Rc::new(RefCell::new(features))),
+        );
+        d.insert(
+            DictKey(Object::from_static("XML_PARAM_ENTITY_PARSING_NEVER")),
+            Object::Int(i64::from(ex::XML_PARAM_ENTITY_PARSING_NEVER)),
+        );
+        d.insert(
+            DictKey(Object::from_static(
+                "XML_PARAM_ENTITY_PARSING_UNLESS_STANDALONE",
+            )),
+            Object::Int(i64::from(ex::XML_PARAM_ENTITY_PARSING_UNLESS_STANDALONE)),
+        );
+        d.insert(
+            DictKey(Object::from_static("XML_PARAM_ENTITY_PARSING_ALWAYS")),
+            Object::Int(i64::from(ex::XML_PARAM_ENTITY_PARSING_ALWAYS)),
+        );
+        d.insert(
+            DictKey(Object::from_static("ParserCreate")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "ParserCreate",
+                binds_instance: false,
+                call: Box::new(move |args| parser_create(args, &[])),
+                call_kw: Some(Box::new(parser_create)),
+            })),
+        );
+        d.insert(
+            DictKey(Object::from_static("ErrorString")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "ErrorString",
+                binds_instance: false,
+                call: Box::new(error_string_fn),
+                call_kw: None,
+            })),
+        );
+        d.insert(
+            DictKey(Object::from_static("XMLParserType")),
+            Object::Type(parser_type()),
+        );
+        let err = expat_error_type();
+        d.insert(
+            DictKey(Object::from_static("ExpatError")),
+            Object::Type(err.clone()),
+        );
+        d.insert(DictKey(Object::from_static("error")), Object::Type(err));
+        d.insert(
+            DictKey(Object::from_static("errors")),
+            Object::Module(errors_submodule()),
+        );
+        d.insert(
+            DictKey(Object::from_static("model")),
+            Object::Module(model_submodule()),
+        );
+    }
+    Rc::new(PyModule {
+        name: "pyexpat".to_owned(),
+        filename: None,
+        dict,
+    })
 }

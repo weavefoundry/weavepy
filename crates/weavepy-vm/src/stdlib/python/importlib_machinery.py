@@ -268,7 +268,12 @@ class SourceFileLoader(_LoaderBase):
         if isinstance(data, (bytes, bytearray)):
             from importlib.util import decode_source
             data = decode_source(bytes(data))
-        return compile(data, path, 'exec')
+        # `_optimize` must reach the compiler: py_compile/compileall route
+        # their `optimize=` through here, and the opt-1/opt-2 pycs they
+        # write must differ (assert/docstring stripping —
+        # `test_compileall.HardlinkDedupTests`).
+        return compile(data, path, 'exec', dont_inherit=True,
+                       optimize=_optimize)
 
     def path_stats(self, path):
         st = os.stat(path)
@@ -602,6 +607,12 @@ class BuiltinImporter:
             # Built-ins are always top-level.
             return None
         if fullname in sys.builtin_module_names:
+            # Some names double-registered as "builtin" actually ship
+            # frozen Python source (random, json, os, …); defer those to
+            # FrozenImporter, whose get_source()/get_filename() let
+            # source consumers (pyclbr) see the real module body.
+            if _is_frozen(fullname):
+                return None
             return ModuleSpec(fullname, cls, origin='built-in')
         return None
 
@@ -677,6 +688,15 @@ class FrozenImporter:
         src = sys._get_frozen_source(fullname) if hasattr(
             sys, '_get_frozen_source') else None
         return src
+
+    @classmethod
+    def get_filename(cls, fullname):
+        # Unlike CPython's FrozenImporter (whose get_source returns
+        # None), WeavePy freezes real .py text, so source consumers that
+        # pair get_source() with get_filename() — pyclbr._readmodule —
+        # reach this. The `<frozen …>` spelling matches what CPython
+        # stamps on frozen code objects.
+        return f'<frozen {fullname}>'
 
     @classmethod
     def is_package(cls, fullname):

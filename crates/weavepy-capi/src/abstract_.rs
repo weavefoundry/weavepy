@@ -528,7 +528,7 @@ fn attr_lookup(o: &Object, key: &str) -> Option<Object> {
             let raw = inst.cls().lookup(key)?;
             match &raw {
                 Object::Property(p) => {
-                    let getter = p.fget.clone();
+                    let getter = p.fget();
                     if matches!(getter, Object::None) {
                         return Some(raw);
                     }
@@ -997,6 +997,10 @@ fn invoke_callable(
             }
         }
     };
+    // The call may have mutated a C-resident bytearray through the VM
+    // (aiohttp's parser: `self._buf.extend(...)` then macro-reads the
+    // buffer); re-publish the struct fields before C code resumes.
+    crate::mirror::sync_bytearray_boxes();
     match result {
         Ok(v) => crate::object::into_owned(v),
         Err(err) => {

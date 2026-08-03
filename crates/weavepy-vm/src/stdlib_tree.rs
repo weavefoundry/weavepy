@@ -64,6 +64,12 @@ const DATA_FILES: &[(&str, &str)] = &[
         "venv/scripts/posix/activate.csh",
         include_str!("stdlib/python/venv/scripts/posix/activate.csh"),
     ),
+    // pydoc's stylesheet, served by `pydoc` and `xmlrpc.server`'s
+    // DocXMLRPCServer (`_get_css` opens it relative to `__file__`).
+    (
+        "pydoc_data/_pydoc.css",
+        include_str!("stdlib/python/pydoc_data/_pydoc.css"),
+    ),
 ];
 
 /// The bundled pip wheel's filename. The version must agree with

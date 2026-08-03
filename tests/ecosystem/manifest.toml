@@ -49,3 +49,85 @@ probe = "probes/packaging_probe.py"
 [packages.pytest]
 requirements = "pytest"
 probe = "probes/pytest_probe.py"
+
+# --- wave 2 (RFC 0056 WS5) -------------------------------------------------
+
+[packages.flask]
+requirements = "flask"
+probe = "probes/flask_probe.py"
+
+[packages.sqlalchemy]
+requirements = "sqlalchemy"
+probe = "probes/sqlalchemy_probe.py"
+
+[packages.httpx]
+requirements = "httpx"
+probe = "probes/httpx_probe.py"
+
+[packages.urllib3]
+requirements = "urllib3"
+probe = "probes/urllib3_probe.py"
+
+[packages.pydantic]
+requirements = "pydantic"
+probe = "probes/pydantic_probe.py"
+
+[packages.pyyaml]
+requirements = "pyyaml"
+probe = "probes/pyyaml_probe.py"
+
+[packages.msgpack]
+requirements = "msgpack"
+probe = "probes/msgpack_probe.py"
+
+[packages.rich]
+requirements = "rich"
+probe = "probes/rich_probe.py"
+
+[packages.tqdm]
+requirements = "tqdm"
+probe = "probes/tqdm_probe.py"
+
+[packages.numpy]
+requirements = "numpy"
+probe = "probes/numpy_probe.py"
+timeout_seconds = 900
+
+[packages.markupsafe]
+requirements = "markupsafe"
+probe = "probes/markupsafe_probe.py"
+
+[packages.certifi]
+requirements = "certifi"
+probe = "probes/certifi_probe.py"
+
+[packages.idna]
+requirements = "idna"
+probe = "probes/idna_probe.py"
+
+[packages.charset_normalizer]
+requirements = "charset-normalizer"
+probe = "probes/charset_normalizer_probe.py"
+
+# --- wave-2 stretch rows (measured whatever their color) --------------------
+
+[packages.cryptography]
+requirements = "cryptography"
+probe = "probes/cryptography_probe.py"
+timeout_seconds = 900
+
+[packages.orjson]
+requirements = "orjson"
+probe = "probes/orjson_probe.py"
+
+[packages.aiohttp]
+requirements = "aiohttp"
+probe = "probes/aiohttp_probe.py"
+timeout_seconds = 900
+
+# --- capstone (RFC 0056 WS6) -------------------------------------------------
+
+[packages.django]
+requirements = "django"
+probe = "probes/django_probe.py"
+timeout_seconds = 900

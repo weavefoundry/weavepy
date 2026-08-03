@@ -165,6 +165,16 @@ def _build_dynamic(spec, name, loader):
         if (spec.submodule_search_locations is not None
                 and not hasattr(module, "__path__")):
             module.__path__ = spec.submodule_search_locations
+        module.__package__ = spec.parent
+        # CPython `_init_module_attrs`: a located spec stamps
+        # `__file__`/`__cached__` from `origin`/`cached`.
+        # `pkgutil.get_data` requires `__file__` on the loaded module to
+        # resolve the resource path it hands `loader.get_data`.
+        if getattr(spec, "has_location", False):
+            if spec.origin is not None:
+                module.__file__ = spec.origin
+            if getattr(spec, "cached", None) is not None:
+                module.__cached__ = spec.cached
     except Exception:
         pass
     sys.modules[name] = module

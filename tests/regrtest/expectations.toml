@@ -278,6 +278,11 @@ reason = "RFC 0052: compile() flags (PyCF_DONT_IMPLY_DEDENT / PyCF_ALLOW_INCOMPL
 status = "pass"
 reason = "measured: passes end-to-end in ~7s under -j8 (RFC 0037 WS8 — CPython's verbatim collections/__init__.py over a new _collections accelerator: deque/defaultdict/_count_elements, OrderedDict, namedtuple via _tuplegetter, ChainMap, PEP 584 dict |/|=) against the vendored CPython 3.13 Lib/test."
 
+[tests."cpython/Lib/test/test_compileall.py"]
+status = "pass"
+timeout_seconds = 300
+reason = "measured (RFC 0056 WS7): passes end-to-end — 145 run, 0 fail / 0 error, 2 skip. Three legs closed: (1) `source_to_code(_optimize=)` now reaches the compiler (`dont_inherit=True, optimize=_optimize`), so opt-0/1/2 pycs genuinely differ (assert/docstring stripping — the HardlinkDedupTests matrix); (2) `cache_from_source(optimization=None)` defers to `sys.flags.optimize`, so `-O -m compileall` writes `.opt-1` artifacts (test_pep3147_paths_optimize); (3) a pyc run directly gets a synthetic `<runpy:pyc>` bootstrap frame, so `--strip`ped build dirs never leak into tracebacks (test_strip_only). The native import cache is now PEP 488-keyed too (`.opt-N` read/write per interpreter level)."
+
 [tests."cpython/Lib/test/test_compile.py"]
 status = "fail"
 # ~119s idle (RFC 0054 re-measure); exceeded 300s under -j8 sweep
@@ -342,7 +347,7 @@ reason = "RFC 0041 WS-csv: native `_csv` rewritten as a faithful port of CPython
 
 [tests."cpython/Lib/test/test_ctypes.py"]
 status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): EException ignored on calling ctypes callback function: ValueError: 42"
+reason = "measured (RFC 0056 WS2): _ctypes rewritten on CPython's real type/metaclass model (StgInfo, CField descriptors, KeepRef/_objects chains, PEP 3118 formats, byteswapped types, callback unraisable routing). 240 tests, 47 skipped, 1 enumerated residual: test_values.test_frozentable needs real _PyImport_Frozen{Bootstrap,Stdlib,Test} C tables + _imp._frozen_module_names + frozen-module import specs."
 
 [tests."cpython/Lib/test/test_dataclasses.py"]
 status = "pass"
@@ -356,8 +361,8 @@ timeout_seconds = 180
 reason = "measured (RFC 0041 WS-datetime): 518 run, OK (48 skipped). Re-split datetime into a verbatim pure-Python `_pydatetime` plus the `Lib/datetime.py` shim (`from _datetime import *` with the `from _pydatetime import *` fallback), so `load_tests`' `import_fresh_module('datetime', blocked=['_datetime'])` dual-module probe runs the `_Pure` suite (the native `_datetime` accelerator is deferred, so its `_Fast` classes skip cleanly). Required native edges, all CPython-faithful: `time.strftime` accepts a `WStr` format and round-trips lone surrogates through the PUA bridge (`'%y\\ud800%m'`, surrogate tznames in `%Z`); the `%c` printf code accepts an int code point in the surrogate range and a one-codepoint `WStr` (un-bridged at the `%` boundary); `time.ctime`/`time.asctime` (libc asctime layout, space-padded day); `struct_time` carries the hidden `tm_gmtoff`/`tm_zone` extras read by `_pydatetime._local_timezone` without leaking them into the 9-element sequence view; `time.localtime`/`gmtime` raise `OverflowError` (not `TypeError`) for out-of-range/non-finite timestamps; `array.byteswap()` for tzfile parsing; and `pickle`'s Python-2 `BINSTRING`/`SHORT_BINSTRING` opcodes plus `_assertNotWarns` for the test harness."
 
 [tests."cpython/Lib/test/test_dbm_sqlite3.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): File '/Users/owencarey/Documents/weavefoundry/weavepy/ve…[truncated]"
+status = "pass"
+reason = "measured (RFC 0056 WS1): passes end-to-end on the native libsqlite3-backed _sqlite3 module."
 
 [tests."cpython/Lib/test/test_decimal.py"]
 status = "skip"
@@ -404,8 +409,8 @@ status = "fail"
 reason = "measured (RFC 0051): co_lnotab now ships, moving the first failure past the wave-5 blocker — the suite now trips at import on a module-level dis.dis() introspection helper returning int where it expects a code object (opcode-coverage/table-format parity is the remaining arc)."
 
 [tests."cpython/Lib/test/test_doctest.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): File '<frozen unittest.suite>', line 122, i…[truncated]"
+status = "pass"
+reason = "measured (RFC 0056 WS4): full 72-test package passes — DocTestFinder counts 830-860 builtins docstrings (docs surface pass + builtin_docs_data table), DocTestCase str/repr parity, pdb/displayhook hooks."
 
 [tests."cpython/Lib/test/test_dynamic.py"]
 status = "pass"
@@ -453,6 +458,10 @@ reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: 'winer
 [tests."cpython/Lib/test/test_exceptions.py"]
 status = "pass"
 reason = "measured: passes end-to-end against the vendored CPython 3.13 Lib/test (RFC 0037 WS1 recursion guard + WS5 PEP 3134/678/654 chaining, add_note/__notes__, ExceptionGroup, and AttributeError.name/.obj population)."
+
+[tests."cpython/Lib/test/test_extcall.py"]
+status = "fail"
+reason = "measured (RFC 0056 WS7): doctest suite — the kwonly too-many-positionals message shape now matches CPython (`N positional argument(s) (and K keyword-only argument(s)) were given`, covered by bundled test_extcall_kwonly_messages.py). ~24 residual Failed examples remain in three clusters: (1) duplicate keyword detection across successive `**` mappings / explicit kwargs (WeavePy merges instead of raising 'got multiple values for keyword argument'); (2) `*`/`**` unpack TypeError spelling (`argument after * must be an iterable, not X` vs the generic `'X' object is not iterable`); (3) builtin `dir()` multiple-values / keyword rejection message fidelity. Not a wave-2 blocker — enumerated for wave 3."
 
 [tests."cpython/Lib/test/test_faulthandler.py"]
 status = "fail"
@@ -601,8 +610,9 @@ status = "pass"
 reason = "html.unescape now ports CPython's full algorithm: the new html.entities module ships the complete HTML5 named-reference table (html5/name2codepoint/codepoint2name/entitydefs), and unescape applies the spec's numeric rules (semicolon-optional decimal/hex refs, the Windows-1252 _invalid_charrefs remap, the _invalid_codepoints drop-set, surrogate/out-of-range -> U+FFFD) plus the longest-named-prefix fallback via re.sub with a callable repl. 2/2."
 
 [tests."cpython/Lib/test/test_htmlparser.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): File '/Users/owencarey/Documents/weavefoundry/weavepy/vendor/cpython/Lib/test/tes…[truncated]"
+status = "pass"
+timeout_seconds = 120
+reason = "measured (RFC 0056 WS3): 67 run, 0 fail — the 134-line regex shim is replaced by verbatim CPython html.parser + _markupbase; the quadratic-complexity EOF tests additionally needed the sre engine's repeat_body_has_mark to walk opcodes structurally (a raw scan misread charset bitmap words equal to 17/OP_MARK and routed 120k-repetition mark-free repeats onto the recursive engine). ~28s sequential; budget raised for -j contention."
 
 [tests."cpython/Lib/test/test_http_cookiejar.py"]
 status = "pass"
@@ -627,6 +637,10 @@ reason = "measured (RFC 0049 wave-5 full-suite baseline): ImportError: cannot im
 
 [tests."cpython/Lib/test/test_importlib.py"]
 status = "fail"
+# ~18s idle (RFC 0056 WS7 re-measure: 1276 run, 205F/478E); exceeded the
+# 60s default under -j8 sweep contention — verdict is stable, raise
+# headroom only.
+timeout_seconds = 300
 reason = "importlib: full FileFinder + frozen module spec semantics"
 
 [tests."cpython/Lib/test/test_index.py"]
@@ -745,8 +759,8 @@ status = "pass"
 reason = "mimetypes is now CPython's verbatim module (full MimeTypes class, strict/non-strict maps, guess_file_type, read/readfp). Unblocked by several reusable engine fixes: bool indexes a sequence as int (seq[True]≡seq[1], used by the strict-map 2-tuple), os.fsdecode/fsencode + os.path.splitdrive, os.PathLike (__fspath__) coercion for open()/os.fspath/fsdecode/fsencode, unittest.mock implicitly creating a builtin name (open) patched onto a module, and test.support.patch/check__all__. 22/24 (+2 skips)."
 
 [tests."cpython/Lib/test/test_minidom.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): File '/Users/owencarey/Documents/weavefoundry/weavepy/vendor/cpython/Lib/test/test_minidom.py', line …[truncated]"
+status = "pass"
+reason = "measured (RFC 0056 WS3): passes end-to-end over the native pyexpat (vendored expat 2.6.4) — the DOM builds through xml.dom.expatbuilder driving the real push parser."
 
 [tests."cpython/Lib/test/test_mmap.py"]
 status = "timeout"
@@ -870,8 +884,8 @@ status = "pass"
 reason = "measured (RFC 0055 WS1): passes end-to-end — sys._git/_framework, structseq sys.version_info, platform identity strings."
 
 [tests."cpython/Lib/test/test_plistlib.py"]
-status = "fail"
-reason = "measured (RFC 0053): no longer a timeout — the suite completes in ~2s with 3 errors left, all in the expat shim: XML plists in utf-16-le/utf-16-be encodings, and entity-declaration rejection (plistlib installs an EntityDeclHandler the shim never invokes)."
+status = "pass"
+reason = "measured (RFC 0056 WS3): the 3 expat-shim errors are gone with the native pyexpat — expat decodes utf-16-le/utf-16-be XML plists itself, and EntityDeclHandler fires so plistlib's entity rejection works."
 
 [tests."cpython/Lib/test/test_poll.py"]
 status = "pass"
@@ -923,12 +937,17 @@ status = "pass"
 reason = "measured (RFC 0055 WS6): native termios + os.openpty/os.login_tty — pty.fork(), spawn, and the SmallPtyTests all pass."
 
 [tests."cpython/Lib/test/test_pulldom.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): ----------------------------------------…[truncated]"
+status = "pass"
+reason = "measured (RFC 0056 WS3): passes (3 expected failures, same as CPython) — xml.dom.pulldom is verbatim CPython over the new verbatim xml.sax + native pyexpat."
 
 [tests."cpython/Lib/test/test_py_compile.py"]
 status = "pass"
 reason = "measured (RFC 0055 WS3): passes end-to-end — cache_from_source optimization levels, _classify_pyc validation, PEP 263 decode errors."
+
+[tests."cpython/Lib/test/test_pyclbr.py"]
+status = "fail"
+timeout_seconds = 1200
+reason = "measured (RFC 0056 WS7): schedules and runs past the load_package_tests gap. importlib.util now ports `_find_spec_from_path`, FrozenImporter grew `get_filename`, and `sys.builtin_module_names` no longer lists frozen pure-Python modules (random/json/re/…), so pyclbr resolves real stdlib source. Budget raised to 1200s: `pyclbr.readmodule_ex` over large modules is pathologically slow here (~30s for pyclbr itself, ~60s for doctest) and the suite's test_others walk (pickle/pdb/pydoc/email.parser) exceeds the prior 400s wall even serially. Residual: `test_others`'s `cm('pickle')` — WeavePy has no `_pickle` accelerator, so `pickle.Pickler` is the pure-Python `_Pickler` alias with `__module__ == 'pickle'` and the test then requires a 'Pickler' ClassDef in the source that verbatim pickle.py doesn't have (CPython skips it because the C Pickler reports `__module__ == '_pickle'`)."
 
 [tests."cpython/Lib/test/test_pydoc.py"]
 status = "fail"
@@ -938,8 +957,8 @@ reason = "measured (RFC 0049 wave-5 full-suite baseline): KeyError: '__doc__'"
 timeout_seconds = 180
 
 [tests."cpython/Lib/test/test_pyexpat.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AttributeError: module '_testcapi' has no attribute 'set_nomemory'"
+status = "pass"
+reason = "measured (RFC 0056 WS3): 60 run, 0 fail, 14 skip — pyexpat is now bindings over vendored expat 2.6.4 (full 22-slot handler table, buffering, subparsers, unknown-encoding handler, live position/error attributes). test_error_path_no_crash skips via the _testcapi.set_nomemory stub (WeavePy has no allocation-failure injection seam)."
 
 [tests."cpython/Lib/test/test_queue.py"]
 status = "pass"
@@ -994,8 +1013,8 @@ status = "pass"
 reason = "measured (RFC 0055 WS3/WS4): passes end-to-end — verbatim runpy (incl. the `-m runpy` __main__ block), ModuleSpec.cached/__cached__ semantics, and zip/directory run_path over the verbatim zipimport."
 
 [tests."cpython/Lib/test/test_sax.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): File '/Users/owencarey/Documents/weavefoundry/we…[truncated]"
+status = "pass"
+reason = "measured (RFC 0056 WS3): passes end-to-end — xml.sax is verbatim CPython (expatreader/saxutils/xmlreader/handler) driving the native pyexpat push parser."
 
 [tests."cpython/Lib/test/test_sched.py"]
 status = "pass"
@@ -1071,13 +1090,13 @@ status = "fail"
 reason = "measured (RFC 0049 wave-5 full-suite baseline): SyntaxErr…[truncated]"
 
 [tests."cpython/Lib/test/test_sqlite3.py"]
-status = "fail"
-reason = "measured: the package __init__ does 'from test.support import load_package_tests' at import, which WeavePy's test.support shim doesn't provide (same gap as test_zoneinfo; test_inspect only references it lazily)."
+status = "pass"
+reason = "measured (RFC 0056 WS1): full native _sqlite3 over libsqlite3-sys + verbatim Lib/sqlite3 — 504 run, 0 fail / 0 error, 6 skip (the two undecodable-path skips match CPython-on-macOS after open() started handing raw bytes paths to the OS; the other four are the >4 GiB memory-bound blob/string cases). Covers the full DB-API surface: Connection/Cursor/Row/Blob heap types, adapters+converters (PEP 246 __adapt__), user functions/aggregates/window functions, authorizer/progress/trace hooks with CPython's unraisable semantics, serialize/deserialize, backup, limits, dbconfig, autocommit modes, and the sqlite3 CLI."
 
 [tests."cpython/Lib/test/test_ssl.py"]
 status = "pass"
-reason = "measured (RFC 0054 WS3): passes end-to-end — 191 run, 0 fail / 0 error, 25 skip. The rustls-backed `_ssl` now covers the OpenSSL-shaped surface the suite asserts: full `getpeercert()` X.509→dict parsing (x509-parser), cipher-suite listing/filtering (`set_ciphers`/`shared_ciphers`, NO_SHARED_CIPHER alerts), options/verify_flags bitmasks (OP_NO_TLSv1_2/1_3, VERIFY_X509_STRICT AKI checks, VERIFY_CRL_CHECK_LEAF), SNI servername callbacks via a two-phase rustls Acceptor handshake (incl. alert propagation and dead-reference unraisable reporting), server-side ALPN intersection, session_stats + session-reuse bookkeeping, set_ecdh_curve group pinning, dual RSA/ECC certificate slots, encrypted PKCS#8 keys with password callbacks (pkcs8 crate), per-message handshake `_msg_callback` replay from a captured transcript, and TLS 1.3 post-handshake-auth emulation. The 25 skips are CPython's own gates (TLS 1.0/1.1 legacy protocols rustls intentionally drops, missing-feature probes, and the walltime-gated IPv6 internet test). ~18s standalone; the generous budget absorbs 8-way sweep contention (observed >10x inflation under full parallel load)."
-timeout_seconds = 600
+reason = "measured (RFC 0054 WS3): passes end-to-end — 191 run, 0 fail / 0 error, 25 skip. The rustls-backed `_ssl` now covers the OpenSSL-shaped surface the suite asserts: full `getpeercert()` X.509→dict parsing (x509-parser), cipher-suite listing/filtering (`set_ciphers`/`shared_ciphers`, NO_SHARED_CIPHER alerts), options/verify_flags bitmasks (OP_NO_TLSv1_2/1_3, VERIFY_X509_STRICT AKI checks, VERIFY_CRL_CHECK_LEAF), SNI servername callbacks via a two-phase rustls Acceptor handshake (incl. alert propagation and dead-reference unraisable reporting), server-side ALPN intersection, session_stats + session-reuse bookkeeping, set_ecdh_curve group pinning, dual RSA/ECC certificate slots, encrypted PKCS#8 keys with password callbacks (pkcs8 crate), per-message handshake `_msg_callback` replay from a captured transcript, and TLS 1.3 post-handshake-auth emulation. The 25 skips are CPython's own gates (TLS 1.0/1.1 legacy protocols rustls intentionally drops, missing-feature probes, and the walltime-gated IPv6 internet test). ~15s standalone; budget raised 600→900→1800 across RFC 0056 WS7 after -j8 sweeps starved the row behind long neighbors (pyclbr ~450s)."
+timeout_seconds = 1800
 
 [tests."cpython/Lib/test/test_stat.py"]
 status = "pass"
@@ -1282,9 +1301,9 @@ timeout_seconds = 180
 reason = "RFC 0050 WS4: unicodedata rebuilt on generated UCD 15.1.0 tables probed from CPython 3.13 (records/names/normalization + ucd_3_2_0 snapshot with NormalizationCorrections), str case methods/predicates rewired to the same tables (method checksum matches), and \\N escapes honour a poisoned sys.modules['unicodedata']. Full suite green."
 
 [tests."cpython/Lib/test/test_unittest.py"]
-status = "fail"
+status = "pass"
 timeout_seconds = 180
-reason = "measured (RFC 0050 WS5 re-baseline; RFC 0051: budget raised for parallel-load headroom, ~100-140s under -j8): the suite now finishes inside the budget (~33s; was killed after 60s) and grades fail — a large residual cluster around unittest.mock/loader internals unrelated to this RFC's codec/UCD scope."
+reason = "measured (RFC 0056 WS4): the unittest/mock/loader residual cluster is resolved — bound-method slot arity, cell objects, doctest docs surface, and _testcapi/_testmultiphase skip guards land the full package green (~27s)."
 
 [tests."cpython/Lib/test/test_unpack.py"]
 status = "pass"
@@ -1344,8 +1363,8 @@ timeout_seconds = 120
 reason = "measured (RFC 0055 WS2): passes end-to-end over the verbatim venv module — creation/upgrade, pyvenv.cfg fields, --with-pip via ensurepip over the bundled wheel, zippath from a non-installed layout."
 
 [tests."cpython/Lib/test/test_warnings.py"]
-status = "fail"
-reason = "measured (RFC 0038 WS-C): 130 pass, 28 fail, 3 error of 279. Gaps need closure-cell introspection (`'cell' object has no attribute 'cell_contents'`, used by the `@deprecated` retained-reference checks) plus filter/`catch_warnings` re-entrancy corners. Deferred (cell_contents is a VM closure-introspection gap)."
+status = "pass"
+reason = "measured (RFC 0056 WS4): passes end-to-end — 173 run, 0F/0E, 3 skip. `_warnings` is now a faithful native port of CPython's `Modules/_warnings.c`: the C module owns the filter state (last-known filters/onceregistry/defaultaction refreshed from the live `warnings` module attributes, so `del warnings.filters` degrades exactly like CPython), `warn`/`warn_explicit` run the full pipeline (registry version gating via `_filters_mutated`, once/module/default dedup, `error` raising the message instance, `_showwarnmsg` dispatch with a stderr fallback), stacklevel resolution walks real frames with `skip_file_prefixes` and importlib-internal skipping, and gh-86298 `module_globals` handling ports `_bless_my_loader` verbatim (ValueError/AttributeError/deprecation matrix). `-W`/`PYTHONWARNINGS` bootstrap-import `warnings` at startup so bad options report before user code. The finalization pair works: `__del__`-time warns resolve the caller frame via the interpreter frame-stack fallback, and a `__main__` sweep in `run_shutdown_finalizers` drains leaked-file ResourceWarnings as CPython's late `<sys>:0` report. `test_tracemalloc` passes via per-object allocation tracebacks (`-X tracemalloc=N` auto-start + `get_object_traceback`, with the dealloc warning's `source` carrying an address token)."
 
 [tests."cpython/Lib/test/test_weakref.py"]
 status = "timeout"
@@ -1364,16 +1383,18 @@ status = "pass"
 reason = "measured (RFC 0037): passes end-to-end — parenthesized context managers and the with-protocol error paths all hold."
 
 [tests."cpython/Lib/test/test_xml_etree.py"]
-status = "skip"
-reason = "pyexpat C accelerator not shipped; ElementTree C-parser paths unavailable"
+status = "pass"
+timeout_seconds = 120
+reason = "measured (RFC 0056 WS3): passes over the native pyexpat (5 skips). The _elementtree C accelerator itself is not shipped; ElementTree runs pure-Python, so accelerator-only legs skip like a CPython --without-c-locale-coercion build would."
 
 [tests."cpython/Lib/test/test_xml_etree_c.py"]
-status = "skip"
-reason = "depends on test_xml_etree (pyexpat C accelerator)"
+status = "pass"
+reason = "measured (RFC 0056 WS3): passes with 24 skips — every leg that needs the _elementtree C accelerator skips cleanly; the shared behavior tests run over the pure-Python ElementTree + native pyexpat."
 
 [tests."cpython/Lib/test/test_xmlrpc.py"]
 status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: {'args': [], 'faultCode': 42, 'faultString': 'Test Fault'} != {'faultCode': 42, 'faultString': 'Test Fault'}"
+timeout_seconds = 120
+reason = "measured (RFC 0056 WS3): 92/93 with the verbatim xmlrpc package (client+server) — the one residual is test_dump_fault: WeavePy stores BaseException's `args` pseudo-slot in the instance __dict__, so Marshaller.dump_instance(Fault) marshals an extra 'args' member (CPython keeps args in a C slot outside __dict__). Needs the exception pseudo-slot storage moved out of instance dicts — tracked for the WS4 introspection cluster."
 
 [tests."cpython/Lib/test/test_yield_from.py"]
 status = "fail"
@@ -1390,8 +1411,8 @@ timeout_seconds = 180
 reason = "measured (RFC 0055 WS3): passes end-to-end over the verbatim zipimport (uncompressed + compressed, namespace merging, sourceless entries). Runs ~58s — the pack/unpack-heavy fixture setup dominates; budget raised accordingly."
 
 [tests."cpython/Lib/test/test_zipimport_support.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): test.support.Test…[truncated]"
+status = "pass"
+reason = "measured (RFC 0056 WS4): the doctest-in-zip leg passes now that doctest discovery/runner parity landed (docs surface pass + pdb/linecache hooks)."
 
 [tests."cpython/Lib/test/test_zlib.py"]
 status = "pass"
@@ -1399,4 +1420,4 @@ reason = "full zlib via flate2/zlib-rs: compressobj/decompressobj, _ZlibDecompre
 
 [tests."cpython/Lib/test/test_zoneinfo.py"]
 status = "fail"
-reason = "measured: the package __init__ does 'from test.support import load_package_tests' at import, which WeavePy's test.support shim doesn't provide (same gap as test_sqlite3)."
+reason = "measured (RFC 0056 WS7): 261 run, 3 fail / 1 error, 28 skip — the load_package_tests harness gap is closed (WS1) and the suite schedules its real package tests. Two residual clusters burned in-wave: ZoneInfo.from_file pickling (object.__reduce_ex__ now honours an instance-dict __reduce__ the way CPython's PyObject_GetAttr(self) does, so the from_file reduce-block raises PicklingError) and PYTHONTZPATH env semantics (empty/relative-only values now yield an empty TZPATH instead of the WeavePy default fallback; import-time warning stacklevel re-anchored for the inlined _tzpath). The 4 remaining are C-extension-implementation-detail tests (CZoneInfoCacheTest weak-cache corruption trio + ExtensionBuiltTest.test_cache_location) that assert C-global cache behavior — unsatisfiable while c_zoneinfo *is* the pure-Python module."

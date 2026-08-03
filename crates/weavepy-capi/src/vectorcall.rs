@@ -156,6 +156,9 @@ unsafe fn call_via_vectorcall(
                     owned_values.push(vp);
                     argvec.push(vp);
                 }
+                // Interned like CPython's kwnames (extensions match by
+                // pointer identity — see `mirror::enter_intern_scope`).
+                let _intern = crate::mirror::enter_intern_scope();
                 kwnames = crate::object::into_owned(Object::new_tuple(names));
             }
         }

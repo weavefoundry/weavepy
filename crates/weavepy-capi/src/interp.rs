@@ -170,13 +170,19 @@ pub fn ensure_active<R>(body: impl FnOnce() -> R) -> R {
         globals: None,
         current_module: None,
     };
-    with_active(ctx, || {
+    let r = with_active(ctx, || {
         // First VM→C transition with a fresh context: publish the static
         // builtins' `tp_bases`/`tp_mro` (run-once) now that the allocator is
         // reachable, before any extension C code can read those slots.
         crate::types::publish_static_type_hierarchy();
         body()
-    })
+    });
+    // Outermost C→VM return: adopt macro writes into seeded lists that were
+    // attached to a parent container mid-call and never crossed again on
+    // their own (orjson's iterative deserializer; see
+    // `reconcile_seeded_lists`).
+    unsafe { crate::mirror::reconcile_seeded_lists() };
+    r
 }
 
 static INIT: Once = Once::new();

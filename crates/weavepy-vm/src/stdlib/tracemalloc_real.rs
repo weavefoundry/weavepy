@@ -36,6 +36,22 @@ pub struct TraceState {
     /// hashtable bucket array here (domain 472) and its test suite
     /// asserts *exact* byte accounting against `Table.sizeof()`.
     pub domain_blocks: HashMap<(u32, usize), u64>,
+    /// Per-object allocation tracebacks, keyed by the object's payload
+    /// address: `addr -> [(filename, lineno)]`, ordered oldest frame
+    /// first (CPython `Traceback` order). Feeds
+    /// `get_object_traceback()`; recorded for resource-carrying objects
+    /// (files) at construction. Entries persist past the object's death
+    /// so a dealloc `ResourceWarning`'s source token can still resolve
+    /// its allocation site (`test_warnings.test_tracemalloc`).
+    pub object_traces: HashMap<usize, Vec<(String, i64)>>,
+    /// Frames pinned for a dying object's pending `ResourceWarning`.
+    /// Moved out of [`Self::object_traces`] at enqueue time so a
+    /// subsequent `open()` that reuses the same payload address
+    /// (common under allocation pressure: `linecache.getline` opens
+    /// the warning's own source file *before*
+    /// `get_object_traceback` runs) cannot overwrite the frames the
+    /// warning still needs to format.
+    pub finalizing_traces: HashMap<usize, Vec<(String, i64)>>,
     pub current: u64,
     pub peak: u64,
     pub tracker_bytes: u64,
@@ -63,6 +79,70 @@ pub fn track_domain(domain: u32, ptr: usize, size: u64) -> bool {
             true
         })
         .unwrap_or(false)
+}
+
+/// Record the allocation traceback of a freshly constructed
+/// resource-carrying object (a `PyFile`), keyed by its payload address.
+/// No-op when tracing is off. The stack snapshot keeps the innermost
+/// `nframe` frames, oldest first (CPython `Traceback` order).
+pub fn track_object_alloc(file: &crate::object::Object) {
+    if !with_state(|s| s.enabled) {
+        return;
+    }
+    let crate::object::Object::File(rc) = file else {
+        return;
+    };
+    let key = Rc::as_ptr(rc) as usize;
+    let Some(h) = crate::vm_singletons::current_thread_handles() else {
+        return;
+    };
+    let nframe = with_state(|s| s.nframe).max(1) as usize;
+    let frames: Vec<(String, i64)> = {
+        let stack = h.frame_stack.borrow();
+        let start = stack.len().saturating_sub(nframe);
+        stack[start..]
+            .iter()
+            .map(|f| (f.code.filename.clone(), i64::from(f.current_lineno())))
+            .collect()
+    };
+    if frames.is_empty() {
+        return;
+    }
+    with_state(|s| {
+        s.object_traces.insert(key, frames);
+    });
+}
+
+/// The recorded allocation traceback for `key`, if any. Prefers a
+/// pinned finalizing entry (see [`pin_object_traceback`]) so a
+/// recycled address's new `track_object_alloc` cannot clobber the
+/// frames a pending `ResourceWarning` still needs.
+pub fn object_traceback_for(key: usize) -> Option<Vec<(String, i64)>> {
+    with_state(|s| {
+        s.finalizing_traces
+            .get(&key)
+            .cloned()
+            .or_else(|| s.object_traces.get(&key).cloned())
+    })
+}
+
+/// Move `key`'s live allocation frames into [`TraceState::finalizing_traces`]
+/// so they survive address reuse until the pending `ResourceWarning` is
+/// formatted. Called from the file destructor when enqueueing the warning.
+pub fn pin_object_traceback(key: usize) {
+    with_state(|s| {
+        if let Some(frames) = s.object_traces.remove(&key) {
+            s.finalizing_traces.insert(key, frames);
+        }
+    });
+}
+
+/// Drop a pinned finalizing entry after the warning that needed it has
+/// been formatted (or abandoned).
+pub fn unpin_object_traceback(key: usize) {
+    with_state(|s| {
+        s.finalizing_traces.remove(&key);
+    });
 }
 
 /// C-API `PyTraceMalloc_Untrack`: forget a tracked block. Returns `false`
@@ -165,6 +245,10 @@ pub fn build(_cache: &crate::import::ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("take_snapshot")),
             builtin("take_snapshot", t_take_snapshot),
         );
+        d.insert(
+            DictKey(Object::from_static("get_object_traceback")),
+            builtin("get_object_traceback", t_get_object_traceback),
+        );
         // Real filter constructors: pandas' hashtable tests build
         // ``DomainFilter(True, KHASH_TRACE_DOMAIN)`` and pass it to
         // ``Snapshot.filter_traces`` to isolate khash C allocations.
@@ -222,10 +306,46 @@ fn t_stop(_args: &[Object]) -> Result<Object, RuntimeError> {
         s.enabled = false;
         s.allocations.clear();
         s.domain_blocks.clear();
+        s.object_traces.clear();
+        s.finalizing_traces.clear();
         s.current = 0;
         s.peak = 0;
     });
     Ok(Object::None)
+}
+
+/// `get_object_traceback(obj)`: the allocation traceback recorded for
+/// `obj`, or `None`. Accepts either the live object (a file) or the
+/// integer address token a dealloc `ResourceWarning` carries as its
+/// `source` (the object is already gone by the time the warning is
+/// formatted — see `Interpreter::warn_resource_with_source`).
+fn t_get_object_traceback(args: &[Object]) -> Result<Object, RuntimeError> {
+    if !with_state(|s| s.enabled) {
+        return Ok(Object::None);
+    }
+    let key = match args.first() {
+        Some(Object::File(rc)) => Rc::as_ptr(rc) as usize,
+        Some(Object::Int(k)) if *k > 0 => *k as usize,
+        _ => return Ok(Object::None),
+    };
+    let Some(frames) = object_traceback_for(key) else {
+        return Ok(Object::None);
+    };
+    // Frame-shaped namespaces (`.filename` / `.lineno`), oldest first —
+    // the surface `warnings._formatwarnmsg` iterates.
+    let items: Vec<Object> = frames
+        .into_iter()
+        .map(|(filename, lineno)| {
+            let mut d = DictData::default();
+            d.insert(
+                DictKey(Object::from_static("filename")),
+                Object::from_str(filename),
+            );
+            d.insert(DictKey(Object::from_static("lineno")), Object::Int(lineno));
+            Object::SimpleNamespace(Rc::new(RefCell::new(d)))
+        })
+        .collect();
+    Ok(Object::new_list(items))
 }
 
 fn t_is_tracing(_args: &[Object]) -> Result<Object, RuntimeError> {

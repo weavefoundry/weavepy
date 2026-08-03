@@ -112,6 +112,7 @@ extern "C" {
         fmt: *const core::ffi::c_char,
         va: *mut core::ffi::c_void,
     ) -> *mut crate::object::PyObject;
+    fn PyErr_FormatUnraisable(fmt: *const core::ffi::c_char, ...);
     fn PyObject_CallFunction(
         callable: *mut crate::object::PyObject,
         fmt: *const core::ffi::c_char,
@@ -518,6 +519,7 @@ static FORCE_LINK: &[FnPtr] = &[
     addr!(slice::PySlice_GetIndicesEx),
     addr!(slice::PySlice_GetIndices),
     // lifecycle.rs
+    addr_static!(mut lifecycle::Py_OptimizeFlag),
     addr!(lifecycle::Py_Initialize),
     addr!(lifecycle::Py_InitializeEx),
     addr!(lifecycle::Py_Finalize),
@@ -579,6 +581,47 @@ static FORCE_LINK: &[FnPtr] = &[
     addr!(PyUnicode_FromFormatV),
     addr!(PyErr_Format),
     addr!(PyErr_FormatV),
+    addr!(PyErr_FormatUnraisable),
+    // abi313.rs — the wave-2 binary-wheel symbol burn (RFC 0056 WS5).
+    addr!(crate::abi313::_Py_IncRef),
+    addr!(crate::abi313::_Py_DecRef),
+    addr!(crate::abi313::Py_IsFinalizing),
+    addr!(crate::abi313::Py_GetConstant),
+    addr!(crate::abi313::Py_GetConstantBorrowed),
+    addr!(crate::abi313::Py_ReprEnter),
+    addr!(crate::abi313::Py_ReprLeave),
+    addr!(crate::abi313::PyException_GetCause),
+    addr!(crate::abi313::PyUnicodeDecodeError_Create),
+    addr!(crate::abi313::PyTraceBack_Print),
+    addr!(crate::abi313::PyGILState_GetThisThreadState),
+    addr!(crate::abi313::PyInterpreterState_Get),
+    addr!(crate::abi313::PyInterpreterState_GetDict),
+    addr!(crate::abi313::PyThreadState_GetDict),
+    addr!(crate::abi313::PyThreadState_Clear),
+    addr!(crate::abi313::PyThreadState_Delete),
+    addr!(crate::abi313::PyType_GetDict),
+    addr!(crate::abi313::PyType_GetModuleName),
+    addr!(crate::abi313::PyType_GetModuleByDef),
+    addr!(crate::abi313::PyWeakref_NewRef),
+    addr!(crate::abi313::PyWeakref_GetRef),
+    addr!(crate::abi313::_PyObject_MakeTpCall),
+    addr!(crate::abi313::_Py_CheckFunctionResult),
+    addr!(crate::abi313::PyLong_AsNativeBytes),
+    addr!(crate::abi313::PyLong_FromNativeBytes),
+    addr!(crate::abi313::_PyBytes_Resize),
+    addr!(crate::abi313::_PyDict_SetItem_KnownHash_LockHeld),
+    addr!(crate::abi313::PyUnicode_FromObject),
+    addr!(crate::abi313::PyUnicode_DecodeUTF8Stateful),
+    addr!(crate::abi313::_PyUnicodeWriter_Init),
+    addr!(crate::abi313::_PyUnicodeWriter_PrepareInternal),
+    addr!(crate::abi313::_PyUnicodeWriter_WriteChar),
+    addr!(crate::abi313::_PyUnicodeWriter_WriteStr),
+    addr!(crate::abi313::_PyUnicodeWriter_Finish),
+    addr!(crate::abi313::_PyUnicodeWriter_Dealloc),
+    addr!(crate::module::PyModule_FromDefAndSpec2),
+    addr!(crate::module::PyModule_ExecDef),
+    addr!(crate::module::PyModule_GetNameObject),
+    addr!(crate::module::PyModule_Add),
     addr!(PyObject_CallFunction),
     addr!(PyObject_CallMethod),
     addr!(PyObject_CallMethodObjArgs),
@@ -590,6 +633,8 @@ static FORCE_LINK: &[FnPtr] = &[
     // extensions). Reference the address of each one so the linker
     // emits them into the dynamic symbol table.
     //
+    // abi313.rs (data)
+    addr_static!(mut crate::abi313::Py_FileSystemDefaultEncoding),
     // singletons.rs
     addr_static!(singletons::_Py_NoneStruct),
     addr_static!(singletons::_Py_TrueStruct),
@@ -623,6 +668,7 @@ static FORCE_LINK: &[FnPtr] = &[
     addr_static!(dt::PyDateTimeAPI_Instance),
     // errors.rs (PyExc_* exception type slots).
     addr_static!(mut errors::PyExc_BaseException),
+    addr_static!(mut errors::PyExc_BaseExceptionGroup),
     addr_static!(mut errors::PyExc_Exception),
     addr_static!(mut errors::PyExc_ArithmeticError),
     addr_static!(mut errors::PyExc_AssertionError),
@@ -1023,6 +1069,10 @@ static FORCE_LINK: &[FnPtr] = &[
     addr!(numbers::_PyFloat_Pack8),
     addr!(numbers::_PyFloat_Unpack4),
     addr!(numbers::_PyFloat_Unpack8),
+    addr!(numbers::PyFloat_Pack4),
+    addr!(numbers::PyFloat_Pack8),
+    addr!(numbers::PyFloat_Unpack4),
+    addr!(numbers::PyFloat_Unpack8),
     addr!(numbers::_PyLong_AsByteArray),
     addr!(numbers::_PyLong_FromByteArray),
     // strings — bytes/bytearray/unicode codecs + helpers.

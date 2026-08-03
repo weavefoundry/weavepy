@@ -116,9 +116,36 @@ pub unsafe extern "C" fn PyType_GenericAlloc(
     // back a real `NAType` instance (not the `Object::None` placeholder).
     // A foreign (un-bridged) extension type keeps the historical `None`.
     let payload_obj = match unsafe { crate::types::bridge_type(ty) } {
-        Some(cls) => Object::Instance(weavepy_vm::sync::Rc::new(
-            weavepy_vm::types::PyInstance::new(cls),
-        )),
+        Some(cls) => {
+            // A builtin-container subclass needs its native payload seeded
+            // at allocation, exactly like the VM's own `instantiate` —
+            // sqlalchemy's `cdef class immutabledict(dict)` allocates
+            // through `dict.tp_new → tp_alloc` (this function) and then
+            // `dict.__init__` demands a real dict payload behind the
+            // instance ("descriptor '__init__' requires a container
+            // instance" otherwise).
+            let bt = weavepy_vm::builtin_types::builtin_types();
+            let native: Option<Object> = if cls.is_subclass_of(&bt.dict_) {
+                Some(Object::Dict(weavepy_vm::sync::Rc::new(
+                    weavepy_vm::sync::RefCell::new(weavepy_vm::object::DictData::default()),
+                )))
+            } else if cls.is_subclass_of(&bt.list_) {
+                Some(Object::List(weavepy_vm::sync::Rc::new(
+                    weavepy_vm::sync::RefCell::new(Vec::new()),
+                )))
+            } else if cls.is_subclass_of(&bt.set_) {
+                Some(Object::Set(weavepy_vm::sync::Rc::new(
+                    weavepy_vm::sync::RefCell::new(weavepy_vm::object::SetData::default()),
+                )))
+            } else {
+                None
+            };
+            let inst = match native {
+                Some(n) => weavepy_vm::types::PyInstance::with_native(cls, n),
+                None => weavepy_vm::types::PyInstance::new(cls),
+            };
+            Object::Instance(weavepy_vm::sync::Rc::new(inst))
+        }
         None => Object::None,
     };
 

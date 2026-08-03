@@ -36,3 +36,76 @@ status = "pass"
 
 [packages.pytest]
 status = "pass"
+
+# --- wave 2 (RFC 0056 WS5) ---------------------------------------------------
+
+[packages.flask]
+status = "pass"
+notes = "route + test-client request/response, session cookie round-trip (werkzeug/itsdangerous/blinker in the chain)."
+
+[packages.sqlalchemy]
+status = "pass"
+notes = "Core table create/insert/select + declarative ORM session over the RFC 0056 WS1 sqlite3."
+
+[packages.httpx]
+status = "pass"
+notes = "sync + async GET against a local http.server (httpcore/anyio/sniffio/h11 chain)."
+
+[packages.urllib3]
+status = "pass"
+
+[packages.pydantic]
+status = "pass"
+notes = "real pydantic-core wheel (PyO3/abi3 surface); validate/dump, field validators, ValidationError shape."
+
+[packages.pyyaml]
+status = "pass"
+notes = "safe_load/safe_dump round-trip incl. anchors; pure-Python leg (wheel carries no _yaml here)."
+
+[packages.msgpack]
+status = "pass"
+
+[packages.rich]
+status = "pass"
+notes = "console render to captured buffer, table + traceback formatting (markdown-it-py/pygments chain)."
+
+[packages.tqdm]
+status = "pass"
+
+[packages.numpy]
+status = "pass"
+notes = "PyPI binary wheel (not source build): dtype arithmetic, broadcasting, linalg.norm, memoryview round-trip."
+
+[packages.markupsafe]
+status = "pass"
+notes = "compiled _speedups leg + escape correctness."
+
+[packages.certifi]
+status = "pass"
+
+[packages.idna]
+status = "pass"
+
+[packages.charset_normalizer]
+status = "pass"
+notes = "mypyc-compiled wheel, exercised directly (previously only transitive via requests)."
+
+# --- wave-2 stretch rows -----------------------------------------------------
+
+[packages.cryptography]
+status = "pass"
+notes = "abi3 Rust wheel (_rust via cffi/PyO3): Fernet round-trip + X.509 parse."
+
+[packages.orjson]
+status = "pass"
+notes = "PyO3 version-specific wheel: dumps/loads round-trip."
+
+[packages.aiohttp]
+status = "pass"
+notes = "C-accelerated multidict/yarl/_http_parser chain over RFC 0054 asyncio; server+client round-trip."
+
+# --- capstone (RFC 0056 WS6) ---------------------------------------------------
+
+[packages.django]
+status = "pass"
+notes = "migrate + ORM CRUD + filter().count() + atomic() rollback + test-client request against the WS1 sqlite3 backend."

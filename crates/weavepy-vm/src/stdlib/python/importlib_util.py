@@ -45,13 +45,18 @@ def cache_from_source(path, debug_override=None, *, optimization=None):
     head, tail = os.path.split(path)
     name, _ = os.path.splitext(tail)
     tag = _cache_tag()
-    # PEP 488: `optimization=''` (or None) is the plain `.pyc`;
-    # anything else is embedded as an alphanumeric `.opt-N` segment.
+    # PEP 488: `optimization=''` (or None at level 0) is the plain
+    # `.pyc`; anything else is embedded as an alphanumeric `.opt-N`
+    # segment. A None optimization defers to the interpreter's own
+    # level (`-O -m compileall` writes `.opt-1` artifacts —
+    # `test_compileall.test_pep3147_paths_optimize`).
     if optimization is None:
         if debug_override is not None:
             optimization = '' if debug_override else 1
         else:
-            optimization = ''
+            optimization = sys.flags.optimize
+            if optimization == 0:
+                optimization = ''
     optimization = str(optimization)
     if optimization:
         if not optimization.isalnum():
@@ -298,6 +303,50 @@ def _is_frozen_name(name):
         return bool(sys._is_frozen(name))
     except (AttributeError, TypeError):
         return False
+
+
+def _find_spec_from_path(name, path=None):
+    """Return the spec for the specified module.
+
+    First, sys.modules is checked to see if the module was already imported.
+    If so, then sys.modules[name].__spec__ is returned. If that happens to be
+    set to None, then ValueError is raised. If the module is not in
+    sys.modules, then sys.meta_path is searched for a suitable spec with the
+    value of 'path' given to the finders. None is returned if no spec could
+    be found.
+
+    Dotted names do not have their parent packages implicitly imported. You
+    will most likely need to explicitly import all parent packages in the
+    proper order for a submodule to get the correct spec.
+
+    Private CPython surface (`importlib/util.py`), but load-bearing for
+    stdlib consumers: `pyclbr._readmodule` resolves every module through it.
+    """
+    if name not in sys.modules:
+        # `_bootstrap._find_spec`: walk sys.meta_path with the raw search
+        # path — no parent-package resolution on this entry point.
+        for finder in sys.meta_path:
+            find_spec_method = getattr(finder, 'find_spec', None)
+            if find_spec_method is None:
+                continue
+            spec = find_spec_method(name, path)
+            if spec is not None:
+                return spec
+        return None
+    module = sys.modules[name]
+    if module is None:
+        return None
+    try:
+        spec = module.__spec__
+    except AttributeError:
+        # CPython raises ValueError('...__spec__ is not set'): its modules
+        # always carry the attribute. WeavePy builds some modules before
+        # the spec machinery is online, so repair with the same
+        # best-effort spec synthesis `find_spec` applies.
+        return find_spec(name)
+    if spec is None:
+        raise ValueError(f'{name}.__spec__ is None')
+    return spec
 
 
 def find_spec(name, package=None):

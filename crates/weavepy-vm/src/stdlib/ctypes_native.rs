@@ -88,8 +88,8 @@ fn code_info(code: char) -> Option<(usize, usize)> {
     Some(match code {
         // signed/unsigned char, bool, char
         'c' | 'b' | 'B' | '?' => (1, 1),
-        // short
-        'h' | 'H' => (size_of::<libc::c_short>(), align_of::<libc::c_short>()),
+        // short (`'v'` is HRESULT-era VARIANT_BOOL: a 16-bit short)
+        'h' | 'H' | 'v' => (size_of::<libc::c_short>(), align_of::<libc::c_short>()),
         // int
         'i' | 'I' => (size_of::<libc::c_int>(), align_of::<libc::c_int>()),
         // long
@@ -352,6 +352,20 @@ fn b_dlopen(args: &[Object]) -> Result<Object, RuntimeError> {
                 LoadLibraryA(cname.as_ptr())
             }
         }
+        // CPython accepts a bytes path and hands it to dlopen() verbatim
+        // (no decoding) — test_dlerror exercises undecodable names.
+        Object::Bytes(b) => {
+            let cname = CString::new(b.to_vec())
+                .map_err(|_| value_error("dlopen: embedded NUL in name"))?;
+            #[cfg(unix)]
+            unsafe {
+                libc::dlopen(cname.as_ptr(), mode)
+            }
+            #[cfg(windows)]
+            unsafe {
+                LoadLibraryA(cname.as_ptr())
+            }
+        }
         other => {
             return Err(type_error(format!(
                 "dlopen: name must be str or None (got '{}')",
@@ -381,9 +395,12 @@ fn b_dlsym(args: &[Object]) -> Result<Object, RuntimeError> {
     #[cfg(windows)]
     let sym = unsafe { GetProcAddress(handle as *mut c_void, cname.as_ptr()) };
     if sym.is_null() {
-        if let Some(err) = last_dlerror() {
-            return Err(value_error(format!("{name}: symbol not found: {err}")));
-        }
+        // CPython's `_ctypes.dlsym` raises OSError carrying the dlerror()
+        // text (callers map it: CDLL attribute -> AttributeError, in_dll ->
+        // ValueError). A NULL result with no pending dlerror (GNU IFUNC
+        // resolving to NULL) is still an error since gh-126554.
+        let msg = last_dlerror().unwrap_or_else(|| format!("symbol {name:?} not found"));
+        return Err(os_error(msg));
     }
     Ok(addr_obj(sym as usize))
 }
@@ -456,6 +473,106 @@ pub(super) fn ctypes_errno_replace(new: i32) -> i32 {
 }
 
 // ----------------------------------------------------------------
+// PEP 3118 view configuration (_ctypes `PyCData_NewGetBuffer`)
+// ----------------------------------------------------------------
+
+/// `configure_view(mv, format, itemsize, shape_or_none)` — stamp the PEP
+/// 3118 metadata computed by the frozen `_ctypes.py` onto a freshly
+/// exported memoryview. `shape_or_none` is `None` for a 0-dimensional
+/// (scalar) export, or a sequence of dimension extents for arrays.
+fn b_configure_view(args: &[Object]) -> Result<Object, RuntimeError> {
+    let Object::MemoryView(mv) = arg(args, 0)? else {
+        return Err(type_error("configure_view: expected memoryview"));
+    };
+    let fmt = arg_str(args, 1)?;
+    let itemsize = arg_usize(args, 2)?;
+    *mv.format.borrow_mut() = fmt;
+    mv.itemsize.set(itemsize);
+    mv.strides.borrow_mut().clear();
+    match arg(args, 3)? {
+        Object::None => {
+            mv.zero_dim.set(true);
+            mv.shape.borrow_mut().clear();
+        }
+        Object::Tuple(dims) => {
+            let mut shape = Vec::with_capacity(dims.len());
+            for d in dims.iter() {
+                shape.push(d.as_usize().ok_or_else(|| {
+                    type_error("configure_view: shape entries must be non-negative ints")
+                })?);
+            }
+            mv.zero_dim.set(false);
+            *mv.shape.borrow_mut() = shape;
+        }
+        other => {
+            return Err(type_error(format!(
+                "configure_view: shape must be tuple or None (got '{}')",
+                other.type_name()
+            )))
+        }
+    }
+    Ok(Object::None)
+}
+
+// ----------------------------------------------------------------
+// Unraisable-exception reporting (callbacks.c `_PyErr_WriteUnraisableMsg`)
+// ----------------------------------------------------------------
+
+/// `unraisable(exc, err_msg)` — route an exception instance through the
+/// interpreter's `sys.unraisablehook` machinery with an explicit message.
+/// The frozen `_ctypes.py` calls this from the closure trampoline when a
+/// user callback raises (the exception cannot propagate into C).
+pub(super) fn b_unraisable(args: &[Object]) -> Result<Object, RuntimeError> {
+    let exc = arg(args, 0)?.clone();
+    let msg = arg_str(args, 1)?;
+    if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+        // SAFETY: published by an enclosing VM frame still live on this
+        // thread; the GIL keeps the access exclusive.
+        let interp = unsafe { &mut *ptr };
+        let err = RuntimeError::PyException(crate::error::PyException::new(exc));
+        interp.write_unraisable_msg(&err, &Object::None, &msg, Some(&msg));
+    }
+    Ok(Object::None)
+}
+
+// ----------------------------------------------------------------
+// macOS dyld shared cache probe (_ctypes/callproc.c)
+// ----------------------------------------------------------------
+
+/// `dyld_shared_cache_contains_path(path)` — true when `path` names a
+/// dylib baked into the macOS dyld shared cache (such libraries have no
+/// on-disk file, so `os.path.exists` cannot find them).
+#[cfg(target_os = "macos")]
+pub(super) fn b_dyld_shared_cache_contains_path(args: &[Object]) -> Result<Object, RuntimeError> {
+    let path = arg_str(args, 0)?;
+    // Resolved lazily via dlsym: the symbol exists on macOS 11+ only.
+    type ProbeFn = unsafe extern "C" fn(*const c_char) -> bool;
+    static PROBE: std::sync::OnceLock<Option<ProbeFn>> = std::sync::OnceLock::new();
+    let probe = PROBE.get_or_init(|| {
+        let name = CString::new("_dyld_shared_cache_contains_path").unwrap();
+        let sym = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+        if sym.is_null() {
+            None
+        } else {
+            Some(unsafe { std::mem::transmute::<*mut c_void, ProbeFn>(sym) })
+        }
+    });
+    match probe {
+        Some(f) => {
+            let c_path =
+                CString::new(path).map_err(|_| value_error("embedded null byte".to_owned()))?;
+            Ok(Object::Bool(unsafe { f(c_path.as_ptr()) }))
+        }
+        None => Err(RuntimeError::PyException(
+            crate::error::PyException::from_builtin(
+                "NotImplementedError",
+                "_dyld_shared_cache_contains_path symbol is missing",
+            ),
+        )),
+    }
+}
+
+// ----------------------------------------------------------------
 // Registration
 // ----------------------------------------------------------------
 
@@ -509,6 +626,14 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         register(&mut d, "dlerror", b_dlerror);
         register(&mut d, "get_errno", b_get_errno);
         register(&mut d, "set_errno", b_set_errno);
+        register(&mut d, "unraisable", b_unraisable);
+        register(&mut d, "configure_view", b_configure_view);
+        #[cfg(target_os = "macos")]
+        register(
+            &mut d,
+            "dyld_shared_cache_contains_path",
+            b_dyld_shared_cache_contains_path,
+        );
         // FFI bridge (libffi) — defined in the `ffi` submodule. All three
         // are positional (the frozen `_ctypes.py` calls them positionally).
         register(&mut d, "call_function", ffi::b_call_function);

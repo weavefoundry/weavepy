@@ -758,8 +758,8 @@ pub unsafe extern "C" fn PyDict_SetItem(
     if d.is_null() || k.is_null() || v.is_null() {
         return -1;
     }
-    match unsafe { crate::object::clone_object(d) } {
-        Object::Dict(rc) => {
+    match as_dict_rc(&unsafe { crate::object::clone_object(d) }) {
+        Some(rc) => {
             let key = unsafe { crate::object::clone_object(k) };
             let val = unsafe { crate::object::clone_object(v) };
             let key_id = dict_key_id(&key);
@@ -780,7 +780,7 @@ pub unsafe extern "C" fn PyDict_SetItem(
             unsafe { crate::mirror::sync_dict_ma_used(d) };
             0
         }
-        _ => {
+        None => {
             crate::errors::set_type_error("expected dict");
             -1
         }
@@ -797,16 +797,17 @@ pub unsafe extern "C" fn PyDict_SetItemString(
         return -1;
     }
     let key = unsafe { CStr::from_ptr(k) }.to_string_lossy().into_owned();
-    match unsafe { crate::object::clone_object(d) } {
-        Object::Dict(rc) => {
-            let val = unsafe { crate::object::clone_object(v) };
-            let key_id = dict_key_id(&Object::from_str(key.clone()));
-            rc.borrow_mut()
-                .insert(DictKey(Object::from_str(key)), val.clone());
-            dict_retain_value(d, key_id, v, val);
-            unsafe { crate::mirror::sync_dict_ma_used(d) };
-            0
-        }
+    let obj = unsafe { crate::object::clone_object(d) };
+    if let Some(rc) = as_dict_rc(&obj) {
+        let val = unsafe { crate::object::clone_object(v) };
+        let key_id = dict_key_id(&Object::from_str(key.clone()));
+        rc.borrow_mut()
+            .insert(DictKey(Object::from_str(key)), val.clone());
+        dict_retain_value(d, key_id, v, val);
+        unsafe { crate::mirror::sync_dict_ma_used(d) };
+        return 0;
+    }
+    match obj {
         Object::Module(m) => {
             // Convenience: PyDict_SetItemString on a module's dict
             // is a common idiom.
@@ -1184,12 +1185,15 @@ pub unsafe extern "C" fn PyDict_Copy(d: *mut PyObject) -> *mut PyObject {
     if d.is_null() {
         return ptr::null_mut();
     }
-    match unsafe { crate::object::clone_object(d) } {
-        Object::Dict(rc) => {
+    match as_dict_rc(&unsafe { crate::object::clone_object(d) }) {
+        Some(rc) => {
             let new_d: DictData = rc.borrow().clone();
             crate::object::into_owned(Object::Dict(Rc::new(RefCell::new(new_d))))
         }
-        _ => ptr::null_mut(),
+        None => {
+            crate::errors::set_type_error("expected dict");
+            ptr::null_mut()
+        }
     }
 }
 
@@ -1207,13 +1211,19 @@ pub unsafe extern "C" fn PyDict_Merge(
     if a.is_null() || b.is_null() {
         return -1;
     }
-    let dst = match unsafe { crate::object::clone_object(a) } {
-        Object::Dict(rc) => rc,
-        _ => return -1,
+    let dst = match as_dict_rc(&unsafe { crate::object::clone_object(a) }) {
+        Some(rc) => rc,
+        None => {
+            crate::errors::set_type_error("expected dict");
+            return -1;
+        }
     };
-    let src_dict = match unsafe { crate::object::clone_object(b) } {
-        Object::Dict(rc) => rc,
-        _ => return -1,
+    let src_dict = match as_dict_rc(&unsafe { crate::object::clone_object(b) }) {
+        Some(rc) => rc,
+        None => {
+            crate::errors::set_type_error("expected dict");
+            return -1;
+        }
     };
     let src_snapshot = src_dict.borrow().clone();
     {
@@ -1233,13 +1243,13 @@ pub unsafe extern "C" fn PyDict_Clear(d: *mut PyObject) -> c_int {
     if d.is_null() {
         return -1;
     }
-    match unsafe { crate::object::clone_object(d) } {
-        Object::Dict(rc) => {
+    match as_dict_rc(&unsafe { crate::object::clone_object(d) }) {
+        Some(rc) => {
             rc.borrow_mut().clear();
             unsafe { crate::mirror::sync_dict_ma_used(d) };
             0
         }
-        _ => -1,
+        None => -1,
     }
 }
 
@@ -1319,18 +1329,34 @@ fn seed_set(data: &mut SetData, iterable: *mut PyObject) {
     }
 }
 
+/// The concrete set payload behind `o`: a plain `set`, or the native
+/// payload of a **set-subclass instance**. CPython's concrete `PySet_*`
+/// API operates on subclasses too (the instance *is* a `PySetObject`) —
+/// sqlalchemy's Cython `OrderedSet(set)` calls `PySet_Add(self, …)`.
+fn as_set_rc(o: &Object) -> Option<Rc<RefCell<SetData>>> {
+    match o {
+        Object::Set(rc) => Some(rc.clone()),
+        Object::Instance(inst) => match inst.native.get() {
+            Some(Object::Set(rc)) => Some(rc.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn PySet_Add(s: *mut PyObject, item: *mut PyObject) -> c_int {
     if s.is_null() || item.is_null() {
         return -1;
     }
-    match unsafe { crate::object::clone_object(s) } {
-        Object::Set(rc) => {
-            rc.borrow_mut()
-                .insert(DictKey(unsafe { crate::object::clone_object(item) }));
-            unsafe { crate::mirror::sync_set_used(s) };
-            0
-        }
+    let obj = unsafe { crate::object::clone_object(s) };
+    if let Some(rc) = as_set_rc(&obj) {
+        rc.borrow_mut()
+            .insert(DictKey(unsafe { crate::object::clone_object(item) }));
+        unsafe { crate::mirror::sync_set_used(s) };
+        return 0;
+    }
+    match obj {
         // CPython's `PySet_Add` explicitly accepts a *frozenset* too — the
         // documented "fill it before it's exposed" idiom. mypyc's
         // `CPyStatics_Initialize` builds every frozenset literal with
@@ -1363,11 +1389,14 @@ pub unsafe extern "C" fn PySet_Contains(s: *mut PyObject, item: *mut PyObject) -
     if s.is_null() || item.is_null() {
         return -1;
     }
-    match unsafe { crate::object::clone_object(s) } {
-        Object::Set(rc) => i32::from(
+    let obj = unsafe { crate::object::clone_object(s) };
+    if let Some(rc) = as_set_rc(&obj) {
+        return i32::from(
             rc.borrow()
                 .contains(&DictKey(unsafe { crate::object::clone_object(item) })),
-        ),
+        );
+    }
+    match obj {
         Object::FrozenSet(s) => {
             i32::from(s.contains(&DictKey(unsafe { crate::object::clone_object(item) })))
         }
@@ -1380,14 +1409,14 @@ pub unsafe extern "C" fn PySet_Discard(s: *mut PyObject, item: *mut PyObject) ->
     if s.is_null() || item.is_null() {
         return -1;
     }
-    match unsafe { crate::object::clone_object(s) } {
-        Object::Set(rc) => {
+    match as_set_rc(&unsafe { crate::object::clone_object(s) }) {
+        Some(rc) => {
             rc.borrow_mut()
                 .shift_remove(&DictKey(unsafe { crate::object::clone_object(item) }));
             unsafe { crate::mirror::sync_set_used(s) };
             0
         }
-        _ => -1,
+        None => -1,
     }
 }
 
@@ -1396,8 +1425,11 @@ pub unsafe extern "C" fn PySet_Size(s: *mut PyObject) -> PySsizeT {
     if s.is_null() {
         return -1;
     }
-    match unsafe { crate::object::clone_object(s) } {
-        Object::Set(rc) => rc.borrow().len() as PySsizeT,
+    let obj = unsafe { crate::object::clone_object(s) };
+    if let Some(rc) = as_set_rc(&obj) {
+        return rc.borrow().len() as PySsizeT;
+    }
+    match obj {
         Object::FrozenSet(s) => s.len() as PySsizeT,
         _ => -1,
     }
@@ -1719,8 +1751,8 @@ pub unsafe extern "C" fn PySet_Pop(s: *mut PyObject) -> *mut PyObject {
     if s.is_null() {
         return ptr::null_mut();
     }
-    match unsafe { crate::object::clone_object(s) } {
-        Object::Set(rc) => {
+    match as_set_rc(&unsafe { crate::object::clone_object(s) }) {
+        Some(rc) => {
             let mut set = rc.borrow_mut();
             let first = set.iter().next().cloned();
             match first {
@@ -1739,7 +1771,7 @@ pub unsafe extern "C" fn PySet_Pop(s: *mut PyObject) -> *mut PyObject {
                 }
             }
         }
-        _ => ptr::null_mut(),
+        None => ptr::null_mut(),
     }
 }
 
@@ -1748,13 +1780,13 @@ pub unsafe extern "C" fn PySet_Clear(s: *mut PyObject) -> c_int {
     if s.is_null() {
         return -1;
     }
-    match unsafe { crate::object::clone_object(s) } {
-        Object::Set(rc) => {
+    match as_set_rc(&unsafe { crate::object::clone_object(s) }) {
+        Some(rc) => {
             rc.borrow_mut().clear();
             unsafe { crate::mirror::sync_set_used(s) };
             0
         }
-        _ => -1,
+        None => -1,
     }
 }
 

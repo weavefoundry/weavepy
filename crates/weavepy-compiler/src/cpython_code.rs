@@ -651,8 +651,12 @@ fn push_loc_svarint(out: &mut Vec<u8>, val: i32, first_mask: u8) {
     push_loc_varint(out, zig, first_mask);
 }
 
-/// Encode the PEP 626 location table using the "no-column" entry form
-/// (`code = 13`): line-accurate, columns reported as `None`.
+/// Encode the PEP 626/657 location table. Instructions with tracked
+/// column spans use the "long" entry form (`code = 14`), preserving
+/// PEP 657 fine-grained positions across the marshal round-trip
+/// (traceback caret underlines from `.pyc`-loaded modules — doctest's
+/// error-report tests compare them textually). Instructions without
+/// columns keep the "no-column" form (`code = 13`).
 fn encode_linetable(
     code: &CodeObject,
     ext: &[usize],
@@ -660,6 +664,7 @@ fn encode_linetable(
     firstlineno: u32,
 ) -> Vec<u8> {
     const CODE_NO_COLUMNS: u8 = 13;
+    const CODE_LONG: u8 = 14;
     const CODE_NO_LOCATION: u8 = 15;
     let mut out = Vec::new();
     let mut prev_line = firstlineno as i32;
@@ -678,12 +683,27 @@ fn encode_linetable(
             }
             continue;
         }
+        let cs = code.coltable.get(i).copied().unwrap_or_default();
+        let has_cols = cs.col >= 0 && cs.end_col >= 0;
+        let end_line_delta = if cs.end_lineno != 0 {
+            (cs.end_lineno as i32 - line).max(0) as u32
+        } else {
+            0
+        };
         let mut delta = line - prev_line;
         while remaining > 0 {
             let chunk = remaining.min(8);
-            let first = 0x80 | (CODE_NO_COLUMNS << 3) | ((chunk - 1) as u8);
-            out.push(first);
-            push_loc_svarint(&mut out, delta, 0);
+            if has_cols {
+                out.push(0x80 | (CODE_LONG << 3) | ((chunk - 1) as u8));
+                push_loc_svarint(&mut out, delta, 0);
+                push_loc_varint(&mut out, end_line_delta, 0);
+                // Columns are stored +1 so `0` means "None" (locations.md).
+                push_loc_varint(&mut out, (cs.col + 1) as u32, 0);
+                push_loc_varint(&mut out, (cs.end_col + 1) as u32, 0);
+            } else {
+                out.push(0x80 | (CODE_NO_COLUMNS << 3) | ((chunk - 1) as u8));
+                push_loc_svarint(&mut out, delta, 0);
+            }
             // Subsequent chunks of the same instruction repeat the line.
             delta = 0;
             remaining -= chunk;
@@ -911,6 +931,10 @@ pub fn decode(co_code: &[u8], nlocals: u32) -> Option<Vec<Instruction>> {
 pub struct DecodedCode {
     pub instructions: Vec<Instruction>,
     pub linetable: Vec<u32>,
+    /// PEP 657 column spans recovered from long-form location entries;
+    /// same length as `instructions` (default sentinel where the table
+    /// carried no columns).
+    pub coltable: Vec<crate::ColSpan>,
     pub exception_table: Vec<ExcHandler>,
     pub varnames: Vec<String>,
     pub cellvars: Vec<String>,
@@ -944,11 +968,12 @@ pub fn decode_full(
     let nlocals = varnames.len() as u32;
     let raws = decode_raws(co_code);
     let instructions = decode_instructions(&raws, nlocals)?;
-    let linetable = decode_linetable(co_linetable, &raws, firstlineno);
+    let (linetable, coltable) = decode_linetable(co_linetable, &raws, firstlineno);
     let exception_table = decode_exception_table(co_exceptiontable, &raws);
     Some(DecodedCode {
         instructions,
         linetable,
+        coltable,
         exception_table,
         varnames,
         cellvars,
@@ -985,12 +1010,17 @@ fn read_loc_svarint(table: &[u8], pos: &mut usize) -> i32 {
     }
 }
 
-/// Decode the PEP 626 location table into a 1-based source line per
-/// WeavePy instruction. WeavePy only emits the "no-column" entry form
-/// (code 13), but we tolerate the other CPython forms so a table written
-/// by CPython still parses without desync.
-fn decode_linetable(table: &[u8], raws: &[DecodedRaw], firstlineno: u32) -> Vec<u32> {
+/// Decode the PEP 626/657 location table into a 1-based source line (and,
+/// where the entry form carries them, PEP 657 column spans) per WeavePy
+/// instruction. WeavePy emits forms 13 and 14, but we tolerate the other
+/// CPython forms so a table written by CPython still parses without desync.
+fn decode_linetable(
+    table: &[u8],
+    raws: &[DecodedRaw],
+    firstlineno: u32,
+) -> (Vec<u32>, Vec<crate::ColSpan>) {
     let mut unit_lines: Vec<u32> = Vec::new();
+    let mut unit_cols: Vec<crate::ColSpan> = Vec::new();
     let mut pos = 0usize;
     let mut line = firstlineno as i32;
     while pos < table.len() {
@@ -1005,37 +1035,64 @@ fn decode_linetable(table: &[u8], raws: &[DecodedRaw], firstlineno: u32) -> Vec<
             // NONE — no location. Units decode to the 0 sentinel and
             // the running line is unchanged.
             unit_lines.extend(std::iter::repeat_n(0, length));
+            unit_cols.extend(std::iter::repeat_n(crate::ColSpan::default(), length));
             continue;
         }
-        let delta = match code {
-            13 => read_loc_svarint(table, &mut pos), // no columns
+        let (delta, span) = match code {
+            13 => (read_loc_svarint(table, &mut pos), crate::ColSpan::default()),
             14 => {
                 let d = read_loc_svarint(table, &mut pos);
-                let _ = read_loc_varint(table, &mut pos); // end-line delta
-                let _ = read_loc_varint(table, &mut pos); // col
-                let _ = read_loc_varint(table, &mut pos); // end col
-                d
+                let end_line_delta = read_loc_varint(table, &mut pos);
+                // Columns are stored +1; `0` means "None".
+                let col = read_loc_varint(table, &mut pos);
+                let end_col = read_loc_varint(table, &mut pos);
+                let span = crate::ColSpan {
+                    end_lineno: (line + d + end_line_delta as i32).max(0) as u32,
+                    col: col as i32 - 1,
+                    end_col: end_col as i32 - 1,
+                };
+                (d, span)
             }
             10..=12 => {
                 let d = i32::from(code) - 10;
-                let _ = read_loc_varint(table, &mut pos); // col
-                let _ = read_loc_varint(table, &mut pos); // end col
-                d
+                let col = read_loc_varint(table, &mut pos);
+                let end_col = read_loc_varint(table, &mut pos);
+                let span = crate::ColSpan {
+                    end_lineno: (line + d).max(0) as u32,
+                    col: col as i32,
+                    end_col: end_col as i32,
+                };
+                (d, span)
             }
             _ => {
-                // Short forms 0..=9 carry one extra column byte, line delta 0.
+                // Short forms 0..=9: one extra byte packs the columns,
+                // line delta 0 (locations.md "short form").
+                let b = table.get(pos).copied().unwrap_or(0);
                 pos += 1;
-                0
+                let col = (u32::from(code) << 3) | u32::from(b >> 4);
+                let span = crate::ColSpan {
+                    end_lineno: line.max(0) as u32,
+                    col: col as i32,
+                    end_col: (col + u32::from(b & 0x0F)) as i32,
+                };
+                (0, span)
             }
         };
         line += delta;
         for _ in 0..length {
             unit_lines.push(line.max(0) as u32);
+            unit_cols.push(span);
         }
     }
-    raws.iter()
+    let lines = raws
+        .iter()
         .map(|r| unit_lines.get(r.start_unit).copied().unwrap_or(firstlineno))
-        .collect()
+        .collect();
+    let cols = raws
+        .iter()
+        .map(|r| unit_cols.get(r.start_unit).copied().unwrap_or_default())
+        .collect();
+    (lines, cols)
 }
 
 // ---------- exception-table decoder (inverse of `encode_exception_table`) -----

@@ -269,6 +269,7 @@ pub unsafe extern "C" fn PyObject_GC_Del(op: *mut c_void) {
     // `PyObject_GC_Del(self)` is absorbed — the block is reclaimed when
     // the instance is collected, not here.
     if unsafe { crate::mirror::is_instance_body(p) } {
+        crate::instance::note_body_free_consented(p as usize);
         return;
     }
     // A *foreign* object's storage is not ours to reclaim, and both

@@ -267,6 +267,22 @@ fn main() {
                 name: "_stockdatetime",
                 env_var: "WEAVEPY_CAPI_STOCKDATETIME_EXTENSION",
             });
+            // `_abi3check.c` — RFC 0056 WS5: the limited-API (abi3) proof.
+            // The source `#define`s `Py_LIMITED_API 0x030D0000` before
+            // including the stock `Python.h`, so it binds only exported
+            // functions (no inlined macros) — the exact surface a PyO3
+            // `abi3-py313` wheel uses (multiphase init, PyType_FromSpec,
+            // PyObject_Vectorcall, PyGILState_*, PyInterpreterState_Get).
+            build_extension(ExtensionBuild {
+                cc: &cc,
+                include_dir: &stock_inc,
+                out_dir: &out_dir,
+                target_os: &target_os,
+                suffix,
+                src: &workspace_root.join("tests/capi_ext/_abi3check.c"),
+                name: "_abi3check",
+                env_var: "WEAVEPY_CAPI_ABI3CHECK_EXTENSION",
+            });
         }
         None => {
             println!(

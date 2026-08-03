@@ -1,0 +1,10 @@
+[package]
+name = "expat-sys"
+version = "2.6.4"
+edition = "2021"
+license = "MIT"
+description = "Vendored expat 2.6.4 with raw FFI bindings (WeavePy pyexpat backend)"
+links = "expat_weavepy"
+
+[build-dependencies]
+cc = "1"

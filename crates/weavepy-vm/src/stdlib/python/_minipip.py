@@ -187,9 +187,13 @@ def _wheel_version(filename):
 
 def _version_key(v):
     """Cheap version sort key: split on `.` / non-numeric chunks and
-    coerce each piece to an int when possible.
+    coerce each piece to an int when possible. Pre-releases (dev/a/b/rc
+    segments) sort *below* every final release so a bare install never
+    picks `1.0.dev3` over `0.28.1` (pip's default, PEP 440).
     """
-    out = []
+    is_pre = bool(re.search(r'(?:^|[.+-])(?:dev|a|b|c|rc|alpha|beta|pre|preview)\d*',
+                            v, re.IGNORECASE))
+    out = [0 if is_pre else 1]
     for chunk in re.split(r'[.+-]', v):
         m = re.match(r'(\d+)', chunk)
         out.append(int(m.group(1)) if m else 0)
@@ -244,13 +248,13 @@ def _compatible_platform_tags():
     platform = sys.platform
     machine = os.uname().machine if hasattr(os, 'uname') else 'x86_64'
     if platform == 'darwin':
-        # Universal2 + arch-specific variants for both x86_64 and
-        # arm64 hosts (macOS 10.9..14 family).
+        # Universal2 plus the *host* arch only (macOS 10.9..15 family) —
+        # a foreign-arch wheel would pass resolution and then dlopen-fail.
+        arch = machine if machine in ('arm64', 'x86_64') else 'x86_64'
         for ver in (10, 11, 12, 13, 14, 15):
             for sub in range(0, 16):
                 tags.append('macosx_%d_%d_universal2' % (ver, sub))
-                tags.append('macosx_%d_%d_x86_64' % (ver, sub))
-                tags.append('macosx_%d_%d_arm64' % (ver, sub))
+                tags.append('macosx_%d_%d_%s' % (ver, sub, arch))
     elif platform.startswith('linux'):
         # manylinux2014 / manylinux_2_xx / linux_<arch>.
         suffix = machine if machine else 'x86_64'
@@ -287,6 +291,16 @@ def _is_compatible_wheel(filename):
     py_ok = any(p in _compatible_python_tags() for p in py_tag.split('.'))
     abi_ok = any(a in _compatible_abi_tags() for a in abi_tag.split('.'))
     plat_ok = any(p in _compatible_platform_tags() for p in plat_tag.split('.'))
+    # PEP 425 stable-ABI backwards series: an abi3 wheel is tagged with
+    # the *oldest* CPython it supports (`cp37-abi3-…` runs on 3.7+), so
+    # the `cp3k`+`abi3` pairing is compatible for any k <= our minor.
+    # Only the pair — `cp37-none-any` stays rejected, matching pip.
+    if not (py_ok and abi_ok) and 'abi3' in abi_tag.split('.'):
+        minor = sys.version_info[1]
+        for p in py_tag.split('.'):
+            if p.startswith('cp3') and p[3:].isdigit() and int(p[3:]) <= minor:
+                py_ok = abi_ok = True
+                break
     return py_ok and abi_ok and plat_ok
 
 

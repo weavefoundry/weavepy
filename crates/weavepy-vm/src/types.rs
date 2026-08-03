@@ -857,6 +857,14 @@ impl TypeObject {
             let mro = self.mro.borrow();
             for ty in mro.iter() {
                 if let Some(v) = ty.dict.borrow().get(&key).cloned() {
+                    // Introspection-only entries (RFC 0056 WS4) are
+                    // invisible to dispatch — keep walking as if absent.
+                    // Only in *builtin* dicts, where the docs surface pass
+                    // installed them: a user class that aliases one
+                    // (`__str__ = object.__str__`) means it, per CPython.
+                    if ty.flags.is_builtin && crate::descr_registry::is_surface_only(&v) {
+                        continue;
+                    }
                     return Some(v);
                 }
             }
@@ -871,6 +879,9 @@ impl TypeObject {
         let mro: Vec<Rc<TypeObject>> = self.mro.borrow().clone();
         for ty in mro.iter() {
             if let Some(v) = ty.dict.borrow().get(&key).cloned() {
+                if ty.flags.is_builtin && crate::descr_registry::is_surface_only(&v) {
+                    continue;
+                }
                 return Some(v);
             }
         }
@@ -888,6 +899,10 @@ impl TypeObject {
             let mro = self.mro.borrow();
             for ty in mro.iter() {
                 if let Some(v) = ty.dict.borrow().get(&key).cloned() {
+                    // Builtin-dict-only skip — see `lookup`.
+                    if ty.flags.is_builtin && crate::descr_registry::is_surface_only(&v) {
+                        continue;
+                    }
                     return Some((v, ty.clone()));
                 }
             }
@@ -898,6 +913,9 @@ impl TypeObject {
         let mro: Vec<Rc<TypeObject>> = self.mro.borrow().clone();
         for ty in mro.iter() {
             if let Some(v) = ty.dict.borrow().get(&key).cloned() {
+                if ty.flags.is_builtin && crate::descr_registry::is_surface_only(&v) {
+                    continue;
+                }
                 return Some((v, ty.clone()));
             }
         }

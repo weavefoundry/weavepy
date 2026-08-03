@@ -99,6 +99,12 @@ pub struct BuiltinTypes {
     pub frame_: Rc<TypeObject>,
     pub code_: Rc<TypeObject>,
     pub traceback_: Rc<TypeObject>,
+    /// `types.CellType` — real closure cells (RFC 0056 WS4):
+    /// constructible (`CellType()` / `CellType(v)`), with writable
+    /// `cell_contents` and contents-based rich comparison, so
+    /// `mock.patch` on closures and `@deprecated` retained-reference
+    /// checks work.
+    pub cell_: Rc<TypeObject>,
 
     pub module_: Rc<TypeObject>,
 
@@ -136,6 +142,13 @@ pub struct BuiltinTypes {
     pub keyboard_interrupt: Rc<TypeObject>,
     pub system_exit: Rc<TypeObject>,
     pub recursion_error: Rc<TypeObject>,
+    /// 3.13 (gh-114570): raised when an operation is attempted during
+    /// interpreter finalization (e.g. `_thread.start_new_thread` after
+    /// shutdown began).
+    pub python_finalization_error: Rc<TypeObject>,
+    /// 3.13: `SyntaxError` subclass the `codeop`/REPL machinery raises
+    /// for source that is syntactically incomplete rather than wrong.
+    pub incomplete_input_error: Rc<TypeObject>,
 
     // RFC 0017 — OSError sub-hierarchy used by the new socket /
     // subprocess / filesystem surface. Mirrors CPython's PEP 3151
@@ -468,6 +481,7 @@ impl BuiltinTypes {
         let frame_ = mk("frame", vec![object_.clone()]);
         let code_ = mk("code", vec![object_.clone()]);
         let traceback_ = mk("traceback", vec![object_.clone()]);
+        let cell_ = mk("cell", vec![object_.clone()]);
         let module_ = mk("module", vec![object_.clone()]);
         install_module_init(&module_);
 
@@ -529,6 +543,7 @@ impl BuiltinTypes {
         let runtime_error = exc("RuntimeError", exception.clone());
         let not_implemented_error = exc("NotImplementedError", runtime_error.clone());
         let recursion_error = exc("RecursionError", runtime_error.clone());
+        let python_finalization_error = exc("PythonFinalizationError", runtime_error.clone());
         let overflow_error = exc("OverflowError", arithmetic_error.clone());
         let floating_point_error = exc("FloatingPointError", arithmetic_error.clone());
         let zero_division_error = exc("ZeroDivisionError", arithmetic_error.clone());
@@ -543,6 +558,7 @@ impl BuiltinTypes {
         // `" (<basename>, line N)"`. Install both so the type behaves as a
         // drop-in whether constructed from Python or raised from Rust.
         install_syntax_error_dunders(&syntax_error);
+        let incomplete_input_error = exc("_IncompleteInputError", syntax_error.clone());
         let indentation_error = exc("IndentationError", syntax_error.clone());
         let tab_error = exc("TabError", indentation_error.clone());
         // `TimeoutError` lands here so `asyncio.wait_for` raises a
@@ -681,6 +697,7 @@ impl BuiltinTypes {
             frame_,
             code_,
             traceback_,
+            cell_,
             module_,
             base_exception,
             exception,
@@ -716,6 +733,8 @@ impl BuiltinTypes {
             keyboard_interrupt,
             system_exit,
             recursion_error,
+            python_finalization_error,
+            incomplete_input_error,
             blocking_io_error,
             broken_pipe_error,
             child_process_error,
@@ -858,6 +877,8 @@ impl BuiltinTypes {
             pair!(keyboard_interrupt, "KeyboardInterrupt"),
             pair!(system_exit, "SystemExit"),
             pair!(recursion_error, "RecursionError"),
+            pair!(python_finalization_error, "PythonFinalizationError"),
+            pair!(incomplete_input_error, "_IncompleteInputError"),
             pair!(blocking_io_error, "BlockingIOError"),
             pair!(broken_pipe_error, "BrokenPipeError"),
             pair!(child_process_error, "ChildProcessError"),
@@ -959,6 +980,8 @@ impl BuiltinTypes {
             "KeyboardInterrupt" => Some(self.keyboard_interrupt.clone()),
             "SystemExit" => Some(self.system_exit.clone()),
             "RecursionError" => Some(self.recursion_error.clone()),
+            "PythonFinalizationError" => Some(self.python_finalization_error.clone()),
+            "_IncompleteInputError" => Some(self.incomplete_input_error.clone()),
             "BlockingIOError" => Some(self.blocking_io_error.clone()),
             "BrokenPipeError" => Some(self.broken_pipe_error.clone()),
             "ChildProcessError" => Some(self.child_process_error.clone()),
@@ -1031,12 +1054,22 @@ pub fn property_class() -> Rc<TypeObject> {
 }
 
 pub fn builtin_types() -> Rc<BuiltinTypes> {
-    BUILTIN_TYPES.with(|cell| {
+    let (bt, fresh) = BUILTIN_TYPES.with(|cell| {
         if cell.borrow().is_none() {
-            *cell.borrow_mut() = Some(Rc::new(BuiltinTypes::build()));
+            let bt = Rc::new(BuiltinTypes::build());
+            *cell.borrow_mut() = Some(bt.clone());
+            (bt, true)
+        } else {
+            (cell.borrow().as_ref().unwrap().clone(), false)
         }
-        cell.borrow().as_ref().unwrap().clone()
-    })
+    });
+    if fresh {
+        // Deferred surface pass (RFC 0056 WS4): synthesizing descriptor-
+        // type members re-enters `builtin_types()`, which must resolve to
+        // the just-published cell rather than recursively rebuild.
+        crate::type_surface::install_docs_table_surface(&bt);
+    }
+    bt
 }
 
 /// Resolve `__objclass__` for a built-in method/slot-wrapper object by
@@ -1571,11 +1604,16 @@ pub(crate) fn overrides_dunder_new(cls: &Rc<TypeObject>) -> bool {
 /// Does `cls` (or a non-`object` base) define a *user* `__init__`?
 pub(crate) fn overrides_dunder_init(cls: &Rc<TypeObject>) -> bool {
     for ty in cls.mro.borrow().iter() {
-        if ty
+        if let Some(init) = ty
             .dict
             .borrow()
-            .contains_key(&DictKey(Object::from_static("__init__")))
+            .get(&DictKey(Object::from_static("__init__")))
         {
+            // Surface-only default-`__init__` mirrors (RFC 0056 WS4)
+            // are not overrides.
+            if crate::descr_registry::is_surface_only(init) {
+                continue;
+            }
             return ty.name != "object";
         }
     }
@@ -1612,7 +1650,7 @@ fn make_default_new() -> Object {
                         t.dict
                             .borrow()
                             .get(&DictKey(Object::from_static("__init__")))
-                            .is_some()
+                            .is_some_and(|init| !crate::descr_registry::is_surface_only(init))
                     }),
                 _ => false,
             };
@@ -1967,6 +2005,13 @@ fn install_module_init(module_: &Rc<TypeObject>) {
 fn install_object_dunders(object_: &Rc<TypeObject>) {
     use crate::object::BuiltinFn;
     fn object_init(args: &[Object]) -> Result<Object, RuntimeError> {
+        // Unbound use (`object.__init__()`) still needs the instance —
+        // CPython's method descriptor rejects the empty call.
+        if args.is_empty() {
+            return Err(crate::error::type_error(
+                "descriptor '__init__' of 'object' object needs an argument".to_owned(),
+            ));
+        }
         // CPython `object_init` arity policy (bpo-31506): excess
         // arguments are an error unless `__new__` is overridden while
         // `__init__` is not (then `__new__` owns the signature and the
@@ -2104,13 +2149,19 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
         }
     }
     fn object_hash(args: &[Object]) -> Result<Object, RuntimeError> {
-        // Default `object.__hash__`: the same canonical hash the `hash()`
-        // builtin falls back to when no custom `__hash__` is defined, so
-        // `object.__hash__(x) == hash(x)` for any object using the default.
+        // CPython's `object.__hash__` is a wrapper around the *default*
+        // identity-hash slot: calling it explicitly never re-dispatches a
+        // subclass override and never unwraps a value subclass. mock relies
+        // on this — `MagicMock`'s `__hash__` return value is computed as
+        // `object.__hash__(self)`, and re-dispatching would invoke the
+        // `MagicProxy` child mock and record a phantom `call()`
+        // (testmagicmethods.test_magic_mock_does_not_reset_magic_returns).
+        // `hash(x)` (which does honour overrides) stays on
+        // `builtins::hash_object`.
         let obj = args.first().ok_or_else(|| {
             crate::error::type_error("object.__hash__() takes exactly 1 argument")
         })?;
-        crate::builtins::hash_object(obj)
+        Ok(Object::Int(crate::object::identity_hash(obj)))
     }
     let mut dict = object_.dict.borrow_mut();
     dict.insert(
@@ -3257,13 +3308,23 @@ fn install_syntax_error_dunders(syntax_error: &Rc<TypeObject>) {
                 .unwrap_or(Object::None)
         };
         let msg = get("msg");
-        // CPython renders the message via `str(self.msg)`.
-        let msg_str = match &msg {
-            Object::None => "None".to_owned(),
-            other => other.to_str(),
-        };
         let filename = get("filename");
         let lineno = get("lineno");
+        drop(dict);
+        // CPython renders the message via `str(self.msg)` — for instance
+        // messages (e.g. `ParseError(ExpatError(...))` in ElementTree) that
+        // means the instance's own `__str__`, not its repr.
+        let msg_str = match &msg {
+            Object::None => "None".to_owned(),
+            inst @ Object::Instance(_) => {
+                match crate::vm_singletons::current_interpreter_ptr() {
+                    // SAFETY: published by an enclosing VM frame on this thread.
+                    Some(ptr) => unsafe { &mut *ptr }.str_object(inst)?,
+                    None => inst.to_str(),
+                }
+            }
+            other => other.to_str(),
+        };
         let have_filename = matches!(filename, Object::Str(_));
         let lineno_val = match &lineno {
             Object::Int(n) => Some(*n),
@@ -3316,12 +3377,12 @@ fn syntax_basename(filename: &Object) -> String {
     s[cut..].to_owned()
 }
 
-fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
-    use crate::object::BuiltinFn;
-    fn exc_init(args: &[Object]) -> Result<Object, RuntimeError> {
-        // CPython's BaseException.__init__(self, *args) stores `args`
-        // on the instance so every subclass — built-in or user-defined
-        // — exposes `e.args` automatically.
+/// CPython's `BaseException.__init__(self, *args)` — stores `args`
+/// on the instance so every subclass — built-in or user-defined
+/// — exposes `e.args` automatically. Module-scope so the docs surface
+/// pass (RFC 0056 WS4) can mint per-exception-type mirrors of it.
+fn exc_init(args: &[Object]) -> Result<Object, RuntimeError> {
+    {
         let inst = args
             .first()
             .ok_or_else(|| crate::error::type_error("expected exception instance".to_owned()))?;
@@ -3347,7 +3408,13 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
         }
         Ok(Object::None)
     }
-    fn exc_str(args: &[Object]) -> Result<Object, RuntimeError> {
+}
+
+/// CPython's `BaseException.__str__` — `str(args[0])` for a single
+/// argument, tuple repr for several. Module-scope for the docs surface
+/// pass (see [`exc_init`]).
+fn exc_str(args: &[Object]) -> Result<Object, RuntimeError> {
+    {
         let inst = args
             .first()
             .ok_or_else(|| crate::error::type_error("expected exception instance".to_owned()))?;
@@ -3396,7 +3463,12 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
         }
         Ok(Object::from_static(""))
     }
-    fn exc_repr(args: &[Object]) -> Result<Object, RuntimeError> {
+}
+
+/// CPython's `BaseException.__repr__` — `ClsName(arg_reprs…)`.
+/// Module-scope for the docs surface pass (see [`exc_init`]).
+fn exc_repr(args: &[Object]) -> Result<Object, RuntimeError> {
+    {
         let inst = args
             .first()
             .ok_or_else(|| crate::error::type_error("expected exception instance".to_owned()))?;
@@ -3418,6 +3490,10 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
         }
         Ok(Object::from_static(""))
     }
+}
+
+fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
+    use crate::object::BuiltinFn;
     // PEP 678: ``e.add_note("...")`` appends a string note to
     // ``__notes__``. The list is created on the first call and
     // travels with the instance through ``raise`` (we store it on

@@ -390,8 +390,9 @@ PyAPI_FUNC(PyObject *) PyType_FromMetaclass(PyTypeObject *metaclass, PyObject *m
 PyAPI_FUNC(int) PyType_Ready(PyTypeObject *type);
 PyAPI_FUNC(int) PyType_IsSubtype(PyTypeObject *a, PyTypeObject *b);
 PyAPI_FUNC(int) PyObject_TypeCheck(PyObject *o, PyTypeObject *t);
-PyAPI_FUNC(const char *) PyType_GetName(PyTypeObject *t);
-PyAPI_FUNC(const char *) PyType_GetQualName(PyTypeObject *t);
+/* Both return a *new reference* to a str object (CPython 3.11+). */
+PyAPI_FUNC(PyObject *) PyType_GetName(PyTypeObject *t);
+PyAPI_FUNC(PyObject *) PyType_GetQualName(PyTypeObject *t);
 PyAPI_FUNC(unsigned long) PyType_GetFlags(PyTypeObject *t);
 PyAPI_FUNC(void *) PyType_GetSlot(PyTypeObject *t, int slot);
 PyAPI_FUNC(PyObject *) PyType_GenericAlloc(PyTypeObject *t, Py_ssize_t nitems);
@@ -764,6 +765,7 @@ PyAPI_FUNC(PyObject *) PyErr_NewException(const char *name, PyObject *base, PyOb
 PyAPI_FUNC(PyObject *) PyErr_NewExceptionWithDoc(const char *name, const char *doc, PyObject *base, PyObject *dict);
 
 PyAPI_DATA(PyObject *) PyExc_BaseException;
+PyAPI_DATA(PyObject *) PyExc_BaseExceptionGroup;
 PyAPI_DATA(PyObject *) PyExc_Exception;
 PyAPI_DATA(PyObject *) PyExc_ArithmeticError;
 PyAPI_DATA(PyObject *) PyExc_AssertionError;

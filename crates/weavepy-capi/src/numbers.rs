@@ -907,6 +907,32 @@ pub unsafe extern "C" fn _PyFloat_Unpack8(p: *const u8, little_endian: c_int) ->
     f64::from_bits(bits)
 }
 
+// CPython 3.11 promoted the pack/unpack family to public API
+// (`_PyFloat_Pack8` → `PyFloat_Pack8`); wheels built against 3.11+
+// headers (msgpack's Cython packer) lazy-bind the public spelling, and
+// an unresolved lazy stub jumps to NULL at first float pack. Both
+// spellings stay exported, like CPython itself.
+
+#[no_mangle]
+pub unsafe extern "C" fn PyFloat_Pack4(x: f64, p: *mut u8, little_endian: c_int) -> c_int {
+    unsafe { _PyFloat_Pack4(x, p, little_endian) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyFloat_Pack8(x: f64, p: *mut u8, little_endian: c_int) -> c_int {
+    unsafe { _PyFloat_Pack8(x, p, little_endian) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyFloat_Unpack4(p: *const u8, little_endian: c_int) -> f64 {
+    unsafe { _PyFloat_Unpack4(p, little_endian) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyFloat_Unpack8(p: *const u8, little_endian: c_int) -> f64 {
+    unsafe { _PyFloat_Unpack8(p, little_endian) }
+}
+
 // ---------- PyBool ----------
 
 #[no_mangle]

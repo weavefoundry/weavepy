@@ -364,6 +364,11 @@ pub fn build_with_state(
 
         // `sys.builtin_module_names` — exposed as a tuple for
         // user-introspection code (e.g. `importlib.util.find_spec`).
+        // Only modules the VM builds *natively* belong here: names that
+        // ship as frozen Python source (random, json, re, …) must not
+        // appear, because stdlib consumers take membership as "no
+        // Python source exists" (`pyclbr._readmodule` early-returns an
+        // empty tree for them — `test_pyclbr.test_others`).
         d.insert(
             DictKey(Object::from_static("builtin_module_names")),
             Object::new_tuple(
@@ -374,27 +379,16 @@ pub fn build_with_state(
                     "_subprocess",
                     "_thread",
                     "_weakref",
-                    "base64",
                     "binascii",
                     "errno",
-                    "fnmatch",
                     "gc",
-                    "glob",
                     "hashlib",
-                    "hmac",
-                    "io",
-                    "json",
                     "math",
                     "os",
                     "pyexpat",
-                    "random",
-                    "re",
                     "secrets",
-                    "signal",
-                    "ssl",
                     "sys",
                     "time",
-                    "uuid",
                     "zlib",
                 ]
                 .iter()

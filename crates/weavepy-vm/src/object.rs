@@ -812,6 +812,14 @@ pub struct PyMemoryView {
     /// C-contiguous strides for `shape`". A negative stride (from a
     /// `seq[::-1]`-style slice) marks the view non-contiguous.
     pub strides: RefCell<Vec<isize>>,
+    /// The object the buffer was exported from — CPython's `mv.obj`
+    /// (`view->obj`). `None` when unknown; the attribute getter then
+    /// reconstructs a bytes-like from the backing buffer.
+    pub exporter: RefCell<Option<Object>>,
+    /// True for a 0-dimensional (scalar) view — PEP 3118 `ndim == 0`, as
+    /// exported by ctypes scalars. Distinguished from an empty stored
+    /// `shape`, which means "derive the 1-D layout".
+    pub zero_dim: Cell<bool>,
 }
 
 impl PyMemoryView {
@@ -827,6 +835,8 @@ impl PyMemoryView {
             itemsize: Cell::new(1),
             shape: RefCell::new(Vec::new()),
             strides: RefCell::new(Vec::new()),
+            exporter: RefCell::new(None),
+            zero_dim: Cell::new(false),
         }
     }
 
@@ -845,6 +855,8 @@ impl PyMemoryView {
             itemsize: Cell::new(1),
             shape: RefCell::new(Vec::new()),
             strides: RefCell::new(Vec::new()),
+            exporter: RefCell::new(None),
+            zero_dim: Cell::new(false),
         }
     }
 
@@ -864,6 +876,8 @@ impl PyMemoryView {
             itemsize: Cell::new(1),
             shape: RefCell::new(Vec::new()),
             strides: RefCell::new(Vec::new()),
+            exporter: RefCell::new(None),
+            zero_dim: Cell::new(false),
         }
     }
 
@@ -889,6 +903,8 @@ impl PyMemoryView {
             itemsize: Cell::new(itemsize),
             shape: RefCell::new(Vec::new()),
             strides: RefCell::new(Vec::new()),
+            exporter: RefCell::new(None),
+            zero_dim: Cell::new(false),
         }
     }
 
@@ -915,6 +931,8 @@ impl PyMemoryView {
             itemsize: Cell::new(self.itemsize.get()),
             shape: RefCell::new(self.shape.borrow().clone()),
             strides: RefCell::new(self.strides.borrow().clone()),
+            exporter: RefCell::new(self.exporter.borrow().clone()),
+            zero_dim: Cell::new(self.zero_dim.get()),
         }
     }
 
@@ -931,6 +949,9 @@ impl PyMemoryView {
     /// Logical dimensions in elements. An empty stored `shape` derives the
     /// 1-D `[nbytes / itemsize]` layout that every plain constructor uses.
     pub fn shape_dims(&self) -> Vec<usize> {
+        if self.zero_dim.get() {
+            return Vec::new();
+        }
         let stored = self.shape.borrow();
         if !stored.is_empty() {
             return stored.clone();
@@ -1231,25 +1252,44 @@ impl MethodWrapper {
 }
 
 /// Internal payload for [`Object::Property`].
+///
+/// All four members are interior-mutable: CPython's `property.__doc__`
+/// is a writable member (`namedtuple` field docs are patched in place:
+/// `Point.x.__doc__ = …`), and `property_init` *re-initialises the
+/// existing object* — a `property` subclass whose `__init__` chains
+/// `super().__init__(fget, doc=doc)` (werkzeug's `cached_property`)
+/// mutates the descriptor that `type.__call__` already allocated.
 #[derive(Debug)]
 pub struct PyProperty {
-    pub fget: Object,
-    pub fset: Object,
-    pub fdel: Object,
-    /// Interior-mutable: CPython's `property.__doc__` is a writable
-    /// member (`namedtuple` field docs are patched in place:
-    /// `Point.x.__doc__ = …`).
+    pub fget: RefCell<Object>,
+    pub fset: RefCell<Object>,
+    pub fdel: RefCell<Object>,
     pub doc: RefCell<Object>,
 }
 
 impl PyProperty {
     pub fn new(fget: Object, fset: Object, fdel: Object, doc: Object) -> Self {
         Self {
-            fget,
-            fset,
-            fdel,
+            fget: RefCell::new(fget),
+            fset: RefCell::new(fset),
+            fdel: RefCell::new(fdel),
             doc: RefCell::new(doc),
         }
+    }
+
+    /// Current getter.
+    pub fn fget(&self) -> Object {
+        self.fget.borrow().clone()
+    }
+
+    /// Current setter.
+    pub fn fset(&self) -> Object {
+        self.fset.borrow().clone()
+    }
+
+    /// Current deleter.
+    pub fn fdel(&self) -> Object {
+        self.fdel.borrow().clone()
     }
 
     /// Current `__doc__` value.
@@ -1257,21 +1297,24 @@ impl PyProperty {
         self.doc.borrow().clone()
     }
 
+    /// CPython `property_init`: replace all four members in place.
+    pub fn reinit(&self, fget: Object, fset: Object, fdel: Object, doc: Object) {
+        *self.fget.borrow_mut() = fget;
+        *self.fset.borrow_mut() = fset;
+        *self.fdel.borrow_mut() = fdel;
+        *self.doc.borrow_mut() = doc;
+    }
+
     /// Return a clone of `self` with the given attribute replaced. Used
     /// by `property.getter`/`setter`/`deleter` (which CPython models as
     /// methods that return a *new* property carrying the patched
     /// callable plus the existing ones).
     pub fn with(&self, which: PropertyAttr, fn_: Object) -> Self {
-        let mut next = Self {
-            fget: self.fget.clone(),
-            fset: self.fset.clone(),
-            fdel: self.fdel.clone(),
-            doc: RefCell::new(self.doc()),
-        };
+        let next = Self::new(self.fget(), self.fset(), self.fdel(), self.doc());
         match which {
-            PropertyAttr::Get => next.fget = fn_,
-            PropertyAttr::Set => next.fset = fn_,
-            PropertyAttr::Del => next.fdel = fn_,
+            PropertyAttr::Get => *next.fget.borrow_mut() = fn_,
+            PropertyAttr::Set => *next.fset.borrow_mut() = fn_,
+            PropertyAttr::Del => *next.fdel.borrow_mut() = fn_,
         }
         next
     }
@@ -2037,6 +2080,28 @@ impl PartialEq for DictKey {
                 KEY_EQ_DEFERRED.with(|c| c.set(true));
                 return false;
             }
+            // CPython dispatches `__eq__` only between keys in the *same
+            // hash bucket*; unequal hashes mean "not equal" without any
+            // user code. indexmap's small-table linear scan compares every
+            // entry through this `eq` with no hash check at all, so enforce
+            // the bucket precondition here — sqlalchemy's
+            // `constraints.discard(ColumnSet())` probes a 1-element set
+            // with a key whose `__eq__` returns a SQL clause that *raises*
+            // on truthiness, and CPython never invokes it (hashes differ).
+            //
+            // Consult the recorded hash first (the value the table stored
+            // when the key was hashed — CPython's `ep->me_hash`), so the
+            // check never re-dispatches a stored key's `__hash__`:
+            // `test_setdefault_atomic` counts exactly one call per key.
+            let h_self = recorded_key_hash(&self.0).unwrap_or_else(|| {
+                py_hash_value(&self.0).unwrap_or_else(|| identity_hash(&self.0))
+            });
+            let h_other = recorded_key_hash(&other.0).unwrap_or_else(|| {
+                py_hash_value(&other.0).unwrap_or_else(|| identity_hash(&other.0))
+            });
+            if h_self != h_other {
+                return false;
+            }
             if let Some(eq) = current_interp_eq(&self.0, &other.0) {
                 return eq;
             }
@@ -2194,11 +2259,26 @@ pub(crate) fn dict_reentrant_probe(
             if !(key_needs_interp_eq(key) || key_needs_interp_eq(stored)) {
                 continue;
             }
+            // Memo first: a restarted snapshot walk must not re-run *any*
+            // user code (hash or eq) for a candidate it already settled.
             if let Some((_, eq)) = memo.iter().find(|(o, _)| o.is_same(stored)) {
                 if *eq {
                     found = Some(stored.clone());
                     break;
                 }
+                continue;
+            }
+            // Same-bucket precondition: indexmap's small-table linear scan
+            // hands `from_hash` every entry regardless of hash, but CPython
+            // only ever dispatches `__eq__` between keys whose hashes match.
+            // The stored key's hash comes from its record (CPython reads the
+            // entry's `me_hash`); only a record-less key pays a dispatch.
+            let sh = match recorded_key_hash(stored) {
+                Some(h) => h,
+                None => key_cmp_scope(|| py_hash_value(stored))?
+                    .unwrap_or_else(|| identity_hash(stored)),
+            };
+            if sh != kh {
                 continue;
             }
             // Python `__eq__` (stored first, CPython's argument order) with
@@ -5299,14 +5379,19 @@ impl Drop for PyFile {
         // `Rc` can hit zero mid-instruction while a container is borrowed), so
         // synthesising the Python warning here would re-enter `warnings.warn`
         // and panic with `BorrowMutError`. The eval loop drains the queue at
-        // its between-bytecodes safe point, matching CPython's dealloc timing.
-        if !crate::vm_singletons::is_finalizing()
-            && !*self.closed.borrow()
+        // its between-bytecodes safe point, matching CPython's dealloc timing;
+        // during shutdown the module sweep in `run_shutdown_finalizers` drains
+        // one last time (CPython's late "<sys>:0: ResourceWarning").
+        if !*self.closed.borrow()
             && self.closefd.get()
             && matches!(&*self.backend.borrow(), FileBackend::Disk(_))
         {
-            let repr = self.repr_with_addr(std::ptr::from_ref(self) as usize);
-            crate::vm_singletons::push_pending_resource_warning(format!("unclosed file {repr}"));
+            let addr = std::ptr::from_ref(self) as usize;
+            let repr = self.repr_with_addr(addr);
+            crate::vm_singletons::push_pending_resource_warning_with_source(
+                format!("unclosed file {repr}"),
+                addr,
+            );
         }
         // Close any still-open OS descriptor *ourselves* rather than letting
         // Rust's `File` (an `OwnedFd`) run its checked drop. User code can
@@ -7391,7 +7476,21 @@ impl Object {
                 s.stop.repr(),
                 s.step.repr()
             ),
-            Object::Cell(inner) => format!("<cell: {}>", inner.borrow().repr()),
+            // CPython `cell_repr`: address of the cell plus the type and
+            // address of its referent (or "empty" for an unbound cell).
+            Object::Cell(inner) => {
+                let addr = crate::sync::Rc::as_ptr(inner) as usize;
+                let v = inner.borrow();
+                match &*v {
+                    Object::Unbound => format!("<cell at 0x{addr:x}: empty>"),
+                    other => format!(
+                        "<cell at 0x{:x}: {} object at 0x{:x}>",
+                        addr,
+                        other.type_name(),
+                        crate::builtins::object_identity(other)
+                    ),
+                }
+            }
             Object::Type(t) => format!("<class '{}'>", t.qualified_display_name()),
             Object::Module(m) => match &m.filename {
                 Some(path) => format!("<module '{}' from '{}'>", m.name, path),
@@ -7508,12 +7607,16 @@ impl Object {
                 // `repr([Color.RED])` would render the elements as
                 // `<Color object>` instead of `<Color.RED: 1>`.
                 let key = DictKey(Object::from_static("__repr__"));
-                let has_user_repr = inst
-                    .cls()
-                    .mro
-                    .borrow()
-                    .iter()
-                    .any(|t| t.dict.borrow().contains_key(&key));
+                let has_user_repr = inst.cls().mro.borrow().iter().any(|t| {
+                    t.dict.borrow().get(&key).is_some_and(|v| {
+                        // Introspection-only mirrors in builtin dicts (the
+                        // docs surface pass puts `object.__repr__` in
+                        // `vars(object)`, RFC 0056 WS4) are not user reprs —
+                        // the default `<module.qualname object at 0x…>`
+                        // rendering below must keep winning.
+                        !(t.flags.is_builtin && crate::descr_registry::is_surface_only(v))
+                    })
+                });
                 if has_user_repr {
                     if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
                         // SAFETY: published by an enclosing VM frame still
@@ -7763,7 +7866,14 @@ impl Object {
             // `len(mv)` is the first-dimension element count, not the byte
             // size — they differ once `cast` sets `itemsize > 1` or adds
             // dimensions (`len(memoryview(b'1234').cast('I')) == 1`).
-            Object::MemoryView(mv) => Ok(mv.shape_dims().first().copied().unwrap_or(0)),
+            Object::MemoryView(mv) => {
+                if mv.zero_dim.get() {
+                    return Err(crate::error::type_error(
+                        "0-dim memory has no length".to_owned(),
+                    ));
+                }
+                Ok(mv.shape_dims().first().copied().unwrap_or(0))
+            }
             Object::MappingProxy(d) => Ok(d.borrow().len()),
             Object::DictView(v) => Ok(v.dict.borrow().len()),
             // A subclass of a built-in container (`class C(list)`, …)
@@ -8341,7 +8451,14 @@ pub(crate) fn identity_hash(obj: &Object) -> i64 {
         Object::Iter(r) => rot(Rc::as_ptr(r).cast()),
         Object::Slice(r) => rot(Rc::as_ptr(r).cast()),
         Object::Type(r) => rot(Rc::as_ptr(r).cast()),
-        Object::Instance(r) => rot(Rc::as_ptr(r).cast()),
+        // A float-subclass instance wrapping a NaN payload hashes like the
+        // payload (`hash(F('nan')) == object.__hash__(F('nan'))`,
+        // test_float test_hash_nan): WeavePy's NaN identity is the tagged
+        // bit pattern (see `tag_nan`), not the wrapper allocation.
+        Object::Instance(r) => match r.native.get() {
+            Some(f @ Object::Float(v)) if v.is_nan() => identity_hash(f),
+            _ => rot(Rc::as_ptr(r).cast()),
+        },
         Object::Module(r) => rot(Rc::as_ptr(r).cast()),
         Object::Generator(r) | Object::Coroutine(r) | Object::AsyncGenerator(r) => {
             rot(Rc::as_ptr(r).cast())
@@ -8399,6 +8516,19 @@ pub(crate) fn identity_hash(obj: &Object) -> i64 {
         // `is`-identity used by `eq`/`id`). A value-hashable foreign
         // object (numpy scalar) is handled earlier via the hash hook.
         Object::Foreign(s) => rot((s.ptr as *const u8).cast()),
+        // A float's "identity" is its (NaN-tagged) bit pattern — the same
+        // derivation `py_hash_double` uses for NaN, so
+        // `object.__hash__(nan) == hash(nan)` (test_float test_hash_nan,
+        // CPython gh-43475 hashes NaN by object identity).
+        Object::Float(v) => {
+            let h =
+                (v.to_bits().rotate_right(4) as i64).wrapping_mul(0x9E37_79B9_7F4A_7C15u64 as i64);
+            if h == -1 {
+                -2
+            } else {
+                h
+            }
+        }
         // Value-hashable variants never reach here (handled by
         // `py_hash_value`); anything else gets a stable constant.
         _ => 0,
@@ -8458,6 +8588,23 @@ pub(crate) fn combine_tuple_hash(lanes: &[i64]) -> i64 {
         1_546_275_796
     } else {
         v
+    }
+}
+
+/// The hash previously *recorded* for `obj` when it was hashed for a keyed
+/// table — the WeavePy stand-in for CPython's per-entry `ep->me_hash`. Only
+/// instances carry a record (the `hash_cache` cell, written by every
+/// [`py_hash_value`] dispatch of a custom `__hash__`); everything else
+/// hashes purely, so `None` just means "compute it".
+///
+/// Used by the same-bucket preconditions in [`DictKey::eq`] and
+/// [`dict_reentrant_probe`]: CPython compares the probe hash against the
+/// *stored entry's* hash and never re-invokes a stored key's `__hash__`
+/// (`test_dict.test_setdefault_atomic` counts the dispatches).
+pub(crate) fn recorded_key_hash(obj: &Object) -> Option<i64> {
+    match obj {
+        Object::Instance(inst) => inst.hash_cache.get(),
+        _ => None,
     }
 }
 
@@ -8555,7 +8702,19 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
                     }
                     return h;
                 }
-                return current_interp_hash(obj);
+                // Mutable wrapper (or plain object subclass): dispatch on
+                // every call, but *record* the result. The record is never
+                // read back here — it stands in for CPython's entry-stored
+                // hash (`ep->me_hash`): when a table probe needs the hash of
+                // an already-*stored* key for the same-bucket precondition
+                // (`DictKey::eq` / `dict_reentrant_probe`), CPython reads the
+                // entry, never re-invoking `__hash__` — `test_dict`'s
+                // `test_setdefault_atomic` counts exactly one call per key.
+                let h = current_interp_hash(obj);
+                if let Some(hv) = h {
+                    inst.hash_cache.set(Some(hv));
+                }
+                return h;
             }
             if let Some(native) = inst.native.get() {
                 // int/str/… subclass instance hashes as the wrapped value.

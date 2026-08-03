@@ -21,6 +21,12 @@ static PLATFORM: &str = if cfg!(target_os = "macos") {
 };
 static BUILD_INFO: &str = "default, weavepy\0";
 
+/// Legacy `Py_OptimizeFlag` global (deprecated in CPython but still
+/// exported; `ctypes.pythonapi` reads it in test_values). WeavePy runs
+/// without `-O` semantics, so it stays 0 to match `sys.flags.optimize`.
+#[no_mangle]
+pub static mut Py_OptimizeFlag: c_int = 0;
+
 #[no_mangle]
 pub unsafe extern "C" fn Py_Initialize() {
     crate::interp::ensure_initialised();

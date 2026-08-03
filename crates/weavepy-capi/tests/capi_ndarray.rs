@@ -326,7 +326,7 @@ fn ndarray_shape_property() {
     // it participates in the descriptor protocol. To exercise the
     // getter directly we drill into `fget` ourselves.
     let getter = match getter {
-        Object::Property(p) => p.fget.clone(),
+        Object::Property(p) => p.fget(),
         other => other,
     };
     let res = interp

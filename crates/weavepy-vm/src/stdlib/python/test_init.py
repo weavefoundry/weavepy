@@ -36,23 +36,49 @@ for _p in _sys.path:
         if not _p or not _os.path.isdir(_p):
             continue
         _norm = _os.path.normpath(_p)
-        if _os.path.basename(_norm) == "test" and _norm not in __path__:
-            __path__.append(_norm)
-            continue
-        # Running a file inside a *subpackage* of `test/` (e.g.
-        # `Lib/test/test_dataclasses/__init__.py`) puts that subpackage
-        # directory on `sys.path` — its parent is the on-disk `test/`.
-        _parent = _os.path.dirname(_norm)
+        # A `Lib/`-shaped entry (the conformance runner puts
+        # `vendor/cpython/Lib` on the path) carries the test package as
+        # a direct child.
+        _child = _os.path.join(_norm, "test")
         if (
-            _os.path.basename(_parent) == "test"
-            and _os.path.isdir(_parent)
-            and _parent not in __path__
+            _os.path.isfile(_os.path.join(_child, "__init__.py"))
+            and _child not in __path__
         ):
-            __path__.append(_parent)
+            __path__.append(_child)
+        # Running a file from `test/` itself or from a (possibly
+        # nested) subpackage — `Lib/test/test_dataclasses/`,
+        # `Lib/test/test_unittest/testmock/` — puts that directory on
+        # `sys.path`; walk up to the enclosing on-disk `test/`.
+        _d = _norm
+        for _ in range(4):
+            if _os.path.basename(_d) == "test" and _os.path.isdir(_d):
+                if _d not in __path__:
+                    __path__.append(_d)
+                break
+            _up = _os.path.dirname(_d)
+            if _up == _d:
+                break
+            _d = _up
+    except (TypeError, ValueError):
+        pass
+# When a full CPython regression suite is among the grafted directories,
+# make it the package's *identity*: tests locate on-disk fixtures via
+# `os.path.dirname(test.__file__)` (testpatch/test_pkgutil resolve
+# `test_import/data`), and the frozen `__file__` points at the
+# materialized stdlib tree, which carries only the support layer.
+for _d in list(__path__):
+    try:
+        if _os.path.isfile(_os.path.join(_d, "test_import", "__init__.py")):
+            _init = _os.path.join(_d, "__init__.py")
+            if _os.path.isfile(_init):
+                __file__ = _init
+            break
     except (TypeError, ValueError):
         pass
 del _os, _sys
-try:
-    del _p
-except NameError:
-    pass
+for _n in ("_p", "_norm", "_child", "_d", "_up", "_init"):
+    try:
+        del globals()[_n]
+    except KeyError:
+        pass
+del _n

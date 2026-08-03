@@ -1756,6 +1756,19 @@ fn build_iobase_family_inner() -> IoFamily {
             .expect("io child type must linearise")
     };
     let text = child("TextIOBase", &iobase);
+    // CPython `_io._TextIOBase` carries default `encoding`/`errors`/
+    // `newlines` getsets that report `None`; concrete wrappers shadow them
+    // with real values (TextIOWrapper via its instance state). Plain class
+    // attributes give the same reads without a data descriptor that would
+    // beat TextIOWrapper's instance-dict entries. `StringIO().encoding is
+    // None` is load-bearing: doctest's `DocTestRunner.run` reads
+    // `sys.stdout.encoding` while stdout is a `_SpoofOut` StringIO.
+    {
+        let mut td = text.dict.borrow_mut();
+        for name in ["encoding", "errors", "newlines"] {
+            td.insert(DictKey(Object::from_static(name)), Object::None);
+        }
+    }
     let fileio = child("FileIO", &raw);
     install_fileio_ctor(&fileio);
     // The concrete, instantiable stream classes, built once and memoised on the
