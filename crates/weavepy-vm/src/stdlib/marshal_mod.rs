@@ -750,9 +750,10 @@ impl<'a> MarshalReader<'a> {
             cellvars: decoded.cellvars,
             exception_table: decoded.exception_table,
             linetable: decoded.linetable,
-            // Marshal doesn't round-trip PEP-657 columns yet; co_positions()
-            // on an unmarshalled code object reports lines only.
-            coltable: Vec::new(),
+            // PEP-657 columns recovered from long-form location entries
+            // (RFC 0056 WS4): traceback caret underlines survive the
+            // `.pyc` round-trip.
+            coltable: decoded.coltable,
             arg_count,
             posonly_count,
             kwonly_count,

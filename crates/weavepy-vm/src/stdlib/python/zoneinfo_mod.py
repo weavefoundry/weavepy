@@ -76,10 +76,14 @@ def _reset_tzpath(to=None, stacklevel=4):
                 env_var = sysconfig.get_config_var("TZPATH")
             except Exception:
                 env_var = None
-        base_tzpath = list(_parse_python_tzpath(env_var, stacklevel))
-        if not base_tzpath:
-            # WeavePy fallback: use the system zoneinfo directories.
-            base_tzpath = [p for p in _DEFAULT_TZPATH]
+        if env_var is None:
+            # WeavePy fallback: neither PYTHONTZPATH nor a sysconfig TZPATH
+            # is set — use the system zoneinfo directories. An *empty or
+            # relative-only* PYTHONTZPATH must still produce an empty
+            # TZPATH exactly like CPython (test_env_variable).
+            base_tzpath = list(_DEFAULT_TZPATH)
+        else:
+            base_tzpath = list(_parse_python_tzpath(env_var, stacklevel))
 
     TZPATH = tuple(base_tzpath)
 
@@ -216,7 +220,12 @@ def available_timezones():
 
 
 TZPATH = ()
-_reset_tzpath(stacklevel=5)
+# CPython's module-level init uses stacklevel=4 from `zoneinfo/_tzpath.py`,
+# where the chain is _parse → _reset → _tzpath module → importing frame
+# (importlib frames are skipped by warn()). WeavePy inlines _tzpath into
+# this single module, so the same depth-4 walk lands on the importer
+# (test_env_variable_relative_paths_warning_location asserts the filename).
+_reset_tzpath(stacklevel=4)
 
 
 # ---------------------------------------------------------------------------

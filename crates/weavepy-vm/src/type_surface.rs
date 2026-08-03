@@ -57,6 +57,261 @@ pub fn install(bt: &BuiltinTypes) {
     register_descriptor_kinds(bt);
 }
 
+/// Materialize every `type.member` entry from the generated CPython
+/// docstring table (RFC 0056 WS4) that the method machinery can already
+/// synthesize but that no earlier install pass put in the type dict.
+/// CPython stores all of these in `tp_dict`; doctest's builtins traversal
+/// (`DocTestFinder.find(builtins)` — test_doctest `non_Python_modules`
+/// asserts 830 < n < 860 discovered docstrings) and `help()` both
+/// enumerate `vars(cls)` directly, so presence matters, not just
+/// gettability. Names that would *change dispatch semantics* by
+/// appearing in a dict that lacks them today (attribute-access hooks,
+/// constructors — `lookup_exception_init` keys off `__init__` presence)
+/// are excluded.
+///
+/// Runs *after* the `BuiltinTypes` thread-local cell is populated (see
+/// [`crate::builtin_types::builtin_types`]), because member synthesis
+/// for the descriptor types re-enters `builtin_types()` — during
+/// `build()` that recursion would rebuild the world.
+pub(crate) fn install_docs_table_surface(bt: &BuiltinTypes) {
+    // Constructor/attribute machinery that must never gain new dict
+    // entries: `__new__` presence drives `overrides_dunder_new`, and the
+    // `setattr`/`getattr` family would defeat the LOAD/STORE_ATTR
+    // specialization checks even as surface entries.
+    const SKIP: &[&str] = &[
+        "__new__",
+        "__getattr__",
+        "__setattr__",
+        "__delattr__",
+        "__init_subclass__",
+        "__subclasshook__",
+    ];
+    install_type_dict_extras(bt);
+    let types: std::collections::HashMap<String, Rc<TypeObject>> = bt
+        .as_globals()
+        .into_iter()
+        .filter_map(|(name, value)| match value {
+            Object::Type(ty) if ty.flags.is_builtin => Some((name.clone(), ty)),
+            _ => None,
+        })
+        .collect();
+    for (key, _) in crate::builtin_docs_data::BUILTIN_DOCS {
+        let Some((tyname, member)) = key.split_once('.') else {
+            continue;
+        };
+        if member.contains('.') || SKIP.contains(&member) {
+            continue;
+        }
+        let Some(ty) = types.get(tyname) else {
+            continue;
+        };
+        if ty
+            .dict
+            .borrow()
+            .contains_key(&crate::object::StrKey(member))
+        {
+            continue;
+        }
+        // Pass 1: the instance method tables (`lookup_method` via a
+        // representative value) — fully functional, dispatch-visible
+        // entries, exactly like the explicit install passes above.
+        install_named_methods(ty, tyname, &[member]);
+        if ty
+            .dict
+            .borrow()
+            .contains_key(&crate::object::StrKey(member))
+        {
+            continue;
+        }
+        // Pass 2: whatever type-level attribute access already resolves
+        // (`dict.__lt__`, `ValueError.__init__`, `object.__str__`, …),
+        // mirrored into the dict as an *introspection-only* entry —
+        // visible to `vars(cls)` / doctest / `help()`, skipped by the
+        // dispatch MRO walk (see `descr_registry::mark_surface_only`).
+        let Some(resolved) = crate::builtin_slot_wrapper(ty, member) else {
+            continue;
+        };
+        // The resolution is often *shared*: `ValueError.__init__` is
+        // `BaseException`'s entry, `dict.__lt__`/`bytearray.__str__` are
+        // `object`'s slot wrappers. CPython gives each type a distinct
+        // wrapper in `tp_dict` (and doctest's traversal dedupes by object
+        // identity), so a type that is not the slot's *defining* class
+        // gets a fresh delegating mirror instead of the alias.
+        let mut owner = ty.clone();
+        {
+            let mro: Vec<Rc<TypeObject>> = ty.mro.borrow().iter().cloned().collect();
+            for base in mro {
+                if let Some(o) = crate::builtin_slot_wrapper(&base, member) {
+                    if descr_identity_eq(&o, &resolved) {
+                        owner = base;
+                    }
+                }
+            }
+        }
+        let entry = if Rc::ptr_eq(&owner, ty) {
+            resolved
+        } else {
+            match mirror_builtin(&resolved) {
+                Some(m) => m,
+                None => continue,
+            }
+        };
+        crate::descr_registry::mark_surface_only(&entry);
+        // Register right away (not just in the final sweep): later table
+        // rows resolve *through this dict entry* (`UnicodeError.__init__`
+        // finds `ValueError`'s mirror), and only a recorded `objclass`
+        // tells them it isn't their own — otherwise they'd alias it.
+        if crate::descr_registry::lookup(&entry).is_none() {
+            let kind = if crate::descr_registry::is_slot_wrapper_name(member) {
+                crate::descr_registry::DescrKind::Wrapper
+            } else {
+                crate::descr_registry::DescrKind::Method
+            };
+            crate::descr_registry::register(&entry, kind, ty.clone(), member, None);
+        }
+        insert_if_absent(ty, member, entry);
+    }
+    // Tag the fresh entries as method/wrapper descriptors so
+    // `__qualname__` / `__objclass__` / table-doc resolution work.
+    register_descriptor_kinds(bt);
+}
+
+/// Same underlying descriptor object? (pointer identity on the
+/// `Builtin`/`Property` payload.)
+fn descr_identity_eq(a: &Object, b: &Object) -> bool {
+    match (a, b) {
+        (Object::Builtin(x), Object::Builtin(y)) => Rc::ptr_eq(x, y),
+        (Object::Property(x), Object::Property(y)) => Rc::ptr_eq(x, y),
+        _ => false,
+    }
+}
+
+/// A fresh `BuiltinFn` that delegates to `orig`'s implementation under the
+/// same name. Keeping the *name* identical preserves every name-keyed
+/// dispatch path (the `.object_reduce`/`.object_getattribute` sentinel
+/// interceptions, the `builtin_needs_interp` routing); the fresh identity
+/// gives the mirror its own `__qualname__`/`__objclass__` registration.
+fn mirror_builtin(orig: &Object) -> Option<Object> {
+    let Object::Builtin(b) = orig else {
+        return None;
+    };
+    let call_src = b.clone();
+    let call_kw = if b.call_kw.is_some() {
+        let kw_src = b.clone();
+        Some(
+            Box::new(move |args: &[Object], kwargs: &[(String, Object)]| {
+                (kw_src.call_kw.as_ref().expect("mirror source lost call_kw"))(args, kwargs)
+            }) as _,
+        )
+    } else {
+        None
+    };
+    Some(Object::Builtin(Rc::new(crate::object::BuiltinFn {
+        name: b.name,
+        binds_instance: b.binds_instance,
+        call: Box::new(move |args| (call_src.call)(args)),
+        call_kw,
+    })))
+}
+
+/// Functional `type.__or__` / `type.__ror__` / `type.__prepare__`
+/// entries (RFC 0056 WS4). CPython stores these in `type`'s `tp_dict`;
+/// they don't synthesize through `builtin_slot_wrapper`, so they get
+/// real implementations here — marked surface-only, since anything in
+/// `type`'s dict is on every metaclass lookup path.
+fn install_type_dict_extras(bt: &BuiltinTypes) {
+    fn type_or(args: &[Object]) -> Result<Object, RuntimeError> {
+        let [a, b] = args else {
+            return Err(type_error(format!(
+                "expected 1 argument, got {}",
+                args.len().saturating_sub(1)
+            )));
+        };
+        Ok(crate::make_pep604_union(a, b))
+    }
+    fn type_ror(args: &[Object]) -> Result<Object, RuntimeError> {
+        let [a, b] = args else {
+            return Err(type_error(format!(
+                "expected 1 argument, got {}",
+                args.len().saturating_sub(1)
+            )));
+        };
+        Ok(crate::make_pep604_union(b, a))
+    }
+    fn type_prepare(_args: &[Object]) -> Result<Object, RuntimeError> {
+        Ok(Object::Dict(Rc::new(RefCell::new(
+            crate::object::DictData::default(),
+        ))))
+    }
+    fn type_mro(args: &[Object]) -> Result<Object, RuntimeError> {
+        let Some(Object::Type(ty)) = args.first() else {
+            return Err(type_error("unbound method type.mro() needs an argument"));
+        };
+        // Fresh C3 linearization, not the cached `ty.mro` — CPython's
+        // `type.mro()` recomputes, and during class construction a custom
+        // metaclass `mro()` chaining to `super().mro()` runs *before* the
+        // cache is seeded (test_descr test_altmro / MroTest).
+        let mro = crate::types::TypeObject::recompute_c3(ty)?;
+        Ok(Object::new_list(
+            mro.into_iter().map(Object::Type).collect(),
+        ))
+    }
+    // Explicit unbound calls of `__subclasses__` go through the same
+    // sentinel name that `load_attr_type`'s bound form uses — the live
+    // subclass registry is only reachable from `Interpreter::call`.
+    fn type_subclasses_sentinel(_args: &[Object]) -> Result<Object, RuntimeError> {
+        Err(crate::error::runtime_error(
+            "type.__subclasses__ must be dispatched via Interpreter::call",
+        ))
+    }
+    for (key, name, call) in [
+        (
+            "__or__",
+            "__or__",
+            type_or as fn(&[Object]) -> Result<Object, RuntimeError>,
+        ),
+        ("__ror__", "__ror__", type_ror),
+        ("__prepare__", "__prepare__", type_prepare),
+        ("mro", "mro", type_mro),
+        (
+            "__subclasses__",
+            ".type_subclasses",
+            type_subclasses_sentinel,
+        ),
+    ] {
+        // `type.__prepare__(*args, **kwds)` swallows arbitrary keywords in
+        // CPython (class-creation kwds are forwarded verbatim).
+        let call_kw: Option<
+            Box<
+                dyn Fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError>
+                    + Send
+                    + Sync,
+            >,
+        > = if key == "__prepare__" {
+            Some(Box::new(|args: &[Object], _kwargs: &[(String, Object)]| {
+                type_prepare(args)
+            }))
+        } else {
+            None
+        };
+        let entry = Object::Builtin(Rc::new(crate::object::BuiltinFn {
+            name,
+            binds_instance: true,
+            call: Box::new(call),
+            call_kw,
+        }));
+        crate::descr_registry::mark_surface_only(&entry);
+        crate::descr_registry::register(
+            &entry,
+            crate::descr_registry::DescrKind::Method,
+            bt.type_.clone(),
+            key,
+            None,
+        );
+        insert_if_absent(&bt.type_, key, entry);
+    }
+}
+
 /// The conversion dunders the `typing.Supports*` protocols probe for via
 /// `attr in base.__dict__` (`__bytes__`, `__complex__`, `__round__`);
 /// CPython stores them as `tp_methods` entries in the type dicts. The
@@ -190,6 +445,13 @@ fn register_descriptor_kinds(bt: &BuiltinTypes) {
             })
             .collect();
         for (name, value) in entries {
+            // A shared entry (the docs surface pass mirrors one object —
+            // e.g. `BaseException.__init__` — into many exception dicts)
+            // keeps its *first* registration: `__qualname__`/`__objclass__`
+            // stay with the defining class.
+            if crate::descr_registry::lookup(&value).is_some() {
+                continue;
+            }
             let kind = if is_slot_wrapper_name(&name) {
                 DescrKind::Wrapper
             } else {
@@ -853,7 +1115,24 @@ fn install_hash_markers(bt: &BuiltinTypes) {
 // container protocol dunders
 // ---------------------------------------------------------------------------
 
+/// CPython's `wrapperobject` call path (`check_num_args`) enforces slot
+/// arity strictly: `[3].__iter__(x)` is `TypeError: expected 0 arguments,
+/// got 1`. mock's `test_bound_methods` depends on this — a foreign bound
+/// `__iter__` grafted onto a Mock is invoked with the mock as an extra
+/// argument and must fail rather than silently iterate the original list.
+fn check_slot_arity(args: &[Object], expected: usize) -> Result<(), RuntimeError> {
+    let got = args.len().saturating_sub(1);
+    if got != expected {
+        let plural = if expected == 1 { "" } else { "s" };
+        return Err(type_error(format!(
+            "expected {expected} argument{plural}, got {got}"
+        )));
+    }
+    Ok(())
+}
+
 fn obj_iter_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
+    check_slot_arity(args, 0)?;
     let recv = as_native(
         args.first()
             .ok_or_else(|| type_error("__iter__() missing self"))?,
@@ -862,6 +1141,7 @@ fn obj_iter_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn obj_len_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
+    check_slot_arity(args, 0)?;
     let recv = as_native(
         args.first()
             .ok_or_else(|| type_error("__len__() missing self"))?,
@@ -870,6 +1150,7 @@ fn obj_len_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn obj_contains_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
+    check_slot_arity(args, 1)?;
     let recv = as_native(
         args.first()
             .ok_or_else(|| type_error("__contains__() missing self"))?,
@@ -1422,6 +1703,8 @@ fn install_class_getitem(bt: &BuiltinTypes) {
         // `Py_GenericAlias`), e.g. `BaseExceptionGroup[T]` in hypothesis.
         &bt.base_exception_group,
         &bt.exception_group,
+        // PEP 585 also covers `enumerate[int]` (RFC 0056 WS4).
+        &bt.enumerate_,
     ] {
         insert_if_absent(
             ty,

@@ -1394,7 +1394,13 @@ fn run_pyc_as_main(
     bootstrap.push_str("del _m\n");
     bootstrap.push_str("del sys, marshal, _f, _data\n");
     bootstrap.push_str("exec(_code, _g)\n");
-    let opts = RunOptions::new(path_str)
+    // The bootstrap gets a synthetic co_filename (the `<runpy:…>`
+    // convention `-m` uses): its frame sits under the pyc's own frames in
+    // a traceback, and it must not leak the on-disk pyc path — compileall's
+    // `--strip`/`--prepend` embed a *rewritten* path in the pyc, and
+    // `test_compileall.test_strip_only` asserts the build dir never
+    // appears in the traceback of a pyc run directly.
+    let opts = RunOptions::new("<runpy:pyc>")
         .with_argv(argv)
         .with_extra_path(extra_path.to_vec())
         .with_script_dir(script_dir)

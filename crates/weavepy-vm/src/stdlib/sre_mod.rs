@@ -387,6 +387,95 @@ struct Matcher<'a> {
     repeat_recur: Option<(usize, usize)>,
 }
 
+/// Structural scan of compiled sre code for a real `MARK` opcode in
+/// `[start, end)`. Operand words are skipped by walking the opcode layout
+/// (the same layouts `do_match` dispatches on), so data words that happen to
+/// equal 17 — charset bitmaps, literal chars, group indices — can't
+/// masquerade as a mark. Unknown opcodes conservatively report `true`, which
+/// only routes the repeat to the (always-correct) recursive engine.
+fn code_range_has_mark(code: &[u32], start: usize, end: usize) -> bool {
+    let mut i = start;
+    while i < end {
+        let op = code[i];
+        i += 1;
+        match op {
+            OP_MARK => return true,
+            // No operands.
+            OP_FAILURE | OP_SUCCESS | OP_ANY | OP_ANY_ALL | OP_MAX_UNTIL | OP_MIN_UNTIL
+            | OP_NEGATE => {}
+            // One data word (char code / position / category / group index).
+            OP_LITERAL
+            | OP_NOT_LITERAL
+            | OP_LITERAL_IGNORE
+            | OP_NOT_LITERAL_IGNORE
+            | OP_LITERAL_LOC_IGNORE
+            | OP_NOT_LITERAL_LOC_IGNORE
+            | OP_LITERAL_UNI_IGNORE
+            | OP_NOT_LITERAL_UNI_IGNORE
+            | OP_AT
+            | OP_CATEGORY
+            | OP_GROUPREF
+            | OP_GROUPREF_IGNORE
+            | OP_GROUPREF_LOC_IGNORE
+            | OP_GROUPREF_UNI_IGNORE => i += 1,
+            // Whole block skipped via its skip word: IN blocks hold charset
+            // data (the bitmap words that caused the false positives), INFO
+            // holds literal-prefix data.
+            OP_IN | OP_IN_IGNORE | OP_IN_LOC_IGNORE | OP_IN_UNI_IGNORE | OP_INFO => {
+                let Some(&skip) = code.get(i) else {
+                    return true;
+                };
+                i += (skip as usize).max(1);
+            }
+            // JUMP's operand is a forward skip within this same contiguous
+            // stream; consume the operand and keep scanning linearly.
+            OP_JUMP => i += 1,
+            // [group][skip] then both arms inline (plain opcodes + JUMPs).
+            OP_GROUPREF_EXISTS => i += 2,
+            // [skip][back] then the lookaround body inline, ending at i+skip.
+            OP_ASSERT | OP_ASSERT_NOT => i += 2,
+            // [skip][min][max] then the body inline; the tail op sits at
+            // i+skip and is scanned in stride.
+            OP_REPEAT
+            | OP_REPEAT_ONE
+            | OP_MIN_REPEAT_ONE
+            | OP_POSSESSIVE_REPEAT
+            | OP_POSSESSIVE_REPEAT_ONE => i += 3,
+            // [skip] then the body inline.
+            OP_ATOMIC_GROUP => i += 1,
+            // Each alternative is [skip][body...]; a zero skip terminates.
+            // The skip words would misread as opcodes in a linear scan, so
+            // walk the alternatives structurally.
+            OP_BRANCH => loop {
+                if i >= end {
+                    break;
+                }
+                let skip = code[i] as usize;
+                if skip == 0 {
+                    i += 1;
+                    break;
+                }
+                if code_range_has_mark(code, i + 1, (i + skip).min(end)) {
+                    return true;
+                }
+                i += skip;
+            },
+            // Charset ops normally live inside (skipped) IN blocks; handle
+            // them defensively in case one appears bare.
+            OP_RANGE | OP_RANGE_UNI_IGNORE => i += 2,
+            OP_CHARSET => i += 8,
+            OP_BIGCHARSET => {
+                let Some(&count) = code.get(i) else {
+                    return true;
+                };
+                i += 1 + 64 + count as usize * 8;
+            }
+            _ => return true,
+        }
+    }
+    false
+}
+
 impl<'a> Matcher<'a> {
     fn new(s: &'a [u32], code: &'a [u32], groups: usize) -> Self {
         Matcher {
@@ -435,21 +524,24 @@ impl<'a> Matcher<'a> {
 
     /// `true` if repeat `idx`'s body contains a `MARK` opcode (a capturing
     /// group) anywhere — including nested sub-patterns, since the body occupies
-    /// the contiguous code range `[item, max_until_op)`. The scan is a sound
-    /// over-approximation: `MARK` *is* opcode 17, so a real group can never be
-    /// missed (no false negatives); at worst an unrelated operand byte equal to
-    /// 17 yields a false positive, which only routes the repeat to the
-    /// (correct) recursive engine. The iterative greedy driver intentionally
-    /// declines capturing bodies: it can't replay the per-repetition mark
-    /// snapshots the recursive engine keeps (e.g. restoring `group(1)` after a
-    /// failed trailing iteration of `(x)*`), so capturing repeats stay on the
-    /// recursive path and keep CPython's exact capture-backtracking semantics.
+    /// the contiguous code range `[item, max_until_op)`. The iterative greedy
+    /// driver intentionally declines capturing bodies: it can't replay the
+    /// per-repetition mark snapshots the recursive engine keeps (e.g. restoring
+    /// `group(1)` after a failed trailing iteration of `(x)*`), so capturing
+    /// repeats stay on the recursive path and keep CPython's exact
+    /// capture-backtracking semantics.
+    ///
+    /// The scan walks the opcode structure rather than doing a raw
+    /// `contains(&17)` — operand words (charset bitmaps in particular) can
+    /// equal `OP_MARK`, and such a false positive used to route long
+    /// mark-free repeats (`html.parser`'s `locatetagend` over `"<a " * n`)
+    /// into the recursive engine, tripping the depth guard.
     fn repeat_body_has_mark(&self, idx: usize) -> bool {
         let rpat = self.repeats[idx].pattern;
         let skip = self.code[rpat] as usize;
         let start = rpat + 3;
-        let end = rpat + skip;
-        end <= self.code.len() && self.code[start..end].contains(&OP_MARK)
+        let end = (rpat + skip).min(self.code.len());
+        start <= end && code_range_has_mark(self.code, start, end)
     }
 
     /// The faithful pre-3.11 recursive `MAX_UNTIL` (CPython `_sre`'s
@@ -1567,6 +1659,9 @@ fn subject_to_vec(obj: &Object) -> Result<Vec<u32>, RuntimeError> {
         Object::WStr(s) => Ok(s.to_vec()),
         Object::Bytes(b) => Ok(b.iter().map(|&x| u32::from(x)).collect()),
         Object::ByteArray(b) => Ok(b.borrow().iter().map(|&x| u32::from(x)).collect()),
+        // CPython's `_sre` accepts any buffer-protocol subject; h11 and
+        // urllib3 match patterns against `memoryview` windows.
+        Object::MemoryView(mv) => Ok(mv.to_bytes().into_iter().map(u32::from).collect()),
         // `str`/`bytes` subclass instances (e.g. email's `ValueTerminal(str)`):
         // CPython's `_sre` accepts any `PyUnicode`/buffer, subclasses
         // included. Unwrap the native payload the subclass instance carries.
@@ -1574,7 +1669,11 @@ fn subject_to_vec(obj: &Object) -> Result<Vec<u32>, RuntimeError> {
             if let Some(native) = other.native_value() {
                 if matches!(
                     native,
-                    Object::Str(_) | Object::WStr(_) | Object::Bytes(_) | Object::ByteArray(_)
+                    Object::Str(_)
+                        | Object::WStr(_)
+                        | Object::Bytes(_)
+                        | Object::ByteArray(_)
+                        | Object::MemoryView(_)
                 ) {
                     return subject_to_vec(&native);
                 }

@@ -113,4 +113,34 @@ assert p.pattern == r"(\d+)" and p.groups == 1
 assert [mo.group(1) for mo in p.finditer("a1b22c")] == ["1", "22"]
 assert isinstance(re.match(r"x", "x").re, re.Pattern)
 
+# --- deep mark-free repeats stay off the recursive engine (RFC 0056) ---
+# html.parser's locatetagend shape: a non-capturing repeat whose body
+# holds charsets, lookarounds and nested optional groups. The engine's
+# has-capturing-group scan must walk opcodes structurally — charset
+# bitmap words that happen to equal OP_MARK used to force ~100k
+# repetitions onto the recursive engine and trip its depth guard.
+_locatetagend = re.compile(r"""
+  [a-zA-Z][^\t\n\r\f />]*
+  [\t\n\r\f /]*
+  (?:(?<=['"\t\n\r\f /])[^\t\n\r\f />][^\t\n\r\f /=>]*
+    (?:[\t\n\r\f ]*=[\t\n\r\f ]*
+      (?:'[^']*'|"[^"]*"|(?!['"])[^>\t\n\r\f ]*)
+     )?
+    [\t\n\r\f /]*
+   )*
+   >?
+""", re.VERBOSE)
+_n = 100_000
+_m = _locatetagend.match("a " + "<a " * _n)
+assert _m is not None and _m.end() == 2 + 3 * _n
+_m = _locatetagend.match("a " + "<a a=v " * _n)
+assert _m is not None and _m.end() == 2 + 7 * _n
+# Capturing repeats still take the recursive path with exact
+# per-repetition mark restoration: after the trailing failed iteration
+# of (x)* backtracks, group(1) must hold the last *successful* body.
+_m = re.match(r"(?:(a)|b)*b", "aab")
+assert _m is not None and _m.group(1) == "a"
+_m = re.match(r"(a[bc])*a$", "abaca")
+assert _m is not None and _m.group(1) == "ac"
+
 print("ok")

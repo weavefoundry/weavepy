@@ -184,6 +184,10 @@ unsafe fn call_fastcall(
             .iter()
             .map(|(k, _)| Object::from_str(k.as_str()))
             .collect();
+        // CPython interns kwname strings; extensions match them against
+        // their own `PyUnicode_InternFromString` pointers by identity
+        // (orjson's `option=`/`default=` dispatch).
+        let _intern = crate::mirror::enter_intern_scope();
         crate::object::into_owned(Object::new_tuple(names))
     };
     let result = if (flags & METH_KEYWORDS) != 0 {
@@ -760,6 +764,146 @@ pub unsafe fn run_multiphase_init(
         }
     }
     Ok(module)
+}
+
+/// `PyModule_FromDefAndSpec2(def, spec, api_version)` — PEP 489 phase 1
+/// only: create the module object for `def` (via its `Py_mod_create`
+/// slot when present, default creation otherwise) *without* running
+/// exec slots; the loader calls [`PyModule_ExecDef`] afterwards. cffi's
+/// embedding glue (cryptography's `_openssl`) drives multi-phase init
+/// through this pair rather than returning the tagged def.
+///
+/// # Safety
+/// `def` must be a live `PyModuleDef`; `spec` a module spec with a
+/// readable `name` attribute.
+#[no_mangle]
+pub unsafe extern "C" fn PyModule_FromDefAndSpec2(
+    def: *mut PyModuleDef,
+    spec: *mut PyObject,
+    _api_version: c_int,
+) -> *mut PyObject {
+    if def.is_null() {
+        crate::errors::set_runtime_error("PyModule_FromDefAndSpec2 with null def");
+        return ptr::null_mut();
+    }
+    // The dotted module name comes from `spec.name`.
+    let full_name = if spec.is_null() {
+        String::new()
+    } else {
+        let name_obj = unsafe {
+            crate::abstract_::PyObject_GetAttrString(spec, b"name\0".as_ptr() as *const c_char)
+        };
+        if name_obj.is_null() {
+            crate::errors::clear_thread_local();
+            String::new()
+        } else {
+            let s = match unsafe { crate::object::clone_object(name_obj) } {
+                Object::Str(s) => s.to_string(),
+                other => other.to_str(),
+            };
+            unsafe { crate::object::Py_DecRef(name_obj) };
+            s
+        }
+    };
+    let slots = unsafe { slots_of(def) };
+    let module: *mut PyObject = if let Some(slot) = slots.iter().find(|s| s.slot == PY_MOD_CREATE) {
+        let create: unsafe extern "C" fn(*mut PyObject, *mut PyModuleDef) -> *mut PyObject =
+            unsafe { std::mem::transmute(slot.value) };
+        unsafe { create(spec, def) }
+    } else {
+        unsafe { PyModule_Create2(def, 1013) }
+    };
+    if module.is_null() {
+        return ptr::null_mut();
+    }
+    if !full_name.is_empty() {
+        if let Object::Module(m) = unsafe { crate::object::clone_object(module) } {
+            let mut d = m.dict.borrow_mut();
+            d.insert(
+                DictKey(Object::from_static("__name__")),
+                Object::from_str(full_name.clone()),
+            );
+            let package = match full_name.rsplit_once('.') {
+                Some((head, _)) => head.to_owned(),
+                None => String::new(),
+            };
+            d.insert(
+                DictKey(Object::from_static("__package__")),
+                Object::from_str(package),
+            );
+        }
+    }
+    module
+}
+
+/// `PyModule_ExecDef(module, def)` — PEP 489 phase 2: run every
+/// `Py_mod_exec` slot of `def` against `module`.
+///
+/// # Safety
+/// Both pointers must be live; `def`'s slot array must be well-formed.
+#[no_mangle]
+pub unsafe extern "C" fn PyModule_ExecDef(module: *mut PyObject, def: *mut PyModuleDef) -> c_int {
+    if module.is_null() || def.is_null() {
+        crate::errors::set_runtime_error("PyModule_ExecDef with null argument");
+        return -1;
+    }
+    for slot in unsafe { slots_of(def) }
+        .iter()
+        .filter(|s| s.slot == PY_MOD_EXEC)
+    {
+        let exec: unsafe extern "C" fn(*mut PyObject) -> c_int =
+            unsafe { std::mem::transmute(slot.value) };
+        if unsafe { exec(module) } != 0 {
+            return -1;
+        }
+    }
+    0
+}
+
+/// `PyModule_GetNameObject(m)` — a **new** str reference to the module's
+/// `__name__`.
+///
+/// # Safety
+/// `m` must be null or a live module pointer.
+#[no_mangle]
+pub unsafe extern "C" fn PyModule_GetNameObject(m: *mut PyObject) -> *mut PyObject {
+    if m.is_null() {
+        crate::errors::set_type_error("PyModule_GetNameObject: not a module");
+        return ptr::null_mut();
+    }
+    match unsafe { crate::object::clone_object(m) } {
+        Object::Module(module) => {
+            let name = module
+                .dict
+                .borrow()
+                .get(&weavepy_vm::object::StrKey("__name__"))
+                .cloned()
+                .unwrap_or_else(|| Object::from_str(module.name.clone()));
+            crate::object::into_owned(name)
+        }
+        _ => {
+            crate::errors::set_type_error("PyModule_GetNameObject: not a module");
+            ptr::null_mut()
+        }
+    }
+}
+
+/// `PyModule_Add(m, name, value)` — 3.13 spelling of `AddObject` that
+/// steals `value` even on failure.
+///
+/// # Safety
+/// Same contract as [`PyModule_AddObject`].
+#[no_mangle]
+pub unsafe extern "C" fn PyModule_Add(
+    m: *mut PyObject,
+    name: *const c_char,
+    value: *mut PyObject,
+) -> c_int {
+    let rc = unsafe { PyModule_AddObjectRef(m, name, value) };
+    if !value.is_null() {
+        unsafe { crate::object::Py_DecRef(value) };
+    }
+    rc
 }
 
 /// Build a minimal `importlib.machinery.ModuleSpec(name, None)` for a

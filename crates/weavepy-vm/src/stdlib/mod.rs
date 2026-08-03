@@ -53,7 +53,7 @@ pub mod select_mod;
 pub mod shutil_mod;
 pub mod signal_mod;
 pub mod socket_mod;
-pub mod sqlite3_mod;
+pub mod sqlite3_native;
 pub mod sre_mod;
 pub mod statistics_accel;
 pub mod struct_mod;
@@ -182,7 +182,7 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("_gzip", gzip_mod::build);
     cache.register_builtin("_bz2", bz2_mod::build);
     cache.register_builtin("_lzma", lzma_mod::build);
-    cache.register_builtin("_sqlite3", sqlite3_mod::build);
+    cache.register_builtin("_sqlite3", sqlite3_native::build);
     cache.register_builtin("_csv", csv_mod::build);
     cache.register_builtin("_weakref", weakref_real::build);
     cache.register_builtin("gc", gc_real::build);
@@ -1086,9 +1086,18 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/html.py"),
             is_package: false,
         },
+        // `html.parser` + `_markupbase` — verbatim CPython (RFC 0056 WS3):
+        // the earlier 134-line regex shim mis-parsed CDATA/declaration/bogus
+        // -comment paths and looped on truncated markup, failing (and
+        // hanging) test_htmlparser.
         FrozenSource {
             name: "html.parser",
             source: include_str!("python/html_parser.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_markupbase",
+            source: include_str!("python/_markupbase.py"),
             is_package: false,
         },
         FrozenSource {
@@ -1158,6 +1167,45 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "http.cookiejar",
             source: include_str!("python/http/cookiejar.py"),
+            is_package: false,
+        },
+        // RFC 0056 WS6 — `wsgiref`, vendored verbatim from
+        // `vendor/cpython/Lib/wsgiref/`. Django's test client imports
+        // `wsgiref.simple_server` (via `django.core.servers.basehttp`),
+        // and flask's dev server sits on `wsgiref.types` through werkzeug.
+        FrozenSource {
+            name: "wsgiref",
+            source: include_str!("python/wsgiref/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "wsgiref.handlers",
+            source: include_str!("python/wsgiref/handlers.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "wsgiref.headers",
+            source: include_str!("python/wsgiref/headers.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "wsgiref.simple_server",
+            source: include_str!("python/wsgiref/simple_server.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "wsgiref.types",
+            source: include_str!("python/wsgiref/types.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "wsgiref.util",
+            source: include_str!("python/wsgiref/util.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "wsgiref.validate",
+            source: include_str!("python/wsgiref/validate.py"),
             is_package: false,
         },
         // RFC 0042 WS3/WS5 — the real CPython `email` package, vendored
@@ -1807,6 +1855,11 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/xml/etree/ElementTree.py"),
             is_package: false,
         },
+        FrozenSource {
+            name: "xml.etree.ElementInclude",
+            source: include_str!("python/xml/etree/ElementInclude.py"),
+            is_package: false,
+        },
         // `xml.parsers.expat` — verbatim CPython over WeavePy's native
         // `pyexpat`. Registering the package + this thin `from pyexpat import *`
         // shim is what lets the verbatim `xml.dom` package below drive the
@@ -1820,6 +1873,40 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "xml.parsers.expat",
             source: include_str!("python/xml/parsers/expat.py"),
+            is_package: false,
+        },
+        // `xml.sax` — verbatim CPython over the native `pyexpat` (RFC 0056
+        // WS3). `expatreader` drives the real expat push parser; `saxutils`
+        // provides `escape`/`quoteattr`/`XMLGenerator` used across the
+        // ecosystem (docutils, openpyxl's xmlfile, plistlib consumers).
+        FrozenSource {
+            name: "xml.sax",
+            source: include_str!("python/xml/sax/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "xml.sax._exceptions",
+            source: include_str!("python/xml/sax/_exceptions.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "xml.sax.handler",
+            source: include_str!("python/xml/sax/handler.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "xml.sax.xmlreader",
+            source: include_str!("python/xml/sax/xmlreader.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "xml.sax.saxutils",
+            source: include_str!("python/xml/sax/saxutils.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "xml.sax.expatreader",
+            source: include_str!("python/xml/sax/expatreader.py"),
             is_package: false,
         },
         // `xml.dom` + `xml.dom.minidom` (and the builders they need) — verbatim
@@ -1861,6 +1948,29 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "xml.dom.minidom",
             source: include_str!("python/xml/dom/minidom.py"),
+            is_package: false,
+        },
+        // `xml.dom.pulldom` — verbatim CPython over `xml.sax` (RFC 0056 WS3).
+        FrozenSource {
+            name: "xml.dom.pulldom",
+            source: include_str!("python/xml/dom/pulldom.py"),
+            is_package: false,
+        },
+        // `xmlrpc` — verbatim CPython (RFC 0056 WS3): client marshalling over
+        // `xml.parsers.expat`, server over `socketserver`/`http.server`.
+        FrozenSource {
+            name: "xmlrpc",
+            source: include_str!("python/xmlrpc/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "xmlrpc.client",
+            source: include_str!("python/xmlrpc/client.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "xmlrpc.server",
+            source: include_str!("python/xmlrpc/server.py"),
             is_package: false,
         },
         // RFC 0018 — introspection, test infrastructure, exception groups.
@@ -2388,14 +2498,45 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/tarfile.py"),
             is_package: false,
         },
+        // RFC 0056 WS1: CPython 3.13's *verbatim* `sqlite3` package over
+        // the native `_sqlite3` core (`stdlib/sqlite3_native/`).
         FrozenSource {
             name: "sqlite3",
-            source: include_str!("python/sqlite3.py"),
+            source: include_str!("python/sqlite3/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "sqlite3.dbapi2",
+            source: include_str!("python/sqlite3/dbapi2.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "sqlite3.dump",
+            source: include_str!("python/sqlite3/dump.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "sqlite3.__main__",
+            source: include_str!("python/sqlite3/__main__.py"),
             is_package: false,
         },
         FrozenSource {
             name: "copyreg",
             source: include_str!("python/copyreg.py"),
+            is_package: false,
+        },
+        // CPython 3.13 `Lib/colorsys.py`, adopted verbatim (RFC 0056 WS5):
+        // rich's color engine imports `rgb_to_hls` at module load.
+        FrozenSource {
+            name: "colorsys",
+            source: include_str!("python/colorsys.py"),
+            is_package: false,
+        },
+        // CPython 3.13 `Lib/netrc.py`, adopted verbatim (RFC 0056 WS5):
+        // aiohttp's helpers import it at module load.
+        FrozenSource {
+            name: "netrc",
+            source: include_str!("python/netrc.py"),
             is_package: false,
         },
         // CPython 3.13 `Lib/graphlib.py`, adopted verbatim (RFC 0051):
@@ -3074,6 +3215,15 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "_testcapi",
             source: include_str!("python/_testcapi.py"),
+            is_package: false,
+        },
+        // Pure-Python stand-in for `_testmultiphase` (RFC 0056 WS4):
+        // `test.test_importlib.util` imports it at module scope as a skip
+        // guard, which otherwise wipes out testmock's entire testpatch.py
+        // (`from test.test_importlib.util import uncache`).
+        FrozenSource {
+            name: "_testmultiphase",
+            source: include_str!("python/_testmultiphase.py"),
             is_package: false,
         },
     ];

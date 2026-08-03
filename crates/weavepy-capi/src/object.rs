@@ -216,12 +216,6 @@ pub fn register_minted(p: *mut PyObject) {
     if p.is_null() {
         return;
     }
-    if freebox_trace_enabled() {
-        let tyname = unsafe { debug_type_name(p) };
-        if tyname.contains("Engine") {
-            eprintln!("[MINT] register p=0x{:x} type={}", p as usize, tyname);
-        }
-    }
     if let Ok(mut g) = MINTED.lock() {
         g.get_or_insert_with(HashSet::new).insert(p as usize);
     }

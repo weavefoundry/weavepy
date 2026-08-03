@@ -579,6 +579,41 @@ pub fn init_static_types() {
             ty.tp_itemsize = itemsize;
         }
     }
+    // CPython's `PyType_Ready` gives every readied type `tp_alloc =
+    // PyType_GenericAlloc` / `tp_free = PyObject_Free`. A *static Cython
+    // subtype* of a built-in (sqlalchemy's `cdef class immutabledict(dict)`)
+    // inherits `tp_alloc` byte-wise from our exported static and calls it
+    // straight off the struct in its `tp_new`; a NULL slot there is a jump
+    // to address zero. Backfill the defaults on every exported static.
+    unsafe {
+        let alloc_fp: unsafe extern "C" fn(*mut PyTypeObject, PySsizeT) -> *mut PyObject =
+            crate::genericalloc::PyType_GenericAlloc;
+        let new_fp: unsafe extern "C" fn(
+            *mut PyTypeObject,
+            *mut PyObject,
+            *mut PyObject,
+        ) -> *mut PyObject = crate::genericalloc::PyType_GenericNew;
+        let free_fp: unsafe extern "C" fn(*mut c_void) = crate::memory::PyObject_Free;
+        for slot in STATIC_TYPE_TABLE {
+            let ty = &mut *slot.as_ptr();
+            if ty.tp_alloc.is_null() {
+                ty.tp_alloc = alloc_fp as *mut c_void;
+            }
+            // `object.__new__` and friends: PyO3's
+            // `PyNativeTypeInitializer` resolves its base's `tp_new`
+            // through `PyType_GetSlot` and refuses a NULL ("base type
+            // without tp_new" — pydantic-core's module init). The value
+            // built-ins with faithful constructors (float/str/bytes/
+            // complex) are overridden later by `builtin_new::install`.
+            if ty.tp_new.is_null() {
+                ty.tp_new = new_fp as *mut c_void;
+            }
+            if ty.tp_free.is_null() {
+                ty.tp_free = free_fp as *mut c_void;
+            }
+        }
+    }
+
     unsafe {
         set_size(&PyType_Type, 928, 40);
         set_size(&PyBaseObject_Type, 16, 0);
@@ -2799,10 +2834,32 @@ pub unsafe extern "C" fn PyType_FromMetaclass(
 /// SlotTable.
 #[no_mangle]
 pub unsafe extern "C" fn PyType_GetSlot(ty: *mut PyTypeObject, slot: c_int) -> *mut c_void {
-    let Some(table) = (unsafe { crate::slottable::slot_table_for(ty) }) else {
+    if ty.is_null() {
         return ptr::null_mut();
-    };
-    table.get(slot).as_void()
+    }
+    if let Some(table) = unsafe { crate::slottable::slot_table_for(ty) } {
+        let p = table.get(slot).as_void();
+        if !p.is_null() {
+            return p;
+        }
+    }
+    // Lifecycle slots live on the faithful struct even when the decoded
+    // table has no entry — static built-in mirrors and `install_user_type`
+    // boxes fill `tp_new`/`tp_alloc`/`tp_free` in the struct only. PyO3's
+    // subclass creation resolves its base's `tp_new` through this call
+    // (pydantic-core: "base type without tp_new" when it comes back NULL).
+    unsafe {
+        match slot {
+            crate::slottable::Py_tp_new => (*ty).tp_new,
+            crate::slottable::Py_tp_alloc => (*ty).tp_alloc,
+            crate::slottable::Py_tp_free => (*ty).tp_free,
+            crate::slottable::Py_tp_dealloc => match (*ty).tp_dealloc {
+                Some(f) => f as *mut c_void,
+                None => ptr::null_mut(),
+            },
+            _ => ptr::null_mut(),
+        }
+    }
 }
 
 /// `PyType_HasFeature(type, flag)` — check a `Py_TPFLAGS_*` bit.
@@ -2848,11 +2905,15 @@ pub unsafe extern "C" fn PyType_GetQualName(ty: *mut PyTypeObject) -> *mut PyObj
 
 #[no_mangle]
 pub unsafe extern "C" fn PyType_FromModuleAndSpec(
-    _module: *mut PyObject,
+    module: *mut PyObject,
     spec: *mut PyType_Spec,
     bases: *mut PyObject,
 ) -> *mut PyObject {
-    unsafe { PyType_FromSpecWithBases(spec, bases) }
+    let ty = unsafe { PyType_FromSpecWithBases(spec, bases) };
+    // Remember the owning module so `PyType_GetModuleByDef` (multidict's
+    // per-module state lookup) can resolve it later.
+    crate::abi313::register_type_module(ty, module);
+    ty
 }
 
 /// True if `ty` is a WeavePy-owned type object (a static built-in or a
@@ -3458,10 +3519,27 @@ pub unsafe extern "C" fn PyObject_TypeCheck(o: *mut PyObject, ty: *mut PyTypeObj
     unsafe { PyType_IsSubtype(head.ob_type, ty) }
 }
 
+/// `PyType_GetName(type)` — the type's `__name__` as a **str object**
+/// (new reference), *not* the raw `tp_name` C string. PyO3's
+/// `PyType::name()` (abi3 ≥ 3.11) wraps the result as a `PyString` and,
+/// via `AddTypeToModule`, appends it to a module's `__all__` — handing it
+/// a `char*` made it dereference string bytes as an object header
+/// (cryptography's `x509.verification.VerificationError` export).
+/// CPython semantics: heap types read `ht_name`; static types get the
+/// tail of `tp_name` after the last dot.
 #[no_mangle]
-pub unsafe extern "C" fn PyType_GetName(ty: *mut PyTypeObject) -> *const c_char {
+pub unsafe extern "C" fn PyType_GetName(ty: *mut PyTypeObject) -> *mut PyObject {
     if ty.is_null() {
-        return ptr::null();
+        return ptr::null_mut();
     }
-    unsafe { (*ty).tp_name }
+    if let Some(cls) = unsafe { bridge_type(ty) } {
+        return crate::object::into_owned(Object::from_str(cls.name.clone()));
+    }
+    let np = unsafe { (*ty).tp_name };
+    if np.is_null() {
+        return ptr::null_mut();
+    }
+    let full = unsafe { std::ffi::CStr::from_ptr(np) }.to_string_lossy();
+    let bare = full.rsplit('.').next().unwrap_or(&full);
+    crate::object::into_owned(Object::from_str(bare))
 }

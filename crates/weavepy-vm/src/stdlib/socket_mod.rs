@@ -412,17 +412,42 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         d.insert(DictKey(Object::from_static("SHUT_WR")), Object::Int(1));
         d.insert(DictKey(Object::from_static("SHUT_RDWR")), Object::Int(2));
 
-        // getaddrinfo flags.
-        d.insert(DictKey(Object::from_static("AI_PASSIVE")), Object::Int(1));
-        d.insert(DictKey(Object::from_static("AI_CANONNAME")), Object::Int(2));
-        d.insert(
-            DictKey(Object::from_static("AI_NUMERICHOST")),
-            Object::Int(4),
-        );
-        d.insert(
-            DictKey(Object::from_static("AI_NUMERICSERV")),
-            Object::Int(8),
-        );
+        // getaddrinfo flags — real libc values (they are passed straight
+        // into `hints.ai_flags`, and differ per platform: AI_NUMERICSERV
+        // is 0x1000 on Darwin, 0x400 on Linux). aiohttp's resolver reads
+        // `AI_ADDRCONFIG` at import.
+        #[cfg(unix)]
+        for (name, val) in [
+            ("AI_PASSIVE", libc::AI_PASSIVE),
+            ("AI_CANONNAME", libc::AI_CANONNAME),
+            ("AI_NUMERICHOST", libc::AI_NUMERICHOST),
+            ("AI_NUMERICSERV", libc::AI_NUMERICSERV),
+            ("AI_ADDRCONFIG", libc::AI_ADDRCONFIG),
+            ("AI_ALL", libc::AI_ALL),
+            ("AI_V4MAPPED", libc::AI_V4MAPPED),
+        ] {
+            d.insert(
+                DictKey(Object::from_str(name.to_owned())),
+                Object::Int(i64::from(val)),
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            d.insert(DictKey(Object::from_static("AI_PASSIVE")), Object::Int(1));
+            d.insert(DictKey(Object::from_static("AI_CANONNAME")), Object::Int(2));
+            d.insert(
+                DictKey(Object::from_static("AI_NUMERICHOST")),
+                Object::Int(4),
+            );
+            d.insert(
+                DictKey(Object::from_static("AI_NUMERICSERV")),
+                Object::Int(8),
+            );
+            d.insert(
+                DictKey(Object::from_static("AI_ADDRCONFIG")),
+                Object::Int(0x0400),
+            );
+        }
 
         // getnameinfo flags.
         d.insert(
@@ -842,11 +867,16 @@ fn sock_init_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
     }
     let as_i32 = |slot: &Option<Object>, default: i32, what: &str| -> Result<i32, RuntimeError> {
         match slot {
-            // CPython treats the -1 sentinel as "use the default".
-            Some(Object::Int(i)) if *i == -1 => Ok(default),
-            Some(Object::Int(i)) => Ok(*i as i32),
             None | Some(Object::None) => Ok(default),
-            _ => Err(type_error(format!("{what} must be int"))),
+            // `as_i64` also unwraps int-subclass instances — `socket.py`
+            // promotes the constants to `AddressFamily`/`SocketKind`
+            // IntEnum members, and CPython accepts any int here.
+            Some(o) => match o.as_i64() {
+                // CPython treats the -1 sentinel as "use the default".
+                Some(-1) => Ok(default),
+                Some(i) => Ok(i as i32),
+                None => Err(type_error(format!("{what} must be int"))),
+            },
         }
     };
     let family = as_i32(&slots[0], libc_af_inet() as i32, "family")?;
@@ -2853,10 +2883,10 @@ fn mod_getaddrinfo(args: &[Object]) -> Result<Object, RuntimeError> {
             ))
         }
     };
-    let int_at = |i: usize| match args.get(i) {
-        Some(Object::Int(n)) => *n as i32,
-        _ => 0,
-    };
+    // `as_i64` unwraps IntEnum members too — `socket.py` promotes the
+    // constants to `AddressFamily`/`SocketKind`, and callers pass e.g.
+    // `getaddrinfo(host, port, 0, SOCK_STREAM)` with the enum.
+    let int_at = |i: usize| args.get(i).and_then(Object::as_i64).unwrap_or(0) as i32;
     let (family, kind, proto, flags) = (int_at(2), int_at(3), int_at(4), int_at(5));
 
     let mut hints: libc::addrinfo = unsafe { std::mem::zeroed() };
@@ -3074,14 +3104,15 @@ fn mod_create_server(args: &[Object]) -> Result<Object, RuntimeError> {
         .first()
         .ok_or_else(|| type_error("create_server: missing address"))?
         .clone();
-    let family = match args.get(1) {
-        Some(Object::Int(n)) => *n as i32,
-        _ => libc_af_inet() as i32,
+    // `as_i64` unwraps the `AddressFamily` IntEnum member `socket.py`
+    // promotes the constant to (a plain `Object::Int` match would silently
+    // fall back to AF_INET and an IPv6 bind would fail with EAFNOSUPPORT —
+    // `test_ftplib.TestIPv6Environment`).
+    let family = match args.get(1).and_then(Object::as_i64) {
+        Some(n) => n as i32,
+        None => libc_af_inet() as i32,
     };
-    let backlog = match args.get(2) {
-        Some(Object::Int(n)) => *n,
-        _ => 100,
-    };
+    let backlog = args.get(2).and_then(Object::as_i64).unwrap_or(100);
     let reuse_port = match args.get(3) {
         Some(Object::Bool(b)) => *b,
         _ => false,
@@ -3120,20 +3151,28 @@ fn mod_socketpair(args: &[Object]) -> Result<Object, RuntimeError> {
     // pipes and the `forkserver` control channel both rely on a real
     // `socketpair(2)` over which `SCM_RIGHTS` fd passing works (a TCP
     // loopback pair cannot carry ancillary data).
+    // `as_i64` also unwraps the `AddressFamily`/`SocketKind` IntEnum
+    // members `socket.py` promotes the constants to.
     let family = match args.first() {
         None | Some(Object::None) => default_socketpair_family(),
-        Some(Object::Int(n)) => *n as i32,
-        _ => return Err(type_error("socketpair: family must be an integer")),
+        Some(o) => o
+            .as_i64()
+            .map(|n| n as i32)
+            .ok_or_else(|| type_error("socketpair: family must be an integer"))?,
     };
     let sock_type = match args.get(1) {
         None | Some(Object::None) => libc_sock_stream() as i32,
-        Some(Object::Int(n)) => *n as i32,
-        _ => return Err(type_error("socketpair: type must be an integer")),
+        Some(o) => o
+            .as_i64()
+            .map(|n| n as i32)
+            .ok_or_else(|| type_error("socketpair: type must be an integer"))?,
     };
     let proto = match args.get(2) {
         None | Some(Object::None) => 0,
-        Some(Object::Int(n)) => *n as i32,
-        _ => return Err(type_error("socketpair: proto must be an integer")),
+        Some(o) => o
+            .as_i64()
+            .map(|n| n as i32)
+            .ok_or_else(|| type_error("socketpair: proto must be an integer"))?,
     };
 
     #[cfg(unix)]
@@ -3261,9 +3300,10 @@ fn mod_inet_ntoa(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn mod_inet_pton(args: &[Object]) -> Result<Object, RuntimeError> {
-    let family = match args.first() {
-        Some(Object::Int(n)) => *n as i32,
-        _ => return Err(type_error("inet_pton: family must be int")),
+    // `as_i64` also unwraps `AddressFamily` IntEnum members.
+    let family = match args.first().and_then(Object::as_i64) {
+        Some(n) => n as i32,
+        None => return Err(type_error("inet_pton: family must be int")),
     };
     let s = match args.get(1) {
         Some(Object::Str(s)) => s.to_string(),
@@ -3290,9 +3330,10 @@ fn mod_inet_pton(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn mod_inet_ntop(args: &[Object]) -> Result<Object, RuntimeError> {
-    let family = match args.first() {
-        Some(Object::Int(n)) => *n as i32,
-        _ => return Err(type_error("inet_ntop: family must be int")),
+    // `as_i64` also unwraps `AddressFamily` IntEnum members.
+    let family = match args.first().and_then(Object::as_i64) {
+        Some(n) => n as i32,
+        None => return Err(type_error("inet_ntop: family must be int")),
     };
     let bytes = match args.get(1) {
         Some(Object::Bytes(b)) => b.to_vec(),

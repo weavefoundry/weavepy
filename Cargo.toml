@@ -11,6 +11,7 @@ members = [
     "crates/weavepy-lexer",
     "crates/weavepy-parser",
     "crates/weavepy-vm",
+    "vendor/expat-sys",
 ]
 # `weavepy-conformance` and `weavepy-bench` are development tools that shell
 # out to `python3` and aren't useful to publish or to compile by default.
@@ -101,11 +102,9 @@ lzma-sys    = "0.1"
 rusqlite    = { version = "0.31", features = ["bundled", "column_decltype"] }
 rust_decimal = "1.36"
 
-# RFC 0040 WS5 — `pyexpat`: a real streaming XML parser behind the native
-# `pyexpat` module (CPython wraps the C `expat` library; we wrap `quick-xml`,
-# a mature pure-Rust streaming parser). Drives `xmlrpc` (the multiprocessing
-# manager serializer), `xml.sax`, `xml.dom.minidom`, and `xml.etree`.
-quick-xml   = { version = "0.36", features = ["encoding"] }
+# RFC 0056 WS3 — real expat: vendored 2.6.4 C sources + raw FFI bindings
+# (see vendor/expat-sys/README.md). Backs the rewritten native `pyexpat`.
+expat-sys   = { path = "vendor/expat-sys" }
 
 # RFC 0020 — interactive REPL + CLI surface.
 rustyline   = { version = "14.0", default-features = false, features = ["with-file-history"] }

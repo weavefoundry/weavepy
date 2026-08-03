@@ -95,8 +95,25 @@ pub(crate) fn builtin_type_constructor(name: &str) -> Option<Rc<BuiltinFn>> {
         "memoryview" => ctor!("memoryview", b_memoryview),
         "enumerate" => ctor!("enumerate", b_enumerate, b_enumerate_kw),
         "reversed" => ctor!("reversed", b_reversed),
+        "cell" => ctor!("cell", b_cell),
         _ => None,
     }
+}
+
+/// `types.CellType()` / `types.CellType(value)` — a real closure cell
+/// (CPython `cell_new`), empty when constructed without a value.
+pub(crate) fn b_cell(args: &[Object]) -> Result<Object, RuntimeError> {
+    let contents = match args {
+        [] => Object::Unbound,
+        [v] => v.clone(),
+        n => {
+            return Err(type_error(format!(
+                "cell expected at most 1 argument, got {}",
+                n.len()
+            )));
+        }
+    };
+    Ok(Object::Cell(Rc::new(crate::sync::RefCell::new(contents))))
 }
 
 /// `slice(stop)` / `slice(start, stop[, step])` → a real `Object::Slice`,
@@ -591,6 +608,20 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "__getitem__" => Some(method("__getitem__", range_getitem)),
             "__len__" => Some(method("__len__", obj_len)),
             "__contains__" => Some(method("__contains__", obj_contains)),
+            // `range.__bool__` / `range.__reversed__` are real `tp_dict`
+            // entries in CPython (RFC 0056 WS4).
+            "__bool__" => Some(method("__bool__", |args| {
+                let recv = args
+                    .first()
+                    .ok_or_else(|| type_error("__bool__() missing self"))?;
+                Ok(Object::Bool(recv.len()? > 0))
+            })),
+            "__reversed__" => Some(method("__reversed__", |args| {
+                b_reversed(std::slice::from_ref(
+                    args.first()
+                        .ok_or_else(|| type_error("__reversed__() missing self"))?,
+                ))
+            })),
             _ => None,
         },
         Object::Dict(_) => match name {
@@ -783,6 +814,34 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "__contains__" => Some(method("__contains__", obj_contains)),
             "__len__" => Some(method("__len__", obj_len)),
             "__getitem__" => Some(method("__getitem__", seq_getitem)),
+            // Mutable mapping/sequence slots (bytearray only) — delegate to
+            // the VM's subscript machinery so int, slice, and `__index__`
+            // keys all behave exactly like `b[k] = v` / `del b[k]`
+            // (RFC 0056 WS4: CPython stores these in `tp_dict`).
+            "__setitem__" if matches!(obj, Object::ByteArray(_)) => {
+                Some(method("__setitem__", reentrant_setitem))
+            }
+            "__delitem__" if matches!(obj, Object::ByteArray(_)) => {
+                Some(method("__delitem__", reentrant_delitem))
+            }
+            "__iadd__" if matches!(obj, Object::ByteArray(_)) => {
+                Some(method("__iadd__", bytearray_iadd))
+            }
+            "__imul__" if matches!(obj, Object::ByteArray(_)) => {
+                Some(method("__imul__", bytearray_imul))
+            }
+            // PEP 688: called when a buffer view over the bytearray is
+            // released. WeavePy views snapshot/share the backing Vec with
+            // no export count, so releasing is a no-op.
+            "__release_buffer__" if matches!(obj, Object::ByteArray(_)) => {
+                Some(method("__release_buffer__", |args| {
+                    args.get(1)
+                        .ok_or_else(|| {
+                            type_error("__release_buffer__() takes exactly one argument (0 given)")
+                        })
+                        .map(|_| Object::None)
+                }))
+            }
             "__add__" => Some(seq_dunder_binop(
                 "__add__",
                 weavepy_compiler::BinOpKind::Add,
@@ -907,11 +966,27 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
         Object::MemoryView(_) => match name {
             "tobytes" => Some(method("tobytes", memoryview_tobytes)),
             "tolist" => Some(method("tolist", memoryview_tolist)),
+            "toreadonly" => Some(method("toreadonly", memoryview_toreadonly)),
             "release" => Some(method("release", memoryview_release)),
             "cast" => Some(method_kw("cast", memoryview_cast)),
             "hex" => Some(method("hex", memoryview_hex)),
             "__enter__" => Some(method("__enter__", memoryview_enter)),
             "__exit__" => Some(method("__exit__", memoryview_exit)),
+            // Sequence/mapping slots as real methods (RFC 0056 WS4):
+            // subscripts delegate to the VM machinery so element unpacking,
+            // slices, and multi-dim views behave exactly like `mv[k]`.
+            "__len__" => Some(method("__len__", obj_len)),
+            "__getitem__" => Some(method("__getitem__", reentrant_getitem)),
+            "__setitem__" => Some(method("__setitem__", reentrant_setitem)),
+            "__delitem__" => Some(method("__delitem__", reentrant_delitem)),
+            "__iter__" => Some(method("__iter__", memoryview_iter)),
+            "__release_buffer__" => Some(method("__release_buffer__", |args| {
+                args.get(1)
+                    .ok_or_else(|| {
+                        type_error("__release_buffer__() takes exactly one argument (0 given)")
+                    })
+                    .map(|_| Object::None)
+            })),
             _ => None,
         },
         Object::DictView(_) => match name {
@@ -948,9 +1023,27 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "getter" => Some(method("getter", property_getter)),
             "setter" => Some(method("setter", property_setter)),
             "deleter" => Some(method("deleter", property_deleter)),
+            // CPython `property_init` re-initialises the descriptor *in
+            // place*; a `property` subclass chaining
+            // `super().__init__(fget, doc=doc)` (werkzeug's
+            // `cached_property`) lands here via super's native-payload
+            // probe.
+            "__init__" => Some(method_kw("__init__", property_init_kw)),
             "__get__" => Some(method("__get__", property_dunder_get)),
             "__set__" => Some(method("__set__", property_dunder_set)),
             "__delete__" => Some(method("__delete__", property_dunder_delete)),
+            // 3.13 (gh-98963): `property.__set_name__(owner, name)` records
+            // the attribute name (surfaced as `prop.__name__`). WeavePy
+            // reports names via the descriptor registry, so accept & ignore.
+            "__set_name__" => Some(method("__set_name__", |args| {
+                if args.len() != 3 {
+                    return Err(type_error(format!(
+                        "__set_name__() takes 2 positional arguments but {} were given",
+                        args.len().saturating_sub(1)
+                    )));
+                }
+                Ok(Object::None)
+            })),
             "fget" | "fset" | "fdel" | "__doc__" => {
                 // These are looked up via `lookup_attr` in the VM
                 // rather than method dispatch; we don't return them
@@ -964,6 +1057,9 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
         // (`staticmethod.__get__`) via the slot-wrapper table.
         Object::StaticMethod(_) => match name {
             "__get__" => Some(method("__get__", staticmethod_descr_get)),
+            // 3.10 (bpo-43682): staticmethods are directly callable —
+            // `sm(*args)` invokes the wrapped callable.
+            "__call__" => Some(method_kw("__call__", staticmethod_call)),
             _ => None,
         },
         Object::ClassMethod(_) => match name {
@@ -991,6 +1087,9 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             // `int.__round__([ndigits])` — same shape as the `round()`
             // builtin's native path (typing's SupportsRound probes for it).
             "__round__" => Some(method("__round__", b_round)),
+            // `int.__float__` — a real `tp_dict` entry in CPython
+            // (RFC 0056 WS4).
+            "__float__" => Some(method("__float__", b_float_compat)),
             _ => numeric_dunder(obj, name),
         },
         Object::Float(_) => match name {
@@ -1045,6 +1144,29 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
                 args.first()
                     .cloned()
                     .ok_or_else(|| type_error("__iter__() missing self"))
+            })),
+            // `enumerate.__next__` / `reversed.__next__` are real `tp_dict`
+            // entries in CPython (RFC 0056 WS4); the load_attr fast path
+            // at `Object::Iter` still serves bound instance access.
+            "__next__" => Some(method("__next__", |args| match args.first() {
+                Some(Object::Iter(it)) => match it.borrow_mut().next_value_checked() {
+                    Ok(Some(v)) => Ok(v),
+                    Ok(None) => Err(crate::error::stop_iteration()),
+                    Err(e) => Err(e),
+                },
+                // An enumerate/reversed *subclass* over a VM-driven source
+                // carries a frozen `_seqtools` iterator instance as its
+                // native payload (`MyEnum(getitem_seq)`) — drive it through
+                // the interpreter's iteration protocol.
+                Some(recv @ Object::Instance(_)) => {
+                    let interp = reentrant_interp()?;
+                    let globals = interp.builtins_dict();
+                    match interp.iter_next(recv, &globals)? {
+                        Some(v) => Ok(v),
+                        None => Err(crate::error::stop_iteration()),
+                    }
+                }
+                _ => Err(type_error("__next__() requires an iterator")),
             })),
             // Pickling support. The actual reduction needs the canonical
             // `iter` builtin (so the result pickles by name and round-trips),
@@ -1320,11 +1442,18 @@ fn seq_dunder_binop(
                 )))
             }
         };
-        if reflected {
-            crate::binary_op(b, a, op)
-        } else {
-            crate::binary_op(a, b, op)
+        let (a, b) = if reflected { (b, a) } else { (a, b) };
+        // `str.__mod__` reached as a slot wrapper (markupsafe's
+        // `super().__mod__(arg)`) still needs `%s`/`%r` of user
+        // instances to dispatch `__str__`/`__repr__` — route through
+        // the VM formatter when one is live, like the `%` opcode does.
+        if matches!(op, weavepy_compiler::BinOpKind::Mod) && a.is_str() {
+            if let Ok(interp) = reentrant_interp() {
+                let globals = interp.builtins_dict();
+                return interp.percent_mod_left_slot(a, b, &globals);
+            }
         }
+        crate::binary_op(a, b, op)
     })
 }
 
@@ -1783,6 +1912,23 @@ pub fn unbound_method(type_name: &str, name: &str) -> Option<Object> {
         ))),
         "staticmethod" => Object::StaticMethod(MethodWrapper::new(Object::None)),
         "classmethod" => Object::ClassMethod(MethodWrapper::new(Object::None)),
+        // Value/container types whose instances resolve methods through
+        // `lookup_method` directly (RFC 0056 WS4): representatives route
+        // type-level access (`memoryview.hex`, `range.count`,
+        // `slice.indices`) to the same tables.
+        "memoryview" => Object::MemoryView(Rc::new(crate::object::PyMemoryView::from_bytes(
+            Rc::from(Vec::<u8>::new()),
+        ))),
+        "range" => Object::Range(Rc::new(crate::object::Range {
+            start: 0,
+            stop: 0,
+            step: 1,
+        })),
+        "slice" => Object::Slice(Rc::new(crate::object::PySlice {
+            start: Object::None,
+            stop: Object::None,
+            step: Object::None,
+        })),
         _ => return None,
     };
     lookup_method(&rep, name)
@@ -2773,6 +2919,68 @@ fn property_self(args: &[Object], op: &str) -> Result<Rc<crate::object::PyProper
     }
 }
 
+/// `property.__init__(self, fget=None, fset=None, fdel=None, doc=None)`
+/// — CPython's `property_init`: replaces all four members on the
+/// *existing* descriptor. Reached by subclass `__init__` chains
+/// (`super().__init__(fget, doc=doc)`); the receiver may be the raw
+/// payload (super's native-payload probe) or the wrapping instance.
+fn property_init_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let recv = args
+        .first()
+        .ok_or_else(|| type_error("__init__() missing self"))?;
+    let prop = match recv {
+        Object::Property(p) => p.clone(),
+        Object::Instance(i) => match i.native.get() {
+            Some(Object::Property(p)) => p.clone(),
+            _ => {
+                return Err(type_error(
+                    "descriptor '__init__' requires a 'property' object",
+                ))
+            }
+        },
+        _ => {
+            return Err(type_error(
+                "descriptor '__init__' requires a 'property' object",
+            ))
+        }
+    };
+    let mut members: [Object; 4] = [
+        args.get(1).cloned().unwrap_or(Object::None),
+        args.get(2).cloned().unwrap_or(Object::None),
+        args.get(3).cloned().unwrap_or(Object::None),
+        args.get(4).cloned().unwrap_or(Object::None),
+    ];
+    if args.len() > 5 {
+        return Err(type_error(format!(
+            "property() takes at most 4 arguments ({} given)",
+            args.len() - 1
+        )));
+    }
+    for (k, v) in kwargs {
+        let idx = match k.as_str() {
+            "fget" => 0,
+            "fset" => 1,
+            "fdel" => 2,
+            "doc" => 3,
+            other => {
+                return Err(type_error(format!(
+                    "property() got an unexpected keyword argument '{other}'"
+                )))
+            }
+        };
+        if idx + 1 < args.len() {
+            return Err(type_error(format!(
+                "argument for property() given by name ('{k}') and position ({})",
+                idx + 1
+            )));
+        }
+        members[idx] = v.clone();
+    }
+    let [fget, fset, fdel, doc] = members;
+    prop.reinit(fget, fset, fdel, doc);
+    Ok(Object::None)
+}
+
 /// `property.__get__(self, obj, objtype=None)` — CPython's
 /// `property_descr_get`: class access (obj is None) returns the property
 /// itself; instance access invokes `fget`.
@@ -2780,10 +2988,11 @@ fn property_dunder_get(args: &[Object]) -> Result<Object, RuntimeError> {
     let p = property_self(args, "__get__")?;
     match args.get(1) {
         Some(obj) if !matches!(obj, Object::None) => {
-            if matches!(p.fget, Object::None) {
+            let fget = p.fget();
+            if matches!(fget, Object::None) {
                 return Err(crate::error::attribute_error("unreadable attribute"));
             }
-            reentrant_call(&p.fget, &[obj.clone()])
+            reentrant_call(&fget, &[obj.clone()])
         }
         _ => Ok(args[0].clone()),
     }
@@ -2796,12 +3005,13 @@ fn property_dunder_set(args: &[Object]) -> Result<Object, RuntimeError> {
         (Some(o), Some(v)) => (o.clone(), v.clone()),
         _ => return Err(type_error("__set__() takes exactly 3 arguments")),
     };
-    if matches!(p.fset, Object::None) {
+    let fset = p.fset();
+    if matches!(fset, Object::None) {
         return Err(crate::error::attribute_error(
             "property has no setter".to_owned(),
         ));
     }
-    reentrant_call(&p.fset, &[obj, value])?;
+    reentrant_call(&fset, &[obj, value])?;
     Ok(Object::None)
 }
 
@@ -2812,12 +3022,13 @@ fn property_dunder_delete(args: &[Object]) -> Result<Object, RuntimeError> {
         .get(1)
         .cloned()
         .ok_or_else(|| type_error("__delete__() takes exactly 2 arguments"))?;
-    if matches!(p.fdel, Object::None) {
+    let fdel = p.fdel();
+    if matches!(fdel, Object::None) {
         return Err(crate::error::attribute_error(
             "property has no deleter".to_owned(),
         ));
     }
-    reentrant_call(&p.fdel, &[obj])?;
+    reentrant_call(&fdel, &[obj])?;
     Ok(Object::None)
 }
 
@@ -3616,11 +3827,23 @@ thread_local! {
 pub(crate) fn code_docstring(c: &weavepy_compiler::CodeObject) -> Option<Object> {
     match c.constants.first() {
         Some(weavepy_compiler::Constant::Str(s)) => Some(DOCSTRING_CACHE.with(|cache| {
-            cache
-                .borrow_mut()
-                .entry(s.as_ptr() as usize)
-                .or_insert_with(|| Object::from_str(s.as_str()))
-                .clone()
+            let mut cache = cache.borrow_mut();
+            let key = s.as_ptr() as usize;
+            // The address key is subject to ABA reuse: dropping a code
+            // object frees its constant buffers, and a later compile can
+            // land a *different* docstring at the same address (doctest
+            // compiles thousands of transient `<doctest …>` snippets and
+            // was nondeterministically reading sibling examples'
+            // docstrings). Trust the entry only if the content still
+            // matches; otherwise replace it.
+            if let Some(Object::Str(cached)) = cache.get(&key) {
+                if cached.as_ref() == s.as_str() {
+                    return Object::Str(cached.clone());
+                }
+            }
+            let fresh = Object::from_str(s.as_str());
+            cache.insert(key, fresh.clone());
+            fresh
         })),
         _ => None,
     }
@@ -5857,17 +6080,32 @@ fn b_open_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
     b_open(&combined)
 }
 
-/// Resolve `open()`'s `file` argument to a filesystem path string. Accepts
-/// `str`, `bytes`/`bytearray` (decoded as UTF-8, like `os.fsdecode`), and any
-/// `os.PathLike` (via `__fspath__`). Mirrors CPython's path coercion.
-/// Resolve `open()`'s `file` argument to a path string, reporting whether the
-/// original (or `__fspath__`-resolved) value was `bytes` so the file's
-/// Python-visible `name` can read back as `bytes`.
-fn open_path_arg(obj: &Object) -> Result<(String, bool), RuntimeError> {
+/// Resolve `open()`'s `file` argument. Accepts `str`, `bytes`/`bytearray`,
+/// and any `os.PathLike` (via `__fspath__`). Returns the display name (for
+/// the file's Python-visible `name`), whether the original value was
+/// `bytes`, and the `OsString` actually handed to the OS — for bytes paths
+/// the *raw* bytes reach the syscall (CPython passes them through
+/// unmodified; on macOS the kernel then rejects undecodable names with
+/// EILSEQ, which `test_sqlite3`'s undecodable-path tests rely on to skip).
+fn open_path_arg(obj: &Object) -> Result<(String, bool, std::ffi::OsString), RuntimeError> {
+    fn from_bytes(b: &[u8]) -> (String, bool, std::ffi::OsString) {
+        #[cfg(unix)]
+        let os = {
+            use std::os::unix::ffi::OsStrExt;
+            std::ffi::OsStr::from_bytes(b).to_owned()
+        };
+        #[cfg(not(unix))]
+        let os = std::ffi::OsString::from(String::from_utf8_lossy(b).into_owned());
+        (String::from_utf8_lossy(b).into_owned(), true, os)
+    }
+    fn from_str(s: String) -> (String, bool, std::ffi::OsString) {
+        let os = std::ffi::OsString::from(&s);
+        (s, false, os)
+    }
     match obj {
-        Object::Str(s) => Ok((s.to_string(), false)),
-        Object::Bytes(b) => Ok((String::from_utf8_lossy(b).into_owned(), true)),
-        Object::ByteArray(b) => Ok((String::from_utf8_lossy(&b.borrow()).into_owned(), true)),
+        Object::Str(s) => Ok(from_str(s.to_string())),
+        Object::Bytes(b) => Ok(from_bytes(b)),
+        Object::ByteArray(b) => Ok(from_bytes(&b.borrow())),
         Object::Instance(_) => {
             // `os.PathLike`: call `__fspath__()` through the interpreter.
             let ptr = crate::vm_singletons::current_interpreter_ptr()
@@ -5882,8 +6120,8 @@ fn open_path_arg(obj: &Object) -> Result<(String, bool), RuntimeError> {
             })?;
             let resolved = interp.call_object(fspath, &[], &[])?;
             match resolved {
-                Object::Str(s) => Ok((s.to_string(), false)),
-                Object::Bytes(b) => Ok((String::from_utf8_lossy(&b).into_owned(), true)),
+                Object::Str(s) => Ok(from_str(s.to_string())),
+                Object::Bytes(b) => Ok(from_bytes(&b)),
                 other => Err(type_error(format!(
                     "expected __fspath__() to return str or bytes, not {}",
                     other.type_name()
@@ -5995,7 +6233,7 @@ pub(crate) fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
             binary,
         );
     }
-    let (path, name_is_bytes) = open_path_arg(&args[0])?;
+    let (path, name_is_bytes, os_path) = open_path_arg(&args[0])?;
     let mut opts = OpenOptions::new();
     let mut writing = false;
     for ch in mode.chars() {
@@ -6026,7 +6264,7 @@ pub(crate) fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
         opts.read(true);
     }
     let f = opts
-        .open(&path)
+        .open(&os_path)
         .map_err(|e| crate::error::io_error_to_py_named(&e, Some(&path)))?;
     // CPython raises `IsADirectoryError` when `open()` targets a directory
     // (the kernel happily opens a dir fd; the error only surfaces on `read`).
@@ -6817,7 +7055,7 @@ pub fn class_of(obj: &Object) -> crate::sync::Rc<crate::types::TypeObject> {
         Object::Module(_) => bt.module_.clone(),
         Object::SlotDescriptor(_) => bt.member_descriptor_.clone(),
         Object::Code(_) => bt.code_.clone(),
-        Object::Cell(_) => bt.object_.clone(),
+        Object::Cell(_) => bt.cell_.clone(),
         // A native stream reports the faithful CPython io layer for its
         // `IoKind` (`type(open(p,'rb')) is io.BufferedReader`,
         // `type(io.BytesIO()) is io.BytesIO`). These are the very type objects
@@ -6908,7 +7146,7 @@ fn b_id(args: &[Object]) -> Result<Object, RuntimeError> {
 /// objects (`int`, `float`, `bool`, `None`) we mix the value with a
 /// per-variant salt — matching CPython's "small ints have stable
 /// ids" semantics without trying to intern.
-fn object_identity(obj: &Object) -> i64 {
+pub(crate) fn object_identity(obj: &Object) -> i64 {
     use crate::object::Object;
     // For DST-backed Rc<T> (`Rc<str>`, `Rc<[u8]>`, `Rc<[Object]>`) we
     // can't `as usize` the fat pointer directly; route through the
@@ -7778,6 +8016,11 @@ pub fn b_memoryview(args: &[Object]) -> Result<Object, RuntimeError> {
             )));
         }
     };
+    // Record the exporter so `mv.obj` answers with the original object
+    // (CPython's `view->obj`). `memoryview(mv)` inherits via shallow_clone.
+    if !matches!(arg, Object::MemoryView(_)) {
+        mv.exporter.replace(Some(arg.clone()));
+    }
     Ok(Object::MemoryView(Rc::new(mv)))
 }
 
@@ -8124,6 +8367,13 @@ fn str_arg_bridged(obj: &Object) -> Option<std::borrow::Cow<'_, str>> {
     match obj {
         Object::Str(s) => Some(std::borrow::Cow::Borrowed(s)),
         Object::WStr(cps) => Some(std::borrow::Cow::Owned(bridge_encode_cps(cps))),
+        // A `str` *subclass* instance is accepted anywhere str is —
+        // CPython's argument clinic checks `PyUnicode_Check`, which is
+        // subtype-inclusive (markupsafe: `super().replace(old, Markup(…))`).
+        Object::Instance(inst) => match inst.native.get() {
+            Some(native @ (Object::Str(_) | Object::WStr(_))) => str_arg_bridged(native),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -13700,6 +13950,10 @@ fn memoryview_cast(args: &[Object], kwargs: &[(String, Object)]) -> Result<Objec
     cast.itemsize.set(itemsize);
     *cast.strides.borrow_mut() = crate::object::c_contiguous_strides(&dims, itemsize);
     *cast.shape.borrow_mut() = dims;
+    // Casting a 0-dim view (a ctypes Structure export) always yields a
+    // regular 1-D view (CPython `memory_cast`: `ndim` becomes
+    // `len(shape)`), so `mv.cast('B')[:] = data` works (test_io byteslike).
+    cast.zero_dim.set(false);
     Ok(Object::MemoryView(Rc::new(cast)))
 }
 
@@ -13720,6 +13974,153 @@ fn memoryview_enter(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn memoryview_exit(_args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
+}
+
+/// `memoryview.toreadonly()` — a fresh view over the same buffer with
+/// the readonly bit set (CPython `memory_toreadonly`).
+fn memoryview_toreadonly(args: &[Object]) -> Result<Object, RuntimeError> {
+    let mv = memoryview_self(args)?;
+    if mv.released.get() {
+        return Err(value_error(
+            "operation forbidden on released memoryview object",
+        ));
+    }
+    let ro = mv.shallow_clone();
+    ro.readonly.set(true);
+    Ok(Object::MemoryView(Rc::new(ro)))
+}
+
+/// `memoryview.__iter__` — iterate the unpacked elements of a 1-D view
+/// (CPython `memory_iter` via the sequence protocol).
+fn memoryview_iter(args: &[Object]) -> Result<Object, RuntimeError> {
+    let mv = memoryview_self(args)?;
+    if mv.released.get() {
+        return Err(value_error(
+            "operation forbidden on released memoryview object",
+        ));
+    }
+    let items = crate::mv_element_objects(&mv)?;
+    Ok(Object::Iter(Rc::new(crate::sync::RefCell::new(
+        crate::object::PyIterator::Tuple {
+            items: Rc::from(items),
+            index: 0,
+        },
+    ))))
+}
+
+/// `staticmethod.__call__(self, *args, **kwargs)` — invoke the wrapped
+/// callable directly (bpo-43682, 3.10+).
+fn staticmethod_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let Some(Object::StaticMethod(w)) = args.first() else {
+        return Err(type_error("__call__() requires a staticmethod receiver"));
+    };
+    let func = w.func();
+    let interp = reentrant_interp()?;
+    let globals = interp.builtins_dict();
+    interp.call_object_with_globals(&func, &args[1..], kwargs, &globals)
+}
+
+/// Fetch the interpreter published by the enclosing VM frame — the
+/// subscript slot methods below delegate to the VM's own subscript
+/// machinery so their behavior is byte-for-byte `recv[key]`.
+fn reentrant_interp() -> Result<&'static mut crate::Interpreter, RuntimeError> {
+    let ptr = crate::vm_singletons::current_interpreter_ptr()
+        .ok_or_else(|| crate::error::runtime_error("no running interpreter"))?;
+    // SAFETY: the pointer was published by an enclosing VM frame still
+    // live on this thread; the GIL keeps the access exclusive.
+    Ok(unsafe { &mut *ptr })
+}
+
+/// `recv.__getitem__(key)` for native buffer types — same code path as
+/// the `BINARY_SUBSCR` opcode (RFC 0056 WS4).
+fn reentrant_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [recv, key] = args else {
+        return Err(type_error(format!(
+            "__getitem__() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    };
+    reentrant_interp()?.binary_subscr(recv, key)
+}
+
+/// `recv.__setitem__(key, value)` — same code path as `STORE_SUBSCR`.
+fn reentrant_setitem(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [recv, key, value] = args else {
+        return Err(type_error(format!(
+            "__setitem__() takes exactly 2 arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    };
+    let interp = reentrant_interp()?;
+    let globals = interp.builtins_dict();
+    interp.store_subscr(recv, key, value.clone(), &globals)?;
+    Ok(Object::None)
+}
+
+/// `recv.__delitem__(key)` — same code path as `DELETE_SUBSCR`.
+fn reentrant_delitem(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [recv, key] = args else {
+        return Err(type_error(format!(
+            "__delitem__() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    };
+    reentrant_interp()?.delete_subscr(recv, key)?;
+    Ok(Object::None)
+}
+
+/// `bytearray.__iadd__(other)` — in-place extend with any bytes-like,
+/// returning the receiver (CPython `bytearray_iconcat`).
+fn bytearray_iadd(args: &[Object]) -> Result<Object, RuntimeError> {
+    let recv = args
+        .first()
+        .cloned()
+        .ok_or_else(|| type_error("__iadd__() missing self"))?;
+    let ba = bytearray_self(args)?;
+    let other = args
+        .get(1)
+        .ok_or_else(|| type_error("__iadd__() takes exactly one argument (0 given)"))?;
+    let extra = match other {
+        Object::Bytes(b) => b.to_vec(),
+        // Cloning first makes `b += b` safe (no aliasing borrow).
+        Object::ByteArray(b) => b.borrow().clone(),
+        Object::MemoryView(mv) => mv.to_bytes(),
+        _ => {
+            return Err(type_error(format!(
+                "can't concat {} to bytearray",
+                other.type_name()
+            )));
+        }
+    };
+    ba.borrow_mut().extend_from_slice(&extra);
+    Ok(recv)
+}
+
+/// `bytearray.__imul__(n)` — in-place repeat, returning the receiver
+/// (CPython `bytearray_irepeat`).
+fn bytearray_imul(args: &[Object]) -> Result<Object, RuntimeError> {
+    let recv = args
+        .first()
+        .cloned()
+        .ok_or_else(|| type_error("__imul__() missing self"))?;
+    let ba = bytearray_self(args)?;
+    let n = args.get(1).and_then(|o| o.as_i64()).ok_or_else(|| {
+        type_error(format!(
+            "can't multiply sequence by non-int of type '{}'",
+            args.get(1).map_or("NoneType", |o| o.type_name())
+        ))
+    })?;
+    let mut data = ba.borrow_mut();
+    if n <= 0 {
+        data.clear();
+    } else {
+        let once = data.clone();
+        for _ in 1..n {
+            data.extend_from_slice(&once);
+        }
+    }
+    drop(data);
+    Ok(recv)
 }
 
 // ----- dict view + mappingproxy methods (RFC 0023) -----

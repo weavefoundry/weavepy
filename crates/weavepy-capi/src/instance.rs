@@ -43,6 +43,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use weavepy_vm::object::Object;
 use weavepy_vm::sync::Rc;
 use weavepy_vm::types::PyInstance;
 
@@ -217,7 +218,32 @@ pub fn make_inline_instance(ty: *mut PyTypeObject, nitems: PySsizeT) -> *mut PyO
         }
     }
     let body_bytes = (basicsize + nitems.max(0) as usize * itemsize).max(min_body);
-    let inst = Rc::new(PyInstance::new(cls));
+    // A builtin-container subclass needs its native payload seeded at
+    // allocation, matching the VM's own `instantiate` — sqlalchemy's
+    // `cdef class immutabledict(dict)` allocates through this path and
+    // `dict.__init__` then demands a real dict payload on the instance.
+    let inst = {
+        let bt = weavepy_vm::builtin_types::builtin_types();
+        let native: Option<Object> = if cls.is_subclass_of(&bt.dict_) {
+            Some(Object::Dict(weavepy_vm::sync::Rc::new(
+                weavepy_vm::sync::RefCell::new(weavepy_vm::object::DictData::default()),
+            )))
+        } else if cls.is_subclass_of(&bt.list_) {
+            Some(Object::List(weavepy_vm::sync::Rc::new(
+                weavepy_vm::sync::RefCell::new(Vec::new()),
+            )))
+        } else if cls.is_subclass_of(&bt.set_) {
+            Some(Object::Set(weavepy_vm::sync::Rc::new(
+                weavepy_vm::sync::RefCell::new(weavepy_vm::object::SetData::default()),
+            )))
+        } else {
+            None
+        };
+        match native {
+            Some(n) => Rc::new(PyInstance::with_native(cls, n)),
+            None => Rc::new(PyInstance::new(cls)),
+        }
+    };
     let body = attach_body(&inst, ty, body_bytes);
     // CPython's `PyType_GenericAlloc` initialises a var-sized instance with
     // `PyObject_InitVar`, which stamps `ob_size = nitems`. numpy's
@@ -316,6 +342,28 @@ pub unsafe fn release_c_ownership(p: *mut PyObject) {
         }
     }
     drop(pinned);
+}
+
+thread_local! {
+    /// Consent window for [`free_instance_body_hook`]: while it runs an
+    /// extension `tp_dealloc` for body `ptr`, this holds `(ptr, false)`.
+    /// The absorbing `tp_free` entry points ([`crate::memory::
+    /// PyObject_Free`], [`crate::gc_bridge::PyObject_GC_Del`]) flip the
+    /// flag when they see that same body — proof the dealloc *released*
+    /// the object rather than stashing its raw pointer in a freelist.
+    static BODY_FREE_CONSENT: std::cell::Cell<(usize, bool)> =
+        const { std::cell::Cell::new((0, false)) };
+}
+
+/// Called by the absorbing `tp_free` paths: record that the extension's
+/// `tp_dealloc` explicitly released `body` (see [`BODY_FREE_CONSENT`]).
+pub(crate) fn note_body_free_consented(body: usize) {
+    BODY_FREE_CONSENT.with(|c| {
+        let (ptr, _) = c.get();
+        if ptr == body {
+            c.set((ptr, true));
+        }
+    });
 }
 
 /// VM hook: free an instance's faithful body when the instance is
@@ -445,9 +493,30 @@ fn free_instance_body_hook(body: usize) {
                     // must see a live C frame (RFC 0047 — the prompt reaper's
                     // borrowed-pointer window).
                     let _cext_guard = weavepy_vm::vm_singletons::enter_cext_call();
+                    // Consent protocol: the dealloc must reach a `tp_free`
+                    // (absorbed by `PyObject_Free`/`PyObject_GC_Del`, which
+                    // flip this flag) for WeavePy to release the storage.
+                    // A dealloc that *stashes* the raw pointer instead —
+                    // mypyc's per-class freelist gates only on "slot empty",
+                    // so the Cython `tp_basicsize` perturbation above cannot
+                    // divert it — keeps the pointer live past this call, and
+                    // freeing the block would hand the next reuse recycled
+                    // garbage (charset-normalizer's `coherence_ratio_env`).
+                    let saved_consent = BODY_FREE_CONSENT.with(|c| c.replace((p as usize, false)));
                     dealloc(p);
+                    let consented = BODY_FREE_CONSENT.with(|c| c.replace(saved_consent)).1;
                     drop(_cext_guard);
                     (*ty).tp_basicsize = orig_basicsize;
+                    if !consented {
+                        // Disown the block: the extension holds a raw
+                        // pointer to it (freelist stash), so the storage —
+                        // prefix, body, and aux — leaks by design. Bounded:
+                        // each such freelist caches at most a few instances.
+                        if crate::mirror::body_trace_enabled() {
+                            eprintln!("[ORPHAN] body=0x{:x} stashed by tp_dealloc", p as usize);
+                        }
+                        return;
+                    }
                 }
             }
         }

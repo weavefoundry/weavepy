@@ -120,6 +120,19 @@ work.
 > packaging` (or pytest, numpy, …) now actually changes what `import
 > packaging` returns. The same wave finished the CLI/REPL residuals
 > (`test_cmd_line`, `test_repl`, `test_cmd_line_script` all pass).
+>
+> `RFC 0056` is the **modern-stack wave**: a faithful `_sqlite3` over
+> rusqlite + verbatim `Lib/sqlite3`, real vendored expat behind
+> `pyexpat`, the ctypes/mock/warnings residual burns, an abi3/PyO3
+> surface audit (`_abi3check`), and an ecosystem matrix grown from 9
+> to **27 rows — all pass**, offline from the wheel cache. Capstone:
+> Django migrates against the new sqlite3 backend, runs ORM CRUD +
+> `atomic()` rollback, and serves a request through `django.test.Client`.
+> Net regrtest flips include `test_sqlite3`, `test_dbm_sqlite3`, the
+> XML family (`test_pyexpat`/`test_sax`/`test_minidom`/`test_pulldom`/
+> `test_plistlib`/`test_xml_etree*`), `test_htmlparser`,
+> `test_unittest`/`test_doctest`/`test_warnings`, and
+> `test_compileall`.
 
 ## Repository layout
 

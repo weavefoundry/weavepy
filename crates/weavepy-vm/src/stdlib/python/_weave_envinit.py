@@ -142,6 +142,9 @@ def _install():
 
     _os.environ = environ
     _os.environb = environb
+    # CPython exposes the class as `os._Environ`; rich's pretty-printer
+    # keys a repr table on it (`os._Environ: lambda ...`).
+    _os._Environ = _Environ
     _os.supports_bytes_environ = True
 
     def getenv(key, default=None):

@@ -24,6 +24,24 @@ for _name in dir(_impl):
         continue
     globals()[_name] = getattr(_impl, _name)
 
+# CPython turns the numeric constants into IntEnum/IntFlag members
+# (`socket.AddressFamily`, `socket.SocketKind`, …); anyio and the
+# asyncio transports import these classes directly.
+from enum import IntEnum as _IntEnum, IntFlag as _IntFlag
+
+_IntEnum._convert_(
+    "AddressFamily", __name__,
+    lambda C: C.isupper() and C.startswith("AF_"))
+_IntEnum._convert_(
+    "SocketKind", __name__,
+    lambda C: C.isupper() and C.startswith("SOCK_"))
+_IntFlag._convert_(
+    "MsgFlag", __name__,
+    lambda C: C.isupper() and C.startswith("MSG_"))
+_IntFlag._convert_(
+    "AddressInfo", __name__,
+    lambda C: C.isupper() and C.startswith("AI_"))
+
 
 _GLOBAL_DEFAULT_TIMEOUT = object()
 

@@ -62,6 +62,21 @@ def _subject_len(string):
     return len(string)
 
 
+def _plain_slice(string, s, e):
+    """Subject slice with CPython `_sre` getslice semantics: a binary
+    subject that is not exactly `bytes` (bytearray, memoryview, bytes
+    subclass) yields plain `bytes` — h11 parses headers out of a
+    `bytearray` receive buffer and asserts the groups are `bytes`.
+    """
+    piece = string[s:e]
+    t = type(piece)
+    if t is str or t is bytes:
+        return piece
+    if isinstance(piece, str):
+        return str(piece)
+    return bytes(piece)
+
+
 def _clamp_span(string, pos, endpos):
     if pos is not None and not -_MAXSIZE - 1 <= pos <= _MAXSIZE:
         raise OverflowError("Python int too large to convert to C ssize_t")
@@ -158,7 +173,7 @@ class Pattern:
 
     def findall(self, string, pos=0, endpos=None):
         g = self.groups
-        empty = string[:0]
+        empty = _plain_slice(string, 0, 0)
         out = []
         for m in self._iter(string, pos, endpos):
             if g == 0:
@@ -186,7 +201,7 @@ class Pattern:
     def _subx(self, repl, string, count):
         if count < 0:
             count = 0
-        empty = string[:0]
+        empty = _plain_slice(string, 0, 0)
         if callable(repl):
             filt = repl
         else:
@@ -210,14 +225,14 @@ class Pattern:
             if r is None:
                 break
             start, end = r[0], r[1]
-            out.append(string[last:start])
+            out.append(_plain_slice(string, last, start))
             m = Match(self, string, 0, endpos, r)
             out.append(filt(m))
             last = end
             n += 1
             must_advance = start == end
             pos = end
-        out.append(string[last:])
+        out.append(_plain_slice(string, last, endpos))
         return empty.join(out), n
 
     def split(self, string, maxsplit=0):
@@ -238,14 +253,14 @@ class Pattern:
                 break
             start, end = r[0], r[1]
             m = Match(self, string, 0, endpos, r)
-            out.append(string[last:start])
+            out.append(_plain_slice(string, last, start))
             for i in range(1, g + 1):
                 out.append(m.group(i))
             last = end
             n += 1
             must_advance = start == end
             pos = end
-        out.append(string[last:])
+        out.append(_plain_slice(string, last, endpos))
         return out
 
     def scanner(self, string, pos=0, endpos=None):
@@ -346,7 +361,7 @@ class Match:
         s, e = self._span_of(idx)
         if s < 0 or e < 0:
             return default
-        return self.string[s:e]
+        return _plain_slice(self.string, s, e)
 
     # -- public API ------------------------------------------------------
 
@@ -411,7 +426,7 @@ class Match:
         return self
 
     def __repr__(self):
-        text = self.string[self._start:self._end]
+        text = _plain_slice(self.string, self._start, self._end)
         return "<re.Match object; span=(%d, %d), match=%r>" % (
             self._start, self._end, text)
 
@@ -478,7 +493,7 @@ def _compile_template(pattern, repl):
 def _expand_template(template, match):
     # `template` is the flat list returned by _parser.parse_template:
     # literals (str/bytes) interleaved with integer group references.
-    empty = match.string[:0]
+    empty = _plain_slice(match.string, 0, 0)
     parts = []
     for item in template:
         if isinstance(item, int):

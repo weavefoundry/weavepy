@@ -57,6 +57,9 @@ __pycache__/
 # we never commit it (size + licensing) — see docs/CONFORMANCE.md.
 #
 # Ignore everything under vendor/ EXCEPT the lightly-patched lzma-sys crate,
-# which is a committed build input wired via Cargo.toml [patch.crates-io].
+# which is a committed build input wired via Cargo.toml [patch.crates-io],
+# and the expat-sys crate (RFC 0056 WS3: vendored expat 2.6.4 + FFI bindings)
+# that backs the native `pyexpat` module.
 /vendor/*
 !/vendor/lzma-sys/
+!/vendor/expat-sys/

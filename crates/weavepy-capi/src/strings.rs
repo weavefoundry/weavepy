@@ -343,11 +343,20 @@ pub unsafe extern "C" fn PyBytes_FromString(s: *const c_char) -> *mut PyObject {
 #[no_mangle]
 pub unsafe extern "C" fn PyBytes_FromStringAndSize(s: *const c_char, n: PySsizeT) -> *mut PyObject {
     let len = n.max(0) as usize;
-    let slice = if s.is_null() {
-        vec![0u8; len]
-    } else {
-        unsafe { std::slice::from_raw_parts(s as *const u8, len).to_vec() }
-    };
+    if s.is_null() {
+        // CPython contract: an *uninitialised* buffer the caller fills
+        // through `PyBytes_AS_STRING` before exposing the object (orjson's
+        // `dumps` writer). Mint a fresh, never-shared mirror and mark it
+        // buffer-authoritative so the C-side writes to `ob_sval` are
+        // adopted when the object crosses back into the VM.
+        let rc: Rc<[u8]> = vec![0u8; len].into();
+        let p = crate::mirror::mirror_out(Object::Bytes(rc));
+        if !p.is_null() && unsafe { crate::mirror::is_mirror(p) } {
+            unsafe { (*crate::mirror::prefix_of(p)).bytes_buffer = true };
+        }
+        return p;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(s as *const u8, len).to_vec() };
     let rc: Rc<[u8]> = slice.into();
     crate::object::into_owned(Object::Bytes(rc))
 }
@@ -449,12 +458,23 @@ pub unsafe extern "C" fn PyByteArray_AsString(o: *mut PyObject) -> *mut c_char {
     }
     match unsafe { crate::object::clone_object_value(o) } {
         Object::ByteArray(b) => {
-            let mut owned = b.borrow().clone();
-            owned.push(0);
-            let rc: Rc<[u8]> = owned.into();
-            let p = rc.as_ptr() as *mut c_char;
-            pin_buffer(rc);
-            p
+            // CPython contract: a pointer to the bytearray's *internal*
+            // buffer, writable, NUL-terminated, valid until the next
+            // resize. A copy is not enough — aiohttp's parser does
+            // `PyByteArray_Resize(buf, n); memcpy(PyByteArray_AsString(buf)
+            // + s, at, len)` and expects the bytes to land in the object.
+            let mut v = b.borrow_mut();
+            v.reserve(1);
+            let p = v.as_mut_ptr();
+            // NUL in the spare capacity (doesn't change `len`).
+            unsafe { *p.add(v.len()) = 0 };
+            drop(v);
+            // `reserve` may have reallocated; keep the faithful struct
+            // fields (which alias this buffer) current.
+            if unsafe { crate::mirror::is_faithful_bytearray(o) } {
+                unsafe { crate::mirror::sync_bytearray_fields(o) };
+            }
+            p as *mut c_char
         }
         _ => ptr::null_mut(),
     }
@@ -775,15 +795,37 @@ pub unsafe extern "C" fn PyUnicode_EqualToUTF8AndSize(
 
 #[no_mangle]
 pub unsafe extern "C" fn PyUnicode_InternFromString(s: *const c_char) -> *mut PyObject {
+    // Content-keyed interning (RFC 0056 WS5): the returned pointer must be
+    // identity-stable for equal text, and must match the kwnames entries
+    // WeavePy marshals for keyword calls — extensions dispatch keyword
+    // arguments by comparing the two pointers (orjson's `option=`).
+    let _intern = crate::mirror::enter_intern_scope();
     unsafe { PyUnicode_FromString(s) }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn PyUnicode_InternInPlace(_p: *mut *mut PyObject) {
-    // No-op: WeavePy doesn't have a separate interned-string
-    // table. Strings are already content-addressed via Rc, which
-    // gives us the same sharing semantics for compile-time
-    // literals.
+pub unsafe extern "C" fn PyUnicode_InternInPlace(p: *mut *mut PyObject) {
+    // Swap the caller's reference for the canonical interned box so later
+    // identity comparisons against `PyUnicode_InternFromString` results
+    // (and kwnames entries) hold.
+    if p.is_null() || unsafe { *p }.is_null() {
+        return;
+    }
+    let old = unsafe { *p };
+    if let Object::Str(_) = unsafe { crate::object::clone_object_value(old) } {
+        let interned = {
+            let _intern = crate::mirror::enter_intern_scope();
+            crate::object::into_owned(unsafe { crate::object::clone_object_value(old) })
+        };
+        if !interned.is_null() && interned != old {
+            unsafe {
+                crate::object::Py_DecRef(old);
+                *p = interned;
+            }
+        } else if interned == old {
+            unsafe { crate::object::Py_DecRef(interned) };
+        }
+    }
 }
 
 /// `PyUnicode_New(size, maxchar)` — mint a fresh, writable, zero-filled
@@ -1378,8 +1420,15 @@ pub unsafe extern "C" fn PyByteArray_Resize(o: *mut PyObject, size: PySsizeT) ->
     }
     match unsafe { crate::object::clone_object_value(o) } {
         Object::ByteArray(b) => {
-            let mut v = b.borrow_mut();
-            v.resize(size as usize, 0);
+            {
+                let mut v = b.borrow_mut();
+                v.resize(size as usize, 0);
+            }
+            // The resize likely reallocated; the faithful struct fields
+            // (`ob_size`/`ob_bytes`) alias the buffer and must follow.
+            if unsafe { crate::mirror::is_faithful_bytearray(o) } {
+                unsafe { crate::mirror::sync_bytearray_fields(o) };
+            }
             0
         }
         _ => {

@@ -227,6 +227,16 @@ pub struct MirrorPrefix {
     /// str mirror (minted by [`mirror_out`]) leaves this `false` and stays
     /// prefix-authoritative: its bytes are never mutated in place.
     pub str_buffer: bool,
+    /// True iff this mirror is a faithful, **buffer-authoritative** bytes
+    /// object: the result of `PyBytes_FromStringAndSize(NULL, n)`, whose
+    /// contract is "caller fills the uninitialised buffer before exposing
+    /// the object". A stock extension writes through the inlined
+    /// `PyBytes_AS_STRING` macro (`ob_sval` directly) — orjson's `dumps`
+    /// builds its output exactly this way — so the C body, not the staged
+    /// prefix [`obj`](Self::obj), is authoritative on the first read-back
+    /// ([`native_of`] adopts `ob_sval` and clears the flag; bytes are
+    /// immutable once exposed, so later crossings reuse the adopted value).
+    pub bytes_buffer: bool,
     /// True once a faithful **list** mirror's prefix [`obj`](Self::obj) has
     /// been seeded from the authoritative inline `ob_item` buffer (RFC 0047,
     /// wave 5). A list mints with `false`; the first [`native_of`] read-back
@@ -471,6 +481,21 @@ pub fn mirror_out_with_type(obj: Object, ty: *mut PyTypeObject) -> *mut PyObject
             return p;
         }
     }
+    // A bytearray likewise crosses as a single canonical box per VM buffer
+    // (RFC 0056 WS5) — extension code holds the pointer across mutations
+    // (aiohttp's parser keeps `self._buf` in a cdef field) and macro-reads
+    // its struct fields, which are refreshed on every crossing.
+    if std::ptr::eq(ty, types::PyByteArray_Type.as_ptr()) {
+        if let Some(key) = bytearray_rc_key(&obj) {
+            if let Some(p) = cached_bytearray_box(key) {
+                unsafe { sync_bytearray_fields(p) };
+                return p;
+            }
+            let p = mirror_out_fresh(obj, ty);
+            register_bytearray_box(key, p);
+            return p;
+        }
+    }
     // A `builtin_function_or_method` crosses as a single canonical box (see
     // [`BUILTIN_BOX_CACHE`]) so pointer-identity tests (`op is operator.eq`,
     // as in `pandas._libs.ops.vec_compare`) hold across the boundary. Reuse
@@ -482,6 +507,17 @@ pub fn mirror_out_with_type(obj: Object, ty: *mut PyTypeObject) -> *mut PyObject
         let p = mirror_out_fresh(obj, ty);
         register_builtin_box(key, p);
         return p;
+    }
+    // RFC 0056 WS5: inside an intern scope (kwnames marshaling, the
+    // `PyUnicode_Intern*` entry points), exact `str` values resolve through
+    // the content-keyed intern table so equal text yields the *same*
+    // pointer — extensions compare interned names by identity (orjson's
+    // keyword dispatch).
+    if intern_scope_active() && std::ptr::eq(ty, types::PyUnicode_Type.as_ptr()) {
+        if let Object::Str(s) = &obj {
+            let text = s.to_string();
+            return interned_str_mirror(&text, ty, obj);
+        }
     }
     // RFC 0047 (wave 5): while marshaling VM arguments into a C call,
     // immutable hashable scalars mint through the canonical pin cache so a
@@ -551,6 +587,7 @@ fn mirror_out_fresh(obj: Object, ty: *mut PyTypeObject) -> *mut PyObject {
                 aux_ptr,
                 aux_size,
                 str_buffer: false,
+                bytes_buffer: false,
                 list_synced: false,
                 scalar_pinned: false,
                 magic: MIRROR_MAGIC,
@@ -609,6 +646,7 @@ pub fn alloc_instance_body(
                 aux_ptr: ptr::null_mut(),
                 aux_size: 0,
                 str_buffer: false,
+                bytes_buffer: false,
                 list_synced: false,
                 scalar_pinned: false,
                 magic: MIRROR_MAGIC,
@@ -976,6 +1014,20 @@ pub unsafe fn native_of(p: *mut PyObject) -> Object {
     // prefix object stays authoritative (and avoids a per-crossing rebuild).
     if unsafe { (*pre).str_buffer } {
         return unsafe { read_str(p) };
+    }
+    // A buffer-authoritative bytes mirror (`PyBytes_FromStringAndSize(NULL,
+    // n)`) was filled through the inlined `PyBytes_AS_STRING` macro after
+    // minting (orjson's `dumps`), so adopt `ob_sval` into the prefix on the
+    // first crossing. Bytes are immutable once exposed to Python, so the
+    // adopted value stays authoritative afterwards.
+    if unsafe { (*pre).bytes_buffer } {
+        if let Some(v) = unsafe { read_bytes_value(p) } {
+            let rc: weavepy_vm::sync::Rc<[u8]> = v.into();
+            unsafe {
+                (*pre).obj = Object::Bytes(rc);
+                (*pre).bytes_buffer = false;
+            }
+        }
     }
     unsafe { (*pre).obj.clone() }
 }
@@ -1483,6 +1535,134 @@ fn list_rc_key(obj: &Object) -> Option<usize> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Canonical bytearray boxes (RFC 0056 WS5).
+// ---------------------------------------------------------------------------
+
+static BYTEARRAY_BOX_CACHE: Mutex<Option<FxHashMap<usize, usize>>> = Mutex::new(None);
+static BYTEARRAY_BOX_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn bytearray_rc_key(obj: &Object) -> Option<usize> {
+    match obj {
+        Object::ByteArray(rc) => Some(weavepy_vm::sync::Rc::as_ptr(rc) as usize),
+        _ => None,
+    }
+}
+
+/// Write the faithful `PyByteArrayObject` fields of `body` from the VM
+/// buffer of the `Object::ByteArray` it carries: `ob_bytes`/`ob_start`
+/// address the `Vec<u8>` data directly (kept alive by the prefix's `Rc`),
+/// so the inlined `PyByteArray_AS_STRING` macro reads real bytes.
+///
+/// # Safety
+/// `body` must be (or be becoming) a bytearray mirror body.
+unsafe fn write_bytearray_fields(body: *mut PyObject, obj: &Object) {
+    if let Object::ByteArray(rc) = obj {
+        let b = rc.borrow();
+        let vo = body as *mut layout::PyVarObject;
+        let bo = body as *mut layout::PyByteArrayObject;
+        // CPython's empty bytearray carries a NULL buffer; a dangling
+        // `Vec::as_ptr` would technically never be read (size 0) but a
+        // NULL is what stock code expects.
+        let data = if b.is_empty() {
+            ptr::null_mut()
+        } else {
+            b.as_ptr() as *mut std::ffi::c_char
+        };
+        unsafe {
+            (*vo).ob_size = b.len() as PySsizeT;
+            (*bo).ob_alloc = b.capacity() as PySsizeT;
+            (*bo).ob_bytes = data;
+            (*bo).ob_start = data;
+            (*bo).ob_exports = 0;
+        }
+    }
+}
+
+/// Refresh a bytearray mirror's struct fields from its prefix `Rc` — the
+/// VM buffer may have grown (and reallocated) since the last publish.
+///
+/// # Safety
+/// `p` must be a live bytearray mirror.
+pub unsafe fn sync_bytearray_fields(p: *mut PyObject) {
+    let pre = unsafe { prefix_of(p) };
+    let obj = unsafe { (*pre).obj.clone() };
+    unsafe { write_bytearray_fields(p, &obj) };
+}
+
+fn cached_bytearray_box(key: usize) -> Option<*mut PyObject> {
+    if BYTEARRAY_BOX_COUNT.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    let g = BYTEARRAY_BOX_CACHE.lock().ok()?;
+    let bp = *g.as_ref()?.get(&key)?;
+    let p = bp as *mut PyObject;
+    unsafe { crate::object::Py_IncRef(p) };
+    Some(p)
+}
+
+fn register_bytearray_box(key: usize, p: *mut PyObject) {
+    if let Ok(mut g) = BYTEARRAY_BOX_CACHE.lock() {
+        if g.get_or_insert_with(FxHashMap::default)
+            .insert(key, p as usize)
+            .is_none()
+        {
+            BYTEARRAY_BOX_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// True iff `p` is a faithful bytearray mirror.
+///
+/// # Safety
+/// `p` must be non-null with a readable head.
+pub unsafe fn is_faithful_bytearray(p: *mut PyObject) -> bool {
+    if !unsafe { is_mirror(p) } {
+        return false;
+    }
+    std::ptr::eq(unsafe { (*p).ob_type }, types::PyByteArray_Type.as_ptr())
+}
+
+/// Drop a bytearray mirror from the canonical cache when its storage is
+/// released.
+///
+/// # Safety
+/// `p` must be a bytearray mirror whose prefix is still intact.
+pub unsafe fn unregister_bytearray_box(p: *mut PyObject) {
+    let key = match bytearray_rc_key(unsafe { &(*prefix_of(p)).obj }) {
+        Some(k) => k,
+        None => return,
+    };
+    if let Ok(mut g) = BYTEARRAY_BOX_CACHE.lock() {
+        if let Some(map) = g.as_mut() {
+            if map.get(&key).copied() == Some(p as usize) && map.remove(&key).is_some() {
+                BYTEARRAY_BOX_COUNT.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Refresh every live bytearray mirror's struct fields. Run after each
+/// bridged C→VM call returns: extension code mutates a C-resident
+/// bytearray through our call surface (`self._buf.extend(...)` in
+/// aiohttp's parser) and then reads the buffer with inlined macros, so
+/// the fields must track the (possibly reallocated) VM buffer.
+pub fn sync_bytearray_boxes() {
+    if BYTEARRAY_BOX_COUNT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let ptrs: Vec<usize> = match BYTEARRAY_BOX_CACHE.lock() {
+        Ok(g) => g
+            .as_ref()
+            .map(|m| m.values().copied().collect())
+            .unwrap_or_default(),
+        Err(_) => return,
+    };
+    for bp in ptrs {
+        unsafe { sync_bytearray_fields(bp as *mut PyObject) };
+    }
+}
+
 /// Return the live canonical box for native-list identity `key`, handing
 /// back a *fresh* C reference (matching `into_owned`'s "+1" contract).
 fn cached_list_box(key: usize) -> Option<*mut PyObject> {
@@ -1711,6 +1891,72 @@ pub fn enter_arg_pin() -> ArgPinGuard {
 
 fn arg_pin_active() -> bool {
     ARG_PIN_DEPTH.try_with(|c| c.get() > 0).unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// Interned strings (RFC 0056 WS5).
+//
+// CPython interns keyword names (`kwnames` entries are interned by the
+// compiler/vectorcall machinery) and gives extensions
+// `PyUnicode_InternFromString`. Extensions compare the two by **pointer
+// identity**: orjson's `dumps` matches each `kwnames` element against the
+// `PyUnicode_InternFromString("option")` pointer it stashed at module init
+// and raises "unexpected keyword argument" on a mismatch. The scalar pin
+// cache can't provide this — it keys strings by their VM `Rc` pointer, not
+// content — so interning needs a content-keyed table of immortal boxes.
+// ---------------------------------------------------------------------------
+
+static STR_INTERN_CACHE: Mutex<Option<FxHashMap<Box<str>, usize>>> = Mutex::new(None);
+
+thread_local! {
+    /// Non-zero while minting strings that must resolve through the
+    /// content-keyed intern table (kwnames marshaling, the
+    /// `PyUnicode_Intern*` entry points).
+    static INTERN_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII guard for one intern-minting region; see [`enter_intern_scope`].
+pub struct InternGuard(());
+
+impl Drop for InternGuard {
+    fn drop(&mut self) {
+        let _ = INTERN_DEPTH.try_with(|c| c.set(c.get().saturating_sub(1)));
+    }
+}
+
+/// Route `Object::Str` mints on this thread through the content-keyed
+/// intern table until the guard drops.
+pub fn enter_intern_scope() -> InternGuard {
+    let _ = INTERN_DEPTH.try_with(|c| c.set(c.get() + 1));
+    InternGuard(())
+}
+
+fn intern_scope_active() -> bool {
+    INTERN_DEPTH.try_with(|c| c.get() > 0).unwrap_or(false)
+}
+
+/// The canonical interned mirror for string content `s` (a fresh strong
+/// reference). Interned boxes are immortal, matching CPython's behaviour
+/// for extension-interned names.
+fn interned_str_mirror(s: &str, ty: *mut PyTypeObject, obj: Object) -> *mut PyObject {
+    if let Ok(g) = STR_INTERN_CACHE.lock() {
+        if let Some(map) = g.as_ref() {
+            if let Some(&bp) = map.get(s) {
+                let p = bp as *mut PyObject;
+                unsafe { crate::object::Py_IncRef(p) };
+                return p;
+            }
+        }
+    }
+    let p = mirror_out_fresh(obj, ty);
+    // Immortal: `scalar_pinned` keeps `free_box` from releasing the block
+    // at C refcount zero, so the identity C extensions captured stays valid.
+    unsafe { (*prefix_of(p)).scalar_pinned = true };
+    if let Ok(mut g) = STR_INTERN_CACHE.lock() {
+        g.get_or_insert_with(FxHashMap::default)
+            .insert(s.into(), p as usize);
+    }
+    p
 }
 
 /// The canonical-cache key for `obj`, or `None` when the value kind is not
@@ -2078,6 +2324,37 @@ pub fn register_seeded_list(p: *mut PyObject) {
                 eprintln!("[LISTSYNC] register {p:p} ob_size={n}");
             }
         }
+    }
+}
+
+/// Adopt every registered seeded list whose `ob_item` buffer no longer
+/// matches its recorded snapshot — the C↩VM twin of [`flush_seeded_lists`],
+/// run at the outermost bridged call's *return* (see `ensure_active`).
+///
+/// This catches macro writes to a list that never crosses the boundary
+/// again on its own: orjson's iterative deserializer attaches a fresh
+/// `PyList_New(n)` to its parent dict/list *first* (our `PyDict_SetItem`
+/// clones the still-placeholder `Rc` at that moment) and only then fills
+/// the elements through the inlined `PyList_SET_ITEM` macro, so without
+/// this sweep the parent keeps `[None, …]` forever.
+///
+/// # Safety
+/// Must run with no extension C frame below (outermost return); entries
+/// are unregistered on free, so every recorded pointer is live.
+pub unsafe fn reconcile_seeded_lists() {
+    if SEEDED_LIST_COUNT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    // Collect first: `reconcile_list_from_c` takes the same lock.
+    let ptrs: Vec<usize> = match SEEDED_LISTS.lock() {
+        Ok(g) => g
+            .as_ref()
+            .map(|m| m.keys().copied().collect())
+            .unwrap_or_default(),
+        Err(_) => return,
+    };
+    for p in ptrs {
+        unsafe { reconcile_list_from_c(p as *mut PyObject) };
     }
 }
 
@@ -2664,6 +2941,7 @@ pub fn new_unicode_mirror(len: usize, maxchar: u32) -> *mut PyObject {
                 aux_ptr: ptr::null_mut(),
                 aux_size: 0,
                 str_buffer: true,
+                bytes_buffer: false,
                 list_synced: false,
                 scalar_pinned: false,
                 magic: MIRROR_MAGIC,
@@ -2953,16 +3231,6 @@ unsafe fn list_prefix_seed_once(p: *mut PyObject) {
 /// `p` must satisfy [`is_faithful_list`]; `item` must be a live,
 /// non-null `PyObject*`.
 pub unsafe fn list_append(p: *mut PyObject, item: *mut PyObject) {
-    if listsync_trace_enabled() {
-        let rcp = unsafe { list_rc_of(p) }
-            .map(|rc| weavepy_vm::sync::Rc::as_ptr(&rc) as usize)
-            .unwrap_or(0);
-        eprintln!(
-            "[LISTSYNC] append p={p:p} rc=0x{rcp:x} synced={} ob_size={}",
-            unsafe { (*prefix_of(p)).list_synced },
-            unsafe { list_size(p) },
-        );
-    }
     unsafe { list_prefix_seed_once(p) };
     // Adopt any *direct* C macro write first (RFC 0047, wave 5). Cython's
     // `__Pyx_PyList_Append` inlines the append — `PyList_SET_ITEM` +
@@ -3141,6 +3409,10 @@ pub unsafe fn free_mirror(p: *mut PyObject) {
     if SET_BOX_COUNT.load(Ordering::Relaxed) > 0 && unsafe { is_faithful_set(p) } {
         unsafe { unregister_set_box(p) };
     }
+    // RFC 0056 WS5: likewise for the canonical bytearray cache.
+    if BYTEARRAY_BOX_COUNT.load(Ordering::Relaxed) > 0 && unsafe { is_faithful_bytearray(p) } {
+        unsafe { unregister_bytearray_box(p) };
+    }
     // Likewise drop this box from the canonical builtin cache (`operator.eq`
     // &c.) before its prefix `Rc` is dropped, so the next crossing of the
     // same native builtin mints (and re-registers) a fresh canonical box.
@@ -3260,6 +3532,14 @@ enum BodyKind {
     Long,
     Complex,
     Bytes,
+    /// Faithful `PyByteArrayObject` whose `ob_bytes`/`ob_start` point at
+    /// the live VM `Vec<u8>` buffer (RFC 0056 WS5). Cython inlines
+    /// `PyByteArray_AS_STRING`/`PyByteArray_GET_SIZE` (aiohttp's
+    /// `_http_parser` decodes its `bytearray` URL buffer that way), so the
+    /// struct fields must address real bytes; they are refreshed on every
+    /// crossing and after every bridged C→VM call (the buffer reallocates
+    /// when the VM grows it) — see [`sync_bytearray_boxes`].
+    ByteArray,
     Str,
     Tuple,
     /// Faithful `PyListObject` with an out-of-line `ob_item` buffer
@@ -3337,6 +3617,12 @@ impl BodyPlan {
                 kind: BodyKind::Bytes,
                 // varhead(24) + ob_shash(8) + (len+1) NUL-terminated.
                 body_size: round_up(24 + 8 + b.len() + 1, 8),
+            },
+            Object::ByteArray(_) => BodyPlan {
+                kind: BodyKind::ByteArray,
+                // Exactly `PyByteArrayObject`; the byte buffer is the VM
+                // `Vec` itself (no copy) — see the `BodyKind` docs.
+                body_size: std::mem::size_of::<layout::PyByteArrayObject>(),
             },
             Object::Str(s) => {
                 // Every string — 1-, 2-, or 4-byte kind — gets a faithful
@@ -3474,6 +3760,11 @@ unsafe fn fill_body(
                     ptr::copy_nonoverlapping(b.as_ptr(), dst, b.len());
                     *dst.add(b.len()) = 0; // NUL terminator
                 }
+            }
+        }
+        BodyKind::ByteArray => {
+            if let Object::ByteArray(_) = obj {
+                unsafe { write_bytearray_fields(body, obj) };
             }
         }
         BodyKind::Str => unsafe { fill_str(body, obj) },

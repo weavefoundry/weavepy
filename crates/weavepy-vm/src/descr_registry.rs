@@ -113,6 +113,37 @@ pub fn module_of_builtin(b: &Rc<crate::object::BuiltinFn>) -> Option<&'static st
 static NATIVE_DESCR_ACCESSOR: LazyLock<parking_lot::RwLock<HashSet<usize>>> =
     LazyLock::new(|| parking_lot::RwLock::new(HashSet::new()));
 
+/// Type-dict entries that exist for *introspection only* (RFC 0056 WS4):
+/// CPython materializes every slot wrapper in `tp_dict` (`'__lt__' in
+/// vars(dict)`, `'__init__' in vars(ValueError)`), and doctest / `help()`
+/// enumerate those dicts directly. WeavePy's dispatch, however, treats
+/// "name present in a type dict" as "custom override" in several places
+/// (`instance_method`, `lookup_exception_init`, …). Entries in this set
+/// are therefore *skipped by [`TypeObject::lookup`]'s MRO walk* — they
+/// are visible through `__dict__` / `dir()` / type-level `getattr` (which
+/// falls back to the same synthesized wrapper), but never change method
+/// dispatch.
+///
+/// PROCESS-GLOBAL for the same reason as [`BUILTIN_MODULE`]: the type
+/// singletons and their dict entries are shared across threads.
+static SURFACE_ONLY: LazyLock<parking_lot::RwLock<HashSet<usize>>> =
+    LazyLock::new(|| parking_lot::RwLock::new(HashSet::new()));
+
+/// Tag `obj` (a builtin placed in a type dict) as introspection-only:
+/// [`TypeObject::lookup`] will skip it during dispatch.
+pub fn mark_surface_only(obj: &Object) {
+    if let Some(k) = key(obj) {
+        SURFACE_ONLY.write().insert(k);
+    }
+}
+
+/// True when `obj` is a surface-only type-dict entry (see
+/// [`mark_surface_only`]). Cheap for non-descriptor objects (no lock).
+pub fn is_surface_only(obj: &Object) -> bool {
+    let Some(k) = key(obj) else { return false };
+    SURFACE_ONLY.read().contains(&k)
+}
+
 /// Tag `obj` as the getter/setter closure of a harvested C descriptor, so
 /// [`is_native_descr_accessor`] recognizes it and the dispatch loop routes
 /// the call to its own closure instead of a same-named builtin fast-path.

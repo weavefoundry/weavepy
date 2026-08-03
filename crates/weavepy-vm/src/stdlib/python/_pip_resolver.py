@@ -185,11 +185,18 @@ class Resolver:
             return
         candidates = self.index.candidates(req.name)
         selected = None
-        for version, filename, url in candidates:
-            if not req.specifier.contains(version, prereleases=True):
-                continue
-            selected = (version, filename, url)
-            break
+        # pip's rule (via packaging's `SpecifierSet.filter`): pre-releases
+        # are excluded unless the specifier itself names one — `pip
+        # install httpx` must pick 0.28.x, not the newer `1.0.dev3` —
+        # falling back to pre-releases only when nothing stable matches.
+        for pre in (None, True):
+            for version, filename, url in candidates:
+                if not req.specifier.contains(version, prereleases=pre):
+                    continue
+                selected = (version, filename, url)
+                break
+            if selected is not None:
+                break
         if selected is None:
             raise ResolutionError(
                 'No compatible distribution found for {}{}'.format(

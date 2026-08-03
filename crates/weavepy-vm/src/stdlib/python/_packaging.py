@@ -509,13 +509,18 @@ class SpecifierSet:
         return hash(frozenset(self.specifiers))
 
     def contains(self, version, prereleases: bool = None) -> bool:
-        if not self.specifiers:
-            return True
         if isinstance(version, str):
             try:
                 version = Version(version)
             except InvalidVersion:
                 return False
+        if not self.specifiers:
+            # packaging's rule for a bare requirement: pre-releases are
+            # excluded unless explicitly allowed (`pip install httpx`
+            # must not select `1.0.dev3` over the stable `0.28.x`).
+            if version.is_prerelease and not prereleases:
+                return False
+            return True
         return all(s.contains(version, prereleases=prereleases)
                    for s in self.specifiers)
 
@@ -855,6 +860,11 @@ class Requirement:
             marker_text = marker_text.strip()
         else:
             spec_text = rest
+        # Legacy metadata parenthesizes the specifier —
+        # `Requires-Dist: pygments (>=2.13.0)` (rich, older setuptools
+        # emissions). PEP 508's grammar allows the parens; strip them.
+        if spec_text.startswith('(') and spec_text.endswith(')'):
+            spec_text = spec_text[1:-1].strip()
         self.specifier = SpecifierSet(spec_text)
         self.marker = Marker(marker_text) if marker_text else None
 
@@ -976,6 +986,14 @@ def compatible_tags():
         for abi in abis:
             for plat in plats:
                 yield WheelTag(py, abi, plat)
+    # PEP 425 stable-ABI backwards series: an abi3 wheel advertises the
+    # *oldest* CPython it supports (`cryptography`'s `cp37-abi3-…` runs
+    # on every 3.7+), so every `cp3k-abi3` pair with k <= the running
+    # minor is installable — pip's `packaging.tags.cpython_tags` yields
+    # the same descending series.
+    for k in range(minor - 1, 1, -1):
+        for plat in plats:
+            yield WheelTag('cp%d%d' % (major, k), 'abi3', plat)
     # `py3-none-any` etc. always work for pure-Python wheels.
     for py in pys:
         yield WheelTag(py, 'none', 'any')
@@ -993,11 +1011,14 @@ def _platform_tags(plat=None, machine=None):
     if not machine:
         machine = 'x86_64'
     if plat == 'darwin':
+        # Only the *host's* architecture (plus universal2) is loadable —
+        # an x86_64-only wheel dlopen-fails on an arm64 Mac (pydantic-core,
+        # numpy), so it must never be a candidate there.
+        arches = ['universal2', 'arm64' if machine == 'arm64' else 'x86_64']
         for major in range(10, 16):
             for minor in range(0, 17):
-                out.append('macosx_%d_%d_universal2' % (major, minor))
-                out.append('macosx_%d_%d_x86_64' % (major, minor))
-                out.append('macosx_%d_%d_arm64' % (major, minor))
+                for arch in arches:
+                    out.append('macosx_%d_%d_%s' % (major, minor, arch))
     elif plat.startswith('linux'):
         out.append('linux_%s' % machine)
         out.append('manylinux1_%s' % machine)
@@ -1057,7 +1078,9 @@ def wheel_score(filename: str) -> int:
             s += 4
         if t.platform != 'any':
             s += 2
-        if t.abi == 'abi3':
+        # Version-specific full-ABI wheels outrank stable-ABI abi3 ones
+        # (pip's ordering); both outrank `none` via the +4 above.
+        if t.abi.startswith('cp'):
             s += 1
         best = max(best, s)
     return best

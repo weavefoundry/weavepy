@@ -1389,8 +1389,15 @@ static int weavepy_format_into(char *buf, size_t bufsize, const char *fmt, va_li
                     cs = fb;
                 }
             } else if (conv == 'T') {
+                /* PyType_GetName returns a str *object* (3.11+); keep it
+                 * alive in `owned` while we borrow its UTF-8 buffer. */
                 PyObject *o = va_arg(ap, PyObject *);
-                cs = o ? PyType_GetName(Py_TYPE(o)) : "NULL";
+                if (o) {
+                    owned = PyType_GetName(Py_TYPE(o));
+                    cs = owned ? PyUnicode_AsUTF8(owned) : "NULL";
+                } else {
+                    cs = "NULL";
+                }
             } else {
                 PyObject *o = va_arg(ap, PyObject *);
                 if (o == NULL) {
@@ -1567,6 +1574,22 @@ PyObject *PyErr_Format(PyObject *ty, const char *fmt, ...) {
     PyObject *r = PyErr_FormatV(ty, fmt, ap);
     va_end(ap);
     return r;
+}
+
+/* PyErr_FormatUnraisable (3.13) — report-and-swallow: CPython routes the
+ * formatted message plus the pending exception to sys.unraisablehook.
+ * WeavePy prints the message to stderr and discards the pending error,
+ * matching the "must not propagate" contract (cffi teardown paths). */
+void PyErr_FormatUnraisable(const char *fmt, ...) {
+    char buf[4096];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = weavepy_format_into(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n > 0) {
+        fprintf(stderr, "%s\n", buf);
+    }
+    PyErr_Clear();
 }
 
 /* _PyErr_FormatFromCause — raise a freshly-formatted exception whose

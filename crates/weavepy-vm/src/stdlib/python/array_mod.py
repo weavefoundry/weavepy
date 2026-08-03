@@ -35,8 +35,10 @@ _TYPECODES = {
     'H': ('H', 0, 2, 'unsigned short'),
     'i': ('i', 0, 4, 'signed int'),
     'I': ('I', 0, 4, 'unsigned int'),
-    'l': ('l', 0, 4, 'signed long'),
-    'L': ('L', 0, 4, 'unsigned long'),
+    # C `long` is platform-sized (8 bytes on LP64) — ctypes'
+    # test_int_from_address overlays c_long on array('l') storage.
+    'l': ('l', 0, _struct.calcsize('l'), 'signed long'),
+    'L': ('L', 0, _struct.calcsize('L'), 'unsigned long'),
     'q': ('q', 0, 8, 'signed long long'),
     'Q': ('Q', 0, 8, 'unsigned long long'),
     'f': ('f', 0.0, 4, 'float'),
@@ -203,7 +205,10 @@ class array:
         return [self._unpack(i) for i in range(len(self))]
 
     def buffer_info(self):
-        return (id(self._buf), len(self))
+        # CPython returns the real data pointer — ctypes tests build
+        # `c_int.from_address(a.buffer_info()[0])` on it.
+        import _ctypes_native
+        return (_ctypes_native.addressof_buffer(self._buf), len(self))
 
     # -- bytes / file / unicode conversions -----------------------------
 

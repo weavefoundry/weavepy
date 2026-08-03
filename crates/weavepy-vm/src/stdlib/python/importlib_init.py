@@ -11,11 +11,25 @@ real bootstrap happens in the VM, not in this Python source.
 import sys
 
 
+# Capture the interpreter's import hook *before* this module defines its
+# own ``__import__`` below (after which the bare name resolves to the
+# module-level function instead of the builtin).
+_builtin_import = __import__
+
+
 def _import(name, globals_=None, locals_=None, fromlist=(), level=0):
     # ``builtins`` module isn't yet importable; reach for the
     # ``__import__`` already wired into the interpreter's builtins
     # dict by name.
-    return __import__(name, globals_, locals_, fromlist, level)
+    return _builtin_import(name, globals_, locals_, fromlist, level)
+
+
+def __import__(name, globals=None, locals=None, fromlist=(), level=0):
+    """Public programmatic mirror of the builtin ``__import__`` (CPython
+    exposes it on importlib for code that wants the import machinery
+    without touching builtins — test.test_importlib.util builds its
+    Frozen/Source variant table from it)."""
+    return _builtin_import(name, globals, locals, fromlist, level)
 
 __all__ = [
     'import_module',

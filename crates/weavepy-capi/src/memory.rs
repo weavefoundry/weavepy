@@ -114,6 +114,7 @@ pub unsafe extern "C" fn PyObject_Free(p: *mut std::ffi::c_void) {
     // `PyObject_Free` scratch buffer for one.
     if !p.is_null() && unsafe { crate::mirror::is_instance_body(p as *mut crate::object::PyObject) }
     {
+        crate::instance::note_body_free_consented(p as usize);
         return;
     }
     // A WeavePy-minted *object* (box or mirror) must never reach the raw
