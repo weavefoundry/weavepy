@@ -9,9 +9,11 @@ vendored for WeavePy's native `pyexpat` module (RFC 0056 WS3).
   `lib/` sources + headers and `COPYING`. Docs, tests, fuzzers, CMake/autoconf
   machinery, `xmlwf` and examples are dropped (the `lzma-sys` vendoring
   discipline).
-- Built via `cc` in `build.rs` with `XML_NS`, `XML_DTD`, `XML_GE=1` and
-  `XML_CONTEXT_BYTES=1024` — the same feature set CPython compiles its
-  bundled expat with (see CPython `Modules/expat`).
+- Built via `cc` in `build.rs`. Feature macros (`XML_NS`, `XML_DTD`,
+  `XML_GE`, `XML_CONTEXT_BYTES`, `HAVE_MEMMOVE`, `BYTEORDER`,
+  `XML_POOR_ENTROPY`) live in a hand-written `lib/expat_config.h`,
+  mirroring CPython `Modules/expat/expat_config.h` without `pyconfig.h`
+  (required on MSVC, which has no system `expat_config.h`).
 - Entropy: `XML_POOR_ENTROPY` is defined only to satisfy expat's
   compile-time entropy-source requirement; WeavePy never relies on it —
   every parser is salted explicitly through `XML_SetHashSalt` with a
