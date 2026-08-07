@@ -195,7 +195,7 @@ so a fresh `rustup` install will pick up the right channel automatically.
 # Build everything.
 cargo build --workspace
 
-# Run the (currently tiny) test suite.
+# Run the test suite.
 cargo test --workspace
 
 # Lint and format checks (matches CI).
@@ -221,10 +221,6 @@ cargo run -p weavepy-cli -- path/to/script.py
 # Print the version (mirrors `python -V`).
 cargo run -p weavepy-cli -- --version
 ```
-
-> The above will currently run successfully but be a no-op, because the
-> compiler and VM are stubs. The plumbing is wired end-to-end so each layer
-> can be filled in independently.
 
 ## CPython conformance
 
