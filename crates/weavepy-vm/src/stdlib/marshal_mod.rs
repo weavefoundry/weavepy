@@ -498,9 +498,20 @@ impl<'a> MarshalReader<'a> {
         Ok(b)
     }
 
+    /// CPython `marshal.c:r_string` raises EOFError("marshal data too
+    /// short") — not ValueError — whenever a fixed-width read runs off
+    /// the end of the buffer (test_importlib SourceLoaderBadBytecode
+    /// `_test_bad_marshal` counts on the EOFError).
+    fn truncated_error() -> RuntimeError {
+        RuntimeError::PyException(crate::error::PyException::from_builtin(
+            "EOFError",
+            "marshal data too short",
+        ))
+    }
+
     fn read_int(&mut self) -> Result<i32, RuntimeError> {
         if self.pos + 4 > self.bytes.len() {
-            return Err(value_error("bad marshal data: short int"));
+            return Err(Self::truncated_error());
         }
         let mut buf = [0u8; 4];
         buf.copy_from_slice(&self.bytes[self.pos..self.pos + 4]);
@@ -510,7 +521,7 @@ impl<'a> MarshalReader<'a> {
 
     fn read_long(&mut self) -> Result<i64, RuntimeError> {
         if self.pos + 8 > self.bytes.len() {
-            return Err(value_error("bad marshal data: short long"));
+            return Err(Self::truncated_error());
         }
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&self.bytes[self.pos..self.pos + 8]);
@@ -520,7 +531,7 @@ impl<'a> MarshalReader<'a> {
 
     fn read_short(&mut self) -> Result<u16, RuntimeError> {
         if self.pos + 2 > self.bytes.len() {
-            return Err(value_error("bad marshal data: short u16"));
+            return Err(Self::truncated_error());
         }
         let v = u16::from_le_bytes([self.bytes[self.pos], self.bytes[self.pos + 1]]);
         self.pos += 2;
@@ -529,7 +540,7 @@ impl<'a> MarshalReader<'a> {
 
     fn read_n_bytes(&mut self, n: usize) -> Result<Vec<u8>, RuntimeError> {
         if self.pos + n > self.bytes.len() {
-            return Err(value_error("bad marshal data: truncated"));
+            return Err(Self::truncated_error());
         }
         let bytes = self.bytes[self.pos..self.pos + n].to_vec();
         self.pos += n;

@@ -922,12 +922,11 @@ fn set_error(st: &StateRef, code: c_int) -> RuntimeError {
     );
     let cls = expat_error_type();
     let einst = PyInstance::new(cls);
+    einst.slot_set("args", Object::new_tuple(vec![Object::from_str(msg)]));
+    // `code`/`lineno`/`offset` are plain instance attributes in CPython's
+    // pyexpat (`PyObject_SetAttrString`), so they stay in the dict.
     {
         let mut d = einst.dict.borrow_mut();
-        d.insert(
-            DictKey(Object::from_static("args")),
-            Object::new_tuple(vec![Object::from_str(msg)]),
-        );
         d.insert(
             DictKey(Object::from_static("code")),
             Object::Int(i64::from(code)),

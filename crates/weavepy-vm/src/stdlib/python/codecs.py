@@ -1942,6 +1942,22 @@ def decode(obj, encoding="utf-8", errors="strict"):
     return out
 
 
+# On CPython, `codecs.encode`/`decode` *are* the C builtins from
+# `_codecs` (`from _codecs import *`), so they pickle by reference as
+# `_codecs encode` — proto-0/1 `bytes` pickles embed exactly that
+# GLOBAL (pickletools' disassembler_test checks the byte offsets).
+# WeavePy's canonical implementations are these Python functions;
+# attribute them to `_codecs` and install them there so
+# `codecs.encode is _codecs.encode` and pickle's `save_global`
+# identity check passes.
+encode.__module__ = '_codecs'
+encode.__qualname__ = 'encode'
+decode.__module__ = '_codecs'
+decode.__qualname__ = 'decode'
+_codecs.encode = encode
+_codecs.decode = decode
+
+
 def register(search_function):
     """Register a search function. CPython's protocol calls it with
     a normalised encoding name and expects a `CodecInfo` (or

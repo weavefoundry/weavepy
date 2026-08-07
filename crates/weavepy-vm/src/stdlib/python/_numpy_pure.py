@@ -24,10 +24,23 @@ build with the native extension. The fallback exists to keep the
 """
 
 import math as _math
+import struct as _struct
 
 
 __all__ = ['NDArray', 'array', 'zeros', 'ones', 'empty', 'arange',
            'concatenate']
+
+
+def _struct_code(dtype):
+    """struct format char + element coercion for a dtype name — covers
+    the dtype spellings the pure core actually produces ('f8', 'int64',
+    'float64', …)."""
+    name = str(dtype).lstrip('<>=|')
+    if name.startswith('u'):
+        return 'Q', int
+    if name.startswith(('i', 'l', 'q')):
+        return 'q', int
+    return 'd', float
 
 
 def _fsum(iterable):
@@ -112,6 +125,14 @@ class NDArray:
     @property
     def T(self):
         return self.transpose()
+
+    @property
+    def flags(self):
+        return _Flags(self)
+
+    @property
+    def ctypes(self):
+        return _CTypes(self)
 
     # --- conversions
 
@@ -259,6 +280,13 @@ class NDArray:
                 return self._flat[i * c + j]
         if isinstance(key, slice) and self.ndim == 1:
             return NDArray(self._flat[key], (len(self._flat[key]),), dtype=self._dtype)
+        if isinstance(key, slice) and self.ndim == 2:
+            r, c = self._shape
+            rows = range(*key.indices(r))
+            flat = []
+            for i in rows:
+                flat.extend(self._flat[i * c:(i + 1) * c])
+            return NDArray(flat, (len(rows), c), dtype=self._dtype)
         return self._flat[key]
 
     def __setitem__(self, key, value):
@@ -346,6 +374,33 @@ class NDArray:
     def copy(self):
         return NDArray(self._flat, self.shape, dtype=self._dtype)
 
+    # --- buffer protocol / pickling (test_pickle's test_buffers_numpy)
+
+    def __buffer__(self, flags):  # noqa: ARG002
+        # PEP 688 export: pack the flat storage into real bytes so
+        # `memoryview(arr)` / `pickle.PickleBuffer(arr)` work. The VM
+        # records *this array* as the view's exporter, which is how the
+        # zero-copy unpickle path below finds its way back to the
+        # original storage.
+        code, coerce = _struct_code(self._dtype)
+        packed = _struct.pack('<%d%s' % (len(self._flat), code),
+                              *[coerce(v) for v in self._flat])
+        return memoryview(packed)
+
+    def __reduce_ex__(self, protocol):
+        # Mirrors numpy's pickle-5 support: protocol >= 5 routes the
+        # data through a PickleBuffer, so a `buffer_callback` can take
+        # it out-of-band and unpickling with `buffers=` reconstructs an
+        # array *sharing* this one's storage (pickletester's
+        # check_no_copy compares `ctypes.data`). Older protocols — and
+        # in-band buffers — rebuild from a plain nested list.
+        if protocol >= 5:
+            import pickle
+            return (_from_buffer,
+                    (pickle.PickleBuffer(self), str(self._dtype),
+                     self._shape))
+        return (_from_list, (self.tolist(), str(self._dtype)))
+
     def dot(self, other):
         if isinstance(other, NDArray):
             if self.ndim == 1 and other.ndim == 1:
@@ -364,6 +419,58 @@ class NDArray:
                         out[i * c + j] = s
                 return NDArray(out, (r, c), dtype=self._dtype)
         return _fsum(a * b for a, b in zip(self._flat, other))
+
+
+class _Flags:
+    """`ndarray.flags` lookalike. The pure core always materialises a
+    dense C-order copy (slices/transposes included), so every array
+    reports C-contiguous."""
+
+    __slots__ = ('c_contiguous', 'f_contiguous', 'writeable')
+
+    def __init__(self, arr):
+        self.c_contiguous = True
+        self.f_contiguous = arr.ndim <= 1
+        self.writeable = True
+
+
+class _CTypes:
+    """`ndarray.ctypes` lookalike: `data` stands in for the data
+    pointer — the identity of the flat storage list, so arrays sharing
+    storage report the same "address" and copies report different
+    ones."""
+
+    __slots__ = ('data',)
+
+    def __init__(self, arr):
+        self.data = id(arr._flat)
+
+
+def _from_list(data, dtype):
+    """Unpickle an array serialized in-band as a nested list."""
+    return array(data, dtype=dtype)
+
+
+def _from_buffer(buf, dtype, shape):
+    """Unpickle a protocol-5 array. When `buf` is the very PickleBuffer
+    the pickler handed to `buffer_callback` (out-of-band, same
+    process), its exported view leads back to the source NDArray —
+    share that storage so the round-trip is zero-copy, like numpy's
+    `_frombuffer` over the original memory. Otherwise (in-band, or
+    cross-process) decode the packed bytes."""
+    with memoryview(buf) as m:
+        src = m.obj
+        if isinstance(src, NDArray):
+            out = NDArray.__new__(NDArray)
+            out._flat = src._flat
+            out._shape = tuple(shape)
+            out._dtype = dtype
+            out._strides = out._calc_strides()
+            return out
+        code, _coerce = _struct_code(dtype)
+        n = _prod(shape) if shape else 1
+        vals = list(_struct.unpack('<%d%s' % (n, code), m.tobytes()))
+        return NDArray(vals, shape, dtype=dtype)
 
 
 def array(data, dtype='float64'):

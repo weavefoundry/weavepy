@@ -441,6 +441,17 @@ fn register_descriptor_kinds(bt: &BuiltinTypes) {
                 {
                     Some((s.to_string(), w.func()))
                 }
+                // `*.maketrans` (and `__new__`) are *staticmethod*-wrapped
+                // builtins: record their metadata, but keep the retrieved
+                // function's type `builtin_function_or_method` — CPython's
+                // `type(str.maketrans)` / `type(object.__new__)` are plain
+                // builtins, and inspect's `_NonUserDefinedCallables` check
+                // relies on it (test_warnings' deprecated-class signature).
+                (Object::Str(s), Object::StaticMethod(w))
+                    if matches!(w.func(), Object::Builtin(_)) =>
+                {
+                    Some((format!("\u{0}static:{s}"), w.func()))
+                }
                 _ => None,
             })
             .collect();
@@ -452,10 +463,12 @@ fn register_descriptor_kinds(bt: &BuiltinTypes) {
             if crate::descr_registry::lookup(&value).is_some() {
                 continue;
             }
-            let kind = if is_slot_wrapper_name(&name) {
-                DescrKind::Wrapper
+            let (name, kind) = if let Some(bare) = name.strip_prefix("\u{0}static:") {
+                (bare.to_owned(), DescrKind::StaticBuiltin)
+            } else if is_slot_wrapper_name(&name) {
+                (name, DescrKind::Wrapper)
             } else {
-                DescrKind::Method
+                (name, DescrKind::Method)
             };
             register(&value, kind, ty.clone(), &name, None);
         }
@@ -1721,19 +1734,82 @@ fn install_class_getitem(bt: &BuiltinTypes) {
 // PEP 688 `__buffer__`
 // ---------------------------------------------------------------------------
 
+/// Coerce a `__buffer__`/`_from_flags` flags argument to a C `int` the way
+/// CPython's argument clinic does: `OverflowError` past the 32-bit range,
+/// `TypeError` for non-ints.
+fn buffer_flags_arg(arg: Option<&Object>) -> Result<i64, RuntimeError> {
+    match arg {
+        None => Err(type_error(
+            "__buffer__() takes exactly one argument (0 given)",
+        )),
+        Some(Object::Int(n)) => {
+            if *n < i64::from(i32::MIN) || *n > i64::from(i32::MAX) {
+                return Err(RuntimeError::PyException(
+                    crate::error::PyException::from_builtin(
+                        "OverflowError",
+                        "Python int too large to convert to C int",
+                    ),
+                ));
+            }
+            Ok(*n)
+        }
+        Some(Object::Bool(b)) => Ok(i64::from(*b)),
+        Some(Object::Long(_)) => Err(RuntimeError::PyException(
+            crate::error::PyException::from_builtin(
+                "OverflowError",
+                "Python int too large to convert to C int",
+            ),
+        )),
+        Some(other) => Err(type_error(format!(
+            "'{}' object cannot be interpreted as an integer",
+            other.type_name()
+        ))),
+    }
+}
+
+/// CPython `PyBUF_WRITABLE`.
+const PYBUF_WRITABLE: i64 = 0x0001;
+
 fn buffer_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
     let recv = as_native(
         args.first()
             .ok_or_else(|| type_error("__buffer__() missing self"))?,
     );
+    let flags = buffer_flags_arg(args.get(1))?;
     match &recv {
-        Object::Bytes(b) => Ok(Object::MemoryView(Rc::new(PyMemoryView::from_bytes(
-            b.clone(),
-        )))),
+        Object::Bytes(b) => {
+            if flags & PYBUF_WRITABLE != 0 {
+                return Err(RuntimeError::PyException(
+                    crate::error::PyException::from_builtin(
+                        "BufferError",
+                        "Object is not writable.",
+                    ),
+                ));
+            }
+            Ok(Object::MemoryView(Rc::new(PyMemoryView::from_bytes(
+                b.clone(),
+            ))))
+        }
         Object::ByteArray(b) => Ok(Object::MemoryView(Rc::new(PyMemoryView::from_bytearray(
             b.clone(),
         )))),
-        Object::MemoryView(_) => Ok(recv.clone()),
+        Object::MemoryView(mv) => {
+            if mv.released.get() || mv.restricted.get() {
+                return Err(value_error(
+                    "operation forbidden on released memoryview object".to_owned(),
+                ));
+            }
+            if flags & PYBUF_WRITABLE != 0 && mv.readonly.get() {
+                return Err(RuntimeError::PyException(
+                    crate::error::PyException::from_builtin(
+                        "BufferError",
+                        "memoryview: underlying buffer is not writable",
+                    ),
+                ));
+            }
+            // CPython hands out a fresh view object per export.
+            Ok(Object::MemoryView(Rc::new(mv.shallow_clone())))
+        }
         other => Err(value_error(format!(
             "__buffer__ not supported for '{}'",
             other.type_name()
@@ -1741,10 +1817,98 @@ fn buffer_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
+/// `bytes.__release_buffer__` / `bytearray.__release_buffer__` /
+/// `memoryview.__release_buffer__` — CPython's `wrap_releasebuffer`:
+/// validates the argument is a live memoryview whose buffer this object
+/// exported, then releases it.
+pub(crate) fn release_buffer_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
+    let recv = as_native(
+        args.first()
+            .ok_or_else(|| type_error("__release_buffer__() missing self"))?,
+    );
+    let view = match args.get(1) {
+        Some(Object::MemoryView(v)) => v.clone(),
+        Some(other) => {
+            return Err(type_error(format!(
+                "expected a memoryview object, got '{}'",
+                other.type_name()
+            )));
+        }
+        None => {
+            return Err(type_error(
+                "__release_buffer__() takes exactly one argument (0 given)",
+            ));
+        }
+    };
+    if view.released.get() {
+        return Err(value_error(
+            "operation forbidden on released memoryview object".to_owned(),
+        ));
+    }
+    // The view must actually be over this object's buffer (CPython:
+    // "memoryview's buffer is not this object").
+    let matches_recv = match (&recv, &view.buffer) {
+        (Object::ByteArray(b), crate::object::MemoryViewBuffer::ByteArray(vb)) => Rc::ptr_eq(b, vb),
+        (Object::Bytes(b), crate::object::MemoryViewBuffer::Bytes(vb)) => Rc::ptr_eq(b, vb),
+        (Object::MemoryView(m), _) => m.shares_buffer(&view),
+        _ => false,
+    };
+    if !matches_recv {
+        return Err(value_error(
+            "memoryview's buffer is not this object".to_owned(),
+        ));
+    }
+    view.release();
+    Ok(Object::None)
+}
+
+/// `memoryview._from_flags(obj, flags)` — CPython's private constructor
+/// used by test_buffer: exports `obj` with explicit request flags (a plain
+/// `memoryview(obj)` always asks for `PyBUF_FULL_RO`).
+fn memoryview_from_flags_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
+    // Tolerate classmethod-style binding: strip a leading `memoryview`
+    // type/instance receiver if present.
+    let args = match args.first() {
+        Some(Object::Type(t)) if t.name == "memoryview" => &args[1..],
+        _ => args,
+    };
+    let obj = args
+        .first()
+        .ok_or_else(|| type_error("_from_flags() missing required argument 'object'"))?;
+    let flags = buffer_flags_arg(args.get(1))?;
+    let ptr = crate::vm_singletons::current_interpreter_ptr()
+        .ok_or_else(|| type_error("_from_flags requires a running interpreter"))?;
+    // SAFETY: published by `publish_interpreter_ptr` from a `&mut
+    // Interpreter` still on the call stack; the GIL makes this thread's
+    // access exclusive.
+    let interp = unsafe { &mut *ptr };
+    let globals = interp.builtins_dict();
+    if let Some(view) = interp.memoryview_from_object_and_flags(obj, flags, &globals)? {
+        return Ok(view);
+    }
+    // Native buffer objects: honour the writable request bit.
+    if flags & PYBUF_WRITABLE != 0 && matches!(as_native(obj), Object::Bytes(_)) {
+        return Err(RuntimeError::PyException(
+            crate::error::PyException::from_builtin("BufferError", "Object is not writable."),
+        ));
+    }
+    crate::builtins::b_memoryview(std::slice::from_ref(obj))
+}
+
 fn install_buffer_protocol(bt: &BuiltinTypes) {
     for ty in [&bt.bytes_, &bt.bytearray_, &bt.memoryview_] {
         insert_if_absent(ty, "__buffer__", builtin("__buffer__", buffer_builtin));
+        insert_if_absent(
+            ty,
+            "__release_buffer__",
+            builtin("__release_buffer__", release_buffer_builtin),
+        );
     }
+    insert_if_absent(
+        &bt.memoryview_,
+        "_from_flags",
+        builtin("_from_flags", memoryview_from_flags_builtin),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1763,6 +1927,13 @@ fn install_named_methods(ty: &Rc<TypeObject>, type_name: &str, names: &[&str]) {
             // argument, which `dict_fromkeys` inspects.
             let entry = if type_name == "dict" && *name == "fromkeys" {
                 Object::ClassMethod(crate::object::MethodWrapper::new(entry))
+            } else if *name == "maketrans" {
+                // `str/bytes/bytearray.maketrans` are *staticmethod*
+                // descriptors in CPython (`STATICMETHOD(...)` in the
+                // clinic tables): `__get__` hands back the plain builtin,
+                // but the raw dict entry is the wrapper — and refuses to
+                // pickle (test_pickle's test_c_methods descriptor probe).
+                Object::StaticMethod(crate::object::MethodWrapper::new(entry))
             } else {
                 entry
             };

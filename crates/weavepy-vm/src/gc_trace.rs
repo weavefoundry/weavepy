@@ -72,7 +72,7 @@
 //! generation than it strictly has to).
 
 use crate::sync::RefCell;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::object::Object;
@@ -310,13 +310,25 @@ pub struct GcState {
     /// path by scanning *this* small set (not the whole tracked
     /// population) at the interpreter's reference-drop safe points. Keyed
     /// by id like `index`; an object is in both while finalizable.
-    finalizable: RefCell<std::collections::HashMap<ObjectId, Arc<TrackedHandle>>>,
+    finalizable: RefCell<std::collections::BTreeMap<ObjectId, Arc<TrackedHandle>>>,
     /// Live population of [`Self::finalizable`]. A relaxed load of this
     /// atomic is the gate the interpreter checks before every prompt-
     /// finalization sweep: when it is zero (the overwhelmingly common
     /// case — most code never defines `__del__`) the sweep is skipped
     /// entirely, so the feature costs one atomic load per safe point.
     finalizable_count: AtomicUsize,
+    /// Rotating scan position for [`Self::reap_dead_finalizable_locked`]
+    /// when the finalizable index outgrows its per-safe-point scan budget
+    /// (70k callback-weakrefs from a `WeakKeyDictionary` stress test must
+    /// not turn every reference-dropping opcode into a full index walk —
+    /// test_weakref's threaded-copy tests went quadratic). Stores the id
+    /// the next bounded scan resumes from.
+    fin_scan_cursor: std::sync::atomic::AtomicU64,
+    /// Safe-point call counter paired with the cursor: when the index is
+    /// over budget, only every [`FIN_SCAN_STRIDE`]-th safe point pays for
+    /// a window scan, keeping the steady-state per-opcode cost a counter
+    /// bump instead of 256 atomic strong-count loads.
+    fin_scan_tick: std::sync::atomic::AtomicU64,
 }
 
 impl Default for GcState {
@@ -387,8 +399,10 @@ impl GcState {
             tracked_version: AtomicUsize::new(0),
             tracked_count: AtomicUsize::new(0),
             finalized_ids: RefCell::new(std::collections::HashSet::new()),
-            finalizable: RefCell::new(std::collections::HashMap::new()),
+            finalizable: RefCell::new(std::collections::BTreeMap::new()),
             finalizable_count: AtomicUsize::new(0),
+            fin_scan_cursor: std::sync::atomic::AtomicU64::new(0),
+            fin_scan_tick: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -751,10 +765,29 @@ impl GcState {
         // lookup via the `weak_clones` fast-path filter.
         static FIN_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let fin_trace = *FIN_TRACE.get_or_init(|| std::env::var_os("WEAVEPY_FIN_TRACE").is_some());
+        // Per-safe-point scan budget. Below this size the whole index is
+        // scanned (full CPython-like promptness — the overwhelmingly common
+        // shape); above it, a rotating window bounds the cost so a huge
+        // population of callback-weakrefs (70k `WeakKeyDictionary` keys in
+        // test_weakref's threaded-copy stress) doesn't make every
+        // reference-dropping opcode O(index) — quadratic over the run.
+        // Deaths are still detected within index_len/budget safe points.
+        const FIN_SCAN_BUDGET: usize = 256;
+        /// When over budget, additionally scan only every N-th safe point:
+        /// with tens of thousands of live callback-weakrefs even a bounded
+        /// window per drop opcode dominates the run; deaths are batched,
+        /// so probing less often loses nothing but a little latency.
+        const FIN_SCAN_STRIDE: u64 = 8;
+        if self.finalizable.borrow().len() > FIN_SCAN_BUDGET {
+            let tick = self.fin_scan_tick.fetch_add(1, Ordering::Relaxed);
+            if !tick.is_multiple_of(FIN_SCAN_STRIDE) {
+                return 0;
+            }
+        }
         let dead: Vec<Arc<TrackedHandle>> = {
             let fin = self.finalizable.borrow();
             let mut out: Vec<Arc<TrackedHandle>> = Vec::new();
-            for h in fin.values() {
+            let mut check = |h: &Arc<TrackedHandle>| {
                 let sc = strong_count_for(&h.object);
                 let cached = h.weak_clones.load(Ordering::Acquire);
                 if fin_trace {
@@ -771,7 +804,7 @@ impl GcState {
                 // (cached, upper-bound) weakref clones ⇒ a program reference is
                 // still live. Skip without touching the registry.
                 if sc > 1 + cached {
-                    continue;
+                    return;
                 }
                 // Borderline: compute the exact live clone count and test for
                 // an effective program refcount of zero.
@@ -789,6 +822,24 @@ impl GcState {
                 if sc.saturating_sub(1).saturating_sub(clones) == 0 {
                     out.push(h.clone());
                 }
+            };
+            if fin.len() <= FIN_SCAN_BUDGET {
+                for h in fin.values() {
+                    check(h);
+                }
+            } else {
+                let start = self.fin_scan_cursor.load(Ordering::Relaxed);
+                let mut next_cursor = start;
+                for (scanned, (id, h)) in fin.range(start..).chain(fin.range(..start)).enumerate() {
+                    if scanned == FIN_SCAN_BUDGET {
+                        next_cursor = *id;
+                        break;
+                    }
+                    check(h);
+                }
+                // budget < len guarantees the break above ran and set the
+                // resume point to the first unscanned id.
+                self.fin_scan_cursor.store(next_cursor, Ordering::Relaxed);
             }
             out
         };
@@ -1289,6 +1340,15 @@ impl GcState {
                         // closes a cycle whose edges live entirely in these
                         // untracked node types (RFC 0054,
                         // test_taskgroups.test_exception_refcycles_*).
+                        // Descriptor wrappers likewise (CPython GC-tracks
+                        // staticmethod/classmethod/property): a user
+                        // `__new__` is stored in the class dict behind a
+                        // staticmethod wrapper, so the wrapper's edge to
+                        // the function must be subtracted or a dead
+                        // `namespace -> class -> __new__ -> __globals__`
+                        // exec cycle keeps the function externally
+                        // reachable forever
+                        // (test_module.test_clear_dict_in_ref_cycle).
                         Object::Iter(_)
                         | Object::Tuple(_)
                         | Object::FrozenSet(_)
@@ -1297,7 +1357,10 @@ impl GcState {
                         | Object::Cell(_)
                         | Object::Traceback(_)
                         | Object::Frame(_)
-                        | Object::BoundMethod(_) => true,
+                        | Object::BoundMethod(_)
+                        | Object::StaticMethod(_)
+                        | Object::ClassMethod(_)
+                        | Object::Property(_) => true,
                         Object::List(_) => parent_is_iter,
                         // An *exception* instance is untracked until a
                         // mutation marks it a cycle suspect, yet `raise X
@@ -1443,6 +1506,26 @@ impl GcState {
         // its `weakref_cb` queued, which is all a blocking `join` needs to
         // unblock its idle workers. Finalizable objects are left for a real
         // collection so `tp_finalize` ordering is preserved.
+        // CPython's `handle_weakrefs`: a weakref that is *itself* part of the
+        // cyclic trash has its callback cleared without invocation — only
+        // weakrefs rooted outside the dying subgraph observe the deaths
+        // (test_callbacks_on_callback: `c.wr`/`d.wr` stay silent while the
+        // external `safe_callback` fires). Snapshot the trash ids so the
+        // queue loops below can drop callbacks belonging to trash wrappers.
+        let mut trash_ids: std::collections::HashSet<ObjectId> =
+            unreachable.iter().map(|h| h.id).collect();
+        let wrapper_is_trash =
+            |slot: &Arc<crate::weakref_registry::WeakRefSlot>,
+             trash: &std::collections::HashSet<ObjectId>| {
+                slot.py_ref
+                    .borrow()
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade)
+                    .is_none_or(|inst| {
+                        trash.contains(&(crate::sync::Rc::as_ptr(&inst) as usize as u64))
+                    })
+            };
+
         if weakref_only {
             let mut weakref_callbacks = Vec::new();
             for h in &unreachable {
@@ -1451,6 +1534,9 @@ impl GcState {
                 }
                 for (slot, cb) in crate::weakref_registry::notify_clear(h.id) {
                     if let Some(cb) = cb {
+                        if wrapper_is_trash(&slot, &trash_ids) {
+                            continue;
+                        }
                         weakref_callbacks.push((slot, cb));
                     }
                 }
@@ -1486,6 +1572,9 @@ impl GcState {
         for h in &unreachable {
             for (slot, cb) in crate::weakref_registry::notify_clear(h.id) {
                 if let Some(cb) = cb {
+                    if wrapper_is_trash(&slot, &trash_ids) {
+                        continue;
+                    }
                     weakref_callbacks.push((slot, cb));
                 }
             }
@@ -1704,7 +1793,10 @@ impl GcState {
                 }
                 // Orphaned: fire its weakref callbacks (queued in 5d below),
                 // capture its children for the cascade, tear it down, and drop
-                // it from the tracked set.
+                // it from the tracked set. The orphan joins the trash set
+                // first so a weakref *wrapper* dying in this cascade never
+                // fires its own callback (CPython `handle_weakrefs` parity).
+                trash_ids.insert(cid);
                 for (slot, cb) in crate::weakref_registry::notify_clear(cid) {
                     if let Some(cb) = cb {
                         weakref_callbacks.push((slot, cb));
@@ -1721,8 +1813,13 @@ impl GcState {
         // 5d: queue weakref callbacks (after finalisers and cyclic
         // clears, matching CPython's order). The interpreter drains
         // the queue at its next safe point — the GC layer can't call
-        // Python itself.
+        // Python itself. Wrappers that turned out to be trash (including
+        // cascade orphans discovered after their callbacks were queued)
+        // are dropped here.
         for (slot, cb) in weakref_callbacks {
+            if wrapper_is_trash(&slot, &trash_ids) {
+                continue;
+            }
             let wr = slot
                 .py_ref
                 .borrow()
@@ -1882,7 +1979,20 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
             if !cls.flags.is_builtin {
                 visit(&Object::Type(cls));
             }
-            if let Ok(m) = i.dict.try_borrow() {
+            // A namespace dict that is itself a GC candidate — a
+            // `types.ModuleType('foo')` instance's `__dict__`, tracked in
+            // tandem with the functions whose `__globals__` it becomes —
+            // is one strong edge from the instance, and its own candidacy
+            // accounts for the contents. Walking the contents here too
+            // would subtract every entry twice; *not* visiting the dict
+            // object would leave it looking externally referenced, and a
+            // `dict -> instance -> class -> method -> __globals__` cycle
+            // in a dead ModuleType namespace would be immortal
+            // (test_module.test_clear_dict_in_ref_cycle).
+            let dict_obj = Object::Dict(i.dict.clone());
+            if is_tracked(id_of(&dict_obj)) {
+                visit(&dict_obj);
+            } else if let Ok(m) = i.dict.try_borrow() {
                 for (k, v) in m.iter() {
                     visit(&k.0);
                     visit(v);
@@ -1912,13 +2022,14 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
             run_external_traverse(obj, visit);
         }
         Object::Module(m) => {
-            let Ok(dict) = m.dict.try_borrow() else {
-                return;
-            };
-            for (k, v) in dict.iter() {
-                visit(&k.0);
-                visit(v);
-            }
+            // The module holds exactly one strong edge: its namespace
+            // dict. `track()` enrolls that dict as its own candidate
+            // (whose traversal covers the entries), so visiting the
+            // contents here as well would double-subtract them. If the
+            // dict was never tracked (pre-dating that pairing), the
+            // `by_id` miss makes this visit harmless and its entries
+            // simply count as externally referenced — conservative.
+            visit(&Object::Dict(m.dict.clone()));
         }
         Object::Cell(c) => {
             let Ok(v) = c.try_borrow() else { return };
@@ -1936,6 +2047,17 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
         Object::BoundMethod(b) => {
             visit(&b.function);
             visit(&b.receiver);
+        }
+        Object::MemoryView(m) => {
+            // CPython's `memory_traverse` visits `view->obj`: an exporter
+            // that (transitively) owns the view closes a cycle
+            // (test_picklebuffer.test_cycle routes one through
+            // `PickleBuffer._view`).
+            if let Ok(exp) = m.exporter.try_borrow() {
+                if let Some(exp) = exp.as_ref() {
+                    visit(exp);
+                }
+            }
         }
         Object::Slice(s) => {
             visit(&s.start);
@@ -1996,6 +2118,31 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
                     visit(&Object::Type(meta.clone()));
                 }
             }
+            // The cached instantiation plan holds strong refs to the
+            // resolved `__new__`/`__init__` (usually aliases of the dict
+            // entries visited above, but still *extra* edges). Without
+            // subtracting them, a class whose `__init__` was ever called
+            // keeps that function externally reachable, and a
+            // `dict -> instance -> class -> __init__ -> __globals__`
+            // exec cycle never collapses
+            // (test_module.test_clear_dict_in_ref_cycle).
+            if let Ok(plan) = t.instance_plan.try_borrow() {
+                if let Some((_, plan)) = plan.as_ref() {
+                    for slot in [&plan.user_new, &plan.init_fn] {
+                        let Some(f) = slot else { continue };
+                        visit(f);
+                        // A classmethod-form `__new__` is cached as a
+                        // plan-private BoundMethod over the class — that
+                        // wrapper is never itself a tracked candidate, so
+                        // its edges (function + the class receiver) are
+                        // this class's edges.
+                        if let Object::BoundMethod(bm) = f {
+                            visit(&bm.function);
+                            visit(&bm.receiver);
+                        }
+                    }
+                }
+            }
         }
         Object::Function(f) => {
             // CPython `func_traverse` visits globals, defaults, kwdefaults,
@@ -2015,10 +2162,12 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
             for cell in &f.closure {
                 visit(cell);
             }
-            if let Ok(attrs) = f.attrs.try_borrow() {
-                for (k, v) in attrs.iter() {
-                    visit(&k.0);
-                    visit(v);
+            if let Ok(attrs_rc) = f.attrs.try_borrow() {
+                if let Ok(attrs) = attrs_rc.try_borrow() {
+                    for (k, v) in attrs.iter() {
+                        visit(&k.0);
+                        visit(v);
+                    }
                 }
             }
             if let Ok(slots) = f.slots.try_borrow() {
@@ -2197,14 +2346,24 @@ pub fn clear_object_fields(obj: &Object) {
                 *v = Object::None;
             }
         }
+        Object::MemoryView(m) => {
+            // Drop the `view->obj` edge (CPython `memory_clear` releases
+            // the buffer). The backing bytes stay valid — only the
+            // exporter reference participates in cycles.
+            if let Ok(mut exp) = m.exporter.try_borrow_mut() {
+                *exp = None;
+            }
+        }
         Object::Function(f) => {
             // Break the function's outgoing edges (CPython `func_clear`).
             // `globals` is intentionally left alone: it's a shared namespace
             // dict (a module's `__dict__` or the `exec` target), reclaimed as
             // its own candidate if it too is unreachable — clearing it here
             // could wipe a live module.
-            if let Ok(mut attrs) = f.attrs.try_borrow_mut() {
-                attrs.clear();
+            if let Ok(attrs_rc) = f.attrs.try_borrow() {
+                if let Ok(mut attrs) = attrs_rc.try_borrow_mut() {
+                    attrs.clear();
+                }
             }
             if let Ok(mut slots) = f.slots.try_borrow_mut() {
                 slots.clear();
@@ -2286,8 +2445,113 @@ pub fn with_state<R>(f: impl FnOnce(&GcState) -> R) -> R {
     f(&GC_STATE)
 }
 
+/// References to `target` held by *zombie* tracked memoryviews — views
+/// whose only remaining strong reference is the registry's own handle
+/// (plus weakref-slot clones). Under CPython refcounting such a view is
+/// already freed, so `sys.getrefcount` must not let its exporter edge
+/// inflate the exporter's count (test_memoryview's getitem/setitem tests
+/// assert `getrefcount(b)` returns to baseline after a short-lived view
+/// over `b` is dropped). Chains (a zombie view of a zombie view) resolve
+/// iteratively. Restricted to memoryviews to keep the scan O(#views),
+/// well away from `getrefcount`-hot paths like pandas'.
+pub fn zombie_memoryview_refs_to(target: ObjectId) -> usize {
+    with_state(|s| {
+        let mut handles: Vec<Arc<TrackedHandle>> = Vec::new();
+        {
+            let Ok(gens) = s.generations.try_borrow() else {
+                return 0;
+            };
+            for gen in gens.iter() {
+                for h in &gen.handles {
+                    if matches!(h.object, Object::MemoryView(_)) {
+                        handles.push(h.clone());
+                    }
+                }
+            }
+        }
+        if let Ok(frozen) = s.frozen.try_borrow() {
+            for h in frozen.iter() {
+                if matches!(h.object, Object::MemoryView(_)) {
+                    handles.push(h.clone());
+                }
+            }
+        }
+        if handles.is_empty() {
+            return 0;
+        }
+        let mut zombies: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
+        loop {
+            // Inbound references each candidate receives from the current
+            // zombie set (a dropped chain of sub-views keeps inner views'
+            // counts up via exporter edges).
+            let mut inbound: std::collections::HashMap<ObjectId, usize> =
+                std::collections::HashMap::new();
+            for h in &handles {
+                if zombies.contains(&h.id) {
+                    traverse_object(&h.object, &mut |c| {
+                        *inbound.entry(id_of(c)).or_insert(0) += 1;
+                    });
+                }
+            }
+            let mut changed = false;
+            for h in &handles {
+                if zombies.contains(&h.id) {
+                    continue;
+                }
+                let strong = strong_count_for(&h.object);
+                let weak = crate::weakref_registry::strong_clone_count(h.id);
+                let from_zombies = inbound.get(&h.id).copied().unwrap_or(0);
+                if strong
+                    .saturating_sub(1) // the registry handle itself
+                    .saturating_sub(weak)
+                    .saturating_sub(from_zombies)
+                    == 0
+                {
+                    zombies.insert(h.id);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut n = 0usize;
+        for h in &handles {
+            if zombies.contains(&h.id) {
+                traverse_object(&h.object, &mut |c| {
+                    if id_of(c) == target {
+                        n += 1;
+                    }
+                });
+            }
+        }
+        n
+    })
+}
+
 /// Convenience: track `obj` in the shared, process-global GC.
 pub fn track(obj: Object) {
+    // A module's namespace dict outlives the module object whenever
+    // functions defined in it survive (their `__globals__`), so it must
+    // be a collection candidate in its own right — a
+    // `dict -> instance -> class -> method -> __globals__` cycle in a
+    // dead module's namespace is otherwise immortal
+    // (test_module.test_clear_dict_in_ref_cycle). The module's own
+    // traversal visits the dict *object* (its single strong edge), and
+    // the dict candidate accounts for the contents.
+    // Likewise, a function's `__globals__` dict is the closing edge of
+    // every `namespace -> object -> function -> __globals__` cycle. A
+    // `types.ModuleType('foo')` namespace (an instance-internal dict
+    // that never went through BuildMap) would otherwise never be a
+    // candidate. CPython tracks every dict; we pair the tracking with
+    // the objects that make the dict cycle-capable.
+    if let Object::Module(m) = &obj {
+        let dict = Object::Dict(m.dict.clone());
+        with_state(|s| s.track(dict));
+    } else if let Object::Function(f) = &obj {
+        let dict = Object::Dict(f.globals.clone());
+        with_state(|s| s.track(dict));
+    }
     with_state(|s| s.track(obj));
 }
 
@@ -2320,6 +2584,26 @@ pub fn track_prompt_reclaim(obj: Object) {
 /// objects the collector itself marshals through transient C boxes.
 pub fn collector_active() -> bool {
     with_state(|s| s.collecting.load(Ordering::Acquire))
+}
+
+/// True for the whole span of a `gc.collect()` *orchestration* — the
+/// mark/sweep passes plus the interpreter-side drains of the `__del__`
+/// finalizers those passes queued. CPython keeps `gcstate->collecting`
+/// set while `finalize_garbage` invokes finalizers, and faulthandler's
+/// bpo-44466 "Garbage-collecting" marker keys on exactly that; WeavePy's
+/// collector can't call Python, so the finalizer phase happens outside
+/// [`collector_active`]'s window and is tracked separately here.
+static COLLECT_FINALIZER_PHASE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_collect_finalizer_phase(on: bool) {
+    COLLECT_FINALIZER_PHASE.store(on, Ordering::Release);
+}
+
+/// The faulthandler dump's view: is a garbage collection in progress on
+/// this process right now? Lock-free (plain atomic loads), so it is safe
+/// to call from the fatal-signal handler.
+pub fn collection_in_progress() -> bool {
+    COLLECT_FINALIZER_PHASE.load(Ordering::Acquire) || collector_active()
 }
 
 /// Convenience: stop tracking `obj` (by identity) in the shared,
@@ -2401,6 +2685,16 @@ fn container_can_cycle(obj: &Object) -> bool {
 /// cycle (see [`container_can_cycle`]). Returns `true` when the object
 /// was added to the tracked set, so the caller can decide whether to
 /// run a threshold-driven young collection at the allocation site.
+/// Track a memoryview that just recorded a buffer exporter. Only a
+/// mutable-container exporter (an instance, list, …) can route a cycle
+/// back through the view, so scalar exporters (`bytes`) stay untracked.
+pub fn track_memoryview_exporter(mv: &Object, exporter: &Object) {
+    debug_assert!(matches!(mv, Object::MemoryView(_)));
+    if !is_atomic(exporter) {
+        track(mv.clone());
+    }
+}
+
 pub fn track_if_cyclic(obj: &Object) -> bool {
     if container_can_cycle(obj) {
         track(obj.clone());
@@ -2468,6 +2762,36 @@ pub fn finalization_candidates() -> Vec<Arc<TrackedHandle>> {
 /// GC (see [`GcState::reap_dead_acyclic`]).
 pub fn reap_dead_acyclic() -> usize {
     with_state(|s| s.reap_dead_acyclic())
+}
+
+/// [`reap_dead_acyclic`] for the prompt-finalization drain's hot path:
+/// the full-index cascade scan is O(tracked) and the drain runs it once
+/// per pass that freed a finalizable. With a huge tracked population
+/// shedding finalizables continuously (70k `WeakKeyDictionary` keys
+/// dying one pop at a time in test_weakref's threaded-copy stress) that
+/// multiplies into minutes, so over a size threshold only every N-th
+/// drain pays for the scan — the skipped cascades are plain containers
+/// whose reclamation the next scan (or any collection) picks up. Small
+/// heaps keep CPython-like promptness (asyncio's SSL leak chains).
+pub fn reap_dead_acyclic_amortized() -> usize {
+    const TRACKED_THRESHOLD: usize = 8192;
+    static STRIDE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let stride = *STRIDE.get_or_init(|| {
+        std::env::var("WEAVEPY_ACYCLIC_STRIDE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64)
+    });
+    static TICK: AtomicU64 = AtomicU64::new(0);
+    with_state(|s| {
+        if s.tracked_count.load(Ordering::Relaxed) > TRACKED_THRESHOLD {
+            let tick = TICK.fetch_add(1, Ordering::Relaxed);
+            if !tick.is_multiple_of(stride) {
+                return 0;
+            }
+        }
+        s.reap_dead_acyclic()
+    })
 }
 
 /// Convenience: is any finalizable object currently tracked in the shared GC?

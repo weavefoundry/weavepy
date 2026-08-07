@@ -14,6 +14,7 @@ from importlib.machinery import (
     SourceFileLoader,
     SourcelessFileLoader,
     ExtensionFileLoader,
+    AppleFrameworkLoader,
 )
 
 __all__ = [
@@ -23,6 +24,7 @@ __all__ = [
     'SourceFileLoader',
     'SourcelessFileLoader',
     'ExtensionFileLoader',
+    'AppleFrameworkLoader',
 ]
 
 import sys as _sys
@@ -242,6 +244,46 @@ def _validate_hash_pyc(data, source_hash, name, exc_details):
             f'hash in bytecode doesn\'t match hash of source {name!r}',
             **exc_details,
         )
+
+
+def _bless_my_loader(module_globals):
+    """Resolve the loader for a module's globals (CPython verbatim,
+    GH#97850 — `_warnings.c` calls this to find the loader whose
+    `get_source` feeds a formatted warning)."""
+    import warnings as _warnings
+
+    if not isinstance(module_globals, dict):
+        return None
+
+    missing = object()
+    loader = module_globals.get('__loader__', None)
+    spec = module_globals.get('__spec__', missing)
+
+    if loader is None:
+        if spec is missing:
+            return None
+        elif spec is None:
+            raise ValueError('Module globals is missing a __spec__.loader')
+
+    spec_loader = getattr(spec, 'loader', missing)
+
+    if spec_loader in (missing, None):
+        if loader is None:
+            exc = AttributeError if spec_loader is missing else ValueError
+            raise exc('Module globals is missing a __spec__.loader')
+        _warnings.warn(
+            'Module globals is missing a __spec__.loader',
+            DeprecationWarning)
+        spec_loader = loader
+
+    assert spec_loader is not None
+    if loader is not None and loader != spec_loader:
+        _warnings.warn(
+            'Module globals; __loader__ != __spec__.loader',
+            DeprecationWarning)
+        return loader
+
+    return spec_loader
 
 
 def _get_sourcefile(bytecode_path):

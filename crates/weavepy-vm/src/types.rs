@@ -285,8 +285,8 @@ impl TypeObject {
                         | "code"
                         | "cell"
                         | "mappingproxy"
-                        | "weakproxy"
-                        | "weakcallableproxy"
+                        | "ProxyType"
+                        | "CallableProxyType"
                         | "member_descriptor"
                         | "method_descriptor"
                         | "getset_descriptor"
@@ -642,40 +642,63 @@ impl TypeObject {
             Some(Object::FrozenSet(s)) if !s.is_empty() => bits |= IS_ABSTRACT,
             _ => {}
         }
-        const SEQUENCE: i64 = 1 << 5;
-        const MAPPING: i64 = 1 << 6;
         for t in self.mro.borrow().iter() {
             if t.flags.is_builtin {
                 match t.name.as_str() {
                     "int" => bits |= LONG_SUBCLASS,
-                    "list" => bits |= LIST_SUBCLASS | SEQUENCE,
-                    "tuple" => bits |= TUPLE_SUBCLASS | SEQUENCE,
+                    "list" => bits |= LIST_SUBCLASS,
+                    "tuple" => bits |= TUPLE_SUBCLASS,
                     "bytes" => bits |= BYTES_SUBCLASS,
                     "str" => bits |= UNICODE_SUBCLASS,
-                    "dict" => bits |= DICT_SUBCLASS | MAPPING,
-                    "range" | "memoryview" | "bytearray" => bits |= SEQUENCE,
-                    "mappingproxy" => bits |= MAPPING,
+                    "dict" => bits |= DICT_SUBCLASS,
                     "type" => bits |= TYPE_SUBCLASS,
                     _ => {}
                 }
             }
-            // ABCs that declared `__abc_tpflags__` (Sequence / Mapping):
-            // `_abc_init` stowed the collection bits here, and CPython
-            // propagates them to subclasses through tp_flags inheritance —
-            // the MRO walk reproduces that.
+        }
+        bits |= self.collection_flags();
+        if self.flags.is_exception {
+            bits |= BASE_EXC_SUBCLASS;
+        }
+        bits
+    }
+
+    /// PEP 634 collection flag for this type: `Py_TPFLAGS_SEQUENCE`
+    /// (1 << 5) or `Py_TPFLAGS_MAPPING` (1 << 6), driving `MATCH_SEQUENCE`
+    /// / `MATCH_MAPPING`. CPython inherits these bits from the dominant
+    /// base, so the *first* flag-bearing entry along the MRO wins —
+    /// `class M1(UserDict, Sequence)` is MAPPING only, and
+    /// `class Both(Sequence, Mapping)` is SEQUENCE only
+    /// (test_patma.TestInheritance). Sources of the flag, per MRO entry:
+    /// the flag-carrying C builtins (list/tuple/range/memoryview are
+    /// sequences; dict/mappingproxy are mappings; str/bytes/bytearray are
+    /// deliberately excluded by the PEP), and `_abc_collection_flags` —
+    /// where ABCMeta stows a class's `__abc_tpflags__` declaration and
+    /// where `ABC.register()` stamps virtual registrations.
+    pub fn collection_flags(&self) -> i64 {
+        const SEQUENCE: i64 = 1 << 5;
+        const MAPPING: i64 = 1 << 6;
+        let mro: Vec<Rc<TypeObject>> = self.mro.borrow().clone();
+        for t in mro.iter() {
+            if t.flags.is_builtin {
+                match t.name.as_str() {
+                    "list" | "tuple" | "range" | "memoryview" => return SEQUENCE,
+                    "dict" | "mappingproxy" => return MAPPING,
+                    _ => {}
+                }
+            }
             if let Some(v) = t
                 .dict
                 .borrow()
                 .get(&DictKey(Object::from_static("_abc_collection_flags")))
                 .and_then(Object::as_i64)
             {
-                bits |= v & (SEQUENCE | MAPPING);
+                if v & (SEQUENCE | MAPPING) != 0 {
+                    return v & (SEQUENCE | MAPPING);
+                }
             }
         }
-        if self.flags.is_exception {
-            bits |= BASE_EXC_SUBCLASS;
-        }
-        bits
+        0
     }
 
     /// Reset the cached `__getattribute__` / `__setattr__` classifications

@@ -673,9 +673,7 @@ fn future_result_impl(
                 // futures.py): awaiting the same future repeatedly must not
                 // accumulate awaiter frames (test_futures2).
                 if let Object::Instance(i) = &exc {
-                    i.dict
-                        .borrow_mut()
-                        .insert(DictKey(Object::from_static("__traceback__")), tb);
+                    i.slot_set("__traceback__", tb);
                 }
                 Err(RuntimeError::PyException(PyException::new(exc)))
             }
@@ -780,12 +778,7 @@ fn future_set_exception_impl(
 /// `exc.__traceback__` at storage time (CPython's `fut_exception_tb`).
 fn exc_traceback_of(exc: &Object) -> Object {
     match exc {
-        Object::Instance(i) => i
-            .dict
-            .borrow()
-            .get(&DictKey(Object::from_static("__traceback__")))
-            .cloned()
-            .unwrap_or(Object::None),
+        Object::Instance(i) => i.slot_get("__traceback__").unwrap_or(Object::None),
         _ => Object::None,
     }
 }
@@ -1855,12 +1848,10 @@ fn task_internal_set_exception(
 
 fn stop_iteration_value(inst: &Object) -> Object {
     if let Object::Instance(i) = inst {
-        if let Some(v) = i.dict.borrow().get(&DictKey(Object::from_static("value"))) {
-            return v.clone();
+        if let Some(v) = crate::builtin_types::exc_attr(i, "value") {
+            return v;
         }
-        if let Some(Object::Tuple(items)) =
-            i.dict.borrow().get(&DictKey(Object::from_static("args")))
-        {
+        if let Some(Object::Tuple(items)) = crate::builtin_types::exc_attr(i, "args") {
             if let Some(first) = items.first() {
                 return first.clone();
             }

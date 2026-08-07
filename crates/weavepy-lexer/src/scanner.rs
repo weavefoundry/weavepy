@@ -31,10 +31,22 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, LexError> {
 pub fn tokenize_with_escapes(source: &str) -> (Result<Vec<Token>, LexError>, Vec<EscapeWarning>) {
     let mut scanner = Scanner::new(source);
     let mut out = Vec::new();
+    let mut seen_content = false;
+    // Set when an INDENT arrives before any content token. A statement can
+    // never begin indented, but CPython's lazy tokenizer only reports the
+    // error once it reaches the first real token of the logical line (which
+    // may sit on a later physical line after backslash continuations), so we
+    // defer until then. Lexical errors hit while scanning for that token
+    // still win, matching CPython's ordering (test_ast
+    // test_literal_eval_syntax_errors).
+    let mut pending_first_indent = None;
     let result = loop {
         match scanner.next_token() {
             Ok(Some(tok)) => {
                 let is_endmarker = matches!(tok.kind, TokenKind::Endmarker);
+                if !seen_content && matches!(tok.kind, TokenKind::Indent) {
+                    pending_first_indent = Some(tok.span.start.0);
+                }
                 // Track whether the most recent token leaves a logical line
                 // "open" (i.e. needs a NEWLINE to terminate it). The EOF
                 // branch of `next_token` consults this to synthesize the
@@ -49,6 +61,17 @@ pub fn tokenize_with_escapes(source: &str) -> (Result<Vec<Token>, LexError>, Vec
                         | TokenKind::Dedent
                         | TokenKind::Endmarker
                 );
+                if scanner.last_was_content && !matches!(tok.kind, TokenKind::Comment) {
+                    if let Some(indent_pos) = pending_first_indent {
+                        // CPython anchors "unexpected indent" at the column
+                        // *before* the offending token (the last whitespace
+                        // character of the indent run).
+                        let start = tok.span.start.0;
+                        let pos = if start > indent_pos { start - 1 } else { start };
+                        break Err(LexError::UnexpectedIndent { pos });
+                    }
+                    seen_content = true;
+                }
                 out.push(tok);
                 if is_endmarker {
                     break Ok(out);

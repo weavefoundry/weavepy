@@ -300,6 +300,14 @@ pub enum OpCode {
     BuildMap,
     BuildString,
     ListAppend,
+    /// Pop an iterable and extend the list `arg` entries below TOS with
+    /// it (CPython `LIST_EXTEND`). A non-iterable operand raises
+    /// CPython's splat wording: "Value after * must be an iterable,
+    /// not X".
+    ListExtend,
+    /// Pop a list, push a tuple of its elements (CPython 3.13's
+    /// `CALL_INTRINSIC_1` / `INTRINSIC_LIST_TO_TUPLE`).
+    ListToTuple,
     SetAdd,
     MapAdd,
     /// Unpack iterable at TOS into `arg` values, push them in
@@ -549,6 +557,8 @@ impl OpCode {
             OpCode::BuildMap => "BUILD_MAP",
             OpCode::BuildString => "BUILD_STRING",
             OpCode::ListAppend => "LIST_APPEND",
+            OpCode::ListExtend => "LIST_EXTEND",
+            OpCode::ListToTuple => "LIST_TO_TUPLE",
             OpCode::SetAdd => "SET_ADD",
             OpCode::MapAdd => "MAP_ADD",
             OpCode::UnpackSequence => "UNPACK_SEQUENCE",

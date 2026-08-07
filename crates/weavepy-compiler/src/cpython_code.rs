@@ -86,6 +86,7 @@ pub mod op {
     pub const DELETE_FAST: u8 = 65;
     pub const DELETE_GLOBAL: u8 = 66;
     pub const DELETE_NAME: u8 = 67;
+    pub const DICT_MERGE: u8 = 68;
     pub const DICT_UPDATE: u8 = 69;
     pub const SETUP_ANNOTATIONS: u8 = 37;
     pub const EXTENDED_ARG: u8 = 71;
@@ -97,6 +98,7 @@ pub mod op {
     pub const JUMP_BACKWARD: u8 = 77;
     pub const JUMP_FORWARD: u8 = 79;
     pub const LIST_APPEND: u8 = 80;
+    pub const LIST_EXTEND: u8 = 81;
     pub const LOAD_ATTR: u8 = 82;
     pub const LOAD_CONST: u8 = 83;
     pub const LOAD_DEREF: u8 = 84;
@@ -144,6 +146,8 @@ pub const MAGIC_NUMBER: [u8; 4] = [0xf3, 0x0d, 0x0d, 0x0a];
 const INTRINSIC_IMPORT_STAR: u32 = 2;
 /// CALL_INTRINSIC_1 sub-op: `INTRINSIC_UNARY_POSITIVE`.
 const INTRINSIC_UNARY_POSITIVE: u32 = 5;
+/// CALL_INTRINSIC_1 sub-op: `INTRINSIC_LIST_TO_TUPLE`.
+const INTRINSIC_LIST_TO_TUPLE: u32 = 6;
 /// CALL_INTRINSIC_2 sub-op: `INTRINSIC_PREP_RERAISE_STAR`.
 const INTRINSIC_PREP_RERAISE_STAR: u32 = 1;
 
@@ -190,6 +194,11 @@ pub fn is_rel_jump(cp_op: u8) -> bool {
 pub fn is_backward_jump(cp_op: u8) -> bool {
     cp_op == op::JUMP_BACKWARD
 }
+
+/// CPython's `NB_INPLACE_ADD` — the in-place variants (`+=` and
+/// friends) occupy `_nb_ops[13..=25]`, offset from their plain
+/// counterparts by this constant.
+const NB_INPLACE_OFFSET: u32 = 13;
 
 /// WeavePy [`BinOpKind`] → CPython `_nb_ops` index (the arg `BINARY_OP`
 /// carries; `dis` renders it through `_nb_ops`).
@@ -273,10 +282,16 @@ fn map_to_cpython(ins: Instruction, nlocals: u32) -> MappedOp {
         O::BinarySubscr => (op::BINARY_SUBSCR, 0),
         O::StoreSubscr => (op::STORE_SUBSCR, 0),
         O::DeleteSubscr => (op::DELETE_SUBSCR, 0),
-        O::BinaryOp => (
-            op::BINARY_OP,
-            BinOpKind::from_arg(ins.arg).map_or(ins.arg, binop_to_nb),
-        ),
+        O::BinaryOp => {
+            // Our arg carries the operator in the low byte plus an
+            // augmented-assignment flag; CPython encodes in-place ops as
+            // separate `_nb_ops` indexes (NB_INPLACE_*).
+            let inplace = ins.arg & crate::bytecode::BINARY_OP_INPLACE_FLAG != 0;
+            let nb = BinOpKind::from_arg(ins.arg & 0xFF).map_or(ins.arg, |k| {
+                binop_to_nb(k) + if inplace { NB_INPLACE_OFFSET } else { 0 }
+            });
+            (op::BINARY_OP, nb)
+        }
         O::UnaryOp => match UnaryKind::from_arg(ins.arg) {
             Some(UnaryKind::Neg) => (op::UNARY_NEGATIVE, 0),
             Some(UnaryKind::Not) => (op::UNARY_NOT, 0),
@@ -289,7 +304,9 @@ fn map_to_cpython(ins: Instruction, nlocals: u32) -> MappedOp {
         O::IsOp => (op::IS_OP, ins.arg),
         O::ContainsOp => (op::CONTAINS_OP, ins.arg),
         O::PopTop => (op::POP_TOP, 0),
-        O::CopyTop => (op::COPY, 1),
+        // Legacy emit sites use arg 0 for a plain dup; CPython COPY's
+        // arg is 1-based (mapping patterns emit deeper copies).
+        O::CopyTop => (op::COPY, ins.arg.max(1)),
         O::Swap => (op::SWAP, ins.arg),
         O::Call => (op::CALL, ins.arg),
         O::CallKw => (op::CALL_KW, ins.arg),
@@ -308,11 +325,23 @@ fn map_to_cpython(ins: Instruction, nlocals: u32) -> MappedOp {
         O::BuildMap => (op::BUILD_MAP, ins.arg),
         O::BuildString => (op::BUILD_STRING, ins.arg),
         O::ListAppend => (op::LIST_APPEND, ins.arg),
+        O::ListExtend => (op::LIST_EXTEND, ins.arg),
+        O::ListToTuple => (op::CALL_INTRINSIC_1, INTRINSIC_LIST_TO_TUPLE),
         O::SetAdd => (op::SET_ADD, ins.arg),
         O::MapAdd => (op::MAP_ADD, ins.arg),
         O::UnpackSequence => (op::UNPACK_SEQUENCE, ins.arg),
-        O::UnpackEx => (op::UNPACK_EX, ins.arg),
-        O::DictUpdate => (op::DICT_UPDATE, ins.arg),
+        // Our UNPACK_EX arg keeps the before-star count in the high
+        // byte; CPython's keeps it in the low byte.
+        O::UnpackEx => (
+            op::UNPACK_EX,
+            ((ins.arg >> 8) & 0xFF) | ((ins.arg & 0xFF) << 8),
+        ),
+        // WeavePy folds CPython's DICT_UPDATE (dict display) and
+        // DICT_MERGE (call `**` splat) into one opcode keyed by arg;
+        // surface them as the distinct CPython opcodes, whose oparg is
+        // the stack offset of the target dict (always 1 here).
+        O::DictUpdate if ins.arg == 1 => (op::DICT_MERGE, 1),
+        O::DictUpdate => (op::DICT_UPDATE, 1),
         O::SetupAnnotations => (op::SETUP_ANNOTATIONS, 0),
         O::MakeFunction => (op::MAKE_FUNCTION, ins.arg),
         O::BuildSlice => (op::BUILD_SLICE, ins.arg),
@@ -516,6 +545,25 @@ pub fn encode(code: &CodeObject) -> CpythonCode {
 
         let mut changed = false;
         for i in 0..n {
+            // `PUSH_EXC_INFO` has no oparg in CPython, but WeavePy tags it
+            // with the pc just past the handler body (the unwinder's
+            // discard cue). The cache is WeavePy-only, so persist the tag
+            // as an *absolute code-unit offset* — losing it (decoding to
+            // the untagged 0) changes handled-exception unwinding, which
+            // is observable through `__context__` chaining.
+            if mapped[i].cp_op == op::PUSH_EXC_INFO {
+                let tag = code.instructions[i].arg as usize;
+                if tag != 0 {
+                    let oparg = starts[tag.min(n)] as u32;
+                    args[i] = oparg;
+                    let need = ext_count(oparg);
+                    if need != ext[i] {
+                        ext[i] = need;
+                        changed = true;
+                    }
+                }
+                continue;
+            }
             if !is_rel_jump(mapped[i].cp_op) {
                 continue;
             }
@@ -904,6 +952,10 @@ fn decode_instructions(raws: &[DecodedRaw], nlocals: u32) -> Option<Vec<Instruct
             } else {
                 target_idx.saturating_sub(idx + 1) as u32
             }
+        } else if r.cp_op == op::PUSH_EXC_INFO && r.arg != 0 {
+            // Inverse of the encoder's handler-body tag: absolute code
+            // unit → instruction index (see the encode fixpoint loop).
+            *unit_to_idx.get(&(r.arg as usize)).unwrap_or(&raws.len()) as u32
         } else {
             op.1
         };
@@ -1178,13 +1230,25 @@ fn map_from_cpython(cp_op: u8, arg: u32, nlocals: u32) -> Option<(OpCode, u32)> 
         op::BINARY_SUBSCR => (O::BinarySubscr, 0),
         op::STORE_SUBSCR => (O::StoreSubscr, 0),
         op::DELETE_SUBSCR => (O::DeleteSubscr, 0),
-        op::BINARY_OP => (O::BinaryOp, nb_to_binop(arg)?.as_arg()),
+        op::BINARY_OP => {
+            let (nb, flag) = if arg >= NB_INPLACE_OFFSET {
+                (
+                    arg - NB_INPLACE_OFFSET,
+                    crate::bytecode::BINARY_OP_INPLACE_FLAG,
+                )
+            } else {
+                (arg, 0)
+            };
+            (O::BinaryOp, nb_to_binop(nb)?.as_arg() | flag)
+        }
         op::UNARY_NEGATIVE => (O::UnaryOp, UnaryKind::Neg.as_arg()),
         op::UNARY_NOT => (O::UnaryOp, UnaryKind::Not.as_arg()),
         op::UNARY_INVERT => (O::UnaryOp, UnaryKind::Invert.as_arg()),
         op::CALL_INTRINSIC_1 => {
             if arg == INTRINSIC_UNARY_POSITIVE {
                 (O::UnaryOp, UnaryKind::Pos.as_arg())
+            } else if arg == INTRINSIC_LIST_TO_TUPLE {
+                (O::ListToTuple, 0)
             } else {
                 (O::ImportStar, 0)
             }
@@ -1195,7 +1259,7 @@ fn map_from_cpython(cp_op: u8, arg: u32, nlocals: u32) -> Option<(OpCode, u32)> 
         op::IS_OP => (O::IsOp, arg),
         op::CONTAINS_OP => (O::ContainsOp, arg),
         op::POP_TOP => (O::PopTop, 0),
-        op::COPY => (O::CopyTop, 0),
+        op::COPY => (O::CopyTop, arg),
         op::SWAP => (O::Swap, arg),
         op::CALL => (O::Call, arg),
         op::CALL_KW => (O::CallKw, arg),
@@ -1215,11 +1279,13 @@ fn map_from_cpython(cp_op: u8, arg: u32, nlocals: u32) -> Option<(OpCode, u32)> 
         op::SETUP_ANNOTATIONS => (O::SetupAnnotations, 0),
         op::BUILD_STRING => (O::BuildString, arg),
         op::LIST_APPEND => (O::ListAppend, arg),
+        op::LIST_EXTEND => (O::ListExtend, arg),
         op::SET_ADD => (O::SetAdd, arg),
         op::MAP_ADD => (O::MapAdd, arg),
         op::UNPACK_SEQUENCE => (O::UnpackSequence, arg),
-        op::UNPACK_EX => (O::UnpackEx, arg),
-        op::DICT_UPDATE => (O::DictUpdate, arg),
+        op::UNPACK_EX => (O::UnpackEx, ((arg & 0xFF) << 8) | ((arg >> 8) & 0xFF)),
+        op::DICT_UPDATE => (O::DictUpdate, 0),
+        op::DICT_MERGE => (O::DictUpdate, 1),
         op::MAKE_FUNCTION => (O::MakeFunction, arg),
         op::BUILD_SLICE => (O::BuildSlice, arg),
         op::LOAD_BUILD_CLASS => (O::LoadBuildClass, 0),
@@ -1542,4 +1608,89 @@ mod tests {
         assert_eq!(cp2.co_linetable, cp.co_linetable);
         assert_eq!(cp2.co_exceptiontable, cp.co_exceptiontable);
     }
+}
+#[test]
+fn pyc_roundtrip_chain_repro() {
+    use weavepy_parser::parse_module;
+    let src = r"
+class RaiseExc:
+    def __init__(self, exc): self.exc = exc
+    def __enter__(self): return self
+    def __exit__(self, *d): raise self.exc
+
+class RaiseExcWithContext:
+    def __init__(self, outer, inner):
+        self.outer = outer
+        self.inner = inner
+    def __enter__(self): return self
+    def __exit__(self, *d):
+        try:
+            raise self.inner
+        except:
+            raise self.outer
+
+class SuppressExc:
+    def __enter__(self): return self
+    def __exit__(self, *d):
+        type(self).saved_details = d
+        return True
+
+def body():
+    try:
+        with RaiseExc(IndexError):
+            with RaiseExcWithContext(KeyError, AttributeError):
+                with SuppressExc():
+                    with RaiseExc(ValueError):
+                        1 / 0
+    except IndexError as exc:
+        return exc.__context__.__context__.__context__
+";
+    let module = parse_module(src).expect("parse");
+    let code = crate::compile_module(&module).expect("compile");
+    fn walk(code: &crate::CodeObject, path: String) {
+        let cp = crate::cpython_code::encode(code);
+        let dc = crate::cpython_code::decode_full(
+            &cp.co_code,
+            &cp.co_linetable,
+            &cp.co_exceptiontable,
+            &cp.localsplusnames,
+            &cp.localspluskinds,
+            cp.firstlineno,
+        )
+        .expect("decode");
+        let norm = |ins: &crate::Instruction| -> crate::Instruction {
+            // Legacy emit sites use `COPY 0` as a plain dup; the VM and
+            // the wire format both read it as `COPY 1`.
+            if ins.op == crate::bytecode::OpCode::CopyTop && ins.arg == 0 {
+                crate::Instruction::new(ins.op, 1)
+            } else {
+                *ins
+            }
+        };
+        for (i, (a, b)) in code
+            .instructions
+            .iter()
+            .zip(dc.instructions.iter())
+            .enumerate()
+        {
+            let (a, b) = (norm(a), norm(b));
+            assert_eq!(a, b, "{path}: instruction {i} diverges: {a:?} vs {b:?}");
+        }
+        assert_eq!(
+            code.instructions.len(),
+            dc.instructions.len(),
+            "{path}: length"
+        );
+        assert_eq!(
+            code.exception_table, dc.exception_table,
+            "{path}: exception table"
+        );
+        assert_eq!(code.linetable, dc.linetable, "{path}: linetable");
+        for c in &code.constants {
+            if let crate::Constant::Code(inner) = c {
+                walk(inner, format!("{path}/{}", inner.name));
+            }
+        }
+    }
+    walk(&code, "<module>".to_owned());
 }

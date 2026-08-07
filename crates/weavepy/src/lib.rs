@@ -85,6 +85,10 @@ impl Error {
                 let message = format!("`{feature}` is not implemented in the slice ({rfc})");
                 format_syntax_error_span(source, filename, span.start.0, span.end.0, &message)
             }
+            Error::Parse(err @ parser::ParseError::IdentifierConstant { .. }) => {
+                // A plain ValueError in CPython — no caret/source context.
+                format!("ValueError: {}\n", err.syntax_message())
+            }
             Error::Compile(compile_err) => format_compile_error(source, filename, compile_err),
             Error::Runtime(vm::RuntimeError::PyException(exc)) => {
                 let mut s = String::new();

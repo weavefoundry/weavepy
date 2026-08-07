@@ -61,10 +61,17 @@ pub struct WeakRefSlot {
     /// `Some(strong_clone_of_target)` while the referent is
     /// alive. Set to `None` by `notify_clear`.
     pub target: RefCell<Option<Object>>,
-    /// `__callback__`. Stored as an `Object` so the user's
-    /// callable can be invoked through the normal call path.
-    /// `None` if no callback was passed to `weakref.ref`.
-    pub callback: RefCell<Option<Object>>,
+    /// Whether a callback was supplied at creation. The callback
+    /// *object* itself lives in the user-visible wrapper's instance
+    /// dict (under `__callback__`), never here: the wrapper is
+    /// GC-tracked when a callback exists, so the reference is a
+    /// *traced edge* the cycle collector can account. A strong clone
+    /// hidden inside this slot would make any cycle routed through a
+    /// weakref callback (`c.wr = weakref.ref(d, c.cb)` with `c ↔ d`)
+    /// permanently uncollectible — CPython's weakref `tp_traverse`
+    /// visits `wr_callback` for exactly this reason
+    /// (test_weakref's `test_callbacks_on_callback`).
+    pub has_callback: bool,
     /// Cached `id(referent)` so the weakref's `__hash__`
     /// remains stable across the referent's life.
     pub identity_hash: i64,
@@ -89,11 +96,11 @@ pub mod kind {
 }
 
 impl WeakRefSlot {
-    pub fn new(target_id: ObjectId, target: Object, callback: Option<Object>, kind: u8) -> Self {
+    pub fn new(target_id: ObjectId, target: Object, has_callback: bool, kind: u8) -> Self {
         Self {
             target_id,
             target: RefCell::new(Some(target.clone())),
-            callback: RefCell::new(callback),
+            has_callback,
             identity_hash: target_id as i64,
             dead: AtomicBool::new(false),
             kind,
@@ -112,18 +119,47 @@ impl WeakRefSlot {
         self.target.borrow().clone()
     }
 
-    /// Clear the slot. Returns the callback (if any) so the
-    /// caller can invoke it on the calling thread.
+    /// Clear the slot. Returns the callback (if any) so the caller can
+    /// invoke it on the calling thread. The callback is *taken* from
+    /// the wrapper's instance dict (set to `None` there), matching
+    /// CPython, which drops `wr_callback` once it has fired:
+    /// `ref.__callback__` reads `None` afterwards
+    /// (test_callback_attribute_after_deletion). If the wrapper object
+    /// itself is already gone, the callback died with it and there is
+    /// nothing to call — also CPython's behavior.
     pub fn clear(&self) -> Option<Object> {
         if self.dead.swap(true, Ordering::AcqRel) {
             return None;
         }
         *self.target.borrow_mut() = None;
-        self.callback.borrow_mut().take()
+        if !self.has_callback {
+            return None;
+        }
+        let inst = self.py_ref.borrow().as_ref().and_then(Weak::upgrade)?;
+        let key = crate::object::DictKey(Object::from_static("__callback__"));
+        let mut d = inst.dict.try_borrow_mut().ok()?;
+        match d.get(&key).cloned() {
+            None | Some(Object::None) => None,
+            Some(cb) => {
+                d.insert(key, Object::None);
+                Some(cb)
+            }
+        }
     }
 
+    /// The live callback, read (non-destructively) from the wrapper's
+    /// instance dict.
     pub fn callback(&self) -> Option<Object> {
-        self.callback.borrow().clone()
+        if !self.has_callback || self.is_dead() {
+            return None;
+        }
+        let inst = self.py_ref.borrow().as_ref().and_then(Weak::upgrade)?;
+        let key = crate::object::DictKey(Object::from_static("__callback__"));
+        let v = inst.dict.borrow().get(&key).cloned();
+        match v {
+            None | Some(Object::None) => None,
+            v => v,
+        }
     }
 }
 
@@ -481,7 +517,7 @@ mod tests {
     #[test]
     fn registry_register_and_clear() {
         let reg = WeakRefRegistry::new();
-        let slot = Arc::new(WeakRefSlot::new(42, Object::Int(7), None, kind::REF));
+        let slot = Arc::new(WeakRefSlot::new(42, Object::Int(7), false, kind::REF));
         reg.register(slot.clone());
         assert_eq!(reg.count(42), 1);
         let cleared = reg.notify_clear(42);
@@ -494,7 +530,7 @@ mod tests {
     fn shrink_drops_dead_slots() {
         let reg = WeakRefRegistry::new();
         {
-            let slot = Arc::new(WeakRefSlot::new(99, Object::Int(0), None, kind::REF));
+            let slot = Arc::new(WeakRefSlot::new(99, Object::Int(0), false, kind::REF));
             reg.register(slot);
         }
         reg.shrink();
@@ -503,7 +539,7 @@ mod tests {
 
     #[test]
     fn thread_local_registry_works() {
-        let slot = Arc::new(WeakRefSlot::new(1, Object::Int(0), None, kind::REF));
+        let slot = Arc::new(WeakRefSlot::new(1, Object::Int(0), false, kind::REF));
         register(slot.clone());
         assert_eq!(count_for(1), 1);
         let cleared = notify_clear(1);

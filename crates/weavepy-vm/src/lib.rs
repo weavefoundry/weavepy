@@ -547,6 +547,13 @@ pub struct InterpreterFlags {
     /// `os.cpu_count()`/`os.process_cpu_count()` (gh-109595). `None`
     /// means the real value (including `cpu_count=default`).
     pub cpu_count: Option<i64>,
+    /// `-X tracemalloc[=NFRAME]` / `PYTHONTRACEMALLOC` — start tracing
+    /// allocations at interpreter startup with this traceback depth.
+    /// `0` (the default) means off; the CLI validated the range.
+    pub tracemalloc: u32,
+    /// `-X faulthandler` / `PYTHONFAULTHANDLER` (dev mode also turns it
+    /// on) — install the fatal-signal traceback dumper at startup.
+    pub faulthandler: bool,
 }
 
 /// The effective `LC_CTYPE` locale name, resolved the way `setlocale(LC_CTYPE,
@@ -618,6 +625,14 @@ pub struct Interpreter {
     /// native dict alive (CPython's function keeps the mapping itself),
     /// so a weak owner would die with the caller's last direct reference.
     globals_missing_hooks: RefCell<Vec<(usize, Rc<PyInstance>)>>,
+    /// Non-zero while the VM is lazily loading one of its own machinery
+    /// modules (e.g. `importlib._bootstrap` for `module.__repr__`). In
+    /// CPython those are frozen and fully initialized before user code
+    /// runs, so their import statements can never observe a user's
+    /// `builtins.__import__` patch; `IMPORT_NAME` skips the hook while
+    /// this is set (testmock's `patch('builtins.__import__')` must not
+    /// see — or worse, service — bootstrap imports).
+    internal_import_depth: u32,
 }
 
 impl Default for Interpreter {
@@ -772,6 +787,7 @@ impl Default for Interpreter {
             excepthook,
             unraisable_hook,
             globals_missing_hooks: RefCell::new(Vec::new()),
+            internal_import_depth: 0,
         };
         // RFC 0025: publish the shared parts of this interpreter
         // (builtins / module cache / stdout / hooks) so workers
@@ -865,6 +881,7 @@ impl Interpreter {
             excepthook: self.excepthook.clone(),
             unraisable_hook: self.unraisable_hook.clone(),
             globals_missing_hooks: RefCell::new(Vec::new()),
+            internal_import_depth: 0,
         }
     }
 
@@ -911,6 +928,10 @@ impl Interpreter {
     /// Prepend a directory to `sys.path`. Idempotent.
     pub fn prepend_path(&self, dir: impl Into<PathBuf>) {
         let s = dir.into().to_string_lossy().into_owned();
+        // Snapshot as CPython's `config->sys_path_0` (the module
+        // shadowing diagnostics compare against startup state, not
+        // live `sys.path`).
+        *self.cache.startup_path0.borrow_mut() = Some(s.clone());
         let mut path = self.cache.path.borrow_mut();
         if !path_contains(&path, &s) {
             path.insert(0, Object::from_str(s));
@@ -947,22 +968,8 @@ impl Interpreter {
             .iter()
             .any(|x| x == "dev" || x.starts_with("dev="));
         crate::vm_singletons::set_dev_mode(dev_mode);
-        // `-X tracemalloc[=NFRAME]` starts tracing at interpreter boot
-        // (CPython's `_PyTraceMalloc_Start` from `config_init_tracemalloc`).
-        for x in &flags.xoptions {
-            let nframe = if x == "tracemalloc" {
-                Some(1u32)
-            } else {
-                x.strip_prefix("tracemalloc=")
-                    .map(|v| v.parse::<u32>().unwrap_or(1).max(1))
-            };
-            if let Some(nframe) = nframe {
-                crate::stdlib::tracemalloc_real::with_state(|s| {
-                    s.enabled = true;
-                    s.nframe = nframe;
-                });
-            }
-        }
+        // (`-X tracemalloc` / `PYTHONTRACEMALLOC` startup tracing is applied
+        // below from the CLI-validated `flags.tracemalloc` nframe.)
         // Resolve `PYTHONIOENCODING`'s encoding half to its canonical codec
         // name up front (CPython reports `sys.stdout.encoding` normalized:
         // `latin1` → `iso8859-1`). Must happen before the sys-dict borrow
@@ -1112,6 +1119,17 @@ impl Interpreter {
             );
             crate::vm_singletons::set_cpu_count_override(flags.cpu_count.unwrap_or(0));
             crate::vm_singletons::set_stdio_unbuffered(flags.unbuffered);
+            // `-X tracemalloc[=NFRAME]` / `PYTHONTRACEMALLOC`: begin tracing
+            // before any user code runs (CPython `_PyTraceMalloc_Init`).
+            if flags.tracemalloc > 0 {
+                crate::stdlib::tracemalloc_real::start_tracing(flags.tracemalloc);
+            }
+            // `-X faulthandler` / `PYTHONFAULTHANDLER` / dev mode: install
+            // the fatal-signal dumper before user code (CPython
+            // `faulthandler_init`). fd 2, all_threads=True.
+            if flags.faulthandler || dev_mode {
+                crate::stdlib::faulthandler_mod::enable_startup(&self.cache);
+            }
             d.insert(
                 crate::object::DictKey(Object::from_static("warnoptions")),
                 Object::new_list(
@@ -2920,8 +2938,10 @@ impl Interpreter {
             // would keep further finalizables/weakref targets alive past this
             // drain (asyncio's SSL leak tests watch such a chain). Only runs
             // on the rare "a finalizable just died" path, so the O(tracked)
-            // scan stays off the hot loop.
-            gc_trace::reap_dead_acyclic();
+            // scan stays off the hot loop; amortized further when the
+            // tracked population itself is huge (see
+            // `reap_dead_acyclic_amortized`).
+            gc_trace::reap_dead_acyclic_amortized();
         }
         IN_PROMPT_FINALIZE.with(|c| c.set(false));
     }
@@ -3089,19 +3109,12 @@ impl Interpreter {
                 }
             }
         }
-        // (2) atexit callbacks (LIFO). `atexit` collects them in a
-        // thread-local; drain and run each with the live interpreter.
-        for (func, args, kwargs) in crate::stdlib::atexit_mod::take_handlers() {
-            let globals = self.builtins.clone();
-            if let Err(err) = self.call(&func, &args, &kwargs, &globals) {
-                let is_exit = matches!(&err,
-                    RuntimeError::PyException(exc) if exc.system_exit_code().is_some());
-                if !is_exit {
-                    let context_repr = func.repr();
-                    self.write_unraisable(&err, &func, &context_repr);
-                }
-            }
-        }
+        // (2) atexit callbacks (LIFO) — `_PyAtExit_Call`. The module owns
+        // the run loop (slot re-reads for re-entrant unregister, the
+        // `PyErr_FormatUnraisable` error shape, no SystemExit
+        // special-casing) so the explicit `atexit._run_exitfuncs()` path
+        // and real shutdown behave identically.
+        crate::stdlib::atexit_mod::run_exit_handlers(self);
     }
 
     /// Run finalizers (`__del__`) for every object still alive at
@@ -3379,12 +3392,7 @@ impl Interpreter {
         // `__traceback__`; surface it as `exc_traceback` like
         // CPython's `UnraisableHookArgs`.
         let tb = match exc_value {
-            Object::Instance(inst) => inst
-                .dict
-                .borrow()
-                .get(&DictKey(Object::from_static("__traceback__")))
-                .cloned()
-                .unwrap_or(Object::None),
+            Object::Instance(inst) => inst.slot_get("__traceback__").unwrap_or(Object::None),
             _ => Object::None,
         };
         d.insert(DictKey(Object::from_static("exc_traceback")), tb);
@@ -3507,12 +3515,7 @@ impl Interpreter {
         let value = exc.instance.clone();
         let exc_type = Object::Type(crate::builtins::class_of(&value));
         let tb = match &value {
-            Object::Instance(inst) => inst
-                .dict
-                .borrow()
-                .get(&DictKey(Object::from_static("__traceback__")))
-                .cloned()
-                .unwrap_or(Object::None),
+            Object::Instance(inst) => inst.slot_get("__traceback__").unwrap_or(Object::None),
             _ => Object::None,
         };
         let globals = self.builtins.clone();
@@ -3662,10 +3665,20 @@ impl Interpreter {
                 Object::from_str(f),
             );
         }
-        g.insert(
-            DictKey(Object::from_static("__builtins__")),
-            Object::Dict(self.builtins.clone()),
-        );
+        // CPython seeds `__main__.__dict__['__builtins__']` with the
+        // builtins *module* (`pymain_run_python` → `Py_RunMain` path);
+        // ordinary imported modules get the plain dict
+        // (test_funcattrs `test___builtins__`). Either shape resolves
+        // identically through `builtins_for_globals`.
+        let builtins_value = if name == "__main__" {
+            match self.cache.get("builtins") {
+                Some(m @ Object::Module(_)) => m,
+                _ => Object::Dict(self.builtins.clone()),
+            }
+        } else {
+            Object::Dict(self.builtins.clone())
+        };
+        g.insert(DictKey(Object::from_static("__builtins__")), builtins_value);
         drop(g);
         globals
     }
@@ -3728,6 +3741,13 @@ impl Interpreter {
                     std::mem::replace(&mut locals[idx], Object::Unbound)
                 });
             cells.push(Rc::new(RefCell::new(initial)));
+        }
+        // tracemalloc: fresh cellvars are allocations. Registered *before*
+        // the new frame is pushed, so the captured stack attributes them to
+        // the calling site — CPython 3.12+ likewise skips the callee's
+        // still-incomplete frame (`test_tracemalloc.test_no_incomplete_frames`).
+        if crate::stdlib::tracemalloc_real::is_tracking() && !cells.is_empty() {
+            crate::stdlib::tracemalloc_real::track_new_cells(&cells);
         }
         for cell in closure {
             match cell {
@@ -4157,7 +4177,27 @@ impl Interpreter {
             // escapes the `try` (test_sys_settrace
             // no_jump_to_non_integers catches the setter's ValueError
             // *inside* the traced frame).
-            let stepped = if let Some(e) = trace_err {
+            let stepped = if crate::vm_singletons::is_finalizing()
+                && crate::vm_singletons::current_thread_is_spawned_worker()
+            {
+                // CPython kills daemon threads at their first eval-breaker
+                // check once `Py_Finalize` begins (`tstate_must_exit`): the
+                // thread unwinds without executing another instruction.
+                // Scoped to threads *WeavePy spawned*: a foreign host thread
+                // running its own embedded interpreter (parallel `run_source`
+                // calls in `cargo test`) has no tstate in the finalizing
+                // runtime and must keep executing — the global `FINALIZING`
+                // flag flipping mid-run otherwise raised a spurious silent
+                // SystemExit in the *other* interpreter (flaky
+                // `run_empty_source_succeeds`).
+                // SystemExit is the silent form everywhere it can surface —
+                // `threading.excepthook` and the `_thread` spawn shim both
+                // swallow it — so the daemon dies without spraying a
+                // traceback over the half-torn-down stderr
+                // (test_io.test_daemon_threads_shutdown_stderr_deadlock).
+                frame.pc += 1;
+                Err(crate::stdlib::thread_real::silent_system_exit())
+            } else if let Some(e) = trace_err {
                 frame.pc += 1;
                 Err(e)
             } else if let Some(exc) = async_exc {
@@ -5110,6 +5150,21 @@ impl Interpreter {
                 crate::trace::HookKind::Trace,
             )?;
         }
+        // CPython's legacy profile adapter (`sys_profile_return` in
+        // Python/legacy_tracing.c) subscribes to PY_YIELD as well as
+        // PY_RETURN: `sys.setprofile` sees every yield as a `'return'`
+        // carrying the yielded value. `_lsprof` needs this to balance
+        // the `'call'` it got when the generator started/resumed
+        // (test_cprofile.test_throw counts genexpr calls).
+        if let Some(profile) = crate::trace::profile_hook() {
+            let _ = self.invoke_observe_hook(
+                &profile,
+                py_frame,
+                "return",
+                value.clone(),
+                crate::trace::HookKind::Profile,
+            )?;
+        }
         self.fire_monitoring_event(py_frame, crate::trace::EVENT_PY_YIELD, value.clone())?;
         Ok(())
     }
@@ -5195,26 +5250,16 @@ impl Interpreter {
         Ok(())
     }
 
-    /// Record an object allocation with `tracemalloc`. Fast path
-    /// short-circuits when tracking is disabled (the common case).
-    /// `nbytes` is the object's approximate footprint as reported
-    /// by `sys.getsizeof`; we use it for the bookkeeping totals.
+    /// Register a freshly built object with `tracemalloc`. Fast path
+    /// short-circuits on one relaxed atomic load when tracking is
+    /// disabled (the common case). The tracker captures the current
+    /// Python stack itself (the executing frame's `lasti` is mirrored
+    /// per-instruction, so mid-frame line numbers are exact).
     #[inline]
-    fn record_alloc(&self, frame: &Frame, nbytes: u64) {
-        if !crate::stdlib::tracemalloc_real::with_state(|s| s.enabled) {
-            return;
+    fn record_alloc(&self, obj: &Object) {
+        if crate::stdlib::tracemalloc_real::is_tracking() {
+            crate::stdlib::tracemalloc_real::track_new_object(obj);
         }
-        let line = frame
-            .code
-            .linetable
-            .get(frame.pc as usize)
-            .copied()
-            .unwrap_or(0);
-        crate::stdlib::tracemalloc_real::record_alloc(
-            &frame.code.filename,
-            i64::from(line),
-            nbytes,
-        );
     }
 
     /// Fire a PEP 669 `sys.monitoring` event. Walks the registered
@@ -5916,6 +5961,12 @@ impl Interpreter {
                     } else {
                         self.dispatch_binary_op(&a, &b, kind, &frame.globals)?
                     };
+                    // tracemalloc: a binary op that built a fresh container /
+                    // string / bytes (`b'x' * n`, `s1 + s2`, `list * 3`) is an
+                    // allocation CPython's allocator hook would see. In-place
+                    // ops on mutables return the same object; the registry
+                    // keyed by identity just overwrites, which is harmless.
+                    self.record_alloc(&r);
                     frame.push(r);
                     // Mirror of the BINARY_SUBSCR retirement: CPython decrefs
                     // both operands as BINARY_OP retires them, so a chained
@@ -6122,7 +6173,14 @@ impl Interpreter {
                 }
             }
             OpCode::CopyTop => {
-                let v = frame.top()?.clone();
+                // CPython COPY(n): push a copy of the n-th item from the
+                // top (1 == TOS). Arg 0 is treated as 1 (plain dup) for
+                // the many legacy emit sites.
+                let n = (ins.arg as usize).max(1);
+                let v = frame
+                    .peek_back(n - 1)
+                    .ok_or_else(|| RuntimeError::Internal("stack underflow".to_owned()))?
+                    .clone();
                 frame.push(v);
             }
             OpCode::Swap => {
@@ -6202,10 +6260,32 @@ impl Interpreter {
                     Object::Tuple(items) => items.iter().cloned().collect(),
                     Object::List(items) => items.borrow().clone(),
                     other => {
-                        return Err(crate::error::type_error(format!(
-                            "argument after * must be an iterable, not {}",
-                            other.type_name()
-                        )))
+                        // A single `f(*x)` splat pushes `x` raw; CPython's
+                        // `do_call` converts via `PySequence_Tuple` and
+                        // brands a non-iterable with `PyObject_FunctionStr`:
+                        // "test.test_extcall.g() argument after * must be
+                        // an iterable, not Nothing" (test_extcall).
+                        let globals = frame.globals.clone();
+                        match self.collect_iterable(other, &globals) {
+                            Ok(items) => items,
+                            Err(e)
+                                if is_type_error(&e)
+                                    && matches!(
+                                        &e,
+                                        RuntimeError::PyException(pe)
+                                            if pe.message().ends_with("object is not iterable")
+                                    ) =>
+                            {
+                                let prefix = callable_function_str(&callable)
+                                    .map(|s| format!("{s} "))
+                                    .unwrap_or_default();
+                                return Err(crate::error::type_error(format!(
+                                    "{prefix}argument after * must be an iterable, not {}",
+                                    other.type_name_owned()
+                                )));
+                            }
+                            Err(e) => return Err(e),
+                        }
                     }
                 };
                 // A `**mapping` key must be a `str` (CPython raises before
@@ -6216,10 +6296,20 @@ impl Interpreter {
                             .iter()
                             .map(|(k, v)| match &k.0 {
                                 Object::Str(_) | Object::WStr(_) => Ok((k.0.to_str(), v.clone())),
+                                // A `str` subclass key matches by its
+                                // *underlying* text (CPython issue2016 —
+                                // test_extcall's `Name(str)` keys), not the
+                                // instance's repr.
                                 Object::Instance(inst)
-                                    if matches!(inst.native.get(), Some(Object::Str(_))) =>
+                                    if matches!(
+                                        inst.native.get(),
+                                        Some(Object::Str(_) | Object::WStr(_))
+                                    ) =>
                                 {
-                                    Ok((k.0.to_str(), v.clone()))
+                                    match inst.native.get() {
+                                        Some(native) => Ok((native.to_str(), v.clone())),
+                                        None => unreachable!("checked above"),
+                                    }
                                 }
                                 _ => Err(crate::error::type_error("keywords must be strings")),
                             })
@@ -6339,6 +6429,7 @@ impl Interpreter {
                         | Object::Instance(_)
                         | Object::LazyIter(_)
                         | Object::Foreign(_)
+                        | Object::File(_)
                 ) {
                     let fresh = self.make_iter(&it_obj, &frame.globals)?;
                     if let Some(slot) = frame.stack.last_mut() {
@@ -6394,6 +6485,13 @@ impl Interpreter {
                         let g = frame.globals.clone();
                         self.foreign_iter_next(&it_obj, &g)?
                     }
+                    // A file is its own iterator (`iter(f) is f`), so the
+                    // loop slot holds the stream itself; each step reads the
+                    // next line.
+                    Object::File(_) => {
+                        let g = frame.globals.clone();
+                        self.iter_next(&it_obj, &g)?
+                    }
                     _ => {
                         return Err(RuntimeError::Internal(
                             "FOR_ITER expects iterator on stack".to_owned(),
@@ -6416,8 +6514,8 @@ impl Interpreter {
                 let n = ins.arg as usize;
                 let split = frame.stack.len().saturating_sub(n);
                 let items = frame.stack.split_off(split);
-                self.record_alloc(frame, 56 + (n as u64) * 8);
                 let obj = Object::new_list(items);
+                self.record_alloc(&obj);
                 // RFC 0024/0039: CPython tracks *every* list — `gc.is_tracked([])`
                 // is True — and a list can close a cycle through later mutation
                 // (`l = []; l.append(l)`), which the content-gated optimization
@@ -6434,7 +6532,6 @@ impl Interpreter {
                 let n = ins.arg as usize;
                 let split = frame.stack.len().saturating_sub(n);
                 let items = frame.stack.split_off(split);
-                self.record_alloc(frame, 40 + (n as u64) * 8);
                 // A tuple is immutable, so it can never *anchor* a reference
                 // cycle on its own: any cycle that passes through a tuple
                 // (`l = []; t = (l,); l.append(t)`) is necessarily closed by a
@@ -6447,7 +6544,9 @@ impl Interpreter {
                 // point CPython frees it by refcount — inflating
                 // `sys.getrefcount` of its elements (`test_traceback`'s
                 // `test_no_refs_to_exception_and_traceback_objects`).
-                frame.push(Object::new_tuple(items));
+                let obj = Object::new_tuple(items);
+                self.record_alloc(&obj);
+                frame.push(obj);
             }
             OpCode::BuildSet => {
                 let n = ins.arg as usize;
@@ -6458,8 +6557,8 @@ impl Interpreter {
                 for it in &items {
                     builtins::ensure_hashable(it)?;
                 }
-                self.record_alloc(frame, 216 + (n as u64) * 16);
                 let obj = Object::new_set_from(items);
+                self.record_alloc(&obj);
                 // CPython tracks every set (`gc.is_tracked(set())` is True);
                 // track unconditionally like lists.
                 gc_trace::track(obj.clone());
@@ -6483,8 +6582,8 @@ impl Interpreter {
                     })?;
                     d.insert(DictKey(k), v);
                 }
-                self.record_alloc(frame, 64 + (n as u64) * 16);
                 let obj = Object::Dict(Rc::new(RefCell::new(d)));
+                self.record_alloc(&obj);
                 // CPython tracks dicts at creation; track unconditionally so a
                 // dict that becomes cyclic (`d = {}; d[0] = d`) is collectable.
                 gc_trace::track(obj.clone());
@@ -6508,15 +6607,17 @@ impl Interpreter {
                             None => cps.extend(p.to_str().chars().map(|ch| ch as u32)),
                         }
                     }
-                    self.record_alloc(frame, 49 + cps.len() as u64);
-                    frame.push(Object::str_from_codepoints(cps));
+                    let obj = Object::str_from_codepoints(cps);
+                    self.record_alloc(&obj);
+                    frame.push(obj);
                 } else {
                     let mut s = String::new();
                     for p in parts {
                         s.push_str(&p.to_str());
                     }
-                    self.record_alloc(frame, 49 + s.len() as u64);
-                    frame.push(Object::from_str(s));
+                    let obj = Object::from_str(s);
+                    self.record_alloc(&obj);
+                    frame.push(obj);
                 }
             }
             OpCode::ListAppend => {
@@ -6536,6 +6637,55 @@ impl Interpreter {
                         "LIST_APPEND target is not a list".to_owned(),
                     ));
                 }
+            }
+            OpCode::ListExtend => {
+                let v = frame.pop()?;
+                let depth = ins.arg as usize;
+                let lst = frame
+                    .stack
+                    .get(frame.stack.len().wrapping_sub(depth))
+                    .cloned()
+                    .ok_or_else(|| {
+                        RuntimeError::Internal("LIST_EXTEND depth out of range".to_owned())
+                    })?;
+                let Object::List(lst) = lst else {
+                    return Err(RuntimeError::Internal(
+                        "LIST_EXTEND target is not a list".to_owned(),
+                    ));
+                };
+                let globals = frame.globals.clone();
+                let items = match self.collect_iterable(&v, &globals) {
+                    Ok(items) => items,
+                    // CPython rebrands only the genuine non-iterable
+                    // TypeError ("Value after * must be an iterable, not
+                    // X" — test_extcall, `[1, *h]` displays); errors from
+                    // inside user `__iter__` pass through.
+                    Err(e)
+                        if is_type_error(&e)
+                            && matches!(
+                                &e,
+                                RuntimeError::PyException(pe)
+                                    if pe.message().ends_with("object is not iterable")
+                            ) =>
+                    {
+                        return Err(type_error(format!(
+                            "Value after * must be an iterable, not {}",
+                            v.type_name_owned()
+                        )))
+                    }
+                    Err(e) => return Err(e),
+                };
+                lst.borrow_mut().extend(items);
+            }
+            OpCode::ListToTuple => {
+                let v = frame.pop()?;
+                let Object::List(lst) = v else {
+                    return Err(RuntimeError::Internal(
+                        "LIST_TO_TUPLE operand is not a list".to_owned(),
+                    ));
+                };
+                let items = std::mem::take(&mut *lst.borrow_mut());
+                frame.push(Object::new_tuple(items));
             }
             OpCode::SetAdd => {
                 let v = frame.pop()?;
@@ -6577,15 +6727,7 @@ impl Interpreter {
                     Object::Tuple(items) => items.iter().cloned().collect(),
                     Object::List(items) => items.borrow().clone(),
                     Object::Str(s) => s.chars().map(|c| Object::from_str(c.to_string())).collect(),
-                    Object::Range(r) => {
-                        let mut out = Vec::new();
-                        let mut cur = r.start;
-                        while (r.step > 0 && cur < r.stop) || (r.step < 0 && cur > r.stop) {
-                            out.push(crate::object::int_from_i128(cur));
-                            cur += r.step;
-                        }
-                        out
-                    }
+                    Object::Range(r) => range_unpack_items(&r),
                     Object::Bytes(b) => b.iter().map(|x| Object::Int(i64::from(*x))).collect(),
                     Object::ByteArray(b) => b
                         .borrow()
@@ -6681,15 +6823,7 @@ impl Interpreter {
                         .collect(),
                     Object::Set(s) => s.borrow().iter().map(|k| k.0.clone()).collect(),
                     Object::FrozenSet(s) => s.iter().map(|k| k.0.clone()).collect(),
-                    Object::Range(r) => {
-                        let mut out = Vec::new();
-                        let mut cur = r.start;
-                        while (r.step > 0 && cur < r.stop) || (r.step < 0 && cur > r.stop) {
-                            out.push(crate::object::int_from_i128(cur));
-                            cur += r.step;
-                        }
-                        out
-                    }
+                    Object::Range(r) => range_unpack_items(&r),
                     Object::Generator(g) => {
                         let gen_obj = Object::Generator(g);
                         let globals = frame.globals.clone();
@@ -6765,7 +6899,27 @@ impl Interpreter {
             }
             OpCode::DictUpdate => {
                 // Stack: [..., dict, other] -> [..., dict (updated)].
+                // `arg = 0`: dict-display `{**a, **b}` (CPython DICT_UPDATE,
+                // last writer wins). `arg = 1`: call-site kwargs splat
+                // (CPython DICT_MERGE): the operand must be a mapping and a
+                // repeated keyword raises TypeError.
+                let is_kw_merge = ins.arg == 1;
                 let other = frame.pop()?;
+                // For the call-site splat, CPython prefixes the duplicate
+                // keyword TypeError with `PyObject_FunctionStr(func)` —
+                // e.g. `__build_class__() got multiple values for keyword
+                // argument 'metaclass'` (test_metaclass). The compiler only
+                // emits DICT_MERGE under CALL_FUNCTION_EX, so the callable
+                // sits below the args tuple and the kwargs dict.
+                let kw_error_prefix: String = if is_kw_merge {
+                    frame
+                        .peek_back(2)
+                        .and_then(callable_function_str)
+                        .map(|s| format!("{s} "))
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
                 let dict = frame.top()?.clone();
                 let target = match &dict {
                     Object::Dict(d) => d.clone(),
@@ -6779,6 +6933,12 @@ impl Interpreter {
                     Object::Dict(src) => {
                         let mut t = target.borrow_mut();
                         for (k, v) in src.borrow().iter() {
+                            if is_kw_merge && t.contains_key(k) {
+                                return Err(type_error(format!(
+                                    "{kw_error_prefix}got multiple values for keyword argument '{}'",
+                                    k.0.to_str()
+                                )));
+                            }
                             t.insert(k.clone(), v.clone());
                         }
                     }
@@ -6786,7 +6946,24 @@ impl Interpreter {
                         // Iterate the mapping protocol via .keys() + subscript.
                         let globals = frame.globals.clone();
                         let key_method = self.load_attr(&other, "keys").map_err(|_| {
-                            type_error("argument to ** must be a mapping".to_owned())
+                            if is_kw_merge {
+                                // Same `PyObject_FunctionStr` prefix as the
+                                // duplicate-kwarg case: `h(**[])` →
+                                // "test.test_extcall.h() argument after **
+                                // must be a mapping, not list".
+                                type_error(format!(
+                                    "{kw_error_prefix}argument after ** must be a mapping, not {}",
+                                    other.type_name_owned()
+                                ))
+                            } else {
+                                // CPython's DICT_UPDATE wording for a dict
+                                // display: `{**1}` → "'int' object is not a
+                                // mapping" (test_unpack_ex doctests).
+                                type_error(format!(
+                                    "'{}' object is not a mapping",
+                                    other.type_name()
+                                ))
+                            }
                         })?;
                         let keys = self.call(&key_method, &[], &[], &globals)?;
                         let keys = self.collect_iterable(&keys, &globals)?;
@@ -6812,7 +6989,14 @@ impl Interpreter {
                         }
                         let mut t = target.borrow_mut();
                         for (k, value) in pairs {
-                            t.insert(crate::object::DictKey(k), value);
+                            let key = crate::object::DictKey(k);
+                            if is_kw_merge && t.contains_key(&key) {
+                                return Err(type_error(format!(
+                                    "{kw_error_prefix}got multiple values for keyword argument '{}'",
+                                    key.0.to_str()
+                                )));
+                            }
+                            t.insert(key, value);
                         }
                     }
                 }
@@ -6911,7 +7095,7 @@ impl Interpreter {
                     defaults,
                     kw_defaults,
                     closure,
-                    attrs: Rc::new(RefCell::new(DictData::default())),
+                    attrs: RefCell::new(Rc::new(RefCell::new(DictData::default()))),
                     slots,
                 };
                 // A function participates in cycles through its globals
@@ -7051,11 +7235,40 @@ impl Interpreter {
                     }
                     1 => {
                         let arg = frame.pop()?;
+                        let arg = self.instantiate_raised_class(arg, &frame.globals)?;
                         Self::normalize_exception(arg, None)?
                     }
                     2 => {
                         let cause = frame.pop()?;
                         let arg = frame.pop()?;
+                        let arg = self.instantiate_raised_class(arg, &frame.globals)?;
+                        // The cause slot has its own wording: anything
+                        // that's not None, an exception class, or an
+                        // exception instance is "exception causes must
+                        // derive from BaseException" (test_invalid_cause).
+                        let cause = match &cause {
+                            Object::None => cause,
+                            Object::Type(_) => {
+                                let c = self.instantiate_raised_class(cause, &frame.globals)?;
+                                if matches!(c, Object::Type(_)) {
+                                    return Err(type_error(
+                                        "exception causes must derive from BaseException",
+                                    ));
+                                }
+                                c
+                            }
+                            Object::Instance(i)
+                                if i.cls().flags.is_exception
+                                    || i.cls().is_subclass_of(&builtin_types().base_exception) =>
+                            {
+                                cause
+                            }
+                            _ => {
+                                return Err(type_error(
+                                    "exception causes must derive from BaseException",
+                                ))
+                            }
+                        };
                         Self::normalize_exception(arg, Some(cause))?
                     }
                     other => {
@@ -7156,12 +7369,10 @@ impl Interpreter {
                                 frame: py_frame,
                                 lineno,
                                 lasti: raised_at,
+                                raw_lasti: None,
                                 next: RefCell::new(None),
                             });
-                            inst.dict.borrow_mut().insert(
-                                DictKey(Object::from_static("__traceback__")),
-                                Object::Traceback(tb),
-                            );
+                            inst.slot_set("__traceback__", Object::Traceback(tb));
                         }
                         (wrapper, Object::None)
                     } else {
@@ -7404,12 +7615,7 @@ impl Interpreter {
                     .ok_or_else(|| RuntimeError::Internal("WITH_EXCEPT_START".to_owned()))?;
                 let (ty, tb) = match &exc {
                     Object::Instance(inst) => {
-                        let tb = inst
-                            .dict
-                            .borrow()
-                            .get(&DictKey(Object::from_static("__traceback__")))
-                            .cloned()
-                            .unwrap_or(Object::None);
+                        let tb = inst.slot_get("__traceback__").unwrap_or(Object::None);
                         (Object::Type(inst.cls()), tb)
                     }
                     _ => (Object::None, Object::None),
@@ -7433,7 +7639,41 @@ impl Interpreter {
                     }
                 };
                 let name = self.name_at(&frame.code, ins.arg)?;
-                let module = self.do_import(&name, &fromlist, level, &frame.globals)?;
+                // CPython `IMPORT_NAME` resolves `__import__` from the
+                // builtins and calls any override with `(name, globals,
+                // locals, fromlist, level)`; only the original C builtin
+                // takes the fast path (test_import.test_override_builtin
+                // swaps in `lambda *x: 5`). VM-internal machinery loads
+                // (`internal_import_depth`) never consult the hook: in
+                // CPython the bootstrap modules are frozen and initialized
+                // before user code can patch `builtins.__import__`.
+                let hook = if self.internal_import_depth == 0 {
+                    self.builtins
+                        .borrow()
+                        .get(&crate::object::StrKey("__import__"))
+                        .cloned()
+                } else {
+                    None
+                };
+                let module = match &hook {
+                    Some(h) if !matches!(h, Object::Builtin(b) if b.name == "__vm:__import__") => {
+                        let h = h.clone();
+                        let g = Object::Dict(frame.globals.clone());
+                        self.call(
+                            &h,
+                            &[
+                                Object::from_str(&name),
+                                g.clone(),
+                                g,
+                                fromlist.clone(),
+                                Object::Int(i64::from(level)),
+                            ],
+                            &[],
+                            &frame.globals,
+                        )?
+                    }
+                    _ => self.do_import(&name, &fromlist, level, &frame.globals)?,
+                };
                 frame.push(module);
             }
             OpCode::ImportFrom => {
@@ -7447,7 +7687,16 @@ impl Interpreter {
             }
             OpCode::ImportStar => {
                 let module = frame.pop()?;
-                self.import_star(&module, &frame.globals)?;
+                // CPython `import_all_from` binds into the frame's *locals*
+                // mapping — the distinct namespace of an `exec(src, g, l)`
+                // frame when one is installed (test_pkg's exec'd
+                // `from t2 import *` reads the names back via `dir()`);
+                // at true module scope locals are the globals dict.
+                let target = frame
+                    .class_namespace
+                    .clone()
+                    .unwrap_or_else(|| frame.globals.clone());
+                self.import_star(&module, &target)?;
             }
             OpCode::FormatValue => {
                 let arg = ins.arg;
@@ -7552,11 +7801,19 @@ impl Interpreter {
                     // fixed payload; the popped `value` is forwarded so a
                     // re-drive (after an inner-await passthrough) resumes it.
                     Object::AsyncGenAwait(a) => self.step_agen_await(a, value),
-                    Object::Iter(_) | Object::LazyIter(_) => {
+                    // A file is its own iterator (`yield from f` delegates to
+                    // it directly), advanced like any plain iterator.
+                    Object::Iter(_) | Object::LazyIter(_) | Object::File(_) => {
                         if !matches!(value, Object::None) {
-                            return Err(type_error(
-                                "can't send non-None value to a just-started iterator",
-                            ));
+                            // CPython `PyIter_Send`: a non-None send to a
+                            // plain iterator calls its `send` method — which
+                            // builtin iterators don't have, so the failure is
+                            // an AttributeError naming `send`
+                            // (test_yield_from.test_attempting_to_send_to_non_generator).
+                            return Err(attribute_error(format!(
+                                "'{}' object has no attribute 'send'",
+                                iter.type_name_owned()
+                            )));
                         }
                         match self.iter_next(&iter, &frame.globals)? {
                             Some(v) => Ok(v),
@@ -7572,13 +7829,14 @@ impl Interpreter {
                     Object::Instance(_) => {
                         let globals = frame.globals.clone();
                         if !matches!(value, Object::None) {
-                            if let Some(m) = instance_method(&iter, "send") {
-                                self.call(&m, std::slice::from_ref(&value), &[], &globals)
-                            } else {
-                                Err(type_error(format!(
-                                    "'{}' object has no attribute 'send'",
-                                    iter.type_name_owned()
-                                )))
+                            // Full attribute lookup (not a class-dict probe):
+                            // a broken `__getattr__` must surface its own
+                            // error, and an absent `send` is an
+                            // AttributeError, per CPython's PyIter_Send
+                            // (test_yield_from.test_broken_getattr_handling).
+                            match self.load_attr(&iter, "send") {
+                                Ok(m) => self.call(&m, std::slice::from_ref(&value), &[], &globals),
+                                Err(e) => Err(e),
                             }
                         } else if let Some(m) = instance_method(&iter, "__next__") {
                             self.call(&m, &[], &[], &globals)
@@ -7682,24 +7940,29 @@ impl Interpreter {
             }
             OpCode::MatchSequence => {
                 let v = frame.top()?;
-                let is_seq = matches!(
-                    v,
-                    Object::Tuple(_) | Object::List(_) | Object::Range(_) | Object::Str(_)
-                );
-                frame.push(Object::Bool(is_seq));
+                frame.push(Object::Bool(object_is_match_sequence(v)));
             }
             OpCode::MatchMapping => {
                 let v = frame.top()?;
-                let is_map = matches!(v, Object::Dict(_));
-                frame.push(Object::Bool(is_map));
+                frame.push(Object::Bool(object_is_match_mapping(v)));
             }
             OpCode::GetLen => {
-                let len = frame.top()?.len()?;
-                frame.push(Object::Int(len as i64));
+                // Full len() semantics: sequence patterns can match user
+                // classes (collections.abc.Sequence subclasses) whose
+                // length comes from a Python-level __len__.
+                let v = frame.top()?.clone();
+                let globals = frame.globals.clone();
+                let len = self.do_len_call(&v, &globals)?;
+                frame.push(len);
             }
             OpCode::MatchKeys => {
-                let keys_obj = frame.pop()?;
-                let subject = frame.top()?.clone();
+                // CPython semantics: subject and keys both stay on the
+                // stack; only the values tuple (or None) is pushed.
+                let keys_obj = frame.top()?.clone();
+                let subject = frame
+                    .peek_back(1)
+                    .ok_or_else(|| RuntimeError::Internal("stack underflow".to_owned()))?
+                    .clone();
                 let keys: Vec<Object> = match keys_obj {
                     Object::Tuple(items) => items.iter().cloned().collect(),
                     _ => {
@@ -7708,8 +7971,24 @@ impl Interpreter {
                         ))
                     }
                 };
+                // CPython `match_keys`: colliding keys are a runtime
+                // ValueError (literal duplicates were already rejected at
+                // compile time; this catches value-pattern keys like
+                // `case {C.X: _, C.Y: _}` resolving to the same value).
+                for i in 1..keys.len() {
+                    for j in 0..i {
+                        if keys[j].eq_value(&keys[i]) {
+                            return Err(crate::error::value_error(format!(
+                                "mapping pattern checks duplicate key ({})",
+                                keys[i].repr()
+                            )));
+                        }
+                    }
+                }
                 let result = match &subject {
-                    Object::Dict(d) => {
+                    // Exact dict / mappingproxy: direct probes (CPython's
+                    // `PyDict_CheckExact` fast path — never `__missing__`).
+                    Object::Dict(d) | Object::MappingProxy(d) => {
                         let d = d.borrow();
                         let mut values = Vec::with_capacity(keys.len());
                         let mut found = true;
@@ -7727,7 +8006,37 @@ impl Interpreter {
                             Object::None
                         }
                     }
-                    _ => Object::None,
+                    // Any other mapping (dict subclass, Mapping ABC user
+                    // class): CPython calls `subject.get(key, <dummy>)` and
+                    // tests the result for identity with the dummy — so
+                    // `defaultdict` never runs `__missing__` and stays
+                    // unchanged (test_patma_119/120).
+                    _ => {
+                        let get = instance_method(&subject, "get").ok_or_else(|| {
+                            crate::error::type_error(format!(
+                                "'{}' object has no attribute 'get'",
+                                subject.type_name()
+                            ))
+                        })?;
+                        let sentinel = Object::new_tuple(vec![Object::None]);
+                        let globals = frame.globals.clone();
+                        let mut values = Vec::with_capacity(keys.len());
+                        let mut found = true;
+                        for k in &keys {
+                            let v =
+                                self.call(&get, &[k.clone(), sentinel.clone()], &[], &globals)?;
+                            if v.is_same(&sentinel) {
+                                found = false;
+                                break;
+                            }
+                            values.push(v);
+                        }
+                        if found {
+                            Object::new_tuple(values)
+                        } else {
+                            Object::None
+                        }
+                    }
                 };
                 frame.push(result);
             }
@@ -7883,6 +8192,7 @@ impl Interpreter {
             frame: py_frame,
             lineno,
             lasti,
+            raw_lasti: None,
             next: RefCell::new(None),
         });
         // CPython chains outward: the catching frame ends up at the
@@ -7890,14 +8200,10 @@ impl Interpreter {
         // propagation prepends the current frame's `tb` to the
         // existing chain.
         if let Object::Instance(inst) = &exc.instance {
-            let key = DictKey(Object::from_static("__traceback__"));
-            let prev = inst.dict.borrow().get(&key).cloned();
-            if let Some(Object::Traceback(prev_tb)) = prev {
+            if let Some(Object::Traceback(prev_tb)) = inst.slot_get("__traceback__") {
                 *new_tb.next.borrow_mut() = Some(prev_tb);
             }
-            inst.dict
-                .borrow_mut()
-                .insert(key, Object::Traceback(new_tb));
+            inst.slot_set("__traceback__", Object::Traceback(new_tb));
         }
     }
 
@@ -7919,8 +8225,7 @@ impl Interpreter {
         let Object::Instance(inst) = exc else {
             return;
         };
-        let key = DictKey(Object::from_static("__traceback__"));
-        if let Some(existing) = inst.dict.borrow().get(&key) {
+        if let Some(existing) = inst.slot_get("__traceback__") {
             if !matches!(existing, Object::None) {
                 return;
             }
@@ -7932,11 +8237,10 @@ impl Interpreter {
             lineno: py_frame.last_line.get().unwrap_or(1),
             lasti: py_frame.lasti.get(),
             frame: py_frame,
+            raw_lasti: None,
             next: RefCell::new(None),
         });
-        inst.dict
-            .borrow_mut()
-            .insert(key, Object::Traceback(new_tb));
+        inst.slot_set("__traceback__", Object::Traceback(new_tb));
     }
 
     /// If the most-recent handled exception is still active when
@@ -8015,9 +8319,8 @@ impl Interpreter {
         target: &Rc<crate::types::PyInstance>,
     ) {
         fn ctx_of(inst: &Rc<crate::types::PyInstance>) -> Option<Rc<crate::types::PyInstance>> {
-            let dict = inst.dict.borrow();
-            match dict.get(&DictKey(Object::from_static("__context__"))) {
-                Some(Object::Instance(i)) => Some(i.clone()),
+            match inst.slot_get("__context__") {
+                Some(Object::Instance(i)) => Some(i),
                 _ => None,
             }
         }
@@ -8027,17 +8330,13 @@ impl Interpreter {
             // Advance `fast` two steps, severing a link to `target`.
             let Some(next) = ctx_of(&fast) else { return };
             if Rc::ptr_eq(&next, target) {
-                fast.dict
-                    .borrow_mut()
-                    .insert(DictKey(Object::from_static("__context__")), Object::None);
+                fast.slot_set("__context__", Object::None);
                 return;
             }
             fast = next;
             let Some(next) = ctx_of(&fast) else { return };
             if Rc::ptr_eq(&next, target) {
-                fast.dict
-                    .borrow_mut()
-                    .insert(DictKey(Object::from_static("__context__")), Object::None);
+                fast.slot_set("__context__", Object::None);
                 return;
             }
             fast = next;
@@ -8053,44 +8352,57 @@ impl Interpreter {
         }
     }
 
-    /// Mirror the `cause` / `context` chain onto the instance dict so
-    /// Python code accessing `e.__cause__` / `e.__context__` sees
-    /// the canonical values. Called right before raising.
+    /// Mirror the `cause` / `context` chain onto the instance's
+    /// exception slots so Python code accessing `e.__cause__` /
+    /// `e.__context__` sees the canonical values. Called right before
+    /// raising. Unset slots read their descriptor defaults (`None` /
+    /// `False`), so only real values need storing.
     fn sync_exc_attrs(exc: &PyException) {
         if let Object::Instance(inst) = &exc.instance {
-            let mut dict = inst.dict.borrow_mut();
             if let Some(cause) = exc.cause.as_ref() {
-                dict.insert(
-                    DictKey(Object::from_static("__cause__")),
-                    cause.instance.clone(),
-                );
+                inst.slot_set("__cause__", cause.instance.clone());
                 // Explicit cause suppresses __context__ rendering by
                 // default; user code can still set __suppress_context__.
-                dict.insert(
-                    DictKey(Object::from_static("__suppress_context__")),
-                    Object::Bool(true),
-                );
-            } else if !dict.contains_key(&DictKey(Object::from_static("__cause__"))) {
-                dict.insert(DictKey(Object::from_static("__cause__")), Object::None);
+                inst.slot_set("__suppress_context__", Object::Bool(true));
             }
             if let Some(context) = exc.context.as_ref() {
-                dict.insert(
-                    DictKey(Object::from_static("__context__")),
-                    context.instance.clone(),
-                );
-            } else if !dict.contains_key(&DictKey(Object::from_static("__context__"))) {
-                dict.insert(DictKey(Object::from_static("__context__")), Object::None);
-            }
-            if !dict.contains_key(&DictKey(Object::from_static("__suppress_context__"))) {
-                dict.insert(
-                    DictKey(Object::from_static("__suppress_context__")),
-                    Object::Bool(false),
-                );
-            }
-            if !dict.contains_key(&DictKey(Object::from_static("__traceback__"))) {
-                dict.insert(DictKey(Object::from_static("__traceback__")), Object::None);
+                inst.slot_set("__context__", context.instance.clone());
             }
         }
+    }
+
+    /// `raise C` / `raise … from C` with an exception *class* operand:
+    /// CPython's `do_raise` calls the class through the full protocol
+    /// (`_PyObject_CallNoArgs`), so a user `__init__` that raises
+    /// propagates (test_raise.test_erroneous_exception) and a `__new__`
+    /// returning a non-exception is a TypeError with the "calling …
+    /// should have returned" wording (test_new_returns_invalid_instance).
+    /// Non-class operands pass through untouched.
+    fn instantiate_raised_class(
+        &mut self,
+        value: Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        let is_exc_class = matches!(&value, Object::Type(t) if t.flags.is_exception
+            || t.is_subclass_of(&builtin_types().base_exception));
+        if !is_exc_class {
+            return Ok(value);
+        }
+        let inst = self.call(&value, &[], &[], globals)?;
+        let ok = matches!(&inst, Object::Instance(i) if i.cls().flags.is_exception
+            || i.cls().is_subclass_of(&builtin_types().base_exception));
+        if !ok {
+            let Object::Type(t) = &value else {
+                unreachable!()
+            };
+            return Err(type_error(format!(
+                "calling <class '{}'> should have returned an instance of BaseException, \
+                 not <class '{}'>",
+                t.qualified_display_name(),
+                inst.type_name()
+            )));
+        }
+        Ok(inst)
     }
 
     /// Materialise a raised value into a [`PyException`]. Accepts an
@@ -8133,10 +8445,7 @@ impl Interpreter {
             if matches!(c, Object::None) {
                 pe.cause = None;
                 if let Object::Instance(ref inst_rc) = pe.instance {
-                    inst_rc.dict.borrow_mut().insert(
-                        crate::object::DictKey(Object::from_static("__suppress_context__")),
-                        Object::Bool(true),
-                    );
+                    inst_rc.slot_set("__suppress_context__", Object::Bool(true));
                 }
             } else {
                 let cpe = Self::normalize_exception(c, None)?;
@@ -8280,6 +8589,14 @@ impl Interpreter {
         if let Some(v) = frame.builtins.borrow().get(&key) {
             return Ok(v.clone());
         }
+        // Lowering-generated intrinsic names (`__weavepy_*__`, CPython's
+        // CALL_INTRINSIC opcodes) resolve from a hidden side table — they
+        // are deliberately absent from the observable `builtins` namespace.
+        if name.starts_with("__weavepy_") {
+            if let Some(v) = builtins::vm_intrinsic(name) {
+                return Ok(v);
+            }
+        }
         // CPython seeds `__main__.__loader__ = BuiltinImporter` when the
         // program comes from `-c` or piped stdin (the module object is
         // created by `_PyImport_AddModule` machinery before `PyRun_*`).
@@ -8339,7 +8656,7 @@ impl Interpreter {
                 return None;
             }
         }
-        let machinery = match self.import_path("importlib.machinery") {
+        let machinery = match self.import_path_internal("importlib.machinery") {
             Ok(Object::Module(m)) => m,
             _ => return None,
         };
@@ -8428,7 +8745,23 @@ impl Interpreter {
                         // return None` (and `repr`'s `name=` probe). Restricted
                         // to instance receivers — class-level access
                         // (`load_attr_type`) still returns the descriptor.
-                        Object::Property(_) if matches!(obj, Object::Instance(_)) => {}
+                        // Slot descriptors likewise: an unset no-default slot
+                        // (`BlockingIOError().characters_written`) must keep
+                        // its AttributeError, not leak the member descriptor.
+                        Object::Property(_) | Object::SlotDescriptor(_)
+                            if matches!(obj, Object::Instance(_)) => {}
+                        // Descriptors from a builtin base's dict still
+                        // bind: `None.__init_subclass__` is `object`'s
+                        // classmethod bound to `NoneType`
+                        // (test_rlcompleter completes it as a no-arg
+                        // callable), and a staticmethod unwraps.
+                        Object::ClassMethod(cm) => {
+                            return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
+                                Object::Type(crate::builtins::class_of(obj)),
+                                cm.func(),
+                            ))));
+                        }
+                        Object::StaticMethod(sm) => return Ok(sm.func()),
                         other => return Ok(other),
                     }
                 }
@@ -8441,17 +8774,16 @@ impl Interpreter {
             if self.is_attribute_error(err) {
                 if let RuntimeError::PyException(pe) = err {
                     if let Object::Instance(inst) = &pe.instance {
-                        let name_k = DictKey(Object::from_static("name"));
-                        let obj_k = DictKey(Object::from_static("obj"));
-                        let need = {
-                            let d = inst.dict.borrow();
-                            matches!(d.get(&name_k), None | Some(Object::None))
-                                && matches!(d.get(&obj_k), None | Some(Object::None))
-                        };
+                        let need = matches!(
+                            crate::builtin_types::exc_attr(inst, "name"),
+                            None | Some(Object::None)
+                        ) && matches!(
+                            crate::builtin_types::exc_attr(inst, "obj"),
+                            None | Some(Object::None)
+                        );
                         if need {
-                            let mut d = inst.dict.borrow_mut();
-                            d.insert(name_k, Object::from_str(name.to_owned()));
-                            d.insert(obj_k, obj.clone());
+                            inst.slot_set("name", Object::from_str(name.to_owned()));
+                            inst.slot_set("obj", obj.clone());
                         }
                     }
                 }
@@ -8640,6 +8972,32 @@ impl Interpreter {
                 "fget" => Ok(p.fget()),
                 "fset" => Ok(p.fset()),
                 "fdel" => Ok(p.fdel()),
+                // 3.13 `property.__name__` (gh-101860): the
+                // `__set_name__`-recorded (or explicitly assigned) name,
+                // falling back to the getter's `__name__`. Any failure —
+                // no getter, or a getter without a `__name__` (e.g.
+                // `property(1)`) — surfaces as the *property's* missing
+                // attribute, not the getter's.
+                "__name__" => {
+                    if let Some(n) = &*p.name.borrow() {
+                        return Ok(n.clone());
+                    }
+                    let missing = || {
+                        attribute_error("'property' object has no attribute '__name__'".to_owned())
+                    };
+                    let fget = p.fget();
+                    if matches!(fget, Object::None) {
+                        return Err(missing());
+                    }
+                    match self.load_attr(&fget, "__name__") {
+                        Ok(v) => Ok(v),
+                        // A getter without `__name__` (`property(1)`)
+                        // surfaces as the *property's* missing attribute; a
+                        // raising `__getattr__` propagates untouched.
+                        Err(e) if self.is_attribute_error(&e) => Err(missing()),
+                        Err(e) => Err(e),
+                    }
+                }
                 "__doc__" => {
                     // CPython `property.__init__`: a missing explicit doc
                     // falls back to the getter's docstring.
@@ -8655,15 +9013,21 @@ impl Interpreter {
                 // `@property` / `@abstractmethod` stacking marks the
                 // whole property abstract.
                 "__isabstractmethod__" => {
+                    // `_PyObject_IsAbstract` per accessor: a missing flag
+                    // reads as false, but a *raising* truth test (e.g. a
+                    // flag object whose `__bool__` raises) must propagate
+                    // (test_property___isabstractmethod__descriptor).
                     for accessor in [p.fget(), p.fset(), p.fdel()] {
                         if matches!(accessor, Object::None) {
                             continue;
                         }
-                        if self
-                            .load_attr(&accessor, "__isabstractmethod__")
-                            .unwrap_or(Object::Bool(false))
-                            .is_truthy()
-                        {
+                        let flag = match self.load_attr(&accessor, "__isabstractmethod__") {
+                            Ok(v) => v,
+                            Err(e) if self.is_attribute_error(&e) => continue,
+                            Err(e) => return Err(e),
+                        };
+                        let globals = self.builtins.clone();
+                        if self.obj_truthy(&flag, &globals)? {
                             return Ok(Object::Bool(true));
                         }
                     }
@@ -8809,10 +9173,56 @@ impl Interpreter {
                         return self.call(&getattr, &[Object::from_str(name)], &[], &globals);
                     }
                 }
-                Err(attribute_error(format!(
-                    "module '{}' has no attribute '{}'",
-                    m.name, name
-                )))
+                // CPython `_Py_module_getattro_impl`'s miss diagnostics:
+                // a module file shadowing a same-named stdlib module gets
+                // the "consider renaming" hint; a miss during the module
+                // body's execution names the circular import; a miss on a
+                // submodule that is itself mid-import names that instead
+                // (test_import shadowing + CircularImportTests).
+                let origin = m.filename.as_deref();
+                let (shadow, shadow_stdlib) = self.module_shadowing(&m.name, origin);
+                let msg = if shadow_stdlib {
+                    format!(
+                        "module '{}' has no attribute '{}' (consider renaming '{}' \
+                         since it has the same name as the standard library module \
+                         named '{}' and prevents importing that standard library module)",
+                        m.name,
+                        name,
+                        origin.unwrap_or("?"),
+                        m.name
+                    )
+                } else if self.cache.is_initializing(&m.name) {
+                    if shadow {
+                        format!(
+                            "module '{}' has no attribute '{}' (consider renaming '{}' \
+                             if it has the same name as a library you intended to import)",
+                            m.name,
+                            name,
+                            origin.unwrap_or("?")
+                        )
+                    } else if let Some(o) = origin {
+                        format!(
+                            "partially initialized module '{}' from '{}' has no \
+                             attribute '{}' (most likely due to a circular import)",
+                            m.name, o, name
+                        )
+                    } else {
+                        format!(
+                            "partially initialized module '{}' has no attribute '{}' \
+                             (most likely due to a circular import)",
+                            m.name, name
+                        )
+                    }
+                } else if self.cache.is_initializing(&format!("{}.{}", m.name, name)) {
+                    format!(
+                        "cannot access submodule '{}' of module '{}' \
+                         (most likely due to a circular import)",
+                        name, m.name
+                    )
+                } else {
+                    format!("module '{}' has no attribute '{}'", m.name, name)
+                };
+                Err(attribute_error(msg))
             }
             Object::SimpleNamespace(d) => {
                 if let Some(v) = d.borrow().get(&crate::object::StrKey(name)) {
@@ -8874,6 +9284,17 @@ impl Interpreter {
                 )))
             }
             Object::MemoryView(mv) => match name {
+                // Buffer-metadata attributes refuse on a released view
+                // (CPython raises ValueError from each getter;
+                // test_memoryview._check_released probes them all).
+                "obj" | "nbytes" | "itemsize" | "ndim" | "readonly" | "format" | "shape"
+                | "strides" | "suboffsets" | "c_contiguous" | "contiguous" | "f_contiguous"
+                    if mv.released.get() =>
+                {
+                    Err(value_error(
+                        "operation forbidden on released memoryview object",
+                    ))
+                }
                 // CPython `mv.obj`: the exporter handed to `memoryview()`.
                 // Views created internally (no recorded exporter)
                 // reconstruct a bytes-like over the backing buffer.
@@ -8931,7 +9352,7 @@ impl Interpreter {
                     if let Some(v) = f.slot(name) {
                         return Ok(v);
                     }
-                } else if let Some(v) = f.attrs.borrow().get(&crate::object::StrKey(name)) {
+                } else if let Some(v) = f.attrs().borrow().get(&crate::object::StrKey(name)) {
                     return Ok(v.clone());
                 }
                 match name {
@@ -8976,21 +9397,17 @@ impl Interpreter {
                         }
                         return Ok(Object::None);
                     }
-                    "__dict__" => return Ok(Object::Dict(f.attrs.clone())),
+                    "__dict__" => return Ok(Object::Dict(f.attrs())),
                     "__code__" => return Ok(Object::Code(f.code())),
                     "__globals__" => return Ok(Object::Dict(f.globals.clone())),
-                    // CPython `function.__builtins__`: the builtins mapping
-                    // the function executes against — `__globals__['__builtins__']`
-                    // when present, else the interpreter's builtins dict.
+                    // CPython `func_get_builtins`: the builtins mapping the
+                    // function executes against, captured once at creation
+                    // (`func_builtins`). Always the *dict* — a module-valued
+                    // `__builtins__` (as `__main__` carries) was already
+                    // unwrapped by `builtins_for_globals` (test_funcattrs
+                    // asserts identity with `__builtins__.__dict__`).
                     "__builtins__" => {
-                        if let Some(b) = f
-                            .globals
-                            .borrow()
-                            .get(&DictKey(Object::from_static("__builtins__")))
-                        {
-                            return Ok(b.clone());
-                        }
-                        return Ok(Object::Dict(self.builtins.clone()));
+                        return Ok(Object::Dict(f.builtins.clone()));
                     }
                     "__defaults__" => {
                         if f.defaults.is_empty() {
@@ -9058,7 +9475,41 @@ impl Interpreter {
                 "f_code" => Ok(Object::Code(fr.code.clone())),
                 "f_globals" => Ok(Object::Dict(fr.globals.clone())),
                 "f_builtins" => Ok(Object::Dict(fr.builtins.clone())),
-                "f_locals" => Ok(fr.locals()),
+                "f_locals" => {
+                    // PEP 709: CPython inlines list/set/dict
+                    // comprehensions, so "their" frame is the enclosing
+                    // one and the iteration variables are *hidden* fast
+                    // locals — visible to `f_locals[...]` lookups but
+                    // absent from `in` / `iter` / `len` (PEP 667 proxy
+                    // semantics, `test_listcomps.test_frame_locals`).
+                    // WeavePy lowers comprehensions to real frames;
+                    // reproduce that exact surface with a proxy over
+                    // (own hidden locals, enclosing frame's mapping).
+                    // Generator expressions keep normal frame locals —
+                    // CPython doesn't inline those.
+                    if matches!(
+                        fr.code.name.as_str(),
+                        "<listcomp>" | "<setcomp>" | "<dictcomp>"
+                    ) {
+                        let back = fr.back.borrow().clone();
+                        if let Some(parent) = back {
+                            let visible =
+                                self.load_attr_inner(&Object::Frame(parent), "f_locals")?;
+                            let hidden = fr.locals();
+                            if let Ok(Object::Module(m)) = self.import_path("_weave_frame_locals") {
+                                let cls = m
+                                    .dict
+                                    .borrow()
+                                    .get(&crate::object::StrKey("CompFrameLocalsProxy"))
+                                    .cloned();
+                                if let Some(cls) = cls {
+                                    return self.call_object(cls, &[hidden, visible], &[]);
+                                }
+                            }
+                        }
+                    }
+                    Ok(fr.locals())
+                }
                 "f_lineno" => {
                     // 0 is the "no line" sentinel (PEP 626 NO_LOCATION
                     // entries) — CPython reports None.
@@ -9103,9 +9554,10 @@ impl Interpreter {
             Object::Traceback(tb) => match name {
                 "tb_frame" => Ok(Object::Frame(tb.frame.clone())),
                 "tb_lineno" => Ok(Object::Int(i64::from(tb.lineno))),
-                "tb_lasti" => Ok(Object::Int(i64::from(
-                    tb.frame.code.cpython_lasti(tb.lasti),
-                ))),
+                "tb_lasti" => Ok(match tb.raw_lasti {
+                    Some(v) => Object::Int(v),
+                    None => Object::Int(i64::from(tb.frame.code.cpython_lasti(tb.lasti))),
+                }),
                 "tb_next" => match tb.next.borrow().as_ref() {
                     Some(n) => Ok(Object::Traceback(n.clone())),
                     None => Ok(Object::None),
@@ -9264,7 +9716,30 @@ impl Interpreter {
                 // `classmethod(contextmanager(f))` relies on this.
                 "__name__" | "__qualname__" => match &bm.function {
                     Object::Function(_) => self.load_attr(&bm.function, name),
-                    Object::Builtin(b) => Ok(Object::from_static(builtin_display_name(b.name))),
+                    Object::Builtin(b) => {
+                        // CPython `meth_get__qualname__`: a bound
+                        // `builtin_function_or_method` qualifies itself with
+                        // its receiver — the class itself for classmethod
+                        // descriptors (`dict.fromkeys` → "dict.fromkeys"),
+                        // else the receiver's type (`[].append` →
+                        // "list.append"). A module receiver keeps the bare
+                        // name (`time.time` → "time"). `__name__` stays bare.
+                        let bare = builtin_display_name(b.name);
+                        if name == "__qualname__" && !matches!(bm.receiver, Object::Module(_)) {
+                            let owner = match &bm.receiver {
+                                Object::Type(t) => t.clone(),
+                                other => crate::builtins::class_of(other),
+                            };
+                            let type_qualname = match self
+                                .load_attr(&Object::Type(owner.clone()), "__qualname__")
+                            {
+                                Ok(Object::Str(s)) => s.to_string(),
+                                _ => owner.name.clone(),
+                            };
+                            return Ok(Object::from_str(format!("{type_qualname}.{bare}")));
+                        }
+                        Ok(Object::from_static(bare))
+                    }
                     // Any other callable (a foreign `cython_function_or_method`,
                     // a wrapped partial, …): forward like CPython's
                     // `method_getattro`, which proxies unknown names to
@@ -9456,13 +9931,26 @@ impl Interpreter {
                                 return Ok(Object::Bool(f.closefd.get()));
                             }
                         }
+                        // `FileIO._blksize` (CPython): the filesystem's
+                        // preferred I/O block size captured from fstat at open
+                        // (io.DEFAULT_BUFFER_SIZE otherwise); in-memory
+                        // streams have no such member.
+                        "_blksize" => {
+                            if !f.is_memory() {
+                                return Ok(Object::Int(f.blksize.get()));
+                            }
+                        }
                         "encoding" => {
-                            // Only *text* OS-backed streams (CPython's
-                            // `TextIOWrapper`) expose `.encoding`; binary
-                            // streams and in-memory `BytesIO`/`StringIO` raise
-                            // `AttributeError`. Report the codec the stream was
-                            // actually opened with (defaulting to UTF-8).
-                            if !f.binary && !f.is_memory() {
+                            // *Text* streams expose `.encoding`: the codec an
+                            // OS-backed `TextIOWrapper` was opened with
+                            // (UTF-8 default), or `None` on a `StringIO`
+                            // (CPython's dummy TextIOBase value,
+                            // test_memoryio.test_textio_properties). Binary
+                            // streams raise `AttributeError`.
+                            if !f.binary {
+                                if f.is_memory() {
+                                    return Ok(Object::None);
+                                }
                                 let enc = f
                                     .encoding
                                     .borrow()
@@ -9472,7 +9960,10 @@ impl Interpreter {
                             }
                         }
                         "errors" => {
-                            if !f.binary && !f.is_memory() {
+                            if !f.binary {
+                                if f.is_memory() {
+                                    return Ok(Object::None);
+                                }
                                 let err = f
                                     .errors
                                     .borrow()
@@ -9488,6 +9979,13 @@ impl Interpreter {
                             if !f.binary {
                                 return Ok(f.newlines_obj());
                             }
+                        }
+                        // `StringIO.line_buffering` is a dummy `False`
+                        // (CPython TextIOBase, test_memoryio
+                        // test_textio_properties); `write_through` is not
+                        // exposed on StringIO.
+                        "line_buffering" if !f.binary && f.is_memory() => {
+                            return Ok(Object::Bool(false));
                         }
                         "line_buffering" | "write_through" => {
                             // `TextIOWrapper` config attributes. Defaults
@@ -9578,9 +10076,9 @@ impl Interpreter {
                 // from a `range`.
                 if let Object::Range(r) = obj {
                     match name {
-                        "start" => return Ok(crate::object::int_from_i128(r.start)),
-                        "stop" => return Ok(crate::object::int_from_i128(r.stop)),
-                        "step" => return Ok(crate::object::int_from_i128(r.step)),
+                        "start" => return Ok(r.start_obj()),
+                        "stop" => return Ok(r.stop_obj()),
+                        "step" => return Ok(r.step_obj()),
                         _ => {}
                     }
                 }
@@ -9951,6 +10449,33 @@ impl Interpreter {
                     ),
                 )));
             }
+            // `type.__prepare__` lives in `type`'s dict but is marked
+            // surface-only (RFC 0056 WS4), so the walk above skipped it.
+            // A metaclass classmethod chaining `super().__prepare__(*args,
+            // **kwds)` (test_metaclass) must reach the default: return a
+            // fresh empty dict, ignoring all arguments like CPython.
+            if name == "__prepare__"
+                && obj_type
+                    .mro
+                    .borrow()
+                    .iter()
+                    .any(|t| Rc::ptr_eq(t, &builtin_types().type_))
+            {
+                fn default_prepare(_args: &[Object]) -> Result<Object, RuntimeError> {
+                    Ok(Object::new_dict())
+                }
+                return Ok(Object::BoundMethod(Rc::new(
+                    crate::object::BoundMethod::new(
+                        receiver.clone(),
+                        Object::Builtin(Rc::new(crate::object::BuiltinFn {
+                            name: "__prepare__",
+                            binds_instance: true,
+                            call: Box::new(default_prepare),
+                            call_kw: Some(Box::new(|args, _kwargs| default_prepare(args))),
+                        })),
+                    ),
+                )));
+            }
             if matches!(name, "__repr__" | "__str__") {
                 let func = if name == "__repr__" {
                     Object::Builtin(Rc::new(crate::object::BuiltinFn {
@@ -9985,6 +10510,21 @@ impl Interpreter {
             // `__get__`, `__repr__`, `__thisclass__`, `__self__`,
             // `__self_class__`) still resolve, ending in the generic
             // `'super' object has no attribute …` AttributeError.
+        }
+
+        // A weakproxy forwards `tp_getattro` wholesale in CPython; the VM
+        // resolves most reads through the proxy type's `__getattr__`
+        // fallback, but names *object* itself provides (`__reduce_ex__`)
+        // never miss, so pickle/copy would otherwise serialize the proxy
+        // shell instead of the referent (test_pickle's
+        // test_newobj_proxies).
+        if matches!(
+            name,
+            "__reduce_ex__" | "__reduce__" | "__copy__" | "__deepcopy__" | "__getstate__"
+        ) {
+            if let Some(target) = crate::stdlib::weakref_real::proxy_referent(instance_obj) {
+                return self.load_attr(&target?, name);
+            }
         }
 
         // (1) Data descriptor on class wins over instance dict — but only
@@ -10330,6 +10870,19 @@ impl Interpreter {
                 return Ok(Object::new_tuple(mro));
             }
             "__class__" => return Ok(Object::Type(meta)),
+            // Argument Clinic's `__text_signature__` getset on static
+            // types: `object` carries "()" (so `inspect.signature(object)`
+            // — the terminal fallback for plain classes — parses to an
+            // empty Signature; rlcompleter appends "()" off it); the other
+            // builtins read as None like CPython's clinic-less types.
+            // Heap types fall through to AttributeError.
+            "__text_signature__" if ty.flags.is_builtin => {
+                return Ok(if ty.name == "object" {
+                    Object::from_static("()")
+                } else {
+                    Object::None
+                });
+            }
             // PEP 695: `type.__type_params__` is a getset defaulting to
             // `()` when the class dict has no entry (generic classes
             // store theirs; `type.__type_params__` itself reads `()`).
@@ -10347,13 +10900,23 @@ impl Interpreter {
             // `object` header. These are advisory on WeavePy (no C layout),
             // but the invariants tests assert must hold.
             "__itemsize__" => {
-                return Ok(Object::Int(if ty.name == "int" { 4 } else { 0 }));
+                // Inherited from `int` like CPython's tp_itemsize
+                // (test_long asserts `MyInt.__itemsize__ ==
+                // sys.int_info.sizeof_digit` for an int subclass).
+                let int_like = ty.name == "int" || ty.mro.borrow().iter().any(|b| b.name == "int");
+                return Ok(Object::Int(if int_like { 4 } else { 0 }));
             }
             "__basicsize__" => {
-                let size: i64 = match ty.name.as_str() {
-                    "int" => 28,
-                    "object" => 16,
-                    _ => 32,
+                let int_like = ty.name == "int" || ty.mro.borrow().iter().any(|b| b.name == "int");
+                let size: i64 = if int_like {
+                    // Keep `MyInt(v).__sizeof__() == MyInt.__basicsize__ +
+                    // 4 * ndigits` self-consistent with slot_sizeof's 28.
+                    28
+                } else {
+                    match ty.name.as_str() {
+                        "object" => 16,
+                        _ => 32,
+                    }
                 };
                 return Ok(Object::Int(size));
             }
@@ -10458,7 +11021,7 @@ impl Interpreter {
         // form `type.mro(X)` resolves against the explicit receiver.
         if name == "mro" {
             let t = ty.clone();
-            return Ok(Object::Builtin(Rc::new(BuiltinFn {
+            let func = Object::Builtin(Rc::new(BuiltinFn {
                 name: "mro",
                 binds_instance: false,
                 call: Box::new(move |args| {
@@ -10472,7 +11035,18 @@ impl Interpreter {
                     ))
                 }),
                 call_kw: None,
-            })));
+            }));
+            // The descriptor lives on the *metaclass* (`type`), so a class
+            // receiver gets a bound method — `C.mro()` takes no arguments
+            // and rlcompleter completes it as `C.mro()`. Accessed on
+            // `type` itself, it's the unbound `method 'mro' of 'type'`.
+            if !Rc::ptr_eq(ty, &builtin_types().type_) {
+                return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
+                    Object::Type(ty.clone()),
+                    func,
+                ))));
+            }
+            return Ok(func);
         }
 
         Err(attribute_error(format!(
@@ -10538,7 +11112,7 @@ impl Interpreter {
                 }
                 if !kwargs.is_empty() {
                     return Err(type_error(format!(
-                        "builtin '{}' does not accept keyword arguments",
+                        "{}() takes no keyword arguments",
                         b.name
                     )));
                 }
@@ -10561,7 +11135,9 @@ impl Interpreter {
                 }
                 let fget = prop.fget();
                 if matches!(fget, Object::None) {
-                    return Err(attribute_error("unreadable attribute"));
+                    return Err(crate::builtins::property_unreachable_error(
+                        prop, instance, "getter",
+                    ));
                 }
                 self.call_descriptor_accessor(
                     &fget,
@@ -10597,6 +11173,9 @@ impl Interpreter {
                     }
                     match inst.slot_get(&slot.name) {
                         Some(v) => Ok(v),
+                        // Exception pseudo-slots read their CPython
+                        // getset default (`()`/`None`/`False`) when unset.
+                        None if slot.default.is_some() => Ok(slot.default.clone().unwrap()),
                         // CPython's member descriptor reports the
                         // owning type's *fully qualified* name here
                         // (e.g. `pkg.mod.Cls`), unlike the generic
@@ -10717,17 +11296,32 @@ impl Interpreter {
         let mut sep = String::from(" ");
         let mut end = String::from("\n");
         let mut file: Option<Object> = None;
+        let mut flush = false;
         for (k, v) in kwargs {
             match k.as_str() {
                 // A `None` value means "use the default", matching
                 // CPython (`print('a', sep=None)` joins with a space).
+                // A non-str, non-None value is a TypeError
+                // (`builtin_print_impl`: "sep must be None or a string").
                 "sep" => {
                     if !matches!(v, Object::None) {
+                        if !v.is_str() {
+                            return Err(type_error(format!(
+                                "sep must be None or a string, not {}",
+                                v.type_name_owned()
+                            )));
+                        }
                         sep = v.to_str();
                     }
                 }
                 "end" => {
                     if !matches!(v, Object::None) {
+                        if !v.is_str() {
+                            return Err(type_error(format!(
+                                "end must be None or a string, not {}",
+                                v.type_name_owned()
+                            )));
+                        }
                         end = v.to_str();
                     }
                 }
@@ -10736,7 +11330,9 @@ impl Interpreter {
                         file = Some(v.clone());
                     }
                 }
-                "flush" => {}
+                // CPython consults `PyObject_IsTrue(flush)` — any object
+                // works; truthiness via __bool__/__len__ applies.
+                "flush" => flush = self.obj_truthy(v, globals)?,
                 other => {
                     return Err(type_error(format!(
                         "'{other}' is an invalid keyword argument for print()"
@@ -10745,53 +11341,104 @@ impl Interpreter {
             }
         }
 
-        // Render the whole line first. Building the string up-front
-        // (rather than streaming into a held `stdout` borrow) keeps
-        // the borrow window tight and lets us route the result either
-        // to the native stdout sink or — when `file=` is supplied —
-        // through that object's `write` method, exactly like CPython.
-        // Build the line preserving lone surrogates: a `WStr` argument is
-        // bridged (surrogates → PUA window) into the working `String`, then the
-        // whole line is canonicalised back to a `str`/`WStr` so a surrogate
-        // survives to the destination (`stringify`/Rust `String` would
-        // otherwise flatten it to U+FFFD).
-        let mut text = String::new();
-        let mut saw_surrogate = false;
+        // Render each piece as its own str object: CPython's
+        // `builtin_print_impl` routes every argument, every separator, and
+        // `end` through a *separate* `PyFile_WriteObject` — i.e. separate
+        // `file.write(...)` calls, which mock-based tests count
+        // (test_code_module asserts `write('123')` then `write('\n')`).
+        // `WStr` arguments stay as-is so lone surrogates survive to the
+        // destination.
+        let mut pieces: Vec<Object> = Vec::with_capacity(args.len() * 2 + 1);
         for (i, a) in args.iter().enumerate() {
             if i > 0 {
-                text.push_str(&sep);
+                pieces.push(Object::from_str(sep.clone()));
             }
-            match a {
-                Object::WStr(cps) => {
-                    saw_surrogate = true;
-                    text.push_str(&crate::builtins::bridge_encode_cps(cps));
-                }
-                Object::Str(s) => text.push_str(s),
-                _ => text.push_str(&self.stringify(a, globals)?),
-            }
+            pieces.push(match a {
+                Object::Str(_) | Object::WStr(_) => a.clone(),
+                _ => Object::from_str(self.stringify(a, globals)?),
+            });
         }
-        text.push_str(&end);
-        let line_obj = if saw_surrogate {
-            crate::builtins::bridge_to_object(&text)
-        } else {
-            Object::from_str(text)
-        };
+        pieces.push(Object::from_str(end.clone()));
 
-        match file {
-            // `print(..., file=f)` calls `f.write(...)` so any
+        // Destination: an explicit `file=`, else a reassigned `sys.stdout`;
+        // `None` means the default native sink (single joined write).
+        let py_sink: Option<Object> = match &file {
+            Some(f) => Some(f.clone()),
+            None => self.current_sys_attr("stdout").filter(|t| {
+                !matches!(
+                    t,
+                    Object::File(f) if matches!(&*f.backend.borrow(), FileBackend::Stdout(_))
+                )
+            }),
+        };
+        match py_sink {
+            // `print(..., file=f)` calls `f.write(...)` piece by piece so any
             // file-like object works: `sys.stderr`, an open file, an
             // `io.StringIO`, or a user type with a `write` method.
-            Some(f) => {
-                let write = self.load_attr(&f, "write")?;
-                self.call(&write, &[line_obj], &[], globals)?;
+            Some(sink_obj) => {
+                let write = self.load_attr(&sink_obj, "write")?;
+                for p in &pieces {
+                    self.call(&write, std::slice::from_ref(p), &[], globals)?;
+                }
             }
-            None => match &line_obj {
-                Object::Str(s) => self.write_to_stdout(s, globals)?,
-                // Surrogate line to the default sink: route the actual code
-                // points through the current `sys.stdout` so its encoding +
-                // error handler decide the bytes (CPython behaviour).
-                _ => self.write_codepoints_to_stdout(&line_obj, globals)?,
-            },
+            None => {
+                // Native sink: join the pieces and write once. A `WStr` piece
+                // is bridged (surrogates → PUA window) into the working
+                // `String`, then the line is emitted as lossless WTF-8 (UTF-8
+                // + `surrogatepass`) — the closest faithful encoding when no
+                // Python-level error handler is in play.
+                let mut text = String::new();
+                let mut saw_surrogate = false;
+                for p in &pieces {
+                    match p {
+                        Object::WStr(cps) => {
+                            saw_surrogate = true;
+                            text.push_str(&crate::builtins::bridge_encode_cps(cps));
+                        }
+                        Object::Str(s) => text.push_str(s),
+                        _ => unreachable!("print pieces are str objects"),
+                    }
+                }
+                if saw_surrogate {
+                    let line_obj = crate::builtins::bridge_to_object(&text);
+                    let cps = line_obj.str_codepoints().unwrap_or_default();
+                    let bytes = crate::stdlib::codecs_mod::encode_codepoints(
+                        &cps,
+                        "utf-8",
+                        "surrogatepass",
+                    )
+                    .unwrap_or_default();
+                    let mut sink = self.stdout.borrow_mut();
+                    let _ = sink.write_all(&bytes);
+                } else {
+                    let mut sink = self.stdout.borrow_mut();
+                    let _ = write!(sink, "{text}");
+                    crate::vm_singletons::note_stdout_write(text.as_bytes());
+                }
+            }
+        }
+        // `flush=True` calls `file.flush()` (CPython `_PyFile_Flush`); a
+        // missing `flush` attribute propagates the AttributeError. The
+        // default sink flushes the *current* `sys.stdout`.
+        if flush {
+            let target = match file {
+                Some(f) => Some(f),
+                None => self.current_sys_attr("stdout"),
+            };
+            if let Some(t) = target {
+                let is_default_sink = matches!(
+                    &t,
+                    Object::File(f) if matches!(&*f.backend.borrow(), FileBackend::Stdout(_))
+                );
+                if is_default_sink {
+                    let _ = self.stdout.borrow_mut().flush();
+                } else {
+                    let flush_m = self.load_attr(&t, "flush")?;
+                    self.call(&flush_m, &[], &[], globals)?;
+                }
+            } else {
+                let _ = self.stdout.borrow_mut().flush();
+            }
         }
         Ok(Object::None)
     }
@@ -10835,35 +11482,6 @@ impl Interpreter {
         let mut sink = self.stdout.borrow_mut();
         let _ = write!(sink, "{text}");
         crate::vm_singletons::note_stdout_write(text.as_bytes());
-        Ok(())
-    }
-
-    /// Write a surrogate-bearing line (a `str`/`WStr`) to the current
-    /// `sys.stdout`. A reassigned stream receives the object directly so its
-    /// own encoding / error handler applies; the default host sink emits
-    /// lossless WTF-8 (UTF-8 + `surrogatepass`), the closest faithful encoding
-    /// for a lone surrogate when no Python-level error handler is in play.
-    fn write_codepoints_to_stdout(
-        &mut self,
-        line: &Object,
-        globals: &Rc<RefCell<DictData>>,
-    ) -> Result<(), RuntimeError> {
-        if let Some(target) = self.current_sys_attr("stdout") {
-            let is_default_sink = matches!(
-                &target,
-                Object::File(f) if matches!(&*f.backend.borrow(), FileBackend::Stdout(_))
-            );
-            if !is_default_sink {
-                let write = self.load_attr(&target, "write")?;
-                self.call(&write, &[line.clone()], &[], globals)?;
-                return Ok(());
-            }
-        }
-        let cps = line.str_codepoints().unwrap_or_default();
-        let bytes = crate::stdlib::codecs_mod::encode_codepoints(&cps, "utf-8", "surrogatepass")
-            .unwrap_or_default();
-        let mut sink = self.stdout.borrow_mut();
-        let _ = sink.write_all(&bytes);
         Ok(())
     }
 
@@ -10944,14 +11562,38 @@ impl Interpreter {
         if matches!(v, Object::Str(_) | Object::WStr(_)) {
             return Ok(v.clone());
         }
-        // A `str` subclass wrapping a surrogate-bearing payload (email's
-        // `ValueTerminal('\udcac…')`) demotes to the plain `WStr` the same
-        // way — unless the subclass overrides `__str__` itself.
         if let Object::Instance(inst) = v {
-            if let Some(native @ Object::WStr(_)) = inst.native.get() {
-                if instance_method(v, "__str__").is_none() {
-                    return Ok(native.clone());
+            // `PyObject_Str` returns the `__str__` result *unchanged*, so a
+            // str-subclass result keeps its type
+            // (test_str.test_conversion: `str(WithStr(StrSubclass('abc')))`
+            // is a `StrSubclass`).
+            if let Some(method) = instance_method(v, "__str__") {
+                let r = self.call(&method, &[], &[], globals)?;
+                if str_like_object(&r) {
+                    return Ok(r);
                 }
+                return Err(type_error(format!(
+                    "__str__ returned non-string (type {})",
+                    r.type_name()
+                )));
+            }
+            // A `str` subclass without an override hands back its payload
+            // directly — routing through `stringify`'s PUA surrogate bridge
+            // would mis-decode a real U+10FFFF as a bridged lone surrogate
+            // (test_str.test_constructor), and a genuine `WStr` payload
+            // (email's `ValueTerminal('\udcac…')`) must keep its surrogates.
+            if let Some(native @ (Object::Str(_) | Object::WStr(_))) = inst.native.get() {
+                return Ok(native.clone());
+            }
+            // No `__str__` and no built-in payload: `PyObject_Str` falls
+            // through to `PyObject_Repr`, whose result is returned unchanged
+            // — a str-subclass `__repr__` result keeps its type
+            // (test_str.test_conversion: `str(WithRepr(StrSubclass('<abc>')))`).
+            // A built-in *value* subclass must instead use the base type's
+            // `tp_str` (an int subclass keeps the digit-limit ValueError,
+            // test_int), which `stringify` below provides.
+            if inst.native.get().is_none() && instance_method(v, "__repr__").is_some() {
+                return self.do_repr_call(v, globals);
             }
         }
         // `stringify` transports lone surrogates through the PUA bridge;
@@ -11047,13 +11689,50 @@ impl Interpreter {
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<String, RuntimeError> {
         let (name_part, conv, spec_part) = split_format_field(field);
+        // A `{` in the field name outside a `[...]` index is malformed
+        // (`'{a{}b}'.format(42)` raises ValueError); inside an index it is a
+        // literal key character.
+        {
+            let mut in_index = false;
+            for b in name_part.bytes() {
+                match b {
+                    b'[' if !in_index => in_index = true,
+                    b']' if in_index => in_index = false,
+                    b'{' | b'}' if !in_index => {
+                        return Err(value_error(format!(
+                            "unexpected '{}' in field name",
+                            b as char
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // A malformed conversion is a parse error and beats argument lookup
+        // (`'{!}'.format()` is ValueError, not the auto-index IndexError).
+        match conv {
+            Some('\0') => {
+                return Err(value_error(
+                    "end of string while looking for conversion specifier",
+                ))
+            }
+            Some('\u{1}') => return Err(value_error("expected ':' after conversion specifier")),
+            _ => {}
+        }
         let value =
             self.resolve_field_str(name_part, positional, keyword, mapping, state, globals)?;
         // Expand a nested spec first (it may consume further auto args),
         // threading the shared numbering state.
         let spec_owned: Option<String> = match spec_part {
             Some(s) if s.as_bytes().contains(&b'{') => {
-                Some(self.format_template_str(s, positional, keyword, mapping, state, globals)?)
+                if state.spec_depth >= 1 {
+                    return Err(value_error("Max string recursion exceeded"));
+                }
+                state.spec_depth += 1;
+                let expanded =
+                    self.format_template_str(s, positional, keyword, mapping, state, globals);
+                state.spec_depth -= 1;
+                Some(expanded?)
             }
             Some(s) => Some(s.to_owned()),
             None => None,
@@ -11073,6 +11752,12 @@ impl Interpreter {
                     },
                     'r' => self.repr_of(&value, globals)?,
                     'a' => self.ascii_of(&value, globals)?,
+                    '\0' => {
+                        return Err(value_error(
+                            "end of string while looking for conversion specifier",
+                        ))
+                    }
+                    '\u{1}' => return Err(value_error("expected ':' after conversion specifier")),
                     other => {
                         return Err(value_error(format!("Unknown conversion specifier {other}")))
                     }
@@ -11096,6 +11781,19 @@ impl Interpreter {
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
         let (base, trailers) = split_name_trailers(name);
+        // Malformed field names fail at *parse* time, before any argument
+        // lookup: `'{0[}'.format()` is "Missing ']'…", not an IndexError
+        // for the absent argument (test_str.test_format).
+        for t in &trailers {
+            if t.starts_with('[') && !t.ends_with(']') {
+                return Err(value_error("Missing ']' in format string"));
+            }
+            if !t.starts_with('[') && !t.starts_with('.') {
+                return Err(value_error(
+                    "Only '.' or '[' may follow ']' in format field specifier",
+                ));
+            }
+        }
         // `str.format_map` forbids positional fields outright (issue #12579):
         // `'{}'.format_map(m)` and `'{0}'.format_map(m)` raise ValueError
         // before any lookup happens.
@@ -11120,17 +11818,27 @@ impl Interpreter {
                     "cannot switch from automatic field numbering to manual field specification",
                 ));
             }
+            // An index that overflows Py_ssize_t is a malformed format string
+            // (ValueError), not a lookup miss (test_format_huge_item_number).
+            if idx > isize::MAX as usize {
+                return Err(value_error("Too many decimal digits in format string"));
+            }
             state.manual_used = true;
             positional.get(idx).cloned().ok_or_else(|| {
                 index_error(format!(
                     "Replacement index {idx} out of range for positional args tuple"
                 ))
             })?
+        } else if base.as_bytes().iter().all(|b| b.is_ascii_digit()) {
+            // All digits but didn't parse as usize: past even the machine
+            // word, still the "too many digits" ValueError.
+            return Err(value_error("Too many decimal digits in format string"));
         } else if let Some(map) = mapping {
             // Full mapping protocol through the interpreter (CPython's
             // `PyObject_GetItem`): dict-subclass `__missing__`, arbitrary
             // `__getitem__` objects, and their exceptions all surface.
-            self.binary_subscr(map, &Object::from_str(base))?
+            let map = map.clone();
+            self.subscr_get_public(&map, &Object::from_str(base))?
         } else {
             keyword
                 .iter()
@@ -11152,11 +11860,20 @@ impl Interpreter {
         _globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
         if let Some(attr) = trailer.strip_prefix('.') {
+            // `'{0.}'.format(x)` is a malformed format string, not an
+            // attribute miss (test_str.test_format).
+            if attr.is_empty() {
+                return Err(value_error("Empty attribute in format string"));
+            }
             self.load_attr(&value, attr)
         } else if trailer.starts_with('[') && trailer.ends_with(']') {
             let inner = &trailer[1..trailer.len() - 1];
             let key = if let Ok(i) = inner.parse::<i64>() {
                 Object::Int(i)
+            } else if !inner.is_empty() && inner.as_bytes().iter().all(|b| b.is_ascii_digit()) {
+                // An all-digit index too large for Py_ssize_t is a malformed
+                // format string (`'{[2309…573]}'.format([0])`, ValueError).
+                return Err(value_error("Too many decimal digits in format string"));
             } else {
                 Object::from_str(inner)
             };
@@ -11270,7 +11987,44 @@ impl Interpreter {
         v: &Object,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
+        // `PyObject_Repr` hands the `__repr__` result back as-is, so a
+        // str-subclass result keeps its type (test_str.test_repr).
+        if let Object::Instance(_) = v {
+            if let Some(method) = instance_method(v, "__repr__") {
+                let r = self.call(&method, &[], &[], globals)?;
+                if str_like_object(&r) {
+                    return Ok(r);
+                }
+                return Err(type_error(format!(
+                    "__repr__ returned non-string (type {})",
+                    r.type_name()
+                )));
+            }
+        }
         Ok(Object::from_str(self.repr_of(v, globals)?))
+    }
+
+    /// `ascii(value)` as an object: `PyObject_ASCII` returns the repr
+    /// *unchanged* when it is already all-ASCII — which preserves a
+    /// str-subclass `__repr__` result (test_str.test_ascii) — and only
+    /// builds a new escaped string otherwise.
+    fn do_ascii_call(
+        &mut self,
+        v: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        let r = self.do_repr_call(v, globals)?;
+        let already_ascii = match &r {
+            Object::Str(s) => s.is_ascii(),
+            Object::Instance(inst) => {
+                matches!(inst.native.get(), Some(Object::Str(s)) if s.is_ascii())
+            }
+            _ => false,
+        };
+        if already_ascii {
+            return Ok(r);
+        }
+        Ok(Object::from_str(self.ascii_of(v, globals)?))
     }
 
     fn do_len_call(
@@ -11863,8 +12617,37 @@ impl Interpreter {
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
         if args.len() == 3 && !matches!(args[2], Object::None) {
+            let ternary_unsupported = || {
+                Err(type_error(format!(
+                    "unsupported operand type(s) for ** or pow(): '{}', '{}', '{}'",
+                    args[0].type_name(),
+                    args[1].type_name(),
+                    args[2].type_name()
+                )))
+            };
             if let Some(method) = instance_method(&args[0], "__pow__") {
-                return self.call(&method, &args[1..3], &[], globals);
+                // CPython's `ternary_op` turns a NotImplemented result into
+                // TypeError (e.g. `pow(Decimal(1), 2, "3")`).
+                let r = self.call(&method, &args[1..3], &[], globals)?;
+                if r.is_same(&crate::vm_singletons::not_implemented()) {
+                    return ternary_unsupported();
+                }
+                return Ok(r);
+            }
+            // CPython's `ternary_op` also offers the operation to the 2nd and
+            // 3rd operands via their `nb_power` slot (this is how the C
+            // `_decimal` handles `pow(10, Decimal(2), 7)`). A Python-level
+            // class has no such hook in 3.13, so a type that needs slot-like
+            // behaviour opts in with `__weavepy_ternary_pow__(base, exp, mod)`
+            // (the frozen `_decimal` accelerator does).
+            for operand in &args[1..3] {
+                if let Some(method) = instance_method(operand, "__weavepy_ternary_pow__") {
+                    let r = self.call(&method, args, &[], globals)?;
+                    if r.is_same(&crate::vm_singletons::not_implemented()) {
+                        return ternary_unsupported();
+                    }
+                    return Ok(r);
+                }
             }
             // `complex.__pow__` rejects a modulus outright (CPython raises
             // `ValueError("complex modulo")` rather than the integer-only
@@ -12224,6 +13007,85 @@ impl Interpreter {
         }
     }
 
+    /// PEP 688 `memoryview(x)` over a non-native object: call
+    /// `__buffer__`, hand out a fresh view sharing the returned view's
+    /// buffer (CPython's `memoryview(x)` never aliases an existing view
+    /// object), and pin its exporter. The exporter is the instance the
+    /// caller handed in (`mv.obj is a`, not `a._buf`) — unless the class
+    /// opts into exporter delegation (`__buffer_delegates_exporter__`),
+    /// the behaviour of CPython's C `PickleBuffer.bf_getbuffer`, which
+    /// forwards to the wrapped object so `memoryview(PickleBuffer(b)).obj
+    /// is b` (pickletester's ZeroCopyBytes reconstructs through
+    /// `memoryview(...).obj`). Returns `None` when the object has no
+    /// `__buffer__` (caller falls through to the plain constructor).
+    fn memoryview_via_buffer_protocol(
+        &mut self,
+        other: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Option<Object>, RuntimeError> {
+        // `memoryview(x)` requests CPython's PyBUF_FULL_RO
+        // (INDIRECT | STRIDES | ND | FORMAT = 0x011C).
+        self.memoryview_from_object_and_flags(other, 0x011C, globals)
+    }
+
+    /// PEP 688 export with explicit request flags — the engine behind both
+    /// `memoryview(x)` (PyBUF_FULL_RO) and `memoryview._from_flags(x, f)`.
+    pub(crate) fn memoryview_from_object_and_flags(
+        &mut self,
+        other: &Object,
+        flags: i64,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Option<Object>, RuntimeError> {
+        let Some(method) = instance_method(other, "__buffer__") else {
+            return Ok(None);
+        };
+        let view = self.call(&method, &[Object::Int(flags)], &[], globals)?;
+        let Object::MemoryView(v) = &view else {
+            // CPython `slot_bf_getbuffer`: the hook must hand back a
+            // memoryview object — bytes and other buffer-ish values are
+            // rejected outright.
+            return Err(crate::error::type_error(format!(
+                "__buffer__ returned non-memoryview object of type '{}'",
+                view.type_name()
+            )));
+        };
+        if v.released.get() || v.restricted.get() {
+            return Err(crate::error::value_error(
+                "operation forbidden on released memoryview object".to_owned(),
+            ));
+        }
+        let delegates = matches!(other, Object::Instance(inst)
+            if inst
+                .cls()
+                .lookup("__buffer_delegates_exporter__")
+                .is_some());
+        let out = Object::MemoryView(Rc::new(v.shallow_clone()));
+        let exporter = if delegates {
+            v.exporter.borrow().clone()
+        } else {
+            Some(other.clone())
+        };
+        if let Object::MemoryView(nv) = &out {
+            // Keep the exact object `__buffer__` returned: it is what a
+            // Python `__release_buffer__` must receive on release
+            // (test_buffer asserts `buffer is self.created_mv`).
+            //
+            // *Except* under exporter delegation: there `__buffer__` hands
+            // back the wrapper's long-lived stored view (PickleBuffer's
+            // `_view`), and releasing this re-export must not kill it —
+            // CPython's `picklebuf_getbuf` copies the stored `Py_buffer`,
+            // so `memoryview(pb).release()` leaves `pb` usable.
+            if !delegates {
+                nv.release_inner.replace(Some(view.clone()));
+            }
+            if let Some(exp) = &exporter {
+                nv.exporter.replace(Some(exp.clone()));
+                crate::gc_trace::track_memoryview_exporter(&out, exp);
+            }
+        }
+        Ok(Some(out))
+    }
+
     /// `next(it[, default])` — drives an iterator. Generators need
     /// the interpreter on the call path, which is why this lives here
     /// rather than in `builtins.rs`.
@@ -12502,25 +13364,41 @@ impl Interpreter {
                 // run the hook and propagate non-TypeError exceptions.
                 if let Object::Instance(inst) = v {
                     let cls = inst.cls();
-                    if !cls.flags.is_builtin
-                        && cls.lookup("__len__").is_none()
-                        && cls.lookup("__length_hint__").is_some()
-                    {
-                        if let Some(hint) = instance_method(v, "__length_hint__") {
-                            match self.call(&hint, &[], &[], globals) {
-                                Ok(_) => {}
-                                Err(e) => {
-                                    let is_type_error = match &e {
-                                        RuntimeError::PyException(pe) => self
-                                            .exception_matches(
-                                                &pe.instance,
-                                                &Object::Type(builtin_types().type_error.clone()),
-                                            )
-                                            .unwrap_or(false),
-                                        RuntimeError::Internal(_) => false,
-                                    };
-                                    if !is_type_error {
-                                        return Err(e);
+                    if !cls.flags.is_builtin {
+                        let err_is_type_error = |vm: &mut Self, e: &RuntimeError| match e {
+                            RuntimeError::PyException(pe) => vm
+                                .exception_matches(
+                                    &pe.instance,
+                                    &Object::Type(builtin_types().type_error.clone()),
+                                )
+                                .unwrap_or(false),
+                            RuntimeError::Internal(_) => false,
+                        };
+                        // `PyObject_LengthHint` order: `__len__` first; a
+                        // raising `__len__` propagates unless it's a
+                        // TypeError (test_iterlen.test_issue1242657's
+                        // `list(BadLen())` must surface the RuntimeError).
+                        let mut need_hint = cls.lookup("__length_hint__").is_some();
+                        if cls.lookup("__len__").is_some() {
+                            if let Some(len_m) = instance_method(v, "__len__") {
+                                match self.call(&len_m, &[], &[], globals) {
+                                    Ok(_) => need_hint = false,
+                                    Err(e) => {
+                                        if !err_is_type_error(self, &e) {
+                                            return Err(e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if need_hint {
+                            if let Some(hint) = instance_method(v, "__length_hint__") {
+                                match self.call(&hint, &[], &[], globals) {
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        if !err_is_type_error(self, &e) {
+                                            return Err(e);
+                                        }
                                     }
                                 }
                             }
@@ -12591,70 +13469,31 @@ impl Interpreter {
         args: &[Object],
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
-        // Laziness is observable whenever `func` can run user code (side
-        // effects must interleave with consumption — CPython's `map` never
-        // calls `func` before `next()`), and a non-callable `func` must
-        // fail at `next()` rather than at construction. Only a pure-native
-        // callable over native containers may take the eager fast path.
-        if !callable_is_pure_native(&args[0]) || args[1..].iter().any(object_needs_vm_iter) {
-            return match self.make_seqtools_iter("_MapIter", args, &[], globals)? {
-                Some(it) => Ok(it),
-                None => Err(runtime_error("internal: _seqtools._MapIter unavailable")),
-            };
+        // Always lazy, like CPython's `map` type: laziness is observable
+        // in type identity (`map` reduces by its own constructor —
+        // test_pickle's test_compat_pickle checks the emitted global is
+        // `itertools.imap` under protocol < 3), in error timing (`func`
+        // failures surface at `next()`, not construction), and in side
+        // effect interleaving.
+        match self.make_seqtools_iter("_MapIter", args, &[], globals)? {
+            Some(it) => Ok(it),
+            None => Err(runtime_error("internal: _seqtools._MapIter unavailable")),
         }
-        let func = args[0].clone();
-        let mut cols: Vec<Vec<Object>> = Vec::with_capacity(args.len() - 1);
-        for it in &args[1..] {
-            cols.push(self.collect_iterable(it, globals)?);
-        }
-        let n = cols.iter().map(Vec::len).min().unwrap_or(0);
-        let mut out = Vec::with_capacity(n);
-        for i in 0..n {
-            let call_args: Vec<Object> = cols.iter().map(|c| c[i].clone()).collect();
-            out.push(self.call(&func, &call_args, &[], globals)?);
-        }
-        let it = Object::new_list(out).make_iter()?;
-        Ok(Object::Iter(Rc::new(RefCell::new(it))))
     }
 
     /// `filter(func_or_None, iterable)` — VM-aware. `None` keeps truthy
     /// items; otherwise an item is kept when `func(item)` is truthy.
-    /// Lazy (`_seqtools._FilterIter`) when the input is a VM-driven
-    /// iterable so filtering an unbounded source terminates; eager
-    /// native iterator otherwise (see [`Self::do_map_call`]).
+    /// Always lazy (`_seqtools._FilterIter`), like CPython's `filter`
+    /// type (see [`Self::do_map_call`]).
     fn do_filter_call(
         &mut self,
         args: &[Object],
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
-        // Same laziness contract as `do_map_call`: predicates that can run
-        // user code (or fail to be callable at all) must be driven on
-        // demand. `None` (identity predicate) stays eager-eligible.
-        let pred_native = matches!(args[0], Object::None) || callable_is_pure_native(&args[0]);
-        if !pred_native || object_needs_vm_iter(&args[1]) {
-            return match self.make_seqtools_iter("_FilterIter", args, &[], globals)? {
-                Some(it) => Ok(it),
-                None => Err(runtime_error("internal: _seqtools._FilterIter unavailable")),
-            };
+        match self.make_seqtools_iter("_FilterIter", args, &[], globals)? {
+            Some(it) => Ok(it),
+            None => Err(runtime_error("internal: _seqtools._FilterIter unavailable")),
         }
-        let func = args[0].clone();
-        let use_pred = !matches!(func, Object::None);
-        let items = self.collect_iterable(&args[1], globals)?;
-        let mut out = Vec::new();
-        for item in items {
-            let verdict = if use_pred {
-                self.call(&func, std::slice::from_ref(&item), &[], globals)?
-            } else {
-                item.clone()
-            };
-            // `PyObject_IsTrue` on the predicate result / element (a foreign
-            // multi-element array raises "truth value ... ambiguous").
-            if self.obj_truthy(&verdict, globals)? {
-                out.push(item);
-            }
-        }
-        let it = Object::new_list(out).make_iter()?;
-        Ok(Object::Iter(Rc::new(RefCell::new(it))))
     }
 
     fn do_sum_call(
@@ -13242,7 +14081,7 @@ impl Interpreter {
     /// reject objects whose class has `__hash__ = None` (CPython's
     /// "unhashable" marker, used e.g. by `dataclass(eq=True)` when
     /// frozen is False).
-    fn do_hash_call(
+    pub(crate) fn do_hash_call(
         &mut self,
         obj: &Object,
         globals: &Rc<RefCell<DictData>>,
@@ -13265,6 +14104,25 @@ impl Interpreter {
                 }
             }
             return Ok(Object::Int(crate::object::combine_tuple_hash(&lanes)));
+        }
+        // `memory_hash` hashes the *exporter* before the contents: the
+        // exporter must itself be hashable (a `toreadonly()` view over a
+        // bytearray fails with the bytearray's TypeError), and a re-entrant
+        // `__hash__` that tries to release the view mid-hash hits the export
+        // guard in `memoryview.release` and propagates its BufferError
+        // (gh-142664; test_memoryview.test_hash_use_after_free).
+        if let Object::MemoryView(mv) = obj {
+            if mv.hash.get() == -1 {
+                builtins::ensure_hashable(obj)?;
+                let exporter = mv.exporter.borrow().clone();
+                if let Some(exp) = exporter {
+                    mv.exports.set(mv.exports.get() + 1);
+                    let r = self.do_hash_call(&exp, globals);
+                    mv.exports.set(mv.exports.get() - 1);
+                    r?;
+                }
+            }
+            return builtins::hash_object(obj);
         }
         if let Object::Instance(inst) = obj {
             match inst.cls().lookup_with_owner("__hash__") {
@@ -13725,7 +14583,20 @@ impl Interpreter {
         // sort" (test_list/test_sort `selfmodifyingComparison`).
         let mut items = std::mem::take(&mut *list.borrow_mut());
         let sort_result = self.sort_with_key(&mut items, key_fn.as_ref(), reverse, globals);
-        let mutated = !list.borrow().is_empty();
+        // The decorate keys died inside `sort_with_key`; their `__del__`s
+        // (queued at drop) must run *while the list is still detached* so a
+        // key finalizer that mutates the list is caught below — CPython
+        // decrefs the keys before the `allocated != -1` check
+        // (test_sort.test_key_with_mutating_del).
+        self.run_pending_finalizers();
+        // Any mutation counts, even one that nets out to "still empty"
+        // (`L.append(3); L.pop()` in a comparator — CPython detects this via
+        // the `allocated = -1` sort guard). The detached `Vec` starts with
+        // capacity 0, so an append during the sort leaves capacity behind.
+        let mutated = {
+            let l = list.borrow();
+            !l.is_empty() || l.capacity() > 0
+        };
         // Restore the saved items (fully sorted on success, partially on
         // error); CPython discards whatever the mutation left behind.
         *list.borrow_mut() = items;
@@ -13792,15 +14663,48 @@ impl Interpreter {
             if reverse {
                 decorated.reverse();
             }
-            *items = decorated.into_iter().map(|(_, v)| v).collect();
+            // Undecorate, then promptly reap the dying key objects: CPython
+            // decrefs the keys inside `list.sort` while the list is still
+            // detached, so a key `__del__` that mutates the list is caught
+            // by the caller's mutation check
+            // (test_sort.test_key_with_mutating_del).
+            let mut dead_keys: Vec<Object> = Vec::with_capacity(decorated.len());
+            *items = decorated
+                .into_iter()
+                .map(|(k, v)| {
+                    dead_keys.push(k);
+                    v
+                })
+                .collect();
+            for k in dead_keys {
+                if matches!(
+                    k,
+                    Object::Instance(_)
+                        | Object::Generator(_)
+                        | Object::Coroutine(_)
+                        | Object::AsyncGenerator(_)
+                ) && Self::is_refcount_dead(&k, 1)
+                {
+                    self.reap_dead_subgraph(k);
+                }
+            }
         } else {
             if reverse {
                 items.reverse();
             }
             if items.iter().any(sort_key_needs_dunder_lt) {
-                let sorted =
-                    merge_sort_by_pylt(self, std::mem::take(items), &|o: &Object| o, globals)?;
-                *items = sorted;
+                // Keep a (cheap, Rc-clone) backup: `merge_sort_by_pylt`
+                // consumes the vec, and a raising `__lt__` must not empty
+                // the caller's list (CPython reattaches the partially
+                // sorted array on error).
+                let backup = items.clone();
+                match merge_sort_by_pylt(self, std::mem::take(items), &|o: &Object| o, globals) {
+                    Ok(sorted) => *items = sorted,
+                    Err(e) => {
+                        *items = backup;
+                        return Err(e);
+                    }
+                }
             } else {
                 let mut err: Option<RuntimeError> = None;
                 items.sort_by(|a, b| match a.cmp(b) {
@@ -14728,6 +15632,15 @@ impl Interpreter {
                     return self.call(&bound, &[], &[], globals);
                 }
                 Err(type_error("'type' object is not iterable"))
+            }
+            // A file is its own iterator (CPython `iter(f) is f`,
+            // test_memoryio.test_iterator asserts the identity). Iterating a
+            // closed stream raises up front.
+            Object::File(f) => {
+                if *f.closed.borrow() {
+                    return Err(value_error("I/O operation on closed file."));
+                }
+                Ok(v.clone())
             }
             _ => {
                 // A PEP 585 generic alias (`tuple[int]`, `list[str]`, …) is
@@ -16340,10 +17253,7 @@ impl Interpreter {
             }
         };
         if let (Some(t), Object::Instance(inst)) = (&tb, &instance) {
-            inst.dict.borrow_mut().insert(
-                DictKey(Object::from_static("__traceback__")),
-                Object::Traceback(t.clone()),
-            );
+            inst.slot_set("__traceback__", Object::Traceback(t.clone()));
         }
         match self.generator_throw(&g, PyException::new(instance)) {
             Err(RuntimeError::PyException(exc))
@@ -16451,6 +17361,31 @@ impl Interpreter {
         // executed instruction was YIELD_VALUE, the one before that
         // was SEND, and the stack top is an iterator-like.
         if let Some(sub_iter) = detect_yield_from_subiter(&frame) {
+            // CPython `gen_throw`: `GeneratorExit` (and subclasses)
+            // is never forwarded as a throw — the sub-iterator is
+            // *closed* (`gen_close_iter`) and the original exception
+            // is then raised at the outer's yield-from point so its
+            // `finally` blocks run. A sub-generator that answers the
+            // close by yielding produces "generator ignored
+            // GeneratorExit"; a close that raises delivers *that*
+            // exception to the outer frame instead (PEP 380 /
+            // test_yield_from's close_and_throw family).
+            if instance_is_subclass(&exc.instance, &builtin_types().generator_exit) {
+                let close_result = self.close_subiter(&sub_iter);
+                if !frame.stack.is_empty() {
+                    frame.stack.pop();
+                }
+                return match close_result {
+                    Ok(()) => self.resume_outer_with_exc(gen, frame, exc),
+                    Err(RuntimeError::PyException(close_exc)) => {
+                        self.resume_outer_with_exc(gen, frame, close_exc)
+                    }
+                    Err(err) => {
+                        *gen.state.borrow_mut() = GeneratorState::Finished;
+                        Err(err)
+                    }
+                };
+            }
             // Make the delegating frame visible on the Python call
             // stack for the duration of the inner throw: CPython
             // re-enters the outer generator frame, so code in the
@@ -16586,7 +17521,23 @@ impl Interpreter {
             },
             Ok(None) => unreachable!(),
             Err(err) => {
+                // The thrown exception found no handler: the frame is
+                // torn down right here, without re-entering the dispatch
+                // loop, so CPython's PY_UNWIND (legacy `'return'` with
+                // `None` to both settrace and setprofile) must fire now —
+                // `gen_close` on a bare genexpr is exactly this path
+                // (test_cprofile.test_throw).
                 *gen.state.borrow_mut() = GeneratorState::Finished;
+                if crate::trace::any_observers_active() {
+                    if let Some(py) = frame.py_frame.clone() {
+                        *py.back.borrow_mut() = self.frame_stack.borrow().last().cloned();
+                        py.on_stack.set(py.on_stack.get() + 1);
+                        self.frame_stack.borrow_mut().push(py.clone());
+                        let hook_result = self.fire_unwind_event(&py);
+                        self.pop_py_frame();
+                        hook_result?;
+                    }
+                }
                 Err(self.pep479_escape(gen, err))
             }
         }
@@ -16680,12 +17631,10 @@ impl Interpreter {
                             frame: pf.clone(),
                             lineno: pf.last_line.get().unwrap_or(1),
                             lasti: pf.lasti.get(),
+                            raw_lasti: None,
                             next: RefCell::new(None),
                         });
-                        inst.dict.borrow_mut().insert(
-                            DictKey(Object::from_static("__traceback__")),
-                            Object::Traceback(tb),
-                        );
+                        inst.slot_set("__traceback__", Object::Traceback(tb));
                     }
                 }
                 Err(err)
@@ -16702,12 +17651,8 @@ impl Interpreter {
                 // GeneratorExit propagating (exit not caught) yields None.
                 if exc.type_name() == "StopIteration" {
                     if let Object::Instance(inst) = &exc.instance {
-                        if let Some(v) = inst
-                            .dict
-                            .borrow()
-                            .get(&DictKey(Object::from_static("value")))
-                        {
-                            return Ok(v.clone());
+                        if let Some(v) = inst.slot_get("value") {
+                            return Ok(v);
                         }
                     }
                 }
@@ -16724,6 +17669,32 @@ impl Interpreter {
     /// own throw machinery. Used by yield-from delegation. Returns
     /// the inner's yielded value, or propagates whatever exception
     /// the inner re-raises.
+    /// CPython `gen_close_iter`: close the sub-iterator a delegating
+    /// frame is paused on. Exact generators/coroutines route through
+    /// `close()`; anything else gets a `close` attribute call. A
+    /// *lookup* failure is unraisable — a missing `close` is fine,
+    /// and a broken `__getattr__` must not mask the shutdown
+    /// (test_yield_from.test_broken_getattr_handling) — while an
+    /// error from calling `close()` propagates to the caller.
+    fn close_subiter(&mut self, sub_iter: &Object) -> Result<(), RuntimeError> {
+        match sub_iter {
+            Object::Generator(_) | Object::Coroutine(_) | Object::AsyncGenerator(_) => {
+                self.gen_method_close(sub_iter).map(|_| ())
+            }
+            _ => {
+                let globals = self.builtins.clone();
+                match self.load_attr(sub_iter, "close") {
+                    Ok(close_m) => self.call(&close_m, &[], &[], &globals).map(|_| ()),
+                    Err(err) if self.is_attribute_error(&err) => Ok(()),
+                    Err(err) => {
+                        self.write_unraisable(&err, sub_iter, "");
+                        Ok(())
+                    }
+                }
+            }
+        }
+    }
+
     fn throw_into_subiter(
         &mut self,
         sub_iter: &Object,
@@ -16735,23 +17706,20 @@ impl Interpreter {
             }
             _ => {
                 let globals = self.builtins.clone();
-                if exc.type_name() == "GeneratorExit" {
-                    // CPython `gen_close_iter`: ask the sub-iterator to
-                    // close itself, then deliver the GeneratorExit to
-                    // the delegating frame (its finally blocks run).
-                    if let Ok(close_m) = self.load_attr(sub_iter, "close") {
-                        self.call(&close_m, &[], &[], &globals)?;
-                    }
-                    return Err(RuntimeError::PyException(exc));
-                }
                 // A custom awaitable/iterator with its own `throw`
                 // (e.g. the `coroutine_wrapper` from `__await__`, or
                 // types.coroutine's _GeneratorWrapper) handles the
-                // exception itself; without one, the exception is
-                // raised at the delegating frame's yield-from point.
+                // exception itself; without one (AttributeError), the
+                // exception is raised at the delegating frame's
+                // yield-from point. A *different* lookup failure — a
+                // broken `__getattr__` — propagates as itself
+                // (CPython gen_throw's PyObject_GetOptionalAttr).
                 match self.load_attr(sub_iter, "throw") {
                     Ok(throw_m) => self.call(&throw_m, &[exc.instance.clone()], &[], &globals),
-                    Err(_) => Err(RuntimeError::PyException(exc)),
+                    Err(err) if self.is_attribute_error(&err) => {
+                        Err(RuntimeError::PyException(exc))
+                    }
+                    Err(err) => Err(err),
                 }
             }
         }
@@ -17002,29 +17970,20 @@ impl Interpreter {
         kw_names: &[String],
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
-        // Type check.
+        // CPython ceval `match_class`. Type check first.
         let ty = match cls {
             Object::Type(t) => t.clone(),
-            _ => return Err(type_error("called match pattern must be a type")),
+            _ => return Err(type_error("called match pattern must be a class")),
         };
-        let is_inst = match subject {
-            Object::Instance(inst) => inst.cls().is_subclass_of(&ty),
-            _ => {
-                // Built-in mapping: roughly match by type_name.
-                let bt = builtin_types();
-                let expected = ty.name.as_str();
-                let actual = subject.type_name();
-                expected == actual
-                    || (expected == "object")
-                    || self.builtin_is_subtype(subject, &ty, &bt)
-            }
-        };
-        if !is_inst {
+        // Full isinstance protocol — metaclass `__instancecheck__`
+        // included, so `typing.Protocol` raises for non-runtime_checkable
+        // protocols and runtime_checkable ones match structurally.
+        if !self.do_isinstance_call(subject, cls, globals)?.is_truthy() {
             return Ok(Object::None);
         }
-        // Positional matching uses `__match_args__` on the class.
-        // For the 8 "self-match" built-in types, `Cls(p)` matches by
-        // identity: the single positional captures the whole subject.
+        // The `_Py_TPFLAGS_MATCH_SELF` builtins: `Cls(p)` captures the
+        // whole subject. Inherited by subclasses via the MRO — but only
+        // acknowledged when the class doesn't define `__match_args__`.
         const SELF_MATCH: &[&str] = &[
             "bool",
             "bytearray",
@@ -17039,63 +17998,88 @@ impl Interpreter {
             "tuple",
         ];
         let mut values: Vec<Object> = Vec::with_capacity(nargs + kw_names.len());
+        // Attributes already captured — a positional (via __match_args__)
+        // and a keyword naming the same attribute is a TypeError.
+        let mut seen: Vec<String> = Vec::new();
+        // Extract one attribute, CPython `match_class_attr`: a missing
+        // attribute fails the match quietly; any other error propagates.
+        macro_rules! grab_attr {
+            ($name:expr) => {{
+                if seen.iter().any(|s| s == $name) {
+                    return Err(type_error(format!(
+                        "{}() got multiple sub-patterns for attribute '{}'",
+                        ty.name, $name
+                    )));
+                }
+                seen.push($name.to_owned());
+                match self.load_attr(subject, $name) {
+                    Ok(v) => v,
+                    Err(e) if self.is_attribute_error(&e) => return Ok(Object::None),
+                    Err(e) => return Err(e),
+                }
+            }};
+        }
         if nargs > 0 {
-            let is_self_match = SELF_MATCH.contains(&ty.name.as_str()) && nargs == 1;
-            if is_self_match {
+            let mut match_self = false;
+            let match_args = match self.load_attr(cls, "__match_args__") {
+                Ok(v) => Some(v),
+                Err(e) if self.is_attribute_error(&e) => {
+                    let mro: Vec<_> = ty.mro.borrow().clone();
+                    match_self = mro
+                        .iter()
+                        .any(|t| t.flags.is_builtin && SELF_MATCH.contains(&t.name.as_str()));
+                    None
+                }
+                Err(e) => return Err(e),
+            };
+            let names: Vec<String> = match &match_args {
+                Some(Object::Tuple(items)) => {
+                    // Elements must be exact strings.
+                    let mut names = Vec::with_capacity(items.len());
+                    for it in items.iter() {
+                        match it {
+                            Object::Str(s) => names.push(s.to_string()),
+                            other => {
+                                return Err(type_error(format!(
+                                    "__match_args__ elements must be strings (got {})",
+                                    other.type_name()
+                                )))
+                            }
+                        }
+                    }
+                    names
+                }
+                Some(other) => {
+                    return Err(type_error(format!(
+                        "{}.__match_args__ must be a tuple (got {})",
+                        ty.name,
+                        other.type_name()
+                    )))
+                }
+                None => Vec::new(),
+            };
+            let allowed = if match_self { 1 } else { names.len() };
+            if allowed < nargs {
+                return Err(type_error(format!(
+                    "{}() accepts {} positional sub-pattern{} ({} given)",
+                    ty.name,
+                    allowed,
+                    if allowed == 1 { "" } else { "s" },
+                    nargs
+                )));
+            }
+            if match_self {
                 values.push(subject.clone());
             } else {
-                let match_args = self
-                    .load_attr(cls, "__match_args__")
-                    .unwrap_or(Object::None);
-                let names: Vec<String> = match match_args {
-                    Object::Tuple(items) => items.iter().map(|x| x.to_str()).collect(),
-                    _ => Vec::new(),
-                };
-                if names.len() < nargs {
-                    return Ok(Object::None);
-                }
                 for name in names.iter().take(nargs) {
-                    match self.load_attr(subject, name) {
-                        Ok(v) => values.push(v),
-                        Err(_) => return Ok(Object::None),
-                    }
+                    values.push(grab_attr!(name));
                 }
             }
         }
         for name in kw_names {
-            match self.load_attr(subject, name) {
-                Ok(v) => values.push(v),
-                Err(_) => return Ok(Object::None),
-            }
+            values.push(grab_attr!(name));
         }
-        let _ = globals;
         Ok(Object::new_tuple(values))
-    }
-
-    /// Heuristic for `match Cls(...)` when `Cls` is a built-in
-    /// wrapper around a primitive type (e.g. `int`, `str`, `list`).
-    fn builtin_is_subtype(
-        &self,
-        subject: &Object,
-        ty: &Rc<TypeObject>,
-        bt: &crate::builtin_types::BuiltinTypes,
-    ) -> bool {
-        let name = ty.name.as_str();
-        match (name, subject) {
-            ("int", Object::Int(_)) => true,
-            ("int", Object::Bool(_)) => true,
-            ("bool", Object::Bool(_)) => true,
-            ("float", Object::Float(_)) => true,
-            ("str", Object::Str(_)) => true,
-            ("tuple", Object::Tuple(_)) => true,
-            ("list", Object::List(_)) => true,
-            ("dict", Object::Dict(_)) => true,
-            ("object", _) => true,
-            _ => {
-                let _ = bt;
-                false
-            }
-        }
     }
 
     /// Augmented assignment (`a += b`). CPython's `binary_iop`: if
@@ -17112,11 +18096,22 @@ impl Interpreter {
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
         // User instances: dispatch the in-place dunder first.
-        if matches!(a, Object::Instance(_)) {
+        if let Object::Instance(inst) = a {
             if let Some(method) = instance_method(a, op.inplace_dunder()) {
                 let not_impl = crate::vm_singletons::not_implemented();
                 let r = self.call(&method, std::slice::from_ref(b), &[], globals)?;
                 if !r.is_same(&not_impl) {
+                    // A builtin in-place slot inherited from a native base
+                    // (`dict.__ior__`, …) binds against the unwrapped
+                    // payload and returns it; CPython's slot returns
+                    // *self*. Restore the subclass identity
+                    // (`defaultdict |= […]` stays the same defaultdict —
+                    // test_defaultdict.test_union).
+                    if let Some(native) = inst.native.get() {
+                        if r.is_same(native) {
+                            return Ok(a.clone());
+                        }
+                    }
                     return Ok(r);
                 }
             }
@@ -17126,13 +18121,63 @@ impl Interpreter {
             // `list += iterable` extends in place and accepts *any* iterable
             // (not just another list, unlike `list + list`).
             (Object::List(items), BinOpKind::Add) => {
+                // CPython's `PyNumber_InPlaceAdd` runs the *number* protocol
+                // before falling back to `sq_inplace_concat`: `list` has no
+                // `nb_add`, so a right operand whose type defines `__radd__`
+                // (a heap type's `slot_nb_add`) gets first refusal —
+                // `list("spam") += UserList("eggs")` returns the UserList
+                // (test_userlist.test_mixed_iadd), not an extended list.
+                if let Object::Instance(_) = b {
+                    if let Some(radd) = instance_method(b, "__radd__") {
+                        let not_impl = crate::vm_singletons::not_implemented();
+                        let r = self.call(&radd, std::slice::from_ref(a), &[], globals)?;
+                        if !r.is_same(&not_impl) {
+                            return Ok(r);
+                        }
+                    }
+                }
                 let extra = self.collect_iterable(b, globals)?;
                 items.borrow_mut().extend(extra);
                 return Ok(a.clone());
             }
             // PEP 584 `dict |= other` updates in place; unlike the binary
             // `|` it accepts anything `dict.update` does (a mapping or an
-            // iterable of key/value pairs).
+            // iterable of key/value pairs). A dict *subclass* instance
+            // without its own `__ior__` inherits this exact behavior —
+            // crucially preserving the receiver's identity and class
+            // (`defaultdict(int, …) |= [(k, v)…]` stays a defaultdict —
+            // test_defaultdict.test_union).
+            (Object::Instance(inst), BinOpKind::BitOr)
+                if matches!(inst.native.get(), Some(Object::Dict(_))) =>
+            {
+                let Some(Object::Dict(dst)) = inst.native.get() else {
+                    unreachable!("guard checked the native payload");
+                };
+                let dict_recv = Object::Dict(dst.clone());
+                match self.dispatch_inplace_op(&dict_recv, b, op, globals) {
+                    Ok(_) => return Ok(a.clone()),
+                    Err(e) => {
+                        // Re-brand the operand-type error with the
+                        // subclass's name; anything else (bad update
+                        // sequence, user exceptions) passes through.
+                        return Err(match &e {
+                            RuntimeError::PyException(pe)
+                                if pe.type_name() == "TypeError"
+                                    && pe
+                                        .message()
+                                        .starts_with("unsupported operand type(s) for |=") =>
+                            {
+                                type_error(format!(
+                                    "unsupported operand type(s) for |=: '{}' and '{}'",
+                                    a.type_name_owned(),
+                                    b.type_name_owned()
+                                ))
+                            }
+                            _ => e,
+                        });
+                    }
+                }
+            }
             (Object::Dict(dst), BinOpKind::BitOr) => {
                 let src: Vec<(DictKey, Object)> = match b {
                     Object::Dict(s) => s
@@ -17389,11 +18434,24 @@ impl Interpreter {
             } else {
                 &bt.bytes_
             };
-            let b_is_left_subclass = match b {
-                Object::Instance(bi) => bi.cls().is_subclass_of(left_ty),
+            // Subclass priority applies only when the subclass *overrides*
+            // `__rmod__` (CPython `binary_op1`'s `Py_TYPE(w)->tp_richcompare
+            // != …` analogue). A plain `class U(str)` inherits the base
+            // wrapper, so the left slot still runs — with the *instance*
+            // intact, keeping `%s`/`%r` virtual (`'%s' % u` must call a
+            // user `__str__`; test_str.test_format_subclass).
+            let b_overrides_rmod = match b {
+                Object::Instance(bi) => {
+                    bi.cls().is_subclass_of(left_ty)
+                        && match (left_ty.lookup("__rmod__"), bi.cls().lookup("__rmod__")) {
+                            (Some(x), Some(y)) => !x.is_same(&y),
+                            (None, Some(_)) => true,
+                            _ => false,
+                        }
+                }
                 _ => false,
             };
-            if !b_is_left_subclass {
+            if !b_overrides_rmod {
                 return self.percent_mod_left_slot(a, b, globals);
             }
         }
@@ -17949,16 +19007,18 @@ impl Interpreter {
         // pair by value if consulted first (pandas `test_nat_comparisons`).
         let cls_a = crate::builtins::class_of(a);
         let cls_b = crate::builtins::class_of(b);
-        let reflected_first = !Rc::ptr_eq(&cls_b, &cls_a) && cls_b.is_subclass_of(&cls_a) && {
-            match (cls_b.lookup(swapped), cls_a.lookup(swapped)) {
-                (Some(mb), Some(ma)) => !mb.is_same(&ma),
-                (Some(_), None) => true,
-                // No VM-visible dunder on the subclass: only a foreign
-                // operand's C slot can still differ (the slot path below
-                // resolves per-type), so give it the priority slot.
-                (None, _) => b_foreign,
-            }
-        };
+        // CPython's `do_richcompare` gives the subclass priority
+        // *unconditionally* — it only checks that `type(b)`'s
+        // `tp_richcompare` slot exists, never that the method differs
+        // from `type(a)`'s. Even a shared inherited method matters:
+        // `object.__ne__` derives from the *receiver's* `__eq__`, so
+        // `IPv4Address(x) != IPv4Interface(x/32)` must consult the
+        // interface's richer `__eq__` first (test_ipaddress), and
+        // `addr < intf` must run the interface's total_ordering
+        // `__gt__` first.
+        let reflected_first = !Rc::ptr_eq(&cls_b, &cls_a)
+            && cls_b.is_subclass_of(&cls_a)
+            && (cls_b.lookup(swapped).is_some() || b_foreign);
         let mut tried_reflected = false;
         // Track whether each operand's *own* `__ne__` slot actually ran.
         // `object.__ne__` (installed on every class) already derives from the
@@ -18030,17 +19090,30 @@ impl Interpreter {
         // `object.__ne__` returns a *bool* (`not result`), so this branch is
         // intrinsically boolean even when `__eq__` returned a non-bool.
         if matches!(op, CompareKind::NotEq) {
-            if !a_slot_ran {
-                if let Some(method) = self.cmp_method(a, "__eq__", globals) {
-                    let r = self.call(&method, std::slice::from_ref(b), &[], globals)?;
-                    if !r.is_same(&not_impl) {
-                        return Ok(Object::Bool(!r.is_truthy()));
-                    }
+            // Subclass priority applies to the derived `__ne__` too: in
+            // CPython every class carries `object.__ne__`, so when
+            // `type(b)` is a proper subclass of `type(a)` its
+            // (eq-derived) slot runs *first* — `IPv4Address(x) !=
+            // IPv4Interface(x/32)` must consult the interface's richer
+            // `__eq__` (test_ipaddress.test_mixed_type_equality).
+            let eq_reflected_first = !Rc::ptr_eq(&cls_b, &cls_a)
+                && cls_b.is_subclass_of(&cls_a)
+                && match (cls_b.lookup("__eq__"), cls_a.lookup("__eq__")) {
+                    (Some(mb), Some(ma)) => !mb.is_same(&ma),
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                };
+            let attempts = if eq_reflected_first {
+                [(b, a, b_slot_ran), (a, b, a_slot_ran)]
+            } else {
+                [(a, b, a_slot_ran), (b, a, b_slot_ran)]
+            };
+            for (x, y, slot_ran) in attempts {
+                if slot_ran {
+                    continue;
                 }
-            }
-            if !b_slot_ran {
-                if let Some(method) = self.cmp_method(b, "__eq__", globals) {
-                    let r = self.call(&method, std::slice::from_ref(a), &[], globals)?;
+                if let Some(method) = self.cmp_method(x, "__eq__", globals) {
+                    let r = self.call(&method, std::slice::from_ref(y), &[], globals)?;
                     if !r.is_same(&not_impl) {
                         return Ok(Object::Bool(!r.is_truthy()));
                     }
@@ -18325,6 +19398,9 @@ impl Interpreter {
                 };
                 let len = frame.stack.len();
                 frame.stack.truncate(len - 2);
+                // tracemalloc: the specialized concat is still a fresh str
+                // allocation.
+                self.record_alloc(&r);
                 frame.push(r);
                 specialize::record_hit(op_idx);
                 Ok(true)
@@ -18943,7 +20019,12 @@ impl Interpreter {
                                 {
                                     Some(std::mem::replace(slot, val))
                                 } else {
-                                    dict.insert(DictKey(Object::from_str(name.as_str())), val);
+                                    // Same interning contract as the slow
+                                    // path (`generic_setattr_instance`).
+                                    dict.insert(
+                                        DictKey(crate::stdlib::sys::intern_name(name.as_str())),
+                                        val,
+                                    );
                                     None
                                 }
                             };
@@ -19467,7 +20548,22 @@ impl Interpreter {
         op: CompareKind,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Option<bool>, RuntimeError> {
-        let (xs, ys): (Vec<Object>, Vec<Object>) = match (a, b) {
+        // A container-subclass instance without its own ordering dunder
+        // (we only get here after `rich_compare_obj` found none) orders as
+        // its native payload — CPython's `list_richcompare` runs for any
+        // `PyList_Check` operand, subclasses included. Elements still
+        // dispatch through the interpreter, so a per-element `__lt__` with
+        // side effects is honoured (test_sort.test_unsafe_object_compare).
+        fn unwrap_native(o: &Object) -> Object {
+            if let Object::Instance(inst) = o {
+                if let Some(n @ (Object::List(_) | Object::Tuple(_))) = inst.native.get() {
+                    return n.clone();
+                }
+            }
+            o.clone()
+        }
+        let (a, b) = (unwrap_native(a), unwrap_native(b));
+        let (xs, ys): (Vec<Object>, Vec<Object>) = match (&a, &b) {
             (Object::Tuple(xs), Object::Tuple(ys)) => {
                 (xs.iter().cloned().collect(), ys.iter().cloned().collect())
             }
@@ -19543,7 +20639,11 @@ impl Interpreter {
         name: &str,
         value: Object,
     ) -> Result<(), RuntimeError> {
-        if ty.flags.is_builtin {
+        // Struct-sequence types are the one "builtin" family CPython creates
+        // as *heap* types, so their attributes are assignable
+        // (test_structseq.test_reference_cycle stores an instance on its own
+        // type).
+        if ty.flags.is_builtin && !crate::stdlib::os::is_struct_seq_type(ty) {
             return Err(type_error(format!(
                 "cannot set '{name}' attribute of immutable type '{}'",
                 ty.name
@@ -19657,8 +20757,16 @@ impl Interpreter {
             // `property.__doc__` is a writable member in CPython
             // (`prop.__doc__ = "…"`); the accessor triple stays
             // immutable (replaced via `.getter/.setter/.deleter`).
+            // Writing it does *not* clear `getter_doc` — copies still
+            // re-harvest from a documented getter (docstring_copy2).
             Object::Property(p) if name == "__doc__" => {
                 *p.doc.borrow_mut() = value;
+                Ok(())
+            }
+            // `property.__name__` is writable (gh-101860): overrides the
+            // `__set_name__`-recorded / getter-derived name.
+            Object::Property(p) if name == "__name__" => {
+                *p.name.borrow_mut() = Some(value);
                 Ok(())
             }
             // `property.fget`/`fset`/`fdel` are read-only member descriptors
@@ -19723,7 +20831,36 @@ impl Interpreter {
                                 c.freevars.len()
                             )));
                         }
+                        // gh-91161: swapping a plain function's code for a
+                        // generator/coroutine code object (or vice versa)
+                        // is deprecated — the kinds must match.
+                        let kind =
+                            |c: &CodeObject| (c.is_generator, c.is_coroutine, c.is_async_generator);
+                        if kind(&f.code()) != kind(&c) {
+                            self.emit_deprecation_warning(
+                                "Assigning a code object of non-matching type is deprecated \
+                                 (e.g., from a generator to a plain function)"
+                                    .to_owned(),
+                            )?;
+                        }
                         *f.code.borrow_mut() = c;
+                        return Ok(());
+                    }
+                    // Read-only getsets (CPython `func_memberlist` /
+                    // getset table): assignment and deletion both raise.
+                    "__globals__" | "__closure__" | "__builtins__" => {
+                        return Err(attribute_error("readonly attribute"));
+                    }
+                    // `func_set_dict`: the assigned dict is *aliased*, not
+                    // copied (`f.__dict__ is d` — test_funcattrs).
+                    "__dict__" => {
+                        let Object::Dict(d) = value else {
+                            return Err(type_error(format!(
+                                "__dict__ must be set to a dictionary, not a '{}'",
+                                value.type_name()
+                            )));
+                        };
+                        *f.attrs.borrow_mut() = d;
                         return Ok(());
                     }
                     "__defaults__" if !matches!(value, Object::Tuple(_) | Object::None) => {
@@ -19739,7 +20876,7 @@ impl Interpreter {
                         return Err(type_error("__annotations__ must be set to a dict object"));
                     }
                     "__type_params__" if !matches!(value, Object::Tuple(_)) => {
-                        return Err(type_error("__type_params__ must be set to a tuple object"));
+                        return Err(type_error("__type_params__ must be set to a tuple"));
                     }
                     _ => {}
                 }
@@ -19748,7 +20885,7 @@ impl Interpreter {
                 if crate::object::is_function_slot(name) {
                     f.set_slot(name, value);
                 } else {
-                    f.attrs
+                    f.attrs()
                         .borrow_mut()
                         .insert(DictKey(Object::from_str(name)), value);
                 }
@@ -19794,6 +20931,16 @@ impl Interpreter {
                             *tb.next.borrow_mut() = None;
                         }
                         Object::Traceback(next) => {
+                            // Reject cycles: CPython walks the new chain
+                            // and raises ValueError if `self` appears
+                            // (test_raise TestTracebackType.test_attrs).
+                            let mut cursor = Some(next.clone());
+                            while let Some(node) = cursor {
+                                if Rc::ptr_eq(&node, tb) {
+                                    return Err(value_error("traceback loop detected"));
+                                }
+                                cursor = node.next.borrow().clone();
+                            }
                             *tb.next.borrow_mut() = Some(next);
                         }
                         other => {
@@ -19883,6 +21030,13 @@ impl Interpreter {
                     f.set_name(value.clone());
                     Ok(())
                 }
+                // `mode`/`closed`/`closefd` are read-only getsets on CPython's
+                // io types — assignment is an AttributeError, never a silent
+                // instance-dict shadow (test_fileio `testAttributes`).
+                "mode" | "closed" | "closefd" => Err(attribute_error(format!(
+                    "attribute '{name}' of '{}' objects is not writable",
+                    obj.type_name()
+                ))),
                 // CPython's file objects carry a `__dict__`, so user code can
                 // assign arbitrary attributes (and monkeypatch methods) on a
                 // live stream. Store them per-instance; `load_attr` checks this
@@ -19917,6 +21071,14 @@ impl Interpreter {
                     "'builtin_function_or_method' object has no attribute '{name}'"
                 ))),
             },
+            // Bound methods have no `__dict__` and no writable attributes;
+            // arbitrary metadata must be set on `m.__func__` (CPython
+            // `PyMethod_Type` generic setattr — test_funcattrs).
+            Object::BoundMethod(_) => Err(bound_method_readonly_error(name, false)),
+            // `range.start/stop/step` are read-only members; assigning them
+            // raises `AttributeError: readonly attribute` — never TypeError
+            // (test_range.test_attributes).
+            Object::Range(_) => Err(range_attr_write_error(name)),
             _ => Err(type_error(format!(
                 "'{}' object has no attribute '{}'",
                 obj.type_name(),
@@ -20042,10 +21204,17 @@ impl Interpreter {
         if matches!(name, "args" | "__traceback__" | "__cause__" | "__context__")
             && inst.cls().mro.borrow().iter().any(|t| t.name == "BaseException")
             // A subclass data descriptor (e.g. a property named `args`)
-            // shadows the BaseException getset, like any MRO lookup.
+            // shadows the BaseException getset, like any MRO lookup. The
+            // BaseException pseudo-slot descriptors themselves (the ones
+            // carrying getset defaults) are exactly what this branch
+            // implements, so they don't suppress it.
             && !matches!(
                 inst.cls().lookup(name),
-                Some(Object::Property(_) | Object::Instance(_) | Object::SlotDescriptor(_))
+                Some(Object::Property(_) | Object::Instance(_))
+            )
+            && !matches!(
+                inst.cls().lookup(name),
+                Some(Object::SlotDescriptor(sd)) if sd.default.is_none()
             )
         {
             let value = match name {
@@ -20076,16 +21245,12 @@ impl Interpreter {
                     value
                 }
             };
-            let mut dict = inst.dict.borrow_mut();
             // Setting `__cause__` implicitly suppresses the context in
             // tracebacks (PEP 415 — `raise X from Y` semantics).
             if name == "__cause__" {
-                dict.insert(
-                    DictKey(Object::from_static("__suppress_context__")),
-                    Object::Bool(true),
-                );
+                inst.slot_set("__suppress_context__", Object::Bool(true));
             }
-            dict.insert(DictKey(Object::from_str(name)), value);
+            inst.slot_set(name, value);
             return Ok(());
         }
         // `obj.__class__ = C` (CPython `object_set_class`): re-point the
@@ -20182,19 +21347,16 @@ impl Interpreter {
                         // Python-level `property`.
                         let native_getset = matches!(&prop.fget(), Object::Builtin(b)
                             if crate::descr_registry::is_native_descr_accessor(b));
-                        return Err(attribute_error(if native_getset {
-                            format!(
+                        if native_getset {
+                            return Err(attribute_error(format!(
                                 "attribute '{}' of '{}' objects is not writable",
                                 name,
                                 inst.cls().name
-                            )
-                        } else {
-                            format!(
-                                "property '{}' of '{}' object has no setter",
-                                name,
-                                inst.cls().name
-                            )
-                        }));
+                            )));
+                        }
+                        return Err(crate::builtins::property_unreachable_error(
+                            prop, obj, "setter",
+                        ));
                     }
                     let setter = prop.fset();
                     self.call_descriptor_accessor(
@@ -20205,12 +21367,17 @@ impl Interpreter {
                     )?;
                     return Ok(());
                 }
-                Object::SlotDescriptor(_) => {
+                Object::SlotDescriptor(sd) => {
                     if name == "__weakref__" {
                         return Err(attribute_error(format!(
                             "attribute '__weakref__' of '{}' objects is not writable",
                             inst.cls().name
                         )));
+                    }
+                    if sd.readonly {
+                        // CPython `Py_READONLY` member set: structmember's
+                        // fixed message.
+                        return Err(attribute_error("readonly attribute".to_owned()));
                     }
                     inst.slot_set(name, value);
                     return Ok(());
@@ -20260,10 +21427,14 @@ impl Interpreter {
         // `insert` returns the value this store displaces; reap it if the
         // slot held its last live binding, mirroring CPython's decref of the
         // previous attribute value (see `maybe_prompt_reap_replaced`).
+        // The key goes through the intern pool, as in CPython's
+        // `PyObject_SetAttr` (`PyUnicode_InternInPlace` on the name), so
+        // attribute keys of independently built instances are `is`-equal
+        // to each other and to `sys.intern(...)` results.
         let old = inst
             .dict
             .borrow_mut()
-            .insert(DictKey(Object::from_str(name)), value);
+            .insert(DictKey(crate::stdlib::sys::intern_name(name)), value);
         if let Some(old) = old {
             self.maybe_prompt_reap_replaced(old);
         }
@@ -20361,7 +21532,37 @@ impl Interpreter {
             // (CPython raises AttributeError — not TypeError — when
             // absent; `functools.update_wrapper` probes with delete).
             Object::Function(f) => {
+                match name {
+                    // Deleting a required getset mirrors setting it to an
+                    // invalid value in CPython (the setter is called with
+                    // NULL and rejects the type).
+                    "__name__" | "__qualname__" => {
+                        return Err(type_error(format!("{name} must be set to a string object")));
+                    }
+                    "__code__" => {
+                        return Err(type_error("__code__ must be set to a code object"));
+                    }
+                    "__type_params__" => {
+                        return Err(type_error("__type_params__ must be set to a tuple"));
+                    }
+                    "__dict__" => {
+                        return Err(type_error("cannot delete __dict__"));
+                    }
+                    "__globals__" | "__closure__" | "__builtins__" => {
+                        return Err(attribute_error("readonly attribute"));
+                    }
+                    _ => {}
+                }
                 if crate::object::is_function_slot(name) {
+                    // `del f.__defaults__` / `__kwdefaults__` *clears* the
+                    // value (subsequent reads yield None and calls see no
+                    // defaults) — store an explicit None override so the
+                    // compiled tuple stops resurfacing (test_funcattrs
+                    // test_func_default_args).
+                    if matches!(name, "__defaults__" | "__kwdefaults__") {
+                        f.set_slot(name, Object::None);
+                        return Ok(());
+                    }
                     // CPython allows deleting the nullable slots
                     // (`__doc__`, `__annotations__`, …): the value
                     // resets so the computed default resurfaces.
@@ -20371,7 +21572,7 @@ impl Interpreter {
                     return Ok(());
                 }
                 let removed = f
-                    .attrs
+                    .attrs()
                     .borrow_mut()
                     .shift_remove(&DictKey(Object::from_str(name)))
                     .is_some();
@@ -20393,8 +21594,17 @@ impl Interpreter {
                 if f.delete_extra_attr(name) {
                     return Ok(());
                 }
-                if name == "name" && f.clear_name_override() {
-                    return Ok(());
+                // `del f.name`: CPython's FileIO stores `name` in the instance
+                // dict (init does `PyObject_SetAttr(self, 'name', ...)`), so it
+                // is deletable — repr then falls back to `fd=N` (test_fileio
+                // `testRepr`). Deleting an already-deleted name (or a memory
+                // stream's absent one) is an AttributeError.
+                if name == "name" {
+                    let had_override = f.clear_name_override();
+                    if had_override || (!f.is_memory() && !f.no_name.get()) {
+                        f.no_name.set(true);
+                        return Ok(());
+                    }
                 }
                 Err(attribute_error(format!(
                     "'{}' object has no attribute '{}'",
@@ -20402,6 +21612,10 @@ impl Interpreter {
                     name
                 )))
             }
+            // Same taxonomy as assignment: methods carry no `__dict__`.
+            Object::BoundMethod(_) => Err(bound_method_readonly_error(name, true)),
+            // `del range(...).start` raises like assignment (readonly member).
+            Object::Range(_) => Err(range_attr_write_error(name)),
             _ => Err(type_error(format!(
                 "'{}' object has no attribute '{}'",
                 obj.type_name(),
@@ -20449,7 +21663,15 @@ impl Interpreter {
                 .any(|t| t.name == "BaseException")
             && !matches!(
                 inst.cls().lookup(name),
-                Some(Object::Property(_) | Object::Instance(_) | Object::SlotDescriptor(_))
+                Some(Object::Property(_) | Object::Instance(_))
+            )
+            // A *real* `__slots__` member (no default) shadowing the
+            // getset belongs to the user class and stays deletable;
+            // the BaseException pseudo-slot descriptors themselves
+            // (default present) reject deletion like CPython's setters.
+            && !matches!(
+                inst.cls().lookup(name),
+                Some(Object::SlotDescriptor(sd)) if sd.default.is_none()
             )
         {
             return Err(type_error(format!("{name} may not be deleted")));
@@ -20474,11 +21696,9 @@ impl Interpreter {
             match &attr {
                 Object::Property(prop) => {
                     if matches!(prop.fdel(), Object::None) {
-                        return Err(attribute_error(format!(
-                            "property '{}' of '{}' object has no deleter",
-                            name,
-                            inst.cls().name
-                        )));
+                        return Err(crate::builtins::property_unreachable_error(
+                            prop, obj, "deleter",
+                        ));
                     }
                     let deleter = prop.fdel();
                     self.call(
@@ -20490,6 +21710,9 @@ impl Interpreter {
                     return Ok(());
                 }
                 Object::SlotDescriptor(slot) => {
+                    if slot.readonly {
+                        return Err(attribute_error("readonly attribute".to_owned()));
+                    }
                     if inst.slot_del(&slot.name) {
                         return Ok(());
                     }
@@ -20676,6 +21899,21 @@ impl Interpreter {
             // unnecessary.
             Object::Slice(_) if matches!(container, Object::Range(_)) => index,
             Object::Slice(s) if is_sequence && slice_needs_resolution(s) => {
+                // For a memoryview, CPython checks the released flag *before*
+                // evaluating the slice bounds; a bound `__index__` that
+                // releases the view mid-subscript must still yield a working
+                // sub-view (gh-92888, test_memoryview.test_use_released_memory)
+                // — so slice and return here, bypassing the arm's (now stale)
+                // released check.
+                if let Object::MemoryView(mv) = container {
+                    if mv.released.get() {
+                        return Err(value_error(
+                            "operation forbidden on released memoryview object",
+                        ));
+                    }
+                    let resolved = resolve_slice_ints(s)?;
+                    return mv_slice_subview(mv, &resolved);
+                }
                 coerced_index = Object::Slice(Rc::new(resolve_slice_ints(s)?));
                 &coerced_index
             }
@@ -20693,7 +21931,10 @@ impl Interpreter {
                     None => index,
                 }
             }
-            Object::Long(_) if is_sequence => {
+            // A range is indexable past ssize_t (`range(-maxsize,
+            // maxsize)[maxsize + 1]` — test_large_range); its own arm
+            // below handles the big index at full width.
+            Object::Long(_) if is_sequence && !matches!(container, Object::Range(_)) => {
                 return Err(index_error("cannot fit 'int' into an index-sized integer"))
             }
             _ => index,
@@ -20767,22 +22008,34 @@ impl Interpreter {
                     .collect();
                 Ok(Object::str_from_codepoints(out))
             }
-            (Object::Range(r), Object::Int(i)) => {
-                let len = container.len()? as i64;
-                let idx = if *i < 0 { i.saturating_add(len) } else { *i };
-                if idx < 0 || idx >= len {
+            (Object::Range(r), Object::Int(_) | Object::Long(_)) => {
+                // Full-width arithmetic: `Object::len()` raises
+                // OverflowError past ssize_t, but indexing a
+                // longer-than-ssize_t range is fine
+                // (`range(-maxsize, maxsize)[maxsize + 1]`,
+                // `range(0, maxsize**10, 2*maxsize)[maxsize + 1]` —
+                // test_large_range).
+                use num_bigint::BigInt;
+                let len = crate::object::range_len_bigint(r);
+                let i = match index {
+                    Object::Int(i) => BigInt::from(*i),
+                    Object::Long(b) => (**b).clone(),
+                    _ => unreachable!("arm matches Int | Long"),
+                };
+                let zero = BigInt::from(0);
+                let idx = if i < zero { i + &len } else { i };
+                if idx < zero || idx >= len {
                     return Err(index_error("range object index out of range"));
                 }
-                Ok(crate::object::int_from_i128(
-                    r.start + i128::from(idx) * r.step,
-                ))
+                let (start, _, step) = r.bounds();
+                Ok(Object::int_from_bigint(start + idx * step))
             }
             (Object::Range(r), Object::Slice(slc)) => {
                 // Full-width length: `range(2**100)[s]` must slice
                 // exactly (`len()` would truncate/overflow — CPython's
                 // `compute_slice` works on PyLongs; test_slice
                 // test_indices sweeps ±2**100).
-                let len = crate::object::range_len_i128(r);
+                let len = crate::object::range_len_bigint(r);
                 range_slice(r, len, slc)
             }
             (Object::Bytes(buf), Object::Int(i)) => {
@@ -20845,8 +22098,44 @@ impl Interpreter {
                 let idx = normalize_index(*i, bytes.len())?;
                 Ok(Object::Int(i64::from(bytes[idx])))
             }
-            (Object::MemoryView(mv), Object::Slice(slc)) => {
+            // Multi-dimensional element access: `m[i, j]` on a
+            // `cast(shape=…)` view (CPython `memory_subscript` →
+            // `ptr_from_tuple`). Indices are coerced *first* — an
+            // `__index__` that releases the view mid-subscript gets the
+            // released ValueError afterwards (gh-92888,
+            // test_memoryview.test_use_released_memory).
+            (Object::MemoryView(mv), Object::Tuple(t)) => {
+                let mut idxs = Vec::with_capacity(t.len());
+                for k in t.iter() {
+                    idxs.push(crate::builtins::coerce_index_i64(k)?);
+                }
                 if mv.released.get() {
+                    return Err(value_error(
+                        "operation forbidden on released memoryview object",
+                    ));
+                }
+                let shape = mv.shape_dims();
+                if idxs.len() != shape.len() {
+                    return Err(type_error(format!(
+                        "cannot index {}-dimension view with {}-element tuple",
+                        shape.len(),
+                        idxs.len()
+                    )));
+                }
+                let strides = mv.stride_bytes();
+                let mut off = mv.start.get() as isize;
+                for ((&i, &dim), &stride) in idxs.iter().zip(&shape).zip(&strides) {
+                    let idx = normalize_index(i, dim)?;
+                    off += idx as isize * stride;
+                }
+                let itemsize = mv.itemsize.get().max(1);
+                let off = off as usize;
+                let fmt = mv_format_char(&mv.format.borrow());
+                mv.buffer
+                    .with_read(|all| mv_unpack_single(fmt, &all[off..off + itemsize]))
+            }
+            (Object::MemoryView(mv), Object::Slice(slc)) => {
+                if mv.released.get() || mv.restricted.get() {
                     return Err(value_error(
                         "operation forbidden on released memoryview object",
                     ));
@@ -20856,29 +22145,7 @@ impl Interpreter {
                 // later `tobytes()`/buffer export reflects the stride. Slicing
                 // adjusts the first dimension; trailing dimensions (from
                 // `cast(shape=…)`) ride along unchanged.
-                let shape = mv.shape_dims();
-                let strides = mv.stride_bytes();
-                let n = shape[0] as i64;
-                let (start_i, _stop, step, slicelen) = adjust_slice(n, slc)?;
-                let itemsize = mv.itemsize.get();
-                let stride0 = strides[0];
-                let base = mv.start.get() as isize;
-                let new_start = if slicelen > 0 {
-                    base + start_i as isize * stride0
-                } else {
-                    base
-                };
-                let mut new_shape = shape;
-                new_shape[0] = slicelen.max(0) as usize;
-                let mut new_strides = strides;
-                new_strides[0] = stride0 * step as isize;
-                let nbytes = new_shape.iter().product::<usize>() * itemsize;
-                let sub = mv.shallow_clone();
-                sub.start.set(new_start.max(0) as usize);
-                sub.len.set(nbytes);
-                *sub.shape.borrow_mut() = new_shape;
-                *sub.strides.borrow_mut() = new_strides;
-                Ok(Object::MemoryView(Rc::new(sub)))
+                mv_slice_subview(mv, slc)
             }
             (Object::MappingProxy(d), key) => {
                 // Borrow released before the KeyError repr (see Dict arm).
@@ -20899,6 +22166,12 @@ impl Interpreter {
                     .cloned()
                     .ok_or_else(|| key_error(key.repr()))
             }
+            // CPython `unicode_subscript`: the index type is *quoted*, and
+            // there's no "or slices" ('abc'['def'] — test_userstring).
+            (Object::Str(_) | Object::WStr(_), other) => Err(type_error(format!(
+                "string indices must be integers, not '{}'",
+                other.type_name()
+            ))),
             (Object::Bytes(_), other) => Err(type_error(format!(
                 "byte indices must be integers or slices, not {}",
                 other.type_name()
@@ -21160,6 +22433,13 @@ impl Interpreter {
                 let fmt = mv_format_char(&mv.format.borrow());
                 let mut packed = vec![0u8; itemsize];
                 mv_pack_single(fmt, &value, &mut packed)?;
+                // The value's `__index__`/`__float__` may have released the
+                // view (gh-92888) — never write through a released view.
+                if mv.released.get() {
+                    return Err(value_error(
+                        "operation forbidden on released memoryview object",
+                    ));
+                }
                 let stride0 = mv.stride_bytes()[0];
                 let off = (mv.start.get() as isize + idx as isize * stride0) as usize;
                 mv.buffer
@@ -21201,12 +22481,15 @@ impl Interpreter {
                         }
                         src.to_bytes()
                     }
-                    other => {
-                        return Err(type_error(format!(
+                    // Any other buffer-protocol exporter (`array.array`, a
+                    // PEP 688 `__buffer__` class) supplies its bytes
+                    // (test_memoryview.test_array_assign: `m[:] = new_a`).
+                    other => crate::builtins::bytes_argview(other).map_err(|_| {
+                        type_error(format!(
                             "a bytes-like object is required, not '{}'",
                             other.type_name()
-                        )))
-                    }
+                        ))
+                    })?,
                 };
                 if src.len() != slicelen as usize * itemsize {
                     return Err(value_error(
@@ -21225,6 +22508,71 @@ impl Interpreter {
                         }
                     })
                     .ok_or_else(|| type_error("cannot modify read-only memory"))
+            }
+            // Multi-dimensional element assignment: `m[i, j] = x` on a
+            // `cast(shape=…)` view. Indices coerce first; a released view
+            // (including one released *by* an `__index__`, gh-92888) then
+            // refuses with ValueError.
+            (Object::MemoryView(mv), Object::Tuple(t))
+                if !t.is_empty() && !t.iter().any(|k| matches!(k, Object::Slice(_))) =>
+            {
+                let mut idxs = Vec::with_capacity(t.len());
+                for k in t.iter() {
+                    idxs.push(crate::builtins::coerce_index_i64(k)?);
+                }
+                if mv.released.get() {
+                    return Err(value_error(
+                        "operation forbidden on released memoryview object",
+                    ));
+                }
+                if mv.readonly.get() {
+                    return Err(type_error("cannot modify read-only memory"));
+                }
+                let shape = mv.shape_dims();
+                if idxs.len() != shape.len() {
+                    return Err(type_error(format!(
+                        "cannot index {}-dimension view with {}-element tuple",
+                        shape.len(),
+                        idxs.len()
+                    )));
+                }
+                let strides = mv.stride_bytes();
+                let mut off = mv.start.get() as isize;
+                for ((&i, &dim), &stride) in idxs.iter().zip(&shape).zip(&strides) {
+                    let idx = normalize_index(i, dim)?;
+                    off += idx as isize * stride;
+                }
+                let itemsize = mv.itemsize.get().max(1);
+                let off = off as usize;
+                let fmt = mv_format_char(&mv.format.borrow());
+                let mut packed = vec![0u8; itemsize];
+                mv_pack_single(fmt, &value, &mut packed)?;
+                // Re-check: the value conversion may have released the view.
+                if mv.released.get() {
+                    return Err(value_error(
+                        "operation forbidden on released memoryview object",
+                    ));
+                }
+                mv.buffer
+                    .with_write(|all| all[off..off + itemsize].copy_from_slice(&packed))
+                    .ok_or_else(|| type_error("cannot modify read-only memory"))
+            }
+            // A tuple key of all-slices is CPython's unimplemented
+            // multi-dimensional slice assignment (NotImplementedError,
+            // test_memoryview.test_setitem_writable); any other tuple —
+            // mixed int/slice or wrong arity — and every non-index key stay
+            // TypeError.
+            (Object::MemoryView(_), Object::Tuple(t))
+                if !t.is_empty() && t.iter().all(|k| matches!(k, Object::Slice(_))) =>
+            {
+                Err(RuntimeError::PyException(crate::error::PyException::new(
+                    crate::builtin_types::make_exception_with_class(
+                        crate::builtin_types::builtin_types()
+                            .not_implemented_error
+                            .clone(),
+                        "memoryview slice assignments are currently restricted to ndim = 1",
+                    ),
+                )))
             }
             (Object::MemoryView(_), other) => Err(type_error(format!(
                 "memoryview: invalid slice key: {}",
@@ -21377,6 +22725,7 @@ impl Interpreter {
                         | "all"
                         | "anext"
                         | "any"
+                        | "ascii"
                         | "bool"
                         | "breakpoint"
                         | "complex"
@@ -21416,6 +22765,10 @@ impl Interpreter {
                         | "sum"
                         | "tuple"
                         | "update"
+                        // `dict.__init__` merges positional + keyword args
+                        // like `update` (routed below); other `__init__`
+                        // builtins fall through unchanged.
+                        | "__init__"
                         | "vars"
                         | "zip"
                         | "open"
@@ -21568,6 +22921,9 @@ impl Interpreter {
                     if b.name == "repr" && args.len() == 1 {
                         return self.do_repr_call(&args[0], outer_globals);
                     }
+                    if b.name == "ascii" && args.len() == 1 {
+                        return self.do_ascii_call(&args[0], outer_globals);
+                    }
                     if b.name == "len" && args.len() == 1 {
                         return self.do_len_call(&args[0], outer_globals);
                     }
@@ -21615,18 +22971,10 @@ impl Interpreter {
                         match &args[0] {
                             Object::Bytes(_) | Object::ByteArray(_) | Object::MemoryView(_) => {}
                             other => {
-                                if let Some(method) = instance_method(other, "__buffer__") {
-                                    let view =
-                                        self.call(&method, &[Object::Int(0)], &[], outer_globals)?;
-                                    // `__buffer__` returns a memoryview; adopt it
-                                    // directly so writes land in its buffer. The
-                                    // *exporter* is the instance the caller handed
-                                    // in (`mv.obj is a`, not `a._buf`).
-                                    if let Object::MemoryView(v) = &view {
-                                        v.exporter.replace(Some(other.clone()));
-                                        return Ok(view);
-                                    }
-                                    return builtins::b_memoryview(std::slice::from_ref(&view));
+                                if let Some(view) =
+                                    self.memoryview_via_buffer_protocol(other, outer_globals)?
+                                {
+                                    return Ok(view);
                                 }
                             }
                         }
@@ -21710,6 +23058,28 @@ impl Interpreter {
                                     Object::Bytes(_) | Object::ByteArray(_) | Object::MemoryView(_)
                                 );
                             if !bytes_like {
+                                // A str is iterable but not an acceptable
+                                // byte source (`int.from_bytes("", 'big')` is
+                                // a TypeError, test_long.test_from_bytes) —
+                                // reject before materializing its characters.
+                                if matches!(data, Object::Str(_) | Object::WStr(_)) {
+                                    return Err(type_error("cannot convert 'str' object to bytes"));
+                                }
+                                // CPython converts through `PyObject_Bytes`,
+                                // so a `__bytes__` hook wins over iteration
+                                // (test_long: `int.from_bytes(ValidBytes())`).
+                                if let Some(m) = instance_method(data, "__bytes__") {
+                                    let b = self.call(&m, &[], &[], outer_globals)?;
+                                    if b.as_bytes_view().is_none() {
+                                        return Err(type_error(format!(
+                                            "__bytes__ returned non-bytes (type {})",
+                                            b.type_name()
+                                        )));
+                                    }
+                                    let mut new_args = args.to_vec();
+                                    new_args[off] = b;
+                                    return invoke(&new_args);
+                                }
                                 let items = self.collect_iterable(data, outer_globals)?;
                                 let mut new_args = args.to_vec();
                                 new_args[off] = Object::new_tuple(items);
@@ -21821,9 +23191,9 @@ impl Interpreter {
                         // is an alias for `locals()`). At module / class /
                         // exec scope this *is* the module dict; in
                         // function scope it's a fresh dict snapshot of
-                        // the locals.
+                        // the locals (PEP 667).
                         if let Some(top) = self.frame_stack.borrow().last() {
-                            return Ok(top.locals());
+                            return Ok(top.locals_snapshot());
                         }
                         return Ok(Object::Dict(outer_globals.clone()));
                     }
@@ -21915,13 +23285,18 @@ impl Interpreter {
                                 )));
                             }
                         }
+                        // A wide string (lone surrogates, e.g. pickling an
+                        // object whose `__module__` is 'x\udbff' —
+                        // test_pickle test_nonencodable_module_name_error) is
+                        // still a `str`; the lookup below simply won't find a
+                        // frozen/disk module and raises ModuleNotFoundError.
                         let name = match args.first() {
-                            Some(Object::Str(s)) => s.to_string(),
+                            Some(s @ (Object::Str(_) | Object::WStr(_))) => s.to_str(),
                             Some(_) => {
                                 return Err(type_error("__import__() argument 1 must be str"))
                             }
                             None => match kwarg("name") {
-                                Some(Object::Str(s)) => s.to_string(),
+                                Some(s @ (Object::Str(_) | Object::WStr(_))) => s.to_str(),
                                 _ => return Err(type_error("__import__() argument 1 must be str")),
                             },
                         };
@@ -22027,6 +23402,11 @@ impl Interpreter {
                         // chains settle, and sum the per-pass counts — a
                         // non-resurrected finalizable object is reclaimed (and
                         // counted) in the follow-up pass, matching CPython.
+                        // bpo-44466: faulthandler marks the current thread
+                        // "Garbage-collecting" while a collection runs —
+                        // including the finalizer drains below, which is when
+                        // a crashing `__del__` is actually on the stack.
+                        gc_trace::set_collect_finalizer_phase(true);
                         let mut collected = gc_trace::collect_upto(generation);
                         for _ in 0..gc_trace::MAX_COLLECT_PASSES {
                             let ran = self.run_pending_finalizers();
@@ -22039,6 +23419,7 @@ impl Interpreter {
                                 break;
                             }
                         }
+                        gc_trace::set_collect_finalizer_phase(false);
                         // The collector parks uncollectable / DEBUG_SAVEALL
                         // objects in a Rust-side buffer (it can't touch the
                         // interpreter). Move them into the Python-visible
@@ -22202,8 +23583,12 @@ impl Interpreter {
                     // route dict receivers here instead of the native builtin.
                     // A dict-*subclass* receiver (`super().update(...)` inside
                     // `Counter.update`) carries its storage in the instance's
-                    // native payload; route it the same way.
-                    if b.name == "update"
+                    // native payload; route it the same way. `dict.__init__`
+                    // has the same signature/semantics as `update` (CPython
+                    // `dict_init`), including keyword arguments — direct
+                    // `d.__init__([...], g=7)` calls must merge, not clear
+                    // (test_ordered_dict.CPythonBuiltinDictTests.test_init).
+                    if (b.name == "update" || b.name == "__init__")
                         && (matches!(args.first(), Some(Object::Dict(_)))
                             || matches!(
                                 args.first(),
@@ -22218,6 +23603,20 @@ impl Interpreter {
                     // (`dir(SomeEnum)` → `EnumType.__dir__`). CPython sorts
                     // the result.
                     if b.name == "dir" && args.len() == 1 {
+                        // CPython `module_dir` for native modules: a dict-level
+                        // `__dir__` callable overrides the key listing
+                        // (test_module.test_module_dir / test_module_dir_errors;
+                        // a non-callable entry is the caller's TypeError).
+                        if let Object::Module(m) = &args[0] {
+                            let custom = m
+                                .dict
+                                .borrow()
+                                .get(&DictKey(Object::from_static("__dir__")))
+                                .cloned();
+                            if let Some(dirfunc) = custom {
+                                return self.call(&dirfunc, &[], &[], outer_globals);
+                            }
+                        }
                         // CPython `module_dir`: a module (or module subclass
                         // instance) reports the keys of its own `__dict__`,
                         // not the type-MRO namespace `object.__dir__` walks.
@@ -22283,17 +23682,19 @@ impl Interpreter {
                     // The bare builtins write straight to the instance dict and
                     // would silently bypass all of that.
                     if b.name == "setattr" && args.len() == 3 {
-                        let name = match &args[1] {
-                            Object::Str(s) => s.to_string(),
-                            _ => return Err(type_error("attribute name must be string")),
+                        // `attr_name_of` also accepts a str *subclass* name
+                        // (test_str.test_str_subclass_attr).
+                        let name = match crate::attr_name_of(&args[1]) {
+                            Some(n) => n,
+                            None => return Err(type_error("attribute name must be string")),
                         };
                         self.store_attr(&args[0], &name, args[2].clone())?;
                         return Ok(Object::None);
                     }
                     if b.name == "delattr" && args.len() == 2 {
-                        let name = match &args[1] {
-                            Object::Str(s) => s.to_string(),
-                            _ => return Err(type_error("attribute name must be string")),
+                        let name = match crate::attr_name_of(&args[1]) {
+                            Some(n) => n,
+                            None => return Err(type_error("attribute name must be string")),
                         };
                         self.delete_attr(&args[0], &name)?;
                         return Ok(Object::None);
@@ -22419,8 +23820,11 @@ impl Interpreter {
                             std::backtrace::Backtrace::force_capture()
                         );
                     }
+                    // CPython (`_PyArg_NoKeywords` and friends):
+                    // `id(1, **{'foo': 1})` → "id() takes no keyword
+                    // arguments" (test_extcall).
                     return Err(type_error(format!(
-                        "builtin '{}' does not accept keyword arguments",
+                        "{}() takes no keyword arguments",
                         b.name
                     )));
                 }
@@ -22813,13 +24217,8 @@ impl Interpreter {
                 match &args[0] {
                     Object::Bytes(_) | Object::ByteArray(_) | Object::MemoryView(_) => {}
                     other => {
-                        if let Some(method) = instance_method(other, "__buffer__") {
-                            let view = self.call(&method, &[Object::Int(0)], &[], &globals)?;
-                            if let Object::MemoryView(v) = &view {
-                                v.exporter.replace(Some(other.clone()));
-                                return Ok(view);
-                            }
-                            return builtins::b_memoryview(std::slice::from_ref(&view));
+                        if let Some(view) = self.memoryview_via_buffer_protocol(other, &globals)? {
+                            return Ok(view);
                         }
                     }
                 }
@@ -22834,14 +24233,20 @@ impl Interpreter {
         }
         // `types.FunctionType(code, globals[, name[, argdefs[, closure]]])`.
         if Rc::ptr_eq(ty, &bt.function_) {
-            return Self::function_type_call(args, kwargs);
+            return self.function_type_call(args, kwargs);
         }
-        self.instantiate(ty.clone(), args, kwargs)
+        let obj = self.instantiate(ty.clone(), args, kwargs)?;
+        // tracemalloc: constructor calls (`list(it)`, `bytes(n)`, …) are
+        // allocations just like their literal forms; `track_new_object`
+        // ignores untrackable result types.
+        self.record_alloc(&obj);
+        Ok(obj)
     }
 
     /// Construct a function object from a code object — CPython's
     /// `func_new_impl`. Keyword forms mirror the positional ones.
     fn function_type_call(
+        &self,
         args: &[Object],
         kwargs: &[(String, Object)],
     ) -> Result<Object, RuntimeError> {
@@ -22927,16 +24332,20 @@ impl Interpreter {
             )));
         }
         // Resolve `func_builtins` from the supplied globals now
-        // (CPython's `PyFunction_New`), falling back to the running
-        // interpreter's dict for a bare `{}` globals so calls still see
-        // builtins. (No `self` here — `function_type_call` is a static
-        // type-constructor; the seed snapshot shares the same dict.)
+        // (CPython's `PyFunction_New` → `_PyEval_BuiltinsFromGlobals`).
+        // A globals dict *without* `__builtins__` inherits the *calling
+        // frame's* builtins — so `type(f)(f.__code__, {})` inside a
+        // sandboxed `exec(code, {'__builtins__': safe})` stays sandboxed
+        // (test_funcattrs test___builtins__ / bpo-42990).
         let builtins = match globals.borrow().get(&crate::object::StrKey("__builtins__")) {
             Some(Object::Dict(d)) => d.clone(),
             Some(Object::Module(m)) => m.dict.clone(),
-            _ => crate::vm_singletons::snapshot_interpreter()
-                .map(|i| i.builtins.clone())
-                .unwrap_or_default(),
+            _ => self
+                .frame_stack
+                .borrow()
+                .last()
+                .map(|f| f.builtins.clone())
+                .unwrap_or_else(|| self.builtins.clone()),
         };
         Ok(Object::Function(Rc::new(crate::object::PyFunction {
             name,
@@ -22946,7 +24355,7 @@ impl Interpreter {
             defaults,
             kw_defaults: vec![],
             closure,
-            attrs: Rc::new(RefCell::new(DictData::default())),
+            attrs: RefCell::new(Rc::new(RefCell::new(DictData::default()))),
             slots: RefCell::new(DictData::default()),
         })))
     }
@@ -23110,24 +24519,19 @@ impl Interpreter {
         kwds: &[(String, Object)],
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Option<Object>, RuntimeError> {
-        let prep = match metaclass.lookup("__prepare__") {
-            Some(p) => p,
-            None => return Ok(None),
+        // CPython fetches `__prepare__` with a plain `getattr(meta, …)`:
+        // the full descriptor protocol runs, so a classmethod binds to
+        // the metaclass, a staticmethod unwraps, a bare `def
+        // __prepare__(name, bases)` in the metaclass body comes back
+        // *unbound* (test_broken_class_namespace), and a descriptor
+        // whose `__get__` raises propagates that exception verbatim
+        // (test_metaclass's FailDescr → ObscureException).
+        let callable = match self.load_attr(&Object::Type(metaclass.clone()), "__prepare__") {
+            Ok(p) => p,
+            Err(e) if self.is_attribute_error(&e) => return Ok(None),
+            Err(e) => return Err(e),
         };
-        // `__prepare__` is conventionally a classmethod (bound to the
-        // metaclass), but CPython fetches it with plain `getattr`: a
-        // bare `def __prepare__(name, bases)` in the metaclass body is
-        // called *unbound* with just `(name, bases, **kwds)`
-        // (test_broken_class_namespace).
-        let (callable, prefix): (Object, Vec<Object>) = match &prep {
-            Object::ClassMethod(inner) => (inner.func(), vec![Object::Type(metaclass.clone())]),
-            Object::StaticMethod(inner) => (inner.func(), Vec::new()),
-            other => (other.clone(), Vec::new()),
-        };
-        let bases_tuple = bases_tuple.clone();
-        let mut call_args = prefix;
-        call_args.push(Object::from_str(name));
-        call_args.push(bases_tuple);
+        let call_args = vec![Object::from_str(name), bases_tuple.clone()];
         let result = self.call(&callable, &call_args, kwds, globals)?;
         // An *empty* plain dict means there's nothing to observe — keep the
         // fast path. A pre-populated dict (a `__prepare__` that seeds entries,
@@ -23726,35 +25130,57 @@ impl Interpreter {
         orig_bases: Option<&[Object]>,
         subclass_kwargs: &[(String, Object)],
     ) -> Result<Object, RuntimeError> {
-        let class_ns = Rc::new(RefCell::new(DictData::default()));
-        // PEP 3115: a non-`type` metaclass still has its `__prepare__` called
-        // (recorded by `BNotMeta.__prepare__` chaining through `super()` in
-        // test_metaclass). Seed the body namespace with whatever it returns.
-        if let Object::Type(mt) = &meta {
-            let bases_tuple = Object::new_tuple(bases.to_vec());
-            if let Some(prepared) = self.call_metaclass_prepare_tuple(
-                mt,
-                name,
-                &bases_tuple,
-                subclass_kwargs,
-                &body_fn.globals,
-            )? {
-                if let Object::Dict(d) = &prepared {
-                    *class_ns.borrow_mut() = d.borrow().clone();
+        let mut class_ns = Rc::new(RefCell::new(DictData::default()));
+        // PEP 3115: a non-`type` metaclass still has its `__prepare__`
+        // fetched — with plain `getattr`, so it works for *any* callable
+        // metaclass (test_metaclass sets a `__prepare__` attribute on a
+        // plain function meta) and any exception from the lookup
+        // propagates. A custom mapping it returns becomes the live body
+        // namespace, observed via `__setitem__` exactly as on the main
+        // path, and is later passed verbatim to the metaclass call.
+        let prep = match self.load_attr(&meta, "__prepare__") {
+            Ok(p) => Some(p),
+            Err(e) if self.is_attribute_error(&e) => None,
+            Err(e) => return Err(e),
+        };
+        let ns_obj: Option<Object> = match prep {
+            Some(p) => {
+                let bases_tuple = Object::new_tuple(bases.to_vec());
+                let result = self.call(
+                    &p,
+                    &[Object::from_str(name), bases_tuple],
+                    subclass_kwargs,
+                    &body_fn.globals,
+                )?;
+                match &result {
+                    // A plain dict *is* the namespace — adopt it (the
+                    // metaclass call below must receive the same object).
+                    Object::Dict(d) => {
+                        class_ns = d.clone();
+                        None
+                    }
+                    _ => Some(result),
                 }
             }
-        }
+            None => None,
+        };
         {
             // Only `__module__` is injected (see the main build path);
             // `__qualname__` is stored by the compiled class body itself.
-            let mut ns = class_ns.borrow_mut();
-            if let Some(m) = body_fn
+            let module_name = body_fn
                 .globals
                 .borrow()
                 .get(&DictKey(Object::from_static("__name__")))
-                .cloned()
-            {
-                ns.insert(DictKey(Object::from_static("__module__")), m);
+                .cloned();
+            if let Some(m) = module_name {
+                if let Some(obj) = &ns_obj {
+                    let g = body_fn.globals.clone();
+                    self.class_ns_store(obj, "__module__", m, &g)?;
+                } else {
+                    class_ns
+                        .borrow_mut()
+                        .insert(DictKey(Object::from_static("__module__")), m);
+                }
             }
         }
         let code = body_fn.code();
@@ -23765,7 +25191,11 @@ impl Interpreter {
             body_fn.globals.clone(),
             Some(body_fn.builtins.clone()),
         );
-        frame.class_namespace = Some(class_ns.clone());
+        if let Some(obj) = &ns_obj {
+            frame.class_namespace_obj = Some(obj.clone());
+        } else {
+            frame.class_namespace = Some(class_ns.clone());
+        }
         // PEP 695: seed any `__classdict__` cell (see the main build path).
         if let Some(i) = frame
             .code
@@ -23774,7 +25204,11 @@ impl Interpreter {
             .position(|c| c == "__classdict__")
         {
             if let Some(cell) = frame.cells.get(i) {
-                *cell.borrow_mut() = Object::Dict(class_ns.clone());
+                let mapping = match &ns_obj {
+                    Some(obj) => obj.clone(),
+                    None => Object::Dict(class_ns.clone()),
+                };
+                *cell.borrow_mut() = mapping;
             }
         }
         let _ = self.run_frame(&mut frame)?;
@@ -23785,16 +25219,26 @@ impl Interpreter {
         // the metaclass (typing's `_generic_init_subclass` relies on
         // it to tell `Generic[T]` from plain `Generic`).
         if let Some(ob) = orig_bases {
-            class_ns.borrow_mut().insert(
-                DictKey(Object::from_static("__orig_bases__")),
-                Object::new_tuple(ob.to_vec()),
-            );
+            let ob_tuple = Object::new_tuple(ob.to_vec());
+            if let Some(obj) = &ns_obj {
+                let g = body_fn.globals.clone();
+                self.class_ns_store(obj, "__orig_bases__", ob_tuple, &g)?;
+            } else {
+                class_ns
+                    .borrow_mut()
+                    .insert(DictKey(Object::from_static("__orig_bases__")), ob_tuple);
+            }
         }
 
+        // Hand the metaclass the *same* mapping `__prepare__` produced.
+        let ns_for_call = match &ns_obj {
+            Some(obj) => obj.clone(),
+            None => Object::Dict(class_ns),
+        };
         let call_args = vec![
             Object::from_str(name),
             Object::new_tuple(bases.to_vec()),
-            Object::Dict(class_ns),
+            ns_for_call,
         ];
         let result = self.call(&meta, &call_args, subclass_kwargs, &body_fn.globals)?;
         // PEP 3135: point any `__class__` cell at whatever the meta
@@ -24455,6 +25899,8 @@ impl Interpreter {
                 let desc = Object::SlotDescriptor(Rc::new(crate::object::SlotDescriptor {
                     name: slot_name.clone(),
                     class_name: ty.name.clone(),
+                    default: None,
+                    readonly: false,
                 }));
                 ty.dict
                     .borrow_mut()
@@ -24495,15 +25941,28 @@ impl Interpreter {
             // already provides one (any user class without slots, or a
             // slots class listing `__weakref__`) suppresses the new
             // descriptor.
-            let base_has_weakref = ty
-                .bases
-                .borrow()
-                .iter()
-                .any(|b| b.lookup("__weakref__").is_some());
+            let base_has_weakref = ty.bases.borrow().iter().any(|b| {
+                b.lookup("__weakref__").is_some()
+                    // Builtin bases with a `tp_weaklistoffset` of their own
+                    // (`type`, `set`, `bytearray`, `module`) already provide
+                    // weakref support without exposing a `__weakref__`
+                    // descriptor; CPython's `may_add_weak` suppresses the new
+                    // getset for their subclasses. Metaclasses are the
+                    // visible case: `SomeMeta.__weakref__` must *not* be a
+                    // data descriptor on the metaclass, or every
+                    // `SomeClass.__weakref__` read would bind to the class
+                    // object instead of returning the descriptor inherited
+                    // from the instance hierarchy (test_abstract_numbers'
+                    // `getattr(cls, name)` probes).
+                    || (b.flags.is_builtin
+                        && matches!(b.name.as_str(), "type" | "set" | "bytearray" | "module"))
+            });
             if !base_has_weakref {
                 let desc = Object::SlotDescriptor(Rc::new(crate::object::SlotDescriptor {
                     name: "__weakref__".to_owned(),
                     class_name: ty.name.clone(),
+                    default: None,
+                    readonly: false,
                 }));
                 ty.dict
                     .borrow_mut()
@@ -24532,6 +25991,8 @@ impl Interpreter {
                 let desc = Object::SlotDescriptor(Rc::new(crate::object::SlotDescriptor {
                     name: "__dict__".to_owned(),
                     class_name: ty.name.clone(),
+                    default: None,
+                    readonly: false,
                 }));
                 ty.dict
                     .borrow_mut()
@@ -24554,6 +26015,14 @@ impl Interpreter {
             })
             .collect();
         for (attr_name, value) in entries {
+            // `property.__set_name__` (3.13, gh-98963) records the
+            // attribute name for `prop.__name__` and error messages. The
+            // exact type short-circuits here; subclass instances run the
+            // full hook below.
+            if let Object::Property(p) = &value {
+                *p.name.borrow_mut() = Some(Object::from_str(&attr_name));
+                continue;
+            }
             if let Object::Instance(inst) = &value {
                 if let Some(hook) = inst.cls().lookup("__set_name__") {
                     let bound = Object::BoundMethod(Rc::new(BoundMethod::new(value.clone(), hook)));
@@ -25036,7 +26505,7 @@ impl Interpreter {
                 }
                 // `weakref.ref(target, callback=None)` — the type object
                 // doubles as the constructor, as in CPython.
-                "weakref" => {
+                "ReferenceType" => {
                     return crate::stdlib::weakref_real::construct_ref(args, kwargs);
                 }
                 // RFC 0039: `threading.Lock` is `_thread.LockType`, so
@@ -25089,6 +26558,11 @@ impl Interpreter {
                         frame: frame.clone(),
                         lineno: u32::try_from(*lineno).unwrap_or(0),
                         lasti: u32::try_from(*lasti).unwrap_or(0),
+                        // Explicit construction stores the given lasti
+                        // verbatim (test_raise TestTracebackType): it's
+                        // already a CPython-style byte offset, not a
+                        // WeavePy instruction index to remap on read.
+                        raw_lasti: Some(*lasti),
                         next: RefCell::new(next),
                     })));
                 }
@@ -25292,6 +26766,19 @@ impl Interpreter {
                         let bound = bind_str_args(args, kwargs)?;
                         return (builtin.call)(&bound);
                     }
+                    // `memoryview(object=ob)` — the single parameter is
+                    // positional-or-keyword (test_memoryview
+                    // test_constructor).
+                    if cls.name == "memoryview" {
+                        if let [(k, v)] = kwargs {
+                            if k == "object" && args.is_empty() {
+                                return (builtin.call)(std::slice::from_ref(v));
+                            }
+                        }
+                        return Err(type_error(
+                            "memoryview() takes no keyword arguments".to_owned(),
+                        ));
+                    }
                     return Err(type_error(format!(
                         "{}() does not accept keyword arguments",
                         cls.name
@@ -25300,12 +26787,19 @@ impl Interpreter {
                 return (builtin.call)(args);
             }
             if cls.flags.is_exception {
-                // PEP 654: `BaseExceptionGroup(msg, excs)` lowers to
-                // `ExceptionGroup` when every leaf is an `Exception`;
-                // nesting a BaseException inside an `ExceptionGroup`
-                // (subclass) is a TypeError.
-                let cls = crate::builtin_types::resolve_exception_group_class(cls.clone(), args)?;
-                let instance = self.build_exception_instance(cls.clone(), args);
+                // PEP 654: `BaseExceptionGroup(msg, excs)` goes through
+                // the full `BaseExceptionGroup.__new__` — argument
+                // validation, class lowering, `exceptions` freezing.
+                let instance = if cls
+                    .is_subclass_of(&crate::builtin_types::builtin_types().base_exception_group)
+                {
+                    let _interp_guard = crate::vm_singletons::publish_interpreter_ptr(
+                        std::ptr::from_mut::<Self>(self),
+                    );
+                    crate::builtin_types::exception_group_new(&cls, args)?
+                } else {
+                    self.build_exception_instance(cls.clone(), args)
+                };
                 // Keyword fields accepted by the builtin constructors:
                 // `AttributeError(name=, obj=)`, `NameError(name=)`,
                 // `ImportError(name=, path=, name_from=)` — mirroring
@@ -25330,9 +26824,11 @@ impl Interpreter {
                                     cls.name, k
                                 )));
                             }
-                            inst.dict
-                                .borrow_mut()
-                                .insert(DictKey(Object::from_str(k.clone())), v.clone());
+                            // These fields are exception pseudo-slots
+                            // (class-level slot descriptors), so the value
+                            // must land in the slot table — an instance-dict
+                            // entry would be shadowed by the descriptor.
+                            inst.slot_set(k, v.clone());
                         }
                     }
                 }
@@ -25420,7 +26916,30 @@ impl Interpreter {
                 // descriptors.
                 let native_desc: Option<Object> = match &plan.native {
                     crate::types::NativeKind::Plain => None,
-                    crate::types::NativeKind::Property => Some(builtins::construct_property(args)?),
+                    crate::types::NativeKind::Property => {
+                        // Bind CPython's keyword form (`fget=`/`fset=`/
+                        // `fdel=`/`doc=`) onto the positional layout;
+                        // unknown keywords are left to the subclass's own
+                        // `__init__` to accept or reject.
+                        let mut bound: Vec<Object> = args.to_vec();
+                        if !kwargs.is_empty() {
+                            bound.resize(4.max(bound.len()), Object::None);
+                            for (k, v) in kwargs {
+                                if let Some(idx) = match k.as_str() {
+                                    "fget" => Some(0),
+                                    "fset" => Some(1),
+                                    "fdel" => Some(2),
+                                    "doc" => Some(3),
+                                    _ => None,
+                                } {
+                                    if idx >= args.len() {
+                                        bound[idx] = v.clone();
+                                    }
+                                }
+                            }
+                        }
+                        Some(builtins::construct_property(&bound)?)
+                    }
                     // CPython `cm_new`: `__func__` is left `None` and set
                     // by `cm_init`; passing no callable here means a
                     // subclass with a non-chaining `__init__` keeps it
@@ -25455,16 +26974,19 @@ impl Interpreter {
                     }
                     None => Object::Instance(Rc::new(PyInstance::new(cls.clone()))),
                 };
+                // `construct_property` above ran CPython's *exact-type*
+                // init; a subclass instance keeps its doc on the instance
+                // itself instead (issue 41287 / gh-98963).
+                if matches!(plan.native, crate::types::NativeKind::Property) {
+                    builtins::property_relocate_subclass_doc(&inst)?;
+                }
                 // CPython `BaseException_new` seeds `.args` from the
                 // constructor positionals even when a subclass
                 // `__init__` never calls `super().__init__`
                 // (test_exceptions NaiveException).
                 if plan.seeds_exception_args {
                     if let Object::Instance(i) = &inst {
-                        i.dict.borrow_mut().insert(
-                            DictKey(Object::from_static("args")),
-                            Object::new_tuple(args.to_vec()),
-                        );
+                        i.slot_set("args", Object::new_tuple(args.to_vec()));
                     }
                 }
                 // RFC 0024: auto-track every fresh user instance with
@@ -25667,27 +27189,29 @@ impl Interpreter {
         let inst = PyInstance::new(cls.clone());
         // `OSError(errno, strerror, ...)` keeps only the first two
         // positionals in `args` (CPython `oserror_init`); everything
-        // else stores the full tuple.
+        // else stores the full tuple. Exception: a `BlockingIOError`
+        // whose numeric third arg became `characters_written` keeps the
+        // full tuple — CPython truncates only when a real *filename* is
+        // stored (test_io `_test_nonblock_pipe_write` reads `e.args[2]`).
         let is_os_error = mro_has("OSError");
-        let args_tuple = if is_os_error && (2..=5).contains(&args.len()) {
+        let written_from_filename = mro_has("BlockingIOError")
+            && args.len() == 3
+            && matches!(args[2], Object::Int(_) | Object::Long(_));
+        let args_tuple = if is_os_error && !written_from_filename && (2..=5).contains(&args.len()) {
             Object::new_tuple(args[..2].to_vec())
         } else {
             Object::new_tuple(args.to_vec())
         };
-        let mut dict = inst.dict.borrow_mut();
-        dict.insert(DictKey(Object::from_static("args")), args_tuple);
+        inst.slot_set("args", args_tuple);
         if let Some(first) = args.first() {
-            dict.insert(DictKey(Object::from_static("message")), first.clone());
+            inst.slot_set("message", first.clone());
         }
         // PEP 380: `StopIteration.value` is the first constructor arg
         // (or None). Generator `return` goes through
         // `stop_iteration_with`, but user code constructs
         // `StopIteration(x)` directly and reads `.value` too.
         if is_stop_iteration {
-            dict.insert(
-                DictKey(Object::from_static("value")),
-                args.first().cloned().unwrap_or(Object::None),
-            );
+            inst.slot_set("value", args.first().cloned().unwrap_or(Object::None));
         }
         // `SystemExit.code`: None for no args, the lone argument for
         // one, the whole tuple otherwise (CPython `SystemExit_init`).
@@ -25697,7 +27221,7 @@ impl Interpreter {
                 1 => args[0].clone(),
                 _ => Object::new_tuple(args.to_vec()),
             };
-            dict.insert(DictKey(Object::from_static("code")), code);
+            inst.slot_set("code", code);
         }
         if is_os_error {
             // CPython `oserror_init`: the named fields populate only for the
@@ -25707,20 +27231,28 @@ impl Interpreter {
             // remain visible through ordinary attribute lookup (asyncio's
             // add_signal_handler error tests). Type-level `None` defaults on
             // `OSError` cover the genuinely-unset case.
+            // `BlockingIOError(errno, strerror, n)` with a *numeric*
+            // third arg records it as `characters_written` and leaves
+            // `filename` unset (CPython `oserror_parse_args` —
+            // test_exception_hierarchy.test_blockingioerror).
+            if written_from_filename {
+                inst.slot_set("characters_written", args[2].clone());
+            }
             if (2..=5).contains(&args.len()) {
                 let get = |i: usize| args.get(i).cloned().unwrap_or(Object::None);
                 for (i, name) in ["errno", "strerror", "filename", "winerror", "filename2"]
                     .into_iter()
                     .enumerate()
                 {
-                    // `winerror` is POSIX-None (slot ignored off Windows).
-                    let v = if name == "winerror" {
+                    // `winerror` only exists on Windows (slot ignored —
+                    // and absent from the type — off Windows).
+                    let v = if name == "winerror" || (name == "filename" && written_from_filename) {
                         Object::None
                     } else {
                         get(i)
                     };
                     if !matches!(v, Object::None) {
-                        dict.insert(DictKey(Object::from_static(name)), v);
+                        inst.slot_set(name, v);
                     }
                 }
             }
@@ -25728,21 +27260,10 @@ impl Interpreter {
         if mro_has("SyntaxError") {
             // `SyntaxError(msg)` / `SyntaxError(msg, (filename, lineno,
             // offset, text[, end_lineno, end_offset]))` — location
-            // fields populate only from the 2-argument detail form.
-            for name in [
-                "msg",
-                "filename",
-                "lineno",
-                "offset",
-                "text",
-                "end_lineno",
-                "end_offset",
-                "print_file_and_line",
-            ] {
-                dict.insert(DictKey(Object::from_static(name)), Object::None);
-            }
+            // fields populate only from the 2-argument detail form; the
+            // rest read their class-descriptor `None` defaults.
             if let Some(msg) = args.first() {
-                dict.insert(DictKey(Object::from_static("msg")), msg.clone());
+                inst.slot_set("msg", msg.clone());
             }
             if args.len() == 2 {
                 let info: Vec<Object> = match &args[1] {
@@ -25752,11 +27273,11 @@ impl Interpreter {
                 };
                 if info.len() == 4 || info.len() == 6 {
                     for (i, name) in ["filename", "lineno", "offset", "text"].iter().enumerate() {
-                        dict.insert(DictKey(Object::from_static(name)), info[i].clone());
+                        inst.slot_set(name, info[i].clone());
                     }
                     if info.len() == 6 {
-                        dict.insert(DictKey(Object::from_static("end_lineno")), info[4].clone());
-                        dict.insert(DictKey(Object::from_static("end_offset")), info[5].clone());
+                        inst.slot_set("end_lineno", info[4].clone());
+                        inst.slot_set("end_offset", info[5].clone());
                     }
                 }
             }
@@ -25765,22 +27286,8 @@ impl Interpreter {
             // `msg` is set only for the single-positional form
             // (CPython `ImportError_init`); name/path/name_from default
             // to None and are overridden by keywords in `instantiate`.
-            dict.insert(
-                DictKey(Object::from_static("msg")),
-                if args.len() == 1 {
-                    args[0].clone()
-                } else {
-                    Object::None
-                },
-            );
-            for name in ["name", "path", "name_from"] {
-                dict.insert(DictKey(Object::from_static(name)), Object::None);
-            }
-        }
-        if mro_has("AttributeError") || mro_has("NameError") {
-            dict.insert(DictKey(Object::from_static("name")), Object::None);
-            if mro_has("AttributeError") {
-                dict.insert(DictKey(Object::from_static("obj")), Object::None);
+            if args.len() == 1 {
+                inst.slot_set("msg", args[0].clone());
             }
         }
         if mro_has("UnicodeEncodeError") || mro_has("UnicodeDecodeError") {
@@ -25801,7 +27308,7 @@ impl Interpreter {
                     ("end", args[3].clone()),
                     ("reason", args[4].clone()),
                 ] {
-                    dict.insert(DictKey(Object::from_static(name)), v);
+                    inst.slot_set(name, v);
                 }
             }
         } else if mro_has("UnicodeTranslateError") {
@@ -25813,23 +27320,13 @@ impl Interpreter {
                     ("end", args[2].clone()),
                     ("reason", args[3].clone()),
                 ] {
-                    dict.insert(DictKey(Object::from_static(name)), v);
+                    inst.slot_set(name, v);
                 }
             }
         }
-        // CPython's `BaseException` always exposes these slots (default
-        // None/None/False/None), so attribute access and exception-context
-        // chain walks (e.g. `contextlib._fix_exception_context`, which reads
-        // `exc.__context__` of every link) never raise `AttributeError`,
-        // even on an exception that was constructed but never raised/chained.
-        dict.insert(DictKey(Object::from_static("__context__")), Object::None);
-        dict.insert(DictKey(Object::from_static("__cause__")), Object::None);
-        dict.insert(
-            DictKey(Object::from_static("__suppress_context__")),
-            Object::Bool(false),
-        );
-        dict.insert(DictKey(Object::from_static("__traceback__")), Object::None);
-        drop(dict);
+        // `__context__`/`__cause__`/`__suppress_context__`/`__traceback__`
+        // need no seeding: the BaseException slot descriptors report their
+        // CPython getset defaults (None/None/False/None) while unset.
         let obj = Object::Instance(Rc::new(inst));
         // CPython makes every exception GC-tracked (`BaseException` is
         // `Py_TPFLAGS_HAVE_GC`), so a reference cycle routed through an
@@ -25982,6 +27479,16 @@ impl Interpreter {
         // flows into `**kwargs` instead, or — absent `**kwargs` — raises
         // the dedicated "positional-only ... passed as keyword" error.
         let posonly = code.posonly_count as usize;
+        // CPython's error lists *every* conflicting name at once
+        // ("… passed as keyword arguments: 'a, b'" — PEP 570,
+        // test_positional_only_arg), so keep the names around when the
+        // error is reachable at all.
+        let kw_names_for_posonly_error: Vec<String> =
+            if posonly > 0 && kwargs_slot.is_none() && !kwargs.is_empty() {
+                kwargs.iter().map(|(n, _)| n.clone()).collect()
+            } else {
+                Vec::new()
+            };
         for (name, value) in kwargs {
             let mut slot = None;
             if let Some(p) = code
@@ -26015,10 +27522,16 @@ impl Interpreter {
                     if kwargs_slot.is_some() {
                         extra_kwargs.insert(crate::object::DictKey(Object::from_str(name)), value);
                     } else if code.varnames.iter().take(posonly).any(|n| *n == name) {
+                        let conflicts: Vec<&str> = kw_names_for_posonly_error
+                            .iter()
+                            .filter(|kw| code.varnames.iter().take(posonly).any(|n| n == *kw))
+                            .map(String::as_str)
+                            .collect();
                         return Err(type_error(format!(
                             "{}() got some positional-only arguments passed as \
                              keyword arguments: '{}'",
-                            code.qualname, name
+                            code.qualname,
+                            conflicts.join(", ")
                         )));
                     } else {
                         return Err(type_error(format!(
@@ -26984,15 +28497,9 @@ impl Interpreter {
                             // expects a `^^` caret, not to-end-of-token.
                             if let RuntimeError::PyException(pe2) = &err {
                                 if let Object::Instance(inst2) = &pe2.instance {
-                                    let mut d = inst2.dict.borrow_mut();
-                                    d.insert(
-                                        DictKey(Object::from_static("end_lineno")),
-                                        Object::Int(i64::from(lineno)),
-                                    );
-                                    d.insert(
-                                        DictKey(Object::from_static("end_offset")),
-                                        Object::Int(i64::from(offset + 2)),
-                                    );
+                                    inst2.slot_set("end_lineno", Object::Int(i64::from(lineno)));
+                                    inst2
+                                        .slot_set("end_offset", Object::Int(i64::from(offset + 2)));
                                 }
                             }
                             return Err(err);
@@ -27232,11 +28739,7 @@ impl Interpreter {
         match recv {
             Object::Range(r) => {
                 let type_obj = crate::builtins::class_of(recv);
-                let args = Object::new_tuple(vec![
-                    crate::object::int_from_i128(r.start),
-                    crate::object::int_from_i128(r.stop),
-                    crate::object::int_from_i128(r.step),
-                ]);
+                let args = Object::new_tuple(vec![r.start_obj(), r.stop_obj(), r.step_obj()]);
                 return Ok(Object::new_tuple(vec![Object::Type(type_obj), args]));
             }
             Object::Slice(s) => {
@@ -27331,14 +28834,24 @@ impl Interpreter {
         ) {
             return Ok(None);
         }
-        // Bare name (`ml_name`), matching `meth_reduce` — *not* the dotted
-        // `__qualname__`: the getattr path fetches the attribute off `self`
-        // by its short name, and the string path lets pickle re-resolve it
-        // through `__module__`.
+        // Bare name (`ml_name`) for the getattr path, which fetches the
+        // attribute off `self` by its short name.
         let name = match self.load_attr(recv, "__name__") {
             Ok(Object::Str(s)) => s.to_string(),
             _ => return Ok(None),
         };
+        // An *unbound* type method (`str.index`, `list.__len__`) is a
+        // method/wrapper descriptor: CPython's `descr_reduce` /
+        // `wrapperdescr_reduce` pickle it as `(getattr, (objclass, name))`.
+        if matches!(ty_name.as_str(), "method_descriptor" | "wrapper_descriptor") {
+            if let Ok(objclass @ Object::Type(_)) = self.load_attr(recv, "__objclass__") {
+                let getattr_fn = self.live_builtin("getattr")?;
+                return Ok(Some(Object::new_tuple(vec![
+                    getattr_fn,
+                    Object::new_tuple(vec![objclass, Object::from_str(name)]),
+                ])));
+            }
+        }
         // A NULL / module `__self__` means module-level → pickle by name.
         let self_obj = self.load_attr(recv, "__self__").ok();
         let module_level = match &self_obj {
@@ -27347,26 +28860,39 @@ impl Interpreter {
             Some(o) => crate::builtins::class_of(o).name == "module",
         };
         if module_level {
-            return Ok(Some(Object::from_str(name)));
+            // CPython `meth_reduce` returns `__qualname__`, not the bare
+            // name: a C *static method* (`bytearray.maketrans`) has a NULL
+            // `__self__` but only resolves through its dotted qualname.
+            let qualname = match self.load_attr(recv, "__qualname__") {
+                Ok(Object::Str(s)) => s.to_string(),
+                _ => name,
+            };
+            return Ok(Some(Object::from_str(qualname)));
         }
         // Bound to an instance → `(getattr, (self, name))`. `getattr` is
         // fetched from the live `builtins` so it round-trips through any
         // unpickler by name.
         let self_obj = self_obj.expect("module_level=false implies Some");
-        let key = DictKey(Object::from_static("getattr"));
-        let getattr_fn = self
-            .cache
+        let getattr_fn = self.live_builtin("getattr")?;
+        Ok(Some(Object::new_tuple(vec![
+            getattr_fn,
+            Object::new_tuple(vec![self_obj, Object::from_str(name)]),
+        ])))
+    }
+
+    /// Resolve a builtin through the live `builtins` *module* dict first
+    /// (CPython's `_PyEval_GetBuiltin`) — the namespace user code sees and
+    /// can rebind — falling back to the VM's pristine table.
+    fn live_builtin(&mut self, name: &'static str) -> Result<Object, RuntimeError> {
+        let key = DictKey(Object::from_static(name));
+        self.cache
             .get("builtins")
             .and_then(|m| match m {
                 Object::Module(m) => m.dict.borrow().get(&key).cloned(),
                 _ => None,
             })
             .or_else(|| self.builtins.borrow().get(&key).cloned())
-            .ok_or_else(|| runtime_error("builtin 'getattr' unavailable"))?;
-        Ok(Some(Object::new_tuple(vec![
-            getattr_fn,
-            Object::new_tuple(vec![self_obj, Object::from_str(name)]),
-        ])))
+            .ok_or_else(|| runtime_error(format!("builtin '{name}' unavailable")))
     }
 
     /// The default object reduction, delegated to the verbatim-ported
@@ -27392,6 +28918,17 @@ impl Interpreter {
         // and every dtype that wraps an ndarray were unpicklable.
         if let Some(reduced) = self.maybe_reduce_builtin_callable(recv)? {
             return Ok(reduced);
+        }
+        // `staticmethod`/`classmethod` wrappers and the C descriptor
+        // flavors (`dict.__dict__['fromkeys']`,
+        // `bytearray.__dict__['maketrans']`) refuse to pickle at any
+        // protocol in CPython 3.13 (test_pickle's
+        // test_py_methods/test_c_methods descriptor probes).
+        if matches!(recv, Object::StaticMethod(_) | Object::ClassMethod(_)) {
+            return Err(type_error(format!(
+                "cannot pickle '{}' object",
+                crate::builtins::class_of(recv).name
+            )));
         }
         let helper_name = if proto >= 2 {
             "_reduce_newobj"
@@ -27563,6 +29100,43 @@ impl Interpreter {
                 Object::Int(*index),
             ]));
         }
+        // A range iterator reduces to `(iter, (range(current, stop, step),))`
+        // — the not-yet-yielded *range*, never a materialized list:
+        // reducing a half-consumed `iter(range(2**32 + 2))` must be O(1)
+        // (test_range.test_iterator_pickling_overflowing_index otherwise
+        // builds a 4-billion-element list and the process is OOM-killed).
+        let range_rest = match &*it.borrow() {
+            crate::object::PyIterator::Range {
+                current,
+                stop,
+                step,
+            } => Some(crate::object::Range::new(
+                i128::from(*current),
+                i128::from(*stop),
+                i128::from(*step),
+            )),
+            crate::object::PyIterator::RangeHuge {
+                current,
+                stop,
+                step,
+            } => Some(crate::object::Range::new(*current, *stop, *step)),
+            crate::object::PyIterator::RangeBig {
+                current,
+                stop,
+                step,
+            } => Some(crate::object::Range::from_bigints(
+                (**current).clone(),
+                (**stop).clone(),
+                (**step).clone(),
+            )),
+            _ => None,
+        };
+        if let Some(r) = range_rest {
+            return Ok(Object::new_tuple(vec![
+                builtin,
+                Object::new_tuple(vec![Object::Range(Rc::new(r))]),
+            ]));
+        }
         // Snapshot remaining *after* the lookup, mirroring CPython reading
         // `it_seq`/index post-`_PyEval_GetBuiltin`.
         let remaining = {
@@ -27592,6 +29166,11 @@ impl Interpreter {
             Object::File(f) => f.clone(),
             _ => return Err(type_error("writelines() requires a file receiver")),
         };
+        // Arity before state: `f.writelines()` with no iterable is a
+        // TypeError even on a closed file (test_fileio `testMethods`).
+        let iterable = args
+            .first()
+            .ok_or_else(|| type_error("writelines() takes exactly one argument"))?;
         // `writelines([])` on a closed stream raises `ValueError` *before*
         // inspecting the (empty) iterable (`test_io.test_io_after_close`);
         // CPython's `CHECK_CLOSED` runs first.
@@ -27601,13 +29180,14 @@ impl Interpreter {
         if !file.writable() {
             return Err(crate::stdlib::io::unsupported_op("write"));
         }
-        let iterable = args
-            .first()
-            .ok_or_else(|| type_error("writelines() takes exactly one argument"))?;
         let it = self.make_iter(iterable, globals)?;
         while let Some(line) = self.iter_next(&it, globals)? {
             match line {
-                Object::Str(s) => {
+                // Only a *text* stream encodes str lines; a binary stream
+                // rejects them like `write()` — `f.writelines("abc")` on a
+                // binary file iterates the string and each 1-char str is a
+                // TypeError (test_fileio `testWritelinesError`).
+                Object::Str(s) if !file.binary => {
                     file.write_bytes(&file.encode_text(&s)?)?;
                 }
                 Object::Bytes(b) => {
@@ -27797,10 +29377,15 @@ impl Interpreter {
                 // CPython validates and returns the tree (constant-folded
                 // when PyCF_OPTIMIZED_AST asks for it).
                 if optimized_ast {
-                    return self.fold_ast_constants(&source_obj, outer_globals);
+                    self.validate_ast_object(&source_obj, outer_globals)?;
+                    return self.fold_ast_constants(&source_obj, optimize, outer_globals);
                 }
                 return Ok(source_obj);
             }
+            // CPython runs PyAST_obj2ast + _PyAST_Validate before any
+            // lowering; the frozen ast module hosts the Python port
+            // (test_ast ASTValidatorTests).
+            self.validate_ast_object(&source_obj, outer_globals)?;
             let converted = crate::stdlib::ast_convert::convert_ast_root(&source_obj, root_mode)?;
             let src = converted.synthetic_source;
             let module = converted.module;
@@ -27824,6 +29409,17 @@ impl Interpreter {
         // ---- textual source ----
         let source = match &source_obj {
             Object::Str(s) => s.to_string(),
+            // A str source carrying lone surrogates: CPython encodes the
+            // source to UTF-8 *before* tokenizing, so `compile("'\ud800'", …)`
+            // raises UnicodeEncodeError('utf-8', …, 'surrogates not allowed')
+            // — the InteractiveConsole surfaces exactly that
+            // (test_code_module.test_unicode_error).
+            Object::WStr(cps) => {
+                let bytes = crate::stdlib::codecs_engine::utf8_encode(cps, "strict")?;
+                String::from_utf8(bytes).map_err(|_| {
+                    type_error("compile() arg 1 must be a string, bytes or AST object")
+                })?
+            }
             // Bytes sources go through PEP 263 detection (BOM + coding
             // cookie), like CPython's `compile()`. `memoryview` (and any
             // contiguous buffer) is accepted the same way.
@@ -27850,9 +29446,11 @@ impl Interpreter {
         // PyCF_ONLY_AST on text: parse and hand back a Python tree —
         // `ast.parse` in builtin form.
         if only_ast {
-            let tree = self.build_ast_object(&source, &filename, &mode, outer_globals)?;
+            let type_comments = explicit_flags & cf::PYCF_TYPE_COMMENTS != 0;
+            let tree =
+                self.build_ast_object(&source, &filename, &mode, type_comments, outer_globals)?;
             if optimized_ast {
-                return self.fold_ast_constants(&tree, outer_globals);
+                return self.fold_ast_constants(&tree, optimize, outer_globals);
             }
             return Ok(tree);
         }
@@ -27953,16 +29551,37 @@ impl Interpreter {
         source: &str,
         filename: &str,
         mode: &str,
+        type_comments: bool,
         outer_globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
+        // The tokenizer's invalid-escape SyntaxWarnings fire under
+        // PyCF_ONLY_AST too — `ast.parse` warns exactly like `compile`
+        // (test_unparse test_backslash_in_format_spec). Emitted first:
+        // the tokenizer sees the escape before any later hard error.
+        let (_, warnings) = weavepy_lexer::tokenize_with_escapes(source);
+        self.emit_escape_warnings(source, filename, &warnings)?;
         let spec = crate::stdlib::ast_mod::parse(&[
             Object::from_str(source.to_owned()),
             Object::from_str(filename.to_owned()),
             Object::from_str(mode.to_owned()),
+            Object::Bool(type_comments),
         ])?;
         let ast_module = self.do_import("ast", &Object::None, 0, outer_globals)?;
         let builder = self.load_attr(&ast_module, "_from_spec")?;
         self.call(&builder, &[spec], &[], outer_globals)
+    }
+
+    /// `compile(tree, …)`: run the frozen `ast` module's validator (the
+    /// pure-Python port of PyAST_obj2ast checks + `_PyAST_Validate`).
+    fn validate_ast_object(
+        &mut self,
+        tree: &Object,
+        outer_globals: &Rc<RefCell<DictData>>,
+    ) -> Result<(), RuntimeError> {
+        let ast_module = self.do_import("ast", &Object::None, 0, outer_globals)?;
+        let validator = self.load_attr(&ast_module, "_validate")?;
+        self.call(&validator, &[tree.clone()], &[], outer_globals)?;
+        Ok(())
     }
 
     /// PyCF_OPTIMIZED_AST: run the frozen `ast` module's constant folder
@@ -27970,11 +29589,24 @@ impl Interpreter {
     fn fold_ast_constants(
         &mut self,
         tree: &Object,
+        optimize: i64,
         outer_globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
+        // `optimize=-1` inherits the interpreter's level, like
+        // _PyAST_Optimize (drives the `__debug__` -> Constant fold).
+        let optimize = if optimize < 0 {
+            i64::from(self.optimize_level)
+        } else {
+            optimize
+        };
         let ast_module = self.do_import("ast", &Object::None, 0, outer_globals)?;
         let folder = self.load_attr(&ast_module, "_fold_constants")?;
-        self.call(&folder, &[tree.clone()], &[], outer_globals)
+        self.call(
+            &folder,
+            &[tree.clone(), Object::Int(optimize)],
+            &[],
+            outer_globals,
+        )
     }
 
     /// Python 3.13 made `globals`/`locals` passable by keyword on
@@ -28336,7 +29968,13 @@ impl Interpreter {
         if name.is_empty() && level == 0 {
             return Err(value_error("Empty module name"));
         }
-        let package = current_package(current_globals);
+        // CPython's `_calc___package__` only consults (and type-checks)
+        // `__package__` for relative imports.
+        let package = if level > 0 {
+            current_package(current_globals)?
+        } else {
+            None
+        };
         let absolute = resolve_relative(package.as_deref(), name, level).map_err(import_error)?;
         // PEP 578 — `import(name, globals, locals, fromlist, level)`
         // audit event. CPython only fires once per import name, at
@@ -28370,7 +30008,25 @@ impl Interpreter {
             // sys.modules so a module that replaced itself during execution
             // (`decimal` → `_pydecimal`) is the one we consult.
             let source = self.cache.get(&absolute);
+            // CPython `_handle_fromlist` expands `'*'` to the package's
+            // `__all__` and recurses, so `from pkg import *` pre-imports the
+            // submodules `__all__` names even when `__init__` never touches
+            // them (test_pkg.test_6's t6 lists 'spam'/'ham'/'eggs').
+            let mut worklist: Vec<Object> = Vec::new();
             for item in items.iter() {
+                if let (Object::Str(s), Some(Object::Module(m))) = (item, &source) {
+                    if s.as_ref() == "*" {
+                        if let Some(Object::List(all)) =
+                            m.dict.borrow().get(&crate::object::StrKey("__all__"))
+                        {
+                            worklist.extend(all.borrow().iter().cloned());
+                        }
+                        continue;
+                    }
+                }
+                worklist.push(item.clone());
+            }
+            for item in &worklist {
                 if let Object::Str(s) = item {
                     if s.as_ref() == "*" {
                         continue;
@@ -28398,6 +30054,26 @@ impl Interpreter {
                     }
                     let sub_name = format!("{absolute}.{s}");
                     if let Err(e) = self.import_path(&sub_name) {
+                        // CPython `_handle_fromlist` only swallows a
+                        // ModuleNotFoundError for the submodule itself —
+                        // and even that propagates when the entry is the
+                        // blocked `None` sentinel in sys.modules
+                        // (test_importlib.import_.test_api:
+                        // test_blocked_fromlist /
+                        // test_fromlist_load_error_propagates).
+                        let is_mnfe = match &e {
+                            RuntimeError::PyException(pe) => self
+                                .exception_matches(
+                                    &pe.instance,
+                                    &Object::Type(builtin_types().module_not_found_error.clone()),
+                                )
+                                .unwrap_or(false),
+                            RuntimeError::Internal(_) => false,
+                        };
+                        let blocked = matches!(self.cache.get(&sub_name), Some(Object::None));
+                        if !is_mnfe || blocked {
+                            return Err(e);
+                        }
                         if std::env::var_os("WEAVEPY_DEBUG_FROMLIST").is_some() {
                             match &e {
                                 RuntimeError::PyException(pe) => eprintln!(
@@ -28421,6 +30097,18 @@ impl Interpreter {
         Ok(self.cache.get(&absolute).unwrap_or(leaf))
     }
 
+    /// `import_path` for VM-internal machinery (`module.__repr__` reaching
+    /// for `importlib._bootstrap`, pickle's `importlib.machinery` probe):
+    /// the loaded modules' own import statements bypass any user
+    /// `builtins.__import__` patch, matching CPython where the bootstrap
+    /// chain is initialized before user code runs.
+    pub fn import_path_internal(&mut self, full: &str) -> Result<Object, RuntimeError> {
+        self.internal_import_depth += 1;
+        let result = self.import_path(full);
+        self.internal_import_depth -= 1;
+        result
+    }
+
     /// Walk a dotted name (`a.b.c`), loading each part lazily and
     /// linking submodules into their parents' dicts. Returns the
     /// leaf module.
@@ -28429,6 +30117,7 @@ impl Interpreter {
         let mut so_far = String::new();
         let mut current: Option<Object> = None;
         for (i, part) in parts.iter().enumerate() {
+            let parent_name = so_far.clone();
             if i > 0 {
                 so_far.push('.');
             }
@@ -28445,11 +30134,53 @@ impl Interpreter {
             let was_cached = self.cache.get(&so_far).is_some();
             let module = self.load_one(&so_far)?;
             if !was_cached {
-                if let Some(Object::Module(parent_mod)) = current.as_ref() {
-                    parent_mod
-                        .dict
-                        .borrow_mut()
-                        .insert(DictKey(Object::from_str(*part)), module.clone());
+                // CPython's trailing `setattr` re-reads `sys.modules[parent]`
+                // after the child loads — the child's body may have replaced
+                // (or popped and re-imported) the parent's entry
+                // (test_import.test_import_from_unloaded_package).
+                let parent_obj = if parent_name.is_empty() {
+                    current.clone()
+                } else {
+                    self.cache.get(&parent_name).or_else(|| current.clone())
+                };
+                match parent_obj.as_ref() {
+                    Some(Object::Module(parent_mod)) => {
+                        parent_mod
+                            .dict
+                            .borrow_mut()
+                            .insert(DictKey(Object::from_str(*part)), module.clone());
+                    }
+                    // `sys.modules` may hold an arbitrary object as the
+                    // parent (the `unwritable` fixture installs a slotted
+                    // instance). CPython setattr's it and downgrades an
+                    // AttributeError to an ImportWarning
+                    // (test_import.test_unwritable_module).
+                    Some(parent) => {
+                        let parent = parent.clone();
+                        if let Err(e) = self.store_attr(&parent, part, module.clone()) {
+                            if self.is_attribute_error(&e) {
+                                let msg = format!(
+                                    "Cannot set an attribute on '{parent_name}' \
+                                     for child module '{part}'"
+                                );
+                                let category = Object::Type(
+                                    crate::builtin_types::builtin_types().import_warning.clone(),
+                                );
+                                if let Some(warn) = self.module_attr("warnings", "warn") {
+                                    let globals = self.builtins.clone();
+                                    self.call(
+                                        &warn,
+                                        &[Object::from_str(msg), category],
+                                        &[],
+                                        &globals,
+                                    )?;
+                                }
+                            } else {
+                                return Err(e);
+                            }
+                        }
+                    }
+                    None => {}
                 }
             }
             current = Some(module);
@@ -28640,7 +30371,49 @@ impl Interpreter {
     /// first, then the built-in registry, then frozen Python sources,
     /// then the filesystem.
     fn load_one(&mut self, full: &str) -> Result<Object, RuntimeError> {
-        if let Some(cached) = self.cache.get(full) {
+        // bpo-34572: if another thread is mid-way through executing this
+        // module's body, block (GIL released) until it finishes — CPython's
+        // per-module import lock (`_bootstrap._lock_unlock_module`) — so we
+        // never hand back a half-initialized module. Re-entry from the
+        // *same* thread (a circular import) proceeds with the partial
+        // module, and a cross-thread wait cycle (concurrent circular
+        // import) is broken by accepting the partial module, exactly like
+        // CPython's `_DeadlockError` handling in `_lock_unlock_module`.
+        //
+        // The wait is re-checked *after* the cache read: the loader marks
+        // the module initializing before seeding `sys.modules`, but this
+        // thread's first `is_initializing` probe can still race ahead of
+        // that mark (probe → other thread begins+seeds → our `get` sees the
+        // shell). Handing the shell back was a real, load-sensitive flake:
+        // `test_pickle.test_unpickle_module_race` saw
+        // `AttributeError: module 'locking_import' has no attribute
+        // 'ToBeUnpickled'` under an 8-way sweep.
+        let me = crate::gil::current_thread_id();
+        let mut accept_partial = false;
+        let cached = loop {
+            while !accept_partial
+                && matches!(self.cache.initializing_holder(full), Some(h) if h != me)
+            {
+                if self.cache.import_wait_would_deadlock(me, full) {
+                    accept_partial = true;
+                    break;
+                }
+                self.cache.set_import_waiting(me, Some(full));
+                crate::gil::allow_threads_then(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                });
+                self.cache.set_import_waiting(me, None);
+            }
+            let cached = self.cache.get(full);
+            if !accept_partial && matches!(self.cache.initializing_holder(full), Some(h) if h != me)
+            {
+                // Raced with the loader's begin→seed window: whatever we
+                // just read (a shell, or nothing yet) is not trustworthy.
+                continue;
+            }
+            break cached;
+        };
+        if let Some(cached) = cached {
             // CPython: a `None` value in `sys.modules` is the "blocked"
             // sentinel (`importlib._bootstrap._find_and_load_unlocked` raises
             // `ModuleNotFoundError("import of {name} halted; None in
@@ -28875,10 +30648,11 @@ impl Interpreter {
                     crate::object::DictKey(Object::from_static("__file__")),
                     Object::None,
                 );
-                g.insert(
-                    crate::object::DictKey(Object::from_static("__spec__")),
-                    Object::None,
-                );
+                // No eager `__spec__: None` here: leaving the key absent
+                // lets the lazy RFC 0053 WS2 synthesis build the real
+                // namespace spec (NamespaceLoader + search locations) on
+                // first read, matching CPython (importlib.resources'
+                // NamespaceDiskTests need `pkg.__spec__.loader`).
             }
             let module_obj = Object::Module(Rc::new(PyModule {
                 name: full.to_owned(),
@@ -29036,10 +30810,15 @@ impl Interpreter {
             dict: globals.clone(),
         }));
         // Register before executing so circular imports observe the partial
-        // module (CPython's `_load` contract).
+        // module (CPython's `_load` contract). Initializing mark first so a
+        // concurrent importer waits instead of grabbing the shell
+        // (bpo-34572).
+        self.cache.begin_initializing(full);
         self.cache.insert(full, module_obj.clone());
         let mut frame = self.make_frame(code_rc, Vec::new(), Vec::new(), globals, None);
-        if let Err(e) = self.run_frame(&mut frame) {
+        let body_result = self.run_frame(&mut frame);
+        self.cache.end_initializing(full);
+        if let Err(e) = body_result {
             self.cache.remove(full);
             return Err(e);
         }
@@ -29145,10 +30924,16 @@ impl Interpreter {
             filename: Some(filename.to_owned()),
             dict: globals.clone(),
         }));
+        // Mark initializing before seeding, for the same bpo-34572 reason
+        // as `load_from_file`: a concurrent importer must wait, not grab
+        // the shell.
+        self.cache.begin_initializing(full);
         self.cache.insert(full, module_obj.clone());
         let code_rc = Rc::new(code);
         let mut frame = self.make_frame(code_rc, Vec::new(), Vec::new(), globals, None);
-        if let Err(e) = self.run_frame(&mut frame) {
+        let body_result = self.run_frame(&mut frame);
+        self.cache.end_initializing(full);
+        if let Err(e) = body_result {
             self.cache.remove(full);
             return Err(e);
         }
@@ -29178,6 +30963,29 @@ impl Interpreter {
         path: &Path,
         is_package: bool,
     ) -> Result<Object, RuntimeError> {
+        // CPython absolutizes a spec's location when it is built (a `''`/`.`
+        // path entry resolves against the cwd), so `__file__` and
+        // `__cached__` come out absolute even for cwd imports
+        // (test_import.PycacheTests.test___cached__).
+        let abs;
+        let path = if path.is_absolute() {
+            path
+        } else if let Ok(cwd) = std::env::current_dir() {
+            let mut clean = PathBuf::new();
+            for c in cwd.join(path).components() {
+                match c {
+                    std::path::Component::CurDir => {}
+                    std::path::Component::ParentDir => {
+                        clean.pop();
+                    }
+                    other => clean.push(other),
+                }
+            }
+            abs = clean;
+            abs.as_path()
+        } else {
+            path
+        };
         let filename = path.to_string_lossy().into_owned();
         let (code, source_for_diag) = if let Some(cached) =
             crate::pycache::try_load(path, self.optimize_level)
@@ -29229,29 +31037,39 @@ impl Interpreter {
                 package_search_path(path),
             );
         }
+        // CPython `_init_module_attrs`: `__cached__` mirrors `spec.cached`
+        // — the PEP 3147 artifact path — for every location-backed module,
+        // whether or not the artifact exists (test_pkg's `dir()` fixtures
+        // list it alongside `__file__`).
+        if let Some(cached) = crate::pycache::cache_path_for(path, self.optimize_level) {
+            globals.borrow_mut().insert(
+                DictKey(Object::from_static("__cached__")),
+                Object::from_str(cached.to_string_lossy().into_owned()),
+            );
+        }
         let module_obj = Object::Module(Rc::new(PyModule {
             name: full.to_owned(),
             filename: Some(filename.clone()),
             dict: globals.clone(),
         }));
+        // The initializing mark must be visible *before* the module is —
+        // `load_one`'s per-module import wait keys off it, and a
+        // seed-then-mark order let a concurrent importer catch the bare
+        // shell in the gap (bpo-34572; test_pickle's
+        // test_unpickle_module_race under sweep load).
+        self.cache.begin_initializing(full);
         self.cache.insert(full, module_obj.clone());
 
-        // Run the body. On failure, drop the partial module so a
-        // subsequent retry can try again from scratch.
-        let code_rc = Rc::new(code);
-        let mut frame = self.make_frame(code_rc, Vec::new(), Vec::new(), globals, None);
-        if let Err(e) = self.run_frame(&mut frame) {
-            self.cache.remove(full);
-            return Err(e);
-        }
         // RFC 0053 WS2 — CPython's import machinery stores `__spec__`
-        // and `__loader__` *in the module dict* eagerly. The frozen
-        // stdlib defers this (lazy synthesis on attribute read) to keep
-        // startup cheap, but an on-disk import already paid parse +
-        // compile, so populate the pair now: consumers that read them as
-        // plain dict entries — `globals()['__loader__']` in
-        // `linecache.lazycache`, `test.support` module-identity checks —
-        // then see them without tripping the attribute fast path.
+        // and `__loader__` *in the module dict* eagerly, before the body
+        // runs. The frozen stdlib defers this (lazy synthesis on
+        // attribute read) to keep startup cheap, but an on-disk import
+        // already paid parse + compile, so populate the pair now:
+        // consumers that read them as plain dict entries —
+        // `globals()['__loader__']` in `linecache.lazycache`, module
+        // bodies snapshotting their own globals (test_import's
+        // `unwritable` fixture) — then see them without tripping the
+        // attribute fast path.
         if let Object::Module(m) = &module_obj {
             let has_both = {
                 let d = m.dict.borrow();
@@ -29262,11 +31080,104 @@ impl Interpreter {
                 let _ = self.ensure_module_spec(m);
             }
         }
+
+        // Run the body. On failure, drop the partial module so a
+        // subsequent retry can try again from scratch. The initializing
+        // window drives the circular-import diagnostics (CPython's
+        // `spec._initializing`).
+        let code_rc = Rc::new(code);
+        let mut frame = self.make_frame(code_rc, Vec::new(), Vec::new(), globals, None);
+        let body_result = self.run_frame(&mut frame);
+        self.cache.end_initializing(full);
+        if let Err(e) = body_result {
+            self.cache.remove(full);
+            return Err(e);
+        }
         // CPython `_load_unlocked` re-reads `sys.modules[name]` after the
         // body runs: a module may replace its own entry (e.g. `decimal.py`
         // sets `sys.modules[__name__] = _pydecimal`). Hand back whatever is
         // bound now, not the shell we seeded before execution.
         Ok(self.cache.get(full).unwrap_or(module_obj))
+    }
+
+    /// CPython `_PyModule_IsPossiblyShadowing` plus the stdlib-name
+    /// check: `(is_possibly_shadowing, is_possibly_shadowing_stdlib)`.
+    /// True when `origin` sits directly in the script directory
+    /// (`sys.path[0]`, or the cwd when that entry is empty/missing) and
+    /// `-P`/safe_path is off — the module attr-miss and `IMPORT_FROM`
+    /// "consider renaming ..." hints (test_import shadowing tests).
+    fn module_shadowing(&self, mod_name: &str, origin: Option<&str>) -> (bool, bool) {
+        let Some(origin) = origin else {
+            return (false, false);
+        };
+        // `-P`/PYTHONSAFEPATH disables the hint entirely; the flag lives
+        // on the `sys.flags` struct-sequence.
+        let safe_path = (|| -> Option<bool> {
+            let Object::Module(sys) = self.cache.get("sys")? else {
+                return None;
+            };
+            let flags = sys
+                .dict
+                .borrow()
+                .get(&crate::object::StrKey("flags"))
+                .cloned()?;
+            let fl = match flags {
+                Object::Dict(fl) | Object::SimpleNamespace(fl) => fl,
+                Object::Instance(inst) => inst.dict.clone(),
+                _ => return None,
+            };
+            let v = fl
+                .borrow()
+                .get(&crate::object::StrKey("safe_path"))
+                .cloned()?;
+            Some(matches!(v, Object::Bool(true) | Object::Int(1)))
+        })()
+        .unwrap_or(false);
+        if safe_path {
+            return (false, false);
+        }
+        // root = dirname(origin.removesuffix(sep + "__init__.py"))
+        let p = std::path::Path::new(origin);
+        let p = if p.file_name().is_some_and(|f| f == "__init__.py") {
+            match p.parent() {
+                Some(x) => x,
+                None => return (false, false),
+            }
+        } else {
+            p
+        };
+        let Some(root) = p.parent() else {
+            return (false, false);
+        };
+        // CPython compares against `config->sys_path_0` — the startup
+        // snapshot — so runtime `sys.path` edits can't defeat the hint.
+        let sys0 = match self.cache.startup_path0.borrow().clone() {
+            Some(s) => s,
+            None => return (false, false),
+        };
+        let sys0 = if sys0.is_empty() {
+            match std::env::current_dir() {
+                Ok(d) => d,
+                Err(_) => return (false, false),
+            }
+        } else {
+            PathBuf::from(sys0)
+        };
+        // Compare absolutized (CPython's sys.path[0] is always absolute;
+        // ours may be spelled relative).
+        let absolutize = |p: &Path| -> PathBuf {
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .map(|d| d.join(p))
+                    .unwrap_or_else(|_| p.to_path_buf())
+            }
+        };
+        if absolutize(root) != absolutize(&sys0) {
+            return (false, false);
+        }
+        (true, crate::stdlib::sys::is_stdlib_module_name(mod_name))
     }
 
     /// `IMPORT_FROM` runtime side. Looks up `name` on the module on
@@ -29310,7 +31221,63 @@ impl Interpreter {
                         Err(e) => return Err(e),
                     }
                 }
-                let err = import_error(format!("cannot import name '{name}' from '{}'", m.name));
+                // CPython `_PyEval_ImportFrom`: the message names the
+                // module's origin — its `__file__`, "(unknown location)"
+                // without one, or the circular-import hint while the module
+                // body is still executing (test_import's
+                // test_from_import_missing_attr_* / CircularImportTests).
+                let file = match m
+                    .dict
+                    .borrow()
+                    .get(&DictKey(Object::from_static("__file__")))
+                {
+                    Some(Object::Str(p)) => Some(p.to_string()),
+                    _ => None,
+                };
+                let (shadow, shadow_stdlib) = self.module_shadowing(&m.name, file.as_deref());
+                let err = if shadow_stdlib {
+                    import_error(format!(
+                        "cannot import name '{name}' from '{}' (consider renaming '{}' \
+                         since it has the same name as the standard library module \
+                         named '{}' and prevents importing that standard library module)",
+                        m.name,
+                        file.as_deref().unwrap_or("?"),
+                        m.name
+                    ))
+                } else if self.cache.is_initializing(&m.name) {
+                    if shadow {
+                        import_error(format!(
+                            "cannot import name '{name}' from '{}' (consider renaming '{}' \
+                             if it has the same name as a library you intended to import)",
+                            m.name,
+                            file.as_deref().unwrap_or("?")
+                        ))
+                    } else {
+                        match &file {
+                            Some(p) => import_error(format!(
+                                "cannot import name '{name}' from partially initialized \
+                                 module '{}' (most likely due to a circular import) ({p})",
+                                m.name
+                            )),
+                            None => import_error(format!(
+                                "cannot import name '{name}' from partially initialized \
+                                 module '{}' (most likely due to a circular import)",
+                                m.name
+                            )),
+                        }
+                    }
+                } else {
+                    match &file {
+                        Some(p) => import_error(format!(
+                            "cannot import name '{name}' from '{}' ({p})",
+                            m.name
+                        )),
+                        None => import_error(format!(
+                            "cannot import name '{name}' from '{}' (unknown location)",
+                            m.name
+                        )),
+                    }
+                };
                 // CPython's `_PyEval_ImportFrom` enriches the error with
                 // `name` (the module) and `name_from` (the missing
                 // attribute) — `traceback.py`'s suggestion machinery keys
@@ -29351,7 +31318,21 @@ impl Interpreter {
                             return Ok(sub);
                         }
                     }
-                    Err(import_error(format!("cannot import name '{name}'")))
+                    // CPython `_PyEval_ImportFrom` fallbacks: an arbitrary
+                    // `sys.modules` object without `__name__`/`__file__`
+                    // gets the placeholder spellings
+                    // (test_import.test_from_import_AttributeError).
+                    let mod_name = match self.load_attr(module, "__name__") {
+                        Ok(Object::Str(s)) => format!("'{s}'"),
+                        _ => "'<unknown module name>'".to_owned(),
+                    };
+                    let location = match self.load_attr(module, "__file__") {
+                        Ok(Object::Str(p)) => format!("({p})"),
+                        _ => "(unknown location)".to_owned(),
+                    };
+                    Err(import_error(format!(
+                        "cannot import name '{name}' from {mod_name} {location}"
+                    )))
                 }
                 Err(e) => Err(e),
             },
@@ -29385,33 +31366,60 @@ impl Interpreter {
         // including modules the package imported (e.g. a submodule's
         // `import subprocess`), which would shadow the real
         // `pkg.subprocess` attribute.
+        // CPython `import_all_from`: a non-str entry is a TypeError naming
+        // the module (test_import.test_from_import_star_invalid_type).
+        let collect =
+            |items: &mut dyn Iterator<Item = &Object>| -> Result<Vec<String>, RuntimeError> {
+                items
+                    .map(|o| match o {
+                        Object::Str(s) => Ok(s.to_string()),
+                        other => Err(type_error(format!(
+                            "Item in {}.__all__ must be str, not {}",
+                            m.name,
+                            other.type_name()
+                        ))),
+                    })
+                    .collect()
+            };
         let all_names: Option<Vec<String>> =
             match dict.get(&DictKey(Object::from_static("__all__"))) {
-                Some(Object::List(l)) => Some(
-                    l.borrow()
-                        .iter()
-                        .filter_map(|o| match o {
-                            Object::Str(s) => Some(s.to_string()),
-                            _ => None,
-                        })
-                        .collect(),
-                ),
-                Some(Object::Tuple(t)) => Some(
-                    t.iter()
-                        .filter_map(|o| match o {
-                            Object::Str(s) => Some(s.to_string()),
-                            _ => None,
-                        })
-                        .collect(),
-                ),
+                Some(Object::List(l)) => Some(collect(&mut l.borrow().iter())?),
+                Some(Object::Tuple(t)) => Some(collect(&mut t.iter())?),
                 _ => None,
             };
         if let Some(names) = all_names {
-            let mut g = globals.borrow_mut();
+            // Release the namespace borrow: PEP 562 hooks below typically
+            // lazy-import and write the resolved name back into the module.
+            drop(dict);
             for n in names {
-                if let Some(v) = dict.get(&crate::object::StrKey(&n)) {
-                    g.insert(DictKey(Object::from_str(n)), v.clone());
-                }
+                let found = m.dict.borrow().get(&crate::object::StrKey(&n)).cloned();
+                let v = match found {
+                    Some(v) => v,
+                    None => {
+                        // CPython `import_all_from` resolves `__all__`
+                        // entries with getattr, so a module-level
+                        // `__getattr__` supplies lazily-materialized names
+                        // (concurrent.futures' executors,
+                        // typing.ContextManager — test___all__).
+                        let hook = m
+                            .dict
+                            .borrow()
+                            .get(&crate::object::StrKey("__getattr__"))
+                            .cloned();
+                        match hook {
+                            Some(hook) => {
+                                self.call(&hook, &[Object::from_str(&n)], &[], globals)?
+                            }
+                            None => {
+                                return Err(import_error(format!(
+                                    "cannot import name '{}' from '{}'",
+                                    n, m.name
+                                )))
+                            }
+                        }
+                    }
+                };
+                globals.borrow_mut().insert(DictKey(Object::from_str(n)), v);
             }
             return Ok(());
         }
@@ -29419,7 +31427,16 @@ impl Interpreter {
         for (k, v) in dict.iter() {
             let name = match &k.0 {
                 Object::Str(s) => s.to_string(),
-                _ => continue,
+                // CPython `import_all_from`: without `__all__` a non-str
+                // namespace key is a TypeError
+                // (test_import.test_from_import_star_invalid_type).
+                other => {
+                    return Err(type_error(format!(
+                        "Key in {}.__dict__ must be str, not {}",
+                        m.name,
+                        other.type_name()
+                    )))
+                }
             };
             if name.starts_with('_') {
                 continue;
@@ -30177,9 +32194,8 @@ fn decode_source_bytes_inner(
             );
             if let RuntimeError::PyException(pe) = &e {
                 if let Object::Instance(inst) = &pe.instance {
-                    let mut d = inst.dict.borrow_mut();
-                    d.insert(DictKey(Object::from_static("lineno")), Object::Int(0));
-                    d.insert(DictKey(Object::from_static("offset")), Object::Int(-1));
+                    inst.slot_set("lineno", Object::Int(0));
+                    inst.slot_set("offset", Object::Int(-1));
                 }
             }
             return Err(e);
@@ -30272,15 +32288,8 @@ fn decode_source_bytes_inner(
             );
             if let RuntimeError::PyException(pe) = &e {
                 if let Object::Instance(inst) = &pe.instance {
-                    let mut d = inst.dict.borrow_mut();
-                    d.insert(
-                        DictKey(Object::from_static("end_lineno")),
-                        Object::Int(line as i64),
-                    );
-                    d.insert(
-                        DictKey(Object::from_static("end_offset")),
-                        Object::Int((offset + position + 1) as i64),
-                    );
+                    inst.slot_set("end_lineno", Object::Int(line as i64));
+                    inst.slot_set("end_offset", Object::Int((offset + position + 1) as i64));
                 }
             }
             Err(e)
@@ -30324,6 +32333,12 @@ fn parse_error_to_syntax_error(
     source: &str,
     filename: &str,
 ) -> RuntimeError {
+    // `identifier field can't represent 'True' constant` is a plain
+    // ValueError in CPython (raised from ast2obj, not the tokenizer), with
+    // no SyntaxError location attributes.
+    if err.exception_class() == "ValueError" {
+        return crate::error::value_error(err.syntax_message());
+    }
     let (lineno, offset, mut text) = line_col_text(source, err.byte_offset());
     // Tokenizer errors detected at EOF/EOL but *reported* at the opening
     // quote/bracket (unterminated literals, "'(' was never closed") get
@@ -30358,15 +32373,8 @@ fn parse_error_to_syntax_error(
     };
     if let RuntimeError::PyException(pe) = &e {
         if let Object::Instance(inst) = &pe.instance {
-            let mut d = inst.dict.borrow_mut();
-            d.insert(
-                DictKey(Object::from_static("end_lineno")),
-                Object::Int(i64::from(end_lineno)),
-            );
-            d.insert(
-                DictKey(Object::from_static("end_offset")),
-                Object::Int(i64::from(end_offset)),
-            );
+            inst.slot_set("end_lineno", Object::Int(i64::from(end_lineno)));
+            inst.slot_set("end_offset", Object::Int(i64::from(end_offset)));
         }
     }
     e
@@ -30433,15 +32441,8 @@ pub fn compile_error_to_syntax_error(
     );
     if let RuntimeError::PyException(pe) = &e {
         if let Object::Instance(inst) = &pe.instance {
-            let mut d = inst.dict.borrow_mut();
-            d.insert(
-                DictKey(Object::from_static("end_lineno")),
-                Object::Int(i64::from(end_lineno)),
-            );
-            d.insert(
-                DictKey(Object::from_static("end_offset")),
-                Object::Int(i64::from(end_offset)),
-            );
+            inst.slot_set("end_lineno", Object::Int(i64::from(end_lineno)));
+            inst.slot_set("end_offset", Object::Int(i64::from(end_offset)));
         }
     }
     e
@@ -30449,21 +32450,62 @@ pub fn compile_error_to_syntax_error(
 
 /// Read the current module's `__package__` (or fall back to
 /// `__name__`'s parent) so relative imports can resolve.
-fn current_package(globals: &Rc<RefCell<DictData>>) -> Option<String> {
+fn current_package(globals: &Rc<RefCell<DictData>>) -> Result<Option<String>, RuntimeError> {
     let dict = globals.borrow();
-    if let Some(Object::Str(p)) = dict.get(&DictKey(Object::from_static("__package__"))) {
-        let s = p.to_string();
-        if !s.is_empty() {
-            return Some(s);
+    match dict.get(&DictKey(Object::from_static("__package__"))) {
+        Some(Object::Str(p)) => {
+            let s = p.to_string();
+            if !s.is_empty() {
+                return Ok(Some(s));
+            }
+        }
+        // CPython `_calc___package__`: a non-None, non-str `__package__`
+        // is a TypeError, not a silent fallback
+        // (test_import.RelativeImportTests.test_issue3221).
+        Some(o) if !matches!(o, Object::None) => {
+            return Err(type_error(format!(
+                "__package__ not set to a string (got {})",
+                o.type_name()
+            )))
+        }
+        _ => {}
+    }
+    // CPython consults `__spec__.parent` before the `__name__`/`__path__`
+    // heuristic (test_importlib.import_.test___package__). `parent` is a
+    // ModuleSpec property — `name` minus its last component unless the
+    // spec has submodule_search_locations (then `name` itself) — computed
+    // here from the instance attributes to avoid interpreter reentry.
+    if let Some(Object::Instance(inst)) = dict.get(&DictKey(Object::from_static("__spec__"))) {
+        let spec_dict = inst.dict.borrow();
+        if let Some(Object::Str(spec_name)) = spec_dict.get(&DictKey(Object::from_static("name"))) {
+            let name = spec_name.to_string();
+            let is_pkg = !matches!(
+                spec_dict.get(&DictKey(Object::from_static("submodule_search_locations"))),
+                None | Some(Object::None)
+            );
+            return Ok(Some(if is_pkg {
+                name
+            } else {
+                name.rsplit_once('.')
+                    .map_or_else(String::new, |(parent, _)| parent.to_owned())
+            }));
         }
     }
     if let Some(Object::Str(n)) = dict.get(&DictKey(Object::from_static("__name__"))) {
         let s = n.to_string();
+        // A module with `__path__` is a package: it is its *own* package
+        // (CPython only strips the last component for non-packages).
+        if dict
+            .get(&DictKey(Object::from_static("__path__")))
+            .is_some()
+        {
+            return Ok(Some(s));
+        }
         if let Some((parent, _)) = s.rsplit_once('.') {
-            return Some(parent.to_owned());
+            return Ok(Some(parent.to_owned()));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Resolve one slice bound to an `i64` the way `PySlice_Unpack` does:
@@ -30629,6 +32671,53 @@ pub(crate) fn slice_indices(len: usize, s: &PySlice) -> Result<Vec<usize>, Runti
 /// CPython's `PySlice_Unpack` + `PySlice_AdjustIndices`: resolve a slice
 /// against a sequence of length `len`, returning
 /// `(start, stop, step, slicelength)` with the same clamping rules.
+/// Build the sub-view for `mv[i:j:k]`: shares the same buffer (not a
+/// copy) — `mv[::-1]`/`mv[::2]` stay non-contiguous and a later
+/// `tobytes()`/buffer export reflects the stride. Slicing adjusts the
+/// first dimension; trailing dimensions (from `cast(shape=…)`) ride along
+/// unchanged. Deliberately does *not* check the released flag: the caller
+/// checks it before evaluating the slice bounds, whose `__index__` may
+/// itself release the view — CPython still returns a working sub-view in
+/// that case because the buffer outlives the release (gh-92888,
+/// test_memoryview.test_use_released_memory).
+fn mv_slice_subview(
+    mv: &Rc<crate::object::PyMemoryView>,
+    slc: &PySlice,
+) -> Result<Object, RuntimeError> {
+    let shape = mv.shape_dims();
+    let strides = mv.stride_bytes();
+    let n = shape[0] as i64;
+    let (start_i, _stop, step, slicelen) = adjust_slice(n, slc)?;
+    let itemsize = mv.itemsize.get();
+    let stride0 = strides[0];
+    let base = mv.start.get() as isize;
+    let new_start = if slicelen > 0 {
+        base + start_i as isize * stride0
+    } else {
+        base
+    };
+    let mut new_shape = shape;
+    new_shape[0] = slicelen.max(0) as usize;
+    let mut new_strides = strides;
+    new_strides[0] = stride0 * step as isize;
+    let nbytes = new_shape.iter().product::<usize>() * itemsize;
+    let sub = mv.shallow_clone();
+    sub.released.set(false);
+    sub.start.set(new_start.max(0) as usize);
+    sub.len.set(nbytes);
+    *sub.shape.borrow_mut() = new_shape;
+    *sub.strides.borrow_mut() = new_strides;
+    let exporter = sub.exporter.borrow().clone();
+    let obj = Object::MemoryView(Rc::new(sub));
+    // The sub-view inherits the exporter edge, so it can close the same
+    // cycles the parent can (test_memoryview.test_gc slices a view of a
+    // bytes-subclass and cycles it through an attribute).
+    if let Some(exp) = &exporter {
+        crate::gc_trace::track_memoryview_exporter(&obj, exp);
+    }
+    Ok(obj)
+}
+
 fn adjust_slice(len: i64, s: &PySlice) -> Result<(i64, i64, i64, i64), RuntimeError> {
     let step = match &s.step {
         Object::None => 1i64,
@@ -30677,75 +32766,94 @@ fn adjust_slice(len: i64, s: &PySlice) -> Result<(i64, i64, i64, i64), RuntimeEr
     Ok((start, stop, step, slicelength.max(0)))
 }
 
+/// Materialise every element of a range for `UNPACK_SEQUENCE`/`UNPACK_EX`
+/// (`a, b = range(2)`). Big-bounded ranges walk at full precision.
+fn range_unpack_items(r: &crate::object::Range) -> Vec<Object> {
+    let mut out = Vec::new();
+    if r.big.is_some() {
+        use num_bigint::BigInt;
+        let (mut cur, stop, step) = r.bounds();
+        let zero = BigInt::from(0);
+        while (step > zero && cur < stop) || (step < zero && cur > stop) {
+            out.push(Object::int_from_bigint(cur.clone()));
+            cur += &step;
+        }
+        return out;
+    }
+    let mut cur = r.start;
+    while (r.step > 0 && cur < r.stop) || (r.step < 0 && cur > r.stop) {
+        out.push(crate::object::int_from_i128(cur));
+        cur += r.step;
+    }
+    out
+}
+
 /// `range(...)[slice]` → a new range, mirroring CPython `compute_slice`.
-/// Full-width (`i128`) arithmetic throughout: the range length and the
-/// slice bounds may exceed `i64` (`range(2**100)[:2**100]`), and CPython
-/// computes this on PyLongs without overflow.
+/// Arbitrary-precision arithmetic throughout: the range length and the
+/// slice bounds may exceed `i64`/`i128` (`range(2**100)[:2**100]`,
+/// `range(0, maxsize**10, 2*maxsize)[idx:idx+1]` — test_large_range),
+/// and CPython computes this on PyLongs without overflow.
 pub(crate) fn range_slice(
     r: &crate::object::Range,
-    len: i128,
+    len: num_bigint::BigInt,
     s: &PySlice,
 ) -> Result<Object, RuntimeError> {
-    // A slice bound too large for `i128` clamps: bounds only ever clamp
-    // to `[-1, len]`, so any value beyond the type's range behaves as
-    // its sign's extreme.
-    let member = |o: &Object, default: i128| -> Result<i128, RuntimeError> {
+    use num_bigint::BigInt;
+    let member = |o: &Object, default: &BigInt| -> Result<BigInt, RuntimeError> {
         match o {
-            Object::None => Ok(default),
+            Object::None => Ok(default.clone()),
             other => match crate::builtins::coerce_index_object(other)? {
-                Object::Int(i) => Ok(i128::from(i)),
-                Object::Long(b) => Ok(i128::try_from(&*b).unwrap_or_else(|_| {
-                    use num_bigint::Sign;
-                    if b.sign() == Sign::Minus {
-                        i128::MIN / 2
-                    } else {
-                        i128::MAX / 2
-                    }
-                })),
+                Object::Int(i) => Ok(BigInt::from(i)),
+                Object::Long(b) => Ok((*b).clone()),
                 _ => unreachable!("coerce_index_object returns Int or Long"),
             },
         }
     };
-    let step = member(&s.step, 1)?;
-    if step == 0 {
+    let one = BigInt::from(1);
+    let zero = BigInt::from(0);
+    let step = member(&s.step, &one)?;
+    if step == zero {
         return Err(value_error("slice step cannot be zero"));
     }
-    let backwards = step < 0;
-    let (lower, upper) = if backwards { (-1, len - 1) } else { (0, len) };
+    let backwards = step < zero;
+    let (lower, upper) = if backwards {
+        (-one.clone(), &len - &one)
+    } else {
+        (zero.clone(), len.clone())
+    };
     // Defaults apply *directly*; only explicit bounds go through the
     // negative-index wrap + clamp (CPython `_PySlice_GetLongIndices`).
-    let resolve = |o: &Object, default: i128| -> Result<i128, RuntimeError> {
+    let resolve = |o: &Object, default: &BigInt| -> Result<BigInt, RuntimeError> {
         if matches!(o, Object::None) {
-            return Ok(default);
+            return Ok(default.clone());
         }
         let v = member(o, default)?;
-        Ok(if v < 0 {
-            v.saturating_add(len).max(lower)
+        Ok(if v < zero {
+            (v + &len).max(lower.clone())
         } else {
-            v.min(upper)
+            v.min(upper.clone())
         })
     };
-    let start = resolve(&s.start, if backwards { upper } else { lower })?;
-    let stop = resolve(&s.stop, if backwards { lower } else { upper })?;
+    let start = resolve(&s.start, if backwards { &upper } else { &lower })?;
+    let stop = resolve(&s.stop, if backwards { &lower } else { &upper })?;
     let slicelen = if backwards {
         if stop < start {
-            (start - stop - 1) / (-step) + 1
+            (&start - &stop - &one) / (-&step) + &one
         } else {
-            0
+            zero.clone()
         }
     } else if start < stop {
-        (stop - start - 1) / step + 1
+        (&stop - &start - &one) / &step + &one
     } else {
-        0
+        zero.clone()
     };
-    let new_start = r.start.saturating_add(start.saturating_mul(r.step));
-    let new_step = r.step.saturating_mul(step);
-    let new_stop = new_start.saturating_add(slicelen.saturating_mul(new_step));
-    Ok(Object::Range(Rc::new(crate::object::Range {
-        start: new_start,
-        stop: new_stop,
-        step: new_step,
-    })))
+    let (r_start, _, r_step) = r.bounds();
+    let new_start = &r_start + &start * &r_step;
+    let new_step = &r_step * &step;
+    let new_stop = &new_start + &slicelen * &new_step;
+    Ok(Object::Range(Rc::new(crate::object::Range::from_bigints(
+        new_start, new_stop, new_step,
+    ))))
 }
 
 /// `del data[start:stop:step]` — remove the slice members in place,
@@ -31021,6 +33129,9 @@ pub(crate) fn mv_unpack_single(fmt: char, bytes: &[u8]) -> Result<Object, Runtim
             f32::from_ne_bytes(a4()),
         ))),
         'd' => Object::Float(crate::object::tag_unpacked_nan(f64::from_ne_bytes(a8()))),
+        'e' => Object::Float(crate::object::tag_unpacked_nan(f16_bits_to_f64(
+            u16::from_ne_bytes(a2()),
+        ))),
         _ => {
             return Err(type_error(
                 "memoryview: format not supported for element access",
@@ -31037,28 +33148,36 @@ pub(crate) fn mv_pack_single(
     value: &Object,
     out: &mut [u8],
 ) -> Result<(), RuntimeError> {
-    let as_i128 = |v: &Object| -> Option<i128> {
-        match v {
-            Object::Bool(b) => Some(i128::from(*b)),
-            Object::Int(i) => Some(i128::from(*i)),
-            Object::Long(b) => b.to_i128(),
-            _ => None,
-        }
-    };
-    let as_f64 = |v: &Object| -> Option<f64> {
-        match v {
-            Object::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
-            Object::Int(i) => Some(*i as f64),
-            Object::Long(b) => b.to_f64(),
-            Object::Float(f) => Some(*f),
-            _ => None,
-        }
-    };
     let bad_type = || type_error(format!("memoryview: invalid type for format '{fmt}'"));
     let bad_val = || value_error(format!("memoryview: invalid value for format '{fmt}'"));
+    // Integer formats run the full `__index__` protocol and float formats
+    // `__float__` (CPython `pack_single` → `PyNumber_Index` /
+    // `PyFloat_AsDouble`); a user conversion raising propagates, and one
+    // that has side effects (releasing the view, gh-92888) is re-checked
+    // by the caller before the write.
+    let as_i128 = |v: &Object| -> Result<i128, RuntimeError> {
+        match v {
+            Object::Bool(b) => Ok(i128::from(*b)),
+            Object::Int(i) => Ok(i128::from(*i)),
+            Object::Long(b) => b.to_i128().ok_or_else(bad_val),
+            v @ (Object::Instance(_) | Object::Foreign(_)) => {
+                match crate::builtins::try_coerce_index_i64(v) {
+                    Some(r) => r.map(i128::from),
+                    None => Err(bad_type()),
+                }
+            }
+            _ => Err(bad_type()),
+        }
+    };
+    let as_f64 = |v: &Object| -> Result<f64, RuntimeError> {
+        match crate::builtins::coerce_f64_opt(v)? {
+            Some(f) => Ok(f),
+            None => Err(bad_type()),
+        }
+    };
     macro_rules! pack_int {
         ($t:ty) => {{
-            let v = as_i128(value).ok_or_else(bad_type)?;
+            let v = as_i128(value)?;
             if v < i128::from(<$t>::MIN) || v > i128::from(<$t>::MAX) {
                 return Err(bad_val());
             }
@@ -31075,19 +33194,44 @@ pub(crate) fn mv_pack_single(
         'I' => pack_int!(u32),
         'l' | 'q' | 'n' => pack_int!(i64),
         'L' | 'Q' | 'N' | 'P' => pack_int!(u64),
-        '?' => out[0] = u8::from(value.is_truthy()),
+        '?' => {
+            // CPython pack '?' is `PyObject_IsTrue` — dispatch a user
+            // `__bool__` (which may release the view; caller re-checks).
+            let truth = match value {
+                Object::Instance(_) => {
+                    if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                        // SAFETY: published by an enclosing VM frame still live
+                        // on this thread; the GIL keeps the access exclusive.
+                        let interp = unsafe { &mut *ptr };
+                        let globals = interp.builtins_dict();
+                        interp.obj_truthy(value, &globals)?
+                    } else {
+                        value.is_truthy()
+                    }
+                }
+                _ => value.is_truthy(),
+            };
+            out[0] = u8::from(truth);
+        }
         'c' => match value {
             Object::Bytes(b) if b.len() == 1 => out[0] = b[0],
             _ => return Err(bad_type()),
         },
         // Raw bytes observe canonical NaN bits — strip the identity tag.
         'f' => {
-            let v = crate::object::untag_nan(as_f64(value).ok_or_else(bad_type)?);
+            let v = crate::object::untag_nan(as_f64(value)?);
             out[..4].copy_from_slice(&(v as f32).to_ne_bytes());
         }
         'd' => {
-            let v = crate::object::untag_nan(as_f64(value).ok_or_else(bad_type)?);
+            let v = crate::object::untag_nan(as_f64(value)?);
             out[..8].copy_from_slice(&v.to_ne_bytes());
+        }
+        'e' => {
+            let v = crate::object::untag_nan(as_f64(value)?);
+            let bits = f64_to_f16_bits(v).ok_or_else(|| {
+                value_error("memoryview: invalid value for format 'e'".to_owned())
+            })?;
+            out[..2].copy_from_slice(&bits.to_ne_bytes());
         }
         _ => {
             return Err(type_error(
@@ -31096,6 +33240,85 @@ pub(crate) fn mv_pack_single(
         }
     }
     Ok(())
+}
+
+/// Widen an IEEE 754 binary16 bit pattern to `f64` (CPython
+/// `PyFloat_Unpack2`).
+pub(crate) fn f16_bits_to_f64(bits: u16) -> f64 {
+    let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exp = i32::from((bits >> 10) & 0x1f);
+    let frac = f64::from(bits & 0x3ff);
+    let mag = match exp {
+        0 => frac * 2f64.powi(-24),
+        0x1f => {
+            if frac == 0.0 {
+                f64::INFINITY
+            } else {
+                return f64::NAN;
+            }
+        }
+        _ => (1.0 + frac / 1024.0) * 2f64.powi(exp - 15),
+    };
+    sign * mag
+}
+
+/// Narrow an `f64` to an IEEE 754 binary16 bit pattern with
+/// round-half-even, following CPython's `PyFloat_Pack2`. `None` signals
+/// overflow (magnitude too large for half precision).
+pub(crate) fn f64_to_f16_bits(v: f64) -> Option<u16> {
+    let sign: u16 = if v.is_sign_negative() { 0x8000 } else { 0 };
+    if v.is_nan() {
+        return Some(sign | 0x7e00);
+    }
+    if v.is_infinite() {
+        return Some(sign | 0x7c00);
+    }
+    let x = v.abs();
+    if x == 0.0 {
+        return Some(sign);
+    }
+    // frexp: x = f * 2^e with f in [0.5, 1). A subnormal double is far
+    // below half-precision range and underflows to zero.
+    let bits = x.to_bits();
+    let biased = ((bits >> 52) & 0x7ff) as i32;
+    if biased == 0 {
+        return Some(sign);
+    }
+    let mut e = biased - 1022;
+    let mut f = f64::from_bits((bits & 0x000f_ffff_ffff_ffff) | (1022u64 << 52));
+    // Normalize f to [1.0, 2.0).
+    f *= 2.0;
+    e -= 1;
+    if e >= 16 {
+        return None;
+    }
+    if e < -25 {
+        // Underflows to (signed) zero even after rounding.
+        return Some(sign);
+    }
+    if e < -14 {
+        // Subnormal half: shift the fraction into place, exponent 0.
+        f *= 2f64.powi(14 + e);
+        e = 0;
+    } else {
+        f -= 1.0;
+        e += 15;
+    }
+    f *= 1024.0;
+    let mut frac = f as u32;
+    let rem = f - f64::from(frac);
+    if rem > 0.5 || (rem == 0.5 && frac & 1 == 1) {
+        frac += 1;
+    }
+    let mut exp = e as u32;
+    if frac == 1024 {
+        frac = 0;
+        exp += 1;
+        if exp == 31 {
+            return None;
+        }
+    }
+    Some(sign | ((exp as u16) << 10) | frac as u16)
 }
 
 /// Map a `bool` to the equivalent `Int` (`True`→1, `False`→0), leaving any
@@ -31202,6 +33425,31 @@ pub(crate) fn bound_is_native_builtin(method: &Object, name: &str) -> bool {
     false
 }
 
+/// CPython's `PyObject_FunctionStr`: the display form a call-site error
+/// uses for its callable — `module.qualname()` for Python functions,
+/// `name()` for builtins and classes, and `repr(obj)` as the fallback
+/// (`None(**h)` → "None argument after ** must be a mapping, …").
+pub(crate) fn callable_function_str(callable: &Object) -> Option<String> {
+    match callable {
+        Object::Builtin(b) => Some(format!("{}()", b.name)),
+        Object::Function(f) => {
+            let qual = f
+                .slot("__qualname__")
+                .as_ref()
+                .map(Object::to_str)
+                .unwrap_or_else(|| f.code().qualname.clone());
+            let module = f.slot("__module__").as_ref().map(Object::to_str);
+            match module {
+                Some(m) if !m.is_empty() && m != "builtins" => Some(format!("{m}.{qual}()")),
+                _ => Some(format!("{qual}()")),
+            }
+        }
+        Object::BoundMethod(bm) => callable_function_str(&bm.function),
+        Object::Type(t) => Some(format!("{}()", t.qualified_display_name())),
+        other => Some(other.repr()),
+    }
+}
+
 pub(crate) fn instance_method(obj: &Object, name: &str) -> Option<Object> {
     let inst = match obj {
         Object::Instance(i) => i.clone(),
@@ -31215,6 +33463,29 @@ pub(crate) fn instance_method(obj: &Object, name: &str) -> Option<Object> {
         Object::Instance(inst),
         m,
     ))))
+}
+
+/// CPython `Py_TPFLAGS_SEQUENCE`: list/tuple/range/memoryview match
+/// sequence patterns; str/bytes/bytearray are explicitly excluded
+/// (PEP 634). User classes qualify through `TypeObject::collection_flags`
+/// — inheriting from or being `register()`ed on `collections.abc.Sequence`.
+pub(crate) fn object_is_match_sequence(v: &Object) -> bool {
+    match v {
+        Object::Tuple(_) | Object::List(_) | Object::Range(_) | Object::MemoryView(_) => true,
+        Object::Instance(inst) => inst.cls().collection_flags() & (1 << 5) != 0,
+        _ => false,
+    }
+}
+
+/// CPython `Py_TPFLAGS_MAPPING`: dict and mappingproxy match mapping
+/// patterns; user classes qualify through `TypeObject::collection_flags`
+/// — inheriting from or being `register()`ed on `collections.abc.Mapping`.
+pub(crate) fn object_is_match_mapping(v: &Object) -> bool {
+    match v {
+        Object::Dict(_) | Object::MappingProxy(_) => true,
+        Object::Instance(inst) => inst.cls().collection_flags() & (1 << 6) != 0,
+        _ => false,
+    }
 }
 
 thread_local! {
@@ -31658,16 +33929,21 @@ fn unbound_gen_method_sentinel(ty: &Rc<TypeObject>, name: &str) -> Option<&'stat
     None
 }
 
-/// True when `instance` is a `PyInstance` whose dict holds a non-None
-/// value for `name`. Used to recognise exceptions that already carry an
-/// explicit `__context__` (set by an earlier raise/sync) so the fresh-
-/// exception context chaining doesn't overwrite it.
+/// True when `instance` is a `PyInstance` carrying a non-None value for
+/// exception pseudo-slot `name` (slot side table, with a dict fallback
+/// for user-assigned attributes). Used to recognise exceptions that
+/// already carry an explicit `__context__` (set by an earlier
+/// raise/sync) so the fresh-exception context chaining doesn't
+/// overwrite it.
 fn instance_has_nonnull_attr(instance: &Object, name: &str) -> bool {
     match instance {
-        Object::Instance(i) => matches!(
-            i.dict.borrow().get(&crate::object::StrKey(name)),
-            Some(v) if !matches!(v, Object::None)
-        ),
+        Object::Instance(i) => {
+            matches!(i.slot_get(name), Some(v) if !matches!(v, Object::None))
+                || matches!(
+                    i.dict.borrow().get(&crate::object::StrKey(name)),
+                    Some(v) if !matches!(v, Object::None)
+                )
+        }
         _ => false,
     }
 }
@@ -31676,18 +33952,10 @@ fn instance_has_nonnull_attr(instance: &Object, name: &str) -> bool {
 /// back to `None` if absent.
 fn exception_value(instance: &Object) -> Object {
     if let Object::Instance(inst) = instance {
-        if let Some(v) = inst
-            .dict
-            .borrow()
-            .get(&DictKey(Object::from_static("value")))
-        {
+        if let Some(v) = inst.slot_get("value") {
             return v.clone();
         }
-        if let Some(Object::Tuple(items)) = inst
-            .dict
-            .borrow()
-            .get(&DictKey(Object::from_static("args")))
-        {
+        if let Some(Object::Tuple(items)) = inst.slot_get("args") {
             if let Some(first) = items.first() {
                 return first.clone();
             }
@@ -31710,17 +33978,27 @@ fn exception_holds_nonatomic(obj: &Object) -> bool {
     let Object::Instance(inst) = obj else {
         return false;
     };
+    let nonatomic = |v: &Object| match v {
+        // `args` is always a tuple; inspect its elements so an all-scalar
+        // tuple like `("msg",)` doesn't force tracking.
+        Object::Tuple(t) => t.iter().any(|x| !crate::gc_trace::is_atomic(x)),
+        other => !crate::gc_trace::is_atomic(other),
+    };
+    // Exception state lives in the slot side table (`args`, OSError
+    // fields, …); user attributes land in the dict. Check both.
+    if let Ok(slots) = inst.slots.try_borrow() {
+        if let Some(slots) = slots.as_ref() {
+            if slots.iter().any(|(_, v)| nonatomic(v)) {
+                return true;
+            }
+        }
+    }
     let Ok(dict) = inst.dict.try_borrow() else {
         // Borrowed elsewhere (shouldn't happen on a just-built instance); err
         // toward tracking rather than silently leaking a potential cycle.
         return true;
     };
-    dict.iter().any(|(_, v)| match v {
-        // `args` is always a tuple; inspect its elements so an all-scalar
-        // tuple like `("msg",)` doesn't force tracking.
-        Object::Tuple(t) => t.iter().any(|x| !crate::gc_trace::is_atomic(x)),
-        other => !crate::gc_trace::is_atomic(other),
-    })
+    dict.iter().any(|(_, v)| nonatomic(v))
 }
 
 /// PEP 3151 errno → `OSError` subclass dispatch. Returns the subclass type
@@ -31834,8 +34112,21 @@ fn sort_key_needs_dunder_lt_depth(o: &Object, depth: u32) -> bool {
             // scalar for `Object::cmp` to order. Detect exactly that: an
             // ordering dunder is present, yet `native_value()` is `None`, so
             // the native path would raise a spurious "'<' not supported".
-            o.native_value().is_none()
+            if o.native_value().is_none()
                 && (inst.cls().lookup("__lt__").is_some() || inst.cls().lookup("__gt__").is_some())
+            {
+                return true;
+            }
+            // A `list`/`tuple` *subclass* instance orders as its native
+            // payload — recurse into it so contained `__lt__`-bearing
+            // elements still get Python `<` dispatch
+            // (test_sort.test_unsafe_object_compare's WackyList1).
+            match inst.native.get() {
+                Some(n @ (Object::List(_) | Object::Tuple(_))) => {
+                    sort_key_needs_dunder_lt_depth(n, depth + 1)
+                }
+                _ => false,
+            }
         }
         // A genuinely foreign extension object (a bare numpy scalar not
         // surfaced as an `Object::Instance`, …) orders through its
@@ -32172,6 +34463,18 @@ pub(crate) fn ascii_value(value: &Object) -> String {
     ascii_repr(value)
 }
 
+/// True when `o` is a string at the Python level: an exact `str`/`WStr`
+/// or a `str`-subclass instance (native payload is a string).
+pub(crate) fn str_like_object(o: &Object) -> bool {
+    match o {
+        Object::Str(_) | Object::WStr(_) => true,
+        Object::Instance(inst) => {
+            matches!(inst.native.get(), Some(Object::Str(_) | Object::WStr(_)))
+        }
+        _ => false,
+    }
+}
+
 /// Implement `str.format(*args, **kwargs)` at runtime. The grammar
 /// matches CPython's `string.Formatter.vformat`: `{}`, `{0}`,
 /// `{name}`, `{0.attr}`, `{name[key]}`, with optional `!r`/`!s`/`!a`
@@ -32271,11 +34574,19 @@ fn utf8_seq_len(b: u8) -> usize {
 /// closing brace.
 fn scan_format_field(bytes: &[u8], start: usize) -> Result<(String, usize), RuntimeError> {
     let mut depth = 0i32;
+    // Inside a `[...]` index of the field *name*, every character is literal:
+    // `'{[{]}'.format({'{': 'a'})` subscripts with the key `'{'`
+    // (test_str.test_format). Brace nesting only applies outside it.
+    let mut in_index = false;
+    let mut in_spec = false;
     let mut i = start;
     while i < bytes.len() {
         match bytes[i] {
-            b'{' => depth += 1,
-            b'}' => {
+            b'[' if !in_spec && !in_index && depth == 0 => in_index = true,
+            b']' if in_index => in_index = false,
+            b':' if !in_index && depth == 0 => in_spec = true,
+            b'{' if !in_index => depth += 1,
+            b'}' if !in_index => {
                 if depth == 0 {
                     let field = std::str::from_utf8(&bytes[start..i])
                         .map_err(|_| value_error("invalid utf-8 in format field"))?
@@ -32334,8 +34645,20 @@ fn split_format_field(field: &str) -> (&str, Option<char>, Option<&str>) {
             b']' => depth -= 1,
             b'!' if depth == 0 && conv.is_none() && spec_start.is_none() => {
                 name_end = i;
-                if let Some(&next) = bytes.get(i + 1) {
-                    conv = Some(next as char);
+                match bytes.get(i + 1) {
+                    Some(&next) => {
+                        conv = Some(next as char);
+                        // The conversion is exactly one character; anything
+                        // but `:` (or the field end) after it is malformed
+                        // (`'{0!rs}'` raises ValueError). U+0001 sentinel.
+                        if matches!(bytes.get(i + 2), Some(&after) if after != b':') {
+                            conv = Some('\u{1}');
+                        }
+                    }
+                    // A trailing `!` with no conversion char is malformed
+                    // (`'{0!}'.format(0)` raises ValueError); the NUL
+                    // sentinel fails in the conversion dispatch.
+                    None => conv = Some('\0'),
                 }
             }
             b':' if depth == 0 && spec_start.is_none() => {
@@ -32425,6 +34748,10 @@ fn split_name_trailers(name: &str) -> (&str, Vec<&str>) {
             trailers.push(&name[start..j]);
             start = j;
         } else {
+            // Junk after a `]` (`'{0[0]x}'`): surface it as a trailer so the
+            // caller can reject the field (CPython: "Only '.' or '[' may
+            // follow ']' in format field specifier").
+            trailers.push(&name[start..]);
             break;
         }
     }
@@ -32772,6 +35099,15 @@ pub(crate) fn percent_format_with(
             if i >= bytes.len() {
                 return Err(value_error("incomplete format"));
             }
+            // C-style length modifiers are accepted and ignored, one
+            // occurrence only ('%3ld' % 42 — CPython unicode_format_arg);
+            // a trailing '%l' is an incomplete format, like a bare '%'.
+            if b"hlL".contains(&bytes[i]) {
+                i += 1;
+                if i >= bytes.len() {
+                    return Err(value_error("incomplete format"));
+                }
+            }
             // Codepoint index of the conversion char, for error messages.
             let kind_index = template[..i].chars().count();
             let kind = bytes[i] as char;
@@ -32956,8 +35292,14 @@ pub(crate) fn percent_format_with(
                         _ => item.clone(),
                     };
                     if !percent_is_real(&numeric) {
-                        // gh-130928: `%i` reports as `%d` in the error.
-                        let kind_msg = if kind == 'i' { 'd' } else { kind };
+                        // str mode names the conversion as written (`%i
+                        // format: …`, test_str.test_formatting); bytes mode
+                        // still reports `%i` as `%d` (test_bytes.test_mod).
+                        let kind_msg = if kind == 'i' && mode == PercentMode::Bytes {
+                            'd'
+                        } else {
+                            kind
+                        };
                         return Err(type_error(format!(
                             "%{kind_msg} format: a real number is required, not {}",
                             item.type_name_owned()
@@ -33258,6 +35600,13 @@ fn builtin_text_signature(name: &str) -> Option<&'static str> {
         // The native `_lru_cache_wrapper` introspection methods
         // (`test_functools.test_common_signatures` expects `()`).
         ".lru_cache_wrapper.cache_info" | ".lru_cache_wrapper.cache_clear" => Some("($self, /)"),
+        // `object.__init_subclass__` — Argument Clinic's `($type, /)`:
+        // bound to a class it presents an empty signature (rlcompleter
+        // completes `None.__init_subclass__()` off it).
+        "__init_subclass__" => Some("($type, /)"),
+        // `type.mro` — clinic `($self, /)`; bound to a class it's a
+        // no-arg call (rlcompleter completes `Cls.mro()`).
+        "mro" => Some("($self, /)"),
         _ => None,
     }
 }
@@ -33344,6 +35693,39 @@ fn apply_format_spec_inner(
     // try to allocate gigabytes); CPython raises here.
     if matches!(parsed.precision, Some(prec) if prec > i32::MAX as usize) {
         return Err(value_error("precision too big"));
+    }
+    // CPython restricts the thousands separators by presentation type as an
+    // *allowlist*: `,` groups only the decimal forms (`d`, the float codes,
+    // and no-type), `_` additionally groups the binary/hex forms — anything
+    // else (`c`, `s`, `n`, unknown codes) raises "Cannot specify ',' with
+    // 'X'." before the type switch would report an unknown code
+    // (test_long.test__format__ checks `,s`).
+    if let Some(sep) = parsed.grouping {
+        let ty = parsed.type_char;
+        let rejected = match sep {
+            ',' => !matches!(
+                ty,
+                None | Some('d' | 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | '%')
+            ),
+            _ => !matches!(
+                ty,
+                None | Some('d' | 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | '%' | 'b' | 'o' | 'x' | 'X')
+            ),
+        };
+        if rejected {
+            return Err(value_error(format!(
+                "Cannot specify '{sep}' with '{}'.",
+                ty.expect("checked above")
+            )));
+        }
+    }
+    // `c` renders a character: a sign has no meaning and CPython rejects it
+    // (`format(3, "+c")` → "Sign not allowed with integer format specifier
+    // 'c'"; test_long.test__format__).
+    if parsed.type_char == Some('c') && parsed.sign.is_some() {
+        return Err(value_error(
+            "Sign not allowed with integer format specifier 'c'",
+        ));
     }
     // Complex routes through its own full formatter (parentheses + repr for
     // the no-type case, `re±imj` for explicit float types).
@@ -33451,7 +35833,12 @@ fn apply_format_spec_inner(
             let mut s = plain.to_owned();
             if let Some(p) = parsed.precision {
                 if matches!(parsed.type_char, Some('s') | None) {
-                    s.truncate(p);
+                    // Precision counts code points, not bytes —
+                    // format('あいう', '.2') keeps two chars (a byte-index
+                    // truncate would panic mid-codepoint).
+                    if let Some((b, _)) = s.char_indices().nth(p) {
+                        s.truncate(b);
+                    }
                 }
             }
             // CPython 3.13: when no presentation type is given,
@@ -33467,7 +35854,40 @@ fn apply_format_spec_inner(
                         | Object::Float(_)
                         | Object::Complex(_)
                 );
-            apply_alignment(&s, &parsed, numeric_default)
+            // String presentation has no digits for `'='` to pad into: an
+            // explicit `=` is rejected, while the `0`-shortcut form keeps the
+            // string's left alignment and zero-fills on the right
+            // (`'{0:08s}'.format('result')` → `'result00'`,
+            // test_str.test_format).
+            let mut sp = parsed.clone();
+            if !numeric_default {
+                // String presentation rejects the numeric-only options
+                // (test_str.test_format pins each message).
+                match sp.sign {
+                    Some(' ') => {
+                        return Err(value_error("Space not allowed in string format specifier"))
+                    }
+                    Some(_) => {
+                        return Err(value_error("Sign not allowed in string format specifier"))
+                    }
+                    None => {}
+                }
+                if sp.alt {
+                    return Err(value_error(
+                        "Alternate form (#) not allowed in string format specifier",
+                    ));
+                }
+                if sp.align == Some('=') {
+                    if sp.eq_from_zero {
+                        sp.align = Some('<');
+                    } else {
+                        return Err(value_error(
+                            "'=' alignment not allowed in string format specifier",
+                        ));
+                    }
+                }
+            }
+            apply_alignment(&s, &sp, numeric_default)
         }
         Some('c') => match value {
             Object::Int(i) => {
@@ -33514,6 +35934,10 @@ struct FmtState {
     auto_used: bool,
     manual_used: bool,
     auto_next: usize,
+    /// Nesting depth of `{…}` inside a format *spec*. CPython allows one
+    /// level (`'{0:{1}}'`); a spec inside a nested spec raises
+    /// "Max string recursion exceeded" (test_str.test_format).
+    spec_depth: usize,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -33526,6 +35950,10 @@ struct ParsedSpec {
     no_neg_zero: bool,
     alt: bool,
     zero: bool,
+    /// The `'='` in `align` came from the `0` shortcut (`{:08}`), not an
+    /// explicit `=` — string presentation then falls back to left alignment
+    /// instead of rejecting the spec.
+    eq_from_zero: bool,
     width: Option<usize>,
     grouping: Option<char>,
     precision: Option<usize>,
@@ -33576,9 +36004,15 @@ fn parse_format_spec(spec: &str, type_name: &str) -> Result<ParsedSpec, RuntimeE
     // [0]
     if let Some(&'0') = chars.get(i) {
         p.zero = true;
+        // The `0` flag supplies the fill even with an explicit alignment
+        // (`{:<08s}` fills with zeros on the right); only the `=` default
+        // depends on no alignment being given.
+        if p.fill.is_none() {
+            p.fill = Some('0');
+        }
         if p.align.is_none() {
             p.align = Some('=');
-            p.fill = Some('0');
+            p.eq_from_zero = true;
         }
         i += 1;
     }
@@ -33674,13 +36108,43 @@ fn int_precision_apply(core: String, p: &ParsedSpec) -> String {
     }
 }
 
+/// Length of the sign + `#` base-prefix decoration that will precede an
+/// integer's digits, so [`group_int_digits`] can budget the zero fill.
+fn int_decor_len(neg: bool, p: &ParsedSpec, prefixed: bool) -> usize {
+    let sign = usize::from(neg || matches!(p.sign, Some('+') | Some(' ')));
+    sign + if prefixed && p.alt { 2 } else { 0 }
+}
+
+/// Apply `,`/`_` grouping to an integer digit string. With the `0` flag
+/// (fill `'0'`, align `'='`) the zero padding participates in the
+/// grouping (CPython `_PyUnicode_InsertThousandsGrouping`):
+/// `format(1234, '08,d')` is `'0,001,234'` — digits are extended until
+/// the grouped result reaches the width, growing *past* it rather than
+/// leading with a separator (test_ipaddress formats `'039_b'`).
+fn group_int_digits(digits: String, p: &ParsedSpec, group: usize, decor: usize) -> String {
+    let Some(sep) = p.grouping else {
+        return digits;
+    };
+    let mut n = digits.len().max(1);
+    if p.fill == Some('0') && p.align == Some('=') {
+        if let Some(w) = p.width {
+            let min = w.saturating_sub(decor);
+            while n + (n - 1) / group < min {
+                n += 1;
+            }
+        }
+    }
+    let padded = if n > digits.len() {
+        format!("{}{digits}", "0".repeat(n - digits.len()))
+    } else {
+        digits
+    };
+    group_str(&padded, sep, group)
+}
+
 fn format_int(i: i64, p: &ParsedSpec) -> String {
     let mag = i.unsigned_abs();
-    let core = if let Some(grp) = p.grouping {
-        group_decimal(mag, grp)
-    } else {
-        mag.to_string()
-    };
+    let core = group_int_digits(mag.to_string(), p, 3, int_decor_len(i < 0, p, false));
     let core = int_precision_apply(core, p);
     let body = with_sign(i < 0, &core, p);
     apply_alignment(&body, p, true)
@@ -33694,6 +36158,8 @@ fn format_int_base(i: i64, base: u32, p: &ParsedSpec) -> String {
         10 => mag.to_string(),
         _ => mag.to_string(),
     };
+    // `_` groups binary/octal digits in fours (`,` is rejected upstream).
+    let core = group_int_digits(core, p, 4, int_decor_len(i < 0, p, true));
     let core = int_precision_apply(core, p);
     let mut body = if p.alt {
         let prefix = match base {
@@ -33716,6 +36182,8 @@ fn format_int_hex(i: i64, upper: bool, p: &ParsedSpec) -> String {
     } else {
         format!("{mag:x}")
     };
+    // `_` groups hex digits in fours (`,` is rejected upstream).
+    let body_core = group_int_digits(body_core, p, 4, int_decor_len(i < 0, p, true));
     let body_core = int_precision_apply(body_core, p);
     let mut body = if p.alt {
         format!("{}{body_core}", if upper { "0X" } else { "0x" })
@@ -33752,11 +36220,7 @@ fn format_bigint(b: &num_bigint::BigInt, p: &ParsedSpec) -> String {
     use num_traits::Signed;
     let neg = b.is_negative();
     let mag = b.abs().to_string();
-    let core = if let Some(grp) = p.grouping {
-        group_str(&mag, grp, 3)
-    } else {
-        mag
-    };
+    let core = group_int_digits(mag, p, 3, int_decor_len(neg, p, false));
     let core = int_precision_apply(core, p);
     let body = with_sign(neg, &core, p);
     apply_alignment(&body, p, true)
@@ -33771,6 +36235,7 @@ fn format_bigint_base(b: &num_bigint::BigInt, base: u32, p: &ParsedSpec) -> Stri
         8 => format!("{abs:o}"),
         _ => abs.to_string(),
     };
+    let core = group_int_digits(core, p, 4, int_decor_len(neg, p, true));
     let core = int_precision_apply(core, p);
     let mut body = if p.alt {
         let prefix = match base {
@@ -33795,6 +36260,7 @@ fn format_bigint_hex(b: &num_bigint::BigInt, upper: bool, p: &ParsedSpec) -> Str
     } else {
         format!("{abs:x}")
     };
+    let core = group_int_digits(core, p, 4, int_decor_len(neg, p, true));
     let core = int_precision_apply(core, p);
     let mut body = if p.alt {
         format!("{}{core}", if upper { "0X" } else { "0x" })
@@ -34197,24 +36663,6 @@ fn apply_alignment(body: &str, p: &ParsedSpec, default_right: bool) -> String {
     }
 }
 
-fn group_decimal(mag: u64, sep: char) -> String {
-    let s = mag.to_string();
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    let mut first = bytes.len() % 3;
-    if first == 0 {
-        first = 3;
-    }
-    out.push_str(std::str::from_utf8(&bytes[..first]).unwrap());
-    let mut i = first;
-    while i < bytes.len() {
-        out.push(sep);
-        out.push_str(std::str::from_utf8(&bytes[i..i + 3]).unwrap());
-        i += 3;
-    }
-    out
-}
-
 /// Does iterating `o` require driving the interpreter (a generator
 /// resume or an instance `__next__`/`__iter__` call)? Such sources are
 /// potentially unbounded and side-effecting, so `map`/`filter`/`zip`
@@ -34247,20 +36695,6 @@ fn object_needs_vm_iter(o: &Object) -> bool {
             | Object::AsyncGenerator(_)
             | Object::Instance(_)
     )
-}
-
-/// True when calling `o` cannot run user Python code: a native builtin
-/// function, or a builtin type's constructor. `map`/`filter` may only
-/// evaluate such callables eagerly — anything else (Python functions,
-/// user classes, callable instances, non-callables) must be driven
-/// lazily so side effects and `TypeError`s surface at `next()` exactly
-/// as in CPython.
-fn callable_is_pure_native(o: &Object) -> bool {
-    match o {
-        Object::Builtin(_) => true,
-        Object::Type(t) => t.flags.is_builtin,
-        _ => false,
-    }
 }
 
 fn is_type_error(e: &RuntimeError) -> bool {
@@ -34340,6 +36774,37 @@ fn is_super_callable(obj: &Object) -> bool {
 /// hierarchy. Matches CPython's ``int.real``, ``int.imag``,
 /// ``int.numerator``, ``int.denominator``, ``float.real`` /
 /// ``float.imag``, and ``complex.real`` / ``complex.imag``.
+/// CPython `PyMethod_Type` setattr/delattr taxonomy: `__func__`/`__self__`
+/// are read-only members, `__class__` is `object`'s guarded getset,
+/// `__doc__` is a non-writable getset, and everything else fails because
+/// methods carry no `__dict__` (test_funcattrs `InstancemethodAttrTest`).
+pub(crate) fn bound_method_readonly_error(name: &str, is_delete: bool) -> RuntimeError {
+    match name {
+        "__func__" | "__self__" => attribute_error("readonly attribute".to_owned()),
+        "__class__" if is_delete => type_error("can't delete __class__ attribute"),
+        "__class__" => type_error(
+            "__class__ assignment only supported for mutable types or ModuleType subclasses",
+        ),
+        "__doc__" => attribute_error(format!(
+            "attribute '{name}' of 'method' objects is not writable"
+        )),
+        _ => attribute_error(format!(
+            "'method' object has no attribute '{name}' and no __dict__ for setting new attributes"
+        )),
+    }
+}
+
+/// Assigning or deleting an attribute on a `range` object: the
+/// `start`/`stop`/`step` members are read-only (CPython raises
+/// `AttributeError: readonly attribute`); any other name is a plain
+/// missing-attribute `AttributeError` — never TypeError.
+pub(crate) fn range_attr_write_error(name: &str) -> RuntimeError {
+    match name {
+        "start" | "stop" | "step" => attribute_error("readonly attribute".to_owned()),
+        _ => attribute_error(format!("'range' object has no attribute '{name}'")),
+    }
+}
+
 fn numeric_data_attr(obj: &Object, name: &str) -> Option<Object> {
     match (obj, name) {
         // int / bool — CPython's `int.real` / `int.numerator` getters
@@ -34464,6 +36929,11 @@ fn constant_to_object(c: Constant) -> Object {
         Constant::WStr(cps) => Object::str_from_codepoints(cps),
         Constant::Bytes(b) => Object::new_bytes(b),
         Constant::Tuple(xs) => Object::new_tuple(xs.into_iter().map(constant_to_object).collect()),
+        Constant::FrozenSet(xs) => {
+            // Route through `new_frozenset_from` so the empty frozenset
+            // constant is the shared singleton (identity, like CPython).
+            Object::new_frozenset_from(xs.into_iter().map(constant_to_object))
+        }
         Constant::Code(c) => Object::Code(Rc::from(*c)),
         Constant::Ellipsis => crate::vm_singletons::ellipsis(),
     }
@@ -34491,7 +36961,7 @@ fn object_to_constant(o: &Object) -> Constant {
         Object::Bytes(b) => Constant::Bytes(b.to_vec()),
         Object::Tuple(xs) => Constant::Tuple(xs.iter().map(object_to_constant).collect()),
         Object::FrozenSet(s) => {
-            Constant::Tuple(s.iter().map(|k| object_to_constant(&k.0)).collect())
+            Constant::FrozenSet(s.iter().map(|k| object_to_constant(&k.0)).collect())
         }
         Object::Code(c) => Constant::Code(Box::new((**c).clone())),
         // `Ellipsis` (`...`) is a singleton instance of the registry
@@ -34642,16 +37112,21 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
 
         (O::Int(x), O::Float(y), op) => binary_op(&O::Float(*x as f64), &O::Float(*y), op),
         (O::Float(x), O::Int(y), op) => binary_op(&O::Float(*x), &O::Float(*y as f64), op),
+        // CPython converts the int operand with `PyLong_AsDouble`, which
+        // raises OverflowError past the finite double range (`1. + huge`,
+        // test_long.test_float_overflow) — never a silent ±inf.
         (O::Long(x), O::Float(y), op) => {
-            let xf = x
-                .to_f64()
-                .ok_or_else(|| value_error("int too large to convert to float"))?;
+            let xf = match x.to_f64() {
+                Some(f) if f.is_finite() => f,
+                _ => return Err(overflow_error("int too large to convert to float")),
+            };
             binary_op(&O::Float(xf), &O::Float(*y), op)
         }
         (O::Float(x), O::Long(y), op) => {
-            let yf = y
-                .to_f64()
-                .ok_or_else(|| value_error("int too large to convert to float"))?;
+            let yf = match y.to_f64() {
+                Some(f) if f.is_finite() => f,
+                _ => return Err(overflow_error("int too large to convert to float")),
+            };
             binary_op(&O::Float(*x), &O::Float(yf), op)
         }
 
@@ -34674,6 +37149,12 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
         }
         // `wstr * n` / `n * wstr`.
         (O::WStr(_), O::Int(n), B::Mult) | (O::Int(n), O::WStr(_), B::Mult) => {
+            // `unicode_repeat` returns the operand itself for `s * 1`
+            // (test_str.test_repeat_id_preserving asserts on `id`).
+            if *n == 1 {
+                let s = if matches!(a, O::WStr(_)) { a } else { b };
+                return Ok(s.clone());
+            }
             let cps = if matches!(a, O::WStr(_)) {
                 a.str_codepoints().unwrap()
             } else {
@@ -34687,9 +37168,20 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             Ok(Object::str_from_codepoints(out))
         }
         (O::Str(x), O::Int(n), B::Mult) | (O::Int(n), O::Str(x), B::Mult) => {
-            let times = checked_repeat_count(x.len(), *n, "string")?;
+            // Same-object return for `s * 1` (CPython `unicode_repeat`).
+            if *n == 1 {
+                return Ok(Object::Str(x.clone()));
+            }
+            // The overflow gate counts *characters* (CPython budgets code
+            // points); the byte-level allocation can still exceed memory
+            // and must surface as MemoryError, not OverflowError
+            // ('é' * (maxsize) in test_str.test_raiseMemError).
+            let times = checked_repeat_count(crate::builtins::str_char_len(x), *n, "string")?;
             let mut out = String::new();
-            if out.try_reserve_exact(x.len() * times).is_err() {
+            if x.len()
+                .checked_mul(times)
+                .is_none_or(|total| out.try_reserve_exact(total).is_err())
+            {
                 return Err(RuntimeError::PyException(
                     crate::error::PyException::from_builtin("MemoryError", ""),
                 ));
@@ -34998,8 +37490,17 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
                     orig_name(b_was_bool, &b)
                 );
             }
+            // Python 2 migration hint (CPython `binary_op1`): `print >> f`
+            // means the caller wrote py2-style stream redirection with the
+            // py3 `print` *function* as the left operand.
+            let hint =
+                if matches!(op, B::RShift) && matches!(&a, O::Builtin(f) if f.name == "print") {
+                    ". Did you mean \"print(<message>, file=<output_stream>)\"?"
+                } else {
+                    ""
+                };
             Err(type_error(format!(
-                "unsupported operand type(s) for {}: '{}' and '{}'",
+                "unsupported operand type(s) for {}: '{}' and '{}'{hint}",
                 op.as_str(),
                 orig_name(a_was_bool, &a),
                 orig_name(b_was_bool, &b)
@@ -35446,7 +37947,16 @@ fn bignum_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             // CPython computes a correctly-rounded quotient; we scale the
             // operands by a power of two so the integer quotient carries
             // ~64 significant bits, convert that, then undo the scaling.
-            Ok(Object::Float(bigint_true_div(&x, &y)))
+            // A quotient beyond the finite double range is CPython's
+            // `long_true_divide` OverflowError, never ±inf
+            // (test_long.test_correctly_rounded_true_division).
+            let q = bigint_true_div(&x, &y);
+            if q.is_infinite() {
+                return Err(overflow_error(
+                    "integer division result too large for a float",
+                ));
+            }
+            Ok(Object::Float(q))
         }
         B::FloorDiv => {
             if y.is_zero() {
@@ -35468,13 +37978,14 @@ fn bignum_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
         }
         B::Pow => {
             if y.is_negative() {
-                let xf = x
-                    .to_f64()
-                    .ok_or_else(|| value_error("int too large for float"))?;
-                let yf = y
-                    .to_f64()
-                    .ok_or_else(|| value_error("int too large for float"))?;
-                return Ok(Object::Float(xf.powf(yf)));
+                // CPython delegates a negative exponent to float pow, whose
+                // operand conversion (PyLong_AsDouble) raises OverflowError
+                // past the finite double range.
+                let conv = |v: &num_bigint::BigInt| match v.to_f64() {
+                    Some(f) if f.is_finite() => Ok(f),
+                    _ => Err(overflow_error("int too large to convert to float")),
+                };
+                return Ok(Object::Float(conv(&x)?.powf(conv(&y)?)));
             }
             let exp = y
                 .to_u32()

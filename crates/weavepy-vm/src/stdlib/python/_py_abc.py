@@ -83,6 +83,18 @@ class ABCMeta(type):
             raise RuntimeError("Refusing to create an inheritance cycle")
         cls._abc_registry.add(subclass)
         ABCMeta._abc_invalidation_counter += 1  # Invalidate negative cache
+        # CPython's C `_abc_register` copies the ABC's collection flag
+        # (Py_TPFLAGS_SEQUENCE / Py_TPFLAGS_MAPPING) onto the registered
+        # class (and recursively its subclasses), so late registration on
+        # Sequence/Mapping makes match patterns work (test_patma). The VM
+        # walks the MRO for this marker, so stamping the registered class
+        # also covers its subclasses.
+        collection_flag = getattr(cls, "_abc_collection_flags", 0)
+        if collection_flag:
+            try:
+                subclass._abc_collection_flags = collection_flag
+            except TypeError:
+                pass  # immutable (builtin) type
         return subclass
 
     def _dump_registry(cls, file=None):

@@ -182,3 +182,10 @@ class local:
 # introspection (and the ``__all__`` audit) matches upstream.
 local.__module__ = '_thread'
 local.__qualname__ = '_local'
+
+# ...and publish the class *on* ``_thread`` itself, so ``from _thread import
+# _local`` (threading's preferred path, and test_threading_local's C-type
+# lane) resolves to this very class. WeavePy has a single ``local``
+# implementation, so both spellings are one object — just as in CPython,
+# where ``threading.local`` *is* ``_thread._local``.
+_thread._local = local

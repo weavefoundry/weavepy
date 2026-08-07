@@ -3474,7 +3474,9 @@ fn ns_shutdown(args: &[Object]) -> Result<Object, RuntimeError> {
         let mut s = cell.borrow_mut();
         let nonblocking = sock_is_nonblocking(&s.sock);
         s.conn.send_close_notify();
-        let TlsSession { conn, sock, .. } = &mut *s;
+        let TlsSession {
+            conn, sock, rec, ..
+        } = &mut *s;
         let res = crate::gil::allow_threads_then(|| -> std::io::Result<()> {
             // 1) Flush our close_notify (and any records still queued).
             while conn.wants_write() {
@@ -3502,14 +3504,37 @@ fn ns_shutdown(args: &[Object]) -> Result<Object, RuntimeError> {
                         Err(_) => break,
                     }
                 }
-                match conn.read_tls(sock) {
+                // Record-precise reads (never past a record boundary): once
+                // the peer's `close_notify` record has been consumed we stop,
+                // and anything the peer sent *after* it — e.g. the plaintext
+                // that follows a STARTTLS-style `unwrap()` — stays in the
+                // kernel buffer for the raw socket. A greedy `read_tls(sock)`
+                // here ate that plaintext when it landed in the same kernel
+                // buffer as the close_notify, deadlocking test_starttls under
+                // sweep load (both peers blocked in recv, all queues empty).
+                match conn.read_tls(&mut RecordReader { sock, st: rec }) {
                     Ok(0) => break, // EOF: peer closed the transport.
-                    Ok(_) => {}
+                    Ok(k) => {
+                        if dbg {
+                            eprintln!("[shutdown drain] read_tls Ok({k})");
+                        }
+                    }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => break,
+                    Err(e) => {
+                        if dbg {
+                            eprintln!("[shutdown drain] read_tls err {e}");
+                        }
+                        break;
+                    }
                 }
                 match conn.process_new_packets() {
                     Ok(io) => {
+                        if dbg {
+                            eprintln!(
+                                "[shutdown drain] processed, peer_has_closed={}",
+                                io.peer_has_closed()
+                            );
+                        }
                         if io.peer_has_closed() {
                             // Flush whatever plaintext that close surfaced, then stop.
                             while let Ok(n) = conn.reader().read(&mut scratch) {
@@ -3526,6 +3551,15 @@ fn ns_shutdown(args: &[Object]) -> Result<Object, RuntimeError> {
             Ok(())
         });
         if dbg {
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd;
+                let fd = s.sock.as_raw_fd();
+                let mut avail: libc::c_int = -1;
+                unsafe { libc::ioctl(fd, libc::FIONREAD, &raw mut avail) };
+                eprintln!("[shutdown id={id} nb={nonblocking}] -> {res:?} kernel_rx_avail={avail}");
+            }
+            #[cfg(not(unix))]
             eprintln!("[shutdown id={id} nb={nonblocking}] -> {res:?}");
         }
         let _ = res;

@@ -36,12 +36,28 @@ def make_spec_and_loader(name, filename, is_package, search_locations):
             loader = BuiltinImporter
         return None, loader
     if filename is None:
+        if is_package and search_locations:
+            # No file but real search locations: a PEP 420 namespace
+            # package the native importer assembled. CPython 3.12+
+            # gives these a NamespaceLoader (importlib.resources
+            # depends on its get_resource_reader — NamespaceDiskTests).
+            from importlib.machinery import NamespaceLoader
+            locations = list(search_locations)
+            loader = NamespaceLoader(name, locations)
+            spec = ModuleSpec(name, loader, origin=None, is_package=True)
+            spec.submodule_search_locations = locations
+            return spec, loader
         spec = ModuleSpec(name, BuiltinImporter, origin="built-in")
         return spec, BuiltinImporter
     if filename.startswith("<"):
         if filename.startswith("<frozen"):
-            spec = ModuleSpec(name, FrozenImporter, origin="frozen",
-                              is_package=is_package)
+            # Prefer the finder so the spec carries CPython's
+            # `loader_state` (origname/filename) — falls back to a bare
+            # spec when the frozen-tests override hides the name.
+            spec = FrozenImporter.find_spec(name)
+            if spec is None:
+                spec = ModuleSpec(name, FrozenImporter, origin="frozen",
+                                  is_package=is_package)
             return spec, FrozenImporter
         return None, None
     if filename.endswith((".so", ".pyd", ".dylib")):

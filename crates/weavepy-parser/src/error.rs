@@ -21,6 +21,11 @@ pub enum ParseError {
         feature: &'static str,
         rfc: &'static str,
     },
+    /// A non-ASCII identifier NFKC-normalized to `True`/`False`/`None`;
+    /// CPython raises `ValueError` (not `SyntaxError`) for these
+    /// (test_ast `test_constant_as_unicode_name`).
+    #[error("identifier field can't represent '{name}' constant")]
+    IdentifierConstant { span: Span, name: String },
 }
 
 impl ParseError {
@@ -31,7 +36,8 @@ impl ParseError {
             ParseError::Lex(e) => e.byte_offset(),
             ParseError::Unexpected { span, .. }
             | ParseError::Indentation { span, .. }
-            | ParseError::NotImplemented { span, .. } => span.start.0,
+            | ParseError::NotImplemented { span, .. }
+            | ParseError::IdentifierConstant { span, .. } => span.start.0,
         }
     }
 
@@ -43,7 +49,8 @@ impl ParseError {
             ParseError::Lex(e) => e.byte_offset(),
             ParseError::Unexpected { span, .. }
             | ParseError::Indentation { span, .. }
-            | ParseError::NotImplemented { span, .. } => span.end.0,
+            | ParseError::NotImplemented { span, .. }
+            | ParseError::IdentifierConstant { span, .. } => span.end.0,
         }
     }
 
@@ -59,7 +66,9 @@ impl ParseError {
             ParseError::Unexpected { message, .. } | ParseError::Indentation { message, .. } => {
                 message.clone()
             }
-            ParseError::NotImplemented { .. } => self.to_string(),
+            ParseError::NotImplemented { .. } | ParseError::IdentifierConstant { .. } => {
+                self.to_string()
+            }
         }
     }
 
@@ -70,10 +79,13 @@ impl ParseError {
     pub fn exception_class(&self) -> &'static str {
         match self {
             ParseError::Indentation { .. }
-            | ParseError::Lex(LexError::UnknownDedent { .. } | LexError::TooDeepIndent { .. }) => {
-                "IndentationError"
-            }
+            | ParseError::Lex(
+                LexError::UnknownDedent { .. }
+                | LexError::TooDeepIndent { .. }
+                | LexError::UnexpectedIndent { .. },
+            ) => "IndentationError",
             ParseError::Lex(LexError::InconsistentIndent { .. }) => "TabError",
+            ParseError::IdentifierConstant { .. } => "ValueError",
             _ => "SyntaxError",
         }
     }

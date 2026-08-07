@@ -1668,6 +1668,14 @@ fn os_urandom(args: &[Object]) -> Result<Object, RuntimeError> {
         // CPython rejects a negative size with `ValueError`.
         Some(n) if n < 0 => return Err(value_error("negative argument not allowed")),
         Some(n) => n as usize,
+        // An int beyond ssize_t overflows the clinic conversion
+        // (SystemRandom.randbytes(1 << 1000) — test_random expects
+        // OverflowError, not TypeError).
+        None if matches!(args.first(), Some(Object::Long(_))) => {
+            return Err(crate::error::overflow_error(
+                "Python int too large to convert to C ssize_t",
+            ))
+        }
         None => return Err(type_error("urandom() argument must be int")),
     };
     #[cfg(unix)]
@@ -1874,7 +1882,7 @@ fn os_fcopyfile(args: &[Object]) -> Result<Object, RuntimeError> {
 /// into a `Disk`-backed `PyFile`, so `read`/`write`/`seek`/`fileno` work and
 /// closing the file closes the fd.
 #[cfg(unix)]
-fn os_fdopen(args: &[Object], _kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+fn os_fdopen(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     use crate::object::{FileBackend, PyFile};
     use std::os::unix::io::FromRawFd;
     // CPython 3.12+: a `bool` fd raises a `RuntimeWarning` before anything
@@ -1913,7 +1921,25 @@ fn os_fdopen(args: &[Object], _kwargs: &[(String, Object)]) -> Result<Object, Ru
     let file = unsafe { std::fs::File::from_raw_fd(fd as i32) };
     let pf = PyFile::new(format!("<fdopen fd={fd}>"), mode, FileBackend::Disk(file));
     pf.no_name.set(true);
-    Ok(Object::File(Rc::new(pf)))
+    // CPython's `os.fdopen` *is* `io.open(fd, …)`: the text-layer
+    // configuration (buffering / encoding / errors / newline) applies the
+    // same way — fileinput's inplace mode fdopens its output with
+    // `encoding=`/`errors=` and expects the codec to run on writes
+    // (test_fileinput.test_inplace_encoding_errors).
+    let kw = |name: &str| kwargs.iter().find(|(k, _)| k == name).map(|(_, v)| v);
+    let buffering = args.get(2).or_else(|| kw("buffering"));
+    let encoding = args.get(3).or_else(|| kw("encoding"));
+    let errors = args.get(4).or_else(|| kw("errors"));
+    let newline = args.get(5).or_else(|| kw("newline"));
+    let binary = pf.binary;
+    crate::stdlib::io_full::finish_open(
+        Object::File(Rc::new(pf)),
+        buffering,
+        encoding,
+        errors,
+        newline,
+        binary,
+    )
 }
 
 #[cfg(not(unix))]
@@ -1989,7 +2015,7 @@ fn os_strerror(args: &[Object]) -> Result<Object, RuntimeError> {
 /// through the live `warnings` machinery (so `assertWarns`/`catch_warnings`
 /// observe it, and an escalating filter turns it into a raised error). A no-op
 /// if no interpreter is published on this thread.
-fn warn_bool_as_fd() -> Result<(), RuntimeError> {
+pub(crate) fn warn_bool_as_fd() -> Result<(), RuntimeError> {
     if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
         // SAFETY: published by the enclosing VM frame still live on this
         // thread; the GIL keeps the pointer exclusive.
@@ -2052,6 +2078,49 @@ fn os_lstat_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, R
     let p = first_path(args, "lstat")?;
     let meta = std::fs::symlink_metadata(&p).map_err(|e| path_io_err(&e, args.first(), &p))?;
     Ok(stat_result_from_meta(&meta))
+}
+
+/// Finish a Rust-built `stat_result`: give the instance its native 10-slot
+/// tuple view (CPython's sequence layout, integer seconds in the three
+/// unnamed time slots) and default any layout-advertised named field the
+/// builder didn't set, so attribute access matches CPython on every platform.
+fn stat_seq_finish(inst: &crate::types::PyInstance) {
+    let mut seq: Vec<Object> = Vec::with_capacity(10);
+    {
+        let d = inst.dict.borrow();
+        let get = |f: &'static str| d.get(&DictKey(Object::from_static(f))).cloned();
+        for f in [
+            "st_mode", "st_ino", "st_dev", "st_nlink", "st_uid", "st_gid", "st_size",
+        ] {
+            seq.push(get(f).unwrap_or(Object::Int(0)));
+        }
+        for f in ["st_atime", "st_mtime", "st_ctime"] {
+            seq.push(match get(f) {
+                Some(Object::Float(x)) => Object::Int(x as i64),
+                Some(other) => other,
+                None => Object::Int(0),
+            });
+        }
+    }
+    let _ = inst.native.set(Object::new_tuple(seq));
+    #[cfg(target_os = "macos")]
+    {
+        let mut d = inst.dict.borrow_mut();
+        for f in ["st_flags", "st_gen"] {
+            let k = DictKey(Object::from_static(f));
+            if d.get(&k).is_none() {
+                d.insert(k, Object::Int(0));
+            }
+        }
+        let k = DictKey(Object::from_static("st_birthtime"));
+        if d.get(&k).is_none() {
+            let v = d
+                .get(&DictKey(Object::from_static("st_ctime")))
+                .cloned()
+                .unwrap_or(Object::Float(0.0));
+            d.insert(k, v);
+        }
+    }
 }
 
 fn stat_result_from_meta(meta: &std::fs::Metadata) -> Object {
@@ -2221,6 +2290,7 @@ fn stat_result_from_meta(meta: &std::fs::Metadata) -> Object {
         );
     }
     drop(d);
+    stat_seq_finish(&inst);
     Object::Instance(Rc::new(inst))
 }
 
@@ -2278,7 +2348,25 @@ fn stat_result_from_libc_stat(st: &libc::stat) -> Object {
         ] {
             d.insert(DictKey(Object::from_static(k)), Object::Float(v));
         }
+        // The BSD extras CPython exposes on macOS (`st_flags`, `st_gen`,
+        // `st_birthtime`) come straight off the raw struct.
+        #[cfg(target_os = "macos")]
+        {
+            d.insert(
+                DictKey(Object::from_static("st_flags")),
+                Object::Int(i64::from(st.st_flags)),
+            );
+            d.insert(
+                DictKey(Object::from_static("st_gen")),
+                Object::Int(i64::from(st.st_gen)),
+            );
+            d.insert(
+                DictKey(Object::from_static("st_birthtime")),
+                Object::Float(ns(st.st_birthtime as i64, st.st_birthtime_nsec as i64)),
+            );
+        }
     }
+    stat_seq_finish(&inst);
     Object::Instance(Rc::new(inst))
 }
 
@@ -4779,24 +4867,46 @@ fn path_like_type_singleton(name: &str) -> Rc<crate::types::TypeObject> {
     ty
 }
 
-/// The "visible" struct-sequence members of `os.stat_result`, in index order
-/// — the first 10 positions `stat_result(seq)` consumes and `st[i]` returns,
-/// matching CPython's `structseq` layout (`Modules/posixmodule.c`).
-const STAT_RESULT_FIELDS: [&str; 10] = [
-    "st_mode", "st_ino", "st_dev", "st_nlink", "st_uid", "st_gid", "st_size", "st_atime",
-    "st_mtime", "st_ctime",
-];
-
 /// Process-wide memoised `os.stat_result` type. Memoisation is load-bearing
 /// for *identity*: `stat`/`lstat`/`fstat`/`DirEntry.stat()` build instances of
 /// this exact type, and the module exposes the very same object as
 /// `os.stat_result` / `posix.stat_result`, so `isinstance(os.stat(p),
 /// os.stat_result)` holds — the CPython invariant tests (and `tarfile`,
-/// `shutil`, `http.server`, …) rely on. The type is a CPython-style struct
-/// sequence: addressable both by `st_*` attribute and by integer index, and
-/// constructible from a 10-sequence (`posix.stat_result((...))`).
+/// `shutil`, `http.server`, …) rely on.
+///
+/// The layout is CPython's (`Modules/posixmodule.c` `stat_result_fields`):
+/// 10 sequence slots of which the trailing three are *unnamed* — those hold
+/// the integer-seconds times, while the float `st_atime`/`st_mtime`/`st_ctime`
+/// are hidden named members (slots 10-12), followed by the `_ns` trio and the
+/// platform extras. That split is why `tuple(st)[7]` is an int while
+/// `st.st_atime` is a float, and why `n_unnamed_fields == 3`
+/// (test_structseq.test_match_args_with_unnamed_fields).
 fn stat_result_type() -> Rc<crate::types::TypeObject> {
-    struct_seq_type("stat_result", "os", &STAT_RESULT_FIELDS)
+    #[allow(unused_mut)]
+    let mut slots: Vec<Option<&'static str>> = vec![
+        Some("st_mode"),
+        Some("st_ino"),
+        Some("st_dev"),
+        Some("st_nlink"),
+        Some("st_uid"),
+        Some("st_gid"),
+        Some("st_size"),
+        None,
+        None,
+        None,
+        Some("st_atime"),
+        Some("st_mtime"),
+        Some("st_ctime"),
+        Some("st_atime_ns"),
+        Some("st_mtime_ns"),
+        Some("st_ctime_ns"),
+        Some("st_blksize"),
+        Some("st_blocks"),
+        Some("st_rdev"),
+    ];
+    #[cfg(target_os = "macos")]
+    slots.extend([Some("st_flags"), Some("st_gen"), Some("st_birthtime")]);
+    struct_seq_type_layout("stat_result", "os", slots, 10)
 }
 
 /// `os.terminal_size` — a 2-field struct sequence (`columns`, `lines`). Verbatim
@@ -4809,27 +4919,116 @@ fn terminal_size_type() -> Rc<crate::types::TypeObject> {
     struct_seq_type("terminal_size", "os", &TERMINAL_SIZE_FIELDS)
 }
 
-/// Build (and memoise, by `name`) a CPython-style `PyStructSequence` type:
-/// addressable both by `fields[i]` attribute and by integer index, with
-/// `__len__` == `fields.len()`, and constructible from a `>= fields.len()`
-/// sequence plus an optional trailing dict of hidden named fields. Backs
-/// `os.stat_result`, `os.terminal_size`, etc. Memoisation keeps type identity
-/// stable across module rebuilds so `isinstance` holds.
+/// Full slot layout of a CPython `PyStructSequence` type
+/// (`Objects/structseq.c`). A C struct sequence has three zones: the leading
+/// `n_sequence` slots form the tuple view — some of which may be *unnamed*,
+/// reachable by position only (the integer-seconds `st_?time` trio of
+/// `os.stat_result`) — and every slot after them is a named-only "hidden"
+/// member (`tm_zone`, `st_atime_ns`, …) reachable by attribute and via the
+/// constructor's `dict` argument.
+pub(crate) struct StructSeqLayout {
+    pub name: &'static str,
+    pub module: &'static str,
+    /// Every slot in index order; `None` is an unnamed slot.
+    pub slots: Vec<Option<&'static str>>,
+    /// How many leading slots the tuple view exposes (`n_sequence_fields`).
+    pub n_sequence: usize,
+}
+
+impl StructSeqLayout {
+    fn n_fields(&self) -> usize {
+        self.slots.len()
+    }
+
+    fn n_unnamed(&self) -> usize {
+        self.slots.iter().filter(|s| s.is_none()).count()
+    }
+
+    /// All named members in slot order — CPython's `tp_members`. Unnamed
+    /// slots are skipped, so `named()[i]` for `i < n_sequence` pulls *later*
+    /// names forward exactly like `tp_members[i]` (which is how `repr(st)`
+    /// pairs `st_atime=` with the integer slot 7).
+    fn named(&self) -> Vec<&'static str> {
+        self.slots.iter().filter_map(|s| *s).collect()
+    }
+
+    fn is_named(&self, attr: &str) -> bool {
+        self.slots.contains(&Some(attr))
+    }
+}
+
+thread_local! {
+    /// name → (memoised type, leaked layout). Memoisation keeps type
+    /// identity stable across module rebuilds so `isinstance` holds.
+    static STRUCT_SEQ_REGISTRY: RefCell<
+        std::collections::HashMap<
+            &'static str,
+            (Rc<crate::types::TypeObject>, &'static StructSeqLayout),
+        >,
+    > = RefCell::new(std::collections::HashMap::new());
+}
+
+/// Fetch a memoised struct-sequence type (and its layout) by name.
+fn struct_seq_lookup(
+    name: &str,
+) -> Option<(Rc<crate::types::TypeObject>, &'static StructSeqLayout)> {
+    STRUCT_SEQ_REGISTRY.with(|r| r.borrow().get(name).map(|(t, l)| (t.clone(), *l)))
+}
+
+/// Is `ty` one of the memoised struct-sequence types? `type.__setattr__`
+/// consults this: CPython struct-sequence types are *heap* types, so scripts
+/// can set attributes on them even though every other builtin type is
+/// immutable (test_structseq.test_reference_cycle stores an instance on its
+/// own type).
+pub(crate) fn is_struct_seq_type(ty: &Rc<crate::types::TypeObject>) -> bool {
+    STRUCT_SEQ_REGISTRY.with(|r| {
+        r.borrow()
+            .get(ty.name.as_str())
+            .is_some_and(|(t, _)| Rc::ptr_eq(t, ty))
+    })
+}
+
+/// Build (and memoise, by `name`) an all-visible, all-named struct-sequence
+/// type — the common shape (`os.times_result`, `os.terminal_size`,
+/// `sys.flags`, …).
 pub(crate) fn struct_seq_type(
     name: &'static str,
     module: &'static str,
     fields: &'static [&'static str],
 ) -> Rc<crate::types::TypeObject> {
+    struct_seq_type_layout(
+        name,
+        module,
+        fields.iter().map(|f| Some(*f)).collect(),
+        fields.len(),
+    )
+}
+
+/// Build (and memoise, by `name`) a CPython-style `PyStructSequence` type
+/// with the given full slot layout: addressable by named attribute and by
+/// integer index, with `__len__` == `n_sequence`, and constructible from a
+/// `n_sequence..=n_fields` element sequence plus an optional `dict` of hidden
+/// named fields. Backs `os.stat_result`, `time.struct_time`, etc.
+pub(crate) fn struct_seq_type_layout(
+    name: &'static str,
+    module: &'static str,
+    slots: Vec<Option<&'static str>>,
+    n_sequence: usize,
+) -> Rc<crate::types::TypeObject> {
     use crate::types::{TypeFlags, TypeObject};
-    use std::collections::HashMap;
-    thread_local! {
-        static REGISTRY: RefCell<HashMap<&'static str, Rc<TypeObject>>> =
-            RefCell::new(HashMap::new());
-    }
-    REGISTRY.with(|reg| {
-        if let Some(c) = reg.borrow().get(name) {
+    STRUCT_SEQ_REGISTRY.with(|reg| {
+        if let Some((c, _)) = reg.borrow().get(name) {
             return c.clone();
         }
+        // Leaked so the method closures can capture a `Send + Sync` handle;
+        // one allocation per struct-sequence *type*, of which there is a
+        // fixed handful per process.
+        let layout: &'static StructSeqLayout = Box::leak(Box::new(StructSeqLayout {
+            name,
+            module,
+            slots,
+            n_sequence,
+        }));
         let bt = crate::builtin_types::builtin_types();
         let mut dict = DictData::default();
         // `__module__`/`__qualname__` let `pickle`/`copy` find the type by
@@ -4842,19 +5041,48 @@ pub(crate) fn struct_seq_type(
             DictKey(Object::from_static("__qualname__")),
             Object::from_static(name),
         );
-        struct_seq_method(&mut dict, "__init__", move |args| {
-            struct_seq_init(name, fields, args)
+        // CPython's struct-sequence class metadata (test_structseq
+        // test_fields / test_match_args): the three counts, plus
+        // `__match_args__` — the named slots up to the first unnamed one
+        // (`st_mode`..`st_size` for `stat_result`, all 9 `tm_*` for
+        // `struct_time`).
+        dict.insert(
+            DictKey(Object::from_static("n_fields")),
+            Object::Int(layout.n_fields() as i64),
+        );
+        dict.insert(
+            DictKey(Object::from_static("n_sequence_fields")),
+            Object::Int(layout.n_sequence as i64),
+        );
+        dict.insert(
+            DictKey(Object::from_static("n_unnamed_fields")),
+            Object::Int(layout.n_unnamed() as i64),
+        );
+        let match_args: Vec<Object> = layout.slots[..layout.n_sequence]
+            .iter()
+            .map_while(|s| s.map(Object::from_static))
+            .collect();
+        dict.insert(
+            DictKey(Object::from_static("__match_args__")),
+            Object::new_tuple(match_args),
+        );
+        struct_seq_method_kw(&mut dict, "__init__", move |args, kwargs| {
+            struct_seq_init(layout, args, kwargs)
         });
         // `__reduce__` makes the struct sequence picklable as
         // `(type, (visible_tuple, hidden_dict))` — CPython's `structseq_reduce`.
         struct_seq_method(&mut dict, "__reduce__", move |args| {
-            struct_seq_reduce(name, module, fields, args)
+            struct_seq_reduce(layout, args)
+        });
+        // `copy.replace()` support (CPython `structseq_replace`).
+        struct_seq_method_kw(&mut dict, "__replace__", move |args, kwargs| {
+            struct_seq_replace(layout, args, kwargs)
         });
         struct_seq_method(&mut dict, "__getitem__", move |args| {
-            struct_seq_getitem(fields, args)
+            struct_seq_getitem(layout, args)
         });
         struct_seq_method(&mut dict, "__len__", move |_args| {
-            Ok(Object::Int(fields.len() as i64))
+            Ok(Object::Int(layout.n_sequence as i64))
         });
         // Now that struct sequences subclass `tuple` (for `isinstance` parity),
         // the inherited `tuple.__iter__` would look at native tuple storage,
@@ -4864,26 +5092,26 @@ pub(crate) fn struct_seq_type(
             let Some(Object::Instance(inst)) = args.first() else {
                 return Err(type_error("__iter__ requires a struct sequence instance"));
             };
-            let values = struct_seq_values(fields, inst);
+            let values = struct_seq_values(layout, inst);
             let it = Object::new_list(values).make_iter()?;
             Ok(Object::Iter(Rc::new(RefCell::new(it))))
         });
-        // CPython struct sequences expose their members as read-only getset
+        // CPython struct sequences expose their members as read-only member
         // descriptors and carry no instance `__dict__`, so *any* attribute
-        // assignment raises `AttributeError` (`test_os.test_stat_attributes`
-        // checks `st.st_mode = 1`, `st.st_rdev = 1`, and `st.parrot = 1` all
-        // raise). The fields themselves are populated through `inst.dict`
-        // directly in Rust (`struct_seq_init` / the `*_from_meta` builders),
-        // which bypasses this guard.
+        // assignment raises `AttributeError`: named fields with the member
+        // descriptor's bare "readonly attribute"
+        // (test_structseq.test_copy_replace_with_invisible_fields matches
+        // that exact wording), unknown names with the generic message. The
+        // fields themselves are populated through `inst.dict` directly in
+        // Rust (`struct_seq_init` / the `*_from_meta` builders), which
+        // bypasses this guard.
         struct_seq_method(&mut dict, "__setattr__", move |args| {
             let attr = match args.get(1) {
                 Some(Object::Str(s)) => s.to_string(),
                 _ => String::new(),
             };
-            if fields.contains(&attr.as_str()) {
-                Err(crate::error::attribute_error(format!(
-                    "attribute '{attr}' of '{name}' objects is not writable"
-                )))
+            if layout.is_named(&attr) {
+                Err(crate::error::attribute_error("readonly attribute"))
             } else {
                 Err(crate::error::attribute_error(format!(
                     "'{name}' object has no attribute '{attr}'"
@@ -4895,20 +5123,35 @@ pub(crate) fn struct_seq_type(
         // in `test_pathlib`, and using a `stat_result` as a dict key). Compare
         // against another struct sequence of the same type or a plain tuple.
         struct_seq_method(&mut dict, "__eq__", move |args| {
-            struct_seq_richcompare(fields, args, CompareKind::Eq)
+            struct_seq_richcompare(layout, args, CompareKind::Eq)
         });
         struct_seq_method(&mut dict, "__ne__", move |args| {
-            struct_seq_richcompare(fields, args, CompareKind::NotEq)
+            struct_seq_richcompare(layout, args, CompareKind::NotEq)
+        });
+        // Ordering too: struct sequences order like their visible tuple
+        // (`strptime('Feb 29', '%b %d') < strptime('Mar 1', '%b %d')` —
+        // test_strptime's leap-year default test).
+        struct_seq_method(&mut dict, "__lt__", move |args| {
+            struct_seq_richcompare(layout, args, CompareKind::Lt)
+        });
+        struct_seq_method(&mut dict, "__le__", move |args| {
+            struct_seq_richcompare(layout, args, CompareKind::LtE)
+        });
+        struct_seq_method(&mut dict, "__gt__", move |args| {
+            struct_seq_richcompare(layout, args, CompareKind::Gt)
+        });
+        struct_seq_method(&mut dict, "__ge__", move |args| {
+            struct_seq_richcompare(layout, args, CompareKind::GtE)
         });
         struct_seq_method(&mut dict, "__hash__", move |args| {
-            struct_seq_hash(fields, args)
+            struct_seq_hash(layout, args)
         });
         // CPython's `structseq_repr`: `module.name(field=repr, …)` over the
-        // visible named members (e.g. `time.struct_time(tm_year=2033, …)`),
-        // *not* the bare tuple repr the native `tuple` base would otherwise give
-        // now that struct sequences subclass `tuple`.
+        // visible slots (e.g. `time.struct_time(tm_year=2033, …)`), *not* the
+        // bare tuple repr the native `tuple` base would otherwise give now
+        // that struct sequences subclass `tuple`.
         struct_seq_method(&mut dict, "__repr__", move |args| {
-            struct_seq_repr(name, module, fields, args)
+            struct_seq_repr(layout, args)
         });
         // CPython struct sequences subclass `tuple` (`type(os.stat(...))`'s MRO
         // is `(stat_result, tuple, object)`), so `isinstance(x, tuple)` is True
@@ -4925,7 +5168,7 @@ pub(crate) fn struct_seq_type(
             },
         )
         .expect("struct sequence type");
-        reg.borrow_mut().insert(name, cls.clone());
+        reg.borrow_mut().insert(name, (cls.clone(), layout));
         cls
     })
 }
@@ -4945,206 +5188,360 @@ where
     );
 }
 
-/// `T(sequence[, dict])` — CPython accepts a `>= len(fields)` element sequence
-/// (the visible fields) plus an optional dict of hidden named fields. Tests
-/// fabricate stat results this way to drive `posixpath.ismount`, `shutil`
-/// device checks, etc.
+/// A struct-sequence method that accepts keyword arguments (`__init__`'s
+/// `sequence=`/`dict=`, `__replace__`'s field names).
+fn struct_seq_method_kw<F>(dict: &mut DictData, name: &'static str, body: F)
+where
+    F: Fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError>
+        + Send
+        + Sync
+        + Clone
+        + 'static,
+{
+    let body_pos = body.clone();
+    dict.insert(
+        DictKey(Object::from_static(name)),
+        Object::Builtin(Rc::new(crate::object::BuiltinFn {
+            name,
+            binds_instance: true,
+            call: Box::new(move |args| body_pos(args, &[])),
+            call_kw: Some(Box::new(move |args, kwargs| body(args, kwargs))),
+        })),
+    );
+}
+
+/// `T(sequence[, dict])` — CPython's `structseq_new_impl`. The sequence must
+/// provide between `n_sequence` and `n_fields` values (positionally filling
+/// hidden slots past the visible ones); the optional `dict` supplies hidden
+/// *named* fields for the slots the sequence didn't reach. Any dict key that
+/// duplicates a positionally-filled slot — or names no consumable slot at all
+/// — is a `TypeError` (test_structseq's duplicate/unknown-field tests). Tests
+/// also fabricate stat results this way to drive `posixpath.ismount`,
+/// `shutil` device checks, etc.
 fn struct_seq_init(
-    name: &'static str,
-    fields: &'static [&'static str],
+    layout: &'static StructSeqLayout,
     args: &[Object],
+    kwargs: &[(String, Object)],
 ) -> Result<Object, RuntimeError> {
+    let name = layout.name;
     let Some(Object::Instance(inst)) = args.first() else {
         return Err(type_error(format!(
             "{name}.__init__ requires a {name} instance"
         )));
     };
-    let seq = args
-        .get(1)
-        .ok_or_else(|| type_error(format!("{name}() missing required argument: 'sequence'")))?;
-    let values = match seq {
-        Object::Tuple(items) => items.to_vec(),
-        Object::List(items) => items.borrow().clone(),
-        other => {
-            let mut it = other
-                .make_iter()
-                .map_err(|_| type_error(format!("{name}() argument must be a sequence")))?;
-            let mut v = Vec::new();
-            while let Some(x) = it.next_value() {
-                v.push(x);
+    if args.len() > 3 {
+        return Err(type_error(format!(
+            "{name}() takes at most 2 arguments ({} given)",
+            args.len() - 1
+        )));
+    }
+    // `PyArg_ParseTupleAndKeywords(…, "O|O!:structseq", {"sequence", "dict"})`.
+    let mut seq: Option<Object> = args.get(1).cloned();
+    let mut dict_arg: Option<Object> = args.get(2).cloned();
+    for (k, v) in kwargs {
+        let slot = match k.as_str() {
+            "sequence" => &mut seq,
+            "dict" => &mut dict_arg,
+            other => {
+                return Err(type_error(format!(
+                    "'{other}' is an invalid keyword argument for {name}()"
+                )));
             }
-            v
+        };
+        if slot.is_some() {
+            return Err(type_error(format!(
+                "argument for {name}() given by name ('{k}') and position"
+            )));
+        }
+        *slot = Some(v.clone());
+    }
+    let Some(seq) = seq else {
+        return Err(type_error(format!(
+            "{name}() takes at least 1 argument (0 given)"
+        )));
+    };
+    let dict_arg = match dict_arg {
+        None => None,
+        Some(Object::Dict(d)) => Some(d),
+        Some(other) => {
+            return Err(type_error(format!(
+                "{name}() argument 2 must be dict, not {}",
+                other.type_name()
+            )));
         }
     };
-    if values.len() < fields.len() {
+    let values = match &seq {
+        Object::Tuple(items) => items.to_vec(),
+        Object::List(items) => items.borrow().clone(),
+        // Everything else goes through the full VM iteration protocol so a
+        // raising `__getitem__` propagates its own exception
+        // (test_structseq.test_eviltuple) and strings/iterators work.
+        other => {
+            let ptr = crate::vm_singletons::current_interpreter_ptr()
+                .ok_or_else(|| type_error("constructor requires a sequence"))?;
+            // SAFETY: published by the enclosing VM frame on this thread.
+            let interp = unsafe { &mut *ptr };
+            let globals = Rc::new(RefCell::new(DictData::default()));
+            interp.collect_iterable(other, &globals)?
+        }
+    };
+    let (min, max) = (layout.n_sequence, layout.n_fields());
+    if min == max && values.len() != min {
         return Err(type_error(format!(
-            "{name}() takes a {}-sequence ({}-sequence given)",
-            fields.len(),
+            "{name}() takes a {min}-sequence ({}-sequence given)",
+            values.len()
+        )));
+    }
+    if values.len() < min {
+        return Err(type_error(format!(
+            "{name}() takes an at least {min}-sequence ({}-sequence given)",
+            values.len()
+        )));
+    }
+    if values.len() > max {
+        return Err(type_error(format!(
+            "{name}() takes an at most {max}-sequence ({}-sequence given)",
             values.len()
         )));
     }
     {
         let mut d = inst.dict.borrow_mut();
-        for (field, value) in fields.iter().zip(values.iter()) {
-            d.insert(DictKey(Object::from_static(field)), value.clone());
+        for (i, v) in values.iter().enumerate() {
+            if let Some(f) = layout.slots[i] {
+                d.insert(DictKey(Object::from_static(f)), v.clone());
+            }
+        }
+        // Hidden slots the sequence didn't reach: fill from `dict`, default
+        // `None`. Only these names are consumable — CPython counts the found
+        // keys and errors if the dict held anything else.
+        let mut n_found = 0usize;
+        for i in values.len()..max {
+            let f = layout.slots[i].expect("hidden struct-seq slots are named");
+            let v = dict_arg
+                .as_ref()
+                .and_then(|d2| d2.borrow().get(&DictKey(Object::from_static(f))).cloned());
+            if v.is_some() {
+                n_found += 1;
+            }
+            d.insert(DictKey(Object::from_static(f)), v.unwrap_or(Object::None));
+        }
+        if let Some(d2) = &dict_arg {
+            if d2.borrow().len() > n_found {
+                return Err(type_error(format!(
+                    "{name}() got duplicate or unexpected field name(s)"
+                )));
+            }
         }
     }
-    // Optional second positional: a dict of named hidden fields. Snapshot the
-    // pairs before borrowing `inst.dict` mutably to avoid a double borrow if
-    // the same Rc backs both (it never does here, but keeps this panic-free).
-    if let Some(Object::Dict(extra)) = args.get(2) {
-        let pairs: Vec<(Object, Object)> = extra
-            .borrow()
-            .iter()
-            .map(|(k, v)| (k.0.clone(), v.clone()))
-            .collect();
+    let _ = inst
+        .native
+        .set(Object::new_tuple(values[..layout.n_sequence].to_vec()));
+    // posixmodule's `statresult_new`: a stat_result initialized from a bare
+    // tuple leaves the float `st_?time` members `None`; backfill them from
+    // the integer-seconds sequence slots so `os.stat_result(range(10)).st_atime`
+    // is `7`, like CPython.
+    if name == "stat_result" {
         let mut d = inst.dict.borrow_mut();
-        for (k, v) in pairs {
-            d.insert(DictKey(k), v);
+        for (slot, f) in [(7usize, "st_atime"), (8, "st_mtime"), (9, "st_ctime")] {
+            let key = DictKey(Object::from_static(f));
+            if matches!(d.get(&key), None | Some(Object::None)) {
+                if let Some(v) = values.get(slot) {
+                    d.insert(key, v.clone());
+                }
+            }
         }
     }
     Ok(Object::None)
 }
 
+/// `__replace__(**kwargs)` — CPython's `structseq_replace`, the engine behind
+/// `copy.replace()`: clone the instance with the given named fields (visible
+/// *or* hidden) swapped. Types with unnamed fields don't support it.
+fn struct_seq_replace(
+    layout: &'static StructSeqLayout,
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
+    let name = layout.name;
+    let Some(Object::Instance(inst)) = args.first() else {
+        return Err(type_error(format!(
+            "{name}.__replace__ requires a {name} instance"
+        )));
+    };
+    if args.len() > 1 {
+        return Err(type_error(format!(
+            "{name}.__replace__ takes no positional arguments"
+        )));
+    }
+    if layout.n_unnamed() > 0 {
+        return Err(type_error(format!(
+            "__replace__() is not supported for {}.{name} because it has unnamed field(s)",
+            layout.module
+        )));
+    }
+    // No unnamed fields, so named members and slots line up one-to-one.
+    let named = layout.named();
+    let mut vals: Vec<Object> = {
+        let d = inst.dict.borrow();
+        named
+            .iter()
+            .map(|f| {
+                d.get(&DictKey(Object::from_static(f)))
+                    .cloned()
+                    .unwrap_or(Object::None)
+            })
+            .collect()
+    };
+    let mut unexpected: Vec<String> = Vec::new();
+    for (k, v) in kwargs {
+        match named.iter().position(|f| f == k) {
+            Some(i) => vals[i] = v.clone(),
+            None => unexpected.push(format!("'{k}'")),
+        }
+    }
+    if !unexpected.is_empty() {
+        return Err(type_error(format!(
+            "Got unexpected field name(s): ([{}])",
+            unexpected.join(", ")
+        )));
+    }
+    let (ty, _) = struct_seq_lookup(name)
+        .ok_or_else(|| type_error(format!("unknown struct sequence type '{name}'")))?;
+    let new_inst = crate::types::PyInstance::new(ty);
+    {
+        let mut d = new_inst.dict.borrow_mut();
+        for (f, v) in named.iter().zip(vals.iter()) {
+            d.insert(DictKey(Object::from_static(f)), v.clone());
+        }
+    }
+    let _ = new_inst
+        .native
+        .set(Object::new_tuple(vals[..layout.n_sequence].to_vec()));
+    let obj = Object::Instance(Rc::new(new_inst));
+    // CPython allocates the copy through the GC heap, so it is tracked from
+    // birth (test_structseq.test_replace_gc_tracked builds a cycle out of it).
+    crate::gc_trace::track(obj.clone());
+    Ok(obj)
+}
+
 fn struct_seq_getitem(
-    fields: &'static [&'static str],
+    layout: &'static StructSeqLayout,
     args: &[Object],
 ) -> Result<Object, RuntimeError> {
     let Some(Object::Instance(inst)) = args.first() else {
         return Err(type_error("struct sequence indexing requires an instance"));
     };
-    let field = |i: usize| -> Object {
-        let v = inst
-            .dict
-            .borrow()
-            .get(&DictKey(Object::from_static(fields[i])))
-            .cloned()
-            .unwrap_or(Object::Int(0));
-        struct_seq_slot(fields[i], v)
-    };
+    let values = struct_seq_values(layout, inst);
     // CPython struct sequences are tuple-backed, so slicing yields a plain
     // `tuple` of the selected fields (e.g. `time.localtime()[:6]`, which
     // `tarfile`/`zipfile` use to build DOS timestamps).
     if let Some(Object::Slice(s)) = args.get(1) {
-        let idxs = crate::slice_indices(fields.len(), s)?;
-        return Ok(Object::new_tuple(idxs.into_iter().map(field).collect()));
+        let idxs = crate::slice_indices(values.len(), s)?;
+        return Ok(Object::new_tuple(
+            idxs.into_iter().map(|i| values[i].clone()).collect(),
+        ));
     }
     let idx = args
         .get(1)
         .and_then(Object::as_i64)
         .ok_or_else(|| type_error("struct sequence indices must be integers"))?;
-    let n = fields.len() as i64;
+    let n = values.len() as i64;
     let i = if idx < 0 { idx + n } else { idx };
     if i < 0 || i >= n {
         return Err(crate::error::index_error("tuple index out of range"));
     }
-    Ok(field(i as usize))
+    Ok(values[i as usize].clone())
 }
 
-/// Read the visible (sequence) field values of a struct-sequence instance,
-/// in declaration order, defaulting absent fields to `0` (as the tuple slot
-/// would be).
+/// Read the sequence (tuple-view) values of a struct-sequence instance. The
+/// native tuple set at construction is authoritative — it holds the unnamed
+/// slots (`stat_result`'s integer times) that the named dict can't represent.
+/// Instances built before the native view existed fall back to the named
+/// visible fields, with `0` in any gap.
 fn struct_seq_values(
-    fields: &'static [&'static str],
+    layout: &'static StructSeqLayout,
     inst: &Rc<crate::types::PyInstance>,
 ) -> Vec<Object> {
+    if let Some(Object::Tuple(t)) = inst.native.get() {
+        return t.to_vec();
+    }
     let d = inst.dict.borrow();
-    fields
+    layout.slots[..layout.n_sequence]
         .iter()
-        .map(|f| {
-            let v = d
+        .map(|slot| match slot {
+            Some(f) => d
                 .get(&DictKey(Object::from_static(f)))
                 .cloned()
-                .unwrap_or(Object::Int(0));
-            struct_seq_slot(f, v)
+                .unwrap_or(Object::Int(0)),
+            None => Object::Int(0),
         })
         .collect()
 }
 
-/// `repr()` for a struct sequence — `module.name(field=value, …)` over the
-/// visible named members, reading the *named* values from the instance dict
-/// (so `stat_result`'s `st_atime` shows as the float, like CPython).
+/// `repr()` for a struct sequence — CPython's `structseq_repr`:
+/// `module.name(field=value, …)` pairing `tp_members[i]` with sequence slot
+/// `i`. With unnamed slots in play the names shift forward, which is exactly
+/// why CPython prints `st_atime=<int seconds>` in `repr(os.stat(...))`.
 fn struct_seq_repr(
-    name: &'static str,
-    module: &'static str,
-    fields: &'static [&'static str],
+    layout: &'static StructSeqLayout,
     args: &[Object],
 ) -> Result<Object, RuntimeError> {
+    let name = layout.name;
     let Some(Object::Instance(inst)) = args.first() else {
         return Err(type_error(format!(
             "{name}.__repr__ requires a {name} instance"
         )));
     };
-    let d = inst.dict.borrow();
-    let body = fields
+    let named = layout.named();
+    let values = struct_seq_values(layout, inst);
+    let body = named
         .iter()
-        .map(|f| {
-            let v = d
-                .get(&DictKey(Object::from_static(f)))
-                .cloned()
-                .unwrap_or(Object::Int(0));
-            format!("{f}={}", v.repr())
-        })
+        .zip(values.iter())
+        .map(|(f, v)| format!("{f}={}", v.repr()))
         .collect::<Vec<_>>()
         .join(", ");
-    Ok(Object::from_str(format!("{module}.{name}({body})")))
+    Ok(Object::from_str(format!(
+        "{}.{name}({body})",
+        layout.module
+    )))
 }
 
 /// `__reduce__` for a struct sequence: `(type, (visible_tuple, hidden_dict))`.
 ///
 /// Mirrors CPython's `structseq_reduce`. The visible tuple carries the
 /// sequence slots (integer `st_*time`s for `stat_result`); the hidden dict
-/// carries every *named-only* member plus the float `st_atime`/`st_mtime`/
-/// `st_ctime` values that the integer slots can't reconstruct. On unpickling,
-/// `struct_seq_init(type, (seq, dict))` restores both.
+/// carries every named member *past* the sequence (the float times, the `_ns`
+/// trio, `tm_zone`, …). On unpickling, `struct_seq_init(type, (seq, dict))`
+/// restores both — every dict key names a consumable hidden slot, so the
+/// duplicate-field check passes.
 fn struct_seq_reduce(
-    name: &'static str,
-    module: &'static str,
-    fields: &'static [&'static str],
+    layout: &'static StructSeqLayout,
     args: &[Object],
 ) -> Result<Object, RuntimeError> {
     let Some(Object::Instance(inst)) = args.first() else {
         return Err(type_error("struct sequence reduce requires an instance"));
     };
-    let visible = Object::new_tuple(struct_seq_values(fields, inst));
+    let visible = Object::new_tuple(struct_seq_values(layout, inst));
     let extra = Rc::new(RefCell::new(DictData::default()));
     {
         let d = inst.dict.borrow();
         let mut e = extra.borrow_mut();
-        for (k, v) in d.iter() {
-            let keep = match &k.0 {
-                Object::Str(s) => {
-                    let ks = s.to_string();
-                    let ks = ks.as_str();
-                    !fields.contains(&ks) || matches!(ks, "st_atime" | "st_mtime" | "st_ctime")
-                }
-                _ => true,
-            };
-            if keep {
-                e.insert(DictKey(k.0.clone()), v.clone());
-            }
+        for slot in &layout.slots[layout.n_sequence..] {
+            let f = slot.expect("hidden struct-seq slots are named");
+            let v = d
+                .get(&DictKey(Object::from_static(f)))
+                .cloned()
+                .unwrap_or(Object::None);
+            e.insert(DictKey(Object::from_static(f)), v);
         }
     }
-    let cls = Object::Type(struct_seq_type(name, module, fields));
+    let cls = struct_seq_lookup(layout.name)
+        .map(|(t, _)| Object::Type(t))
+        .ok_or_else(|| type_error("unknown struct sequence type"))?;
     Ok(Object::new_tuple(vec![
         cls,
         Object::new_tuple(vec![visible, Object::Dict(extra)]),
     ]))
-}
-
-/// Map a struct-sequence field to its *sequence-slot* representation.
-///
-/// CPython's `os.stat_result` is the canonical example: the named attributes
-/// `st_atime`/`st_mtime`/`st_ctime` are floats, but the corresponding tuple
-/// slots (`st[7..10]`, and therefore `tuple(st)`, hashing and comparison)
-/// hold the *integer* seconds. Everything else passes through unchanged.
-fn struct_seq_slot(field: &str, value: Object) -> Object {
-    if matches!(field, "st_atime" | "st_mtime" | "st_ctime") {
-        if let Object::Float(f) = value {
-            return Object::Int(f as i64);
-        }
-    }
-    value
 }
 
 /// `__eq__`/`__ne__` for struct sequences: compare the visible fields as a
@@ -5152,7 +5549,7 @@ fn struct_seq_slot(field: &str, value: Object) -> Object {
 /// plain `tuple`/`list`. Anything else yields `NotImplemented` so the other
 /// operand gets a chance (matching tuple semantics).
 fn struct_seq_richcompare(
-    fields: &'static [&'static str],
+    layout: &'static StructSeqLayout,
     args: &[Object],
     op: CompareKind,
 ) -> Result<Object, RuntimeError> {
@@ -5161,10 +5558,10 @@ fn struct_seq_richcompare(
             "struct sequence comparison requires an instance",
         ));
     };
-    let self_tuple = Object::new_tuple(struct_seq_values(fields, inst));
+    let self_tuple = Object::new_tuple(struct_seq_values(layout, inst));
     let other = match args.get(1) {
         Some(Object::Instance(other_inst)) if Rc::ptr_eq(&inst.cls(), &other_inst.cls()) => {
-            Object::new_tuple(struct_seq_values(fields, other_inst))
+            Object::new_tuple(struct_seq_values(layout, other_inst))
         }
         Some(t @ Object::Tuple(_)) => t.clone(),
         Some(Object::List(items)) => Object::new_tuple(items.borrow().clone()),
@@ -5180,13 +5577,13 @@ fn struct_seq_richcompare(
 /// `__hash__` for struct sequences: hash the visible fields as a tuple, so a
 /// `stat_result` hashes like `tuple(stat_result)` (CPython relies on this).
 fn struct_seq_hash(
-    fields: &'static [&'static str],
+    layout: &'static StructSeqLayout,
     args: &[Object],
 ) -> Result<Object, RuntimeError> {
     let Some(Object::Instance(inst)) = args.first() else {
         return Err(type_error("struct sequence hash requires an instance"));
     };
-    let tuple = Object::new_tuple(struct_seq_values(fields, inst));
+    let tuple = Object::new_tuple(struct_seq_values(layout, inst));
     crate::builtins::hash_object(&tuple)
 }
 
@@ -5202,8 +5599,8 @@ pub(crate) fn struct_seq_instance(
     let inst = crate::types::PyInstance::new(ty);
     {
         let mut d = inst.dict.borrow_mut();
-        for (field, value) in fields.iter().zip(values) {
-            d.insert(DictKey(Object::from_static(field)), value);
+        for (field, value) in fields.iter().zip(values.iter()) {
+            d.insert(DictKey(Object::from_static(field)), value.clone());
         }
     }
     // Struct sequences subclass `tuple`, so give the instance a native tuple
@@ -5211,20 +5608,7 @@ pub(crate) fn struct_seq_instance(
     // (`__contains__`, `__add__`, `__mul__`, `index`, `count`, …) unwrap this
     // payload, so they operate on the same values the `__getitem__`/`__len__`
     // overrides expose — without us re-implementing every sequence method.
-    let visible: Vec<Object> = {
-        let d = inst.dict.borrow();
-        fields
-            .iter()
-            .map(|f| {
-                let v = d
-                    .get(&DictKey(Object::from_static(f)))
-                    .cloned()
-                    .unwrap_or(Object::Int(0));
-                struct_seq_slot(f, v)
-            })
-            .collect()
-    };
-    let _ = inst.native.set(Object::new_tuple(visible));
+    let _ = inst.native.set(Object::new_tuple(values));
     Object::Instance(Rc::new(inst))
 }
 

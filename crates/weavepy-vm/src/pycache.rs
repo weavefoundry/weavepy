@@ -93,7 +93,37 @@ pub const MAGIC: &[u8; 4] = b"\xf3\x0d\x0d\x0a";
 ///   `py_compile`/`compileall`) contain *unoptimized* code under the
 ///   optimized filename; one bump flushes them before the native
 ///   reader starts trusting the suffix.
-pub const CACHE_TAG: &str = "weavepy-313-14";
+/// - rev `15`: class bodies store `__static_attributes__` *after* the
+///   body statements (CPython 3.13's emission order, observed by
+///   `__prepare__` mappings — test_metaclass), and comprehension
+///   `GET_ITER`/`FOR_ITER` carry the iterable expression's column span
+///   (test_dictcomps/test_listcomps `test_exception_locations`).
+///   Rev-14 artifacts bake the old ordering and whole-comprehension
+///   spans.
+/// - rev `16`: `*x` splats lower through `LIST_EXTEND` /
+///   `LIST_TO_TUPLE` (CPython's shape; the errors carry CPython's
+///   "Value after * must be an iterable" / func-prefixed wording —
+///   test_extcall), replacing the old `tuple(x)`-by-name lowering.
+///   Rev-15 artifacts still call the possibly-shadowed `tuple` builtin.
+/// - rev `17`: RFC 0057 match-codegen rewrite changed three encoding
+///   conventions: `COPY` carries its real depth (was hardcoded 1),
+///   `UNPACK_EX` uses CPython's byte order (before-star count in the
+///   low byte; ours had it in the high byte), and `BINARY_OP` encodes
+///   in-place operators as `NB_INPLACE_*` indexes (the augmented flag
+///   was previously dropped). Rev-16 artifacts decode incorrectly
+///   under all three.
+/// - rev `18`: RFC 0057 trace-fidelity work changed codegen shape:
+///   jump threading with CPython's synthetic/same-line eligibility,
+///   `pass` lowered to a located NOP, and per-site `return None`
+///   copies gated by the same eligibility. Rev-17 artifacts bake the
+///   over-threaded jumps (spurious/missing `'line'` trace events).
+/// - rev `19`: `PUSH_EXC_INFO` persists its handler-body-end tag (the
+///   unwinder's cue for discarding handled-exception entries when an
+///   exception escapes a handler) as an absolute code-unit oparg.
+///   Rev-18 artifacts decode the tag as 0 (untagged), which loosens
+///   handled-exception unwinding and corrupts `__context__` chains
+///   (test_contextlib_async `test_exit_exception_chaining_reference`).
+pub const CACHE_TAG: &str = "weavepy-313-19";
 
 const HEADER_LEN: usize = 16;
 
@@ -227,7 +257,32 @@ pub fn try_write(source_path: &Path, code: &CodeObject, optimize: u8) {
     }
     // Atomic-ish write: write to a tempfile next door, then rename
     // so concurrent imports can't observe a half-written cache.
+    // CPython's `_write_atomic` creates the file with the *source's*
+    // permission bits (forced user-writable for later cache updates —
+    // issue #6074) masked to 0o666, letting the umask apply at open
+    // (test_import.FilePermissionTests).
     let tmp = cache_path.with_extension("pyc.tmp");
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mode = (meta.permissions().mode() | 0o200) & 0o666;
+        let Ok(mut f) = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(mode)
+            .open(&tmp)
+        else {
+            return;
+        };
+        if f.write_all(&bytes).is_err() {
+            drop(f);
+            let _ = fs::remove_file(&tmp);
+            return;
+        }
+    }
+    #[cfg(not(unix))]
     if fs::write(&tmp, &bytes).is_err() {
         return;
     }

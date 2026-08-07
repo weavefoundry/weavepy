@@ -290,6 +290,25 @@ impl BuiltinTypes {
             );
         }
         let iterator_ = mk("iterator", vec![object_.clone()]);
+        // The concrete iterator types have no `tp_new` either —
+        // `type(iter('abc'))()` is a TypeError
+        // (test_str.test_iterators_invocation).
+        {
+            use crate::object::BuiltinFn;
+            iterator_.dict.borrow_mut().insert(
+                DictKey(Object::from_static("__new__")),
+                Object::Builtin(Rc::new(BuiltinFn {
+                    name: "__new__",
+                    binds_instance: false,
+                    call: Box::new(|_args| {
+                        Err(crate::error::type_error(
+                            "cannot create 'iterator' instances",
+                        ))
+                    }),
+                    call_kw: None,
+                })),
+            );
+        }
         let enumerate_ = mk("enumerate", vec![object_.clone()]);
         let reversed_ = mk("reversed", vec![object_.clone()]);
         let none_type = mk("NoneType", vec![object_.clone()]);
@@ -484,6 +503,7 @@ impl BuiltinTypes {
         let cell_ = mk("cell", vec![object_.clone()]);
         let module_ = mk("module", vec![object_.clone()]);
         install_module_init(&module_);
+        install_module_methods(&module_);
 
         let base_exception = exc("BaseException", object_.clone());
         let exception = exc("Exception", base_exception.clone());
@@ -502,16 +522,16 @@ impl BuiltinTypes {
             for key in ["__traceback__", "__context__", "__cause__"] {
                 d.insert(
                     crate::object::DictKey(Object::from_static(key)),
-                    Object::None,
+                    exc_slot(key, "BaseException", Object::None),
                 );
             }
             d.insert(
                 crate::object::DictKey(Object::from_static("__suppress_context__")),
-                Object::Bool(false),
+                exc_slot("__suppress_context__", "BaseException", Object::Bool(false)),
             );
             d.insert(
                 crate::object::DictKey(Object::from_static("args")),
-                Object::new_tuple(Vec::new()),
+                exc_slot("args", "BaseException", Object::new_tuple(Vec::new())),
             );
         }
 
@@ -531,7 +551,10 @@ impl BuiltinTypes {
         fn install_field_defaults(ty: &Rc<TypeObject>, fields: &[&'static str]) {
             let mut d = ty.dict.borrow_mut();
             for f in fields {
-                d.insert(crate::object::DictKey(Object::from_static(f)), Object::None);
+                d.insert(
+                    crate::object::DictKey(Object::from_static(f)),
+                    exc_slot(f, &ty.name, Object::None),
+                );
             }
         }
         install_field_defaults(&attribute_error, &["name", "obj"]);
@@ -645,6 +668,41 @@ impl BuiltinTypes {
         )
         .expect("ExceptionGroup MRO");
         install_exception_group_init(&base_exception_group);
+        // Exception pseudo-slots (RFC 0057): CPython keeps these in C
+        // struct members/getsets outside the instance `__dict__`, so
+        // `vars(e)` never shows them. Reads of an unset slot answer the
+        // descriptor default; writes land in the slot side table.
+        install_field_defaults(&stop_iteration, &["value"]);
+        install_field_defaults(&system_exit, &["code"]);
+        install_field_defaults(
+            &syntax_error,
+            &[
+                "msg",
+                "filename",
+                "lineno",
+                "offset",
+                "text",
+                "end_lineno",
+                "end_offset",
+                "print_file_and_line",
+            ],
+        );
+        install_field_defaults(
+            &unicode_error,
+            &["encoding", "object", "start", "end", "reason"],
+        );
+        // CPython declares `message`/`exceptions` as `Py_READONLY`
+        // members of the C struct: Python-level assignment raises
+        // `AttributeError("readonly attribute")`.
+        {
+            let mut d = base_exception_group.dict.borrow_mut();
+            for f in ["message", "exceptions"] {
+                d.insert(
+                    crate::object::DictKey(Object::from_static(f)),
+                    exc_slot_readonly(f, "BaseExceptionGroup", Object::None),
+                );
+            }
+        }
 
         let bt = BuiltinTypes {
             object_: object_.clone(),
@@ -1144,6 +1202,45 @@ pub fn install_shared(bt: Rc<BuiltinTypes>) {
     });
 }
 
+/// A [`crate::object::SlotDescriptor`] for an exception pseudo-slot:
+/// reads of an unset slot answer `default` (mirroring CPython's
+/// getset/member defaults) and writes land in the instance's slot side
+/// table — never the `__dict__`, so `vars(e)` stays clean.
+fn exc_slot(name: &str, class_name: &str, default: Object) -> Object {
+    Object::SlotDescriptor(Rc::new(crate::object::SlotDescriptor {
+        name: name.to_owned(),
+        class_name: class_name.to_owned(),
+        default: Some(default),
+        readonly: false,
+    }))
+}
+
+/// A read-only exception pseudo-slot (CPython `Py_READONLY` member):
+/// `BaseExceptionGroup.message` / `.exceptions` reject Python-level
+/// assignment and deletion with `AttributeError("readonly attribute")`.
+fn exc_slot_readonly(name: &str, class_name: &str, default: Object) -> Object {
+    Object::SlotDescriptor(Rc::new(crate::object::SlotDescriptor {
+        name: name.to_owned(),
+        class_name: class_name.to_owned(),
+        default: Some(default),
+        readonly: true,
+    }))
+}
+
+/// Read an exception pseudo-slot: the slot side table first, then the
+/// instance `__dict__` (a user subclass may have stored a plain
+/// same-named attribute before the descriptor existed — e.g. state
+/// applied by an old pickle, or `self.args = …` in a shadowing
+/// `__init__` that ran before the class descriptor was reachable).
+pub(crate) fn exc_attr(inst: &crate::types::PyInstance, name: &str) -> Option<Object> {
+    inst.slot_get(name).or_else(|| {
+        inst.dict
+            .borrow()
+            .get(&crate::object::StrKey(name))
+            .cloned()
+    })
+}
+
 /// Construct an exception instance of `class_name` with `message` as
 /// `args[0]`. Used by Rust-side error helpers.
 pub fn make_exception(class_name: &str, message: impl Into<String>) -> Object {
@@ -1162,15 +1259,8 @@ pub fn make_exception(class_name: &str, message: impl Into<String>) -> Object {
 pub fn make_exception_with_object(class_name: &str, arg: Object) -> Object {
     let exc = make_exception(class_name, "");
     if let Object::Instance(inst) = &exc {
-        let mut dict = inst.dict.borrow_mut();
-        dict.insert(
-            DictKey(Object::from_static("args")),
-            Object::new_tuple(vec![arg.clone()]),
-        );
-        dict.insert(
-            DictKey(Object::from_static("message")),
-            Object::from_str(arg.repr()),
-        );
+        inst.slot_set("args", Object::new_tuple(vec![arg.clone()]));
+        inst.slot_set("message", Object::from_str(arg.repr()));
     }
     exc
 }
@@ -1216,31 +1306,21 @@ pub fn make_unicode_encode_error_obj(
     let start_o = Object::Int(start as i64);
     let end_o = Object::Int(end as i64);
     let reason_o = Object::from_str(reason);
-    {
-        let mut dict = inst.dict.borrow_mut();
-        dict.insert(
-            DictKey(Object::from_static("args")),
-            Object::new_tuple(vec![
-                enc.clone(),
-                obj.clone(),
-                start_o.clone(),
-                end_o.clone(),
-                reason_o.clone(),
-            ]),
-        );
-        dict.insert(DictKey(Object::from_static("encoding")), enc);
-        dict.insert(DictKey(Object::from_static("object")), obj);
-        dict.insert(DictKey(Object::from_static("start")), start_o);
-        dict.insert(DictKey(Object::from_static("end")), end_o);
-        dict.insert(DictKey(Object::from_static("reason")), reason_o);
-        dict.insert(DictKey(Object::from_static("__context__")), Object::None);
-        dict.insert(DictKey(Object::from_static("__cause__")), Object::None);
-        dict.insert(
-            DictKey(Object::from_static("__suppress_context__")),
-            Object::Bool(false),
-        );
-        dict.insert(DictKey(Object::from_static("__traceback__")), Object::None);
-    }
+    inst.slot_set(
+        "args",
+        Object::new_tuple(vec![
+            enc.clone(),
+            obj.clone(),
+            start_o.clone(),
+            end_o.clone(),
+            reason_o.clone(),
+        ]),
+    );
+    inst.slot_set("encoding", enc);
+    inst.slot_set("object", obj);
+    inst.slot_set("start", start_o);
+    inst.slot_set("end", end_o);
+    inst.slot_set("reason", reason_o);
     Object::Instance(Rc::new(inst))
 }
 
@@ -1265,31 +1345,21 @@ pub fn make_unicode_decode_error(
     let start_o = Object::Int(start as i64);
     let end_o = Object::Int(end as i64);
     let reason_o = Object::from_str(reason);
-    {
-        let mut dict = inst.dict.borrow_mut();
-        dict.insert(
-            DictKey(Object::from_static("args")),
-            Object::new_tuple(vec![
-                enc.clone(),
-                obj.clone(),
-                start_o.clone(),
-                end_o.clone(),
-                reason_o.clone(),
-            ]),
-        );
-        dict.insert(DictKey(Object::from_static("encoding")), enc);
-        dict.insert(DictKey(Object::from_static("object")), obj);
-        dict.insert(DictKey(Object::from_static("start")), start_o);
-        dict.insert(DictKey(Object::from_static("end")), end_o);
-        dict.insert(DictKey(Object::from_static("reason")), reason_o);
-        dict.insert(DictKey(Object::from_static("__context__")), Object::None);
-        dict.insert(DictKey(Object::from_static("__cause__")), Object::None);
-        dict.insert(
-            DictKey(Object::from_static("__suppress_context__")),
-            Object::Bool(false),
-        );
-        dict.insert(DictKey(Object::from_static("__traceback__")), Object::None);
-    }
+    inst.slot_set(
+        "args",
+        Object::new_tuple(vec![
+            enc.clone(),
+            obj.clone(),
+            start_o.clone(),
+            end_o.clone(),
+            reason_o.clone(),
+        ]),
+    );
+    inst.slot_set("encoding", enc);
+    inst.slot_set("object", obj);
+    inst.slot_set("start", start_o);
+    inst.slot_set("end", end_o);
+    inst.slot_set("reason", reason_o);
     Object::Instance(Rc::new(inst))
 }
 
@@ -1556,6 +1626,32 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
                     let interp = unsafe { &mut *ptr };
                     let s = interp.type_call_default(&bt.str_, &args[1..], &[])?;
                     let inst = Object::Instance(Rc::new(PyInstance::with_native(cls.clone(), s)));
+                    crate::gc_trace::track(inst.clone());
+                    return Ok(inst);
+                }
+            }
+        }
+    }
+    // `int.__new__(cls, value[, base])` on a subclass converts exactly like
+    // `int(value[, base])` (CPython `long_new` builds the int, then
+    // `long_subtype_new` re-wraps it): pickletester's ComplexNewObj seeds
+    // from `('FACE', 16)` via `__getnewargs__`, and a str/bytes/float seed
+    // must coerce through the real constructor rather than default to 0.
+    {
+        let bt = builtin_types();
+        if cls.is_subclass_of(&bt.int_) && !Rc::ptr_eq(&cls, &bt.int_) && args.len() > 1 {
+            let needs_convert = args.len() > 2
+                || matches!(
+                    args[1],
+                    Object::Str(_) | Object::Bytes(_) | Object::ByteArray(_) | Object::Float(_)
+                );
+            if needs_convert {
+                if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                    // SAFETY: published by an enclosing VM frame still live
+                    // on this thread; the GIL keeps the access exclusive.
+                    let interp = unsafe { &mut *ptr };
+                    let v = interp.type_call_default(&bt.int_, &args[1..], &[])?;
+                    let inst = Object::Instance(Rc::new(PyInstance::with_native(cls.clone(), v)));
                     crate::gc_trace::track(inst.clone());
                     return Ok(inst);
                 }
@@ -1996,6 +2092,179 @@ fn install_module_init(module_: &Rc<TypeObject>) {
             call: Box::new(module_init),
             call_kw: None,
         })),
+    );
+}
+
+/// CPython `moduleobject.c` surface on the module *type*. Imported
+/// modules are `Object::Module` and take the native fast paths in
+/// `lib.rs` (`load_attr`'s Module arm, the `Object::Module` repr arm);
+/// modules built *from Python* — `types.ModuleType('foo')` and module
+/// subclasses — are plain `Object::Instance`s of this class and reach
+/// the same behavior through the generic protocol instead
+/// (test_module's repr/getattr/annotations matrix).
+fn install_module_methods(module_: &Rc<TypeObject>) {
+    use crate::object::{BuiltinFn, PyProperty};
+
+    /// The namespace dict of either module representation.
+    fn dict_of(o: &Object) -> Result<Rc<RefCell<DictData>>, RuntimeError> {
+        match o {
+            Object::Instance(i) => Ok(i.dict.clone()),
+            Object::Module(m) => Ok(m.dict.clone()),
+            _ => Err(crate::error::type_error(
+                "descriptor requires a 'module' object".to_owned(),
+            )),
+        }
+    }
+
+    // `module.__repr__` — CPython's `module_repr` delegates wholesale to
+    // `importlib._bootstrap._module_repr`; so do we. Without a running
+    // interpreter, fall back to the anonymous shape CPython shows before
+    // importlib is initialized.
+    fn module_repr(args: &[Object]) -> Result<Object, RuntimeError> {
+        let this = args.first().ok_or_else(|| {
+            crate::error::type_error("__repr__ requires a module object".to_owned())
+        })?;
+        if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+            // SAFETY: published by an enclosing VM frame still live on
+            // this thread; the GIL keeps access exclusive.
+            let interp = unsafe { &mut *ptr };
+            let repr = (|| {
+                let m = interp.import_path_internal("importlib._bootstrap")?;
+                let f = interp.load_attr_public(&m, "_module_repr")?;
+                interp.call_object(f, &[this.clone()], &[])
+            })();
+            if let Ok(r) = repr {
+                return Ok(r);
+            }
+        }
+        Ok(Object::from_str(format!(
+            "<module object at 0x{:x}>",
+            crate::builtins::object_identity(this)
+        )))
+    }
+
+    // `module.__getattr__` — the miss half of CPython's
+    // `module_getattro`: PEP 562 dict-level `__getattr__` dispatch, then
+    // the exact error wording ("module 'foo' has no attribute 'x'";
+    // nameless uninitialized modules drop the quoted name —
+    // test_module.test_uninitialized_missing_getattr).
+    fn module_getattr_miss(args: &[Object]) -> Result<Object, RuntimeError> {
+        let (this, name) = match args {
+            [this, Object::Str(s)] => (this, s.to_string()),
+            _ => {
+                return Err(crate::error::type_error(
+                    "module.__getattr__ requires (module, name)".to_owned(),
+                ))
+            }
+        };
+        let dict = dict_of(this)?;
+        if name != "__getattr__" {
+            let hook = dict
+                .borrow()
+                .get(&crate::object::StrKey("__getattr__"))
+                .cloned();
+            if let Some(hook) = hook {
+                if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                    // SAFETY: as in `module_repr` above.
+                    let interp = unsafe { &mut *ptr };
+                    return interp.call_object(hook, &[Object::from_str(&name)], &[]);
+                }
+            }
+        }
+        let mod_name = dict
+            .borrow()
+            .get(&crate::object::StrKey("__name__"))
+            .cloned();
+        Err(match mod_name {
+            Some(Object::Str(s)) => {
+                crate::error::attribute_error(format!("module '{}' has no attribute '{}'", s, name))
+            }
+            _ => crate::error::attribute_error(format!("module has no attribute '{}'", name)),
+        })
+    }
+
+    // `module.__annotations__` — CPython `module_get_annotations`:
+    // reading through the descriptor lazily creates-and-caches an empty
+    // dict (test_module.test_lazy_create_annotations); set/delete write
+    // through to the namespace dict.
+    fn module_annotations_get(args: &[Object]) -> Result<Object, RuntimeError> {
+        let this = args.first().ok_or_else(|| {
+            crate::error::type_error("descriptor requires a 'module' object".to_owned())
+        })?;
+        let dict = dict_of(this)?;
+        if let Some(v) = dict.borrow().get(&crate::object::StrKey("__annotations__")) {
+            return Ok(v.clone());
+        }
+        let fresh = Object::new_dict();
+        dict.borrow_mut().insert(
+            DictKey(Object::from_static("__annotations__")),
+            fresh.clone(),
+        );
+        Ok(fresh)
+    }
+    fn module_annotations_set(args: &[Object]) -> Result<Object, RuntimeError> {
+        let (this, value) = match args {
+            [this, value] => (this, value.clone()),
+            _ => {
+                return Err(crate::error::type_error(
+                    "__annotations__ setter requires (module, value)".to_owned(),
+                ))
+            }
+        };
+        dict_of(this)?
+            .borrow_mut()
+            .insert(DictKey(Object::from_static("__annotations__")), value);
+        Ok(Object::None)
+    }
+    fn module_annotations_del(args: &[Object]) -> Result<Object, RuntimeError> {
+        let this = args.first().ok_or_else(|| {
+            crate::error::type_error("descriptor requires a 'module' object".to_owned())
+        })?;
+        let removed = dict_of(this)?
+            .borrow_mut()
+            .shift_remove(&DictKey(Object::from_static("__annotations__")));
+        if removed.is_none() {
+            return Err(crate::error::attribute_error("__annotations__".to_owned()));
+        }
+        Ok(Object::None)
+    }
+
+    fn builtin(name: &'static str, f: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
+        Object::Builtin(Rc::new(BuiltinFn {
+            name,
+            binds_instance: true,
+            call: Box::new(f),
+            call_kw: None,
+        }))
+    }
+
+    let mut d = module_.dict.borrow_mut();
+    // CPython's `module_doc` — `test_module.test_uninitialized` reads it
+    // through an uninitialized instance (empty namespace dict, so the
+    // lookup falls back to the type).
+    d.insert(
+        DictKey(Object::from_static("__doc__")),
+        Object::from_static(
+            "Create a module object.\n\nThe name must be a string; \
+             the optional doc argument can have any type.",
+        ),
+    );
+    d.insert(
+        DictKey(Object::from_static("__repr__")),
+        builtin("__repr__", module_repr),
+    );
+    d.insert(
+        DictKey(Object::from_static("__getattr__")),
+        builtin("__getattr__", module_getattr_miss),
+    );
+    d.insert(
+        DictKey(Object::from_static("__annotations__")),
+        Object::Property(Rc::new(PyProperty::new(
+            builtin("__annotations__", module_annotations_get),
+            builtin("__annotations__", module_annotations_set),
+            builtin("__annotations__", module_annotations_del),
+            Object::None,
+        ))),
     );
 }
 
@@ -2765,22 +3034,18 @@ fn install_import_error_init(import_error: &Rc<TypeObject>) {
                     }
                 }
             }
-            let mut dict = inst_rc.dict.borrow_mut();
-            dict.insert(
-                DictKey(Object::from_static("args")),
-                Object::new_tuple(rest.to_vec()),
-            );
-            dict.insert(
-                DictKey(Object::from_static("msg")),
+            inst_rc.slot_set("args", Object::new_tuple(rest.to_vec()));
+            inst_rc.slot_set(
+                "msg",
                 if rest.len() == 1 {
                     rest[0].clone()
                 } else {
                     Object::None
                 },
             );
-            dict.insert(DictKey(Object::from_static("name")), name);
-            dict.insert(DictKey(Object::from_static("path")), path);
-            dict.insert(DictKey(Object::from_static("name_from")), name_from);
+            inst_rc.slot_set("name", name);
+            inst_rc.slot_set("path", path);
+            inst_rc.slot_set("name_from", name_from);
         }
         Ok(Object::None)
     }
@@ -2807,32 +3072,51 @@ fn install_os_error_init(os_error: &Rc<TypeObject>) {
             .first()
             .ok_or_else(|| crate::error::type_error("expected exception instance".to_owned()))?;
         if let Object::Instance(inst_rc) = inst {
+            // CPython's `oserror_use_init` (issue12555): when a subclass
+            // overrides `__new__` but *not* `__init__`, everything was
+            // already done in the overridden `__new__`'s chain and
+            // `OSError.__init__` must leave `args` alone
+            // (test_exception_hierarchy.test_new_overridden — the extra
+            // `baz` argument is dropped, not folded into `.args`).
+            {
+                let cls = inst_rc.cls();
+                // A *user* `__new__` is a Python function or a
+                // staticmethod wrapping one — the default allocator is
+                // also StaticMethod-wrapped but wraps the builtin named
+                // `__new__` (same discrimination as `instance_plan`).
+                // Matching it here made every plain OSError subclass
+                // skip errno/strerror parsing (test_ssl's SSLError
+                // BIO loop branches on `e.errno`).
+                let user_new = match cls.lookup("__new__") {
+                    Some(Object::Function(_)) => true,
+                    Some(Object::StaticMethod(inner)) => {
+                        !matches!(&inner.func(), Object::Builtin(b) if b.name == "__new__")
+                    }
+                    _ => false,
+                };
+                let user_init = matches!(cls.lookup("__init__"), Some(Object::Function(_)));
+                if user_new && !user_init {
+                    return Ok(Object::None);
+                }
+            }
             let rest = if args.len() > 1 { &args[1..] } else { &[][..] };
-            let mut dict = inst_rc.dict.borrow_mut();
             // CPython `oserror_init` special case: a `BlockingIOError` (and
-            // subclasses) built with *exactly three* positional args treats
-            // the third as `characters_written` rather than `filename`, keeps
-            // the full 3-tuple as `.args`, and leaves `filename` unset. With
-            // any other arity it parses as a plain `OSError`
+            // subclasses) built with *exactly three* positional args whose
+            // third is a *number* treats it as `characters_written` rather
+            // than `filename` and leaves `filename` unset
             // (`test_io.test_write_non_blocking` relies on
-            // `BlockingIOError(EAGAIN, msg, written).characters_written`).
+            // `BlockingIOError(EAGAIN, msg, written).characters_written`;
+            // a non-numeric third arg parses as a plain OSError —
+            // test_exception_hierarchy.test_blockingioerror).
             let is_blocking = inst_rc
                 .cls()
                 .is_subclass_of(&builtin_types().blocking_io_error);
-            if is_blocking && rest.len() == 3 {
-                dict.insert(
-                    DictKey(Object::from_static("args")),
-                    Object::new_tuple(rest.to_vec()),
-                );
-                dict.insert(DictKey(Object::from_static("errno")), rest[0].clone());
-                dict.insert(DictKey(Object::from_static("strerror")), rest[1].clone());
-                dict.insert(
-                    DictKey(Object::from_static("characters_written")),
-                    rest[2].clone(),
-                );
-                dict.insert(DictKey(Object::from_static("filename")), Object::None);
-                dict.insert(DictKey(Object::from_static("winerror")), Object::None);
-                dict.insert(DictKey(Object::from_static("filename2")), Object::None);
+            if is_blocking && rest.len() == 3 && matches!(rest[2], Object::Int(_) | Object::Long(_))
+            {
+                inst_rc.slot_set("args", Object::new_tuple(rest.to_vec()));
+                inst_rc.slot_set("errno", rest[0].clone());
+                inst_rc.slot_set("strerror", rest[1].clone());
+                inst_rc.slot_set("characters_written", rest[2].clone());
                 return Ok(Object::None);
             }
             // CPython `oserror_init`: the named fields populate only
@@ -2845,7 +3129,7 @@ fn install_os_error_init(os_error: &Rc<TypeObject>) {
             } else {
                 Object::new_tuple(rest.to_vec())
             };
-            dict.insert(DictKey(Object::from_static("args")), args_tuple);
+            inst_rc.slot_set("args", args_tuple);
             let pick = |i: usize| {
                 if populated {
                     rest.get(i).cloned().unwrap_or(Object::None)
@@ -2864,9 +3148,14 @@ fn install_os_error_init(os_error: &Rc<TypeObject>) {
                 .into_iter()
                 .enumerate()
             {
+                // The 4th positional (winerror) is accepted but *ignored*
+                // on posix, where the member doesn't exist at all.
+                if cfg!(not(windows)) && name == "winerror" {
+                    continue;
+                }
                 let v = pick(i);
                 if !matches!(v, Object::None) {
-                    dict.insert(DictKey(Object::from_static(name)), v);
+                    inst_rc.slot_set(name, v);
                 }
             }
         }
@@ -2881,8 +3170,7 @@ fn install_os_error_init(os_error: &Rc<TypeObject>) {
         let Some(Object::Instance(inst)) = args.first() else {
             return Ok(Object::from_static(""));
         };
-        let dict = inst.dict.borrow();
-        let get = |name: &'static str| dict.get(&DictKey(Object::from_static(name))).cloned();
+        let get = |name: &'static str| exc_attr(inst, name);
         let set = |o: &Option<Object>| matches!(o, Some(v) if !matches!(v, Object::None));
         let errno = get("errno");
         let strerror = get("strerror");
@@ -2906,7 +3194,7 @@ fn install_os_error_init(os_error: &Rc<TypeObject>) {
             return Ok(Object::from_str(format!("[Errno {errno_s}] {strerror_s}")));
         }
         // BaseException.__str__: "" / str(arg) / repr(args).
-        match dict.get(&DictKey(Object::from_static("args"))) {
+        match get("args") {
             Some(Object::Tuple(items)) => Ok(match items.as_ref() {
                 [] => Object::from_static(""),
                 [single] => Object::from_str(single.to_str()),
@@ -2948,9 +3236,30 @@ fn install_os_error_init(os_error: &Rc<TypeObject>) {
     // `args`/`reason`) still expect `inst.filename` to resolve — so provide
     // the defaults at the type level, where instance-dict entries shadow
     // them once a real value is assigned.
-    for name in ["errno", "strerror", "filename", "filename2", "winerror"] {
-        dict.insert(DictKey(Object::from_static(name)), Object::None);
+    // `winerror` is Windows-only in CPython (`#ifdef MS_WINDOWS` member):
+    // `dir(OSError)` on posix must not show it
+    // (test_exception_hierarchy.test_windows_error).
+    #[cfg(windows)]
+    const OSERROR_FIELDS: [&str; 5] = ["errno", "strerror", "filename", "filename2", "winerror"];
+    #[cfg(not(windows))]
+    const OSERROR_FIELDS: [&str; 4] = ["errno", "strerror", "filename", "filename2"];
+    for name in OSERROR_FIELDS {
+        dict.insert(
+            DictKey(Object::from_static(name)),
+            exc_slot(name, "OSError", Object::None),
+        );
     }
+    // `characters_written` raises AttributeError while unset (CPython's
+    // getset has no default), so its descriptor carries no fallback.
+    dict.insert(
+        DictKey(Object::from_static("characters_written")),
+        Object::SlotDescriptor(Rc::new(crate::object::SlotDescriptor {
+            name: "characters_written".to_owned(),
+            class_name: "OSError".to_owned(),
+            default: None,
+            readonly: false,
+        })),
+    );
 }
 
 /// Which of the three concrete unicode errors we're installing dunders
@@ -2977,10 +3286,6 @@ enum UnicodeErrorKind {
 /// one-position slice and the `position M-N` form for a range.
 fn install_unicode_error_dunders(ty: &Rc<TypeObject>, kind: UnicodeErrorKind) {
     use crate::object::BuiltinFn;
-
-    fn set(dict: &mut crate::object::DictData, name: &'static str, value: Object) {
-        dict.insert(DictKey(Object::from_static(name)), value);
-    }
 
     let init = move |args: &[Object]| -> Result<Object, RuntimeError> {
         let Some(Object::Instance(inst_rc)) = args.first() else {
@@ -3046,11 +3351,10 @@ fn install_unicode_error_dunders(ty: &Rc<TypeObject>, kind: UnicodeErrorKind) {
                 check(is_str(&rest[3]), 3, "str", &rest[3])?;
             }
         }
-        let mut dict = inst_rc.dict.borrow_mut();
-        set(&mut dict, "args", Object::new_tuple(rest.to_vec()));
+        inst_rc.slot_set("args", Object::new_tuple(rest.to_vec()));
         let mut i = 0;
         if kind != UnicodeErrorKind::Translate {
-            set(&mut dict, "encoding", rest[i].clone());
+            inst_rc.slot_set("encoding", rest[i].clone());
             i += 1;
         }
         // Decode errors normalize a bytes-like payload to `bytes`
@@ -3062,10 +3366,10 @@ fn install_unicode_error_dunders(ty: &Rc<TypeObject>, kind: UnicodeErrorKind) {
             }
             _ => rest[i].clone(),
         };
-        set(&mut dict, "object", object);
-        set(&mut dict, "start", rest[i + 1].clone());
-        set(&mut dict, "end", rest[i + 2].clone());
-        set(&mut dict, "reason", rest[i + 3].clone());
+        inst_rc.slot_set("object", object);
+        inst_rc.slot_set("start", rest[i + 1].clone());
+        inst_rc.slot_set("end", rest[i + 2].clone());
+        inst_rc.slot_set("reason", rest[i + 3].clone());
         Ok(Object::None)
     };
 
@@ -3073,8 +3377,7 @@ fn install_unicode_error_dunders(ty: &Rc<TypeObject>, kind: UnicodeErrorKind) {
         let Some(Object::Instance(inst_rc)) = args.first() else {
             return Ok(Object::from_static(""));
         };
-        let dict = inst_rc.dict.borrow();
-        let get = |name: &'static str| dict.get(&DictKey(Object::from_static(name))).cloned();
+        let get = |name: &'static str| exc_attr(inst_rc, name);
         let as_i = |o: &Object| -> i64 {
             match o {
                 Object::Int(n) => *n,
@@ -3222,8 +3525,7 @@ fn install_syntax_error_dunders(syntax_error: &Rc<TypeObject>) {
             return Ok(Object::None);
         };
         let rest = if args.len() > 1 { &args[1..] } else { &[][..] };
-        let mut dict = inst_rc.dict.borrow_mut();
-        set(&mut dict, "args", Object::new_tuple(rest.to_vec()));
+        inst_rc.slot_set("args", Object::new_tuple(rest.to_vec()));
         // Defaults — CPython always defines these slots.
         for name in [
             "msg",
@@ -3234,10 +3536,10 @@ fn install_syntax_error_dunders(syntax_error: &Rc<TypeObject>) {
             "end_lineno",
             "end_offset",
         ] {
-            set(&mut dict, name, Object::None);
+            inst_rc.slot_set(name, Object::None);
         }
         if let Some(msg) = rest.first() {
-            set(&mut dict, "msg", msg.clone());
+            inst_rc.slot_set("msg", msg.clone());
         }
         // `SyntaxError(msg, detail)` — `detail` is a `(filename, lineno,
         // offset, text[, end_lineno, end_offset])` sequence. CPython runs
@@ -3282,13 +3584,13 @@ fn install_syntax_error_dunders(syntax_error: &Rc<TypeObject>) {
                 ));
             }
             let pick = |i: usize| items.get(i).cloned().unwrap_or(Object::None);
-            set(&mut dict, "filename", pick(0));
-            set(&mut dict, "lineno", pick(1));
-            set(&mut dict, "offset", pick(2));
-            set(&mut dict, "text", pick(3));
+            inst_rc.slot_set("filename", pick(0));
+            inst_rc.slot_set("lineno", pick(1));
+            inst_rc.slot_set("offset", pick(2));
+            inst_rc.slot_set("text", pick(3));
             if items.len() == 6 {
-                set(&mut dict, "end_lineno", pick(4));
-                set(&mut dict, "end_offset", pick(5));
+                inst_rc.slot_set("end_lineno", pick(4));
+                inst_rc.slot_set("end_offset", pick(5));
             }
         }
         Ok(Object::None)
@@ -3301,16 +3603,10 @@ fn install_syntax_error_dunders(syntax_error: &Rc<TypeObject>) {
         let Object::Instance(inst_rc) = inst else {
             return Ok(Object::from_static(""));
         };
-        let dict = inst_rc.dict.borrow();
-        let get = |name: &'static str| {
-            dict.get(&DictKey(Object::from_static(name)))
-                .cloned()
-                .unwrap_or(Object::None)
-        };
+        let get = |name: &'static str| exc_attr(inst_rc, name).unwrap_or(Object::None);
         let msg = get("msg");
         let filename = get("filename");
         let lineno = get("lineno");
-        drop(dict);
         // CPython renders the message via `str(self.msg)` — for instance
         // messages (e.g. `ParseError(ExpatError(...))` in ElementTree) that
         // means the instance's own `__str__`, not its repr.
@@ -3396,15 +3692,9 @@ fn exc_init(args: &[Object]) -> Result<Object, RuntimeError> {
             // built-in class and any user subclass (CPython stores it
             // in `StopIteration.__init__`).
             if is_subclass_by_name(&inst_rc.cls(), "StopIteration") {
-                inst_rc.dict.borrow_mut().insert(
-                    DictKey(Object::from_static("value")),
-                    rest.first().cloned().unwrap_or(Object::None),
-                );
+                inst_rc.slot_set("value", rest.first().cloned().unwrap_or(Object::None));
             }
-            inst_rc.dict.borrow_mut().insert(
-                DictKey(Object::from_static("args")),
-                Object::new_tuple(rest),
-            );
+            inst_rc.slot_set("args", Object::new_tuple(rest));
         }
         Ok(Object::None)
     }
@@ -3425,8 +3715,7 @@ fn exc_str(args: &[Object]) -> Result<Object, RuntimeError> {
             // because the runtime constructs them from Rust and we
             // can't easily install a per-subclass ``__str__``.
             let is_key_error = is_subclass_by_name(&inst_rc.cls(), "KeyError");
-            let dict = inst_rc.dict.borrow();
-            if let Some(Object::Tuple(items)) = dict.get(&DictKey(Object::from_static("args"))) {
+            if let Some(Object::Tuple(items)) = exc_attr(inst_rc, "args") {
                 return Ok(match items.as_ref() {
                     [] => Object::from_static(""),
                     [single] => {
@@ -3474,10 +3763,7 @@ fn exc_repr(args: &[Object]) -> Result<Object, RuntimeError> {
             .ok_or_else(|| crate::error::type_error("expected exception instance".to_owned()))?;
         if let Object::Instance(inst_rc) = inst {
             let cls = inst_rc.cls().name.clone();
-            let dict = inst_rc.dict.borrow();
-            let args_repr = if let Some(Object::Tuple(items)) =
-                dict.get(&DictKey(Object::from_static("args")))
-            {
+            let args_repr = if let Some(Object::Tuple(items)) = exc_attr(inst_rc, "args") {
                 items
                     .iter()
                     .map(|x| x.repr())
@@ -3542,10 +3828,7 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
             .ok_or_else(|| crate::error::type_error("expected exception instance".to_owned()))?;
         let tb = args.get(1).cloned().unwrap_or(Object::None);
         if let Object::Instance(inst_rc) = inst {
-            inst_rc
-                .dict
-                .borrow_mut()
-                .insert(DictKey(Object::from_static("__traceback__")), tb);
+            inst_rc.slot_set("__traceback__", tb);
         }
         Ok(inst.clone())
     }
@@ -3572,15 +3855,39 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
                 .iter()
                 .map(|(k, v)| (k.0.clone(), v.clone()))
                 .collect();
-            let mut dict = inst_rc.dict.borrow_mut();
+            let cls = inst_rc.cls();
             for (k, v) in entries {
-                if !matches!(k, Object::Str(_)) {
+                // CPython routes each entry through `PyObject_SetAttr`,
+                // which accepts any `str` *subclass* as the name
+                // (test_baseexception.test_setstate_refcount_no_crash).
+                let is_str = match &k {
+                    Object::Str(_) | Object::WStr(_) => true,
+                    Object::Instance(i) => {
+                        matches!(i.native.get(), Some(Object::Str(_) | Object::WStr(_)))
+                    }
+                    _ => false,
+                };
+                if !is_str {
                     return Err(crate::error::type_error(format!(
                         "attribute name must be string, not '{}'",
                         k.type_name_owned()
                     )));
                 }
-                dict.insert(DictKey(k), v);
+                // Normalize a subclass key to its plain-str value so the
+                // regular attribute lookup (keyed on `Object::Str`) finds it.
+                let key = match &k {
+                    Object::Str(_) | Object::WStr(_) => k,
+                    other => Object::from_str(other.to_str()),
+                };
+                // Route through the same storage a setattr would use:
+                // names the class exposes as slot descriptors land in
+                // the slot side table, everything else in `__dict__`.
+                let name = key.to_str();
+                if matches!(cls.lookup(&name), Some(Object::SlotDescriptor(_))) {
+                    inst_rc.slot_set(&name, v);
+                } else {
+                    inst_rc.dict.borrow_mut().insert(DictKey(key), v);
+                }
             }
         }
         Ok(Object::None)
@@ -3600,8 +3907,7 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
             ));
         };
         let cls = inst.cls();
-        let dict = inst.dict.borrow();
-        let get = |name: &'static str| dict.get(&DictKey(Object::from_static(name))).cloned();
+        let get = |name: &'static str| exc_attr(inst, name);
         let mut ctor_args: Vec<Object> = match get("args") {
             Some(Object::Tuple(t)) => t.to_vec(),
             _ => Vec::new(),
@@ -3621,23 +3927,59 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
         // interpreter metadata); everything else round-trips.
         const SKIP: &[&str] = &[
             "args",
-            "message",
             "__traceback__",
             "__context__",
             "__cause__",
             "__suppress_context__",
         ];
+        // `message` is WeavePy's internal mirror of `str(args[0])`; while
+        // it matches, it's the auto-derived value and stays out of the
+        // state (CPython has no such attribute at all). Once user code
+        // diverges it (configparser's `ParsingError.append` does
+        // `self.message += …` — test_configparser's pickling cases), it
+        // must round-trip like any other instance attribute.
+        let dict = inst.dict.borrow();
+        let message_is_derived = match (get("message"), ctor_args.first()) {
+            (Some(m), Some(a)) => {
+                m.is_same(a) || matches!((&m, a), (Object::Str(x), Object::Str(y)) if x == y)
+            }
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
         // GH-103352: AttributeError deliberately drops `obj` from its
         // pickled state (it may be huge or unpicklable).
         let skip_obj = is_subclass_by_name(&cls, "AttributeError");
         let mut state = crate::object::DictData::default();
         for (k, v) in dict.iter() {
             if let Object::Str(s) = &k.0 {
-                if SKIP.contains(&s.as_ref()) || (skip_obj && s.as_ref() == "obj") {
+                if SKIP.contains(&s.as_ref())
+                    || (skip_obj && s.as_ref() == "obj")
+                    || (message_is_derived && s.as_ref() == "message")
+                {
                     continue;
                 }
             }
             state.insert(k.clone(), v.clone());
+        }
+        drop(dict);
+        // CPython `ImportError_getstate`: the `name`/`path`/`name_from`
+        // slots ride in the pickle state when populated, so
+        // `pickle.loads(pickle.dumps(ImportError('m', name='n')))`
+        // keeps its `.name` (test_exceptions ImportErrorTests
+        // test_copy_pickle).
+        if is_subclass_by_name(&cls, "ImportError") {
+            for key in ["name", "path", "name_from"] {
+                if let Some(v) = get(key).filter(|v| !matches!(v, Object::None)) {
+                    state.insert(DictKey(Object::from_static(key)), v);
+                }
+            }
+        }
+        // CPython `AttributeError_getstate` (gh-103352): `name` rides in
+        // the state; `obj` is deliberately dropped (often unpicklable).
+        if skip_obj {
+            if let Some(v) = get("name").filter(|v| !matches!(v, Object::None)) {
+                state.insert(DictKey(Object::from_static("name")), v);
+            }
         }
         let cls_obj = Object::Type(cls);
         let args_obj = Object::new_tuple(ctor_args);
@@ -3731,71 +4073,43 @@ pub fn make_exception_with_class(class: Rc<TypeObject>, message: impl Into<Strin
     } else {
         Object::new_tuple(vec![msg.clone()])
     };
-    {
-        let mut dict = inst.dict.borrow_mut();
-        // PEP 380: `StopIteration.value` is always present (CPython sets it
-        // in `StopIteration.__init__`, defaulting to None). A Rust-raised
-        // bare `StopIteration` must answer `.value` too — asyncio's
-        // `Task.__step` reads `exc.value` on every coroutine return, and a
-        // missing attribute leaves the task wedged (gh: shutdown_asyncgens).
-        if is_stop_iteration {
-            let value = if msg.to_str().is_empty() {
-                Object::None
-            } else {
-                msg.clone()
-            };
-            dict.insert(DictKey(Object::from_static("value")), value);
-        }
-        dict.insert(DictKey(Object::from_static("args")), args);
-        dict.insert(DictKey(Object::from_static("message")), msg.clone());
-        // Always-present `BaseException` slots (see `build_exception_instance`):
-        // default None/None/False/None so attribute access and context-chain
-        // walks never `AttributeError`.
-        dict.insert(DictKey(Object::from_static("__context__")), Object::None);
-        dict.insert(DictKey(Object::from_static("__cause__")), Object::None);
-        dict.insert(
-            DictKey(Object::from_static("__suppress_context__")),
-            Object::Bool(false),
-        );
-        dict.insert(DictKey(Object::from_static("__traceback__")), Object::None);
-        // OSError named fields (`errno`/`strerror`/…) are *not* seeded on
-        // the instance: the `OSError` type carries `None` defaults at the
-        // class level, and instance-dict entries here would shadow a
-        // subclass's own class attribute (`class Err(OSError): errno =
-        // EINVAL`, raised bare via `raise Err` — asyncio's
-        // add_signal_handler error tests read `exc.errno` through the
-        // class).
-        if is_import {
-            // ImportError/ModuleNotFoundError expose `msg` (the message
-            // string). CPython always defines the slot; a Rust-raised
-            // ImportError must answer `.msg` so consumers (e.g. numpy's
-            // `_core/__init__` error handling, which reads `exc.msg`) don't
-            // AttributeError. `name`/`path`/`name_from` are intentionally
-            // *not* pre-set on the instance here so the import machinery's
-            // `set_exception_attr` (which skips already-present keys) can
-            // still populate the real module name; their type-level
-            // defaults keep attribute access from raising in the meantime.
-            dict.insert(DictKey(Object::from_static("msg")), msg.clone());
-        }
-        if is_syntax {
-            // SyntaxError exposes `msg` plus a location payload. CPython
-            // always defines these slots (default `None`); a Rust-raised
-            // bare SyntaxError gets `msg` from `args[0]` and `None`
-            // elsewhere so `e.lineno` / `e.offset` never `AttributeError`.
-            // `error::syntax_error_located` overwrites them with real
-            // values when a byte offset is available.
-            dict.insert(DictKey(Object::from_static("msg")), msg);
-            for name in [
-                "filename",
-                "lineno",
-                "offset",
-                "text",
-                "end_lineno",
-                "end_offset",
-            ] {
-                dict.insert(DictKey(Object::from_static(name)), Object::None);
-            }
-        }
+    // PEP 380: `StopIteration.value` is always present (CPython sets it
+    // in `StopIteration.__init__`, defaulting to None). A Rust-raised
+    // bare `StopIteration` must answer `.value` too — asyncio's
+    // `Task.__step` reads `exc.value` on every coroutine return, and a
+    // missing attribute leaves the task wedged (gh: shutdown_asyncgens).
+    if is_stop_iteration {
+        let value = if msg.to_str().is_empty() {
+            Object::None
+        } else {
+            msg.clone()
+        };
+        inst.slot_set("value", value);
+    }
+    inst.slot_set("args", args);
+    inst.slot_set("message", msg.clone());
+    // The BaseException pseudo-slots (`__context__`/`__cause__`/
+    // `__suppress_context__`/`__traceback__`) and OSError's named fields
+    // (`errno`/`strerror`/…) are *not* seeded per-instance: their class
+    // slot descriptors answer the CPython getset defaults while unset,
+    // and a subclass's own class attribute (`class Err(OSError): errno =
+    // EINVAL`, raised bare via `raise Err`) stays visible.
+    if is_import {
+        // ImportError/ModuleNotFoundError expose `msg` (the message
+        // string). CPython always defines the slot; a Rust-raised
+        // ImportError must answer `.msg` so consumers (e.g. numpy's
+        // `_core/__init__` error handling, which reads `exc.msg`) don't
+        // AttributeError. `name`/`path`/`name_from` are intentionally
+        // *not* pre-set here so the import machinery's
+        // `set_exception_attr` (which skips already-present slots) can
+        // still populate the real module name.
+        inst.slot_set("msg", msg.clone());
+    }
+    if is_syntax {
+        // SyntaxError gets `msg` from `args[0]`; the location payload
+        // reads `None` off the class descriptors until
+        // `error::syntax_error_located` fills real values.
+        inst.slot_set("msg", msg);
     }
     Object::Instance(Rc::new(inst))
 }
@@ -3808,42 +4122,16 @@ pub fn make_exception_with_class(class: Rc<TypeObject>, message: impl Into<Strin
 fn install_exception_group_init(base: &Rc<TypeObject>) {
     use crate::object::BuiltinFn;
     fn eg_init(args: &[Object]) -> Result<Object, RuntimeError> {
-        // args = (self, msg, exceptions[, ...])
+        // CPython `BaseExceptionGroup_init` → `BaseException_init`:
+        // `__init__` only (re)binds `args` to the positional arguments;
+        // `message`/`exceptions` were normalized by `__new__`. Subclass
+        // `__init__`s with extra parameters (`EG(msg, excs, code)`)
+        // therefore work — `args` simply keeps all three.
         let inst = args
             .first()
             .ok_or_else(|| crate::error::type_error("expected exception instance"))?;
-        let msg = args.get(1).cloned().unwrap_or(Object::from_static(""));
-        let excs = args
-            .get(2)
-            .cloned()
-            .unwrap_or(Object::new_tuple(Vec::new()));
-        // `exceptions` must be a sequence of BaseException instances;
-        // CPython raises ValueError on empty. We're lenient here —
-        // the caller may construct empty groups for split/subgroup.
-        let excs_tuple = match &excs {
-            Object::Tuple(items) => items.clone(),
-            Object::List(items) => Rc::from(items.borrow().clone().into_boxed_slice()),
-            other => {
-                return Err(crate::error::type_error(format!(
-                    "second argument (exceptions) must be a sequence, not '{}'",
-                    other.type_name()
-                )))
-            }
-        };
         if let Object::Instance(inst_rc) = inst {
-            let mut dict = inst_rc.dict.borrow_mut();
-            // `args` keeps the *original* second argument (a list stays
-            // a list — `repr(eg)` shows it); only the `.exceptions`
-            // accessor is normalized to a tuple, like CPython.
-            dict.insert(
-                DictKey(Object::from_static("args")),
-                Object::new_tuple(vec![msg.clone(), excs]),
-            );
-            dict.insert(DictKey(Object::from_static("message")), msg);
-            dict.insert(
-                DictKey(Object::from_static("exceptions")),
-                Object::Tuple(excs_tuple),
-            );
+            inst_rc.slot_set("args", Object::new_tuple(args[1..].to_vec()));
         }
         Ok(Object::None)
     }
@@ -3852,13 +4140,8 @@ fn install_exception_group_init(base: &Rc<TypeObject>) {
             .first()
             .ok_or_else(|| crate::error::type_error("expected exception instance"))?;
         if let Object::Instance(inst_rc) = inst {
-            let dict = inst_rc.dict.borrow();
-            let message = dict
-                .get(&DictKey(Object::from_static("message")))
-                .cloned()
-                .unwrap_or(Object::from_static(""));
-            let n = dict
-                .get(&DictKey(Object::from_static("exceptions")))
+            let message = exc_attr(inst_rc, "message").unwrap_or(Object::from_static(""));
+            let n = exc_attr(inst_rc, "exceptions")
                 .and_then(|e| match e {
                     Object::Tuple(t) => Some(t.len()),
                     _ => None,
@@ -3868,17 +4151,49 @@ fn install_exception_group_init(base: &Rc<TypeObject>) {
                 "{} ({} sub-exception{})",
                 message.to_str(),
                 n,
-                if n == 1 { "" } else { "s" }
+                if n > 1 { "s" } else { "" }
             )));
         }
         Ok(Object::from_static(""))
     }
+    fn eg_repr(args: &[Object]) -> Result<Object, RuntimeError> {
+        // CPython `BaseExceptionGroup_repr`: renders from the frozen
+        // `exceptions` tuple (or the repr string saved at construction
+        // for custom sequences), *not* from the possibly-mutated
+        // `args[1]` — but keeps `args[1]`'s list/tuple brackets.
+        let Some(Object::Instance(inst)) = args.first() else {
+            return Err(crate::error::type_error("expected exception instance"));
+        };
+        let name = inst.cls().name.clone();
+        let msg = exc_attr(inst, "message").unwrap_or(Object::from_static(""));
+        let interp = eg_interp()?;
+        let excs_str = if let Some(Object::Str(s)) = inst.slot_get("__excs_str__") {
+            s.to_string()
+        } else {
+            let excs: Vec<Object> = match exc_attr(inst, "exceptions") {
+                Some(Object::Tuple(t)) => t.to_vec(),
+                _ => Vec::new(),
+            };
+            let args_second_is_list = matches!(
+                exc_attr(inst, "args"),
+                Some(Object::Tuple(t)) if t.len() == 2 && matches!(t[1], Object::List(_))
+            );
+            if args_second_is_list {
+                interp.repr_object(&Object::new_list(excs))?
+            } else {
+                interp.repr_object(&Object::new_tuple(excs))?
+            }
+        };
+        let msg_repr = interp.repr_object(&msg)?;
+        Ok(Object::from_str(format!("{name}({msg_repr}, {excs_str})")))
+    }
     fn eg_derive(args: &[Object]) -> Result<Object, RuntimeError> {
-        // Default `derive(self, excs)` — CPython's returns a *plain*
-        // `BaseExceptionGroup(self.message, excs)` (not `type(self)`),
-        // which `__new__`'s PEP 654 magic lowers to `ExceptionGroup`
-        // when every leaf is an `Exception`. Subclasses that want to
-        // survive `split`/`subgroup` must override `derive`.
+        // Default `derive(self, excs)` — CPython's calls the *plain*
+        // `BaseExceptionGroup(self.message, excs)` constructor (not
+        // `type(self)`), which `__new__`'s PEP 654 magic lowers to
+        // `ExceptionGroup` when every leaf is an `Exception`.
+        // Subclasses that want to survive `split`/`subgroup` must
+        // override `derive`.
         let inst = args
             .first()
             .ok_or_else(|| crate::error::type_error("expected exception instance"))?;
@@ -3886,46 +4201,23 @@ fn install_exception_group_init(base: &Rc<TypeObject>) {
             .get(1)
             .cloned()
             .unwrap_or(Object::new_tuple(Vec::new()));
-        if let Object::Instance(inst_rc) = inst {
-            let dict = inst_rc.dict.borrow();
-            let msg = dict
-                .get(&DictKey(Object::from_static("message")))
-                .cloned()
-                .unwrap_or(Object::from_static(""));
-            drop(dict);
-            let excs_tuple: Rc<[Object]> = match excs {
-                Object::Tuple(t) => t,
-                Object::List(l) => Rc::from(l.borrow().clone().into_boxed_slice()),
-                _ => Rc::from(Vec::<Object>::new().into_boxed_slice()),
-            };
-            let cls = exception_group_class_for(&excs_tuple);
-            let new_inst = make_exception_with_class(cls, "");
-            if let Object::Instance(ni) = &new_inst {
-                let mut d = ni.dict.borrow_mut();
-                d.insert(
-                    DictKey(Object::from_static("args")),
-                    Object::new_tuple(vec![msg.clone(), Object::Tuple(excs_tuple.clone())]),
-                );
-                d.insert(DictKey(Object::from_static("message")), msg);
-                d.insert(
-                    DictKey(Object::from_static("exceptions")),
-                    Object::Tuple(excs_tuple),
-                );
-            }
-            return Ok(new_inst);
-        }
-        Ok(Object::None)
+        let Object::Instance(inst_rc) = inst else {
+            return Ok(Object::None);
+        };
+        let msg = exc_attr(inst_rc, "message").unwrap_or(Object::from_static(""));
+        eg_new(&[
+            Object::Type(builtin_types().base_exception_group.clone()),
+            msg,
+            excs,
+        ])
     }
     fn eg_split(args: &[Object]) -> Result<Object, RuntimeError> {
-        let inst = args
-            .first()
-            .ok_or_else(|| crate::error::type_error("expected exception instance"))?;
-        let pred = args
-            .get(1)
-            .cloned()
-            .ok_or_else(|| crate::error::type_error("split requires a type argument"))?;
-        let (m, r) = split_exception_group(inst, &pred)?;
+        let (m, r) = eg_split_impl(args, true)?;
         Ok(Object::new_tuple(vec![m, r]))
+    }
+    fn eg_subgroup(args: &[Object]) -> Result<Object, RuntimeError> {
+        let (m, _) = eg_split_impl(args, false)?;
+        Ok(m)
     }
     fn eg_new(args: &[Object]) -> Result<Object, RuntimeError> {
         // `BaseExceptionGroup.__new__(cls, message, exceptions)` —
@@ -3936,62 +4228,7 @@ fn install_exception_group_init(base: &Rc<TypeObject>) {
                 "BaseExceptionGroup.__new__ requires a class argument",
             ));
         };
-        let ctor_args = &args[1..];
-        let excs = ctor_args
-            .get(1)
-            .cloned()
-            .ok_or_else(|| crate::error::type_error("expected 2 arguments, got 1"))?;
-        let items: Vec<Object> = match &excs {
-            Object::Tuple(t) => t.to_vec(),
-            Object::List(l) => l.borrow().clone(),
-            _ => {
-                return Err(crate::error::type_error(
-                    "second argument (exceptions) must be a sequence",
-                ))
-            }
-        };
-        if items.is_empty() {
-            return Err(crate::error::value_error(
-                "second argument (exceptions) must be a non-empty sequence".to_owned(),
-            ));
-        }
-        for (i, item) in items.iter().enumerate() {
-            if !instance_is_subclass(item, &builtin_types().base_exception) {
-                return Err(crate::error::value_error(format!(
-                    "Item {i} of second argument (exceptions) is not an exception"
-                )));
-            }
-        }
-        let cls = resolve_exception_group_class(cls.clone(), ctor_args)?;
-        let msg = ctor_args
-            .first()
-            .cloned()
-            .unwrap_or(Object::from_static(""));
-        let inst = make_exception_with_class(cls, "");
-        if let Object::Instance(inst_rc) = &inst {
-            let mut dict = inst_rc.dict.borrow_mut();
-            dict.insert(
-                DictKey(Object::from_static("args")),
-                Object::new_tuple(vec![msg.clone(), excs]),
-            );
-            dict.insert(DictKey(Object::from_static("message")), msg);
-            dict.insert(
-                DictKey(Object::from_static("exceptions")),
-                Object::new_tuple(items),
-            );
-        }
-        Ok(inst)
-    }
-    fn eg_subgroup(args: &[Object]) -> Result<Object, RuntimeError> {
-        let inst = args
-            .first()
-            .ok_or_else(|| crate::error::type_error("expected exception instance"))?;
-        let pred = args
-            .get(1)
-            .cloned()
-            .ok_or_else(|| crate::error::type_error("subgroup requires a type argument"))?;
-        let (m, _) = split_exception_group(inst, &pred)?;
-        Ok(m)
+        exception_group_new(cls, &args[1..])
     }
     let mut dict = base.dict.borrow_mut();
     dict.insert(
@@ -4009,6 +4246,15 @@ fn install_exception_group_init(base: &Rc<TypeObject>) {
             name: "__str__",
             binds_instance: true,
             call: Box::new(eg_str),
+            call_kw: None,
+        })),
+    );
+    dict.insert(
+        DictKey(Object::from_static("__repr__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__repr__",
+            binds_instance: true,
+            call: Box::new(eg_repr),
             call_kw: None,
         })),
     );
@@ -4067,42 +4313,191 @@ fn exception_group_class_for(items: &[Object]) -> Rc<TypeObject> {
     }
 }
 
-/// Enforce PEP 654's construction rules when instantiating exception
-/// classes: lower a plain `BaseExceptionGroup` to `ExceptionGroup`
-/// when every contained exception is an `Exception`, and refuse to
-/// nest a bare `BaseException` inside an `ExceptionGroup` (subclass).
-pub fn resolve_exception_group_class(
+/// CPython `BaseExceptionGroup_new`'s class-selection block: a plain
+/// `BaseExceptionGroup` of all-`Exception` leaves lowers to
+/// `ExceptionGroup`; nesting a bare `BaseException` inside
+/// `ExceptionGroup` — or any user subclass that derives from
+/// `Exception` — is a `TypeError`.
+fn resolve_eg_class(
     cls: Rc<TypeObject>,
-    args: &[Object],
+    nested_base_exceptions: bool,
 ) -> Result<Rc<TypeObject>, RuntimeError> {
     let bt = builtin_types();
-    if !cls.is_subclass_of(&bt.base_exception_group) {
-        return Ok(cls);
-    }
-    let items: Vec<Object> = match args.get(1) {
-        Some(Object::Tuple(t)) => t.to_vec(),
-        Some(Object::List(l)) => l.borrow().clone(),
-        _ => return Ok(cls),
-    };
-    let all_exceptions = items.iter().all(|e| instance_is_subclass(e, &bt.exception));
-    if Rc::ptr_eq(&cls, &bt.base_exception_group) {
-        if all_exceptions {
+    if Rc::ptr_eq(&cls, &bt.exception_group) {
+        if nested_base_exceptions {
+            return Err(crate::error::type_error(
+                "Cannot nest BaseExceptions in an ExceptionGroup",
+            ));
+        }
+    } else if Rc::ptr_eq(&cls, &bt.base_exception_group) {
+        if !nested_base_exceptions {
             return Ok(bt.exception_group.clone());
         }
-        return Ok(cls);
-    }
-    if cls.is_subclass_of(&bt.exception_group) && !all_exceptions {
-        return Err(crate::error::type_error(
-            "Cannot nest BaseExceptions in an ExceptionGroup",
-        ));
+    } else if nested_base_exceptions && cls.is_subclass_of(&bt.exception) {
+        return Err(crate::error::type_error(format!(
+            "Cannot nest BaseExceptions in '{}'",
+            cls.name
+        )));
     }
     Ok(cls)
 }
 
-/// `True` if `class` overrides `derive` somewhere below the builtin
-/// `BaseExceptionGroup` implementation in its MRO.
-fn overrides_eg_derive(class: &Rc<TypeObject>) -> bool {
-    overrides_eg_method(class, "derive")
+/// CPython `BaseExceptionGroup_new`, step for step: parse
+/// `(message: str, exceptions: sequence)`, freeze a repr of custom
+/// sequences (for `__repr__` accuracy after mutation), convert to a
+/// tuple, validate the items, apply the PEP 654 class-selection rules,
+/// and populate `args`/`message`/`exceptions`.
+///
+/// `ctor_args` are the constructor arguments *without* the class.
+pub(crate) fn exception_group_new(
+    cls: &Rc<TypeObject>,
+    ctor_args: &[Object],
+) -> Result<Object, RuntimeError> {
+    let bt = builtin_types();
+    if ctor_args.len() != 2 {
+        return Err(crate::error::type_error(format!(
+            "BaseExceptionGroup.__new__() takes exactly 2 arguments ({} given)",
+            ctor_args.len()
+        )));
+    }
+    let msg = ctor_args[0].clone();
+    if !matches!(msg, Object::Str(_)) && !instance_is_subclass(&msg, &bt.str_) {
+        return Err(crate::error::type_error(format!(
+            "BaseExceptionGroup.__new__() argument 1 must be str, not {}",
+            msg.type_name()
+        )));
+    }
+    let excs = ctor_args[1].clone();
+    // `PySequence_Check`: lists, tuples, and instances whose class
+    // exposes `__getitem__` (sets/dicts/None are not sequences).
+    let is_sequence = match &excs {
+        Object::Tuple(_) | Object::List(_) | Object::Str(_) | Object::Bytes(_) => true,
+        Object::ByteArray(_) => true,
+        Object::Instance(i) => {
+            i.cls().lookup("__getitem__").is_some()
+                && !i.cls().is_subclass_of(&bt.dict_)
+                && !i.cls().is_subclass_of(&bt.set_)
+                && !i.cls().is_subclass_of(&bt.frozenset_)
+        }
+        _ => false,
+    };
+    if !is_sequence {
+        return Err(crate::error::type_error(
+            "second argument (exceptions) must be a sequence",
+        ));
+    }
+    // Freeze a repr of custom (non-list/tuple) sequences now, so
+    // `repr(eg)` stays accurate after the caller mutates them.
+    let excs_str = if matches!(excs, Object::List(_) | Object::Tuple(_)) {
+        None
+    } else {
+        Some(Object::from_str(eg_interp()?.repr_object(&excs)?))
+    };
+    let items: Vec<Object> = match &excs {
+        Object::Tuple(t) => t.to_vec(),
+        Object::List(l) => l.borrow().clone(),
+        _ => {
+            let interp = eg_interp()?;
+            let globals = interp.builtins_dict();
+            interp.collect_iterable(&excs, &globals)?
+        }
+    };
+    if items.is_empty() {
+        return Err(crate::error::value_error(
+            "second argument (exceptions) must be a non-empty sequence".to_owned(),
+        ));
+    }
+    let mut nested_base_exceptions = false;
+    for (i, item) in items.iter().enumerate() {
+        if !instance_is_subclass(item, &bt.base_exception) {
+            return Err(crate::error::value_error(format!(
+                "Item {i} of second argument (exceptions) is not an exception"
+            )));
+        }
+        if !instance_is_subclass(item, &bt.exception) {
+            nested_base_exceptions = true;
+        }
+    }
+    let cls = resolve_eg_class(cls.clone(), nested_base_exceptions)?;
+    let inst = make_exception_with_class(cls, "");
+    if let Object::Instance(inst_rc) = &inst {
+        // `args` keeps the *original* second argument (mutations show
+        // through `eg.args`); `.exceptions` is the frozen tuple copy.
+        inst_rc.slot_set("args", Object::new_tuple(vec![msg.clone(), excs]));
+        inst_rc.slot_set("message", msg);
+        inst_rc.slot_set("exceptions", Object::new_tuple(items));
+        if let Some(s) = excs_str {
+            inst_rc.slot_set("__excs_str__", s);
+        }
+    }
+    // An exception group always anchors other exception instances, so
+    // it can participate in reference cycles — GC-track it like
+    // `build_exception_instance` does for enriched exceptions.
+    crate::gc_trace::track(inst.clone());
+    Ok(inst)
+}
+
+/// Fetch the interpreter published by the enclosing VM frame —
+/// exception-group construction and split need re-entry for `repr`,
+/// sequence iteration, predicate calls, and truthiness.
+fn eg_interp() -> Result<&'static mut crate::Interpreter, RuntimeError> {
+    let ptr = crate::vm_singletons::current_interpreter_ptr()
+        .ok_or_else(|| crate::error::runtime_error("no running interpreter"))?;
+    // SAFETY: the pointer was published by an enclosing VM frame still
+    // live on this thread; the GIL keeps the access exclusive.
+    Ok(unsafe { &mut *ptr })
+}
+
+/// CPython `get_matcher_type`: a callable that is not a class is a
+/// predicate matcher; an exception class or tuple of exception classes
+/// matches by type; anything else is a `TypeError`. Returns `true`
+/// for predicate matchers.
+fn eg_matcher_is_predicate(pred: &Object) -> Result<bool, RuntimeError> {
+    let bt = builtin_types();
+    let is_exc_type =
+        |o: &Object| matches!(o, Object::Type(t) if t.is_subclass_of(&bt.base_exception));
+    let ok = match pred {
+        Object::Function(_)
+        | Object::Builtin(_)
+        | Object::BoundMethod(_)
+        | Object::StaticMethod(_) => return Ok(true),
+        Object::Instance(i) if i.cls().lookup("__call__").is_some() => return Ok(true),
+        Object::Type(_) => is_exc_type(pred),
+        Object::Tuple(items) => items.iter().all(is_exc_type),
+        _ => false,
+    };
+    if ok {
+        return Ok(false);
+    }
+    Err(crate::error::type_error(
+        "expected an exception type, a tuple of exception types, or a callable (other than a class)",
+    ))
+}
+
+/// `BaseExceptionGroup.split(matcher)` / `.subgroup(matcher)` — the
+/// method entry points: validate the matcher, then run the recursive
+/// split. `construct_rest` is `false` for `subgroup`, which never
+/// builds (or `derive`s) the non-matching parts.
+fn eg_split_impl(args: &[Object], construct_rest: bool) -> Result<(Object, Object), RuntimeError> {
+    let inst = args
+        .first()
+        .ok_or_else(|| crate::error::type_error("expected exception instance"))?;
+    let pred = args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| crate::error::type_error("split requires a matcher argument"))?;
+    let by_predicate = eg_matcher_is_predicate(&pred)?;
+    let matcher = |exc: &Object| -> Result<bool, RuntimeError> {
+        if by_predicate {
+            let r = crate::builtins::reentrant_call(&pred, std::slice::from_ref(exc))?;
+            let interp = eg_interp()?;
+            let globals = interp.builtins_dict();
+            interp.obj_truthy(&r, &globals)
+        } else {
+            Ok(exception_matches_type(exc, &pred))
+        }
+    };
+    split_eg_recursive(inst, &matcher, construct_rest, 1)
 }
 
 /// `True` if `class` overrides `split` below the builtin
@@ -4147,7 +4542,7 @@ pub fn split_exception_group(
     group: &Object,
     type_pred: &Object,
 ) -> Result<(Object, Object), RuntimeError> {
-    split_exception_group_by(group, &|exc| exception_matches_type(exc, type_pred))
+    split_exception_group_by(group, &|exc| Ok(exception_matches_type(exc, type_pred)))
 }
 
 /// Predicate-based core of [`split_exception_group`]. Also used for
@@ -4155,89 +4550,121 @@ pub fn split_exception_group(
 /// the `except*` re-raise machinery.
 pub fn split_exception_group_by(
     group: &Object,
-    leaf_matches: &dyn Fn(&Object) -> bool,
+    leaf_matches: &dyn Fn(&Object) -> Result<bool, RuntimeError>,
 ) -> Result<(Object, Object), RuntimeError> {
-    let (cls, message, excs) = match group {
-        Object::Instance(inst) => {
-            let dict = inst.dict.borrow();
-            let msg = dict
-                .get(&DictKey(Object::from_static("message")))
-                .cloned()
-                .unwrap_or(Object::from_static(""));
-            let excs = match dict.get(&DictKey(Object::from_static("exceptions"))) {
-                Some(Object::Tuple(t)) => t.to_vec(),
-                _ => Vec::new(),
-            };
-            (inst.cls(), msg, excs)
-        }
+    split_eg_recursive(group, leaf_matches, true, 1)
+}
+
+/// CPython `exceptiongroup_split_recursive`: a matching exception
+/// (leaf *or whole group*) passes through by identity; a non-matching
+/// leaf lands in `rest`; a non-matching group recurses and rebuilds
+/// the matching/non-matching parts via [`eg_subset`]. Depth is guarded
+/// like `_Py_EnterRecursiveCall` (`RecursionError` past the C limit).
+fn split_eg_recursive(
+    exc: &Object,
+    matches_pred: &dyn Fn(&Object) -> Result<bool, RuntimeError>,
+    construct_rest: bool,
+    depth: usize,
+) -> Result<(Object, Object), RuntimeError> {
+    if depth > crate::recursion::C_RECURSION_LIMIT {
+        return Err(crate::error::recursion_error(
+            "maximum recursion depth exceeded in exceptiongroup split",
+        ));
+    }
+    if matches_pred(exc)? {
+        // Full match — passes through by identity.
+        return Ok((exc.clone(), Object::None));
+    }
+    let group_inst = match exc {
+        Object::Instance(i) if is_subclass_by_name(&i.cls(), "BaseExceptionGroup") => i.clone(),
         _ => {
-            return Err(crate::error::type_error(
-                "split argument must be an exception group",
-            ))
+            // Leaf exception, no match.
+            let rest = if construct_rest {
+                exc.clone()
+            } else {
+                Object::None
+            };
+            return Ok((Object::None, rest));
         }
+    };
+    let excs: Vec<Object> = match exc_attr(&group_inst, "exceptions") {
+        Some(Object::Tuple(t)) => t.to_vec(),
+        _ => Vec::new(),
     };
     let mut matched = Vec::new();
     let mut rest = Vec::new();
-    for exc in excs {
-        // For nested groups, recurse.
-        let is_group = match &exc {
-            Object::Instance(i) => is_subclass_by_name(&i.cls(), "BaseExceptionGroup"),
-            _ => false,
-        };
-        if is_group && !leaf_matches(&exc) {
-            let (m, r) = split_exception_group_by(&exc, leaf_matches)?;
-            if !matches!(m, Object::None) {
-                matched.push(m);
-            }
-            if !matches!(r, Object::None) {
-                rest.push(r);
-            }
-        } else if leaf_matches(&exc) {
-            matched.push(exc);
-        } else {
-            rest.push(exc);
+    for e in excs {
+        let (m, r) = split_eg_recursive(&e, matches_pred, construct_rest, depth + 1)?;
+        if !matches!(m, Object::None) {
+            matched.push(m);
+        }
+        if !matches!(r, Object::None) {
+            rest.push(r);
         }
     }
-    let derive_override = overrides_eg_derive(&cls);
-    let mk = |items: Vec<Object>| -> Result<Object, RuntimeError> {
-        if items.is_empty() {
-            return Ok(Object::None);
-        }
-        let items_t = Object::new_tuple(items.clone());
-        let new_inst = if derive_override {
-            // Dispatch the subclass's own `derive(self, excs)`.
-            let derive = cls
-                .lookup("derive")
-                .ok_or_else(|| crate::error::type_error("exception group lost its derive"))?;
-            crate::builtins::reentrant_call(&derive, &[group.clone(), items_t.clone()])?
-        } else {
-            let new_cls = exception_group_class_for(&items);
-            let ni = make_exception_with_class(new_cls, "");
-            if let Object::Instance(inst_rc) = &ni {
-                let mut d = inst_rc.dict.borrow_mut();
-                d.insert(
-                    DictKey(Object::from_static("args")),
-                    Object::new_tuple(vec![message.clone(), items_t.clone()]),
-                );
-                d.insert(DictKey(Object::from_static("message")), message.clone());
-                d.insert(DictKey(Object::from_static("exceptions")), items_t.clone());
-            }
-            ni
-        };
-        // CPython copies the chaining/traceback metadata from the
-        // original group onto each derived part.
-        if let (Object::Instance(src), Object::Instance(dst)) = (group, &new_inst) {
-            let src_d = src.dict.borrow();
-            let mut dst_d = dst.dict.borrow_mut();
-            for key in ["__cause__", "__context__", "__traceback__", "__notes__"] {
-                if let Some(v) = src_d.get(&DictKey(Object::from_static(key))) {
-                    dst_d.insert(DictKey(Object::from_static(key)), v.clone());
-                }
-            }
-        }
-        Ok(new_inst)
+    let match_part = eg_subset(exc, &group_inst, matched)?;
+    let rest_part = if construct_rest {
+        eg_subset(exc, &group_inst, rest)?
+    } else {
+        Object::None
     };
-    Ok((mk(matched)?, mk(rest)?))
+    Ok((match_part, rest_part))
+}
+
+/// CPython `exceptiongroup_subset`: wrap a sub-sequence of `orig`'s
+/// exceptions in a new group with `orig`'s metadata. Dispatches
+/// `orig.derive(excs)` (always — the default `derive` reconstructs via
+/// the `BaseExceptionGroup` constructor), validates the result, then
+/// copies `__traceback__`/`__context__`/`__cause__` and shallow-copies
+/// a sequence-valued `__notes__` so each part gets its own list.
+fn eg_subset(
+    orig: &Object,
+    orig_inst: &Rc<crate::types::PyInstance>,
+    items: Vec<Object>,
+) -> Result<Object, RuntimeError> {
+    if items.is_empty() {
+        return Ok(Object::None);
+    }
+    let excs_list = Object::new_list(items);
+    let derive = orig_inst
+        .cls()
+        .lookup("derive")
+        .ok_or_else(|| crate::error::type_error("exception group lost its derive"))?;
+    let derived = crate::builtins::reentrant_call(&derive, &[orig.clone(), excs_list])?;
+    if !instance_is_subclass(&derived, &builtin_types().base_exception_group) {
+        return Err(crate::error::type_error(
+            "derive must return an instance of BaseExceptionGroup",
+        ));
+    }
+    if let Object::Instance(dst) = &derived {
+        for key in ["__traceback__", "__context__", "__cause__"] {
+            if let Some(v) = orig_inst.slot_get(key) {
+                dst.slot_set(key, v);
+            }
+        }
+        // `__notes__` is a real instance attribute (PEP 678). A
+        // sequence is shallow-copied so the parts have independent
+        // lists; a non-sequence is silently skipped (split is not the
+        // place to report that user error — CPython does the same).
+        let notes = orig_inst
+            .dict
+            .borrow()
+            .get(&crate::object::StrKey("__notes__"))
+            .cloned();
+        if let Some(notes) = notes {
+            let copied = match &notes {
+                Object::List(l) => Some(Object::new_list(l.borrow().clone())),
+                Object::Tuple(t) => Some(Object::new_list(t.to_vec())),
+                _ => None,
+            };
+            if let Some(c) = copied {
+                dst.dict
+                    .borrow_mut()
+                    .insert(DictKey(Object::from_static("__notes__")), c);
+            }
+        }
+    }
+    Ok(derived)
 }
 
 /// Wrap a naked (non-group) exception caught by an `except*` clause in
@@ -4250,16 +4677,12 @@ pub fn make_naked_eg_wrapper(exc: &Object) -> Object {
     let items_t = Object::new_tuple(items);
     let wrapper = make_exception_with_class(cls, "");
     if let Object::Instance(inst) = &wrapper {
-        let mut d = inst.dict.borrow_mut();
-        d.insert(
-            DictKey(Object::from_static("args")),
+        inst.slot_set(
+            "args",
             Object::new_tuple(vec![Object::from_static(""), items_t.clone()]),
         );
-        d.insert(
-            DictKey(Object::from_static("message")),
-            Object::from_static(""),
-        );
-        d.insert(DictKey(Object::from_static("exceptions")), items_t);
+        inst.slot_set("message", Object::from_static(""));
+        inst.slot_set("exceptions", items_t);
     }
     wrapper
 }
@@ -4273,12 +4696,10 @@ fn is_same_exception_metadata(a: &Object, b: &Object) -> bool {
     let (Object::Instance(ia), Object::Instance(ib)) = (a, b) else {
         return false;
     };
-    let da = ia.dict.borrow();
-    let db = ib.dict.borrow();
     for key in ["__notes__", "__traceback__", "__cause__", "__context__"] {
-        let va = da.get(&DictKey(Object::from_static(key)));
-        let vb = db.get(&DictKey(Object::from_static(key)));
-        let same = match (va, vb) {
+        let va = exc_attr(ia, key);
+        let vb = exc_attr(ib, key);
+        let same = match (&va, &vb) {
             (Some(Object::None) | None, Some(Object::None) | None) => true,
             (Some(x), Some(y)) => x.is_same(y),
             _ => false,
@@ -4299,11 +4720,7 @@ fn collect_eg_leaf_ids(exc: &Object, ids: &mut std::collections::HashSet<usize>)
     );
     if is_group {
         if let Object::Instance(inst) = exc {
-            let excs = inst
-                .dict
-                .borrow()
-                .get(&DictKey(Object::from_static("exceptions")))
-                .cloned();
+            let excs = exc_attr(inst, "exceptions");
             if let Some(Object::Tuple(t)) = excs {
                 for e in t.iter() {
                     collect_eg_leaf_ids(e, ids);
@@ -4326,9 +4743,17 @@ fn exception_group_projection(orig: &Object, keep: &[Object]) -> Result<Object, 
     for e in keep {
         collect_eg_leaf_ids(e, &mut ids);
     }
-    let (matched, _rest) = split_exception_group_by(orig, &|exc| match exc {
-        Object::Instance(i) => ids.contains(&(Rc::as_ptr(i) as usize)),
-        _ => false,
+    let (matched, _rest) = split_exception_group_by(orig, &|exc| {
+        // CPython's `EXCEPTION_GROUP_MATCH_INSTANCE_IDS` never matches
+        // a *group* — only leaves are compared by identity.
+        let is_group = matches!(
+            exc,
+            Object::Instance(i) if is_subclass_by_name(&i.cls(), "BaseExceptionGroup")
+        );
+        Ok(match exc {
+            Object::Instance(i) if !is_group => ids.contains(&(Rc::as_ptr(i) as usize)),
+            _ => false,
+        })
     })?;
     Ok(matched)
 }
@@ -4389,16 +4814,12 @@ pub fn prep_reraise_star(orig: &Object, excs: &[Object]) -> Result<Object, Runti
     let items_t = Object::new_tuple(raised);
     let combined = make_exception_with_class(cls, "");
     if let Object::Instance(inst) = &combined {
-        let mut d = inst.dict.borrow_mut();
-        d.insert(
-            DictKey(Object::from_static("args")),
+        inst.slot_set(
+            "args",
             Object::new_tuple(vec![Object::from_static(""), items_t.clone()]),
         );
-        d.insert(
-            DictKey(Object::from_static("message")),
-            Object::from_static(""),
-        );
-        d.insert(DictKey(Object::from_static("exceptions")), items_t);
+        inst.slot_set("message", Object::from_static(""));
+        inst.slot_set("exceptions", items_t);
     }
     Ok(combined)
 }
@@ -4427,11 +4848,10 @@ fn is_subclass_by_name(class: &Rc<TypeObject>, ancestor: &str) -> bool {
 pub fn exception_message(obj: &Object) -> Option<String> {
     match obj {
         Object::Instance(inst) => {
-            let dict: crate::sync::Ref<'_, DictData> = inst.dict.borrow();
-            if let Some(Object::Str(s)) = dict.get(&DictKey(Object::from_static("message"))) {
+            if let Some(Object::Str(s)) = exc_attr(inst, "message") {
                 return Some(s.to_string());
             }
-            if let Some(Object::Tuple(items)) = dict.get(&DictKey(Object::from_static("args"))) {
+            if let Some(Object::Tuple(items)) = exc_attr(inst, "args") {
                 if let Some(first) = items.first() {
                     return Some(first.to_str());
                 }
@@ -4496,23 +4916,78 @@ fn install_value_type_new(bt: &BuiltinTypes) {
 /// built-in subclass with its own constructor semantics).
 fn make_owned_new(owner: &'static str) -> Object {
     use crate::object::BuiltinFn;
+    fn reject_bool(owner: &str, args: &[Object]) -> Result<(), RuntimeError> {
+        if owner == "int" {
+            if let Some(Object::Type(cls)) = args.first() {
+                if cls.flags.is_builtin && cls.name == "bool" {
+                    return Err(crate::error::type_error(
+                        "int.__new__(bool) is not safe, use bool.__new__()".to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+    let owner2 = owner;
     Object::StaticMethod(MethodWrapper::new(Object::Builtin(Rc::new(BuiltinFn {
         name: "__new__",
         binds_instance: true,
         call: Box::new(move |args| {
-            if owner == "int" {
-                if let Some(Object::Type(cls)) = args.first() {
-                    if cls.flags.is_builtin && cls.name == "bool" {
-                        return Err(crate::error::type_error(
-                            "int.__new__(bool) is not safe, use bool.__new__()".to_owned(),
-                        ));
-                    }
-                }
-            }
+            reject_bool(owner, args)?;
             object_new(args)
         }),
-        call_kw: None,
+        // `int.__new__(cls, x, base=…)` — the argument clinic exposes
+        // `base` by keyword (pickletester's ComplexNewObjEx round-trips
+        // through NEWOBJ_EX exactly this way).
+        call_kw: Some(Box::new(move |args, kwargs| {
+            reject_bool(owner2, args)?;
+            if kwargs.is_empty() {
+                return object_new(args);
+            }
+            if let Some(res) = int_new_kw(args, kwargs) {
+                return res;
+            }
+            Err(crate::error::type_error(
+                "__new__() takes no keyword arguments".to_owned(),
+            ))
+        })),
     }))))
+}
+
+/// `int.__new__(cls, …, base=…)`: forward the keyword form to the real int
+/// constructor, then re-wrap in `cls` when it's a strict subclass (CPython
+/// `long_new` → `long_subtype_new`). Returns `None` when `cls` isn't an
+/// int-family user type (the caller falls back to its arity policy).
+fn int_new_kw(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Option<Result<Object, RuntimeError>> {
+    use crate::types::PyInstance;
+    let Some(Object::Type(cls)) = args.first() else {
+        return None;
+    };
+    let bt = builtin_types();
+    if !cls.is_subclass_of(&bt.int_) {
+        return None;
+    }
+    if cls.flags.is_builtin && !Rc::ptr_eq(cls, &bt.int_) {
+        // bool (and any other builtin int-family type) rejects kwargs.
+        return None;
+    }
+    let ptr = crate::vm_singletons::current_interpreter_ptr()?;
+    // SAFETY: published by an enclosing VM frame still live on this
+    // thread; the GIL keeps the access exclusive.
+    let interp = unsafe { &mut *ptr };
+    let v = match interp.type_call_default(&bt.int_, &args[1..], kwargs) {
+        Ok(v) => v,
+        Err(e) => return Some(Err(e)),
+    };
+    if Rc::ptr_eq(cls, &bt.int_) {
+        return Some(Ok(v));
+    }
+    let inst = Object::Instance(Rc::new(PyInstance::with_native(cls.clone(), v)));
+    crate::gc_trace::track(inst.clone());
+    Some(Ok(inst))
 }
 
 /// The mutable containers own a real `tp_init` in CPython: `dict.__init__`

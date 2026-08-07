@@ -135,17 +135,23 @@ impl PyException {
         {
             return None;
         }
-        let dict = inst.dict.borrow();
-        if let Some(code) = dict.get(&crate::object::DictKey(Object::from_static("code"))) {
-            return Some(code.clone());
+        // `code`/`args` live in the exception slot table; a user
+        // subclass assigning `self.code = …` without the descriptor
+        // (plain instance attribute) lands in the dict — honour both.
+        let code = inst.slot_get("code").or_else(|| {
+            inst.dict
+                .borrow()
+                .get(&crate::object::StrKey("code"))
+                .cloned()
+        });
+        if let Some(code) = code {
+            return Some(code);
         }
-        if let Some(Object::Tuple(args)) =
-            dict.get(&crate::object::DictKey(Object::from_static("args")))
-        {
+        if let Some(Object::Tuple(args)) = inst.slot_get("args") {
             return Some(match args.len() {
                 0 => Object::None,
                 1 => args[0].clone(),
-                _ => Object::Tuple(args.clone()),
+                _ => Object::Tuple(args),
             });
         }
         Some(Object::None)
@@ -199,13 +205,10 @@ impl Eq for RuntimeError {}
 /// structured fields the way CPython's C raisers do (`AttributeError.name`
 /// / `.obj`, `NameError.name`, `ImportError.name_from`, …).
 pub fn set_exception_attr(err: &RuntimeError, key: &'static str, value: Object) {
-    use crate::object::DictKey;
     if let RuntimeError::PyException(pe) = err {
         if let Object::Instance(inst) = &pe.instance {
-            let k = DictKey(Object::from_static(key));
-            let mut dict = inst.dict.borrow_mut();
-            if !dict.contains_key(&k) {
-                dict.insert(k, value);
+            if inst.slot_get(key).is_none() {
+                inst.slot_set(key, value);
             }
         }
     }
@@ -240,7 +243,6 @@ pub fn attribute_error(message: impl Into<String>) -> RuntimeError {
 /// CPython's C raise sites populate (PEP 3134-adjacent; used by
 /// suggestion machinery and asserted on by `test_exceptions`).
 pub fn attribute_error_named(obj: &Object, name: &str) -> RuntimeError {
-    use crate::object::DictKey;
     let err = attribute_error(format!(
         "'{}' object has no attribute '{}'",
         obj.type_name_owned(),
@@ -248,9 +250,8 @@ pub fn attribute_error_named(obj: &Object, name: &str) -> RuntimeError {
     ));
     if let RuntimeError::PyException(pe) = &err {
         if let Object::Instance(inst) = &pe.instance {
-            let mut dict = inst.dict.borrow_mut();
-            dict.insert(DictKey(Object::from_static("name")), Object::from_str(name));
-            dict.insert(DictKey(Object::from_static("obj")), obj.clone());
+            inst.slot_set("name", Object::from_str(name));
+            inst.slot_set("obj", obj.clone());
         }
     }
     err
@@ -371,18 +372,16 @@ pub fn stop_async_iteration() -> RuntimeError {
 pub fn stop_iteration_with(value: Object) -> RuntimeError {
     let pe = PyException::from_builtin("StopIteration", "");
     if let Object::Instance(ref inst) = pe.instance {
-        let key = crate::object::DictKey(Object::from_static("value"));
-        inst.dict.borrow_mut().insert(key, value.clone());
+        inst.slot_set("value", value.clone());
         // A bare `return` (value None) raises `StopIteration()` with
         // *empty* args, so `str(e)` renders bare and `e.args` is `()` —
         // CPython's `gen_return` only packs non-None return values.
-        let args_key = crate::object::DictKey(Object::from_static("args"));
         let args = if matches!(value, Object::None) {
             Object::new_tuple(Vec::new())
         } else {
             Object::new_tuple(vec![value])
         };
-        inst.dict.borrow_mut().insert(args_key, args);
+        inst.slot_set("args", args);
     }
     RuntimeError::PyException(pe)
 }
@@ -440,7 +439,6 @@ pub fn syntax_error_located_as(
     offset: Option<u32>,
     text: Option<&str>,
 ) -> RuntimeError {
-    use crate::object::DictKey;
     let message = message.into();
     let pe = PyException::from_builtin(class, message.clone());
     if let Object::Instance(inst) = &pe.instance {
@@ -455,18 +453,12 @@ pub fn syntax_error_located_as(
             off_obj.clone(),
             text_obj.clone(),
         ]);
-        let mut dict = inst.dict.borrow_mut();
-        dict.insert(DictKey(Object::from_static("msg")), msg_obj.clone());
-        dict.insert(DictKey(Object::from_static("filename")), file_obj);
-        dict.insert(DictKey(Object::from_static("lineno")), line_obj);
-        dict.insert(DictKey(Object::from_static("offset")), off_obj);
-        dict.insert(DictKey(Object::from_static("text")), text_obj);
-        dict.insert(DictKey(Object::from_static("end_lineno")), Object::None);
-        dict.insert(DictKey(Object::from_static("end_offset")), Object::None);
-        dict.insert(
-            DictKey(Object::from_static("args")),
-            Object::new_tuple(vec![msg_obj, detail]),
-        );
+        inst.slot_set("msg", msg_obj.clone());
+        inst.slot_set("filename", file_obj);
+        inst.slot_set("lineno", line_obj);
+        inst.slot_set("offset", off_obj);
+        inst.slot_set("text", text_obj);
+        inst.slot_set("args", Object::new_tuple(vec![msg_obj, detail]));
     }
     RuntimeError::PyException(pe)
 }
@@ -496,21 +488,14 @@ pub fn oserror_subclass_with_errno(
     errno: i32,
     strerror: impl Into<String>,
 ) -> RuntimeError {
-    use crate::object::{DictKey, Object};
+    use crate::object::Object;
     let strerror = strerror.into();
     let pe = PyException::from_builtin(class, strerror.clone());
     if let Object::Instance(inst) = &pe.instance {
-        let mut d = inst.dict.borrow_mut();
-        d.insert(
-            DictKey(Object::from_static("errno")),
-            Object::Int(i64::from(errno)),
-        );
-        d.insert(
-            DictKey(Object::from_static("strerror")),
-            Object::from_str(strerror.clone()),
-        );
-        d.insert(
-            DictKey(Object::from_static("args")),
+        inst.slot_set("errno", Object::Int(i64::from(errno)));
+        inst.slot_set("strerror", Object::from_str(strerror.clone()));
+        inst.slot_set(
+            "args",
             Object::new_tuple(vec![
                 Object::Int(i64::from(errno)),
                 Object::from_str(strerror),
@@ -534,25 +519,14 @@ pub fn blocking_io_error_written(
     strerror: &str,
     characters_written: i64,
 ) -> RuntimeError {
-    use crate::object::{DictKey, Object};
+    use crate::object::Object;
     let pe = PyException::from_builtin("BlockingIOError", strerror.to_owned());
     if let Object::Instance(inst) = &pe.instance {
-        let mut dict = inst.dict.borrow_mut();
-        dict.insert(
-            DictKey(Object::from_static("errno")),
-            Object::Int(i64::from(errno)),
-        );
-        dict.insert(
-            DictKey(Object::from_static("strerror")),
-            Object::from_str(strerror.to_owned()),
-        );
-        dict.insert(
-            DictKey(Object::from_static("characters_written")),
-            Object::Int(characters_written),
-        );
-        dict.insert(DictKey(Object::from_static("filename")), Object::None);
-        dict.insert(
-            DictKey(Object::from_static("args")),
+        inst.slot_set("errno", Object::Int(i64::from(errno)));
+        inst.slot_set("strerror", Object::from_str(strerror.to_owned()));
+        inst.slot_set("characters_written", Object::Int(characters_written));
+        inst.slot_set(
+            "args",
             Object::new_tuple(vec![
                 Object::Int(i64::from(errno)),
                 Object::from_str(strerror.to_owned()),
@@ -698,40 +672,27 @@ pub fn io_error_to_py_named2(
     };
     if let RuntimeError::PyException(ref mut exc) = runtime {
         if let crate::object::Object::Instance(inst) = &exc.instance {
-            use crate::object::{DictKey, Object};
-            let mut dict = inst.dict.borrow_mut();
+            use crate::object::Object;
             if let Some(errno) = errno {
-                dict.insert(
-                    DictKey(Object::from_static("errno")),
-                    Object::Int(i64::from(errno)),
-                );
+                inst.slot_set("errno", Object::Int(i64::from(errno)));
                 // CPython: a syscall `OSError` carries `args == (errno,
                 // strerror)`, so `e.args[0]` is the integer errno (not
                 // the formatted message). The `[Errno N] …` rendering is
                 // reconstructed by `OSError.__str__` from these fields.
-                dict.insert(
-                    DictKey(Object::from_static("args")),
+                inst.slot_set(
+                    "args",
                     Object::new_tuple(vec![
                         Object::Int(i64::from(errno)),
                         Object::from_str(strerror.clone()),
                     ]),
                 );
             }
-            dict.insert(
-                DictKey(Object::from_static("strerror")),
-                Object::from_str(strerror),
-            );
+            inst.slot_set("strerror", Object::from_str(strerror));
             if let Some(f) = filename {
-                dict.insert(
-                    DictKey(Object::from_static("filename")),
-                    Object::from_str(f.to_owned()),
-                );
+                inst.slot_set("filename", Object::from_str(f.to_owned()));
             }
             if let Some(f2) = filename2 {
-                dict.insert(
-                    DictKey(Object::from_static("filename2")),
-                    Object::from_str(f2.to_owned()),
-                );
+                inst.slot_set("filename2", Object::from_str(f2.to_owned()));
             }
         }
     }
@@ -745,13 +706,12 @@ pub fn io_error_to_py_named2(
 /// `bytes` path (`test_os.test_oserror_filename`). Cloning an `Rc`-backed
 /// [`Object`] keeps the same allocation, so the `is` check passes.
 fn set_oserror_filename_obj(rt: &mut RuntimeError, filename: Object, filename2: Option<Object>) {
-    use crate::object::{DictKey, Object};
+    use crate::object::Object;
     if let RuntimeError::PyException(exc) = rt {
         if let Object::Instance(inst) = &exc.instance {
-            let mut dict = inst.dict.borrow_mut();
-            dict.insert(DictKey(Object::from_static("filename")), filename);
+            inst.slot_set("filename", filename);
             if let Some(f2) = filename2 {
-                dict.insert(DictKey(Object::from_static("filename2")), f2);
+                inst.slot_set("filename2", f2);
             }
         }
     }

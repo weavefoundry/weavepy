@@ -61,6 +61,28 @@ for _p in _sys.path:
             _d = _up
     except (TypeError, ValueError):
         pass
+# Source-tree layout detection, mirroring a CPython build-tree python
+# finding `Lib/test` next to the executable: a `weavepy` binary running
+# out of `target/<profile>/` in a repo checkout can resolve the vendored
+# suite even under `-I` (no script dir, no cwd on sys.path). This is what
+# lets `assert_python_ok('-c', 'from test.test_weakref import …')`
+# children — spawned isolated by design — import their own test module,
+# exactly as CPython children resolve it from the stdlib
+# (test_weakref FinalizeTestCase.test_atexit).
+try:
+    _exe_dir = _os.path.dirname(_os.path.abspath(_sys.executable))
+    for _cand in (
+        _os.path.join(_exe_dir, "..", "..", "vendor", "cpython", "Lib", "test"),
+        _os.path.join(_exe_dir, "..", "vendor", "cpython", "Lib", "test"),
+    ):
+        _cand = _os.path.normpath(_cand)
+        if (
+            _os.path.isfile(_os.path.join(_cand, "__init__.py"))
+            and _cand not in __path__
+        ):
+            __path__.append(_cand)
+except (TypeError, ValueError, OSError):
+    pass
 # When a full CPython regression suite is among the grafted directories,
 # make it the package's *identity*: tests locate on-disk fixtures via
 # `os.path.dirname(test.__file__)` (testpatch/test_pkgutil resolve
@@ -76,7 +98,7 @@ for _d in list(__path__):
     except (TypeError, ValueError):
         pass
 del _os, _sys
-for _n in ("_p", "_norm", "_child", "_d", "_up", "_init"):
+for _n in ("_p", "_norm", "_child", "_d", "_up", "_init", "_exe_dir", "_cand"):
     try:
         del globals()[_n]
     except KeyError:

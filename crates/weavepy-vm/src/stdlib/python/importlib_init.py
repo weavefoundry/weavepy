@@ -29,6 +29,13 @@ def __import__(name, globals=None, locals=None, fromlist=(), level=0):
     exposes it on importlib for code that wants the import machinery
     without touching builtins — test.test_importlib.util builds its
     Frozen/Source variant table from it)."""
+    # CPython `_bootstrap._sanity_check`: reject these *before* the
+    # machinery runs (test_importlib.import_.test_api).
+    if not isinstance(name, str):
+        raise TypeError('module name must be str, not {}'.format(
+            type(name).__name__))
+    if level < 0:
+        raise ValueError('level must be >= 0')
     return _builtin_import(name, globals, locals, fromlist, level)
 
 __all__ = [
@@ -138,5 +145,13 @@ def __getattr__(name):
         module = import_module('importlib.' + name)
         globals()[name] = module
         return module
+    if name in ('_pack_uint32', '_unpack_uint32'):
+        # CPython's importlib/__init__ re-exports these from
+        # `_bootstrap_external` at import time; keep them lazy here for
+        # the same startup-weight reason as the submodules above.
+        module = import_module('importlib._bootstrap_external')
+        value = getattr(module, name)
+        globals()[name] = value
+        return value
     raise AttributeError(
         "module 'importlib' has no attribute {!r}".format(name))

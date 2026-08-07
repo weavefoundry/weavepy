@@ -10,7 +10,9 @@ use crate::sync::Rc;
 use crate::sync::RefCell;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use chrono::{DateTime, Datelike, Local, TimeZone, Timelike, Utc};
+#[cfg(not(unix))]
+use chrono::Local;
+use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
 
 use crate::error::{type_error, RuntimeError};
 use crate::import::ModuleCache;
@@ -131,12 +133,13 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             Object::new_tuple(vec![Object::from_str(std_name), Object::from_str(dst_name)]),
         );
         // `_strptime._strptime_time` slices its result to this many items
-        // before building a `struct_time`. Our `struct_time` exposes the 9
-        // visible `tm_*` fields (the hidden `tm_zone`/`tm_gmtoff` are set by
-        // name, not positionally), so 9 is the faithful count.
+        // before building a `struct_time`: 11 = the 9 visible `tm_*` fields
+        // plus the hidden `tm_zone`/`tm_gmtoff` slots the constructor fills
+        // positionally (CPython's HAVE_STRUCT_TM_TM_ZONE value; also
+        // `struct_time.n_fields`, test_structseq.test_fields).
         d.insert(
             DictKey(Object::from_static("_STRUCT_TM_ITEMS")),
-            Object::Int(9),
+            Object::Int(11),
         );
     }
     // `time.tzset()` — re-read the `TZ` environment variable (CPython calls
@@ -266,7 +269,15 @@ const STRUCT_TIME_FIELDS: [&str; 9] = [
 /// bare tuple (the old shape) broke them with `'tuple' object has no attribute
 /// 'tm_year'`.
 fn struct_time_type() -> Rc<crate::types::TypeObject> {
-    crate::stdlib::os::struct_seq_type("struct_time", "time", &STRUCT_TIME_FIELDS)
+    // Full CPython layout: 9 sequence slots plus the two hidden named
+    // members, so `n_fields` is 11 and an 10/11-element constructor sequence
+    // fills `tm_zone`/`tm_gmtoff` positionally (test_structseq).
+    let slots: Vec<Option<&'static str>> = STRUCT_TIME_FIELDS
+        .iter()
+        .map(|f| Some(*f))
+        .chain([Some("tm_zone"), Some("tm_gmtoff")])
+        .collect();
+    crate::stdlib::os::struct_seq_type_layout("struct_time", "time", slots, 9)
 }
 
 fn make_struct_time(values: Vec<Object>) -> Object {
@@ -522,6 +533,7 @@ fn time_sleep(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
+#[cfg(not(unix))]
 fn tuple_to_dt(args: Option<&Object>) -> Result<DateTime<Local>, RuntimeError> {
     // Accept both a bare 9-tuple/list and a real `struct_time` instance (which
     // stores the calendar fields under their `tm_*` names but is no longer a
@@ -604,14 +616,244 @@ fn tuple_to_dt(args: Option<&Object>) -> Result<DateTime<Local>, RuntimeError> {
     Ok(dt)
 }
 
+/// CPython `gettmarg`'s output: the C-convention `struct tm` fields (year
+/// −1900, 0-based month/yday, Sunday-first wday), plus the hidden
+/// `struct_time` extras when the argument carries them.
+struct TmFields {
+    /// The original Python year — kept at full width so `asctime` can
+    /// print `TIME_MAXYEAR` without the `tm_year + 1900` i32 overflow.
+    year: i64,
+    tm_mon: i32,
+    tm_mday: i32,
+    tm_hour: i32,
+    tm_min: i32,
+    tm_sec: i32,
+    tm_wday: i32,
+    tm_yday: i32,
+    tm_isdst: i32,
+    /// Only the unix `strftime`/`mktime` paths read these back.
+    #[cfg_attr(windows, allow(dead_code))]
+    zone: Option<String>,
+    #[cfg_attr(windows, allow(dead_code))]
+    gmtoff: Option<i64>,
+}
+
+impl TmFields {
+    #[cfg_attr(windows, allow(dead_code))]
+    fn tm_year(&self) -> i32 {
+        (self.year - 1900) as i32
+    }
+}
+
+/// CPython `gettmarg` (`Modules/timemodule.c`): convert a 9-item tuple or a
+/// `struct_time` to C `struct tm` conventions. Rejects lists and other
+/// types with the same TypeError CPython raises.
+fn gettmarg(arg: Option<&Object>, func: &str) -> Result<TmFields, RuntimeError> {
+    use crate::error::overflow_error;
+    let illegal = || type_error(format!("{func}(): illegal time tuple argument"));
+    let items: Vec<Object> = match arg {
+        Some(Object::Tuple(t)) => t.to_vec(),
+        Some(Object::Instance(inst)) => {
+            let d = inst.dict.borrow();
+            let mut v = Vec::with_capacity(9);
+            for f in STRUCT_TIME_FIELDS {
+                v.push(
+                    d.get(&DictKey(Object::from_static(f)))
+                        .cloned()
+                        .ok_or_else(illegal)?,
+                );
+            }
+            v
+        }
+        _ => return Err(type_error("Tuple or struct_time argument required")),
+    };
+    if items.len() != 9 {
+        return Err(illegal());
+    }
+    // PyArg_ParseTuple "iiiiiiiii": each field converts through C int,
+    // overflowing (not truncating) beyond its range.
+    let as_int = |o: &Object| -> Result<i64, RuntimeError> {
+        match o {
+            Object::Int(v) => Ok(*v),
+            Object::Bool(b) => Ok(i64::from(*b)),
+            Object::Long(b) => {
+                use num_traits::ToPrimitive;
+                b.to_i64()
+                    .ok_or_else(|| overflow_error("Python int too large to convert to C int"))
+            }
+            _ => Err(illegal()),
+        }
+    };
+    let as_c_int = |o: &Object| -> Result<i32, RuntimeError> {
+        i32::try_from(as_int(o)?)
+            .map_err(|_| overflow_error("Python int too large to convert to C int"))
+    };
+    let y = i64::from(as_c_int(&items[0])?);
+    // `tm_year = y - 1900` must not underflow C int (TIME_MINYEAR - 1 is an
+    // OverflowError — test_time's _Test4dYear.test_negative).
+    if y < i64::from(i32::MIN) + 1900 {
+        return Err(overflow_error("year out of range"));
+    }
+    let (zone, gmtoff) = match arg {
+        Some(Object::Instance(inst)) => {
+            let d = inst.dict.borrow();
+            let zone = match d.get(&DictKey(Object::from_static("tm_zone"))) {
+                Some(z @ (Object::Str(_) | Object::WStr(_))) => Some(z.to_str()),
+                _ => None,
+            };
+            let gmtoff = match d.get(&DictKey(Object::from_static("tm_gmtoff"))) {
+                Some(Object::Int(v)) => Some(*v),
+                _ => None,
+            };
+            (zone, gmtoff)
+        }
+        _ => (None, None),
+    };
+    Ok(TmFields {
+        year: y,
+        tm_mon: as_c_int(&items[1])? - 1,
+        tm_mday: as_c_int(&items[2])?,
+        tm_hour: as_c_int(&items[3])?,
+        tm_min: as_c_int(&items[4])?,
+        // C-style `%`: `(wday + 1) % 7` keeps the sign of the dividend, so
+        // wday -2 becomes -1 and fails checktm (wday -1 wraps to 0 — the
+        // bounds-check test relies on both).
+        tm_sec: as_c_int(&items[5])?,
+        tm_wday: (as_c_int(&items[6])? + 1) % 7,
+        tm_yday: as_c_int(&items[7])? - 1,
+        tm_isdst: as_c_int(&items[8])?,
+        zone,
+        gmtoff,
+    })
+}
+
+/// CPython `checktm` (bug #897625/#1520914): zero is accepted for
+/// month/day/yday and forced to the lowest valid value; anything else out
+/// of range is a ValueError so strftime/asctime never index blindly.
+fn checktm(tm: &mut TmFields) -> Result<(), RuntimeError> {
+    use crate::error::value_error;
+    if tm.tm_mon == -1 {
+        tm.tm_mon = 0;
+    } else if !(0..=11).contains(&tm.tm_mon) {
+        return Err(value_error("month out of range"));
+    }
+    if tm.tm_mday == 0 {
+        tm.tm_mday = 1;
+    } else if !(1..=31).contains(&tm.tm_mday) {
+        return Err(value_error("day of month out of range"));
+    }
+    if !(0..=23).contains(&tm.tm_hour) {
+        return Err(value_error("hour out of range"));
+    }
+    if !(0..=59).contains(&tm.tm_min) {
+        return Err(value_error("minute out of range"));
+    }
+    if !(0..=61).contains(&tm.tm_sec) {
+        return Err(value_error("seconds out of range"));
+    }
+    if tm.tm_wday < 0 {
+        return Err(value_error("day of week out of range"));
+    }
+    if tm.tm_yday == -1 {
+        tm.tm_yday = 0;
+    } else if !(0..=365).contains(&tm.tm_yday) {
+        return Err(value_error("day of year out of range"));
+    }
+    Ok(())
+}
+
+/// The current local time as `TmFields`, for the no-argument forms of
+/// `strftime`/`asctime`.
+fn localtime_now_tm() -> Result<TmFields, RuntimeError> {
+    #[cfg(unix)]
+    {
+        let t: libc::time_t = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as libc::time_t;
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        if unsafe { libc::localtime_r(&raw const t, &raw mut tm) }.is_null() {
+            return Err(crate::error::overflow_error(
+                "timestamp out of range for platform time_t",
+            ));
+        }
+        let zone = if tm.tm_zone.is_null() {
+            None
+        } else {
+            Some(
+                unsafe { std::ffi::CStr::from_ptr(tm.tm_zone) }
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        };
+        Ok(TmFields {
+            year: i64::from(tm.tm_year) + 1900,
+            tm_mon: tm.tm_mon,
+            tm_mday: tm.tm_mday,
+            tm_hour: tm.tm_hour,
+            tm_min: tm.tm_min,
+            tm_sec: tm.tm_sec,
+            tm_wday: tm.tm_wday,
+            tm_yday: tm.tm_yday,
+            tm_isdst: tm.tm_isdst,
+            zone,
+            gmtoff: Some(tm.tm_gmtoff as i64),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        use chrono::Offset;
+        let dt = Local::now();
+        Ok(TmFields {
+            year: i64::from(dt.year()),
+            tm_mon: dt.month0() as i32,
+            tm_mday: dt.day() as i32,
+            tm_hour: dt.hour() as i32,
+            tm_min: dt.minute() as i32,
+            tm_sec: dt.second() as i32,
+            tm_wday: dt.weekday().num_days_from_sunday() as i32,
+            tm_yday: dt.ordinal0() as i32,
+            tm_isdst: -1,
+            zone: Some(dt.format("%Z").to_string()),
+            gmtoff: Some(i64::from(dt.offset().fix().local_minus_utc())),
+        })
+    }
+}
+
+/// Format one ASCII chunk of a strftime format through libc, growing the
+/// buffer CPython-style: a zero return is retried until the buffer is 256×
+/// the format length, at which point it's an genuinely empty rendering
+/// (empty format, `%Z` with unknown zone, …).
+#[cfg(unix)]
+fn strftime_chunk(chunk: &str, tm: &libc::tm) -> String {
+    let cfmt = std::ffi::CString::new(chunk).expect("ASCII run contains no NUL");
+    let mut bufsize = 1024usize;
+    loop {
+        let mut buf = vec![0u8; bufsize];
+        let n = unsafe {
+            libc::strftime(
+                buf.as_mut_ptr().cast::<libc::c_char>(),
+                bufsize,
+                cfmt.as_ptr(),
+                tm,
+            )
+        };
+        if n == 0 && bufsize < 256 * chunk.len().max(1) {
+            bufsize *= 2;
+            continue;
+        }
+        buf.truncate(n);
+        return String::from_utf8_lossy(&buf).into_owned();
+    }
+}
+
 fn time_strftime(args: &[Object]) -> Result<Object, RuntimeError> {
     // A format string may carry lone surrogates: `_pydatetime._wrap_strftime`
     // splices the object's `%Z`/`%z`/`%f` values in *before* calling us, so a
     // surrogate tzname (`datetimetester.test_zones`) or a surrogate literal
     // (`t.strftime('%y\ud800%m')`) arrives as an `Object::WStr`. Bridge the
-    // code points into the PUA window so `chrono`'s UTF-8 formatter copies
-    // them through as opaque literals, then map them back — exactly how the
-    // `%`/`str.format` engines preserve surrogates.
+    // code points into the PUA window — non-ASCII chars are copied through
+    // verbatim (never handed to libc), then mapped back at the end.
     let cps = match args.first() {
         Some(o @ (Object::Str(_) | Object::WStr(_))) => o.str_codepoints().unwrap_or_default(),
         Some(other) => {
@@ -623,39 +865,125 @@ fn time_strftime(args: &[Object]) -> Result<Object, RuntimeError> {
         None => return Err(type_error("strftime expects format string")),
     };
     let fmt = crate::builtins::bridge_encode_cps(&cps);
-    let dt = if args.len() >= 2 {
-        tuple_to_dt(args.get(1))?
-    } else {
-        Local::now()
+    let mut tm = match args.get(1) {
+        None => localtime_now_tm()?,
+        Some(o) => {
+            let mut tm = gettmarg(Some(o), "strftime")?;
+            checktm(&mut tm)?;
+            tm
+        }
     };
-    // `chrono`'s `DelayedFormat` reports an unsupported/invalid directive (e.g.
-    // the glibc extension `%4Y`) by returning `Err` from its `Display` impl;
-    // calling `.to_string()` on that panics. Render through `write!` so we can
-    // surface a Python-level `ValueError` instead of aborting the interpreter
-    // (CPython's `time.strftime` likewise raises on a bad format string).
-    use std::fmt::Write as _;
-    let mut rendered = String::new();
-    match write!(rendered, "{}", dt.format(&fmt)) {
-        Ok(()) => Ok(crate::builtins::bridge_to_object(&rendered)),
-        Err(_) => Err(crate::error::value_error("Invalid format string")),
+    // Normalize tm_isdst in case a %Z implementation assumes [-1, 1].
+    tm.tm_isdst = tm.tm_isdst.clamp(-1, 1);
+    #[cfg(unix)]
+    {
+        // CPython hands the format to the system strftime — that's where
+        // the platform-specific behaviours the suite adapts to come from
+        // (%w reads tm_wday straight off the tuple, macOS zero-pads %Y to
+        // '0001'/'-001', %Z prints tm_zone). Mirror its chunking: ASCII
+        // runs go through libc, anything else is copied verbatim.
+        let zone_c = tm
+            .zone
+            .as_ref()
+            .and_then(|z| std::ffi::CString::new(z.as_str()).ok());
+        let mut ctm: libc::tm = unsafe { std::mem::zeroed() };
+        ctm.tm_year = tm.tm_year();
+        ctm.tm_mon = tm.tm_mon;
+        ctm.tm_mday = tm.tm_mday;
+        ctm.tm_hour = tm.tm_hour;
+        ctm.tm_min = tm.tm_min;
+        ctm.tm_sec = tm.tm_sec;
+        ctm.tm_wday = tm.tm_wday;
+        ctm.tm_yday = tm.tm_yday;
+        ctm.tm_isdst = tm.tm_isdst;
+        ctm.tm_gmtoff = tm.gmtoff.unwrap_or(0) as _;
+        ctm.tm_zone = zone_c
+            .as_ref()
+            .map_or(std::ptr::null_mut(), |c| c.as_ptr().cast_mut());
+        let chars: Vec<char> = fmt.chars().collect();
+        let mut out = String::new();
+        let mut i = 0;
+        while i < chars.len() {
+            let start = i;
+            while i < chars.len() && (1..=0x7f).contains(&(chars[i] as u32)) {
+                i += 1;
+            }
+            if i > start {
+                let chunk: String = chars[start..i].iter().collect();
+                out.push_str(&strftime_chunk(&chunk, &ctm));
+            }
+            // Literal copy up to the next '%' (CPython time_strftime):
+            // covers the non-ASCII (or NUL) char that broke the run plus
+            // any directive-free text after it.
+            let start = i;
+            while i < chars.len() && chars[i] != '%' {
+                i += 1;
+            }
+            for &c in &chars[start..i] {
+                out.push(c);
+            }
+        }
+        drop(zone_c);
+        Ok(crate::builtins::bridge_to_object(&out))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = &tm;
+        let dt = if args.len() >= 2 {
+            tuple_to_dt(args.get(1))?
+        } else {
+            Local::now()
+        };
+        // `chrono`'s `DelayedFormat` reports an unsupported/invalid
+        // directive by returning `Err` from its `Display` impl; calling
+        // `.to_string()` on that panics. Render through `write!` so we can
+        // surface a Python-level `ValueError` instead.
+        use std::fmt::Write as _;
+        let mut rendered = String::new();
+        match write!(rendered, "{}", dt.format(&fmt)) {
+            Ok(()) => Ok(crate::builtins::bridge_to_object(&rendered)),
+            Err(_) => Err(crate::error::value_error("Invalid format string")),
+        }
     }
 }
 
-/// `time.asctime([t])` / `time.ctime([secs])` shared formatter — CPython's
-/// `asctime`/`ctime` both render `"%a %b %e %H:%M:%S %Y"` (the libc
-/// `asctime` layout: day-of-month *space*-padded to width 2), which is what
-/// `_pydatetime.date.ctime()` reproduces with its `"%s %s %2d …"` format.
-fn format_ctime_local(dt: DateTime<Local>) -> Object {
-    Object::from_str(dt.format("%a %b %e %H:%M:%S %Y").to_string())
+const ASCTIME_DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const ASCTIME_MONS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// CPython `_asctime`: hand-rolled `"%s %s%3d %.2d:%.2d:%.2d %d"` — locale
+/// independent, year printed unpadded at any width (`asctime((12345,) +
+/// (0,)*8)` ends in '12345', not a zero-padded field).
+fn asctime_from(tm: &TmFields) -> Object {
+    Object::from_str(format!(
+        "{} {}{:>3} {:02}:{:02}:{:02} {}",
+        ASCTIME_DAYS[tm.tm_wday as usize % 7],
+        ASCTIME_MONS[tm.tm_mon as usize % 12],
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec,
+        tm.year,
+    ))
 }
 
 fn time_asctime(args: &[Object]) -> Result<Object, RuntimeError> {
-    let dt = if args.first().is_some_and(|o| !matches!(o, Object::None)) {
-        tuple_to_dt(args.first())?
-    } else {
-        Local::now()
+    if args.len() > 1 {
+        return Err(type_error(format!(
+            "asctime expected at most 1 argument, got {}",
+            args.len()
+        )));
+    }
+    let tm = match args.first() {
+        None => localtime_now_tm()?,
+        Some(o) => {
+            let mut tm = gettmarg(Some(o), "asctime")?;
+            checktm(&mut tm)?;
+            tm
+        }
     };
-    Ok(format_ctime_local(dt))
+    Ok(asctime_from(&tm))
 }
 
 fn time_ctime(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -686,17 +1014,13 @@ fn time_ctime(args: &[Object]) -> Result<Object, RuntimeError> {
                 "timestamp out of range for platform time_t",
             ));
         }
-        const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-        const MONS: [&str; 12] = [
-            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-        ];
         // The `return` is required: the `#[cfg(not(unix))]` tail below is
         // compiled out on unix, but rustc still needs this arm to diverge.
         #[allow(clippy::needless_return)]
         return Ok(Object::from_str(format!(
-            "{} {} {:2} {:02}:{:02}:{:02} {}",
-            DAYS[tm.tm_wday as usize],
-            MONS[tm.tm_mon as usize],
+            "{} {}{:>3} {:02}:{:02}:{:02} {}",
+            ASCTIME_DAYS[tm.tm_wday as usize % 7],
+            ASCTIME_MONS[tm.tm_mon as usize % 12],
             tm.tm_mday,
             tm.tm_hour,
             tm.tm_min,
@@ -705,7 +1029,22 @@ fn time_ctime(args: &[Object]) -> Result<Object, RuntimeError> {
         )));
     }
     #[cfg(not(unix))]
-    Ok(format_ctime_local(local_from_timestamp(secs)?))
+    {
+        let dt = local_from_timestamp(secs)?;
+        Ok(asctime_from(&TmFields {
+            year: i64::from(dt.year()),
+            tm_mon: dt.month0() as i32,
+            tm_mday: dt.day() as i32,
+            tm_hour: dt.hour() as i32,
+            tm_min: dt.minute() as i32,
+            tm_sec: dt.second() as i32,
+            tm_wday: dt.weekday().num_days_from_sunday() as i32,
+            tm_yday: dt.ordinal0() as i32,
+            tm_isdst: -1,
+            zone: None,
+            gmtoff: None,
+        }))
+    }
 }
 
 /// Convert a float timestamp to whole seconds, raising CPython's
@@ -887,11 +1226,14 @@ fn time_mktime(args: &[Object]) -> Result<Object, RuntimeError> {
             tm.tm_min = extract(4)? as _;
             tm.tm_sec = extract(5)? as _;
             tm.tm_isdst = extract(8).unwrap_or(-1) as _;
+            // -1 is both the error sentinel and the legitimate second
+            // before the epoch. CPython disambiguates with a tm_wday
+            // sentinel: mktime normalizes tm_wday on success, so a -1
+            // return that *also* left tm_wday untouched is a real error
+            // (`mktime(localtime(-1))` must round-trip — test_time).
+            tm.tm_wday = -1;
             let t = unsafe { libc::mktime(&raw mut tm) };
-            if t == -1 && tm.tm_mday != 30 {
-                // -1 is both the error sentinel and a legitimate second
-                // before the epoch; CPython retries with tm_mday bumped to
-                // disambiguate. Practical inputs never hit this, so raise.
+            if t == -1 && tm.tm_wday == -1 {
                 return Err(crate::error::overflow_error("mktime argument out of range"));
             }
             return Ok(Object::Float(t as f64));

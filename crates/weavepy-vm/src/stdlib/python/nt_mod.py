@@ -11,6 +11,12 @@ Python shim so that ``import nt`` works for code (notably ``shutil`` and
 import os as _os
 import sys as _sys
 
+# CPython only builds the ``nt`` module on Windows; on POSIX hosts
+# ``import nt`` must fail so `os.name` probes and test gates (e.g.
+# test_ntpath's `@unittest.skipUnless(nt, ...)`) take the POSIX branch.
+if not _sys.platform.startswith("win"):
+    raise ModuleNotFoundError("No module named 'nt'")
+
 # Re-export every public name the underlying ``os`` module advertises so that
 # code written against CPython's ``nt`` finds what it expects.
 _names = []

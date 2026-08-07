@@ -88,8 +88,9 @@ class ModuleSpec:
       path that ``open()`` would accept.
     """
 
-    __slots__ = ('name', 'loader', 'origin', 'submodule_search_locations',
-                 'loader_state', '_cached', '_set_fileattr', '_initializing')
+    # No __slots__: CPython's ModuleSpec is a plain class with an
+    # instance dict, and consumers hang private state off specs
+    # (LazyLoader stores `spec._lazy_loader`, tests attach markers).
 
     def __init__(self, name, loader, *, origin=None, loader_state=None,
                  is_package=None):
@@ -99,7 +100,11 @@ class ModuleSpec:
         self.loader_state = loader_state
         self.submodule_search_locations = [] if is_package else None
         self._cached = None
-        self._set_fileattr = origin is not None
+        # CPython: False by default — even with an `origin`. Virtual
+        # origins ('frozen', 'built-in') are not locations; file-backed
+        # spec factories (FileFinder, spec_from_file_location) flip it
+        # explicitly (test_importlib.frozen asserts `not has_location`).
+        self._set_fileattr = False
         self._initializing = False
 
     @property
@@ -203,13 +208,27 @@ class _LoaderBase:
                                           self.path)
 
     def get_filename(self, fullname=None):
+        # CPython wraps FileLoader.get_filename in `_check_name`: asking a
+        # loader bound to one module about another is an ImportError
+        # (test_file_loader.SimpleTest.test_unloadable).
+        if (fullname is not None and self.name is not None
+                and fullname != self.name):
+            raise ImportError(
+                'loader for %s cannot handle %s' % (self.name, fullname),
+                name=fullname)
         return self.path
 
     def is_package(self, fullname=None):
         if not self.path:
             return False
-        base = os.path.basename(self.path)
-        return base.startswith('__init__.')
+        # CPython FileLoader.is_package: a module literally *named*
+        # `__init__` is not a package even though its file is
+        # `__init__.py` — modulefinder probes `find_module('__init__',
+        # pkg.__path__)` and recurses forever without this clause.
+        filename = os.path.basename(self.path)
+        filename_base = filename.rsplit('.', 1)[0]
+        tail_name = (fullname or self.name or '').rpartition('.')[2]
+        return filename_base == '__init__' and tail_name != '__init__'
 
     def get_source(self, fullname=None):
         if not self.path:
@@ -253,6 +272,15 @@ class _LoaderBase:
         from importlib.resources.readers import FileReader
         return FileReader(self)
 
+    def load_module(self, fullname=None):
+        # Pre-PEP 451 legacy API, still exercised by test_importlib and
+        # old tooling. CPython routes it through
+        # `_bootstrap._load_module_shim`.
+        if fullname is None:
+            fullname = self.name
+        import importlib._bootstrap
+        return importlib._bootstrap._load_module_shim(self, fullname)
+
 
 class SourceFileLoader(_LoaderBase):
     """Load a module from a ``.py`` file on disk.
@@ -275,6 +303,118 @@ class SourceFileLoader(_LoaderBase):
         return compile(data, path, 'exec', dont_inherit=True,
                        optimize=_optimize)
 
+    def get_code(self, fullname=None):
+        """CPython `SourceLoader.get_code`: prefer a *valid* cached pyc,
+        regenerate from source otherwise.
+
+        Exception taxonomy is load-bearing
+        (test_file_loader.SourceLoaderBadBytecodeTest*): a bad header
+        (magic/staleness/truncation) silently falls back to source, but
+        unmarshalling errors from a well-formed header propagate
+        (ValueError for garbage, EOFError for truncation).
+        """
+        if fullname is None:
+            fullname = self.name
+        source_path = self.get_filename(fullname)
+        source_mtime = None
+        st = None
+        bytecode_path = None
+        try:
+            from importlib.util import cache_from_source
+            bytecode_path = cache_from_source(source_path)
+        except NotImplementedError:
+            pass
+        data = None
+        if bytecode_path is not None:
+            try:
+                st = self.path_stats(source_path)
+            except OSError:
+                pass
+            else:
+                source_mtime = int(st['mtime'])
+                try:
+                    data = self.get_data(bytecode_path)
+                except OSError:
+                    data = None
+        if data is not None:
+            try:
+                magic = data[:4]
+                if magic != MAGIC_NUMBER:
+                    raise ImportError(
+                        'bad magic number in {!r}: {!r}'.format(
+                            fullname, magic),
+                        name=fullname, path=bytecode_path)
+                if len(data) < 16:
+                    raise EOFError(
+                        'reached EOF while reading pyc header of '
+                        '{!r}'.format(fullname))
+                flags = int.from_bytes(data[4:8], 'little')
+                if flags & ~0b11:
+                    raise ImportError(
+                        'invalid flags {!r} in {!r}'.format(
+                            flags, fullname),
+                        name=fullname, path=bytecode_path)
+                if flags & 0b1:
+                    # Hash-based pyc: WeavePy never writes these; accept
+                    # unchecked ones (CPython default policy) rather than
+                    # hashing the source.
+                    pass
+                else:
+                    if (int.from_bytes(data[8:12], 'little')
+                            != (source_mtime & 0xFFFFFFFF)):
+                        raise ImportError(
+                            'bytecode is stale for {!r}'.format(fullname),
+                            name=fullname, path=bytecode_path)
+                    if (int.from_bytes(data[12:16], 'little')
+                            != (int(st['size']) & 0xFFFFFFFF)):
+                        raise ImportError(
+                            'bytecode is stale for {!r}'.format(fullname),
+                            name=fullname, path=bytecode_path)
+            except (ImportError, EOFError):
+                data = None
+            else:
+                try:
+                    code = marshal.loads(data[16:])
+                except ValueError as exc:
+                    # WeavePy's VM writes pyc payloads with its own
+                    # marshal; a code object using VM-internal opcodes
+                    # can't be rebuilt Python-side. Recompile from source
+                    # instead of failing the import (CPython never hits
+                    # this branch). Genuine garbage still propagates.
+                    if 'unsupported opcode' not in str(exc):
+                        raise
+                    code = None
+                if code is not None:
+                    if not isinstance(
+                            code, type(_read_code_marker.__code__)):
+                        raise ImportError(
+                            'Non-code object in {!r}'.format(bytecode_path),
+                            name=fullname, path=bytecode_path)
+                    return code
+        source_bytes = self.get_data(source_path)
+        code_object = self.source_to_code(source_bytes, source_path)
+        if (not sys.dont_write_bytecode and bytecode_path is not None
+                and source_mtime is not None):
+            try:
+                from importlib._bootstrap_external import (
+                    _code_to_timestamp_pyc)
+                pyc = _code_to_timestamp_pyc(
+                    code_object, source_mtime, len(source_bytes))
+                self.set_data(bytecode_path, pyc)
+            except Exception:
+                pass
+        return code_object
+
+    def exec_module(self, module):
+        spec = getattr(module, '__spec__', None)
+        name = spec.name if spec is not None else self.name
+        code = self.get_code(name)
+        if code is None:
+            raise ImportError(
+                'cannot load module {!r} when get_code() returns '
+                'None'.format(name), name=name)
+        exec(code, module.__dict__)
+
     def path_stats(self, path):
         st = os.stat(path)
         return {'mtime': st.st_mtime, 'size': st.st_size}
@@ -296,6 +436,12 @@ class SourceFileLoader(_LoaderBase):
             pass
 
 
+def _read_code_marker():
+    # Only used for its `__code__` attribute (the code-object type probe
+    # in `SourcelessFileLoader._read_code`).
+    pass
+
+
 class SourcelessFileLoader(_LoaderBase):
     """Load a module from a ``.pyc`` file (no source available).
 
@@ -310,19 +456,30 @@ class SourcelessFileLoader(_LoaderBase):
     def _read_code(self):
         with open(self.path, 'rb') as f:
             data = f.read()
-        if len(data) < 16 or data[:4] != MAGIC_NUMBER:
-            # CPython's `_classify_pyc` wording: the *module name* and the
-            # magic bytes actually seen (`python -m pkg` over an invalid
-            # `__init__.pyc` surfaces this through runpy's
-            # "Error while finding module specification" wrapper).
+        # Follow CPython `_classify_pyc`'s check order and exception
+        # taxonomy exactly: bad magic is ImportError, but a *truncated*
+        # header with valid magic is EOFError, and unmarshalling errors
+        # (ValueError/EOFError) propagate untouched
+        # (test_file_loader.SourcelessLoaderBadBytecodeTest*).
+        magic = data[:4]
+        if magic != MAGIC_NUMBER:
             raise ImportError(
-                "bad magic number in {!r}: {!r}".format(self.name, data[:4]),
+                "bad magic number in {!r}: {!r}".format(self.name, magic),
                 name=self.name, path=self.path)
-        try:
-            return marshal.loads(data[16:])
-        except Exception as exc:
-            raise ImportError("bad marshal in {!r}: {}".format(self.path, exc),
+        if len(data) < 16:
+            raise EOFError(
+                'reached EOF while reading pyc header of {!r}'.format(
+                    self.name))
+        flags = int.from_bytes(data[4:8], 'little')
+        if flags & ~0b11:
+            raise ImportError(
+                'invalid flags {!r} in {!r}'.format(flags, self.name),
+                name=self.name, path=self.path)
+        code = marshal.loads(data[16:])
+        if not isinstance(code, type(_read_code_marker.__code__)):
+            raise ImportError('Non-code object in {!r}'.format(self.path),
                               name=self.name, path=self.path)
+        return code
 
     def get_code(self, fullname=None):
         # Unmarshal the `.pyc`'s code object without executing it
@@ -380,6 +537,50 @@ class ExtensionFileLoader(_LoaderBase):
         # canonical.
         if loaded is not None and loaded is not module:
             module.__dict__.update(loaded.__dict__)
+
+
+class AppleFrameworkLoader(ExtensionFileLoader):
+    """A loader for modules that have been packaged as frameworks for
+    compatibility with Apple's iOS App Store policies.
+
+    3.13 surface parity: it only *activates* on Apple framework builds
+    (``sys.platform`` in ``('ios', 'tvos', 'watchos')``), but the class
+    must exist unconditionally — ``test_import``/``test_types`` import
+    it by name and ``modulefinder`` references it at module scope.
+    """
+
+    def create_module(self, spec):
+        # If the ModuleSpec was produced by FileFinder its origin points
+        # at the `.fwork` redirect file; resolve it to the real binary
+        # inside the app bundle's Frameworks folder (CPython verbatim,
+        # modulo os.path spelling — this path never runs off-framework).
+        if spec.origin.endswith(".fwork"):
+            with open(spec.origin, 'rb') as file:
+                framework_binary = file.read().decode().strip()
+            bundle_path = os.path.dirname(sys.executable)
+            spec.origin = os.path.join(bundle_path, framework_binary)
+
+        # A loader built from a loaded module's spec carries the
+        # Frameworks-folder path; recover the original `.fwork` location
+        # for the module's `__file__`.
+        if self.path.endswith(".fwork"):
+            path = self.path
+        else:
+            with open(self.path + ".origin", 'rb') as file:
+                origin = file.read().decode().strip()
+                bundle_path = os.path.dirname(sys.executable)
+                path = os.path.join(bundle_path, origin)
+
+        import _imp
+        module = _imp.create_dynamic(spec)
+
+        # Ensure that __file__ points at the .fwork location.
+        try:
+            module.__file__ = path
+        except AttributeError:
+            pass
+
+        return module
 
 
 class NamespaceLoader:
@@ -445,7 +646,15 @@ class FileFinder:
     """
 
     def __init__(self, path, *loader_details):
-        self.path = path
+        # CPython 3.13 (`_bootstrap_external.FileFinder.__init__`)
+        # absolutizes the directory up front, so every spec origin —
+        # and therefore `__file__`/`__cached__` — is absolute even for
+        # a relative `sys.path` entry like `os.curdir`
+        # (test_import.PycacheTests.test_missing_source_legacy).
+        if not path:
+            self.path = os.getcwd()
+        else:
+            self.path = os.path.abspath(path)
         # Each entry is (loader_cls, [suffixes]).
         self._loaders = list(loader_details)
         self._path_mtime = -1
@@ -498,6 +707,7 @@ class FileFinder:
                             fullname, loader,
                             origin=init, is_package=True)
                         spec.submodule_search_locations = [pkg_dir]
+                        spec._set_fileattr = True
                         return spec
             # PEP 420: directory exists but has no __init__ — that's a
             # namespace package.
@@ -513,7 +723,9 @@ class FileFinder:
                     p = (os.path.join(self.path, cand)
                           if self.path else cand)
                     loader = loader_cls(fullname, p)
-                    return ModuleSpec(fullname, loader, origin=p)
+                    spec = ModuleSpec(fullname, loader, origin=p)
+                    spec._set_fileattr = True
+                    return spec
         return None
 
 
@@ -539,7 +751,13 @@ class PathFinder:
         caching the result in ``sys.path_importer_cache``.
         """
         if path == '':
-            path = '.'
+            # CPython uses the current working directory for the
+            # empty path entry (and lets the finder go stale if the
+            # cwd changes — same trade-off).
+            try:
+                path = os.getcwd()
+            except OSError:
+                return None
         cache = sys.path_importer_cache
         if path in cache:
             return cache[path]
@@ -583,7 +801,11 @@ class PathFinder:
                 namespace_path.extend(p for p in portions
                                       if p not in namespace_path)
         if namespace_path:
-            spec = ModuleSpec(fullname, None, is_package=True)
+            # CPython 3.12+ gives namespace packages a real loader so
+            # `importlib.resources.files()` can reach NamespaceReader
+            # (test_importlib.resources ReadNamespaceZipTests).
+            loader = NamespaceLoader(fullname, namespace_path)
+            spec = ModuleSpec(fullname, loader, is_package=True)
             spec.submodule_search_locations = namespace_path
             spec.origin = None
             spec._set_fileattr = False
@@ -623,6 +845,12 @@ class BuiltinImporter:
         return spec.loader if spec is not None else None
 
     @classmethod
+    def load_module(cls, fullname):
+        # Pre-PEP 451 legacy API (CPython binds `_load_module_shim`).
+        import importlib._bootstrap
+        return importlib._bootstrap._load_module_shim(cls, fullname)
+
+    @classmethod
     def create_module(cls, spec):
         if spec.name in sys.modules:
             return sys.modules[spec.name]
@@ -630,21 +858,42 @@ class BuiltinImporter:
 
     @classmethod
     def exec_module(cls, module):
-        # The actual loading happens in the host VM; if the
-        # module is already in sys.modules we have nothing left
-        # to do here.
-        pass
+        # The actual loading happens in the host VM; if the module is
+        # already in sys.modules we have nothing left to do here. A
+        # non-builtin module reaching this hook (legacy
+        # `BuiltinImporter.load_module('importlib')`) is an error, as in
+        # CPython's `_imp.exec_builtin`
+        # (test_importlib.builtin.test_loader.test_already_imported).
+        spec = getattr(module, '__spec__', None)
+        name = spec.name if spec is not None else module.__name__
+        if name not in sys.builtin_module_names:
+            raise ImportError(
+                '{!r} is not a built-in module'.format(name), name=name)
 
+    # The trio below mirrors CPython's `_requires_builtin` guard: probing
+    # a non-builtin name is an ImportError, not a soft None/False.
     @classmethod
     def get_code(cls, fullname):
+        if fullname not in sys.builtin_module_names:
+            raise ImportError(
+                '{!r} is not a built-in module'.format(fullname),
+                name=fullname)
         return None
 
     @classmethod
     def get_source(cls, fullname):
+        if fullname not in sys.builtin_module_names:
+            raise ImportError(
+                '{!r} is not a built-in module'.format(fullname),
+                name=fullname)
         return None
 
     @classmethod
     def is_package(cls, fullname):
+        if fullname not in sys.builtin_module_names:
+            raise ImportError(
+                '{!r} is not a built-in module'.format(fullname),
+                name=fullname)
         return False
 
 
@@ -653,13 +902,67 @@ class FrozenImporter:
     the WeavePy binary.
     """
 
+    _ORIGIN = 'frozen'
+
+    # Alias rows of CPython's frozen TEST table (`Python/frozen.c`):
+    # frozen name -> origname of the module whose source it freezes.
+    # `None` marks a data-only row (no origname, no filename); a
+    # leading `<` marks a `<pkg>` init alias (see `_resolve_filename`).
+    _ORIGNAME_ALIASES = {
+        '__hello_alias__': '__hello__',
+        '__phello_alias__': '__hello__',
+        '__phello_alias__.spam': '__hello__',
+        '__hello_only__': None,
+        '__phello__.__init__': '<__phello__',
+        '__phello__.ham.__init__': '<__phello__.ham',
+        '_frozen_importlib': 'importlib._bootstrap',
+        '_frozen_importlib_external': 'importlib._bootstrap_external',
+    }
+
+    @classmethod
+    def _resolve_filename(cls, fullname, alias=None, ispkg=False):
+        """Map a frozen origname to the stdlib source file it was frozen
+        from (CPython `_bootstrap.FrozenImporter._resolve_filename`).
+        Returns ``(filename, pkgdir)``.
+        """
+        if not fullname or not getattr(sys, '_stdlib_dir', None):
+            return None, None
+        sep = '\\' if sys.platform == 'win32' else '/'
+        if fullname != alias:
+            if fullname.startswith('<'):
+                fullname = fullname[1:]
+                if not ispkg:
+                    fullname = f'{fullname}.__init__'
+            else:
+                ispkg = False
+        relfile = fullname.replace('.', sep)
+        if ispkg:
+            pkgdir = f'{sys._stdlib_dir}{sep}{relfile}'
+            filename = f'{pkgdir}{sep}__init__.py'
+        else:
+            pkgdir = None
+            filename = f'{sys._stdlib_dir}{sep}{relfile}.py'
+        return filename, pkgdir
+
     @classmethod
     def find_spec(cls, fullname, path=None, target=None):
         if not _is_frozen(fullname):
             return None
-        return ModuleSpec(
-            fullname, cls, origin='frozen',
-            is_package=_is_frozen_package(fullname))
+        ispkg = _is_frozen_package(fullname)
+        spec = ModuleSpec(fullname, cls, origin=cls._ORIGIN,
+                          is_package=ispkg)
+        origname = cls._ORIGNAME_ALIASES.get(fullname, fullname)
+        if origname:
+            filename, pkgdir = cls._resolve_filename(
+                origname, fullname, ispkg)
+        else:
+            filename, pkgdir = None, None
+        import types
+        spec.loader_state = types.SimpleNamespace(
+            filename=filename, origname=origname)
+        if pkgdir:
+            spec.submodule_search_locations.insert(0, pkgdir)
+        return spec
 
     @classmethod
     def find_module(cls, fullname, path=None):
@@ -674,20 +977,36 @@ class FrozenImporter:
 
     @classmethod
     def exec_module(cls, module):
-        # Frozen modules are executed by the VM's loader; by the
-        # time we reach this hook the module is already
-        # populated.
-        pass
+        # Unlike CPython (which unmarshals a frozen code blob), WeavePy
+        # freezes source text — compile it here so a hand-built spec
+        # really executes (test_importlib.frozen.test_loader asserts
+        # `__hello__` prints and sets `initialized`).
+        spec = getattr(module, '__spec__', None)
+        name = spec.name if spec is not None else module.__name__
+        code = cls.get_code(name)
+        exec(code, module.__dict__)
 
     @classmethod
     def get_code(cls, fullname):
-        return None
+        src = sys._get_frozen_source(fullname) if hasattr(
+            sys, '_get_frozen_source') else None
+        if src is None:
+            raise ImportError(
+                f'{fullname!r} is not a frozen module', name=fullname)
+        return compile(src, f'<frozen {fullname}>', 'exec',
+                       dont_inherit=True)
 
     @classmethod
     def get_source(cls, fullname):
         src = sys._get_frozen_source(fullname) if hasattr(
             sys, '_get_frozen_source') else None
         return src
+
+    @classmethod
+    def load_module(cls, fullname):
+        # Pre-PEP 451 legacy API (CPython binds `_load_module_shim`).
+        import importlib._bootstrap
+        return importlib._bootstrap._load_module_shim(cls, fullname)
 
     @classmethod
     def get_filename(cls, fullname):
@@ -700,6 +1019,12 @@ class FrozenImporter:
 
     @classmethod
     def is_package(cls, fullname):
+        # CPython's `_requires_frozen` guard: probing a non-frozen name
+        # is an ImportError (test_importlib.frozen InspectLoaderTests).
+        if not _is_frozen(fullname):
+            raise ImportError(
+                '{!r} is not a frozen module'.format(fullname),
+                name=fullname)
         return _is_frozen_package(fullname)
 
 
@@ -806,6 +1131,7 @@ __all__ = [
     'SourceFileLoader',
     'SourcelessFileLoader',
     'ExtensionFileLoader',
+    'AppleFrameworkLoader',
     'NamespaceLoader',
     'FileFinder',
     'PathFinder',

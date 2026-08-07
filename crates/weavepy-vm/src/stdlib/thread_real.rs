@@ -1340,23 +1340,24 @@ fn is_system_exit(err: &RuntimeError) -> bool {
 /// swallows it (CPython only the main thread terminates the process); on
 /// the main thread it propagates like `sys.exit()`.
 fn thread_exit(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Err(silent_system_exit())
+}
+
+/// A bare `SystemExit()` (code `None`, empty `args`) — the exception the
+/// thread machinery treats as a silent thread termination: the spawn shim
+/// skips the unraisable hook for it and `threading.excepthook` ignores it.
+/// Also used by the dispatch loop to kill daemon threads once interpreter
+/// finalization begins (CPython's `tstate_must_exit`).
+pub(crate) fn silent_system_exit() -> RuntimeError {
     let inst = crate::builtin_types::make_exception_with_class(
         crate::builtin_types::builtin_types().system_exit.clone(),
         "",
     );
     if let Object::Instance(inst_rc) = &inst {
-        inst_rc
-            .dict
-            .borrow_mut()
-            .insert(DictKey(Object::from_static("code")), Object::None);
-        inst_rc.dict.borrow_mut().insert(
-            DictKey(Object::from_static("args")),
-            Object::new_tuple(vec![]),
-        );
+        inst_rc.slot_set("code", Object::None);
+        inst_rc.slot_set("args", Object::new_tuple(vec![]));
     }
-    Err(RuntimeError::PyException(crate::error::PyException::new(
-        inst,
-    )))
+    RuntimeError::PyException(crate::error::PyException::new(inst))
 }
 
 fn interrupt_main(args: &[Object]) -> Result<Object, RuntimeError> {

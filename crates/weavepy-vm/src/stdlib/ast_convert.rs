@@ -111,7 +111,7 @@ pub fn convert_ast_root(obj: &Object, mode: RootMode) -> Result<ConvertedAst, Ru
             }
         }
         RootMode::Eval => {
-            let body = field(inst, "body").ok_or_else(|| missing_field("body", "Expression"))?;
+            let body = conv.req_node(inst, "body", "Expression")?;
             let expr = conv.expr(&body)?;
             let span = expr.span;
             past::Module {
@@ -122,6 +122,9 @@ pub fn convert_ast_root(obj: &Object, mode: RootMode) -> Result<ConvertedAst, Ru
             }
         }
     };
+    // Semantic validation (`_PyAST_Validate`) already ran: `compile()`
+    // invokes the frozen ast module's `_validate` (the pure-Python port)
+    // before this lowering, matching CPython's obj2ast → validate order.
     Ok(ConvertedAst {
         module,
         synthetic_source: pos.synthetic_source(),
@@ -291,9 +294,25 @@ fn repr_lite(obj: &Object) -> String {
         Object::Int(i) => i.to_string(),
         Object::Float(f) => f.to_string(),
         Object::Str(s) => format!("{s:?}").replace('"', "'"),
-        Object::Instance(inst) => format!("<{} object>", inst.cls().name),
+        Object::Instance(inst) => instance_repr(inst),
         other => format!("<{}>", other.type_name()),
     }
+}
+
+/// Default-object-repr shape for a node instance
+/// (`<ast.expr object at 0x…>`), module-qualified like CPython —
+/// `test_invalid_sum` greps for the `<ast.` prefix.
+fn instance_repr(inst: &Rc<PyInstance>) -> String {
+    let cls = inst.cls();
+    let module = match cls.lookup("__module__") {
+        Some(Object::Str(m)) if &*m != "builtins" => format!("{m}."),
+        _ => String::new(),
+    };
+    format!(
+        "<{module}{} object at {:#x}>",
+        cls.name,
+        Rc::as_ptr(inst) as usize
+    )
 }
 
 fn identifier(obj: &Object) -> Result<String, RuntimeError> {
@@ -384,7 +403,13 @@ impl Conv<'_> {
     fn stmt_list(&mut self, obj: &Object, node: &str) -> Result<Vec<past::Stmt>, RuntimeError> {
         list_items(obj, node, "body")?
             .iter()
-            .map(|s| self.stmt(s))
+            .map(|s| match s {
+                // CPython's obj2ast lowers a `None` list item to NULL and
+                // lets the validator report it; surface the validator's
+                // message here since our tree can't carry the hole.
+                Object::None => Err(value_error("None disallowed in statement list")),
+                s => self.stmt(s),
+            })
             .collect()
     }
 
@@ -396,7 +421,10 @@ impl Conv<'_> {
     ) -> Result<Vec<past::Expr>, RuntimeError> {
         list_items(obj, node, fieldname)?
             .iter()
-            .map(|e| self.expr(e))
+            .map(|e| match e {
+                Object::None => Err(value_error("None disallowed in expression list")),
+                e => self.expr(e),
+            })
             .collect()
     }
 
@@ -415,6 +443,25 @@ impl Conv<'_> {
         field(inst, name).ok_or_else(|| missing_field(name, node))
     }
 
+    /// A required *node-valued* field: a missing attribute is a
+    /// `TypeError` (as [`Self::req`]), but an explicit `None` is
+    /// CPython's obj2ast `ValueError` (`"field 'value' is required for
+    /// YieldFrom"` — `test_empty_yield_from` / `test_none_checks`).
+    fn req_node(
+        &self,
+        inst: &Rc<PyInstance>,
+        name: &str,
+        node: &str,
+    ) -> Result<Object, RuntimeError> {
+        match field(inst, name) {
+            None => Err(missing_field(name, node)),
+            Some(Object::None) => Err(value_error(format!(
+                "field '{name}' is required for {node}"
+            ))),
+            Some(v) => Ok(v),
+        }
+    }
+
     // ---------------- statements ----------------
 
     fn stmt(&mut self, obj: &Object) -> Result<past::Stmt, RuntimeError> {
@@ -422,7 +469,7 @@ impl Conv<'_> {
         let span = self.span_of(&inst, "stmt")?;
         let kind = match name.as_str() {
             "FunctionDef" | "AsyncFunctionDef" => {
-                let args = self.arguments(&self.req(&inst, "args", &name)?)?;
+                let args = self.arguments(&self.req_node(&inst, "args", &name)?)?;
                 let body = self.stmt_list(&self.req(&inst, "body", &name)?, &name)?;
                 let decorator_list = self.expr_list(
                     &self.req(&inst, "decorator_list", &name)?,
@@ -431,7 +478,7 @@ impl Conv<'_> {
                 )?;
                 let returns = self.opt_boxed(field(&inst, "returns"))?;
                 let type_params = self.type_params(field(&inst, "type_params"))?;
-                let fname = identifier(&self.req(&inst, "name", &name)?)?;
+                let fname = identifier(&self.req_node(&inst, "name", &name)?)?;
                 if name == "FunctionDef" {
                     past::StmtKind::FunctionDef {
                         name: fname,
@@ -453,7 +500,7 @@ impl Conv<'_> {
                 }
             }
             "ClassDef" => past::StmtKind::ClassDef {
-                name: identifier(&self.req(&inst, "name", "ClassDef")?)?,
+                name: identifier(&self.req_node(&inst, "name", "ClassDef")?)?,
                 bases: self.expr_list(
                     &self.req(&inst, "bases", "ClassDef")?,
                     "ClassDef",
@@ -480,29 +527,29 @@ impl Conv<'_> {
                     "Assign",
                     "targets",
                 )?,
-                value: self.expr(&self.req(&inst, "value", "Assign")?)?,
+                value: self.expr(&self.req_node(&inst, "value", "Assign")?)?,
             },
             "AugAssign" => past::StmtKind::AugAssign {
-                target: self.expr(&self.req(&inst, "target", "AugAssign")?)?,
-                op: bin_op(&self.req(&inst, "op", "AugAssign")?)?,
-                value: self.expr(&self.req(&inst, "value", "AugAssign")?)?,
+                target: self.expr(&self.req_node(&inst, "target", "AugAssign")?)?,
+                op: bin_op(&self.req_node(&inst, "op", "AugAssign")?)?,
+                value: self.expr(&self.req_node(&inst, "value", "AugAssign")?)?,
             },
             "AnnAssign" => past::StmtKind::AnnAssign {
-                target: self.expr(&self.req(&inst, "target", "AnnAssign")?)?,
-                annotation: self.expr(&self.req(&inst, "annotation", "AnnAssign")?)?,
+                target: self.expr(&self.req_node(&inst, "target", "AnnAssign")?)?,
+                annotation: self.expr(&self.req_node(&inst, "annotation", "AnnAssign")?)?,
                 value: self.opt_expr(field(&inst, "value"))?,
-                simple: int_field(&self.req(&inst, "simple", "AnnAssign")?, "simple")? != 0,
+                simple: int_field(&self.req_node(&inst, "simple", "AnnAssign")?, "simple")? != 0,
             },
             "TypeAlias" => {
                 // The parser desugars `type X = v` to `X =
                 // __weavepy_type_alias__(...)`; mirror it for trees.
-                let target = self.expr(&self.req(&inst, "name", "TypeAlias")?)?;
+                let target = self.expr(&self.req_node(&inst, "name", "TypeAlias")?)?;
                 let alias_name = match &target.kind {
                     past::ExprKind::Name(n) => n.clone(),
                     // CPython: Python/compile.c `codegen_typealias` message.
                     _ => return Err(type_error("TypeAlias with non-Name name")),
                 };
-                let value = self.expr(&self.req(&inst, "value", "TypeAlias")?)?;
+                let value = self.expr(&self.req_node(&inst, "value", "TypeAlias")?)?;
                 let type_params = self.type_params(field(&inst, "type_params"))?;
                 let rhs = weavepy_parser::build_lazy_type_alias(
                     &alias_name,
@@ -516,8 +563,8 @@ impl Conv<'_> {
                 }
             }
             "For" | "AsyncFor" => {
-                let target = self.expr(&self.req(&inst, "target", &name)?)?;
-                let iter = self.expr(&self.req(&inst, "iter", &name)?)?;
+                let target = self.expr(&self.req_node(&inst, "target", &name)?)?;
+                let iter = self.expr(&self.req_node(&inst, "iter", &name)?)?;
                 let body = self.stmt_list(&self.req(&inst, "body", &name)?, &name)?;
                 let orelse = self.stmt_list(&self.req(&inst, "orelse", &name)?, &name)?;
                 if name == "For" {
@@ -537,12 +584,12 @@ impl Conv<'_> {
                 }
             }
             "While" => past::StmtKind::While {
-                test: self.expr(&self.req(&inst, "test", "While")?)?,
+                test: self.expr(&self.req_node(&inst, "test", "While")?)?,
                 body: self.stmt_list(&self.req(&inst, "body", "While")?, "While")?,
                 orelse: self.stmt_list(&self.req(&inst, "orelse", "While")?, "While")?,
             },
             "If" => past::StmtKind::If {
-                test: self.expr(&self.req(&inst, "test", "If")?)?,
+                test: self.expr(&self.req_node(&inst, "test", "If")?)?,
                 body: self.stmt_list(&self.req(&inst, "body", "If")?, "If")?,
                 orelse: self.stmt_list(&self.req(&inst, "orelse", "If")?, "If")?,
             },
@@ -556,7 +603,7 @@ impl Conv<'_> {
                 }
             }
             "Match" => past::StmtKind::Match {
-                subject: self.expr(&self.req(&inst, "subject", "Match")?)?,
+                subject: self.expr(&self.req_node(&inst, "subject", "Match")?)?,
                 cases: list_items(&self.req(&inst, "cases", "Match")?, "Match", "cases")?
                     .iter()
                     .map(|c| self.match_case(c))
@@ -580,13 +627,13 @@ impl Conv<'_> {
                 }
             }
             "Assert" => past::StmtKind::Assert {
-                test: self.expr(&self.req(&inst, "test", "Assert")?)?,
+                test: self.expr(&self.req_node(&inst, "test", "Assert")?)?,
                 msg: self.opt_expr(field(&inst, "msg"))?,
             },
             "Import" => past::StmtKind::Import(
                 list_items(&self.req(&inst, "names", "Import")?, "Import", "names")?
                     .iter()
-                    .map(alias)
+                    .map(|o| alias(self, span, o))
                     .collect::<Result<_, _>>()?,
             ),
             "ImportFrom" => past::StmtKind::ImportFrom {
@@ -597,7 +644,7 @@ impl Conv<'_> {
                     "names",
                 )?
                 .iter()
-                .map(alias)
+                .map(|o| alias(self, span, o))
                 .collect::<Result<_, _>>()?,
                 level: match field(&inst, "level") {
                     None | Some(Object::None) => 0,
@@ -616,13 +663,14 @@ impl Conv<'_> {
                     .map(identifier)
                     .collect::<Result<_, _>>()?,
             ),
-            "Expr" => past::StmtKind::Expr(self.expr(&self.req(&inst, "value", "Expr")?)?),
+            "Expr" => past::StmtKind::Expr(self.expr(&self.req_node(&inst, "value", "Expr")?)?),
             "Pass" => past::StmtKind::Pass,
             "Break" => past::StmtKind::Break,
             "Continue" => past::StmtKind::Continue,
-            other => {
+            _ => {
                 return Err(type_error(format!(
-                    "expected some sort of stmt, but got <{other} object>"
+                    "expected some sort of stmt, but got {}",
+                    instance_repr(&inst)
                 )))
             }
         };
@@ -639,14 +687,14 @@ impl Conv<'_> {
                 let value = self.req(&inst, "value", "Constant")?;
                 past::ExprKind::Constant(constant_value(&value)?)
             }
-            "Name" => past::ExprKind::Name(identifier(&self.req(&inst, "id", "Name")?)?),
+            "Name" => past::ExprKind::Name(identifier(&self.req_node(&inst, "id", "Name")?)?),
             "Attribute" => past::ExprKind::Attribute {
-                value: Box::new(self.expr(&self.req(&inst, "value", "Attribute")?)?),
-                attr: identifier(&self.req(&inst, "attr", "Attribute")?)?,
+                value: Box::new(self.expr(&self.req_node(&inst, "value", "Attribute")?)?),
+                attr: identifier(&self.req_node(&inst, "attr", "Attribute")?)?,
             },
             "Subscript" => past::ExprKind::Subscript {
-                value: Box::new(self.expr(&self.req(&inst, "value", "Subscript")?)?),
-                slice: Box::new(self.expr(&self.req(&inst, "slice", "Subscript")?)?),
+                value: Box::new(self.expr(&self.req_node(&inst, "value", "Subscript")?)?),
+                slice: Box::new(self.expr(&self.req_node(&inst, "slice", "Subscript")?)?),
             },
             "Slice" => past::ExprKind::Slice {
                 lower: self.opt_boxed(field(&inst, "lower"))?,
@@ -654,12 +702,12 @@ impl Conv<'_> {
                 step: self.opt_boxed(field(&inst, "step"))?,
             },
             "BinOp" => past::ExprKind::BinOp {
-                left: Box::new(self.expr(&self.req(&inst, "left", "BinOp")?)?),
-                op: bin_op(&self.req(&inst, "op", "BinOp")?)?,
-                right: Box::new(self.expr(&self.req(&inst, "right", "BinOp")?)?),
+                left: Box::new(self.expr(&self.req_node(&inst, "left", "BinOp")?)?),
+                op: bin_op(&self.req_node(&inst, "op", "BinOp")?)?,
+                right: Box::new(self.expr(&self.req_node(&inst, "right", "BinOp")?)?),
             },
             "BoolOp" => past::ExprKind::BoolOp {
-                op: bool_op(&self.req(&inst, "op", "BoolOp")?)?,
+                op: bool_op(&self.req_node(&inst, "op", "BoolOp")?)?,
                 values: self.expr_list(
                     &self.req(&inst, "values", "BoolOp")?,
                     "BoolOp",
@@ -667,8 +715,8 @@ impl Conv<'_> {
                 )?,
             },
             "UnaryOp" => past::ExprKind::UnaryOp {
-                op: unary_op(&self.req(&inst, "op", "UnaryOp")?)?,
-                operand: Box::new(self.expr(&self.req(&inst, "operand", "UnaryOp")?)?),
+                op: unary_op(&self.req_node(&inst, "op", "UnaryOp")?)?,
+                operand: Box::new(self.expr(&self.req_node(&inst, "operand", "UnaryOp")?)?),
             },
             "Compare" => {
                 let ops: Vec<_> =
@@ -692,18 +740,18 @@ impl Conv<'_> {
                     ));
                 }
                 past::ExprKind::Compare {
-                    left: Box::new(self.expr(&self.req(&inst, "left", "Compare")?)?),
+                    left: Box::new(self.expr(&self.req_node(&inst, "left", "Compare")?)?),
                     ops,
                     comparators,
                 }
             }
             "IfExp" => past::ExprKind::IfExp {
-                test: Box::new(self.expr(&self.req(&inst, "test", "IfExp")?)?),
-                body: Box::new(self.expr(&self.req(&inst, "body", "IfExp")?)?),
-                orelse: Box::new(self.expr(&self.req(&inst, "orelse", "IfExp")?)?),
+                test: Box::new(self.expr(&self.req_node(&inst, "test", "IfExp")?)?),
+                body: Box::new(self.expr(&self.req_node(&inst, "body", "IfExp")?)?),
+                orelse: Box::new(self.expr(&self.req_node(&inst, "orelse", "IfExp")?)?),
             },
             "NamedExpr" => {
-                let target_obj = self.req(&inst, "target", "NamedExpr")?;
+                let target_obj = self.req_node(&inst, "target", "NamedExpr")?;
                 // CPython's `validate_expr` rejects this before
                 // compilation (gh-109351).
                 if !matches!(node_name(&target_obj, "expression"), Ok((_, n)) if n == "Name") {
@@ -711,15 +759,15 @@ impl Conv<'_> {
                 }
                 past::ExprKind::NamedExpr {
                     target: Box::new(self.expr(&target_obj)?),
-                    value: Box::new(self.expr(&self.req(&inst, "value", "NamedExpr")?)?),
+                    value: Box::new(self.expr(&self.req_node(&inst, "value", "NamedExpr")?)?),
                 }
             }
             "Lambda" => past::ExprKind::Lambda {
-                args: self.arguments(&self.req(&inst, "args", "Lambda")?)?,
-                body: Box::new(self.expr(&self.req(&inst, "body", "Lambda")?)?),
+                args: self.arguments(&self.req_node(&inst, "args", "Lambda")?)?,
+                body: Box::new(self.expr(&self.req_node(&inst, "body", "Lambda")?)?),
             },
             "Call" => past::ExprKind::Call {
-                func: Box::new(self.expr(&self.req(&inst, "func", "Call")?)?),
+                func: Box::new(self.expr(&self.req_node(&inst, "func", "Call")?)?),
                 args: self.expr_list(&self.req(&inst, "args", "Call")?, "Call", "args")?,
                 keywords: self.keywords(&self.req(&inst, "keywords", "Call")?)?,
             },
@@ -756,7 +804,7 @@ impl Conv<'_> {
                 }
             }
             "ListComp" | "SetComp" | "GeneratorExp" => {
-                let elt = Box::new(self.expr(&self.req(&inst, "elt", &name)?)?);
+                let elt = Box::new(self.expr(&self.req_node(&inst, "elt", &name)?)?);
                 let generators =
                     self.comprehensions(&self.req(&inst, "generators", &name)?, &name)?;
                 match name.as_str() {
@@ -766,39 +814,40 @@ impl Conv<'_> {
                 }
             }
             "DictComp" => past::ExprKind::DictComp {
-                key: Box::new(self.expr(&self.req(&inst, "key", "DictComp")?)?),
-                value: Box::new(self.expr(&self.req(&inst, "value", "DictComp")?)?),
+                key: Box::new(self.expr(&self.req_node(&inst, "key", "DictComp")?)?),
+                value: Box::new(self.expr(&self.req_node(&inst, "value", "DictComp")?)?),
                 generators: self
                     .comprehensions(&self.req(&inst, "generators", "DictComp")?, "DictComp")?,
             },
-            "Starred" => {
-                past::ExprKind::Starred(Box::new(self.expr(&self.req(&inst, "value", "Starred")?)?))
-            }
+            "Starred" => past::ExprKind::Starred(Box::new(
+                self.expr(&self.req_node(&inst, "value", "Starred")?)?,
+            )),
             "Yield" => past::ExprKind::Yield(self.opt_boxed(field(&inst, "value"))?),
-            "YieldFrom" => past::ExprKind::YieldFrom(Box::new(self.expr(&self.req(
+            "YieldFrom" => past::ExprKind::YieldFrom(Box::new(self.expr(&self.req_node(
                 &inst,
                 "value",
                 "YieldFrom",
             )?)?)),
-            "Await" => {
-                past::ExprKind::Await(Box::new(self.expr(&self.req(&inst, "value", "Await")?)?))
-            }
+            "Await" => past::ExprKind::Await(Box::new(
+                self.expr(&self.req_node(&inst, "value", "Await")?)?,
+            )),
             "JoinedStr" => past::ExprKind::JoinedStr(self.expr_list(
                 &self.req(&inst, "values", "JoinedStr")?,
                 "JoinedStr",
                 "values",
             )?),
             "FormattedValue" => past::ExprKind::FormattedValue {
-                value: Box::new(self.expr(&self.req(&inst, "value", "FormattedValue")?)?),
+                value: Box::new(self.expr(&self.req_node(&inst, "value", "FormattedValue")?)?),
                 conversion: match field(&inst, "conversion") {
                     None | Some(Object::None) => -1,
                     Some(v) => int_field(&v, "conversion")? as i32,
                 },
                 format_spec: self.opt_boxed(field(&inst, "format_spec"))?,
             },
-            other => {
+            _ => {
                 return Err(type_error(format!(
-                    "expected some sort of expr, but got <{other} object>"
+                    "expected some sort of expr, but got {}",
+                    instance_repr(&inst)
                 )))
             }
         };
@@ -843,7 +892,10 @@ impl Conv<'_> {
             None | Some(Object::None) => Vec::new(),
             Some(v) => list_items(&v, "arguments", "defaults")?
                 .iter()
-                .map(|e| self.expr(e))
+                .map(|e| match e {
+                    Object::None => Err(value_error("None disallowed in expression list")),
+                    e => self.expr(e),
+                })
                 .collect::<Result<Vec<_>, RuntimeError>>()?,
         };
         Ok(past::Arguments {
@@ -861,7 +913,7 @@ impl Conv<'_> {
         let (inst, _name) = node_name(obj, "arg")?;
         let span = self.span_of(&inst, "arg")?;
         Ok(past::Arg {
-            name: identifier(&self.req(&inst, "arg", "arg")?)?,
+            name: identifier(&self.req_node(&inst, "arg", "arg")?)?,
             annotation: self.opt_boxed(field(&inst, "annotation"))?,
             span,
         })
@@ -872,9 +924,11 @@ impl Conv<'_> {
             .iter()
             .map(|k| {
                 let (inst, _name) = node_name(k, "keyword")?;
+                let span = self.span_of(&inst, "keyword")?;
                 Ok(past::Keyword {
                     arg: opt_identifier(field(&inst, "arg"))?,
-                    value: self.expr(&self.req(&inst, "value", "keyword")?)?,
+                    value: self.expr(&self.req_node(&inst, "value", "keyword")?)?,
+                    span,
                 })
             })
             .collect()
@@ -890,8 +944,8 @@ impl Conv<'_> {
             .map(|c| {
                 let (inst, _name) = node_name(c, "comprehension")?;
                 Ok(past::Comprehension {
-                    target: self.expr(&self.req(&inst, "target", "comprehension")?)?,
-                    iter: self.expr(&self.req(&inst, "iter", "comprehension")?)?,
+                    target: self.expr(&self.req_node(&inst, "target", "comprehension")?)?,
+                    iter: self.expr(&self.req_node(&inst, "iter", "comprehension")?)?,
                     ifs: self.expr_list(
                         &self.req(&inst, "ifs", "comprehension")?,
                         "comprehension",
@@ -912,7 +966,11 @@ impl Conv<'_> {
             .map(|w| {
                 let (inst, _name) = node_name(w, "withitem")?;
                 Ok(past::WithItem {
-                    context_expr: self.expr(&self.req(&inst, "context_expr", "withitem")?)?,
+                    context_expr: self.expr(&self.req_node(
+                        &inst,
+                        "context_expr",
+                        "withitem",
+                    )?)?,
                     optional_vars: self.opt_expr(field(&inst, "optional_vars"))?,
                 })
             })
@@ -937,7 +995,7 @@ impl Conv<'_> {
 
     fn match_case(&mut self, obj: &Object) -> Result<past::MatchCase, RuntimeError> {
         let (inst, _name) = node_name(obj, "match_case")?;
-        let pattern_obj = self.req(&inst, "pattern", "match_case")?;
+        let pattern_obj = self.req_node(&inst, "pattern", "match_case")?;
         let pattern = self.pattern(&pattern_obj)?;
         // `match_case` carries no positions in CPython; fall back to
         // the pattern node's span.
@@ -954,17 +1012,19 @@ impl Conv<'_> {
     }
 
     fn pattern(&mut self, obj: &Object) -> Result<past::Pattern, RuntimeError> {
+        use past::PatternKind;
         let (inst, name) = node_name(obj, "pattern")?;
-        Ok(match name.as_str() {
+        let span = self.span_opt(&inst, Span::new(0, 0));
+        let kind = match name.as_str() {
             "MatchValue" => {
-                past::Pattern::Value(self.expr(&self.req(&inst, "value", "MatchValue")?)?)
+                PatternKind::Value(self.expr(&self.req_node(&inst, "value", "MatchValue")?)?)
             }
-            "MatchSingleton" => past::Pattern::Singleton(constant_value(&self.req(
+            "MatchSingleton" => PatternKind::Singleton(constant_value(&self.req(
                 &inst,
                 "value",
                 "MatchSingleton",
             )?)?),
-            "MatchSequence" => past::Pattern::Sequence(
+            "MatchSequence" => PatternKind::Sequence(
                 list_items(
                     &self.req(&inst, "patterns", "MatchSequence")?,
                     "MatchSequence",
@@ -974,8 +1034,8 @@ impl Conv<'_> {
                 .map(|p| self.pattern(p))
                 .collect::<Result<_, _>>()?,
             ),
-            "MatchStar" => past::Pattern::Star(opt_identifier(field(&inst, "name"))?),
-            "MatchMapping" => past::Pattern::Mapping {
+            "MatchStar" => PatternKind::Star(opt_identifier(field(&inst, "name"))?),
+            "MatchMapping" => PatternKind::Mapping {
                 keys: self.expr_list(
                     &self.req(&inst, "keys", "MatchMapping")?,
                     "MatchMapping",
@@ -1016,8 +1076,8 @@ impl Conv<'_> {
                         "MatchClass doesn't have the same number of keyword attributes as patterns",
                     ));
                 }
-                past::Pattern::Class {
-                    cls: self.expr(&self.req(&inst, "cls", "MatchClass")?)?,
+                PatternKind::Class {
+                    cls: self.expr(&self.req_node(&inst, "cls", "MatchClass")?)?,
                     positionals: list_items(
                         &self.req(&inst, "patterns", "MatchClass")?,
                         "MatchClass",
@@ -1029,7 +1089,7 @@ impl Conv<'_> {
                     keywords: kwd_attrs.into_iter().zip(kwd_patterns).collect(),
                 }
             }
-            "MatchOr" => past::Pattern::Or(
+            "MatchOr" => PatternKind::Or(
                 list_items(
                     &self.req(&inst, "patterns", "MatchOr")?,
                     "MatchOr",
@@ -1046,8 +1106,8 @@ impl Conv<'_> {
                 };
                 let capture = opt_identifier(field(&inst, "name"))?;
                 match (sub, capture) {
-                    (None, n) => past::Pattern::Capture(n),
-                    (Some(p), Some(n)) => past::Pattern::As {
+                    (None, n) => PatternKind::Capture(n),
+                    (Some(p), Some(n)) => PatternKind::As {
                         pattern: Box::new(p),
                         name: n,
                     },
@@ -1063,7 +1123,8 @@ impl Conv<'_> {
                     "expected some sort of pattern, but got <{other} object>"
                 )))
             }
-        })
+        };
+        Ok(past::Pattern { kind, span })
     }
 
     fn type_params(&mut self, obj: Option<Object>) -> Result<Vec<past::TypeParam>, RuntimeError> {
@@ -1075,7 +1136,7 @@ impl Conv<'_> {
             .map(|tp| {
                 let (inst, name) = node_name(tp, "type_param")?;
                 let span = self.span_opt(&inst, Span::new(0, 0));
-                let pname = identifier(&self.req(&inst, "name", &name)?)?;
+                let pname = identifier(&self.req_node(&inst, "name", &name)?)?;
                 let default = self.opt_boxed(field(&inst, "default_value"))?;
                 let kind = match name.as_str() {
                     "TypeVar" => past::TypeParamKind::TypeVar {
@@ -1184,14 +1245,17 @@ fn cmp_op(obj: &Object) -> Result<past::CmpOp, RuntimeError> {
     })
 }
 
-fn alias(obj: &Object) -> Result<past::Alias, RuntimeError> {
+fn alias(conv: &Conv<'_>, fallback: Span, obj: &Object) -> Result<past::Alias, RuntimeError> {
     let (inst, _name) = node_name(obj, "alias")?;
-    let name = field(&inst, "name")
-        .ok_or_else(|| missing_field("name", "alias"))
-        .and_then(|v| identifier(&v))?;
+    let name = match field(&inst, "name") {
+        None => return Err(missing_field("name", "alias")),
+        Some(Object::None) => return Err(value_error("field 'name' is required for alias")),
+        Some(v) => identifier(&v)?,
+    };
     Ok(past::Alias {
         name,
         asname: opt_identifier(field(&inst, "asname"))?,
+        span: conv.span_opt(&inst, fallback),
     })
 }
 
@@ -1209,6 +1273,11 @@ fn constant_value(obj: &Object) -> Result<past::Constant, RuntimeError> {
         Object::Str(s) => past::Constant::Str(s.to_string()),
         Object::WStr(cps) => past::Constant::WStr(cps.to_vec()),
         Object::Bytes(b) => past::Constant::Bytes(b.to_vec()),
+        Object::FrozenSet(s) => past::Constant::FrozenSet(
+            s.iter()
+                .map(|k| constant_value(&k.0))
+                .collect::<Result<_, _>>()?,
+        ),
         Object::Tuple(items) => {
             past::Constant::Tuple(items.iter().map(constant_value).collect::<Result<_, _>>()?)
         }
@@ -1216,7 +1285,8 @@ fn constant_value(obj: &Object) -> Result<past::Constant, RuntimeError> {
             if crate::vm_singletons::is_ellipsis(other) {
                 past::Constant::Ellipsis
             } else {
-                return Err(value_error(format!(
+                // CPython's validate_constant raises TypeError here.
+                return Err(type_error(format!(
                     "got an invalid type in Constant: {}",
                     other.type_name()
                 )));

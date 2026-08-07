@@ -18,8 +18,8 @@
 use std::collections::HashSet;
 
 use weavepy_parser::ast::{
-    Arguments, Comprehension, ExceptHandler, Expr, ExprKind, MatchCase, Pattern, Stmt, StmtKind,
-    TypeParamKind,
+    Arguments, Comprehension, ExceptHandler, Expr, ExprKind, MatchCase, Pattern, PatternKind, Stmt,
+    StmtKind, TypeParamKind,
 };
 
 /// Recover the source spelling of a binding that was mangled against
@@ -405,17 +405,17 @@ impl Mangler {
     }
 
     fn pattern(&self, p: &mut Pattern) {
-        match p {
-            Pattern::Value(e) => self.expr(e),
-            Pattern::Singleton(_) => {}
-            Pattern::Capture(n) => self.opt_name(n),
-            Pattern::Sequence(items) | Pattern::Or(items) => {
+        match &mut p.kind {
+            PatternKind::Value(e) => self.expr(e),
+            PatternKind::Singleton(_) => {}
+            PatternKind::Capture(n) => self.opt_name(n),
+            PatternKind::Sequence(items) | PatternKind::Or(items) => {
                 for x in items {
                     self.pattern(x);
                 }
             }
-            Pattern::Star(n) => self.opt_name(n),
-            Pattern::Mapping {
+            PatternKind::Star(n) => self.opt_name(n),
+            PatternKind::Mapping {
                 keys,
                 patterns,
                 rest,
@@ -430,7 +430,7 @@ impl Mangler {
                     self.opt_name(r);
                 }
             }
-            Pattern::Class {
+            PatternKind::Class {
                 cls,
                 positionals,
                 keywords,
@@ -440,11 +440,15 @@ impl Mangler {
                     self.pattern(x);
                 }
                 for (n, x) in keywords {
-                    self.name(n);
+                    // Keyword attribute names are *not* mangled:
+                    // `case C(__attr=y):` in a class body looks up
+                    // `__attr`, not `_Outer__attr` (test_patma_249 —
+                    // CPython compiles kwd_attrs verbatim).
                     self.pattern(x);
+                    let _ = n;
                 }
             }
-            Pattern::As { pattern, name } => {
+            PatternKind::As { pattern, name } => {
                 self.pattern(pattern);
                 self.name(name);
             }

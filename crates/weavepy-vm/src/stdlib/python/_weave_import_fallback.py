@@ -101,12 +101,12 @@ def import_via_finders(name):
     if spec is None:
         return None
     loader = spec.loader
-    if loader is None:
-        # A loaderless spec is a PEP 420 namespace package. The native
-        # loader handles the on-disk flavour itself, but portions that
-        # live in archives (zip namespace packages) only surface here —
-        # build the namespace module directly (`test_zipimport.
-        # testNamespacePackage`).
+    if loader is None or _is_namespace_loader(loader):
+        # A loaderless (or NamespaceLoader-backed, CPython 3.12+) spec is
+        # a PEP 420 namespace package. The native loader handles the
+        # on-disk flavour itself, but portions that live in archives (zip
+        # namespace packages) only surface here — build the namespace
+        # module directly (`test_zipimport.testNamespacePackage`).
         locations = spec.submodule_search_locations
         if locations is None:
             return None
@@ -116,13 +116,26 @@ def import_via_finders(name):
             module = types.ModuleType(name)
             module.__path__ = list(locations)
             module.__spec__ = spec
-            module.__loader__ = None
+            module.__loader__ = loader
             module.__package__ = name
             sys.modules[name] = module
         return (_LIVE_MODULE, module)
     get_code = getattr(loader, "get_code", None)
     code = get_code(name) if get_code is not None else None
     if code is not None:
+        # A sourceless `.pyc` on disk takes the full PEP 451 protocol so
+        # `_init_module_attrs` stamps `__file__`/`__cached__` from the
+        # spec (for a legacy pyc both are the pyc's own absolute path —
+        # test_import.PycacheTests.test___cached___legacy_pyc). The
+        # module object is a native `types.ModuleType`, so dotted-import
+        # binding still works.
+        try:
+            from importlib.machinery import SourcelessFileLoader
+        except ImportError:
+            SourcelessFileLoader = None
+        if SourcelessFileLoader is not None and isinstance(
+                loader, SourcelessFileLoader):
+            return (_LIVE_MODULE, _build_dynamic(spec, name, loader))
         locations = spec.submodule_search_locations
         is_package = locations is not None
         return (code, is_package, spec.origin,
@@ -130,6 +143,14 @@ def import_via_finders(name):
     # No code object: a finder that constructs the module itself. Drive the
     # PEP 451 create_module/exec_module protocol and hand the result back.
     return (_LIVE_MODULE, _build_dynamic(spec, name, loader))
+
+
+def _is_namespace_loader(loader):
+    try:
+        from importlib.machinery import NamespaceLoader
+    except ImportError:
+        return False
+    return isinstance(loader, NamespaceLoader)
 
 
 def _build_dynamic(spec, name, loader):

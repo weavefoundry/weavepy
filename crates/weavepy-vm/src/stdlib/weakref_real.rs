@@ -303,6 +303,105 @@ fn ref_type_hash(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(h)
 }
 
+/// CPython's `%T` formatter (`PyType_GetFullyQualifiedName`):
+/// `module.qualname`, with a `builtins`/`__main__` prefix omitted.
+fn fq_type_name(target: &Object) -> String {
+    if let Object::Instance(i) = target {
+        let cls = i.cls();
+        let qual = cls
+            .qualname
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| cls.name.clone());
+        let module = match cls
+            .dict
+            .borrow()
+            .get(&DictKey(Object::from_static("__module__")))
+        {
+            Some(Object::Str(s)) => s.to_string(),
+            _ => String::new(),
+        };
+        if module.is_empty() || module == "builtins" || module == "__main__" {
+            qual
+        } else {
+            format!("{module}.{qual}")
+        }
+    } else {
+        target.type_name_owned()
+    }
+}
+
+/// The referent's `__name__` for `weakref.__repr__`'s optional
+/// `(name)` suffix. CPython performs a *type-restricted* lookup
+/// (`_PyObject_LookupSpecial`), so an instance `__getattr__` is never
+/// consulted and can't blow up the repr (gh-99184: a dict subclass
+/// whose `__getattr__` raises `KeyError` for `__name__`).
+fn referent_display_name(target: &Object) -> Option<String> {
+    match target {
+        Object::Type(t) => Some(t.name.clone()),
+        Object::Function(f) => Some(f.name.clone()),
+        Object::Module(m) => Some(m.name.clone()),
+        Object::Instance(i) => match i.cls().lookup("__name__")? {
+            Object::Str(s) => Some(s.to_string()),
+            Object::Property(p) => {
+                let fget = p.fget.borrow().clone();
+                let ptr = crate::vm_singletons::current_interpreter_ptr()?;
+                // SAFETY: published by an enclosing VM frame on this thread.
+                let interp = unsafe { &mut *ptr };
+                match interp.call_object(fget, &[target.clone()], &[]).ok()? {
+                    Object::Str(s) => Some(s.to_string()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Type-level `weakref.__repr__` — CPython's `weakref_repr`:
+/// `<weakref at 0x…; to 'T' at 0x… (name)>` while alive,
+/// `<weakref at 0x…; dead>` afterwards.
+fn ref_type_repr(args: &[Object]) -> Result<Object, RuntimeError> {
+    let me = args
+        .first()
+        .ok_or_else(|| type_error("__repr__() missing self"))?;
+    let self_addr = id_of(me);
+    let txt = match wrapper_referent(me) {
+        Some(Some(target)) => {
+            let tn = fq_type_name(&target);
+            let taddr = id_of(&target);
+            match referent_display_name(&target) {
+                Some(n) => {
+                    format!("<weakref at 0x{self_addr:x}; to '{tn}' at 0x{taddr:x} ({n})>")
+                }
+                None => format!("<weakref at 0x{self_addr:x}; to '{tn}' at 0x{taddr:x}>"),
+            }
+        }
+        _ => format!("<weakref at 0x{self_addr:x}; dead>"),
+    };
+    Ok(Object::from_str(txt))
+}
+
+/// Getter behind the read-only `__callback__` property: the live
+/// callback before the referent dies, `None` once it has fired (the
+/// clear path nulls the backing dict entry). The property (a data
+/// descriptor with no setter) is what makes
+/// `ref.__callback__ = …` raise `AttributeError`
+/// (test_set_callback_attribute).
+fn ref_callback_get(args: &[Object]) -> Result<Object, RuntimeError> {
+    if let Some(Object::Instance(inst)) = args.first() {
+        if let Some(v) = inst
+            .dict
+            .borrow()
+            .get(&DictKey(Object::from_static("__callback__")))
+        {
+            return Ok(v.clone());
+        }
+    }
+    Ok(Object::None)
+}
+
 fn ref_type() -> Rc<TypeObject> {
     REF_TYPE.with(|cell| {
         if let Some(t) = cell.borrow().clone() {
@@ -321,8 +420,57 @@ fn ref_type() -> Rc<TypeObject> {
             DictKey(Object::from_static("__hash__")),
             m("__hash__", ref_type_hash),
         );
+        type_dict.insert(
+            DictKey(Object::from_static("__repr__")),
+            m("__repr__", ref_type_repr),
+        );
+        // Read-only data descriptor: shadows the per-instance dict entry
+        // (which backs it) and rejects assignment
+        // (test_set_callback_attribute).
+        type_dict.insert(
+            DictKey(Object::from_static("__callback__")),
+            Object::Property(Rc::new(crate::object::PyProperty::new(
+                m("__callback__", ref_callback_get),
+                Object::None,
+                Object::None,
+                Object::None,
+            ))),
+        );
+        type_dict.insert(
+            DictKey(Object::from_static("__module__")),
+            Object::from_static("weakref"),
+        );
+        // Real `__new__`/`__init__` entries so *subclasses* construct
+        // through the weakref machinery (CPython's `weakref___new__` /
+        // `weakref___init__`): `class WeakMethod(ref)` and test_weakref's
+        // `MyRef` call `ref.__new__(cls, ob, callback)` and expect an
+        // instance of `cls` wired to a live slot. The base type's own
+        // call path stays on the VM's `construct_ref` special-case.
+        type_dict.insert(
+            DictKey(Object::from_static("__new__")),
+            Object::StaticMethod(crate::object::MethodWrapper::new(Object::Builtin(Rc::new(
+                BuiltinFn {
+                    name: "weakref.__new__",
+                    binds_instance: false,
+                    call: Box::new(|args| ref_subclass_new(args, &[])),
+                    call_kw: Some(Box::new(ref_subclass_new)),
+                },
+            )))),
+        );
+        type_dict.insert(
+            DictKey(Object::from_static("__init__")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "__init__",
+                binds_instance: true,
+                call: Box::new(|args| ref_init(args, &[])),
+                call_kw: Some(Box::new(ref_init)),
+            })),
+        );
+        // CPython 3.13's `tp_name` is `"weakref.ReferenceType"`, so
+        // `weakref.ref.__name__ == 'ReferenceType'` and
+        // `__module__ == 'weakref'` (test_weakref's ModuleTestCase).
         let t = TypeObject::new_with_flags(
-            "weakref",
+            "ReferenceType",
             vec![crate::builtin_types::builtin_types().object_.clone()],
             type_dict,
             TypeFlags {
@@ -416,6 +564,16 @@ fn install_proxy_forwarding(td: &mut DictData) {
     }
     fn fwd_next(args: &[Object]) -> Result<Object, RuntimeError> {
         let target = proxy_target(args.first().ok_or_else(|| type_error("missing self"))?)?;
+        // CPython's `proxy_iternext` checks `PyIter_Check` on the referent
+        // first and raises its own message (test_proxy_bad_next).
+        let is_iterator = match &target {
+            Object::Iter(_) | Object::Generator(_) => true,
+            Object::Instance(inst) => inst.cls().lookup("__next__").is_some(),
+            _ => false,
+        };
+        if !is_iterator {
+            return Err(type_error("Weakref proxy referenced a non-iterator"));
+        }
         proxy_forward_via_builtin("next", &target)
     }
     fn fwd_len(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -456,6 +614,38 @@ fn install_proxy_forwarding(td: &mut DictData) {
         interp.delete_attr_public(&target, &name)?;
         Ok(Object::None)
     }
+    fn fwd_dir(args: &[Object]) -> Result<Object, RuntimeError> {
+        let target = proxy_target(args.first().ok_or_else(|| type_error("missing self"))?)?;
+        proxy_forward_via_builtin("dir", &target)
+    }
+    fn fwd_reversed(args: &[Object]) -> Result<Object, RuntimeError> {
+        let target = proxy_target(args.first().ok_or_else(|| type_error("missing self"))?)?;
+        proxy_forward_via_builtin("reversed", &target)
+    }
+    // CPython's `proxy_bool` runs the full `PyObject_IsTrue` protocol on
+    // the referent (`__bool__`, then `__len__`, then default-true), so
+    // forward through the `bool` builtin rather than a bare dunder.
+    fn fwd_bool(args: &[Object]) -> Result<Object, RuntimeError> {
+        let target = proxy_target(args.first().ok_or_else(|| type_error("missing self"))?)?;
+        proxy_forward_via_builtin("bool", &target)
+    }
+    // CPython's `proxy_contains` is `PySequence_Contains(referent, v)` —
+    // the *full* membership protocol, including the fall-back to
+    // `__iter__` when the referent has no `__contains__`
+    // (test_proxy_iter's `"blech" in p` where the referent only
+    // defines `__iter__`).
+    fn fwd_contains(args: &[Object]) -> Result<Object, RuntimeError> {
+        let target = proxy_target(args.first().ok_or_else(|| type_error("missing self"))?)?;
+        let item = args
+            .get(1)
+            .cloned()
+            .ok_or_else(|| type_error("__contains__ expected 1 argument"))?;
+        let ptr = crate::vm_singletons::current_interpreter_ptr()
+            .ok_or_else(|| type_error("no running interpreter"))?;
+        // SAFETY: published by an enclosing VM frame on this thread.
+        let interp = unsafe { &mut *ptr };
+        Ok(Object::Bool(interp.py_contains(&target, &item)?))
+    }
     for (name, f) in [
         (
             "__getattr__",
@@ -467,9 +657,171 @@ fn install_proxy_forwarding(td: &mut DictData) {
         ("__next__", fwd_next),
         ("__len__", fwd_len),
         ("__str__", fwd_str),
+        ("__dir__", fwd_dir),
+        ("__reversed__", fwd_reversed),
+        ("__bool__", fwd_bool),
+        ("__contains__", fwd_contains),
     ] {
         td.insert(DictKey(Object::from_static(name)), m(name, f));
     }
+    // Proxies are unhashable in CPython (`tp_hash = PyObject_HashNotImplemented`):
+    // `hash(proxy(o))` raises TypeError (test_proxy_hash). `__hash__ = None`
+    // in the type dict is the Python-level spelling of that slot.
+    td.insert(DictKey(Object::from_static("__hash__")), Object::None);
+
+    // CPython's proxy fills in the *entire* number/sequence/mapping slot
+    // tables with unwrapping forwarders (`WRAP_BINARY(proxy_add,
+    // PyNumber_Add)` etc.), so `p + 1.0`, `p // 5`, `p @ m`, `p[1] = x`,
+    // `del p[0]`, `operator.index(p)` … all operate on the referent
+    // (test_proxy_div/matmul/index/deletion, test_newstyle_number_ops).
+    // A binary forwarder that finds no such dunder on the referent
+    // declines with `NotImplemented` so the interpreter's reflected /
+    // fallback protocol proceeds exactly as if the referent itself were
+    // the operand.
+    for name in [
+        "__add__",
+        "__radd__",
+        "__iadd__",
+        "__sub__",
+        "__rsub__",
+        "__isub__",
+        "__mul__",
+        "__rmul__",
+        "__imul__",
+        "__matmul__",
+        "__rmatmul__",
+        "__imatmul__",
+        "__truediv__",
+        "__rtruediv__",
+        "__itruediv__",
+        "__floordiv__",
+        "__rfloordiv__",
+        "__ifloordiv__",
+        "__mod__",
+        "__rmod__",
+        "__imod__",
+        "__divmod__",
+        "__rdivmod__",
+        "__pow__",
+        "__rpow__",
+        "__ipow__",
+        "__lshift__",
+        "__rlshift__",
+        "__ilshift__",
+        "__rshift__",
+        "__rrshift__",
+        "__irshift__",
+        "__and__",
+        "__rand__",
+        "__iand__",
+        "__xor__",
+        "__rxor__",
+        "__ixor__",
+        "__or__",
+        "__ror__",
+        "__ior__",
+        "__eq__",
+        "__ne__",
+        "__lt__",
+        "__le__",
+        "__gt__",
+        "__ge__",
+    ] {
+        td.insert(
+            DictKey(Object::from_static(name)),
+            make_proxy_forwarder(name, true),
+        );
+    }
+    // Unary / conversion / container dunders: forwarded the same way but
+    // errors propagate (there is no reflected protocol to fall back to).
+    for name in [
+        "__neg__",
+        "__pos__",
+        "__abs__",
+        "__invert__",
+        "__int__",
+        "__float__",
+        "__index__",
+        "__complex__",
+        "__bytes__",
+        "__getitem__",
+        "__setitem__",
+        "__delitem__",
+    ] {
+        td.insert(
+            DictKey(Object::from_static(name)),
+            make_proxy_forwarder(name, false),
+        );
+    }
+}
+
+/// A type-dict method that dereferences the proxy receiver and re-invokes
+/// the named dunder on the referent, unwrapping any proxy among the
+/// remaining operands (CPython's `proxy_add`/`proxy_getitem`/… wrappers).
+/// With `decline_missing`, a referent without the dunder yields
+/// `NotImplemented` instead of an error so binary-operator dispatch can
+/// continue with the reflected operand.
+fn make_proxy_forwarder(name: &'static str, decline_missing: bool) -> Object {
+    let body = move |args: &[Object]| -> Result<Object, RuntimeError> {
+        let target = proxy_target(args.first().ok_or_else(|| type_error("missing self"))?)?;
+        let ptr = crate::vm_singletons::current_interpreter_ptr()
+            .ok_or_else(|| type_error("no running interpreter"))?;
+        // SAFETY: published by an enclosing VM frame on this thread.
+        let interp = unsafe { &mut *ptr };
+        let func = match interp.load_attr_public(&target, name) {
+            Ok(f) => f,
+            Err(e) => {
+                if decline_missing {
+                    return Ok(crate::vm_singletons::not_implemented());
+                }
+                return Err(e);
+            }
+        };
+        let rest: Vec<Object> = args[1..]
+            .iter()
+            .map(|a| match proxy_referent(a) {
+                Some(Ok(t)) => t,
+                _ => a.clone(),
+            })
+            .collect();
+        interp.call_object(func, &rest, &[])
+    };
+    Object::Builtin(Rc::new(BuiltinFn {
+        name,
+        binds_instance: true,
+        call: Box::new(body),
+        call_kw: None,
+    }))
+}
+
+/// `__call__` for `CallableProxyType`: dereference and call the referent
+/// with the original positional and keyword arguments
+/// (test_callable_proxy's `ref1('twinkies!')` / `ref1(x='Splat.')`).
+fn install_callable_proxy_call(td: &mut DictData) {
+    fn call_fwd(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+        let target = proxy_target(args.first().ok_or_else(|| type_error("missing self"))?)?;
+        let ptr = crate::vm_singletons::current_interpreter_ptr()
+            .ok_or_else(|| type_error("no running interpreter"))?;
+        // SAFETY: published by an enclosing VM frame on this thread.
+        let interp = unsafe { &mut *ptr };
+        let rest: Vec<Object> = args[1..]
+            .iter()
+            .map(|a| match proxy_referent(a) {
+                Some(Ok(t)) => t,
+                _ => a.clone(),
+            })
+            .collect();
+        interp.call_object(target, &rest, kwargs)
+    }
+    td.insert(
+        DictKey(Object::from_static("__call__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__call__",
+            binds_instance: true,
+            call: Box::new(|args| call_fwd(args, &[])),
+            call_kw: Some(Box::new(call_fwd)),
+        })),
+    );
 }
 
 fn proxy_type() -> Rc<TypeObject> {
@@ -479,8 +831,12 @@ fn proxy_type() -> Rc<TypeObject> {
         }
         let mut td = DictData::default();
         install_proxy_forwarding(&mut td);
+        td.insert(
+            DictKey(Object::from_static("__module__")),
+            Object::from_static("weakref"),
+        );
         let t = TypeObject::new_with_flags(
-            "weakproxy",
+            "ProxyType",
             vec![crate::builtin_types::builtin_types().object_.clone()],
             td,
             TypeFlags {
@@ -501,8 +857,13 @@ fn callable_proxy_type() -> Rc<TypeObject> {
         }
         let mut td = DictData::default();
         install_proxy_forwarding(&mut td);
+        install_callable_proxy_call(&mut td);
+        td.insert(
+            DictKey(Object::from_static("__module__")),
+            Object::from_static("weakref"),
+        );
         let t = TypeObject::new_with_flags(
-            "weakcallableproxy",
+            "CallableProxyType",
             vec![crate::builtin_types::builtin_types().object_.clone()],
             td,
             TypeFlags {
@@ -539,7 +900,71 @@ fn new_ref(args: &[Object]) -> Result<Object, RuntimeError> {
         )));
     }
     let callback = extract_callback(args.get(1));
+    if callback.is_none() {
+        // Reuse the cached callback-less basic ref (CPython's
+        // `weakref.ref(o) is weakref.ref(o)` — test_ref_reuse).
+        if let Some(cached) = find_cached_wrapper(id_of(&target), kind::REF) {
+            return Ok(cached);
+        }
+    }
     Ok(make_ref_object(target, callback, kind::REF))
+}
+
+/// `weakref.__new__(cls, ob, callback=None)` — the subclass allocation
+/// path (CPython's `weakref___new__`): validate the target, then mint a
+/// fully-wired ref whose class is `cls`, so `WeakMethod`/user subclasses
+/// get live slots plus their own MRO.
+fn ref_subclass_new(args: &[Object], _kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    // CPython's `weakref___new__` unpacks positionals only
+    // (`PyArg_UnpackTuple`) and silently ignores keywords — a subclass
+    // like test_weakref's `MyRef(o, value=24)` passes its kwargs on to
+    // its own `__init__`; the base `__init__` rejects them instead.
+    let cls = match args.first() {
+        Some(Object::Type(t)) => t.clone(),
+        _ => return Err(type_error("weakref.__new__(): not a type")),
+    };
+    if args.len() < 2 {
+        return Err(type_error("__new__ expected at least 1 argument, got 0"));
+    }
+    if args.len() > 3 {
+        return Err(type_error(format!(
+            "__new__ expected at most 2 arguments, got {}",
+            args.len() - 1
+        )));
+    }
+    let target = args[1].clone();
+    if !supports_weakref(&target) {
+        return Err(type_error(format!(
+            "cannot create weak reference to '{}' object",
+            target.type_name_owned()
+        )));
+    }
+    let callback = extract_callback(args.get(2));
+    Ok(make_ref_object_with_class(
+        target,
+        callback,
+        kind::REF,
+        Some(cls),
+    ))
+}
+
+/// `weakref.__init__(self, ob, callback=None)` — accepts the
+/// constructor arguments and does nothing (allocation already wired the
+/// slot), exactly like CPython's `weakref___init__`. Present so a
+/// subclass `__init__` can chain `super().__init__(ob, callback)`
+/// without hitting `object.__init__`'s arity error.
+fn ref_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    if !kwargs.is_empty() {
+        return Err(type_error("ref() takes no keyword arguments"));
+    }
+    // (self, ob[, callback])
+    if args.len() < 2 || args.len() > 3 {
+        return Err(type_error(format!(
+            "__init__ expected at most 2 arguments, got {}",
+            args.len().saturating_sub(1)
+        )));
+    }
+    Ok(Object::None)
 }
 
 /// Entry point for `weakref.ref(target, callback=None)` when invoked by
@@ -550,7 +975,7 @@ pub(crate) fn construct_ref(
     kwargs: &[(String, Object)],
 ) -> Result<Object, RuntimeError> {
     if !kwargs.is_empty() {
-        return Err(type_error("ref() does not take keyword arguments"));
+        return Err(type_error("ref() takes no keyword arguments"));
     }
     if args.len() > 2 {
         return Err(type_error(format!(
@@ -559,6 +984,30 @@ pub(crate) fn construct_ref(
         )));
     }
     new_ref(args)
+}
+
+/// The live cached wrapper for `(target, kind)` when one exists —
+/// CPython reuses a referent's callback-less basic ref and proxy
+/// (`get_basic_refs` + the `new == NULL` reuse branch), so
+/// `weakref.ref(o) is weakref.ref(o)` and `proxy(o) is proxy(o)` hold
+/// (test_ref_reuse / test_proxy_reuse). Only exact native-type wrappers
+/// are shared; subclass instances never are.
+fn find_cached_wrapper(target_id: ObjectId, kind_tag: u8) -> Option<Object> {
+    let base = match kind_tag {
+        kind::PROXY => proxy_type(),
+        kind::CALLABLE_PROXY => callable_proxy_type(),
+        _ => ref_type(),
+    };
+    for slot in reg::collect_for(target_id) {
+        if slot.kind == kind_tag && !slot.is_dead() && !slot.has_callback {
+            if let Some(inst) = slot.py_ref.borrow().as_ref().and_then(|w| w.upgrade()) {
+                if Rc::ptr_eq(&inst.cls(), &base) {
+                    return Some(Object::Instance(inst));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// `_weakref.proxy(obj, callback=None)` — returns a delegating
@@ -576,24 +1025,50 @@ fn new_proxy(args: &[Object]) -> Result<Object, RuntimeError> {
         )));
     }
     let callback = extract_callback(args.get(1));
-    let is_callable = matches!(
-        target,
-        Object::Function(_) | Object::Builtin(_) | Object::BoundMethod(_) | Object::Type(_)
-    );
+    // CPython's `PyCallable_Check` (tp_call): instances count when their
+    // class MRO exposes `__call__` (test_callable_proxy wraps a plain
+    // class with a `__call__` method).
+    let is_callable = match &target {
+        Object::Function(_)
+        | Object::Builtin(_)
+        | Object::BoundMethod(_)
+        | Object::Type(_)
+        | Object::StaticMethod(_) => true,
+        Object::Instance(inst) => inst.cls().lookup("__call__").is_some(),
+        _ => false,
+    };
     let k = if is_callable {
         kind::CALLABLE_PROXY
     } else {
         kind::PROXY
     };
+    if callback.is_none() {
+        if let Some(cached) = find_cached_wrapper(id_of(&target), k) {
+            return Ok(cached);
+        }
+    }
     Ok(make_ref_object(target, callback, k))
 }
 
 fn make_ref_object(target: Object, callback: Option<Object>, kind_tag: u8) -> Object {
+    make_ref_object_with_class(target, callback, kind_tag, None)
+}
+
+/// [`make_ref_object`] with an explicit instance class — the
+/// `ref.__new__(cls, ...)` path, where `cls` is a user subclass
+/// (`weakref.WeakMethod`, test_weakref's `MyRef`). `None` selects the
+/// kind's own native type.
+fn make_ref_object_with_class(
+    target: Object,
+    callback: Option<Object>,
+    kind_tag: u8,
+    class_override: Option<Rc<TypeObject>>,
+) -> Object {
     let target_id = id_of(&target);
     let slot = Arc::new(WeakRefSlot::new(
         target_id,
         target.clone(),
-        callback.clone(),
+        callback.is_some(),
         kind_tag,
     ));
     register(slot.clone());
@@ -621,11 +1096,11 @@ fn make_ref_object(target: Object, callback: Option<Object>, kind_tag: u8) -> Ob
 
     let dict = Rc::new(RefCell::new(DictData::default()));
 
-    let class = match kind_tag {
+    let class = class_override.unwrap_or_else(|| match kind_tag {
         kind::PROXY => proxy_type(),
         kind::CALLABLE_PROXY => callable_proxy_type(),
         _ => ref_type(),
-    };
+    });
 
     // Methods.
     let slot_for_call = slot.clone();
@@ -703,7 +1178,34 @@ fn make_ref_object(target: Object, callback: Option<Object>, kind_tag: u8) -> Ob
     // Back-pointer so `obj.__weakref__` / `getweakrefs(obj)` can return
     // this same wrapper object.
     *slot.py_ref.borrow_mut() = Some(Rc::downgrade(&inst));
-    Object::Instance(inst)
+    let wrapper = Object::Instance(inst);
+    // CPython GC-tracks a weakref *with a callback* (`gc_track` in
+    // `weakref___init__`): the wrapper's strong `wr_callback` edge (our
+    // `__callback__` dict entry) must be visible to the cycle collector
+    // or a cycle routed through the callback — `c.wr = ref(d, c.cb)`
+    // with `c ↔ d` — is never collected (test_callbacks_on_callback,
+    // test_callback_in_cycle_resurrection). Callback-less wrappers stay
+    // untracked, as in CPython.
+    //
+    // We narrow CPython's rule for throughput: a callback that is a
+    // builtin or a closure-free plain function can only route a cycle
+    // through its module globals, which stay alive until interpreter
+    // shutdown anyway — while `WeakValueDictionary`/`WeakSet` mint one
+    // closure-free `_remove` callback ref per entry, so tracking those
+    // would put the whole population (70k in test_weakref's threaded
+    // copy tests) on the collector's candidate list. Instances (a
+    // `weakref.finalize` object is its own callback), bound methods and
+    // closures — the shapes that can actually close a user-visible
+    // cycle — are tracked.
+    let callback_can_cycle = match &callback {
+        None | Some(Object::Builtin(_)) => false,
+        Some(Object::Function(f)) => !f.closure.is_empty(),
+        Some(_) => true,
+    };
+    if callback_can_cycle {
+        crate::gc_trace::track(wrapper.clone());
+    }
+    wrapper
 }
 
 /// Can a weak reference be created to `target`? Mirrors CPython's
@@ -717,17 +1219,22 @@ pub(crate) fn supports_weakref(target: &Object) -> bool {
         Object::Instance(inst) => inst,
         // Built-ins that carry a `tp_weaklistoffset` in CPython and so can
         // be the target of a `weakref.ref`: `set`, `bytearray`, functions,
-        // classes, modules, generators/coroutines/async-generators, file
-        // objects and `types.SimpleNamespace`.
+        // bound methods, classes, modules, generators/coroutines/
+        // async-generators, file objects and `types.SimpleNamespace`.
         Object::Set(_)
         | Object::ByteArray(_)
         | Object::Function(_)
+        | Object::BoundMethod(_)
         | Object::Type(_)
         | Object::Module(_)
         | Object::Generator(_)
         | Object::Coroutine(_)
         | Object::AsyncGenerator(_)
         | Object::File(_)
+        // `memoryview` grew `tp_weaklistoffset` support in CPython
+        // (test_memoryio.test_getbuffer_gc_collect takes a `weakref.ref`
+        // to a `BytesIO.getbuffer()` view).
+        | Object::MemoryView(_)
         | Object::SimpleNamespace(_) => return true,
         // Everything else — numbers, `str`/`bytes`, `tuple`/`list`/`dict`/
         // `frozenset`/`range`, slices, the descriptor and internal frame/
@@ -749,11 +1256,17 @@ pub(crate) fn supports_weakref(target: &Object) -> bool {
     if cls.is_subclass_of(&crate::builtin_types::builtin_types().module_) {
         return true;
     }
-    // The native `_thread` synchronisation primitives carry a
-    // `tp_weaklistoffset` in CPython (`lock_tests` takes weakrefs to
-    // them). They're builtin types with an all-builtin MRO, so the loop
-    // below would otherwise reject them.
-    if matches!(cls.name.as_str(), "lock" | "RLock" | "_ThreadHandle") {
+    // The native `_thread` synchronisation primitives and `mmap.mmap`
+    // carry a `tp_weaklistoffset` in CPython (`lock_tests` takes weakrefs
+    // to locks; `test_mmap.test_weakref` to mappings). They're builtin
+    // types with an all-builtin MRO, so the loop below would otherwise
+    // reject them.
+    if cls
+        .mro
+        .borrow()
+        .iter()
+        .any(|t| matches!(t.name.as_str(), "lock" | "RLock" | "_ThreadHandle" | "mmap"))
+    {
         return true;
     }
     // CPython's `_io._IOBase` carries a `tp_weaklistoffset`, so every io
@@ -823,18 +1336,32 @@ fn get_weakrefs(args: &[Object]) -> Result<Object, RuntimeError> {
         .first()
         .ok_or_else(|| type_error("getweakrefs() requires 1 argument"))?;
     let id = id_of(target);
-    let mut out = Vec::new();
+    // CPython keeps the *basic* refs (exact `ReferenceType`, no callback —
+    // the shared/cached ones) at the head of the referent's weakref list;
+    // subclass instances and callback-carrying refs follow
+    // (test_subclass_refs_dont_replace_standard_refs asserts
+    // `getweakrefs(o)[0]` is the plain `weakref.ref(o)`).
+    let base = ref_type();
+    let mut basics = Vec::new();
+    let mut rest = Vec::new();
     for slot in reg::collect_for(id) {
         if slot.is_dead() {
             continue;
         }
         if let Some(w) = slot.py_ref.borrow().as_ref() {
             if let Some(inst) = w.upgrade() {
-                out.push(Object::Instance(inst));
+                let is_basic =
+                    slot.kind == kind::REF && !slot.has_callback && Rc::ptr_eq(&inst.cls(), &base);
+                if is_basic {
+                    basics.push(Object::Instance(inst));
+                } else {
+                    rest.push(Object::Instance(inst));
+                }
             }
         }
     }
-    Ok(Object::new_list(out))
+    basics.extend(rest);
+    Ok(Object::new_list(basics))
 }
 
 /// `_weakref._remove_dead_weakref(dct, key)` — CPython's atomic

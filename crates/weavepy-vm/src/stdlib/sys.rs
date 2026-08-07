@@ -322,6 +322,14 @@ pub fn build_with_state(
             DictKey(Object::from_static("getrefcount")),
             builtin("getrefcount", sys_getrefcount),
         );
+        // `sys._clear_type_cache()` drops CPython's method-lookup cache; the
+        // observable contract (test_type_cache) is only that existing type
+        // version tags survive and are never reused, which WeavePy's
+        // monotonic per-type `attr_version` counters give for free.
+        d.insert(
+            DictKey(Object::from_static("_clear_type_cache")),
+            builtin("_clear_type_cache", |_| Ok(Object::None)),
+        );
         d.insert(
             DictKey(Object::from_static("get_coroutine_origin_tracking_depth")),
             builtin("get_coroutine_origin_tracking_depth", |_| {
@@ -386,7 +394,6 @@ pub fn build_with_state(
                     "math",
                     "os",
                     "pyexpat",
-                    "secrets",
                     "sys",
                     "time",
                     "zlib",
@@ -574,8 +581,12 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         // execute frozen modules. Looks up a frozen source by name;
         // returns ``None`` if the module isn't frozen (or doesn't
         // exist). Mirrors CPython's `_imp.get_frozen_source` shape.
+        // Both helpers go through `ModuleCache::frozen_source` (not the
+        // raw table) so the `_imp._override_frozen_modules_for_tests`
+        // knob hides the frozen test modules here too — the Python-level
+        // `FrozenImporter.find_spec` keys off `sys._is_frozen`.
         {
-            let frozen = cache.frozen.clone();
+            let cache_for_source = cache.clone();
             d.insert(
                 DictKey(Object::from_static("_get_frozen_source")),
                 Object::Builtin(Rc::new(BuiltinFn {
@@ -586,9 +597,8 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
                             Some(Object::Str(s)) => s.to_string(),
                             _ => return Err(type_error("_get_frozen_source() expects a string")),
                         };
-                        let table = frozen.borrow();
-                        Ok(table
-                            .get(name.as_str())
+                        Ok(cache_for_source
+                            .frozen_source(&name)
                             .map(|src| Object::from_static(src.source))
                             .unwrap_or(Object::None))
                     }),
@@ -597,7 +607,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             );
         }
         {
-            let frozen = cache.frozen.clone();
+            let cache_for_probe = cache.clone();
             d.insert(
                 DictKey(Object::from_static("_is_frozen")),
                 Object::Builtin(Rc::new(BuiltinFn {
@@ -608,8 +618,24 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
                             Some(Object::Str(s)) => s.to_string(),
                             _ => return Ok(Object::Bool(false)),
                         };
-                        let table = frozen.borrow();
-                        Ok(Object::Bool(table.contains_key(name.as_str())))
+                        if cache_for_probe.frozen_source(&name).is_none() {
+                            return Ok(Object::Bool(false));
+                        }
+                        // Mirror the VM importer's precedence: a source file
+                        // on the path entries before the stdlib landmark
+                        // shadows the frozen copy (anywhere on the path for
+                        // bundled third-party facades), so `FrozenImporter`
+                        // must decline and let `PathFinder` claim the name —
+                        // `runpy`/`-m` resolve through `find_spec`
+                        // (test_import's script-shadowing suites).
+                        let shadowed = if crate::import::ModuleCache::is_third_party_facade(&name) {
+                            cache_for_probe.find_source(&name).is_some()
+                        } else {
+                            cache_for_probe
+                                .find_source_shadowing_stdlib(&name)
+                                .is_some()
+                        };
+                        Ok(Object::Bool(!shadowed))
                     }),
                     call_kw: None,
                 })),
@@ -862,14 +888,8 @@ fn sys_exit(args: &[Object]) -> Result<Object, RuntimeError> {
         "",
     );
     if let Object::Instance(inst_rc) = &inst {
-        inst_rc
-            .dict
-            .borrow_mut()
-            .insert(DictKey(Object::from_static("code")), code.clone());
-        inst_rc.dict.borrow_mut().insert(
-            DictKey(Object::from_static("args")),
-            Object::new_tuple(vec![code]),
-        );
+        inst_rc.slot_set("code", code.clone());
+        inst_rc.slot_set("args", Object::new_tuple(vec![code]));
     }
     Err(RuntimeError::PyException(crate::error::PyException::new(
         inst,
@@ -897,6 +917,9 @@ pub fn int_max_str_digits() -> i64 {
 /// `PYTHONINTMAXSTRDIGITS`, already validated by the CLI).
 pub fn set_int_max_str_digits(n: i64) {
     INT_MAX_STR_DIGITS.with(|c| c.set(n));
+    // The parser enforces the same cap on decimal int literals (CPython's
+    // parsenumber goes through PyLong_FromString).
+    weavepy_parser::set_int_literal_max_digits(n);
 }
 
 fn sys_get_int_max_str_digits(_args: &[Object]) -> Result<Object, RuntimeError> {
@@ -913,7 +936,7 @@ fn sys_set_int_max_str_digits(args: &[Object]) -> Result<Object, RuntimeError> {
     if n != 0 && n < 640 {
         return Err(value_error("maxdigits must be 0 or larger than 640"));
     }
-    INT_MAX_STR_DIGITS.with(|c| c.set(n));
+    set_int_max_str_digits(n);
     Ok(Object::None)
 }
 
@@ -950,18 +973,40 @@ fn sys_setrecursionlimit(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
+// Real interning: equal strings collapse to a single canonical object so
+// `intern(a) is intern(b)` holds for `a == b`. CPython (and code that
+// relies on it, e.g. `pathlib`'s `sys.intern(str(x))` over path parts,
+// exercised by `test_parts_interning`) keeps a process-wide pool; ours is
+// per-thread, which matches WeavePy's per-thread interpreter model.
+//
+// The pool is shared with the VM's instance-attribute store: CPython
+// interns attribute names inside `PyObject_SetAttr`, which is what makes
+// `sorted(x.__dict__)[0] is sorted(pickle.loads(s).__dict__)[0]` hold
+// (pickle's `load_build` inserts `sys.intern(k)` keys —
+// test_pickle test_attribute_name_interning).
+thread_local! {
+    static INTERN_POOL: RefCell<std::collections::HashMap<String, Object>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// Canonicalize `name` through the interpreter's intern pool, seeding it
+/// on first sight. Returns the pooled `Object::Str`.
+pub(crate) fn intern_name(name: &str) -> Object {
+    INTERN_POOL.with(|pool| {
+        let mut map = pool.borrow_mut();
+        if let Some(existing) = map.get(name) {
+            existing.clone()
+        } else {
+            let obj = Object::from_str(name);
+            map.insert(name.to_owned(), obj.clone());
+            obj
+        }
+    })
+}
+
 fn sys_intern(args: &[Object]) -> Result<Object, RuntimeError> {
-    // Real interning: equal strings collapse to a single canonical object so
-    // `intern(a) is intern(b)` holds for `a == b`. CPython (and code that
-    // relies on it, e.g. `pathlib`'s `sys.intern(str(x))` over path parts,
-    // exercised by `test_parts_interning`) keeps a process-wide pool; ours is
-    // per-thread, which matches WeavePy's per-thread interpreter model.
-    use std::collections::HashMap;
-    thread_local! {
-        static POOL: RefCell<HashMap<String, Object>> = RefCell::new(HashMap::new());
-    }
     match args.first() {
-        Some(s @ Object::Str(_)) => POOL.with(|pool| {
+        Some(s @ Object::Str(_)) => INTERN_POOL.with(|pool| {
             let key = s.to_str();
             let mut map = pool.borrow_mut();
             if let Some(existing) = map.get(&key) {
@@ -1039,14 +1084,7 @@ fn sys_exc_info(
             _ => Object::None,
         };
         let tb = match &inst {
-            Object::Instance(i) => i
-                .dict
-                .borrow()
-                .get(&crate::object::DictKey(Object::from_static(
-                    "__traceback__",
-                )))
-                .cloned()
-                .unwrap_or(Object::None),
+            Object::Instance(i) => i.slot_get("__traceback__").unwrap_or(Object::None),
             _ => Object::None,
         };
         Ok(Object::new_tuple(vec![type_obj, inst, tb]))
@@ -1194,23 +1232,52 @@ fn sys_getprofile(_args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(crate::trace::profile_hook().unwrap_or(Object::None))
 }
 
+/// Best-effort CPython-shaped `sys.getsizeof` estimate. Shared with
+/// `tracemalloc`'s per-object accounting so `get_traced_memory()` and
+/// `sys.getsizeof` agree (`test_tracemalloc.test_get_traced_memory`
+/// computes the expected traced size from `sys.getsizeof(b'')`).
+pub(crate) fn sizeof_estimate(o: &Object) -> i64 {
+    match o {
+        Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None => 28,
+        // CPython's compact-unicode layout: 40-byte ASCII struct or 56-byte
+        // wide struct, plus len+1 units of the kind width
+        // (test_str.test_raiseMemError pins all four kinds).
+        Object::Str(s) => {
+            let len = crate::builtins::str_char_len(s) as i64;
+            match s.chars().map(u32::from).max().unwrap_or(0) {
+                0..=0x7f => 40 + len + 1,
+                0x80..=0xff => 56 + (len + 1),
+                0x100..=0xffff => 56 + 2 * (len + 1),
+                _ => 56 + 4 * (len + 1),
+            }
+        }
+        Object::WStr(s) => {
+            let len = s.len() as i64;
+            match s.iter().copied().max().unwrap_or(0) {
+                0..=0x7f => 40 + len + 1,
+                0x80..=0xff => 56 + (len + 1),
+                0x100..=0xffff => 56 + 2 * (len + 1),
+                _ => 56 + 4 * (len + 1),
+            }
+        }
+        Object::Bytes(b) => 33 + b.len() as i64,
+        Object::ByteArray(b) => 56 + b.borrow().len() as i64,
+        Object::List(l) => 56 + (l.borrow().len() as i64) * 8,
+        Object::Tuple(t) => 40 + (t.len() as i64) * 8,
+        Object::Dict(d) => 64 + (d.borrow().len() as i64) * 16,
+        Object::Set(s) => 216 + (s.borrow().len() as i64) * 16,
+        Object::FrozenSet(s) => 216 + (s.len() as i64) * 16,
+        // CPython: `sys.getsizeof(cell)` is 40 on 64-bit builds.
+        Object::Cell(_) => 40,
+        _ => 16,
+    }
+}
+
 fn sys_getsizeof(args: &[Object]) -> Result<Object, RuntimeError> {
     // CPython's `getsizeof` is a per-object slot. We answer with a
     // best-effort estimate so user code doesn't crash, but make no
     // promise of accuracy.
-    let size = args
-        .first()
-        .map(|o| match o {
-            Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None => 28,
-            Object::Str(s) => 49 + s.len() as i64,
-            Object::Bytes(b) => 33 + b.len() as i64,
-            Object::List(l) => 56 + (l.borrow().len() as i64) * 8,
-            Object::Tuple(t) => 40 + (t.len() as i64) * 8,
-            Object::Dict(d) => 64 + (d.borrow().len() as i64) * 16,
-            Object::Set(s) => 216 + (s.borrow().len() as i64) * 16,
-            _ => 16,
-        })
-        .unwrap_or(0);
+    let size = args.first().map(sizeof_estimate).unwrap_or(0);
     Ok(Object::Int(size))
 }
 
@@ -1353,6 +1420,18 @@ fn sys_hash_info() -> Object {
     d.insert(DictKey(Object::from_static("seed_bits")), Object::Int(128));
     d.insert(DictKey(Object::from_static("cutoff")), Object::Int(0));
     Object::SimpleNamespace(Rc::new(RefCell::new(d)))
+}
+
+/// Whether `name` is a documented stdlib module name. The module
+/// shadowing diagnostics (attribute miss / `IMPORT_FROM` on a module
+/// whose file sits in the script directory) consult this, mirroring
+/// CPython's `sys.stdlib_module_names` lookup (error path only, so
+/// rebuilding the set is acceptable).
+pub fn is_stdlib_module_name(name: &str) -> bool {
+    match stdlib_module_names_value() {
+        Object::FrozenSet(s) => s.contains(&DictKey(Object::from_str(name))),
+        _ => false,
+    }
 }
 
 /// `sys.stdlib_module_names` — the documented set of standard-
@@ -1677,9 +1756,15 @@ fn sys_getrefcount(args: &[Object]) -> Result<Object, RuntimeError> {
     let id = crate::weakref_registry::id_of(obj);
     let registry = usize::from(crate::gc_trace::is_tracked(id));
     let weak_clones = crate::weakref_registry::strong_clone_count(id);
+    // A dropped-but-registry-pinned memoryview (dead under CPython
+    // refcounting) must not count through its exporter edge.
+    let zombie_refs = crate::gc_trace::zombie_memoryview_refs_to(id);
     // The clone in our `args` slice plays the role of CPython's
     // "+1 for the argument reference" — no extra increment needed.
-    let visible = strong.saturating_sub(registry).saturating_sub(weak_clones);
+    let visible = strong
+        .saturating_sub(registry)
+        .saturating_sub(weak_clones)
+        .saturating_sub(zombie_refs);
     Ok(Object::Int(visible.max(1) as i64))
 }
 

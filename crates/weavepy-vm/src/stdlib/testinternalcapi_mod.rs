@@ -96,6 +96,36 @@ fn end_spawned_pthread(_args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
+/// Read a type's attribute-resolution version counter (WeavePy's analogue
+/// of CPython's `tp_version_tag` invalidation signal). The frozen
+/// `_testcapi` shim derives its `type_get_version`/`type_modified` family
+/// from this: a class-dict or MRO change bumps the counter, which the shim
+/// treats as "version tag reset to 0" (test_type_cache).
+fn type_attr_version(args: &[Object]) -> Result<Object, RuntimeError> {
+    match args.first() {
+        Some(Object::Type(t)) => Ok(Object::Int(i64::from(t.attr_version.get()))),
+        _ => Err(crate::error::type_error("argument must be a type")),
+    }
+}
+
+/// `_testcapi.fatal_error(message, release_gil=False)`: invoke
+/// `Py_FatalError` with the C-side function name CPython's helper reports
+/// (`_testcapi_fatal_error_impl`). Never returns — the process dumps a
+/// traceback to stderr and aborts. `release_gil` only changes *when* the
+/// GIL is dropped in CPython; the observable output is identical.
+fn fatal_error(args: &[Object]) -> Result<Object, RuntimeError> {
+    let msg = match args.first() {
+        Some(Object::Bytes(b)) => String::from_utf8_lossy(b).into_owned(),
+        Some(Object::Str(s)) => s.as_ref().to_owned(),
+        _ => {
+            return Err(crate::error::type_error(
+                "fatal_error() argument 1 must be bytes",
+            ))
+        }
+    };
+    crate::stdlib::faulthandler_mod::py_fatal_error("_testcapi_fatal_error_impl", &msg)
+}
+
 fn has_inline_values(args: &[Object]) -> Result<Object, RuntimeError> {
     let inline = match args.first() {
         Some(Object::Instance(inst)) => {
@@ -219,6 +249,24 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             Object::from_static("WeavePy stand-in for CPython internal-API test probes."),
         );
         d.insert(
+            DictKey(Object::from_static("fatal_error")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "fatal_error",
+                binds_instance: false,
+                call: Box::new(fatal_error),
+                call_kw: None,
+            })),
+        );
+        d.insert(
+            DictKey(Object::from_static("_type_attr_version")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "_type_attr_version",
+                binds_instance: false,
+                call: Box::new(type_attr_version),
+                call_kw: None,
+            })),
+        );
+        d.insert(
             DictKey(Object::from_static("has_inline_values")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "has_inline_values",
@@ -268,6 +316,17 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 name: "DecodeLocaleEx",
                 binds_instance: false,
                 call: Box::new(decode_locale_ex),
+                call_kw: None,
+            })),
+        );
+        // `_PyTraceMalloc_GetTraceback(domain, ptr)` — the traceback of a
+        // domain-tracked block, or None (`test_tracemalloc.TestCAPI`).
+        d.insert(
+            DictKey(Object::from_static("_PyTraceMalloc_GetTraceback")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "_PyTraceMalloc_GetTraceback",
+                binds_instance: false,
+                call: Box::new(tracemalloc_get_traceback),
                 call_kw: None,
             })),
         );
@@ -336,10 +395,301 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 call_kw: None,
             })),
         );
+        // The `_PyTime_t` conversion API (`Python/pytime.c`), exercised
+        // exhaustively by `test_time.TestCPyTime`/`TestOldPyTime`. WeavePy's
+        // timestamps are i64 nanoseconds like CPython's PyTime_t, so these
+        // are exact ports of the C rounding/overflow arithmetic.
+        d.insert(
+            DictKey(Object::from_static("SIZEOF_TIME_T")),
+            Object::Int(std::mem::size_of::<libc::time_t>() as i64),
+        );
+        for (name, f) in [
+            (
+                "_PyTime_FromSeconds",
+                pytime_from_seconds as fn(&[Object]) -> Result<Object, RuntimeError>,
+            ),
+            ("_PyTime_FromSecondsObject", pytime_from_seconds_object),
+            ("_PyTime_AsTimeval", pytime_as_timeval),
+            ("_PyTime_AsMilliseconds", pytime_as_milliseconds),
+            ("_PyTime_AsMicroseconds", pytime_as_microseconds),
+            ("_PyTime_ObjectToTime_t", pytime_object_to_time_t),
+            ("_PyTime_ObjectToTimeval", pytime_object_to_timeval),
+            ("_PyTime_ObjectToTimespec", pytime_object_to_timespec),
+        ] {
+            d.insert(
+                DictKey(Object::from_static(name)),
+                Object::Builtin(Rc::new(BuiltinFn {
+                    name,
+                    binds_instance: false,
+                    call: Box::new(f),
+                    call_kw: None,
+                })),
+            );
+        }
     }
     Rc::new(PyModule {
         name: "_testinternalcapi".to_owned(),
         filename: None,
         dict,
     })
+}
+
+/// `_PyTraceMalloc_GetTraceback(domain, ptr)` → most-recent-first frames
+/// tuple or None (`test_tracemalloc.TestCAPI.get_traceback`).
+fn tracemalloc_get_traceback(args: &[Object]) -> Result<Object, RuntimeError> {
+    crate::stdlib::tracemalloc_real::capi_get_traceback(args)
+}
+
+// --- `Python/pytime.c` conversion API -----------------------------------
+
+const SEC_TO_NS: i64 = 1_000_000_000;
+
+/// A `_PyTime_round_t` argument (test_time passes `_PyTime` IntEnum members).
+fn pytime_round_arg(o: Option<&Object>) -> Result<i32, RuntimeError> {
+    o.and_then(|o| o.as_i64())
+        .map(|v| v as i32)
+        .ok_or_else(|| crate::error::type_error("an integer is required"))
+}
+
+/// An i64 timestamp argument; a Python int beyond 64 bits overflows like the
+/// clinic `long long` conversion.
+fn pytime_t_arg(o: Option<&Object>) -> Result<i64, RuntimeError> {
+    match o {
+        Some(Object::Int(v)) => Ok(*v),
+        Some(Object::Bool(b)) => Ok(i64::from(*b)),
+        Some(Object::Long(b)) => {
+            use num_traits::ToPrimitive;
+            b.to_i64().ok_or_else(|| {
+                crate::error::overflow_error("Python int too large to convert to C long long")
+            })
+        }
+        _ => Err(crate::error::type_error("an integer is required")),
+    }
+}
+
+/// `pytime_round()` on a double: FLOOR / CEILING / HALF_EVEN / UP
+/// (away from zero).
+fn pytime_round_f64(x: f64, round: i32) -> f64 {
+    match round {
+        0 => x.floor(),
+        1 => x.ceil(),
+        2 => x.round_ties_even(),
+        _ => {
+            if x >= 0.0 {
+                x.ceil()
+            } else {
+                x.floor()
+            }
+        }
+    }
+}
+
+/// `pytime_divide()`: integer division by `k > 1` under a rounding mode,
+/// with CPython's exact tie-break (parity of the truncated quotient).
+fn pytime_divide(t: i64, k: i64, round: i32) -> i64 {
+    fn divide_round_away(t: i64, k: i64) -> i64 {
+        let q = t / k;
+        if t % k != 0 {
+            if t >= 0 {
+                q + 1
+            } else {
+                q - 1
+            }
+        } else {
+            q
+        }
+    }
+    match round {
+        2 => {
+            // HALF_EVEN
+            let mut x = t / k;
+            let abs_r = (t % k).abs();
+            if abs_r > k / 2 || (abs_r == k / 2 && (x.abs() & 1) == 1) {
+                if t >= 0 {
+                    x += 1;
+                } else {
+                    x -= 1;
+                }
+            }
+            x
+        }
+        1 => {
+            // CEILING: truncation is already the ceiling for negatives.
+            if t >= 0 {
+                divide_round_away(t, k)
+            } else {
+                t / k
+            }
+        }
+        0 => {
+            // FLOOR: truncation is already the floor for positives.
+            if t >= 0 {
+                t / k
+            } else {
+                divide_round_away(t, k)
+            }
+        }
+        _ => divide_round_away(t, k), // UP (away from zero)
+    }
+}
+
+/// `_PyTime_FromSeconds(seconds)` — C int seconds to nanoseconds (a C int
+/// times 10^9 always fits in i64).
+fn pytime_from_seconds(args: &[Object]) -> Result<Object, RuntimeError> {
+    let secs = match args.first() {
+        Some(Object::Int(v)) => i32::try_from(*v)
+            .map_err(|_| crate::error::overflow_error("signed integer is greater than maximum"))?,
+        Some(Object::Bool(b)) => i32::from(*b),
+        Some(Object::Long(_)) => {
+            return Err(crate::error::overflow_error(
+                "Python int too large to convert to C int",
+            ))
+        }
+        _ => return Err(crate::error::type_error("an integer is required")),
+    };
+    Ok(Object::Int(i64::from(secs) * SEC_TO_NS))
+}
+
+/// `pytime_from_double()`: seconds (double) to nanoseconds under a rounding
+/// mode, with the `(double)PyTime_MIN <= d < -(double)PyTime_MIN` overflow
+/// window from `Python/pytime.c`.
+fn pytime_ns_from_double(value: f64, round: i32) -> Result<i64, RuntimeError> {
+    if value.is_nan() {
+        return Err(crate::error::value_error(
+            "Invalid value NaN (not a number)",
+        ));
+    }
+    let d = pytime_round_f64(value * SEC_TO_NS as f64, round);
+    if !((i64::MIN as f64) <= d && d < -(i64::MIN as f64)) {
+        return Err(crate::error::overflow_error(
+            "timestamp too large to convert to C PyTime_t",
+        ));
+    }
+    Ok(d as i64)
+}
+
+/// `_PyTime_FromSecondsObject(obj, round)` — int or float seconds to ns.
+fn pytime_from_seconds_object(args: &[Object]) -> Result<Object, RuntimeError> {
+    let round = pytime_round_arg(args.get(1))?;
+    match args.first() {
+        Some(Object::Float(d)) => Ok(Object::Int(pytime_ns_from_double(*d, round)?)),
+        other => {
+            let secs = pytime_t_arg(other)?;
+            let ns = secs.checked_mul(SEC_TO_NS).ok_or_else(|| {
+                crate::error::overflow_error("timestamp too large to convert to C PyTime_t")
+            })?;
+            Ok(Object::Int(ns))
+        }
+    }
+}
+
+/// `_PyTime_AsTimeval(t, round)` → `(tv_sec, tv_usec)` with `tv_usec` in
+/// `[0, 10^6)`.
+fn pytime_as_timeval(args: &[Object]) -> Result<Object, RuntimeError> {
+    let t = pytime_t_arg(args.first())?;
+    let round = pytime_round_arg(args.get(1))?;
+    let us = pytime_divide(t, 1_000, round);
+    Ok(Object::new_tuple(vec![
+        Object::Int(us.div_euclid(1_000_000)),
+        Object::Int(us.rem_euclid(1_000_000)),
+    ]))
+}
+
+fn pytime_as_milliseconds(args: &[Object]) -> Result<Object, RuntimeError> {
+    let t = pytime_t_arg(args.first())?;
+    let round = pytime_round_arg(args.get(1))?;
+    Ok(Object::Int(pytime_divide(t, 1_000_000, round)))
+}
+
+fn pytime_as_microseconds(args: &[Object]) -> Result<Object, RuntimeError> {
+    let t = pytime_t_arg(args.first())?;
+    let round = pytime_round_arg(args.get(1))?;
+    Ok(Object::Int(pytime_divide(t, 1_000, round)))
+}
+
+/// `_PyTime_DoubleToTimet()`: cast with a round-trip check.
+fn double_to_time_t(d: f64) -> Result<i64, RuntimeError> {
+    let intpart = d as i64; // saturating in Rust; the check below rejects it
+    let err = d - intpart as f64;
+    if err <= -1.0 || err >= 1.0 {
+        return Err(crate::error::overflow_error(
+            "timestamp out of range for platform time_t",
+        ));
+    }
+    Ok(intpart)
+}
+
+/// `_PyLong_AsTime_t()` for our purposes: any i64 fits time_t on 64-bit.
+fn long_as_time_t(o: Option<&Object>) -> Result<i64, RuntimeError> {
+    match o {
+        Some(Object::Int(v)) => Ok(*v),
+        Some(Object::Bool(b)) => Ok(i64::from(*b)),
+        Some(Object::Long(b)) => {
+            use num_traits::ToPrimitive;
+            b.to_i64().ok_or_else(|| {
+                crate::error::overflow_error("timestamp out of range for platform time_t")
+            })
+        }
+        _ => Err(crate::error::type_error("an integer is required")),
+    }
+}
+
+/// `_PyTime_ObjectToTime_t(obj, round)` → whole seconds.
+fn pytime_object_to_time_t(args: &[Object]) -> Result<Object, RuntimeError> {
+    let round = pytime_round_arg(args.get(1))?;
+    match args.first() {
+        Some(Object::Float(d)) => {
+            if d.is_nan() {
+                return Err(crate::error::value_error(
+                    "Invalid value NaN (not a number)",
+                ));
+            }
+            Ok(Object::Int(double_to_time_t(pytime_round_f64(*d, round))?))
+        }
+        other => Ok(Object::Int(long_as_time_t(other)?)),
+    }
+}
+
+/// `pytime_object_to_denominator()`: split seconds into `(sec, frac)` with
+/// `frac` in `[0, denominator)` — the modf-then-round dance from pytime.c
+/// (test_time's `create_converter` mirrors it step for step).
+fn pytime_object_to_denominator(args: &[Object], denominator: i64) -> Result<Object, RuntimeError> {
+    let round = pytime_round_arg(args.get(1))?;
+    match args.first() {
+        Some(Object::Float(d)) => {
+            if d.is_nan() {
+                return Err(crate::error::value_error(
+                    "Invalid value NaN (not a number)",
+                ));
+            }
+            let denom = denominator as f64;
+            let mut intpart = d.trunc();
+            let mut floatpart = (d - intpart) * denom;
+            floatpart = pytime_round_f64(floatpart, round);
+            if floatpart >= denom {
+                floatpart -= denom;
+                intpart += 1.0;
+            } else if floatpart < 0.0 {
+                floatpart += denom;
+                intpart -= 1.0;
+            }
+            let sec = double_to_time_t(intpart)?;
+            Ok(Object::new_tuple(vec![
+                Object::Int(sec),
+                Object::Int(floatpart as i64),
+            ]))
+        }
+        other => Ok(Object::new_tuple(vec![
+            Object::Int(long_as_time_t(other)?),
+            Object::Int(0),
+        ])),
+    }
+}
+
+fn pytime_object_to_timeval(args: &[Object]) -> Result<Object, RuntimeError> {
+    pytime_object_to_denominator(args, 1_000_000)
+}
+
+fn pytime_object_to_timespec(args: &[Object]) -> Result<Object, RuntimeError> {
+    pytime_object_to_denominator(args, 1_000_000_000)
 }

@@ -1,13 +1,11 @@
-//! The `atexit` module — RFC 0023.
+//! The `atexit` module — RFC 0023, event-exactness per RFC 0057 WS6.
 //!
-//! Registers callables to run on interpreter shutdown. We keep the
-//! list in a thread-local. There are two drains, sharing the same
-//! `take_handlers` storage so a handler never runs twice:
-//!   * the CLI driver runs whatever remains at real interpreter exit
-//!     (after `__main__` returns), and
-//!   * `_run_exitfuncs()` runs them on demand — `test_atexit` and
-//!     `multiprocessing.popen_fork`'s forked child both call it
-//!     explicitly before `os._exit`.
+//! Mirrors CPython 3.13's `Modules/atexitmodule.c`: the registry is a
+//! slot array in *registration order* where `unregister`/`_run_exitfuncs`
+//! null out slots rather than compacting, so an `__eq__` or callback
+//! that re-enters `unregister`/`_clear` mid-iteration (gh-112127,
+//! bpo-46025) sees a stable indexing scheme, exactly like the C
+//! `state->callbacks` array.
 
 use crate::sync::Rc;
 use crate::sync::RefCell;
@@ -15,10 +13,13 @@ use crate::sync::RefCell;
 use crate::error::{type_error, RuntimeError};
 use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
+use weavepy_compiler::CompareKind;
+
+type Callback = (Object, Vec<Object>, Vec<(String, Object)>);
 
 thread_local! {
-    static HANDLERS: RefCell<Vec<(Object, Vec<Object>, Vec<(String, Object)>)>> =
-        const { RefCell::new(Vec::new()) };
+    /// Registration-order slots; `None` = deleted (CPython's NULL holes).
+    static HANDLERS: RefCell<Vec<Option<Callback>>> = const { RefCell::new(Vec::new()) };
 }
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
@@ -29,9 +30,15 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("__name__")),
             Object::from_static("atexit"),
         );
+        // `register` takes `func, *args, **kwargs` (atexit_register).
         d.insert(
             DictKey(Object::from_static("register")),
-            builtin("register", a_register),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "register",
+                binds_instance: false,
+                call: Box::new(|args| a_register(args, &[])),
+                call_kw: Some(Box::new(a_register)),
+            })),
         );
         d.insert(
             DictKey(Object::from_static("unregister")),
@@ -66,66 +73,88 @@ fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeErro
     }))
 }
 
-fn a_register(args: &[Object]) -> Result<Object, RuntimeError> {
+fn current_interp(what: &str) -> Result<&'static mut crate::Interpreter, RuntimeError> {
+    let ptr = crate::vm_singletons::current_interpreter_ptr()
+        .ok_or_else(|| crate::error::runtime_error(format!("{what}: no running interpreter")))?;
+    // SAFETY: the pointer was published by an enclosing VM frame still live
+    // on this thread (we were called through VM dispatch); the GIL keeps the
+    // access exclusive.
+    Ok(unsafe { &mut *ptr })
+}
+
+fn a_register(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let func = args
         .first()
         .cloned()
-        .ok_or_else(|| type_error("atexit.register() requires a callable"))?;
+        .ok_or_else(|| type_error("register() takes at least 1 argument (0 given)"))?;
     let positional = args.get(1..).map(|s| s.to_vec()).unwrap_or_default();
-    HANDLERS.with(|h| h.borrow_mut().push((func.clone(), positional, Vec::new())));
+    HANDLERS.with(|h| {
+        h.borrow_mut()
+            .push(Some((func.clone(), positional, kwargs.to_vec())));
+    });
     Ok(func)
 }
 
 fn a_unregister(args: &[Object]) -> Result<Object, RuntimeError> {
     let func = args
         .first()
-        .ok_or_else(|| type_error("atexit.unregister() requires a callable"))?;
-    HANDLERS.with(|h| {
-        h.borrow_mut().retain(|(f, _, _)| !f.is_same(func));
-    });
+        .cloned()
+        .ok_or_else(|| type_error("unregister() takes exactly one argument (0 given)"))?;
+    let interp = current_interp("atexit.unregister()")?;
+    // CPython `atexit_unregister`: walk slots 0..ncallbacks comparing each
+    // live entry with `PyObject_RichCompareBool(cb->func, func, Py_EQ)` and
+    // null every match. The `__eq__` call may re-enter `unregister`/`_clear`
+    // (gh-112127), so re-read length and slot state on every step and never
+    // hold the registry borrow across the comparison.
+    let mut i = 0usize;
+    loop {
+        let stored = HANDLERS.with(|h| {
+            let v = h.borrow();
+            if i >= v.len() {
+                None
+            } else {
+                Some(v[i].as_ref().map(|(f, _, _)| f.clone()))
+            }
+        });
+        let stored = match stored {
+            None => break, // past the end
+            Some(None) => {
+                i += 1;
+                continue; // deleted slot
+            }
+            Some(Some(f)) => f,
+        };
+        // `PyObject_RichCompareBool` identity shortcut for Py_EQ, then the
+        // full forward/reflected `__eq__` protocol.
+        let eq = if stored.is_same(&func) {
+            true
+        } else {
+            interp
+                .rich_compare_public(&stored, &func, CompareKind::Eq)?
+                .is_truthy()
+        };
+        if eq {
+            HANDLERS.with(|h| {
+                let mut v = h.borrow_mut();
+                if i < v.len() {
+                    v[i] = None;
+                }
+            });
+        }
+        i += 1;
+    }
     Ok(Object::None)
 }
 
 fn a_run_exitfuncs(_args: &[Object]) -> Result<Object, RuntimeError> {
     // CPython's `atexit._run_exitfuncs()` (`Modules/atexitmodule.c`
-    // `atexit_callfuncs`): invoke every registered callback in LIFO order,
-    // *clearing* the registry as it goes, and report any callback error
-    // through `sys.unraisablehook` rather than propagating it (so one bad
-    // handler can't abort the rest).
-    //
-    // This is reachable two ways and both depend on it actually running the
-    // callables — until now it was a silent no-op:
+    // `atexit_callfuncs`). Reachable two ways:
     //   * `test_atexit` calls `atexit._run_exitfuncs()` directly;
     //   * `multiprocessing.popen_fork`'s forked child calls it in a
-    //     `finally` immediately before `os._exit(code)`. That's what runs
-    //     the `Queue` feeder's `Finalize` (send-sentinel + join-thread), so
-    //     the daemon feeder flushes its buffer to the pipe before the child
-    //     dies. Without it the child `os._exit`s mid-flush and the parent's
-    //     `Queue.get()` sees nothing.
-    // The normal full-shutdown path still drains any *remaining* handlers
-    // via `take_handlers` in the CLI driver; `take_handlers` here makes the
-    // two paths share one drain so handlers never run twice.
-    let handlers = take_handlers();
-    if handlers.is_empty() {
-        return Ok(Object::None);
-    }
-    let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
-        crate::error::runtime_error("atexit._run_exitfuncs(): no running interpreter")
-    })?;
-    // SAFETY: the pointer was published by an enclosing VM frame still live
-    // on this thread (we were called through VM dispatch); the GIL keeps the
-    // access exclusive.
-    let interp = unsafe { &mut *ptr };
-    for (func, args, kwargs) in handlers {
-        if let Err(err) = interp.call_object(func.clone(), &args, &kwargs) {
-            let is_exit = matches!(&err,
-                RuntimeError::PyException(exc) if exc.system_exit_code().is_some());
-            if !is_exit {
-                let context_repr = func.repr();
-                interp.write_unraisable_msg(&err, &func, &context_repr, None);
-            }
-        }
-    }
+    //     `finally` immediately before `os._exit(code)` to flush the
+    //     `Queue` feeder before the child dies.
+    let interp = current_interp("atexit._run_exitfuncs()")?;
+    run_exit_handlers(interp);
     Ok(Object::None)
 }
 
@@ -135,16 +164,44 @@ fn a_clear(_args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn a_ncallbacks(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::Int(HANDLERS.with(|h| h.borrow().len() as i64)))
+    Ok(Object::Int(HANDLERS.with(|h| {
+        h.borrow().iter().filter(|s| s.is_some()).count() as i64
+    })))
 }
 
-/// Drain the registered handlers in LIFO order. Called by the CLI
-/// shutdown sequence. The caller invokes each `(func, args, kwargs)`
-/// triple in turn.
-pub fn take_handlers() -> Vec<(Object, Vec<Object>, Vec<(String, Object)>)> {
-    HANDLERS.with(|h| {
-        let mut v = h.borrow_mut();
-        let drained: Vec<_> = v.drain(..).collect();
-        drained.into_iter().rev().collect()
-    })
+/// CPython `atexit_callfuncs`: walk the slots from the highest index at
+/// entry down to 0 (LIFO), re-reading each slot at its turn so a callback
+/// that `unregister`s a not-yet-run entry suppresses it, and a callback
+/// that unregisters *itself* still runs to completion (bpo-46025: the C
+/// code takes `Py_NewRef(cb->func)` before the call). A failing callback
+/// is reported through `sys.unraisablehook` with `object=None` and
+/// `err_msg="Exception ignored in atexit callback {func!r}"`
+/// (`PyErr_FormatUnraisable`); 3.13 does *not* special-case `SystemExit`.
+/// Afterwards the whole registry is cleared (`atexit_cleanup`), including
+/// entries registered by the callbacks themselves.
+///
+/// Called both by `atexit._run_exitfuncs()` and by the interpreter's
+/// shutdown sequence (`_PyAtExit_Call`); the shared registry means a
+/// handler never runs twice.
+pub fn run_exit_handlers(interp: &mut crate::Interpreter) {
+    let start = HANDLERS.with(|h| h.borrow().len());
+    for i in (0..start).rev() {
+        let cb = HANDLERS.with(|h| {
+            let v = h.borrow();
+            if i < v.len() {
+                v[i].clone()
+            } else {
+                None
+            }
+        });
+        let Some((func, args, kwargs)) = cb else {
+            continue;
+        };
+        if let Err(err) = interp.call_object(func.clone(), &args, &kwargs) {
+            let func_repr = interp.repr_object(&func).unwrap_or_else(|_| func.repr());
+            let err_msg = format!("Exception ignored in atexit callback {func_repr}");
+            interp.write_unraisable_msg(&err, &Object::None, &func_repr, Some(&err_msg));
+        }
+    }
+    HANDLERS.with(|h| h.borrow_mut().clear());
 }

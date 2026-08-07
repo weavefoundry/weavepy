@@ -488,11 +488,11 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         );
         d.insert(
             DictKey(Object::from_static("herror")),
-            Object::Type(crate::builtin_types::builtin_types().os_error.clone()),
+            Object::Type(herror_class()),
         );
         d.insert(
             DictKey(Object::from_static("gaierror")),
-            Object::Type(crate::builtin_types::builtin_types().os_error.clone()),
+            Object::Type(gaierror_class()),
         );
         d.insert(
             DictKey(Object::from_static("timeout")),
@@ -532,6 +532,47 @@ fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) ->
         call: Box::new(body),
         call_kw: None,
     }))
+}
+
+/// `socket.gaierror` — a real `OSError` subclass, as in CPython
+/// (`test_exception_hierarchy` asserts `gaierror.__base__ is OSError`).
+fn gaierror_class() -> Rc<TypeObject> {
+    static GAIERROR: std::sync::OnceLock<Rc<TypeObject>> = std::sync::OnceLock::new();
+    GAIERROR
+        .get_or_init(|| {
+            let bt = crate::builtin_types::builtin_types();
+            TypeObject::new_exception("gaierror", bt.os_error.clone()).expect("socket.gaierror")
+        })
+        .clone()
+}
+
+/// Build a raised `socket.gaierror(code, msg)` the way CPython's
+/// `set_gaierror` does: `args = (code, msg)` with `errno`/`strerror`
+/// populated so `str(e)` renders `[Errno code] msg`. Only the unix
+/// `getaddrinfo` path raises it.
+#[cfg(unix)]
+fn gaierror(code: i32, msg: String) -> crate::error::RuntimeError {
+    let exc = crate::builtin_types::make_exception_with_class(gaierror_class(), &msg);
+    if let Object::Instance(inst) = &exc {
+        inst.slot_set(
+            "args",
+            Object::new_tuple(vec![Object::Int(i64::from(code)), Object::from_str(&msg)]),
+        );
+        inst.slot_set("errno", Object::Int(i64::from(code)));
+        inst.slot_set("strerror", Object::from_str(msg));
+    }
+    crate::error::RuntimeError::PyException(crate::error::PyException::new(exc))
+}
+
+/// `socket.herror` — likewise a direct `OSError` subclass.
+fn herror_class() -> Rc<TypeObject> {
+    static HERROR: std::sync::OnceLock<Rc<TypeObject>> = std::sync::OnceLock::new();
+    HERROR
+        .get_or_init(|| {
+            let bt = crate::builtin_types::builtin_types();
+            TypeObject::new_exception("herror", bt.os_error.clone()).expect("socket.herror")
+        })
+        .clone()
 }
 
 // ---- socket class construction ----
@@ -1190,12 +1231,8 @@ fn sock_connect_ex(args: &[Object]) -> Result<Object, RuntimeError> {
 /// (see [`crate::error::io_error_to_py`]), if present.
 fn errno_of_exception(p: &crate::error::PyException) -> Option<i64> {
     if let Object::Instance(inst) = &p.instance {
-        if let Some(Object::Int(n)) = inst
-            .dict
-            .borrow()
-            .get(&DictKey(Object::from_static("errno")))
-        {
-            return Some(*n);
+        if let Some(Object::Int(n)) = crate::builtin_types::exc_attr(inst, "errno") {
+            return Some(n);
         }
     }
     None
@@ -2910,7 +2947,7 @@ fn mod_getaddrinfo(args: &[Object]) -> Result<Object, RuntimeError> {
                 CStr::from_ptr(p).to_string_lossy().into_owned()
             }
         };
-        return Err(os_error(format!("[Errno {rc}] {msg}")));
+        return Err(gaierror(rc, msg));
     }
 
     let mut out = Vec::new();

@@ -21,6 +21,7 @@ pub mod asyncio_mod;
 pub mod binascii_mod;
 pub mod bisect_accel;
 pub mod bz2_mod;
+pub mod cmath_mod;
 pub mod codecs_engine;
 pub mod codecs_mod;
 pub mod csv_mod;
@@ -48,7 +49,6 @@ pub mod os_process;
 pub mod posixsubprocess_mod;
 pub mod pyexpat_mod;
 pub mod resource_mod;
-pub mod secrets_mod;
 pub mod select_mod;
 pub mod shutil_mod;
 pub mod signal_mod;
@@ -83,7 +83,6 @@ pub mod https_mod;
 pub mod io_full;
 pub mod locale_mod;
 pub mod mmap_mod;
-pub mod pickle_accel;
 pub mod random_core;
 pub mod ssl_real;
 pub mod string_mod;
@@ -100,6 +99,11 @@ pub fn register_all(cache: &ModuleCache) {
     // Rust-defined factories.
     cache.register_builtin("sys", sys::build);
     cache.register_builtin("math", math::build);
+    // Native port of CPython 3.13's `Modules/cmathmodule.c` — builtin
+    // functions must not bind as instance methods (test_cmath's
+    // `isclose = cmath.isclose` class attribute), and the C special-value
+    // tables demand exact signed-zero fidelity a Python port can't give.
+    cache.register_builtin("cmath", cmath_mod::build);
     cache.register_builtin("os", os::build);
     cache.register_builtin("os.path", os::build_path);
     // RFC 0040 WS7 — the public `io` module is a thin frozen wrapper
@@ -148,7 +152,6 @@ pub fn register_all(cache: &ModuleCache) {
     // the verbatim `statistics` module's `try: from _statistics import …`.
     cache.register_builtin("_statistics", statistics_accel::build);
     cache.register_builtin("binascii", binascii_mod::build);
-    cache.register_builtin("secrets", secrets_mod::build);
     // `uuid` is CPython's verbatim pure-Python `Lib/uuid.py` (registered as a
     // frozen source below), NOT a native dict shim — the shim's fake UUID
     // (a `dict`) could not carry a real `__str__`, so `str(uuid.uuid4())`
@@ -208,7 +211,6 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("_string", string_mod::build);
     cache.register_builtin("_random", random_core::build);
     cache.register_builtin("_warnings", warnings_mod::build);
-    cache.register_builtin("_pickle", pickle_accel::build);
     cache.register_builtin("mmap", mmap_mod::build);
     cache.register_builtin("_locale", locale_mod::build);
     cache.register_builtin("_abc", abc_mod::build);
@@ -232,8 +234,10 @@ pub fn register_all(cache: &ModuleCache) {
     // RFC 0031 — debugger / profiler observability is now fully
     // wired in the VM dispatch loop; the modules below expose the
     // user-visible registration / snapshot API.
-    cache.register_builtin("tracemalloc", tracemalloc_real::build);
-    cache.register_builtin("_tracemalloc", tracemalloc_real::build_ext);
+    // RFC 0057 WS6: `tracemalloc` is now CPython's verbatim
+    // `Lib/tracemalloc.py` (frozen below) over this raw `_tracemalloc`
+    // core, mirroring the upstream split.
+    cache.register_builtin("_tracemalloc", tracemalloc_real::build);
     // RFC 0031 — PEP 684 sub-interpreters. Frontend lives in the
     // pure-Python `interpreters.py` shim; this is the C-extension
     // façade.
@@ -352,6 +356,14 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/_weave_spec.py"),
             is_package: false,
         },
+        // RFC 0057 WS4 — PEP 667/709 f_locals surface for lowered-
+        // comprehension frames (hidden iteration variables). See the
+        // `f_locals` arm of `Interpreter::load_attr_inner`.
+        FrozenSource {
+            name: "_weave_frame_locals",
+            source: include_str!("python/_weave_frame_locals.py"),
+            is_package: false,
+        },
         // RFC 0040 WS7 — CPython's pure-Python `io` reference implementation.
         // `test_io`/`test_fileio` import `_pyio` and exercise *both* the native
         // `io` and `_pyio` side-by-side; without it the whole suite fails to
@@ -405,6 +417,26 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "random",
             source: include_str!("python/random_mod.py"),
+            is_package: false,
+        },
+        // `secrets` — verbatim CPython `Lib/secrets.py` (PEP 506). A
+        // thin composition of `SystemRandom` + `hmac.compare_digest`,
+        // both of which WeavePy already provides; the previous native
+        // stub lacked `DEFAULT_ENTROPY`/`SystemRandom` and its
+        // `compare_digest` skipped the str/bytes type checks
+        // (test_secrets).
+        FrozenSource {
+            name: "secrets",
+            source: include_str!("python/secrets.py"),
+            is_package: false,
+        },
+        // `rlcompleter` — verbatim CPython source. Pure attribute/name
+        // completion over `__main__` namespaces; readline is optional
+        // (it degrades to import-less mode, which is exactly how the
+        // suite exercises it).
+        FrozenSource {
+            name: "rlcompleter",
+            source: include_str!("python/rlcompleter.py"),
             is_package: false,
         },
         // `uuid` — verbatim CPython `Lib/uuid.py`. The full `UUID` class
@@ -567,15 +599,10 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             is_package: false,
         },
         // RFC 0037 WS8 verbatim/faithful module ports that gate import-time
-        // clusters: `cmath` (pure-Python over the `math` core) unblocks
-        // `test_fractions`; the C-locale `locale` unblocks `test_format`
+        // clusters: the C-locale `locale` unblocks `test_format`
         // and backs `calendar`'s `LocaleTextCalendar`; `calendar` is the
-        // verbatim CPython 3.13 module.
-        FrozenSource {
-            name: "cmath",
-            source: include_str!("python/cmath.py"),
-            is_package: false,
-        },
+        // verbatim CPython 3.13 module. (`cmath` is now a native module —
+        // see stdlib/cmath_mod.rs.)
         FrozenSource {
             name: "locale",
             source: include_str!("python/locale.py"),
@@ -2054,6 +2081,14 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/_pydatetime.py"),
             is_package: false,
         },
+        // RFC 0057 WS10: `_datetime` accelerator alias over `_pydatetime` —
+        // needed by test_types (datetime_CAPI / types.CapsuleType) and the
+        // datetimetester type-cache script.
+        FrozenSource {
+            name: "_datetime",
+            source: include_str!("python/_datetime.py"),
+            is_package: false,
+        },
         FrozenSource {
             name: "linecache",
             source: include_str!("python/linecache.py"),
@@ -2347,11 +2382,30 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/test_list_tests.py"),
             is_package: false,
         },
-        // `test.pickletester`: only `ExtensionSaver` is carried (test_copyreg
-        // imports it); the full CPython file is ~4900 lines of pickle matrix.
+        // `test.test_grammar` / `test.test_unpack_ex`: verbatim CPython 3.13
+        // sources. `test_ast.ASTHelpers_Test.test_stdlib_validates` parses and
+        // validates these two files from the installed stdlib tree.
+        FrozenSource {
+            name: "test.test_grammar",
+            source: include_str!("python/test_test_grammar.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.test_unpack_ex",
+            source: include_str!("python/test_test_unpack_ex.py"),
+            is_package: false,
+        },
+        // `test.pickletester` / `test.picklecommon`: verbatim CPython 3.13
+        // pickle test matrix (RFC 0057 WS8) — `test_pickle`,
+        // `test_pickletools`, and `test_copyreg` all import from it.
         FrozenSource {
             name: "test.pickletester",
             source: include_str!("python/test_pickletester.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.picklecommon",
+            source: include_str!("python/test_picklecommon.py"),
             is_package: false,
         },
         // `test.test_longexp` (verbatim, 10 lines): CPython's own
@@ -2571,9 +2625,36 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/_compat_pickle.py"),
             is_package: false,
         },
+        // `_pickle` — pure-Python aliases of pickle's implementation (RFC
+        // 0057 WS8): `test_pickle`'s "C" lanes import Pickler/Unpickler/
+        // PickleBuffer from it directly.
+        FrozenSource {
+            name: "_pickle",
+            source: include_str!("python/_pickle.py"),
+            is_package: false,
+        },
         FrozenSource {
             name: "shelve",
             source: include_str!("python/shelve.py"),
+            is_package: false,
+        },
+        // `dbm` — verbatim CPython 3.13 (RFC 0057 WS8). The `__init__` picks
+        // a backend lazily; only the pure-Python `dumb` and the
+        // `sqlite3`-backed backends are carried (`gnu`/`ndbm` need C libs
+        // and `whichdb` degrades gracefully without them).
+        FrozenSource {
+            name: "dbm",
+            source: include_str!("python/dbm/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "dbm.dumb",
+            source: include_str!("python/dbm/dumb.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "dbm.sqlite3",
+            source: include_str!("python/dbm/sqlite3.py"),
             is_package: false,
         },
         FrozenSource {
@@ -2592,6 +2673,16 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "_pydecimal",
             source: include_str!("python/_pydecimal.py"),
+            is_package: false,
+        },
+        // RFC 0057 WS7 — `_decimal` accelerator identity: a fork of
+        // _pydecimal patched to expose the C-accelerator surface
+        // (mpdec constants, immutability, SignalDict, validation) that
+        // test_decimal probes. Lib/decimal.py adopts it via
+        // `from _decimal import *`.
+        FrozenSource {
+            name: "_decimal",
+            source: include_str!("python/_decimal.py"),
             is_package: false,
         },
         FrozenSource {
@@ -2872,9 +2963,27 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/pprint_mod.py"),
             is_package: false,
         },
+        // The real CPython `tomllib` package (a vendored `tomli`),
+        // verbatim — the earlier trimmed port failed the TOML 1.0
+        // conformance suite's error-position and validation edges.
         FrozenSource {
             name: "tomllib",
-            source: include_str!("python/tomllib_mod.py"),
+            source: include_str!("python/tomllib/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "tomllib._parser",
+            source: include_str!("python/tomllib/_parser.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "tomllib._re",
+            source: include_str!("python/tomllib/_re.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "tomllib._types",
+            source: include_str!("python/tomllib/_types.py"),
             is_package: false,
         },
         FrozenSource {
@@ -2924,6 +3033,13 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "pstats",
             source: include_str!("python/pstats_mod.py"),
+            is_package: false,
+        },
+        // RFC 0057 WS6 — CPython's verbatim `Lib/tracemalloc.py` over the
+        // native `_tracemalloc` core.
+        FrozenSource {
+            name: "tracemalloc",
+            source: include_str!("python/tracemalloc_mod.py"),
             is_package: false,
         },
         FrozenSource {
@@ -3224,6 +3340,82 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "_testmultiphase",
             source: include_str!("python/_testmultiphase.py"),
+            is_package: false,
+        },
+        // RFC 0057 WS3 — CPython's frozen *test* modules (Python/frozen.c's
+        // TEST section, sources verbatim from `Lib/__hello__.py` and
+        // `Lib/__phello__/`). `test_frozen` and `test_importlib` import them
+        // to probe FrozenImporter semantics: `import __hello__` prints
+        // "Hello world!", `__phello__` is a package with a frozen submodule,
+        // and `__phello__.ham(.eggs)` is an empty frozen package. Unlike the
+        // rest of the frozen stdlib these honour
+        // `_imp._override_frozen_modules_for_tests` (see
+        // `ModuleCache::frozen_source`) and keep `<frozen …>` identity
+        // (FrozenImporter loader, origin='frozen' — see
+        // `stdlib_tree::module_path`).
+        FrozenSource {
+            name: "__hello__",
+            source: include_str!("python/__hello__.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "__phello__",
+            source: include_str!("python/__phello__/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "__phello__.spam",
+            source: include_str!("python/__phello__/spam.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "__phello__.ham",
+            source: include_str!("python/__phello__/ham/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "__phello__.ham.eggs",
+            source: include_str!("python/__phello__/ham/eggs.py"),
+            is_package: false,
+        },
+        // Alias rows of CPython's frozen TEST table (`Python/frozen.c`):
+        // frozen names whose *code* comes from another module's source.
+        // `test_importlib.frozen` asserts FrozenImporter.find_spec resolves
+        // them (spec.loader_state.origname carries the alias mapping — see
+        // `importlib_machinery.FrozenImporter._ORIGNAME_ALIASES`).
+        FrozenSource {
+            name: "__hello_alias__",
+            source: include_str!("python/__hello__.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "__phello_alias__",
+            source: include_str!("python/__hello__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "__phello_alias__.spam",
+            source: include_str!("python/__hello__.py"),
+            is_package: false,
+        },
+        // In CPython `__hello_only__` freezes `Tools/freeze/flag.py` (a
+        // data-only row: no origname, no filename). The source text is
+        // irrelevant to the tests; only its *presence* in the table is.
+        FrozenSource {
+            name: "__hello_only__",
+            source: "initialized = True\n",
+            is_package: false,
+        },
+        // Explicit `<pkg>.__init__` rows (importable spellings of the
+        // package init, origname `<<pkg>` in the frozen table).
+        FrozenSource {
+            name: "__phello__.__init__",
+            source: include_str!("python/__phello__/__init__.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "__phello__.ham.__init__",
+            source: include_str!("python/__phello__/ham/__init__.py"),
             is_package: false,
         },
     ];

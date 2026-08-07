@@ -54,6 +54,34 @@ pub struct ModuleCache {
     /// Rust-defined built-ins so a host can override frozen stdlib by
     /// registering a builtin with the same name.
     pub frozen: Rc<RefCell<HashMap<&'static str, FrozenSource>>>,
+    /// RFC 0057 WS3 — `_imp._override_frozen_modules_for_tests` state:
+    /// `0` default, `1` force-enabled, `-1` force-disabled. CPython's
+    /// override disables every *non-essential* frozen module (imports
+    /// fall back to the on-disk stdlib); WeavePy's frozen registry *is*
+    /// the stdlib with no disk twin on `sys.path`, so every module is
+    /// "essential" except the CPython frozen *test* modules
+    /// (`__hello__` / `__phello__…`), which `test_frozen` toggles via
+    /// `test.support.import_helper.frozen_modules()`.
+    pub frozen_tests_override: Rc<crate::sync::Cell<i32>>,
+    /// Names whose module body is currently executing — CPython's
+    /// `spec._initializing` window — mapped to the executing thread's
+    /// id. Attribute misses and `IMPORT_FROM` failures on these modules
+    /// carry the "(most likely due to a circular import)" hint
+    /// (test_import.CircularImportTests); the holder id lets a *racing*
+    /// import from another thread block until the body finishes, like
+    /// CPython's per-module import lock (bpo-34572,
+    /// test_pickle test_unpickle_module_race).
+    pub initializing: Rc<RefCell<std::collections::HashMap<String, u64>>>,
+    /// Which module each blocked thread is currently waiting to import
+    /// — CPython `_bootstrap._blocking_on`, used for import-lock
+    /// deadlock detection (`_ModuleLock.has_deadlock`).
+    pub import_waiting: Rc<RefCell<std::collections::HashMap<u64, String>>>,
+    /// The script directory / cwd the host prepended at startup —
+    /// CPython's `config->sys_path_0`. The module-shadowing diagnostics
+    /// compare against this snapshot, not live `sys.path`, so user
+    /// mutations don't defeat the hint (test_import's
+    /// test_script_shadowing_stdlib_sys_path_modification).
+    pub startup_path0: Rc<RefCell<Option<String>>>,
 }
 
 impl Default for ModuleCache {
@@ -64,8 +92,26 @@ impl Default for ModuleCache {
             argv: Rc::new(RefCell::new(Vec::new())),
             builtins: Rc::new(RefCell::new(HashMap::new())),
             frozen: Rc::new(RefCell::new(HashMap::new())),
+            frozen_tests_override: Rc::new(crate::sync::Cell::new(0)),
+            initializing: Rc::new(RefCell::new(std::collections::HashMap::new())),
+            import_waiting: Rc::new(RefCell::new(std::collections::HashMap::new())),
+            startup_path0: Rc::new(RefCell::new(None)),
         }
     }
+}
+
+/// Whether `name` is one of CPython's frozen *test* modules — the
+/// only frozen names `_imp._override_frozen_modules_for_tests` can
+/// actually disable in WeavePy (see `ModuleCache::frozen_source`).
+/// Mirrors the TEST section of CPython's frozen-module table.
+pub fn is_test_frozen_name(name: &str) -> bool {
+    name == "__hello__"
+        || name == "__hello_alias__"
+        || name == "__hello_only__"
+        || name == "__phello_alias__"
+        || name.starts_with("__phello_alias__.")
+        || name == "__phello__"
+        || name.starts_with("__phello__.")
 }
 
 impl ModuleCache {
@@ -101,6 +147,61 @@ impl ModuleCache {
             .shift_remove(&DictKey(Object::from_str(full_name)));
     }
 
+    /// Mark/unmark `full_name`'s body as executing (the
+    /// `spec._initializing` window) and query membership.
+    pub fn begin_initializing(&self, full_name: &str) {
+        self.initializing
+            .borrow_mut()
+            .insert(full_name.to_owned(), crate::gil::current_thread_id());
+    }
+    pub fn end_initializing(&self, full_name: &str) {
+        self.initializing.borrow_mut().remove(full_name);
+    }
+    pub fn is_initializing(&self, full_name: &str) -> bool {
+        self.initializing.borrow().contains_key(full_name)
+    }
+    /// The thread currently executing `full_name`'s body, if any.
+    pub fn initializing_holder(&self, full_name: &str) -> Option<u64> {
+        self.initializing.borrow().get(full_name).copied()
+    }
+    /// Record / clear which module `thread` is blocked importing —
+    /// CPython's `_blocking_on` table, consulted by
+    /// [`Self::import_wait_would_deadlock`].
+    pub fn set_import_waiting(&self, thread: u64, module: Option<&str>) {
+        let mut map = self.import_waiting.borrow_mut();
+        match module {
+            Some(m) => {
+                map.insert(thread, m.to_owned());
+            }
+            None => {
+                map.remove(&thread);
+            }
+        }
+    }
+    /// Whether `me` blocking on `full_name` closes a holder→waiter
+    /// cycle — CPython `_ModuleLock.has_deadlock`. Walk holder(module)
+    /// → module-that-holder-waits-on → … until the chain dies out or
+    /// reaches `me`.
+    pub fn import_wait_would_deadlock(&self, me: u64, full_name: &str) -> bool {
+        let initializing = self.initializing.borrow();
+        let waiting = self.import_waiting.borrow();
+        let mut name = full_name.to_owned();
+        // Bounded walk: chains are at most one hop per live thread.
+        for _ in 0..128 {
+            let Some(&holder) = initializing.get(&name) else {
+                return false;
+            };
+            if holder == me {
+                return true;
+            }
+            let Some(next) = waiting.get(&holder) else {
+                return false;
+            };
+            name = next.clone();
+        }
+        false
+    }
+
     pub fn builtin_factory(&self, name: &str) -> Option<BuiltinModuleFactory> {
         self.builtins.borrow().get(name).copied()
     }
@@ -120,7 +221,22 @@ impl ModuleCache {
     }
 
     pub fn frozen_source(&self, name: &str) -> Option<FrozenSource> {
+        // `frozen_modules(enabled=False)` (i.e. the override at `-1`)
+        // hides the frozen test modules from every consumer — the
+        // loader, `_imp.is_frozen`/`find_frozen`, `sys._is_frozen` —
+        // exactly as CPython's `find_frozen` reports "not frozen" for
+        // non-essential names under the override. Imports then fall
+        // through to the on-disk copy (see `find_source`).
+        if self.frozen_tests_override.get() < 0 && is_test_frozen_name(name) {
+            return None;
+        }
         self.frozen.borrow().get(name).copied()
+    }
+
+    /// Set the `_imp._override_frozen_modules_for_tests` knob
+    /// (`0` reset / `1` force-enabled / `-1` force-disabled).
+    pub fn set_frozen_tests_override(&self, value: i32) {
+        self.frozen_tests_override.set(value);
     }
 
     /// The *live* `sys.path` list. The loader must read this rather than
@@ -158,6 +274,24 @@ impl ModuleCache {
             .collect()
     }
 
+    /// CPython `FileFinder`'s case check (`_relax_case`): the on-disk
+    /// spelling of `path`'s final component must match the requested
+    /// name byte-for-byte, even on case-insensitive filesystems —
+    /// `import RAnDoM` must not resolve `random.py`
+    /// (test_import.test_case_sensitivity). `PYTHONCASEOK` relaxes it.
+    fn entry_case_ok(path: &Path) -> bool {
+        if std::env::var_os("PYTHONCASEOK").is_some() {
+            return true;
+        }
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+            return true;
+        };
+        match std::fs::read_dir(dir) {
+            Ok(rd) => rd.flatten().any(|e| e.file_name() == name),
+            Err(_) => true,
+        }
+    }
+
     /// Locate a module's source on disk by walking `sys.path`.
     ///
     /// Returns:
@@ -165,15 +299,49 @@ impl ModuleCache {
     ///   `<dir>/<leaf>/__init__.py` matches.
     /// - `None` if the module is not present anywhere on the path.
     pub fn find_source(&self, full_name: &str) -> Option<(PathBuf, bool)> {
+        // While frozen imports are enabled, CPython's FrozenImporter sits
+        // *ahead* of PathFinder on `sys.meta_path`, so a disk copy of a
+        // frozen test module (e.g. a vendored CPython `Lib/__phello__/`)
+        // never wins — `test_frozen` asserts `__spec__.loader is
+        // FrozenImporter` even with `Lib/` on `sys.path`. Only the `-1`
+        // override (`frozen_modules(enabled=False)`) re-enables the disk
+        // fallback below.
+        if self.frozen_tests_override.get() >= 0
+            && is_test_frozen_name(full_name)
+            && self.frozen.borrow().contains_key(full_name)
+        {
+            return None;
+        }
         let rel: PathBuf = full_name.split('.').collect();
         for dir in self.search_dirs() {
+            // CPython's FileFinder probes the package directory before
+            // the module file within each path entry, so `t4/__init__.py`
+            // shadows a sibling `t4.py` (test_pkg.test_4).
+            let pkg_init = dir.join(&rel).join("__init__.py");
+            if pkg_init.is_file() && Self::entry_case_ok(pkg_init.parent().unwrap_or(&pkg_init)) {
+                return Some((pkg_init, true));
+            }
             let module_file = dir.join(&rel).with_extension("py");
-            if module_file.is_file() {
+            if module_file.is_file() && Self::entry_case_ok(&module_file) {
                 return Some((module_file, false));
             }
-            let pkg_init = dir.join(&rel).join("__init__.py");
-            if pkg_init.is_file() {
-                return Some((pkg_init, true));
+        }
+        // A frozen test module hidden by the `-1` override must still be
+        // importable *unfrozen*: in CPython the stdlib directory is on
+        // `sys.path` and carries `__hello__.py` / `__phello__/`, so the
+        // import falls through to SourceFileLoader. WeavePy's stdlib
+        // position (the materialized tree) is *not* a `sys.path` entry,
+        // so resolve the same fallback against the tree explicitly —
+        // it holds byte-identical projections of the frozen sources.
+        if self.frozen_tests_override.get() < 0 && is_test_frozen_name(full_name) {
+            if let Some(frozen) = self.frozen.borrow().get(full_name) {
+                if let Some(path) =
+                    crate::stdlib_tree::test_frozen_disk_path(full_name, frozen.is_package)
+                {
+                    if path.is_file() {
+                        return Some((path, frozen.is_package));
+                    }
+                }
             }
         }
         None
@@ -199,13 +367,14 @@ impl ModuleCache {
             if dir.join("os.py").is_file() {
                 return None;
             }
-            let module_file = dir.join(&rel).with_extension("py");
-            if module_file.is_file() {
-                return Some((module_file, false));
-            }
+            // Package directory before module file, as in `find_source`.
             let pkg_init = dir.join(&rel).join("__init__.py");
-            if pkg_init.is_file() {
+            if pkg_init.is_file() && Self::entry_case_ok(pkg_init.parent().unwrap_or(&pkg_init)) {
                 return Some((pkg_init, true));
+            }
+            let module_file = dir.join(&rel).with_extension("py");
+            if module_file.is_file() && Self::entry_case_ok(&module_file) {
+                return Some((module_file, false));
             }
         }
         None

@@ -256,25 +256,38 @@ class SimpleNamespace:
 
 
 class DynamicClassAttribute:
-    """Minimal stand-in for ``types.DynamicClassAttribute``.
+    """Route attribute access on a class to __getattr__.
 
-    Behaves like a property on instances; on the class itself, raises
-    :class:`AttributeError`.
+    This is a descriptor, used to define attributes that act differently when
+    accessed through an instance and through a class.  Instance access remains
+    normal, but access to an attribute through a class will be routed to the
+    class's __getattr__ method; this is done by raising AttributeError.
+
+    This allows one to have properties active on an instance, and have virtual
+    attributes on the class with the same name.  (Enum used this between Python
+    versions 3.4 - 3.9 .)
+
+    Subclass from this to use a different method of accessing virtual attributes
+    and still be treated properly by the inspect module. (Enum uses this since
+    Python 3.10 .)
+
     """
-
     def __init__(self, fget=None, fset=None, fdel=None, doc=None):
         self.fget = fget
         self.fset = fset
         self.fdel = fdel
-        if doc is None and fget is not None:
-            doc = fget.__doc__
-        self.__doc__ = doc
+        # next two lines make DynamicClassAttribute act the same as property
+        self.__doc__ = doc or fget.__doc__
         self.overwrite_doc = doc is None
+        # support for abstract methods
+        self.__isabstractmethod__ = bool(getattr(fget, '__isabstractmethod__', False))
 
-    def __get__(self, instance, owner=None):
+    def __get__(self, instance, ownerclass=None):
         if instance is None:
+            if self.__isabstractmethod__:
+                return self
             raise AttributeError()
-        if self.fget is None:
+        elif self.fget is None:
             raise AttributeError("unreadable attribute")
         return self.fget(instance)
 
@@ -289,13 +302,20 @@ class DynamicClassAttribute:
         self.fdel(instance)
 
     def getter(self, fget):
-        return type(self)(fget, self.fset, self.fdel, self.__doc__)
+        fdoc = fget.__doc__ if self.overwrite_doc else None
+        result = type(self)(fget, self.fset, self.fdel, fdoc or self.__doc__)
+        result.overwrite_doc = self.overwrite_doc
+        return result
 
     def setter(self, fset):
-        return type(self)(self.fget, fset, self.fdel, self.__doc__)
+        result = type(self)(self.fget, fset, self.fdel, self.__doc__)
+        result.overwrite_doc = self.overwrite_doc
+        return result
 
     def deleter(self, fdel):
-        return type(self)(self.fget, self.fset, fdel, self.__doc__)
+        result = type(self)(self.fget, self.fset, fdel, self.__doc__)
+        result.overwrite_doc = self.overwrite_doc
+        return result
 
 
 def coroutine(func):
@@ -489,6 +509,19 @@ def _cell_factory():
         return a
 
     return f.__closure__[0]
+
+
+def __getattr__(name):
+    # CPython 3.13 exposes CapsuleType lazily (its types.py pulls the type
+    # from `_socket.CAPI`); WeavePy sources it from `_datetime.datetime_CAPI`.
+    if name == 'CapsuleType':
+        import _datetime
+
+        return type(_datetime.datetime_CAPI)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+__all__ += ['CapsuleType']
 
 
 # Cleanup helper names so the module's public surface stays clean.
