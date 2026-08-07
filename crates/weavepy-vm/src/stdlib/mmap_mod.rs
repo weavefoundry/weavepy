@@ -33,12 +33,16 @@ pub const ACCESS_READ: i64 = 1;
 pub const ACCESS_WRITE: i64 = 2;
 pub const ACCESS_COPY: i64 = 3;
 
+/// Only the no-`mremap()` resize fallback raises SystemError; Linux
+/// resizes in place.
+#[cfg(not(target_os = "linux"))]
 fn system_error(message: &str) -> RuntimeError {
     RuntimeError::PyException(PyException::from_builtin("SystemError", message))
 }
 
 /// `OSError` from the thread's current `errno`, with CPython's PEP 3151
 /// subclass mapping (EACCES → `PermissionError`, …).
+#[cfg(unix)]
 fn errno_error() -> RuntimeError {
     io_error_to_py(&std::io::Error::last_os_error())
 }
@@ -339,6 +343,8 @@ struct MmapState {
     /// File offset the mapping starts at (repr / resize / size).
     offset: i64,
     /// The dup'ed file descriptor (`-1` for anonymous or `trackfd=False`).
+    /// Only the unix `size`/`resize` paths read it back.
+    #[cfg_attr(windows, allow(dead_code))]
     fd: i32,
     /// The `mmap(2)` flags actually used (only the Linux `resize` path
     /// consults it, for the shared-anonymous-grow guard).

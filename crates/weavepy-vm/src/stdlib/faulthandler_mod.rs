@@ -33,6 +33,7 @@
 //! peer's Python stack exactly like CPython walks its `PyThreadState`
 //! list.
 
+#[cfg(unix)]
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -898,6 +899,10 @@ fn fh_register(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, R
         .map(Object::is_truthy)
         .unwrap_or(false);
     let fd = resolve_fd(interp, file)?;
+    // Windows has no user-signal registration; the arguments are still
+    // validated above, exactly like CPython's stub.
+    #[cfg(not(unix))]
+    let _ = (signum, all_threads, chain, fd);
     #[cfg(unix)]
     {
         ensure_altstack();
@@ -931,6 +936,8 @@ fn fh_register(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, R
 
 fn fh_unregister(args: &[Object]) -> Result<Object, RuntimeError> {
     let signum = signum_arg(args.first())?;
+    #[cfg(not(unix))]
+    let _ = signum;
     #[cfg(unix)]
     {
         let mut guard = USER_SIGNALS.lock().unwrap();

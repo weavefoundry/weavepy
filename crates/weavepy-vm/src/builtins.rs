@@ -6736,8 +6736,9 @@ pub(crate) fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
         // PyFile detaches the fd on close instead of running `close(2)`.
         let f = unsafe { std::fs::File::from_raw_fd(fd) };
         let file = PyFile::new(fd.to_string(), mode, FileBackend::Disk(f));
-        // `st_blksize` is i32 on macOS and i64 on Linux.
-        #[allow(clippy::unnecessary_cast)]
+        // `st_blksize` is i32 on macOS and i64 on Linux, so the widening
+        // conversion is a no-op there (useless_conversion fires per-target).
+        #[allow(clippy::useless_conversion)]
         if st.st_blksize > 1 {
             file.blksize.set(i64::from(st.st_blksize));
         }

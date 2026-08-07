@@ -631,11 +631,15 @@ struct TmFields {
     tm_wday: i32,
     tm_yday: i32,
     tm_isdst: i32,
+    /// Only the unix `strftime`/`mktime` paths read these back.
+    #[cfg_attr(windows, allow(dead_code))]
     zone: Option<String>,
+    #[cfg_attr(windows, allow(dead_code))]
     gmtoff: Option<i64>,
 }
 
 impl TmFields {
+    #[cfg_attr(windows, allow(dead_code))]
     fn tm_year(&self) -> i32 {
         (self.year - 1900) as i32
     }

@@ -548,7 +548,9 @@ fn gaierror_class() -> Rc<TypeObject> {
 
 /// Build a raised `socket.gaierror(code, msg)` the way CPython's
 /// `set_gaierror` does: `args = (code, msg)` with `errno`/`strerror`
-/// populated so `str(e)` renders `[Errno code] msg`.
+/// populated so `str(e)` renders `[Errno code] msg`. Only the unix
+/// `getaddrinfo` path raises it.
+#[cfg(unix)]
 fn gaierror(code: i32, msg: String) -> crate::error::RuntimeError {
     let exc = crate::builtin_types::make_exception_with_class(gaierror_class(), &msg);
     if let Object::Instance(inst) = &exc {
