@@ -115,14 +115,20 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("check_hash_based_pycs")),
             Object::from_static("default"),
         );
-        // RFC 0048 — the CPython-test-only override knobs the verbatim
-        // `test.support.import_helper` calls at module scope. WeavePy's
-        // frozen modules are always available (there is no `-X frozen_modules`
-        // toggle), so the override is accepted and ignored; the
+        // RFC 0057 WS3 — the CPython-test-only override knob
+        // `test.support.import_helper.frozen_modules()` drives
+        // (`1` force-enabled / `-1` force-disabled / `0` reset). WeavePy's
+        // frozen stdlib has no on-disk twin to fall back to, so — unlike
+        // CPython, where only the bootstrap modules are exempt — the
+        // override affects only the frozen *test* modules (`__hello__`,
+        // `__phello__…`; see `ModuleCache::frozen_source`). The
         // multi-interp-extensions check reports the "allow" default.
         d.insert(
             DictKey(Object::from_static("_override_frozen_modules_for_tests")),
-            builtin("_override_frozen_modules_for_tests", |_| Ok(Object::None)),
+            builtin(
+                "_override_frozen_modules_for_tests",
+                imp_override_frozen_modules_for_tests,
+            ),
         );
         d.insert(
             DictKey(Object::from_static(
@@ -229,17 +235,28 @@ fn imp_exec_dynamic(_args: &[Object]) -> Result<Object, RuntimeError> {
 fn extract_spec(spec: &Object) -> Result<(String, String), RuntimeError> {
     match spec {
         Object::Instance(inst) => {
-            let dict = inst.dict.borrow();
-            let name = dict
-                .get(&DictKey(Object::from_static("name")))
-                .cloned()
-                .or_else(|| dict.get(&DictKey(Object::from_static("__name__"))).cloned())
-                .unwrap_or(Object::None);
-            let origin = dict
-                .get(&DictKey(Object::from_static("origin")))
-                .cloned()
-                .or_else(|| dict.get(&DictKey(Object::from_static("__file__"))).cloned())
-                .unwrap_or(Object::None);
+            // Instance dict first, then the class namespace — the specs
+            // test_import.test_create_dynamic_null builds carry `name` /
+            // `origin` as plain class attributes.
+            let lookup = |keys: &[&'static str]| -> Object {
+                let dict = inst.dict.borrow();
+                for k in keys {
+                    if let Some(v) = dict.get(&DictKey(Object::from_static(k))) {
+                        return v.clone();
+                    }
+                }
+                drop(dict);
+                let cls = inst.cls();
+                let class_dict = cls.dict.borrow();
+                for k in keys {
+                    if let Some(v) = class_dict.get(&DictKey(Object::from_static(k))) {
+                        return v.clone();
+                    }
+                }
+                Object::None
+            };
+            let name = lookup(&["name", "__name__"]);
+            let origin = lookup(&["origin", "__file__"]);
             let n = match name {
                 Object::Str(s) => s.to_string(),
                 _ => return Err(crate::error::type_error("spec.name must be a string")),
@@ -248,10 +265,38 @@ fn extract_spec(spec: &Object) -> Result<(String, String), RuntimeError> {
                 Object::Str(s) => s.to_string(),
                 _ => String::new(),
             };
+            // CPython converts both through `PyUnicode_FSConverter` /
+            // argument clinic, which rejects embedded NULs
+            // (test_import.test_create_dynamic_null).
+            if n.contains('\0') || p.contains('\0') {
+                return Err(crate::error::value_error("embedded null character"));
+            }
             Ok((n, p))
         }
         _ => Err(crate::error::type_error("expected a ModuleSpec instance")),
     }
+}
+
+/// `_imp._override_frozen_modules_for_tests(n)` — record the override
+/// on the interpreter's module cache so subsequent frozen lookups
+/// honour it. Returns `None`, like CPython.
+fn imp_override_frozen_modules_for_tests(args: &[Object]) -> Result<Object, RuntimeError> {
+    let value = match args.first() {
+        Some(Object::Int(i)) => *i,
+        Some(Object::Bool(b)) => i64::from(*b),
+        _ => {
+            return Err(crate::error::type_error(
+                "_override_frozen_modules_for_tests() requires an int",
+            ))
+        }
+    };
+    if let Some(interp_ptr) = crate::vm_singletons::current_interpreter_ptr() {
+        let interp = unsafe { &*interp_ptr };
+        interp
+            .module_cache()
+            .set_frozen_tests_override(value.clamp(-1, 1) as i32);
+    }
+    Ok(Object::None)
 }
 
 fn imp_is_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -307,9 +352,23 @@ fn imp_is_frozen_package(args: &[Object]) -> Result<Object, RuntimeError> {
     ))
 }
 
-fn imp_get_frozen_object(_args: &[Object]) -> Result<Object, RuntimeError> {
-    // We don't pre-compile frozen modules into code objects; the
-    // FrozenImporter falls back to source.
+fn imp_get_frozen_object(args: &[Object]) -> Result<Object, RuntimeError> {
+    // With an explicit `data` payload CPython unmarshals it into a code
+    // object; WeavePy freezes *source* (no marshal format), so any
+    // payload is "invalid" — the wording test_import.test_issue105979
+    // asserts. Without data we don't pre-compile frozen modules into
+    // code objects; the FrozenImporter falls back to source.
+    if let Some(data) = args.get(1) {
+        if !matches!(data, Object::None) {
+            let name = match args.first() {
+                Some(Object::Str(s)) => s.to_string(),
+                _ => "?".to_owned(),
+            };
+            return Err(import_error(format!(
+                "Frozen object named '{name}' is invalid"
+            )));
+        }
+    }
     Ok(Object::None)
 }
 

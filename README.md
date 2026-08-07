@@ -133,6 +133,29 @@ work.
 > `test_plistlib`/`test_xml_etree*`), `test_htmlparser`,
 > `test_unittest`/`test_doctest`/`test_warnings`, and
 > `test_compileall`.
+>
+> `RFC 0057` is the **long-tail wave**: the measured whole-suite
+> baseline moves from 418 to **496 of 543 `Lib/test` files passing**
+> (+78 net flips, zero timeout rows, `unexpected 0`), with the
+> ecosystem lane still 27/27 offline. The wave lands the
+> comprehension-scope root-cause fix (the
+> `test_listcomps`/`test_dictcomps`/`test_setcomps`/
+> `test_named_expressions` quartet flips), exception `args` as a real
+> slot, the slot-descriptor error taxonomy, `compile()` from AST with
+> the `PyCF_*` flags (`test_ast` residual: 169F/80E → **1F**), frozen
+> module specs + `AppleFrameworkLoader` (`test_import`/`test_types`
+> now run end-to-end), a `_decimal` that passes the decTest corpus
+> (`test_decimal` is a measured pass row), pickle protocol 5 with
+> out-of-band `PickleBuffer` round-trips (`test_pickle`/
+> `test_picklebuffer`/`test_pickletools` all pass), CPython-faithful
+> pattern-match codegen + jump threading for trace-event exactness,
+> and the retirement of every `timeout` row (`test_deque`/`test_mmap`/
+> `test_weakref` pass under measured budgets). The re-baseline itself
+> caught two engine bugs: a greedy TLS shutdown drain that could eat
+> post-`close_notify` plaintext under load (intermittent `test_ssl`
+> STARTTLS deadlock), and a `datetime_CAPI` stand-in shadowing the
+> real capsule (segfaulting any extension doing `PyDateTime_IMPORT`,
+> e.g. orjson) — both fixed and re-measured.
 
 ## Repository layout
 

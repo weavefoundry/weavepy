@@ -25,6 +25,23 @@ def constructor(object):
 
 _safe_constructors = {}
 
+# Example: provide pickling support for complex numbers.
+
+
+def pickle_complex(c):
+    return complex, (c.real, c.imag)
+
+
+pickle(complex, pickle_complex, complex)
+
+
+def pickle_union(obj):
+    import functools, operator
+    return functools.reduce, (operator.or_, obj.__args__)
+
+
+pickle(type(int | str), pickle_union)
+
 
 def _reconstructor(cls, base, state):
     if base is object:

@@ -541,6 +541,22 @@ pub unsafe extern "C" fn PyCapsule_Import(
             unsafe { crate::object::Py_DecRef(object_ptr) };
             return ptr::null_mut();
         }
+        if !is_capsule(next) {
+            // The attribute resolved but to a non-capsule. RFC 0057:
+            // `_datetime.py` publishes a Python-level `datetime_CAPI`
+            // stand-in (so `types.CapsuleType` and `test_types`' module-
+            // scope import work without the C bridge). A downstream C
+            // extension doing `PyDateTime_IMPORT` must win over the
+            // stand-in — mint the real capsule and overwrite the module
+            // attribute, otherwise `PyCapsule_GetPointer` below returns
+            // NULL and the extension (orjson, numpy, ...) dereferences it.
+            if let Some(c) = try_install_well_known_capsule(&dotted, object_ptr) {
+                unsafe { crate::object::Py_DecRef(next) };
+                unsafe { crate::object::Py_DecRef(object_ptr) };
+                object_ptr = c;
+                continue;
+            }
+        }
         unsafe { crate::object::Py_DecRef(object_ptr) };
         object_ptr = next;
     }

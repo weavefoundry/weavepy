@@ -105,8 +105,8 @@ fn last_termios_error() -> RuntimeError {
         .to_owned();
     let inst = make_exception_with_class(error_class(), strerror.clone());
     if let Object::Instance(i) = &inst {
-        i.dict.borrow_mut().insert(
-            DictKey(Object::from_static("args")),
+        i.slot_set(
+            "args",
             Object::new_tuple(vec![
                 Object::Int(i64::from(errno)),
                 Object::from_str(strerror),

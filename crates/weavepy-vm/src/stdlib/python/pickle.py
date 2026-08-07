@@ -50,7 +50,15 @@ except ImportError:
     class PickleBuffer:
         """Wrapper for a buffer exposing the PEP 574 picklebuffer protocol."""
 
-        __slots__ = ("_view",)
+        # CPython's C PickleBuffer is weakref-able (tp_weaklistoffset set;
+        # test_picklebuffer.test_cycle takes a weakref).
+        __slots__ = ("_view", "__weakref__")
+
+        # CPython's `PickleBuffer.bf_getbuffer` forwards the request to
+        # the wrapped object, so `memoryview(PickleBuffer(b)).obj is b`.
+        # This marker tells the VM's PEP 688 path to keep the inner
+        # view's exporter instead of substituting the PickleBuffer.
+        __buffer_delegates_exporter__ = True
 
         def __init__(self, buffer):
             self._view = memoryview(buffer)

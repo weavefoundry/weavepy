@@ -925,8 +925,8 @@ impl Builder {
     }
 
     fn visit_pattern(&mut self, p: &past::Pattern) {
-        use past::Pattern as P;
-        match p {
+        use past::PatternKind as P;
+        match &p.kind {
             P::Value(e) => self.visit_expr(e),
             P::Singleton(_) => {}
             P::Capture(Some(n)) => self.add_def(n, DEF_LOCAL),

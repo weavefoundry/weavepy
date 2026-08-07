@@ -96,6 +96,25 @@ pub fn prefix() -> Option<&'static Path> {
 /// carry, or `None` when the tree is unavailable. The path is
 /// guaranteed to exist and hold exactly the embedded source.
 pub fn module_path(name: &str, is_package: bool) -> Option<PathBuf> {
+    // RFC 0057 WS3 — the frozen *test* modules keep their `<frozen …>`
+    // pseudo-filename even though the tree carries their sources. In
+    // CPython they import with `origin='frozen'` and
+    // `loader is FrozenImporter` (`test_frozen` asserts the loader
+    // identity); a real path here would re-label them as
+    // SourceFileLoader modules via `_weave_spec`'s taxonomy.
+    if crate::import::is_test_frozen_name(name) {
+        return None;
+    }
+    let dir = stdlib_dir()?;
+    Some(dir.join(rel_path(name, is_package)))
+}
+
+/// The tree projection of a frozen test module's source, bypassing the
+/// `module_path` pseudo-filename exception. This is the disk copy the
+/// loader falls back to when `_imp._override_frozen_modules_for_tests`
+/// disables the frozen import (CPython finds the same files in its
+/// on-`sys.path` stdlib directory).
+pub fn test_frozen_disk_path(name: &str, is_package: bool) -> Option<PathBuf> {
     let dir = stdlib_dir()?;
     Some(dir.join(rel_path(name, is_package)))
 }

@@ -335,10 +335,18 @@ pub struct MatchCase {
     pub span: Span,
 }
 
-/// A pattern in a `case` clause. Each variant corresponds 1:1 to a
-/// CPython `match_*` AST node so `ast.dump` output lines up.
+/// A pattern in a `case` clause: variant plus source span (CPython
+/// `pattern` nodes carry positions like every other AST node).
 #[derive(Debug, Clone, PartialEq)]
-pub enum Pattern {
+pub struct Pattern {
+    pub kind: PatternKind,
+    pub span: Span,
+}
+
+/// Pattern variants. Each corresponds 1:1 to a CPython `Match*` AST
+/// node so `ast.dump` output lines up.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PatternKind {
     /// Literal value patterns: `0`, `"x"`, `Color.RED`. The `Expr`
     /// must be a constant or a dotted attribute chain.
     Value(Expr),
@@ -396,6 +404,8 @@ pub struct WithItem {
 pub struct Alias {
     pub name: String,
     pub asname: Option<String>,
+    /// Covers `name [as asname]` (CPython `alias` nodes carry positions).
+    pub span: Span,
 }
 
 // ---------- function arguments ----------
@@ -592,6 +602,9 @@ pub struct Keyword {
     /// `None` represents `**kwargs` splat.
     pub arg: Option<String>,
     pub value: Expr,
+    /// Covers `name=value` / `**value` (CPython `keyword` nodes carry
+    /// positions since 3.9).
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -630,6 +643,10 @@ pub enum Constant {
     WStr(Vec<u32>),
     Bytes(Vec<u8>),
     Tuple(Vec<Constant>),
+    /// `frozenset` constant. Never produced by the parser (there is no
+    /// frozenset literal); appears only when `compile()` lowers a
+    /// caller-built `ast.Constant(frozenset(...))` node.
+    FrozenSet(Vec<Constant>),
     Ellipsis,
 }
 
@@ -1197,18 +1214,18 @@ fn dump_stmt(out: &mut String, s: &Stmt, depth: usize) {
 }
 
 fn dump_pattern(out: &mut String, p: &Pattern, depth: usize) {
-    match p {
-        Pattern::Value(e) => {
+    match &p.kind {
+        PatternKind::Value(e) => {
             out.push_str("MatchValue(value=");
             dump_expr(out, e, depth);
             out.push(')');
         }
-        Pattern::Singleton(c) => {
+        PatternKind::Singleton(c) => {
             out.push_str("MatchSingleton(value=");
             dump_constant(out, c);
             out.push(')');
         }
-        Pattern::Capture(name) => match name {
+        PatternKind::Capture(name) => match name {
             Some(n) => {
                 out.push_str("MatchAs(pattern=None, name='");
                 out.push_str(n);
@@ -1216,7 +1233,7 @@ fn dump_pattern(out: &mut String, p: &Pattern, depth: usize) {
             }
             None => out.push_str("MatchAs(pattern=None, name=None)"),
         },
-        Pattern::Sequence(items) => {
+        PatternKind::Sequence(items) => {
             out.push_str("MatchSequence(patterns=[");
             for (i, x) in items.iter().enumerate() {
                 if i > 0 {
@@ -1226,7 +1243,7 @@ fn dump_pattern(out: &mut String, p: &Pattern, depth: usize) {
             }
             out.push_str("])");
         }
-        Pattern::Star(name) => match name {
+        PatternKind::Star(name) => match name {
             Some(n) => {
                 out.push_str("MatchStar(name='");
                 out.push_str(n);
@@ -1234,7 +1251,7 @@ fn dump_pattern(out: &mut String, p: &Pattern, depth: usize) {
             }
             None => out.push_str("MatchStar(name=None)"),
         },
-        Pattern::Mapping {
+        PatternKind::Mapping {
             keys,
             patterns,
             rest,
@@ -1265,7 +1282,7 @@ fn dump_pattern(out: &mut String, p: &Pattern, depth: usize) {
             }
             out.push(')');
         }
-        Pattern::Class {
+        PatternKind::Class {
             cls,
             positionals,
             keywords,
@@ -1297,7 +1314,7 @@ fn dump_pattern(out: &mut String, p: &Pattern, depth: usize) {
             }
             out.push_str("])");
         }
-        Pattern::Or(items) => {
+        PatternKind::Or(items) => {
             out.push_str("MatchOr(patterns=[");
             for (i, x) in items.iter().enumerate() {
                 if i > 0 {
@@ -1307,7 +1324,7 @@ fn dump_pattern(out: &mut String, p: &Pattern, depth: usize) {
             }
             out.push_str("])");
         }
-        Pattern::As { pattern, name } => {
+        PatternKind::As { pattern, name } => {
             out.push_str("MatchAs(pattern=");
             dump_pattern(out, pattern, depth);
             out.push_str(", name='");
@@ -1790,6 +1807,20 @@ fn dump_constant(out: &mut String, c: &Constant) {
                 out.push(',');
             }
             out.push(')');
+        }
+        Constant::FrozenSet(items) => {
+            if items.is_empty() {
+                out.push_str("frozenset()");
+            } else {
+                out.push_str("frozenset({");
+                for (i, x) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    dump_constant(out, x);
+                }
+                out.push_str("})");
+            }
         }
         Constant::Ellipsis => out.push_str("Ellipsis"),
     }

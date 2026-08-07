@@ -410,6 +410,13 @@ fn is_descriptor_object(o: &Object) -> bool {
 /// Construct the backing in-memory `PyFile` for a `BytesIO`, reading the
 /// optional initial buffer from positionals/`initial_bytes=`.
 fn bytesio_file(args: &[Object], kwargs: &[(String, Object)]) -> Result<Rc<PyFile>, RuntimeError> {
+    // `initial_bytes` is the only keyword `BytesIO(...)` accepts
+    // (test_memoryio.test_issue5449: `BytesIO(buf, foo=None)` → TypeError).
+    if let Some((k, _)) = kwargs.iter().find(|(k, _)| k != "initial_bytes") {
+        return Err(type_error(format!(
+            "'{k}' is an invalid keyword argument for BytesIO()"
+        )));
+    }
     let initial = args
         .get(1)
         .cloned()
@@ -422,7 +429,10 @@ fn bytesio_file(args: &[Object], kwargs: &[(String, Object)]) -> Result<Rc<PyFil
         // init treats as no data) — `test_tarfile`'s filter helper relies on
         // `io.BytesIO(None)`.
         Some(Object::None) | None => Vec::new(),
-        Some(o) => o.as_bytes_view().ok_or_else(|| {
+        // Anything else goes through the full buffer protocol —
+        // `array.array` and PEP 688 `__buffer__` exporters are accepted
+        // (test_memoryio.test_bytes_array).
+        Some(o) => crate::builtins::bytes_argview(&o).map_err(|_| {
             type_error(format!(
                 "a bytes-like object is required, not '{}'",
                 o.type_name()
@@ -487,6 +497,15 @@ fn stringio_translate(data: String, newline: Option<&str>) -> String {
 }
 
 fn stringio_file(args: &[Object], kwargs: &[(String, Object)]) -> Result<Rc<PyFile>, RuntimeError> {
+    // Keyword surface mirrors CPython's `StringIO(initial_value, newline)`.
+    if let Some((k, _)) = kwargs
+        .iter()
+        .find(|(k, _)| k != "initial_value" && k != "newline")
+    {
+        return Err(type_error(format!(
+            "'{k}' is an invalid keyword argument for StringIO()"
+        )));
+    }
     let newline = stringio_newline_arg(args, kwargs)?;
     let initial = args
         .get(1)
@@ -657,6 +676,12 @@ fn fileio_new(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
             f.closefd.set(closefd);
             // `io.FileIO` is the raw, unbuffered layer (a `RawIOBase`).
             f.set_io_kind(crate::object::IoKind::Raw);
+            // A subclass instance repr()s with its own class name (CPython
+            // prints `Py_TYPE(self)->tp_name`; test_fileio
+            // `test_subclass_repr`).
+            if !cls.flags.is_builtin {
+                *f.repr_class.borrow_mut() = Some(cls.name.clone());
+            }
             Ok(wrap_memory_stream(&cls, f))
         }
         other => Ok(other),
@@ -740,22 +765,58 @@ fn fileio_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, R
             "Cannot use closefd=False with file name",
         ));
     }
-    let raw = fileio_open_raw(&file, &binmode, opener.as_ref())?;
-    let new_pf = match raw {
-        Object::File(nf) => nf,
-        _ => return Err(type_error("FileIO.__init__(): could not open file")),
+    // `__new__` already opened this very descriptor for a subclass
+    // construction (`TestSubclass(fd)`): `__init__` runs right after with the
+    // same fd. Re-opening would adopt the fd a second time and the re-init
+    // would close it from under the fresh backend — skip the reopen and just
+    // apply the ownership flag.
+    let same_fd = match &file {
+        Object::Int(n) => f.fileno() == Some(*n) && !f.is_closed(),
+        Object::Bool(b) => f.fileno() == Some(i64::from(*b)) && !f.is_closed(),
+        _ => false,
     };
-    // Steal the freshly-opened descriptor out of the temporary `PyFile` (so its
-    // drop won't close the fd) and move it into the existing instance.
-    let new_backend = std::mem::replace(
-        &mut *new_pf.backend.borrow_mut(),
-        crate::object::FileBackend::MemBytes {
-            data: Rc::new(RefCell::new(Vec::new())),
-            pos: 0,
-        },
-    );
-    f.reinit_fileio(new_backend, closefd);
+    if !same_fd {
+        let raw = fileio_open_raw(&file, &binmode, opener.as_ref())?;
+        let new_pf = match raw {
+            Object::File(nf) => nf,
+            _ => return Err(type_error("FileIO.__init__(): could not open file")),
+        };
+        // Steal the freshly-opened descriptor out of the temporary `PyFile`
+        // (so its drop won't close the fd) and move it into the existing
+        // instance.
+        let new_backend = std::mem::replace(
+            &mut *new_pf.backend.borrow_mut(),
+            crate::object::FileBackend::MemBytes {
+                data: Rc::new(RefCell::new(Vec::new())),
+                pos: 0,
+            },
+        );
+        f.reinit_fileio(new_backend, closefd);
+    } else {
+        f.closefd.set(closefd);
+    }
     f.set_io_kind(crate::object::IoKind::Raw);
+    // CPython's `_io_FileIO___init___impl` finishes with
+    // `PyObject_SetAttr(self, 'name', nameobj)` — a *virtual* assignment, so
+    // a subclass `__setattr__` runs and may veto the construction. On
+    // failure a caller-owned descriptor (the fd form) must NOT be closed
+    // (test_fileio `testUnclosedFDOnException`); a path-opened fd is ours and
+    // is released. Only subclass instances need the dispatch — the base
+    // `Object::File` serves `name` natively.
+    if let Some(self_obj @ Object::Instance(_)) = args.first() {
+        let ptr = crate::vm_singletons::current_interpreter_ptr()
+            .ok_or_else(|| crate::error::runtime_error("FileIO: no running interpreter"))?;
+        // SAFETY: published by an enclosing VM frame on this thread.
+        let interp = unsafe { &mut *ptr };
+        if let Err(e) = interp.store_attr_public(self_obj, "name", file.clone()) {
+            let fd_form = matches!(file, Object::Int(_) | Object::Bool(_));
+            if fd_form {
+                f.closefd.set(false);
+            }
+            f.close();
+            return Err(e);
+        }
+    }
     Ok(Object::None)
 }
 
@@ -766,10 +827,61 @@ fn fileio_open_flags(mode: &str) -> i64 {
     crate::stdlib::os::open_flags_for_mode(mode)
 }
 
+/// `FileIO.__enter__` — return self after CPython's closed check (a closed
+/// raw file refuses to enter a `with` block).
+fn fileio_enter(args: &[Object]) -> Result<Object, RuntimeError> {
+    let f = crate::builtins::file_self(args)?;
+    crate::builtins::file_check_open(&f)?;
+    args.first()
+        .cloned()
+        .ok_or_else(|| type_error("expected stream receiver"))
+}
+
 /// Install `FileIO.__new__` so `io.FileIO(name|fd, mode, closefd, opener)` is
 /// constructible (CPython's raw file). Done once, on the shared type.
+///
+/// The native method suite is installed alongside (CPython's `FileIO` defines
+/// its own `close`/`read`/`seek`/… rather than inheriting the `IOBase`
+/// mixins). Without them a *subclass* instance resolved `close` to
+/// `IOBase.close`, which only flips the mixin's closed flag — the real
+/// descriptor stayed open (`with TestSubclass(fn): ...` leaked the fd).
 fn install_fileio_ctor(ty: &Rc<crate::types::TypeObject>) {
     use crate::object::MethodWrapper;
+    {
+        let mut dict = ty.dict.borrow_mut();
+        let mut method = |n: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>| {
+            dict.insert(
+                DictKey(Object::from_static(n)),
+                Object::Builtin(Rc::new(BuiltinFn {
+                    name: n,
+                    binds_instance: true,
+                    call: Box::new(body),
+                    call_kw: None,
+                })),
+            );
+        };
+        method("read", crate::builtins::file_read);
+        method("readall", crate::builtins::file_readall);
+        method("readline", crate::builtins::file_readline);
+        method("readlines", crate::builtins::file_readlines);
+        method("readinto", crate::builtins::file_readinto);
+        method("write", crate::builtins::file_write);
+        method("writelines", crate::builtins::file_writelines);
+        method("seek", crate::builtins::file_seek);
+        method("tell", crate::builtins::file_tell);
+        method("truncate", crate::builtins::file_truncate);
+        method("flush", crate::builtins::file_flush);
+        method("close", crate::builtins::file_close);
+        method("readable", crate::builtins::file_readable);
+        method("writable", crate::builtins::file_writable);
+        method("seekable", crate::builtins::file_seekable);
+        method("isatty", crate::builtins::file_isatty);
+        method("fileno", crate::builtins::file_fileno);
+        method("__next__", crate::builtins::file_next);
+        method("__iter__", mem_return_self);
+        method("__enter__", fileio_enter);
+        method("__exit__", crate::builtins::file_exit);
+    }
     ty.dict.borrow_mut().insert(
         DictKey(Object::from_static("__new__")),
         Object::StaticMethod(MethodWrapper::new(Object::Builtin(Rc::new(BuiltinFn {
@@ -816,7 +928,10 @@ fn bytesio_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
         Some(o) => o,
     };
     let is_bytes_like = matches!(initial, Object::Bytes(_) | Object::ByteArray(_))
-        || initial.as_bytes_view().is_some();
+        || initial.as_bytes_view().is_some()
+        // PEP 688 `__buffer__` exporters (`array.array`, …) are bytes-like;
+        // the `file_write` below extracts the actual bytes.
+        || crate::instance_method(&initial, "__buffer__").is_some();
     if !is_bytes_like {
         return Err(type_error(format!(
             "a bytes-like object is required, not '{}'",
@@ -827,6 +942,16 @@ fn bytesio_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
         .first()
         .cloned()
         .ok_or_else(|| type_error("BytesIO.__init__ requires a stream"))?;
+    // Re-`__init__` resets the stream before writing the new value
+    // (CPython `bytesio_init` zeroes `string_size`/`pos` first;
+    // test_memoryio.test_init re-inits a filled stream).
+    if let Ok(f) = crate::builtins::file_self(args) {
+        if let FileBackend::MemBytes { data, pos } = &mut *f.backend.borrow_mut() {
+            crate::object::bytearray_check_resizable(data)?;
+            data.borrow_mut().clear();
+            *pos = 0;
+        }
+    }
     crate::builtins::file_write(&[me.clone(), initial])?;
     crate::builtins::file_seek(&[me, Object::Int(0)])?;
     Ok(Object::None)
@@ -859,6 +984,13 @@ fn stringio_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object,
         .first()
         .cloned()
         .ok_or_else(|| type_error("StringIO.__init__ requires a stream"))?;
+    // Same reset-then-fill discipline as `bytesio_init`.
+    if let Ok(f) = crate::builtins::file_self(args) {
+        if let FileBackend::MemText { data, pos } = &mut *f.backend.borrow_mut() {
+            data.clear();
+            *pos = 0;
+        }
+    }
     crate::builtins::file_write(&[me.clone(), initial])?;
     crate::builtins::file_seek(&[me, Object::Int(0)])?;
     Ok(Object::None)
@@ -2274,6 +2406,25 @@ fn iobase_del(args: &[Object]) -> Result<Object, RuntimeError> {
     if closed {
         return Ok(Object::None);
     }
+    // CPython's `fileio_dealloc_warn`: an OS-backed file that reaches
+    // finalization still open emits `ResourceWarning("unclosed file %R")`
+    // *before* the close runs (test_io `test_destructor` asserts the warning
+    // even though `__del__` then closes cleanly). Only descriptor-owning
+    // streams warn — in-memory buffers and `closefd=False` wrappers don't.
+    if let Ok(f) = crate::builtins::file_self(args) {
+        if !f.is_closed()
+            && f.closefd.get()
+            && matches!(&*f.backend.borrow(), crate::object::FileBackend::Disk(_))
+        {
+            if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                // SAFETY: published by the enclosing VM frame on this thread.
+                let interp = unsafe { &mut *ptr };
+                let addr = Rc::as_ptr(&f) as usize;
+                let repr = f.repr_with_addr(addr);
+                let _ = interp.warn_resource_with_source(format!("unclosed file {repr}"), None);
+            }
+        }
+    }
     py_call(&me, "close", &[])?;
     Ok(Object::None)
 }
@@ -2518,16 +2669,9 @@ fn chain_cause(primary: RuntimeError, cause: RuntimeError) -> RuntimeError {
     match (primary, cause) {
         (RuntimeError::PyException(mut p), RuntimeError::PyException(c)) => {
             if let Object::Instance(inst) = &p.instance {
-                let mut dict = inst.dict.borrow_mut();
-                dict.insert(
-                    DictKey(Object::from_static("__cause__")),
-                    c.instance.clone(),
-                );
+                inst.slot_set("__cause__", c.instance.clone());
                 // Explicit cause suppresses implicit `__context__` rendering.
-                dict.insert(
-                    DictKey(Object::from_static("__suppress_context__")),
-                    Object::Bool(true),
-                );
+                inst.slot_set("__suppress_context__", Object::Bool(true));
             }
             p.cause = Some(Box::new(c));
             RuntimeError::PyException(p)
@@ -4718,12 +4862,11 @@ fn is_blocking_io_error(err: &RuntimeError) -> bool {
 fn blocking_errno_strerror(err: &RuntimeError) -> (i32, String) {
     if let RuntimeError::PyException(pe) = err {
         if let Object::Instance(inst) = &pe.instance {
-            let dict = inst.dict.borrow();
-            let errno = dict
-                .get(&DictKey(Object::from_static("errno")))
+            let errno = crate::builtin_types::exc_attr(inst, "errno")
+                .as_ref()
                 .and_then(Object::as_i64)
                 .unwrap_or_else(|| i64::from(eagain())) as i32;
-            let strerror = match dict.get(&DictKey(Object::from_static("strerror"))) {
+            let strerror = match crate::builtin_types::exc_attr(inst, "strerror") {
                 Some(Object::Str(s)) => s.to_string(),
                 _ => "write could not complete without blocking".to_owned(),
             };
@@ -5332,10 +5475,7 @@ fn chain_context(primary: RuntimeError, context: RuntimeError) -> RuntimeError {
         (RuntimeError::PyException(mut p), RuntimeError::PyException(c)) => {
             if p.context.is_none() {
                 if let Object::Instance(inst) = &p.instance {
-                    inst.dict.borrow_mut().insert(
-                        DictKey(Object::from_static("__context__")),
-                        c.instance.clone(),
-                    );
+                    inst.slot_set("__context__", c.instance.clone());
                 }
                 p.context = Some(Box::new(c));
                 p.context_settled = true;

@@ -1662,6 +1662,20 @@ fn subject_to_vec(obj: &Object) -> Result<Vec<u32>, RuntimeError> {
         // CPython's `_sre` accepts any buffer-protocol subject; h11 and
         // urllib3 match patterns against `memoryview` windows.
         Object::MemoryView(mv) => Ok(mv.to_bytes().into_iter().map(u32::from).collect()),
+        // A buffer-protocol exporter: `re.search(b'…', mmap.mmap(…))` scans
+        // the mapping directly in CPython (`test_mmap.test_basic`).
+        Object::Instance(inst) if inst.cls().mro.borrow().iter().any(|t| t.name == "mmap") => {
+            match crate::stdlib::mmap_mod::shared_buffer(inst) {
+                Some(buf) => {
+                    // SAFETY: the region pointer is stable while `buf` (an
+                    // `Arc` to the mapping) is held; GIL-serialised access.
+                    let bytes =
+                        unsafe { std::slice::from_raw_parts(buf.data_ptr(), buf.byte_len()) };
+                    Ok(bytes.iter().map(|&x| u32::from(x)).collect())
+                }
+                None => Err(value_error("mmap closed or invalid")),
+            }
+        }
         // `str`/`bytes` subclass instances (e.g. email's `ValueTerminal(str)`):
         // CPython's `_sre` accepts any `PyUnicode`/buffer, subclasses
         // included. Unwrap the native payload the subclass instance carries.

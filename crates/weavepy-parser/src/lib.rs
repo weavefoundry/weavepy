@@ -21,7 +21,8 @@ pub mod unparse;
 pub use ast::{dump_module, Module};
 pub use error::ParseError;
 pub use parser::{
-    build_lazy_type_alias, lower_type_alias_stmt, set_unicode_name_resolver, UnicodeNameResolution,
+    build_lazy_type_alias, lower_type_alias_stmt, set_int_literal_max_digits,
+    set_unicode_name_resolver, TypeComments, UnicodeNameResolution,
 };
 pub use weavepy_lexer::EscapeWarning;
 
@@ -114,6 +115,23 @@ pub fn parse_eval_with_warnings_flags(
         }
     }
     (result, warnings)
+}
+
+/// Parse with CPython's `func_type_input` start rule — backs
+/// `ast.parse(..., mode='func_type')` (PEP 484 signature type comments).
+/// Returns the argument-type expressions and the return-type expression
+/// of `(t1, t2) -> ret`.
+pub fn parse_func_type(source: &str) -> Result<(Vec<ast::Expr>, ast::Expr), ParseError> {
+    let tokens = weavepy_lexer::tokenize(source).map_err(ParseError::from)?;
+    parser::parse_func_type(source, tokens)
+}
+
+/// Parse with PEP 484 type-comment collection — backs
+/// `ast.parse(..., type_comments=True)`. Returns the module plus the
+/// `# type:` side tables (ignores, per-statement, per-argument).
+pub fn parse_module_type_comments(source: &str) -> Result<(Module, TypeComments), ParseError> {
+    let tokens = weavepy_lexer::tokenize(source).map_err(ParseError::from)?;
+    parser::parse_type_comments(source, tokens)
 }
 
 fn parse_with_warnings(

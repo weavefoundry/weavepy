@@ -585,6 +585,22 @@ fn write_constant(out: &mut String, c: &Constant) -> Option<()> {
             }
             out.push('\'');
         }
+        Constant::FrozenSet(items) => {
+            // CPython `append_ast_constant` reprs the value; frozenset's
+            // repr is `frozenset({…})` (or bare `frozenset()` when empty).
+            if items.is_empty() {
+                out.push_str("frozenset()");
+            } else {
+                out.push_str("frozenset({");
+                for (i, x) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    write_constant(out, x)?;
+                }
+                out.push_str("})");
+            }
+        }
         Constant::Tuple(items) => {
             out.push('(');
             for (i, x) in items.iter().enumerate() {

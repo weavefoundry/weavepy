@@ -326,7 +326,14 @@ impl fmt::Debug for Object {
             Object::SlotDescriptor(sd) => write!(f, "<slot {:?} of {:?}>", sd.name, sd.class_name),
             Object::Frame(fr) => write!(f, "<frame at 0x{:x}>", Rc::as_ptr(fr) as usize),
             Object::Traceback(tb) => write!(f, "<traceback at 0x{:x}>", Rc::as_ptr(tb) as usize),
-            Object::MemoryView(mv) => write!(f, "<memory at 0x{:x}>", Rc::as_ptr(mv) as usize),
+            Object::MemoryView(mv) => {
+                let state = if mv.released.get() {
+                    "released memory"
+                } else {
+                    "memory"
+                };
+                write!(f, "<{state} at 0x{:x}>", Rc::as_ptr(mv) as usize)
+            }
             Object::MappingProxy(d) => {
                 let d = d.borrow();
                 let mut m = f.debug_map();
@@ -495,6 +502,20 @@ impl PyFrame {
         dict
     }
 
+    /// The `locals()` builtin, PEP 667 split: function (optimized)
+    /// scopes return an *independent snapshot* per call — mutating it
+    /// never affects the frame, and later calls return new dicts
+    /// (test_patma_204: `out = locals(); del out["w"]`). Module, class,
+    /// and exec scopes return the live namespace itself, which is what
+    /// the provider hands back for those frames. The identity-stable
+    /// [`Self::locals`] cache stays reserved for `frame.f_locals`.
+    pub fn locals_snapshot(&self) -> Object {
+        match self.locals_provider.borrow().clone() {
+            Some(provider) => provider(),
+            None => self.locals(),
+        }
+    }
+
     /// Refresh the materialised `f_locals` dict *in place*, keeping
     /// its identity stable (PEP 667: a handle obtained earlier
     /// observes later execution of the frame). Frame names are
@@ -582,6 +603,10 @@ pub struct PyTraceback {
     pub frame: Rc<PyFrame>,
     pub lineno: u32,
     pub lasti: u32,
+    /// `types.TracebackType(…)` stores the caller-supplied `tb_lasti`
+    /// verbatim; interpreter-raised tracebacks leave this `None` and map
+    /// the instruction index through `cpython_lasti` on read.
+    pub raw_lasti: Option<i64>,
     pub next: RefCell<Option<Rc<PyTraceback>>>,
 }
 
@@ -820,6 +845,27 @@ pub struct PyMemoryView {
     /// exported by ctypes scalars. Distinguished from an empty stored
     /// `shape`, which means "derive the 1-D layout".
     pub zero_dim: Cell<bool>,
+    /// Cached content hash (CPython `mv->hash`), `-1` when not yet computed.
+    /// Once set, `hash(mv)` keeps answering it even after `release()` —
+    /// "releasing the memoryview keeps the stored hash value (as with
+    /// weakrefs)" (test_memoryview.test_hash).
+    pub hash: Cell<i64>,
+    /// Re-entrancy guard for `memory_hash` (CPython `mv->exports`, gh-142664):
+    /// while the exporter's `__hash__` runs, `release()` must fail with
+    /// BufferError instead of freeing the buffer out from under the hash.
+    pub exports: Cell<u32>,
+    /// PEP 688: the memoryview object a Python-level `__buffer__` returned
+    /// when this view was constructed (`memoryview(obj)` over a class with
+    /// `def __buffer__`). Kept so releasing this view can hand the *same
+    /// object* to the exporter's `__release_buffer__`
+    /// (test_buffer.test_same_buffer_returned asserts identity). `None`
+    /// for views over native buffers.
+    pub release_inner: RefCell<Option<Object>>,
+    /// CPython's `_Py_MEMORYVIEW_RESTRICTED` (PEP 688): set on the view
+    /// passed to `__release_buffer__` — further exports (`memoryview(mv)`,
+    /// `cast`, `toreadonly`, slicing, `__buffer__`) raise ValueError,
+    /// while reads (`tobytes`) and `release` stay legal.
+    pub restricted: Cell<bool>,
 }
 
 impl PyMemoryView {
@@ -837,6 +883,10 @@ impl PyMemoryView {
             strides: RefCell::new(Vec::new()),
             exporter: RefCell::new(None),
             zero_dim: Cell::new(false),
+            hash: Cell::new(-1),
+            exports: Cell::new(0),
+            release_inner: RefCell::new(None),
+            restricted: Cell::new(false),
         }
     }
 
@@ -857,6 +907,10 @@ impl PyMemoryView {
             strides: RefCell::new(Vec::new()),
             exporter: RefCell::new(None),
             zero_dim: Cell::new(false),
+            hash: Cell::new(-1),
+            exports: Cell::new(0),
+            release_inner: RefCell::new(None),
+            restricted: Cell::new(false),
         }
     }
 
@@ -878,6 +932,10 @@ impl PyMemoryView {
             strides: RefCell::new(Vec::new()),
             exporter: RefCell::new(None),
             zero_dim: Cell::new(false),
+            hash: Cell::new(-1),
+            exports: Cell::new(0),
+            release_inner: RefCell::new(None),
+            restricted: Cell::new(false),
         }
     }
 
@@ -905,6 +963,10 @@ impl PyMemoryView {
             strides: RefCell::new(Vec::new()),
             exporter: RefCell::new(None),
             zero_dim: Cell::new(false),
+            hash: Cell::new(-1),
+            exports: Cell::new(0),
+            release_inner: RefCell::new(None),
+            restricted: Cell::new(false),
         }
     }
 
@@ -933,6 +995,25 @@ impl PyMemoryView {
             strides: RefCell::new(self.strides.borrow().clone()),
             exporter: RefCell::new(self.exporter.borrow().clone()),
             zero_dim: Cell::new(self.zero_dim.get()),
+            // A fresh object: the hash cache and re-entrancy guard are
+            // per-view state, not shared with the source.
+            hash: Cell::new(-1),
+            exports: Cell::new(0),
+            release_inner: RefCell::new(None),
+            restricted: Cell::new(false),
+        }
+    }
+
+    /// Whether two views window the same backing buffer (identity, not
+    /// content) — `bytearray.__release_buffer__` validation.
+    pub fn shares_buffer(&self, other: &PyMemoryView) -> bool {
+        match (&self.buffer, &other.buffer) {
+            (MemoryViewBuffer::Bytes(a), MemoryViewBuffer::Bytes(b)) => Rc::ptr_eq(a, b),
+            (MemoryViewBuffer::ByteArray(a), MemoryViewBuffer::ByteArray(b)) => Rc::ptr_eq(a, b),
+            (MemoryViewBuffer::Shared(a), MemoryViewBuffer::Shared(b)) => {
+                std::ptr::addr_eq(Rc::as_ptr(a), Rc::as_ptr(b))
+            }
+            _ => false,
         }
     }
 
@@ -1062,6 +1143,30 @@ impl PyMemoryView {
             self.to_bytes() == bytes
         }
     }
+}
+
+/// Byte offset of character index `ci` in `s`. Positions past the end
+/// extrapolate one byte per character: the StringIO overseek gap is filled
+/// with 1-byte `'\0'`s on the next write, so the mapping stays exact.
+pub(crate) fn memtext_byte_of_char(s: &str, ci: usize) -> usize {
+    let mut count = 0usize;
+    for (b, _) in s.char_indices() {
+        if count == ci {
+            return b;
+        }
+        count += 1;
+    }
+    s.len() + (ci - count)
+}
+
+/// Character index of byte offset `b` in `s` (must sit on a char boundary
+/// when within the string); see [`memtext_byte_of_char`] for the
+/// past-the-end extrapolation.
+fn memtext_char_of_byte(s: &str, b: usize) -> usize {
+    if b >= s.len() {
+        return s.chars().count() + (b - s.len());
+    }
+    s.char_indices().take_while(|(i, _)| *i < b).count()
 }
 
 /// C-contiguous (row-major) byte strides for `shape` at the given itemsize:
@@ -1265,6 +1370,17 @@ pub struct PyProperty {
     pub fset: RefCell<Object>,
     pub fdel: RefCell<Object>,
     pub doc: RefCell<Object>,
+    /// CPython 3.13 `prop_name` (gh-98963): recorded by `__set_name__`
+    /// during class creation and surfaced as `prop.__name__` and in the
+    /// "property 'x' of 'C' object has no getter" error family. `None`
+    /// means *unset* (distinct from an explicit `p.__name__ = None`,
+    /// which stores `Some(Object::None)`).
+    pub name: RefCell<Option<Object>>,
+    /// CPython `getter_doc`: whether `doc` was harvested from the
+    /// getter's `__doc__` (as opposed to passed explicitly). Drives
+    /// `property_copy`: a getter-derived doc is *not* carried over to
+    /// the copy, so the new getter's own docstring wins.
+    pub getter_doc: Cell<bool>,
 }
 
 impl PyProperty {
@@ -1274,6 +1390,8 @@ impl PyProperty {
             fset: RefCell::new(fset),
             fdel: RefCell::new(fdel),
             doc: RefCell::new(doc),
+            name: RefCell::new(None),
+            getter_doc: Cell::new(false),
         }
     }
 
@@ -1297,30 +1415,20 @@ impl PyProperty {
         self.doc.borrow().clone()
     }
 
-    /// CPython `property_init`: replace all four members in place.
+    /// CPython `property_init`: replace all four members in place and
+    /// forget any `__set_name__`-recorded name (re-initialisation makes
+    /// the descriptor anonymous again).
     pub fn reinit(&self, fget: Object, fset: Object, fdel: Object, doc: Object) {
         *self.fget.borrow_mut() = fget;
         *self.fset.borrow_mut() = fset;
         *self.fdel.borrow_mut() = fdel;
         *self.doc.borrow_mut() = doc;
-    }
-
-    /// Return a clone of `self` with the given attribute replaced. Used
-    /// by `property.getter`/`setter`/`deleter` (which CPython models as
-    /// methods that return a *new* property carrying the patched
-    /// callable plus the existing ones).
-    pub fn with(&self, which: PropertyAttr, fn_: Object) -> Self {
-        let next = Self::new(self.fget(), self.fset(), self.fdel(), self.doc());
-        match which {
-            PropertyAttr::Get => *next.fget.borrow_mut() = fn_,
-            PropertyAttr::Set => *next.fset.borrow_mut() = fn_,
-            PropertyAttr::Del => *next.fdel.borrow_mut() = fn_,
-        }
-        next
+        *self.name.borrow_mut() = None;
+        self.getter_doc.set(false);
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PropertyAttr {
     Get,
     Set,
@@ -1337,6 +1445,17 @@ pub struct SlotDescriptor {
     /// error messages (we do not need a hard reference back to the
     /// type for correctness).
     pub class_name: String,
+    /// Value reported when the slot is unset. `__slots__` members have
+    /// none (an unset slot raises `AttributeError`); the exception
+    /// pseudo-slots (`BaseException.args`/`__context__`/`errno`/…)
+    /// mirror CPython's getset/member defaults — `()`, `None`, `False`
+    /// — so a freshly constructed, never-raised instance still answers.
+    pub default: Option<Object>,
+    /// CPython `Py_READONLY` members (`BaseExceptionGroup.message` /
+    /// `.exceptions`): attribute assignment and deletion raise
+    /// `AttributeError("readonly attribute")`; only internal
+    /// `slot_set` writes land.
+    pub readonly: bool,
 }
 
 /// Ordered set backing for [`Object::Set`] and [`Object::FrozenSet`].
@@ -1421,14 +1540,109 @@ impl PyComplex {
 
 /// `range(...)` bounds. `i128` so ranges straddling the `i64` boundary
 /// (`range(sys.maxsize - 5, sys.maxsize + 5)`) still work; elements that
-/// don't fit `i64` materialise as `Object::Long`. (CPython supports
-/// arbitrary ints here; i128 covers every realistic bound while keeping
-/// the in-range iteration fast path allocation-free.)
+/// don't fit `i64` materialise as `Object::Long`. CPython supports
+/// arbitrary ints here; bounds past `i128` (test_range's `2**200` /
+/// `sys.maxsize**10` cases) spill into `big`, keeping the in-range
+/// iteration fast path allocation-free for every realistic range.
 #[derive(Debug, Clone)]
 pub struct Range {
     pub start: i128,
     pub stop: i128,
     pub step: i128,
+    /// Arbitrary-precision `(start, stop, step)` when any bound exceeds
+    /// `i128`. The `i128` mirrors then hold *saturated* values (clamped
+    /// to the `i128` limits) so direction/emptiness checks that only
+    /// compare signs stay truthful; every value-producing operation must
+    /// consult this triple first (via [`Range::bounds`] and friends).
+    pub big: Option<Box<(BigInt, BigInt, BigInt)>>,
+}
+
+impl Range {
+    pub fn new(start: i128, stop: i128, step: i128) -> Self {
+        Self {
+            start,
+            stop,
+            step,
+            big: None,
+        }
+    }
+
+    pub fn from_bigints(start: BigInt, stop: BigInt, step: BigInt) -> Self {
+        use num_traits::ToPrimitive;
+        match (start.to_i128(), stop.to_i128(), step.to_i128()) {
+            (Some(a), Some(b), Some(c)) => Self::new(a, b, c),
+            _ => {
+                let clamp = |b: &BigInt| -> i128 {
+                    b.to_i128()
+                        .unwrap_or(if b.sign() == num_bigint::Sign::Minus {
+                            i128::MIN
+                        } else {
+                            i128::MAX
+                        })
+                };
+                Self {
+                    start: clamp(&start),
+                    stop: clamp(&stop),
+                    step: clamp(&step),
+                    big: Some(Box::new((start, stop, step))),
+                }
+            }
+        }
+    }
+
+    /// The `(start, stop, step)` triple at full precision.
+    pub fn bounds(&self) -> (BigInt, BigInt, BigInt) {
+        match &self.big {
+            Some(b) => (b.0.clone(), b.1.clone(), b.2.clone()),
+            None => (
+                BigInt::from(self.start),
+                BigInt::from(self.stop),
+                BigInt::from(self.step),
+            ),
+        }
+    }
+
+    pub fn start_obj(&self) -> Object {
+        match &self.big {
+            Some(b) => Object::int_from_bigint(b.0.clone()),
+            None => int_from_i128(self.start),
+        }
+    }
+
+    pub fn stop_obj(&self) -> Object {
+        match &self.big {
+            Some(b) => Object::int_from_bigint(b.1.clone()),
+            None => int_from_i128(self.stop),
+        }
+    }
+
+    pub fn step_obj(&self) -> Object {
+        match &self.big {
+            Some(b) => Object::int_from_bigint(b.2.clone()),
+            None => int_from_i128(self.step),
+        }
+    }
+}
+
+/// Full-precision element count of `r` (CPython `compute_range_length`
+/// without the `Py_ssize_t` clamp). The `big`-aware sibling of
+/// [`range_len_i128`]; used wherever a big-bounded range can reach.
+pub(crate) fn range_len_bigint(r: &Range) -> BigInt {
+    let (start, stop, step) = r.bounds();
+    let zero = BigInt::from(0);
+    let span = if step > zero {
+        (stop - &start).max(zero.clone())
+    } else if step < zero {
+        (start - &stop).max(zero.clone())
+    } else {
+        return zero;
+    };
+    if span == zero {
+        return zero;
+    }
+    let step_abs = step.magnitude().clone();
+    let step_abs = BigInt::from(step_abs);
+    (span + &step_abs - 1) / step_abs
 }
 
 /// An int object from an `i128`: machine `Int` when it fits, `Long`
@@ -1502,7 +1716,9 @@ fn read_fd_intr(fd: std::os::unix::io::RawFd, n: Option<usize>) -> Result<Vec<u8
                 service_pending_signals_io()?;
                 continue;
             }
-            return Err(os_error(format!("read: {err}")));
+            // Carry the errno so a stale descriptor surfaces as
+            // `OSError(EBADF)` (test_fileio `testErrnoOnClosedRead`).
+            return Err(crate::error::io_error_to_py(&err));
         }
     };
     match n {
@@ -1623,12 +1839,11 @@ fn runtime_err_is_blocking(err: &RuntimeError) -> bool {
 fn runtime_err_eagain_info(err: &RuntimeError) -> (i32, String) {
     if let RuntimeError::PyException(pe) = err {
         if let Object::Instance(inst) = &pe.instance {
-            let dict = inst.dict.borrow();
-            let errno = dict
-                .get(&DictKey(Object::from_static("errno")))
+            let errno = crate::builtin_types::exc_attr(inst, "errno")
+                .as_ref()
                 .and_then(Object::as_i64)
                 .unwrap_or(i64::from(EAGAIN_FALLBACK)) as i32;
-            let strerror = match dict.get(&DictKey(Object::from_static("strerror"))) {
+            let strerror = match crate::builtin_types::exc_attr(inst, "strerror") {
                 Some(Object::Str(s)) => s.to_string(),
                 _ => "write could not complete without blocking".to_owned(),
             };
@@ -1976,23 +2191,29 @@ thread_local! {
 /// nesting depth has hit `sys.getrecursionlimit()` (sets the overflow flag, so
 /// the boundary raises `RecursionError` instead of blowing the native stack).
 fn repr_enter(id: usize) -> bool {
-    REPR_GUARD.with(|g| {
-        let mut b = g.borrow_mut();
-        if b.stack.contains(&id) {
-            return false;
-        }
-        if b.stack.len() >= crate::recursion::recursion_limit() {
-            b.overflow = true;
-            return false;
-        }
-        b.stack.push(id);
-        true
-    })
+    // `try_with`: a leaked stream can drop during thread-local *destruction*
+    // (its `Drop` renders a repr for the unclosed-file ResourceWarning); the
+    // guard TLS may already be gone, and `with` would abort the process.
+    // No guard means no cycle in flight — admit.
+    REPR_GUARD
+        .try_with(|g| {
+            let mut b = g.borrow_mut();
+            if b.stack.contains(&id) {
+                return false;
+            }
+            if b.stack.len() >= crate::recursion::recursion_limit() {
+                b.overflow = true;
+                return false;
+            }
+            b.stack.push(id);
+            true
+        })
+        .unwrap_or(true)
 }
 
 /// Finish rendering the container most recently admitted by [`repr_enter`].
 fn repr_leave() {
-    REPR_GUARD.with(|g| {
+    let _ = REPR_GUARD.try_with(|g| {
         g.borrow_mut().stack.pop();
     });
 }
@@ -2567,8 +2788,11 @@ pub struct PyFunction {
     /// `__dict__` for arbitrary attribute assignment on the
     /// function — e.g. `@functools.wraps`, `@abstractmethod`'s
     /// `__isabstractmethod__`, or any decorator that stashes
-    /// per-callable metadata.
-    pub attrs: Rc<RefCell<DictData>>,
+    /// per-callable metadata. The outer `RefCell` exists because
+    /// CPython's `func_set_dict` *aliases* the assigned dict
+    /// (`f.__dict__ = d; f.__dict__ is d` — test_funcattrs), so the
+    /// whole payload must be swappable, not just its contents.
+    pub attrs: RefCell<Rc<RefCell<DictData>>>,
     /// CPython function *getset/member slots* (`__name__`,
     /// `__qualname__`, `__doc__`, `__module__`, `__annotations__`,
     /// `__type_params__`, …). These live outside `__dict__`: they're
@@ -2600,6 +2824,11 @@ impl PyFunction {
     /// The current code object (honours `f.__code__ = …` rebinding).
     pub fn code(&self) -> Rc<CodeObject> {
         self.code.borrow().clone()
+    }
+
+    /// The live `__dict__` payload (honours `f.__dict__ = d` swapping).
+    pub fn attrs(&self) -> Rc<RefCell<DictData>> {
+        self.attrs.borrow().clone()
     }
 
     /// Read a slot value if one has been stored (explicitly assigned or
@@ -3311,6 +3540,15 @@ pub struct PyFile {
     /// Lazily-built incremental decoder + cookie state (see [`TextIncr`]).
     /// `None` until the incremental path activates.
     pub text_incr: RefCell<Option<TextIncr>>,
+    /// CPython `FileIO._blksize`: the filesystem's preferred block size,
+    /// captured from `fstat` at open time (falling back to
+    /// `io.DEFAULT_BUFFER_SIZE` when the stat has no useful `st_blksize`).
+    /// `open()` seeds it; other constructors keep the default.
+    pub blksize: crate::sync::Cell<i64>,
+    /// The class name to render in `repr()` for a `FileIO` *subclass*
+    /// instance (CPython's `fileio_repr` prints `Py_TYPE(self)->tp_name`, so
+    /// `<TestSubclass name=...>`). `None` renders the base `_io.FileIO`.
+    pub repr_class: RefCell<Option<String>>,
 }
 
 impl PyFile {
@@ -3342,6 +3580,8 @@ impl PyFile {
             telling: crate::sync::Cell::new(true),
             text_incr_gate: crate::sync::Cell::new(None),
             text_incr: RefCell::new(None),
+            blksize: crate::sync::Cell::new(DEFAULT_BUFFER_SIZE as i64),
+            repr_class: RefCell::new(None),
         }
     }
 
@@ -3418,8 +3658,13 @@ impl PyFile {
             return Ok(());
         }
         let flush_res = self.flush_write_buf();
-        self.close();
-        flush_res
+        // `close(2)` can itself fail — CPython's `FileIO.close` raises
+        // `OSError(EBADF)` when the descriptor was already closed out from
+        // under the object (`os.close(f.fileno())`; test_fileio
+        // `testErrnoOnClose`). The object still transitions to closed.
+        let close_res = self.close_report();
+        flush_res?;
+        close_res.map_err(|e| crate::error::io_error_to_py(&e))
     }
 
     /// Read a monkeypatched per-instance attribute, if set.
@@ -3626,6 +3871,18 @@ impl PyFile {
             IoKind::BytesIO => format!("<_io.BytesIO object at 0x{self_addr:x}>"),
             IoKind::StringIO => format!("<_io.StringIO object at 0x{self_addr:x}>"),
             kind => {
+                // A `FileIO` subclass instance renders its own class name
+                // (CPython prints `Py_TYPE(self)->tp_name`).
+                let cls: String = self
+                    .repr_class
+                    .borrow()
+                    .clone()
+                    .unwrap_or_else(|| "_io.FileIO".to_owned());
+                // CPython's `fileio_repr`: a closed raw file (fd < 0) prints
+                // no name/mode at all (test_fileio `testRepr`).
+                if kind == IoKind::Raw && self.is_closed() {
+                    return format!("<{cls} [closed]>");
+                }
                 // CPython's `fileio_repr`/`textiowrapper_repr` guard the
                 // `name` render with `Py_ReprEnter`: a `name` that leads back
                 // to this stream raises RuntimeError instead of recursing
@@ -3637,14 +3894,26 @@ impl PyFile {
                     ));
                     return "<...>".to_owned();
                 }
+                // A raw file whose `name` was deleted (`del f.name`) falls
+                // back to `fd=N` (CPython keeps `name` in the instance dict;
+                // `fileio_repr` catches the AttributeError and prints the fd).
+                let deleted_name = kind == IoKind::Raw && self.name_obj().is_none();
                 let name = self
                     .name_obj()
                     .map(|o| o.repr())
                     .unwrap_or_else(|| format!("'{}'", self.name));
                 repr_leave();
                 match kind {
+                    IoKind::Raw if deleted_name => format!(
+                        "<{} fd={} mode='{}' closefd={}>",
+                        cls,
+                        self.fileno().unwrap_or(-1),
+                        self.reported_mode(),
+                        if self.closefd.get() { "True" } else { "False" }
+                    ),
                     IoKind::Raw => format!(
-                        "<_io.FileIO name={} mode='{}' closefd={}>",
+                        "<{} name={} mode='{}' closefd={}>",
+                        cls,
                         name,
                         self.reported_mode(),
                         if self.closefd.get() { "True" } else { "False" }
@@ -3820,9 +4089,17 @@ impl PyFile {
             // `_io.StringIO.write` drives the incremental newline decoder over
             // the incoming text), so the buffer — and thus `getvalue()` —
             // holds the collapsed form. Byte-backed text files translate on
-            // *read* instead (`translate_newlines_read`).
-            None if self.io_kind.get() == IoKind::StringIO && s.as_bytes().contains(&b'\r') => {
-                s.replace("\r\n", "\n").replace('\r', "\n")
+            // *read* instead (`translate_newlines_read`). Because the raw
+            // `\r`/`\r\n` endings are gone once collapsed, the `.newlines`
+            // tally must be taken *here*, pre-translation
+            // (test_memoryio.test_newlines_property).
+            None if self.io_kind.get() == IoKind::StringIO => {
+                self.record_seen_newlines(s);
+                if s.as_bytes().contains(&b'\r') {
+                    s.replace("\r\n", "\n").replace('\r', "\n")
+                } else {
+                    s.to_owned()
+                }
             }
             _ => s.to_owned(),
         }
@@ -3981,7 +4258,8 @@ impl PyFile {
                 // whole characters so a multibyte char is never split
                 // (`StringIO("h\u00e9llo").read(2)` == "h\u00e9"). The raw
                 // `read_bytes` path deliberately counts *bytes*, not chars.
-                let s = &data[*pos..];
+                // A position seeked past the end reads as EOF.
+                let s = data.get(*pos..).unwrap_or("");
                 let end_rel = s.char_indices().nth(n).map(|(i, _)| i).unwrap_or(s.len());
                 let out = s.as_bytes()[..end_rel].to_vec();
                 *pos += end_rel;
@@ -4615,6 +4893,15 @@ impl PyFile {
     }
 
     pub fn close(&self) {
+        let _ = self.close_report();
+    }
+
+    /// [`PyFile::close`] that reports the `close(2)` result instead of
+    /// swallowing it. The stream always transitions to closed and the backend
+    /// is always released; only the syscall's verdict is returned (a stale
+    /// descriptor yields `EBADF`). Drop paths and internal callers ignore it;
+    /// the Python-level `close()` raises it as `OSError`.
+    pub fn close_report(&self) -> std::io::Result<()> {
         *self.closed.borrow_mut() = true;
         // Release OS-backed resources promptly. Dropping a real fd (a disk
         // file, or a subprocess pipe re-wrapped as a `Disk` backend) closes
@@ -4649,10 +4936,8 @@ impl PyFile {
                     // keeps ownership, so we detach without closing.
                     use std::os::unix::io::IntoRawFd;
                     let fd = f.into_raw_fd();
-                    if self.closefd.get() {
-                        unsafe {
-                            libc::close(fd);
-                        }
+                    if self.closefd.get() && unsafe { libc::close(fd) } != 0 {
+                        return Err(std::io::Error::last_os_error());
                     }
                 }
                 #[cfg(not(unix))]
@@ -4662,6 +4947,7 @@ impl PyFile {
                 }
             }
         }
+        Ok(())
     }
 
     /// Re-initialise a `FileIO` in place over a new descriptor. CPython's
@@ -4739,12 +5025,12 @@ impl PyFile {
                 buf.resize(n, 0);
                 let read = f
                     .read(&mut buf)
-                    .map_err(|e| os_error(format!("read: {e}")))?;
+                    .map_err(|e| crate::error::io_error_to_py(&e))?;
                 buf.truncate(read);
             }
             (FileBackend::Disk(f), None) => {
                 f.read_to_end(&mut buf)
-                    .map_err(|e| os_error(format!("read: {e}")))?;
+                    .map_err(|e| crate::error::io_error_to_py(&e))?;
             }
             (FileBackend::MemBytes { data, pos }, None) => {
                 let d = data.borrow();
@@ -5069,6 +5355,12 @@ impl PyFile {
                 // `BytesIO` with a live `getbuffer()` export refuses *any*
                 // write (it might re-size the shared buffer).
                 bytearray_check_resizable(buf)?;
+                // Writing nothing is a no-op — in particular it must not
+                // zero-fill an overseek gap (test_memoryio.test_overseek:
+                // `write(b'')` past EOF leaves getvalue() unchanged).
+                if data.is_empty() {
+                    return Ok(0);
+                }
                 let mut b = buf.borrow_mut();
                 if *pos > b.len() {
                     // Seeked past EOF: writing zero-fills the gap (CPython
@@ -5090,15 +5382,31 @@ impl PyFile {
             FileBackend::MemText { data: buf, pos } => {
                 let s = std::str::from_utf8(data)
                     .map_err(|_| value_error("StringIO requires utf-8 bytes"))?;
-                if *pos == buf.len() {
-                    buf.push_str(s);
-                } else {
-                    // Simple replace: drop trailing & append.
-                    buf.truncate(*pos);
-                    buf.push_str(s);
+                // CPython `StringIO.write` overwrites *in place*, keeping any
+                // tail beyond the written region ('h' over "Hello world"
+                // yields "hello world", test_memoryio.write_ops), and pads a
+                // past-the-end position with '\0' (test_overseek). Writing
+                // nothing must not pad. The return value counts *bytes*
+                // consumed — `write_text_all` loops on it; the char count
+                // CPython reports is computed by the `file_write` surface.
+                if s.is_empty() {
+                    return Ok(0);
                 }
-                *pos = buf.len();
-                data.len()
+                let n_chars = s.chars().count();
+                if *pos > buf.len() {
+                    let gap = *pos - buf.len();
+                    buf.extend(std::iter::repeat_n('\0', gap));
+                }
+                let start = *pos;
+                let tail = &buf[start..];
+                let end_rel = tail
+                    .char_indices()
+                    .nth(n_chars)
+                    .map(|(i, _)| i)
+                    .unwrap_or(tail.len());
+                buf.replace_range(start..start + end_rel, s);
+                *pos = start + s.len();
+                s.len()
             }
             FileBackend::Stdout(sink) => {
                 let mut s = sink.borrow_mut();
@@ -5178,13 +5486,20 @@ impl PyFile {
     }
 
     /// Current position. Works for both in-memory buffers and disk files.
+    ///
+    /// `StringIO` positions are *character* counts at the Python surface
+    /// (CPython addresses the UCS payload directly); the `MemText` backend
+    /// stores a byte offset into its UTF-8 buffer, translated at this
+    /// boundary by [`memtext_char_of_byte`]/[`memtext_byte_of_char`].
     pub fn position(&self) -> usize {
         // Staged `BufferedWriter` bytes sit logically after the descriptor
         // offset, so `tell()` counts them (CPython's `BufferedWriter.tell`
         // returns `raw.tell() + len(buffer)`).
         let pending = self.write_buf.borrow().len();
         match &mut *self.backend.borrow_mut() {
-            FileBackend::MemBytes { pos, .. } | FileBackend::MemText { pos, .. } => *pos,
+            FileBackend::MemBytes { pos, .. } => *pos,
+            // Public StringIO positions count characters, not bytes.
+            FileBackend::MemText { data, pos } => memtext_char_of_byte(data, *pos),
             FileBackend::Disk(f) => {
                 use std::io::Seek;
                 f.stream_position().map(|n| n as usize).unwrap_or(0) + pending
@@ -5200,7 +5515,8 @@ impl PyFile {
     pub fn tell(&self) -> Result<usize, RuntimeError> {
         let pending = self.write_buf.borrow().len();
         match &mut *self.backend.borrow_mut() {
-            FileBackend::MemBytes { pos, .. } | FileBackend::MemText { pos, .. } => Ok(*pos),
+            FileBackend::MemBytes { pos, .. } => Ok(*pos),
+            FileBackend::MemText { data, pos } => Ok(memtext_char_of_byte(data, *pos)),
             FileBackend::Disk(f) => {
                 use std::io::Seek;
                 let p = f
@@ -5224,10 +5540,20 @@ impl PyFile {
                 FileBackend::MemBytes { data, pos } => {
                     let dlen = data.borrow().len();
                     let new_pos = match whence {
-                        0 => offset.max(0) as usize,
+                        // An absolute negative position is an error
+                        // (`bytesio.c`); relative seeks clamp to 0 instead
+                        // (test_memoryio.test_seek).
+                        0 if offset < 0 => {
+                            return Err(value_error(format!("negative seek value {offset}")))
+                        }
+                        0 => offset as usize,
                         1 => (*pos as isize + offset).max(0) as usize,
                         2 => (dlen as isize + offset).max(0) as usize,
-                        _ => return Err(value_error("invalid whence")),
+                        _ => {
+                            return Err(value_error(format!(
+                                "invalid whence ({whence}, should be 0, 1 or 2)"
+                            )))
+                        }
                     };
                     // CPython's in-memory streams allow seeking *past* the end
                     // (the next write zero-fills the gap); don't clamp to `dlen`.
@@ -5235,14 +5561,27 @@ impl PyFile {
                     *pos
                 }
                 FileBackend::MemText { data, pos } => {
-                    let new_pos = match whence {
-                        0 => offset.max(0) as usize,
-                        1 => (*pos as isize + offset).max(0) as usize,
-                        2 => (data.len() as isize + offset).max(0) as usize,
-                        _ => return Err(value_error("invalid whence")),
+                    // Public positions are in *characters* (CPython
+                    // `StringIO`); the stored `pos` stays a byte offset —
+                    // see `memtext_byte_of_char`. Seeking past the end is
+                    // legal (the next write pads with '\0', one byte per
+                    // padded char, so the mapping stays consistent).
+                    let clen = data.chars().count();
+                    let new_char = match whence {
+                        0 if offset < 0 => {
+                            return Err(value_error(format!("Negative seek position {offset}")))
+                        }
+                        0 => offset as usize,
+                        1 => (memtext_char_of_byte(data, *pos) as isize + offset).max(0) as usize,
+                        2 => (clen as isize + offset).max(0) as usize,
+                        _ => {
+                            return Err(value_error(format!(
+                                "Invalid whence ({whence}, should be 0, 1 or 2)"
+                            )))
+                        }
                     };
-                    *pos = new_pos.min(data.len());
-                    *pos
+                    *pos = memtext_byte_of_char(data, new_char);
+                    new_char
                 }
                 FileBackend::Disk(f) => {
                     use std::io::Seek;
@@ -5253,7 +5592,7 @@ impl PyFile {
                         _ => return Err(value_error("invalid whence")),
                     };
                     f.seek(whence_pos)
-                        .map_err(|e| os_error(format!("seek: {e}")))? as usize
+                        .map_err(|e| crate::error::io_error_to_py(&e))? as usize
                 }
                 _ => return Err(os_error("stream is not seekable")),
             }
@@ -5283,27 +5622,23 @@ impl PyFile {
                 bytearray_check_resizable(data)?;
                 let n = size.unwrap_or(*pos as u64) as usize;
                 let mut d = data.borrow_mut();
+                // `bytesio.c` only ever *shrinks*: a size beyond the end
+                // leaves the buffer untouched, and the requested size is
+                // returned either way (test_memoryio.test_truncate).
                 if n < d.len() {
                     d.truncate(n);
-                } else {
-                    d.resize(n, 0);
                 }
                 Ok(n as u64)
             }
             FileBackend::MemText { data, pos } => {
-                let n = size.unwrap_or(*pos as u64) as usize;
-                if n < data.len() {
-                    // Clamp to a char boundary so we never split a UTF-8
-                    // scalar (WeavePy's MemText position is a byte offset).
-                    let mut cut = n;
-                    while cut > 0 && !data.is_char_boundary(cut) {
-                        cut -= 1;
-                    }
+                // `size` counts characters (StringIO); shrink-only and
+                // return the requested size, like the bytes form.
+                let n = size.unwrap_or_else(|| memtext_char_of_byte(data, *pos) as u64) as usize;
+                let cut = memtext_byte_of_char(data, n);
+                if cut < data.len() {
                     data.truncate(cut);
-                    Ok(cut as u64)
-                } else {
-                    Ok(data.len() as u64)
                 }
+                Ok(n as u64)
             }
             FileBackend::Disk(f) => {
                 use std::io::Seek;
@@ -5311,10 +5646,9 @@ impl PyFile {
                     Some(s) => s,
                     None => f
                         .stream_position()
-                        .map_err(|e| os_error(format!("truncate: {e}")))?,
+                        .map_err(|e| crate::error::io_error_to_py(&e))?,
                 };
-                f.set_len(n)
-                    .map_err(|e| os_error(format!("truncate: {e}")))?;
+                f.set_len(n).map_err(|e| crate::error::io_error_to_py(&e))?;
                 Ok(n)
             }
             _ => Err(os_error("File or stream is not seekable")),
@@ -5675,6 +6009,14 @@ pub enum PyIterator {
         stop: i128,
         step: i128,
     },
+    /// Range with bounds past `i128` (CPython's `longrange_iterator`,
+    /// e.g. `iter(range(1 << 1000))` — test_range). Boxed to keep the
+    /// `PyIterator` enum small for the common variants.
+    RangeBig {
+        current: Box<BigInt>,
+        stop: Box<BigInt>,
+        step: Box<BigInt>,
+    },
     /// Live iterator over a dict (CPython's `dictiterobject`): walks the
     /// `IndexMap` by entry index rather than snapshotting, so it pins no
     /// key/value `Rc`s of its own — an overwritten value is freed promptly
@@ -5847,6 +6189,26 @@ impl PyIterator {
                 let v = *current;
                 *current += *step;
                 Some(int_from_i128(v))
+            }
+            PyIterator::RangeBig {
+                current,
+                stop,
+                step,
+            } => {
+                let zero = BigInt::from(0);
+                let exhausted = if **step > zero {
+                    **current >= **stop
+                } else if **step < zero {
+                    **current <= **stop
+                } else {
+                    true
+                };
+                if exhausted {
+                    return None;
+                }
+                let v = (**current).clone();
+                **current += &**step;
+                Some(Object::int_from_bigint(v))
             }
             PyIterator::DictKeys {
                 kind, index, dict, ..
@@ -6042,6 +6404,7 @@ impl PyIterator {
             | PyIterator::ByteArray { .. }
             | PyIterator::Range { .. }
             | PyIterator::RangeHuge { .. }
+            | PyIterator::RangeBig { .. }
             | PyIterator::File { .. } => {}
         }
     }
@@ -6053,10 +6416,15 @@ impl PyIterator {
     /// drain a freshly-built iterator without mutating its source can
     /// keep calling the cheaper [`next_value`].
     pub fn next_value_checked(&mut self) -> Result<Option<Object>, RuntimeError> {
-        if let PyIterator::Set { set, len, .. } = self {
+        if let PyIterator::Set { set, len, index } = self {
             // `setiter_iternext`: a size change since creation is fatal,
             // even on the step that would otherwise raise StopIteration.
             if set.borrow().len() != *len {
+                // Sticky, like CPython's `si_used = -1`: every further
+                // `next()` keeps raising, and `__length_hint__` reports 0
+                // (test_iterlen.test_immutable_during_iteration).
+                *len = usize::MAX;
+                *index = usize::MAX;
                 return Err(runtime_error("Set changed size during iteration"));
             }
         }
@@ -6064,6 +6432,7 @@ impl PyIterator {
             dict: Some(d),
             len,
             watch,
+            index,
             ..
         } = self
         {
@@ -6071,6 +6440,10 @@ impl PyIterator {
             // mirroring CPython's `di_used != ma_used` guard. Triggers even
             // on the step that would otherwise raise StopIteration.
             if d.borrow().len() != *len {
+                // Sticky (`di_used = -1`): further `next()` calls keep
+                // raising and `__length_hint__` reports 0.
+                *len = usize::MAX;
+                *index = usize::MAX;
                 return Err(runtime_error("dictionary changed size during iteration"));
             }
             // Same size but keys churned (`del d[k]; d[k] = v` between
@@ -6125,7 +6498,17 @@ impl PyIterator {
             PyIterator::Enumerate { inner, .. } => inner.borrow().remaining(),
             PyIterator::Shared(inner) => inner.borrow().remaining(),
             PyIterator::Set { set, index, .. } => Some(set.borrow().len().saturating_sub(*index)),
-            PyIterator::Reversed { index, .. } => Some((*index + 1).max(0) as usize),
+            // CPython `listreviter_len`: `index + 1`, but 0 when the live
+            // list shrank below the cursor (test_iterlen
+            // TestListReversed.test_mutation).
+            PyIterator::Reversed { items, index } => {
+                let len = (*index + 1).max(0) as usize;
+                if items.borrow().len() < len {
+                    Some(0)
+                } else {
+                    Some(len)
+                }
+            }
             PyIterator::Range {
                 current,
                 stop,
@@ -6154,6 +6537,22 @@ impl PyIterator {
                     usize::try_from((*stop - *current + *step - 1) / *step).ok()
                 } else if *step < 0 && *current > *stop {
                     usize::try_from((*current - *stop + (-*step) - 1) / (-*step)).ok()
+                } else {
+                    Some(0)
+                }
+            }
+            PyIterator::RangeBig {
+                current,
+                stop,
+                step,
+            } => {
+                use num_traits::ToPrimitive;
+                let zero = BigInt::from(0);
+                let one = BigInt::from(1);
+                if **step > zero && **current < **stop {
+                    ((&**stop - &**current + &**step - &one) / &**step).to_usize()
+                } else if **step < zero && **current > **stop {
+                    ((&**current - &**stop - &**step - &one) / (-&**step)).to_usize()
                 } else {
                     Some(0)
                 }
@@ -6249,6 +6648,32 @@ impl PyIterator {
                     while c > st {
                         out.push(int_from_i128(c));
                         c += sp;
+                    }
+                }
+                out
+            }
+            PyIterator::RangeBig {
+                current,
+                stop,
+                step,
+            } => {
+                // Materialisable only when the remaining count fits memory
+                // anyway; an astronomically long iterator snapshots empty
+                // (pickling it is impossible in CPython too — MemoryError).
+                let mut out = Vec::new();
+                if self.remaining().is_some() {
+                    let (mut c, st, sp) = ((**current).clone(), &**stop, &**step);
+                    let zero = BigInt::from(0);
+                    if *sp > zero {
+                        while c < *st {
+                            out.push(Object::int_from_bigint(c.clone()));
+                            c += sp;
+                        }
+                    } else if *sp < zero {
+                        while c > *st {
+                            out.push(Object::int_from_bigint(c.clone()));
+                            c += sp;
+                        }
                     }
                 }
                 out
@@ -6364,7 +6789,18 @@ impl Object {
             Object::List(items) => !items.borrow().is_empty(),
             Object::Dict(d) => !d.borrow().is_empty(),
             Object::Range(r) => {
-                if r.step > 0 {
+                if let Some(b) = &r.big {
+                    // Both saturated mirrors can clamp to the same extreme
+                    // (`range(2**200, 2**201)`), so compare at full width.
+                    let zero = BigInt::from(0);
+                    if b.2 > zero {
+                        b.0 < b.1
+                    } else if b.2 < zero {
+                        b.0 > b.1
+                    } else {
+                        false
+                    }
+                } else if r.step > 0 {
                     r.start < r.stop
                 } else if r.step < 0 {
                     r.start > r.stop
@@ -6619,10 +7055,29 @@ impl Object {
                     a.buffer_eq(b)
                 }
             }
+            // A released view compares unequal to any buffer (CPython
+            // `BASE_INACCESSIBLE` short-circuits to NotEqual).
             (Object::MemoryView(a), Object::Bytes(b))
-            | (Object::Bytes(b), Object::MemoryView(a)) => a.eq_byte_slice(b),
+            | (Object::Bytes(b), Object::MemoryView(a)) => !a.released.get() && a.eq_byte_slice(b),
             (Object::MemoryView(a), Object::ByteArray(b))
-            | (Object::ByteArray(b), Object::MemoryView(a)) => a.eq_byte_slice(&b.borrow()),
+            | (Object::ByteArray(b), Object::MemoryView(a)) => {
+                !a.released.get() && a.eq_byte_slice(&b.borrow())
+            }
+            // Any other buffer exporter (`array.array`, a PEP 688
+            // `__buffer__` class) compares structurally through its exported
+            // view — format/shape plus contents, like CPython's
+            // `memory_richcompare` (test_memoryview.test_compare with
+            // `array('i', …)`).
+            (Object::MemoryView(a), other @ Object::Instance(_))
+            | (other @ Object::Instance(_), Object::MemoryView(a)) => {
+                if a.released.get() {
+                    return false;
+                }
+                match crate::builtins::buffer_exported_view(other) {
+                    Some(b) => a.buffer_eq(&b),
+                    None => false,
+                }
+            }
             // `slice` objects compare as the `(start, stop, step)` triple
             // (CPython's `slice_richcompare`), identity-first per field so
             // `slice(None)` fields (NaN-free here, but consistent) match.
@@ -6689,6 +7144,23 @@ impl Object {
                 if Rc::ptr_eq(a, b) {
                     return true;
                 }
+                if a.big.is_some() || b.big.is_some() {
+                    // Full-width comparison (test_range's `2**200` bounds).
+                    let la = range_len_bigint(a);
+                    let zero = BigInt::from(0);
+                    if la != range_len_bigint(b) {
+                        return false;
+                    }
+                    if la == zero {
+                        return true;
+                    }
+                    let (sa, _, ta) = a.bounds();
+                    let (sb, _, tb) = b.bounds();
+                    if sa != sb {
+                        return false;
+                    }
+                    return la == BigInt::from(1) || ta == tb;
+                }
                 let la = range_len_i128(a);
                 if la != range_len_i128(b) {
                     false
@@ -6734,9 +7206,11 @@ impl Object {
             (O::Long(a), O::Long(b)) => Ok((**a).cmp(b)),
             (O::Int(a), O::Long(b)) => Ok(BigInt::from(*a).cmp(b)),
             (O::Long(a), O::Int(b)) => Ok((**a).cmp(&BigInt::from(*b))),
-            (O::Float(a), O::Float(b)) => Ok(a
-                .partial_cmp(b)
-                .ok_or_else(|| value_error(format!("cannot order {a} and {b} (NaN)")))?),
+            // NaN is unordered: CPython's sort/min/max only ever ask `a < b`,
+            // which is False both ways for NaN — observationally `Equal`
+            // (stable sort keeps original order, test_sort
+            // test_unsafe_tuple_compare).
+            (O::Float(a), O::Float(b)) => Ok(a.partial_cmp(b).unwrap_or(Ordering::Equal)),
             (O::Int(a), O::Float(b)) => i64_cmp_f64(*a, *b),
             (O::Float(a), O::Int(b)) => Ok(i64_cmp_f64(*b, *a)?.reverse()),
             (O::Long(a), O::Float(b)) => Ok(bigint_cmp_f64(a, *b)?),
@@ -6748,10 +7222,10 @@ impl Object {
             (O::Long(a), O::Bool(b)) => Ok((**a).cmp(&BigInt::from(i64::from(*b)))),
             (O::Bool(a), O::Float(b)) => Ok((i64::from(*a) as f64)
                 .partial_cmp(b)
-                .ok_or_else(|| value_error("cannot order with NaN"))?),
+                .unwrap_or(Ordering::Equal)),
             (O::Float(a), O::Bool(b)) => Ok(a
                 .partial_cmp(&(i64::from(*b) as f64))
-                .ok_or_else(|| value_error("cannot order with NaN"))?),
+                .unwrap_or(Ordering::Equal)),
             (O::Str(a), O::Str(b)) => Ok(a.cmp(b)),
             // Any comparison involving a surrogate-bearing string orders by
             // code point (CPython compares `str` by code point; UTF-8 byte
@@ -6893,12 +7367,38 @@ impl Object {
             }
             Object::Range(r) => {
                 use num_traits::ToPrimitive;
+                let big_item: Option<BigInt> = match item {
+                    Object::Bool(b) => Some(BigInt::from(i64::from(*b))),
+                    Object::Int(i) => Some(BigInt::from(*i)),
+                    Object::Long(b) => Some((**b).clone()),
+                    _ => None,
+                };
+                if r.big.is_some() {
+                    if let Some(i) = big_item.clone() {
+                        let (start, stop, step) = r.bounds();
+                        let zero = BigInt::from(0);
+                        return if step > zero {
+                            Ok(i >= start && i < stop && (i - start) % step == zero)
+                        } else if step < zero {
+                            Ok(i <= start && i > stop && (start - i) % (-step) == zero)
+                        } else {
+                            Ok(false)
+                        };
+                    }
+                }
                 let i: Option<i128> = match item {
                     Object::Bool(b) => Some(i128::from(*b)),
                     Object::Int(i) => Some(i128::from(*i)),
                     Object::Long(b) => b.to_i128(),
                     _ => None,
                 };
+                // A `Long` outside i128 can't be a member of a non-big
+                // range... unless the fallthrough below finds it via `==`
+                // scan — but a pure-int probe is exactly CPython's
+                // arithmetic fast path, so answer directly.
+                if big_item.is_some() && i.is_none() && r.big.is_none() {
+                    return Ok(false);
+                }
                 if let Some(i) = i {
                     if r.step > 0 {
                         Ok(i >= r.start && i < r.stop && (i - r.start) % r.step == 0)
@@ -6908,6 +7408,18 @@ impl Object {
                         Ok(false)
                     }
                 } else {
+                    // CPython's `range_contains` fast-paths only exact
+                    // ints/bools; every other type falls back to
+                    // `_PySequence_IterSearch`, so `5.0 in range(10)` and an
+                    // always-equal object are found through per-element `==`
+                    // (test_range.test_contains / test_types).
+                    let mut cur = r.start;
+                    while (r.step > 0 && cur < r.stop) || (r.step < 0 && cur > r.stop) {
+                        if member_eq(&int_from_i128(cur), item)? {
+                            return Ok(true);
+                        }
+                        cur += r.step;
+                    }
                     Ok(false)
                 }
             }
@@ -6987,30 +7499,39 @@ impl Object {
                 )),
                 index: 0,
             }),
-            Object::Range(r) => Ok(
-                match (
-                    i64::try_from(r.start),
-                    i64::try_from(r.stop),
-                    i64::try_from(r.step),
-                ) {
-                    // `current += step` must not overflow after the last
-                    // yielded element (current peaks at stop-1+step for
-                    // positive step, bottoms at stop+1+step for negative),
-                    // so boundary-hugging ranges take the i128 variant too.
-                    (Ok(current), Ok(stop), Ok(step)) if stop.checked_add(step).is_some() => {
-                        PyIterator::Range {
-                            current,
-                            stop,
-                            step,
-                        }
+            Object::Range(r) => Ok({
+                if let Some(b) = &r.big {
+                    // CPython's `longrange_iterator`: bounds past i128.
+                    PyIterator::RangeBig {
+                        current: Box::new(b.0.clone()),
+                        stop: Box::new(b.1.clone()),
+                        step: Box::new(b.2.clone()),
                     }
-                    _ => PyIterator::RangeHuge {
-                        current: r.start,
-                        stop: r.stop,
-                        step: r.step,
-                    },
-                },
-            ),
+                } else {
+                    match (
+                        i64::try_from(r.start),
+                        i64::try_from(r.stop),
+                        i64::try_from(r.step),
+                    ) {
+                        // `current += step` must not overflow after the last
+                        // yielded element (current peaks at stop-1+step for
+                        // positive step, bottoms at stop+1+step for negative),
+                        // so boundary-hugging ranges take the i128 variant too.
+                        (Ok(current), Ok(stop), Ok(step)) if stop.checked_add(step).is_some() => {
+                            PyIterator::Range {
+                                current,
+                                stop,
+                                step,
+                            }
+                        }
+                        _ => PyIterator::RangeHuge {
+                            current: r.start,
+                            stop: r.stop,
+                            step: r.step,
+                        },
+                    }
+                }
+            }),
             Object::Dict(d) => {
                 let len = d.borrow().len();
                 Ok(PyIterator::DictKeys {
@@ -7419,10 +7940,11 @@ impl Object {
                 s
             }
             Object::Range(r) => {
-                if r.step == 1 {
-                    format!("range({}, {})", r.start, r.stop)
+                let (start, stop, step) = r.bounds();
+                if step == BigInt::from(1) {
+                    format!("range({start}, {stop})")
                 } else {
-                    format!("range({}, {}, {})", r.start, r.stop, r.step)
+                    format!("range({start}, {stop}, {step})")
                 }
             }
             Object::Function(f) => {
@@ -7435,7 +7957,39 @@ impl Object {
                     .unwrap_or_else(|| f.code().qualname.clone());
                 format!("<function {} at 0x{:x}>", qual, Rc::as_ptr(f) as usize)
             }
-            Object::Builtin(b) => format!("<built-in function {}>", b.name),
+            Object::Builtin(b) => {
+                // A registered descriptor reprs per its CPython kind
+                // (test_reprlib.test_descriptors): `dict.items` is
+                // `<method 'items' of 'dict' objects>`, `int.__add__` a
+                // slot wrapper, and so on. Untagged builtins (and
+                // staticmethod-wrapped C functions, whose type stays
+                // `builtin_function_or_method`) keep the plain form.
+                use crate::descr_registry::DescrKind;
+                match crate::descr_registry::lookup(self) {
+                    Some(meta) => match meta.kind {
+                        DescrKind::Method => format!(
+                            "<method '{}' of '{}' objects>",
+                            meta.name, meta.objclass.name
+                        ),
+                        DescrKind::Wrapper => format!(
+                            "<slot wrapper '{}' of '{}' objects>",
+                            meta.name, meta.objclass.name
+                        ),
+                        DescrKind::GetSet => format!(
+                            "<attribute '{}' of '{}' objects>",
+                            meta.name, meta.objclass.name
+                        ),
+                        DescrKind::Member => format!(
+                            "<member '{}' of '{}' objects>",
+                            meta.name, meta.objclass.name
+                        ),
+                        DescrKind::StaticBuiltin => {
+                            format!("<built-in function {}>", b.name)
+                        }
+                    },
+                    None => format!("<built-in function {}>", b.name),
+                }
+            }
             // CPython `method_repr`: `<bound method qualname of repr(self)>`.
             // The name is `func.__qualname__` then `func.__name__`, and
             // finally `?` when the wrapped callable carries neither — e.g.
@@ -7447,7 +8001,18 @@ impl Object {
                         .as_ref()
                         .map(Object::to_str)
                         .unwrap_or_else(|| f.code().qualname.clone()),
-                    Object::Builtin(b) => b.name.to_owned(),
+                    // A C function bound to its receiver is CPython's
+                    // `builtin_function_or_method`, whose repr is
+                    // `<built-in method split of str object at 0x…>`
+                    // (test_reprlib.test_builtin_function).
+                    Object::Builtin(b) => {
+                        return format!(
+                            "<built-in method {} of {} object at 0x{:x}>",
+                            b.name,
+                            bm.receiver.type_name(),
+                            crate::builtins::object_identity(&bm.receiver)
+                        )
+                    }
                     Object::Instance(i) => {
                         let pick = |key: &str| -> Option<String> {
                             if let Some(Object::Str(s)) =
@@ -7493,6 +8058,14 @@ impl Object {
             }
             Object::Type(t) => format!("<class '{}'>", t.qualified_display_name()),
             Object::Module(m) => match &m.filename {
+                // A module whose only identity is the `<frozen name>`
+                // pseudo-filename reprs as CPython's FrozenImporter
+                // modules do (`_module_repr_from_spec` with
+                // origin='frozen' and no location): `<module 'x'
+                // (frozen)>`, not `from '<frozen x>'`.
+                Some(path) if *path == format!("<frozen {}>", m.name) => {
+                    format!("<module '{}' (frozen)>", m.name)
+                }
                 Some(path) => format!("<module '{}' from '{}'>", m.name, path),
                 None => format!("<module '{}' (built-in)>", m.name),
             },
@@ -7656,7 +8229,16 @@ impl Object {
             }
             Object::Frame(fr) => format!("<frame at 0x{:x}>", Rc::as_ptr(fr) as usize),
             Object::Traceback(tb) => format!("<traceback at 0x{:x}>", Rc::as_ptr(tb) as usize),
-            Object::MemoryView(mv) => format!("<memory at 0x{:x}>", Rc::as_ptr(mv) as usize),
+            Object::MemoryView(mv) => {
+                // A released view reprs distinctly (CPython `memory_repr`);
+                // str()/repr() must keep working after release.
+                let state = if mv.released.get() {
+                    "released memory"
+                } else {
+                    "memory"
+                };
+                format!("<{state} at 0x{:x}>", Rc::as_ptr(mv) as usize)
+            }
             Object::MappingProxy(d) => {
                 let body = Object::Dict(d.clone()).repr();
                 format!("mappingproxy({body})")
@@ -7849,6 +8431,16 @@ impl Object {
             Object::List(items) => Ok(items.borrow().len()),
             Object::Dict(d) => Ok(d.borrow().len()),
             Object::Range(r) => {
+                if r.big.is_some() {
+                    use num_traits::ToPrimitive;
+                    let len = range_len_bigint(r);
+                    return match len.to_i64() {
+                        Some(n) if n >= 0 => Ok(n as usize),
+                        _ => Err(crate::error::overflow_error(
+                            "Python int too large to convert to C ssize_t",
+                        )),
+                    };
+                }
                 let span = if r.step > 0 {
                     (r.stop - r.start).max(0)
                 } else if r.step < 0 {
@@ -7857,7 +8449,16 @@ impl Object {
                     return Err(value_error("range step cannot be zero"));
                 };
                 let step = r.step.unsigned_abs() as i128;
-                Ok(((span + step - 1) / step).max(0) as usize)
+                let len = ((span + step - 1) / step).max(0);
+                // CPython's `range_length` computes a `Py_ssize_t`; a range
+                // longer than that (`range(-maxsize, maxsize)`) raises
+                // OverflowError from `len()` (test_range.test_large_range).
+                if len > i128::from(i64::MAX) {
+                    return Err(crate::error::overflow_error(
+                        "Python int too large to convert to C ssize_t",
+                    ));
+                }
+                Ok(len as usize)
             }
             Object::Bytes(b) => Ok(b.len()),
             Object::ByteArray(b) => Ok(b.borrow().len()),
@@ -7867,6 +8468,13 @@ impl Object {
             // size — they differ once `cast` sets `itemsize > 1` or adds
             // dimensions (`len(memoryview(b'1234').cast('I')) == 1`).
             Object::MemoryView(mv) => {
+                // A released view refuses (CPython `memory_length`,
+                // test_memoryview._check_released).
+                if mv.released.get() {
+                    return Err(value_error(
+                        "operation forbidden on released memoryview object",
+                    ));
+                }
                 if mv.zero_dim.get() {
                     return Err(crate::error::type_error(
                         "0-dim memory has no length".to_owned(),
@@ -7965,7 +8573,8 @@ pub(crate) fn codepoint_subslice_contains(haystack: &[u32], needle: &[u32]) -> b
 /// uncomparable.
 pub(crate) fn bigint_cmp_f64(a: &BigInt, b: f64) -> Result<Ordering, RuntimeError> {
     if b.is_nan() {
-        return Err(value_error("cannot order with NaN"));
+        // Unordered (`<` is False both ways); see `Object::cmp`'s float arm.
+        return Ok(Ordering::Equal);
     }
     if b == f64::INFINITY {
         return Ok(Ordering::Less);
@@ -8027,7 +8636,8 @@ pub(crate) fn i64_eq_f64(a: i64, b: f64) -> bool {
 /// Exact `i64` vs `f64` ordering (see [`i64_eq_f64`]).
 pub(crate) fn i64_cmp_f64(a: i64, b: f64) -> Result<Ordering, RuntimeError> {
     if b.is_nan() {
-        return Err(value_error("cannot order with NaN"));
+        // Unordered (`<` is False both ways); see `Object::cmp`'s float arm.
+        return Ok(Ordering::Equal);
     }
     if b == f64::INFINITY {
         return Ok(Ordering::Less);
@@ -8314,65 +8924,132 @@ pub(crate) fn numeric_hash(obj: &Object) -> Option<i64> {
 /// pointer-derived value.
 const PY_HASH_NONE: i64 = 0xFCA8_6420;
 
-/// Deterministic structural hash for a byte slice (backs both `str` and
-/// `bytes`). CPython randomises string hashing per process via SipHash, so
-/// we don't need to reproduce its exact output — only to be stable within a
-/// run so equal strings bucket together. `hash("") == hash(b"") == 0`,
-/// matching CPython, and the reserved `-1` is remapped to `-2`.
+/// Per-process `str`/`bytes`/`memoryview` hash algorithm (PEP 456).
 ///
-/// Uses the internal Fx fold rather than SipHash: this function sits under
-/// *every* string-keyed dict probe (attribute lookups, globals, keyword
-/// matching), where profiling showed SipHash itself as a top-ten CPU
-/// consumer. Python-level `hash(s)` carries no cross-process stability
-/// contract, and the byte length is folded in so prefixes don't collide.
-/// Per-process `str`/`bytes` hash salt (CPython's hash randomization,
-/// PEP 456 in spirit). Initialized once, from OS entropy by default;
-/// `PYTHONHASHSEED=n` pins it (`0` disables randomization entirely —
-/// the salt is 0 and hashing is bit-identical across runs).
-static HASH_SALT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+/// Randomized (default) hashing carries no cross-process stability contract,
+/// so it uses the internal Fx fold: this function sits under *every*
+/// string-keyed dict probe (attribute lookups, globals, keyword matching),
+/// where profiling showed SipHash itself as a top-ten CPU consumer. When
+/// `PYTHONHASHSEED` is pinned, though, the *values* are the contract —
+/// test_hash spawns children with a fixed seed and compares `hash('abc')`
+/// bit-for-bit — so the pinned mode is CPython's exact SipHash-1-3 keyed by
+/// the LCG-expanded seed. Both modes agree that `hash("") == hash(b"") == 0`
+/// and remap the reserved `-1` to `-2`.
+enum HashAlgo {
+    /// Randomized default: Fx fold salted with per-process OS entropy,
+    /// finished with a murmur3 avalanche so the low bits distribute
+    /// (dict-slot quality; test_hash's `hash(prefix + chr(c)) & 0xf`).
+    Fx { salt: u64 },
+    /// `PYTHONHASHSEED=n` pinned: CPython-exact SipHash-1-3.
+    Sip { k0: u64, k1: u64 },
+}
 
-/// Pin the hash salt from `PYTHONHASHSEED`. Must run before the first
+static HASH_ALGO: std::sync::OnceLock<HashAlgo> = std::sync::OnceLock::new();
+
+/// Pin the hash secret from `PYTHONHASHSEED`. Must run before the first
 /// `str`/`bytes` hash of the process (the CLI calls it first thing);
 /// a later call is a no-op, matching CPython where the seed is fixed
 /// at startup.
 pub fn set_hash_seed(seed: u32) {
-    let salt = if seed == 0 {
-        0
+    let (k0, k1) = if seed == 0 {
+        // `PYTHONHASHSEED=0` zeroes `_Py_HashSecret` outright.
+        (0, 0)
     } else {
-        // SplitMix64 expansion of the 32-bit seed: deterministic per
-        // seed, well-mixed across the 64-bit salt space.
-        let mut z = u64::from(seed).wrapping_add(0x9e37_79b9_7f4a_7c15);
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^= z >> 31;
-        z
+        // CPython `lcg_urandom` (bootstrap_hash.c): an MSVC-style LCG
+        // expands the 32-bit seed byte-by-byte into `_Py_HashSecret`;
+        // the first 16 bytes are SipHash's k0/k1, little-endian.
+        let mut buf = [0u8; 16];
+        let mut x: u32 = seed;
+        for b in &mut buf {
+            x = x.wrapping_mul(214_013).wrapping_add(2_531_011);
+            *b = (x >> 16) as u8;
+        }
+        (
+            u64::from_le_bytes(buf[..8].try_into().unwrap()),
+            u64::from_le_bytes(buf[8..].try_into().unwrap()),
+        )
     };
-    let _ = HASH_SALT.set(salt);
+    let _ = HASH_ALGO.set(HashAlgo::Sip { k0, k1 });
 }
 
-fn hash_salt() -> u64 {
-    *HASH_SALT.get_or_init(|| {
+fn hash_algo() -> &'static HashAlgo {
+    HASH_ALGO.get_or_init(|| {
         use std::hash::{BuildHasher, Hasher};
         // `RandomState` is seeded from OS entropy once per process.
-        std::collections::hash_map::RandomState::new()
-            .build_hasher()
-            .finish()
+        HashAlgo::Fx {
+            salt: std::collections::hash_map::RandomState::new()
+                .build_hasher()
+                .finish(),
+        }
     })
+}
+
+/// CPython's SipHash-1-3 (`pysiphash` in Python/pyhash.c): one compression
+/// round per 8-byte word, three finalization rounds, keyed by the two
+/// 64-bit halves of `_Py_HashSecret`.
+fn siphash13(k0: u64, k1: u64, data: &[u8]) -> u64 {
+    #[inline(always)]
+    fn round(v0: &mut u64, v1: &mut u64, v2: &mut u64, v3: &mut u64) {
+        *v0 = v0.wrapping_add(*v1);
+        *v2 = v2.wrapping_add(*v3);
+        *v1 = v1.rotate_left(13) ^ *v0;
+        *v3 = v3.rotate_left(16) ^ *v2;
+        *v0 = v0.rotate_left(32);
+        *v2 = v2.wrapping_add(*v1);
+        *v0 = v0.wrapping_add(*v3);
+        *v1 = v1.rotate_left(17) ^ *v2;
+        *v3 = v3.rotate_left(21) ^ *v0;
+        *v2 = v2.rotate_left(32);
+    }
+    let mut v0 = k0 ^ 0x736f_6d65_7073_6575;
+    let mut v1 = k1 ^ 0x646f_7261_6e64_6f6d;
+    let mut v2 = k0 ^ 0x6c79_6765_6e65_7261;
+    let mut v3 = k1 ^ 0x7465_6462_7974_6573;
+    let mut chunks = data.chunks_exact(8);
+    for chunk in &mut chunks {
+        let mi = u64::from_le_bytes(chunk.try_into().unwrap());
+        v3 ^= mi;
+        round(&mut v0, &mut v1, &mut v2, &mut v3);
+        v0 ^= mi;
+    }
+    let rem = chunks.remainder();
+    let mut tail = [0u8; 8];
+    tail[..rem.len()].copy_from_slice(rem);
+    let b = ((data.len() as u64) << 56) | u64::from_le_bytes(tail);
+    v3 ^= b;
+    round(&mut v0, &mut v1, &mut v2, &mut v3);
+    v0 ^= b;
+    v2 ^= 0xff;
+    round(&mut v0, &mut v1, &mut v2, &mut v3);
+    round(&mut v0, &mut v1, &mut v2, &mut v3);
+    round(&mut v0, &mut v1, &mut v2, &mut v3);
+    (v0 ^ v1) ^ (v2 ^ v3)
 }
 
 fn py_hash_bytes_slice(bytes: &[u8]) -> i64 {
     if bytes.is_empty() {
         return 0;
     }
-    use std::hash::Hasher;
-    let mut h = crate::fasthash::FxHasher::default();
-    let salt = hash_salt();
-    if salt != 0 {
-        h.write_u64(salt);
-    }
-    h.write(bytes);
-    h.write_usize(bytes.len());
-    let v = h.finish() as i64;
+    let v = match hash_algo() {
+        HashAlgo::Sip { k0, k1 } => siphash13(*k0, *k1, bytes) as i64,
+        HashAlgo::Fx { salt } => {
+            use std::hash::Hasher;
+            let mut h = crate::fasthash::FxHasher::default();
+            h.write_u64(*salt);
+            h.write(bytes);
+            h.write_usize(bytes.len());
+            // murmur3 fmix64: the Fx fold alone avalanches poorly into the
+            // low bits, which is where dict slots (and test_hash's
+            // distribution check) look.
+            let mut x = h.finish();
+            x ^= x >> 33;
+            x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+            x ^= x >> 33;
+            x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+            x ^= x >> 33;
+            x as i64
+        }
+    };
     if v == -1 {
         -2
     } else {
@@ -8390,7 +9067,24 @@ fn py_hash_bytes_slice(bytes: &[u8]) -> i64 {
 /// compute — without it every Cython call with a keyword argument fails
 /// with a spurious "unexpected keyword argument".
 pub fn py_str_hash(s: &str) -> i64 {
-    py_hash_bytes_slice(s.as_bytes())
+    if s.is_ascii() || matches!(hash_algo(), HashAlgo::Fx { .. }) {
+        return py_hash_bytes_slice(s.as_bytes());
+    }
+    // Pinned seed: CPython hashes the *compact-unicode payload* — one byte
+    // per char through U+00FF, two through U+FFFF, four beyond, in native
+    // endianness (test_hash pins the UCS2 values per endianness) — so the
+    // unit buffer must be rebuilt from the UTF-8 storage.
+    let max = s.chars().map(u32::from).max().unwrap_or(0);
+    let buf: Vec<u8> = if max <= 0xff {
+        s.chars().map(|c| c as u32 as u8).collect()
+    } else if max <= 0xffff {
+        s.chars()
+            .flat_map(|c| (c as u32 as u16).to_ne_bytes())
+            .collect()
+    } else {
+        s.chars().flat_map(|c| (c as u32).to_ne_bytes()).collect()
+    };
+    py_hash_bytes_slice(&buf)
 }
 
 /// Interpreter-independent hash of a `bytes` value — the exact value
@@ -8404,11 +9098,25 @@ pub fn py_bytes_hash(b: &[u8]) -> i64 {
 /// value [`py_hash_value`] computes for `Object::WStr`. Used by the
 /// C-API's faithful `PyUnicode_Type.tp_hash`.
 pub fn py_wstr_hash(cps: &[u32]) -> i64 {
-    let mut bytes = Vec::with_capacity(cps.len() * 4);
-    for &c in cps {
-        bytes.extend_from_slice(&c.to_le_bytes());
+    if matches!(hash_algo(), HashAlgo::Fx { .. }) {
+        let mut bytes = Vec::with_capacity(cps.len() * 4);
+        for &c in cps {
+            bytes.extend_from_slice(&c.to_le_bytes());
+        }
+        return py_hash_bytes_slice(&bytes);
     }
-    py_hash_bytes_slice(&bytes)
+    // Pinned seed: same compact-payload layout as [`py_str_hash`]. Lone
+    // surrogates are ordinary BMP code points here, so a surrogate-bearing
+    // string hashes over 2-byte units exactly as CPython's UCS2 kind does.
+    let max = cps.iter().copied().max().unwrap_or(0);
+    let buf: Vec<u8> = if max <= 0xff {
+        cps.iter().map(|&c| c as u8).collect()
+    } else if max <= 0xffff {
+        cps.iter().flat_map(|&c| (c as u16).to_ne_bytes()).collect()
+    } else {
+        cps.iter().flat_map(|&c| c.to_ne_bytes()).collect()
+    };
+    py_hash_bytes_slice(&buf)
 }
 
 /// Identity-based hash for objects that hash by allocation identity in
@@ -8614,19 +9322,30 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
     }
     match obj {
         Object::None => Some(PY_HASH_NONE),
-        Object::Str(s) => Some(py_hash_bytes_slice(s.as_bytes())),
+        Object::Str(s) => Some(py_str_hash(s)),
         // Surrogate-bearing string: hash the code-point sequence. Need only be
         // deterministic and self-consistent — a `WStr` never equals a `Str`
         // (disjoint by invariant), so cross-representation hash agreement is
         // unnecessary; collisions only cost a probe, never correctness.
-        Object::WStr(cps) => {
-            let mut bytes = Vec::with_capacity(cps.len() * 4);
-            for &c in cps.iter() {
-                bytes.extend_from_slice(&c.to_le_bytes());
-            }
-            Some(py_hash_bytes_slice(&bytes))
-        }
+        Object::WStr(cps) => Some(py_wstr_hash(cps)),
         Object::Bytes(b) => Some(py_hash_bytes_slice(b)),
+        // A read-only byte-format view hashes as its contents — equal to the
+        // hash of `tobytes()` regardless of alignment or strides (CPython
+        // `memory_hash`; test_hash.test_unaligned_buffers). The value is
+        // computed once and cached, so a released view keeps answering it.
+        // The error cases (released / writable / non-byte format) are
+        // rejected up front by `ensure_hashable`; a view that reaches here
+        // unvetted falls back to identity below.
+        Object::MemoryView(mv) if mv.hash.get() != -1 => Some(mv.hash.get()),
+        Object::MemoryView(mv)
+            if !mv.released.get()
+                && mv.readonly.get()
+                && matches!(mv.format.borrow().as_str(), "B" | "b" | "c") =>
+        {
+            let h = py_hash_bytes_slice(&mv.to_bytes());
+            mv.hash.set(h);
+            Some(h)
+        }
         Object::Tuple(items) => {
             let lanes: Vec<i64> = items
                 .iter()
@@ -8743,15 +9462,20 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
         // with `eq_value` above — equal ranges (same generated sequence) share
         // a hash and can therefore key a `dict`/`set` (or a pandas index).
         Object::Range(r) => {
-            let len = range_len_i128(r);
-            let (start_obj, step_obj) = if len == 0 {
+            let len = range_len_bigint(r);
+            let zero = BigInt::from(0);
+            let (start_obj, step_obj) = if len == zero {
                 (Object::None, Object::None)
-            } else if len == 1 {
-                (int_from_i128(r.start), Object::None)
+            } else if len == BigInt::from(1) {
+                (r.start_obj(), Object::None)
             } else {
-                (int_from_i128(r.start), int_from_i128(r.step))
+                (r.start_obj(), r.step_obj())
             };
-            let triple = Object::Tuple(Rc::from(vec![int_from_i128(len), start_obj, step_obj]));
+            let triple = Object::Tuple(Rc::from(vec![
+                Object::int_from_bigint(len),
+                start_obj,
+                step_obj,
+            ]));
             py_hash_value(&triple)
         }
         _ => None,
@@ -9160,11 +9884,29 @@ impl Object {
         for v in iter {
             s.insert(DictKey(v));
         }
+        if s.is_empty() {
+            // CPython serves a shared empty-frozenset singleton:
+            // `frozenset() is frozenset()` and the compiled constant
+            // `frozenset()` are the same object (test_ast
+            // ConstantTests.test_singletons).
+            static EMPTY: std::sync::OnceLock<Rc<FrozenSetObj>> = std::sync::OnceLock::new();
+            return Object::FrozenSet(
+                EMPTY
+                    .get_or_init(|| Rc::new(FrozenSetObj::new(SetData::default())))
+                    .clone(),
+            );
+        }
         Object::FrozenSet(Rc::new(FrozenSetObj::new(s)))
     }
 
     pub fn new_bytes(data: impl Into<Vec<u8>>) -> Self {
         let v = data.into();
+        if v.is_empty() {
+            // CPython caches the empty bytes object (`b"" is b""` across
+            // compiles — test_ast ConstantTests.test_singletons).
+            static EMPTY: std::sync::OnceLock<Rc<[u8]>> = std::sync::OnceLock::new();
+            return Object::Bytes(EMPTY.get_or_init(|| Rc::from(&[][..])).clone());
+        }
         Object::Bytes(Rc::from(v.as_slice()))
     }
 

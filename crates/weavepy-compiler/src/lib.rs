@@ -350,6 +350,10 @@ fn format_constant(c: &Constant) -> String {
             let inner: Vec<_> = items.iter().map(format_constant).collect();
             format!("({})", inner.join(", "))
         }
+        Constant::FrozenSet(items) => {
+            let inner: Vec<_> = items.iter().map(format_constant).collect();
+            format!("frozenset({{{}}})", inner.join(", "))
+        }
         Constant::Code(co) => format!("<code object {}>", co.name),
         Constant::Ellipsis => "Ellipsis".to_owned(),
     }
@@ -380,6 +384,10 @@ pub enum Constant {
     WStr(Vec<u32>),
     Bytes(Vec<u8>),
     Tuple(Vec<Constant>),
+    /// `frozenset` constant — no literal form; reaches the pool via
+    /// `compile()` of a caller-built `ast.Constant` (or the `in (…)`
+    /// peephole, matching CPython's frozenset conversion).
+    FrozenSet(Vec<Constant>),
     Code(Box<CodeObject>),
     Ellipsis,
 }
@@ -400,6 +408,7 @@ impl PartialEq for Constant {
             (C::WStr(a), C::WStr(b)) => a == b,
             (C::Bytes(a), C::Bytes(b)) => a == b,
             (C::Tuple(a), C::Tuple(b)) => a == b,
+            (C::FrozenSet(a), C::FrozenSet(b)) => a == b,
             (C::Code(_), C::Code(_)) => false,
             (C::Ellipsis, C::Ellipsis) => true,
             // Cross-type equality is intentionally rejected so that
@@ -429,6 +438,7 @@ impl From<AstConstant> for Constant {
             AstConstant::WStr(cps) => Self::WStr(cps),
             AstConstant::Bytes(b) => Self::Bytes(b),
             AstConstant::Tuple(xs) => Self::Tuple(xs.into_iter().map(Self::from).collect()),
+            AstConstant::FrozenSet(xs) => Self::FrozenSet(xs.into_iter().map(Self::from).collect()),
             AstConstant::Ellipsis => Self::Ellipsis,
         }
     }
@@ -889,9 +899,12 @@ struct LineIndex {
 
 impl LineIndex {
     fn new(source: &str) -> Self {
+        // `\n`, `\r\n`, and lone `\r` all terminate a line, matching the
+        // tokenizer's universal-newline handling.
+        let bytes = source.as_bytes();
         let mut starts = vec![0u32];
-        for (i, b) in source.bytes().enumerate() {
-            if b == b'\n' {
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b'\n' || (b == b'\r' && bytes.get(i + 1) != Some(&b'\n')) {
                 starts.push((i + 1) as u32);
             }
         }
@@ -971,6 +984,13 @@ struct Compiler {
     /// `__qualname__` (CPython's `compiler_set_qualname` GLOBAL_EXPLICIT
     /// rule), which is what makes `global P; class P: ...` pickleable.
     explicit_globals: HashSet<String>,
+    /// Class scopes only: names whose class-level binding is an explicit
+    /// `global`, but where an *enclosing function* binds the same name.
+    /// PEP 227 makes class scopes invisible to nested scopes, so a
+    /// comprehension/def below the class still closes over the enclosing
+    /// function's cell — the class forwards it via `free_order` without
+    /// changing its own (global) loads and stores.
+    class_transparent_frees: HashSet<String>,
     /// Free variables (in declaration order) — populated by inner
     /// scopes looking up to their lexical parents.
     free_order: Vec<String>,
@@ -1022,6 +1042,16 @@ struct Compiler {
     /// emitted. Drives PEP-657 column tracking in [`Self::emit`]. Updated
     /// at statement and expression granularity as the compiler descends.
     current_span: (u32, u32),
+    /// Offsets of *structural* jumps — instructions CPython emits with
+    /// `NO_LOCATION` (loop back edges, `if`/`else` join jumps, `match`
+    /// end jumps). CPython's flowgraph optimizer may thread a jump
+    /// *through* these (they carry no observable line of their own),
+    /// but never through an explicit-statement jump on a different
+    /// line (`continue` keeps its own 'line' trace event —
+    /// test_break_to_continue1). Our linetable stamps them with the
+    /// preceding instruction's line (CPython's `propagate_line_numbers`
+    /// result), so threading eligibility needs this side channel.
+    synthetic_jumps: HashSet<u32>,
     /// Number of *live exception values* sitting on the operand stack at
     /// the current compile point: a `finally` body (or the unmatched
     /// re-raise path of a `try/except`) runs with the propagating
@@ -1220,6 +1250,7 @@ impl Compiler {
             comp_kind: None,
             bindings: IndexMap::new(),
             explicit_globals: HashSet::new(),
+            class_transparent_frees: HashSet::new(),
             free_order: Vec::new(),
             loop_stack: Vec::new(),
             finally_stack: Vec::new(),
@@ -1233,6 +1264,7 @@ impl Compiler {
             current_line: 0,
             line_pinned: None,
             current_span: (0, 0),
+            synthetic_jumps: HashSet::new(),
             exc_on_stack: 0,
             handler_depth: 0,
             inside_class_body: false,
@@ -1329,6 +1361,59 @@ impl Compiler {
         // trailing `return None` keeps the end-of-code offset a valid target;
         // when it is genuinely unreachable it is harmless dead code (two
         // instructions) exactly as in CPython.
+        // CPython's flowgraph optimizer threads jump-to-jump chains: a
+        // branch whose target is itself an unconditional jump goes
+        // straight to the final destination. Beyond saving a hop, this
+        // is *observable* under sys.settrace: an `if` body inside a
+        // loop must not bounce through the join-point `JUMP_BACKWARD`
+        // sitting on the `else` body's line (that would fire a spurious
+        // 'line' event there — test_sys_settrace's no_pop_tops /
+        // break_to_break family). Threading keeps execution off the
+        // intermediate instruction entirely; the retargeted jump keeps
+        // its own source location (gh-123048).
+        //
+        // Eligibility mirrors CPython's `jump_thread`: only hop through
+        // a jump that is *synthetic* (CPython would have emitted it
+        // with NO_LOCATION) or one sharing the source line of the jump
+        // being threaded. An explicit `continue` on its own line stays
+        // a distinct hop so its 'line' event still fires.
+        let n = self.next_offset();
+        for i in 0..n {
+            let ins = self.co.instructions[i as usize];
+            let (is_cond, target) = match ins.op {
+                OpCode::JumpForward => (false, i + 1 + ins.arg),
+                OpCode::PopJumpIfFalse | OpCode::PopJumpIfTrue => (true, i + 1 + ins.arg),
+                _ => continue,
+            };
+            let site_line = self.co.linetable[i as usize];
+            let mut t = target;
+            let mut hops = 0u32;
+            while t < n && hops <= n {
+                if !(self.synthetic_jumps.contains(&t)
+                    || self.co.linetable[t as usize] == site_line)
+                {
+                    break;
+                }
+                let tin = self.co.instructions[t as usize];
+                match tin.op {
+                    OpCode::JumpForward => t = t + 1 + tin.arg,
+                    // Our conditional jump opcodes only encode forward
+                    // displacements, so they stop at a backward hop.
+                    OpCode::JumpBackward if !is_cond => t = (t + 1) - tin.arg,
+                    _ => break,
+                }
+                hops += 1;
+            }
+            if t == target || t >= n || hops > n {
+                continue;
+            }
+            if t > i {
+                self.co.instructions[i as usize].arg = t - (i + 1);
+            } else if !is_cond {
+                self.co.instructions[i as usize].op = OpCode::JumpBackward;
+                self.co.instructions[i as usize].arg = (i + 1) - t;
+            }
+        }
         let none_idx = self.co.intern_constant(Constant::None);
         let epilogue = self.next_offset();
         self.emit(OpCode::LoadConst, none_idx);
@@ -1354,10 +1439,20 @@ impl Compiler {
         // line of the *original* jump site, not an intermediate hop.
         // Forward jumps strictly increase the offset, so the chase
         // terminates.
-        let resolve = |co: &CodeObject, mut t: u32| -> u32 {
+        //
+        // The chase honours the same eligibility rule as the
+        // threading pass above: hop only through synthetic jumps or
+        // ones sharing the site's line. A nested `break` targeting an
+        // outer `break`'s jump on its own line must keep the hop so
+        // the outer line's 'line' event still fires
+        // (test_break_to_break).
+        let synth = &self.synthetic_jumps;
+        let resolve = |co: &CodeObject, site_line: u32, mut t: u32| -> u32 {
             while (t as usize) < co.instructions.len() {
                 let ins = co.instructions[t as usize];
-                if ins.op == OpCode::JumpForward {
+                if ins.op == OpCode::JumpForward
+                    && (synth.contains(&t) || co.linetable[t as usize] == site_line)
+                {
                     t = t + 1 + ins.arg;
                 } else {
                     break;
@@ -1371,7 +1466,7 @@ impl Compiler {
                 matches!(
                     ins.op,
                     OpCode::JumpForward | OpCode::PopJumpIfFalse | OpCode::PopJumpIfTrue
-                ) && resolve(&self.co, i + 1 + ins.arg) == epilogue
+                ) && resolve(&self.co, self.co.linetable[i as usize], i + 1 + ins.arg) == epilogue
             })
             .collect();
         if std::env::var_os("WP_DBG_FINISH").is_some() {
@@ -1799,7 +1894,13 @@ impl Compiler {
                 let lowered = weavepy_parser::lower_type_alias_stmt(stmt);
                 self.compile_stmt(&lowered)?;
             }
-            StmtKind::Pass => {}
+            StmtKind::Pass => {
+                // CPython lowers `pass` to a NOP carrying the statement's
+                // location (its optimizer only deletes NOPs whose line is
+                // already covered by a neighbour), so a traced `pass`
+                // line fires a 'line' event (test_21_repeated_pass).
+                self.emit(OpCode::Nop, 0);
+            }
             StmtKind::Delete(targets) => {
                 for target in targets {
                     self.compile_delete(target)?;
@@ -1914,7 +2015,9 @@ impl Compiler {
                     let target = self.next_offset();
                     self.patch_jump(jump_else, target);
                 } else {
+                    // Structural join jump: NO_LOCATION in CPython.
                     let jump_end = self.emit(OpCode::JumpForward, 0);
+                    self.synthetic_jumps.insert(jump_end);
                     let else_target = self.next_offset();
                     self.patch_jump(jump_else, else_target);
                     for s in orelse {
@@ -1983,6 +2086,7 @@ impl Compiler {
                     jump_exit_bottom = Some(self.emit(OpCode::PopJumpIfFalse, 0));
                 }
                 let back = self.emit(OpCode::JumpBackward, 0);
+                self.synthetic_jumps.insert(back);
                 self.patch_jump(back, body_start);
                 let frame = self.loop_stack.pop().expect("loop frame");
                 // Natural exit: condition went false. Run the
@@ -2036,6 +2140,7 @@ impl Compiler {
                     self.compile_stmt(s)?;
                 }
                 let back = self.emit(OpCode::JumpBackward, 0);
+                self.synthetic_jumps.insert(back);
                 self.patch_jump(back, loop_top);
                 let frame = self.loop_stack.pop().expect("loop frame");
                 let after = self.next_offset();
@@ -2423,37 +2528,120 @@ impl Compiler {
     }
 
     // ---------- structural pattern matching (RFC 0009) ----------
+    //
+    // Faithful port of CPython's `compile.c` pattern codegen
+    // (`compiler_match_inner` and the `codegen_pattern_*` family).
+    // The key invariants, quoting CPython:
+    //
+    // - `on_top` tracks the number of *working* items currently on the
+    //   top of the stack (subjects being examined, unpacked element
+    //   tuples, …). They are popped by the fail-pop chain on failure.
+    // - Captured values are *not* stored immediately: they are rotated
+    //   *underneath* the working items and recorded in `stores`; the
+    //   actual `STORE_NAME`s happen only once the entire case pattern
+    //   has matched. This is what makes a failed `|` alternative (or a
+    //   failed later sub-pattern) leave no bindings behind.
+    // - Every conditional failure jumps to `fail_pops[k]` where `k` is
+    //   the number of stack items to discard; the chain of `POP_TOP`s
+    //   is emitted after the success jump, attributed to the pattern's
+    //   source location (not the last line of the body).
 
-    /// Lower `match subject: case ...:` into bytecode.
-    ///
-    /// At runtime the subject sits on the stack while each case is
-    /// tried; we pop it (and any extracted values) on a successful
-    /// match before jumping to the chosen body. The subject is also
-    /// popped before falling off the end of the match.
+    /// Lower `match subject: case ...:` into bytecode
+    /// (CPython `compiler_match_inner`).
     fn compile_match(&mut self, subject: &Expr, cases: &[MatchCase]) -> Result<(), CompileError> {
+        // CPython's compile-stage pattern validation (PEP 634): duplicate
+        // name bindings, unreachable alternatives, mismatched `|` binding
+        // sets, duplicate literal mapping keys, repeated class-pattern
+        // attributes, multiple stars. An irrefutable pattern (bare capture
+        // or wildcard) is only allowed on the last case or under a guard.
+        let cases_len = cases.len();
+        for (i, case) in cases.iter().enumerate() {
+            let allow_irrefutable = case.guard.is_some() || i + 1 == cases_len;
+            let mut stores: Vec<String> = Vec::new();
+            validate_case_pattern(&case.pattern, allow_irrefutable, &mut stores)?;
+        }
         self.compile_expr(subject)?;
+        // A trailing `case _:` saves the redundant COPY/POP_TOP dance:
+        // the second-to-last case consumes the subject directly and the
+        // default body runs with a clean stack.
+        let has_default = matches!(
+            cases[cases_len - 1].pattern.kind,
+            weavepy_parser::ast::PatternKind::Capture(None)
+        ) && cases_len > 1;
+        let ncompiled = cases_len - usize::from(has_default);
         let mut end_jumps: Vec<u32> = Vec::new();
-        for case in cases {
-            let mut fail_sites: Vec<u32> = Vec::new();
-            self.emit(OpCode::CopyTop, 0);
-            self.compile_pattern(&case.pattern, &mut fail_sites)?;
-            if let Some(guard) = &case.guard {
-                self.compile_expr(guard)?;
-                let g = self.emit(OpCode::PopJumpIfFalse, 0);
-                fail_sites.push(g);
+        for (i, case) in cases.iter().take(ncompiled).enumerate() {
+            self.set_line_from(case.pattern.span.start.0);
+            self.set_span(case.pattern.span);
+            // Only copy the subject if we're *not* on the last case:
+            if i != ncompiled - 1 {
+                self.emit(OpCode::CopyTop, 0);
             }
-            self.emit(OpCode::PopTop, 0);
+            let mut pc = PatmaCtx::default();
+            self.compile_pattern(&case.pattern, &mut pc)?;
+            debug_assert_eq!(pc.on_top, 0);
+            // It's a match! Store all of the captured names (they're on
+            // the stack, first capture on top).
+            self.set_line_from(case.pattern.span.start.0);
+            self.set_span(case.pattern.span);
+            let stores = std::mem::take(&mut pc.stores);
+            for name in &stores {
+                self.compile_assign(&Expr {
+                    kind: ExprKind::Name(name.clone()),
+                    span: case.pattern.span,
+                })?;
+            }
+            if let Some(guard) = &case.guard {
+                // Guard failure jumps to fail_pops[0]: bindings from the
+                // matched pattern intentionally survive (PEP 634).
+                if pc.fail_pops.is_empty() {
+                    pc.fail_pops.push(Vec::new());
+                }
+                self.compile_expr(guard)?;
+                self.set_span(guard.span);
+                let g = self.emit(OpCode::PopJumpIfFalse, 0);
+                pc.fail_pops[0].push(g);
+                self.set_line_from(case.pattern.span.start.0);
+                self.set_span(case.pattern.span);
+            }
+            // Success! Pop the subject off, we're done with it:
+            if i != ncompiled - 1 {
+                self.emit(OpCode::PopTop, 0);
+            }
             for s in &case.body {
                 self.compile_stmt(s)?;
             }
-            let jump_end = self.emit(OpCode::JumpForward, 0);
-            end_jumps.push(jump_end);
-            let fail_target = self.next_offset();
-            for site in fail_sites {
-                self.patch_jump(site, fail_target);
+            // CPython emits this jump with NO_LOCATION, but its
+            // flowgraph pass (`propagate_line_numbers`) then stamps it
+            // with the preceding instruction's location — which is what
+            // we have right now (the body's last statement). Same line
+            // ⇒ no spurious trace event, and `dis` sees a located jump
+            // (gh-123048 / test_jump_threading).
+            let j = self.emit(OpCode::JumpForward, 0);
+            self.synthetic_jumps.insert(j);
+            end_jumps.push(j);
+            // The cleanup chain is associated with the failed pattern,
+            // not the last line of the body:
+            self.set_line_from(case.pattern.span.start.0);
+            self.set_span(case.pattern.span);
+            self.patma_emit_fail_pops(&mut pc);
+        }
+        if has_default {
+            let case = &cases[cases_len - 1];
+            self.set_line_from(case.pattern.span.start.0);
+            self.set_span(case.pattern.span);
+            // The subject was consumed by the previous case (which did
+            // not copy); a NOP still gives the `case _:` line coverage.
+            self.emit(OpCode::Nop, 0);
+            if let Some(guard) = &case.guard {
+                self.compile_expr(guard)?;
+                self.set_span(guard.span);
+                end_jumps.push(self.emit(OpCode::PopJumpIfFalse, 0));
+            }
+            for s in &case.body {
+                self.compile_stmt(s)?;
             }
         }
-        self.emit(OpCode::PopTop, 0);
         let end = self.next_offset();
         for j in end_jumps {
             self.patch_jump(j, end);
@@ -2461,324 +2649,489 @@ impl Compiler {
         Ok(())
     }
 
-    /// Compile a pattern. The subject is at TOS when this is called
-    /// and must still be there on the failure path. On success TOS
-    /// remains the subject and any captures have been stored.
-    fn compile_pattern(
-        &mut self,
-        pat: &Pattern,
-        fail_sites: &mut Vec<u32>,
-    ) -> Result<(), CompileError> {
-        match pat {
-            Pattern::Value(expr) => {
-                self.compile_expr(expr)?;
-                self.emit(OpCode::CompareOp, CompareKind::Eq as u32);
-                let j = self.emit(OpCode::PopJumpIfFalse, 0);
-                fail_sites.push(j);
+    /// CPython `jump_to_fail_pop`: emit `op` jumping to the fail-pop
+    /// block that discards everything this pattern currently has in
+    /// flight (working items + deferred captures).
+    fn patma_jump_to_fail_pop(&mut self, pc: &mut PatmaCtx, op: OpCode) {
+        let pops = pc.on_top + pc.stores.len();
+        if pc.fail_pops.len() <= pops {
+            pc.fail_pops.resize_with(pops + 1, Vec::new);
+        }
+        let site = self.emit(op, 0);
+        pc.fail_pops[pops].push(site);
+    }
+
+    /// CPython `emit_and_reset_fail_pop`: lay out the cascade
+    /// `fail_pops[k]: POP_TOP; fail_pops[k-1]: POP_TOP; … fail_pops[0]:`
+    /// so a jump to level `k` pops exactly `k` items, then falls
+    /// through to the "no match" continuation.
+    fn patma_emit_fail_pops(&mut self, pc: &mut PatmaCtx) {
+        let fail_pops = std::mem::take(&mut pc.fail_pops);
+        if fail_pops.is_empty() {
+            return;
+        }
+        for k in (1..fail_pops.len()).rev() {
+            let here = self.next_offset();
+            for site in &fail_pops[k] {
+                self.patch_jump(*site, here);
             }
-            Pattern::Singleton(c) => {
+            self.emit(OpCode::PopTop, 0);
+        }
+        let here = self.next_offset();
+        for site in &fail_pops[0] {
+            self.patch_jump(*site, here);
+        }
+    }
+
+    /// CPython `pattern_helper_rotate`: move TOS down `count - 1`
+    /// places (below the items currently above that slot).
+    fn patma_rotate(&mut self, count: usize) {
+        let mut count = count;
+        while count > 1 {
+            self.emit(OpCode::Swap, count as u32);
+            count -= 1;
+        }
+    }
+
+    /// CPython `pattern_helper_store_name`: defer the capture at TOS by
+    /// rotating it underneath the working items and previous captures.
+    /// `None` (wildcard) just pops. Duplicate-name errors were already
+    /// raised by `validate_case_pattern`.
+    fn patma_store_name(&mut self, name: Option<&str>, pc: &mut PatmaCtx) {
+        match name {
+            None => {
+                self.emit(OpCode::PopTop, 0);
+            }
+            Some(n) => {
+                let rotations = pc.on_top + pc.stores.len() + 1;
+                self.patma_rotate(rotations);
+                pc.stores.push(n.to_owned());
+            }
+        }
+    }
+
+    /// Compile a pattern (CPython `compiler_pattern`). The subject is
+    /// at TOS. On success it is consumed (captures deferred beneath the
+    /// working items); on failure control jumps into `pc.fail_pops`.
+    fn compile_pattern(&mut self, pat: &Pattern, pc: &mut PatmaCtx) -> Result<(), CompileError> {
+        use weavepy_parser::ast::PatternKind;
+        self.set_line_from(pat.span.start.0);
+        self.set_span(pat.span);
+        match &pat.kind {
+            PatternKind::Value(expr) => {
+                self.compile_expr(expr)?;
+                self.set_span(pat.span);
+                self.emit(OpCode::CompareOp, CompareKind::Eq as u32);
+                self.patma_jump_to_fail_pop(pc, OpCode::PopJumpIfFalse);
+            }
+            PatternKind::Singleton(c) => {
                 let idx = self.co.intern_constant(c.clone().into());
                 self.emit(OpCode::LoadConst, idx);
                 self.emit(OpCode::IsOp, 0);
-                let j = self.emit(OpCode::PopJumpIfFalse, 0);
-                fail_sites.push(j);
+                self.patma_jump_to_fail_pop(pc, OpCode::PopJumpIfFalse);
             }
-            Pattern::Capture(None) => {
-                self.emit(OpCode::PopTop, 0);
+            PatternKind::Capture(name) => {
+                self.patma_store_name(name.as_deref(), pc);
             }
-            Pattern::Capture(Some(name)) => {
-                let name_expr = Expr {
-                    kind: ExprKind::Name(name.clone()),
-                    span: weavepy_lexer::Span::new(0, 0),
-                };
-                self.compile_assign(&name_expr)?;
+            PatternKind::Star(name) => {
+                self.patma_store_name(name.as_deref(), pc);
             }
-            Pattern::Sequence(items) => {
-                self.compile_sequence_pattern(items, fail_sites)?;
+            PatternKind::Sequence(items) => {
+                self.compile_sequence_pattern(pat, items, pc)?;
             }
-            Pattern::Star(_) => {
-                return Err(CompileError::internal(
-                    "`*name` patterns may only appear inside a sequence",
-                ));
-            }
-            Pattern::Mapping {
+            PatternKind::Mapping {
                 keys,
                 patterns,
                 rest,
             } => {
-                self.compile_mapping_pattern(keys, patterns, rest.as_ref(), fail_sites)?;
+                self.compile_mapping_pattern(pat, keys, patterns, rest.as_ref(), pc)?;
             }
-            Pattern::Class {
+            PatternKind::Class {
                 cls,
                 positionals,
                 keywords,
             } => {
-                self.compile_class_pattern(cls, positionals, keywords, fail_sites)?;
+                self.compile_class_pattern(pat, cls, positionals, keywords, pc)?;
             }
-            Pattern::Or(alts) => {
-                let mut end_jumps: Vec<u32> = Vec::new();
-                let n = alts.len();
-                for (i, alt) in alts.iter().enumerate() {
-                    let mut local_fail: Vec<u32> = Vec::new();
-                    if i + 1 < n {
-                        self.emit(OpCode::CopyTop, 0);
-                    }
-                    self.compile_pattern(alt, &mut local_fail)?;
-                    if i + 1 < n {
-                        let j = self.emit(OpCode::JumpForward, 0);
-                        end_jumps.push(j);
-                        let fail_target = self.next_offset();
-                        for site in local_fail {
-                            self.patch_jump(site, fail_target);
-                        }
-                    } else {
-                        for site in local_fail {
-                            fail_sites.push(site);
-                        }
-                    }
-                }
-                let end = self.next_offset();
-                for j in end_jumps {
-                    self.patch_jump(j, end);
-                }
+            PatternKind::Or(alts) => {
+                self.compile_or_pattern(pat, alts, pc)?;
             }
-            Pattern::As { pattern, name } => {
+            PatternKind::As { pattern, name } => {
+                // Need to make a copy for (possibly) storing later:
+                pc.on_top += 1;
                 self.emit(OpCode::CopyTop, 0);
-                let name_expr = Expr {
-                    kind: ExprKind::Name(name.clone()),
-                    span: weavepy_lexer::Span::new(0, 0),
-                };
-                self.compile_assign(&name_expr)?;
-                self.compile_pattern(pattern, fail_sites)?;
+                self.compile_pattern(pattern, pc)?;
+                // Success! Store it:
+                pc.on_top -= 1;
+                self.set_line_from(pat.span.start.0);
+                self.set_span(pat.span);
+                self.patma_store_name(Some(name), pc);
             }
         }
         Ok(())
     }
 
+    /// CPython `compiler_pattern_sequence`.
     fn compile_sequence_pattern(
         &mut self,
+        pat: &Pattern,
         items: &[Pattern],
-        fail_sites: &mut Vec<u32>,
+        pc: &mut PatmaCtx,
     ) -> Result<(), CompileError> {
+        use weavepy_parser::ast::PatternKind;
+        let size = items.len();
+        let star = items
+            .iter()
+            .position(|p| matches!(p.kind, PatternKind::Star(_)));
+        let star_wildcard = star.is_some_and(|i| matches!(items[i].kind, PatternKind::Star(None)));
+        let only_wildcard = items.iter().all(|p| {
+            matches!(p.kind, PatternKind::Capture(None))
+                || matches!(p.kind, PatternKind::Star(None))
+        });
+        // We need to keep the subject on top during the sequence and
+        // length checks:
+        pc.on_top += 1;
         self.emit(OpCode::MatchSequence, 0);
-        let j = self.emit(OpCode::PopJumpIfFalse, 0);
-        fail_sites.push(j);
-        let star_index = items.iter().position(|p| matches!(p, Pattern::Star(_)));
-        let expected_len = if star_index.is_some() {
-            items.len() - 1
-        } else {
-            items.len()
-        };
-        self.emit(OpCode::GetLen, 0);
-        let len_idx = self.co.intern_constant(Constant::Int(expected_len as i64));
-        self.emit(OpCode::LoadConst, len_idx);
-        if star_index.is_some() {
-            self.emit(OpCode::CompareOp, CompareKind::GtE as u32);
-        } else {
-            self.emit(OpCode::CompareOp, CompareKind::Eq as u32);
-        }
-        let j = self.emit(OpCode::PopJumpIfFalse, 0);
-        fail_sites.push(j);
-        for (i, pat) in items.iter().enumerate() {
-            self.emit(OpCode::CopyTop, 0);
-            match pat {
-                Pattern::Star(name) => {
-                    if let Some(n) = name {
-                        let tail = items.len() - i - 1;
-                        self.emit_pattern_subscript_slice(i, tail);
-                        // A `*name` capture must always bind a `list`, even when the
-                        // matched subject is a `tuple` (PEP 634 / `UNPACK_EX`
-                        // semantics). Slicing a tuple subject yields a tuple, so the
-                        // slice is re-boxed into a fresh list here.
-                        self.wrap_tos_in_list();
-                        let name_expr = Expr {
-                            kind: ExprKind::Name(n.clone()),
-                            span: weavepy_lexer::Span::new(0, 0),
-                        };
-                        self.compile_assign(&name_expr)?;
-                    } else {
-                        // Anonymous `*_` binds nothing; just drop the working copy of
-                        // the subject pushed by the enclosing `CopyTop` (no slice
-                        // needed, matching CPython, which never materialises it).
-                        self.emit(OpCode::PopTop, 0);
-                    }
-                }
-                _ => {
-                    let idx = if let Some(si) = star_index {
-                        if i > si {
-                            // negative index from end
-                            -((items.len() - i) as i64)
-                        } else {
-                            i as i64
-                        }
-                    } else {
-                        i as i64
-                    };
-                    let cidx = self.co.intern_constant(Constant::Int(idx));
-                    self.emit(OpCode::LoadConst, cidx);
-                    self.emit(OpCode::BinarySubscr, 0);
-                    self.compile_pattern(pat, fail_sites)?;
-                }
+        self.patma_jump_to_fail_pop(pc, OpCode::PopJumpIfFalse);
+        match star {
+            None => {
+                // No star: len(subject) == size
+                self.emit(OpCode::GetLen, 0);
+                let idx = self.co.intern_constant(Constant::Int(size as i64));
+                self.emit(OpCode::LoadConst, idx);
+                self.emit(OpCode::CompareOp, CompareKind::Eq as u32);
+                self.patma_jump_to_fail_pop(pc, OpCode::PopJumpIfFalse);
             }
+            Some(_) if size > 1 => {
+                // Star: len(subject) >= size - 1
+                self.emit(OpCode::GetLen, 0);
+                let idx = self.co.intern_constant(Constant::Int((size - 1) as i64));
+                self.emit(OpCode::LoadConst, idx);
+                self.emit(OpCode::CompareOp, CompareKind::GtE as u32);
+                self.patma_jump_to_fail_pop(pc, OpCode::PopJumpIfFalse);
+            }
+            // A lone `[*_]` / `[*x]` matches any length: no len() call
+            // (Sequence-registered classes needn't have a usable __len__).
+            Some(_) => {}
+        }
+        // Whatever comes next should consume the subject:
+        pc.on_top -= 1;
+        if only_wildcard {
+            // Patterns like: [] / [_] / [_, _] / [*_] / [_, *_] / etc.
+            self.emit(OpCode::PopTop, 0);
+        } else if star_wildcard {
+            self.patma_sequence_subscr(pat, items, star.unwrap(), pc)?;
+        } else {
+            self.patma_sequence_unpack(pat, items, star, pc)?;
         }
         Ok(())
     }
 
-    /// Re-box the iterable on top of the stack into a fresh `list`,
-    /// leaving `list(TOS)` in its place. Used by `*name` sequence-pattern
-    /// captures, which must always bind a `list` even for tuple subjects.
-    ///
-    /// Implemented with the `list.extend` idiom over pure stack ops so it
-    /// never depends on the `list` builtin name (which user code may
-    /// shadow). Stack walk (top on the right):
-    /// `[it] → BuildList → [it, L] → CopyTop → [it, L, L] →
-    ///  LoadAttr extend → [it, L, L.extend] → Swap 2 → [it, L.extend, L]
-    ///  → Swap 3 → [L, L.extend, it] → Call 1 → [L, None] → PopTop → [L]`.
-    fn wrap_tos_in_list(&mut self) {
-        self.emit(OpCode::BuildList, 0);
-        self.emit(OpCode::CopyTop, 0);
-        let extend = self.co.intern_name("extend");
-        self.emit(OpCode::LoadAttr, extend);
-        self.emit(OpCode::Swap, 2);
-        self.emit(OpCode::Swap, 3);
-        self.emit(OpCode::Call, 1);
-        self.emit(OpCode::PopTop, 0);
-    }
-
-    /// Emit a slice subscription `subject[head:len-tail]` for a `*name`
-    /// position inside a sequence pattern. Leaves the slice list on the
-    /// stack.
-    fn emit_pattern_subscript_slice(&mut self, head: usize, tail: usize) {
-        let lower = self.co.intern_constant(Constant::Int(head as i64));
-        self.emit(OpCode::LoadConst, lower);
-        if tail == 0 {
-            let none = self.co.intern_constant(Constant::None);
-            self.emit(OpCode::LoadConst, none);
-        } else {
-            let neg = self.co.intern_constant(Constant::Int(-(tail as i64)));
-            self.emit(OpCode::LoadConst, neg);
+    /// CPython `pattern_helper_sequence_unpack`: UNPACK the subject and
+    /// match each element (the unpacked items count toward `on_top`).
+    fn patma_sequence_unpack(
+        &mut self,
+        pat: &Pattern,
+        items: &[Pattern],
+        star: Option<usize>,
+        pc: &mut PatmaCtx,
+    ) -> Result<(), CompileError> {
+        let n = items.len();
+        match star {
+            Some(si) => {
+                if si >= (1 << 8) || n - si > (1 << 8) {
+                    return Err(CompileError::spanned(
+                        "too many expressions in star-unpacking sequence pattern",
+                        pat.span,
+                    ));
+                }
+                // Our UnpackEx encoding: before in the high byte.
+                self.emit(OpCode::UnpackEx, ((si as u32) << 8) | (n - si - 1) as u32);
+            }
+            None => {
+                self.emit(OpCode::UnpackSequence, n as u32);
+            }
         }
-        let none = self.co.intern_constant(Constant::None);
-        self.emit(OpCode::LoadConst, none);
-        self.emit(OpCode::BuildSlice, 3);
-        self.emit(OpCode::BinarySubscr, 0);
+        // We've now got a bunch of new subjects on the stack (first
+        // element on top). They need to remain there after each
+        // subpattern match:
+        pc.on_top += n;
+        for item in items {
+            // One less item to keep track of each time we loop through:
+            pc.on_top -= 1;
+            self.compile_pattern(item, pc)?;
+        }
+        Ok(())
     }
 
+    /// CPython `pattern_helper_sequence_subscr`: for patterns with a
+    /// starred wildcard, index the needed elements instead of unpacking.
+    fn patma_sequence_subscr(
+        &mut self,
+        pat: &Pattern,
+        items: &[Pattern],
+        star: usize,
+        pc: &mut PatmaCtx,
+    ) -> Result<(), CompileError> {
+        use weavepy_parser::ast::PatternKind;
+        // We need to keep the subject around for extracting elements:
+        pc.on_top += 1;
+        let size = items.len();
+        for (i, item) in items.iter().enumerate() {
+            if matches!(item.kind, PatternKind::Capture(None)) {
+                continue;
+            }
+            if i == star {
+                continue;
+            }
+            self.set_line_from(pat.span.start.0);
+            self.set_span(pat.span);
+            self.emit(OpCode::CopyTop, 0);
+            if i < star {
+                let idx = self.co.intern_constant(Constant::Int(i as i64));
+                self.emit(OpCode::LoadConst, idx);
+            } else {
+                // The subject may not support negative indexing! Compute
+                // a nonnegative index:
+                self.emit(OpCode::GetLen, 0);
+                let idx = self.co.intern_constant(Constant::Int((size - i) as i64));
+                self.emit(OpCode::LoadConst, idx);
+                self.emit(OpCode::BinaryOp, BinOpKind::Sub as u32);
+            }
+            self.emit(OpCode::BinarySubscr, 0);
+            self.compile_pattern(item, pc)?;
+        }
+        // Pop the subject, we're done with it:
+        pc.on_top -= 1;
+        self.set_line_from(pat.span.start.0);
+        self.set_span(pat.span);
+        self.emit(OpCode::PopTop, 0);
+        Ok(())
+    }
+
+    /// CPython `compiler_pattern_mapping`.
     fn compile_mapping_pattern(
         &mut self,
+        pat: &Pattern,
         keys: &[Expr],
         patterns: &[Pattern],
         rest: Option<&Option<String>>,
-        fail_sites: &mut Vec<u32>,
+        pc: &mut PatmaCtx,
     ) -> Result<(), CompileError> {
+        let size = keys.len();
+        // We need to keep the subject on top during the mapping and
+        // length checks:
+        pc.on_top += 1;
         self.emit(OpCode::MatchMapping, 0);
-        let j = self.emit(OpCode::PopJumpIfFalse, 0);
-        fail_sites.push(j);
-        if !keys.is_empty() {
-            for k in keys {
-                self.compile_expr(k)?;
-            }
-            self.emit(OpCode::BuildTuple, keys.len() as u32);
-            self.emit(OpCode::MatchKeys, 0);
-            let none_idx = self.co.intern_constant(Constant::None);
-            self.emit(OpCode::LoadConst, none_idx);
-            self.emit(OpCode::IsOp, 1);
-            let j = self.emit(OpCode::PopJumpIfFalse, 0);
-            fail_sites.push(j);
-            for (i, pat) in patterns.iter().enumerate() {
-                self.emit(OpCode::CopyTop, 0);
-                let idx = self.co.intern_constant(Constant::Int(i as i64));
-                self.emit(OpCode::LoadConst, idx);
-                self.emit(OpCode::BinarySubscr, 0);
-                self.compile_pattern(pat, fail_sites)?;
-            }
+        self.patma_jump_to_fail_pop(pc, OpCode::PopJumpIfFalse);
+        if size == 0 && rest.is_none() {
+            // If the pattern is just "{}", we're done! Pop the subject:
+            pc.on_top -= 1;
             self.emit(OpCode::PopTop, 0);
+            return Ok(());
         }
+        if size > 0 {
+            // If the pattern has any keys in it, perform a length check:
+            self.emit(OpCode::GetLen, 0);
+            let idx = self.co.intern_constant(Constant::Int(size as i64));
+            self.emit(OpCode::LoadConst, idx);
+            self.emit(OpCode::CompareOp, CompareKind::GtE as u32);
+            self.patma_jump_to_fail_pop(pc, OpCode::PopJumpIfFalse);
+        }
+        // Collect all of the keys into a tuple for MATCH_KEYS and
+        // **rest (duplicate literal keys were rejected at validation;
+        // value-pattern collisions are a runtime ValueError):
+        for k in keys {
+            self.compile_expr(k)?;
+        }
+        self.set_line_from(pat.span.start.0);
+        self.set_span(pat.span);
+        self.emit(OpCode::BuildTuple, size as u32);
+        // MATCH_KEYS peeks both; there's now a tuple of keys and a
+        // tuple of values (or None) on top of the subject:
+        self.emit(OpCode::MatchKeys, 0);
+        pc.on_top += 2;
+        self.emit(OpCode::CopyTop, 0);
+        let none_idx = self.co.intern_constant(Constant::None);
+        self.emit(OpCode::LoadConst, none_idx);
+        self.emit(OpCode::IsOp, 1);
+        self.patma_jump_to_fail_pop(pc, OpCode::PopJumpIfFalse);
+        // So far so good. Use that tuple of values on the stack to
+        // match sub-patterns against:
+        self.emit(OpCode::UnpackSequence, size as u32);
+        pc.on_top += size;
+        pc.on_top -= 1;
+        for p in patterns {
+            pc.on_top -= 1;
+            self.compile_pattern(p, pc)?;
+        }
+        // If we get this far, it's a match! Whatever happens next
+        // should consume the tuple of keys and the subject:
+        pc.on_top -= 2;
+        self.set_line_from(pat.span.start.0);
+        self.set_span(pat.span);
         if let Some(rest_name) = rest {
-            self.emit(OpCode::CopyTop, 0);
-            self.emit_dict_copy_without_keys(keys.len());
-            if let Some(n) = rest_name {
-                let name_expr = Expr {
-                    kind: ExprKind::Name(n.clone()),
-                    span: weavepy_lexer::Span::new(0, 0),
-                };
-                self.compile_assign(&name_expr)?;
-            } else {
-                self.emit(OpCode::PopTop, 0);
+            // `**rest`: rest = dict(subject); for key in keys: del rest[key].
+            // Our DICT_UPDATE takes [dict, other] adjacent, so the walk
+            // differs slightly from CPython's SWAP 3 dance:
+            self.emit(OpCode::Swap, 2); //          [keys, subject]
+            self.emit(OpCode::BuildMap, 0); //      [keys, subject, {}]
+            self.emit(OpCode::Swap, 2); //          [keys, {}, subject]
+            self.emit(OpCode::DictUpdate, 0); //    [keys, copy]
+            self.emit(OpCode::Swap, 2); //          [copy, keys]
+            self.emit(OpCode::UnpackSequence, size as u32); // [copy, k_n..k_1]
+            let mut remaining = size;
+            while remaining > 0 {
+                self.emit(OpCode::CopyTop, (1 + remaining) as u32); // [copy, keys.., copy]
+                self.emit(OpCode::Swap, 2); //                         [copy, keys.., copy, key]
+                self.emit(OpCode::DeleteSubscr, 0); //                 [copy, keys..]
+                remaining -= 1;
             }
+            self.patma_store_name(rest_name.as_deref(), pc);
+        } else {
+            self.emit(OpCode::PopTop, 0); // Tuple of keys.
+            self.emit(OpCode::PopTop, 0); // Subject.
         }
         Ok(())
     }
 
-    fn emit_dict_copy_without_keys(&mut self, _key_count: usize) {
-        // Stub: the VM provides this as a builtin call via dict.copy()
-        // for now; real CPython uses a dedicated opcode.
-        let idx = self.co.intern_name("dict");
-        self.emit(OpCode::LoadGlobal, idx);
-        self.emit(OpCode::Swap, 1);
-        self.emit(OpCode::Call, 1);
-    }
-
+    /// CPython `compiler_pattern_class`.
     fn compile_class_pattern(
         &mut self,
+        pat: &Pattern,
         cls: &Expr,
         positionals: &[Pattern],
         keywords: &[(String, Pattern)],
-        fail_sites: &mut Vec<u32>,
+        pc: &mut PatmaCtx,
     ) -> Result<(), CompileError> {
-        // Stack on entry (top-down): subject_copy. We must end with
-        // the subject_copy popped on success, and the subject_copy
-        // popped (and fail_sites taken) on failure.
+        use weavepy_parser::ast::PatternKind;
+        let nargs = positionals.len();
+        let nattrs = keywords.len();
         self.compile_expr(cls)?;
+        self.set_line_from(pat.span.start.0);
+        self.set_span(pat.span);
         let kw_names: Vec<Constant> = keywords
             .iter()
             .map(|(n, _)| Constant::Str(n.clone()))
             .collect();
         let kw_idx = self.co.intern_constant(Constant::Tuple(kw_names));
         self.emit(OpCode::LoadConst, kw_idx);
-        self.emit(OpCode::MatchClass, positionals.len() as u32);
-        // Stack now: [..., result_or_none]
+        self.emit(OpCode::MatchClass, nargs as u32);
         self.emit(OpCode::CopyTop, 0);
         let none_idx = self.co.intern_constant(Constant::None);
         self.emit(OpCode::LoadConst, none_idx);
-        self.emit(OpCode::IsOp, 0);
-        let bad = self.emit(OpCode::PopJumpIfTrue, 0);
-        // Result is a tuple. Inner patterns get their own fail list
-        // so we can pop the tuple before joining the outer fail path.
-        let mut local_fails: Vec<u32> = Vec::new();
-        for (i, pat) in positionals.iter().enumerate() {
+        self.emit(OpCode::IsOp, 1);
+        // TOS is now a tuple of (nargs + nattrs) attributes (or None):
+        pc.on_top += 1;
+        self.patma_jump_to_fail_pop(pc, OpCode::PopJumpIfFalse);
+        self.emit(OpCode::UnpackSequence, (nargs + nattrs) as u32);
+        pc.on_top += nargs + nattrs;
+        pc.on_top -= 1;
+        for i in 0..(nargs + nattrs) {
+            pc.on_top -= 1;
+            let pattern = if i < nargs {
+                &positionals[i]
+            } else {
+                &keywords[i - nargs].1
+            };
+            if matches!(pattern.kind, PatternKind::Capture(None)) {
+                self.emit(OpCode::PopTop, 0);
+                continue;
+            }
+            self.compile_pattern(pattern, pc)?;
+        }
+        Ok(())
+    }
+
+    /// CPython `compiler_pattern_or`.
+    fn compile_or_pattern(
+        &mut self,
+        pat: &Pattern,
+        alts: &[Pattern],
+        pc: &mut PatmaCtx,
+    ) -> Result<(), CompileError> {
+        let mut end_jumps: Vec<u32> = Vec::new();
+        // `control` is the list of names bound by the first alternative;
+        // later alternatives must bind the same set (validated earlier)
+        // and get their stack slots reordered to match.
+        let mut control: Option<Vec<String>> = None;
+        for alt in alts {
+            // Each alternative runs in a fresh sub-context against a
+            // fresh copy of the subject:
+            let mut sub = PatmaCtx::default();
+            self.set_line_from(alt.span.start.0);
+            self.set_span(alt.span);
             self.emit(OpCode::CopyTop, 0);
-            let idx = self.co.intern_constant(Constant::Int(i as i64));
-            self.emit(OpCode::LoadConst, idx);
-            self.emit(OpCode::BinarySubscr, 0);
-            self.compile_pattern(pat, &mut local_fails)?;
+            self.compile_pattern(alt, &mut sub)?;
+            // Success!
+            let nstores = sub.stores.len();
+            match &control {
+                None => {
+                    // First alternative: its stores become the control.
+                    control = Some(sub.stores.clone());
+                }
+                Some(ctrl) => {
+                    debug_assert_eq!(ctrl.len(), nstores);
+                    // Reorder the captures on the stack (stores[0] is the
+                    // item nearest TOS) to match the control order:
+                    let ctrl = ctrl.clone();
+                    let mut stores = sub.stores.clone();
+                    self.set_line_from(alt.span.start.0);
+                    self.set_span(alt.span);
+                    for icontrol in (0..nstores).rev() {
+                        let name = &ctrl[icontrol];
+                        let istores = stores
+                            .iter()
+                            .position(|s| s == name)
+                            .expect("validated: alternatives bind the same names");
+                        if icontrol != istores {
+                            debug_assert!(istores < icontrol);
+                            let rotations = istores + 1;
+                            // Perform the same rotation on the list:
+                            // rotated = stores[:rotations]
+                            // del stores[:rotations]
+                            // stores[icontrol-istores:icontrol-istores] = rotated
+                            let rotated: Vec<String> = stores.drain(0..rotations).collect();
+                            let at = icontrol - istores;
+                            for (k, n) in rotated.into_iter().enumerate() {
+                                stores.insert(at + k, n);
+                            }
+                            // Do the same thing to the stack:
+                            for _ in 0..rotations {
+                                self.patma_rotate(icontrol + 1);
+                            }
+                        }
+                    }
+                    debug_assert_eq!(stores, ctrl);
+                }
+            }
+            end_jumps.push(self.emit(OpCode::JumpForward, 0));
+            self.patma_emit_fail_pops(&mut sub);
         }
-        for (i, (_, pat)) in keywords.iter().enumerate() {
-            self.emit(OpCode::CopyTop, 0);
-            let idx = self
-                .co
-                .intern_constant(Constant::Int((positionals.len() + i) as i64));
-            self.emit(OpCode::LoadConst, idx);
-            self.emit(OpCode::BinarySubscr, 0);
-            self.compile_pattern(pat, &mut local_fails)?;
-        }
-        self.emit(OpCode::PopTop, 0); // drop result tuple
-        let success = self.emit(OpCode::JumpForward, 0);
-        // On inner failure path: stack has the result tuple. Drop it
-        // and join the outer fail_sites.
-        let inner_fail_target = self.next_offset();
-        for site in local_fails {
-            self.patch_jump(site, inner_fail_target);
-        }
-        self.emit(OpCode::PopTop, 0); // drop result tuple
-        fail_sites.push(self.emit(OpCode::JumpForward, 0));
-        // bad path: result was None; pop and join outer fail_sites.
-        let bad_target = self.next_offset();
-        self.patch_jump(bad, bad_target);
-        self.emit(OpCode::PopTop, 0); // drop the None
-        fail_sites.push(self.emit(OpCode::JumpForward, 0));
+        // No match. Pop the remaining copy of the subject and fail:
+        self.set_line_from(pat.span.start.0);
+        self.set_span(pat.span);
+        self.emit(OpCode::PopTop, 0);
+        self.patma_jump_to_fail_pop(pc, OpCode::JumpForward);
+        // Success target:
         let end = self.next_offset();
-        self.patch_jump(success, end);
+        for j in end_jumps {
+            self.patch_jump(j, end);
+        }
+        let control = control.expect("|-pattern has at least one alternative");
+        // There's a bunch of stuff on the stack between where the new
+        // stores are and where they need to be: the other new stores, a
+        // copy of the subject, anything on top, and any previous stores.
+        let nstores = control.len();
+        let nrots = nstores + 1 + pc.on_top + pc.stores.len();
+        for name in control {
+            // Rotate this capture to its proper place on the stack
+            // (duplicates against outer stores were rejected earlier):
+            self.patma_rotate(nrots);
+            pc.stores.push(name);
+        }
+        // Pop the copy of the subject:
+        self.emit(OpCode::PopTop, 0);
         Ok(())
     }
 
@@ -3377,25 +3730,19 @@ impl Compiler {
         // CPython exposes the resulting dict as
         // ``func.__annotations__``; we pop it inside MakeFunction
         // when flag 0x04 is set.
+        // CPython's compiler_visit_annotations order: posonly, args,
+        // *args, kwonly, **kwargs, then 'return'.
         let mut annotated_params: Vec<(String, &Expr)> = Vec::new();
         for a in args
             .posonlyargs
             .iter()
             .chain(args.args.iter())
+            .chain(args.vararg.iter())
             .chain(args.kwonlyargs.iter())
+            .chain(args.kwarg.iter())
         {
             if let Some(ann) = a.annotation.as_ref() {
                 annotated_params.push((a.name.clone(), ann));
-            }
-        }
-        if let Some(va) = &args.vararg {
-            if let Some(ann) = va.annotation.as_ref() {
-                annotated_params.push((va.name.clone(), ann));
-            }
-        }
-        if let Some(kw) = &args.kwarg {
-            if let Some(ann) = kw.annotation.as_ref() {
-                annotated_params.push((kw.name.clone(), ann));
             }
         }
         // `-> R` joins the same dict under the `'return'` key — at
@@ -3672,9 +4019,6 @@ impl Compiler {
             if !matches!(inner.bindings.get(name), Some(Binding::Global)) {
                 continue;
             }
-            if inner.explicit_globals.contains(name) {
-                continue;
-            }
             if matches!(
                 self.bindings.get(name),
                 Some(
@@ -3685,9 +4029,18 @@ impl Compiler {
                         | Binding::ClassPassthrough
                 )
             ) {
-                inner
-                    .bindings
-                    .insert(name.clone(), Binding::ClassPassthrough);
+                if inner.explicit_globals.contains(name) {
+                    // `global y` in the class body: the class's own
+                    // loads/stores stay global, but nested scopes skip
+                    // the class scope (PEP 227) and still reach the
+                    // enclosing function's `y` — forward the cell
+                    // without touching the class-level binding.
+                    inner.class_transparent_frees.insert(name.clone());
+                } else {
+                    inner
+                        .bindings
+                        .insert(name.clone(), Binding::ClassPassthrough);
+                }
                 if !inner.free_order.contains(name) {
                     inner.free_order.push(name.clone());
                 }
@@ -3705,9 +4058,11 @@ impl Compiler {
         inner.emit(OpCode::LoadConst, qualname_const);
         inner.emit(OpCode::StoreName, qualname_idx);
 
-        // CPython 3.13 compiler extras: `__firstlineno__` (the line of
-        // the `class` statement) and `__static_attributes__` (sorted
-        // names assigned through `self.X` in any method body).
+        // CPython 3.13 compiler extra: `__firstlineno__` (the line of
+        // the `class` statement). Its sibling `__static_attributes__`
+        // is stored *after* the body statements (see below), matching
+        // CPython's emission order — a `__prepare__` mapping with an
+        // instrumented `__setitem__` observes it last (test_metaclass).
         {
             let line_const = inner
                 .co
@@ -3715,33 +4070,6 @@ impl Compiler {
             let line_name = inner.co.intern_name("__firstlineno__");
             inner.emit(OpCode::LoadConst, line_const);
             inner.emit(OpCode::StoreName, line_name);
-
-            let mut attrs: HashSet<String> = HashSet::new();
-            for s in body {
-                if let StmtKind::FunctionDef {
-                    args, body: fbody, ..
-                }
-                | StmtKind::AsyncFunctionDef {
-                    args, body: fbody, ..
-                } = &s.kind
-                {
-                    let self_name = args
-                        .posonlyargs
-                        .first()
-                        .or_else(|| args.args.first())
-                        .map(|a| a.name.clone());
-                    if let Some(self_name) = self_name {
-                        collect_self_attr_stores(fbody, &self_name, &mut attrs);
-                    }
-                }
-            }
-            let mut attrs: Vec<String> = attrs.into_iter().collect();
-            attrs.sort();
-            let tup = Constant::Tuple(attrs.into_iter().map(Constant::Str).collect());
-            let tup_const = inner.co.intern_constant(tup);
-            let tup_name = inner.co.intern_name("__static_attributes__");
-            inner.emit(OpCode::LoadConst, tup_const);
-            inner.emit(OpCode::StoreName, tup_name);
         }
 
         // CPython stores a class body's leading string literal as
@@ -3773,6 +4101,39 @@ impl Compiler {
         for s in body {
             inner.compile_stmt(s)?;
         }
+
+        // `__static_attributes__` (sorted names assigned through
+        // `self.X` in any method body) — stored after the body runs,
+        // exactly where CPython 3.13's compiler emits it.
+        {
+            let mut attrs: HashSet<String> = HashSet::new();
+            for s in body {
+                if let StmtKind::FunctionDef {
+                    args, body: fbody, ..
+                }
+                | StmtKind::AsyncFunctionDef {
+                    args, body: fbody, ..
+                } = &s.kind
+                {
+                    let self_name = args
+                        .posonlyargs
+                        .first()
+                        .or_else(|| args.args.first())
+                        .map(|a| a.name.clone());
+                    if let Some(self_name) = self_name {
+                        collect_self_attr_stores(fbody, &self_name, &mut attrs);
+                    }
+                }
+            }
+            let mut attrs: Vec<String> = attrs.into_iter().collect();
+            attrs.sort();
+            let tup = Constant::Tuple(attrs.into_iter().map(Constant::Str).collect());
+            let tup_const = inner.co.intern_constant(tup);
+            let tup_name = inner.co.intern_name("__static_attributes__");
+            inner.emit(OpCode::LoadConst, tup_const);
+            inner.emit(OpCode::StoreName, tup_name);
+        }
+
         // Expose the `__class__` cell via `__classcell__` so the
         // `__build_class__` builtin can patch it — only when a method
         // closed over it (see `needs_class_closure` above).
@@ -4092,7 +4453,11 @@ impl Compiler {
             for s in finalbody {
                 self.compile_stmt(s)?;
             }
-            self.emit(OpCode::JumpForward, 0)
+            // Structural skip over the handler region: NO_LOCATION in
+            // CPython, so jump threading may hop through it.
+            let j = self.emit(OpCode::JumpForward, 0);
+            self.synthetic_jumps.insert(j);
+            j
         } else {
             self.next_offset()
         };
@@ -4212,6 +4577,7 @@ impl Compiler {
                 self.co.instructions[push_match_site as usize].arg = clause_body_end;
                 self.emit(OpCode::PopExcept, 0);
                 let after_body = self.emit(OpCode::JumpForward, 0);
+                self.synthetic_jumps.insert(after_body);
 
                 // Collector: an exception raised by the clause body
                 // lands here with `[raised_exc]` on the stack (its
@@ -4238,6 +4604,7 @@ impl Compiler {
                     }
                 }
                 let after_collect = self.emit(OpCode::JumpForward, 0);
+                self.synthetic_jumps.insert(after_collect);
 
                 let skip_target = self.next_offset();
                 self.patch_jump(skip_body, skip_target);
@@ -4292,6 +4659,7 @@ impl Compiler {
                 self.finally_stack.push(f);
             }
             let exit = self.emit(OpCode::JumpForward, 0);
+            self.synthetic_jumps.insert(exit);
             // Shared finally-cleanup for exceptions escaping the
             // `except*` machinery — clause-internal raises are collected
             // (above), so this covers match evaluation and the final
@@ -4470,6 +4838,7 @@ impl Compiler {
                         // must not see `'line'` events for it
                         // (test_no_tracing_of_named_except_cleanup).
                         let over = self.emit(OpCode::JumpForward, 0);
+                        self.synthetic_jumps.insert(over);
                         let saved_line = self.current_line;
                         let saved_span = self.current_span;
                         let saved_pin = self.line_pinned;
@@ -4522,6 +4891,7 @@ impl Compiler {
                     self.finally_stack.push(f);
                 }
                 let exit = self.emit(OpCode::JumpForward, 0);
+                self.synthetic_jumps.insert(exit);
                 handler_exit_jumps.push(exit);
             }
             // Unmatched: re-raise. Patch the last failed-match jump.
@@ -5034,13 +5404,29 @@ impl Compiler {
                 let starred_idx = items
                     .iter()
                     .position(|t| matches!(t.kind, ExprKind::Starred(_)));
+                // CPython's compiler rejects a second `*x` before emitting
+                // anything (test_unpack_ex doctests).
+                if let Some(second) = items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| matches!(t.kind, ExprKind::Starred(_)))
+                    .nth(1)
+                {
+                    return Err(CompileError::parser_spanned(
+                        "multiple starred expressions in assignment",
+                        second.1.span,
+                    ));
+                }
                 if let Some(idx) = starred_idx {
                     let before = idx as u32;
                     let after = (items.len() - idx - 1) as u32;
                     if before > 0xFF || after > 0xFF {
-                        return Err(CompileError::not_implemented(
-                            "starred unpack with more than 255 leading or trailing names",
-                            "too many names on either side of the star",
+                        // CPython's limit check (`compile.c`
+                        // `assignment_helper`): 255 leading names is the
+                        // UNPACK_EX operand ceiling.
+                        return Err(CompileError::parser_spanned(
+                            "too many expressions in star-unpacking assignment",
+                            target.span,
                         ));
                     }
                     self.emit(OpCode::UnpackEx, (before << 8) | after);
@@ -5058,14 +5444,16 @@ impl Compiler {
                 }
                 Ok(())
             }
-            ExprKind::Starred(inner) => {
-                // A bare top-level starred target (`*a = xs` outside
-                // of any tuple/list pattern) is a `SyntaxError` in
-                // CPython, but a `*a,` on its own is the special
-                // one-element-tuple form. Compile the inner — the
-                // surrounding tuple/list path is responsible for
-                // emitting the UNPACK_EX.
-                self.compile_assign(inner)
+            ExprKind::Starred(_) => {
+                // The tuple/list arm above unwraps its starred element
+                // before recursing, so reaching here means a *bare*
+                // top-level starred target (`*a = xs`) — a SyntaxError in
+                // CPython (`*a,` parses as a one-element tuple and never
+                // lands here).
+                Err(CompileError::parser_spanned(
+                    "starred assignment target must be in a list or tuple",
+                    target.span,
+                ))
             }
             _ => Err(CompileError::parser_spanned(
                 format!("cannot assign to {}", expr_name(target)),
@@ -5081,47 +5469,28 @@ impl Compiler {
     /// `BinaryOp::Add` because that already does the right thing for
     /// tuples.
     fn compile_starred_args_tuple(&mut self, args: &[Expr]) -> Result<(), CompileError> {
-        let mut pending: Vec<&Expr> = Vec::new();
-        let mut tuple_count: u32 = 0;
-        let emit_pending = |slf: &mut Self,
-                            pending: &mut Vec<&Expr>,
-                            tuple_count: &mut u32|
-         -> Result<(), CompileError> {
-            if pending.is_empty() {
-                return Ok(());
-            }
-            for e in pending.iter() {
-                slf.compile_expr(e)?;
-            }
-            slf.emit(OpCode::BuildTuple, pending.len() as u32);
-            pending.clear();
-            *tuple_count += 1;
-            Ok(())
-        };
+        self.compile_splat_list(args)?;
+        self.emit(OpCode::ListToTuple, 0);
+        Ok(())
+    }
+
+    /// Lower a positional-argument (or display-element) list containing
+    /// `*x` splats into a single `list` on the stack, CPython-style:
+    /// `BUILD_LIST 0`, plain elements folded in with `LIST_APPEND`, each
+    /// splat with `LIST_EXTEND` (whose non-iterable error is "Value
+    /// after * must be an iterable, not X" — test_extcall).
+    fn compile_splat_list(&mut self, args: &[Expr]) -> Result<(), CompileError> {
+        self.emit(OpCode::BuildList, 0);
         for a in args {
             match &a.kind {
                 ExprKind::Starred(inner) => {
-                    emit_pending(self, &mut pending, &mut tuple_count)?;
-                    // Coerce arbitrary iterable into a tuple. We load
-                    // `tuple` first so the resulting stack lines up
-                    // with `Call`'s expected layout (callable below
-                    // args), then evaluate the iterable as its sole
-                    // argument.
-                    let tup_idx = self.co.intern_name("tuple");
-                    self.emit(OpCode::LoadGlobal, tup_idx);
                     self.compile_expr(inner)?;
-                    self.emit(OpCode::Call, 1);
-                    tuple_count += 1;
+                    self.emit(OpCode::ListExtend, 1);
                 }
-                _ => pending.push(a),
-            }
-        }
-        emit_pending(self, &mut pending, &mut tuple_count)?;
-        if tuple_count == 0 {
-            self.emit(OpCode::BuildTuple, 0);
-        } else {
-            for _ in 1..tuple_count {
-                self.emit(OpCode::BinaryOp, BinOpKind::Add as u32);
+                _ => {
+                    self.compile_expr(a)?;
+                    self.emit(OpCode::ListAppend, 1);
+                }
             }
         }
         Ok(())
@@ -5185,12 +5554,13 @@ impl Compiler {
         self.emit(OpCode::BuildMap, explicit_count);
         for k in kwargs {
             if k.arg.is_none() {
-                let update_idx = self.co.intern_name("update");
-                self.emit(OpCode::CopyTop, 0);
-                self.emit(OpCode::LoadAttr, update_idx);
+                // `arg = 1` selects CPython's DICT_MERGE semantics
+                // (call-site `**` splat): the operand must be a mapping
+                // ("argument after ** must be a mapping, not list") and
+                // duplicate keywords raise, unlike the dict-display
+                // DICT_UPDATE which last-writer-wins.
                 self.compile_expr(&k.value)?;
-                self.emit(OpCode::Call, 1);
-                self.emit(OpCode::PopTop, 0);
+                self.emit(OpCode::DictUpdate, 1);
             }
         }
         Ok(())
@@ -5494,14 +5864,41 @@ impl Compiler {
                 }
             }
             ExprKind::UnaryOp { op, operand } => {
-                self.compile_expr(operand)?;
-                let kind = match op {
-                    UnaryOp::UAdd => UnaryKind::Pos,
-                    UnaryOp::USub => UnaryKind::Neg,
-                    UnaryOp::Not => UnaryKind::Not,
-                    UnaryOp::Invert => UnaryKind::Invert,
+                // CPython's AST optimizer folds `not` over an identity /
+                // membership test into the inverted operator (`not (x is
+                // y)` → `x is not y`), so no UNARY_NOT reaches the
+                // bytecode (test_positional_only_arg
+                // test_annotations_constant_fold).
+                let inverted = if matches!(op, UnaryOp::Not) {
+                    match &operand.kind {
+                        ExprKind::Compare {
+                            left,
+                            ops,
+                            comparators,
+                        } if ops.len() == 1 => match ops[0] {
+                            CmpOp::Is => Some((left, CmpOp::IsNot, comparators)),
+                            CmpOp::IsNot => Some((left, CmpOp::Is, comparators)),
+                            CmpOp::In => Some((left, CmpOp::NotIn, comparators)),
+                            CmpOp::NotIn => Some((left, CmpOp::In, comparators)),
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                } else {
+                    None
                 };
-                self.emit(OpCode::UnaryOp, kind as u32);
+                if let Some((left, inv, comparators)) = inverted {
+                    self.compile_compare(left, &[inv], comparators)?;
+                } else {
+                    self.compile_expr(operand)?;
+                    let kind = match op {
+                        UnaryOp::UAdd => UnaryKind::Pos,
+                        UnaryOp::USub => UnaryKind::Neg,
+                        UnaryOp::Not => UnaryKind::Not,
+                        UnaryOp::Invert => UnaryKind::Invert,
+                    };
+                    self.emit(OpCode::UnaryOp, kind as u32);
+                }
             }
             ExprKind::Compare {
                 left,
@@ -5573,10 +5970,21 @@ impl Compiler {
                 };
                 self.compile_expr(func)?;
                 if has_starred || has_kw_splat {
-                    // Build a single args tuple by concatenating
-                    // positional groups split on each `*x`. The VM's
-                    // `CallEx` unpacks it once we land on the call.
-                    self.compile_starred_args_tuple(args)?;
+                    // `f(*x)` with a lone splat passes `x` through raw —
+                    // the VM's `CallEx` converts it, branding a
+                    // non-iterable with the callable's name (CPython
+                    // `do_call`: "g() argument after * must be an
+                    // iterable, not Nothing"). Mixed positionals fold
+                    // into a list via LIST_APPEND/LIST_EXTEND instead.
+                    if let [a] = args.as_slice() {
+                        if let ExprKind::Starred(inner) = &a.kind {
+                            self.compile_expr(inner.as_ref())?;
+                        } else {
+                            self.compile_splat_list(args)?;
+                        }
+                    } else {
+                        self.compile_splat_list(args)?;
+                    }
                     if !keywords.is_empty() || has_kw_splat {
                         self.compile_kwargs_dict(keywords)?;
                         emit_call(self, OpCode::CallEx, 1);
@@ -5648,7 +6056,7 @@ impl Compiler {
             }
             ExprKind::List(items) => {
                 if items.iter().any(|x| matches!(x.kind, ExprKind::Starred(_))) {
-                    self.compile_unpacking_sequence(items, OpCode::BuildList, "append", "extend")?;
+                    self.compile_splat_list(items)?;
                 } else {
                     for x in items {
                         self.compile_expr(x)?;
@@ -6317,6 +6725,72 @@ impl Compiler {
                 inner.bindings.insert(n, Binding::Local);
             }
         }
+        // PEP 572: enforce the symtable-stage named-expression rules once
+        // per comprehension nest (the outermost comprehension sees the
+        // whole nest; nested ones were already covered by that walk).
+        if !matches!(self.kind, CodeKind::Comprehension) {
+            let mut stack = Vec::new();
+            check_comp_walrus_nest(
+                matches!(self.kind, CodeKind::Class),
+                elt,
+                value,
+                generators,
+                &mut stack,
+            )?;
+        }
+        // …then bind each walrus target in the nearest enclosing
+        // non-comprehension scope: a comprehension in a *function* stores
+        // it through a cell (implicit `nonlocal`), a comprehension at
+        // module scope stores a global, and an intermediate comprehension
+        // just forwards its own enclosing binding. The enclosing
+        // function's side of this — the name existing as a local at all —
+        // is handled by `collect_walrus_stmt`'s descent at scope entry.
+        {
+            let mut walrus_names: Vec<String> = Vec::new();
+            collect_comp_scope_walruses(elt, value, generators, &mut |n| {
+                if !walrus_names.iter().any(|w| w == n) {
+                    walrus_names.push(n.to_owned());
+                }
+            });
+            for name in walrus_names {
+                if inner.bindings.contains_key(&name) {
+                    continue;
+                }
+                let enclosing = self.bindings.get(&name).copied();
+                let binding = match (self.kind, enclosing) {
+                    // Explicit `global` declarations win in any scope;
+                    // module scope binds globals by definition. (A class
+                    // body already errored in the check above.)
+                    (_, Some(Binding::Global)) | (CodeKind::Module | CodeKind::Class, _) => {
+                        Binding::Global
+                    }
+                    // An intermediate comprehension forwards whatever its
+                    // own creation recorded (Free towards a function cell,
+                    // or Global). A missing record degrades to Global.
+                    (CodeKind::Comprehension, Some(Binding::Free)) => Binding::Free,
+                    (CodeKind::Comprehension, None) => Binding::Global,
+                    // Function scope: route through a cell, creating the
+                    // enclosing local if the pre-pass didn't already.
+                    _ => {
+                        if matches!(enclosing, None | Some(Binding::Local)) {
+                            self.bindings.insert(name.clone(), Binding::Cell);
+                            if !self.co.cellvars.contains(&name) {
+                                self.co.cellvars.push(name.clone());
+                            }
+                        }
+                        Binding::Free
+                    }
+                };
+                if matches!(binding, Binding::Free) {
+                    inner.bindings.insert(name.clone(), Binding::Free);
+                    if !inner.free_order.contains(&name) {
+                        inner.free_order.push(name);
+                    }
+                } else {
+                    inner.bindings.insert(name, binding);
+                }
+            }
+        }
         for name in reads {
             if inner.bindings.contains_key(&name) {
                 continue;
@@ -6330,6 +6804,16 @@ impl Compiler {
                         | Binding::Nonlocal
                         | Binding::ClassPassthrough
                 ) {
+                    inner.bindings.insert(name.clone(), Binding::Free);
+                    inner.free_order.push(name);
+                } else if matches!(b, Binding::Global)
+                    && self.class_transparent_frees.contains(&name)
+                {
+                    // `global y` in the enclosing *class* body doesn't
+                    // reach into the comprehension: class scopes are
+                    // invisible to nested scopes, so the name still
+                    // closes over the enclosing function's cell (which
+                    // the class forwards — see `class_transparent_frees`).
                     inner.bindings.insert(name.clone(), Binding::Free);
                     inner.free_order.push(name);
                 }
@@ -6353,11 +6837,16 @@ impl Compiler {
             }
             for (gi, g) in generators.iter().enumerate() {
                 // generators[0].iter is evaluated in the *enclosing*
-                // scope (passed in as `.0`); every later iter and every
-                // filter runs inside this comprehension.
+                // scope (passed in as `.0`); every later iter, every
+                // filter, and every *target sub-expression* (a nested
+                // comprehension can sit in a subscripted target —
+                // `for a[[x for x in [1] if _C][0]] in …` — and close
+                // over this comprehension's variables) runs inside
+                // this comprehension.
                 if gi > 0 {
                     collect_inner_free_expr(&g.iter, &inner.bindings, &mut needed_in_inner);
                 }
+                collect_inner_free_expr(&g.target, &inner.bindings, &mut needed_in_inner);
                 for cond in &g.ifs {
                     collect_inner_free_expr(cond, &inner.bindings, &mut needed_in_inner);
                 }
@@ -6431,6 +6920,15 @@ impl Compiler {
         // comprehension we still pass the raw source — the inner
         // body fetches `aiter()` when it sees `is_async`.
         self.compile_expr(&generators[0].iter)?;
+        // The GET_ITER and the invoking CALL carry the *iterable
+        // expression's* location, not the whole comprehension's: an
+        // exception raised from `iter()`/`__next__` must anchor its
+        // traceback at the iterable (CPython 3.12+ inlined comprehensions
+        // put FOR_ITER at that span; `test_listcomps.test_exception_
+        // locations` asserts the resulting `colno`/`end_colno`).
+        let iter_span = generators[0].iter.span;
+        self.set_line_from(iter_span.start.0);
+        self.set_span(iter_span);
         if !(is_async_comp && generators[0].is_async) {
             self.emit(OpCode::GetIter, 0);
         }
@@ -6456,6 +6954,531 @@ enum CompKind {
     Set,
     Dict,
     Generator,
+}
+
+// ---------- PEP 572: named expressions in comprehensions ----------
+
+/// Walrus target names bound *through* one comprehension scope, in
+/// syntactic order. Covers the comprehension's element/value, filters,
+/// non-outermost iterables, targets (their non-name sub-expressions), and
+/// every nested comprehension (a walrus there extends through this scope
+/// too, per `symtable_extend_namedexpr_scope`). The **outermost iterable
+/// is excluded** — it is evaluated in the enclosing scope, so a nested
+/// comprehension's walrus inside it never routes through *this* scope.
+/// Lambda/def bodies are opaque (their walruses bind in them); lambda
+/// defaults evaluate here and are included.
+fn collect_comp_scope_walruses(
+    elt: &Expr,
+    value: Option<&Expr>,
+    generators: &[Comprehension],
+    out: &mut dyn FnMut(&str),
+) {
+    fn visit(e: &Expr, out: &mut dyn FnMut(&str)) {
+        match &e.kind {
+            ExprKind::NamedExpr { target, value } => {
+                if let ExprKind::Name(n) = &target.kind {
+                    out(n);
+                }
+                visit(value, out);
+            }
+            ExprKind::ListComp { elt, generators }
+            | ExprKind::SetComp { elt, generators }
+            | ExprKind::GeneratorExp { elt, generators } => {
+                collect_comp_scope_walruses(elt, None, generators, out);
+            }
+            ExprKind::DictComp {
+                key,
+                value,
+                generators,
+            } => {
+                collect_comp_scope_walruses(key, Some(value), generators, out);
+            }
+            ExprKind::Lambda { args, .. } | ExprKind::TypeParamFn { args, .. } => {
+                for d in &args.defaults {
+                    visit(d, out);
+                }
+                for d in args.kw_defaults.iter().flatten() {
+                    visit(d, out);
+                }
+            }
+            ExprKind::Attribute { value, .. } | ExprKind::Starred(value) => visit(value, out),
+            ExprKind::Subscript { value, slice } => {
+                visit(value, out);
+                visit(slice, out);
+            }
+            ExprKind::Slice { lower, upper, step } => {
+                for x in [lower.as_deref(), upper.as_deref(), step.as_deref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    visit(x, out);
+                }
+            }
+            ExprKind::BinOp { left, right, .. } => {
+                visit(left, out);
+                visit(right, out);
+            }
+            ExprKind::BoolOp { values, .. } => {
+                for v in values {
+                    visit(v, out);
+                }
+            }
+            ExprKind::UnaryOp { operand, .. } => visit(operand, out),
+            ExprKind::Compare {
+                left, comparators, ..
+            } => {
+                visit(left, out);
+                for c in comparators {
+                    visit(c, out);
+                }
+            }
+            ExprKind::IfExp { test, body, orelse } => {
+                visit(test, out);
+                visit(body, out);
+                visit(orelse, out);
+            }
+            ExprKind::Call {
+                func,
+                args,
+                keywords,
+            } => {
+                visit(func, out);
+                for a in args {
+                    visit(a, out);
+                }
+                for k in keywords {
+                    visit(&k.value, out);
+                }
+            }
+            ExprKind::Tuple(items) | ExprKind::List(items) | ExprKind::Set(items) => {
+                for x in items {
+                    visit(x, out);
+                }
+            }
+            ExprKind::Dict { keys, values } => {
+                for k in keys.iter().flatten() {
+                    visit(k, out);
+                }
+                for v in values {
+                    visit(v, out);
+                }
+            }
+            ExprKind::Yield(v) => {
+                if let Some(v) = v {
+                    visit(v, out);
+                }
+            }
+            ExprKind::YieldFrom(v) | ExprKind::Await(v) => visit(v, out),
+            ExprKind::JoinedStr(parts) => {
+                for p in parts {
+                    visit(p, out);
+                }
+            }
+            ExprKind::FormattedValue {
+                value, format_spec, ..
+            } => {
+                visit(value, out);
+                if let Some(fs) = format_spec.as_deref() {
+                    visit(fs, out);
+                }
+            }
+            ExprKind::Name(_) | ExprKind::Constant(_) => {}
+        }
+    }
+    for (gi, g) in generators.iter().enumerate() {
+        if gi > 0 {
+            visit(&g.iter, out);
+        }
+        visit(&g.target, out);
+        for cond in &g.ifs {
+            visit(cond, out);
+        }
+    }
+    visit(elt, out);
+    if let Some(v) = value {
+        visit(v, out);
+    }
+}
+
+/// Presentation form of a possibly-mangled private name: the AST reaching
+/// the compiler already carries PEP 8 private-name mangling (`__x` in
+/// `class Foo` arrives as `_Foo__x`), but CPython's symtable errors show
+/// the *source* spelling. Strip the `_ClassName` prefix back off.
+fn unmangled(name: &str) -> &str {
+    if name.starts_with('_') && !name.starts_with("__") {
+        if let Some(i) = name.find("__") {
+            return &name[i..];
+        }
+    }
+    name
+}
+
+/// PEP 572: no assignment expression may appear *anywhere lexically
+/// inside* a comprehension's iterable expression — CPython flags even a
+/// walrus buried in a lambda body or a nested comprehension there
+/// (`ste_comp_iter_expr` stays raised across those symtable entries).
+fn reject_walrus_in_iterable(e: &Expr) -> Result<(), CompileError> {
+    struct Found(weavepy_lexer::Span);
+    fn scan(e: &Expr) -> Result<(), Found> {
+        if let ExprKind::NamedExpr { .. } = &e.kind {
+            return Err(Found(e.span));
+        }
+        match &e.kind {
+            ExprKind::Lambda { args, body } | ExprKind::TypeParamFn { args, body } => {
+                for d in &args.defaults {
+                    scan(d)?;
+                }
+                for d in args.kw_defaults.iter().flatten() {
+                    scan(d)?;
+                }
+                scan(body)
+            }
+            ExprKind::ListComp { elt, generators }
+            | ExprKind::SetComp { elt, generators }
+            | ExprKind::GeneratorExp { elt, generators } => {
+                for g in generators {
+                    scan(&g.iter)?;
+                    scan(&g.target)?;
+                    for c in &g.ifs {
+                        scan(c)?;
+                    }
+                }
+                scan(elt)
+            }
+            ExprKind::DictComp {
+                key,
+                value,
+                generators,
+            } => {
+                for g in generators {
+                    scan(&g.iter)?;
+                    scan(&g.target)?;
+                    for c in &g.ifs {
+                        scan(c)?;
+                    }
+                }
+                scan(key)?;
+                scan(value)
+            }
+            ExprKind::Attribute { value, .. } | ExprKind::Starred(value) => scan(value),
+            ExprKind::Subscript { value, slice } => {
+                scan(value)?;
+                scan(slice)
+            }
+            ExprKind::Slice { lower, upper, step } => {
+                for x in [lower.as_deref(), upper.as_deref(), step.as_deref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    scan(x)?;
+                }
+                Ok(())
+            }
+            ExprKind::BinOp { left, right, .. } => {
+                scan(left)?;
+                scan(right)
+            }
+            ExprKind::BoolOp { values, .. } => {
+                for v in values {
+                    scan(v)?;
+                }
+                Ok(())
+            }
+            ExprKind::UnaryOp { operand, .. } => scan(operand),
+            ExprKind::Compare {
+                left, comparators, ..
+            } => {
+                scan(left)?;
+                for c in comparators {
+                    scan(c)?;
+                }
+                Ok(())
+            }
+            ExprKind::IfExp { test, body, orelse } => {
+                scan(test)?;
+                scan(body)?;
+                scan(orelse)
+            }
+            ExprKind::Call {
+                func,
+                args,
+                keywords,
+            } => {
+                scan(func)?;
+                for a in args {
+                    scan(a)?;
+                }
+                for k in keywords {
+                    scan(&k.value)?;
+                }
+                Ok(())
+            }
+            ExprKind::Tuple(items) | ExprKind::List(items) | ExprKind::Set(items) => {
+                for x in items {
+                    scan(x)?;
+                }
+                Ok(())
+            }
+            ExprKind::Dict { keys, values } => {
+                for k in keys.iter().flatten() {
+                    scan(k)?;
+                }
+                for v in values {
+                    scan(v)?;
+                }
+                Ok(())
+            }
+            ExprKind::Yield(v) => match v {
+                Some(v) => scan(v),
+                None => Ok(()),
+            },
+            ExprKind::YieldFrom(v) | ExprKind::Await(v) => scan(v),
+            ExprKind::JoinedStr(parts) => {
+                for p in parts {
+                    scan(p)?;
+                }
+                Ok(())
+            }
+            ExprKind::FormattedValue {
+                value, format_spec, ..
+            } => {
+                scan(value)?;
+                if let Some(fs) = format_spec.as_deref() {
+                    scan(fs)?;
+                }
+                Ok(())
+            }
+            ExprKind::Name(_) | ExprKind::Constant(_) | ExprKind::NamedExpr { .. } => Ok(()),
+        }
+    }
+    match scan(e) {
+        Ok(()) => Ok(()),
+        Err(Found(span)) => Err(CompileError::spanned(
+            "assignment expression cannot be used in a comprehension iterable expression",
+            span,
+        )),
+    }
+}
+
+/// One comprehension scope on the PEP 572 checker's stack.
+#[derive(Default)]
+struct CompWalrusScope {
+    /// Iteration-variable names bound so far (syntactic order — a later
+    /// `for` clause is "not yet bound" while an earlier filter runs).
+    iter_vars: HashSet<String>,
+    /// Walrus target names recorded so far. Extension marks the name in
+    /// every comprehension scope it passes through on its way to the
+    /// binding scope, exactly like CPython's `DEF_LOCAL` marking.
+    walrus_targets: HashSet<String>,
+}
+
+/// Enforce CPython's four symtable-stage named-expression rules over a
+/// comprehension nest (`symtable.c`): no walrus in any comprehension
+/// iterable expression, no rebinding an iteration variable, no `for`
+/// target rebinding an earlier walrus target, and no comprehension
+/// walrus binding into a class body. Called once per *outermost*
+/// comprehension (`compile_comprehension` skips it when the enclosing
+/// scope is itself a comprehension — the outermost run already walked
+/// the whole nest). Lambda/def bodies are separate scopes and are
+/// skipped; their own comprehensions get checked when they compile.
+fn check_comp_walrus_nest(
+    in_class_body: bool,
+    elt: &Expr,
+    value: Option<&Expr>,
+    generators: &[Comprehension],
+    stack: &mut Vec<CompWalrusScope>,
+) -> Result<(), CompileError> {
+    fn visit(
+        e: &Expr,
+        in_class_body: bool,
+        stack: &mut Vec<CompWalrusScope>,
+    ) -> Result<(), CompileError> {
+        match &e.kind {
+            ExprKind::NamedExpr { target, value } => {
+                if let ExprKind::Name(n) = &target.kind {
+                    // Rebinding outranks the class-body diagnostic
+                    // (the extension walk hits comprehension scopes
+                    // before it reaches the class block).
+                    for scope in stack.iter() {
+                        if scope.iter_vars.contains(n) {
+                            return Err(CompileError::spanned(
+                                format!(
+                                    "assignment expression cannot rebind comprehension \
+                                     iteration variable '{}'",
+                                    unmangled(n)
+                                ),
+                                e.span,
+                            ));
+                        }
+                    }
+                    if in_class_body {
+                        return Err(CompileError::spanned(
+                            "assignment expression within a comprehension cannot be used in a \
+                             class body",
+                            e.span,
+                        ));
+                    }
+                    for scope in stack.iter_mut() {
+                        scope.walrus_targets.insert(n.clone());
+                    }
+                }
+                visit(value, in_class_body, stack)
+            }
+            ExprKind::ListComp { elt, generators }
+            | ExprKind::SetComp { elt, generators }
+            | ExprKind::GeneratorExp { elt, generators } => {
+                check_comp_walrus_nest(in_class_body, elt, None, generators, stack)
+            }
+            ExprKind::DictComp {
+                key,
+                value,
+                generators,
+            } => check_comp_walrus_nest(in_class_body, key, Some(value), generators, stack),
+            ExprKind::Lambda { args, .. } | ExprKind::TypeParamFn { args, .. } => {
+                for d in &args.defaults {
+                    visit(d, in_class_body, stack)?;
+                }
+                for d in args.kw_defaults.iter().flatten() {
+                    visit(d, in_class_body, stack)?;
+                }
+                Ok(())
+            }
+            ExprKind::Attribute { value, .. } | ExprKind::Starred(value) => {
+                visit(value, in_class_body, stack)
+            }
+            ExprKind::Subscript { value, slice } => {
+                visit(value, in_class_body, stack)?;
+                visit(slice, in_class_body, stack)
+            }
+            ExprKind::Slice { lower, upper, step } => {
+                for x in [lower.as_deref(), upper.as_deref(), step.as_deref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    visit(x, in_class_body, stack)?;
+                }
+                Ok(())
+            }
+            ExprKind::BinOp { left, right, .. } => {
+                visit(left, in_class_body, stack)?;
+                visit(right, in_class_body, stack)
+            }
+            ExprKind::BoolOp { values, .. } => {
+                for v in values {
+                    visit(v, in_class_body, stack)?;
+                }
+                Ok(())
+            }
+            ExprKind::UnaryOp { operand, .. } => visit(operand, in_class_body, stack),
+            ExprKind::Compare {
+                left, comparators, ..
+            } => {
+                visit(left, in_class_body, stack)?;
+                for c in comparators {
+                    visit(c, in_class_body, stack)?;
+                }
+                Ok(())
+            }
+            ExprKind::IfExp { test, body, orelse } => {
+                visit(test, in_class_body, stack)?;
+                visit(body, in_class_body, stack)?;
+                visit(orelse, in_class_body, stack)
+            }
+            ExprKind::Call {
+                func,
+                args,
+                keywords,
+            } => {
+                visit(func, in_class_body, stack)?;
+                for a in args {
+                    visit(a, in_class_body, stack)?;
+                }
+                for k in keywords {
+                    visit(&k.value, in_class_body, stack)?;
+                }
+                Ok(())
+            }
+            ExprKind::Tuple(items) | ExprKind::List(items) | ExprKind::Set(items) => {
+                for x in items {
+                    visit(x, in_class_body, stack)?;
+                }
+                Ok(())
+            }
+            ExprKind::Dict { keys, values } => {
+                for k in keys.iter().flatten() {
+                    visit(k, in_class_body, stack)?;
+                }
+                for v in values {
+                    visit(v, in_class_body, stack)?;
+                }
+                Ok(())
+            }
+            ExprKind::Yield(v) => match v {
+                Some(v) => visit(v, in_class_body, stack),
+                None => Ok(()),
+            },
+            ExprKind::YieldFrom(v) | ExprKind::Await(v) => visit(v, in_class_body, stack),
+            ExprKind::JoinedStr(parts) => {
+                for p in parts {
+                    visit(p, in_class_body, stack)?;
+                }
+                Ok(())
+            }
+            ExprKind::FormattedValue {
+                value, format_spec, ..
+            } => {
+                visit(value, in_class_body, stack)?;
+                if let Some(fs) = format_spec.as_deref() {
+                    visit(fs, in_class_body, stack)?;
+                }
+                Ok(())
+            }
+            ExprKind::Name(_) | ExprKind::Constant(_) => Ok(()),
+        }
+    }
+
+    stack.push(CompWalrusScope::default());
+    for g in generators {
+        // Every iterable — outermost included — rejects walruses
+        // *anywhere lexically inside it*: CPython flags even a walrus
+        // buried in a lambda body or a nested comprehension within the
+        // iterable (test_named_expressions' "Lambda expression" /
+        // "Nested comprehension body" cases).
+        reject_walrus_in_iterable(&g.iter)?;
+        let mut names = HashSet::new();
+        collect_target_names(&g.target, &mut names);
+        for scope in stack.iter() {
+            for n in &names {
+                if scope.walrus_targets.contains(n) {
+                    return Err(CompileError::spanned(
+                        format!(
+                            "comprehension inner loop cannot rebind assignment expression \
+                             target '{}'",
+                            unmangled(n)
+                        ),
+                        g.target.span,
+                    ));
+                }
+            }
+        }
+        stack
+            .last_mut()
+            .expect("scope pushed above")
+            .iter_vars
+            .extend(names);
+        // Non-name parts of the target (subscript bases/indices, …)
+        // evaluate inside the comprehension scope.
+        visit(&g.target, in_class_body, stack)?;
+        for cond in &g.ifs {
+            visit(cond, in_class_body, stack)?;
+        }
+    }
+    visit(elt, in_class_body, stack)?;
+    if let Some(v) = value {
+        visit(v, in_class_body, stack)?;
+    }
+    stack.pop();
+    Ok(())
 }
 
 fn compile_comp_body(
@@ -8351,12 +9374,29 @@ fn collect_walrus_expr(expr: &Expr, out: &mut HashSet<String>) {
                 collect_walrus_expr(v, out);
             }
         }
-        // Comprehensions are their own scope; their walrus-leak semantics are
-        // handled when the comprehension itself is compiled.
-        ExprKind::ListComp { .. }
-        | ExprKind::SetComp { .. }
-        | ExprKind::GeneratorExp { .. }
-        | ExprKind::DictComp { .. } => {}
+        // PEP 572: a named expression inside a comprehension binds in the
+        // *nearest enclosing non-comprehension scope* — i.e. right here.
+        // Collecting through the comprehension boundary is what makes
+        // `res = [(y := f(x)) for x in xs]` create a real local `y` in
+        // this scope (the comprehension itself stores through a cell /
+        // global; see `compile_comprehension`'s walrus binding pass).
+        // Lambda/def bodies inside the comprehension stay opaque.
+        ExprKind::ListComp { elt, generators }
+        | ExprKind::SetComp { elt, generators }
+        | ExprKind::GeneratorExp { elt, generators } => {
+            collect_comp_scope_walruses(elt, None, generators, &mut |n| {
+                out.insert(n.to_owned());
+            });
+        }
+        ExprKind::DictComp {
+            key,
+            value,
+            generators,
+        } => {
+            collect_comp_scope_walruses(key, Some(value), generators, &mut |n| {
+                out.insert(n.to_owned());
+            });
+        }
         ExprKind::Yield(value) => {
             if let Some(v) = value {
                 collect_walrus_expr(v, out);
@@ -8792,20 +9832,21 @@ fn collect_target_names(expr: &Expr, out: &mut HashSet<String>) {
 /// the binding `STORE_FAST`s while the closure `LOAD_DEREF`s an empty cell
 /// (`test_statistics` `kde` kernels).
 fn collect_pattern_names(pat: &Pattern, out: &mut HashSet<String>) {
-    match pat {
-        Pattern::Value(_)
-        | Pattern::Singleton(_)
-        | Pattern::Capture(None)
-        | Pattern::Star(None) => {}
-        Pattern::Capture(Some(n)) | Pattern::Star(Some(n)) => {
+    use weavepy_parser::ast::PatternKind;
+    match &pat.kind {
+        PatternKind::Value(_)
+        | PatternKind::Singleton(_)
+        | PatternKind::Capture(None)
+        | PatternKind::Star(None) => {}
+        PatternKind::Capture(Some(n)) | PatternKind::Star(Some(n)) => {
             out.insert(n.clone());
         }
-        Pattern::Sequence(items) => {
+        PatternKind::Sequence(items) => {
             for p in items {
                 collect_pattern_names(p, out);
             }
         }
-        Pattern::Mapping { patterns, rest, .. } => {
+        PatternKind::Mapping { patterns, rest, .. } => {
             for p in patterns {
                 collect_pattern_names(p, out);
             }
@@ -8813,7 +9854,7 @@ fn collect_pattern_names(pat: &Pattern, out: &mut HashSet<String>) {
                 out.insert(n.clone());
             }
         }
-        Pattern::Class {
+        PatternKind::Class {
             positionals,
             keywords,
             ..
@@ -8825,16 +9866,273 @@ fn collect_pattern_names(pat: &Pattern, out: &mut HashSet<String>) {
                 collect_pattern_names(p, out);
             }
         }
-        Pattern::Or(alts) => {
+        PatternKind::Or(alts) => {
             for p in alts {
                 collect_pattern_names(p, out);
             }
         }
-        Pattern::As { pattern, name } => {
+        PatternKind::As { pattern, name } => {
             out.insert(name.clone());
             collect_pattern_names(pattern, out);
         }
     }
+}
+
+/// Record a name bound by a pattern, rejecting rebinds within the same
+/// case (CPython compile.c `pattern_helper_store_name`).
+fn bind_pattern_name(
+    name: &str,
+    stores: &mut Vec<String>,
+    span: weavepy_lexer::Span,
+) -> Result<(), CompileError> {
+    if stores.iter().any(|s| s == name) {
+        return Err(CompileError::spanned(
+            format!("multiple assignments to name '{name}' in pattern"),
+            span,
+        ));
+    }
+    stores.push(name.to_owned());
+    Ok(())
+}
+
+/// Fold a literal-pattern expression (mapping key) to its constant value:
+/// plain literals, `-literal`, and the `real ± imaginary` complex form.
+/// Attribute lookups (value-pattern keys) fold to `None` — their duplicate
+/// check happens at runtime in `MATCH_KEYS`.
+fn fold_pattern_literal(expr: &Expr) -> Option<AstConstant> {
+    match &expr.kind {
+        ExprKind::Constant(c) => Some(c.clone()),
+        ExprKind::UnaryOp {
+            op: UnaryOp::USub,
+            operand,
+        } => match &operand.kind {
+            ExprKind::Constant(AstConstant::Int(i)) => i.checked_neg().map(AstConstant::Int),
+            ExprKind::Constant(AstConstant::Float(f)) => Some(AstConstant::Float(-f)),
+            ExprKind::Constant(AstConstant::Complex(r, i)) => Some(AstConstant::Complex(-r, -i)),
+            ExprKind::Constant(AstConstant::BigInt(s)) => Some(AstConstant::BigInt(
+                if let Some(stripped) = s.strip_prefix('-') {
+                    stripped.to_owned()
+                } else {
+                    format!("-{s}")
+                },
+            )),
+            _ => None,
+        },
+        ExprKind::BinOp { left, op, right } if matches!(op, BinOp::Add | BinOp::Sub) => {
+            let (lr, li) = pattern_const_as_complex(&fold_pattern_literal(left)?)?;
+            let (rr, ri) = pattern_const_as_complex(&fold_pattern_literal(right)?)?;
+            Some(match op {
+                BinOp::Add => AstConstant::Complex(lr + rr, li + ri),
+                _ => AstConstant::Complex(lr - rr, li - ri),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Numeric constant as `(real, imag)`; `None` for non-numbers.
+fn pattern_const_as_complex(c: &AstConstant) -> Option<(f64, f64)> {
+    match c {
+        AstConstant::Bool(b) => Some((f64::from(u8::from(*b)), 0.0)),
+        AstConstant::Int(i) => Some((*i as f64, 0.0)),
+        AstConstant::BigInt(s) => s.parse::<f64>().ok().map(|f| (f, 0.0)),
+        AstConstant::Float(f) => Some((*f, 0.0)),
+        AstConstant::Complex(r, i) => Some((*r, *i)),
+        _ => None,
+    }
+}
+
+/// Python `==` between two literal mapping keys: cross-type numeric
+/// equality (`0 == False == 0.0 == -0 == 0j`), exact for integers.
+fn pattern_keys_equal(a: &AstConstant, b: &AstConstant) -> bool {
+    fn exact_int(c: &AstConstant) -> Option<String> {
+        match c {
+            AstConstant::Bool(b) => Some(i64::from(*b).to_string()),
+            AstConstant::Int(i) => Some(i.to_string()),
+            AstConstant::BigInt(s) => Some(s.clone()),
+            _ => None,
+        }
+    }
+    if let (Some(x), Some(y)) = (exact_int(a), exact_int(b)) {
+        return x == y;
+    }
+    if let (Some(x), Some(y)) = (pattern_const_as_complex(a), pattern_const_as_complex(b)) {
+        return x == y;
+    }
+    match (a, b) {
+        (AstConstant::Str(x), AstConstant::Str(y)) => x == y,
+        (AstConstant::Bytes(x), AstConstant::Bytes(y)) => x == y,
+        (AstConstant::None, AstConstant::None) => true,
+        (AstConstant::Ellipsis, AstConstant::Ellipsis) => true,
+        _ => false,
+    }
+}
+
+/// `repr()`-ish rendering of a literal key for the duplicate-key message.
+fn pattern_key_repr(c: &AstConstant) -> String {
+    match c {
+        AstConstant::None => "None".to_owned(),
+        AstConstant::Bool(true) => "True".to_owned(),
+        AstConstant::Bool(false) => "False".to_owned(),
+        AstConstant::Int(i) => i.to_string(),
+        AstConstant::BigInt(s) => s.clone(),
+        AstConstant::Float(f) => format!("{f:?}"),
+        AstConstant::Complex(r, i) if *r == 0.0 => format!("{i:?}j"),
+        AstConstant::Complex(r, i) => format!("({r:?}{}{:?}j)", if *i < 0.0 { "" } else { "+" }, i),
+        AstConstant::Str(s) => format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'")),
+        other => format!("{other:?}"),
+    }
+}
+
+/// CPython's compile-stage PEP 634 pattern validation (`compile.c`
+/// `codegen_pattern_*`). `stores` accumulates the names the case binds;
+/// `allow_irrefutable` is only true for the last `match` case (or one
+/// with a guard) and for the final `|` alternative.
+fn validate_case_pattern(
+    pat: &Pattern,
+    allow_irrefutable: bool,
+    stores: &mut Vec<String>,
+) -> Result<(), CompileError> {
+    use weavepy_parser::ast::PatternKind;
+    match &pat.kind {
+        PatternKind::Value(_) | PatternKind::Singleton(_) => Ok(()),
+        PatternKind::Capture(None) => {
+            if !allow_irrefutable {
+                return Err(CompileError::spanned(
+                    "wildcard makes remaining patterns unreachable",
+                    pat.span,
+                ));
+            }
+            Ok(())
+        }
+        PatternKind::Capture(Some(name)) => {
+            if !allow_irrefutable {
+                return Err(CompileError::spanned(
+                    format!("name capture '{name}' makes remaining patterns unreachable"),
+                    pat.span,
+                ));
+            }
+            bind_pattern_name(name, stores, pat.span)
+        }
+        PatternKind::Star(name) => {
+            if let Some(n) = name {
+                bind_pattern_name(n, stores, pat.span)?;
+            }
+            Ok(())
+        }
+        PatternKind::Sequence(items) => {
+            let stars = items
+                .iter()
+                .filter(|p| matches!(p.kind, PatternKind::Star(_)))
+                .count();
+            if stars > 1 {
+                return Err(CompileError::spanned(
+                    "multiple starred names in sequence pattern",
+                    pat.span,
+                ));
+            }
+            for item in items {
+                // Subpatterns may always be irrefutable (`case [x]:`).
+                validate_case_pattern(item, true, stores)?;
+            }
+            Ok(())
+        }
+        PatternKind::Mapping {
+            keys,
+            patterns,
+            rest,
+        } => {
+            let folded: Vec<Option<AstConstant>> = keys.iter().map(fold_pattern_literal).collect();
+            for i in 0..keys.len() {
+                if let Some(ci) = &folded[i] {
+                    for cj in folded[..i].iter().flatten() {
+                        if pattern_keys_equal(ci, cj) {
+                            return Err(CompileError::spanned(
+                                format!(
+                                    "mapping pattern checks duplicate key ({})",
+                                    pattern_key_repr(ci)
+                                ),
+                                keys[i].span,
+                            ));
+                        }
+                    }
+                }
+            }
+            for p in patterns {
+                validate_case_pattern(p, true, stores)?;
+            }
+            if let Some(Some(n)) = rest {
+                bind_pattern_name(n, stores, pat.span)?;
+            }
+            Ok(())
+        }
+        PatternKind::Class {
+            positionals,
+            keywords,
+            ..
+        } => {
+            for (i, (name, _)) in keywords.iter().enumerate() {
+                if keywords[..i].iter().any(|(m, _)| m == name) {
+                    return Err(CompileError::spanned(
+                        format!("attribute name repeated in class pattern: {name}"),
+                        pat.span,
+                    ));
+                }
+            }
+            for p in positionals {
+                validate_case_pattern(p, true, stores)?;
+            }
+            for (_, p) in keywords {
+                validate_case_pattern(p, true, stores)?;
+            }
+            Ok(())
+        }
+        PatternKind::Or(alts) => {
+            let base_len = stores.len();
+            let last = alts.len() - 1;
+            let mut first_added: Option<Vec<String>> = None;
+            for (i, alt) in alts.iter().enumerate() {
+                let mut local = stores[..base_len].to_vec();
+                validate_case_pattern(alt, allow_irrefutable && i == last, &mut local)?;
+                let mut added: Vec<String> = local[base_len..].to_vec();
+                added.sort();
+                match &first_added {
+                    None => first_added = Some(added),
+                    Some(f) if *f != added => {
+                        return Err(CompileError::spanned(
+                            "alternative patterns bind different names",
+                            pat.span,
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(added) = first_added {
+                stores.extend(added);
+            }
+            Ok(())
+        }
+        PatternKind::As { pattern, name } => {
+            validate_case_pattern(pattern, allow_irrefutable, stores)?;
+            bind_pattern_name(name, stores, pat.span)
+        }
+    }
+}
+
+/// CPython's `pattern_context`: per-case (or per-`|`-alternative)
+/// bookkeeping for pattern codegen. See the commentary at the
+/// "structural pattern matching" section of the `Compiler` impl.
+#[derive(Default)]
+struct PatmaCtx {
+    /// Names of deferred captures, in capture order. `stores[0]`'s
+    /// value is the one nearest the top of the stack.
+    stores: Vec<String>,
+    /// Number of working items currently on top of the stack (they
+    /// must be discarded on failure, and captures rotate below them).
+    on_top: usize,
+    /// `fail_pops[k]` holds the jump sites that need to discard `k`
+    /// items; resolved by [`Compiler::patma_emit_fail_pops`].
+    fail_pops: Vec<Vec<u32>>,
 }
 
 /// Walk a STORE target (`a = …`, `a, b = …`, `a.b = …`, `a[i] = …`)
@@ -9063,7 +10361,62 @@ fn collect_reads_stmt(stmt: &Stmt, out: &mut HashSet<String>) {
                 collect_reads_expr(m, out);
             }
         }
+        StmtKind::Match { subject, cases } => {
+            // Patterns read names too: value patterns (`case Color.RED:`),
+            // mapping keys, and class-pattern heads all resolve in the
+            // enclosing scope, so they must surface for free-variable
+            // promotion (test_patma_198: `Color` closed over from the
+            // enclosing test method).
+            collect_reads_expr(subject, out);
+            for case in cases {
+                collect_pattern_reads(&case.pattern, out);
+                if let Some(g) = &case.guard {
+                    collect_reads_expr(g, out);
+                }
+                for s in &case.body {
+                    collect_reads_stmt(s, out);
+                }
+            }
+        }
         _ => {}
+    }
+}
+
+/// Names *read* by a `match` pattern: value-pattern expressions, mapping
+/// keys, and class-pattern heads. Capture/star/rest names are bindings,
+/// not reads ([`collect_pattern_names`] tracks those).
+fn collect_pattern_reads(pat: &Pattern, out: &mut HashSet<String>) {
+    use weavepy_parser::ast::PatternKind;
+    match &pat.kind {
+        PatternKind::Value(e) => collect_reads_expr(e, out),
+        PatternKind::Singleton(_) | PatternKind::Capture(_) | PatternKind::Star(_) => {}
+        PatternKind::Sequence(items) | PatternKind::Or(items) => {
+            for p in items {
+                collect_pattern_reads(p, out);
+            }
+        }
+        PatternKind::Mapping { keys, patterns, .. } => {
+            for k in keys {
+                collect_reads_expr(k, out);
+            }
+            for p in patterns {
+                collect_pattern_reads(p, out);
+            }
+        }
+        PatternKind::Class {
+            cls,
+            positionals,
+            keywords,
+        } => {
+            collect_reads_expr(cls, out);
+            for p in positionals {
+                collect_pattern_reads(p, out);
+            }
+            for (_, p) in keywords {
+                collect_pattern_reads(p, out);
+            }
+        }
+        PatternKind::As { pattern, .. } => collect_pattern_reads(pattern, out),
     }
 }
 

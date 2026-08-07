@@ -161,6 +161,10 @@ subprocess sweep reports `unexpected 0`. Each `cpython/Lib/test/*` row
 carries a `reason` that, where the file fails, quotes the measured first
 failure so the gap is concrete.
 
+As of RFC 0057 the baseline stands at **496 of 543 files passing**
+(fail 41, skip 6, zero timeout rows) with the ecosystem lane at 27/27
+offline; every red row carries an enumerated, measured residual.
+
 ## CI integration
 
 A `conformance` job runs on every push and pull request. It:

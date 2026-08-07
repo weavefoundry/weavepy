@@ -58,6 +58,12 @@ def stack_effect(opcode, oparg=None, jump=None):
     return _opcode_tables.stack_effect(opcode, oparg, jump=jump)
 
 
+def get_specialization_stats():
+    """CPython returns None unless built with `--enable-pystats`;
+    WeavePy has no specializing interpreter, so stats never exist."""
+    return None
+
+
 def get_executor(code, offset):
     """No tier-2 executor is ever attached to WeavePy code objects."""
     if not hasattr(code, "co_code"):

@@ -91,14 +91,190 @@ pub fn parse(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Str(s)) => s.to_string(),
         _ => "exec".to_owned(),
     };
+    // PEP 484 signature type comments: `(t1, t2) -> ret` parses under
+    // its own start rule into a `FunctionType` root (a `mod` — no
+    // position attributes).
+    if mode == "func_type" {
+        let (argtypes, returns) = weavepy_parser::parse_func_type(&source)
+            .map_err(|e| crate::parse_error_to_syntax_error(&e, &source, &filename))?;
+        let lm = LineMap::new(&source);
+        let b = Builder {
+            lm: &lm,
+            src: &source,
+            tc_stmts: std::collections::HashMap::default(),
+            tc_args: std::collections::HashMap::default(),
+            tc_ignores: Vec::new(),
+        };
+        let spec = node_noloc(
+            "FunctionType",
+            vec![
+                ("argtypes", list_of(&argtypes, |e| b.expr(e))),
+                ("returns", b.expr(&returns)),
+            ],
+        );
+        fix_contexts(&spec);
+        return Ok(spec);
+    }
+    // PyCF_TYPE_COMMENTS (`ast.parse(..., type_comments=True)`): the
+    // parser collects `# type:` comments into side tables — statement /
+    // per-argument `type_comment` strings plus `Module.type_ignores` —
+    // and rejects misplaced ones, mirroring pegen's TYPE_COMMENT tokens.
+    let type_comments = matches!(args.get(3), Some(Object::Bool(true)));
     // CPython raises `SyntaxError` (never `ValueError`) from
     // `ast.parse` — callers like `traceback`'s caret-anchor probe rely
     // on `except SyntaxError` swallowing bad segments.
-    let module = weavepy_parser::parse_module(&source)
-        .map_err(|e| crate::parse_error_to_syntax_error(&e, &source, &filename))?;
+    let (module, tc) = if type_comments {
+        let (m, t) = weavepy_parser::parse_module_type_comments(&source)
+            .map_err(|e| crate::parse_error_to_syntax_error(&e, &source, &filename))?;
+        (m, Some(t))
+    } else {
+        let m = weavepy_parser::parse_module(&source)
+            .map_err(|e| crate::parse_error_to_syntax_error(&e, &source, &filename))?;
+        (m, None)
+    };
     let lm = LineMap::new(&source);
-    let b = Builder { lm: &lm };
-    Ok(b.module(&module, &mode))
+    let (tc_stmts, tc_args, tc_ignores) = match tc {
+        Some(t) => (
+            t.stmts.into_iter().collect(),
+            t.args.into_iter().collect(),
+            t.ignores,
+        ),
+        None => Default::default(),
+    };
+    let b = Builder {
+        lm: &lm,
+        src: &source,
+        tc_stmts,
+        tc_args,
+        tc_ignores,
+    };
+    let spec = b.module(&module, &mode);
+    fix_contexts(&spec);
+    Ok(spec)
+}
+
+/// A field of a spec-node dict, by key.
+fn spec_field(node: &Object, key: &'static str) -> Option<Object> {
+    match node {
+        Object::Dict(d) => d.borrow().get(&DictKey(Object::from_static(key))).cloned(),
+        _ => None,
+    }
+}
+
+/// The `_type` tag of a spec-node dict.
+fn spec_type(node: &Object) -> Option<Rc<str>> {
+    match spec_field(node, "_type") {
+        Some(Object::Str(s)) => Some(s),
+        _ => None,
+    }
+}
+
+/// The string payload of a `Constant` spec node (`None` for any other
+/// node shape or a non-str constant).
+fn const_str_of(node: &Object) -> Option<Rc<str>> {
+    if !matches!(spec_type(node).as_deref(), Some("Constant")) {
+        return None;
+    }
+    match spec_field(node, "value") {
+        Some(Object::Str(s)) => Some(s),
+        _ => None,
+    }
+}
+
+/// Stamp `ctx` onto an expression in a store/del position, recursing
+/// through tuple/list/starred targets (CPython's `set_context`).
+/// `Attribute`/`Subscript` only flip their own `ctx`; their
+/// `.value`/`.slice` stay `Load`.
+fn set_ctx(node: &Object, ctx: &'static str) {
+    let Some(ty) = spec_type(node) else { return };
+    if !matches!(
+        &*ty,
+        "Name" | "Attribute" | "Subscript" | "Starred" | "List" | "Tuple"
+    ) {
+        return;
+    }
+    if let Object::Dict(d) = node {
+        d.borrow_mut()
+            .insert(DictKey(Object::from_static("ctx")), singleton(ctx));
+    }
+    match &*ty {
+        "List" | "Tuple" => {
+            if let Some(Object::List(elts)) = spec_field(node, "elts") {
+                let elts = elts.borrow().clone();
+                for elt in &elts {
+                    set_ctx(elt, ctx);
+                }
+            }
+        }
+        "Starred" => {
+            if let Some(v) = spec_field(node, "value") {
+                set_ctx(&v, ctx);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The parser doesn't track expression contexts, and the [`Builder`]
+/// stamps `Load` everywhere; rewrite `ctx` to `Store`/`Del` for
+/// assignment/deletion targets so `ast.dump` matches CPython. Done here,
+/// on the spec dicts, rather than in `ast.py` — the Python tree re-walk
+/// used to dominate `ast.parse` (~3x the cost of node construction).
+fn fix_contexts(root: &Object) {
+    let mut todo: Vec<Object> = vec![root.clone()];
+    while let Some(cur) = todo.pop() {
+        match &cur {
+            Object::List(items) => todo.extend(items.borrow().iter().cloned()),
+            Object::Dict(d) => {
+                if let Some(ty) = spec_type(&cur) {
+                    match &*ty {
+                        "Assign" => {
+                            if let Some(Object::List(ts)) = spec_field(&cur, "targets") {
+                                let ts = ts.borrow().clone();
+                                for t in &ts {
+                                    set_ctx(t, "Store");
+                                }
+                            }
+                        }
+                        "AugAssign" | "AnnAssign" | "NamedExpr" | "For" | "AsyncFor"
+                        | "comprehension" => {
+                            if let Some(t) = spec_field(&cur, "target") {
+                                set_ctx(&t, "Store");
+                            }
+                        }
+                        "Delete" => {
+                            if let Some(Object::List(ts)) = spec_field(&cur, "targets") {
+                                let ts = ts.borrow().clone();
+                                for t in &ts {
+                                    set_ctx(t, "Del");
+                                }
+                            }
+                        }
+                        "With" | "AsyncWith" => {
+                            if let Some(Object::List(items)) = spec_field(&cur, "items") {
+                                let items = items.borrow().clone();
+                                for item in &items {
+                                    match spec_field(item, "optional_vars") {
+                                        Some(Object::None) | None => {}
+                                        Some(ov) => set_ctx(&ov, "Store"),
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let children: Vec<Object> = d
+                    .borrow()
+                    .values()
+                    .filter(|v| matches!(v, Object::Dict(_) | Object::List(_)))
+                    .cloned()
+                    .collect();
+                todo.extend(children);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Byte-offset → (1-based line, 0-based UTF-8 column) resolver.
@@ -109,11 +285,16 @@ struct LineMap {
 
 impl LineMap {
     fn new(source: &str) -> Self {
-        let newlines = source
-            .bytes()
-            .enumerate()
-            .filter_map(|(i, b)| (b == b'\n').then_some(i))
-            .collect();
+        // The tokenizer treats `\n`, `\r\n`, and a lone `\r` as line
+        // terminators (test_source_segment_endings); record the offset of
+        // each terminator's final byte.
+        let bytes = source.as_bytes();
+        let mut newlines = Vec::new();
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b'\n' || (b == b'\r' && bytes.get(i + 1) != Some(&b'\n')) {
+                newlines.push(i);
+            }
+        }
         Self { newlines }
     }
 
@@ -137,6 +318,15 @@ impl LineMap {
 /// Walks a parsed module into the value-based spec tree.
 struct Builder<'a> {
     lm: &'a LineMap,
+    /// Original source text — consulted for details the Rust AST does
+    /// not carry (the `u` string-prefix that populates `Constant.kind`).
+    src: &'a str,
+    /// PEP 484 type-comment side tables (`type_comments=True`), keyed by
+    /// node span-start byte offset; empty on the default path.
+    tc_stmts: std::collections::HashMap<u32, String>,
+    tc_args: std::collections::HashMap<u32, String>,
+    /// `# type: ignore<tag>` comments: (comment start offset, tag).
+    tc_ignores: Vec<(u32, String)>,
 }
 
 /// Build a node `dict` with `_type`, the given fields, and the four
@@ -196,6 +386,22 @@ fn list_of<T>(items: &[T], mut f: impl FnMut(&T) -> Object) -> Object {
 }
 
 impl Builder<'_> {
+    /// The claimed `# type:` comment for the statement starting at
+    /// `sp.start`, or `None`.
+    fn stmt_type_comment(&self, sp: Span) -> Object {
+        match self.tc_stmts.get(&sp.start.0) {
+            Some(t) => Object::from_str(t.clone()),
+            None => Object::None,
+        }
+    }
+
+    fn arg_type_comment(&self, sp: Span) -> Object {
+        match self.tc_args.get(&sp.start.0) {
+            Some(t) => Object::from_str(t.clone()),
+            None => Object::None,
+        }
+    }
+
     fn module(&self, m: &past::Module, mode: &str) -> Object {
         let body = list_of(&m.body, |s| self.stmt(s));
         match mode {
@@ -208,10 +414,26 @@ impl Builder<'_> {
                 node_noloc("Expression", vec![("body", inner.unwrap_or(Object::None))])
             }
             "single" => node_noloc("Interactive", vec![("body", body)]),
-            _ => node_noloc(
-                "Module",
-                vec![("body", body), ("type_ignores", Object::new_list(vec![]))],
-            ),
+            _ => {
+                let ignores = self
+                    .tc_ignores
+                    .iter()
+                    .map(|(off, tag)| {
+                        let (lineno, _) = self.lm.pos(*off);
+                        node_noloc(
+                            "TypeIgnore",
+                            vec![
+                                ("lineno", Object::Int(lineno)),
+                                ("tag", Object::from_str(tag.clone())),
+                            ],
+                        )
+                    })
+                    .collect();
+                node_noloc(
+                    "Module",
+                    vec![("body", body), ("type_ignores", Object::new_list(ignores))],
+                )
+            }
         }
     }
 
@@ -237,7 +459,7 @@ impl Builder<'_> {
                         "returns",
                         returns.as_deref().map_or(Object::None, |r| self.expr(r)),
                     ),
-                    ("type_comment", Object::None),
+                    ("type_comment", self.stmt_type_comment(sp)),
                     ("type_params", self.type_params(type_params)),
                 ],
                 sp,
@@ -261,7 +483,7 @@ impl Builder<'_> {
                         "returns",
                         returns.as_deref().map_or(Object::None, |r| self.expr(r)),
                     ),
-                    ("type_comment", Object::None),
+                    ("type_comment", self.stmt_type_comment(sp)),
                     ("type_params", self.type_params(type_params)),
                 ],
                 sp,
@@ -321,7 +543,7 @@ impl Builder<'_> {
                 vec![
                     ("targets", list_of(targets, |x| self.expr(x))),
                     ("value", self.expr(value)),
-                    ("type_comment", Object::None),
+                    ("type_comment", self.stmt_type_comment(sp)),
                 ],
                 sp,
                 self.lm,
@@ -384,7 +606,7 @@ impl Builder<'_> {
                     ("iter", self.expr(iter)),
                     ("body", list_of(body, |x| self.stmt(x))),
                     ("orelse", list_of(orelse, |x| self.stmt(x))),
-                    ("type_comment", Object::None),
+                    ("type_comment", self.stmt_type_comment(sp)),
                 ],
                 sp,
                 self.lm,
@@ -401,7 +623,7 @@ impl Builder<'_> {
                     ("iter", self.expr(iter)),
                     ("body", list_of(body, |x| self.stmt(x))),
                     ("orelse", list_of(orelse, |x| self.stmt(x))),
-                    ("type_comment", Object::None),
+                    ("type_comment", self.stmt_type_comment(sp)),
                 ],
                 sp,
                 self.lm,
@@ -441,7 +663,7 @@ impl Builder<'_> {
                 vec![
                     ("items", list_of(items, |i| self.withitem(i))),
                     ("body", list_of(body, |x| self.stmt(x))),
-                    ("type_comment", Object::None),
+                    ("type_comment", self.stmt_type_comment(sp)),
                 ],
                 sp,
                 self.lm,
@@ -451,14 +673,14 @@ impl Builder<'_> {
                 vec![
                     ("items", list_of(items, |i| self.withitem(i))),
                     ("body", list_of(body, |x| self.stmt(x))),
-                    ("type_comment", Object::None),
+                    ("type_comment", self.stmt_type_comment(sp)),
                 ],
                 sp,
                 self.lm,
             ),
             S::Import(aliases) => node(
                 "Import",
-                vec![("names", list_of(aliases, alias))],
+                vec![("names", list_of(aliases, |a| self.alias(a)))],
                 sp,
                 self.lm,
             ),
@@ -470,7 +692,7 @@ impl Builder<'_> {
                 "ImportFrom",
                 vec![
                     ("module", opt_ident(module.as_deref())),
-                    ("names", list_of(names, alias)),
+                    ("names", list_of(names, |a| self.alias(a))),
                     ("level", Object::Int(i64::from(*level))),
                 ],
                 sp,
@@ -523,12 +745,34 @@ impl Builder<'_> {
         use past::ExprKind as E;
         let sp = e.span;
         match &e.kind {
-            E::Constant(c) => node(
-                "Constant",
-                vec![("value", constant(c)), ("kind", Object::None)],
-                sp,
-                self.lm,
-            ),
+            E::Constant(c) => {
+                // `Constant.kind` is `"u"` for a u-prefixed str literal
+                // (PEP 414), `None` otherwise. The Rust AST doesn't keep
+                // the prefix, so consult the literal's source text: the
+                // prefix letter must be *immediately* followed by a quote,
+                // or this is not a literal prefix (e.g. the text piece of
+                // an f-string whose span starts mid-literal at a `u`).
+                let kind = match c {
+                    past::Constant::Str(_) | past::Constant::WStr(_)
+                        if matches!(
+                            self.src.as_bytes().get(sp.start.0 as usize),
+                            Some(b'u' | b'U')
+                        ) && matches!(
+                            self.src.as_bytes().get(sp.start.0 as usize + 1),
+                            Some(b'\'' | b'"')
+                        ) =>
+                    {
+                        Object::from_static("u")
+                    }
+                    _ => Object::None,
+                };
+                node(
+                    "Constant",
+                    vec![("value", constant(c)), ("kind", kind)],
+                    sp,
+                    self.lm,
+                )
+            }
             E::Name(id) => node(
                 "Name",
                 vec![("id", ident(id)), ("ctx", singleton("Load"))],
@@ -738,7 +982,7 @@ impl Builder<'_> {
             E::Await(value) => node("Await", vec![("value", self.expr(value))], sp, self.lm),
             E::JoinedStr(parts) => node(
                 "JoinedStr",
-                vec![("values", list_of(parts, |x| self.expr(x)))],
+                vec![("values", self.joinedstr_values(parts))],
                 sp,
                 self.lm,
             ),
@@ -759,6 +1003,41 @@ impl Builder<'_> {
         }
     }
 
+    /// `JoinedStr.values` with adjacent string constants coalesced —
+    /// CPython's parser emits one `Constant` for consecutive literal
+    /// segments (the text between `{}` fields, `=`-debug prefixes,
+    /// implicit concatenation), so `f"{a=} {b=}"` has `Constant(' b=')`,
+    /// not `Constant(' ')`, `Constant('b=')`. `ast.unparse` round-trips
+    /// rely on the merged shape (test_unparse on e.g. test_pow.py).
+    fn joinedstr_values(&self, parts: &[past::Expr]) -> Object {
+        let mut out: Vec<Object> = Vec::with_capacity(parts.len());
+        for p in parts {
+            let built = self.expr(p);
+            if let Some(prev) = out.last() {
+                if let (Some(a), Some(b)) = (const_str_of(prev), const_str_of(&built)) {
+                    if let Object::Dict(d) = prev {
+                        let mut d = d.borrow_mut();
+                        d.insert(
+                            DictKey(Object::from_static("value")),
+                            Object::from_str(format!("{a}{b}")),
+                        );
+                        // Extend the merged constant's span to the end of
+                        // the absorbed part (compile-from-AST maps
+                        // locations back to source bytes).
+                        for key in ["end_lineno", "end_col_offset"] {
+                            if let Some(v) = spec_field(&built, key) {
+                                d.insert(DictKey(Object::from_static(key)), v);
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+            out.push(built);
+        }
+        Object::new_list(out)
+    }
+
     fn opt_expr(&self, e: Option<&past::Expr>) -> Object {
         match e {
             Some(x) => self.expr(x),
@@ -774,12 +1053,14 @@ impl Builder<'_> {
     }
 
     fn keyword(&self, k: &past::Keyword) -> Object {
-        node_noloc(
+        node(
             "keyword",
             vec![
                 ("arg", opt_ident(k.arg.as_deref())),
                 ("value", self.expr(&k.value)),
             ],
+            k.span,
+            self.lm,
         )
     }
 
@@ -860,27 +1141,37 @@ impl Builder<'_> {
     }
 
     fn pattern(&self, p: &past::Pattern) -> Object {
-        use past::Pattern as P;
-        match p {
-            P::Value(e) => node_noloc("MatchValue", vec![("value", self.expr(e))]),
-            P::Singleton(c) => node_noloc("MatchSingleton", vec![("value", constant(c))]),
-            P::Capture(name) => node_noloc(
+        use past::PatternKind as P;
+        let sp = p.span;
+        match &p.kind {
+            P::Value(e) => node("MatchValue", vec![("value", self.expr(e))], sp, self.lm),
+            P::Singleton(c) => node("MatchSingleton", vec![("value", constant(c))], sp, self.lm),
+            P::Capture(name) => node(
                 "MatchAs",
                 vec![
                     ("pattern", Object::None),
                     ("name", opt_ident(name.as_deref())),
                 ],
+                sp,
+                self.lm,
             ),
-            P::Sequence(items) => node_noloc(
+            P::Sequence(items) => node(
                 "MatchSequence",
                 vec![("patterns", list_of(items, |x| self.pattern(x)))],
+                sp,
+                self.lm,
             ),
-            P::Star(name) => node_noloc("MatchStar", vec![("name", opt_ident(name.as_deref()))]),
+            P::Star(name) => node(
+                "MatchStar",
+                vec![("name", opt_ident(name.as_deref()))],
+                sp,
+                self.lm,
+            ),
             P::Mapping {
                 keys,
                 patterns,
                 rest,
-            } => node_noloc(
+            } => node(
                 "MatchMapping",
                 vec![
                     ("keys", list_of(keys, |k| self.expr(k))),
@@ -893,12 +1184,14 @@ impl Builder<'_> {
                         },
                     ),
                 ],
+                sp,
+                self.lm,
             ),
             P::Class {
                 cls,
                 positionals,
                 keywords,
-            } => node_noloc(
+            } => node(
                 "MatchClass",
                 vec![
                     ("cls", self.expr(cls)),
@@ -906,17 +1199,23 @@ impl Builder<'_> {
                     ("kwd_attrs", list_of(keywords, |(n, _)| ident(n))),
                     ("kwd_patterns", list_of(keywords, |(_, p)| self.pattern(p))),
                 ],
+                sp,
+                self.lm,
             ),
-            P::Or(items) => node_noloc(
+            P::Or(items) => node(
                 "MatchOr",
                 vec![("patterns", list_of(items, |x| self.pattern(x)))],
+                sp,
+                self.lm,
             ),
-            P::As { pattern, name } => node_noloc(
+            P::As { pattern, name } => node(
                 "MatchAs",
                 vec![
                     ("pattern", self.pattern(pattern)),
                     ("name", Object::from_str(name.clone())),
                 ],
+                sp,
+                self.lm,
             ),
         }
     }
@@ -944,12 +1243,13 @@ impl Builder<'_> {
             Some(e) => self.expr(e),
             None => Object::None,
         };
+        let type_comment = self.arg_type_comment(a.span);
         node(
             "arg",
             vec![
                 ("arg", ident(&a.name)),
                 ("annotation", annotation),
-                ("type_comment", Object::None),
+                ("type_comment", type_comment),
             ],
             a.span,
             self.lm,
@@ -962,16 +1262,18 @@ impl Builder<'_> {
             None => Object::None,
         }
     }
-}
 
-fn alias(a: &past::Alias) -> Object {
-    node_noloc(
-        "alias",
-        vec![
-            ("name", ident(&a.name)),
-            ("asname", opt_ident(a.asname.as_deref())),
-        ],
-    )
+    fn alias(&self, a: &past::Alias) -> Object {
+        node(
+            "alias",
+            vec![
+                ("name", ident(&a.name)),
+                ("asname", opt_ident(a.asname.as_deref())),
+            ],
+            a.span,
+            self.lm,
+        )
+    }
 }
 
 /// Lower a parser literal into the runtime value `ast.Constant.value`
@@ -992,6 +1294,7 @@ fn constant(c: &past::Constant) -> Object {
         C::WStr(cps) => Object::str_from_codepoints(cps.clone()),
         C::Bytes(b) => Object::new_bytes(b.clone()),
         C::Tuple(items) => Object::new_tuple(items.iter().map(constant).collect()),
+        C::FrozenSet(items) => Object::new_frozenset_from(items.iter().map(constant)),
         C::Ellipsis => crate::vm_singletons::ellipsis(),
     }
 }

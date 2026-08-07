@@ -59,7 +59,15 @@ import io
 buf = io.StringIO()
 with buf as fp:
     fp.write("hello")
-assert buf.getvalue() == "hello"
+    assert buf.getvalue() == "hello"
+# StringIO.__exit__ closes the buffer (CPython behaviour).
+assert buf.closed
+try:
+    buf.getvalue()
+except ValueError:
+    pass
+else:
+    raise AssertionError("getvalue() after close must raise ValueError")
 
 # nested loops + else
 found = None

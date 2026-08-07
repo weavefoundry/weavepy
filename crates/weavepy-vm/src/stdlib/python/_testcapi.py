@@ -22,6 +22,20 @@ from _testinternalcapi import (  # noqa: F401
     _end_spawned_pthread,
 )
 
+# `Py_FatalError` trigger (test_faulthandler.test_fatal_error): dumps a
+# traceback to stderr and aborts the process. Native — it must never
+# return, and the dump comes from the interpreter's own frame registry.
+from _testinternalcapi import fatal_error  # noqa: F401
+
+# `PyTraceMalloc_Track`/`Untrack` probes (`test_tracemalloc.TestCAPI`).
+# Direct aliases of the native builtins — a Python wrapper `def` would
+# add its own frame to the traceback the C API captures from the caller.
+# The native side accepts and ignores the trailing `release_gil` flag.
+from _tracemalloc import (  # noqa: F401
+    _weave_track as tracemalloc_track,
+    _weave_untrack as tracemalloc_untrack,
+)
+
 # CPython's test suite gates many tests on attributes of _testcapi;
 # expose the couple of constants commonly probed so `hasattr` checks
 # behave sensibly.
@@ -38,6 +52,21 @@ LLONG_MIN = -(2**63)
 ULLONG_MAX = 2**64 - 1
 SHRT_MAX = 2**15 - 1
 SHRT_MIN = -(2**15)
+
+def PyTime_AsSecondsDouble(t):
+    """`PyTime_AsSecondsDouble()` (Python/pytime.c): exact whole seconds
+    convert via integer division so huge timestamps don't lose precision;
+    everything else divides as C doubles (test_time.test_AsSecondsDouble)."""
+    t = t.__index__()
+    if not (LLONG_MIN <= t <= LLONG_MAX):
+        raise OverflowError("Python int too large to convert to C long long")
+    if t % 1_000_000_000 == 0:
+        return float(t // 1_000_000_000)
+    # C computes `(double)t / 1e9`: the *operand* is narrowed to double
+    # first (dropping low bits of huge timestamps), unlike Python's
+    # correctly-rounded int/int true division.
+    return float(t) / 1e9
+
 
 # CPython 3.13's C-stack recursion budget (`Include/cpython/pystate.h`).
 # WeavePy's tree-walking evaluator enforces `sys.setrecursionlimit` on a
@@ -83,6 +112,18 @@ def traceback_print(tb, file):
     file.write("\n".join(kept) + "\n")
 
 
+def Py_CompileStringExFlags(source, filename, start, flags=0, optimize=-1):
+    # C-API compile shim: `start` is the grammar start token
+    # (Py_single_input=256, Py_file_input=257, Py_eval_input=258).
+    # PyCF_IGNORE_COOKIE (0x0800) means "the buffer is UTF-8, skip PEP
+    # 263 cookie detection" — so a non-UTF-8 byte is a
+    # UnicodeDecodeError up front (test_type_comments).
+    mode = {256: 'single', 257: 'exec', 258: 'eval'}.get(start, 'exec')
+    if isinstance(source, bytes) and flags & 0x0800:
+        source = source.decode('utf-8')
+    return compile(source, filename, mode, flags & ~0x0800, optimize=optimize)
+
+
 def bad_get(self, obj, cls):
     # C helper used as a `__get__` replacement (bpo-25750): it calls the
     # owning class mid-dispatch, which clobbers the descriptor out of
@@ -103,6 +144,43 @@ def set_nomemory(start, stop=None):
 
 def remove_mem_hooks():
     pass
+
+
+def test_pymem_alloc0():
+    # CPython's C probe checks PyMem_Malloc(0) & friends return unique
+    # non-NULL pointers with tracemalloc enabled (bpo-21639). WeavePy's
+    # allocator is Rust's global allocator, which already guarantees
+    # this; the observable contract is simply "does not crash".
+    return None
+
+
+def tracemalloc_track_race():
+    # gh-128679 regression probe: hammer PyTraceMalloc_Track/Untrack
+    # from worker threads racing tracemalloc.stop(). Exercises the same
+    # public entry points; passes iff nothing crashes.
+    import _tracemalloc
+    import threading
+
+    _tracemalloc.start(1)
+
+    def worker(base):
+        for i in range(200):
+            try:
+                _tracemalloc._weave_track(5, base + i, 16)
+                _tracemalloc._weave_untrack(5, base + i)
+            except RuntimeError:
+                # Raised once stop() wins the race — exactly the C
+                # behaviour (_PyTraceMalloc_Track returns -2).
+                pass
+
+    threads = [
+        threading.Thread(target=worker, args=(0x1000 * (n + 1),)) for n in range(4)
+    ]
+    for t in threads:
+        t.start()
+    _tracemalloc.stop()
+    for t in threads:
+        t.join()
 
 
 def run_in_subinterp(code):
@@ -138,3 +216,155 @@ def run_in_subinterp(code):
         sys.set_int_max_str_digits(saved_digits)
         sys.setrecursionlimit(saved_recursion)
     return 0
+
+
+# `call_in_temporary_c_thread()` (Modules/_testcapi/run.c): run *callback*
+# once on a freshly spawned "foreign" thread. With `wait=False` the thread is
+# left for `join_temporary_c_thread()` to reap
+# (test_threading_local.test_threading_local_clear_race). A real OS thread
+# via `_thread` reproduces the observable shape — the callback runs off the
+# calling thread, and joining synchronizes with its completion.
+_temporary_c_thread_done = None
+
+
+def call_in_temporary_c_thread(callback, wait=True):
+    import _thread
+
+    global _temporary_c_thread_done
+    done = _thread.allocate_lock()
+    done.acquire()
+
+    def run():
+        try:
+            callback()
+        finally:
+            done.release()
+
+    _thread.start_new_thread(run, ())
+    if wait:
+        with done:
+            pass
+    else:
+        _temporary_c_thread_done = done
+
+
+def join_temporary_c_thread():
+    global _temporary_c_thread_done
+    done = _temporary_c_thread_done
+    if done is not None:
+        _temporary_c_thread_done = None
+        with done:
+            pass
+
+
+# --- `tp_version_tag` probes (test_type_cache) -------------------------
+#
+# CPython's `type_get_version`/`type_assign_version`/`type_modified`/
+# `type_assign_specific_version_unsafe` read and write `tp_version_tag`
+# directly. WeavePy's analogue is the per-type attribute-resolution
+# counter (`TypeObject::attr_version`, exposed through
+# `_testinternalcapi._type_attr_version`): it bumps whenever the class
+# dict or MRO changes, which is exactly the event that zeroes
+# `tp_version_tag` in CPython. A tag assigned here is therefore stamped
+# with the counter observed at assignment time and reads back as 0 once
+# the class has been modified since.
+from _testinternalcapi import _type_attr_version
+
+# type -> (tag, attr_version at assignment). Keyed by the type object
+# itself (strong reference) so ids are never recycled under us; this is
+# a test-only helper, the leak is bounded by the test's own classes.
+_type_version_tags = {}
+_type_versions_used = {}
+# CPython assigns globally unique, monotonically increasing tags that
+# are never reused — even across `sys._clear_type_cache()`.
+_next_version_tag = 1_000_000
+# `MAX_VERSIONS_PER_CLASS` (Objects/typeobject.c): a class that has
+# consumed its budget can never get a fresh tag again.
+_MAX_VERSIONS_PER_CLASS = 1000
+
+
+def type_get_version(tp):
+    rec = _type_version_tags.get(tp)
+    if rec is not None and rec[1] == _type_attr_version(tp):
+        return rec[0]
+    return 0
+
+
+def type_assign_version(tp):
+    if type_get_version(tp) != 0:
+        return 1
+    used = _type_versions_used.get(tp, 0)
+    if used >= _MAX_VERSIONS_PER_CLASS:
+        return 0
+    global _next_version_tag
+    tag = _next_version_tag
+    _next_version_tag += 1
+    _type_version_tags[tp] = (tag, _type_attr_version(tp))
+    _type_versions_used[tp] = used + 1
+    return 1
+
+
+def type_modified(tp):
+    _type_version_tags.pop(tp, None)
+
+
+def type_assign_specific_version_unsafe(tp, version):
+    _type_version_tags[tp] = (version, _type_attr_version(tp))
+
+
+# ---------------------------------------------------------------------------
+# PEP 3118 / PEP 688 buffer test helpers (Modules/_testcapi/buffer.c)
+# ---------------------------------------------------------------------------
+
+# `PyMemoryView_FromMemory` access modes — *invalid* as `PyObject_GetBuffer`
+# request flags; the C helpers reject them with SystemError
+# (PyErr_BadInternalCall).
+_PyBUF_READ = 0x100
+_PyBUF_WRITE = 0x200
+_PyBUF_WRITABLE = 0x001
+
+
+def _check_getbuffer_flags(flags):
+    if flags == _PyBUF_READ or flags == _PyBUF_WRITE:
+        raise SystemError("PyBUF_READ and PyBUF_WRITE are invalid flags")
+
+
+def _view_is_released(view):
+    try:
+        view.nbytes
+    except ValueError:
+        return True
+    return False
+
+
+class testBuf:
+    """`_testcapi.testBuf` — a minimal C buffer exporter with an export
+    counter (`references`), backed by the fixed payload b\"test\"."""
+
+    def __init__(self):
+        self.references = 0
+        self._data = b"test"
+
+    def __buffer__(self, flags):
+        _check_getbuffer_flags(flags)
+        view = memoryview(self._data)
+        self.references += 1
+        return view
+
+    def __release_buffer__(self, view):
+        if _view_is_released(view):
+            raise ValueError("operation forbidden on released memoryview object")
+        view.release()
+        self.references -= 1
+
+
+def buffer_fill_info(source, readonly, flags):
+    """`PyBuffer_FillInfo` + `PyMemoryView_FromBuffer` over `source`'s
+    bytes: SystemError for the FromMemory access modes, BufferError when a
+    writable buffer is requested from a readonly filling."""
+    _check_getbuffer_flags(flags)
+    if readonly and flags & _PyBUF_WRITABLE:
+        raise BufferError("Object is not writable.")
+    if readonly:
+        return memoryview(bytes(source))
+    return memoryview(bytearray(source))

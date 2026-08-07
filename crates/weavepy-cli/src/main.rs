@@ -300,10 +300,10 @@ PYTHONSAFEPATH        : same as -P option.
 
 const HELP_XOPTIONS: &str = "\
 The following implementation-specific options are available:
--X faulthandler        : enable faulthandler (no-op today).
+-X faulthandler        : dump the Python traceback on fatal signals.
 -X dev                 : enable runtime checks helpful for development.
 -X utf8                : enable UTF-8 mode for the interpreter.
--X tracemalloc         : start tracing Python memory allocations (no-op today).
+-X tracemalloc[=N]     : start tracing Python memory allocations, keeping N frames.
 -X importtime          : show how long each import takes (no-op today).
 -X showrefcount        : output the total reference count (no-op today).
 -X frozen_modules=on|off : whether frozen modules should be used.
@@ -924,6 +924,39 @@ fn build_flags(cli: &Cli, env: &EnvOverrides) -> InterpreterFlags {
             "PYTHON_GIL / -X gil must be \"0\" or \"1\"",
         ),
     }
+    // `-X tracemalloc[=NFRAME]` beats `PYTHONTRACEMALLOC` (CPython
+    // `config_init_tracemalloc`): a parse failure or negative value is a
+    // startup fatal error; `0` means disabled; a value beyond
+    // `_tracemalloc`'s MAX_NFRAME fails at init with the module's own
+    // ValueError text (`test_tracemalloc.TestCommandLine`).
+    let tracemalloc_nframe = match xoption_value(&cli.xoptions, "tracemalloc") {
+        Some(Some(v)) => match v.parse::<i64>() {
+            Ok(n) if n >= 0 => Some(n),
+            _ => config_fatal_error(
+                "config_init_tracemalloc",
+                "-X tracemalloc=NFRAME: invalid number of frames",
+            ),
+        },
+        // Bare `-X tracemalloc` behaves as `-X tracemalloc=1`.
+        Some(None) => Some(1),
+        None => env.tracemalloc.as_deref().map(|v| match v.parse::<i64>() {
+            Ok(n) if n >= 0 => n,
+            _ => config_fatal_error(
+                "config_init_tracemalloc",
+                "PYTHONTRACEMALLOC: invalid number of frames",
+            ),
+        }),
+    };
+    let tracemalloc = match tracemalloc_nframe {
+        None | Some(0) => 0u32,
+        Some(n) if n > 65535 => {
+            // CPython surfaces `_PyTraceMalloc_Start`'s ValueError during
+            // interpreter init.
+            eprintln!("ValueError: the number of frames must be in range [1; 65535]");
+            std::process::exit(1);
+        }
+        Some(n) => n as u32,
+    };
     let mut xoptions = cli.xoptions.clone();
     // `PYTHONDEVMODE` behaves like `-X dev` for `sys.flags.dev_mode`
     // (though CPython does *not* mirror it into `sys._xoptions`; the
@@ -965,6 +998,11 @@ fn build_flags(cli: &Cli, env: &EnvOverrides) -> InterpreterFlags {
         pycache_prefix,
         int_max_str_digits,
         cpu_count,
+        tracemalloc,
+        // `-X faulthandler` beats `PYTHONFAULTHANDLER` only in the sense
+        // that either one turns it on (CPython `config_init_faulthandler`;
+        // there is no "off" spelling).
+        faulthandler: env.faulthandler || xoption_value(&cli.xoptions, "faulthandler").is_some(),
     }
 }
 
@@ -993,6 +1031,12 @@ struct EnvOverrides {
     cpu_count: Option<String>,
     /// `PYTHON_GIL`, raw (`"0"` / `"1"`).
     gil: Option<String>,
+    /// `PYTHONTRACEMALLOC`, raw (validated during flag composition so
+    /// `-X tracemalloc` precedence applies first).
+    tracemalloc: Option<String>,
+    /// `PYTHONFAULTHANDLER` — any non-empty value enables the
+    /// fatal-signal traceback dumper at startup.
+    faulthandler: bool,
     warning_filters: Vec<String>,
     hash_seed: Option<u32>,
     /// `PYTHONIOENCODING=encoding[:errors]`, split into its halves. Either
@@ -1043,6 +1087,8 @@ impl EnvOverrides {
         o.int_max_str_digits = nonempty("PYTHONINTMAXSTRDIGITS");
         o.cpu_count = nonempty("PYTHON_CPU_COUNT");
         o.gil = nonempty("PYTHON_GIL");
+        o.tracemalloc = nonempty("PYTHONTRACEMALLOC");
+        o.faulthandler = nonempty("PYTHONFAULTHANDLER").is_some();
         if let Ok(w) = env::var("PYTHONWARNINGS") {
             o.warning_filters = w.split(',').map(str::to_owned).collect();
         }
@@ -1509,11 +1555,14 @@ fn exit_with_system_exit(code: weavepy::vm::object::Object) -> ! {
         // `BaseException.__str__` from the args tuple directly
         // (`test_cmd_line_script.test_issue20500_exit_with_exception_value`).
         Object::Instance(inst) => {
-            let args = inst
-                .dict
-                .borrow()
-                .get(&weavepy::vm::object::DictKey(Object::from_static("args")))
-                .cloned();
+            // `args` is a real slot on exceptions (RFC 0057); older
+            // plain instances may still carry it in the dict.
+            let args = inst.slot_get("args").or_else(|| {
+                inst.dict
+                    .borrow()
+                    .get(&weavepy::vm::object::DictKey(Object::from_static("args")))
+                    .cloned()
+            });
             let text = match args {
                 Some(Object::Tuple(args)) => match args.len() {
                     0 => String::new(),

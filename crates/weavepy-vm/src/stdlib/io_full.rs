@@ -424,6 +424,18 @@ fn apply_text_config(
         return Ok(());
     };
     if f.binary {
+        // CPython's `io.open` rejects text-only arguments on binary
+        // streams up front (test_fileinput.test_modes relies on the
+        // ValueError from `open(..., 'rb', encoding=...)`).
+        if !matches!(encoding, None | Some(Object::None)) {
+            return Err(value_error("binary mode doesn't take an encoding argument"));
+        }
+        if !matches!(errors, None | Some(Object::None)) {
+            return Err(value_error("binary mode doesn't take an errors argument"));
+        }
+        if !matches!(newline, None | Some(Object::None)) {
+            return Err(value_error("binary mode doesn't take a newline argument"));
+        }
         return Ok(());
     }
     if let Some(Object::Str(enc)) = encoding {

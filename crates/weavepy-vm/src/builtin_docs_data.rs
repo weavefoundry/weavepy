@@ -619,6 +619,7 @@ pub static BUILTIN_DOCS: &[(&str, &str)] = &[
     ("memoryview.tolist", "Return the data in the buffer as a list of elements."),
     ("memoryview.toreadonly", "Return a readonly version of the memoryview."),
     ("min", "min(iterable, *[, default=obj, key=func]) -> value\nmin(arg1, arg2, *args, *[, key=func]) -> value\n\nWith a single iterable argument, return its smallest item. The\ndefault keyword-only argument specifies an object to return if\nthe provided iterable is empty.\nWith two or more positional arguments, return the smallest argument."),
+    ("module", "Create a module object.\n\nThe name must be a string; the optional doc argument can have any type."),
     ("next", "next(iterator[, default])\n\nReturn the next item from the iterator. If default is given and the iterator\nis exhausted, it is returned instead of raising StopIteration."),
     ("object", "The base class of the class hierarchy.\n\nWhen called, it accepts no arguments and returns a new featureless\ninstance that has no instance attributes and cannot be given any.\n"),
     ("object.__delattr__", "Implement delattr(self, name)."),

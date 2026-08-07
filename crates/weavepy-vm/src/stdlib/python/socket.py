@@ -267,7 +267,11 @@ class socket(_impl.socket):
         return _impl.socket.detach(self)
 
 
-SocketType = socket
+# CPython's `SocketType` is the *C* socket type from `_socket` (socket.py
+# re-exports it via `from _socket import *`), not the Python subclass —
+# `_compat_pickle` maps ('socket', '_socketobject') to it and
+# test_pickle's CompatPickleTests.test_name_mapping checks the identity.
+SocketType = _impl.socket
 
 
 class SocketIO(io.RawIOBase):

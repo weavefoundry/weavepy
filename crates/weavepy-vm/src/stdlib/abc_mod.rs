@@ -131,6 +131,18 @@ fn abc_register(args: &[Object]) -> Result<Object, RuntimeError> {
             reg.borrow_mut().insert(DictKey(sub.clone()));
         }
     }
+    // CPython's `_abc_register` copies the ABC's collection flag
+    // (Py_TPFLAGS_SEQUENCE / Py_TPFLAGS_MAPPING) onto the registered
+    // class so late registration makes match patterns work (PEP 634).
+    if let (Some(Object::Type(t)), Object::Type(s)) = (args.first(), &sub) {
+        let flag = t.collection_flags();
+        if flag != 0 {
+            s.dict.borrow_mut().insert(
+                DictKey(Object::from_static("_abc_collection_flags")),
+                Object::Int(flag),
+            );
+        }
+    }
     bump_cache();
     Ok(sub)
 }

@@ -232,6 +232,10 @@ fn clone_memoryview(other: &PyMemoryView) -> PyMemoryView {
         strides: RefCell::new(other.strides.borrow().clone()),
         exporter: RefCell::new(other.exporter.borrow().clone()),
         zero_dim: Cell::new(other.zero_dim.get()),
+        hash: Cell::new(-1),
+        exports: Cell::new(0),
+        release_inner: RefCell::new(None),
+        restricted: Cell::new(false),
     }
 }
 

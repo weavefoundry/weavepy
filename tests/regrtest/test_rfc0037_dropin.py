@@ -32,7 +32,7 @@ else:
 assert str.upper("hi") == "HI"
 assert str.capitalize("hi") == "Hi"
 assert str.split("a b c") == ["a", "b", "c"]
-assert float.hex(1.5) == "0x1.8p+0"
+assert float.hex(1.5) == "0x1.8000000000000p+0"
 assert int.bit_length(255) == 8
 assert bytes.hex(b"\x01\x02") == "0102"
 assert dict.get({"a": 1}, "a") == 1
@@ -45,7 +45,7 @@ assert "hi".upper() == str.upper("hi")
 # ---------------------------------------------------------------------------
 # WS3 — numeric protocol surface.
 # ---------------------------------------------------------------------------
-assert (1.5).hex() == "0x1.8p+0"
+assert (1.5).hex() == "0x1.8000000000000p+0"
 assert float.fromhex("0x1.8p+0") == 1.5
 assert (3.0).__trunc__() == 3
 assert (3.7).__floor__() == 3

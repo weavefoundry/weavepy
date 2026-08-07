@@ -33,6 +33,11 @@ pub enum DescrKind {
     Wrapper,
     GetSet,
     Member,
+    /// A `staticmethod`-wrapped C function (`str.maketrans`,
+    /// `object.__new__`): carries `__qualname__`/`__objclass__` metadata
+    /// like a descriptor, but its *type* stays
+    /// `builtin_function_or_method`, as in CPython.
+    StaticBuiltin,
 }
 
 #[derive(Clone, Debug)]
@@ -243,6 +248,7 @@ pub fn descr_type(obj: &Object) -> Option<Rc<TypeObject>> {
         DescrKind::Wrapper => bt.wrapper_descriptor_.clone(),
         DescrKind::GetSet => bt.getset_descriptor_.clone(),
         DescrKind::Member => bt.member_descriptor_.clone(),
+        DescrKind::StaticBuiltin => bt.builtin_function_.clone(),
     })
 }
 

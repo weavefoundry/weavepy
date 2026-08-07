@@ -110,6 +110,12 @@ pub enum LexError {
     /// `E_TOODEEP`, an `IndentationError`.
     #[error("too many levels of indentation")]
     TooDeepIndent { pos: u32 },
+    /// An INDENT before any content token — a statement can never begin
+    /// indented, and CPython's lazy tokenizer surfaces this before any
+    /// later lexical error on the same source (test_ast
+    /// test_literal_eval_syntax_errors).
+    #[error("unexpected indent")]
+    UnexpectedIndent { pos: u32 },
     /// Malformed numeric literal. `message` carries CPython's exact
     /// wording ("invalid hexadecimal literal", "invalid digit '9' in
     /// octal literal", "leading zeros in decimal integer literals…");
@@ -153,6 +159,7 @@ impl LexError {
             | LexError::InconsistentIndent { pos }
             | LexError::UnknownDedent { pos }
             | LexError::TooDeepIndent { pos }
+            | LexError::UnexpectedIndent { pos }
             | LexError::InvalidNumber { pos, .. }
             | LexError::InvalidStringPrefix { pos, .. }
             | LexError::StrayBackslash { pos }

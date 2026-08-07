@@ -49,16 +49,16 @@ timeout_seconds = 60
 # ---------------------------------------------------------------------
 
 [tests."cpython/Lib/test/test___all__.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): Dur…[truncated]"
+status = "pass"
+reason = "measured (RFC 0057 full-suite sweep): passes end-to-end after the object-model/compiler/pickle-5 workstreams landed."
 
 [tests."cpython/Lib/test/test__locale.py"]
 status = "pass"
 reason = "RFC 0050 WS5: real libc-backed _locale — setlocale/localeconv/nl_langinfo (with the full langinfo constant table incl. RADIXCHAR/THOUSEP/ERA/ALT_DIGITS), wcscoll/wcsxfrm collation, getencoding via nl_langinfo(CODESET), and locale strings decoded with mbstowcs under the current LC_CTYPE. LC_CTYPE is adopted from the environment at interpreter start (CPython's _Py_SetLocaleFromEnv). ALT_DIGITS/ERA subtests skip on macOS exactly as CPython does (the host locales don't carry that data)."
 
 [tests."cpython/Lib/test/test__opcode.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: 0 != -1"
+status = "pass"
+reason = "RFC 0057 WS10: opcode.stack_effect ported from CPython 3.13's generated num_popped/num_pushed metadata (verified value-identical to the real _opcode across every opcode/oparg/jump combination); _specializations/_specialized_opmap filled with the real _opcode_metadata tables; _opcode.get_specialization_stats returns None (no pystats build)."
 
 [tests."cpython/Lib/test/test__osx_support.py"]
 status = "pass"
@@ -69,8 +69,8 @@ status = "pass"
 reason = "WS8: verbatim _py_abc + _weakrefset ports, type.__subclasses__(), object.__subclasshook__, abc.py routed through _py_abc, plus VM fixes (universal __class__, __new__ implicit staticmethod, positional-only/keyword binding, class-creation kwargs ignored by builtin type.__init__, del on type attrs, property.__isabstractmethod__, and property/classmethod/staticmethod subclasses acting as descriptors). All 72 tests pass under both the Python and C ABCMeta factories."
 
 [tests."cpython/Lib/test/test_abstract_numbers.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): TypeError: slot descriptor requires an instance"
+status = "pass"
+reason = "measured (RFC 0057 full-suite sweep): passes end-to-end after the object-model/compiler/pickle-5 workstreams landed."
 
 [tests."cpython/Lib/test/test_argparse.py"]
 status = "pass"
@@ -80,13 +80,13 @@ timeout_seconds = 180
 reason = "measured (RFC 0053): the two architectural blockers fell — the materialized stdlib tree gives frozen modules a real on-disk `__file__` (so `open(argparse.__file__)` works), and the patchable-builtins work lets `mock.patch('builtins.open')` take effect."
 
 [tests."cpython/Lib/test/test_array.py"]
-status = "fail"
+status = "pass"
 timeout_seconds = 180
-reason = "measured (RFC 0049): fails in ~60s idle; near-boundary under load, budget raised"
+reason = "RFC 0057 WS10: array_mod rewritten for CPython parity — __slots__-based class (subclass __dict__/AttributeError semantics), strict item coercion (__index__/__float__ with TypeError/OverflowError discipline), platform-sized 'u' (wchar_t=4) and 'l'/'L', index-based arrayiterator with CPython pickle/(gh-128961) exhaustion semantics, pickle state dict for subclass attrs, value-before-index __setitem__ ordering (gh-142555 use-after-clear), reconstructor argument validation, and 'u' DeprecationWarning."
 
 [tests."cpython/Lib/test/test_ast.py"]
 status = "fail"
-reason = "measured (RFC 0052): suite now completes (~18s standalone, previously killed after 60s) via the compile()-from-AST path; 169 failures / 80 errors remain across full AST validation, node-construction, and position fidelity"
+reason = "measured (RFC 0057 WS2): 193 run, residual down from 169F/80E to 1F/0E (7 skips) — full AST validation, node construction, compile()-from-AST and position fidelity now conform. The single residual is ASTConstructorTests.test_non_str_kwarg (non-string keyword through ast.Call construction error shape)."
 # ~18s standalone but sits near the 60s budget on a loaded 8-job sweep.
 timeout_seconds = 180
 
@@ -140,8 +140,8 @@ status = "pass"
 timeout_seconds = 180
 
 [tests."cpython/Lib/test/test_atexit.py"]
-status = "fail"
-reason = "atexit: register/unregister ordering + exceptions in callbacks"
+status = "pass"
+reason = "measured (RFC 0057 full-suite sweep): passes end-to-end after the object-model/compiler/pickle-5 workstreams landed."
 
 [tests."cpython/Lib/test/test_audit.py"]
 status = "fail"
@@ -152,8 +152,8 @@ status = "pass"
 reason = "verbatim base64.py; full suite passes"
 
 [tests."cpython/Lib/test/test_baseexception.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): TypeError: attribute name must be string, not 'HashThisKeyWillClearTheDict'"
+status = "pass"
+reason = "measured (RFC 0057 WS10): all tests OK — __setstate__ accepts str-subclass attribute names (normalized to plain str), and __reduce__ carries a mutated `message` attribute in the pickled state"
 
 [tests."cpython/Lib/test/test_bdb.py"]
 status = "pass"
@@ -164,8 +164,8 @@ status = "pass"
 reason = "RFC 0036: passes end-to-end (bigaddrspacetest fixtures skip cleanly without the address space)"
 
 [tests."cpython/Lib/test/test_bigmem.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: False is not true"
+status = "pass"
+reason = "RFC 0057 WS10: bytes/bytearray isspace() now honors \\x0b/\\x0c (Py_ISSPACE), and str/bytes strip/lstrip/rstrip return self unchanged (CPython's identity fast path, asserted by the suite's `is` checks). All 165 non-bigmem-decorated tests pass; the @bigmemtest cases skip without -M as in CPython."
 
 [tests."cpython/Lib/test/test_binascii.py"]
 status = "pass"
@@ -177,7 +177,7 @@ reason = "RFC 0041 WS-containers: native `_bisect` accelerator (faithful port of
 
 [tests."cpython/Lib/test/test_buffer.py"]
 status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AttributeError: type object 'memoryview' has no attribute '_from_flags'"
+reason = "RFC 0057 WS10: the Python-level PEP 688 surface now passes (memoryview._from_flags, __release_buffer__ dispatch with CPython's restricted-view semantics, strict __buffer__ returns, _testcapi.testBuf/buffer_fill_info) — 91/95 pass. The 4 residual errors need the PyBUF_* constants from CPython's `_testbuffer` C module; providing it requires a real multi-dim ndarray (a stub would regress pickletester/test_picklebuffer, and a truthy ndarray un-skips the ~70-test multi-dimensional TestBufferProtocol class, which needs full multi-dim buffer support). Left for a dedicated workstream."
 
 [tests."cpython/Lib/test/test_builtin.py"]
 status = "fail"
@@ -210,8 +210,8 @@ status = "pass"
 reason = "measured (RFC 0037 WS6): passes end-to-end (skipped=1 — the _testinternalcapi inline-values probe skips cleanly)."
 
 [tests."cpython/Lib/test/test_cmath.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AttributeError: 'int' object has no attribute '__float__'. Did you mean: '__format__'?"
+status = "pass"
+reason = "measured (RFC 0057 full-suite sweep): passes end-to-end after the object-model/compiler/pickle-5 workstreams landed."
 
 [tests."cpython/Lib/test/test_cmd.py"]
 status = "pass"
@@ -230,8 +230,8 @@ status = "fail"
 reason = "measured (RFC 0049 wave-5 full-suite baseline): AttributeError: 'code' object has no attribute 'co_lnotab'"
 
 [tests."cpython/Lib/test/test_code_module.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): ValueError: substring not found"
+status = "pass"
+reason = "measured (RFC 0057 WS10): 17 tests OK — compile() now UTF-8-encodes a lone-surrogate str source before tokenizing (UnicodeEncodeError 'surrogates not allowed', the console's test_unicode_error contract), and print() writes through PyFile_WriteObject piece-by-piece: each argument, each separator, and end are *separate* file.write() calls (the sysexcepthook tests count `write('123')` then `write('\\n')` on a mock stdout)"
 
 [tests."cpython/Lib/test/test_codeccallbacks.py"]
 status = "pass"
@@ -310,8 +310,8 @@ timeout_seconds = 600
 reason = "RFC 0040 WS6: passes as a graded unit — 267 run, 0 fail, 0 err, 20 skip (release build). The whole `concurrent.futures` matrix is green: ThreadPool + ProcessPool (fork/forkserver/spawn) across test_init/test_future/test_as_completed/test_wait/test_thread_pool/test_process_pool/test_shutdown/test_deadlock. Two fixes landed this wave. (1) A VM deterministic-finalization bug: a comprehension's anonymous `<listcomp>`/`<setcomp>`/`<dictcomp>`/`<genexpr>` is GC-tracked when it captures cells, so when emitted by `MakeFunction` and consumed by the very next `Call` a plain `Rc` drop left it pinned by its own GC handle — leaking the captured locals until the next cycle collection. `ThreadPoolExecutor.map`'s `result_iterator` closes over the listcomp's `self`, so every `map` leaked one ref to the executor; `del executor` then never hit refcount 0, the idle-worker wakeup weakref-callback never fired, and `test_shutdown`/`test_del_shutdown` hung. `reap_call_receiver` now routes a uniquely-held call-temporary `Function` through the same prompt-reap cascade as closure-function locals (the leak also resolved the test_future 18→20 and test_as_completed 19→20 residuals). (2) Added the native `faulthandler` module: `test_deadlock` fires `faulthandler._sigsegv()` inside a pool worker to force a hard crash and assert `BrokenProcessPool` recovery; without the module `import faulthandler` raised in the worker, so the crash never happened and every recovery case errored or hung to `LONG_TIMEOUT`. The crash primitives genuinely `raise(3)` the signal, and ProcessPool broken-worker detection (verified independently for SIGSEGV/SIGABRT/os._exit) recovers promptly."
 
 [tests."cpython/Lib/test/test_configparser.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: 'Sour[31 chars]urce'\\n\\t[line  1]: 'line1'\\n\\t[line  2]: 'lin[21 chars]ne3'' != 'Sour[31 chars]urce''"
+status = "pass"
+reason = "measured (RFC 0057 WS10): all tests OK (5 skipped) — exception __reduce__ round-trips a `message` that deviates from args[0], so ParsingError pickles correctly"
 
 [tests."cpython/Lib/test/test_context.py"]
 status = "fail"
@@ -338,8 +338,8 @@ status = "pass"
 reason = "measured (RFC 0037 WS7): passes end-to-end (skipped=3). Coroutine send/throw/close fidelity, PEP 530 implicit-async comprehension lowering, unawaited-coroutine RuntimeWarnings, and CPython-exact coroutine doctest SyntaxErrors."
 
 [tests."cpython/Lib/test/test_cprofile.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): ModuleNotFoundError: No module named '_lsprof'"
+status = "pass"
+reason = "measured (RFC 0057 full-suite sweep): passes end-to-end after the object-model/compiler/pickle-5 workstreams landed."
 
 [tests."cpython/Lib/test/test_csv.py"]
 status = "pass"
@@ -365,20 +365,24 @@ status = "pass"
 reason = "measured (RFC 0056 WS1): passes end-to-end on the native libsqlite3-backed _sqlite3 module."
 
 [tests."cpython/Lib/test/test_decimal.py"]
-status = "skip"
-reason = "decimal module is pure-Python fallback only; many tests probe _decimal"
+status = "pass"
+# Measured 161-180s on a loaded 8-job sweep (cold bytecode cache);
+# the old 180s budget had zero headroom.
+timeout_seconds = 600
+reason = "measured (RFC 0057 WS7): 777 tests OK (11 skipped: -DEXTRA_FUNCTIONALITY builds, locale separators, CPython impl detail) on the frozen _decimal accelerator identity"
 
 [tests."cpython/Lib/test/test_decorators.py"]
 status = "pass"
 reason = "RFC 0037 WS6: classmethod/staticmethod expose __wrapped__/__func__ and delegate __module__/__qualname__/__name__/__doc__/__annotations__ to the wrapped function with stable object identity, staticmethod instances are themselves callable (bpo-43682), and a function's __name__ is pinned so assertIs holds — the full decorators suite passes."
 
 [tests."cpython/Lib/test/test_defaultdict.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): File '<frozen _collections>', line 54, in __r…[truncated]"
+status = "pass"
+reason = "measured (RFC 0057 WS10): 13 tests OK — __missing__ uses setdefault (factory may populate the key first, gh-91618), __repr__ guards recursive factory reprs like Py_ReprEnter, and `defaultdict |= …` returns the same defaultdict instance"
 
 [tests."cpython/Lib/test/test_deque.py"]
-status = "timeout"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): killed after 60s"
+status = "pass"
+reason = "measured (RFC 0057 full-suite sweep): passes end-to-end after the object-model/compiler/pickle-5 workstreams landed. ~28s warm, ~49s under an 8-way sweep; a cold bytecode cache pushes it past the 60s default wall, hence the measured budget."
+timeout_seconds = 180
 
 [tests."cpython/Lib/test/test_descr.py"]
 status = "pass"
@@ -397,8 +401,8 @@ status = "fail"
 reason = "measured (RFC 0049 wave-5 full-suite baseline): File '/Users/owencarey/Documents/weavefoundry/weavepy/vendor/cpython/Lib/test/test_dict_version.py', lin…[truncated]"
 
 [tests."cpython/Lib/test/test_dictcomps.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): TypeError: unsupported operand type(s) for -: 'NoneType' and 'int'"
+status = "pass"
+reason = "measured (RFC 0057 WS10): 10 tests OK — comprehension GET_ITER/FOR_ITER carry the iterable expression's column span (test_exception_locations)"
 
 [tests."cpython/Lib/test/test_dictviews.py"]
 status = "pass"
@@ -417,8 +421,8 @@ status = "pass"
 reason = "measured (RFC 0051 wave-6): eval() now accepts non-dict mappings for globals per CPython (the wave-5 first-failure was 'TypeError: eval() globals must be a dict')."
 
 [tests."cpython/Lib/test/test_dynamicclassattribute.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AttributeError: 'DynamicClassAttribute' object has no attribute '__isabstractmethod__'"
+status = "pass"
+reason = "measured (RFC 0057 WS10): all tests OK (1 skipped) — types.DynamicClassAttribute is CPython's implementation verbatim (abstractmethod support, getter/setter/deleter doc propagation)"
 
 [tests."cpython/Lib/test/test_email.py"]
 status = "fail"
@@ -448,24 +452,24 @@ status = "pass"
 reason = "RFC 0052: CPython-exact unterminated-string / EOF SyntaxError wording ('detected at line N')"
 
 [tests."cpython/Lib/test/test_exception_group.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): TypeError: Cannot nest BaseExceptions in an ExceptionGroup"
+status = "pass"
 
 [tests."cpython/Lib/test/test_exception_hierarchy.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: 'winerror' unexpectedly found in ['__cause__', '__context__', '__delattr__', '__eq__', '__ge__', '__getattribute__', '__gt__', '__hash__', '__in"
+status = "pass"
+reason = "measured (RFC 0057 WS10): 16 tests OK (1 skipped) — winerror is Windows-only (absent from dir(OSError) on posix), BlockingIOError's numeric third arg becomes characters_written (full 3-tuple args, filename unset, AttributeError when never set), OSError.__init__ is a no-op when a subclass overrides __new__ but not __init__ (issue12555), and socket.gaierror/herror are real OSError subclasses (getaddrinfo failures raise gaierror)"
 
 [tests."cpython/Lib/test/test_exceptions.py"]
 status = "pass"
 reason = "measured: passes end-to-end against the vendored CPython 3.13 Lib/test (RFC 0037 WS1 recursion guard + WS5 PEP 3134/678/654 chaining, add_note/__notes__, ExceptionGroup, and AttributeError.name/.obj population)."
 
 [tests."cpython/Lib/test/test_extcall.py"]
-status = "fail"
-reason = "measured (RFC 0056 WS7): doctest suite — the kwonly too-many-positionals message shape now matches CPython (`N positional argument(s) (and K keyword-only argument(s)) were given`, covered by bundled test_extcall_kwonly_messages.py). ~24 residual Failed examples remain in three clusters: (1) duplicate keyword detection across successive `**` mappings / explicit kwargs (WeavePy merges instead of raising 'got multiple values for keyword argument'); (2) `*`/`**` unpack TypeError spelling (`argument after * must be an iterable, not X` vs the generic `'X' object is not iterable`); (3) builtin `dir()` multiple-values / keyword rejection message fidelity. Not a wave-2 blocker — enumerated for wave 3."
+status = "pass"
+reason = "measured (RFC 0057 WS10): full doctest suite OK — `*x` splats lower through LIST_EXTEND/LIST_TO_TUPLE (CPython's shape), a lone `f(*x)` passes the operand raw so CallEx brands non-iterables with PyObject_FunctionStr ('g() argument after * must be an iterable, not Nothing'), `**` mapping errors carry the same prefix, str-subclass kwargs keys match by underlying text (issue2016), and no-kwargs builtins say 'id() takes no keyword arguments'"
 
 [tests."cpython/Lib/test/test_faulthandler.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: Lists differ: ['Current thread (most recent call first):'[116 chars]le>'] != ['Stack (most recent call first):', '  File[107 chars]le>']"
+status = "pass"
+timeout_seconds = 120
+reason = "measured (RFC 0057 WS10): full suite OK — fatal-signal re-raise forces SIG_DFL (Rust's stack-overflow probe swallowed raise_signal(SIGBUS), child exited 0), bpo-44466 Garbage-collecting marker spans the whole gc.collect() orchestration including interpreter-side __del__ drains, and _testcapi.fatal_error is a frameless native alias of the Py_FatalError dump"
 
 [tests."cpython/Lib/test/test_fcntl.py"]
 status = "pass"
@@ -476,12 +480,12 @@ status = "fail"
 reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: Error from IO process exited rc=1:"
 
 [tests."cpython/Lib/test/test_fileinput.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): File '/Users/owencarey/Documents/weavefoundry/weavepy/vendor/cpython/Lib/test/test_fileinput.py', line 914, in do_t…[truncated]"
+status = "pass"
+reason = "measured (RFC 0057 WS10): 57 tests OK — os.fdopen now routes buffering/encoding/errors/newline through the io.open text-layer config (fileinput's inplace output encodes through its codec + error handler), and open() rejects encoding/errors/newline args in binary mode with CPython's ValueError wording (hook_encoded('utf-7') under mode='rb')"
 
 [tests."cpython/Lib/test/test_fileio.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AttributeError: 'file' object has no attribute '_blksize'"
+status = "pass"
+reason = "measured (RFC 0057 WS10): 97 tests OK (1 skip) — the raw FileIO surface is CPython-complete: `_blksize` from fstat at open (io.DEFAULT_BUFFER_SIZE fallback), `name` lives in the instance store so it's deletable (repr falls back to `fd=N`, `<_io.FileIO [closed]>` after close, subclass repr prints the subclass name), `mode`/`closed`/`closefd` are read-only getsets, the constructor validates like fileio init (bool fd → RuntimeWarning 'bool is used as a file descriptor', negative fd → ValueError, fstat *before* adopting so a stale fd is OSError(EBADF) and a directory EISDIR without closing the caller's fd, NUL in a path → ValueError('embedded null character'/'byte'), and init ends with a *virtual* `self.name = file` so a subclass __setattr__ veto leaves the borrowed fd open), close/read/readall/readinto/seek/truncate carry the real errno (EBADF after `os.close(f.fileno())`) while readable/writable/seekable raise ValueError only when the *object* is closed, method arity beats the closed check (`f.seek()` on a closed file is TypeError), binary `writelines` rejects str items, and the FileIO type ships the native method suite so a subclass's `close` really closes (previously it resolved to the IOBase mixin flag — `with TestSubclass(fn)` leaked the descriptor) with `IOBase.__del__` emitting the unclosed-file ResourceWarning before the destructor-chain close (test_io.test_destructor)"
 
 [tests."cpython/Lib/test/test_fileutils.py"]
 status = "fail"
@@ -516,8 +520,8 @@ status = "fail"
 reason = "measured (RFC 0049 wave-5 full-suite baseline): TypeError: 'frame' object has no attribute 'f_lineno'"
 
 [tests."cpython/Lib/test/test_frozen.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AttributeError: module '__phello__' has no attribute '__spec__'. Did you mean: '__doc__'?"
+status = "pass"
+reason = "measured (RFC 0057 full-suite sweep): passes end-to-end after the object-model/compiler/pickle-5 workstreams landed."
 
 [tests."cpython/Lib/test/test_fstring.py"]
 status = "pass"
@@ -528,8 +532,8 @@ status = "pass"
 reason = "measured (RFC 0042 WS5): passes end-to-end — 94 run, 0 fail / 0 error, 1 skip. `ftplib` is CPython's verbatim `Lib/ftplib.py` over the WS1 `socket.makefile()` + WS2 `ssl.wrap_socket`; the suite's own threaded asyncore mock FTP server (incl. the TLS `FTP_TLS` legs: AUTH TLS, PROT P, CCC) round-trips over loopback."
 
 [tests."cpython/Lib/test/test_funcattrs.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): TypeError: 'method' object has no attribute 'known_attr'"
+status = "pass"
+reason = "measured (RFC 0057 full-suite sweep): passes end-to-end after the object-model/compiler/pickle-5 workstreams landed."
 
 [tests."cpython/Lib/test/test_functools.py"]
 status = "pass"
@@ -589,8 +593,8 @@ status = "pass"
 reason = "full gzip: CPython gzip.py port over zlib.compressobj/_ZlibDecompressor + subclassable io.BytesIO, TextIOWrapper explicit-newline translation, bytes()/memoryview.cast buffer-protocol writes, and a real-pipe `python -m gzip` stdin subprocess path"
 
 [tests."cpython/Lib/test/test_hash.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: -1847135856053276283 != 7764564197781545852"
+status = "pass"
+reason = "full hash conformance: CPython-exact SipHash-1-3 (LCG-derived secret) when PYTHONHASHSEED is pinned, avalanche-finished Fx fold when randomized, compact-unicode unit hashing, and content-hashing read-only byte memoryviews"
 
 [tests."cpython/Lib/test/test_hashlib.py"]
 status = "fail"
@@ -633,7 +637,7 @@ reason = "measured (RFC 0042 WS5): passes end-to-end — 98 run, 0 fail / 0 erro
 
 [tests."cpython/Lib/test/test_import.py"]
 status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): ImportError: cannot import name 'AppleFrameworkLoader' from 'importlib.machinery'"
+reason = "measured (RFC 0057 WS3): the old module-level ImportError (AppleFrameworkLoader) is gone and the suite runs end-to-end — 122 run, 3F/12E, 28 skips. Residuals are dominated by SubinterpImportTests (multi-init extension isolation and per-interpreter-GIL compat probes needing the _testsinglephase/_testmultiphase C fixtures), plus frozen-module from-import error shape, PycRewritingTests.test_foreign_code, and the script-shadowing-stdlib edge-case messages."
 
 [tests."cpython/Lib/test/test_importlib.py"]
 status = "fail"
@@ -665,8 +669,8 @@ status = "pass"
 reason = "measured (RFC 0055 WS6): os.openpty unlocked the pty-backed legs; fcntl.ioctl masks a negative code to its 32-bit pattern like CPython's bitwise unsigned-int converter."
 
 [tests."cpython/Lib/test/test_ipaddress.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: '0000_0001_0000_0010_0000_0011_0010_1010' != '000000000000001000000100000001100101010'"
+status = "pass"
+reason = "measured (RFC 0057 WS10): 211 tests OK — int format grouping now matches CPython (`_` groups b/o/x/X in fours, zero-fill padding participates in the grouping so '039_b' renders '0000_0001_…', ',' with b/o/x/X/c raises), and rich comparison gives the right operand unconditional subclass priority per do_richcompare (IPv4Address != IPv4Interface consults the interface's __eq__/total_ordering first)"
 
 [tests."cpython/Lib/test/test_isinstance.py"]
 status = "pass"
@@ -678,8 +682,8 @@ status = "pass"
 reason = "RFC 0037 WS7: full iterator-protocol fidelity. The prior gc-reachable hang is gone — the legacy __getitem__ sequence protocol and iter(callable, sentinel) now build *lazy* iterators (frozen _seqtools _SeqIter/_CallableIter) instead of eagerly materialising, so an unbounded sequence iterates on demand. Built-in iterators gained a faithful __reduce__ ((iter, (remaining,)) / (reversed, (fwd,), idx)) that resolves the iter/reversed builtin through the live builtins module dict so a hash-colliding custom __eq__ exhausts the iterator before its state is snapshotted (gh-101765); a PEP 585 generic alias iterates by yielding typing.Unpack[self] once (matching CPython ga_iternext). Plus: file objects are iterable (for line in f / x in f / list(f)) and writelines accepts any iterable; pickle gained memoisation so co-referenced instances unpickle shared; closures over enclosing-function locals resolve in nested methods; and tracebacks carry PEP 657 column offsets (co_positions/f_lasti/tb_lasti translated to CPython byte offsets). (skipped=2 are @cpython_only refcount subtests.)"
 
 [tests."cpython/Lib/test/test_iterlen.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: RuntimeError not raised by next"
+status = "pass"
+reason = "measured (RFC 0057 full-suite sweep): passes end-to-end after the object-model/compiler/pickle-5 workstreams landed."
 
 [tests."cpython/Lib/test/test_itertools.py"]
 status = "pass"
@@ -709,8 +713,8 @@ status = "pass"
 reason = "RFC 0039 WS5: the gc.collect() reachable-hang is gone. All 67 tests pass (1 skip for the CPython-only sizeof probe). Required CPython-faithful list fidelity: `PyObject_RichCompareBool` semantics for `count`/`index`/`remove`/`in` and `list_richcompare` (identity-first then Python `__eq__`, with the live-length re-read so a mutating `__eq__` matches bpo-38588), `METH_NOARGS`/positional-only arity for `pop`/`clear`/`copy`/`reverse`/`sort`, `list.sort` list-modified-during-sort detection (detach + re-check), `__setitem__` 'indices must be integers or slices' message, list-iterator detach-on-exhaustion in the FOR_ITER fast path, recursive-repr cycle detection (`[...]`) with RecursionError, an inherited builtin `__init__` that tolerates excess kwargs when `__new__` is overridden, and shared-store list/reverse-iterator pickling (`(iter|reversed, (live_list,), index)`)."
 
 [tests."cpython/Lib/test/test_listcomps.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): TypeError: unsupported operand type(s) for -: 'NoneType' and 'int'"
+status = "pass"
+reason = "measured (RFC 0057 WS10): 42 tests OK — inlined-comprehension semantics (scoping, walrus, exception locations) all conform"
 
 [tests."cpython/Lib/test/test_locale.py"]
 status = "skip"
@@ -722,8 +726,8 @@ timeout_seconds = 150
 reason = "measured (RFC 0049): residual failures after handler tests; ~35s to verdict, budget raised"
 
 [tests."cpython/Lib/test/test_long.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): ~~~~~~~…[truncated]"
+status = "pass"
+reason = "measured (RFC 0057 WS10): 45 tests OK (7 skips) — big-int error discipline matches CPython: float conversions raise OverflowError instead of saturating (true division, negative-exponent pow, complex()/divmod() operands), __sizeof__ uses 28+4*ndigits with 30-bit digits, to_bytes raises OverflowError (not ValueError) when the value doesn't fit and accepts str-subclass byteorder, from_bytes rejects str data with TypeError, honours __bytes__ (PyObject_Bytes order) before falling back to iteration, and range-checks iterated byte values; format specifiers validate the thousands-separator as an allowlist (',s' → \"Cannot specify ',' with 's'.\") and reject signs with 'c'; as_integer_ratio returns true ints for bool receivers"
 
 [tests."cpython/Lib/test/test_lzma.py"]
 status = "pass"
@@ -743,16 +747,16 @@ timeout_seconds = 600
 reason = "RFC 0041 WS-math (C-accelerator numeric/data tower): passes end-to-end (86 ran, OK, 3 skipped) in ~6.5min — test_sumprod_stress alone sweeps ~9 pools x size<=3 cross products against a naive-baseline oracle. RFC 0054 follow-up: sumprod's float path now uses CPython's TripleLength (Algorithm 5.10 SumKVert K=3 over 2Prod/2Sum error-free transforms) and its int path is a machine-word accumulator that finalizes on overflow, reproducing CPython's exact flush ordering (int-overflow pairs spill to the float path, e.g. sumprod((10,-5,2**31),(2**80,1.5,1.5)) == 1.2089258196146296e+25). The math module was rebuilt as a faithful port of CPython 3.13 mathmodule.c: added math.fma/sumprod, rewrote gamma/lgamma (g=6.024 Lanczos + m_sinpi reflection), erf/erfc (series + continued fraction), pow/fmod/frexp/modf/ldexp/remainder/nextafter(steps=)/ulp with exact IEEE-754 domain+overflow semantics, fsum (Shewchuk msum) and hypot/dist (vector_norm with double-length compensated arithmetic), and comb/perm/factorial/gcd/lcm on arbitrary-precision BigInt; loghelper handles huge-int logs via bigint frexp. ceil/floor/trunc dispatch __ceil__/__floor__/__trunc__, gcd/lcm/isqrt and friends coerce via __index__, and hypot/dist accept __float__ elements (iterating tuple subclasses/generators through the VM). Also fixed three core-arithmetic gaps the suite depends on: builtin sum() now accumulates through the interpreter so reflected __radd__ fires (int + Fraction/Decimal), rejects str/bytes/bytearray start, and takes start= as a keyword; float coercion of an over-range int raises OverflowError instead of yielding inf; and 0 ** -negative raises ZeroDivisionError (plus an i64::MIN % -1 remainder-overflow guard)."
 
 [tests."cpython/Lib/test/test_memoryio.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): TypeError: a bytes-like object is required, not 'object'"
+status = "pass"
+reason = "measured (RFC 0057 WS10): full suite OK — BytesIO/StringIO seek/truncate/write argument coercion via __index__, character-based StringIO positions with overseek padding, readlines(hint), re-__init__ reset, getvalue/getbuffer closed checks, live getbuffer export blocks close (BufferError), buffer-protocol initial_bytes (array.array), invalid ctor kwargs TypeError, iter(f) is f identity, detach/line_buffering/encoding/errors dummies, weakref-able memoryview, write-time .newlines tally and newline=None pickle round-trip"
 
 [tests."cpython/Lib/test/test_memoryview.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AttributeError: 'memoryview' object has no attribute '…[truncated]"
+status = "pass"
+reason = "measured (RFC 0057 WS10): full suite OK — weakref-able views, object= kwarg ctor, released-view guards on len/attrs/iter/subscript, cast('l'/'L') native long itemsize + 'e' half-float + '?' bool formats, multi-dim m[i,j] get/set, gh-92888 use-after-release re-checks around __index__/__float__/__bool__ in pack and slice bounds, hex() via bytes.hex with export guard, unpicklable TypeError, buffer-protocol equality with array.array, zombie-view getrefcount compensation"
 
 [tests."cpython/Lib/test/test_metaclass.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: Failed doctest test for test.test_metaclass.__test__.doctests"
+status = "pass"
+reason = "measured (RFC 0057 WS10): full PEP 3115 doctest suite OK — __prepare__ fetched via plain getattr (descriptors raise through, classmethods bind, works on non-type callable metaclasses), custom mappings observe __module__/body stores/__static_attributes__ in CPython's order, super().__prepare__ reaches type.__prepare__, and the duplicate-metaclass-kwarg TypeError carries the __build_class__() prefix"
 
 [tests."cpython/Lib/test/test_mimetypes.py"]
 status = "pass"
@@ -763,17 +767,17 @@ status = "pass"
 reason = "measured (RFC 0056 WS3): passes end-to-end over the native pyexpat (vendored expat 2.6.4) — the DOM builds through xml.dom.expatbuilder driving the real push parser."
 
 [tests."cpython/Lib/test/test_mmap.py"]
-status = "timeout"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): killed after 60s"
+status = "pass"
+reason = "measured (RFC 0057 WS9): 42 tests OK (9 skipped: Windows-only tagname/trackfd/_protect, cpython_only sizeof, and the no-mremap resize skip CPython itself takes on macOS) on the raw-mmap(2) rebuild: real flags/prot/offset/trackfd constructor semantics, two-phase __new__ so subclasses delegate mmap.mmap.__new__, extended-slice subscripting, find/rfind with slice-notation bounds, move/madvise/flush validation, size() via the dup'ed fd, closed property, CPython repr, weakref support, and _sre matching straight over the mapping"
 
 [tests."cpython/Lib/test/test_module.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AttributeError: 'module' object has no attribute '__annotations__'"
+status = "pass"
+reason = "measured (RFC 0057 WS10): 39 tests OK — the cycle GC now reaches every edge of a dead exec/ModuleType namespace: module and function tracking pair-track the namespace dict as its own candidate (visited as one object edge, not re-walked contents), the cached InstancePlan's __new__/__init__ refs are traversed, and staticmethod/classmethod/property wrappers join the temporary-candidate promotion so `dict -> instance -> class -> method -> __globals__` cycles collapse and run __del__ (test_clear_dict_in_ref_cycle)"
 
 [tests."cpython/Lib/test/test_modulefinder.py"]
-status = "fail"
+status = "pass"
 timeout_seconds = 150
-reason = "measured (RFC 0049): ModuleFinder E cluster; ~36s to verdict, budget raised"
+reason = "measured (RFC 0057 full-suite sweep): passes end-to-end after the object-model/compiler/pickle-5 workstreams landed."
 
 [tests."cpython/Lib/test/test_monitoring.py"]
 status = "fail"
@@ -803,12 +807,12 @@ timeout_seconds = 1200
 reason = "correct but slow (~400s idle, spawn-heavy); budget raised for parallel-load headroom"
 
 [tests."cpython/Lib/test/test_named_expressions.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): NameError: name 'f' is not defined"
+status = "pass"
+reason = "measured (RFC 0057 WS10): PEP 572 walrus scoping/syntax-error suite OK"
 
 [tests."cpython/Lib/test/test_ntpath.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): ImportError: cannot import name 'ALLOW_MISSING' from 'ntpath'"
+status = "pass"
+reason = "measured (RFC 0057 WS10): 105 tests OK (21 skips — the same nt-module-gated set CPython skips on POSIX). The frozen `nt` shim now raises ModuleNotFoundError off Windows, exactly like CPython's Windows-only builtin, so `import nt` probes and the nt-gated abspath/_getfinalpathname tests skip instead of erroring"
 
 [tests."cpython/Lib/test/test_numeric_tower.py"]
 status = "pass"
@@ -827,8 +831,8 @@ status = "pass"
 reason = "measured: passes end-to-end after vendoring CPython's `optparse` verbatim and fixing `shutil.get_terminal_size()` to honor `os.environ['COLUMNS']`/`LINES` (so help-formatter column wrapping matches CPython)."
 
 [tests."cpython/Lib/test/test_ordered_dict.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): File '/Users/owencarey/Documents/weavefoundry/weavepy/vendor/cpython/Lib/test/test_ordered_dict.py', line 56, in test_…[truncated]"
+status = "pass"
+reason = "measured (RFC 0057 WS10): 295 tests OK (8 skips: @cpython_only sizeof/gc internals). `_collections` now ships an OrderedDict with the C implementation's observable semantics — od_state-guarded iterators that pickle as iter(remaining) and raise 'OrderedDict mutated during iteration', the gh-119004 state re-check inside the order-sensitive __eq__ key walk, order-preserving __ne__, and all state built in __new__ (test_overridden_init); `dict.__init__` also merges positional+keyword args like `update` instead of rejecting kwargs"
 
 [tests."cpython/Lib/test/test_os.py"]
 status = "pass"
@@ -843,8 +847,8 @@ timeout_seconds = 600
 reason = "measured (RFC 0049): E/F cluster in pathlib walk/glob tests; ~175s to verdict, budget raised"
 
 [tests."cpython/Lib/test/test_patma.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): sel…[truncated]"
+status = "pass"
+reason = "measured (RFC 0057 WS10): 327 run, 0F/0E. Match codegen rewritten as a faithful port of CPython compile.c (compiler_match_inner + codegen_pattern_* family): deferred captures rotated beneath on_top working items with stores flushed only after the whole case matches (failed | alternatives leak no bindings), per-depth fail-pop POP_TOP chains attributed to the pattern location (tracing line events now match CPython exactly), MATCH_KEYS peek semantics with **rest built via BUILD_MAP/DICT_UPDATE/DELETE_SUBSCR, UNPACK_EX star captures, self-matching builtins and full __match_args__ validation in MATCH_CLASS, group-pattern (*x) parse rejection, and BINARY_OP NB_INPLACE_* encoding so dis sees located jumps (gh-123048)."
 
 [tests."cpython/Lib/test/test_pdb.py"]
 status = "skip"
@@ -856,24 +860,26 @@ timeout_seconds = 120
 reason = "measured (RFC 0049): optimizer-introspection expectations (WeavePy emits different bytecode); ~22s to verdict"
 
 [tests."cpython/Lib/test/test_pep646_syntax.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: Failed doctest test for test.test_pep646_syntax.__test__.doctests"
+status = "pass"
+reason = "measured (RFC 0057 full-suite sweep): passes end-to-end after the object-model/compiler/pickle-5 workstreams landed."
 
 [tests."cpython/Lib/test/test_pickle.py"]
-status = "skip"
-reason = "pickle protocol 5 + out-of-band buffers not implemented"
+status = "pass"
+timeout_seconds = 600
+reason = "measured (RFC 0057 WS8): protocol 5 + PickleBuffer land end-to-end — frozen `_pickle` re-export module with the C accelerator's error discipline (UnpicklingError on truncation/stack underflow, save_reduce argument validation, reentrancy guards, memo validation), DICT_MERGE kwargs strictness, lazy map/filter with own-type reduce, sys.intern-canonical instance attr keys, PickleBuffer exporter delegation (`memoryview(PickleBuffer(b)).obj is b`), per-module import lock for the unpickle module race, and pickle-5 zero-copy support in the pure-numpy shim. 980 tests, 62 skips (same principled skips as CPython). Full matrix runs ~2.5min standalone; a cold bytecode cache under an 8-way sweep can approach 5min, hence the measured budget."
 
 [tests."cpython/Lib/test/test_picklebuffer.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): TypeError: cannot create weak reference to 'PickleBuffer' object"
+status = "pass"
+reason = "measured (RFC 0057 WS8): PickleBuffer raw()/release()/weakref surface passes; the 3 skips are the CPython ND/suboffset cases guarded by import checks."
 
 [tests."cpython/Lib/test/test_pickletools.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): ImportError: cannot import name 'AbstractPickleTests' from 'test.pickletester'"
+status = "pass"
+timeout_seconds = 300
+reason = "measured (RFC 0057 WS8): pickletester imports resolve and the disassembler doctests match byte-for-byte — proto-0/1 bytes pickles now emit `_codecs encode` (codecs.encode/decode are attributed to and installed on `_codecs`, matching CPython's C-builtin layout). ~130s standalone (optimize() matrix)."
 
 [tests."cpython/Lib/test/test_pkg.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): rais…[truncated]"
+status = "pass"
+reason = "measured (RFC 0057 full-suite sweep): passes end-to-end after the object-model/compiler/pickle-5 workstreams landed."
 
 [tests."cpython/Lib/test/test_pkgutil.py"]
 status = "pass"
@@ -896,8 +902,8 @@ status = "pass"
 reason = "measured (RFC 0054 WS3): passes end-to-end — 71 run, 0 fail / 0 error, 0 skip. The earlier parallel-load flake was a real bug: the asyncore mock POP3 server calls send() on a `wrap_socket(do_handshake_on_connect=False)` socket before the handshake, and the native layer raised `ValueError: closed connection` instead of SSLWantReadError. The two-phase server handshake now reports WANT_READ for pending sessions and `SSLSocket.read`/`write` drive the deferred handshake transparently (OpenSSL semantics), so the STLS/POP3_SSL legs round-trip over loopback."
 
 [tests."cpython/Lib/test/test_positional_only_arg.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: ('UNARY_NOT', None) unexpectedly found in [('RESUME', 0), ('LOAD_CONST', 'x'), ('LOAD_GLOBAL', 'int'), ('LOAD_GLOBAL', 'int'), ('IS_OP', 0), ('U"
+status = "pass"
+reason = "measured (RFC 0057 WS10): 28 tests OK — the posonly-as-keyword TypeError lists every conflicting name ('a, b'), and `not (x is/in y)` folds to the inverted IS_OP/CONTAINS_OP like CPython's AST optimizer (test_annotations_constant_fold)"
 
 [tests."cpython/Lib/test/test_posix.py"]
 status = "pass"
@@ -908,25 +914,25 @@ status = "pass"
 reason = "measured (RFC 0040 WTF-8 arc): passes end-to-end — 94 run, 0 fail, 89 pass, 5 skip. The sole prior failure (`test_realpath_invalid_paths`: `realpath('/\\udfff')` must raise `UnicodeEncodeError`) closed via two fixes: (1) lone surrogates now survive in `str` literals/constants (`Object::WStr`) — the bug was masked by stale `.pyc` (pre-WTF-8 bytecode stored the literal as U+FFFD); WeavePy's `.pyc` cache tag is bumped (`weavepy-313-2`) so the pinned-to-CPython MAGIC can't, invalidating the lossy caches; (2) the `os.*` path converter (`os.stat`/`scandir`/`readlink` guards) accept `Object::WStr` and fsencode it (`surrogateescape`), raising `UnicodeEncodeError` for a non-escapable surrogate exactly like CPython's `path_converter`. Also flips the (untracked) `test_genericpath` `PosixCommonTest` `exists`/`isdir`/`isfile` surrogate cases."
 
 [tests."cpython/Lib/test/test_pow.py"]
-status = "fail"
+status = "pass"
 timeout_seconds = 120
-reason = "measured (RFC 0049): two F's in pow edge cases; ~23s to verdict, budget raised"
+reason = "measured (RFC 0057 full-suite sweep): passes end-to-end after the object-model/compiler/pickle-5 workstreams landed."
 
 [tests."cpython/Lib/test/test_pprint.py"]
 status = "pass"
 reason = "measured (RFC 0038 WS-C): passes end-to-end (frozen `pprint`; width/depth, sorted-dict, recursion/cycle `...` fallback, and dataclass/namedtuple reprs all match)."
 
 [tests."cpython/Lib/test/test_print.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: 0 != 2"
+status = "pass"
+reason = "measured (RFC 0057 full-suite sweep): passes end-to-end after the object-model/compiler/pickle-5 workstreams landed."
 
 [tests."cpython/Lib/test/test_profile.py"]
 status = "pass"
 reason = "measured (RFC 0053 WS5): verbatim `profile.py`/`pstats.py` over the new `_lsprof`-backed profiling stack (c_call/c_return/c_exception events, CPython-exact entry labels)."
 
 [tests."cpython/Lib/test/test_property.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): TypeError: builtin '__init__' does not accept keyword arguments"
+status = "pass"
+reason = "measured (RFC 0057 full-suite sweep): passes end-to-end after the object-model/compiler/pickle-5 workstreams landed."
 
 [tests."cpython/Lib/test/test_pstats.py"]
 status = "pass"
@@ -945,9 +951,9 @@ status = "pass"
 reason = "measured (RFC 0055 WS3): passes end-to-end — cache_from_source optimization levels, _classify_pyc validation, PEP 263 decode errors."
 
 [tests."cpython/Lib/test/test_pyclbr.py"]
-status = "fail"
+status = "pass"
 timeout_seconds = 1200
-reason = "measured (RFC 0056 WS7): schedules and runs past the load_package_tests gap. importlib.util now ports `_find_spec_from_path`, FrozenImporter grew `get_filename`, and `sys.builtin_module_names` no longer lists frozen pure-Python modules (random/json/re/…), so pyclbr resolves real stdlib source. Budget raised to 1200s: `pyclbr.readmodule_ex` over large modules is pathologically slow here (~30s for pyclbr itself, ~60s for doctest) and the suite's test_others walk (pickle/pdb/pydoc/email.parser) exceeds the prior 400s wall even serially. Residual: `test_others`'s `cm('pickle')` — WeavePy has no `_pickle` accelerator, so `pickle.Pickler` is the pure-Python `_Pickler` alias with `__module__ == 'pickle'` and the test then requires a 'Pickler' ClassDef in the source that verbatim pickle.py doesn't have (CPython skips it because the C Pickler reports `__module__ == '_pickle'`)."
+reason = "measured (RFC 0057 full-suite sweep): passes end-to-end after the object-model/compiler/pickle-5 workstreams landed."
 
 [tests."cpython/Lib/test/test_pydoc.py"]
 status = "fail"
@@ -966,18 +972,18 @@ timeout_seconds = 150
 reason = "correct but slow (~39s idle); budget raised for parallel-load headroom"
 
 [tests."cpython/Lib/test/test_raise.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): IndexError"
+status = "pass"
+reason = "measured (RFC 0057 WS10): 37 tests OK — `raise C` calls the class through the full protocol (user __init__ raises propagate, non-exception __new__ results are the 'calling … should have returned an instance of BaseException' TypeError), invalid causes say 'exception causes must derive from BaseException', tb_next assignment rejects loops with ValueError, and types.TracebackType(...) stores tb_lasti verbatim"
 
 [tests."cpython/Lib/test/test_random.py"]
-status = "fail"
+status = "pass"
 timeout_seconds = 180
-reason = "random: Mersenne Twister state save/load + SystemRandom. RFC 0051: observed flipping fail→timeout at the 60s budget under -j8 contention; budget raised so the verdict is deterministic."
+reason = "measured (RFC 0057 WS10): 106 tests OK (4 skips: bigmem + @cpython_only) — float.hex() now prints the full 13-hex-digit fraction ('0x1.0000000000000p-4', test_guaranteed_stable compares verbatim), (0).to_bytes(0, ...) is b'' (randbytes(0)), getrandbits is METH_O-strict, takes __index__ objects, and overflows like clinic 'i' on 1<<1000, and randbytes/os.urandom raise OverflowError for ints beyond ssize_t"
 
 [tests."cpython/Lib/test/test_range.py"]
-status = "fail"
+status = "pass"
 timeout_seconds = 180
-reason = "measured (RFC 0050 WS5 re-baseline; RFC 0051: budget raised for parallel-load headroom, ~33-60s under -j8): the suite now completes inside the budget (was: killed after 60s), surfacing three pre-existing engine gaps — range attribute assignment raises TypeError instead of AttributeError (test_attributes), range() over ints beyond i64 overflows (test_comparison, 2**200 bounds), and float membership `5.0 in range(10)` is False (test_contains). Object-model follow-ups outside RFC 0050's codec/UCD scope."
+reason = "measured (RFC 0057 full-suite sweep): passes end-to-end after the object-model/compiler/pickle-5 workstreams landed."
 
 [tests."cpython/Lib/test/test_re.py"]
 status = "fail"
@@ -997,16 +1003,16 @@ timeout_seconds = 180
 reason = "measured (RFC 0055 WS4): passes end-to-end — excepthook-rendered REPL tracebacks with linecache._register_code'd interactive source, CPython-shaped compound-statement continuation and EOF handling, and the `-m asyncio` REPL over `_pyrepl.console`/`_pyrepl.main` + os.openpty. 3 skips are CPython-implementation-detail cases."
 
 [tests."cpython/Lib/test/test_reprlib.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AttributeError: 'SimpleNamespace' object has no attribute '__bound__'"
+status = "pass"
+reason = "measured (RFC 0057 WS10): 32 tests OK (2 skipped) — bound C functions repr as '<built-in method split of str object at 0x…>' and registered descriptors repr per kind ('<method 'items' of 'dict' objects>', slot wrapper, attribute, member)"
 
 [tests."cpython/Lib/test/test_resource.py"]
 status = "fail"
 reason = "resource: getrusage delta + setrlimit raises on permission"
 
 [tests."cpython/Lib/test/test_rlcompleter.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: Lists differ: ['None.__class__()', 'None.__delattr__(', 'None.__[276 chars]k__'] != ['None.__delattr__(', 'None.__eq__(', 'None.__ge__[259 chars"
+status = "pass"
+reason = "measured (RFC 0057 WS10): all tests OK — builtin classmethods (None.__init_subclass__, C.mro) bind correctly and carry __text_signature__, so rlcompleter's inspect.signature-driven parenthesis placement matches CPython"
 
 [tests."cpython/Lib/test/test_runpy.py"]
 status = "pass"
@@ -1025,8 +1031,8 @@ status = "pass"
 reason = "measured (RFC 0051 wave-6): the four residual class-body free-variable scoping failures are fixed (wave-5 residuals)."
 
 [tests."cpython/Lib/test/test_secrets.py"]
-status = "fail"
-reason = "secrets: token_urlsafe + compare_digest edge cases"
+status = "pass"
+reason = "measured (RFC 0057 WS10): all tests OK — `secrets` is CPython's pure-Python module frozen verbatim (DEFAULT_ENTROPY, compare_digest type errors, token_* defaults)"
 
 [tests."cpython/Lib/test/test_select.py"]
 status = "pass"
@@ -1042,16 +1048,16 @@ timeout_seconds = 360
 reason = "correct but slow (~120s idle, hash-collision stress); budget raised for parallel-load headroom"
 
 [tests."cpython/Lib/test/test_setcomps.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): TypeError: unsupported operand type(s) for -: 'NoneType' and 'int'"
+status = "pass"
+reason = "measured (RFC 0057 WS10): doctest suite + exception-location cases OK"
 
 [tests."cpython/Lib/test/test_shelve.py"]
 status = "pass"
 reason = "measured (RFC 0053): verbatim `shelve.py` (Shelf/BsdDbShelf/DbfilenameShelf surface) over the dbm stack."
 
 [tests."cpython/Lib/test/test_shlex.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): TypeError: maketrans expected str"
+status = "pass"
+reason = "measured (RFC 0057 WS10): 18 tests OK — str.maketrans/bytes.maketrans reached through an *instance* now bind as CPython static methods (no receiver prepended), so shlex's `self.wordchars.maketrans(dict.fromkeys(punctuation_chars))` takes the one-argument dict form"
 
 [tests."cpython/Lib/test/test_shutil.py"]
 status = "pass"
@@ -1082,8 +1088,8 @@ status = "pass"
 reason = "measured (RFC 0042 WS1): passes end-to-end — 27 run, 0 fail / 0 error / 0 skip. The harness subprocess bootstrap now enables the loopback-safe `-u` resource set (WEAVEPY_REGRTEST_RESOURCES=network,subprocess,…) so `requires('network')` grades instead of raising ResourceDenied, and `socket`/`select` work on 127.0.0.1, so the TCP/UDP/threading/forking mix-in server matrix round-trips over real loopback sockets."
 
 [tests."cpython/Lib/test/test_sort.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): File '/Users/owencarey/Documents/weavefoundry/weavepy/vendor/cpython/Lib/test/test_sort.py', line 306, in check_against_PyObject_Ric…[truncated]"
+status = "pass"
+reason = "measured (RFC 0057 full-suite sweep): passes end-to-end after the object-model/compiler/pickle-5 workstreams landed."
 
 [tests."cpython/Lib/test/test_source_encoding.py"]
 status = "fail"
@@ -1095,7 +1101,7 @@ reason = "measured (RFC 0056 WS1): full native _sqlite3 over libsqlite3-sys + ve
 
 [tests."cpython/Lib/test/test_ssl.py"]
 status = "pass"
-reason = "measured (RFC 0054 WS3): passes end-to-end — 191 run, 0 fail / 0 error, 25 skip. The rustls-backed `_ssl` now covers the OpenSSL-shaped surface the suite asserts: full `getpeercert()` X.509→dict parsing (x509-parser), cipher-suite listing/filtering (`set_ciphers`/`shared_ciphers`, NO_SHARED_CIPHER alerts), options/verify_flags bitmasks (OP_NO_TLSv1_2/1_3, VERIFY_X509_STRICT AKI checks, VERIFY_CRL_CHECK_LEAF), SNI servername callbacks via a two-phase rustls Acceptor handshake (incl. alert propagation and dead-reference unraisable reporting), server-side ALPN intersection, session_stats + session-reuse bookkeeping, set_ecdh_curve group pinning, dual RSA/ECC certificate slots, encrypted PKCS#8 keys with password callbacks (pkcs8 crate), per-message handshake `_msg_callback` replay from a captured transcript, and TLS 1.3 post-handshake-auth emulation. The 25 skips are CPython's own gates (TLS 1.0/1.1 legacy protocols rustls intentionally drops, missing-feature probes, and the walltime-gated IPv6 internet test). ~15s standalone; budget raised 600→900→1800 across RFC 0056 WS7 after -j8 sweeps starved the row behind long neighbors (pyclbr ~450s)."
+reason = "measured (RFC 0054 WS3): passes end-to-end — 191 run, 0 fail / 0 error, 25 skip. The rustls-backed `_ssl` now covers the OpenSSL-shaped surface the suite asserts: full `getpeercert()` X.509→dict parsing (x509-parser), cipher-suite listing/filtering (`set_ciphers`/`shared_ciphers`, NO_SHARED_CIPHER alerts), options/verify_flags bitmasks (OP_NO_TLSv1_2/1_3, VERIFY_X509_STRICT AKI checks, VERIFY_CRL_CHECK_LEAF), SNI servername callbacks via a two-phase rustls Acceptor handshake (incl. alert propagation and dead-reference unraisable reporting), server-side ALPN intersection, session_stats + session-reuse bookkeeping, set_ecdh_curve group pinning, dual RSA/ECC certificate slots, encrypted PKCS#8 keys with password callbacks (pkcs8 crate), per-message handshake `_msg_callback` replay from a captured transcript, and TLS 1.3 post-handshake-auth emulation. The 25 skips are CPython's own gates (TLS 1.0/1.1 legacy protocols rustls intentionally drops, missing-feature probes, and the walltime-gated IPv6 internet test). ~15s standalone; budget raised 600→900→1800 across RFC 0056 WS7 after -j8 sweeps starved the row behind long neighbors (pyclbr ~450s). RFC 0057 WS11 fixed the residual intermittent sweep timeout: the TLS shutdown drain used a greedy `read_tls(sock)` that, under load, consumed the plaintext following the peer's close_notify in the same kernel buffer (STARTTLS unwrap → both peers deadlocked in recv with empty queues, test_starttls, ~3-5% repro under 6-way stress); the drain is now record-precise (RecordReader), 600/600 clean."
 timeout_seconds = 1800
 
 [tests."cpython/Lib/test/test_stat.py"]
@@ -1108,9 +1114,9 @@ timeout_seconds = 180
 reason = "correct but slow (~43s idle); budget raised for parallel-load headroom"
 
 [tests."cpython/Lib/test/test_str.py"]
-status = "fail"
+status = "pass"
 timeout_seconds = 150
-reason = "measured (RFC 0049): residual F/E cluster in str formatting/encoding edges; ~45s to verdict, budget raised"
+reason = "measured (RFC 0057 WS10): 138 tests OK (8 skips) — str is CPython-complete end to end: the constructor takes the full clinic signature (object/encoding/errors keywords, b'' default when decoding, `str(errors='strict') == ''`, dup name-and-position and >3-arg messages, any buffer decodes), `str()`/`repr()`/`ascii()` return `__str__`/`__repr__` results *unchanged* so str-subclass results keep their type (ascii only when already-ASCII, like PyObject_ASCII), a str subclass without overrides hands back its payload without the PUA surrogate bridge (real U+10FFFF survives), `%`-formatting gives subclass-of-str right operands reflected priority only when `__rmod__` is actually overridden so `'%s' % u` stays virtual, `%i` errors say `%i` in str mode (`%d` in bytes mode), the format mini-language rejects malformed fields at parse time (`{0.}`, `{0[}`, `{0!}`, `{0!rs}`, `{a{}b}`, huge indexes, junk after `]`), allows `{` inside `[...]` keys, caps spec nesting at one level ('Max string recursion exceeded'), validates string presentation (sign/space/#/'=' messages) with `0`-fill padding strings on the right, format_map drives the full mapping protocol (`__missing__`), identity semantics match (`s*1`/`1*s`/single-item join return the operand, `__getnewargs__` copies), `__sizeof__` models the compact-unicode layout (40/56-byte structs by kind), expandtabs takes `tabsize=` by keyword, maketrans validates key length/types and argument 3, translate range-checks targets without bridge aliasing, set/delattr accept str-subclass names, and `type(iter(''))()` raises TypeError"
 
 [tests."cpython/Lib/test/test_string.py"]
 status = "pass"
@@ -1125,20 +1131,20 @@ status = "pass"
 reason = "RFC 0050 WS4: unicodedata rebuilt on generated UCD 15.1.0 tables (matching CPython 3.13's pinned database), so the stringprep table predicates line up."
 
 [tests."cpython/Lib/test/test_strptime.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): File …[truncated]"
+status = "pass"
+reason = "measured (RFC 0057 WS10): 57 tests OK (48 skips: locale-gated) — strftime now round-trips every directive (%Z reads tm_zone off the struct_time, %w/%a honour the tuple's wday), and struct_time orders like its visible tuple (__lt__/__le__/__gt__/__ge__ on struct sequences, the Feb-29 < Mar-1 leap-year default test)"
 
 [tests."cpython/Lib/test/test_strtod.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: '0x1.0000000000000p+0' != '0x1.0p+0'"
+status = "pass"
+reason = "measured (RFC 0057 WS10): 9 tests OK (1 skip: bigcomp) — float.hex() now prints the full 13-hex-digit fraction, which was the only failure"
 
 [tests."cpython/Lib/test/test_struct.py"]
 status = "pass"
 reason = "RFC 0037 WS8: faithful struct port (buffer-protocol pack_into/unpack_from, half-float round-half-to-even with OverflowError, embedded-NUL/format validation, UnicodeEncodeError on non-ASCII formats, real unpack_iterator). The reference-cycle and runtime-shutdown subtests pass via new interpreter features: import_fresh_module hands back a collectable copy of native singletons, and shutdown finalization runs __del__ for live objects with the default sys.unraisablehook printing 'Exception ignored in:'. (skipped=4 are CPython _testcapi/refcount-only subtests.)"
 
 [tests."cpython/Lib/test/test_structseq.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): TypeError: '<' not supported between instances of 'tuple' and 'struct_time'"
+status = "pass"
+reason = "measured (RFC 0057 WS10): 25 tests OK — struct sequences now carry CPython's full slot layout: n_fields/n_sequence_fields/n_unnamed_fields and __match_args__ on the type (stat_result is 10 sequence slots with the 3 unnamed integer-seconds times plus hidden named members; struct_time is 9+tm_zone/tm_gmtoff, _STRUCT_TM_ITEMS=11), the constructor is structseq_new_impl (sequence=/dict= keywords, min/max length messages, 'got duplicate or unexpected field name(s)' when the dict names a positionally-filled or unknown slot, posix's st_?time backfill from the int slots), __reduce__ ships (seq_tuple, hidden_dict), __replace__ backs copy.replace() with GC-tracked results and rejects unnamed-field types, named-field assignment raises AttributeError('readonly attribute'), and struct-seq types are heap types so `type(t).attr = t` works (test_reference_cycle)"
 
 [tests."cpython/Lib/test/test_subclassinit.py"]
 status = "pass"
@@ -1154,8 +1160,8 @@ status = "pass"
 reason = "measured (RFC 0051 wave-6): super() attribute lookup through the type (super().mro & friends) matches CPython — the wave-5 first-failure."
 
 [tests."cpython/Lib/test/test_support.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): EOFError: EOF when reading a line"
+status = "pass"
+reason = "measured (RFC 0057 WS10): 50 run under the harness — the wave-5 EOFError (input() probe) is gone; the flag-propagation and unload legs pass in the harness environment (they remain sensitive to an inherited PYTHONPATH/interactive stdin when run by hand)."
 
 [tests."cpython/Lib/test/test_symtable.py"]
 status = "pass"
@@ -1170,12 +1176,12 @@ status = "fail"
 reason = "measured (RFC 0049 wave-5 full-suite baseline): ........FFException"
 
 [tests."cpython/Lib/test/test_sys_setprofile.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: Expected events:"
+status = "pass"
+reason = "measured (RFC 0057 full-suite sweep): passes end-to-end after the object-model/compiler/pickle-5 workstreams landed."
 
 [tests."cpython/Lib/test/test_sys_settrace.py"]
 status = "fail"
-reason = "measured (RFC 0051 WS4): writable frame.f_lineno landed over linejump.rs — 449 run, residual down from 159F/16E to 58F/0E with only 6 jump-matrix cases left (comprehension-inlining RuntimeWarning divergences among them); the remaining failures are line-event granularity diffs, not jumps."
+reason = "measured (RFC 0057 WS10): 449 run, residual down from 58F to 49F/0E. Jump threading now mirrors CPython's flowgraph rule (hop only through synthetic/NO_LOCATION jumps or same-line jumps; loop backedges, if/else joins, try/except skips, handler exits and match end-jumps marked synthetic), `pass` lowers to a located NOP, and the epilogue return-copy chase honours the same eligibility — fixing the break_to_continue/break_to_break/try_in_try/repeated_pass families. Remaining failures are except*-group and finally-path line-event granularity diffs plus 2 comprehension-inlining jump-matrix cases."
 
 [tests."cpython/Lib/test/test_sysconfig.py"]
 status = "pass"
@@ -1216,16 +1222,16 @@ timeout_seconds = 600
 reason = "RFC 0039: real OS threads with cooperative GIL hand-off, faithful Lock/RLock (subclassable `_thread.RLock`), thread-death thread-local cleanup (foreign-thread `_DummyThread` reaping), and prompt refcount reclamation of acyclic garbage — including the cross-thread `Thread.run` teardown cycle (`test_no_refcycle_through_target`) swept on `join()`. All 213 tests pass (29 skips for CPython-only knobs). RFC 0054: fixed the fork-child GIL wedge in `test_3_join_in_forked_from_thread` (~30% flake) — the GIL's parking_lot primitives are now re-boxed at fresh addresses after fork (the parking table is keyed by address, so in-place rebuilds inherited ghost waiters) and blocking acquires use timed-wait loops like CPython's `take_gil`, so a lost wakeup self-heals; 1000 fork-loop iterations + 15 suite runs clean. 600s: the suite runs ~32s standalone and passes under moderate load, but with the main thread participating in GIL hand-offs it has been observed exceeding even 300s under full parallel sweep load (RFC 0050 WS6 re-measure); the raised budget keeps the verdict about correctness, not scheduler contention. RFC 0054 follow-up: fixed the `test_no_refcycle_through_target` flake (~50% under load) at its root — every `f(**d)` call leaked one GC-tracked kwargs-temporary dict (the compiler's `BuildMap 0` + `dict.update(d)` splat lowering), refcount-dead but pinned by its own collector handle, holding a strong clone of every kwarg value until the next full collection; `Thread(kwargs={...})` pinned the target instance through it, keeping the weakref live past `join()`. `CALL_FUNCTION_EX` now runs the splat temporaries (kwargs mapping and *args sequence) through the prompt reaper, restoring CPython's refcount timing; the busy-daemon + gc.disable() repro went from 30/30 failures to 0/30, and 3 consecutive suite runs pass."
 
 [tests."cpython/Lib/test/test_threading_local.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AttributeError: module '_thread' has no attribute '_local'"
+status = "pass"
+reason = "measured (RFC 0057 WS10): 22 tests OK (2 skips: @cpython_only) — `_threading_local` now publishes its `local` class as `_thread._local` (one implementation behind both spellings, like CPython where threading.local *is* the C type), so the ThreadLocalTest lane runs; _testcapi grew call_in_temporary_c_thread/join_temporary_c_thread (real _thread-spawned foreign thread) for the gh-100892 clear-race test"
 
 [tests."cpython/Lib/test/test_threadsignals.py"]
 status = "pass"
 reason = "RFC 0039: real OS signal subsystem — per-platform signal numbers (via libc, so SIGUSR1=30 on macOS not 10), sigaction trampolines that trip a flag + write the wakeup fd, real signal.alarm/raise_signal/pause, and a main-thread signal-interruptible lock.acquire (EINTR + PyErr_CheckSignals retry loop). All 6 tests pass."
 
 [tests."cpython/Lib/test/test_time.py"]
-status = "fail"
-reason = "time: timezone strings + monotonic stability under leap seconds"
+status = "pass"
+reason = "measured (RFC 0057 WS10): 63 tests OK (14 skips) — strftime/asctime now run CPython's gettmarg+checktm (zero month/day forced to 1, out-of-range fields ValueError, year-1900 overflow OverflowError) and format through the system strftime with tm_zone/tm_gmtoff, so %w/%a read the tuple's wday and macOS pads %Y ('0001'/'-001'); asctime is the hand-rolled '%s %s%3d …' with unpadded year; mktime uses the tm_wday sentinel so mktime(localtime(-1)) round-trips; _testinternalcapi grew the _PyTime_* conversion API (exact pytime.c rounding) and _testcapi PyTime_AsSecondsDouble"
 
 [tests."cpython/Lib/test/test_timeit.py"]
 status = "pass"
@@ -1237,8 +1243,7 @@ timeout_seconds = 600
 reason = "measured (RFC 0052): native _tokenize_core lexer port; the roundtrip sweeps over the vendored stdlib are correct but slow"
 
 [tests."cpython/Lib/test/test_tomllib.py"]
-status = "fail"
-reason = "tomllib: TOML 1.0 conformance edges (datetime offsets)"
+status = "pass"
 
 [tests."cpython/Lib/test/test_trace.py"]
 status = "fail"
@@ -1249,8 +1254,8 @@ status = "pass"
 reason = "measured: passes end-to-end (RFC 0037 WS5 traceback module — StackSummary/TracebackException formatting, exception-chaining display) against the vendored CPython 3.13 Lib/test."
 
 [tests."cpython/Lib/test/test_tracemalloc.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AttributeError: module 'tracemalloc' has no attribute 'Traceback'"
+status = "pass"
+reason = "measured (RFC 0057 full-suite sweep): passes end-to-end after the object-model/compiler/pickle-5 workstreams landed."
 
 [tests."cpython/Lib/test/test_tty.py"]
 status = "pass"
@@ -1265,12 +1270,12 @@ status = "pass"
 reason = "measured (RFC 0051 wave-6): PEP 695 `type X = ...` statements construct native _typing.TypeAliasType with lazy __value__, __type_params__, subscription, unions, and pickling."
 
 [tests."cpython/Lib/test/test_type_cache.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AttributeError: module '_testcapi' has no attribute 'type_get_version'"
+status = "pass"
+reason = "measured (RFC 0057 WS10): OK (skipped=11) — _testcapi exposes the tp_version_tag probe family (type_get_version/assign/modified/assign_specific_version_unsafe, virtual tags stamped against TypeObject::attr_version with CPython's 1000-per-class budget) and sys._clear_type_cache exists, so the module imports; the test classes themselves are @cpython_only implementation-detail checks and skip"
 
 [tests."cpython/Lib/test/test_type_comments.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): File '<frozen ast>', line 619, in p…[truncated]"
+status = "pass"
+reason = "measured (RFC 0057 full-suite sweep): passes end-to-end after the object-model/compiler/pickle-5 workstreams landed."
 
 [tests."cpython/Lib/test/test_type_params.py"]
 status = "pass"
@@ -1278,7 +1283,7 @@ reason = "measured (RFC 0051 wave-6): PEP 695/696 native — full syntax capture
 
 [tests."cpython/Lib/test/test_types.py"]
 status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): ImportError: cannot import name 'AppleFrameworkLoader' from 'importlib.machinery'"
+reason = "measured (RFC 0057 WS3): the old module-level ImportError (AppleFrameworkLoader) is gone and the suite runs end-to-end — 125 run, 24F/10E, 2 skips. Residual clusters: PEP 604 Union runtime semantics (hash/instancecheck/GenericAlias interop), SimpleNamespace repr/replace/constructor edges, mappingproxy constructor+methods, coroutine duck-typing wrappers, int/float __format__ locale edges, and type-layout internals (test_internal_sizes)."
 
 [tests."cpython/Lib/test/test_typing.py"]
 status = "pass"
@@ -1310,15 +1315,14 @@ status = "pass"
 reason = "measured: passes end-to-end (non-target; sequence-unpacking edge cases now clean)."
 
 [tests."cpython/Lib/test/test_unpack_ex.py"]
-status = "fail"
-reason = "starred-target unpacking with generators"
+status = "pass"
+reason = "measured (RFC 0057 WS10): doctest suite OK — multiple-star and bare-star assignment targets are SyntaxErrors with CPython's wording, {**1} raises \"'int' object is not a mapping\", {**{} for …} gets pegen's dict-unpacking message, >255-name star unpacks report \"too many expressions in star-unpacking assignment\""
 
 [tests."cpython/Lib/test/test_unparse.py"]
-status = "fail"
-# ~99s idle (RFC 0054 re-measure); exceeded the previous 150s budget
-# under -j4 sweep contention — verdict is stable, raise headroom only.
-timeout_seconds = 300
-reason = "measured (RFC 0049): ast.unparse F/E cluster; ~35s to verdict, budget raised"
+status = "pass"
+# ~205s idle: DirectoryTestCase round-trips large stdlib test files.
+timeout_seconds = 400
+reason = "RFC 0057 WS10: parser now matches CPython's AST for the two remaining round-trip breakers — debug f-string fields inside a format spec (`f\"{2:{y=}}\"`) splice Constant/FormattedValue into the spec's JoinedStr instead of nesting, and negative literal match patterns (`case -1j:`) stay UnaryOp(USub, Constant) rather than folding into a signed Constant."
 
 [tests."cpython/Lib/test/test_urllib.py"]
 status = "pass"
@@ -1337,13 +1341,13 @@ status = "pass"
 reason = "measured (RFC 0042 WS4): passes end-to-end — 77 run, 0 fail / 0 error, 5 skip. `urllib.parse` is CPython's verbatim module: `SplitResult`/`ParseResult` are real `tuple` subclasses (named-tuple `_fields`, `.geturl()`, the `_encoded`/`_decoded` result pair), and `urlsplit`/`urljoin`/`quote`/`unquote`/`parse_qs[l]` + IDNA match."
 
 [tests."cpython/Lib/test/test_userlist.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: <class 'list'> is not <class 'collections.UserList'>"
+status = "pass"
+reason = "measured (RFC 0057 WS10): all tests OK — `list += UserList` dispatches the RHS __radd__ first (CPython's PyNumber_InPlaceAdd order), so the result stays a UserList"
 
 [tests."cpython/Lib/test/test_userstring.py"]
-status = "fail"
+status = "pass"
 timeout_seconds = 180
-reason = "measured (RFC 0049): UserString F cluster mirrors test_str residuals; ~54s to verdict, budget raised"
+reason = "measured (RFC 0057 WS10): 71 tests OK (2 skips) — startswith/endswith return False when start > adjusted end even for an empty needle (tailmatch semantics), rsplit scans right-to-left so overlapping separators match CPython, partition/rpartition raise ValueError('empty separator'), find/rfind/index/rindex/count arity-check under their own names (issue 11828 messages), str subscripting says \"string indices must be integers, not 'X'\", and %-formatting accepts-and-ignores one h/l/L length modifier ('%3ld' % 42)"
 
 [tests."cpython/Lib/test/test_utf8_mode.py"]
 status = "pass"
@@ -1367,8 +1371,12 @@ status = "pass"
 reason = "measured (RFC 0056 WS4): passes end-to-end — 173 run, 0F/0E, 3 skip. `_warnings` is now a faithful native port of CPython's `Modules/_warnings.c`: the C module owns the filter state (last-known filters/onceregistry/defaultaction refreshed from the live `warnings` module attributes, so `del warnings.filters` degrades exactly like CPython), `warn`/`warn_explicit` run the full pipeline (registry version gating via `_filters_mutated`, once/module/default dedup, `error` raising the message instance, `_showwarnmsg` dispatch with a stderr fallback), stacklevel resolution walks real frames with `skip_file_prefixes` and importlib-internal skipping, and gh-86298 `module_globals` handling ports `_bless_my_loader` verbatim (ValueError/AttributeError/deprecation matrix). `-W`/`PYTHONWARNINGS` bootstrap-import `warnings` at startup so bad options report before user code. The finalization pair works: `__del__`-time warns resolve the caller frame via the interpreter frame-stack fallback, and a `__main__` sweep in `run_shutdown_finalizers` drains leaked-file ResourceWarnings as CPython's late `<sys>:0` report. `test_tracemalloc` passes via per-object allocation tracebacks (`-X tracemalloc=N` auto-start + `get_object_traceback`, with the dealloc warning's `source` carrying an address token)."
 
 [tests."cpython/Lib/test/test_weakref.py"]
-status = "timeout"
-reason = "RFC 0039 WS5: the cyclic-GC hang is gone — WeakValueDictionary/WeakKeyDictionary were ported from CPython (O(1) id-keyed, `_IterationGuard`-deferred removal) over a real native `_weakref._remove_dead_weakref`, weakref callbacks now fire in CPython order (referent cleared -> oldest-first callbacks -> cycle broken) including the older-generation refcount cascade, and the threaded-consistency / self-cleaning cases pass. The module still exceeds the 60s budget (killed at 60s; ~125s at a larger budget): MappingTestCase alone is ~100s, dominated by the threaded stress loops (NUM_THREADED_ITERATIONS=100000, `collect_in_thread()` spinning `gc.collect()` every 5ms, and the 70k-entry dict-copy) — raw interpreter+collector throughput (CPython runs the same loops in <1s), not an algorithmic regression; deferred to the incremental-GC perf arc. The remaining assertion failures are object-model fidelity outside the concurrency scope: `weakref.ref` Python-subclassing (incl. `__slots__` + `getweakrefs` ordering), the weakproxy operator protocol (arithmetic/index/reversed/item-assign), ref/proxy identity reuse, and `WeakMethod` (a `ref` subclass) — deferred to an object-model wave."
+status = "pass"
+# ~134s standalone: MappingTestCase's threaded 70k-entry dict-copy /
+# pop-and-collect stress loops dominate (collector throughput, not an
+# algorithmic gap); needs generous headroom on a loaded parallel sweep.
+timeout_seconds = 600
+reason = "measured (RFC 0057 WS9/WS10): 137 tests OK (7 skipped: interned-str/_testcapi/EXTRA_FUNCTIONALITY gates). weakref.ref is subclassable with real __new__/__init__ (WeakMethod is CPython's verbatim ref subclass); basic ref/proxy identity reuse; getweakrefs orders basic refs first; read-only __callback__ property cleared after firing; CPython weakref_repr with type-restricted __name__ lookup (gh-99184); ReferenceType/ProxyType/CallableProxyType names; full weakproxy operator forwarding incl. PySequence_Contains fallback and kw-aware CallableProxyType.__call__; trash weakrefs' callbacks suppressed during cyclic collection while external watchers fire (callback edge is GC-traced via the wrapper dict, wrapper tracked when the callback can close a cycle)."
 
 [tests."cpython/Lib/test/test_weakset.py"]
 status = "pass"
@@ -1392,13 +1400,12 @@ status = "pass"
 reason = "measured (RFC 0056 WS3): passes with 24 skips — every leg that needs the _elementtree C accelerator skips cleanly; the shared behavior tests run over the pure-Python ElementTree + native pyexpat."
 
 [tests."cpython/Lib/test/test_xmlrpc.py"]
-status = "fail"
+status = "pass"
 timeout_seconds = 120
-reason = "measured (RFC 0056 WS3): 92/93 with the verbatim xmlrpc package (client+server) — the one residual is test_dump_fault: WeavePy stores BaseException's `args` pseudo-slot in the instance __dict__, so Marshaller.dump_instance(Fault) marshals an extra 'args' member (CPython keeps args in a C slot outside __dict__). Needs the exception pseudo-slot storage moved out of instance dicts — tracked for the WS4 introspection cluster."
 
 [tests."cpython/Lib/test/test_yield_from.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): ---…[truncated]"
+status = "pass"
+reason = "measured (RFC 0057 WS10): 42 tests OK — gen.throw(GeneratorExit) into a delegating frame now *closes* the sub-iterator (CPython gen_close_iter: gen close for generators, `close` attr otherwise; lookup errors unraisable, call errors delivered to the outer frame) and then raises the original exit at the yield-from point; non-None send to a plain iterator is an AttributeError naming `send` (PyIter_Send), and a broken __getattr__ on send/throw/close propagates its own error instead of being masked"
 
 [tests."cpython/Lib/test/test_zipfile.py"]
 status = "pass"

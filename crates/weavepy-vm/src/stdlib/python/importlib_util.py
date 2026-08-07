@@ -42,21 +42,29 @@ def cache_from_source(path, debug_override=None, *, optimization=None):
     ``sys.pycache_prefix`` is set, the resulting path lives under
     that directory instead of next to the source.
     """
+    if debug_override is not None:
+        import warnings
+        warnings.warn('the debug_override parameter is deprecated; use '
+                      "'optimization' instead", DeprecationWarning)
+        if optimization is not None:
+            raise TypeError(
+                'debug_override or optimization must be set to None')
+        optimization = '' if debug_override else 1
+    path = os.fspath(path)
     head, tail = os.path.split(path)
     name, _ = os.path.splitext(tail)
     tag = _cache_tag()
+    if tag is None:
+        raise NotImplementedError('sys.implementation.cache_tag is None')
     # PEP 488: `optimization=''` (or None at level 0) is the plain
     # `.pyc`; anything else is embedded as an alphanumeric `.opt-N`
     # segment. A None optimization defers to the interpreter's own
     # level (`-O -m compileall` writes `.opt-1` artifacts —
     # `test_compileall.test_pep3147_paths_optimize`).
     if optimization is None:
-        if debug_override is not None:
-            optimization = '' if debug_override else 1
-        else:
-            optimization = sys.flags.optimize
-            if optimization == 0:
-                optimization = ''
+        optimization = sys.flags.optimize
+        if optimization == 0:
+            optimization = ''
     optimization = str(optimization)
     if optimization:
         if not optimization.isalnum():
@@ -83,22 +91,42 @@ def source_from_cache(path):
 
     Tries to recover ``<dir>/<name>.py`` from a ``.pyc`` path,
     raising ``ValueError`` if the layout doesn't look like a
-    cache hit.
+    cache hit (CPython `_bootstrap_external.source_from_cache`
+    validation, verbatim — test_importlib.test_util.PEP3147Tests).
     """
-    if not path.endswith('.pyc'):
-        raise ValueError("not a .pyc path: {!r}".format(path))
-    head, tail = os.path.split(path)
-    # PEP 3147 names a cache file ``<name>.<tag>[.opt-N].pyc``; the source
-    # base is everything before the *first* dot (the cache tag never contains
-    # a dot, so this is unambiguous). Taking the first component — as CPython's
-    # ``source_from_cache`` does (``partition('.')[0]``) — is what keeps a
-    # multi-dotted tag from leaking into the recovered ``<name>.py``.
-    base = tail.partition('.')[0]
-    if os.path.basename(head) == '__pycache__':
-        parent = os.path.dirname(head)
-    else:
-        parent = head
-    return os.path.join(parent, base + '.py')
+    if _cache_tag() is None:
+        raise NotImplementedError('sys.implementation.cache_tag is None')
+    path = os.fspath(path)
+    head, pycache_filename = os.path.split(path)
+    found_in_pycache_prefix = False
+    pycache_prefix = getattr(sys, 'pycache_prefix', None)
+    if pycache_prefix is not None:
+        stripped_path = pycache_prefix.rstrip(os.path.sep)
+        if head.startswith(stripped_path + os.path.sep):
+            head = head[len(stripped_path):]
+            found_in_pycache_prefix = True
+    if not found_in_pycache_prefix:
+        head, pycache = os.path.split(head)
+        if pycache != '__pycache__':
+            raise ValueError(
+                f'__pycache__ not bottom-level directory in {path!r}')
+    dot_count = pycache_filename.count('.')
+    if dot_count not in {2, 3}:
+        raise ValueError(
+            f'expected only 2 or 3 dots in {pycache_filename!r}')
+    elif dot_count == 3:
+        optimization = pycache_filename.rsplit('.', 2)[-2]
+        if not optimization.startswith('opt-'):
+            raise ValueError(
+                "optimization portion of filename does not start "
+                "with {!r}".format('opt-'))
+        opt_level = optimization[len('opt-'):]
+        if not opt_level.isalnum():
+            raise ValueError(
+                f"optimization level {optimization!r} is not an "
+                "alphanumeric value")
+    base_filename = pycache_filename.partition('.')[0]
+    return os.path.join(head, base_filename + '.py')
 
 
 def _coding_cookie(line):
@@ -288,6 +316,13 @@ def module_from_spec(spec):
     module.__spec__ = spec
     if spec.origin is not None and spec.has_location:
         module.__file__ = spec.origin
+        # CPython `_init_module_attrs` also stamps `__cached__` for
+        # located specs (test_file_loader asserts it after load_module).
+        if spec.cached is not None:
+            try:
+                module.__cached__ = spec.cached
+            except AttributeError:
+                pass
     if spec.is_package:
         module.__path__ = list(spec.submodule_search_locations or [])
     module.__loader__ = spec.loader
@@ -382,6 +417,10 @@ def find_spec(name, package=None):
         is_package = hasattr(mod, '__path__')
         spec = _machinery.ModuleSpec(
             fullname, loader, origin=origin, is_package=is_package)
+        if origin is not None and origin not in ('built-in', 'frozen'):
+            # A real `__file__` origin is a location (CPython
+            # `_spec_from_module` keeps `has_location` in sync).
+            spec._set_fileattr = True
         if is_package:
             spec.submodule_search_locations = list(mod.__path__ or [])
         try:

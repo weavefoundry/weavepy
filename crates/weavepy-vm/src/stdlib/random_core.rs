@@ -327,14 +327,28 @@ fn random_random(args: &[Object]) -> Result<Object, RuntimeError> {
 fn random_getrandbits(args: &[Object]) -> Result<Object, RuntimeError> {
     use num_bigint::{BigUint, Sign};
     let inst = self_instance(args, "getrandbits()")?;
+    // METH_O in CPython: exactly one argument
+    // (test_random.test_getrandbits passes two and expects TypeError).
+    if args.len() > 2 {
+        return Err(type_error(format!(
+            "getrandbits() takes exactly one argument ({} given)",
+            args.len() - 1
+        )));
+    }
     let k = match args.get(1) {
         Some(Object::Bool(b)) => i64::from(*b),
         Some(Object::Int(i)) => *i,
         Some(Object::Long(b)) => {
             use num_traits::ToPrimitive;
-            b.to_i64()
-                .ok_or_else(|| value_error("number of bits is too large"))?
+            // Clinic 'i' conversion: an int beyond C int is an
+            // OverflowError (getrandbits(1 << 1000), test_random).
+            b.to_i64().ok_or_else(|| {
+                crate::error::overflow_error("Python int too large to convert to C int")
+            })?
         }
+        // Clinic 'i' accepts anything indexable — `getrandbits(MyIndex(100))`
+        // runs the user __index__ (test_random.test_getrandbits).
+        Some(other @ Object::Instance(_)) => crate::builtins::coerce_index_i64(other)?,
         _ => return Err(type_error("getrandbits() requires an integer argument")),
     };
     if k < 0 {
@@ -379,6 +393,13 @@ fn random_randbytes(args: &[Object]) -> Result<Object, RuntimeError> {
     let n = match args.get(1) {
         Some(Object::Int(i)) if *i >= 0 => *i as usize,
         Some(Object::Int(_)) => return Err(value_error("negative argument not allowed")),
+        // Clinic 'n' conversion: an int beyond ssize_t is an
+        // OverflowError (randbytes(1 << 1000), test_random).
+        Some(Object::Long(_)) => {
+            return Err(crate::error::overflow_error(
+                "Python int too large to convert to C ssize_t",
+            ))
+        }
         _ => return Err(type_error("randbytes() requires a non-negative int")),
     };
     let out = with_mt(&inst, |mt| {

@@ -6,12 +6,16 @@ for asyncio and library code: `ContextVar`, `Context`, `Token`,
 pointer; `Context.run(fn, ...)` swaps it on entry and restores it on
 exit.
 
-Without an OS-thread story we currently model "the current context"
-as a single module-level reference. `Context.run` is fully re-entrant
-and reentry-safe for the async / single-thread cooperative case.
+PEP 567 semantics: each OS thread has its own independent "current
+context"; a freshly started thread begins with an empty context (it
+does NOT inherit the spawning thread's values). We keep the per-thread
+state in a dict keyed by `_thread.get_ident()` — all mutations happen
+under the GIL, so plain dict operations are safe.
 """
 
 __all__ = ["ContextVar", "Context", "Token", "copy_context"]
+
+import _thread
 
 # `ContextVar[int]` yields a `types.GenericAlias` (CPython exposes this on
 # the C `ContextVar`). `types` only imports `sys`, so this is safe here.
@@ -107,21 +111,28 @@ class ContextVar:
 class Context:
     """A mapping of `ContextVar` -> value."""
 
-    __slots__ = ("_data",)
+    __slots__ = ("_data", "_entered")
 
     def __init__(self):
         self._data = {}
+        self._entered = False
 
     def run(self, callable_, *args, **kwargs):
-        global _CURRENT_CONTEXT
-        prev = _CURRENT_CONTEXT
-        if prev is self:
-            raise RuntimeError("cannot enter context: already entered")
-        _CURRENT_CONTEXT = self
+        if self._entered:
+            raise RuntimeError(
+                f"cannot enter context: {self!r} is already entered")
+        ident = _thread.get_ident()
+        prev = _STATES.get(ident)
+        self._entered = True
+        _STATES[ident] = self
         try:
             return callable_(*args, **kwargs)
         finally:
-            _CURRENT_CONTEXT = prev
+            self._entered = False
+            if prev is None:
+                _STATES.pop(ident, None)
+            else:
+                _STATES[ident] = prev
 
     def copy(self):
         new = Context()
@@ -165,7 +176,9 @@ class Context:
         return [(k, self._data[k._id]) for k in iter(self)]
 
 
-_CURRENT_CONTEXT = Context()
+# Per-thread current context: thread ident -> Context. A thread with
+# no entry yet lazily gets a fresh empty Context on first access.
+_STATES = {}
 _REGISTRY = {}
 
 
@@ -178,8 +191,13 @@ def _resolve_keys(data):
 
 
 def _current_context():
-    return _CURRENT_CONTEXT
+    ident = _thread.get_ident()
+    ctx = _STATES.get(ident)
+    if ctx is None:
+        ctx = Context()
+        _STATES[ident] = ctx
+    return ctx
 
 
 def copy_context():
-    return _CURRENT_CONTEXT.copy()
+    return _current_context().copy()

@@ -12,8 +12,8 @@
 
 use weavepy_lexer::Span;
 use weavepy_parser::ast::{
-    Arguments, Comprehension, ExceptHandler, Expr, ExprKind, MatchCase, Module, Pattern, Stmt,
-    StmtKind,
+    Arguments, Comprehension, ExceptHandler, Expr, ExprKind, MatchCase, Module, Pattern,
+    PatternKind, Stmt, StmtKind,
 };
 
 use crate::CompileError;
@@ -735,18 +735,18 @@ impl Validator<'_> {
     }
 
     fn visit_pattern(&mut self, pattern: &Pattern) -> Result<(), CompileError> {
-        match pattern {
-            Pattern::Value(e) => self.visit_expr(e)?,
-            Pattern::Capture(Some(n)) | Pattern::Star(Some(n)) => {
+        match &pattern.kind {
+            PatternKind::Value(e) => self.visit_expr(e)?,
+            PatternKind::Capture(Some(n)) | PatternKind::Star(Some(n)) => {
                 let n = n.clone();
                 self.mark_assigned(&n);
             }
-            Pattern::Sequence(items) | Pattern::Or(items) => {
+            PatternKind::Sequence(items) | PatternKind::Or(items) => {
                 for p in items {
                     self.visit_pattern(p)?;
                 }
             }
-            Pattern::Mapping {
+            PatternKind::Mapping {
                 keys,
                 patterns,
                 rest,
@@ -762,7 +762,7 @@ impl Validator<'_> {
                     self.mark_assigned(&n);
                 }
             }
-            Pattern::Class {
+            PatternKind::Class {
                 cls,
                 positionals,
                 keywords,
@@ -775,7 +775,7 @@ impl Validator<'_> {
                     self.visit_pattern(p)?;
                 }
             }
-            Pattern::As { pattern, name } => {
+            PatternKind::As { pattern, name } => {
                 self.visit_pattern(pattern)?;
                 let name = name.clone();
                 self.mark_assigned(&name);
@@ -945,24 +945,17 @@ impl Validator<'_> {
         generators: &[Comprehension],
         elements: &[&Expr],
     ) -> Result<(), CompileError> {
-        let mut iter_vars: Vec<String> = Vec::new();
-        let mut walrus_vars: Vec<String> = Vec::new();
+        // The PEP 572 *error* rules (walrus in an iterable expression,
+        // rebinding an iteration variable, an inner loop rebinding a
+        // walrus target, a comprehension walrus in a class body) live in
+        // `check_comp_walrus_nest`, which `compile_comprehension` runs
+        // over the whole nest with cross-scope visibility. Here we only
+        // keep the scope *bookkeeping* other validator diagnostics rely
+        // on (e.g. `annotated name … used prior to global declaration`).
         for (gi, g) in generators.iter().enumerate() {
-            // Iteration target: reject names already bound by a walrus
-            // earlier in this comprehension.
             let mut targets: Vec<(&str, Span)> = Vec::new();
             collect_name_targets(&g.target, &mut targets);
-            for (name, span) in &targets {
-                if walrus_vars.iter().any(|w| w == name) {
-                    return Err(CompileError::spanned(
-                        format!(
-                            "comprehension inner loop cannot rebind assignment expression \
-                             target '{name}'"
-                        ),
-                        *span,
-                    ));
-                }
-                iter_vars.push((*name).to_owned());
+            for (name, _) in &targets {
                 // Iteration variables bind in the comprehension scope
                 // itself, not the enclosing one.
                 let s = self.scope_mut();
@@ -972,50 +965,29 @@ impl Validator<'_> {
             if gi > 0 {
                 self.visit_expr(&g.iter)?;
             }
-            self.check_walrus(&g.iter, &iter_vars, &mut walrus_vars)?;
+            self.record_walrus(&g.iter);
             for cond in &g.ifs {
                 self.visit_expr(cond)?;
-                self.check_walrus(cond, &iter_vars, &mut walrus_vars)?;
+                self.record_walrus(cond);
             }
         }
         for e in elements {
             self.visit_expr(e)?;
-            self.check_walrus(e, &iter_vars, &mut walrus_vars)?;
+            self.record_walrus(e);
         }
         Ok(())
     }
 
     /// Record walrus targets in `expr` (without descending into nested
-    /// comprehension/lambda scopes) and reject rebinds of comprehension
-    /// iteration variables.
-    fn check_walrus(
-        &mut self,
-        expr: &Expr,
-        iter_vars: &[String],
-        walrus_vars: &mut Vec<String>,
-    ) -> Result<(), CompileError> {
-        let mut found: Vec<(String, Span)> = Vec::new();
-        {
-            let mut borrowed: Vec<(&str, Span)> = Vec::new();
-            collect_walrus_targets(expr, &mut borrowed);
-            found.extend(borrowed.into_iter().map(|(n, s)| (n.to_owned(), s)));
-        }
-        for (name, span) in found {
-            if iter_vars.iter().any(|v| v == &name) {
-                return Err(CompileError::spanned(
-                    format!(
-                        "assignment expression cannot rebind comprehension iteration \
-                         variable '{name}'"
-                    ),
-                    span,
-                ));
-            }
-            // Walrus targets bind through the comprehension scope into
-            // the enclosing function/class/module scope.
+    /// comprehension/lambda scopes): they bind through the comprehension
+    /// scope into the enclosing function/class/module scope.
+    fn record_walrus(&mut self, expr: &Expr) {
+        let mut found: Vec<(&str, Span)> = Vec::new();
+        collect_walrus_targets(expr, &mut found);
+        for (name, _) in found {
+            let name = name.to_owned();
             self.mark_assigned(&name);
-            walrus_vars.push(name);
         }
-        Ok(())
     }
 }
 

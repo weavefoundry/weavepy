@@ -296,6 +296,17 @@ pub fn current_worker_thread_id() -> u64 {
     native
 }
 
+/// `True` when the calling OS thread was spawned by WeavePy's own thread
+/// machinery (`_thread.start_new_thread`). Foreign threads — the process
+/// main thread, or a host-application thread embedding its *own*
+/// interpreter (e.g. `cargo test` running several `run_source` calls in
+/// parallel) — are not workers of the finalizing interpreter and must not
+/// be killed by the daemon-thread shutdown check in the dispatch loop.
+pub fn current_thread_is_spawned_worker() -> bool {
+    let native = crate::gil::current_native_thread_id();
+    worker_map().lock().contains_key(&native)
+}
+
 /// `True` when `id` is the public ident (`threading.get_ident()`
 /// value) of a currently-live thread: the caller itself, a live
 /// worker, or the main interpreter thread. Backs
@@ -350,6 +361,24 @@ thread_local! {
     /// frame/exception state on unwind.
     static CURRENT_THREAD_HANDLES: RefCell<Vec<ThreadHandles>> =
         const { RefCell::new(Vec::new()) };
+
+    /// RFC 0057 WS6: one-shot registration of this OS thread's frame
+    /// stack with `faulthandler`'s cross-thread registry (the analogue of
+    /// CPython's per-interpreter tstate list, which
+    /// `_Py_DumpTracebackThreads` walks). The guard's `Drop` at thread
+    /// exit removes the entry.
+    static FAULTHANDLER_REG: std::cell::RefCell<Option<FaulthandlerThreadGuard>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct FaulthandlerThreadGuard {
+    ident: u64,
+}
+
+impl Drop for FaulthandlerThreadGuard {
+    fn drop(&mut self) {
+        crate::stdlib::faulthandler_mod::note_thread_exit(self.ident);
+    }
 }
 
 /// Push `handles` as the active per-thread state. Returns a guard
@@ -362,6 +391,17 @@ thread_local! {
 /// // guard drops here, restoring the prior state.
 /// ```
 pub fn activate_thread_handles(handles: ThreadHandles) -> ThreadHandlesGuard {
+    // First activation on this OS thread: publish its frame stack to the
+    // faulthandler registry (workers install their synthetic ident before
+    // their first activation, so `current_worker_thread_id` matches
+    // `threading.get_ident()`).
+    let _ = FAULTHANDLER_REG.try_with(|slot| {
+        if slot.borrow().is_none() {
+            let ident = current_worker_thread_id();
+            crate::stdlib::faulthandler_mod::note_thread_start(ident, handles.frame_stack.clone());
+            *slot.borrow_mut() = Some(FaulthandlerThreadGuard { ident });
+        }
+    });
     CURRENT_THREAD_HANDLES.with(|cell| cell.borrow_mut().push(handles));
     ThreadHandlesGuard { _private: () }
 }
@@ -907,14 +947,8 @@ pub fn quitter(name: &'static str) -> Object {
                 code.to_str(),
             );
             if let Object::Instance(inst_rc) = &inst {
-                inst_rc.dict.borrow_mut().insert(
-                    crate::object::DictKey(Object::from_static("code")),
-                    code.clone(),
-                );
-                inst_rc.dict.borrow_mut().insert(
-                    crate::object::DictKey(Object::from_static("args")),
-                    Object::new_tuple(vec![code]),
-                );
+                inst_rc.slot_set("code", code.clone());
+                inst_rc.slot_set("args", Object::new_tuple(vec![code]));
             }
             Err(crate::error::RuntimeError::PyException(
                 crate::error::PyException::new(inst),

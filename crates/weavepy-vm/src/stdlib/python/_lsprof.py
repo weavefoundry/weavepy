@@ -18,6 +18,8 @@ The observable surface matches `_lsprof`:
 
 import sys as _sys
 import time as _time
+import types as _types
+import operator as _operator
 from collections import namedtuple as _namedtuple
 
 __all__ = ["Profiler", "profiler_entry", "profiler_subentry"]
@@ -30,6 +32,26 @@ profiler_subentry = _namedtuple(
     "profiler_subentry",
     ["code", "callcount", "reccallcount", "totaltime", "inlinetime"],
 )
+
+
+def _report_unraisable(exc, obj):
+    """CPython's `PyErr_WriteUnraisable(pObj)`: route a swallowed
+    exception through `sys.unraisablehook` (object = the profiler,
+    no err_msg) so `support.catch_unraisable_exception` observes it."""
+    hook = getattr(_sys, "unraisablehook", None)
+    if hook is None:
+        return
+    args = _types.SimpleNamespace(
+        exc_type=type(exc),
+        exc_value=exc,
+        exc_traceback=exc.__traceback__,
+        err_msg=None,
+        object=obj,
+    )
+    try:
+        hook(args)
+    except Exception:
+        pass
 
 
 def _normalize(func):
@@ -125,10 +147,22 @@ class Profiler:
     # -- timing ------------------------------------------------------
 
     def _now(self):
+        # CPython `CallExternalTimer`: with a timeunit the result is
+        # read as an integer (PyLong_AsLongLong), otherwise as a double
+        # (PyFloat_AsDouble); a conversion failure (bpo-3895: a timer
+        # returning a type) is swallowed into the unraisable hook and
+        # timed as 0.0 rather than crashing during dealloc/disable.
         timer = self._timer
         if timer is None:
             return _time.perf_counter()
-        return timer()
+        result = timer()
+        try:
+            if self._timeunit > 0.0:
+                return _operator.index(result)
+            return float(result)
+        except BaseException as exc:
+            _report_unraisable(exc, self)
+            return 0.0
 
     def _scale(self, delta):
         if self._timer is None:
@@ -212,6 +246,15 @@ class Profiler:
 
     def _push(self, code):
         now = self._now()
+        if self._timer is not None and not self._enabled:
+            # gh-120289 (`initContext` in _lsprof.c): the external timer
+            # disabled the profiler mid-call — report and bail instead
+            # of pushing a context onto a dead profiler.
+            _report_unraisable(
+                RuntimeError("the profiler was disabled during the timer call"),
+                self,
+            )
+            return
         entry = self._get_entry(code)
         entry.callcount += 1
         if entry.recursionLevel:
@@ -238,7 +281,17 @@ class Profiler:
         # returns whose code doesn't match the top context.
         if ctx.entry.code != code:
             return
-        self._pop_context(self._now())
+        now = self._now()
+        if self._timer is not None and not self._enabled:
+            # gh-120289 (`Stop` in _lsprof.c): the external timer
+            # disabled the profiler mid-return; `disable()` already
+            # flushed the context stack.
+            _report_unraisable(
+                RuntimeError("the profiler was disabled during the timer call"),
+                self,
+            )
+            return
+        self._pop_context(now)
 
     def _pop_context(self, now):
         ctx = self._current
