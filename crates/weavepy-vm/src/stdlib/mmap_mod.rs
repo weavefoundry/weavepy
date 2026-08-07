@@ -21,8 +21,7 @@ use crate::sync::RefCell;
 
 use crate::builtins::{coerce_index_i64, seq_index_bound, try_coerce_index_i64};
 use crate::error::{
-    buffer_error, index_error, io_error_to_py, overflow_error, type_error, value_error,
-    PyException, RuntimeError,
+    buffer_error, index_error, overflow_error, type_error, value_error, RuntimeError,
 };
 use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule, SharedMemBuffer};
@@ -37,14 +36,17 @@ pub const ACCESS_COPY: i64 = 3;
 /// resizes in place.
 #[cfg(not(target_os = "linux"))]
 fn system_error(message: &str) -> RuntimeError {
-    RuntimeError::PyException(PyException::from_builtin("SystemError", message))
+    RuntimeError::PyException(crate::error::PyException::from_builtin(
+        "SystemError",
+        message,
+    ))
 }
 
 /// `OSError` from the thread's current `errno`, with CPython's PEP 3151
 /// subclass mapping (EACCES → `PermissionError`, …).
 #[cfg(unix)]
 fn errno_error() -> RuntimeError {
-    io_error_to_py(&std::io::Error::last_os_error())
+    crate::error::io_error_to_py(&std::io::Error::last_os_error())
 }
 
 fn closed_error() -> RuntimeError {
@@ -880,9 +882,9 @@ fn mm_size(args: &[Object]) -> Result<Object, RuntimeError> {
     #[cfg(unix)]
     {
         if st.fd < 0 {
-            return Err(io_error_to_py(&std::io::Error::from_raw_os_error(
-                libc::EBADF,
-            )));
+            return Err(crate::error::io_error_to_py(
+                &std::io::Error::from_raw_os_error(libc::EBADF),
+            ));
         }
         let mut status: libc::stat = unsafe { std::mem::zeroed() };
         if unsafe { libc::fstat(st.fd, &raw mut status) } != 0 {
