@@ -452,13 +452,26 @@ impl<T> GilCell<T> {
 
 impl<T: Copy> GilCell<T> {
     /// Get the inner value (copying it). Equivalent to
-    /// `*self.borrow()`.
+    /// `*self.borrow()` but skips guard construction and the
+    /// [`LIVE_CELL_GUARDS`] bookkeeping (RFC 0058 WS2): a `Copy`
+    /// read cannot re-enter Python, so no GIL hand-off can occur
+    /// while the lock is held — the yield-refusal counter exists
+    /// only for guards that outlive a re-entrant call. `Cell::get`
+    /// on object fields is the single hottest operation in the
+    /// interpreter, and the two thread-local touches per access
+    /// dominated its cost.
+    #[track_caller]
     pub fn get(&self) -> T {
+        // BISECT-B: pre-wave guard path
         *self.borrow()
     }
 
-    /// Replace the inner value with `value`.
+    /// Replace the inner value with `value`. Equivalent to
+    /// `*self.borrow_mut() = value` minus the guard machinery — see
+    /// [`Self::get`] for why that's sound.
+    #[track_caller]
     pub fn set(&self, value: T) {
+        // BISECT-B: pre-wave guard path
         *self.borrow_mut() = value;
     }
 }

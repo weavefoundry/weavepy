@@ -44,7 +44,7 @@ use crate::sync::RefCell;
 
 use crate::error::{type_error, value_error, RuntimeError};
 use crate::import::ModuleCache;
-use crate::object::{BuiltinFn, DictData, DictKey, Object, PyFrame, PyModule};
+use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
 
 /// Process-global "is a fault handler installed" flag (CPython's
 /// `fatal_error.enabled`).
@@ -66,7 +66,7 @@ static WATCHDOG_GEN: AtomicU64 = AtomicU64::new(0);
 
 struct RegisteredThread {
     ident: u64,
-    frame_stack: Rc<RefCell<Vec<Rc<PyFrame>>>>,
+    frame_stack: crate::object::FrameStack,
 }
 
 /// Registration order == thread creation order; CPython's
@@ -75,7 +75,7 @@ struct RegisteredThread {
 static THREADS: Mutex<Vec<RegisteredThread>> = Mutex::new(Vec::new());
 
 /// Called (once per OS thread) by `vm_singletons::activate_thread_handles`.
-pub fn note_thread_start(ident: u64, frame_stack: Rc<RefCell<Vec<Rc<PyFrame>>>>) {
+pub fn note_thread_start(ident: u64, frame_stack: crate::object::FrameStack) {
     let mut g = THREADS.lock().unwrap();
     if g.iter().any(|t| t.ident == ident) {
         return;
@@ -142,7 +142,10 @@ fn put_truncated(out: &mut String, s: &str) {
 }
 
 /// One `  File "<file>", line N in <name>` line (CPython `dump_frame`).
-fn dump_frame_line(out: &mut String, frame: &PyFrame) {
+/// Reads the shell directly — file/line/name never require the
+/// Python-visible frame object, and materialising inside a signal
+/// handler would be unsafe anyway (RFC 0058).
+fn dump_frame_line(out: &mut String, frame: &crate::object::FrameShell) {
     out.push_str("  File \"");
     put_truncated(out, &frame.code.filename);
     out.push_str(&format!("\", line {} in ", frame.current_lineno()));
@@ -152,7 +155,7 @@ fn dump_frame_line(out: &mut String, frame: &PyFrame) {
 
 /// CPython `dump_traceback(fd, tstate, write_header=0)`: frames most
 /// recent first, capped at [`MAX_FRAME_DEPTH`].
-fn dump_frames(out: &mut String, frame_stack: &Rc<RefCell<Vec<Rc<PyFrame>>>>) {
+fn dump_frames(out: &mut String, frame_stack: &crate::object::FrameStack) {
     // `try_borrow`, not `borrow`: at crash time the owning thread may
     // have the stack mutably borrowed; a headerless dump beats a panic
     // inside the signal handler.

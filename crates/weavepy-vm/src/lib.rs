@@ -94,7 +94,10 @@ struct Frame {
     /// friends).
     locals: Rc<RefCell<Vec<Object>>>,
     /// Cell storage. Layout: `code.cellvars` first, then `code.freevars`.
-    cells: Vec<Rc<RefCell<Object>>>,
+    /// Behind an `Rc` (RFC 0058): built once in `make_frame`, never
+    /// resized afterwards, and shared with the frame's `FrameShell` /
+    /// `PyFrame` without a per-call `Vec` clone.
+    cells: Rc<Vec<Rc<RefCell<Object>>>>,
     /// Evaluation stack.
     stack: Vec<Object>,
     /// Globals shared across frames within the same module.
@@ -163,6 +166,11 @@ struct Frame {
     /// first entry and re-push the same object on each resume.
     /// `None` for ordinary frames, which are only ever entered once.
     py_frame: Option<Rc<PyFrame>>,
+    /// Backlink to the generator/coroutine owning this frame (weak),
+    /// set at generator creation. Copied onto each activation's
+    /// `FrameShell` so `gi_frame` can locate the executing frame of a
+    /// *running* generator even when nothing has been materialised.
+    gen_owner: Option<crate::sync::Weak<PyGenerator>>,
     /// RFC 0051 (WS4): skip the frame-entry `'call'` trace event for
     /// the *next* activation. Set by `generator_throw`, which fires
     /// CPython's PY_THROW (`'call'`) + RAISE (`'exception'`) pair at
@@ -267,7 +275,7 @@ fn generator_frame_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
         for v in &frame.stack {
             visit(v);
         }
-        for c in &frame.cells {
+        for c in frame.cells.iter() {
             if let Ok(v) = c.try_borrow() {
                 visit(&v);
             }
@@ -596,11 +604,12 @@ pub struct Interpreter {
     /// internal compile (imports, `exec`/`eval` of source) resolve to
     /// this level (RFC 0052).
     pub(crate) optimize_level: u8,
-    /// Live call stack of Python-visible frame snapshots, in
-    /// outer-to-inner order. The topmost entry corresponds to the
-    /// currently-executing `Frame`. RFC 0018: used by
-    /// `sys._getframe`, `traceback`, and the unwind machinery.
-    pub(crate) frame_stack: Rc<RefCell<Vec<Rc<PyFrame>>>>,
+    /// Live call stack of frame *shells*, in outer-to-inner order —
+    /// the topmost entry corresponds to the currently-executing
+    /// `Frame`. RFC 0058: shells are cheap per-call spine entries;
+    /// the Python-visible `PyFrame` is materialised on demand (see
+    /// `sys._getframe`, `traceback`, and the unwind machinery).
+    pub(crate) frame_stack: crate::object::FrameStack,
     /// Stack of currently-handled exceptions across all frames. The
     /// top is what `sys.exc_info()` returns. Pushed by
     /// `PUSH_EXC_INFO`; popped by `POP_EXCEPT`.
@@ -633,6 +642,15 @@ pub struct Interpreter {
     /// this is set (testmock's `patch('builtins.__import__')` must not
     /// see — or worse, service — bootstrap imports).
     internal_import_depth: u32,
+    /// RFC 0058 (WS2) — recycled fast-locals storage. Every Python call
+    /// used to malloc a fresh `Rc<RefCell<Vec<Object>>>`; a returned
+    /// frame whose storage nothing else shares (no escaped `PyFrame`,
+    /// no traceback) hands the allocation back here instead. CPython's
+    /// analogue is the `_PyFreeListState` frame/object freelists.
+    frame_locals_pool: RefCell<Vec<Rc<RefCell<Vec<Object>>>>>,
+    /// Recycled operand-stack vectors, same motivation. The operand
+    /// stack is never shared, so every returned frame donates one.
+    frame_stack_pool: RefCell<Vec<Vec<Object>>>,
 }
 
 impl Default for Interpreter {
@@ -748,7 +766,7 @@ impl Default for Interpreter {
         });
         let excepthook = Rc::new(RefCell::new(Object::None));
         let unraisable_hook = Rc::new(RefCell::new(Object::None));
-        let frame_stack: Rc<RefCell<Vec<Rc<PyFrame>>>> = Rc::new(RefCell::new(Vec::new()));
+        let frame_stack: crate::object::FrameStack = Rc::new(RefCell::new(Vec::new()));
         let exc_info_stack = Rc::new(RefCell::new(Vec::new()));
         // Eagerly build the `sys` module so the per-interpreter
         // frame_stack / exc_info_stack are visible to user code via
@@ -788,6 +806,8 @@ impl Default for Interpreter {
             unraisable_hook,
             globals_missing_hooks: RefCell::new(Vec::new()),
             internal_import_depth: 0,
+            frame_locals_pool: RefCell::new(Vec::new()),
+            frame_stack_pool: RefCell::new(Vec::new()),
         };
         // RFC 0025: publish the shared parts of this interpreter
         // (builtins / module cache / stdout / hooks) so workers
@@ -882,6 +902,8 @@ impl Interpreter {
             unraisable_hook: self.unraisable_hook.clone(),
             globals_missing_hooks: RefCell::new(Vec::new()),
             internal_import_depth: 0,
+            frame_locals_pool: RefCell::new(Vec::new()),
+            frame_stack_pool: RefCell::new(Vec::new()),
         }
     }
 
@@ -3702,6 +3724,58 @@ impl Interpreter {
     /// builtins mapping when the caller already has one — a Python
     /// function's cached `func_builtins` — and `None` for module /
     /// exec / class-body frames, which resolve from `globals` here.
+    /// Fetch a recycled fast-locals storage sized to `n` slots (all
+    /// `Unbound`), or allocate a fresh one on pool miss (RFC 0058 WS2).
+    fn pooled_locals(&self, n: usize) -> Rc<RefCell<Vec<Object>>> {
+        if let Some(rc) = self.frame_locals_pool.borrow_mut().pop() {
+            {
+                let mut v = rc.borrow_mut();
+                debug_assert!(v.is_empty());
+                v.resize(n, Object::Unbound);
+            }
+            return rc;
+        }
+        Rc::new(RefCell::new(vec![Object::Unbound; n]))
+    }
+
+    /// Fetch a recycled operand-stack vector, or allocate one.
+    fn pooled_stack(&self) -> Vec<Object> {
+        self.frame_stack_pool
+            .borrow_mut()
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(16))
+    }
+
+    /// Return a finished frame's heap allocations to the pools. Only
+    /// called on the ordinary `Returned` path (a yielded/suspended
+    /// frame lives on; an exceptional exit may sit in a traceback).
+    /// The locals storage is recycled only when this frame is its sole
+    /// owner — an escaped `PyFrame` shares it via `locals_mirror` and
+    /// keeps `strong_count > 1`, so PEP 667 handles are never torn out
+    /// from under a live reference. Dropping the leftover values here
+    /// is exactly the drop the frame's own destructor would perform.
+    fn recycle_frame_allocs(&self, frame: &mut Frame) {
+        const POOL_CAP: usize = 64;
+        let mut stack = std::mem::take(&mut frame.stack);
+        if stack.capacity() > 0 {
+            stack.clear();
+            let mut pool = self.frame_stack_pool.borrow_mut();
+            if pool.len() < POOL_CAP {
+                pool.push(stack);
+            }
+        }
+        if Rc::strong_count(&frame.locals) == 1 {
+            // Clear before touching the pool: dropping the leftover
+            // values runs arbitrary Rust `Drop` glue (file handles, GC
+            // bookkeeping), which must not observe a held pool borrow.
+            frame.locals.borrow_mut().clear();
+            let mut pool = self.frame_locals_pool.borrow_mut();
+            if pool.len() < POOL_CAP {
+                pool.push(frame.locals.clone());
+            }
+        }
+    }
+
     fn make_frame(
         &self,
         code: Rc<CodeObject>,
@@ -3710,10 +3784,13 @@ impl Interpreter {
         globals: Rc<RefCell<DictData>>,
         builtins: Option<Rc<RefCell<DictData>>>,
     ) -> Frame {
-        let mut locals = vec![Object::Unbound; code.varnames.len()];
-        for (i, v) in positional.into_iter().enumerate() {
-            if i < locals.len() {
-                locals[i] = v;
+        let locals_rc = self.pooled_locals(code.varnames.len());
+        {
+            let mut locals = locals_rc.borrow_mut();
+            for (i, v) in positional.into_iter().enumerate() {
+                if i < locals.len() {
+                    locals[i] = v;
+                }
             }
         }
         // Build cells: cellvars come first (fresh), then freevars
@@ -3738,7 +3815,7 @@ impl Interpreter {
                 .iter()
                 .position(|n| n == cell_name)
                 .map_or(Object::Unbound, |idx| {
-                    std::mem::replace(&mut locals[idx], Object::Unbound)
+                    std::mem::replace(&mut locals_rc.borrow_mut()[idx], Object::Unbound)
                 });
             cells.push(Rc::new(RefCell::new(initial)));
         }
@@ -3756,11 +3833,16 @@ impl Interpreter {
             }
         }
         let builtins = builtins.unwrap_or_else(|| self.builtins_for_globals(&globals));
+        let cells = if cells.is_empty() {
+            crate::object::empty_cells()
+        } else {
+            Rc::new(cells)
+        };
         Frame {
             code,
-            locals: Rc::new(RefCell::new(locals)),
+            locals: locals_rc,
             cells,
-            stack: Vec::with_capacity(16),
+            stack: self.pooled_stack(),
             globals,
             builtins,
             class_namespace: None,
@@ -3770,6 +3852,7 @@ impl Interpreter {
             agen_yielded_value: true,
             pc: 0,
             py_frame: None,
+            gen_owner: None,
             cleanup_lasti: None,
             suppress_call_event: false,
         }
@@ -3781,6 +3864,7 @@ impl Interpreter {
         match self.run_until_yield_or_return(frame, None)? {
             FrameOutcome::Returned(v) => {
                 self.reap_frame_locals_on_exit(frame, Some(&v));
+                self.recycle_frame_allocs(frame);
                 Ok(v)
             }
             FrameOutcome::Yielded(_) => Err(RuntimeError::Internal(
@@ -3865,11 +3949,12 @@ impl Interpreter {
         if let Some(v) = sent {
             frame.push(v);
         }
-        // Push a Python-visible frame snapshot for the duration of
-        // this run. The same frame may be entered multiple times
-        // (generators on resume) — each entry gets a fresh PyFrame
-        // because the `back` chain reflects who is calling *now*.
-        let py_frame = self.push_py_frame(frame);
+        // Push a cheap frame *shell* for the duration of this run
+        // (RFC 0058). The Python-visible `PyFrame` is materialised
+        // only when something introspects it — tracing, `sys._getframe`,
+        // traceback capture — via `ensure_top_py_frame`.
+        let shell = self.push_frame_shell(frame);
+        let mut py_frame_slot: Option<Rc<PyFrame>> = shell.materialized.borrow().clone();
         // Depth of the interpreter-wide handled-exception stack on entry.
         // Used on completion to discard any `PUSH_EXC_INFO` entries this
         // activation leaves un-popped (see the reconciliation at the
@@ -3905,6 +3990,7 @@ impl Interpreter {
         let observers_active = crate::trace::any_observers_active();
         let suppress_call = std::mem::take(&mut frame.suppress_call_event);
         if observers_active && !is_gen_bootstrap && !suppress_call {
+            let py_frame = self.ensure_top_py_frame(&mut py_frame_slot);
             self.fire_call_event(&py_frame)?;
             // On a resume, line tracing must continue from the line
             // where the frame suspended — CPython reports the `call`
@@ -3921,7 +4007,9 @@ impl Interpreter {
                     .copied()
                     .unwrap_or(0);
                 if line != 0 {
-                    py_frame.last_line.set(Some(line));
+                    self.ensure_top_py_frame(&mut py_frame_slot)
+                        .last_line
+                        .set(Some(line));
                 }
             }
         }
@@ -3932,9 +4020,9 @@ impl Interpreter {
         // rewrites `frame` and falls through to resume interpretation.
         #[cfg(feature = "jit")]
         if !is_resume && !observers_active && frame.pc == 0 && frame.stack.is_empty() {
-            match crate::tier2::try_enter(frame) {
+            match crate::tier2::try_enter(self, frame) {
                 crate::tier2::JitEntry::Ran(v) => {
-                    self.pop_py_frame();
+                    self.pop_frame_shell();
                     return Ok(FrameOutcome::Returned(v));
                 }
                 crate::tier2::JitEntry::Deopt | crate::tier2::JitEntry::Skip => {}
@@ -4012,8 +4100,12 @@ impl Interpreter {
             // of the re-entered code (pandas' import runs minutes long
             // under that quadratic churn). Draining only at depth 0 runs
             // each parked object through the cascade exactly once.
-            if !crate::vm_singletons::cext_call_active()
-                && crate::vm_singletons::has_pending_cext_drops()
+            // Probe order matters: `has_pending_cext_drops` is one
+            // relaxed load when empty (the overwhelming case), while
+            // `cext_call_active` is a thread-local read — so ask
+            // "is there anything to do" before "may we do it".
+            if crate::vm_singletons::has_pending_cext_drops()
+                && !crate::vm_singletons::cext_call_active()
             {
                 static REAP_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                 let reap_trace =
@@ -4046,12 +4138,25 @@ impl Interpreter {
             if crate::vm_singletons::has_pending_resource_warnings() {
                 self.drain_pending_resource_warnings();
             }
-            // Mirror the live `pc` into the snapshot so `f_lineno`
-            // reads correctly when user code introspects via
-            // `sys._getframe`. The locals need no per-step sync: the
-            // snapshot shares the live storage (`build_py_frame`), and a
+            // Mirror the live `pc` into the shell so `f_lineno` reads
+            // correctly when user code introspects via `sys._getframe`
+            // (materialisation copies it). The locals need no per-step
+            // sync: any snapshot shares the live storage, and a
             // materialised `f_locals` dict refreshes itself on access.
-            py_frame.lasti.set(frame.pc);
+            shell
+                .lasti
+                .store(frame.pc, std::sync::atomic::Ordering::Relaxed);
+            if shell
+                .has_materialized
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                // Something materialised the real frame (possibly from
+                // inside an instruction): keep its `lasti` cell in sync
+                // exactly as the eager path used to.
+                self.ensure_top_py_frame(&mut py_frame_slot)
+                    .lasti
+                    .set(frame.pc);
+            }
             // Fire a 'line' event when the source line changes.
             // Fast path: skip the line-table read entirely when no
             // observer is active. The generator-creation bootstrap
@@ -4067,6 +4172,8 @@ impl Interpreter {
             let mut trace_err: Option<RuntimeError> = None;
             let cur_pc = frame.pc as usize;
             if crate::trace::any_observers_active() && !is_gen_bootstrap {
+                let py_frame = self.ensure_top_py_frame(&mut py_frame_slot);
+                py_frame.lasti.set(frame.pc);
                 let line = py_frame.current_lineno();
                 // RFC 0051 (WS4): CPython 3.13 line-event semantics.
                 // A `'line'` event fires when execution reaches an
@@ -4207,6 +4314,7 @@ impl Interpreter {
                     Err(e) => e,
                 })
             } else if crate::stdlib::signal_mod::signals_pending() && crate::gil::is_main_thread() {
+                let py_frame = self.ensure_top_py_frame(&mut py_frame_slot);
                 match self.run_pending_signals(&py_frame) {
                     Ok(()) => {
                         instruction_ran = true;
@@ -4247,12 +4355,14 @@ impl Interpreter {
                 Ok(StepOutcome::Continue) => {}
                 Ok(StepOutcome::Return(v)) => {
                     if crate::trace::any_observers_active() {
+                        let py_frame = self.ensure_top_py_frame(&mut py_frame_slot);
                         self.fire_return_event(&py_frame, &v)?;
                     }
                     break Ok(FrameOutcome::Returned(v));
                 }
                 Ok(StepOutcome::Yield(v)) => {
                     if crate::trace::any_observers_active() {
+                        let py_frame = self.ensure_top_py_frame(&mut py_frame_slot);
                         self.fire_yield_event(&py_frame, &v)?;
                         // A jump set from the yield's 'return' trace event
                         // (CPython allows these) lands on the suspended
@@ -4316,6 +4426,7 @@ impl Interpreter {
                             // (CPython `call_exc_trace` drops the
                             // original); the replacement unwinds through
                             // this same frame's handlers.
+                            let py_frame = self.ensure_top_py_frame(&mut py_frame_slot);
                             if let Err(trace_e) = self.fire_exception_event(&py_frame, &exc) {
                                 match trace_e {
                                     RuntimeError::PyException(new_exc) => exc = new_exc,
@@ -4334,6 +4445,7 @@ impl Interpreter {
                                 // path (sys.monitoring sees PY_UNWIND). bdb's
                                 // `set_return` waits for exactly this event.
                                 if crate::trace::any_observers_active() {
+                                    let py_frame = self.ensure_top_py_frame(&mut py_frame_slot);
                                     self.fire_unwind_event(&py_frame)?;
                                 }
                                 break Err(e);
@@ -4345,7 +4457,7 @@ impl Interpreter {
                 }
             }
         };
-        self.pop_py_frame();
+        self.pop_frame_shell();
         // A normally-returning frame is dead: CPython deallocates it the
         // instant it returns, releasing every local by refcount. Drop the
         // live-locals mirror (and any materialised `f_locals`) so a
@@ -4364,35 +4476,54 @@ impl Interpreter {
         // (`StartGenerator`) keep their mirror — the frame lives on and is
         // re-entered — and an *exceptional* exit (`Err`) keeps it so the
         // frame's `f_locals` stays readable while it sits in a traceback.
-        if matches!(result, Ok(FrameOutcome::Returned(_))) {
-            // `pop_py_frame` above already dropped the call stack's clone,
-            // so `strong_count == 1` means *this* local is the only owner:
-            // the frame object dies here and its share of the locals
-            // storage dies with it — `reap_frame_locals_on_exit` (in the
-            // caller) then finalizes promptly. `> 1` means the frame object
-            // genuinely outlives the activation — a live traceback whose
-            // exception was caught and `return`ed/stored, or an explicit
-            // `sys._getframe`/`gi_frame` handle. CPython keeps such a
-            // frame's locals readable (`take_ownership`); the materialised
-            // dict's clones also keep those values above the exit sweep's
-            // dead threshold, so they are not reaped out from under the
-            // escaped frame. The locals storage itself is shared with the
-            // frame object (no mirror copy), so no re-sync is needed —
-            // the provider reads the final post-return state directly.
-            if Rc::strong_count(&py_frame) > 1 {
-                py_frame.take_ownership_of_locals();
+        // A never-materialised activation (the common case) has no
+        // Python-visible frame object at all: nothing can hold a stale
+        // locals view, so there is nothing to reconcile.
+        if let Some(py_frame) = shell.materialized.borrow().as_ref() {
+            if matches!(result, Ok(FrameOutcome::Returned(_))) {
+                // The pop above dropped the call stack's shell (the loop
+                // slot and the shell's own cell are the bookkeeping refs
+                // counted below): any owner beyond those means the frame
+                // object genuinely outlives the activation — a live
+                // traceback whose exception was caught and
+                // `return`ed/stored, or an explicit
+                // `sys._getframe`/`gi_frame` handle. CPython keeps such a
+                // frame's locals readable (`take_ownership`); the
+                // materialised dict's clones also keep those values above
+                // the exit sweep's dead threshold, so they are not reaped
+                // out from under the escaped frame. The locals storage
+                // itself is shared with the frame object (no mirror
+                // copy), so no re-sync is needed — the provider reads the
+                // final post-return state directly.
+                let mut internal = 1; // the shell's `materialized` cell
+                if py_frame_slot
+                    .as_ref()
+                    .is_some_and(|s| Rc::ptr_eq(s, py_frame))
+                {
+                    internal += 1;
+                }
+                if frame
+                    .py_frame
+                    .as_ref()
+                    .is_some_and(|s| Rc::ptr_eq(s, py_frame))
+                {
+                    internal += 1;
+                }
+                if Rc::strong_count(py_frame) > internal {
+                    py_frame.take_ownership_of_locals();
+                } else {
+                    py_frame.invalidate_locals();
+                }
             } else {
+                // Suspending (yield) or exiting on an exception: bring any
+                // handed-out materialised `f_locals` dict up to date *now*.
+                // PEP 667 reads track execution live, so a handle captured
+                // early in a generator body must show assignments made
+                // before the yield the moment `next()` returns —
+                // `test_generators.test_frame_locals_outlive_generator`
+                // reads `frame_locals1['a']` without ever resuming again.
                 py_frame.invalidate_locals();
             }
-        } else {
-            // Suspending (yield) or exiting on an exception: bring any
-            // handed-out materialised `f_locals` dict up to date *now*.
-            // PEP 667 reads track execution live, so a handle captured
-            // early in a generator body must show assignments made
-            // before the yield the moment `next()` returns —
-            // `test_generators.test_frame_locals_outlive_generator`
-            // reads `frame_locals1['a']` without ever resuming again.
-            py_frame.invalidate_locals();
         }
         // Reconcile the interpreter-wide handled-exception stack. When
         // control leaves an `except` / `finally` block *early* — a
@@ -4432,45 +4563,76 @@ impl Interpreter {
         result
     }
 
-    /// Build a [`PyFrame`] snapshot for `frame` and push it onto the
-    /// interpreter's call stack. The snapshot's `back` chain points
-    /// at whatever was on top of the stack before the push, so the
-    /// call hierarchy is recoverable from any frame.
-    fn push_py_frame(&self, frame: &mut Frame) -> Rc<PyFrame> {
-        // Generator-family frames are re-entered on every resume.
-        // Reuse the cached `PyFrame` so the Python-visible frame keeps
-        // a stable identity across suspensions (CPython's `gi_frame`),
-        // only refreshing the bits that change per resume: the `back`
-        // pointer (who's resuming us now) and `lasti`. The locals
-        // mirror is shared by reference and kept current by
-        // `sync_py_locals`, so we just drop the materialised cache.
-        if let Some(existing) = frame.py_frame.clone() {
-            let back = self.frame_stack.borrow().last().cloned();
-            *existing.back.borrow_mut() = back;
+    /// Push a cheap [`FrameShell`](crate::object::FrameShell) spine
+    /// entry for `frame` (RFC 0058).
+    /// The Python-visible `PyFrame` is only materialised on demand;
+    /// a generator resume whose frame was already materialised
+    /// (stable `gi_frame` identity) re-pushes the cached object with
+    /// refreshed `lasti` — its `back` link is refreshed lazily by the
+    /// next materialisation walk.
+    fn push_frame_shell(&self, frame: &mut Frame) -> Rc<crate::object::FrameShell> {
+        let is_gen =
+            frame.code.is_generator || frame.code.is_coroutine || frame.code.is_async_generator;
+        let materialized = frame.py_frame.clone();
+        if let Some(existing) = &materialized {
             existing.lasti.set(frame.pc);
             existing.invalidate_locals();
             existing.on_stack.set(existing.on_stack.get() + 1);
-            self.frame_stack.borrow_mut().push(existing.clone());
-            return existing;
         }
-        let back = self.frame_stack.borrow().last().cloned();
-        let py = self.build_py_frame(frame, back);
-        // Cache the snapshot on generator-family frames so the next
-        // resume re-pushes this very object (stable identity). Plain
-        // function frames run exactly once and are never re-entered,
-        // so caching them would only waste a clone.
-        if frame.code.is_generator || frame.code.is_coroutine || frame.code.is_async_generator {
-            frame.py_frame = Some(py.clone());
-        }
+        let shell = Rc::new(crate::object::FrameShell {
+            code: frame.code.clone(),
+            locals: frame.locals.clone(),
+            cells: frame.cells.clone(),
+            globals: frame.globals.clone(),
+            builtins: frame.builtins.clone(),
+            class_namespace: frame.class_namespace.clone(),
+            class_namespace_obj: frame.class_namespace_obj.clone(),
+            is_gen,
+            gen_owner: RefCell::new(
+                materialized
+                    .as_ref()
+                    .and_then(|py| py.gen_owner.borrow().clone())
+                    .or_else(|| frame.gen_owner.clone()),
+            ),
+            lasti: std::sync::atomic::AtomicU32::new(frame.pc),
+            has_materialized: std::sync::atomic::AtomicBool::new(materialized.is_some()),
+            materialized: RefCell::new(materialized),
+        });
+        self.frame_stack.borrow_mut().push(shell.clone());
+        shell
+    }
+
+    /// Push an already-materialised `PyFrame` (event dispatch around
+    /// generator throw/unwind) onto the spine.
+    fn push_materialized_frame(&self, py: &Rc<PyFrame>) {
         py.on_stack.set(py.on_stack.get() + 1);
-        self.frame_stack.borrow_mut().push(py.clone());
+        let shell = Rc::new(crate::object::FrameShell::from_py_frame(py));
+        self.frame_stack.borrow_mut().push(shell);
+    }
+
+    /// Materialise (or fetch) the Python-visible frame for the top of
+    /// this interpreter's spine, linking the `back` chain below it.
+    pub(crate) fn materialize_top_py_frame(&self) -> Option<Rc<PyFrame>> {
+        crate::object::materialize_stack_top(&self.frame_stack)
+    }
+
+    /// Dispatch-loop helper: materialise the current activation's
+    /// `PyFrame` once and cache it in the loop-local slot.
+    fn ensure_top_py_frame(&self, slot: &mut Option<Rc<PyFrame>>) -> Rc<PyFrame> {
+        if let Some(py) = slot {
+            return py.clone();
+        }
+        let py = self
+            .materialize_top_py_frame()
+            .expect("frame shell was pushed for this activation");
+        *slot = Some(py.clone());
         py
     }
 
     /// Construct a [`PyFrame`] snapshot for `frame` with the given
     /// `back` pointer, *without* touching the interpreter's call stack
-    /// or caching it on the frame. [`Self::push_py_frame`] uses this for
-    /// live frames (passing the current stack top as `back`); generator
+    /// or caching it on the frame. Shell materialisation covers live
+    /// frames (linking the current stack top as `back`); generator
     /// introspection (`gi_frame`/`cr_frame`/`ag_frame`) uses it to
     /// materialise the frame of a not-yet-started generator on demand,
     /// where `back` is `None` (a suspended/created generator frame has
@@ -4478,106 +4640,28 @@ impl Interpreter {
     fn build_py_frame(&self, frame: &Frame, back: Option<Rc<PyFrame>>) -> Rc<PyFrame> {
         // Share the live locals storage (RFC 0047): `f_locals` reads see
         // the current values with no per-instruction mirroring and no
-        // second strong clone per local (getrefcount parity).
-        let locals_snapshot = frame.locals.clone();
-        // Everything the provider needs is captured by cheap `Rc` bumps —
-        // the variable/cell *names* are read through the code object at
-        // materialisation time, never copied per call. (This closure is
-        // built for every Python frame push but invoked only on an actual
-        // `locals()` / `f_locals` access, so its construction must stay
-        // allocation-light: one `Rc` for the closure itself plus the
-        // cells vec clone, which is empty for closure-free functions.)
-        let code_for_provider = frame.code.clone();
-        let cells_snapshot: Vec<Rc<RefCell<Object>>> = frame.cells.clone();
-        let globals = frame.globals.clone();
-        let class_ns = frame.class_namespace.clone();
-        let class_ns_obj = frame.class_namespace_obj.clone();
-        let snapshot_for_provider = locals_snapshot.clone();
-        // At module / exec scope CPython makes `locals() is globals()`.
-        // We detect the module body by its conventional code name so a
-        // top-level `locals()` / `dir()` reflects the module namespace
-        // instead of an (empty) function-style snapshot.
-        let is_module_scope = frame.code.name == "<module>";
-        let globals_for_provider = globals.clone();
-        let provider: Rc<dyn Fn() -> Object + Send + Sync> = Rc::new(move || {
-            let snapshot = snapshot_for_provider.borrow();
-            // For module / class bodies the user-visible locals are
-            // the corresponding namespace dict (class_ns when set,
-            // otherwise globals).
-            // PEP 3115 custom class namespace (e.g. `enum.EnumDict`):
-            // `locals()`/`vars()` in the class body hand back the live
-            // mapping object itself, exactly as CPython does.
-            if let Some(ns_obj) = class_ns_obj.as_ref() {
-                return ns_obj.clone();
-            }
-            if let Some(ns) = class_ns.as_ref() {
-                return Object::Dict(ns.clone());
-            }
-            if is_module_scope {
-                return Object::Dict(globals_for_provider.clone());
-            }
-            let varnames = &code_for_provider.varnames;
-            let cell_names: Vec<&String> = code_for_provider
-                .cellvars
-                .iter()
-                .chain(code_for_provider.freevars.iter())
-                .collect();
-            // Function frames: copy the locals array into a dict so
-            // user code can read by name. We honour cell variables
-            // (their value lives in the cell, not the local slot).
-            let mut d = DictData::default();
-            for (name, value) in varnames.iter().zip(snapshot.iter()) {
-                // Compiler-synthesized temporaries (`.retval0`,
-                // `.eg_remaining0`, …) are implementation detail —
-                // CPython keeps its equivalents on the value stack, so
-                // they never appear in `f_locals`.
-                if name.starts_with('.') {
-                    continue;
-                }
-                if matches!(value, Object::Unbound) {
-                    if let Some(idx) = cell_names.iter().position(|c| *c == name) {
-                        if let Some(cell) = cells_snapshot.get(idx) {
-                            let v = cell.borrow().clone();
-                            if !matches!(v, Object::Unbound) {
-                                d.insert(DictKey(Object::from_str(name.clone())), v);
-                            }
-                            continue;
-                        }
-                    }
-                }
-                // Unbound slots (never assigned, or `del`eted) are
-                // absent from `f_locals`; a local that *is* bound to
-                // `None` stays visible (NameError suggestions rely on
-                // this distinction).
-                if !matches!(value, Object::Unbound) {
-                    d.insert(DictKey(Object::from_str(name.clone())), value.clone());
-                }
-            }
-            // Cellvars not present in varnames (e.g. `__class__`).
-            for (i, name) in cell_names.iter().enumerate() {
-                if varnames.iter().any(|v| v == *name) {
-                    continue;
-                }
-                if let Some(cell) = cells_snapshot.get(i) {
-                    let v = cell.borrow().clone();
-                    if !matches!(v, Object::Unbound) {
-                        d.insert(DictKey(Object::from_str((*name).clone())), v);
-                    }
-                }
-            }
-            Object::Dict(Rc::new(RefCell::new(d)))
-        });
+        // second strong clone per local (getrefcount parity). The
+        // locals-dict computation lives in `PyFrame::compute_locals`
+        // (RFC 0058) reading these plain fields — no provider closure.
         Rc::new(PyFrame {
             code: frame.code.clone(),
-            globals,
+            globals: frame.globals.clone(),
             builtins: frame.builtins.clone(),
             lasti: Cell::new(frame.pc),
             back: RefCell::new(back),
             locals_cache: RefCell::new(None),
-            locals_provider: RefCell::new(Some(provider)),
-            locals_mirror: RefCell::new(Some(locals_snapshot)),
+            cells: frame.cells.clone(),
+            class_namespace: frame.class_namespace.clone(),
+            class_namespace_obj: frame.class_namespace_obj.clone(),
+            // At module / exec scope CPython makes `locals() is
+            // globals()`. We detect the module body by its
+            // conventional code name so a top-level `locals()` /
+            // `dir()` reflects the module namespace instead of an
+            // (empty) function-style snapshot.
+            is_module_scope: frame.code.name == "<module>",
+            locals_mirror: RefCell::new(Some(frame.locals.clone())),
             trace: RefCell::new(Object::None),
-            gen_owner: RefCell::new(None),
+            gen_owner: RefCell::new(frame.gen_owner.clone()),
             override_lineno: Cell::new(None),
             trace_event: Cell::new(crate::linejump::TraceEvent::None),
             pending_jump: Cell::new(None),
@@ -4681,7 +4765,14 @@ impl Interpreter {
         // thread's live locals (multiprocessing's QueueFeederThread
         // `_feed` frame, cleared by unittest's `clear_frames` sweep in
         // test_concurrent_futures).
-        if py.on_stack.get() > 0 || self.frame_stack.borrow().iter().any(|f| Rc::ptr_eq(f, py)) {
+        let on_this_stack = self.frame_stack.borrow().iter().any(|shell| {
+            shell
+                .materialized
+                .borrow()
+                .as_ref()
+                .is_some_and(|f| Rc::ptr_eq(f, py))
+        });
+        if py.on_stack.get() > 0 || on_this_stack {
             return Err(crate::error::runtime_error(
                 "cannot clear an executing frame",
             ));
@@ -4779,32 +4870,34 @@ impl Interpreter {
         // (see `build_py_frame`), so there is nothing to copy; only the
         // materialised `f_locals` dict (if any) needs refreshing so a
         // previously handed-out handle observes the latest mutations.
+        // A never-materialised shell has no handed-out view to refresh.
         let _ = frame;
-        if let Some(py) = self.frame_stack.borrow().last() {
-            py.invalidate_locals();
+        if let Some(shell) = self.frame_stack.borrow().last() {
+            if let Some(py) = shell.materialized.borrow().as_ref() {
+                py.invalidate_locals();
+            }
         }
     }
 
-    fn pop_py_frame(&self) {
+    fn pop_frame_shell(&self) -> Option<Rc<crate::object::FrameShell>> {
         let popped = self.frame_stack.borrow_mut().pop();
-        if let Some(popped) = &popped {
-            popped.on_stack.set(popped.on_stack.get().saturating_sub(1));
-        }
-        // A generator-family frame that just suspended (yielded) or
-        // finished is no longer reachable from a live caller. CPython
-        // reports `gi_frame.f_back is None` whenever the generator is not
-        // currently executing, so drop the resumer link we set on entry.
-        // Ordinary function frames keep their `back` (tracebacks chain
-        // through it); only generator-family frames are re-entered and
-        // observed while suspended.
-        if let Some(popped) = popped {
-            if popped.code.is_generator
-                || popped.code.is_coroutine
-                || popped.code.is_async_generator
-            {
-                *popped.back.borrow_mut() = None;
+        if let Some(shell) = &popped {
+            if let Some(py) = shell.materialized.borrow().as_ref() {
+                py.on_stack.set(py.on_stack.get().saturating_sub(1));
+                // A generator-family frame that just suspended (yielded)
+                // or finished is no longer reachable from a live caller.
+                // CPython reports `gi_frame.f_back is None` whenever the
+                // generator is not currently executing, so drop the
+                // resumer link. Ordinary function frames keep their
+                // `back` (tracebacks chain through it); only
+                // generator-family frames are re-entered and observed
+                // while suspended.
+                if shell.is_gen {
+                    *py.back.borrow_mut() = None;
+                }
             }
         }
+        popped
     }
 
     /// The code object backing a generator/coroutine/async-generator
@@ -4862,13 +4955,16 @@ impl Interpreter {
             // `Task.get_stack()` reads from inside the running coroutine
             // (RFC 0054 WS2, test_tasks.test_get_stack).
             GeneratorState::Running => {
-                for py in self.frame_stack.borrow().iter().rev() {
-                    let owner = py.gen_owner.borrow().as_ref().and_then(|w| w.upgrade());
-                    if owner.is_some_and(|o| Rc::ptr_eq(&o, g)) {
-                        return Object::Frame(py.clone());
-                    }
+                let found_idx = self.frame_stack.borrow().iter().rposition(|shell| {
+                    let owner = shell.gen_owner.borrow().as_ref().and_then(|w| w.upgrade());
+                    owner.is_some_and(|o| Rc::ptr_eq(&o, g))
+                });
+                match found_idx
+                    .and_then(|idx| crate::object::materialize_stack_at(&self.frame_stack, idx))
+                {
+                    Some(py) => Object::Frame(py),
+                    None => Object::None,
                 }
-                Object::None
             }
             // Finished: the frame has been dropped.
             GeneratorState::Finished => Object::None,
@@ -5212,8 +5308,7 @@ impl Interpreter {
         if !crate::trace::any_observers_active() {
             return Ok(());
         }
-        let py_frame = self.frame_stack.borrow().last().cloned();
-        if let Some(py_frame) = py_frame {
+        if let Some(py_frame) = self.materialize_top_py_frame() {
             self.fire_exception_event(&py_frame, exc)?;
         }
         Ok(())
@@ -5680,6 +5775,9 @@ impl Interpreter {
                 self.delete_attr(&obj, &name)?;
             }
             OpCode::BinarySubscr => {
+                if self.specialized_binary_subscr(frame, cache_pc)? {
+                    return Ok(StepOutcome::Continue);
+                }
                 let i = frame.pop()?;
                 let v = frame.pop()?;
                 let r = if let Object::Instance(inst) = &v {
@@ -5836,6 +5934,9 @@ impl Interpreter {
                 }
             }
             OpCode::StoreSubscr => {
+                if self.specialized_store_subscr(frame, cache_pc)? {
+                    return Ok(StepOutcome::Continue);
+                }
                 let i = frame.pop()?;
                 let target = frame.pop()?;
                 let value = frame.pop()?;
@@ -7357,7 +7458,7 @@ impl Interpreter {
                     if self.exception_matches(&exc, &ty)? {
                         let wrapper = crate::builtin_types::make_naked_eg_wrapper(&exc);
                         if let (Object::Instance(inst), Some(py_frame)) =
-                            (&wrapper, self.frame_stack.borrow().last().cloned())
+                            (&wrapper, self.materialize_top_py_frame())
                         {
                             let lineno = frame
                                 .code
@@ -7547,8 +7648,13 @@ impl Interpreter {
                 // here, as RERAISE may have set it"); redirecting the pc
                 // would re-enter the same cleanup handler forever.
                 if let Some(orig) = frame.cleanup_lasti.take() {
-                    if let Some(py_frame) = self.frame_stack.borrow().last() {
-                        py_frame.lasti.set(orig);
+                    if let Some(shell) = self.frame_stack.borrow().last() {
+                        shell
+                            .lasti
+                            .store(orig, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(py_frame) = shell.materialized.borrow().as_ref() {
+                            py_frame.lasti.set(orig);
+                        }
                     }
                 }
                 return Err(RuntimeError::PyException(pe));
@@ -8139,7 +8245,7 @@ impl Interpreter {
     /// for the cheap `RuntimeError` Display impl) and the new
     /// `PyTraceback` chain stored on the instance dict so Python code
     /// can walk `exc.__traceback__`.
-    fn append_traceback(&self, exc: &mut PyException, frame: &Frame, lasti: u32, lineno: u32) {
+    fn append_traceback(&self, exc: &mut PyException, frame: &mut Frame, lasti: u32, lineno: u32) {
         exc.push_traceback(TracebackEntry {
             filename: frame.code.filename.clone(),
             funcname: frame.code.name.clone(),
@@ -8158,35 +8264,37 @@ impl Interpreter {
             .py_frame
             .clone()
             .or_else(|| {
-                self.frame_stack
+                // Materialise the current activation's shell when it is
+                // the stack top (the common raise path) — the traceback
+                // must reference *this* frame's snapshot. Activation
+                // identity is the shared locals storage, which is exact
+                // even under recursion (the code object is shared).
+                let is_top = self
+                    .frame_stack
                     .borrow()
                     .last()
-                    .filter(|top| Rc::ptr_eq(&top.code, &frame.code))
-                    .cloned()
+                    .is_some_and(|top| Rc::ptr_eq(&top.locals, &frame.locals));
+                if is_top {
+                    self.materialize_top_py_frame()
+                } else {
+                    None
+                }
             })
             .unwrap_or_else(|| {
-                // Fall back to a synthetic snapshot when neither source
-                // matches (e.g. a not-yet-entered generator frame, or an
-                // empty stack) so the chain stays non-empty.
-                Rc::new(PyFrame {
-                    code: frame.code.clone(),
-                    globals: frame.globals.clone(),
-                    builtins: frame.builtins.clone(),
-                    lasti: Cell::new(lasti),
-                    back: RefCell::new(None),
-                    locals_cache: RefCell::new(None),
-                    locals_provider: RefCell::new(None),
-                    locals_mirror: RefCell::new(None),
-                    trace: RefCell::new(Object::None),
-                    gen_owner: RefCell::new(None),
-                    override_lineno: Cell::new(None),
-                    trace_event: Cell::new(crate::linejump::TraceEvent::None),
-                    pending_jump: Cell::new(None),
-                    last_line: Cell::new(None),
-                    trace_lines: Cell::new(true),
-                    trace_opcodes: Cell::new(false),
-                    on_stack: Cell::new(0),
-                })
+                // Fall back to a fresh snapshot when neither source
+                // matches (e.g. a not-yet-entered generator frame
+                // receiving a throw, or an empty stack) so the chain
+                // stays non-empty. Cache it on generator-family frames
+                // so `gi_frame` keeps a stable identity.
+                let py = self.build_py_frame(frame, None);
+                py.lasti.set(lasti);
+                if frame.code.is_generator
+                    || frame.code.is_coroutine
+                    || frame.code.is_async_generator
+                {
+                    frame.py_frame = Some(py.clone());
+                }
+                py
             });
         let new_tb = Rc::new(PyTraceback {
             frame: py_frame,
@@ -8230,7 +8338,7 @@ impl Interpreter {
                 return;
             }
         }
-        let Some(py_frame) = self.frame_stack.borrow().last().cloned() else {
+        let Some(py_frame) = self.materialize_top_py_frame() else {
             return;
         };
         let new_tb = Rc::new(PyTraceback {
@@ -17390,16 +17498,12 @@ impl Interpreter {
             // stack for the duration of the inner throw: CPython
             // re-enters the outer generator frame, so code in the
             // inner generator sees `f_back` chain through it
-            // (`check_stack_names` expects ['f', 'g']).
-            let pushed_outer = frame.py_frame.clone().inspect(|py| {
-                *py.back.borrow_mut() = self.frame_stack.borrow().last().cloned();
-                py.on_stack.set(py.on_stack.get() + 1);
-                self.frame_stack.borrow_mut().push(py.clone());
-            });
+            // (`check_stack_names` expects ['f', 'g']). A cheap shell
+            // suffices — materialisation (and `back` linking) happens
+            // lazily if anything introspects the stack (RFC 0058).
+            self.push_frame_shell(&mut frame);
             let inner_result = self.throw_into_subiter(&sub_iter, exc.clone());
-            if pushed_outer.is_some() {
-                self.pop_py_frame();
-            }
+            self.pop_frame_shell();
             match inner_result {
                 Ok(v) => {
                     // Inner yielded: re-suspend the outer at the
@@ -17469,30 +17573,34 @@ impl Interpreter {
         // frame-entry call event (it would see the handler's no-line
         // `PUSH_EXC_INFO` and report `f_lineno = None`).
         if crate::trace::any_observers_active() {
-            if let Some(py) = frame.py_frame.clone() {
-                py.lasti.set(frame.pc);
-                let line = frame
-                    .code
-                    .linetable
-                    .get(frame.pc as usize)
-                    .copied()
-                    .unwrap_or(0);
-                if line != 0 {
-                    py.last_line.set(Some(line));
-                }
-                *py.back.borrow_mut() = self.frame_stack.borrow().last().cloned();
-                py.on_stack.set(py.on_stack.get() + 1);
-                self.frame_stack.borrow_mut().push(py.clone());
-                let hook_result = self
-                    .fire_call_event(&py)
-                    .and_then(|()| self.fire_exception_event(&py, &exc));
-                self.pop_py_frame();
-                if let Err(err) = hook_result {
-                    *gen.state.borrow_mut() = GeneratorState::Finished;
-                    return Err(err);
-                }
-                frame.suppress_call_event = true;
+            let py = frame.py_frame.clone().unwrap_or_else(|| {
+                // Tracing needs the real frame object; build and cache
+                // it so `gi_frame` keeps a stable identity (RFC 0058).
+                let py = self.build_py_frame(&frame, None);
+                frame.py_frame = Some(py.clone());
+                py
+            });
+            py.lasti.set(frame.pc);
+            let line = frame
+                .code
+                .linetable
+                .get(frame.pc as usize)
+                .copied()
+                .unwrap_or(0);
+            if line != 0 {
+                py.last_line.set(Some(line));
             }
+            *py.back.borrow_mut() = self.materialize_top_py_frame();
+            self.push_materialized_frame(&py);
+            let hook_result = self
+                .fire_call_event(&py)
+                .and_then(|()| self.fire_exception_event(&py, &exc));
+            self.pop_frame_shell();
+            if let Err(err) = hook_result {
+                *gen.state.borrow_mut() = GeneratorState::Finished;
+                return Err(err);
+            }
+            frame.suppress_call_event = true;
         }
 
         // Let the suspended frame handle the exception via its own
@@ -17529,14 +17637,16 @@ impl Interpreter {
                 // (test_cprofile.test_throw).
                 *gen.state.borrow_mut() = GeneratorState::Finished;
                 if crate::trace::any_observers_active() {
-                    if let Some(py) = frame.py_frame.clone() {
-                        *py.back.borrow_mut() = self.frame_stack.borrow().last().cloned();
-                        py.on_stack.set(py.on_stack.get() + 1);
-                        self.frame_stack.borrow_mut().push(py.clone());
-                        let hook_result = self.fire_unwind_event(&py);
-                        self.pop_py_frame();
-                        hook_result?;
-                    }
+                    let py = frame.py_frame.clone().unwrap_or_else(|| {
+                        let py = self.build_py_frame(&frame, None);
+                        frame.py_frame = Some(py.clone());
+                        py
+                    });
+                    *py.back.borrow_mut() = self.materialize_top_py_frame();
+                    self.push_materialized_frame(&py);
+                    let hook_result = self.fire_unwind_event(&py);
+                    self.pop_frame_shell();
+                    hook_result?;
                 }
                 Err(self.pep479_escape(gen, err))
             }
@@ -19367,6 +19477,82 @@ impl Interpreter {
                 specialize::record_hit(op_idx);
                 Ok(true)
             }
+            IC::BinOpDivInt | IC::BinOpFloorDivInt | IC::BinOpModInt | IC::BinOpPowInt => {
+                let matches_kind = matches!(
+                    (cache, kind),
+                    (IC::BinOpDivInt, BinOpKind::Div)
+                        | (IC::BinOpFloorDivInt, BinOpKind::FloorDiv)
+                        | (IC::BinOpModInt, BinOpKind::Mod)
+                        | (IC::BinOpPowInt, BinOpKind::Pow)
+                );
+                if !matches_kind {
+                    return self.deopt_binary_op(frame, cache_pc);
+                }
+                let (a, b) = match (frame.peek_back(1), frame.peek_back(0)) {
+                    (Some(Object::Int(x)), Some(Object::Int(y))) => (*x, *y),
+                    _ => return self.deopt_binary_op(frame, cache_pc),
+                };
+                // `i64_op` is the same primitive the generic path runs, so
+                // error semantics (ZeroDivisionError messages, `0 ** -n`)
+                // match exactly; `None` (result needs the bignum path)
+                // deopts to the generic handler.
+                let len = frame.stack.len();
+                let r = match i64_op(a, b, kind) {
+                    Ok(Some(r)) => r,
+                    Ok(None) => return self.deopt_binary_op(frame, cache_pc),
+                    Err(e) => {
+                        frame.stack.truncate(len - 2);
+                        return Err(e);
+                    }
+                };
+                frame.stack.truncate(len - 2);
+                frame.push(r);
+                specialize::record_hit(op_idx);
+                Ok(true)
+            }
+            IC::BinOpDivFloat | IC::BinOpFloorDivFloat | IC::BinOpModFloat | IC::BinOpPowFloat => {
+                let matches_kind = matches!(
+                    (cache, kind),
+                    (IC::BinOpDivFloat, BinOpKind::Div)
+                        | (IC::BinOpFloorDivFloat, BinOpKind::FloorDiv)
+                        | (IC::BinOpModFloat, BinOpKind::Mod)
+                        | (IC::BinOpPowFloat, BinOpKind::Pow)
+                );
+                if !matches_kind {
+                    return self.deopt_binary_op(frame, cache_pc);
+                }
+                let (a, b) = match (frame.peek_back(1), frame.peek_back(0)) {
+                    (Some(Object::Float(x)), Some(Object::Float(y))) => (*x, *y),
+                    _ => return self.deopt_binary_op(frame, cache_pc),
+                };
+                // Same helpers as the generic `binary_op` float arms.
+                let res = match kind {
+                    BinOpKind::Div => {
+                        if b == 0.0 {
+                            Err(zero_division_error("float division by zero"))
+                        } else {
+                            Ok(crate::object::fresh_float(a / b))
+                        }
+                    }
+                    BinOpKind::FloorDiv => py_float_divmod(a, b, "float floor division by zero")
+                        .map(|(q, _)| crate::object::fresh_float(q)),
+                    BinOpKind::Mod => py_float_mod(a, b).map(crate::object::fresh_float),
+                    BinOpKind::Pow => float_pow(a, b),
+                    _ => unreachable!("kind checked against cache above"),
+                };
+                let len = frame.stack.len();
+                let r = match res {
+                    Ok(r) => r,
+                    Err(e) => {
+                        frame.stack.truncate(len - 2);
+                        return Err(e);
+                    }
+                };
+                frame.stack.truncate(len - 2);
+                frame.push(r);
+                specialize::record_hit(op_idx);
+                Ok(true)
+            }
             IC::BinOpAddFloat | IC::BinOpSubFloat | IC::BinOpMulFloat => {
                 let (a, b) = match (frame.peek_back(1), frame.peek_back(0)) {
                     (Some(Object::Float(x)), Some(Object::Float(y))) => (*x, *y),
@@ -19512,6 +19698,229 @@ impl Interpreter {
     #[inline]
     fn deopt_compare_op(&self, frame: &Frame, cache_pc: u32) -> Result<bool, RuntimeError> {
         specialize::record_miss(OpCode::CompareOp as u8);
+        frame
+            .code
+            .caches
+            .set(cache_pc, weavepy_compiler::InlineCache::Cooldown(COOLDOWN));
+        Ok(false)
+    }
+
+    /// Run the `BINARY_SUBSCR` cache machinery (RFC 0058 WS3). Returns
+    /// `Ok(true)` if a fast path consumed both operands and pushed the
+    /// result, `Ok(false)` if the caller should run the generic handler
+    /// (operands untouched on the stack), or an error raised with
+    /// CPython-identical semantics from inside a fast path.
+    ///
+    /// The container's enum variant is the guard — no fingerprint is
+    /// stored, so a type change at the site deopts on the next hit. The
+    /// raising paths (out-of-range index, missing dict key) mirror the
+    /// generic arm exactly: operands leave the stack first, then the
+    /// same error constructor runs, so a hot loop that legitimately
+    /// raises once doesn't thrash the cache through a deopt cycle.
+    fn specialized_binary_subscr(
+        &mut self,
+        frame: &mut Frame,
+        cache_pc: u32,
+    ) -> Result<bool, RuntimeError> {
+        use weavepy_compiler::InlineCache as IC;
+        let cache = frame.code.caches.get(cache_pc);
+        let op_idx = OpCode::BinarySubscr as u8;
+        match cache {
+            IC::Empty => {
+                specialize::record_specialize_attempt(op_idx);
+                let decision = match (frame.peek_back(1), frame.peek_back(0)) {
+                    (Some(c), Some(i)) => specialize::attempt_specialize_binary_subscr(c, i),
+                    _ => return Ok(false),
+                };
+                frame.code.caches.set(cache_pc, decision);
+                if matches!(decision, IC::Cooldown(_)) {
+                    specialize::record_specialize_skip(op_idx);
+                    return Ok(false);
+                }
+                specialize::record_specialize_success(op_idx);
+                self.specialized_binary_subscr(frame, cache_pc)
+            }
+            IC::SubscrListInt => {
+                let (items, idx) = match (frame.peek_back(1), frame.peek_back(0)) {
+                    (Some(Object::List(xs)), Some(Object::Int(i))) => (xs.clone(), *i),
+                    _ => return self.deopt_binary_subscr(frame, cache_pc),
+                };
+                let len = frame.stack.len();
+                let r = {
+                    let xs = items.borrow();
+                    match normalize_index_msg(idx, xs.len(), "list index out of range") {
+                        Ok(i) => xs[i].clone(),
+                        Err(e) => {
+                            drop(xs);
+                            frame.stack.truncate(len - 2);
+                            return Err(e);
+                        }
+                    }
+                };
+                frame.stack.truncate(len - 2);
+                frame.push(r);
+                specialize::record_hit(op_idx);
+                Ok(true)
+            }
+            IC::SubscrTupleInt => {
+                let (items, idx) = match (frame.peek_back(1), frame.peek_back(0)) {
+                    (Some(Object::Tuple(t)), Some(Object::Int(i))) => (t.clone(), *i),
+                    _ => return self.deopt_binary_subscr(frame, cache_pc),
+                };
+                let len = frame.stack.len();
+                let r = match normalize_index_msg(idx, items.len(), "tuple index out of range") {
+                    Ok(i) => items[i].clone(),
+                    Err(e) => {
+                        frame.stack.truncate(len - 2);
+                        return Err(e);
+                    }
+                };
+                frame.stack.truncate(len - 2);
+                frame.push(r);
+                specialize::record_hit(op_idx);
+                Ok(true)
+            }
+            IC::SubscrStrInt => {
+                let (s, idx) = match (frame.peek_back(1), frame.peek_back(0)) {
+                    (Some(Object::Str(s)), Some(Object::Int(i))) => (s.clone(), *i),
+                    _ => return self.deopt_binary_subscr(frame, cache_pc),
+                };
+                // Re-verify the ASCII property (code-point count ==
+                // byte count) — the slot outlives any one receiver.
+                if crate::object::str_char_len(&s) != s.len() {
+                    return self.deopt_binary_subscr(frame, cache_pc);
+                }
+                let len = frame.stack.len();
+                let r = match normalize_index_msg(idx, s.len(), "string index out of range") {
+                    Ok(i) => Object::from_str((s.as_bytes()[i] as char).to_string()),
+                    Err(e) => {
+                        frame.stack.truncate(len - 2);
+                        return Err(e);
+                    }
+                };
+                frame.stack.truncate(len - 2);
+                frame.push(r);
+                specialize::record_hit(op_idx);
+                Ok(true)
+            }
+            IC::SubscrDict => {
+                let (d, key) = match (frame.peek_back(1), frame.peek_back(0)) {
+                    (Some(Object::Dict(d)), Some(k)) => (d.clone(), k.clone()),
+                    _ => return self.deopt_binary_subscr(frame, cache_pc),
+                };
+                // Operands leave the stack before the lookup / error
+                // construction, matching the generic arm — a user
+                // `__eq__` / `__repr__` on the key can re-enter the VM.
+                let len = frame.stack.len();
+                frame.stack.truncate(len - 2);
+                crate::builtins::ensure_hashable(&key)?;
+                let found = crate::builtins::dict_lookup(&d, &key)?;
+                let r = found.ok_or_else(|| key_error_object(key.clone()))?;
+                frame.push(r);
+                specialize::record_hit(op_idx);
+                Ok(true)
+            }
+            IC::Cooldown(n) => {
+                let next = if n > 0 {
+                    IC::Cooldown(n - 1)
+                } else {
+                    IC::Empty
+                };
+                frame.code.caches.set(cache_pc, next);
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Deopt a `BINARY_SUBSCR` cache.
+    #[inline]
+    fn deopt_binary_subscr(&self, frame: &Frame, cache_pc: u32) -> Result<bool, RuntimeError> {
+        specialize::record_miss(OpCode::BinarySubscr as u8);
+        frame
+            .code
+            .caches
+            .set(cache_pc, weavepy_compiler::InlineCache::Cooldown(COOLDOWN));
+        Ok(false)
+    }
+
+    /// Run the `STORE_SUBSCR` cache machinery (RFC 0058 WS3). Same
+    /// contract as [`Self::specialized_binary_subscr`], for the write
+    /// side. Stack on entry: `… value, target, index` (index on top).
+    fn specialized_store_subscr(
+        &mut self,
+        frame: &mut Frame,
+        cache_pc: u32,
+    ) -> Result<bool, RuntimeError> {
+        use weavepy_compiler::InlineCache as IC;
+        let cache = frame.code.caches.get(cache_pc);
+        let op_idx = OpCode::StoreSubscr as u8;
+        match cache {
+            IC::Empty => {
+                specialize::record_specialize_attempt(op_idx);
+                let decision = match (frame.peek_back(1), frame.peek_back(0)) {
+                    (Some(t), Some(i)) => specialize::attempt_specialize_store_subscr(t, i),
+                    _ => return Ok(false),
+                };
+                frame.code.caches.set(cache_pc, decision);
+                if matches!(decision, IC::Cooldown(_)) {
+                    specialize::record_specialize_skip(op_idx);
+                    return Ok(false);
+                }
+                specialize::record_specialize_success(op_idx);
+                self.specialized_store_subscr(frame, cache_pc)
+            }
+            IC::StoreSubscrListInt => {
+                let (items, idx) = match (frame.peek_back(1), frame.peek_back(0)) {
+                    (Some(Object::List(xs)), Some(Object::Int(i))) => (xs.clone(), *i),
+                    _ => return self.deopt_store_subscr(frame, cache_pc),
+                };
+                let len = frame.stack.len();
+                frame.stack.truncate(len - 2);
+                let value = frame.pop()?;
+                let evicted = {
+                    let mut xs = items.borrow_mut();
+                    let i =
+                        normalize_index_msg(idx, xs.len(), "list assignment index out of range")?;
+                    std::mem::replace(&mut xs[i], value)
+                };
+                crate::vm_singletons::queue_container_removed(&evicted);
+                specialize::record_hit(op_idx);
+                Ok(true)
+            }
+            IC::StoreSubscrDict => {
+                let (d, key) = match (frame.peek_back(1), frame.peek_back(0)) {
+                    (Some(Object::Dict(d)), Some(k)) => (d.clone(), k.clone()),
+                    _ => return self.deopt_store_subscr(frame, cache_pc),
+                };
+                let len = frame.stack.len();
+                frame.stack.truncate(len - 2);
+                let value = frame.pop()?;
+                crate::builtins::ensure_hashable(&key)?;
+                let old = crate::builtins::dict_insert(&d, key, value)?;
+                if let Some(old) = old {
+                    crate::vm_singletons::queue_container_removed(&old);
+                }
+                specialize::record_hit(op_idx);
+                Ok(true)
+            }
+            IC::Cooldown(n) => {
+                let next = if n > 0 {
+                    IC::Cooldown(n - 1)
+                } else {
+                    IC::Empty
+                };
+                frame.code.caches.set(cache_pc, next);
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Deopt a `STORE_SUBSCR` cache.
+    #[inline]
+    fn deopt_store_subscr(&self, frame: &Frame, cache_pc: u32) -> Result<bool, RuntimeError> {
+        specialize::record_miss(OpCode::StoreSubscr as u8);
         frame
             .code
             .caches
@@ -20222,6 +20631,34 @@ impl Interpreter {
                 self.deopt_for_iter(frame, cache_pc);
                 Ok(false)
             }
+            IC::ForIterStr | IC::ForIterDict => {
+                let mut it = it_handle.borrow_mut();
+                let guard_ok = matches!(
+                    (cache, &*it),
+                    (IC::ForIterStr, crate::object::PyIterator::Str { .. })
+                        | (IC::ForIterDict, crate::object::PyIterator::DictKeys { .. })
+                );
+                if !guard_ok {
+                    drop(it);
+                    self.deopt_for_iter(frame, cache_pc);
+                    return Ok(false);
+                }
+                // Same checked step as the generic `Object::Iter` arm —
+                // the dict size/keys-changed guards live inside
+                // `next_value_checked`, so mutation-during-iteration
+                // errors propagate identically.
+                let next = it.next_value_checked()?;
+                drop(it);
+                match next {
+                    Some(v) => frame.push(v),
+                    None => {
+                        frame.pop()?;
+                        frame.pc += jump_arg;
+                    }
+                }
+                specialize::record_hit(op_idx);
+                Ok(true)
+            }
             IC::Empty => {
                 let receiver = frame.stack.last().cloned().unwrap_or(Object::None);
                 specialize::record_specialize_attempt(op_idx);
@@ -20807,9 +21244,24 @@ impl Interpreter {
                 // ambient lookup namespace (RFC 0052 WS5), so no
                 // mirroring is needed: this plain insert is immediately
                 // visible to every frame's name resolution.
-                m.dict
+                let old = m
+                    .dict
                     .borrow_mut()
                     .insert(DictKey(Object::from_str(name)), value);
+                // CPython decrefs the displaced attribute at store time
+                // (`module_setattro` → dict insert), and a module attr
+                // store is just a global rebind spelled from outside, so
+                // mirror the `StoreGlobal` reap. The motivating shape:
+                // `catch_warnings.__exit__` restoring
+                // `warnings._showwarnmsg_impl` displaces the recording
+                // `log.append` bound method — the last reference to the
+                // record log and every `WarningMessage` on it, including
+                // finalizer-emitted `source=` objects that must die (and
+                // close their files) the instant the log does
+                // (test_tempfile.test_warnings_on_cleanup).
+                if let Some(old) = old {
+                    self.maybe_prompt_reap_replaced(old);
+                }
                 Ok(())
             }
             Object::Function(f) => {
@@ -21517,9 +21969,11 @@ impl Interpreter {
                 let removed = m
                     .dict
                     .borrow_mut()
-                    .shift_remove(&DictKey(Object::from_str(name)))
-                    .is_some();
-                if removed {
+                    .shift_remove(&DictKey(Object::from_str(name)));
+                if let Some(old) = removed {
+                    // Same decref-at-removal semantics as the store arm
+                    // above / `DeleteGlobal`.
+                    self.maybe_prompt_reap_replaced(old);
                     Ok(())
                 } else {
                     Err(attribute_error(format!(
@@ -22701,99 +23155,6 @@ impl Interpreter {
         kwargs: &[(String, Object)],
         outer_globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
-        /// Names handled by the interpreter-aware dispatch chain in the
-        /// `Object::Builtin` arm. Single `match` (length + memcmp) so
-        /// the hot native-method path doesn't walk ~50 comparisons.
-        #[inline]
-        fn builtin_needs_interp(name: &str) -> bool {
-            name.starts_with("__vm:")
-                || name.starts_with(".u.")
-                || name == builtins::BUILD_CLASS_NAME
-                || matches!(
-                    name,
-                    ".format"
-                        | ".format_map"
-                        | ".gc.collect"
-                        | ".gc.get_objects"
-                        | ".gc.get_referrers"
-                        | ".object_getattribute"
-                        | ".object_reduce"
-                        | ".object_reduce_ex"
-                        | "__new__"
-                        | "abs"
-                        | "aiter"
-                        | "all"
-                        | "anext"
-                        | "any"
-                        | "ascii"
-                        | "bool"
-                        | "breakpoint"
-                        | "complex"
-                        | "delattr"
-                        | "dict"
-                        | "dir"
-                        | "divmod"
-                        | "extend"
-                        | "filter"
-                        | "float"
-                        | "format"
-                        | "getattr"
-                        | "globals"
-                        | "hasattr"
-                        | "hash"
-                        | "int"
-                        | "isinstance"
-                        | "issubclass"
-                        | "iter"
-                        | "len"
-                        | "list"
-                        | "locals"
-                        | "map"
-                        | "max"
-                        | "memoryview"
-                        | "min"
-                        | "next"
-                        | "pow"
-                        | "print"
-                        | "repr"
-                        | "reversed"
-                        | "round"
-                        | "setattr"
-                        | "sort"
-                        | "sorted"
-                        | "str"
-                        | "sum"
-                        | "tuple"
-                        | "update"
-                        // `dict.__init__` merges positional + keyword args
-                        // like `update` (routed below); other `__init__`
-                        // builtins fall through unchanged.
-                        | "__init__"
-                        | "vars"
-                        | "zip"
-                        | "open"
-                        | "fspath"
-                        | "fsdecode"
-                        | "fsencode"
-                        | "join"
-                        | "fromkeys"
-                        | "union"
-                        | "intersection"
-                        | "difference"
-                        | "symmetric_difference"
-                        | "intersection_update"
-                        | "difference_update"
-                        | "symmetric_difference_update"
-                        | "issubset"
-                        | "issuperset"
-                        | "isdisjoint"
-                        | "writelines"
-                        | "enumerate"
-                        | "prod"
-                        | "getsizeof"
-                        | "from_bytes"
-                )
-        }
         let _ = outer_globals;
         match callable {
             Object::Builtin(b) => {
@@ -23192,7 +23553,7 @@ impl Interpreter {
                         // exec scope this *is* the module dict; in
                         // function scope it's a fresh dict snapshot of
                         // the locals (PEP 667).
-                        if let Some(top) = self.frame_stack.borrow().last() {
+                        if let Some(top) = self.materialize_top_py_frame() {
                             return Ok(top.locals_snapshot());
                         }
                         return Ok(Object::Dict(outer_globals.clone()));
@@ -23202,7 +23563,7 @@ impl Interpreter {
                         // bound in the *current* local scope — CPython's
                         // `sorted(locals())`. (With an argument it falls
                         // through to the generic `b_dir` introspection.)
-                        let locals = match self.frame_stack.borrow().last() {
+                        let locals = match self.materialize_top_py_frame() {
                             Some(top) => top.locals(),
                             None => Object::Dict(outer_globals.clone()),
                         };
@@ -27731,6 +28092,7 @@ impl Interpreter {
                         gen_code,
                         Box::new(frame),
                     ));
+                    Self::set_frame_gen_owner(&gen);
                     if let Some(origin) = cr_origin {
                         *gen.origin.borrow_mut() = origin;
                     }
@@ -27763,6 +28125,18 @@ impl Interpreter {
         }
     }
 
+    /// Stamp a freshly-created generator's weak backlink onto its own
+    /// boxed frame (RFC 0058) — the executing frame's `FrameShell`
+    /// inherits it so a *running* generator's `gi_frame` can be found
+    /// without eager `PyFrame` construction.
+    fn set_frame_gen_owner(gen: &Rc<PyGenerator>) {
+        if let GeneratorState::Created(boxed) = &mut *gen.state.borrow_mut() {
+            if let Some(fr) = boxed.downcast_mut::<Frame>() {
+                fr.gen_owner = Some(Rc::downgrade(gen));
+            }
+        }
+    }
+
     /// Bootstrap a generator/coroutine *code object* frame that was not
     /// entered through a `PyFunction` call — `eval(co)` / `exec(co)` of
     /// PyCF_ALLOW_TOP_LEVEL_AWAIT module code (RFC 0052). Runs the frame
@@ -27790,6 +28164,7 @@ impl Interpreter {
                     gen_code,
                     Box::new(frame),
                 ));
+                Self::set_frame_gen_owner(&gen);
                 let obj = if code.is_coroutine {
                     Object::Coroutine(gen)
                 } else if code.is_async_generator {
@@ -27899,6 +28274,66 @@ impl Interpreter {
             // descriptor instances), so `redispatch_descriptor` doesn't
             // disqualify the owned path.
             if let Object::Function(f) = &bm.function {
+                // RFC 0058 WS3 — `CallBoundMethodExact`: the exact-arity
+                // binder skip applied to `obj.m(...)`. Consulted here
+                // because bound Python methods never reach the shared
+                // cache match below.
+                let cache = frame.code.caches.get(cache_pc);
+                match cache {
+                    IC::CallBoundMethodExact { func_id, argc: ca } if ca as usize == argc => {
+                        let code = f.code();
+                        // Same ABA / `__code__`-rebinding re-verification
+                        // as the plain-function shapes.
+                        if specialize::rc_id(f) == func_id
+                            && args.len() == argc
+                            && code.arg_count as usize == argc + 1
+                            && !code.is_generator
+                            && !code.is_coroutine
+                            && !code.is_async_generator
+                            && !code.has_varargs
+                            && !code.has_varkeywords
+                            && code.kwonly_count == 0
+                            && code.cellvars.is_empty()
+                            && code.freevars.is_empty()
+                            && f.closure.is_empty()
+                        {
+                            specialize::record_hit(op_idx);
+                            let f = f.clone();
+                            let mut combined: Vec<Object> = Vec::with_capacity(argc + 1);
+                            combined.push(bm.receiver.clone());
+                            combined.append(&mut args);
+                            drop(callable);
+                            let r = self.run_py_exact_nofree(&f, combined)?;
+                            frame.push(r);
+                            return Ok(());
+                        }
+                        specialize::record_miss(op_idx);
+                        frame.code.caches.set(cache_pc, IC::Cooldown(COOLDOWN));
+                    }
+                    IC::Empty => {
+                        specialize::record_specialize_attempt(op_idx);
+                        let decision = if args.len() == argc {
+                            specialize::attempt_specialize_call_bound_py(f, argc)
+                        } else {
+                            IC::Cooldown(COOLDOWN)
+                        };
+                        frame.code.caches.set(cache_pc, decision);
+                        if matches!(decision, IC::Cooldown(_)) {
+                            specialize::record_specialize_skip(op_idx);
+                        } else {
+                            specialize::record_specialize_success(op_idx);
+                        }
+                    }
+                    IC::Cooldown(n) => {
+                        let next = if n > 0 {
+                            IC::Cooldown(n - 1)
+                        } else {
+                            IC::Empty
+                        };
+                        frame.code.caches.set(cache_pc, next);
+                    }
+                    _ => {}
+                }
                 let f = f.clone();
                 let mut combined: Vec<Object> = Vec::with_capacity(args.len() + 1);
                 combined.push(bm.receiver.clone());
@@ -27933,6 +28368,9 @@ impl Interpreter {
                         if specialize::rc_id(f) == func_id
                             && args.len() == argc
                             && code.arg_count as usize == argc
+                            && !code.is_generator
+                            && !code.is_coroutine
+                            && !code.is_async_generator
                             && !code.has_varargs
                             && !code.has_varkeywords
                             && code.kwonly_count == 0
@@ -27963,6 +28401,9 @@ impl Interpreter {
                         if specialize::rc_id(f) == func_id
                             && args.len() == argc
                             && code.arg_count as usize == argc
+                            && !code.is_generator
+                            && !code.is_coroutine
+                            && !code.is_async_generator
                             && !code.has_varargs
                             && !code.has_varkeywords
                             && code.kwonly_count == 0
@@ -27979,9 +28420,113 @@ impl Interpreter {
                     self.deopt_call_generic(frame, cache_pc, &callable, &mut args)?;
                 }
             }
+            IC::CallPyDefaults { func_id, argc: ca } => {
+                let mut took_fast = false;
+                if ca as usize == argc {
+                    if let Object::Function(f) = &callable {
+                        let code = f.code();
+                        let total = code.arg_count as usize;
+                        if specialize::rc_id(f) == func_id
+                            && args.len() == argc
+                            && argc < total
+                            && f.defaults.len() >= total - argc
+                            && !code.is_generator
+                            && !code.is_coroutine
+                            && !code.is_async_generator
+                            && !code.has_varargs
+                            && !code.has_varkeywords
+                            && code.kwonly_count == 0
+                            && code.cellvars.is_empty()
+                            && code.freevars.is_empty()
+                            && f.closure.is_empty()
+                            // A later `f.__defaults__ = …` override lives in
+                            // the slot store and replaces the compiled tuple
+                            // in the generic binder — deopt to honour it.
+                            && f.slot("__defaults__").is_none()
+                        {
+                            specialize::record_hit(op_idx);
+                            let f = f.clone();
+                            let mut full = std::mem::take(&mut args);
+                            // Defaults align right-to-left with the
+                            // declared positionals, exactly like the
+                            // generic binder's missing-tail fill.
+                            let missing = total - full.len();
+                            full.extend(f.defaults[f.defaults.len() - missing..].iter().cloned());
+                            let r = self.run_py_exact_nofree(&f, full)?;
+                            frame.push(r);
+                            took_fast = true;
+                        }
+                    }
+                }
+                if !took_fast {
+                    self.deopt_call_generic(frame, cache_pc, &callable, &mut args)?;
+                }
+            }
+            IC::CallNative { func_id, argc: ca } => {
+                // Deopt whenever observers are active so `c_call` /
+                // `c_return` profile events keep firing through the
+                // generic (profiled) path.
+                let mut took_fast = false;
+                if ca as usize == argc && !crate::trace::any_observers_active() {
+                    if let Object::Builtin(b) = &callable {
+                        // Re-verify the name gate (ABA: a recycled
+                        // allocation could be a different builtin).
+                        if specialize::rc_id(b) == func_id
+                            && args.len() == argc
+                            && native_call_ic_safe(b.name)
+                        {
+                            specialize::record_hit(op_idx);
+                            let r = match b.call_kw.as_ref() {
+                                Some(ckw) => ckw(&args, &[])?,
+                                None => (b.call)(&args)?,
+                            };
+                            frame.push(r);
+                            took_fast = true;
+                        }
+                    }
+                }
+                if !took_fast {
+                    self.deopt_call_generic(frame, cache_pc, &callable, &mut args)?;
+                }
+            }
+            IC::CallNativeMethod { func_id, argc: ca } => {
+                let mut took_fast = false;
+                if ca as usize == argc && !crate::trace::any_observers_active() {
+                    if let Object::BoundMethod(bm) = &callable {
+                        if let Object::Builtin(b) = &bm.function {
+                            if specialize::rc_id(b) == func_id
+                                && args.len() == argc
+                                && native_call_ic_safe(b.name)
+                            {
+                                specialize::record_hit(op_idx);
+                                let mut combined: Vec<Object> = Vec::with_capacity(argc + 1);
+                                combined.push(bm.receiver.clone());
+                                combined.extend(args.iter().cloned());
+                                let r = match b.call_kw.as_ref() {
+                                    Some(ckw) => ckw(&combined, &[])?,
+                                    None => (b.call)(&combined)?,
+                                };
+                                frame.push(r);
+                                took_fast = true;
+                            }
+                        }
+                    }
+                }
+                if !took_fast {
+                    self.deopt_call_generic(frame, cache_pc, &callable, &mut args)?;
+                }
+            }
             IC::Empty => {
                 specialize::record_specialize_attempt(op_idx);
-                let decision = specialize::attempt_specialize_call(&callable, argc);
+                let decision = if args.len() == argc {
+                    specialize::attempt_specialize_call(&callable, argc)
+                } else {
+                    // Argument fixups ran (zero-arg `super()` injection):
+                    // the opcode arity no longer matches the vector, so
+                    // any cached shape would guard against the wrong
+                    // count. Stay generic.
+                    IC::Cooldown(COOLDOWN)
+                };
                 frame.code.caches.set(cache_pc, decision);
                 if matches!(decision, IC::Cooldown(_)) {
                     specialize::record_specialize_skip(op_idx);
@@ -28071,8 +28616,7 @@ impl Interpreter {
     ) -> Result<Object, RuntimeError> {
         if crate::trace::any_observers_active() && is_c_profiled_callable(callable) {
             if let Some(profile) = crate::trace::profile_hook() {
-                let py_frame = self.frame_stack.borrow().last().cloned();
-                if let Some(py_frame) = py_frame {
+                if let Some(py_frame) = self.materialize_top_py_frame() {
                     self.invoke_observe_hook(
                         &profile,
                         &py_frame,
@@ -28113,15 +28657,18 @@ impl Interpreter {
         args: Vec<Object>,
     ) -> Result<Object, RuntimeError> {
         let code = f.code();
-        let mut locals = vec![Object::Unbound; code.varnames.len()];
-        for (slot, v) in args.into_iter().enumerate() {
-            locals[slot] = v;
+        let locals_rc = self.pooled_locals(code.varnames.len());
+        {
+            let mut locals = locals_rc.borrow_mut();
+            for (slot, v) in args.into_iter().enumerate() {
+                locals[slot] = v;
+            }
         }
         let mut frame = Frame {
             code,
-            locals: Rc::new(RefCell::new(locals)),
-            cells: Vec::new(),
-            stack: Vec::with_capacity(16),
+            locals: locals_rc,
+            cells: crate::object::empty_cells(),
+            stack: self.pooled_stack(),
             globals: f.globals.clone(),
             builtins: f.builtins.clone(),
             class_namespace: None,
@@ -28131,6 +28678,7 @@ impl Interpreter {
             agen_yielded_value: true,
             pc: 0,
             py_frame: None,
+            gen_owner: None,
             cleanup_lasti: None,
             suppress_call_event: false,
         };
@@ -29692,7 +30240,7 @@ impl Interpreter {
                     // the same dict (CPython), i.e. no distinct mapping.
                     None
                 } else {
-                    let caller = self.frame_stack.borrow().last().cloned();
+                    let caller = self.materialize_top_py_frame();
                     caller.and_then(|f| {
                         f.invalidate_locals();
                         match f.locals() {
@@ -29838,7 +30386,7 @@ impl Interpreter {
                     // caller's frame.
                     None
                 } else {
-                    let caller = self.frame_stack.borrow().last().cloned();
+                    let caller = self.materialize_top_py_frame();
                     caller.and_then(|f| {
                         f.invalidate_locals();
                         match f.locals() {
@@ -36759,6 +37307,115 @@ fn is_c_profiled_callable(obj: &Object) -> bool {
     }
 }
 
+/// Names handled by the interpreter-aware dispatch chain in
+/// [`Interpreter::call`]'s `Object::Builtin` arm. Single `match`
+/// (length + memcmp) so the hot native-method path doesn't walk ~50
+/// comparisons. Shared with the CALL inline caches (RFC 0058 WS3),
+/// whose native fast paths must never bypass this chain.
+#[inline]
+pub(crate) fn builtin_needs_interp(name: &str) -> bool {
+    name.starts_with("__vm:")
+        || name.starts_with(".u.")
+        || name == builtins::BUILD_CLASS_NAME
+        || matches!(
+            name,
+            ".format"
+                | ".format_map"
+                | ".gc.collect"
+                | ".gc.get_objects"
+                | ".gc.get_referrers"
+                | ".object_getattribute"
+                | ".object_reduce"
+                | ".object_reduce_ex"
+                | "__new__"
+                | "abs"
+                | "aiter"
+                | "all"
+                | "anext"
+                | "any"
+                | "ascii"
+                | "bool"
+                | "breakpoint"
+                | "complex"
+                | "delattr"
+                | "dict"
+                | "dir"
+                | "divmod"
+                | "extend"
+                | "filter"
+                | "float"
+                | "format"
+                | "getattr"
+                | "globals"
+                | "hasattr"
+                | "hash"
+                | "int"
+                | "isinstance"
+                | "issubclass"
+                | "iter"
+                | "len"
+                | "list"
+                | "locals"
+                | "map"
+                | "max"
+                | "memoryview"
+                | "min"
+                | "next"
+                | "pow"
+                | "print"
+                | "repr"
+                | "reversed"
+                | "round"
+                | "setattr"
+                | "sort"
+                | "sorted"
+                | "str"
+                | "sum"
+                | "tuple"
+                | "update"
+                // `dict.__init__` merges positional + keyword args
+                // like `update` (routed in the dispatch chain); other
+                // `__init__` builtins fall through unchanged.
+                | "__init__"
+                | "vars"
+                | "zip"
+                | "open"
+                | "fspath"
+                | "fsdecode"
+                | "fsencode"
+                | "join"
+                | "fromkeys"
+                | "union"
+                | "intersection"
+                | "difference"
+                | "symmetric_difference"
+                | "intersection_update"
+                | "difference_update"
+                | "symmetric_difference_update"
+                | "issubset"
+                | "issuperset"
+                | "isdisjoint"
+                | "writelines"
+                | "enumerate"
+                | "prod"
+                | "getsizeof"
+                | "from_bytes"
+        )
+}
+
+/// Whether a native callable's *name* qualifies for the RFC 0058 WS3
+/// `CallNative`/`CallNativeMethod` inline caches: nothing sentinel-
+/// prefixed, nothing the interpreter-aware chain intercepts, and none
+/// of the tail-position special cases (`__getitem__`'s `__missing__`
+/// dispatch, the `fspath` coercion family, zero-arg `super`).
+#[inline]
+pub(crate) fn native_call_ic_safe(name: &str) -> bool {
+    !name.starts_with('.')
+        && name != "__getitem__"
+        && name != "super"
+        && !builtin_needs_interp(name)
+}
+
 fn is_super_callable(obj: &Object) -> bool {
     // `super` is now the real type; the legacy builtin-function form is
     // kept as a fallback for globals dicts that never received the
@@ -39021,6 +39678,180 @@ mod tests {
         assert!(deopts >= 1, "overflowing kernel should deopt at least once");
         assert_eq!(out, "20000000000000000000\n");
         assert_eq!(out, run(src), "deopt path diverged from the interpreter");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_param_type_change_skips_native_entry() {
+        // A kernel tiered up on int arguments must not enter native code
+        // when later called with a float — the parameter entry guard has
+        // to fail and the interpreter must produce the mixed-arith
+        // result.
+        let src = "def kernel(n):\n    s = 0\n    i = 0\n\
+                   \x20   while i < n:\n        s = s + i\n        i = i + 1\n\
+                   \x20   return s\n\
+                   j = 0\n\
+                   while j < 50:\n    r = kernel(10)\n    j = j + 1\n\
+                   print(kernel(10))\nprint(kernel(3.5))\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the kernel");
+        assert_eq!(out, "45\n6\n");
+        assert_eq!(out, run(src), "float-arg call diverged from interpreter");
+    }
+
+    // RFC 0058 WS4 — tier-2 range loops, guarded globals, and mixed
+    // int/float lanes.
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_for_range_loop_compiles_and_matches() {
+        let src = "def kernel(n):\n    total = 0\n\
+                   \x20   for i in range(n):\n        total = total + i * 2\n\
+                   \x20   return total\n\
+                   def bench(m):\n    t = 0\n    k = 0\n\
+                   \x20   while k < m:\n        t = t + kernel(50)\n        k = k + 1\n\
+                   \x20   return t\n\
+                   print(bench(100))\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the range kernel");
+        assert_eq!(deopts, 0, "clean range kernel should not deopt");
+        assert_eq!(out, "245000\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_nested_range_loops() {
+        // The nested_loops fixture shape: three levels of FOR_ITER over
+        // range, each rewritten to its own synthetic induction pair.
+        let src = "def kernel(n):\n    total = 0\n\
+                   \x20   for i in range(n):\n        for j in range(n):\n            for k in range(n):\n                total = total + i + j + k\n\
+                   \x20   return total\n\
+                   r = 0\nz = 0\n\
+                   while z < 20:\n    r = kernel(8)\n    z = z + 1\n\
+                   print(r)\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the nested kernel");
+        assert_eq!(deopts, 0);
+        assert_eq!(out, "5376\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_range_start_stop_and_break() {
+        // `range(a, b)` seeds the induction variable from `a`; `break`
+        // pops the phantom iterator (erased by the rewrite).
+        let src = "def kernel(a, b):\n    s = 0\n\
+                   \x20   for i in range(a, b):\n        if i > 90:\n            break\n        s = s + i\n\
+                   \x20   return s\n\
+                   r = 0\nz = 0\n\
+                   while z < 50:\n    r = kernel(5, 200)\n    z = z + 1\n\
+                   print(r)\nprint(kernel(7, 3))\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the break kernel");
+        assert_eq!(deopts, 0);
+        // sum(5..=90) = 4085; empty range → 0.
+        assert_eq!(out, "4085\n0\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_range_loop_overflow_deopt_rebuilds_iterator() {
+        // The accumulator overflows i64 mid-loop. The deopt must rebuild
+        // the live range iterator on the interpreter stack so the
+        // remaining iterations still run — the final big-int total is
+        // only right if iteration state survives the side exit.
+        let src = "def kernel(n):\n    s = 0\n\
+                   \x20   for i in range(n):\n        s = s + 1000000000000000000\n\
+                   \x20   return s\n\
+                   r = 0\nz = 0\n\
+                   while z < 50:\n    r = kernel(20)\n    z = z + 1\n\
+                   print(r)\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the kernel");
+        assert!(deopts >= 1, "overflow must deopt");
+        assert_eq!(out, "20000000000000000000\n");
+        assert_eq!(out, run(src), "deopt path diverged from the interpreter");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_shadowed_range_stays_generic() {
+        // A module-level `range` shadow makes the loop callee opaque:
+        // the frame must not compile, and results stay correct.
+        let src = "def range(n):\n    return [7, 8, 9]\n\
+                   def kernel(n):\n    s = 0\n\
+                   \x20   for i in range(n):\n        s = s + i\n\
+                   \x20   return s\n\
+                   r = 0\nz = 0\n\
+                   while z < 50:\n    r = kernel(3)\n    z = z + 1\n\
+                   print(r)\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert_eq!(compiled, 0, "shadowed range must not tier up");
+        assert_eq!(out, "24\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_global_const_burnin_and_rebind_guard() {
+        // `N` burns in as a constant; rebinding it must fail the entry
+        // identity guard so the next call sees the new value.
+        let src = "N = 5\n\
+                   def kernel(n):\n    s = 0\n\
+                   \x20   for i in range(n):\n        s = s + N\n\
+                   \x20   return s\n\
+                   r = 0\nz = 0\n\
+                   while z < 50:\n    r = r + kernel(10)\n    z = z + 1\n\
+                   N = 7\n\
+                   print(r)\nprint(kernel(10))\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the const-global kernel");
+        assert_eq!(out, "2500\n70\n");
+        assert_eq!(out, run(src), "guard miss diverged from interpreter");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_mixed_int_float_arith() {
+        // A float accumulator fed by int terms exercises the unguarded
+        // promotion; the `i < 10.5` bound exercises the guarded mixed
+        // comparison in its exact range.
+        let src = "def kernel():\n    s = 0.0\n    i = 0\n\
+                   \x20   while i < 10.5:\n        s = s + i * 2\n        i = i + 1\n\
+                   \x20   return s\n\
+                   r = 0.0\nz = 0\n\
+                   while z < 50:\n    r = kernel()\n    z = z + 1\n\
+                   print(r)\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the mixed kernel");
+        assert_eq!(deopts, 0, "in-range mixed compare must not deopt");
+        assert_eq!(out, "110.0\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_mixed_compare_exactness_deopts_past_2_53() {
+        // 2**53 + 1 compares exactly in the interpreter: it is greater
+        // than 2.0**53 even though the two are equal after a lossy f64
+        // cast. The guarded promotion must deopt and preserve exactness.
+        // (`big` is derived from int arithmetic so it lands on the int
+        // lane; passed as an argument it would be inferred float and the
+        // entry guard would keep the frame interpreted.)
+        let src = "def kernel(n):\n    big = 9007199254740992 + n\n    c = 0\n    i = 0\n\
+                   \x20   while i < n:\n        if big > 9007199254740992.0:\n            c = c + 1\n        i = i + 1\n\
+                   \x20   return c\n\
+                   r = 0\nz = 0\n\
+                   while z < 50:\n    r = kernel(4)\n    z = z + 1\n\
+                   print(r)\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the compare kernel");
+        assert!(deopts >= 1, "past-2^53 compare must deopt for exactness");
+        assert_eq!(out, "4\n");
+        assert_eq!(out, run(src));
     }
 
     #[test]

@@ -64,6 +64,8 @@ fn add_two_ints() {
         livein_locals: vec![0, 1],
         max_stack: 2,
         entry_block: 0,
+        global_guards: vec![],
+        range_loops: vec![],
         blocks: vec![TBlock {
             entry_stack: vec![],
             stmts: vec![
@@ -90,6 +92,8 @@ fn add_overflow_deopts_with_operands_spilled() {
         livein_locals: vec![0, 1],
         max_stack: 2,
         entry_block: 0,
+        global_guards: vec![],
+        range_loops: vec![],
         blocks: vec![TBlock {
             entry_stack: vec![],
             stmts: vec![
@@ -117,6 +121,8 @@ fn sum_loop() -> TFunc {
         livein_locals: vec![0],
         max_stack: 2,
         entry_block: 0,
+        global_guards: vec![],
+        range_loops: vec![],
         blocks: vec![
             // B0: s=0; i=0; -> B1
             TBlock {
@@ -193,6 +199,8 @@ fn binop_fn(op: ArithKind) -> TFunc {
         livein_locals: vec![0, 1],
         max_stack: 2,
         entry_block: 0,
+        global_guards: vec![],
+        range_loops: vec![],
         blocks: vec![TBlock {
             entry_stack: vec![],
             stmts: vec![
@@ -252,6 +260,8 @@ fn int_truediv_returns_float() {
         livein_locals: vec![0, 1],
         max_stack: 2,
         entry_block: 0,
+        global_guards: vec![],
+        range_loops: vec![],
         blocks: vec![TBlock {
             entry_stack: vec![],
             stmts: vec![

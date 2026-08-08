@@ -382,11 +382,21 @@ pub struct PyFrame {
     /// writes to it don't propagate back to the frame's `locals`
     /// array.
     pub locals_cache: RefCell<Option<Object>>,
-    /// Provider closure that materialises the locals dict on first
-    /// access. Captures the (interior-mutable) locals array at the
-    /// time the snapshot is taken so the same provider can be called
-    /// again after a `clear()` to refresh.
-    pub locals_provider: RefCell<Option<Rc<dyn Fn() -> Object + Send + Sync>>>,
+    /// Cell storage shared with the executing frame (cellvars first,
+    /// then freevars) — read by [`Self::compute_locals`] so
+    /// `f_locals` honours cell variables. RFC 0058 replaced the
+    /// per-call provider *closure* with these plain fields: the
+    /// closure was a separate allocation capturing seven `Rc` clones
+    /// on every Python call.
+    pub cells: Rc<Vec<Rc<RefCell<Object>>>>,
+    /// Class-body namespace (see `Frame::class_namespace`): when set,
+    /// `f_locals` is this dict rather than a fast-locals snapshot.
+    pub class_namespace: Option<Rc<RefCell<DictData>>>,
+    /// PEP 3115 custom class-body mapping; takes precedence over
+    /// [`Self::class_namespace`] for `f_locals`.
+    pub class_namespace_obj: Option<Object>,
+    /// Module/exec scope: `f_locals is f_globals`.
+    pub is_module_scope: bool,
     /// Shared, mutable mirror of the running frame's `locals` array.
     /// The VM updates this between steps so `f_locals` reflects live
     /// state. `None` once the frame has returned.
@@ -484,6 +494,81 @@ impl PyFrame {
         self.code.linetable.get(pc).copied().unwrap_or(0)
     }
 
+    /// Compute a fresh locals mapping from the live frame state —
+    /// the class/module namespace itself for those scopes, or a
+    /// fast-locals snapshot dict for function scopes. This replaces
+    /// the RFC 0047 per-call provider closure (RFC 0058): same
+    /// logic, but reading plain fields instead of captured clones.
+    /// Returns `None` when the live mirror has been severed (the
+    /// frame returned and ownership was not taken).
+    pub fn compute_locals(&self) -> Option<Object> {
+        // For module / class bodies the user-visible locals are the
+        // corresponding namespace dict (class_ns when set, otherwise
+        // globals). PEP 3115 custom class namespaces hand back the
+        // live mapping object itself, exactly as CPython does.
+        if let Some(ns_obj) = self.class_namespace_obj.as_ref() {
+            return Some(ns_obj.clone());
+        }
+        if let Some(ns) = self.class_namespace.as_ref() {
+            return Some(Object::Dict(ns.clone()));
+        }
+        if self.is_module_scope {
+            return Some(Object::Dict(self.globals.clone()));
+        }
+        let mirror = self.locals_mirror.borrow().clone()?;
+        let snapshot = mirror.borrow();
+        let varnames = &self.code.varnames;
+        let cell_names: Vec<&String> = self
+            .code
+            .cellvars
+            .iter()
+            .chain(self.code.freevars.iter())
+            .collect();
+        // Function frames: copy the locals array into a dict so user
+        // code can read by name. Cell variables live in the cell, not
+        // the local slot.
+        let mut d = DictData::default();
+        for (name, value) in varnames.iter().zip(snapshot.iter()) {
+            // Compiler-synthesized temporaries (`.retval0`,
+            // `.eg_remaining0`, …) are implementation detail —
+            // CPython keeps its equivalents on the value stack, so
+            // they never appear in `f_locals`.
+            if name.starts_with('.') {
+                continue;
+            }
+            if matches!(value, Object::Unbound) {
+                if let Some(idx) = cell_names.iter().position(|c| *c == name) {
+                    if let Some(cell) = self.cells.get(idx) {
+                        let v = cell.borrow().clone();
+                        if !matches!(v, Object::Unbound) {
+                            d.insert(DictKey(Object::from_str(name.clone())), v);
+                        }
+                        continue;
+                    }
+                }
+            }
+            // Unbound slots (never assigned, or `del`eted) are absent
+            // from `f_locals`; a local that *is* bound to `None`
+            // stays visible (NameError suggestions rely on this).
+            if !matches!(value, Object::Unbound) {
+                d.insert(DictKey(Object::from_str(name.clone())), value.clone());
+            }
+        }
+        // Cellvars not present in varnames (e.g. `__class__`).
+        for (i, name) in cell_names.iter().enumerate() {
+            if varnames.iter().any(|v| v == *name) {
+                continue;
+            }
+            if let Some(cell) = self.cells.get(i) {
+                let v = cell.borrow().clone();
+                if !matches!(v, Object::Unbound) {
+                    d.insert(DictKey(Object::from_str((*name).clone())), v);
+                }
+            }
+        }
+        Some(Object::Dict(Rc::new(RefCell::new(d))))
+    }
+
     /// Materialise the locals dict, caching the result. Subsequent
     /// calls return the same dict object so `id(frame.f_locals)` is
     /// stable.
@@ -494,10 +579,7 @@ impl PyFrame {
                 return v.clone();
             }
         }
-        let provider = self.locals_provider.borrow().clone();
-        let dict = provider
-            .as_ref()
-            .map_or_else(Object::new_dict, |provider| provider());
+        let dict = self.compute_locals().unwrap_or_else(Object::new_dict);
         *self.locals_cache.borrow_mut() = Some(dict.clone());
         dict
     }
@@ -506,12 +588,12 @@ impl PyFrame {
     /// scopes return an *independent snapshot* per call — mutating it
     /// never affects the frame, and later calls return new dicts
     /// (test_patma_204: `out = locals(); del out["w"]`). Module, class,
-    /// and exec scopes return the live namespace itself, which is what
-    /// the provider hands back for those frames. The identity-stable
-    /// [`Self::locals`] cache stays reserved for `frame.f_locals`.
+    /// and exec scopes return the live namespace itself. The
+    /// identity-stable [`Self::locals`] cache stays reserved for
+    /// `frame.f_locals`.
     pub fn locals_snapshot(&self) -> Object {
-        match self.locals_provider.borrow().clone() {
-            Some(provider) => provider(),
+        match self.compute_locals() {
+            Some(dict) => dict,
             None => self.locals(),
         }
     }
@@ -526,9 +608,7 @@ impl PyFrame {
         let Some(Object::Dict(cached_rc)) = cached else {
             return;
         };
-        let provider = self.locals_provider.borrow().clone();
-        let Some(provider) = provider else { return };
-        let Object::Dict(fresh_rc) = provider() else {
+        let Some(Object::Dict(fresh_rc)) = self.compute_locals() else {
             return;
         };
         // Module/class scopes hand back the namespace dict itself —
@@ -580,20 +660,200 @@ impl PyFrame {
     /// by garbage, is *not* given ownership (the caller keeps clearing the
     /// mirror there) and prompt refcount finalization is preserved.
     pub fn take_ownership_of_locals(&self) {
-        let provider = self.locals_provider.borrow().clone();
-        let Some(provider) = provider else {
-            // Already detached (or never had a provider): nothing to own.
+        let Some(dict) = self.compute_locals() else {
+            // Already detached: nothing to own.
             return;
         };
-        let dict = provider();
         *self.locals_cache.borrow_mut() = Some(dict);
-        // Sever the live links: future reads return the frozen snapshot
-        // (`refresh_locals` early-returns once the provider is `None`), and
-        // dropping the provider releases its captured clones of the frame's
-        // locals mirror and cell handles.
-        *self.locals_provider.borrow_mut() = None;
+        // Sever the live link: future reads return the frozen snapshot
+        // (`refresh_locals` early-returns once the mirror is `None`),
+        // and dropping the mirror releases the frame's share of the
+        // locals storage.
         *self.locals_mirror.borrow_mut() = None;
     }
+}
+
+/// RFC 0058 (WS2) — one entry of the interpreter's Python-visible
+/// call-stack spine.
+///
+/// Pushing a call used to construct a full [`PyFrame`] (17 fields, a
+/// provider closure, and an eagerly linked `back` chain) for every
+/// activation, though almost no call is ever introspected. A shell
+/// carries just the cheap `Rc` handles needed to *materialise* the
+/// real `PyFrame` on demand — `sys._getframe`, tracing, traceback
+/// capture, `gi_frame` — plus a relaxed-atomic `lasti` mirror the
+/// dispatch loop keeps current.
+///
+/// Invariants:
+///
+/// - `materialized` frames obtained through [`materialize_stack_at`]
+///   have their `back` chain linked for everything below them at the
+///   moment of the call. Callers cannot change while a frame is on
+///   the stack, so the chain stays correct for the frame's lifetime.
+/// - A shell pushed with a pre-materialised frame (generator resume)
+///   may carry a stale/None `back` until the next walk refreshes it;
+///   direct `f_back` reads on the current thread route through the
+///   walk (see the `f_back` attribute handler).
+#[derive(Debug)]
+pub struct FrameShell {
+    pub code: Rc<CodeObject>,
+    pub locals: Rc<RefCell<Vec<Object>>>,
+    pub cells: Rc<Vec<Rc<RefCell<Object>>>>,
+    pub globals: Rc<RefCell<DictData>>,
+    pub builtins: Rc<RefCell<DictData>>,
+    pub class_namespace: Option<Rc<RefCell<DictData>>>,
+    pub class_namespace_obj: Option<Object>,
+    /// Generator/coroutine/async-generator frame?
+    pub is_gen: bool,
+    /// Backlink to the owning generator, when this activation is a
+    /// generator resume (lets `gi_frame` find the executing frame).
+    pub gen_owner: RefCell<Option<crate::sync::Weak<PyGenerator>>>,
+    /// Live mirror of the executing frame's `pc`, stored relaxed by
+    /// the dispatch loop each instruction so materialisation at any
+    /// point reports the correct `f_lineno`.
+    pub lasti: std::sync::atomic::AtomicU32,
+    /// Fast gate for [`Self::materialized`]: one relaxed load tells
+    /// the dispatch loop whether it must also sync the materialised
+    /// frame's `lasti` cell each instruction.
+    pub has_materialized: std::sync::atomic::AtomicBool,
+    /// The real Python frame object, once someone asked for it.
+    pub materialized: RefCell<Option<Rc<PyFrame>>>,
+}
+
+impl FrameShell {
+    /// Wrap an already-materialised frame (generator resume, event
+    /// dispatch around throw/unwind) in a shell for the spine.
+    pub fn from_py_frame(py: &Rc<PyFrame>) -> Self {
+        FrameShell {
+            code: py.code.clone(),
+            locals: py
+                .locals_mirror
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| Rc::new(RefCell::new(Vec::new()))),
+            cells: py.cells.clone(),
+            globals: py.globals.clone(),
+            builtins: py.builtins.clone(),
+            class_namespace: py.class_namespace.clone(),
+            class_namespace_obj: py.class_namespace_obj.clone(),
+            is_gen: py.code.is_generator || py.code.is_coroutine || py.code.is_async_generator,
+            gen_owner: RefCell::new(py.gen_owner.borrow().clone()),
+            lasti: std::sync::atomic::AtomicU32::new(py.lasti.get()),
+            has_materialized: std::sync::atomic::AtomicBool::new(true),
+            materialized: RefCell::new(Some(py.clone())),
+        }
+    }
+
+    /// Build the real [`PyFrame`] for this shell with the given
+    /// `back` pointer, caching it. Bumps `on_stack` exactly once per
+    /// materialisation — the pop path decrements it for shells whose
+    /// `materialized` is set.
+    pub fn materialize(&self, back: Option<Rc<PyFrame>>) -> Rc<PyFrame> {
+        if let Some(existing) = self.materialized.borrow().as_ref() {
+            return existing.clone();
+        }
+        let py = Rc::new(PyFrame {
+            code: self.code.clone(),
+            globals: self.globals.clone(),
+            builtins: self.builtins.clone(),
+            lasti: Cell::new(self.lasti.load(std::sync::atomic::Ordering::Relaxed)),
+            back: RefCell::new(back),
+            locals_cache: RefCell::new(None),
+            cells: self.cells.clone(),
+            class_namespace: self.class_namespace.clone(),
+            class_namespace_obj: self.class_namespace_obj.clone(),
+            is_module_scope: self.code.name == "<module>",
+            locals_mirror: RefCell::new(Some(self.locals.clone())),
+            trace: RefCell::new(Object::None),
+            gen_owner: RefCell::new(self.gen_owner.borrow().clone()),
+            override_lineno: Cell::new(None),
+            trace_event: Cell::new(crate::linejump::TraceEvent::None),
+            pending_jump: Cell::new(None),
+            last_line: Cell::new(None),
+            trace_lines: Cell::new(true),
+            trace_opcodes: Cell::new(false),
+            on_stack: Cell::new(1),
+        });
+        *self.materialized.borrow_mut() = Some(py.clone());
+        self.has_materialized
+            .store(true, std::sync::atomic::Ordering::Release);
+        py
+    }
+
+    /// The current instruction index, preferring the shell's live
+    /// mirror (kept current by the dispatch loop).
+    pub fn current_lasti(&self) -> u32 {
+        self.lasti.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The source line currently executing, honouring a materialised
+    /// frame's `f_lineno` override when one exists. Cheap enough for
+    /// consumers that only need file/line (warnings' `stacklevel`
+    /// walk, faulthandler dumps) to skip materialisation entirely.
+    pub fn current_lineno(&self) -> u32 {
+        // `try_borrow`: faulthandler calls this from crash context,
+        // where a panic on a live mutable borrow would be fatal.
+        if let Ok(m) = self.materialized.try_borrow() {
+            if let Some(py) = m.as_ref() {
+                return py.current_lineno();
+            }
+        }
+        let pc = self.current_lasti() as usize;
+        self.code.linetable.get(pc).copied().unwrap_or(0)
+    }
+}
+
+/// The interpreter call-stack spine: one shell per live activation.
+pub type FrameStack = Rc<RefCell<Vec<Rc<FrameShell>>>>;
+
+/// The shared, immutable empty cell vector — cell-free calls (the
+/// overwhelming majority) share one allocation instead of building a
+/// fresh `Rc<Vec>` each.
+pub fn empty_cells() -> Rc<Vec<Rc<RefCell<Object>>>> {
+    static EMPTY: std::sync::OnceLock<Rc<Vec<Rc<RefCell<Object>>>>> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(|| Rc::new(Vec::new())).clone()
+}
+
+/// Materialise the frame at `idx` (0 = outermost) together with
+/// everything below it, linking `back` pointers bottom-up, and return
+/// it. Refreshes `back` on already-materialised entries too, so a
+/// generator frame re-pushed with a stale link is corrected.
+pub fn materialize_stack_at(stack: &FrameStack, idx: usize) -> Option<Rc<PyFrame>> {
+    let shells: Vec<Rc<FrameShell>> = {
+        let s = stack.borrow();
+        if idx >= s.len() {
+            return None;
+        }
+        s[..=idx].to_vec()
+    };
+    let mut back: Option<Rc<PyFrame>> = None;
+    for shell in &shells {
+        let existing = shell.materialized.borrow().clone();
+        let py = match existing {
+            Some(py) => {
+                *py.back.borrow_mut() = back;
+                py
+            }
+            None => {
+                let py = shell.materialize(back);
+                // Materialised while live on the stack: count the
+                // activation so `frame.clear()` refuses it.
+                py
+            }
+        };
+        back = Some(py);
+    }
+    back
+}
+
+/// Materialise and return the top frame of a stack, or `None` when
+/// the stack is empty.
+pub fn materialize_stack_top(stack: &FrameStack) -> Option<Rc<PyFrame>> {
+    let len = stack.borrow().len();
+    if len == 0 {
+        return None;
+    }
+    materialize_stack_at(stack, len - 1)
 }
 
 /// Internal payload for [`Object::Traceback`]. Built lazily by the
@@ -1693,6 +1953,17 @@ fn service_pending_signals_io() -> Result<(), RuntimeError> {
     Ok(())
 }
 
+/// Acquire a [`PyFile::fd_syscall_lock`], immune to poisoning (a panicking
+/// holder can't corrupt a `()` payload). Must only be called with the GIL
+/// released: a holder may be blocked in a syscall (pipe read/full-pipe write)
+/// indefinitely, and waiting for it while holding the GIL would stall every
+/// thread. This is CPython's `ENTER_BUFFERED` (grab the buffered object's
+/// lock under `Py_BEGIN_ALLOW_THREADS`).
+#[cfg(unix)]
+fn fd_lock(lock: &std::sync::Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
+    lock.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Blocking `read(2)` from a raw descriptor honouring PEP 475: release the
 /// GIL across the (possibly blocking) syscall, and on `EINTR` run any tripped
 /// Python signal handler and retry instead of surfacing `InterruptedError`
@@ -1700,13 +1971,21 @@ fn service_pending_signals_io() -> Result<(), RuntimeError> {
 /// pipe and the interrupted read must resume and deliver those bytes). A
 /// handler that raises propagates and abandons the read. `n = None` reads to
 /// EOF. The borrow on the file's backend is *not* held here, so a handler
-/// touching the same stream can't trip a `BorrowMutError`.
+/// touching the same stream can't trip a `BorrowMutError`. The `read(2)`
+/// itself runs under the stream's [`PyFile::fd_syscall_lock`] so it can never
+/// interleave with a concurrent `write(2)`/`lseek(2)` on the same file
+/// description (see the field's doc for the offset race this prevents).
 #[cfg(unix)]
-fn read_fd_intr(fd: std::os::unix::io::RawFd, n: Option<usize>) -> Result<Vec<u8>, RuntimeError> {
+fn read_fd_intr(
+    fd: std::os::unix::io::RawFd,
+    n: Option<usize>,
+    lock: &std::sync::Mutex<()>,
+) -> Result<Vec<u8>, RuntimeError> {
     let read_once = |buf: &mut [u8]| -> Result<usize, RuntimeError> {
         loop {
-            let r = crate::gil::allow_threads_then(|| unsafe {
-                libc::read(fd, buf.as_mut_ptr().cast(), buf.len())
+            let r = crate::gil::allow_threads_then(|| {
+                let _serialized = fd_lock(lock);
+                unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) }
             });
             if r >= 0 {
                 return Ok(r as usize);
@@ -1759,10 +2038,14 @@ fn read_fd_intr(fd: std::os::unix::io::RawFd, n: Option<usize>) -> Result<Vec<u8
 /// prefix is always drained from `pending` first — including when a signal
 /// handler raises mid-flush — so the remainder is never double-written. The
 /// descriptor is borrowed, not owned, so the backing `File` must outlive it.
+/// Each `write(2)` runs under the stream's [`PyFile::fd_syscall_lock`] so it
+/// can never interleave with a concurrent `read(2)`/`lseek(2)` on the same
+/// file description (see the field's doc for the offset race this prevents).
 #[cfg(unix)]
 fn write_drain_fd_intr(
     fd: std::os::unix::io::RawFd,
     pending: &mut Vec<u8>,
+    lock: &std::sync::Mutex<()>,
 ) -> Result<(), RuntimeError> {
     let mut off = 0usize;
     let res = loop {
@@ -1770,8 +2053,9 @@ fn write_drain_fd_intr(
             break Ok(());
         }
         let chunk = &pending[off..];
-        let r = crate::gil::allow_threads_then(|| unsafe {
-            libc::write(fd, chunk.as_ptr().cast(), chunk.len())
+        let r = crate::gil::allow_threads_then(|| {
+            let _serialized = fd_lock(lock);
+            unsafe { libc::write(fd, chunk.as_ptr().cast(), chunk.len()) }
         });
         if r < 0 {
             let err = std::io::Error::last_os_error();
@@ -1876,6 +2160,7 @@ fn fd_is_nonblocking(fd: std::os::unix::io::RawFd) -> bool {
 fn read_fd_nonblock(
     fd: std::os::unix::io::RawFd,
     n: Option<usize>,
+    lock: &std::sync::Mutex<()>,
 ) -> Result<Option<Vec<u8>>, RuntimeError> {
     match n {
         Some(want) => {
@@ -1884,8 +2169,9 @@ fn read_fd_nonblock(
             }
             let mut buf = vec![0u8; want];
             loop {
-                let r = crate::gil::allow_threads_then(|| unsafe {
-                    libc::read(fd, buf.as_mut_ptr().cast(), want)
+                let r = crate::gil::allow_threads_then(|| {
+                    let _serialized = fd_lock(lock);
+                    unsafe { libc::read(fd, buf.as_mut_ptr().cast(), want) }
                 });
                 if r < 0 {
                     let err = std::io::Error::last_os_error();
@@ -1909,8 +2195,9 @@ fn read_fd_nonblock(
             let mut out = Vec::new();
             let mut chunk = [0u8; 8192];
             loop {
-                let r = crate::gil::allow_threads_then(|| unsafe {
-                    libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len())
+                let r = crate::gil::allow_threads_then(|| {
+                    let _serialized = fd_lock(lock);
+                    unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) }
                 });
                 if r < 0 {
                     let err = std::io::Error::last_os_error();
@@ -3549,6 +3836,19 @@ pub struct PyFile {
     /// instance (CPython's `fileio_repr` prints `Py_TYPE(self)->tp_name`, so
     /// `<TestSubclass name=...>`). `None` renders the base `_io.FileIO`.
     pub repr_class: RefCell<Option<String>>,
+    /// Serializes the raw descriptor syscalls (`read`/`write`/`lseek`) this
+    /// stream issues with the GIL released. CPython's buffered objects
+    /// (`BufferedReader`/`Writer`/`Random`, which `TextIOWrapper` stacks on)
+    /// guard every raw op with a per-object lock acquired GIL-free
+    /// (`ENTER_BUFFERED`), so two threads never have a `read(2)` and a
+    /// `write(2)` in flight on the same file description at once. Without
+    /// that, the kernel's read path can observe the shared offset *before* a
+    /// concurrent write publishes its offset advance, letting an iterating
+    /// reader steal a just-written byte and desync the offset from EOF
+    /// (test_io.test_write_readline_races). `Arc` so the dup-ed `.buffer`
+    /// sibling — which shares the OS file description and offset — shares the
+    /// lock too.
+    pub fd_syscall_lock: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
 impl PyFile {
@@ -3582,6 +3882,7 @@ impl PyFile {
             text_incr: RefCell::new(None),
             blksize: crate::sync::Cell::new(DEFAULT_BUFFER_SIZE as i64),
             repr_class: RefCell::new(None),
+            fd_syscall_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         }
     }
 
@@ -3623,7 +3924,7 @@ impl PyFile {
                 _ => None,
             };
             if let Some(fd) = raw_fd {
-                let res = write_drain_fd_intr(fd, &mut pending);
+                let res = write_drain_fd_intr(fd, &mut pending, &self.fd_syscall_lock);
                 // A partial / would-block flush (or a signal-handler raise)
                 // leaves the unwritten remainder in `pending`; put it back into
                 // `write_buf` so it isn't lost and a later flush can finish it.
@@ -3800,7 +4101,11 @@ impl PyFile {
                 if !binmode.contains('b') {
                     binmode.push('b');
                 }
-                let bf = PyFile::new(self.name.clone(), binmode, FileBackend::Disk(dup));
+                let mut bf = PyFile::new(self.name.clone(), binmode, FileBackend::Disk(dup));
+                // The dup-ed descriptor shares the OS file *description* —
+                // and thus the seek offset — with this stream, so raw
+                // syscalls on either object must serialize on one lock.
+                bf.fd_syscall_lock = self.fd_syscall_lock.clone();
                 if let Some(n) = self.name_override.borrow().as_ref() {
                     *bf.name_override.borrow_mut() = Some(n.clone());
                 }
@@ -4903,6 +5208,24 @@ impl PyFile {
     /// the Python-level `close()` raises it as `OSError`.
     pub fn close_report(&self) -> std::io::Result<()> {
         *self.closed.borrow_mut() = true;
+        // CPython's `TextIOWrapper.close()` closes its underlying buffer
+        // layer. The collapsed `PyFile` mints `.buffer` as a memoised
+        // *sibling* stream over a dup-ed descriptor (see
+        // [`PyFile::binary_buffer`]); without closing it in lock-step, the
+        // sibling stays "open" after the text stream closes and its
+        // finalizer later emits `ResourceWarning("unclosed file
+        // <_io.BufferedRandom ...>")` — surfacing inside whatever
+        // unrelated `check_warnings` block runs the next collection
+        // (test_tempfile.test_warnings_on_cleanup). The sibling's close
+        // verdict is secondary (the text layer's own close below is the
+        // reported one), so errors are swallowed like other drop paths.
+        let sibling = self.binary_buffer_cache.borrow().clone();
+        if let Some(Object::File(buf)) = sibling {
+            if !*buf.closed.borrow() {
+                let _ = buf.flush_write_buf();
+                let _ = buf.close_report();
+            }
+        }
         // Release OS-backed resources promptly. Dropping a real fd (a disk
         // file, or a subprocess pipe re-wrapped as a `Disk` backend) closes
         // the descriptor — and closing the write end of a child's `stdin`
@@ -4990,7 +5313,7 @@ impl PyFile {
             };
             if let Some(fd) = raw_fd {
                 if fd_is_nonblocking(fd) {
-                    return read_fd_nonblock(fd, n);
+                    return read_fd_nonblock(fd, n, &self.fd_syscall_lock);
                 }
             }
         }
@@ -5015,7 +5338,7 @@ impl PyFile {
                 _ => None,
             };
             if let Some(fd) = raw_fd {
-                return read_fd_intr(fd, n);
+                return read_fd_intr(fd, n, &self.fd_syscall_lock);
             }
         }
         let mut backend = self.backend.borrow_mut();
@@ -5276,7 +5599,7 @@ impl PyFile {
             };
             if let Some(fd) = raw_fd {
                 let mut pending = data.to_vec();
-                return write_drain_fd_intr(fd, &mut pending);
+                return write_drain_fd_intr(fd, &mut pending, &self.fd_syscall_lock);
             }
         }
         let mut off = 0;
@@ -5534,6 +5857,52 @@ impl PyFile {
         // CPython's `BufferedWriter.seek` flushes the write buffer first so the
         // descriptor offset the seek is relative to is current.
         self.flush_write_buf()?;
+        // Unix disk descriptors: serialize the offset move against this
+        // file's in-flight GIL-released raw reads/writes (see
+        // `fd_syscall_lock`) — an `lseek` interleaving with a concurrent
+        // `write(2)`'s deposit/offset-advance window would desync the offset
+        // from EOF just like the read/write race. The fd is snapshotted
+        // under a short borrow (dropped before the GIL release, so a thread
+        // we yield to can touch this stream without tripping the `RefCell`),
+        // and the lock is only taken with the GIL released — its holder may
+        // be blocked in a syscall indefinitely.
+        #[cfg(unix)]
+        let disk_fd = {
+            use std::os::unix::io::AsRawFd;
+            match &*self.backend.borrow() {
+                FileBackend::Disk(f) => Some(f.as_raw_fd()),
+                _ => None,
+            }
+        };
+        #[cfg(unix)]
+        if let Some(fd) = disk_fd {
+            let lseek_whence = match whence {
+                0 => libc::SEEK_SET,
+                1 => libc::SEEK_CUR,
+                2 => libc::SEEK_END,
+                _ => return Err(value_error("invalid whence")),
+            };
+            let target = if whence == 0 {
+                offset.max(0) as libc::off_t
+            } else {
+                offset as libc::off_t
+            };
+            let lock = &self.fd_syscall_lock;
+            let r = crate::gil::allow_threads_then(|| {
+                let _serialized = fd_lock(lock);
+                unsafe { libc::lseek(fd, target, lseek_whence) }
+            });
+            if r < 0 {
+                return Err(crate::error::io_error_to_py(
+                    &std::io::Error::last_os_error(),
+                ));
+            }
+            let result = r as usize;
+            if !self.binary {
+                self.text_start_of_stream.set(result == 0);
+            }
+            return Ok(result);
+        }
         let result = {
             let mut backend = self.backend.borrow_mut();
             match &mut *backend {
@@ -5583,6 +5952,8 @@ impl PyFile {
                     *pos = memtext_byte_of_char(data, new_char);
                     new_char
                 }
+                // Unix disk descriptors take the lock-serialized `lseek`
+                // early-exit above; this arm serves the other platforms.
                 FileBackend::Disk(f) => {
                     use std::io::Seek;
                     let whence_pos = match whence {

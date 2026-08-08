@@ -171,6 +171,32 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let fb = self.cl_blocks[fallthrough];
                 self.b.ins().brif(truthy, tb, &[], fb, &[]);
             }
+            TTerm::ForRange {
+                cur_slot,
+                stop_slot,
+                var_slot,
+                body,
+                exit,
+            } => {
+                // if cur < stop { var = cur; cur += 1; goto body }
+                // else { goto exit }. `cur < stop <= i64::MAX` makes the
+                // unit-step increment overflow-free.
+                let cur_var = self.vars[cur_slot as usize].expect("managed range cur");
+                let stop_var = self.vars[stop_slot as usize].expect("managed range stop");
+                let loop_var = self.vars[var_slot as usize].expect("managed loop var");
+                let cur = self.b.use_var(cur_var);
+                let stop = self.b.use_var(stop_var);
+                let cond = self.b.ins().icmp(IntCC::SignedLessThan, cur, stop);
+                let body_pre = self.b.create_block();
+                let eb = self.cl_blocks[exit];
+                self.b.ins().brif(cond, body_pre, &[], eb, &[]);
+                self.b.switch_to_block(body_pre);
+                self.b.def_var(loop_var, cur);
+                let next = self.b.ins().iadd_imm(cur, 1);
+                self.b.def_var(cur_var, next);
+                let bb = self.cl_blocks[body];
+                self.b.ins().jump(bb, &[]);
+            }
         }
     }
 
@@ -254,7 +280,36 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let len = self.vstack.len();
                 self.vstack.swap(len - 1, len - 2);
             }
+            TOp::IntToFloatTos { guarded } => {
+                let depth = self.vstack.len() - 1;
+                self.emit_int_to_float(depth, guarded, stmt.pc);
+            }
+            TOp::IntToFloatSecond { guarded } => {
+                let depth = self.vstack.len() - 2;
+                self.emit_int_to_float(depth, guarded, stmt.pc);
+            }
         }
+    }
+
+    /// Promote the integral value at `vstack[depth]` to a float in
+    /// place. When `guarded`, deopt unless `|v| <= 2^53` — the range
+    /// where `fcvt_from_sint` is exact — with the stack spilled in its
+    /// original, unpromoted order.
+    fn emit_int_to_float(&mut self, depth: usize, guarded: bool, pc: u32) {
+        let v = self.vstack[depth].0;
+        if guarded {
+            let snapshot = self.vstack.clone();
+            const EXACT: i64 = 1 << 53;
+            let hi = self.b.ins().iconst(types::I64, EXACT);
+            let lo = self.b.ins().iconst(types::I64, -EXACT);
+            let too_big = self.b.ins().icmp(IntCC::SignedGreaterThan, v, hi);
+            let too_small = self.b.ins().icmp(IntCC::SignedLessThan, v, lo);
+            let inexact = self.b.ins().bor(too_big, too_small);
+            let cont = self.guard(inexact, pc, &snapshot);
+            self.b.switch_to_block(cont);
+        }
+        let f = self.b.ins().fcvt_from_sint(types::F64, v);
+        self.vstack[depth] = (f, JitType::Float);
     }
 
     // ---- arithmetic ------------------------------------------------

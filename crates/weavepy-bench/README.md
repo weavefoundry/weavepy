@@ -1,44 +1,65 @@
 # weavepy-bench
 
-RFC 0021 — `pyperformance`-shaped microbench harness for WeavePy.
+RFC 0058 — the `pyperformance`-shaped benchmark lane for WeavePy
+(supersedes the RFC 0021 harness).
+
+The harness times each fixture's `bench(n)` under **both** the built
+`weavepy` binary and the host CPython, as subprocesses with an
+identical `WEAVEPY_BENCH_WORK`. Fixtures self-time the bench region
+with `time.perf_counter_ns()` and print `WEAVEPY_BENCH_NS=<int>`, so
+startup / parse / import cost is excluded symmetrically (the dedicated
+`startup` fixture measures full subprocess wall time instead).
+
+The tracked baseline (`baselines/bench.json`) stores medians for both
+interpreters plus the WeavePy/CPython **ratio** per fixture and the
+suite geometric mean. `gate` compares ratios — host-independent,
+unlike absolute nanoseconds — and fails on regressions beyond a
+threshold, like the regrtest and ecosystem lanes' `--check`. CI runs
+`gate --pct=25` on ubuntu + macos (the `bench` job).
 
 The crate is excluded from `default-members` so `cargo build` /
-`cargo test --workspace` doesn't pull it in. Opt in with `-p
-weavepy-bench` when you want to run the benches.
+`cargo test --workspace` doesn't pull it in. Opt in with
+`-p weavepy-bench`.
 
 ## Usage
 
 ```bash
-# Run all fixtures, print a markdown report.
-cargo run -p weavepy-bench -- run
+# The harness needs the binary under test next to it.
+cargo build --release -p weavepy-cli -p weavepy-bench
 
-# Skip the host CPython subprocess (faster on CI without python3).
-cargo run -p weavepy-bench -- run --no-cpython
+# Run all fixtures, print a markdown report (ratio column + geomean).
+cargo xbench run
 
-# Print the report as JSON instead of markdown.
-cargo run -p weavepy-bench -- run --json
+# Compare current ratios against the baseline; exit non-zero on
+# regression beyond 10% (default threshold).
+cargo xbench gate
+cargo xbench gate --pct=25
 
 # Refresh the baseline JSON tracked at `baselines/bench.json`.
-cargo run -p weavepy-bench -- run --update-baseline
+cargo xbench run --update-baseline
 
-# Compare current run against the baseline; exit non-zero on
-# regression beyond 10% (default threshold).
-cargo run -p weavepy-bench -- gate
-cargo run -p weavepy-bench -- gate --pct=15
+# Point at explicit interpreters.
+cargo xbench run --weavepy=target/release/weavepy --python=python3.13
+
+# Add a WEAVEPY_JIT=1 column (reported, never gated). The binary must
+# be built with the tier-2 JIT compiled in:
+cargo build --release -p weavepy-cli --features weavepy-cli/jit
+cargo xbench run --jit
+
+# Print the report as JSON instead of markdown.
+cargo xbench run --json
 ```
-
-Run with `--release` for representative numbers — the dev profile
-is far slower than what CI / shipped binaries see.
 
 ## Adding a fixture
 
-1. Drop `fixtures/foo.py`. The file should:
-   - Import `os`.
-   - Define a `bench(n)` callable that runs the workload `n` times.
-   - Have a `if __name__ == "__main__":` block that reads
-     `WEAVEPY_BENCH_WORK` from the environment so the runner can
-     parameterize CPython runs.
+1. Drop `fixtures/foo.py`. The file must:
+   - Define a `bench(n)` callable that runs the workload scaled by `n`.
+   - End with the standard self-timing block (copy it from any
+     fixture): read `WEAVEPY_BENCH_WORK`, time `bench(n)` with
+     `time.perf_counter_ns()`, print `WEAVEPY_BENCH_NS=<int>`.
 2. Add `"foo"` to `FIXTURES` in `src/fixtures.rs`.
-3. Pick a default `work` parameter in `default_work(...)`.
-4. Run `cargo run -p weavepy-bench -- run --update-baseline` and
-   inspect the diff before committing.
+3. Pick a `default_work(...)` value sized so the **CPython** leg takes
+   ~25–65 ms.
+4. Run `cargo xbench run --update-baseline` and inspect the diff
+   before committing. The gate fails fixtures that have no baseline
+   row, so the baseline refresh ships in the same change.

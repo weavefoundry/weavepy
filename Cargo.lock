@@ -2693,10 +2693,6 @@ version = "0.0.0"
 dependencies = [
  "serde",
  "serde_json",
- "weavepy",
- "weavepy-compiler",
- "weavepy-parser",
- "weavepy-vm",
 ]
 
 [[package]]
@@ -2767,6 +2763,7 @@ dependencies = [
  "cranelift-module",
  "cranelift-native",
  "weavepy-compiler",
+ "weavepy-parser",
 ]
 
 [[package]]

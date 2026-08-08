@@ -20,5 +20,9 @@ cranelift-jit      = { workspace = true }
 cranelift-module   = { workspace = true }
 cranelift-native   = { workspace = true }
 
+[dev-dependencies]
+# Analyzer tests parse + compile real Python shapes (RFC 0058 WS4).
+weavepy-parser     = { workspace = true }
+
 [lints]
 workspace = true

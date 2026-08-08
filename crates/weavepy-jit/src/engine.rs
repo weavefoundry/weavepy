@@ -17,7 +17,7 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
 
 use crate::analyze::{analyze, JitVerdict};
-use crate::ir::TFunc;
+use crate::ir::{GlobalGuard, RangeLoopMeta, ResolvedGlobal, TFunc};
 use crate::lower::build_function;
 use crate::runtime::{JitFrame, JitStatus};
 use crate::value::JitType;
@@ -38,8 +38,14 @@ pub struct CompiledFrame {
     pub local_types: Vec<Option<JitType>>,
     /// Max abstract operand-stack depth, for sizing the spill buffer.
     pub max_stack: u32,
-    /// Number of local slots.
+    /// Number of local slots, *including* synthetic range-loop slots.
     pub n_locals: u32,
+    /// Global resolutions burned into the code; the embedder must
+    /// re-validate each before every native entry (RFC 0058 WS4).
+    pub global_guards: Vec<GlobalGuard>,
+    /// Rewritten range loops, outermost-first, for rebuilding the live
+    /// iterators on the interpreter stack after a mid-loop deopt.
+    pub range_loops: Vec<RangeLoopMeta>,
 }
 
 impl CompiledFrame {
@@ -109,10 +115,18 @@ impl JitEngine {
         })
     }
 
-    /// Analyze and compile a code object. Returns the compiled frame, or
-    /// the [`JitVerdict`] explaining why it is not JITable.
-    pub fn compile(&mut self, code: &CodeObject) -> Result<CompiledFrame, JitVerdict> {
-        let tfunc = analyze(code)?;
+    /// Analyze and compile a code object. `resolve` reports what each
+    /// `LOAD_GLOBAL` name currently resolves to (see
+    /// [`ResolvedGlobal`]); the caller must re-validate every resolution
+    /// listed in [`CompiledFrame::global_guards`] before each entry.
+    /// Returns the compiled frame, or the [`JitVerdict`] explaining why
+    /// the code is not JITable.
+    pub fn compile(
+        &mut self,
+        code: &CodeObject,
+        resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
+    ) -> Result<CompiledFrame, JitVerdict> {
+        let tfunc = analyze(code, resolve)?;
         self.compile_tfunc(&tfunc)
     }
 
@@ -160,6 +174,8 @@ impl JitEngine {
             local_types: tfunc.local_types.clone(),
             max_stack: tfunc.max_stack,
             n_locals: tfunc.n_locals,
+            global_guards: tfunc.global_guards.clone(),
+            range_loops: tfunc.range_loops.clone(),
         })
     }
 }

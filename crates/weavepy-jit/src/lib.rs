@@ -31,7 +31,10 @@ mod value;
 
 pub use analyze::{analyze, JitVerdict};
 pub use engine::{CompiledFrame, JitEngine};
-pub use ir::{ArithKind, BlockId, CmpKind, TBlock, TFunc, TOp, TStmt, TTerm};
+pub use ir::{
+    ArithKind, BlockId, CmpKind, GlobalGuard, RangeLoopMeta, ResolvedGlobal, TBlock, TFunc, TOp,
+    TStmt, TTerm,
+};
 pub use runtime::{JitFrame, JitStatus, SlotTag};
 pub use value::JitType;
 

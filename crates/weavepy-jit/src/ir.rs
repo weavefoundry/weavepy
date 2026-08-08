@@ -90,6 +90,16 @@ pub enum TOp {
     Dup,
     /// Swap the top two stack entries (`SWAP 2`).
     Swap2,
+    /// Convert the integral value at TOS to `float` (RFC 0058 WS4 mixed
+    /// arithmetic promotion, matching the interpreter's `as f64` cast).
+    /// When `guarded`, deopt unless `|v| <= 2^53` — the range where the
+    /// conversion is exact — because mixed-lane *comparisons* are
+    /// mathematically exact in the interpreter.
+    IntToFloatTos { guarded: bool },
+    /// Same conversion applied to the entry *below* TOS. A dedicated op
+    /// (rather than `Swap2` + `IntToFloatTos` + `Swap2`) so a guarded
+    /// deopt spills the operand stack in its original order.
+    IntToFloatSecond { guarded: bool },
 }
 
 /// One IR statement: a [`TOp`] tagged with its originating bytecode pc
@@ -120,6 +130,18 @@ pub enum TTerm {
         target: BlockId,
         fallthrough: BlockId,
     },
+    /// RFC 0058 WS4 — a recognized `FOR_ITER` over a unit-step `range`,
+    /// rewritten to an i64 counted loop over two synthetic local slots.
+    /// If `cur < stop`: store `cur` into `var_slot`, bump `cur`, and
+    /// branch to `body`; else branch to `exit`. `cur < stop <= i64::MAX`
+    /// makes the unit-step increment provably overflow-free.
+    ForRange {
+        cur_slot: u32,
+        stop_slot: u32,
+        var_slot: u32,
+        body: BlockId,
+        exit: BlockId,
+    },
 }
 
 /// A basic block: a static entry-stack shape, a straight-line body, and
@@ -133,10 +155,55 @@ pub struct TBlock {
     pub term: TTerm,
 }
 
+/// What a `LOAD_GLOBAL` name resolved to at analysis time. Provided by
+/// the embedder's resolver closure; anything other than `Opaque` is
+/// burned into the compiled code, and the embedder must re-validate the
+/// resolution (an identity guard) on every native entry.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ResolvedGlobal {
+    /// The canonical builtin `range` — eligible as a counted-loop callee.
+    RangeBuiltin,
+    /// An `int` global, burned in as a constant.
+    ConstInt(i64),
+    /// A `float` global, burned in as a constant (stored as bits so the
+    /// enum stays `Copy` + `PartialEq`).
+    ConstFloat(u64),
+    /// A `bool` global, burned in as a constant.
+    ConstBool(bool),
+    /// Anything else — not representable; the load disqualifies the frame.
+    Opaque,
+}
+
+/// One entry guard the embedder must re-validate before each native
+/// entry: `name` must still resolve (globals-then-builtins) to the same
+/// object it resolved to at compile time.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlobalGuard {
+    pub name: String,
+    pub expect: ResolvedGlobal,
+}
+
+/// Deopt-reconstruction metadata for one rewritten `range` loop: at any
+/// deopt pc in `[live_from, live_to)` the *interpreter's* operand stack
+/// would hold the live range iterator below the spilled temporaries, so
+/// the embedder must rebuild it from the two synthetic slots.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RangeLoopMeta {
+    /// Synthetic slot holding the next value to yield.
+    pub cur_slot: u32,
+    /// Synthetic slot holding the exclusive stop bound.
+    pub stop_slot: u32,
+    /// First pc (the `FOR_ITER`) at which the iterator is live.
+    pub live_from: u32,
+    /// The `END_FOR` pc; the iterator is dead from here on.
+    pub live_to: u32,
+}
+
 /// A fully analyzed, JITable function body.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TFunc {
-    /// Number of local slots in the originating code object.
+    /// Number of local slots, *including* the synthetic `range`-loop
+    /// slots appended after the code object's real locals.
     pub n_locals: u32,
     /// Stable JIT type of each local slot, or `None` for slots the
     /// region never touches (left untouched by the JIT).
@@ -150,6 +217,12 @@ pub struct TFunc {
     pub max_stack: u32,
     pub blocks: Vec<TBlock>,
     pub entry_block: BlockId,
+    /// Entry guards for every `LOAD_GLOBAL` burned into the code
+    /// (RFC 0058 WS4), deduplicated by name.
+    pub global_guards: Vec<GlobalGuard>,
+    /// Rewritten `range` loops, ordered outermost-first (ascending
+    /// `live_from`), for deopt stack reconstruction.
+    pub range_loops: Vec<RangeLoopMeta>,
 }
 
 impl TOp {
@@ -168,6 +241,8 @@ impl TOp {
             ) | TOp::IntNeg
                 | TOp::IntTrueDiv
                 | TOp::FloatArith(ArithKind::TrueDiv)
+                | TOp::IntToFloatTos { guarded: true }
+                | TOp::IntToFloatSecond { guarded: true }
         )
     }
 }

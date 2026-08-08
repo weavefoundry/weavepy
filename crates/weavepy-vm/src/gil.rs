@@ -607,12 +607,18 @@ pub fn allow_threads_then<R>(f: impl FnOnce() -> R) -> R {
 /// How many dispatch-loop opcodes elapse between cooperative GIL
 /// hand-off checks. CPython switches on a 5ms wall-clock interval;
 /// we approximate with an opcode countdown that's cheap to test in
-/// the hot path (a thread-local decrement, no atomics).
+/// the hot path.
 const GIL_CHECK_INTERVAL: u32 = 128;
 
+/// The countdown itself is a process-global relaxed atomic rather
+/// than a thread-local (RFC 0058 WS2): only the GIL holder executes
+/// bytecode, so a shared counter preserves the "check every ~128
+/// opcodes" cadence while replacing a macOS `tlv_get_addr` call per
+/// instruction with one uncontended atomic RMW.
+static YIELD_COUNTDOWN: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(GIL_CHECK_INTERVAL);
+
 std::thread_local! {
-    static YIELD_COUNTDOWN: std::cell::Cell<u32> =
-        const { std::cell::Cell::new(GIL_CHECK_INTERVAL) };
 
     /// Wall-clock instant at which this thread last (re)acquired the GIL
     /// for a contiguous run. [`maybe_yield_gil`] reads it to enforce
@@ -717,22 +723,17 @@ impl Drop for NoYieldGuard {
 /// `_started`. Mirrors CPython's `eval_breaker` / `gil_drop_request`
 /// switch driven by `sys.setswitchinterval`.
 ///
-/// The fast path is a thread-local countdown decrement; the GIL is
+/// The fast path is a relaxed atomic countdown decrement; the GIL is
 /// only actually dropped every [`GIL_CHECK_INTERVAL`] opcodes *and*
 /// only when another thread is blocked waiting for it.
 #[inline]
 pub fn periodic_gil_checkpoint() {
-    let fire = YIELD_COUNTDOWN.with(|c| {
-        let n = c.get();
-        if n <= 1 {
-            c.set(GIL_CHECK_INTERVAL);
-            true
-        } else {
-            c.set(n - 1);
-            false
-        }
-    });
-    if fire {
+    // Relaxed is enough: the countdown only paces how often we
+    // *consider* yielding, so lost updates under a rare race merely
+    // shift the next check by a few opcodes.
+    let prev = YIELD_COUNTDOWN.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    if prev <= 1 {
+        YIELD_COUNTDOWN.store(GIL_CHECK_INTERVAL, std::sync::atomic::Ordering::Relaxed);
         maybe_yield_gil();
     }
 }
