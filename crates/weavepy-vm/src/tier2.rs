@@ -16,9 +16,11 @@ use std::collections::HashMap;
 use std::rc::Rc as StdRc;
 
 use weavepy_compiler::CodeObject;
-use weavepy_jit::{CompiledFrame, JitEngine, JitFrame, JitStatus, JitType, SlotTag};
+use weavepy_jit::{
+    CompiledFrame, JitEngine, JitFrame, JitStatus, JitType, ResolvedGlobal, SlotTag,
+};
 
-use crate::object::Object;
+use crate::object::{Object, PyIterator, StrKey};
 use crate::sync::Rc;
 
 /// What happened when the VM offered a frame to the JIT.
@@ -33,11 +35,20 @@ pub(crate) enum JitEntry {
     Skip,
 }
 
+/// A compiled frame plus the globals it burned in: `snapshot[i]` is the
+/// object `guards[i].name` resolved to at compile time. Every entry
+/// re-resolves each name against the entering frame's namespaces and
+/// requires identity (`is_same`) with the snapshot (RFC 0058 WS4).
+struct CompiledEntry {
+    cf: StdRc<CompiledFrame>,
+    guard_snapshot: StdRc<Vec<(String, Object)>>,
+}
+
 /// Per-`CodeObject` compilation state.
 enum Tier {
     Cold,
     NotJitable,
-    Compiled(StdRc<CompiledFrame>),
+    Compiled(StdRc<CompiledFrame>, StdRc<Vec<(String, Object)>>),
 }
 
 struct CacheEntry {
@@ -88,9 +99,16 @@ impl JitState {
     }
 
     /// Bump the hot counter for `code` and, once it crosses the
-    /// threshold, attempt compilation. Returns the compiled frame when
-    /// one is available.
-    fn get_compiled(&mut self, code: &Rc<CodeObject>) -> Option<StdRc<CompiledFrame>> {
+    /// threshold, attempt compilation. `resolve_obj` maps a
+    /// `LOAD_GLOBAL` name to its current resolution in the requesting
+    /// frame's namespaces (used both to classify globals for analysis
+    /// and to snapshot the guard expectations). Returns the compiled
+    /// frame + guard snapshot when one is available.
+    fn get_compiled(
+        &mut self,
+        code: &Rc<CodeObject>,
+        resolve_obj: &mut dyn FnMut(&str) -> Option<Object>,
+    ) -> Option<CompiledEntry> {
         let key = Rc::as_ptr(code).cast::<CodeObject>();
         {
             let entry = self.cache.entry(key).or_insert_with(|| CacheEntry {
@@ -99,7 +117,12 @@ impl JitState {
                 _code: code.clone(),
             });
             match &entry.tier {
-                Tier::Compiled(cf) => return Some(cf.clone()),
+                Tier::Compiled(cf, snap) => {
+                    return Some(CompiledEntry {
+                        cf: cf.clone(),
+                        guard_snapshot: snap.clone(),
+                    })
+                }
                 Tier::NotJitable => return None,
                 Tier::Cold => {
                     entry.counter += 1;
@@ -119,11 +142,33 @@ impl JitState {
             }
         }
         let engine = self.engine.as_mut()?;
-        let (tier, out) = match engine.compile(code) {
+        let mut classify = |name: &str| classify_global(resolve_obj(name).as_ref());
+        let (tier, out) = match engine.compile(code, &mut classify) {
             Ok(cf) => {
                 self.stats.frames_compiled += 1;
-                let rc = StdRc::new(cf);
-                (Tier::Compiled(rc.clone()), Some(rc))
+                // Snapshot the exact objects the guards must keep
+                // resolving to. Every guarded name resolved during
+                // analysis, so it resolves here too (nothing ran since
+                // — same thread, GIL held).
+                let snap: Vec<(String, Object)> = cf
+                    .global_guards
+                    .iter()
+                    .filter_map(|g| resolve_obj(&g.name).map(|o| (g.name.clone(), o)))
+                    .collect();
+                if snap.len() != cf.global_guards.len() {
+                    self.stats.frames_notjitable += 1;
+                    (Tier::NotJitable, None)
+                } else {
+                    let rc = StdRc::new(cf);
+                    let snap = StdRc::new(snap);
+                    (
+                        Tier::Compiled(rc.clone(), snap.clone()),
+                        Some(CompiledEntry {
+                            cf: rc,
+                            guard_snapshot: snap,
+                        }),
+                    )
+                }
             }
             Err(_) => {
                 self.stats.frames_notjitable += 1;
@@ -192,22 +237,74 @@ pub(crate) fn note_backedge(code: &Rc<CodeObject>) {
     JIT.with(|cell| cell.borrow_mut().note_backedge(code));
 }
 
+/// Resolve a global name the way `LOAD_GLOBAL`'s happy path does —
+/// globals then builtins, plain dict gets only. Returns `None` for a
+/// dict-subclass globals mapping (whose `__missing__` hook the generic
+/// path would consult), so such frames never take the burned-in fast
+/// path.
+fn resolve_plain_global(
+    interp: &super::Interpreter,
+    frame: &super::Frame,
+    name: &str,
+) -> Option<Object> {
+    if interp.globals_missing_owner(&frame.globals).is_some() {
+        return None;
+    }
+    let key = StrKey(name);
+    if let Some(v) = frame.globals.borrow().get(&key) {
+        return Some(v.clone());
+    }
+    frame.builtins.borrow().get(&key).cloned()
+}
+
+/// Classify a resolved global for the analyzer (RFC 0058 WS4): the
+/// canonical `range` becomes a counted-loop callee; scalar constants
+/// burn in; everything else is opaque. `range` appears in two canonical
+/// shapes — module globals hold the singleton `range` *type* object
+/// (from `builtin_types().as_globals()`), while the `builtins` dict
+/// holds the function-flavoured `BuiltinFn` — and both call through
+/// `b_range`. Builtin types reject attribute mutation, so identity
+/// implies unmodified call semantics.
+fn classify_global(obj: Option<&Object>) -> ResolvedGlobal {
+    match obj {
+        Some(Object::Builtin(b)) if b.name == "range" => ResolvedGlobal::RangeBuiltin,
+        Some(Object::Type(t)) if Rc::ptr_eq(t, &crate::builtin_types::builtin_types().range_) => {
+            ResolvedGlobal::RangeBuiltin
+        }
+        Some(Object::Int(v)) => ResolvedGlobal::ConstInt(*v),
+        Some(Object::Float(v)) => ResolvedGlobal::ConstFloat(v.to_bits()),
+        Some(Object::Bool(v)) => ResolvedGlobal::ConstBool(*v),
+        _ => ResolvedGlobal::Opaque,
+    }
+}
+
 /// Offer a fresh frame (pc 0, empty stack) to the JIT. See [`JitEntry`].
-pub(crate) fn try_enter(frame: &mut super::Frame) -> JitEntry {
+pub(crate) fn try_enter(interp: &super::Interpreter, frame: &mut super::Frame) -> JitEntry {
     // Phase 1: counter + compilation, holding the state borrow briefly.
-    let cf = JIT.with(|cell| {
+    let entry = JIT.with(|cell| {
         let mut st = cell.borrow_mut();
         if !st.enabled {
             return None;
         }
         st.stats.frames_seen += 1;
-        st.get_compiled(&frame.code)
+        let mut resolve = |name: &str| resolve_plain_global(interp, frame, name);
+        st.get_compiled(&frame.code, &mut resolve)
     });
-    let Some(cf) = cf else {
+    let Some(CompiledEntry { cf, guard_snapshot }) = entry else {
         return JitEntry::Skip;
     };
 
-    // Phase 2: entry type-guard on the live-in locals.
+    // Phase 2a: global identity guards — every burned-in resolution
+    // must still hold in *this* frame's namespaces.
+    for (name, expected) in guard_snapshot.iter() {
+        let ok = resolve_plain_global(interp, frame, name).is_some_and(|cur| cur.is_same(expected));
+        if !ok {
+            JIT.with(|cell| cell.borrow_mut().stats.entry_guard_failures += 1);
+            return JitEntry::Skip;
+        }
+    }
+
+    // Phase 2b: entry type-guard on the live-in locals.
     {
         let locals = frame.locals.borrow();
         for &slot in &cf.livein {
@@ -270,14 +367,37 @@ pub(crate) fn try_enter(frame: &mut super::Frame) -> JitEntry {
     match status {
         JitStatus::Returned => JitEntry::Ran(unpack(jf.ret_bits, jf.ret_tag)),
         JitStatus::Deopt => {
-            // Write back managed locals, rebuild the operand stack from
-            // the spill, and resume at the deopt pc.
+            // Write back managed locals (synthetic range slots have no
+            // interpreter home — they feed the iterator rebuild below),
+            // rebuild the operand stack from the spill, and resume at
+            // the deopt pc.
             {
                 let mut locals = frame.locals.borrow_mut();
                 for (slot, &bits) in locals_buf.iter().enumerate() {
                     if let Some(ty) = cf.local_types[slot] {
-                        locals[slot] = unpack_ty(bits, ty);
+                        if let Some(dst) = locals.get_mut(slot) {
+                            *dst = unpack_ty(bits, ty);
+                        }
                     }
+                }
+            }
+            // RFC 0058 WS4 — at a deopt inside a rewritten range loop
+            // the interpreter's stack would hold the live iterator(s)
+            // below the spilled temporaries. Rebuild them from the
+            // synthetic slots, outermost first.
+            for lp in &cf.range_loops {
+                if lp.live_from <= jf.deopt_pc && jf.deopt_pc < lp.live_to {
+                    let current = locals_buf[lp.cur_slot as usize] as i64;
+                    let stop = locals_buf[lp.stop_slot as usize] as i64;
+                    frame
+                        .stack
+                        .push(Object::Iter(Rc::new(crate::sync::RefCell::new(
+                            PyIterator::Range {
+                                current,
+                                stop,
+                                step: 1,
+                            },
+                        ))));
                 }
             }
             for i in 0..jf.stack_len as usize {

@@ -13,7 +13,7 @@ use crate::sync::RefCell;
 
 use crate::error::{type_error, value_error, RuntimeError};
 use crate::import::ModuleCache;
-use crate::object::{BuiltinFn, DictData, DictKey, FileBackend, Object, PyFile, PyFrame, PyModule};
+use crate::object::{BuiltinFn, DictData, DictKey, FileBackend, Object, PyFile, PyModule};
 
 /// CPython compatibility version we advertise. This is intentionally
 /// independent from the WeavePy package version (see
@@ -28,7 +28,7 @@ pub const PY_VERSION: (i64, i64, i64) = (3, 13, 0);
 /// interpreter itself so module-level callables can read live state.
 pub fn build_with_state(
     cache: &ModuleCache,
-    frame_stack: Rc<RefCell<Vec<Rc<PyFrame>>>>,
+    frame_stack: crate::object::FrameStack,
     exc_info_stack: Rc<RefCell<Vec<crate::error::PyException>>>,
     excepthook: Rc<RefCell<Object>>,
     unraisable_hook: Rc<RefCell<Object>>,
@@ -292,9 +292,9 @@ pub fn build_with_state(
                     call: Box::new(move |_args| {
                         let frame = if let Some(h) = crate::vm_singletons::current_thread_handles()
                         {
-                            h.frame_stack.borrow().last().cloned()
+                            crate::object::materialize_stack_top(&h.frame_stack)
                         } else {
-                            fs_cf.borrow().last().cloned()
+                            crate::object::materialize_stack_top(&fs_cf)
                         };
                         let mut d = DictData::default();
                         if let Some(f) = frame {
@@ -1039,25 +1039,27 @@ fn sys_getfilesystemencodeerrors(_args: &[Object]) -> Result<Object, RuntimeErro
 
 fn sys_getframe(
     args: &[Object],
-    frame_stack: &Rc<RefCell<Vec<Rc<PyFrame>>>>,
+    frame_stack: &crate::object::FrameStack,
 ) -> Result<Object, RuntimeError> {
     let depth = match args.first() {
         Some(Object::Int(d)) => *d as usize,
         None => 0,
         _ => return Err(type_error("depth must be an int")),
     };
-    let stack = frame_stack.borrow();
     // The topmost frame is the currently-executing one, which is
     // the *callee* of `sys._getframe`. CPython considers the
     // calling frame as depth 0; we mirror by indexing from the back.
-    if stack.is_empty() {
+    let len = frame_stack.borrow().len();
+    if depth >= len {
         return Err(value_error("call stack is not deep enough"));
     }
-    if depth >= stack.len() {
-        return Err(value_error("call stack is not deep enough"));
+    let idx = len - 1 - depth;
+    // RFC 0058: the spine holds cheap shells; the Python-visible
+    // frame object is materialised on demand right here.
+    match crate::object::materialize_stack_at(frame_stack, idx) {
+        Some(py) => Ok(Object::Frame(py)),
+        None => Err(value_error("call stack is not deep enough")),
     }
-    let idx = stack.len() - 1 - depth;
-    Ok(Object::Frame(stack[idx].clone()))
 }
 
 /// `sys.exception()` (PEP 3134 / 3.11+): the exception instance currently

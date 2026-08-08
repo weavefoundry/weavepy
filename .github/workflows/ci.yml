@@ -107,6 +107,47 @@ jobs:
           path: target/regrtest/
           if-no-files-found: warn
 
+  bench:
+    name: bench gate (blocking, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    # RFC 0058 — the benchmark lane. Gates on WeavePy/CPython *ratios*
+    # against baselines/bench.json (host-independent, unlike absolute
+    # times); the 25% threshold absorbs shared-runner noise. The
+    # markdown report lands in the job summary so every PR shows its
+    # ratio table.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build weavepy CLI + bench harness
+        run: cargo build --release -p weavepy-cli -p weavepy-bench
+      - name: Run bench gate
+        run: |
+          target/release/weavepy-bench gate --pct=25 \
+            --weavepy=target/release/weavepy \
+            | tee bench-report.md
+      - name: Append bench report to job summary
+        if: always()
+        run: |
+          {
+            echo "## WeavePy bench"
+            echo
+            cat bench-report.md || echo "(no report produced)"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-report-${{ matrix.os }}
+          path: bench-report.md
+          if-no-files-found: warn
+
   conformance:
     name: cpython conformance (non-blocking)
     runs-on: ubuntu-latest

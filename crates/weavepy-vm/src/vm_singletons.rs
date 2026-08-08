@@ -51,35 +51,62 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
 }
 
+/// Process-wide count of parked `__del__` requests across all threads'
+/// [`PENDING_FINALIZERS`] queues (RFC 0058 WS2). The eval loop probes
+/// for pending finalizers *every instruction*; a macOS thread-local
+/// access plus a `RefCell` borrow there is measurably expensive, so
+/// this relaxed atomic is the fast gate and the thread-local queue
+/// stays the precise, per-thread source of truth.
+static PENDING_FINALIZER_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Push an instance whose `__del__` should run at the next safe
 /// point. Called by the cycle GC during its clear phase.
 pub fn push_pending_finalizer(obj: Object) {
     PENDING_FINALIZERS.with(|cell| {
         cell.borrow_mut().push(obj);
     });
+    PENDING_FINALIZER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
 /// Like [`push_pending_finalizer`], but callable from `Drop` impls:
 /// tolerates thread-teardown (destroyed TLS) and re-entrant borrows
 /// by silently dropping the request.
 pub fn try_push_pending_finalizer(obj: Object) {
-    let _ = PENDING_FINALIZERS.try_with(|cell| {
-        if let Ok(mut queue) = cell.try_borrow_mut() {
-            queue.push(obj);
-        }
-    });
+    let pushed = PENDING_FINALIZERS
+        .try_with(|cell| {
+            if let Ok(mut queue) = cell.try_borrow_mut() {
+                queue.push(obj);
+                true
+            } else {
+                false
+            }
+        })
+        .unwrap_or(false);
+    if pushed {
+        PENDING_FINALIZER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// Drain the pending-finalizer queue. The eval loop calls this
 /// at every eval-breaker tick that has the GC flag set.
 pub fn drain_pending_finalizers() -> Vec<Object> {
-    PENDING_FINALIZERS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+    let taken = PENDING_FINALIZERS.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+    if !taken.is_empty() {
+        PENDING_FINALIZER_COUNT.fetch_sub(taken.len(), std::sync::atomic::Ordering::Release);
+    }
+    taken
 }
 
 /// Whether any `__del__` requests are parked on this thread's queue —
 /// the eval loop's between-bytecodes gate for running them promptly.
-/// Teardown-safe (one thread-local read).
+/// One relaxed atomic load in the (overwhelmingly common) empty case;
+/// the thread-local queue is consulted only when *some* thread has
+/// parked work. Teardown-safe.
 pub fn has_pending_finalizers() -> bool {
+    if PENDING_FINALIZER_COUNT.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return false;
+    }
     PENDING_FINALIZERS
         .try_with(|cell| cell.try_borrow().map(|q| !q.is_empty()).unwrap_or(false))
         .unwrap_or(false)
@@ -278,10 +305,27 @@ pub fn clear_worker_thread_id() {
 /// `Rc::strong_count` snapshots) and can make the peer's live objects look
 /// like garbage. Called from the worker teardown in `thread_real.rs`.
 pub fn clear_thread_python_tls() {
-    let _ = PENDING_FINALIZERS.try_with(|cell| cell.borrow_mut().clear());
+    // The process-global fast-gate counts mirror the *sum* of every
+    // thread's queue lengths; entries discarded here must come off the
+    // counts too, or the eval loop's per-instruction gates stay
+    // permanently "hot" and every thread pays the slow thread-local
+    // probe forever (the counts never reach zero again).
+    let dropped_finalizers =
+        PENDING_FINALIZERS.try_with(|cell| std::mem::take(&mut *cell.borrow_mut()).len());
+    if let Ok(n) = dropped_finalizers {
+        if n > 0 {
+            PENDING_FINALIZER_COUNT.fetch_sub(n, std::sync::atomic::Ordering::Release);
+        }
+    }
     let _ = PENDING_WEAKREF_CALLBACKS.try_with(|cell| cell.borrow_mut().clear());
     let _ = CURRENT_THREAD_HANDLES.try_with(|cell| cell.borrow_mut().clear());
-    let _ = PENDING_CEXT_DROPS.try_with(|cell| cell.borrow_mut().clear());
+    let dropped_cext =
+        PENDING_CEXT_DROPS.try_with(|cell| std::mem::take(&mut *cell.borrow_mut()).len());
+    if let Ok(n) = dropped_cext {
+        if n > 0 {
+            PENDING_CEXT_COUNT.fetch_sub(n, std::sync::atomic::Ordering::Release);
+        }
+    }
     crate::builtin_types::clear_thread_type_registry();
 }
 
@@ -348,7 +392,7 @@ pub fn thread_ident_is_live(id: u64) -> bool {
 /// frame that registered them (e.g. when a builtin re-enters the VM).
 #[derive(Clone, Debug)]
 pub struct ThreadHandles {
-    pub frame_stack: Rc<RefCell<Vec<Rc<crate::object::PyFrame>>>>,
+    pub frame_stack: crate::object::FrameStack,
     pub exc_info_stack: Rc<RefCell<Vec<crate::error::PyException>>>,
     pub excepthook: Rc<RefCell<Object>>,
     pub unraisable_hook: Rc<RefCell<Object>>,
@@ -730,12 +774,22 @@ pub fn queue_parked_drop(obj: &Object) {
             }
         }
         let _ = PENDING_CEXT_FLAG.try_with(|c| c.set(true));
+        PENDING_CEXT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 }
+
+/// Process-wide count of parked C-dropped objects (RFC 0058 WS2): the
+/// eval loop's per-instruction fast gate, saving the thread-local
+/// flag read (and the `cext_call_active` thread-local that follows it)
+/// in the common empty case.
+static PENDING_CEXT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Cheap probe for the eval-loop safe point: are any C-dropped objects
 /// awaiting a prompt-reap pass on this thread?
 pub fn has_pending_cext_drops() -> bool {
+    if PENDING_CEXT_COUNT.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return false;
+    }
     PENDING_CEXT_FLAG
         .try_with(std::cell::Cell::get)
         .unwrap_or(false)
@@ -744,13 +798,17 @@ pub fn has_pending_cext_drops() -> bool {
 /// Drain this thread's queue of C-dropped objects.
 pub fn drain_pending_cext_drops() -> Vec<Object> {
     let _ = PENDING_CEXT_FLAG.try_with(|c| c.set(false));
-    PENDING_CEXT_DROPS
+    let taken: Vec<Object> = PENDING_CEXT_DROPS
         .try_with(|cell| {
             cell.try_borrow_mut()
                 .map(|mut q| std::mem::take(&mut *q))
                 .unwrap_or_default()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if !taken.is_empty() {
+        PENDING_CEXT_COUNT.fetch_sub(taken.len(), std::sync::atomic::Ordering::Release);
+    }
+    taken
 }
 
 /// RAII guard for one VM→C-extension transition; see [`enter_cext_call`].

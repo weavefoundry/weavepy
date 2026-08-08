@@ -77,9 +77,17 @@ pub fn attempt_specialize_binary_op(a: &Object, b: &Object, op: BinOpKind) -> In
         (O::Int(_), O::Int(_), B::Add) => InlineCache::BinOpAddInt,
         (O::Int(_), O::Int(_), B::Sub) => InlineCache::BinOpSubInt,
         (O::Int(_), O::Int(_), B::Mult) => InlineCache::BinOpMulInt,
+        (O::Int(_), O::Int(_), B::Div) => InlineCache::BinOpDivInt,
+        (O::Int(_), O::Int(_), B::FloorDiv) => InlineCache::BinOpFloorDivInt,
+        (O::Int(_), O::Int(_), B::Mod) => InlineCache::BinOpModInt,
+        (O::Int(_), O::Int(_), B::Pow) => InlineCache::BinOpPowInt,
         (O::Float(_), O::Float(_), B::Add) => InlineCache::BinOpAddFloat,
         (O::Float(_), O::Float(_), B::Sub) => InlineCache::BinOpSubFloat,
         (O::Float(_), O::Float(_), B::Mult) => InlineCache::BinOpMulFloat,
+        (O::Float(_), O::Float(_), B::Div) => InlineCache::BinOpDivFloat,
+        (O::Float(_), O::Float(_), B::FloorDiv) => InlineCache::BinOpFloorDivFloat,
+        (O::Float(_), O::Float(_), B::Mod) => InlineCache::BinOpModFloat,
+        (O::Float(_), O::Float(_), B::Pow) => InlineCache::BinOpPowFloat,
         (O::Str(_), O::Str(_), B::Add) => InlineCache::BinOpAddStr,
         _ => InlineCache::Cooldown(COOLDOWN),
     }
@@ -348,6 +356,8 @@ pub fn attempt_specialize_for_iter(it: &Object) -> InlineCache {
             PyIterator::List { .. } => InlineCache::ForIterList,
             PyIterator::Tuple { .. } => InlineCache::ForIterTuple,
             PyIterator::Range { .. } => InlineCache::ForIterRange,
+            PyIterator::Str { .. } => InlineCache::ForIterStr,
+            PyIterator::DictKeys { .. } => InlineCache::ForIterDict,
             _ => InlineCache::Cooldown(COOLDOWN),
         }
     } else {
@@ -368,6 +378,42 @@ pub fn attempt_specialize_unpack_sequence(seq: &Object, n: usize) -> InlineCache
         Object::Tuple(items) if items.len() == n && n == 2 => InlineCache::UnpackSequenceTwoTuple,
         Object::Tuple(items) if items.len() == n => InlineCache::UnpackSequenceTuple,
         Object::List(xs) if xs.borrow().len() == n => InlineCache::UnpackSequenceList,
+        _ => InlineCache::Cooldown(COOLDOWN),
+    }
+}
+
+// ---------- specialization decisions: BINARY_SUBSCR / STORE_SUBSCR ----------
+
+/// Decide on a `BINARY_SUBSCR` specialization (RFC 0058 WS3). No
+/// fingerprint is stored — the container's enum variant *is* the
+/// guard, re-checked at the start of every hit.
+///
+/// The string shape only installs for pure-ASCII strings (code-point
+/// count == byte count, both cached on the `Rc<str>`), where indexing
+/// is an O(1) byte read; the fast path re-verifies that property per
+/// hit because a cache slot outlives any one receiver.
+pub fn attempt_specialize_binary_subscr(container: &Object, index: &Object) -> InlineCache {
+    use Object as O;
+    match (container, index) {
+        (O::List(_), O::Int(_)) => InlineCache::SubscrListInt,
+        (O::Tuple(_), O::Int(_)) => InlineCache::SubscrTupleInt,
+        (O::Str(s), O::Int(_)) if crate::object::str_char_len(s) == s.len() => {
+            InlineCache::SubscrStrInt
+        }
+        (O::Dict(_), _) => InlineCache::SubscrDict,
+        _ => InlineCache::Cooldown(COOLDOWN),
+    }
+}
+
+/// Decide on a `STORE_SUBSCR` specialization. Mirrors
+/// [`attempt_specialize_binary_subscr`] for the write side: only the
+/// element-overwrite list shape and the dict-insert shape — slices and
+/// everything descriptor-flavored stay generic.
+pub fn attempt_specialize_store_subscr(target: &Object, index: &Object) -> InlineCache {
+    use Object as O;
+    match (target, index) {
+        (O::List(_), O::Int(_)) => InlineCache::StoreSubscrListInt,
+        (O::Dict(_), _) => InlineCache::StoreSubscrDict,
         _ => InlineCache::Cooldown(COOLDOWN),
     }
 }
@@ -394,20 +440,99 @@ pub fn attempt_specialize_call(callable: &Object, argc: usize) -> InlineCache {
             if code.has_varargs || code.has_varkeywords || code.kwonly_count != 0 {
                 return InlineCache::Cooldown(COOLDOWN);
             }
-            // Only the exact-arity shape: anything needing defaults (too
-            // few) or *args overflow (too many) keeps the generic path.
-            if code.arg_count as usize != argc {
-                return InlineCache::Cooldown(COOLDOWN);
-            }
             let func_id = rc_id(f);
-            let argc = u32::try_from(argc).unwrap_or(u32::MAX);
-            if code.cellvars.is_empty() && code.freevars.is_empty() && f.closure.is_empty() {
-                InlineCache::CallPyExactNoFree { func_id, argc }
+            let argc32 = u32::try_from(argc).unwrap_or(u32::MAX);
+            let cell_free =
+                code.cellvars.is_empty() && code.freevars.is_empty() && f.closure.is_empty();
+            // Exact positional arity: the RFC 0032 binder-skip shapes.
+            if code.arg_count as usize == argc {
+                return if cell_free {
+                    InlineCache::CallPyExactNoFree {
+                        func_id,
+                        argc: argc32,
+                    }
+                } else {
+                    InlineCache::CallPyExact {
+                        func_id,
+                        argc: argc32,
+                    }
+                };
+            }
+            // Fewer positionals with the missing tail covered verbatim by
+            // `__defaults__` (RFC 0058 WS3). Cell-free only — the frame is
+            // built like the no-free shape with the defaults spliced in.
+            // A slot-stored `__defaults__` override (`f.__defaults__ = …`,
+            // namedtuple's `__new__`) replaces the compiled tuple in the
+            // generic binder, so those stay generic (and the hit guard
+            // re-checks, since the override can arrive later).
+            if argc < code.arg_count as usize
+                && f.defaults.len() >= code.arg_count as usize - argc
+                && cell_free
+                && f.slot("__defaults__").is_none()
+            {
+                return InlineCache::CallPyDefaults {
+                    func_id,
+                    argc: argc32,
+                };
+            }
+            InlineCache::Cooldown(COOLDOWN)
+        }
+        // Module-level native callable (RFC 0058 WS3): safe to jump
+        // straight to the Rust `fn` when the name never enters the
+        // interpreter-aware dispatch chain.
+        Object::Builtin(b) => {
+            if crate::native_call_ic_safe(b.name) {
+                InlineCache::CallNative {
+                    func_id: rc_id(b),
+                    argc: u32::try_from(argc).unwrap_or(u32::MAX),
+                }
             } else {
-                InlineCache::CallPyExact { func_id, argc }
+                InlineCache::Cooldown(COOLDOWN)
             }
         }
+        // Bound native method (`xs.append`, `s.startswith`, …): the
+        // generic path prepends the receiver and lands on the same
+        // Rust `fn`; cache that fusion. Bound *Python* methods are
+        // intercepted before the cache is consulted and use
+        // [`attempt_specialize_call_bound_py`] instead.
+        Object::BoundMethod(bm) => {
+            if let Object::Builtin(b) = &bm.function {
+                if crate::native_call_ic_safe(b.name) {
+                    return InlineCache::CallNativeMethod {
+                        func_id: rc_id(b),
+                        argc: u32::try_from(argc).unwrap_or(u32::MAX),
+                    };
+                }
+            }
+            InlineCache::Cooldown(COOLDOWN)
+        }
         _ => InlineCache::Cooldown(COOLDOWN),
+    }
+}
+
+/// Decide on a `CALL` specialization for a bound method whose target is
+/// a plain Python function (RFC 0058 WS3). Mirrors the exact-arity
+/// no-free shape with the receiver counted as the leading argument.
+pub fn attempt_specialize_call_bound_py(
+    f: &Rc<crate::object::PyFunction>,
+    argc: usize,
+) -> InlineCache {
+    let code = f.code();
+    if code.is_generator || code.is_coroutine || code.is_async_generator {
+        return InlineCache::Cooldown(COOLDOWN);
+    }
+    if code.has_varargs || code.has_varkeywords || code.kwonly_count != 0 {
+        return InlineCache::Cooldown(COOLDOWN);
+    }
+    if code.arg_count as usize != argc + 1 {
+        return InlineCache::Cooldown(COOLDOWN);
+    }
+    if !(code.cellvars.is_empty() && code.freevars.is_empty() && f.closure.is_empty()) {
+        return InlineCache::Cooldown(COOLDOWN);
+    }
+    InlineCache::CallBoundMethodExact {
+        func_id: rc_id(f),
+        argc: u32::try_from(argc).unwrap_or(u32::MAX),
     }
 }
 
@@ -483,14 +608,17 @@ pub const OPCODE_TABLE_LEN: usize = 256;
 
 thread_local! {
     static STATS: RefCell<Stats> = RefCell::new(Stats::default());
-    static STATS_ENABLED: bool = std::env::var("WEAVEPY_VM_STATS").is_ok();
 }
 
-/// Whether stats collection is enabled for this thread (cached
-/// from the env var on first read).
+/// Whether stats collection is enabled (cached from the env var on
+/// first read). Process-global — the env var cannot change after
+/// startup, and a plain static read keeps the disabled fast path to
+/// a single load with no TLS traffic (RFC 0058 WS2: the previous
+/// per-thread `with` was a measurable per-instruction cost).
 #[inline]
 pub fn stats_enabled() -> bool {
-    STATS_ENABLED.with(|e| *e)
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("WEAVEPY_VM_STATS").is_some())
 }
 
 /// Increment the `total_dispatches` counter. No-op when stats
@@ -670,6 +798,114 @@ mod tests {
         assert_eq!(
             attempt_specialize_unpack_sequence(&t, 3),
             InlineCache::UnpackSequenceTuple
+        );
+    }
+
+    #[test]
+    fn binop_int_division_family_specializes() {
+        let a = Object::Int(7);
+        let b = Object::Int(2);
+        assert_eq!(
+            attempt_specialize_binary_op(&a, &b, BinOpKind::Div),
+            InlineCache::BinOpDivInt
+        );
+        assert_eq!(
+            attempt_specialize_binary_op(&a, &b, BinOpKind::FloorDiv),
+            InlineCache::BinOpFloorDivInt
+        );
+        assert_eq!(
+            attempt_specialize_binary_op(&a, &b, BinOpKind::Mod),
+            InlineCache::BinOpModInt
+        );
+        assert_eq!(
+            attempt_specialize_binary_op(&a, &b, BinOpKind::Pow),
+            InlineCache::BinOpPowInt
+        );
+    }
+
+    #[test]
+    fn binop_float_division_family_specializes() {
+        let a = Object::Float(7.5);
+        let b = Object::Float(2.0);
+        assert_eq!(
+            attempt_specialize_binary_op(&a, &b, BinOpKind::Div),
+            InlineCache::BinOpDivFloat
+        );
+        assert_eq!(
+            attempt_specialize_binary_op(&a, &b, BinOpKind::Mod),
+            InlineCache::BinOpModFloat
+        );
+        assert_eq!(
+            attempt_specialize_binary_op(&a, &b, BinOpKind::Pow),
+            InlineCache::BinOpPowFloat
+        );
+    }
+
+    #[test]
+    fn subscr_decisions_cover_ws3_shapes() {
+        let xs = Object::new_list(vec![Object::Int(1)]);
+        let idx = Object::Int(0);
+        assert_eq!(
+            attempt_specialize_binary_subscr(&xs, &idx),
+            InlineCache::SubscrListInt
+        );
+        let t = Object::new_tuple(vec![Object::Int(1)]);
+        assert_eq!(
+            attempt_specialize_binary_subscr(&t, &idx),
+            InlineCache::SubscrTupleInt
+        );
+        let s = Object::from_static("ascii");
+        assert_eq!(
+            attempt_specialize_binary_subscr(&s, &idx),
+            InlineCache::SubscrStrInt
+        );
+        // Non-ASCII strings must not install the byte-indexing shape.
+        let s = Object::from_static("héllo");
+        assert!(matches!(
+            attempt_specialize_binary_subscr(&s, &idx),
+            InlineCache::Cooldown(_)
+        ));
+        let d = Object::Dict(Rc::new(RefCell::new(DictData::default())));
+        assert_eq!(
+            attempt_specialize_binary_subscr(&d, &idx),
+            InlineCache::SubscrDict
+        );
+        // Slices stay generic.
+        assert!(matches!(
+            attempt_specialize_binary_subscr(&xs, &Object::None),
+            InlineCache::Cooldown(_)
+        ));
+    }
+
+    #[test]
+    fn store_subscr_decisions_cover_ws3_shapes() {
+        let xs = Object::new_list(vec![Object::Int(1)]);
+        let idx = Object::Int(0);
+        assert_eq!(
+            attempt_specialize_store_subscr(&xs, &idx),
+            InlineCache::StoreSubscrListInt
+        );
+        let d = Object::Dict(Rc::new(RefCell::new(DictData::default())));
+        assert_eq!(
+            attempt_specialize_store_subscr(&d, &Object::from_static("k")),
+            InlineCache::StoreSubscrDict
+        );
+        let t = Object::new_tuple(vec![Object::Int(1)]);
+        assert!(matches!(
+            attempt_specialize_store_subscr(&t, &idx),
+            InlineCache::Cooldown(_)
+        ));
+    }
+
+    #[test]
+    fn for_iter_str_and_dict_specialize() {
+        let s_iter = Object::Iter(Rc::new(RefCell::new(PyIterator::Str {
+            s: Rc::from("abc"),
+            index: 0,
+        })));
+        assert_eq!(
+            attempt_specialize_for_iter(&s_iter),
+            InlineCache::ForIterStr
         );
     }
 }

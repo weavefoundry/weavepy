@@ -662,6 +662,18 @@ pub enum InlineCache {
     BinOpSubFloat,
     BinOpMulFloat,
     BinOpAddStr,
+    // RFC 0058 WS3 — division/modulo/power completion. The int shapes
+    // deopt to the generic (bignum) path when the i64 primitive can't
+    // represent the result; error semantics (ZeroDivisionError…) are
+    // shared with the generic path via the same helper.
+    BinOpDivInt,
+    BinOpFloorDivInt,
+    BinOpModInt,
+    BinOpPowInt,
+    BinOpDivFloat,
+    BinOpFloorDivFloat,
+    BinOpModFloat,
+    BinOpPowFloat,
 
     // COMPARE_OP family — both operands int / float / str.
     CompareOpInt,
@@ -744,6 +756,12 @@ pub enum InlineCache {
     ForIterList,
     ForIterTuple,
     ForIterRange,
+    /// `for c in s:` over a `str` iterator (RFC 0058 WS3).
+    ForIterStr,
+    /// `for k in d:` / dict-view loops — one shape for keys, values
+    /// and items cursors; the step runs the same checked `__next__`
+    /// (size/keys-changed guards) as the generic path.
+    ForIterDict,
 
     // UNPACK_SEQUENCE family.
     UnpackSequenceTuple,
@@ -767,6 +785,58 @@ pub enum InlineCache {
         func_id: u64,
         argc: u32,
     },
+    /// Bound method (`obj.m(...)`) whose target is a plain Python
+    /// function with exact arity `argc + 1` (receiver prepended) —
+    /// the binder skip applied to method calls. WeavePy has no
+    /// `LOAD_METHOD` opcode; the `LoadAttrMethod` + this pair is the
+    /// CPython fusion equivalent (RFC 0058 WS3).
+    CallBoundMethodExact {
+        func_id: u64,
+        argc: u32,
+    },
+    /// Plain Python function called with fewer positionals than it
+    /// declares, the missing tail covered verbatim by `__defaults__`
+    /// — skips the binder and splices the defaults suffix directly
+    /// (RFC 0058 WS3).
+    CallPyDefaults {
+        func_id: u64,
+        argc: u32,
+    },
+    /// Module-level native callable (`math.sqrt`, `ord`, …) with no
+    /// interpreter-aware dispatch chain: straight to the Rust `fn`
+    /// (RFC 0058 WS3). Deopts whenever observers (profile/trace
+    /// hooks) are active so `c_call` events still fire.
+    CallNative {
+        func_id: u64,
+        argc: u32,
+    },
+    /// Bound native method (`xs.append`, `s.startswith`, …): receiver
+    /// prepended, straight to the Rust `fn` (RFC 0058 WS3). Same
+    /// observer deopt as [`InlineCache::CallNative`].
+    CallNativeMethod {
+        func_id: u64,
+        argc: u32,
+    },
+
+    // BINARY_SUBSCR family (RFC 0058 WS3). The container's enum
+    // variant is the fingerprint, checked at the start of each hit.
+    /// `list[int]` — in-range index (negative handled inline).
+    SubscrListInt,
+    /// `tuple[int]`.
+    SubscrTupleInt,
+    /// Pure-ASCII `str[int]` (code-point count == byte count, both
+    /// cached) — O(1) byte indexing; re-verified on every hit.
+    SubscrStrInt,
+    /// `dict[key]` — skips the instance/type/foreign dispatch chain;
+    /// the hash lookup itself is unavoidable (CPython's
+    /// `BINARY_SUBSCR_DICT` does the same).
+    SubscrDict,
+
+    // STORE_SUBSCR family (RFC 0058 WS3).
+    /// `list[int] = v` — in-range element overwrite.
+    StoreSubscrListInt,
+    /// `dict[key] = v`.
+    StoreSubscrDict,
 }
 
 /// Number of generic dispatches a deopted cache must serve before it

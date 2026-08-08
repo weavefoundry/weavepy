@@ -36,6 +36,19 @@ pub fn percentile(xs: &[f64], p: f64) -> f64 {
     sorted[idx.min(sorted.len() - 1)]
 }
 
+/// Geometric mean of strictly-positive values; 0.0 for an empty
+/// slice. Used for the suite-level WeavePy/CPython ratio summary
+/// (RFC 0058) — ratios multiply, so the geometric mean is the only
+/// average that composes correctly.
+pub fn geometric_mean(xs: &[f64]) -> f64 {
+    let positive: Vec<f64> = xs.iter().copied().filter(|x| *x > 0.0).collect();
+    if positive.is_empty() {
+        return 0.0;
+    }
+    let log_sum: f64 = positive.iter().map(|x| x.ln()).sum();
+    (log_sum / positive.len() as f64).exp()
+}
+
 pub fn stddev(xs: &[f64]) -> f64 {
     if xs.len() < 2 {
         return 0.0;

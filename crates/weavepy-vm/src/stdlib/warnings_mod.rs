@@ -432,7 +432,19 @@ fn call_show_warning(
         &[],
         &globals,
     )?;
-    ip.call_object_with_globals(&show_fn, &[msg], &[], &globals)?;
+    let shown = ip.call_object_with_globals(&show_fn, &[msg.clone()], &[], &globals);
+    // CPython decrefs the transient `WarningMessage` the moment
+    // `_showwarnmsg` returns; when the hook did not retain it (the stock
+    // stderr writer), the message — and, through `source=`, the very
+    // object whose finalizer emitted the warning — dies right here. A
+    // plain Rust drop would leave the tracked message pinned by its own
+    // GC handle until the next cyclic collection, keeping e.g. an
+    // unclosed `SpooledTemporaryFile`'s buffered fd alive across tests
+    // (test_tempfile.test_warnings_on_cleanup). The refcount guard
+    // inside leaves a *recorded* message (a `catch_warnings(record=True)`
+    // log holds it) untouched.
+    ip.maybe_prompt_reap_replaced(msg);
+    shown?;
     Ok(())
 }
 
@@ -744,18 +756,21 @@ fn setup_context(
     // Per-thread frame stack, with the interpreter's own as a fallback
     // (shutdown finalizers run `__del__` without re-activating handles —
     // same fallback `sys._getframe` keeps).
-    let frames: Option<Rc<RefCell<Vec<Rc<crate::object::PyFrame>>>>> =
+    let frames: Option<crate::object::FrameStack> =
         match crate::vm_singletons::current_thread_handles() {
             Some(h) => Some(h.frame_stack.clone()),
             None => interp().ok().map(|ip| ip.frame_stack.clone()),
         };
-    let frame: Option<Rc<crate::object::PyFrame>> = frames.and_then(|fs| {
+    // The walk only needs filename / lineno / globals, all present on
+    // the cheap shells — no `PyFrame` materialisation (RFC 0058).
+    let frame: Option<Rc<crate::object::FrameShell>> = frames.and_then(|fs| {
         let stack = fs.borrow();
         if stack.is_empty() {
             return None;
         }
-        let is_internal = |f: &Rc<crate::object::PyFrame>| is_internal_filename(&f.code.filename);
-        let to_skip = |f: &Rc<crate::object::PyFrame>| {
+        let is_internal =
+            |f: &Rc<crate::object::FrameShell>| is_internal_filename(&f.code.filename);
+        let to_skip = |f: &Rc<crate::object::FrameShell>| {
             is_internal(f)
                 || skip_file_prefixes
                     .iter()

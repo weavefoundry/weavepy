@@ -9,6 +9,9 @@ xtest = "test --workspace --all-targets"
 xcheck = "check --workspace --all-targets --all-features"
 xclippy = "clippy --workspace --all-targets --all-features -- -D warnings"
 xfmt = "fmt --all"
+# RFC 0058 — the benchmark lane. Requires a release `weavepy` binary
+# (`cargo build --release -p weavepy-cli`) next to the bench binary.
+xbench = "run --release -p weavepy-bench --"
 
 [build]
 # Faster incremental builds for local dev. CI overrides via env if needed.

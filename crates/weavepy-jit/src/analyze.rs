@@ -22,7 +22,10 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use weavepy_compiler::{BinOpKind, CodeObject, CompareKind, Constant, OpCode, UnaryKind};
 
-use crate::ir::{ArithKind, BlockId, CmpKind, TBlock, TFunc, TOp, TStmt, TTerm};
+use crate::ir::{
+    ArithKind, BlockId, CmpKind, GlobalGuard, RangeLoopMeta, ResolvedGlobal, TBlock, TFunc, TOp,
+    TStmt, TTerm,
+};
 use crate::value::JitType;
 
 /// Why a code object could not be compiled by the v1 JIT. Carried back
@@ -66,9 +69,53 @@ struct RawBlock {
 /// Maximum type-inference iterations before giving up.
 const MAX_INFER_ITERS: usize = 64;
 
-/// Analyze a code object. Returns the typed IR on success or a
-/// [`JitVerdict`] describing the first disqualifying property found.
-pub fn analyze(code: &CodeObject) -> Result<TFunc, JitVerdict> {
+/// The bytecode rewrite plan computed before block construction
+/// (RFC 0058 WS4): which pcs become no-ops, which `CALL`s store range
+/// bounds into synthetic slots, which `FOR_ITER`s become counted-loop
+/// terminators, and which `LOAD_GLOBAL`s burn in as constants.
+#[derive(Default)]
+struct Plan {
+    /// pcs erased from the rewritten program: the `LOAD_GLOBAL range`,
+    /// `GET_ITER`, `END_FOR`, and an explicit unit-step `LOAD_CONST 1`.
+    nop: HashSet<usize>,
+    /// `CALL` pcs → (values to pop, cur slot, stop slot). One popped
+    /// value means `range(stop)` (cur seeds to 0); two means
+    /// `range(start, stop)`.
+    calls: HashMap<usize, (u8, u32, u32)>,
+    /// `FOR_ITER` pcs → (cur slot, stop slot, loop variable slot).
+    headers: HashMap<usize, (u32, u32, u32)>,
+    /// The fused `STORE_FAST` pc directly after each `FOR_ITER` → its
+    /// slot. The `ForRange` terminator performs this store.
+    fused_store: HashMap<usize, u32>,
+    /// `LOAD_GLOBAL` name index → resolution (resolved once up front so
+    /// the inference fixpoint doesn't re-query the embedder).
+    globals: HashMap<u32, ResolvedGlobal>,
+    /// Entry guards, deduplicated by name.
+    guards: Vec<GlobalGuard>,
+    /// Rewritten loops, outermost-first.
+    loops: Vec<RangeLoopMeta>,
+    /// Synthetic slots appended after the code object's real locals.
+    n_synth: u32,
+}
+
+impl Plan {
+    /// `true` when the interpreter would have a live range iterator on
+    /// its stack at `pc` — i.e. `pc` is inside some rewritten loop.
+    fn in_loop_span(&self, pc: usize) -> bool {
+        self.loops
+            .iter()
+            .any(|l| (l.live_from as usize) <= pc && pc < l.live_to as usize)
+    }
+}
+
+/// Analyze a code object. `resolve` maps a `LOAD_GLOBAL` name to what it
+/// currently resolves to (the embedder re-validates every resolution as
+/// an entry guard). Returns the typed IR on success or a [`JitVerdict`]
+/// describing the first disqualifying property found.
+pub fn analyze(
+    code: &CodeObject,
+    resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
+) -> Result<TFunc, JitVerdict> {
     if code.is_generator || code.is_coroutine || code.is_async_generator || code.is_class_body {
         return Err(JitVerdict::UnsupportedSignature);
     }
@@ -80,14 +127,16 @@ pub fn analyze(code: &CodeObject) -> Result<TFunc, JitVerdict> {
         return Err(JitVerdict::Trivial);
     }
 
+    let plan = plan_rewrite(code, resolve)?;
+
     let raw = build_blocks(code)?;
     let reachable = reachable_blocks(&raw);
     if reachable.is_empty() {
         return Err(JitVerdict::Trivial);
     }
 
-    let n_locals = code.varnames.len() as u32;
-    let livein = compute_livein(code, &raw, &reachable, n_locals);
+    let n_locals = code.varnames.len() as u32 + plan.n_synth;
+    let livein = compute_livein(code, &raw, &reachable, code.varnames.len() as u32);
 
     // Type inference fixpoint.
     let mut local_types: Vec<Option<JitType>> = vec![None; n_locals as usize];
@@ -95,7 +144,7 @@ pub fn analyze(code: &CodeObject) -> Result<TFunc, JitVerdict> {
     loop {
         let mut changed = false;
         for &bi in &reachable {
-            infer_block(code, &raw[bi], &mut local_types, &mut changed)?;
+            infer_block(code, &raw[bi], &plan, &mut local_types, &mut changed)?;
         }
         if !changed {
             break;
@@ -120,10 +169,28 @@ pub fn analyze(code: &CodeObject) -> Result<TFunc, JitVerdict> {
     let mut blocks: Vec<TBlock> = Vec::with_capacity(reachable.len());
     let mut max_stack = 0u32;
     for &bi in &reachable {
-        let tb = emit_block(code, &raw[bi], &local_types, &compact, &mut max_stack)?;
+        let tb = emit_block(
+            code,
+            &raw[bi],
+            &plan,
+            &local_types,
+            &compact,
+            &mut max_stack,
+        )?;
         blocks.push(tb);
     }
 
+    // Parameters flow in from the caller, so every *typed* parameter
+    // slot must be entry-guarded even though the definite-assignment
+    // analysis treats it as already assigned. (Without this, a hot
+    // kernel first called with ints and later with a float would pack
+    // the float as 0 and silently compute garbage.)
+    let mut livein = livein;
+    for slot in 0..code.arg_count {
+        if local_types.get(slot as usize).copied().flatten().is_some() {
+            livein.insert(slot);
+        }
+    }
     let mut livein_vec: Vec<u32> = livein.into_iter().collect();
     livein_vec.sort_unstable();
 
@@ -134,7 +201,172 @@ pub fn analyze(code: &CodeObject) -> Result<TFunc, JitVerdict> {
         max_stack,
         blocks,
         entry_block,
+        global_guards: plan.guards,
+        range_loops: plan.loops,
     })
+}
+
+/// Recognize every `FOR_ITER` as the canonical counted `range` loop and
+/// build the rewrite [`Plan`]. Any `FOR_ITER` that doesn't match the
+/// shape disqualifies the whole frame (there is no generic iterator
+/// support in the tier-2 subset), as does any `LOAD_GLOBAL` that neither
+/// feeds a recognized loop nor resolves to a burnable constant.
+fn plan_rewrite(
+    code: &CodeObject,
+    resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
+) -> Result<Plan, JitVerdict> {
+    let ins = &code.instructions;
+    let n = ins.len();
+    let n_real = code.varnames.len() as u32;
+    let mut plan = Plan::default();
+
+    // All jump-landing pcs, to reject jumps into the middle of a
+    // recognized `range(...)` prefix.
+    let mut targets: HashSet<usize> = HashSet::new();
+    for (i, item) in ins.iter().enumerate() {
+        match item.op {
+            OpCode::PopJumpIfFalse
+            | OpCode::PopJumpIfTrue
+            | OpCode::JumpForward
+            | OpCode::ForIter => {
+                targets.insert(forward_target(i, item.arg));
+            }
+            OpCode::JumpBackward => {
+                targets.insert(backward_target(i, item.arg).ok_or(JitVerdict::BadJumpTarget)?);
+            }
+            _ => {}
+        }
+    }
+
+    // Resolve every LOAD_GLOBAL name once.
+    for item in ins.iter() {
+        if matches!(item.op, OpCode::LoadGlobal) {
+            if let std::collections::hash_map::Entry::Vacant(e) = plan.globals.entry(item.arg) {
+                let name = code
+                    .names
+                    .get(item.arg as usize)
+                    .ok_or(JitVerdict::UnsupportedOpcode("LOAD_GLOBAL bad name"))?;
+                e.insert(resolve(name));
+            }
+        }
+    }
+
+    for i in 0..n {
+        if !matches!(ins[i].op, OpCode::ForIter) {
+            continue;
+        }
+        let bail = || JitVerdict::UnsupportedOpcode("FOR_ITER (non-range shape)");
+        let exit = forward_target(i, ins[i].arg);
+        if exit >= n || !matches!(ins[exit].op, OpCode::EndFor) {
+            return Err(bail());
+        }
+        // Fused loop-variable store.
+        if i + 1 >= n || !matches!(ins[i + 1].op, OpCode::StoreFast) {
+            return Err(bail());
+        }
+        let var_slot = ins[i + 1].arg;
+        // Walk the prefix backwards: GET_ITER, CALL k, k simple args,
+        // LOAD_GLOBAL <range>.
+        if i < 2
+            || !matches!(ins[i - 1].op, OpCode::GetIter)
+            || !matches!(ins[i - 2].op, OpCode::Call)
+        {
+            return Err(bail());
+        }
+        let k = ins[i - 2].arg as usize;
+        if !(1..=3).contains(&k) || i < 3 + k {
+            return Err(bail());
+        }
+        let args_start = i - 2 - k;
+        for arg_ins in &ins[args_start..(i - 2)] {
+            match arg_ins.op {
+                OpCode::LoadFast => {}
+                OpCode::LoadConst
+                    if matches!(
+                        code.constants.get(arg_ins.arg as usize),
+                        Some(Constant::Int(_))
+                    ) => {}
+                _ => return Err(bail()),
+            }
+        }
+        // An explicit step is only allowed as the constant 1; it is
+        // erased so the call effectively becomes `range(start, stop)`.
+        let mut pops = k as u8;
+        if k == 3 {
+            let step_pc = i - 3;
+            if !matches!(ins[step_pc].op, OpCode::LoadConst)
+                || !matches!(
+                    code.constants.get(ins[step_pc].arg as usize),
+                    Some(Constant::Int(1))
+                )
+            {
+                return Err(bail());
+            }
+            plan.nop.insert(step_pc);
+            pops = 2;
+        }
+        let callee = args_start - 1;
+        if !matches!(ins[callee].op, OpCode::LoadGlobal) {
+            return Err(bail());
+        }
+        if plan.globals.get(&ins[callee].arg) != Some(&ResolvedGlobal::RangeBuiltin) {
+            return Err(bail());
+        }
+        // No jump may land inside the prefix or on the fused store — the
+        // header itself (a JUMP_BACKWARD target) is the only allowed
+        // landing point.
+        if targets.iter().any(|&t| callee < t && t <= i + 1 && t != i) {
+            return Err(bail());
+        }
+        let name = code.names[ins[callee].arg as usize].clone();
+        if !plan.guards.iter().any(|g| g.name == name) {
+            plan.guards.push(GlobalGuard {
+                name,
+                expect: ResolvedGlobal::RangeBuiltin,
+            });
+        }
+
+        let cur_slot = n_real + plan.n_synth;
+        let stop_slot = cur_slot + 1;
+        plan.n_synth += 2;
+        plan.nop.insert(callee);
+        plan.nop.insert(i - 1);
+        plan.nop.insert(exit);
+        plan.calls.insert(i - 2, (pops, cur_slot, stop_slot));
+        plan.headers.insert(i, (cur_slot, stop_slot, var_slot));
+        plan.fused_store.insert(i + 1, var_slot);
+        plan.loops.push(RangeLoopMeta {
+            cur_slot,
+            stop_slot,
+            live_from: i as u32,
+            live_to: exit as u32,
+        });
+    }
+
+    // Burnable constants: every LOAD_GLOBAL that is not a recognized
+    // range callee must resolve to a scalar constant, and needs a guard.
+    for (i, item) in ins.iter().enumerate() {
+        if !matches!(item.op, OpCode::LoadGlobal) || plan.nop.contains(&i) {
+            continue;
+        }
+        let resolved = plan.globals[&item.arg];
+        match resolved {
+            ResolvedGlobal::ConstInt(_)
+            | ResolvedGlobal::ConstFloat(_)
+            | ResolvedGlobal::ConstBool(_) => {
+                let name = &code.names[item.arg as usize];
+                if !plan.guards.iter().any(|g| g.name == *name) {
+                    plan.guards.push(GlobalGuard {
+                        name: name.clone(),
+                        expect: resolved,
+                    });
+                }
+            }
+            _ => return Err(JitVerdict::UnsupportedOpcode("LOAD_GLOBAL")),
+        }
+    }
+
+    Ok(plan)
 }
 
 /// Resolve a forward branch/jump target instruction index.
@@ -183,6 +415,18 @@ fn build_blocks(code: &CodeObject) -> Result<Vec<RawBlock>, JitVerdict> {
                     leaders.insert(i + 1);
                 }
             }
+            // A rewritten range loop's header: branches to the body
+            // (fallthrough) or the exit (`END_FOR`) when exhausted.
+            OpCode::ForIter => {
+                let t = forward_target(i, ins.arg);
+                if t > n {
+                    return Err(JitVerdict::BadJumpTarget);
+                }
+                leaders.insert(t);
+                if i + 1 < n {
+                    leaders.insert(i + 1);
+                }
+            }
             OpCode::ReturnValue if i + 1 < n => {
                 leaders.insert(i + 1);
             }
@@ -209,6 +453,15 @@ fn build_blocks(code: &CodeObject) -> Result<Vec<RawBlock>, JitVerdict> {
                 vec![index_of[&backward_target(last, ins.arg).ok_or(JitVerdict::BadJumpTarget)?]]
             }
             OpCode::PopJumpIfFalse | OpCode::PopJumpIfTrue => {
+                let t = index_of[&forward_target(last, ins.arg)];
+                let f = index_of
+                    .get(&(last + 1))
+                    .copied()
+                    .ok_or(JitVerdict::BadJumpTarget)?;
+                vec![f, t]
+            }
+            // succs[0] = body (fallthrough), succs[1] = exit.
+            OpCode::ForIter => {
                 let t = index_of[&forward_target(last, ins.arg)];
                 let f = index_of
                     .get(&(last + 1))
@@ -376,12 +629,13 @@ fn const_type(c: &Constant) -> Option<JitType> {
 fn infer_block(
     code: &CodeObject,
     b: &RawBlock,
+    plan: &Plan,
     local_types: &mut [Option<JitType>],
     changed: &mut bool,
 ) -> Result<(), JitVerdict> {
     let mut stack: Vec<SE> = Vec::new();
     for i in b.start..(b.end - 1) {
-        step_abstract(code, i, &mut stack, local_types, changed, false)?;
+        step_abstract(code, i, &mut stack, plan, local_types, changed, false)?;
     }
     // Terminator stack-shape validation.
     let last = b.end - 1;
@@ -397,6 +651,13 @@ fn infer_block(
                 return Err(JitVerdict::NonEmptyBoundaryStack);
             }
         }
+        // A rewritten range header operates purely on its synthetic
+        // slots; the operand stack must be empty like any other jump.
+        OpCode::ForIter => {
+            if !stack.is_empty() {
+                return Err(JitVerdict::NonEmptyBoundaryStack);
+            }
+        }
         OpCode::PopJumpIfFalse | OpCode::PopJumpIfTrue => {
             if stack.len() != 1 {
                 return Err(JitVerdict::NonEmptyBoundaryStack);
@@ -408,7 +669,7 @@ fn infer_block(
         }
         // Fall-through terminator: must leave an empty stack.
         _ => {
-            step_abstract(code, last, &mut stack, local_types, changed, false)?;
+            step_abstract(code, last, &mut stack, plan, local_types, changed, false)?;
             if !stack.is_empty() {
                 return Err(JitVerdict::NonEmptyBoundaryStack);
             }
@@ -423,13 +684,50 @@ fn step_abstract(
     code: &CodeObject,
     i: usize,
     stack: &mut Vec<SE>,
+    plan: &Plan,
     local_types: &mut [Option<JitType>],
     changed: &mut bool,
     strict: bool,
 ) -> Result<(), JitVerdict> {
     let ins = code.instructions[i];
+    // RFC 0058 WS4 — rewritten range-loop pcs.
+    if plan.nop.contains(&i) {
+        return Ok(());
+    }
+    if let Some(&(pops, cur, stop)) = plan.calls.get(&i) {
+        for _ in 0..pops {
+            let v = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            if v.ty.is_representable() {
+                if !v.ty.is_integral() {
+                    return Err(JitVerdict::TypeUnknown);
+                }
+            } else if let Some(slot) = v.src {
+                // A live-in feeding a range bound must be an int.
+                set_local(local_types, slot, JitType::Int, changed)?;
+            } else if strict {
+                return Err(JitVerdict::TypeUnknown);
+            }
+        }
+        set_local(local_types, cur, JitType::Int, changed)?;
+        set_local(local_types, stop, JitType::Int, changed)?;
+        return Ok(());
+    }
+    if let Some(&var) = plan.fused_store.get(&i) {
+        // Performed by the `ForRange` terminator; no stack effect here.
+        set_local(local_types, var, JitType::Int, changed)?;
+        return Ok(());
+    }
     match ins.op {
         OpCode::Nop | OpCode::Resume => {}
+        OpCode::LoadGlobal => {
+            let ty = match plan.globals.get(&ins.arg) {
+                Some(ResolvedGlobal::ConstInt(_)) => JitType::Int,
+                Some(ResolvedGlobal::ConstFloat(_)) => JitType::Float,
+                Some(ResolvedGlobal::ConstBool(_)) => JitType::Bool,
+                _ => return Err(JitVerdict::UnsupportedOpcode("LOAD_GLOBAL")),
+            };
+            stack.push(SE::known(ty));
+        }
         OpCode::LoadConst => {
             let c = code
                 .constants
@@ -479,6 +777,13 @@ fn step_abstract(
             stack.push(SE::known(res));
         }
         OpCode::PopTop => {
+            // `break` inside a rewritten range loop pops the *iterator*,
+            // which the rewrite never pushed — erase the pop. (When the
+            // rewritten stack is empty inside a loop span, the
+            // interpreter's stack holds exactly the live iterators.)
+            if stack.is_empty() && plan.in_loop_span(i) {
+                return Ok(());
+            }
             stack.pop().ok_or(JitVerdict::StackUnderflow)?;
         }
         OpCode::CopyTop => {
@@ -575,7 +880,10 @@ fn bin_result_type(
             }
             _ => Ok(JitType::Int),
         }
-    } else if a == JitType::Float && b == JitType::Float {
+    } else if a == JitType::Float || b == JitType::Float {
+        // Float∘float, or mixed integral/float (RFC 0058 WS4): the
+        // integral operand is promoted with the same `as f64` cast the
+        // interpreter applies, so only the float-lane op set is legal.
         match kind {
             ArithKind::Add | ArithKind::Sub | ArithKind::Mul | ArithKind::TrueDiv => {
                 Ok(JitType::Float)
@@ -587,7 +895,9 @@ fn bin_result_type(
     }
 }
 
-/// Validate comparison operand lanes (same lane required in v1).
+/// Validate comparison operand lanes. Same-lane always works; mixed
+/// integral/float works via a *guarded* promotion (the interpreter
+/// compares exactly, so the JIT deopts when the int exceeds ±2^53).
 fn cmp_check(a: JitType, b: JitType, strict: bool) -> Result<(), JitVerdict> {
     if !a.is_representable() || !b.is_representable() {
         return if strict {
@@ -596,7 +906,7 @@ fn cmp_check(a: JitType, b: JitType, strict: bool) -> Result<(), JitVerdict> {
             Ok(())
         };
     }
-    if (a.is_integral() && b.is_integral()) || (a == JitType::Float && b == JitType::Float) {
+    if (a.is_integral() || a == JitType::Float) && (b.is_integral() || b == JitType::Float) {
         Ok(())
     } else {
         Err(JitVerdict::MixedArithTypes)
@@ -679,6 +989,7 @@ fn unary_kind(arg: u32) -> Result<UnaryKind, JitVerdict> {
 fn emit_block(
     code: &CodeObject,
     b: &RawBlock,
+    plan: &Plan,
     local_types: &[Option<JitType>],
     compact: &HashMap<usize, BlockId>,
     max_stack: &mut u32,
@@ -687,7 +998,15 @@ fn emit_block(
     let mut stmts: Vec<TStmt> = Vec::new();
 
     for i in b.start..(b.end - 1) {
-        emit_instr(code, i, local_types, &mut stack, &mut stmts, max_stack)?;
+        emit_instr(
+            code,
+            i,
+            plan,
+            local_types,
+            &mut stack,
+            &mut stmts,
+            max_stack,
+        )?;
     }
 
     let last = b.end - 1;
@@ -713,8 +1032,29 @@ fn emit_block(
             fallthrough: compact[&block_succ(b, 0)],
             target: compact[&block_succ(b, 1)],
         },
+        OpCode::ForIter => {
+            let &(cur_slot, stop_slot, var_slot) = plan
+                .headers
+                .get(&last)
+                .ok_or(JitVerdict::UnsupportedOpcode("FOR_ITER (unplanned)"))?;
+            TTerm::ForRange {
+                cur_slot,
+                stop_slot,
+                var_slot,
+                body: compact[&block_succ(b, 0)],
+                exit: compact[&block_succ(b, 1)],
+            }
+        }
         _ => {
-            emit_instr(code, last, local_types, &mut stack, &mut stmts, max_stack)?;
+            emit_instr(
+                code,
+                last,
+                plan,
+                local_types,
+                &mut stack,
+                &mut stmts,
+                max_stack,
+            )?;
             TTerm::Jump(compact[&block_succ(b, 0)])
         }
     };
@@ -737,6 +1077,7 @@ fn block_succ(b: &RawBlock, k: usize) -> usize {
 fn emit_instr(
     code: &CodeObject,
     i: usize,
+    plan: &Plan,
     local_types: &[Option<JitType>],
     stack: &mut Vec<JitType>,
     stmts: &mut Vec<TStmt>,
@@ -752,8 +1093,41 @@ fn emit_instr(
             }
             *max_stack = (*max_stack).max(stack.len() as u32);
         };
+    // RFC 0058 WS4 — rewritten range-loop pcs.
+    if plan.nop.contains(&i) || plan.fused_store.contains_key(&i) {
+        return Ok(());
+    }
+    if let Some(&(pops, cur_slot, stop_slot)) = plan.calls.get(&i) {
+        // Stack is [.., start?, stop]; store the bounds into the
+        // synthetic slots (one arg seeds `cur` with 0).
+        stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+        push(TOp::StoreLocal(stop_slot), None, stack, stmts);
+        if pops == 2 {
+            stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+        } else {
+            push(TOp::PushConstInt(0), Some(JitType::Int), stack, stmts);
+            stack.pop();
+        }
+        push(TOp::StoreLocal(cur_slot), None, stack, stmts);
+        return Ok(());
+    }
+    // `break` inside a rewritten loop: erase the phantom iterator pop.
+    if matches!(ins.op, OpCode::PopTop) && stack.is_empty() && plan.in_loop_span(i) {
+        return Ok(());
+    }
     match ins.op {
         OpCode::Nop | OpCode::Resume => {}
+        OpCode::LoadGlobal => {
+            let (op, ty) = match plan.globals.get(&ins.arg) {
+                Some(&ResolvedGlobal::ConstInt(v)) => (TOp::PushConstInt(v), JitType::Int),
+                Some(&ResolvedGlobal::ConstFloat(bits)) => {
+                    (TOp::PushConstFloat(bits), JitType::Float)
+                }
+                Some(&ResolvedGlobal::ConstBool(v)) => (TOp::PushConstBool(v), JitType::Bool),
+                _ => return Err(JitVerdict::UnsupportedOpcode("LOAD_GLOBAL")),
+            };
+            push(op, Some(ty), stack, stmts);
+        }
         OpCode::LoadConst => {
             let c = &code.constants[ins.arg as usize];
             let (op, ty) = match c {
@@ -780,21 +1154,64 @@ fn emit_instr(
             let kind = bin_kind(ins.arg)?;
             let b = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             let a = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
-            let (op, ty) = lower_bin(kind, a, b)?;
-            push(op, Some(ty), stack, stmts);
+            if (a.is_integral() && b == JitType::Float) || (a == JitType::Float && b.is_integral())
+            {
+                // Mixed integral/float (RFC 0058 WS4): promote the
+                // integral operand exactly like the interpreter's
+                // `as f64` cast, then run the float-lane op. Only the
+                // float-supported op set is legal.
+                if !matches!(
+                    kind,
+                    ArithKind::Add | ArithKind::Sub | ArithKind::Mul | ArithKind::TrueDiv
+                ) {
+                    return Err(JitVerdict::UnsupportedOpcode("mixed floordiv/mod/bitop"));
+                }
+                // Both operands are conceptually back on the stack for
+                // the promotion op (they only left the *model*).
+                stack.push(a);
+                stack.push(b);
+                let promote = if b == JitType::Float {
+                    TOp::IntToFloatSecond { guarded: false }
+                } else {
+                    TOp::IntToFloatTos { guarded: false }
+                };
+                push(promote, None, stack, stmts);
+                stack.pop();
+                stack.pop();
+                push(TOp::FloatArith(kind), Some(JitType::Float), stack, stmts);
+            } else {
+                let (op, ty) = lower_bin(kind, a, b)?;
+                push(op, Some(ty), stack, stmts);
+            }
         }
         OpCode::CompareOp => {
             let kind = cmp_kind(ins.arg)?;
             let b = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             let a = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
-            let op = if a.is_integral() && b.is_integral() {
-                TOp::IntCmp(kind)
+            if a.is_integral() && b.is_integral() {
+                push(TOp::IntCmp(kind), Some(JitType::Bool), stack, stmts);
             } else if a == JitType::Float && b == JitType::Float {
-                TOp::FloatCmp(kind)
+                push(TOp::FloatCmp(kind), Some(JitType::Bool), stack, stmts);
+            } else if (a.is_integral() && b == JitType::Float)
+                || (a == JitType::Float && b.is_integral())
+            {
+                // Mixed comparison is mathematically exact in the
+                // interpreter, so the promotion is *guarded*: outside
+                // ±2^53 (where f64 stops being exact) it deopts.
+                stack.push(a);
+                stack.push(b);
+                let promote = if b == JitType::Float {
+                    TOp::IntToFloatSecond { guarded: true }
+                } else {
+                    TOp::IntToFloatTos { guarded: true }
+                };
+                push(promote, None, stack, stmts);
+                stack.pop();
+                stack.pop();
+                push(TOp::FloatCmp(kind), Some(JitType::Bool), stack, stmts);
             } else {
                 return Err(JitVerdict::MixedArithTypes);
-            };
-            push(op, Some(JitType::Bool), stack, stmts);
+            }
         }
         OpCode::UnaryOp => {
             let kind = unary_kind(ins.arg)?;
