@@ -197,7 +197,7 @@ pub struct GilState {
     pub depth: AtomicI64,
     /// Monotonic counter bumped on every successful (blocking)
     /// `acquire`. The cooperative hand-off in
-    /// [`periodic_gil_checkpoint`] reads it before dropping the
+    /// [`yield_checkpoint`] reads it before dropping the
     /// GIL and waits for it to advance, proving another thread
     /// actually took the lock before re-acquiring. This is
     /// WeavePy's analogue of CPython's `gil->switch_number`.
@@ -608,15 +608,15 @@ pub fn allow_threads_then<R>(f: impl FnOnce() -> R) -> R {
 /// hand-off checks. CPython switches on a 5ms wall-clock interval;
 /// we approximate with an opcode countdown that's cheap to test in
 /// the hot path.
-const GIL_CHECK_INTERVAL: u32 = 128;
-
-/// The countdown itself is a process-global relaxed atomic rather
-/// than a thread-local (RFC 0058 WS2): only the GIL holder executes
-/// bytecode, so a shared counter preserves the "check every ~128
-/// opcodes" cadence while replacing a macOS `tlv_get_addr` call per
-/// instruction with one uncontended atomic RMW.
-static YIELD_COUNTDOWN: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(GIL_CHECK_INTERVAL);
+///
+/// RFC 0059 WS2: the countdown lives as a plain (non-atomic) field on
+/// each `Interpreter` — only the GIL holder executes bytecode, so a
+/// per-interpreter counter preserves the "check every ~128 opcodes"
+/// cadence while replacing RFC 0058's process-global atomic RMW per
+/// instruction with a register decrement. The field persists across
+/// nested frame activations, so deep call chains where every frame
+/// runs only a few instructions still hit the checkpoint on cadence.
+pub const GIL_CHECK_INTERVAL: u32 = 128;
 
 std::thread_local! {
 
@@ -723,19 +723,13 @@ impl Drop for NoYieldGuard {
 /// `_started`. Mirrors CPython's `eval_breaker` / `gil_drop_request`
 /// switch driven by `sys.setswitchinterval`.
 ///
-/// The fast path is a relaxed atomic countdown decrement; the GIL is
-/// only actually dropped every [`GIL_CHECK_INTERVAL`] opcodes *and*
-/// only when another thread is blocked waiting for it.
+/// The dispatch loop counts [`GIL_CHECK_INTERVAL`] opcodes on a plain
+/// interpreter-local counter (RFC 0059 WS2) and calls this on expiry;
+/// the GIL is only actually dropped when another thread is blocked
+/// waiting for it and the switch interval has elapsed.
 #[inline]
-pub fn periodic_gil_checkpoint() {
-    // Relaxed is enough: the countdown only paces how often we
-    // *consider* yielding, so lost updates under a rare race merely
-    // shift the next check by a few opcodes.
-    let prev = YIELD_COUNTDOWN.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    if prev <= 1 {
-        YIELD_COUNTDOWN.store(GIL_CHECK_INTERVAL, std::sync::atomic::Ordering::Relaxed);
-        maybe_yield_gil();
-    }
+pub fn yield_checkpoint() {
+    maybe_yield_gil();
 }
 
 /// Hand the GIL to a waiting thread, if any. Drops the calling
@@ -817,12 +811,40 @@ fn maybe_yield_gil() {
     note_gil_acquired();
 }
 
+std::thread_local! {
+    /// Per-thread cache of [`current_thread_id`] (RFC 0059 WS1a). A
+    /// thread's native id is stable for its lifetime, but deriving it
+    /// via `libc::pthread_self` is a dyld-stub call — and `GilCell`
+    /// consults the id on **every** borrow, several times per bytecode
+    /// instruction. `const`-initialized to 0 (never a valid id: pthread
+    /// ids are pointers, Windows ids are non-zero for live threads, and
+    /// the hash fallback re-derives on the impossible collision) so the
+    /// fast path is one TLS load + branch with no lazy-init bookkeeping.
+    static THREAD_ID_CACHE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Best-effort current-thread native id. Returns the OS thread
 /// id on Linux/macOS via `libc::pthread_self`; uses
 /// `GetCurrentThreadId` on Windows. The exact representation
 /// is opaque; the only invariant is uniqueness within the
-/// running process.
+/// running process. Cached per thread (RFC 0059): the derivation
+/// call runs once, every later lookup is a TLS load.
+#[inline]
 pub fn current_thread_id() -> u64 {
+    let cached = THREAD_ID_CACHE.try_with(std::cell::Cell::get).unwrap_or(0);
+    if cached != 0 {
+        return cached;
+    }
+    let id = derive_thread_id();
+    // Cache best-effort: during TLS teardown the cell may be gone, in
+    // which case every call re-derives — correct, just slower.
+    let _ = THREAD_ID_CACHE.try_with(|c| c.set(id));
+    id
+}
+
+/// Uncached [`current_thread_id`] body — the OS derivation call.
+#[cold]
+fn derive_thread_id() -> u64 {
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
     unsafe {
         let h = libc::pthread_self();
@@ -886,6 +908,13 @@ pub fn set_async_exc(ident: u64, exc: Option<crate::object::Object>) {
         m.insert(ident, e);
         ASYNC_EXC_COUNT.fetch_add(1, Ordering::AcqRel);
     }
+    // Hot-gate bit maintained under the map lock, so set/clear cannot
+    // interleave with another scheduler (RFC 0059 WS2).
+    if m.is_empty() {
+        crate::hot_gates::clear(crate::hot_gates::ASYNC_EXC);
+    } else {
+        crate::hot_gates::set(crate::hot_gates::ASYNC_EXC);
+    }
 }
 
 /// Hot-path probe: is *any* async exception scheduled process-wide?
@@ -900,6 +929,9 @@ pub fn take_async_exc(ident: u64) -> Option<crate::object::Object> {
     let v = m.remove(&ident);
     if v.is_some() {
         ASYNC_EXC_COUNT.fetch_sub(1, Ordering::AcqRel);
+    }
+    if m.is_empty() {
+        crate::hot_gates::clear(crate::hot_gates::ASYNC_EXC);
     }
     v
 }

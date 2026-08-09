@@ -17,9 +17,9 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
 
 use crate::analyze::{analyze, JitVerdict};
-use crate::ir::{GlobalGuard, RangeLoopMeta, ResolvedGlobal, TFunc};
+use crate::ir::{CalleeSpanMeta, GlobalGuard, OsrEntry, RangeLoopMeta, ResolvedGlobal, TFunc};
 use crate::lower::build_function;
-use crate::runtime::{JitFrame, JitStatus};
+use crate::runtime::{self, JitFrame, JitStatus};
 use crate::value::JitType;
 use weavepy_compiler::CodeObject;
 
@@ -46,6 +46,16 @@ pub struct CompiledFrame {
     /// Rewritten range loops, outermost-first, for rebuilding the live
     /// iterators on the interpreter stack after a mid-loop deopt.
     pub range_loops: Vec<RangeLoopMeta>,
+    /// Erased Python callees (RFC 0059 WS3), for rebuilding the callee
+    /// object on the interpreter stack after a mid-arguments deopt.
+    pub callee_spans: Vec<CalleeSpanMeta>,
+    /// Loop-header pcs enterable mid-frame via `entry_pc` (OSR).
+    pub osr_entries: Vec<OsrEntry>,
+    /// Widest `CallPy` argument count, for sizing the marshal buffers.
+    pub max_call_args: u32,
+    /// The function's own stable scalar return lane, when every return
+    /// site agrees (feeds callers' `PyFunc` classification).
+    pub ret_lane: Option<JitType>,
 }
 
 impl CompiledFrame {
@@ -132,6 +142,11 @@ impl JitEngine {
 
     /// Compile an already-analyzed [`TFunc`] (also the unit-test entry).
     pub fn compile_tfunc(&mut self, tfunc: &TFunc) -> Result<CompiledFrame, JitVerdict> {
+        // A frame with native Python-to-Python calls needs the embedder's
+        // call helper burned in (RFC 0059 WS3).
+        if !tfunc.callee_spans.is_empty() && runtime::call_py_helper_addr() == 0 {
+            return Err(JitVerdict::UnsupportedOpcode("CALL (no helper registered)"));
+        }
         self.module.clear_context(&mut self.ctx);
 
         // Signature: (frame: ptr) -> i64.
@@ -176,6 +191,10 @@ impl JitEngine {
             n_locals: tfunc.n_locals,
             global_guards: tfunc.global_guards.clone(),
             range_loops: tfunc.range_loops.clone(),
+            callee_spans: tfunc.callee_spans.clone(),
+            osr_entries: tfunc.osr_entries.clone(),
+            max_call_args: tfunc.max_call_args,
+            ret_lane: tfunc.ret_lane,
         })
     }
 }

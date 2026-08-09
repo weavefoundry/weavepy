@@ -14,6 +14,11 @@ pub struct RunSet {
     pub median_ns: f64,
     pub p95_ns: f64,
     pub stddev_ns: f64,
+    /// Peak resident set size across the samples' subprocesses, in
+    /// bytes (RFC 0059 WS5b). `None` in pre-v3 baselines and on
+    /// platforms without an rusage source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rss_bytes: Option<u64>,
 }
 
 impl RunSet {
@@ -25,7 +30,15 @@ impl RunSet {
             median_ns: stats::median(samples),
             p95_ns: stats::percentile(samples, 95.0),
             stddev_ns: stats::stddev(samples),
+            max_rss_bytes: None,
         }
+    }
+
+    /// Attach the peak RSS observed across the samples (RFC 0059 WS5b).
+    #[must_use]
+    pub fn with_max_rss(mut self, max_rss_bytes: Option<u64>) -> Self {
+        self.max_rss_bytes = max_rss_bytes;
+        self
     }
 }
 
@@ -45,6 +58,10 @@ pub struct Row {
     /// `weavepy.median_ns / cpython.median_ns`.
     #[serde(default)]
     pub ratio: Option<f64>,
+    /// `weavepy.max_rss_bytes / cpython.max_rss_bytes` (RFC 0059
+    /// WS5b). Reported, not gated this wave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_ratio: Option<f64>,
 }
 
 impl Row {
@@ -59,6 +76,13 @@ impl Row {
             .as_ref()
             .filter(|c| c.median_ns > 0.0 && weavepy.median_ns > 0.0)
             .map(|c| weavepy.median_ns / c.median_ns);
+        let memory_ratio = match (
+            weavepy.max_rss_bytes,
+            cpython.as_ref().and_then(|c| c.max_rss_bytes),
+        ) {
+            (Some(w), Some(c)) if w > 0 && c > 0 => Some(w as f64 / c as f64),
+            _ => None,
+        };
         Self {
             name,
             work,
@@ -66,6 +90,7 @@ impl Row {
             cpython,
             jit,
             ratio,
+            memory_ratio,
         }
     }
 }
@@ -92,7 +117,10 @@ impl Report {
             Some(stats::geometric_mean(&ratios))
         };
         Self {
-            version: 2,
+            // v3 (RFC 0059 WS5b): rows carry `max_rss_bytes` +
+            // `memory_ratio`. The gate reads v2 baselines too — the
+            // new fields are `Option` with serde defaults.
+            version: 3,
             host: hostname_or_unknown(),
             created_at: now_rfc3339(),
             geomean_ratio,
@@ -112,18 +140,24 @@ impl Report {
             self.host, self.created_at
         );
         let _ = writeln!(out);
+        let has_rss = self.rows.iter().any(|r| r.weavepy.max_rss_bytes.is_some());
+        let (rss_head, rss_bars) = if has_rss {
+            (" max RSS | ×RSS |", "---|---|")
+        } else {
+            ("", "")
+        };
         if has_jit {
             let _ = writeln!(
                 out,
-                "| fixture | work | WeavePy | WeavePy+JIT | CPython | ×CPython (lower is better) |"
+                "| fixture | work | WeavePy | WeavePy+JIT | CPython | ×CPython (lower is better) |{rss_head}"
             );
-            let _ = writeln!(out, "|---|---|---|---|---|---|");
+            let _ = writeln!(out, "|---|---|---|---|---|---|{rss_bars}");
         } else {
             let _ = writeln!(
                 out,
-                "| fixture | work | WeavePy | CPython | ×CPython (lower is better) |"
+                "| fixture | work | WeavePy | CPython | ×CPython (lower is better) |{rss_head}"
             );
-            let _ = writeln!(out, "|---|---|---|---|---|");
+            let _ = writeln!(out, "|---|---|---|---|---|{rss_bars}");
         }
         for r in &self.rows {
             let wp = format_ns(r.weavepy.median_ns);
@@ -135,6 +169,19 @@ impl Report {
                 Some(x) => format!("{x:.2}×"),
                 None => "-".to_owned(),
             };
+            let rss_cells = if has_rss {
+                let rss = match r.weavepy.max_rss_bytes {
+                    Some(b) => format_bytes(b),
+                    None => "-".to_owned(),
+                };
+                let mratio = match r.memory_ratio {
+                    Some(x) => format!("{x:.2}×"),
+                    None => "-".to_owned(),
+                };
+                format!(" {rss} | {mratio} |")
+            } else {
+                String::new()
+            };
             if has_jit {
                 let jit = match &r.jit {
                     Some(j) => format_ns(j.median_ns),
@@ -142,13 +189,13 @@ impl Report {
                 };
                 let _ = writeln!(
                     out,
-                    "| {} | {} | {} | {} | {} | {} |",
+                    "| {} | {} | {} | {} | {} | {} |{rss_cells}",
                     r.name, r.work, wp, jit, cp, ratio
                 );
             } else {
                 let _ = writeln!(
                     out,
-                    "| {} | {} | {} | {} | {} |",
+                    "| {} | {} | {} | {} | {} |{rss_cells}",
                     r.name, r.work, wp, cp, ratio
                 );
             }
@@ -220,6 +267,17 @@ impl Report {
             }
         }
         out
+    }
+}
+
+fn format_bytes(b: u64) -> String {
+    let b = b as f64;
+    if b < 1024.0 * 1024.0 {
+        format!("{:.0}KiB", b / 1024.0)
+    } else if b < 1024.0 * 1024.0 * 1024.0 {
+        format!("{:.1}MiB", b / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2}GiB", b / (1024.0 * 1024.0 * 1024.0))
     }
 }
 

@@ -36,6 +36,7 @@ pub mod foreign;
 pub mod frozen_code_cache;
 pub mod gc_trace;
 pub mod gil;
+pub mod hot_gates;
 pub mod import;
 pub mod linejump;
 pub mod object;
@@ -651,6 +652,14 @@ pub struct Interpreter {
     /// Recycled operand-stack vectors, same motivation. The operand
     /// stack is never shared, so every returned frame donates one.
     frame_stack_pool: RefCell<Vec<Vec<Object>>>,
+    /// RFC 0059 (WS2) — cooperative GIL hand-off countdown. A plain
+    /// field (no atomic): only the GIL holder executes bytecode, and
+    /// one interpreter drives one thread's frames, so a register
+    /// decrement per instruction replaces RFC 0058's process-global
+    /// `fetch_sub`. Persists across nested activations so deep call
+    /// chains keep the ~[`crate::gil::GIL_CHECK_INTERVAL`]-opcode
+    /// checkpoint cadence.
+    gil_countdown: u32,
 }
 
 impl Default for Interpreter {
@@ -808,6 +817,7 @@ impl Default for Interpreter {
             internal_import_depth: 0,
             frame_locals_pool: RefCell::new(Vec::new()),
             frame_stack_pool: RefCell::new(Vec::new()),
+            gil_countdown: crate::gil::GIL_CHECK_INTERVAL,
         };
         // RFC 0025: publish the shared parts of this interpreter
         // (builtins / module cache / stdout / hooks) so workers
@@ -904,6 +914,7 @@ impl Interpreter {
             internal_import_depth: 0,
             frame_locals_pool: RefCell::new(Vec::new()),
             frame_stack_pool: RefCell::new(Vec::new()),
+            gil_countdown: crate::gil::GIL_CHECK_INTERVAL,
         }
     }
 
@@ -3746,14 +3757,15 @@ impl Interpreter {
             .unwrap_or_else(|| Vec::with_capacity(16))
     }
 
-    /// Return a finished frame's heap allocations to the pools. Only
-    /// called on the ordinary `Returned` path (a yielded/suspended
-    /// frame lives on; an exceptional exit may sit in a traceback).
-    /// The locals storage is recycled only when this frame is its sole
-    /// owner — an escaped `PyFrame` shares it via `locals_mirror` and
-    /// keeps `strong_count > 1`, so PEP 667 handles are never torn out
-    /// from under a live reference. Dropping the leftover values here
-    /// is exactly the drop the frame's own destructor would perform.
+    /// Return a finished frame's heap allocations to the pools. Called
+    /// on the ordinary `Returned` path and on generator-family
+    /// exhaustion (RFC 0059 WS4) — a yielded/suspended frame lives on
+    /// untouched. The locals storage is recycled only when this frame
+    /// is its sole owner — an escaped `PyFrame` shares it via
+    /// `locals_mirror` and keeps `strong_count > 1`, so PEP 667 handles
+    /// (and tracebacks pinning the frame) are never torn out from under
+    /// a live reference. Dropping the leftover values here is exactly
+    /// the drop the frame's own destructor would perform.
     fn recycle_frame_allocs(&self, frame: &mut Frame) {
         const POOL_CAP: usize = 64;
         let mut stack = std::mem::take(&mut frame.stack);
@@ -4025,6 +4037,26 @@ impl Interpreter {
                     self.pop_frame_shell();
                     return Ok(FrameOutcome::Returned(v));
                 }
+                // RFC 0059 WS3 — a native Python-to-Python call raised.
+                // The frame state has been rewritten to the post-CALL
+                // point; run the normal exception machinery (the JIT
+                // subset contains no handlers, so this appends the
+                // frame's traceback and propagates — but if a handler
+                // is somehow found, fall through and interpret from it).
+                crate::tier2::JitEntry::Raised(err) => match err {
+                    RuntimeError::PyException(exc) => match self.handle_exception(frame, exc) {
+                        Ok(Some(())) => {}
+                        Ok(None) => unreachable!(),
+                        Err(e) => {
+                            self.pop_frame_shell();
+                            return Err(e);
+                        }
+                    },
+                    other => {
+                        self.pop_frame_shell();
+                        return Err(other);
+                    }
+                },
                 crate::tier2::JitEntry::Deopt | crate::tier2::JitEntry::Skip => {}
             }
         }
@@ -4039,12 +4071,25 @@ impl Interpreter {
         let mut prev_pc: Option<usize> = None;
         let mut line_starts: Option<Vec<bool>> = None;
         let result = loop {
-            // RFC 0039 (WS2): cooperative GIL hand-off. Cheap
-            // thread-local countdown in the common case; drops and
+            // RFC 0039 (WS2) / RFC 0059 (WS2): cooperative GIL hand-off.
+            // A plain interpreter-local countdown — one register
+            // decrement + predictable branch per instruction; drops and
             // re-acquires the GIL every ~128 opcodes when another
             // thread is blocked waiting for it, so compute-bound
             // threads can't starve the rest.
-            crate::gil::periodic_gil_checkpoint();
+            self.gil_countdown = self.gil_countdown.wrapping_sub(1);
+            if self.gil_countdown == 0 {
+                self.gil_countdown = crate::gil::GIL_CHECK_INTERVAL;
+                crate::gil::yield_checkpoint();
+            }
+            // RFC 0059 (WS2): the unified eval-breaker word. One relaxed
+            // load answers "is *any* deferred work pending?" for the six
+            // subsystems that used to probe independently every
+            // instruction (parked finalizers, C-ext drops, deferred
+            // ResourceWarnings, async exceptions, signals, finalizing).
+            // Each bit-guarded arm below re-checks its subsystem's
+            // precise gate, so a stale-set bit is harmless.
+            let hot = crate::hot_gates::load();
             // RFC 0040 (GC arc): prompt finalization. Between bytecodes — a
             // safe point with no outstanding container borrows — run `__del__`
             // and fire callback-weakrefs for any object whose last reference
@@ -4052,12 +4097,12 @@ impl Interpreter {
             // refcount-driven `tp_dealloc` timing. Two gates keep this free in
             // the common case: a finalizable object must be live *and* the
             // previous instruction must have dropped a reference (`take_maybe_
-            // _dead`), so a hot loop that neither allocates `__del__` objects
-            // nor drops references pays only two relaxed atomic loads.
-            if (gc_trace::has_any_finalizable() || gc_trace::has_suspects())
-                && gc_trace::take_maybe_dead()
-            {
-                if gc_trace::has_any_finalizable() {
+            // _dead`, made variant-precise by RFC 0059 WS1b), so a hot loop
+            // that neither allocates `__del__` objects nor drops heap-graph
+            // references pays only the relaxed loads.
+            let any_finalizable = gc_trace::has_any_finalizable();
+            if (any_finalizable || gc_trace::has_suspects()) && gc_trace::take_maybe_dead() {
+                if any_finalizable {
                     self.drain_prompt_finalizers();
                 }
                 // Re-probe cascade-skipped suspects (see `note_suspect`): a
@@ -4069,7 +4114,9 @@ impl Interpreter {
                         self.reap_dead_subgraph(obj);
                     }
                 }
-            } else if crate::vm_singletons::has_pending_finalizers() {
+            } else if hot & crate::hot_gates::PENDING_FINALIZERS != 0
+                && crate::vm_singletons::has_pending_finalizers()
+            {
                 // An *untracked* finalizable instance freed by a plain `Rc`
                 // drop (its container temporary died between bytecodes — a
                 // `for k, v in d.items()` loop rebinding its tuple, dropping
@@ -4104,7 +4151,8 @@ impl Interpreter {
             // relaxed load when empty (the overwhelming case), while
             // `cext_call_active` is a thread-local read — so ask
             // "is there anything to do" before "may we do it".
-            if crate::vm_singletons::has_pending_cext_drops()
+            if hot & crate::hot_gates::PENDING_CEXT != 0
+                && crate::vm_singletons::has_pending_cext_drops()
                 && !crate::vm_singletons::cext_call_active()
             {
                 static REAP_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -4135,7 +4183,9 @@ impl Interpreter {
             // queued by a `PyFile` destructor since the previous instruction.
             // Same between-bytecodes safe point as prompt finalization; gated on
             // a single relaxed atomic load so the common (empty) case is free.
-            if crate::vm_singletons::has_pending_resource_warnings() {
+            if hot & crate::hot_gates::RESOURCE_WARNINGS != 0
+                && crate::vm_singletons::has_pending_resource_warnings()
+            {
                 self.drain_pending_resource_warnings();
             }
             // Mirror the live `pc` into the shell so `f_lineno` reads
@@ -4269,11 +4319,12 @@ impl Interpreter {
             // next instruction boundary — CPython's eval-breaker async-exc
             // delivery. The probe is one relaxed load; the map lock is only
             // taken while an exception is pending somewhere in the process.
-            let async_exc = if crate::gil::async_exc_pending() {
-                crate::gil::take_async_exc(crate::vm_singletons::current_worker_thread_id())
-            } else {
-                None
-            };
+            let async_exc =
+                if hot & crate::hot_gates::ASYNC_EXC != 0 && crate::gil::async_exc_pending() {
+                    crate::gil::take_async_exc(crate::vm_singletons::current_worker_thread_id())
+                } else {
+                    None
+                };
             let mut instruction_ran = false;
             // An error injected *before* the instruction runs (raising
             // trace callback, async exc, signal handler) is attributed to
@@ -4284,7 +4335,8 @@ impl Interpreter {
             // escapes the `try` (test_sys_settrace
             // no_jump_to_non_integers catches the setter's ValueError
             // *inside* the traced frame).
-            let stepped = if crate::vm_singletons::is_finalizing()
+            let stepped = if hot & crate::hot_gates::FINALIZING != 0
+                && crate::vm_singletons::is_finalizing()
                 && crate::vm_singletons::current_thread_is_spawned_worker()
             {
                 // CPython kills daemon threads at their first eval-breaker
@@ -4313,7 +4365,10 @@ impl Interpreter {
                     Ok(pe) => RuntimeError::PyException(pe),
                     Err(e) => e,
                 })
-            } else if crate::stdlib::signal_mod::signals_pending() && crate::gil::is_main_thread() {
+            } else if hot & crate::hot_gates::SIGNALS != 0
+                && crate::stdlib::signal_mod::signals_pending()
+                && crate::gil::is_main_thread()
+            {
                 let py_frame = self.ensure_top_py_frame(&mut py_frame_slot);
                 match self.run_pending_signals(&py_frame) {
                     Ok(()) => {
@@ -4337,7 +4392,19 @@ impl Interpreter {
             if instruction_ran {
                 prev_pc = Some(cur_pc);
             }
+            // RFC 0059 WS1b: opcodes whose handlers account for every value
+            // they discard via `gc_trace::note_dropped` (audited: `POP_TOP`,
+            // `STORE_FAST`, and the `BINARY_OP`/`COMPARE_OP` arms — the
+            // specialized scalar fast paths of the latter two consume only
+            // pure-leaf variants by construction) are exempt from the coarse
+            // stack-shrink heuristic, so scalar-churning hot loops stop
+            // scheduling finalizer sweeps. Every other opcode keeps the
+            // conservative mark.
             if watch_drops
+                && !matches!(
+                    op_before,
+                    Some(OpCode::PopTop | OpCode::StoreFast | OpCode::BinaryOp | OpCode::CompareOp)
+                )
                 && (frame.stack.len() < stack_before
                     || matches!(
                         op_before,
@@ -5526,6 +5593,11 @@ impl Interpreter {
                     }
                 };
                 if let Some(old) = old {
+                    // RFC 0059 WS1b: this handler is exempt from the eval
+                    // loop's coarse stack-shrink mark, so the displaced value
+                    // must be noted here (no-op for pure-leaf rebinds — loop
+                    // counters, accumulators, first bindings over `Unbound`).
+                    gc_trace::note_dropped(&old);
                     // CPython decrefs the value previously bound to the local;
                     // when that was the last reference to a finalizable object
                     // its `__del__` runs at the rebind, not at frame exit
@@ -6057,11 +6129,22 @@ impl Interpreter {
                 if !self.specialized_binary_op(frame, cache_pc, kind)? {
                     let b = frame.pop()?;
                     let a = frame.pop()?;
-                    let r = if inplace {
-                        self.dispatch_inplace_op(&a, &b, kind, &frame.globals)?
+                    let r_res = if inplace {
+                        self.dispatch_inplace_op(&a, &b, kind, &frame.globals)
                     } else {
-                        self.dispatch_binary_op(&a, &b, kind, &frame.globals)?
+                        self.dispatch_binary_op(&a, &b, kind, &frame.globals)
                     };
+                    // RFC 0059 WS1b: BINARY_OP is exempt from the eval loop's
+                    // coarse stack-shrink mark (the specialized arms consume
+                    // only pure-leaf scalars), so the generic path notes its
+                    // operands itself. Noted *after* the dispatch — a user
+                    // dunder re-enters the eval loop, whose safe points would
+                    // consume the thread-local flag before the operands
+                    // actually drop — and before the `?`, so the error path's
+                    // unwind drop is covered too.
+                    gc_trace::note_dropped(&a);
+                    gc_trace::note_dropped(&b);
+                    let r = r_res?;
                     // tracemalloc: a binary op that built a fresh container /
                     // string / bytes (`b'x' * n`, `s1 + s2`, `list * 3`) is an
                     // allocation CPython's allocator hook would see. In-place
@@ -6164,7 +6247,12 @@ impl Interpreter {
                     // `x == y` is whatever `__eq__` returned, not its truthiness
                     // (`NormalDist.__eq__` declines, so `nd == A()` yields `A`'s
                     // `10`). Native/identity fallbacks already yield a bool.
-                    let r = self.rich_compare_obj(&a, &b, kind, &frame.globals)?;
+                    let r_res = self.rich_compare_obj(&a, &b, kind, &frame.globals);
+                    // RFC 0059 WS1b: same operand accounting (and ordering)
+                    // as BINARY_OP above.
+                    gc_trace::note_dropped(&a);
+                    gc_trace::note_dropped(&b);
+                    let r = r_res?;
                     frame.push(r);
                     // Operand retirement, as for BINARY_OP above.
                     if matches!(&a, Object::Instance(_)) {
@@ -6246,6 +6334,11 @@ impl Interpreter {
             }
             OpCode::PopTop => {
                 let v = frame.pop()?;
+                // RFC 0059 WS1b: POP_TOP is exempt from the eval loop's
+                // coarse stack-shrink mark; note the discarded value here
+                // (no-op for pure leaves — e.g. a discarded expression
+                // statement's int/str result).
+                gc_trace::note_dropped(&v);
                 // Discarding the last reference to a temporary mirrors
                 // CPython's refcount-driven finalization (`f()` as a
                 // statement finalizes the result immediately). This covers
@@ -6499,8 +6592,25 @@ impl Interpreter {
                 frame.pc = frame.pc.saturating_sub(ins.arg);
                 // RFC 0032 — a loop back-edge heats the code object so a
                 // subsequent activation can tier up to native code.
+                // RFC 0059 WS3b — once hot, the *running* activation
+                // tiers up mid-loop through an OSR entry at this jump
+                // target (compiling on the first hot back edge if
+                // needed). Native code fires no trace events, so OSR is
+                // gated on observers exactly like the fresh-entry path.
                 #[cfg(feature = "jit")]
-                crate::tier2::note_backedge(&frame.code);
+                if crate::tier2::note_backedge(&frame.code) && !crate::trace::any_observers_active()
+                {
+                    match crate::tier2::try_enter_osr(self, frame) {
+                        crate::tier2::JitEntry::Ran(v) => {
+                            return Ok(StepOutcome::Return(v));
+                        }
+                        // A raised native call propagates through the
+                        // dispatch loop's normal error path; the frame
+                        // state is already the post-CALL point.
+                        crate::tier2::JitEntry::Raised(err) => return Err(err),
+                        crate::tier2::JitEntry::Deopt | crate::tier2::JitEntry::Skip => {}
+                    }
+                }
             }
             OpCode::GetIter => {
                 let v = frame.pop()?;
@@ -17490,6 +17600,7 @@ impl Interpreter {
                     }
                     Err(err) => {
                         *gen.state.borrow_mut() = GeneratorState::Finished;
+                        self.recycle_frame_allocs(&mut frame);
                         Err(err)
                     }
                 };
@@ -17535,6 +17646,7 @@ impl Interpreter {
                         }
                         Ok(FrameOutcome::Returned(v)) => {
                             *gen.state.borrow_mut() = GeneratorState::Finished;
+                            self.recycle_frame_allocs(&mut frame);
                             Err(stop_iteration_with(v))
                         }
                         Ok(FrameOutcome::StartGenerator) => {
@@ -17545,7 +17657,9 @@ impl Interpreter {
                         }
                         Err(err) => {
                             *gen.state.borrow_mut() = GeneratorState::Finished;
-                            Err(self.pep479_escape(gen, err))
+                            let escaped = self.pep479_escape(gen, err);
+                            self.recycle_frame_allocs(&mut frame);
+                            Err(escaped)
                         }
                     };
                 }
@@ -17559,6 +17673,7 @@ impl Interpreter {
                 }
                 Err(err) => {
                     *gen.state.borrow_mut() = GeneratorState::Finished;
+                    self.recycle_frame_allocs(&mut frame);
                     return Err(err);
                 }
             }
@@ -17614,6 +17729,7 @@ impl Interpreter {
                 }
                 Ok(FrameOutcome::Returned(v)) => {
                     *gen.state.borrow_mut() = GeneratorState::Finished;
+                    self.recycle_frame_allocs(&mut frame);
                     Err(stop_iteration_with(v))
                 }
                 Ok(FrameOutcome::StartGenerator) => {
@@ -17624,7 +17740,9 @@ impl Interpreter {
                 }
                 Err(err) => {
                     *gen.state.borrow_mut() = GeneratorState::Finished;
-                    Err(self.pep479_escape(gen, err))
+                    let escaped = self.pep479_escape(gen, err);
+                    self.recycle_frame_allocs(&mut frame);
+                    Err(escaped)
                 }
             },
             Ok(None) => unreachable!(),
@@ -17648,7 +17766,9 @@ impl Interpreter {
                     self.pop_frame_shell();
                     hook_result?;
                 }
-                Err(self.pep479_escape(gen, err))
+                let escaped = self.pep479_escape(gen, err);
+                self.recycle_frame_allocs(&mut frame);
+                Err(escaped)
             }
         }
     }
@@ -17852,6 +17972,7 @@ impl Interpreter {
                 }
                 Ok(FrameOutcome::Returned(v)) => {
                     *gen.state.borrow_mut() = GeneratorState::Finished;
+                    self.recycle_frame_allocs(&mut frame);
                     Err(stop_iteration_with(v))
                 }
                 Ok(FrameOutcome::StartGenerator) => {
@@ -17862,13 +17983,17 @@ impl Interpreter {
                 }
                 Err(err) => {
                     *gen.state.borrow_mut() = GeneratorState::Finished;
-                    Err(self.pep479_escape(gen, err))
+                    let escaped = self.pep479_escape(gen, err);
+                    self.recycle_frame_allocs(&mut frame);
+                    Err(escaped)
                 }
             },
             Ok(None) => unreachable!(),
             Err(err) => {
                 *gen.state.borrow_mut() = GeneratorState::Finished;
-                Err(self.pep479_escape(gen, err))
+                let escaped = self.pep479_escape(gen, err);
+                self.recycle_frame_allocs(&mut frame);
+                Err(escaped)
             }
         }
     }
@@ -18052,6 +18177,9 @@ impl Interpreter {
                 // "")`.
                 *gen.state.borrow_mut() = GeneratorState::Finished;
                 self.reap_dead_frame(&mut frame);
+                // RFC 0059 WS4: the exhausted frame's storage is dead —
+                // donate it back to the frame pools.
+                self.recycle_frame_allocs(&mut frame);
                 Err(stop_iteration_with(v))
             }
             Ok(FrameOutcome::StartGenerator) => {
@@ -18064,6 +18192,7 @@ impl Interpreter {
                 *gen.state.borrow_mut() = GeneratorState::Finished;
                 let escaped = self.pep479_escape(gen, err);
                 self.reap_dead_frame(&mut frame);
+                self.recycle_frame_allocs(&mut frame);
                 Err(escaped)
             }
         }
@@ -31102,6 +31231,12 @@ impl Interpreter {
                 if let Some(code) = frozen_code_cache::get(full) {
                     return self.run_frozen_compiled(full, code, frozen.is_package, &display);
                 }
+                // RFC 0059 WS5a — the per-user disk cache lets a *fresh
+                // process* skip parse + compile too (the dominant cost
+                // of `import site` at startup).
+                if let Some(code) = frozen_code_cache::get_disk(full, frozen.source, &display) {
+                    return self.run_frozen_compiled(full, code, frozen.is_package, &display);
+                }
             }
             return self.load_from_source(full, frozen.source, frozen.is_package, &display);
         }
@@ -31405,6 +31540,12 @@ impl Interpreter {
             || crate::stdlib_tree::contains(std::path::Path::new(filename))
         {
             frozen_code_cache::insert(full, &code);
+            // RFC 0059 WS5a — persist for future processes as well.
+            // `-B`/`PYTHONDONTWRITEBYTECODE` suppresses the write like
+            // any other bytecode artifact (reads stay enabled).
+            if !self.bytecode_writes_disabled() {
+                frozen_code_cache::write_disk(full, source, &code);
+            }
         }
         self.run_frozen_compiled(full, code, is_package, filename)
     }
@@ -39851,6 +39992,157 @@ mod tests {
         assert!(compiled >= 1, "JIT never compiled the compare kernel");
         assert!(deopts >= 1, "past-2^53 compare must deopt for exactness");
         assert_eq!(out, "4\n");
+        assert_eq!(out, run(src));
+    }
+
+    // RFC 0059 WS3 — native Python-to-Python calls and OSR loop entry.
+
+    /// As [`run_jit`] but also reports the OSR entry count.
+    #[cfg(feature = "jit")]
+    fn run_jit_osr(src: &str) -> (String, u64, u64, u64) {
+        let src = src.to_owned();
+        std::thread::spawn(move || {
+            crate::tier2::force_enable_for_test(2);
+            let out = run(&src);
+            let (compiled, _entries, deopts) = crate::tier2::stats_for_test();
+            let osr = crate::tier2::osr_stats_for_test();
+            (out, compiled, deopts, osr)
+        })
+        .join()
+        .expect("jit worker thread")
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_self_recursive_call_compiles() {
+        // fib recurses through a `CallPy` on itself: the analyzer's
+        // return-lane fixpoint types the call, and the recursive calls
+        // run through the `wpjit_call_py` helper.
+        let src = "def fib(n):\n    if n < 2:\n        return n\n\
+                   \x20   return fib(n - 1) + fib(n - 2)\n\
+                   r = 0\nk = 0\n\
+                   while k < 5:\n    r = fib(15)\n    k = k + 1\n\
+                   print(r)\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled fib");
+        assert_eq!(deopts, 0, "clean recursive kernel should not deopt");
+        assert_eq!(out, "610\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_calls_helper_with_known_return_lane() {
+        // A non-self callee: `half` is analyzable with a stable int
+        // return lane, so `driver`'s loop calls it natively.
+        let src = "def half(x):\n    return x // 2\n\
+                   def driver(n):\n    t = 0\n    i = 0\n\
+                   \x20   while i < n:\n        t = t + half(i)\n        i = i + 1\n\
+                   \x20   return t\n\
+                   r = 0\nk = 0\n\
+                   while k < 60:\n    r = driver(40)\n    k = k + 1\n\
+                   print(r)\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the driver");
+        assert_eq!(out, "380\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_call_raising_callee_propagates_exception() {
+        // The callee raises mid-loop; the native caller must take its
+        // `Raised` exit and the exception must surface with normal
+        // try/except semantics in the (interpreted) outer frame.
+        let src = "def boom(x):\n    return 10 // x\n\
+                   def driver(n):\n    t = 0\n    i = 0 - 1\n\
+                   \x20   while i < n:\n        t = t + boom(i)\n        i = i + 1\n\
+                   \x20   return t\n\
+                   k = 0\n\
+                   while k < 60:\n    try:\n        driver(5)\n    except ZeroDivisionError:\n        pass\n    k = k + 1\n\
+                   print('ok')\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the raising driver");
+        assert_eq!(out, "ok\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_call_result_outside_lane_deopts_with_result() {
+        // `grow` returns an int that overflows into a big integer for
+        // large inputs: the helper's lane check fails, the caller
+        // deopts *after* the call with the parked result, and the
+        // interpreter finishes with exact big-int arithmetic.
+        let src = "def grow(x):\n    return x * 1000000000000000000\n\
+                   def driver(n):\n    t = 0\n    i = 0\n\
+                   \x20   while i < n:\n        t = t + grow(i)\n        i = i + 1\n\
+                   \x20   return t\n\
+                   r = 0\nk = 0\n\
+                   while k < 60:\n    r = driver(20)\n    k = k + 1\n\
+                   print(r)\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the overflow driver");
+        assert_eq!(out, "190000000000000000000\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_callee_code_rebind_fails_entry_guard() {
+        // `helper.__code__ = third.__code__` keeps the function's
+        // *identity* (so the burned-global guard alone would pass) but
+        // invalidates the burned-in callee assumptions. The callee-code
+        // entry guard must catch it and keep the frame interpreted.
+        let src = "def half(x):\n    return x // 2\n\
+                   def third(x):\n    return x // 3\n\
+                   def driver(n):\n    t = 0\n    i = 0\n\
+                   \x20   while i < n:\n        t = t + helper(i)\n        i = i + 1\n\
+                   \x20   return t\n\
+                   helper = half\n\
+                   r = 0\nk = 0\n\
+                   while k < 60:\n    r = driver(40)\n    k = k + 1\n\
+                   print(r)\n\
+                   helper.__code__ = third.__code__\n\
+                   print(driver(40))\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the driver");
+        assert_eq!(out, "380\n247\n");
+        assert_eq!(out, run(src), "code rebind diverged from interpreter");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_osr_enters_single_hot_activation() {
+        // One long-running activation, called exactly once: only OSR
+        // can tier it up (the fresh-entry path never sees it again).
+        let src = "def kernel(n):\n    s = 0\n    i = 0\n\
+                   \x20   while i < n:\n        s = s + i * 3 - (i % 5)\n        i = i + 1\n\
+                   \x20   return s\n\
+                   print(kernel(20000))\n";
+        let (out, compiled, deopts, osr) = run_jit_osr(src);
+        assert!(compiled >= 1, "hot back edges never triggered a compile");
+        assert!(osr >= 1, "single hot activation should enter via OSR");
+        assert_eq!(deopts, 0, "clean OSR kernel should not deopt");
+        assert_eq!(out, "599930000\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_osr_enters_range_loop_mid_iteration() {
+        // OSR at a rewritten `range` loop header: the live iterator on
+        // the interpreter stack is decomposed into the synthetic
+        // (cur, stop) slots and the counted loop resumes natively.
+        let src = "def kernel(n):\n    total = 0\n\
+                   \x20   for i in range(n):\n        total = total + i * 2\n\
+                   \x20   return total\n\
+                   print(kernel(20000))\n";
+        let (out, compiled, deopts, osr) = run_jit_osr(src);
+        assert!(compiled >= 1, "hot range back edges never compiled");
+        assert!(osr >= 1, "range loop should enter via OSR");
+        assert_eq!(deopts, 0, "clean OSR range kernel should not deopt");
+        assert_eq!(out, "399980000\n");
         assert_eq!(out, run(src));
     }
 

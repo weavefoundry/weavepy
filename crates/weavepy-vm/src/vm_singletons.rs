@@ -67,6 +67,7 @@ pub fn push_pending_finalizer(obj: Object) {
         cell.borrow_mut().push(obj);
     });
     PENDING_FINALIZER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Release);
+    crate::hot_gates::set(crate::hot_gates::PENDING_FINALIZERS);
 }
 
 /// Like [`push_pending_finalizer`], but callable from `Drop` impls:
@@ -85,15 +86,23 @@ pub fn try_push_pending_finalizer(obj: Object) {
         .unwrap_or(false);
     if pushed {
         PENDING_FINALIZER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Release);
+        crate::hot_gates::set(crate::hot_gates::PENDING_FINALIZERS);
     }
 }
 
 /// Drain the pending-finalizer queue. The eval loop calls this
 /// at every eval-breaker tick that has the GC flag set.
 pub fn drain_pending_finalizers() -> Vec<Object> {
+    // Clear-drain-recheck (RFC 0059 WS2): lower the hot-gate bit before
+    // draining so a producer racing this drain re-raises it; re-set it
+    // ourselves if other threads' queues still hold parked work.
+    crate::hot_gates::clear(crate::hot_gates::PENDING_FINALIZERS);
     let taken = PENDING_FINALIZERS.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
     if !taken.is_empty() {
         PENDING_FINALIZER_COUNT.fetch_sub(taken.len(), std::sync::atomic::Ordering::Release);
+    }
+    if PENDING_FINALIZER_COUNT.load(std::sync::atomic::Ordering::Acquire) > 0 {
+        crate::hot_gates::set(crate::hot_gates::PENDING_FINALIZERS);
     }
     taken
 }
@@ -538,6 +547,7 @@ static PENDING_RW_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 pub fn push_pending_resource_warning(message: String) {
     PENDING_RESOURCE_WARNINGS.with(|cell| cell.borrow_mut().push((message, None)));
     PENDING_RW_FLAG.store(true, std::sync::atomic::Ordering::Release);
+    crate::hot_gates::set(crate::hot_gates::RESOURCE_WARNINGS);
 }
 
 /// As [`push_pending_resource_warning`], carrying the dying object's
@@ -550,6 +560,7 @@ pub fn push_pending_resource_warning_with_source(message: String, source_key: us
     crate::stdlib::tracemalloc_real::pin_object_traceback(source_key);
     PENDING_RESOURCE_WARNINGS.with(|cell| cell.borrow_mut().push((message, Some(source_key))));
     PENDING_RW_FLAG.store(true, std::sync::atomic::Ordering::Release);
+    crate::hot_gates::set(crate::hot_gates::RESOURCE_WARNINGS);
 }
 
 /// Cheap probe for the eval-loop safe point: are any deferred resource
@@ -561,6 +572,10 @@ pub fn has_pending_resource_warnings() -> bool {
 /// Drain and return all queued deferred resource-warning messages on this
 /// thread, clearing the fast-path flag.
 pub fn take_pending_resource_warnings() -> Vec<(String, Option<usize>)> {
+    // Clear-drain-recheck (RFC 0059 WS2). The RW flag and queue are
+    // per-thread; a producer on another thread re-raises the shared bit
+    // itself, so no recheck-and-reset pass is needed here.
+    crate::hot_gates::clear(crate::hot_gates::RESOURCE_WARNINGS);
     PENDING_RW_FLAG.store(false, std::sync::atomic::Ordering::Release);
     PENDING_RESOURCE_WARNINGS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
 }
@@ -775,6 +790,7 @@ pub fn queue_parked_drop(obj: &Object) {
         }
         let _ = PENDING_CEXT_FLAG.try_with(|c| c.set(true));
         PENDING_CEXT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Release);
+        crate::hot_gates::set(crate::hot_gates::PENDING_CEXT);
     }
 }
 
@@ -797,6 +813,8 @@ pub fn has_pending_cext_drops() -> bool {
 
 /// Drain this thread's queue of C-dropped objects.
 pub fn drain_pending_cext_drops() -> Vec<Object> {
+    // Clear-drain-recheck (RFC 0059 WS2): see `drain_pending_finalizers`.
+    crate::hot_gates::clear(crate::hot_gates::PENDING_CEXT);
     let _ = PENDING_CEXT_FLAG.try_with(|c| c.set(false));
     let taken: Vec<Object> = PENDING_CEXT_DROPS
         .try_with(|cell| {
@@ -807,6 +825,9 @@ pub fn drain_pending_cext_drops() -> Vec<Object> {
         .unwrap_or_default();
     if !taken.is_empty() {
         PENDING_CEXT_COUNT.fetch_sub(taken.len(), std::sync::atomic::Ordering::Release);
+    }
+    if PENDING_CEXT_COUNT.load(std::sync::atomic::Ordering::Acquire) > 0 {
+        crate::hot_gates::set(crate::hot_gates::PENDING_CEXT);
     }
     taken
 }
@@ -843,6 +864,14 @@ static FINALIZING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 
 pub fn set_finalizing(value: bool) {
     FINALIZING.store(value, std::sync::atomic::Ordering::Release);
+    // Level-style hot-gate bit (RFC 0059 WS2): maintained on the state
+    // transition itself, so the dispatch loop's daemon-kill probe is
+    // covered by the single fused load.
+    if value {
+        crate::hot_gates::set(crate::hot_gates::FINALIZING);
+    } else {
+        crate::hot_gates::clear(crate::hot_gates::FINALIZING);
+    }
 }
 
 pub fn is_finalizing() -> bool {

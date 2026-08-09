@@ -206,7 +206,7 @@ pub fn try_load(source_path: &Path, optimize: u8) -> Option<CodeObject> {
 
 /// Recursively stamp `filename` on a code object and every nested code
 /// constant (function/class bodies, comprehensions).
-fn rewrite_filenames(code: &mut CodeObject, filename: &str) {
+pub(crate) fn rewrite_filenames(code: &mut CodeObject, filename: &str) {
     code.filename = filename.to_owned();
     fn walk(c: &mut weavepy_compiler::Constant, filename: &str) {
         match c {

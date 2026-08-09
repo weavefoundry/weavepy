@@ -1461,8 +1461,13 @@ impl GcState {
         if std::env::var_os("WP_REAP_DBG").is_some() {
             let dbg_class = std::env::var("WP_REAP_DBG_CLASS").unwrap_or("Executor".into());
             for h in &candidate_set {
-                if let Object::Instance(i) = &h.object {
-                    if i.cls().name.contains(&dbg_class) {
+                let matches_dbg = match &h.object {
+                    Object::Instance(i) => i.cls().name.contains(&dbg_class),
+                    Object::Type(t) => t.name.contains(&dbg_class),
+                    _ => false,
+                };
+                {
+                    if matches_dbg {
                         let exec_id = h.id;
                         let mut referrers: Vec<String> = Vec::new();
                         for c in &scan_all {
@@ -1484,8 +1489,9 @@ impl GcState {
                             }
                         }
                         eprintln!(
-                            "[mark wronly={}] Executor sc={} clones={} gc_refs={} white={} tracked_referrers={:?}",
+                            "[mark wronly={}] {} sc={} clones={} gc_refs={} white={} tracked_referrers={:?}",
                             weakref_only,
+                            h.object.type_name_owned(),
                             strong_count_for(&h.object),
                             crate::weakref_registry::strong_clone_count(h.id),
                             h.gc_refs.load(Ordering::Acquire),
@@ -1835,6 +1841,19 @@ impl GcState {
         // generation `g` (color != White) move to generation
         // min(g+1, N_GENERATIONS-1).
         self.rebuild_generations(gen, &candidate_set);
+
+        // The rebuild dropped the dead objects' index handles *directly*
+        // (not via `untrack_id`), so purge any suspect-list clones in
+        // lock-step here — after the index borrow is released, matching
+        // `untrack_id`'s ordering. A stale suspect entry shares the dead
+        // handle's `Arc`, whose strong `object` reference would otherwise
+        // keep the just-collected object alive until the suspect probe
+        // ages it out: `test_descr.test_remove_subclass` observed a
+        // collected class still listed in `Parent.__subclasses__()`
+        // right after an explicit `gc.collect()`.
+        for h in &dead {
+            remove_suspect(h.id);
+        }
 
         // Adjust the population counter.
         self.tracked_count.fetch_sub(
@@ -2946,6 +2965,42 @@ thread_local! {
 #[inline]
 pub fn mark_maybe_dead() {
     MAYBE_DEAD.with(|c| c.set(true));
+}
+
+/// Precise per-value drop note (RFC 0059 WS1b). Called by the audited
+/// opcode handlers (`POP_TOP`, `STORE_FAST`, the generic `BINARY_OP` /
+/// `COMPARE_OP` paths) with each value they discard; the eval loop
+/// exempts those opcodes from its coarse "operand stack shrank ⇒ maybe
+/// dead" heuristic in return.
+///
+/// A **pure leaf** — a variant that owns no [`Object`]s and whose
+/// instances can never carry a finalizer (subclass instances live in
+/// `Object::Instance`, never in the scalar variants) — cannot make
+/// anything finalizable unreachable when dropped, so it schedules no
+/// sweep. This is what keeps an int-accumulating hot loop
+/// (`total = total + i`, the RFC 0059 `nested_loops` profile) from
+/// paying a `reap_dead_finalizable` scan per iteration whenever *some*
+/// `__del__`-bearing object is alive anywhere in the process.
+/// Everything else conservatively marks: the sweep itself refcount-
+/// checks, so a false positive costs one scan, never correctness.
+#[inline]
+pub fn note_dropped(obj: &crate::object::Object) {
+    use crate::object::Object as O;
+    match obj {
+        O::None
+        | O::Unbound
+        | O::Bool(_)
+        | O::Int(_)
+        | O::Long(_)
+        | O::Float(_)
+        | O::Complex(_)
+        | O::Str(_)
+        | O::WStr(_)
+        | O::Bytes(_)
+        | O::Range(_)
+        | O::Code(_) => {}
+        _ => mark_maybe_dead(),
+    }
 }
 
 /// Consume the "a reference may have dropped" flag, returning whether it was
