@@ -738,7 +738,15 @@ fn infer_block(
         }
         // Fall-through terminator: must leave an empty stack.
         _ => {
-            step_abstract(code, last, &mut stack, plan, local_types, *ret_lane, changed)?;
+            step_abstract(
+                code,
+                last,
+                &mut stack,
+                plan,
+                local_types,
+                *ret_lane,
+                changed,
+            )?;
             if !stack.is_empty() {
                 return Err(JitVerdict::NonEmptyBoundaryStack);
             }
