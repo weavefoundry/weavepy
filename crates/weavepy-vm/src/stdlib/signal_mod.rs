@@ -168,6 +168,8 @@ extern "C" fn handler_trampoline(signum: libc::c_int) {
     if s >= 1 && (s as usize) < TRIP_SLOTS {
         TRIPPED[s as usize].store(true, Ordering::Release);
         ANY_TRIPPED.store(true, Ordering::Release);
+        // Lock-free atomic RMW — async-signal-safe (RFC 0059 WS2).
+        crate::hot_gates::set(crate::hot_gates::SIGNALS);
     }
     let fd = WAKEUP_FD.load(Ordering::Relaxed);
     if fd >= 0 {
@@ -432,6 +434,7 @@ pub fn trip_signal(signum: i32) {
     if signum >= 1 && (signum as usize) < TRIP_SLOTS {
         TRIPPED[signum as usize].store(true, Ordering::Release);
         ANY_TRIPPED.store(true, Ordering::Release);
+        crate::hot_gates::set(crate::hot_gates::SIGNALS);
     }
 }
 
@@ -459,6 +462,9 @@ pub fn take_wakeup_write_error() -> Option<i32> {
 /// clearing the global gate. Returns the signal numbers to service.
 /// By convention only the main thread calls this.
 pub fn take_tripped() -> Vec<i32> {
+    // Clear-drain-recheck: a signal tripping mid-drain re-raises the
+    // hot-gate bit itself (the trampoline sets it after `TRIPPED`).
+    crate::hot_gates::clear(crate::hot_gates::SIGNALS);
     if !ANY_TRIPPED.swap(false, Ordering::AcqRel) {
         return Vec::new();
     }

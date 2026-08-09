@@ -32,10 +32,12 @@ mod value;
 pub use analyze::{analyze, JitVerdict};
 pub use engine::{CompiledFrame, JitEngine};
 pub use ir::{
-    ArithKind, BlockId, CmpKind, GlobalGuard, RangeLoopMeta, ResolvedGlobal, TBlock, TFunc, TOp,
-    TStmt, TTerm,
+    ArithKind, BlockId, CalleeSpanMeta, CmpKind, GlobalGuard, OsrEntry, RangeLoopMeta,
+    ResolvedGlobal, TBlock, TFunc, TOp, TStmt, TTerm,
 };
-pub use runtime::{JitFrame, JitStatus, SlotTag};
+pub use runtime::{
+    register_call_py_helper, CallPyHelper, CallStatus, JitFrame, JitStatus, SlotTag,
+};
 pub use value::JitType;
 
 /// Outcome of attempting to compile a code object.

@@ -100,6 +100,15 @@ pub enum TOp {
     /// (rather than `Swap2` + `IntToFloatTos` + `Swap2`) so a guarded
     /// deopt spills the operand stack in its original order.
     IntToFloatSecond { guarded: bool },
+    /// RFC 0059 WS3 — a Python-to-Python call through the embedder's
+    /// `wpjit_call_py` helper. Pops `argc` scalar arguments (the burned
+    /// callee never reached the JIT stack — see
+    /// [`CalleeSpanMeta`]), calls `token` (an index into the compiled
+    /// frame's callee table), and pushes a `ret` result. A raised
+    /// callee takes the `Raised` exit at this pc; a result outside the
+    /// `ret` lane (or a caller guard invalidated by the callee's side
+    /// effects) deopts *after* the call with the result spilled.
+    CallPy { token: u32, argc: u8, ret: JitType },
 }
 
 /// One IR statement: a [`TOp`] tagged with its originating bytecode pc
@@ -170,6 +179,19 @@ pub enum ResolvedGlobal {
     ConstFloat(u64),
     /// A `bool` global, burned in as a constant.
     ConstBool(bool),
+    /// RFC 0059 WS3 — a plain Python function, callable natively through
+    /// the `wpjit_call_py` helper. `token` indexes the embedder's callee
+    /// table (parallel to resolution order); `arg_count` is the callee's
+    /// positional arity; `ret` is the callee's inferred scalar return
+    /// lane (`None` when the callee is the function being compiled —
+    /// the analyzer resolves self-recursion through its own return-lane
+    /// fixpoint).
+    PyFunc {
+        token: u32,
+        arg_count: u32,
+        is_self: bool,
+        ret: Option<JitType>,
+    },
     /// Anything else — not representable; the load disqualifies the frame.
     Opaque,
 }
@@ -181,6 +203,39 @@ pub enum ResolvedGlobal {
 pub struct GlobalGuard {
     pub name: String,
     pub expect: ResolvedGlobal,
+}
+
+/// Deopt-reconstruction metadata for one erased callee (RFC 0059 WS3):
+/// between the (erased) `LOAD_GLOBAL` of a Python callee and its `CALL`,
+/// the *interpreter's* operand stack holds the callee object at absolute
+/// depth `interp_depth` (below the argument temporaries, above any
+/// enclosing range iterators). A deopt at a pc strictly inside
+/// `(live_from, live_to)` must re-insert the callee-table object at that
+/// index when rebuilding the stack.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CalleeSpanMeta {
+    /// Callee-table index (same space as [`TOp::CallPy`]'s `token`).
+    pub token: u32,
+    /// The erased `LOAD_GLOBAL` pc.
+    pub live_from: u32,
+    /// The `CALL` pc (the call itself consumes the callee, so the span
+    /// is open only for pcs strictly between the endpoints).
+    pub live_to: u32,
+    /// Absolute interpreter-stack index of the callee object,
+    /// accounting for enclosing erased entities (range iterators and
+    /// outer callee spans).
+    pub interp_depth: u32,
+}
+
+/// One OSR entry point (RFC 0059 WS3b): a backward-jump target block
+/// with an empty boundary stack, enterable mid-frame via
+/// [`crate::JitFrame::entry_pc`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OsrEntry {
+    /// The bytecode pc of the block leader (the backward jump's target).
+    pub pc: u32,
+    /// The [`TBlock`] to enter.
+    pub block: BlockId,
 }
 
 /// Deopt-reconstruction metadata for one rewritten `range` loop: at any
@@ -223,6 +278,18 @@ pub struct TFunc {
     /// Rewritten `range` loops, ordered outermost-first (ascending
     /// `live_from`), for deopt stack reconstruction.
     pub range_loops: Vec<RangeLoopMeta>,
+    /// Erased Python callees (RFC 0059 WS3), ascending `live_from`, for
+    /// deopt stack reconstruction during argument computation.
+    pub callee_spans: Vec<CalleeSpanMeta>,
+    /// OSR entry points (RFC 0059 WS3b): backward-jump target blocks
+    /// enterable via `entry_pc`.
+    pub osr_entries: Vec<OsrEntry>,
+    /// Widest `CallPy` argument count, for sizing the marshal buffer.
+    pub max_call_args: u32,
+    /// The function's own scalar return lane, when every `return` site
+    /// agrees on one representable lane (RFC 0059 WS3). This is what a
+    /// *caller's* analysis burns in as `PyFunc::ret`.
+    pub ret_lane: Option<JitType>,
 }
 
 impl TOp {
@@ -243,6 +310,7 @@ impl TOp {
                 | TOp::FloatArith(ArithKind::TrueDiv)
                 | TOp::IntToFloatTos { guarded: true }
                 | TOp::IntToFloatSecond { guarded: true }
+                | TOp::CallPy { .. }
         )
     }
 }

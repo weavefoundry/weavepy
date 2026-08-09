@@ -9,20 +9,25 @@
 //! [`JitStatus::Deopt`] so the interpreter resumes at the exact pc.
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::{types, Block, Function, InstBuilder, MemFlags, Type, Value};
+use cranelift_codegen::ir::{
+    types, AbiParam, Block, Function, InstBuilder, MemFlags, SigRef, Signature, Type, Value,
+};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 
 use crate::ir::{ArithKind, CmpKind, TFunc, TOp, TStmt, TTerm};
-use crate::runtime::{JitFrame, JitStatus, SlotTag};
+use crate::runtime::{self, JitFrame, JitStatus, SlotTag};
 use crate::value::JitType;
 
 const OFF_LOCALS: i32 = core::mem::offset_of!(JitFrame, locals) as i32;
+const OFF_ENTRY_PC: i32 = core::mem::offset_of!(JitFrame, entry_pc) as i32;
 const OFF_RET_BITS: i32 = core::mem::offset_of!(JitFrame, ret_bits) as i32;
 const OFF_RET_TAG: i32 = core::mem::offset_of!(JitFrame, ret_tag) as i32;
 const OFF_DEOPT_PC: i32 = core::mem::offset_of!(JitFrame, deopt_pc) as i32;
 const OFF_STACK_SPILL: i32 = core::mem::offset_of!(JitFrame, stack_spill) as i32;
 const OFF_STACK_TAGS: i32 = core::mem::offset_of!(JitFrame, stack_tags) as i32;
 const OFF_STACK_LEN: i32 = core::mem::offset_of!(JitFrame, stack_len) as i32;
+const OFF_CALL_ARGS: i32 = core::mem::offset_of!(JitFrame, call_args) as i32;
+const OFF_CALL_TAGS: i32 = core::mem::offset_of!(JitFrame, call_tags) as i32;
 
 /// Build the Cranelift function body for `tfunc` into `func`.
 pub(crate) fn build_function(
@@ -50,6 +55,12 @@ struct Lowerer<'a, 'b> {
     locals_base: Value,
     spill_base: Value,
     tags_base: Value,
+    /// Argument marshal bases (RFC 0059 WS3); only loaded when the
+    /// function contains `CallPy` statements.
+    call_args_base: Value,
+    call_tags_base: Value,
+    /// Imported signature of the `wpjit_call_py` helper (lazy).
+    call_sig: Option<SigRef>,
     /// The abstract operand stack: SSA value + lane.
     vstack: Vec<(Value, JitType)>,
 }
@@ -68,6 +79,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             locals_base: dummy,
             spill_base: dummy,
             tags_base: dummy,
+            call_args_base: dummy,
+            call_tags_base: dummy,
+            call_sig: None,
             vstack: Vec::new(),
         }
     }
@@ -108,6 +122,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .b
             .ins()
             .load(self.ptr_ty, trusted, self.frame_ptr, OFF_STACK_TAGS);
+        if !self.tfunc.callee_spans.is_empty() {
+            self.call_args_base =
+                self.b
+                    .ins()
+                    .load(self.ptr_ty, trusted, self.frame_ptr, OFF_CALL_ARGS);
+            self.call_tags_base =
+                self.b
+                    .ins()
+                    .load(self.ptr_ty, trusted, self.frame_ptr, OFF_CALL_TAGS);
+        }
 
         // One Cranelift block per TBlock.
         self.cl_blocks = (0..self.tfunc.blocks.len())
@@ -127,8 +151,30 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             }
         }
 
+        // Entry dispatch (RFC 0059 WS3b): `entry_pc == 0` enters at the
+        // function start; a recognized loop-header pc OSR-enters its
+        // block (all OSR blocks have empty boundary stacks). The VM
+        // guarantees every managed local was packed before an OSR entry.
         let entry_target = self.cl_blocks[self.tfunc.entry_block];
-        self.b.ins().jump(entry_target, &[]);
+        if self.tfunc.osr_entries.is_empty() {
+            self.b.ins().jump(entry_target, &[]);
+        } else {
+            let entry_pc = self
+                .b
+                .ins()
+                .load(types::I32, trusted, self.frame_ptr, OFF_ENTRY_PC);
+            for e in &self.tfunc.osr_entries {
+                let hit = self
+                    .b
+                    .ins()
+                    .icmp_imm(IntCC::Equal, entry_pc, i64::from(e.pc));
+                let next = self.b.create_block();
+                let target = self.cl_blocks[e.block];
+                self.b.ins().brif(hit, target, &[], next, &[]);
+                self.b.switch_to_block(next);
+            }
+            self.b.ins().jump(entry_target, &[]);
+        }
 
         // Emit each block body.
         for bi in 0..self.tfunc.blocks.len() {
@@ -288,7 +334,95 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let depth = self.vstack.len() - 2;
                 self.emit_int_to_float(depth, guarded, stmt.pc);
             }
+            TOp::CallPy { token, argc, ret } => self.emit_call_py(token, argc, ret, stmt.pc),
         }
+    }
+
+    /// Lower a native Python-to-Python call (RFC 0059 WS3): marshal the
+    /// arguments, write back the managed locals (the callee may observe
+    /// the caller frame), call the registered `wpjit_call_py` helper,
+    /// then dispatch on its [`crate::runtime::CallStatus`]:
+    ///
+    /// - `Ok`  — the result (already lane-checked by the helper) is in
+    ///   `ret_bits`; load and push it.
+    /// - `Raised` — exit with [`JitStatus::Raised`] at the call's pc
+    ///   (the helper parked the exception in the embedder).
+    /// - `Boxed` — the call *completed* but its result is
+    ///   unrepresentable (or a caller guard was invalidated by callee
+    ///   side effects): exit with [`JitStatus::Deopt`] at `pc + 1`; the
+    ///   embedder pushes the parked result after rebuilding the stack.
+    ///   The call is never re-executed.
+    fn emit_call_py(&mut self, token: u32, argc: u8, ret: JitType, pc: u32) {
+        let trusted = MemFlags::trusted();
+        let n = argc as usize;
+        let base = self.vstack.len() - n;
+        for (j, &(v, ty)) in self.vstack[base..].iter().enumerate() {
+            let voff = (j as i32) * 8;
+            let toff = (j as i32) * 4;
+            // Store f64 lanes by value (same bit pattern, typed store).
+            self.b.ins().store(trusted, v, self.call_args_base, voff);
+            let tagv = self.b.ins().iconst(types::I32, Self::tag(ty));
+            self.b.ins().store(trusted, tagv, self.call_tags_base, toff);
+        }
+        self.vstack.truncate(base);
+        let snapshot = self.vstack.clone();
+
+        // Keep the frame's local slots observably current across the
+        // call (`sys._getframe`, tracebacks through this frame, and the
+        // Raised/Boxed exits below all read them).
+        self.writeback_locals();
+
+        let sig = self.call_py_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::call_py_helper_addr() as i64);
+        let tokenv = self.b.ins().iconst(types::I32, i64::from(token));
+        let argcv = self.b.ins().iconst(types::I32, i64::from(argc));
+        let expect = self.b.ins().iconst(types::I32, Self::tag(ret));
+        let call =
+            self.b
+                .ins()
+                .call_indirect(sig, helper, &[self.frame_ptr, tokenv, argcv, expect]);
+        let status = self.b.inst_results(call)[0];
+
+        let ok_b = self.b.create_block();
+        let bad_b = self.b.create_block();
+        let is_ok = self.b.ins().icmp_imm(IntCC::Equal, status, 0);
+        self.b.ins().brif(is_ok, ok_b, &[], bad_b, &[]);
+
+        self.b.switch_to_block(bad_b);
+        let raised_b = self.b.create_block();
+        let boxed_b = self.b.create_block();
+        let is_raised = self.b.ins().icmp_imm(IntCC::Equal, status, 1);
+        self.b.ins().brif(is_raised, raised_b, &[], boxed_b, &[]);
+        self.b.switch_to_block(raised_b);
+        self.emit_exit(pc, &snapshot, JitStatus::Raised);
+        self.b.switch_to_block(boxed_b);
+        self.emit_exit(pc + 1, &snapshot, JitStatus::Deopt);
+
+        self.b.switch_to_block(ok_b);
+        let res = self
+            .b
+            .ins()
+            .load(Self::cl_ty(ret), trusted, self.frame_ptr, OFF_RET_BITS);
+        self.vstack.push((res, ret));
+    }
+
+    /// The imported signature of the `wpjit_call_py` helper (lazy).
+    fn call_py_sig(&mut self) -> SigRef {
+        if let Some(sig) = self.call_sig {
+            return sig;
+        }
+        let mut sig = Signature::new(self.b.func.signature.call_conv);
+        sig.params.push(AbiParam::new(self.ptr_ty)); // frame
+        sig.params.push(AbiParam::new(types::I32)); // token
+        sig.params.push(AbiParam::new(types::I32)); // argc
+        sig.params.push(AbiParam::new(types::I32)); // expect_tag
+        sig.returns.push(AbiParam::new(types::I64)); // CallStatus
+        let r = self.b.import_signature(sig);
+        self.call_sig = Some(r);
+        r
     }
 
     /// Promote the integral value at `vstack[depth]` to a float in
@@ -548,15 +682,26 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     }
 
     fn emit_deopt(&mut self, pc: u32, snapshot: &[(Value, JitType)]) {
+        self.emit_exit(pc, snapshot, JitStatus::Deopt);
+    }
+
+    /// Write back every managed local into the frame's locals buffer.
+    fn writeback_locals(&mut self) {
         let trusted = MemFlags::trusted();
-        // Write back every managed local.
-        for (slot, var) in self.vars.iter().enumerate() {
-            if let Some(var) = *var {
+        for slot in 0..self.vars.len() {
+            if let Some(var) = self.vars[slot] {
                 let v = self.b.use_var(var);
                 let off = (slot as i32) * 8;
                 self.b.ins().store(trusted, v, self.locals_base, off);
             }
         }
+    }
+
+    /// Full side-exit: write back locals, spill `snapshot`, set
+    /// `deopt_pc = pc`, and return `status`.
+    fn emit_exit(&mut self, pc: u32, snapshot: &[(Value, JitType)], status: JitStatus) {
+        let trusted = MemFlags::trusted();
+        self.writeback_locals();
         // Spill the abstract stack bottom-to-top.
         for (idx, (val, ty)) in snapshot.iter().enumerate() {
             let voff = (idx as i32) * 8;
@@ -573,7 +718,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.b
             .ins()
             .store(trusted, pcv, self.frame_ptr, OFF_DEOPT_PC);
-        let status = self.b.ins().iconst(types::I64, JitStatus::Deopt as i64);
+        let status = self.b.ins().iconst(types::I64, status as i64);
         self.b.ins().return_(&[status]);
     }
 

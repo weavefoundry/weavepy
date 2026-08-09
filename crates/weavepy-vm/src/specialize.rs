@@ -610,33 +610,64 @@ thread_local! {
     static STATS: RefCell<Stats> = RefCell::new(Stats::default());
 }
 
+/// Tri-state stats switch: `2` = not yet read from the environment,
+/// `1` = enabled, `0` = disabled. Relaxed everywhere — the env var is
+/// immutable after process start, so the worst a race can do is
+/// initialize twice to the same value. RFC 0059 WS1c: the previous
+/// `OnceLock` cost an *acquire* load per probe, which on ARM is an
+/// ordering instruction the dispatch loop paid on every instruction.
+static STATS_ENABLED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+
 /// Whether stats collection is enabled (cached from the env var on
-/// first read). Process-global — the env var cannot change after
-/// startup, and a plain static read keeps the disabled fast path to
-/// a single load with no TLS traffic (RFC 0058 WS2: the previous
-/// per-thread `with` was a measurable per-instruction cost).
+/// first read). Process-global; the hot disabled path is one relaxed
+/// load + compare.
 #[inline]
 pub fn stats_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("WEAVEPY_VM_STATS").is_some())
+    let v = STATS_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+    if v != 2 {
+        return v == 1;
+    }
+    init_stats_enabled()
 }
+
+/// One-time [`STATS_ENABLED`] initialization from `WEAVEPY_VM_STATS`.
+#[cold]
+fn init_stats_enabled() -> bool {
+    let on = std::env::var_os("WEAVEPY_VM_STATS").is_some();
+    STATS_ENABLED.store(u8::from(on), std::sync::atomic::Ordering::Relaxed);
+    on
+}
+
+// The `record_*` helpers below keep their thread-local accounting in
+// `#[cold]` out-of-line bodies so the (overwhelmingly common) disabled
+// path inlines to a relaxed load + predictable branch at every call
+// site — the eval loop calls `record_dispatch` per instruction and the
+// specialized handlers call `record_hit` per fast-path success.
 
 /// Increment the `total_dispatches` counter. No-op when stats
 /// are disabled.
 #[inline]
 pub fn record_dispatch() {
-    if !stats_enabled() {
-        return;
+    if stats_enabled() {
+        record_dispatch_cold();
     }
+}
+
+#[cold]
+fn record_dispatch_cold() {
     STATS.with(|s| s.borrow_mut().total_dispatches += 1);
 }
 
 /// Record a successful specialized fast path for an opcode.
 #[inline]
 pub fn record_hit(op: u8) {
-    if !stats_enabled() {
-        return;
+    if stats_enabled() {
+        record_hit_cold(op);
     }
+}
+
+#[cold]
+fn record_hit_cold(op: u8) {
     STATS.with(|s| s.borrow_mut().specialized_hit[op as usize] += 1);
 }
 
@@ -644,9 +675,13 @@ pub fn record_hit(op: u8) {
 /// types, but the guard failed and we deopted.
 #[inline]
 pub fn record_miss(op: u8) {
-    if !stats_enabled() {
-        return;
+    if stats_enabled() {
+        record_miss_cold(op);
     }
+}
+
+#[cold]
+fn record_miss_cold(op: u8) {
     STATS.with(|s| s.borrow_mut().specialized_miss[op as usize] += 1);
 }
 
@@ -654,9 +689,13 @@ pub fn record_miss(op: u8) {
 /// we're considering installing a fast path).
 #[inline]
 pub fn record_specialize_attempt(op: u8) {
-    if !stats_enabled() {
-        return;
+    if stats_enabled() {
+        record_specialize_attempt_cold(op);
     }
+}
+
+#[cold]
+fn record_specialize_attempt_cold(op: u8) {
     STATS.with(|s| s.borrow_mut().specialization_attempts[op as usize] += 1);
 }
 
@@ -664,9 +703,13 @@ pub fn record_specialize_attempt(op: u8) {
 /// cache entry.
 #[inline]
 pub fn record_specialize_success(op: u8) {
-    if !stats_enabled() {
-        return;
+    if stats_enabled() {
+        record_specialize_success_cold(op);
     }
+}
+
+#[cold]
+fn record_specialize_success_cold(op: u8) {
     STATS.with(|s| s.borrow_mut().specialization_success[op as usize] += 1);
 }
 
@@ -674,9 +717,13 @@ pub fn record_specialize_success(op: u8) {
 /// fast path (cooldown).
 #[inline]
 pub fn record_specialize_skip(op: u8) {
-    if !stats_enabled() {
-        return;
+    if stats_enabled() {
+        record_specialize_skip_cold(op);
     }
+}
+
+#[cold]
+fn record_specialize_skip_cold(op: u8) {
     STATS.with(|s| s.borrow_mut().specialization_skip[op as usize] += 1);
 }
 

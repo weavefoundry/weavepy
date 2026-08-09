@@ -23,8 +23,8 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use weavepy_compiler::{BinOpKind, CodeObject, CompareKind, Constant, OpCode, UnaryKind};
 
 use crate::ir::{
-    ArithKind, BlockId, CmpKind, GlobalGuard, RangeLoopMeta, ResolvedGlobal, TBlock, TFunc, TOp,
-    TStmt, TTerm,
+    ArithKind, BlockId, CalleeSpanMeta, CmpKind, GlobalGuard, OsrEntry, RangeLoopMeta,
+    ResolvedGlobal, TBlock, TFunc, TOp, TStmt, TTerm,
 };
 use crate::value::JitType;
 
@@ -138,13 +138,23 @@ pub fn analyze(
     let n_locals = code.varnames.len() as u32 + plan.n_synth;
     let livein = compute_livein(code, &raw, &reachable, code.varnames.len() as u32);
 
-    // Type inference fixpoint.
+    // Type inference fixpoint. `ret_lane` is the function's own scalar
+    // return lane, fed back into self-recursive `CallPy` results
+    // (RFC 0059 WS3) — fib-shaped recursion converges in two passes.
     let mut local_types: Vec<Option<JitType>> = vec![None; n_locals as usize];
+    let mut ret_lane: Option<JitType> = None;
     let mut iters = 0;
     loop {
         let mut changed = false;
         for &bi in &reachable {
-            infer_block(code, &raw[bi], &plan, &mut local_types, &mut changed)?;
+            infer_block(
+                code,
+                &raw[bi],
+                &plan,
+                &mut local_types,
+                &mut ret_lane,
+                &mut changed,
+            )?;
         }
         if !changed {
             break;
@@ -167,18 +177,44 @@ pub fn analyze(
 
     // Emission pass.
     let mut blocks: Vec<TBlock> = Vec::with_capacity(reachable.len());
-    let mut max_stack = 0u32;
+    let mut out = EmitOut {
+        max_stack: 0,
+        callee_spans: Vec::new(),
+        max_call_args: 0,
+    };
     for &bi in &reachable {
         let tb = emit_block(
             code,
             &raw[bi],
             &plan,
             &local_types,
+            ret_lane,
             &compact,
-            &mut max_stack,
+            &mut out,
         )?;
         blocks.push(tb);
     }
+
+    // OSR entry points (RFC 0059 WS3b): every backward-jump target is a
+    // block leader with an empty boundary stack in this subset, so it is
+    // enterable mid-frame once the VM packs the locals (and decomposes
+    // any live range iterators into their synthetic slots).
+    let mut osr_entries: Vec<OsrEntry> = Vec::new();
+    let mut osr_seen: HashSet<usize> = HashSet::new();
+    for (i, ins) in code.instructions.iter().enumerate() {
+        if matches!(ins.op, OpCode::JumpBackward) {
+            let t = backward_target(i, ins.arg).ok_or(JitVerdict::BadJumpTarget)?;
+            if osr_seen.insert(t) {
+                if let Some(&bid) = compact.get(&block_index_at(&raw, t)) {
+                    osr_entries.push(OsrEntry {
+                        pc: t as u32,
+                        block: bid,
+                    });
+                }
+            }
+        }
+    }
+    osr_entries.sort_unstable_by_key(|e| e.pc);
 
     // Parameters flow in from the caller, so every *typed* parameter
     // slot must be entry-guarded even though the definite-assignment
@@ -198,11 +234,15 @@ pub fn analyze(
         n_locals,
         local_types,
         livein_locals: livein_vec,
-        max_stack,
+        max_stack: out.max_stack,
         blocks,
         entry_block,
         global_guards: plan.guards,
         range_loops: plan.loops,
+        callee_spans: out.callee_spans,
+        osr_entries,
+        max_call_args: out.max_call_args,
+        ret_lane: ret_lane.filter(|t| t.is_representable()),
     })
 }
 
@@ -343,8 +383,9 @@ fn plan_rewrite(
         });
     }
 
-    // Burnable constants: every LOAD_GLOBAL that is not a recognized
-    // range callee must resolve to a scalar constant, and needs a guard.
+    // Burnable globals: every LOAD_GLOBAL that is not a recognized range
+    // callee must resolve to a scalar constant or a callable Python
+    // function (RFC 0059 WS3), and needs an identity guard either way.
     for (i, item) in ins.iter().enumerate() {
         if !matches!(item.op, OpCode::LoadGlobal) || plan.nop.contains(&i) {
             continue;
@@ -353,7 +394,8 @@ fn plan_rewrite(
         match resolved {
             ResolvedGlobal::ConstInt(_)
             | ResolvedGlobal::ConstFloat(_)
-            | ResolvedGlobal::ConstBool(_) => {
+            | ResolvedGlobal::ConstBool(_)
+            | ResolvedGlobal::PyFunc { .. } => {
                 let name = &code.names[item.arg as usize];
                 if !plan.guards.iter().any(|g| g.name == *name) {
                     plan.guards.push(GlobalGuard {
@@ -599,17 +641,41 @@ fn assigned_out(code: &CodeObject, b: &RawBlock, assigned_in: &HashSet<u32>) -> 
     out
 }
 
+/// A `LOAD_GLOBAL`-resolved Python callee riding the *abstract* stack
+/// between its load and its `CALL` (RFC 0059 WS3). The object itself
+/// never reaches the native stack — the marker only carries what the
+/// `CALL` site and the deopt metadata need.
+#[derive(Clone, Copy)]
+struct CalleeMark {
+    token: u32,
+    arg_count: u32,
+    is_self: bool,
+    ret: Option<JitType>,
+    /// The erased `LOAD_GLOBAL` pc.
+    load_pc: u32,
+    /// Interpreter-stack index of the callee object at load time
+    /// (emission only; 0 during inference).
+    interp_depth: u32,
+}
+
 /// One operand-stack entry during analysis, with provenance for the
-/// live-in inference (`src` is the slot of an as-yet-untyped load).
+/// live-in inference (`src` is the slot of an as-yet-untyped load) and
+/// an optional callee marker (`ty` is `Unknown` when `callee` is set —
+/// the marker is consumed by `CALL`, never by a value op).
 #[derive(Clone, Copy)]
 struct SE {
     ty: JitType,
     src: Option<u32>,
+    callee: Option<CalleeMark>,
 }
 
 impl SE {
     fn known(ty: JitType) -> SE {
-        SE { ty, src: None }
+        SE {
+            ty,
+            src: None,
+            callee: None,
+        }
     }
 }
 
@@ -631,20 +697,23 @@ fn infer_block(
     b: &RawBlock,
     plan: &Plan,
     local_types: &mut [Option<JitType>],
+    ret_lane: &mut Option<JitType>,
     changed: &mut bool,
 ) -> Result<(), JitVerdict> {
     let mut stack: Vec<SE> = Vec::new();
     for i in b.start..(b.end - 1) {
-        step_abstract(code, i, &mut stack, plan, local_types, changed, false)?;
+        step_abstract(code, i, &mut stack, plan, local_types, *ret_lane, changed)?;
     }
     // Terminator stack-shape validation.
     let last = b.end - 1;
     let ins = code.instructions[last];
     match ins.op {
         OpCode::ReturnValue => {
-            if stack.is_empty() {
-                return Err(JitVerdict::StackUnderflow);
+            let v = *stack.last().ok_or(JitVerdict::StackUnderflow)?;
+            if v.callee.is_some() {
+                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
             }
+            merge_ret_lane(ret_lane, v.ty, changed);
         }
         OpCode::JumpForward | OpCode::JumpBackward => {
             if !stack.is_empty() {
@@ -669,13 +738,36 @@ fn infer_block(
         }
         // Fall-through terminator: must leave an empty stack.
         _ => {
-            step_abstract(code, last, &mut stack, plan, local_types, changed, false)?;
+            step_abstract(code, last, &mut stack, plan, local_types, *ret_lane, changed)?;
             if !stack.is_empty() {
                 return Err(JitVerdict::NonEmptyBoundaryStack);
             }
         }
     }
     Ok(())
+}
+
+/// Merge one `return` site's lane into the function-wide return lane
+/// (RFC 0059 WS3). Two *concrete* conflicting lanes poison the lane to
+/// `Unknown` (sticky — the function still compiles, but `CallPy` sites
+/// targeting it bail). An `Unknown` return value contributes nothing:
+/// either a later iteration types it, or emission bails on the
+/// untypable value anyway.
+fn merge_ret_lane(ret_lane: &mut Option<JitType>, ty: JitType, changed: &mut bool) {
+    if !ty.is_representable() {
+        return;
+    }
+    match *ret_lane {
+        None => {
+            *ret_lane = Some(ty);
+            *changed = true;
+        }
+        Some(existing) if existing == ty || existing == JitType::Unknown => {}
+        Some(_) => {
+            *ret_lane = Some(JitType::Unknown);
+            *changed = true;
+        }
+    }
 }
 
 /// Abstract-execute one non-terminator instruction, updating the type
@@ -686,8 +778,8 @@ fn step_abstract(
     stack: &mut Vec<SE>,
     plan: &Plan,
     local_types: &mut [Option<JitType>],
+    ret_lane: Option<JitType>,
     changed: &mut bool,
-    strict: bool,
 ) -> Result<(), JitVerdict> {
     let ins = code.instructions[i];
     // RFC 0058 WS4 — rewritten range-loop pcs.
@@ -704,8 +796,6 @@ fn step_abstract(
             } else if let Some(slot) = v.src {
                 // A live-in feeding a range bound must be an int.
                 set_local(local_types, slot, JitType::Int, changed)?;
-            } else if strict {
-                return Err(JitVerdict::TypeUnknown);
             }
         }
         set_local(local_types, cur, JitType::Int, changed)?;
@@ -724,6 +814,28 @@ fn step_abstract(
                 Some(ResolvedGlobal::ConstInt(_)) => JitType::Int,
                 Some(ResolvedGlobal::ConstFloat(_)) => JitType::Float,
                 Some(ResolvedGlobal::ConstBool(_)) => JitType::Bool,
+                Some(&ResolvedGlobal::PyFunc {
+                    token,
+                    arg_count,
+                    is_self,
+                    ret,
+                }) => {
+                    // RFC 0059 WS3: the callee rides the abstract stack
+                    // as a marker until its CALL consumes it.
+                    stack.push(SE {
+                        ty: JitType::Unknown,
+                        src: None,
+                        callee: Some(CalleeMark {
+                            token,
+                            arg_count,
+                            is_self,
+                            ret,
+                            load_pc: i as u32,
+                            interp_depth: 0,
+                        }),
+                    });
+                    return Ok(());
+                }
                 _ => return Err(JitVerdict::UnsupportedOpcode("LOAD_GLOBAL")),
             };
             stack.push(SE::known(ty));
@@ -743,38 +855,75 @@ fn step_abstract(
                 None => stack.push(SE {
                     ty: JitType::Unknown,
                     src: Some(ins.arg),
+                    callee: None,
                 }),
             }
         }
         OpCode::StoreFast => {
             let v = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            if v.callee.is_some() {
+                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+            }
             if v.ty.is_representable() {
                 set_local(local_types, ins.arg, v.ty, changed)?;
-            } else if strict {
-                return Err(JitVerdict::TypeUnknown);
             }
         }
         OpCode::BinaryOp => {
             let kind = bin_kind(ins.arg)?;
             let b = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             let a = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            if a.callee.is_some() || b.callee.is_some() {
+                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+            }
             let (a, b) = resolve_pair(a, b, local_types, changed);
-            let res = bin_result_type(kind, a.ty, b.ty, strict)?;
+            let res = bin_result_type(kind, a.ty, b.ty)?;
             stack.push(SE::known(res));
         }
         OpCode::CompareOp => {
             let _ = cmp_kind(ins.arg)?;
             let b = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             let a = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            if a.callee.is_some() || b.callee.is_some() {
+                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+            }
             let (a, b) = resolve_pair(a, b, local_types, changed);
-            cmp_check(a.ty, b.ty, strict)?;
+            cmp_check(a.ty, b.ty)?;
             stack.push(SE::known(JitType::Bool));
         }
         OpCode::UnaryOp => {
             let kind = unary_kind(ins.arg)?;
             let a = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
-            let res = unary_result_type(kind, a.ty, strict)?;
+            if a.callee.is_some() {
+                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+            }
+            let res = unary_result_type(kind, a.ty)?;
             stack.push(SE::known(res));
+        }
+        // RFC 0059 WS3 — a Python-to-Python call: the marker beneath the
+        // arguments names the callee. Nested calls compose (an inner
+        // call's marker sits above the outer one and is consumed first).
+        OpCode::Call => {
+            let argc = ins.arg as usize;
+            if stack.len() < argc + 1 {
+                return Err(JitVerdict::StackUnderflow);
+            }
+            for _ in 0..argc {
+                let v = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+                if v.callee.is_some() {
+                    return Err(JitVerdict::UnsupportedOpcode("CALL (callee as argument)"));
+                }
+            }
+            let f = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            let Some(mark) = f.callee else {
+                return Err(JitVerdict::UnsupportedOpcode("CALL"));
+            };
+            // Exact positional arity only: default-filled or mis-arity
+            // calls would chronically deopt, so they disqualify instead.
+            if mark.arg_count as usize != argc {
+                return Err(JitVerdict::UnsupportedOpcode("CALL (arity)"));
+            }
+            let ret = if mark.is_self { ret_lane } else { mark.ret };
+            stack.push(SE::known(ret.unwrap_or(JitType::Unknown)));
         }
         OpCode::PopTop => {
             // `break` inside a rewritten range loop pops the *iterator*,
@@ -784,10 +933,16 @@ fn step_abstract(
             if stack.is_empty() && plan.in_loop_span(i) {
                 return Ok(());
             }
-            stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            let v = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            if v.callee.is_some() {
+                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+            }
         }
         OpCode::CopyTop => {
             let v = *stack.last().ok_or(JitVerdict::StackUnderflow)?;
+            if v.callee.is_some() {
+                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+            }
             stack.push(v);
         }
         OpCode::Swap => {
@@ -797,6 +952,11 @@ fn step_abstract(
             let len = stack.len();
             if len < 2 {
                 return Err(JitVerdict::StackUnderflow);
+            }
+            // A marker's recorded interp-stack position must stay fixed
+            // between load and call; reordering it disqualifies.
+            if stack[len - 1].callee.is_some() || stack[len - 2].callee.is_some() {
+                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
             }
             stack.swap(len - 1, len - 2);
         }
@@ -850,19 +1010,12 @@ fn set_local(
     }
 }
 
-/// Result lane of a binary arithmetic op, given operand lanes.
-fn bin_result_type(
-    kind: ArithKind,
-    a: JitType,
-    b: JitType,
-    strict: bool,
-) -> Result<JitType, JitVerdict> {
+/// Result lane of a binary arithmetic op, given operand lanes. An
+/// `Unknown` operand yields `Unknown` — a later inference iteration may
+/// resolve it, and emission bails if it never does.
+fn bin_result_type(kind: ArithKind, a: JitType, b: JitType) -> Result<JitType, JitVerdict> {
     if !a.is_representable() || !b.is_representable() {
-        return if strict {
-            Err(JitVerdict::TypeUnknown)
-        } else {
-            Ok(JitType::Unknown)
-        };
+        return Ok(JitType::Unknown);
     }
     let a_int = a.is_integral();
     let b_int = b.is_integral();
@@ -898,13 +1051,9 @@ fn bin_result_type(
 /// Validate comparison operand lanes. Same-lane always works; mixed
 /// integral/float works via a *guarded* promotion (the interpreter
 /// compares exactly, so the JIT deopts when the int exceeds ±2^53).
-fn cmp_check(a: JitType, b: JitType, strict: bool) -> Result<(), JitVerdict> {
+fn cmp_check(a: JitType, b: JitType) -> Result<(), JitVerdict> {
     if !a.is_representable() || !b.is_representable() {
-        return if strict {
-            Err(JitVerdict::TypeUnknown)
-        } else {
-            Ok(())
-        };
+        return Ok(());
     }
     if (a.is_integral() || a == JitType::Float) && (b.is_integral() || b == JitType::Float) {
         Ok(())
@@ -914,13 +1063,9 @@ fn cmp_check(a: JitType, b: JitType, strict: bool) -> Result<(), JitVerdict> {
 }
 
 /// Result lane of a unary op.
-fn unary_result_type(kind: UnaryKind, a: JitType, strict: bool) -> Result<JitType, JitVerdict> {
+fn unary_result_type(kind: UnaryKind, a: JitType) -> Result<JitType, JitVerdict> {
     if !a.is_representable() {
-        return if strict {
-            Err(JitVerdict::TypeUnknown)
-        } else {
-            Ok(JitType::Unknown)
-        };
+        return Ok(JitType::Unknown);
     }
     match kind {
         UnaryKind::Not => Ok(JitType::Bool),
@@ -985,16 +1130,48 @@ fn unary_kind(arg: u32) -> Result<UnaryKind, JitVerdict> {
     Ok(k)
 }
 
+/// One emission-stack entry: a native lane, or an open callee marker
+/// (present on the *interpreter's* stack but never the native one).
+#[derive(Clone, Copy)]
+struct ESlot {
+    ty: JitType,
+    callee: Option<CalleeMark>,
+}
+
+impl ESlot {
+    fn val(ty: JitType) -> ESlot {
+        ESlot { ty, callee: None }
+    }
+}
+
+/// Pop an emission-stack value that must be a plain lane (not a callee
+/// marker).
+fn pop_val(stack: &mut Vec<ESlot>) -> Result<JitType, JitVerdict> {
+    let s = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+    if s.callee.is_some() {
+        return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+    }
+    Ok(s.ty)
+}
+
+/// Mutable side outputs of the emission pass shared across blocks.
+struct EmitOut {
+    max_stack: u32,
+    callee_spans: Vec<CalleeSpanMeta>,
+    max_call_args: u32,
+}
+
 /// Emit the typed IR for one block, with all local types now known.
 fn emit_block(
     code: &CodeObject,
     b: &RawBlock,
     plan: &Plan,
     local_types: &[Option<JitType>],
+    ret_lane: Option<JitType>,
     compact: &HashMap<usize, BlockId>,
-    max_stack: &mut u32,
+    out: &mut EmitOut,
 ) -> Result<TBlock, JitVerdict> {
-    let mut stack: Vec<JitType> = Vec::new();
+    let mut stack: Vec<ESlot> = Vec::new();
     let mut stmts: Vec<TStmt> = Vec::new();
 
     for i in b.start..(b.end - 1) {
@@ -1003,9 +1180,10 @@ fn emit_block(
             i,
             plan,
             local_types,
+            ret_lane,
             &mut stack,
             &mut stmts,
-            max_stack,
+            out,
         )?;
     }
 
@@ -1015,8 +1193,9 @@ fn emit_block(
         OpCode::ReturnValue => {
             // Lowering pops the return value off its own type stack at
             // the `Return` terminator; no statement is emitted here.
-            if stack.is_empty() {
-                return Err(JitVerdict::StackUnderflow);
+            let top = stack.last().ok_or(JitVerdict::StackUnderflow)?;
+            if top.callee.is_some() {
+                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
             }
             TTerm::Return
         }
@@ -1051,9 +1230,10 @@ fn emit_block(
                 last,
                 plan,
                 local_types,
+                ret_lane,
                 &mut stack,
                 &mut stmts,
-                max_stack,
+                out,
             )?;
             TTerm::Jump(compact[&block_succ(b, 0)])
         }
@@ -1074,22 +1254,31 @@ fn block_succ(b: &RawBlock, k: usize) -> usize {
 
 /// Emit one instruction's [`TStmt`](s), tracking the type stack so
 /// result lanes match what lowering will reconstruct.
+#[allow(clippy::too_many_arguments)]
 fn emit_instr(
     code: &CodeObject,
     i: usize,
     plan: &Plan,
     local_types: &[Option<JitType>],
-    stack: &mut Vec<JitType>,
+    ret_lane: Option<JitType>,
+    stack: &mut Vec<ESlot>,
     stmts: &mut Vec<TStmt>,
-    max_stack: &mut u32,
+    out: &mut EmitOut,
 ) -> Result<(), JitVerdict> {
     let ins = code.instructions[i];
     let pc = i as u32;
+    let EmitOut {
+        max_stack,
+        callee_spans,
+        max_call_args,
+    } = out;
+    // Note: `max_stack` counts markers too — a harmless overestimate of
+    // the native spill depth (markers are never spilled).
     let mut push =
-        |op: TOp, ty: Option<JitType>, stack: &mut Vec<JitType>, stmts: &mut Vec<TStmt>| {
+        |op: TOp, ty: Option<JitType>, stack: &mut Vec<ESlot>, stmts: &mut Vec<TStmt>| {
             stmts.push(TStmt { pc, op });
             if let Some(t) = ty {
-                stack.push(t);
+                stack.push(ESlot::val(t));
             }
             *max_stack = (*max_stack).max(stack.len() as u32);
         };
@@ -1124,6 +1313,35 @@ fn emit_instr(
                     (TOp::PushConstFloat(bits), JitType::Float)
                 }
                 Some(&ResolvedGlobal::ConstBool(v)) => (TOp::PushConstBool(v), JitType::Bool),
+                Some(&ResolvedGlobal::PyFunc {
+                    token,
+                    arg_count,
+                    is_self,
+                    ret,
+                }) => {
+                    // RFC 0059 WS3: the callee never reaches the native
+                    // stack — push a marker and record where the
+                    // *interpreter's* stack would hold the object (below
+                    // any values already pushed, above the live range
+                    // iterators of enclosing rewritten loops).
+                    let n_iters = plan
+                        .loops
+                        .iter()
+                        .filter(|l| (l.live_from as usize) <= i && i < l.live_to as usize)
+                        .count() as u32;
+                    stack.push(ESlot {
+                        ty: JitType::Unknown,
+                        callee: Some(CalleeMark {
+                            token,
+                            arg_count,
+                            is_self,
+                            ret,
+                            load_pc: pc,
+                            interp_depth: n_iters + stack.len() as u32,
+                        }),
+                    });
+                    return Ok(());
+                }
                 _ => return Err(JitVerdict::UnsupportedOpcode("LOAD_GLOBAL")),
             };
             push(op, Some(ty), stack, stmts);
@@ -1147,13 +1365,13 @@ fn emit_instr(
             push(TOp::LoadLocal(ins.arg), Some(ty), stack, stmts);
         }
         OpCode::StoreFast => {
-            stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            pop_val(stack)?;
             push(TOp::StoreLocal(ins.arg), None, stack, stmts);
         }
         OpCode::BinaryOp => {
             let kind = bin_kind(ins.arg)?;
-            let b = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
-            let a = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            let b = pop_val(stack)?;
+            let a = pop_val(stack)?;
             if (a.is_integral() && b == JitType::Float) || (a == JitType::Float && b.is_integral())
             {
                 // Mixed integral/float (RFC 0058 WS4): promote the
@@ -1168,8 +1386,8 @@ fn emit_instr(
                 }
                 // Both operands are conceptually back on the stack for
                 // the promotion op (they only left the *model*).
-                stack.push(a);
-                stack.push(b);
+                stack.push(ESlot::val(a));
+                stack.push(ESlot::val(b));
                 let promote = if b == JitType::Float {
                     TOp::IntToFloatSecond { guarded: false }
                 } else {
@@ -1186,8 +1404,8 @@ fn emit_instr(
         }
         OpCode::CompareOp => {
             let kind = cmp_kind(ins.arg)?;
-            let b = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
-            let a = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            let b = pop_val(stack)?;
+            let a = pop_val(stack)?;
             if a.is_integral() && b.is_integral() {
                 push(TOp::IntCmp(kind), Some(JitType::Bool), stack, stmts);
             } else if a == JitType::Float && b == JitType::Float {
@@ -1198,8 +1416,8 @@ fn emit_instr(
                 // Mixed comparison is mathematically exact in the
                 // interpreter, so the promotion is *guarded*: outside
                 // ±2^53 (where f64 stops being exact) it deopts.
-                stack.push(a);
-                stack.push(b);
+                stack.push(ESlot::val(a));
+                stack.push(ESlot::val(b));
                 let promote = if b == JitType::Float {
                     TOp::IntToFloatSecond { guarded: true }
                 } else {
@@ -1215,11 +1433,11 @@ fn emit_instr(
         }
         OpCode::UnaryOp => {
             let kind = unary_kind(ins.arg)?;
-            let a = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            let a = pop_val(stack)?;
             match (kind, a) {
                 (UnaryKind::Pos, JitType::Int | JitType::Float) => {
                     // Identity; re-push same lane, emit nothing.
-                    stack.push(a);
+                    stack.push(ESlot::val(a));
                 }
                 (UnaryKind::Neg, t) if t.is_integral() => {
                     push(TOp::IntNeg, Some(JitType::Int), stack, stmts)
@@ -1239,13 +1457,58 @@ fn emit_instr(
                 _ => return Err(JitVerdict::UnsupportedOpcode("UNARY_OP lane")),
             }
         }
+        // RFC 0059 WS3 — Python-to-Python call: pop the scalar args and
+        // the callee marker, close the deopt span, and emit `CallPy`.
+        OpCode::Call => {
+            let argc = ins.arg as usize;
+            if stack.len() < argc + 1 {
+                return Err(JitVerdict::StackUnderflow);
+            }
+            for _ in 0..argc {
+                let ty = pop_val(stack)?;
+                if !ty.is_representable() {
+                    return Err(JitVerdict::TypeUnknown);
+                }
+            }
+            let f = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            let Some(mark) = f.callee else {
+                return Err(JitVerdict::UnsupportedOpcode("CALL"));
+            };
+            if mark.arg_count as usize != argc {
+                return Err(JitVerdict::UnsupportedOpcode("CALL (arity)"));
+            }
+            let ret = match if mark.is_self { ret_lane } else { mark.ret } {
+                Some(t) if t.is_representable() => t,
+                _ => return Err(JitVerdict::TypeUnknown),
+            };
+            callee_spans.push(CalleeSpanMeta {
+                token: mark.token,
+                live_from: mark.load_pc,
+                live_to: pc,
+                interp_depth: mark.interp_depth,
+            });
+            *max_call_args = (*max_call_args).max(argc as u32);
+            push(
+                TOp::CallPy {
+                    token: mark.token,
+                    argc: argc as u8,
+                    ret,
+                },
+                Some(ret),
+                stack,
+                stmts,
+            );
+        }
         OpCode::PopTop => {
-            stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            pop_val(stack)?;
             push(TOp::Pop, None, stack, stmts);
         }
         OpCode::CopyTop => {
             let t = *stack.last().ok_or(JitVerdict::StackUnderflow)?;
-            push(TOp::Dup, Some(t), stack, stmts);
+            if t.callee.is_some() {
+                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+            }
+            push(TOp::Dup, Some(t.ty), stack, stmts);
         }
         OpCode::Swap => {
             if ins.arg != 2 {
@@ -1254,6 +1517,9 @@ fn emit_instr(
             let len = stack.len();
             if len < 2 {
                 return Err(JitVerdict::StackUnderflow);
+            }
+            if stack[len - 1].callee.is_some() || stack[len - 2].callee.is_some() {
+                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
             }
             stack.swap(len - 1, len - 2);
             push(TOp::Swap2, None, stack, stmts);

@@ -33,6 +33,9 @@ fn run(tfunc: &TFunc, locals_in: &[u64]) -> (JitStatus, u64, u32, Vec<(u64, u32)
         stack_tags: tags.as_mut_ptr(),
         stack_len: 0,
         stack_cap: cap as u32,
+        ctx: std::ptr::null_mut(),
+        call_args: std::ptr::null_mut(),
+        call_tags: std::ptr::null_mut(),
     };
     // SAFETY: buffers are sized to n_locals / max_stack; `engine` (and so
     // the backing module) outlives this call.
@@ -66,6 +69,10 @@ fn add_two_ints() {
         entry_block: 0,
         global_guards: vec![],
         range_loops: vec![],
+        callee_spans: vec![],
+        osr_entries: vec![],
+        max_call_args: 0,
+        ret_lane: None,
         blocks: vec![TBlock {
             entry_stack: vec![],
             stmts: vec![
@@ -94,6 +101,10 @@ fn add_overflow_deopts_with_operands_spilled() {
         entry_block: 0,
         global_guards: vec![],
         range_loops: vec![],
+        callee_spans: vec![],
+        osr_entries: vec![],
+        max_call_args: 0,
+        ret_lane: None,
         blocks: vec![TBlock {
             entry_stack: vec![],
             stmts: vec![
@@ -123,6 +134,10 @@ fn sum_loop() -> TFunc {
         entry_block: 0,
         global_guards: vec![],
         range_loops: vec![],
+        callee_spans: vec![],
+        osr_entries: vec![],
+        max_call_args: 0,
+        ret_lane: None,
         blocks: vec![
             // B0: s=0; i=0; -> B1
             TBlock {
@@ -201,6 +216,10 @@ fn binop_fn(op: ArithKind) -> TFunc {
         entry_block: 0,
         global_guards: vec![],
         range_loops: vec![],
+        callee_spans: vec![],
+        osr_entries: vec![],
+        max_call_args: 0,
+        ret_lane: None,
         blocks: vec![TBlock {
             entry_stack: vec![],
             stmts: vec![
@@ -262,6 +281,10 @@ fn int_truediv_returns_float() {
         entry_block: 0,
         global_guards: vec![],
         range_loops: vec![],
+        callee_spans: vec![],
+        osr_entries: vec![],
+        max_call_args: 0,
+        ret_lane: None,
         blocks: vec![TBlock {
             entry_stack: vec![],
             stmts: vec![
