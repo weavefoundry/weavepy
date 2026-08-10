@@ -160,6 +160,9 @@ pub(super) fn register(d: &mut DictData) {
     // `environb` — a bytes-keyed/-valued view of the environment. CPython
     // builds it lazily from the raw `environ` block; we snapshot at import
     // (writes go through `os.environ`; `environb` is read-mostly in tests).
+    // CPython only defines it where `supports_bytes_environ` is True, i.e.
+    // not on Windows — callers there probe with `getattr`/`hasattr`.
+    #[cfg(unix)]
     d.insert(
         DictKey(Object::from_static("environb")),
         environb_snapshot(),
@@ -1555,6 +1558,7 @@ fn os_device_encoding(_args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
+#[cfg(unix)]
 fn environb_snapshot() -> Object {
     let mut d = DictData::default();
     for (k, v) in std::env::vars_os() {
@@ -1569,10 +1573,6 @@ fn environb_snapshot() -> Object {
 fn os_str_bytes(s: &std::ffi::OsStr) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt;
     s.as_bytes().to_vec()
-}
-#[cfg(not(unix))]
-fn os_str_bytes(s: &std::ffi::OsStr) -> Vec<u8> {
-    s.to_string_lossy().into_owned().into_bytes()
 }
 
 // ---------------------------------------------------------------------------
