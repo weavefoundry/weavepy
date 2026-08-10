@@ -22,6 +22,15 @@ pub enum JitType {
     /// CPython `bool`. Distinct from `Int` so the VM rebuilds the right
     /// `Object` variant on deopt; arithmetic promotes it to `Int` first.
     Bool,
+    /// RFC 0061 WS5 — a *pinned* `list` of `int` elements. The machine
+    /// value is an `i64` index into the embedder's per-entry pinned-
+    /// object table (no pointer ever crosses the JIT boundary); element
+    /// access goes through the registered `wpjit_list_get`/`_set`
+    /// helpers, which re-validate shape per access and deopt on any
+    /// surprise.
+    ListInt,
+    /// RFC 0061 WS5 — a pinned `list` of `float` elements.
+    ListFloat,
     /// Anything the JIT can't represent. Its presence as an operand to a
     /// supported opcode makes the enclosing region non-JITable.
     Unknown,
@@ -41,6 +50,36 @@ impl JitType {
     #[must_use]
     pub fn is_integral(self) -> bool {
         matches!(self, JitType::Int | JitType::Bool)
+    }
+
+    /// `true` for a pinned-list lane (RFC 0061 WS5).
+    #[inline]
+    #[must_use]
+    pub fn is_list(self) -> bool {
+        matches!(self, JitType::ListInt | JitType::ListFloat)
+    }
+
+    /// A pinned list's element lane, or `None` for non-list lanes.
+    #[inline]
+    #[must_use]
+    pub fn elem_lane(self) -> Option<JitType> {
+        match self {
+            JitType::ListInt => Some(JitType::Int),
+            JitType::ListFloat => Some(JitType::Float),
+            _ => None,
+        }
+    }
+
+    /// The pinned-list lane for an element lane (inverse of
+    /// [`Self::elem_lane`]).
+    #[inline]
+    #[must_use]
+    pub fn list_of(elem: JitType) -> Option<JitType> {
+        match elem {
+            JitType::Int => Some(JitType::ListInt),
+            JitType::Float => Some(JitType::ListFloat),
+            _ => None,
+        }
     }
 
     /// Dataflow join at a control-flow merge. Two equal types join to

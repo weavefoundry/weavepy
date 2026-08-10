@@ -109,6 +109,19 @@ pub enum TOp {
     /// `ret` lane (or a caller guard invalidated by the callee's side
     /// effects) deopts *after* the call with the result spilled.
     CallPy { token: u32, argc: u8, ret: JitType },
+    /// RFC 0061 WS5 — `BINARY_SUBSCR` on a pinned list: pops the `int`
+    /// index and the pin reference, calls the registered
+    /// `wpjit_list_get` helper (bounds + element-lane checked against
+    /// the real `Object::List`), and pushes the `elem`-lane result.
+    /// Any surprise (out of range, aliased shape change) deopts at
+    /// this pc with both operands spilled, so the interpreter
+    /// re-executes the subscript generically.
+    ListGet { elem: JitType },
+    /// RFC 0061 WS5 — `STORE_SUBSCR` on a pinned list: pops the index,
+    /// the pin reference, and the value (staged through the frame's
+    /// `ret_bits`), and calls `wpjit_list_set`. Out-of-range deopts at
+    /// this pc; the interpreter re-executes the store and raises.
+    ListSet,
 }
 
 /// One IR statement: a [`TOp`] tagged with its originating bytecode pc
@@ -311,6 +324,8 @@ impl TOp {
                 | TOp::IntToFloatTos { guarded: true }
                 | TOp::IntToFloatSecond { guarded: true }
                 | TOp::CallPy { .. }
+                | TOp::ListGet { .. }
+                | TOp::ListSet
         )
     }
 }

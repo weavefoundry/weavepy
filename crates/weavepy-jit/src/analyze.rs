@@ -112,9 +112,27 @@ impl Plan {
 /// currently resolves to (the embedder re-validates every resolution as
 /// an entry guard). Returns the typed IR on success or a [`JitVerdict`]
 /// describing the first disqualifying property found.
+///
+/// Convenience wrapper over [`analyze_with_probe`] with no pinned-list
+/// probing (RFC 0061 WS5) — subscripted locals disqualify the frame.
 pub fn analyze(
     code: &CodeObject,
     resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
+) -> Result<TFunc, JitVerdict> {
+    analyze_with_probe(code, resolve, &mut |_| None)
+}
+
+/// [`analyze`] with a pinned-list lane probe (RFC 0061 WS5). When a
+/// local slot is subscripted before any other typing evidence exists,
+/// `probe_list` reports the slot's *observed* shape in the requesting
+/// activation — `Some(Int)`/`Some(Float)` for a homogeneous `int`/
+/// `float` list, `None` otherwise. A probed lane is only a prediction:
+/// the embedder re-validates it as an entry guard on every native
+/// entry, and the list helpers re-check shape per access.
+pub fn analyze_with_probe(
+    code: &CodeObject,
+    resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
+    probe_list: &mut dyn FnMut(u32) -> Option<JitType>,
 ) -> Result<TFunc, JitVerdict> {
     if code.is_generator || code.is_coroutine || code.is_async_generator || code.is_class_body {
         return Err(JitVerdict::UnsupportedSignature);
@@ -154,6 +172,7 @@ pub fn analyze(
                 &mut local_types,
                 &mut ret_lane,
                 &mut changed,
+                probe_list,
             )?;
         }
         if !changed {
@@ -699,10 +718,20 @@ fn infer_block(
     local_types: &mut [Option<JitType>],
     ret_lane: &mut Option<JitType>,
     changed: &mut bool,
+    probe_list: &mut dyn FnMut(u32) -> Option<JitType>,
 ) -> Result<(), JitVerdict> {
     let mut stack: Vec<SE> = Vec::new();
     for i in b.start..(b.end - 1) {
-        step_abstract(code, i, &mut stack, plan, local_types, *ret_lane, changed)?;
+        step_abstract(
+            code,
+            i,
+            &mut stack,
+            plan,
+            local_types,
+            *ret_lane,
+            changed,
+            probe_list,
+        )?;
     }
     // Terminator stack-shape validation.
     let last = b.end - 1;
@@ -732,6 +761,11 @@ fn infer_block(
                 return Err(JitVerdict::NonEmptyBoundaryStack);
             }
             let c = stack[0];
+            // RFC 0061 WS5 — a pinned list's truth is its length, which
+            // the pin-index machine value cannot express.
+            if c.ty.is_list() {
+                return Err(JitVerdict::UnsupportedOpcode("truth test on list"));
+            }
             if !c.ty.is_representable() && c.src.is_none() {
                 return Err(JitVerdict::TypeUnknown);
             }
@@ -746,6 +780,7 @@ fn infer_block(
                 local_types,
                 *ret_lane,
                 changed,
+                probe_list,
             )?;
             if !stack.is_empty() {
                 return Err(JitVerdict::NonEmptyBoundaryStack);
@@ -780,6 +815,7 @@ fn merge_ret_lane(ret_lane: &mut Option<JitType>, ty: JitType, changed: &mut boo
 
 /// Abstract-execute one non-terminator instruction, updating the type
 /// stack and (via inference) `local_types`.
+#[allow(clippy::too_many_arguments)]
 fn step_abstract(
     code: &CodeObject,
     i: usize,
@@ -788,6 +824,7 @@ fn step_abstract(
     local_types: &mut [Option<JitType>],
     ret_lane: Option<JitType>,
     changed: &mut bool,
+    probe_list: &mut dyn FnMut(u32) -> Option<JitType>,
 ) -> Result<(), JitVerdict> {
     let ins = code.instructions[i];
     // RFC 0058 WS4 — rewritten range-loop pcs.
@@ -968,9 +1005,100 @@ fn step_abstract(
             }
             stack.swap(len - 1, len - 2);
         }
+        // RFC 0061 WS5 — pinned-list element read. The container must
+        // be (or probe as) a homogeneous int/float list local; the
+        // index must be an `int`.
+        OpCode::BinarySubscr => {
+            let idx = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            let cont = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            if idx.callee.is_some() || cont.callee.is_some() {
+                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+            }
+            check_subscr_index(&idx, local_types, changed)?;
+            let elem = resolve_list_container(&cont, local_types, changed, probe_list)?;
+            stack.push(match elem {
+                Some(l) => SE::known(l),
+                None => SE {
+                    ty: JitType::Unknown,
+                    src: None,
+                    callee: None,
+                },
+            });
+        }
+        // RFC 0061 WS5 — pinned-list element write. The stored value's
+        // lane must equal the pinned element lane exactly (a `bool`
+        // into an int list, say, would change list shape).
+        OpCode::StoreSubscr => {
+            let idx = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            let cont = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            let val = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            if idx.callee.is_some() || cont.callee.is_some() || val.callee.is_some() {
+                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+            }
+            check_subscr_index(&idx, local_types, changed)?;
+            let elem = resolve_list_container(&cont, local_types, changed, probe_list)?;
+            if let Some(el) = elem {
+                if val.ty.is_representable() {
+                    if val.ty != el {
+                        return Err(JitVerdict::UnsupportedOpcode("STORE_SUBSCR (value lane)"));
+                    }
+                } else if let Some(slot) = val.src {
+                    set_local(local_types, slot, el, changed)?;
+                }
+            }
+        }
         other => return Err(JitVerdict::UnsupportedOpcode(other.name())),
     }
     Ok(())
+}
+
+/// RFC 0061 WS5 — validate a subscript index operand: a concrete lane
+/// must be exactly `Int`; an untyped live-in load is inferred as `Int`;
+/// a transient `Unknown` is tolerated for a later iteration.
+fn check_subscr_index(
+    idx: &SE,
+    local_types: &mut [Option<JitType>],
+    changed: &mut bool,
+) -> Result<(), JitVerdict> {
+    if idx.ty.is_representable() {
+        if idx.ty != JitType::Int {
+            return Err(JitVerdict::UnsupportedOpcode("subscript index lane"));
+        }
+        Ok(())
+    } else if let Some(slot) = idx.src {
+        set_local(local_types, slot, JitType::Int, changed)
+    } else {
+        Ok(())
+    }
+}
+
+/// RFC 0061 WS5 — resolve a subscript container operand to a pinned
+/// element lane. An untyped local load consults the embedder's shape
+/// probe and pins the slot; a concrete non-list lane disqualifies;
+/// a transient `Unknown` yields `None` (tolerated during inference,
+/// bailed at emission if never resolved).
+fn resolve_list_container(
+    cont: &SE,
+    local_types: &mut [Option<JitType>],
+    changed: &mut bool,
+    probe_list: &mut dyn FnMut(u32) -> Option<JitType>,
+) -> Result<Option<JitType>, JitVerdict> {
+    if let Some(el) = cont.ty.elem_lane() {
+        return Ok(Some(el));
+    }
+    if cont.ty.is_representable() {
+        return Err(JitVerdict::UnsupportedOpcode("subscript container lane"));
+    }
+    if let Some(slot) = cont.src {
+        let Some(elem) = probe_list(slot) else {
+            return Err(JitVerdict::UnsupportedOpcode("subscript container shape"));
+        };
+        let list_ty =
+            JitType::list_of(elem).ok_or(JitVerdict::UnsupportedOpcode("subscript elem lane"))?;
+        set_local(local_types, slot, list_ty, changed)?;
+        return Ok(Some(elem));
+    }
+    Ok(None)
 }
 
 /// If exactly one operand is an untyped live-in load and the other is a
@@ -1477,6 +1605,12 @@ fn emit_instr(
                 if !ty.is_representable() {
                     return Err(JitVerdict::TypeUnknown);
                 }
+                // RFC 0061 WS5 — a pin index is meaningless outside this
+                // activation; a pinned list cannot be marshaled as a
+                // scalar call argument.
+                if ty.is_list() {
+                    return Err(JitVerdict::UnsupportedOpcode("CALL (list argument)"));
+                }
             }
             let f = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             let Some(mark) = f.callee else {
@@ -1489,6 +1623,12 @@ fn emit_instr(
                 Some(t) if t.is_representable() => t,
                 _ => return Err(JitVerdict::TypeUnknown),
             };
+            // RFC 0061 WS5 — a pin index is only meaningful within its
+            // own activation's pinned-object table; a callee's returned
+            // list cannot cross the boundary as one.
+            if ret.is_list() {
+                return Err(JitVerdict::UnsupportedOpcode("CALL (list return)"));
+            }
             callee_spans.push(CalleeSpanMeta {
                 token: mark.token,
                 live_from: mark.load_pc,
@@ -1531,6 +1671,35 @@ fn emit_instr(
             }
             stack.swap(len - 1, len - 2);
             push(TOp::Swap2, None, stack, stmts);
+        }
+        // RFC 0061 WS5 — pinned-list element read/write. Inference
+        // already pinned the container slot's lane; emission just
+        // re-validates the operand lanes it sees.
+        OpCode::BinarySubscr => {
+            let idx = pop_val(stack)?;
+            if idx != JitType::Int {
+                return Err(JitVerdict::UnsupportedOpcode("subscript index lane"));
+            }
+            let cont = pop_val(stack)?;
+            let elem = cont
+                .elem_lane()
+                .ok_or(JitVerdict::UnsupportedOpcode("subscript container lane"))?;
+            push(TOp::ListGet { elem }, Some(elem), stack, stmts);
+        }
+        OpCode::StoreSubscr => {
+            let idx = pop_val(stack)?;
+            if idx != JitType::Int {
+                return Err(JitVerdict::UnsupportedOpcode("subscript index lane"));
+            }
+            let cont = pop_val(stack)?;
+            let elem = cont
+                .elem_lane()
+                .ok_or(JitVerdict::UnsupportedOpcode("subscript container lane"))?;
+            let val = pop_val(stack)?;
+            if val != elem {
+                return Err(JitVerdict::UnsupportedOpcode("STORE_SUBSCR (value lane)"));
+            }
+            push(TOp::ListSet, None, stack, stmts);
         }
         other => return Err(JitVerdict::UnsupportedOpcode(other.name())),
     }

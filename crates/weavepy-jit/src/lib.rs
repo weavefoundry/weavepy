@@ -29,14 +29,15 @@ mod lower;
 mod runtime;
 mod value;
 
-pub use analyze::{analyze, JitVerdict};
+pub use analyze::{analyze, analyze_with_probe, JitVerdict};
 pub use engine::{CompiledFrame, JitEngine};
 pub use ir::{
     ArithKind, BlockId, CalleeSpanMeta, CmpKind, GlobalGuard, OsrEntry, RangeLoopMeta,
     ResolvedGlobal, TBlock, TFunc, TOp, TStmt, TTerm,
 };
 pub use runtime::{
-    register_call_py_helper, CallPyHelper, CallStatus, JitFrame, JitStatus, SlotTag,
+    register_call_py_helper, register_list_helpers, CallPyHelper, CallStatus, JitFrame, JitStatus,
+    ListGetHelper, ListSetHelper, SlotTag,
 };
 pub use value::JitType;
 

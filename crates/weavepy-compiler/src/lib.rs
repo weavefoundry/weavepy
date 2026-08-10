@@ -106,6 +106,43 @@ pub use weavepy_parser::ast::expr_name;
 
 // ---------- code object ----------
 
+/// RFC 0061 (WS2a): an opaque, VM-owned per-code-object extension slot.
+///
+/// The VM stashes derived, execution-only state here (today: the
+/// materialized constant-object table, so `LOAD_CONST` is an indexed
+/// clone instead of a per-execution `Constant` deep-clone + conversion).
+/// The compiler crate stays Object-free: the payload is type-erased and
+/// only the VM ever downcasts it.
+///
+/// Semantics mirror [`CacheTable`]: derived state does not follow
+/// clones (a `replace()`d code object may change `constants`, so a
+/// cloned code object starts with an empty slot), never participates in
+/// equality, and is not serialized.
+#[derive(Default)]
+pub struct VmExt(pub std::sync::OnceLock<std::sync::Arc<dyn std::any::Any + Send + Sync>>);
+
+impl Clone for VmExt {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for VmExt {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for VmExt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.get().is_some() {
+            "VmExt(populated)"
+        } else {
+            "VmExt(empty)"
+        })
+    }
+}
+
 /// A compiled Python code object. Mirrors the subset of
 /// `PyCodeObject` we need to emulate.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -125,6 +162,8 @@ pub struct CodeObject {
     /// serialised by marshal (caches are re-warmed on the next run
     /// because the type pointers they capture wouldn't be valid).
     pub caches: CacheTable,
+    /// RFC 0061 (WS2a): VM-owned derived state (see [`VmExt`]).
+    pub vm_ext: VmExt,
     pub constants: Vec<Constant>,
     /// Names referenced by `LOAD_NAME` / `LOAD_GLOBAL` / `STORE_NAME` etc.
     pub names: Vec<String>,

@@ -837,6 +837,34 @@ pub enum InlineCache {
     StoreSubscrListInt,
     /// `dict[key] = v`.
     StoreSubscrDict,
+
+    // ----- RFC 0061 (WS2b): fused dispatch -----
+    //
+    // A fusion marker lives in the *first* instruction's cache slot and
+    // means "the fall-through pair starting here may execute as one
+    // dispatch". The instruction stream is untouched (`co_code`, `dis`,
+    // line tables and jump targets cannot tell), a jump landing on the
+    // second instruction executes it normally, and the dispatcher only
+    // honours markers while no observer (trace/profile/monitoring) is
+    // active — under observation every instruction single-steps through
+    // the generic arms, so PEP 669 / `sys.settrace` event streams are
+    // bit-identical.
+    /// `LOAD_FAST a; LOAD_FAST b` — push two locals in one dispatch.
+    FuseLoadFastLoadFast,
+    /// `LOAD_FAST a; LOAD_CONST c` — local + materialized constant.
+    FuseLoadFastLoadConst,
+    /// `LOAD_FAST a; LOAD_ATTR n` — attribute of a local. The second
+    /// slot's own LOAD_ATTR cache supplies the specialization; the
+    /// fused arm reads the receiver *in place* (no clone onto the
+    /// operand stack, no Arc round-trip).
+    FuseLoadFastLoadAttr,
+    /// `COMPARE_OP (int, int); POP_JUMP_IF_{TRUE,FALSE}` — compare and
+    /// branch without materializing the intermediate `Bool`. Replaces
+    /// `CompareOpInt` on the compare's slot (its guards subsume it).
+    FuseCompareIntPopJump,
+    /// The dispatcher inspected this site once and found no fusable
+    /// pair; permanent (the fall-through successor never changes).
+    FuseBlocked,
 }
 
 /// Number of generic dispatches a deopted cache must serve before it
