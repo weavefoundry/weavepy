@@ -6,6 +6,13 @@
 //! `-m test` entry point — argument parsing, discovery, per-module
 //! classification, the CPython-shaped summary, and the propagated exit
 //! code — never silently rots, without needing a CPython checkout.
+//!
+//! POSIX-only for now, like the regrtest CI jobs: running regrtest
+//! end-to-end needs the raw fd interface (`tempfile.gettempdir()`'s
+//! `os.open` write-probe is the first hit), which WeavePy has not
+//! implemented on Windows yet (`os.rs`'s `os_open_stub`). Ungate this
+//! when the Windows fd layer lands.
+#![cfg(unix)]
 
 use std::path::PathBuf;
 use std::process::Command;
