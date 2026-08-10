@@ -17,6 +17,9 @@ use super::os::{builtin, builtin_kw};
 use crate::error::value_error;
 use crate::error::{type_error, RuntimeError};
 use crate::object::{DictData, DictKey, Object};
+// Only the unix-gated helpers (`env_mapping_dict`, `environb_snapshot`)
+// need these; an unconditional import trips `-D warnings` on Windows.
+#[cfg(unix)]
 use crate::sync::{Rc, RefCell};
 use parking_lot::Mutex;
 
