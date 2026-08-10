@@ -635,6 +635,11 @@ static FORCE_LINK: &[FnPtr] = &[
     //
     // abi313.rs (data)
     addr_static!(mut crate::abi313::Py_FileSystemDefaultEncoding),
+    // frozen_table.rs — the `struct _frozen` arrays test_frozentable
+    // walks through ctypes.pythonapi (RFC 0060).
+    addr_static!(crate::frozen_table::_PyImport_FrozenBootstrap),
+    addr_static!(crate::frozen_table::_PyImport_FrozenStdlib),
+    addr_static!(crate::frozen_table::_PyImport_FrozenTest),
     // singletons.rs
     addr_static!(singletons::_Py_NoneStruct),
     addr_static!(singletons::_Py_TrueStruct),
@@ -797,6 +802,10 @@ static FORCE_LINK: &[FnPtr] = &[
     addr!(wave4::PyImport_Import),
     addr!(wave4::PySys_GetObject),
     addr!(wave4::PyEval_GetBuiltins),
+    addr!(wave4::PyEval_GetFrameLocals),
+    addr!(wave4::PyEval_GetFrameGlobals),
+    addr!(wave4::PyEval_GetFrameBuiltins),
+    addr!(wave4::PyFrame_GetLocals),
     addr!(wave4::PyInterpreterState_Main),
     // wave4.rs — errors
     addr!(wave4::_PyErr_BadInternalCall),

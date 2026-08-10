@@ -79,6 +79,19 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("find_frozen")),
             builtin("find_frozen", imp_find_frozen),
         );
+        // RFC 0060 — the frozen-table view `test_frozentable` cross-checks
+        // against the exported `_PyImport_Frozen*` C arrays.
+        d.insert(
+            DictKey(Object::from_static("_frozen_module_names")),
+            builtin("_frozen_module_names", |_| {
+                Ok(Object::new_list(
+                    crate::frozen_table::frozen_module_names()
+                        .into_iter()
+                        .map(Object::from_static)
+                        .collect(),
+                ))
+            }),
+        );
         d.insert(
             DictKey(Object::from_static("acquire_lock")),
             builtin("acquire_lock", |_| Ok(Object::None)),

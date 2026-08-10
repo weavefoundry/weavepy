@@ -527,6 +527,16 @@ fn mm_new(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runtim
         if offset < 0 {
             return Err(overflow_error("memory mapped offset must be positive"));
         }
+        // PEP 578: `mmap.__new__(fileno, length, access, offset)`.
+        crate::stdlib::sys::audit_event(
+            "mmap.__new__",
+            &[
+                Object::Int(fileno),
+                Object::Int(map_size),
+                Object::Int(access),
+                Object::Int(offset),
+            ],
+        )?;
         if access != ACCESS_DEFAULT
             && (flags != i64::from(libc::MAP_SHARED)
                 || prot != i64::from(libc::PROT_READ | libc::PROT_WRITE))

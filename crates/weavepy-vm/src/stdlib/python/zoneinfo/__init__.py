@@ -393,32 +393,23 @@ def _load_timedelta(seconds):
     return timedelta(seconds=seconds)
 
 
-class ZoneInfo(tzinfo):
-    _strong_cache_size = 8
-    _strong_cache = collections.OrderedDict()
-    _weak_cache = weakref.WeakValueDictionary()
-    __module__ = "zoneinfo"
+# Classes whose repr spells the dotted C `tp_name` ("zoneinfo.ZoneInfo").
+# Both the pure-Python root and the `_zoneinfo` accelerator root register
+# here; subclasses keep their bare `__name__` (CPython heap-type rule).
+_REPR_ROOTS = set()
 
-    def __init_subclass__(cls):
-        cls._strong_cache = collections.OrderedDict()
-        cls._weak_cache = weakref.WeakValueDictionary()
 
-    def __new__(cls, key):
-        instance = cls._weak_cache.get(key, None)
-        if instance is None:
-            instance = cls._weak_cache.setdefault(key, cls._new_instance(key))
-            instance._from_cache = True
+class _ZoneInfoBase(tzinfo):
+    """Cache-free ZoneInfo machinery shared by the pure-Python class below
+    and the C-accelerator-shaped ``_zoneinfo.ZoneInfo``.
 
-        # Update the "strong" cache
-        cls._strong_cache[key] = cls._strong_cache.pop(key, instance)
-
-        if len(cls._strong_cache) > cls._strong_cache_size:
-            try:
-                cls._strong_cache.popitem(last=False)
-            except KeyError:
-                pass
-
-        return instance
+    CPython ships the algorithmic core twice (C and Python) with the two
+    implementations differing *only* in how instances are cached — the C
+    accelerator keeps its base-class caches in module state (so the type
+    has no ``_weak_cache`` attribute — test_zoneinfo asserts this), the
+    pure class keeps them in class attributes. WeavePy shares the core and
+    lets each front-end class own its caching policy.
+    """
 
     @classmethod
     def no_cache(cls, key):
@@ -455,16 +446,6 @@ class ZoneInfo(tzinfo):
         obj.__reduce__ = obj._file_reduce
 
         return obj
-
-    @classmethod
-    def clear_cache(cls, *, only_keys=None):
-        if only_keys is not None:
-            for key in only_keys:
-                cls._weak_cache.pop(key, None)
-                cls._strong_cache.pop(key, None)
-        else:
-            cls._weak_cache.clear()
-            cls._strong_cache.clear()
 
     @property
     def key(self):
@@ -570,7 +551,7 @@ class ZoneInfo(tzinfo):
         # types keep their bare name). Test-suite parametrize IDs embed
         # this repr, so match it exactly.
         cls = self.__class__
-        name = "zoneinfo.ZoneInfo" if cls is ZoneInfo else cls.__name__
+        name = "zoneinfo.ZoneInfo" if cls in _REPR_ROOTS else cls.__name__
         if self._key is not None:
             return f"{name}(key={self._key!r})"
         else:
@@ -748,6 +729,50 @@ class ZoneInfo(tzinfo):
             trans_list_wall[1][i] += offset_1
 
         return trans_list_wall
+
+
+class ZoneInfo(_ZoneInfoBase):
+    """The pure-Python implementation: caches live in class attributes
+    (CPython's ``zoneinfo._zoneinfo.ZoneInfo``)."""
+
+    _strong_cache_size = 8
+    _strong_cache = collections.OrderedDict()
+    _weak_cache = weakref.WeakValueDictionary()
+    __module__ = "zoneinfo"
+
+    def __init_subclass__(cls):
+        cls._strong_cache = collections.OrderedDict()
+        cls._weak_cache = weakref.WeakValueDictionary()
+
+    def __new__(cls, key):
+        instance = cls._weak_cache.get(key, None)
+        if instance is None:
+            instance = cls._weak_cache.setdefault(key, cls._new_instance(key))
+            instance._from_cache = True
+
+        # Update the "strong" cache
+        cls._strong_cache[key] = cls._strong_cache.pop(key, instance)
+
+        if len(cls._strong_cache) > cls._strong_cache_size:
+            try:
+                cls._strong_cache.popitem(last=False)
+            except KeyError:
+                pass
+
+        return instance
+
+    @classmethod
+    def clear_cache(cls, *, only_keys=None):
+        if only_keys is not None:
+            for key in only_keys:
+                cls._weak_cache.pop(key, None)
+                cls._strong_cache.pop(key, None)
+        else:
+            cls._weak_cache.clear()
+            cls._strong_cache.clear()
+
+
+_REPR_ROOTS.add(ZoneInfo)
 
 
 class _ttinfo:
@@ -1130,3 +1155,17 @@ def _parse_tz_delta(tz_delta):
         total = -total
 
     return total
+
+
+# CPython's `zoneinfo/__init__.py` prefers the C accelerator when it
+# imports (`from _zoneinfo import ZoneInfo`), keeping the pure class as
+# the fallback. `test.support.import_fresh_module("zoneinfo",
+# blocked=["_zoneinfo"])` relies on this seam to obtain the pure copy.
+# The pure class stays reachable through the `zoneinfo._zoneinfo`
+# submodule (CPython's `Lib/zoneinfo/_zoneinfo.py`), which pandas'
+# Cython modules import directly.
+_PurePythonZoneInfo = ZoneInfo
+try:
+    from _zoneinfo import ZoneInfo
+except ImportError:
+    pass

@@ -928,6 +928,17 @@ fn sock_init_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
         Some(Object::Int(fd)) => Some(*fd),
         _ => return Err(type_error("fileno must be int or None")),
     };
+    // PEP 578: `socket.__new__(self, family, type, proto)` — fired
+    // from CPython's `sock_initobj` before the descriptor exists.
+    crate::stdlib::sys::audit_event(
+        "socket.__new__",
+        &[
+            args[0].clone(),
+            Object::Int(i64::from(family)),
+            Object::Int(i64::from(kind)),
+            Object::Int(i64::from(proto)),
+        ],
+    )?;
     let (inner, owns_fd) = match fileno {
         Some(fd) => {
             // `socket(fileno=other.fileno())` aliases a descriptor. If another
@@ -1044,6 +1055,14 @@ fn sock_repr(args: &[Object]) -> Result<Object, RuntimeError> {
 fn sock_bind(args: &[Object]) -> Result<Object, RuntimeError> {
     let state = state_of(args)?;
     let family = state.borrow().family;
+    // PEP 578: `socket.bind(self, address)` with the pre-parse address.
+    crate::stdlib::sys::audit_event(
+        "socket.bind",
+        &[
+            args[0].clone(),
+            args.get(1).cloned().unwrap_or(Object::None),
+        ],
+    )?;
     let addr = parse_sockaddr2(args.get(1), family)?;
     let s_borrow = state.borrow();
     let sock = s_borrow.inner.as_ref().ok_or_else(closed_socket_error)?;
@@ -2635,6 +2654,7 @@ fn cmsg_size_arg(arg: Option<&Object>) -> Result<u32, RuntimeError> {
 /// non-`localhost` file URL look remote (test_urllib2.HandlerTests).
 #[cfg(unix)]
 fn mod_gethostname(_args: &[Object]) -> Result<Object, RuntimeError> {
+    crate::stdlib::sys::audit_event("socket.gethostname", &[])?;
     let mut buf = [0_u8; 1024];
     let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast::<libc::c_char>(), buf.len()) };
     if rc != 0 {
@@ -2649,6 +2669,7 @@ fn mod_gethostname(_args: &[Object]) -> Result<Object, RuntimeError> {
 /// the environment's machine name, like the pre-RFC-0054 placeholder.
 #[cfg(not(unix))]
 fn mod_gethostname(_args: &[Object]) -> Result<Object, RuntimeError> {
+    crate::stdlib::sys::audit_event("socket.gethostname", &[])?;
     let name = std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "localhost".to_string());

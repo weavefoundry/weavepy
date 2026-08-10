@@ -447,14 +447,14 @@ def find_spec(name, package=None):
             raise ModuleNotFoundError(
                 f"__path__ attribute not found on {parent_name!r} "
                 f"while trying to find {fullname!r}", name=fullname) from e
+    # CPython's `_bootstrap._find_spec` lets finder exceptions
+    # propagate — swallowing them here masked RecursionError inside a
+    # deeply nested `runpy.run_path` as "No module named X"
+    # (test_runpy test_main_recursion_error).
     for finder in sys.meta_path:
-        try:
-            if hasattr(finder, 'find_spec'):
-                spec = finder.find_spec(fullname, parent_path)
-            else:
-                spec = None
-        except Exception:
-            spec = None
+        if not hasattr(finder, 'find_spec'):
+            continue
+        spec = finder.find_spec(fullname, parent_path)
         if spec is not None:
             return spec
     return None

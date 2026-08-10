@@ -58,8 +58,17 @@ pub mod op {
     pub const POP_EXCEPT: u8 = 31;
     pub const POP_TOP: u8 = 32;
     pub const PUSH_EXC_INFO: u8 = 33;
+    /// Decoder-only (the encoder never emits it: WeavePy's `Call`
+    /// convention has no self-or-null stack slot).
+    pub const PUSH_NULL: u8 = 34;
+    /// Decoder-only: folded into the preceding `MAKE_FUNCTION`'s
+    /// WeavePy flag bits (same 0x01/0x02/0x04/0x08 meanings).
+    pub const SET_FUNCTION_ATTRIBUTE: u8 = 106;
     pub const RETURN_GENERATOR: u8 = 35;
     pub const RETURN_VALUE: u8 = 36;
+    /// Emitted by the encoder's `LOAD_CONST` + `RETURN_VALUE` fusion
+    /// (CPython 3.13 compiles `return <const>` to this single unit).
+    pub const RETURN_CONST: u8 = 103;
     pub const STORE_SUBSCR: u8 = 39;
     pub const UNARY_INVERT: u8 = 41;
     pub const UNARY_NEGATIVE: u8 = 42;
@@ -485,9 +494,9 @@ impl PartialEq for CpCache {
     }
 }
 
-const CO_FAST_LOCAL: u8 = 0x20;
-const CO_FAST_CELL: u8 = 0x40;
-const CO_FAST_FREE: u8 = 0x80;
+pub const CO_FAST_LOCAL: u8 = 0x20;
+pub const CO_FAST_CELL: u8 = 0x40;
+pub const CO_FAST_FREE: u8 = 0x80;
 
 /// Build the merged `co_localsplusnames` / `co_localspluskinds` pair.
 fn build_localsplus(code: &CodeObject) -> (Vec<String>, Vec<u8>) {
@@ -513,18 +522,66 @@ fn build_localsplus(code: &CodeObject) -> (Vec<String>, Vec<u8>) {
 pub fn encode(code: &CodeObject) -> CpythonCode {
     let nlocals = code.varnames.len() as u32;
     let n = code.instructions.len();
-    let mapped: Vec<MappedOp> = code
+    let mut mapped: Vec<MappedOp> = code
         .instructions
         .iter()
         .map(|ins| map_to_cpython(*ins, nlocals))
         .collect();
 
+    // CPython 3.13 compiles `return <const>` to a single RETURN_CONST
+    // unit; WeavePy's internal stream keeps the LOAD_CONST +
+    // RETURN_VALUE pair. Fuse on the wire so instruction offsets (and
+    // `sys.monitoring` INSTRUCTION events keyed to them) line up. A
+    // pair is fusable only when nothing addresses the RETURN_VALUE
+    // itself (jump target, exception-range boundary, handler tag) and
+    // both halves share one source location (RETURN_CONST carries a
+    // single position).
+    let mut fused = vec![false; n];
+    // Location source per emitted instruction: normally itself, but a
+    // fused RETURN_CONST takes the RETURN_VALUE's location (CPython
+    // stamps the whole `return <const>` statement span, not the
+    // constant expression's).
+    let mut loc_src: Vec<usize> = (0..n).collect();
+    {
+        let mut boundary = vec![false; n + 1];
+        for (i, m) in mapped.iter().enumerate() {
+            if is_rel_jump(m.cp_op) {
+                let t = if is_backward_jump(m.cp_op) {
+                    (i + 1).saturating_sub(args_target_delta(code.instructions[i]))
+                } else {
+                    i + 1 + args_target_delta(code.instructions[i])
+                };
+                boundary[t.min(n)] = true;
+            }
+            if m.cp_op == op::PUSH_EXC_INFO {
+                boundary[(code.instructions[i].arg as usize).min(n)] = true;
+            }
+        }
+        for h in &code.exception_table {
+            boundary[(h.start as usize).min(n)] = true;
+            boundary[(h.end as usize).min(n)] = true;
+            boundary[(h.handler as usize).min(n)] = true;
+        }
+        for i in 1..n {
+            if mapped[i].cp_op == op::RETURN_VALUE
+                && mapped[i - 1].cp_op == op::LOAD_CONST
+                && !boundary[i]
+                && code.linetable.get(i) == code.linetable.get(i - 1)
+            {
+                fused[i] = true;
+                mapped[i - 1].cp_op = op::RETURN_CONST;
+                loc_src[i - 1] = i;
+            }
+        }
+    }
+
     // Fixpoint: jump args depend on code-unit offsets, which depend on
     // how many EXTENDED_ARG units precede each instruction.
     let mut ext: Vec<usize> = mapped
         .iter()
-        .map(|m| {
-            if is_rel_jump(m.cp_op) {
+        .enumerate()
+        .map(|(i, m)| {
+            if is_rel_jump(m.cp_op) || fused[i] {
                 0
             } else {
                 ext_count(m.arg)
@@ -539,7 +596,9 @@ pub fn encode(code: &CodeObject) -> CpythonCode {
         let mut off = 0usize;
         for i in 0..n {
             starts[i] = off;
-            off += ext[i] + 1 + cache_entries(mapped[i].cp_op);
+            if !fused[i] {
+                off += ext[i] + 1 + cache_entries(mapped[i].cp_op);
+            }
         }
         starts[n] = off;
 
@@ -610,11 +669,19 @@ pub fn encode(code: &CodeObject) -> CpythonCode {
         code.linetable.first().copied().unwrap_or(1)
     };
     for i in 0..n {
-        let line = code.linetable.get(i).copied().unwrap_or(firstlineno) as i32;
+        if fused[i] {
+            // Zero-width: the RETURN_CONST unit emitted for `i - 1`
+            // stands for this instruction too (same `f_lasti`).
+            let prev = inst_offsets.last().copied().unwrap_or(0);
+            inst_offsets.push(prev);
+            continue;
+        }
+        let li = loc_src[i];
+        let line = code.linetable.get(li).copied().unwrap_or(firstlineno) as i32;
         // PEP-657 columns, when the compiler tracked them for this
         // instruction. `col`/`end_col` are byte offsets (`-1` = unknown);
         // `end_lineno` is `0` when unknown (fall back to the start line).
-        let cs = code.coltable.get(i).copied().unwrap_or_default();
+        let cs = code.coltable.get(li).copied().unwrap_or_default();
         let end_lineno = if cs.end_lineno != 0 {
             cs.end_lineno as i32
         } else {
@@ -649,7 +716,7 @@ pub fn encode(code: &CodeObject) -> CpythonCode {
 
     let (localsplusnames, localspluskinds) = build_localsplus(code);
     CpythonCode {
-        co_linetable: encode_linetable(code, &ext, &mapped, firstlineno),
+        co_linetable: encode_linetable(code, &ext, &mapped, &fused, &loc_src, firstlineno),
         co_exceptiontable: encode_exception_table(code, &starts),
         co_code,
         localsplusnames,
@@ -709,6 +776,8 @@ fn encode_linetable(
     code: &CodeObject,
     ext: &[usize],
     mapped: &[MappedOp],
+    fused: &[bool],
+    loc_src: &[usize],
     firstlineno: u32,
 ) -> Vec<u8> {
     const CODE_NO_COLUMNS: u8 = 13;
@@ -717,7 +786,13 @@ fn encode_linetable(
     let mut out = Vec::new();
     let mut prev_line = firstlineno as i32;
     for i in 0..code.instructions.len() {
-        let line = code.linetable.get(i).copied().unwrap_or(firstlineno) as i32;
+        if fused[i] {
+            // Zero-width on the wire; the RETURN_CONST entry for the
+            // preceding instruction covers the merged location.
+            continue;
+        }
+        let li = loc_src[i];
+        let line = code.linetable.get(li).copied().unwrap_or(firstlineno) as i32;
         let units = ext[i] + 1 + cache_entries(mapped[i].cp_op);
         // Each location entry covers 1..=8 code units; split if longer.
         let mut remaining = units;
@@ -731,7 +806,7 @@ fn encode_linetable(
             }
             continue;
         }
-        let cs = code.coltable.get(i).copied().unwrap_or_default();
+        let cs = code.coltable.get(li).copied().unwrap_or_default();
         let has_cols = cs.col >= 0 && cs.end_col >= 0;
         let end_line_delta = if cs.end_lineno != 0 {
             (cs.end_lineno as i32 - line).max(0) as u32
@@ -932,13 +1007,68 @@ fn unit_index_map(raws: &[DecodedRaw]) -> std::collections::HashMap<usize, usize
     unit_to_idx
 }
 
+/// Instruction count a raw expands to: `RETURN_CONST` unfuses back into
+/// `LOAD_CONST` + `RETURN_VALUE`; everything else is 1:1.
+fn raw_expansion(cp_op: u8) -> usize {
+    if cp_op == op::RETURN_CONST {
+        2
+    } else {
+        1
+    }
+}
+
+/// Per-raw index of its first WeavePy instruction (plus the total as a
+/// final sentinel entry), accounting for `RETURN_CONST` expansion.
+fn raw_first_instr(raws: &[DecodedRaw]) -> Vec<usize> {
+    let mut first = Vec::with_capacity(raws.len() + 1);
+    let mut cur = 0usize;
+    for r in raws {
+        first.push(cur);
+        cur += raw_expansion(r.cp_op);
+    }
+    first.push(cur);
+    first
+}
+
 /// Translate decoded raws into WeavePy instructions, recomputing relative
 /// jump args back into the instruction-delta domain.
 fn decode_instructions(raws: &[DecodedRaw], nlocals: u32) -> Option<Vec<Instruction>> {
     let unit_to_idx = unit_index_map(raws);
-    let mut out = Vec::with_capacity(raws.len());
+    let first = raw_first_instr(raws);
+    let total = *first.last().unwrap_or(&0);
+    let instr_of_raw = |raw_idx: usize| -> usize { first.get(raw_idx).copied().unwrap_or(total) };
+    let mut out = Vec::with_capacity(total);
     for (idx, r) in raws.iter().enumerate() {
+        if r.cp_op == op::RETURN_CONST {
+            out.push(Instruction::new(OpCode::LoadConst, r.arg));
+            out.push(Instruction::new(OpCode::ReturnValue, 0));
+            continue;
+        }
+        // Foreign-stream (3.13-native) shapes WeavePy's encoder never
+        // produces, reached through `types.CodeType(...)` /
+        // `_testinternalcapi.assemble_code_object` (RFC 0060):
+        // `SET_FUNCTION_ATTRIBUTE n` right after `MAKE_FUNCTION` folds
+        // into WeavePy's flag-style `MakeFunction n` (same bit
+        // meanings, same stack order: attribute value below the code
+        // object). `PUSH_NULL` has no WeavePy equivalent — its `Call`
+        // convention carries no self-or-null slot — so it lowers to a
+        // stack-neutral `Nop`.
+        if r.cp_op == op::SET_FUNCTION_ATTRIBUTE {
+            match out.last_mut() {
+                Some(prev) if prev.op == OpCode::MakeFunction => {
+                    prev.arg |= r.arg;
+                    out.push(Instruction::new(OpCode::Nop, 0));
+                    continue;
+                }
+                _ => return None,
+            }
+        }
+        if r.cp_op == op::PUSH_NULL {
+            out.push(Instruction::new(OpCode::Nop, 0));
+            continue;
+        }
         let op = map_from_cpython(r.cp_op, r.arg, nlocals)?;
+        let self_idx = instr_of_raw(idx);
         let arg = if is_rel_jump(r.cp_op) {
             let next_unit = r.start_unit + r.size;
             let target_unit = if is_backward_jump(r.cp_op) {
@@ -946,22 +1076,46 @@ fn decode_instructions(raws: &[DecodedRaw], nlocals: u32) -> Option<Vec<Instruct
             } else {
                 next_unit + r.arg as usize
             };
-            let target_idx = *unit_to_idx.get(&target_unit).unwrap_or(&raws.len());
+            let target_raw = *unit_to_idx.get(&target_unit).unwrap_or(&raws.len());
+            let target_idx = instr_of_raw(target_raw);
             if is_backward_jump(r.cp_op) {
-                (idx + 1).saturating_sub(target_idx) as u32
+                (self_idx + 1).saturating_sub(target_idx) as u32
             } else {
-                target_idx.saturating_sub(idx + 1) as u32
+                target_idx.saturating_sub(self_idx + 1) as u32
             }
         } else if r.cp_op == op::PUSH_EXC_INFO && r.arg != 0 {
             // Inverse of the encoder's handler-body tag: absolute code
             // unit → instruction index (see the encode fixpoint loop).
-            *unit_to_idx.get(&(r.arg as usize)).unwrap_or(&raws.len()) as u32
+            let raw_idx = *unit_to_idx.get(&(r.arg as usize)).unwrap_or(&raws.len());
+            instr_of_raw(raw_idx) as u32
         } else {
             op.1
         };
         out.push(Instruction::new(op.0, arg));
     }
     Some(out)
+}
+
+/// Is `cp_op` outside CPython 3.13's known opcode set (including the
+/// specialized adaptive forms)? `ceval` raises `SystemError: unknown
+/// opcode N` when it reaches one (test_code.test_invalid_bytecode).
+/// The unknown ranges come from `_opcode_metadata.opmap` ∪
+/// `_specialized_opmap`: every byte outside them is a real opcode.
+#[must_use]
+pub fn is_unknown_opcode(cp_op: u8) -> bool {
+    matches!(cp_op, 119..=148 | 223..=235 | 255)
+}
+
+/// First unknown opcode byte in a raw `co_code` stream, if any. Even
+/// offsets are always opcode bytes in the 3.13 wire format (`CACHE`
+/// filler included), so a simple stride-2 scan suffices.
+#[must_use]
+pub fn first_unknown_opcode(co_code: &[u8]) -> Option<u8> {
+    co_code
+        .iter()
+        .step_by(2)
+        .copied()
+        .find(|&o| is_unknown_opcode(o))
 }
 
 /// Decode a CPython-3.13 `co_code` stream back into WeavePy instructions.
@@ -1136,14 +1290,18 @@ fn decode_linetable(
             unit_cols.push(span);
         }
     }
-    let lines = raws
-        .iter()
-        .map(|r| unit_lines.get(r.start_unit).copied().unwrap_or(firstlineno))
-        .collect();
-    let cols = raws
-        .iter()
-        .map(|r| unit_cols.get(r.start_unit).copied().unwrap_or_default())
-        .collect();
+    let mut lines = Vec::new();
+    let mut cols = Vec::new();
+    for r in raws {
+        let line = unit_lines.get(r.start_unit).copied().unwrap_or(firstlineno);
+        let col = unit_cols.get(r.start_unit).copied().unwrap_or_default();
+        // A RETURN_CONST raw expands to two instructions sharing the
+        // fused unit's location.
+        for _ in 0..raw_expansion(r.cp_op) {
+            lines.push(line);
+            cols.push(col);
+        }
+    }
     (lines, cols)
 }
 
@@ -1168,11 +1326,14 @@ fn read_exc_field(table: &[u8], pos: &mut usize) -> u32 {
 /// code-unit offsets to WeavePy instruction indices.
 fn decode_exception_table(table: &[u8], raws: &[DecodedRaw]) -> Vec<ExcHandler> {
     let unit_to_idx = unit_index_map(raws);
+    let first = raw_first_instr(raws);
+    let total = *first.last().unwrap_or(&0) as u32;
     let map_unit = |unit: usize| -> u32 {
         unit_to_idx
             .get(&unit)
+            .and_then(|i| first.get(*i))
             .map(|i| *i as u32)
-            .unwrap_or(raws.len() as u32)
+            .unwrap_or(total)
     };
     let mut out = Vec::new();
     let mut pos = 0usize;

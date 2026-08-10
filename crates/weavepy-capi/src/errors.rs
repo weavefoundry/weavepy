@@ -238,12 +238,23 @@ pub(crate) fn message_for(o: &Object) -> String {
     match o {
         Object::Str(s) => s.to_string(),
         Object::Instance(inst) => {
+            // `args` lives in the BaseException pseudo-slot storage for
+            // VM-constructed exceptions (`make_exception_with_class`), and
+            // in the instance dict for others — check both.
             let key = DictKey(Object::from_static("args"));
-            if let Some(args) = inst.dict.borrow().get(&key).cloned() {
-                if let Object::Tuple(items) = args {
-                    if let Some(Object::Str(s)) = items.first().cloned() {
-                        return s.to_string();
+            let args = inst
+                .dict
+                .borrow()
+                .get(&key)
+                .cloned()
+                .or_else(|| inst.slot_get("args"));
+            if let Some(Object::Tuple(items)) = args {
+                match items.first() {
+                    Some(Object::Str(s)) => return s.to_string(),
+                    Some(Object::WStr(cps)) => {
+                        return cps.iter().filter_map(|&c| char::from_u32(c)).collect()
                     }
+                    _ => {}
                 }
             }
             format!("<{}>", inst.cls().name)

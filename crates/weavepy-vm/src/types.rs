@@ -120,6 +120,17 @@ pub struct TypeObject {
     /// `make_iter` consults this to replicate that distinction, which the
     /// synthesised `__getitem__` dunder alone cannot express.
     pub c_sq_item: Cell<bool>,
+    /// WeavePy analogue of `Py_TPFLAGS_IMMUTABLETYPE` for *frozen-stdlib*
+    /// classes standing in for CPython's static C types (decimal's
+    /// `Decimal`/`Context`, typing's `TypeAliasType`, …): attribute
+    /// set/delete on the class raises TypeError, exactly like
+    /// `flags.is_builtin` types, while `type(cls)` stays plain `type`.
+    /// Opted into with a `__weave_immutable_type__ = True` class-body
+    /// marker (stripped from the namespace at class creation). A visible
+    /// metaclass emulation is not equivalent: Cython's `cdef type x =
+    /// Decimal` compiles to `PyType_CheckExact`, which demands
+    /// `Py_TYPE(Decimal) == &PyType_Type` (pandas `_libs.missing`).
+    pub immutable: Cell<bool>,
 }
 
 /// Per-class resolution of the `type.__call__` protocol, cached on the
@@ -414,6 +425,7 @@ impl TypeObject {
             instance_plan: RefCell::new(None),
             c_tp_name: Cell::new(None),
             c_sq_item: Cell::new(false),
+            immutable: Cell::new(false),
         });
         let mro = compute_c3(&ty, &bases, name)?;
         *ty.mro.borrow_mut() = mro;
@@ -558,6 +570,8 @@ impl TypeObject {
         const BASETYPE: i64 = 1 << 10;
         const READY: i64 = 1 << 12;
         const HAVE_GC: i64 = 1 << 14;
+        const HAVE_VECTORCALL: i64 = 1 << 11;
+        const METHOD_DESCRIPTOR: i64 = 1 << 17;
         const IS_ABSTRACT: i64 = 1 << 20;
         const LONG_SUBCLASS: i64 = 1 << 24;
         const LIST_SUBCLASS: i64 = 1 << 25;
@@ -569,6 +583,12 @@ impl TypeObject {
         const TYPE_SUBCLASS: i64 = 1 << 31;
 
         let mut bits = READY;
+        // Frozen-stdlib stand-ins for CPython static C types (see
+        // [`TypeObject::immutable`]) report the immutability bit exactly
+        // as their CPython counterparts do.
+        if self.immutable.get() {
+            bits |= IMMUTABLETYPE;
+        }
         if self.flags.is_builtin {
             bits |= IMMUTABLETYPE;
             // Built-ins that refuse subclassing.
@@ -631,6 +651,33 @@ impl TypeObject {
                 if !self.has_var_sized_base() {
                     bits |= INLINE_VALUES;
                 }
+            }
+        }
+        // `Py_TPFLAGS_METHOD_DESCRIPTOR` (PEP 590): types whose instances
+        // behave like unbound methods under vectorcall. Matches CPython's
+        // static-type set; heap types never inherit the bit.
+        if self.flags.is_builtin
+            && matches!(
+                self.name.as_str(),
+                "function" | "method_descriptor" | "wrapper_descriptor"
+            )
+        {
+            bits |= METHOD_DESCRIPTOR | HAVE_VECTORCALL;
+        }
+        // `functools.lru_cache`'s C wrapper type is a *static* method
+        // descriptor in CPython; WeavePy builds it as a heap type
+        // (`functools_mod::lru_type`), so match it by name.
+        if self.name == "_lru_cache_wrapper" {
+            bits |= METHOD_DESCRIPTOR | HAVE_VECTORCALL;
+        }
+        // RFC 0060 — the `_testcapi` vectorcall fixtures answer these two
+        // bits from their registries (gated so ordinary programs skip it).
+        if crate::stdlib::testcapi_call::fixtures_active() {
+            if crate::stdlib::testcapi_call::type_is_method_descriptor(self) {
+                bits |= METHOD_DESCRIPTOR;
+            }
+            if crate::stdlib::testcapi_call::type_has_vectorcall(self) {
+                bits |= HAVE_VECTORCALL;
             }
         }
         match self

@@ -35,21 +35,48 @@ fn resource_id(obj: &Object) -> Result<i32, RuntimeError> {
     }
 }
 
-/// Coerce a Python object to an `rlim_t` (mirrors CPython's
-/// `(rlim_t)PyLong_AsLongLong`): an int wider than 64 bits raises
-/// `OverflowError`, a non-int raises `TypeError`. Negative values are
-/// cast to the wide unsigned representation exactly as CPython does
-/// (the kernel then rejects them with `EINVAL`, which the caller maps to
-/// `ValueError`).
+/// Coerce a Python object to an `rlim_t`, mirroring CPython 3.13's
+/// `py2rlim` (`Modules/resource.c`): the value is written into an
+/// unsigned 8-byte buffer. A negative int is only accepted when its
+/// two's-complement low 64 bits equal `RLIM_INFINITY` *and* it fits in
+/// 8 signed bytes (so `-1` maps to infinity on Linux but is a
+/// `ValueError` on macOS, where `RLIM_INFINITY` is `2**63-1`); any
+/// other negative raises `ValueError` and a value needing more than 8
+/// bytes raises `OverflowError` (test_resource test_fsize_negative /
+/// test_fsize_not_too_big).
 fn rlim_from_obj(obj: &Object) -> Result<u64, RuntimeError> {
-    match obj {
-        Object::Int(n) => Ok(*n as u64),
-        Object::Bool(b) => Ok(u64::from(*b)),
-        Object::Long(_) => Err(overflow_error(
-            "Python int too large to convert to C long long",
-        )),
-        _ => Err(type_error("an integer is required")),
+    let (neg, fits_8_bytes, low64): (bool, bool, u64) = match obj {
+        Object::Int(n) => (*n < 0, true, *n as u64),
+        Object::Bool(b) => (false, true, u64::from(*b)),
+        Object::Long(big) => {
+            use num_bigint::BigInt;
+            use num_traits::{Signed, ToPrimitive};
+            let neg = big.is_negative();
+            let fits = if neg {
+                big.to_i64().is_some()
+            } else {
+                big.to_u64().is_some()
+            };
+            let modulus = BigInt::from(1u8) << 64u32;
+            let mut low = (&**big) % &modulus;
+            if low.is_negative() {
+                low += &modulus;
+            }
+            let low64 = low.to_u64().unwrap_or(0);
+            (neg, fits, low64)
+        }
+        _ => return Err(type_error("an integer is required")),
+    };
+    let infinity = rlim_infinity() as u64;
+    if neg && (low64 != infinity || !fits_8_bytes) {
+        return Err(value_error("Cannot convert negative int"));
     }
+    if !fits_8_bytes {
+        return Err(overflow_error(
+            "Python int too large to convert to C rlim_t",
+        ));
+    }
+    Ok(low64)
 }
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
@@ -149,16 +176,28 @@ fn resource_setrlimit(args: &[Object]) -> Result<Object, RuntimeError> {
         )));
     }
     let which = resource_id(&args[0])?;
-    // CPython requires a 2-element *sequence*; a wrong length is a
-    // ValueError ("expected a tuple of 2 integers"), a non-sequence is a
-    // TypeError. Element type/overflow errors come from `rlim_from_obj`.
+    // CPython converts via `PySequence_Tuple`, so *any* iterable —
+    // including an old-style `__len__`/`__getitem__` sequence — is
+    // accepted (test_resource test_setrusage_refcount); a wrong length
+    // is a ValueError ("expected a tuple of 2 integers"). Element
+    // type/overflow errors come from `rlim_from_obj`.
     let items: Vec<Object> = match &args[1] {
         Object::Tuple(t) => t.iter().cloned().collect(),
         Object::List(l) => l.borrow().clone(),
-        _ => {
-            return Err(type_error(
-                "setrlimit() argument 2 must be a sequence of 2 integers",
-            ))
+        other => {
+            let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
+                type_error("setrlimit() argument 2 must be a sequence of 2 integers")
+            })?;
+            // SAFETY: published by the enclosing VM frame on this thread.
+            let interp = unsafe { &mut *ptr };
+            let iter = interp.iter_object(other.clone()).map_err(|_| {
+                type_error("setrlimit() argument 2 must be a sequence of 2 integers")
+            })?;
+            let mut collected = Vec::new();
+            while let Some(item) = interp.iter_next_object(iter.clone())? {
+                collected.push(item);
+            }
+            collected
         }
     };
     if items.len() != 2 {
@@ -185,18 +224,23 @@ fn resource_setrlimit(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn resource_getrusage(args: &[Object]) -> Result<Object, RuntimeError> {
-    let who = match args.first() {
-        Some(Object::Int(n)) => *n as i32,
-        Some(Object::None) | None => 0,
-        _ => return Err(type_error("getrusage() requires an int")),
-    };
+    // Clinic signature: exactly one positional int (test_getrusage
+    // asserts TypeError for zero and two arguments).
+    if args.len() != 1 {
+        return Err(type_error(format!(
+            "getrusage() takes exactly 1 argument ({} given)",
+            args.len()
+        )));
+    }
+    let who = resource_id(&args[0])?;
     let mut ru = RawRusage::default();
     let ret = unsafe { libc_getrusage(who, &mut ru) };
     if ret != 0 {
-        return Err(os_error(format!(
-            "getrusage({who}) failed: errno={}",
-            last_os_error_code()
-        )));
+        let e = last_os_error_code();
+        if e == libc::EINVAL {
+            return Err(value_error("invalid who parameter"));
+        }
+        return Err(os_error(format!("getrusage({who}) failed: errno={e}")));
     }
     let utime = ru.ru_utime_sec as f64 + (ru.ru_utime_usec as f64) / 1.0e6;
     let stime = ru.ru_stime_sec as f64 + (ru.ru_stime_usec as f64) / 1.0e6;

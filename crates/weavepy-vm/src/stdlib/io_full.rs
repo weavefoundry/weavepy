@@ -677,6 +677,7 @@ pub(crate) fn io_open(args: &[Object]) -> Result<Object, RuntimeError> {
             }
         };
         crate::builtins::validate_open_mode(&mode)?;
+        crate::builtins::audit_open_event(&Object::Int(*fd), &mode)?;
         if *fd < 0 {
             return Err(value_error("negative file descriptor"));
         }
@@ -720,18 +721,12 @@ pub(crate) fn io_open(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Int(n)) => *n != 0,
         _ => true,
     };
+    // PEP 578 — `open(file, mode, flags)`; fires before the closefd
+    // rejection, matching FileIO.__init__ ordering.
+    crate::builtins::audit_open_event(&Object::from_str(path.clone()), &mode)?;
     if !closefd {
         return Err(value_error("Cannot use closefd=False with file name"));
     }
-    // PEP 578 — `open(file, mode, flags)` audit event.
-    crate::stdlib::sys::audit_event(
-        "open",
-        &[
-            Object::from_str(path.clone()),
-            Object::from_str(mode.clone()),
-            Object::Int(0),
-        ],
-    );
     let binary = mode.contains('b');
     let writable =
         mode.contains('w') || mode.contains('a') || mode.contains('+') || mode.contains('x');

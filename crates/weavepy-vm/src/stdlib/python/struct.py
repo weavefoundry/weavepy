@@ -231,6 +231,16 @@ def iter_unpack(fmt, buffer):
     return _make_unpack_iterator(fmt, buffer, calcsize(fmt))
 
 
+def _clearcache():
+    """Clear the internal format cache.
+
+    CPython's ``_struct`` memoizes compiled ``Struct`` objects and exposes
+    this hook to flush them (``test.libregrtest``'s ``clear_caches`` calls
+    it between tests). WeavePy compiles formats natively without a
+    Python-visible cache, so this is a compatibility no-op.
+    """
+
+
 class Struct:
     """Pre-compiled binary format. Mirrors `struct.Struct`."""
 

@@ -177,6 +177,14 @@ pub fn default_builtins() -> DictData {
         }};
     }
 
+    // The VM intercepts calls to this marker (`LoadBuildClass` /
+    // `dispatch_call`); it lives in the dict so sandbox copies of the
+    // builtins namespace (`frozendict(builtins.__dict__)`) keep class
+    // statements working (test_builtin test_exec_globals).
+    d.insert(
+        DictKey(Object::from_static("__build_class__")),
+        Object::Builtin(Rc::new(build_class_builtin())),
+    );
     reg!("len", b_len);
     reg!("range", b_range);
     reg_kw!("str", b_str_kw);
@@ -243,7 +251,7 @@ pub fn default_builtins() -> DictData {
         b_mark_iterable_coroutine
     );
     reg!("divmod", b_divmod);
-    reg!("round", b_round);
+    reg_kw!("round", b_round_kw);
     reg!("format", b_format);
     reg!("ascii", b_ascii);
     // `property`, `staticmethod`, `classmethod` are exposed as
@@ -263,7 +271,7 @@ pub fn default_builtins() -> DictData {
     // reach for. `breakpoint` is intercepted by the VM so it can
     // honour `sys.breakpointhook`; `help`/`copyright`/`license` are
     // intentionally cheap "interactive use only" stubs.
-    reg!("pow", b_pow);
+    reg_kw!("pow", b_pow_kw);
     reg!("breakpoint", b_breakpoint);
     reg!("memoryview", b_memoryview);
     {
@@ -872,6 +880,12 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             // protocol, not just native sequences.
             "writelines" => Some(method(".file_writelines", file_writelines)),
             "flush" => Some(method("flush", file_flush)),
+            // `reconfigure` lives on `TextIOWrapper` only: text-mode
+            // OS-backed streams (including stdio). `StringIO` and binary
+            // streams genuinely lack it in CPython.
+            "reconfigure" if !f.binary && !f.is_memory() => {
+                Some(method_kw("reconfigure", file_reconfigure))
+            }
             "close" => Some(method("close", file_close)),
             "isatty" => Some(method("isatty", file_isatty)),
             "fileno" => Some(method("fileno", file_fileno)),
@@ -916,8 +930,10 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
                 Err(crate::stdlib::io::unsupported_op("detach"))
             })),
             // `BytesIO.getbuffer()` — binary in-memory streams only (CPython
-            // text `StringIO` genuinely lacks the attribute).
-            "getbuffer" if f.binary => Some(method("getbuffer", file_getbuffer)),
+            // text `StringIO` and file-backed streams genuinely lack the
+            // attribute; `hashlib.file_digest` probes it with `hasattr` to
+            // pick its zero-copy fast path).
+            "getbuffer" if f.binary && f.is_memory() => Some(method("getbuffer", file_getbuffer)),
             "__enter__" => Some(method("__enter__", file_enter)),
             "__exit__" => Some(method("__exit__", file_exit)),
             // A file is its own iterator (CPython): `iter(f) is f`, and
@@ -2142,7 +2158,16 @@ fn slot_format(args: &[Object]) -> Result<Object, RuntimeError> {
         .ok_or_else(|| type_error("__format__() takes exactly 2 arguments (0 given)"))?;
     let spec = match args.get(1) {
         Some(Object::Str(s)) => s.to_string(),
-        Some(Object::None) | None => String::new(),
+        // A `str` subclass is a legal spec (PyUnicode_Check).
+        Some(Object::Instance(inst)) if matches!(inst.native.get(), Some(Object::Str(_))) => {
+            match inst.native.get() {
+                Some(Object::Str(s)) => s.to_string(),
+                _ => unreachable!(),
+            }
+        }
+        None => String::new(),
+        // CPython's `object.__format__` requires a str spec — `None` too
+        // is a TypeError (test_builtin test_format).
         Some(other) => {
             return Err(type_error(format!(
                 "__format__() argument 1 must be str, not {}",
@@ -3436,7 +3461,14 @@ fn b_getattr(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let name = match crate::attr_name_of(&args[1]) {
         Some(n) => n,
-        None => return Err(type_error("attribute name must be string")),
+        // CPython 3.12+ names the offending type (test_builtin
+        // test_getattr/test_setattr/test_hasattr/test_delattr).
+        None => {
+            return Err(type_error(format!(
+                "attribute name must be string, not '{}'",
+                args[1].type_name()
+            )))
+        }
     };
     let default = args.get(2).cloned();
     match attr_get(&args[0], &name) {
@@ -3458,7 +3490,14 @@ fn b_setattr(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let name = match crate::attr_name_of(&args[1]) {
         Some(n) => n,
-        None => return Err(type_error("attribute name must be string")),
+        // CPython 3.12+ names the offending type (test_builtin
+        // test_getattr/test_setattr/test_hasattr/test_delattr).
+        None => {
+            return Err(type_error(format!(
+                "attribute name must be string, not '{}'",
+                args[1].type_name()
+            )))
+        }
     };
     attr_set(&args[0], &name, args[2].clone())?;
     Ok(Object::None)
@@ -3470,7 +3509,14 @@ fn b_delattr(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let name = match crate::attr_name_of(&args[1]) {
         Some(n) => n,
-        None => return Err(type_error("attribute name must be string")),
+        // CPython 3.12+ names the offending type (test_builtin
+        // test_getattr/test_setattr/test_hasattr/test_delattr).
+        None => {
+            return Err(type_error(format!(
+                "attribute name must be string, not '{}'",
+                args[1].type_name()
+            )))
+        }
     };
     attr_delete(&args[0], &name)?;
     Ok(Object::None)
@@ -3482,7 +3528,14 @@ fn b_hasattr(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let name = match crate::attr_name_of(&args[1]) {
         Some(n) => n,
-        None => return Err(type_error("attribute name must be string")),
+        // CPython 3.12+ names the offending type (test_builtin
+        // test_getattr/test_setattr/test_hasattr/test_delattr).
+        None => {
+            return Err(type_error(format!(
+                "attribute name must be string, not '{}'",
+                args[1].type_name()
+            )))
+        }
     };
     Ok(Object::Bool(attr_get(&args[0], &name).is_some()))
 }
@@ -3527,8 +3580,8 @@ fn b_vm_intrinsic(_args: &[Object]) -> Result<Object, RuntimeError> {
     ))
 }
 
-fn b_callable(args: &[Object]) -> Result<Object, RuntimeError> {
-    let v = one(args, "callable")?;
+/// `callable(v)` — shared with the VM's `iter(v, sentinel)` validation.
+pub(crate) fn object_is_callable(v: &Object) -> bool {
     let intrinsic = matches!(
         v,
         Object::Function(_)
@@ -3540,13 +3593,18 @@ fn b_callable(args: &[Object]) -> Result<Object, RuntimeError> {
             | Object::StaticMethod(_)
     );
     if intrinsic {
-        return Ok(Object::Bool(true));
+        return true;
     }
     // Instances are callable when their class exposes `__call__`.
     if let Object::Instance(inst) = v {
-        return Ok(Object::Bool(inst.cls().lookup("__call__").is_some()));
+        return inst.cls().lookup("__call__").is_some();
     }
-    Ok(Object::Bool(false))
+    false
+}
+
+fn b_callable(args: &[Object]) -> Result<Object, RuntimeError> {
+    let v = one(args, "callable")?;
+    Ok(Object::Bool(object_is_callable(v)))
 }
 
 fn b_object(_args: &[Object]) -> Result<Object, RuntimeError> {
@@ -3800,8 +3858,18 @@ pub(crate) fn code_synthetic_attr(
         "co_posonlyargcount" => Some(Object::Int(i64::from(c.posonly_count))),
         "co_kwonlyargcount" => Some(Object::Int(i64::from(c.kwonly_count))),
         "co_nlocals" => Some(Object::Int(c.varnames.len() as i64)),
-        "co_stacksize" => Some(Object::Int(i64::from(c.to_cpython().stacksize))),
-        "co_flags" => Some(Object::Int(i64::from(code_flags(c)))),
+        "co_stacksize" => Some(Object::Int(i64::from(
+            c.wire
+                .as_ref()
+                .and_then(|w| w.stacksize)
+                .unwrap_or_else(|| c.to_cpython().stacksize),
+        ))),
+        "co_flags" => Some(Object::Int(i64::from(
+            c.wire
+                .as_ref()
+                .and_then(|w| w.flags)
+                .unwrap_or_else(|| code_flags(c)),
+        ))),
         "co_varnames" => Some(Object::new_tuple(
             c.varnames.iter().map(Object::from_str).collect(),
         )),
@@ -3831,12 +3899,27 @@ pub(crate) fn code_synthetic_attr(
                 .map(crate::constant_to_object_public)
                 .collect(),
         )),
-        // CPython-3.13 wire view (RFC 0033). Computed on demand.
-        "co_code" => Some(Object::Bytes(Rc::from(c.to_cpython().co_code.clone()))),
-        "co_linetable" => Some(Object::Bytes(Rc::from(c.to_cpython().co_linetable.clone()))),
-        "co_exceptiontable" => Some(Object::Bytes(Rc::from(
-            c.to_cpython().co_exceptiontable.clone(),
-        ))),
+        // CPython-3.13 wire view (RFC 0033). Computed on demand; a raw
+        // override pinned by `CodeType(...)`/`replace()` (RFC 0060) wins
+        // so constructor/replace round-trips are byte-exact.
+        "co_code" => Some(Object::Bytes(
+            match c.wire.as_ref().and_then(|w| w.co_code.as_deref()) {
+                Some(b) => Rc::from(b.to_vec()),
+                None => Rc::from(c.to_cpython().co_code.clone()),
+            },
+        )),
+        "co_linetable" => Some(Object::Bytes(
+            match c.wire.as_ref().and_then(|w| w.co_linetable.as_deref()) {
+                Some(b) => Rc::from(b.to_vec()),
+                None => Rc::from(c.to_cpython().co_linetable.clone()),
+            },
+        )),
+        "co_exceptiontable" => Some(Object::Bytes(
+            match c.wire.as_ref().and_then(|w| w.co_exceptiontable.as_deref()) {
+                Some(b) => Rc::from(b.to_vec()),
+                None => Rc::from(c.to_cpython().co_exceptiontable.clone()),
+            },
+        )),
         "co_localsplusnames" => Some(Object::new_tuple(
             c.to_cpython()
                 .localsplusnames
@@ -3959,6 +4042,18 @@ fn decode_compact_linetable(table: &[u8], firstlineno: u32) -> Vec<Option<u32>> 
     out
 }
 
+/// The unbound `code.__replace__` callable installed in the `code`
+/// type's dict — `copy.replace(code, **changes)` resolves it on the
+/// class and calls it with the receiver first (RFC 0060).
+pub(crate) fn code_dunder_replace_object() -> Object {
+    Object::Builtin(Rc::new(BuiltinFn {
+        name: "__replace__",
+        binds_instance: false,
+        call: Box::new(|args| code_replace(args, &[])),
+        call_kw: Some(Box::new(code_replace)),
+    }))
+}
+
 fn code_replace(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let c = code_self(args)?;
     let mut nc: weavepy_compiler::CodeObject = (*c).clone();
@@ -3991,17 +4086,63 @@ fn code_replace(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
         items.iter().map(|it| want_str(it, field)).collect()
     }
 
+    let mut requested_nlocals: Option<u32> = None;
     for (k, v) in kwargs {
         match k.as_str() {
             "co_name" => nc.name = want_str(v, "co_name")?,
+            "co_qualname" => nc.qualname = want_str(v, "co_qualname")?,
             "co_filename" => nc.filename = want_str(v, "co_filename")?,
             "co_argcount" => nc.arg_count = want_u32(v, "co_argcount")?,
             "co_posonlyargcount" => nc.posonly_count = want_u32(v, "co_posonlyargcount")?,
             "co_kwonlyargcount" => nc.kwonly_count = want_u32(v, "co_kwonlyargcount")?,
+            "co_nlocals" => requested_nlocals = Some(want_u32(v, "co_nlocals")?),
             "co_varnames" => nc.varnames = want_str_seq(v, "co_varnames")?,
             "co_names" => nc.names = want_str_seq(v, "co_names")?,
             "co_freevars" => nc.freevars = want_str_seq(v, "co_freevars")?,
             "co_cellvars" => nc.cellvars = want_str_seq(v, "co_cellvars")?,
+            "co_stacksize" => {
+                nc.wire.get_or_insert_with(Default::default).stacksize =
+                    Some(want_u32(v, "co_stacksize")?);
+            }
+            "co_flags" => {
+                nc.wire.get_or_insert_with(Default::default).flags = Some(want_u32(v, "co_flags")?);
+            }
+            "co_consts" => {
+                let items: Vec<Object> = match v {
+                    Object::Tuple(t) => t.iter().cloned().collect(),
+                    Object::List(l) => l.borrow().iter().cloned().collect(),
+                    _ => {
+                        return Err(type_error(
+                            "code.replace(): co_consts must be a tuple".to_owned(),
+                        ))
+                    }
+                };
+                nc.constants = items.iter().map(crate::object_to_constant_public).collect();
+            }
+            "co_code" => {
+                let bytes: Vec<u8> = match v {
+                    Object::Bytes(b) => b.to_vec(),
+                    _ => {
+                        return Err(type_error(
+                            "code.replace(): co_code must be bytes".to_owned(),
+                        ))
+                    }
+                };
+                install_wire_code(&mut nc, bytes);
+            }
+            "co_exceptiontable" => {
+                let bytes: Vec<u8> = match v {
+                    Object::Bytes(b) => b.to_vec(),
+                    _ => {
+                        return Err(type_error(
+                            "code.replace(): co_exceptiontable must be bytes".to_owned(),
+                        ))
+                    }
+                };
+                nc.wire
+                    .get_or_insert_with(Default::default)
+                    .co_exceptiontable = Some(bytes);
+            }
             "co_firstlineno" => {
                 // Shift the absolute per-instruction line table so the
                 // first line reports the requested value while keeping
@@ -4032,18 +4173,241 @@ fn code_replace(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
                 for (i, slot) in nc.linetable.iter_mut().enumerate() {
                     *slot = unit_lines.get(i).copied().flatten().unwrap_or(0);
                 }
+                // Pin the raw table so `co_linetable` round-trips exactly
+                // and `co_lines()`/`co_positions()` report *its* entries
+                // (empty table ⇒ no location info, test_empty_linetable).
+                nc.wire.get_or_insert_with(Default::default).co_linetable = Some(bytes);
             }
-            // Recognised CPython fields WeavePy derives on demand rather
-            // than storing independently. Accepted (carried through) so
-            // `replace()` callers don't break, but not independently set.
-            "co_qualname" | "co_flags" | "co_stacksize" | "co_code" | "co_consts"
-            | "co_exceptiontable" | "co_nlocals" | "co_lnotab" => {}
+            // Deprecated derived field: accepted, carried through.
+            "co_lnotab" => {}
             other => {
                 return Err(type_error(format!(
                     "replace() got an unexpected keyword argument '{other}'"
                 )))
             }
         }
+    }
+    // CPython validates that an explicit co_nlocals agrees with the
+    // (possibly replaced) co_varnames (test_nlocals_mismatch).
+    if let Some(n) = requested_nlocals {
+        if n as usize != nc.varnames.len() {
+            return Err(value_error(format!(
+                "code: co_nlocals != len(co_varnames) ({} != {})",
+                n,
+                nc.varnames.len()
+            )));
+        }
+    }
+    Ok(Object::Code(Rc::new(nc)))
+}
+
+/// Pin raw CPython `co_code` bytes on `nc` (RFC 0060 — `CodeType(...)` /
+/// `replace(co_code=…)`). When the stream decodes back into WeavePy
+/// instructions the code object stays executable; otherwise executing it
+/// raises `SystemError` (CPython: "unknown opcode N",
+/// test_code.test_invalid_bytecode).
+fn install_wire_code(nc: &mut weavepy_compiler::CodeObject, bytes: Vec<u8>) {
+    let nlocals = nc.varnames.len() as u32;
+    match weavepy_compiler::cpython_code::decode(&bytes, nlocals) {
+        Some(instructions) => {
+            // Keep per-instruction side tables in sync with the new
+            // instruction count; line info defaults to the first line.
+            let first = nc.linetable.iter().copied().find(|l| *l > 0).unwrap_or(1);
+            nc.linetable = vec![first; instructions.len()];
+            nc.coltable = Vec::new();
+            nc.caches = weavepy_compiler::CacheTable::with_len(instructions.len());
+            nc.instructions = instructions;
+            nc.exception_table = Vec::new();
+            let w = nc.wire.get_or_insert_with(Default::default);
+            w.co_code = Some(bytes);
+            w.exec_error = None;
+        }
+        None => {
+            let msg = match weavepy_compiler::cpython_code::first_unknown_opcode(&bytes) {
+                Some(op) => format!("unknown opcode {op}"),
+                None => "cannot execute foreign bytecode".to_owned(),
+            };
+            let w = nc.wire.get_or_insert_with(Default::default);
+            w.co_code = Some(bytes);
+            w.exec_error = Some(msg);
+        }
+    }
+}
+
+/// `types.CodeType(argcount, posonlyargcount, kwonlyargcount, nlocals,
+/// stacksize, flags, codestring, constants, names, varnames, filename,
+/// name, qualname, firstlineno, linetable, exceptiontable[, freevars[,
+/// cellvars]])` — CPython's `code_new` (RFC 0060). The raw wire fields
+/// are pinned on the result so the attribute surface round-trips
+/// byte-exactly; when the bytecode decodes into WeavePy instructions the
+/// object is also executable.
+pub(crate) fn code_type_call(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
+    use weavepy_compiler::cpython_code::{CO_FAST_CELL, CO_FAST_FREE, CO_FAST_LOCAL};
+    if !kwargs.is_empty() {
+        return Err(type_error("code() takes no keyword arguments"));
+    }
+    if args.len() < 16 || args.len() > 18 {
+        return Err(type_error(format!(
+            "code expected at most 18 arguments, got {}",
+            args.len()
+        )));
+    }
+    fn want_int(o: &Object, field: &str) -> Result<u32, RuntimeError> {
+        match o {
+            Object::Int(i) if *i >= 0 => Ok(*i as u32),
+            Object::Int(_) => Err(value_error(format!("code: {field} must be non-negative"))),
+            _ => Err(type_error(format!(
+                "code: {field} must be int, not {}",
+                o.type_name()
+            ))),
+        }
+    }
+    fn want_bytes(o: &Object, field: &str) -> Result<Vec<u8>, RuntimeError> {
+        match o {
+            Object::Bytes(b) => Ok(b.to_vec()),
+            _ => Err(type_error(format!(
+                "code: {field} must be bytes, not {}",
+                o.type_name()
+            ))),
+        }
+    }
+    fn want_str(o: &Object, field: &str) -> Result<String, RuntimeError> {
+        match o {
+            Object::Str(s) => Ok(s.to_string()),
+            _ => Err(type_error(format!(
+                "code: {field} must be str, not {}",
+                o.type_name()
+            ))),
+        }
+    }
+    fn want_str_tuple(o: &Object, field: &str) -> Result<Vec<String>, RuntimeError> {
+        match o {
+            Object::Tuple(t) => t.iter().map(|it| want_str(it, field)).collect(),
+            _ => Err(type_error(format!(
+                "code: {field} must be tuple, not {}",
+                o.type_name()
+            ))),
+        }
+    }
+    let arg_count = want_int(&args[0], "argcount")?;
+    let posonly_count = want_int(&args[1], "posonlyargcount")?;
+    let kwonly_count = want_int(&args[2], "kwonlyargcount")?;
+    let nlocals = want_int(&args[3], "nlocals")?;
+    let stacksize = want_int(&args[4], "stacksize")?;
+    let flags = want_int(&args[5], "flags")?;
+    let codestring = want_bytes(&args[6], "codestring")?;
+    let constants = match &args[7] {
+        Object::Tuple(t) => t
+            .iter()
+            .map(crate::object_to_constant_public)
+            .collect::<Vec<_>>(),
+        other => {
+            return Err(type_error(format!(
+                "code: constants must be tuple, not {}",
+                other.type_name()
+            )))
+        }
+    };
+    let names = want_str_tuple(&args[8], "names")?;
+    let varnames = want_str_tuple(&args[9], "varnames")?;
+    let filename = want_str(&args[10], "filename")?;
+    let name = want_str(&args[11], "name")?;
+    let qualname = want_str(&args[12], "qualname")?;
+    let firstlineno = want_int(&args[13], "firstlineno")?;
+    let linetable = want_bytes(&args[14], "linetable")?;
+    let exceptiontable = want_bytes(&args[15], "exceptiontable")?;
+    let freevars = match args.get(16) {
+        Some(o) => want_str_tuple(o, "freevars")?,
+        None => Vec::new(),
+    };
+    let cellvars = match args.get(17) {
+        Some(o) => want_str_tuple(o, "cellvars")?,
+        None => Vec::new(),
+    };
+    if nlocals as usize != varnames.len() {
+        return Err(value_error(format!(
+            "code: co_nlocals != len(co_varnames) ({} != {})",
+            nlocals,
+            varnames.len()
+        )));
+    }
+    // Locals-plus layout mirrors `encode`: plain locals, then cells,
+    // then frees (the deref offsets in the wire form assume it).
+    let mut localsplusnames: Vec<String> = Vec::new();
+    let mut localspluskinds: Vec<u8> = Vec::new();
+    for v in &varnames {
+        localsplusnames.push(v.clone());
+        localspluskinds.push(CO_FAST_LOCAL);
+    }
+    for v in &cellvars {
+        localsplusnames.push(v.clone());
+        localspluskinds.push(CO_FAST_CELL);
+    }
+    for v in &freevars {
+        localsplusnames.push(v.clone());
+        localspluskinds.push(CO_FAST_FREE);
+    }
+    const CO_VARARGS: u32 = 0x0004;
+    const CO_VARKEYWORDS: u32 = 0x0008;
+    const CO_GENERATOR: u32 = 0x0020;
+    const CO_COROUTINE: u32 = 0x0080;
+    const CO_ITERABLE_COROUTINE: u32 = 0x0100;
+    const CO_ASYNC_GENERATOR: u32 = 0x0200;
+    let mut nc = weavepy_compiler::CodeObject {
+        name,
+        qualname,
+        filename,
+        constants,
+        names,
+        varnames,
+        freevars,
+        cellvars,
+        arg_count,
+        posonly_count,
+        kwonly_count,
+        has_varargs: flags & CO_VARARGS != 0,
+        has_varkeywords: flags & CO_VARKEYWORDS != 0,
+        is_generator: flags & CO_GENERATOR != 0,
+        is_coroutine: flags & CO_COROUTINE != 0,
+        is_iterable_coroutine: flags & CO_ITERABLE_COROUTINE != 0,
+        is_async_generator: flags & CO_ASYNC_GENERATOR != 0,
+        future_flags: flags & weavepy_compiler::flags::PYCF_MASK,
+        ..Default::default()
+    };
+    match weavepy_compiler::cpython_code::decode_full(
+        &codestring,
+        &linetable,
+        &exceptiontable,
+        &localsplusnames,
+        &localspluskinds,
+        firstlineno,
+    ) {
+        Some(decoded) => {
+            nc.caches = weavepy_compiler::CacheTable::with_len(decoded.instructions.len());
+            nc.instructions = decoded.instructions;
+            nc.linetable = decoded.linetable;
+            nc.coltable = decoded.coltable;
+            nc.exception_table = decoded.exception_table;
+        }
+        None => {
+            let msg = match weavepy_compiler::cpython_code::first_unknown_opcode(&codestring) {
+                Some(op) => format!("unknown opcode {op}"),
+                None => "cannot execute foreign bytecode".to_owned(),
+            };
+            nc.linetable = vec![firstlineno.max(1)];
+            nc.wire.get_or_insert_with(Default::default).exec_error = Some(msg);
+        }
+    }
+    {
+        let w = nc.wire.get_or_insert_with(Default::default);
+        w.co_code = Some(codestring);
+        w.co_linetable = Some(linetable);
+        w.co_exceptiontable = Some(exceptiontable);
+        w.stacksize = Some(stacksize);
+        w.flags = Some(flags);
     }
     Ok(Object::Code(Rc::new(nc)))
 }
@@ -4076,6 +4440,20 @@ fn code_self(args: &[Object]) -> Result<Rc<weavepy_compiler::CodeObject>, Runtim
 /// lands (RFC 0033 follow-up).
 fn code_co_positions(args: &[Object]) -> Result<Object, RuntimeError> {
     let c = code_self(args)?;
+    // A pinned raw linetable (RFC 0060 `replace(co_linetable=…)`) is the
+    // sole source of location info: decode its entries directly (an empty
+    // table yields an empty iterator, test_co_positions_empty_linetable).
+    if let Some(t) = c.wire.as_ref().and_then(|w| w.co_linetable.as_deref()) {
+        let first = c.linetable.iter().copied().find(|l| *l > 0).unwrap_or(1);
+        let items = decode_compact_linetable(t, first)
+            .into_iter()
+            .map(|line| {
+                let l = line.map_or(Object::None, |v| Object::Int(i64::from(v)));
+                Object::new_tuple(vec![l.clone(), l, Object::None, Object::None])
+            })
+            .collect();
+        return list_iter(items);
+    }
     let cp = c.to_cpython();
     let debug_ranges = crate::vm_singletons::debug_ranges();
     let col = |v: Option<u32>| {
@@ -4094,9 +4472,13 @@ fn code_co_positions(args: &[Object]) -> Result<Object, RuntimeError> {
         .iter()
         .map(|p| {
             // A NO_LOCATION unit (lineno 0) reports all-None (PEP 657).
+            // With debug ranges disabled only start lines survive, so
+            // end_line collapses onto line (CPython stores no
+            // end-position table; test_endline_and_columntable_none_…).
+            let end_lineno = if debug_ranges { p.end_lineno } else { p.lineno };
             Object::new_tuple(vec![
                 line(p.lineno),
-                line(p.end_lineno),
+                line(end_lineno),
                 col(p.col),
                 col(p.end_col),
             ])
@@ -4166,14 +4548,30 @@ fn code_lnotab_bytes(c: &Rc<weavepy_compiler::CodeObject>) -> Vec<u8> {
 /// merging consecutive code units that share a line.
 fn code_co_lines(args: &[Object]) -> Result<Object, RuntimeError> {
     let c = code_self(args)?;
-    let cp = c.to_cpython();
-    let n = cp.positions.len();
+    // Pinned raw linetable (RFC 0060): its entries are the whole story —
+    // an empty table means no line info at all (test_empty_linetable).
+    let pinned: Option<Vec<i32>> =
+        c.wire
+            .as_ref()
+            .and_then(|w| w.co_linetable.as_deref())
+            .map(|t| {
+                let first = c.linetable.iter().copied().find(|l| *l > 0).unwrap_or(1);
+                decode_compact_linetable(t, first)
+                    .into_iter()
+                    .map(|l| l.map_or(0i32, |v| v as i32))
+                    .collect()
+            });
+    let lines: Vec<i32> = match pinned {
+        Some(v) => v,
+        None => c.to_cpython().positions.iter().map(|p| p.lineno).collect(),
+    };
+    let n = lines.len();
     let mut out = Vec::new();
     let mut i = 0;
     while i < n {
-        let line = cp.positions[i].lineno;
+        let line = lines[i];
         let start = i;
-        while i < n && cp.positions[i].lineno == line {
+        while i < n && lines[i] == line {
             i += 1;
         }
         out.push(Object::new_tuple(vec![
@@ -4262,12 +4660,19 @@ pub(crate) fn code_flags(c: &weavepy_compiler::CodeObject) -> u32 {
     const CO_NEWLOCALS: u32 = 0x0002;
     const CO_VARARGS: u32 = 0x0004;
     const CO_VARKEYWORDS: u32 = 0x0008;
+    const CO_NESTED: u32 = 0x0010;
     const CO_GENERATOR: u32 = 0x0020;
-    const CO_NOFREE: u32 = 0x0040;
     const CO_COROUTINE: u32 = 0x0080;
     const CO_ITERABLE_COROUTINE: u32 = 0x0100;
     const CO_ASYNC_GENERATOR: u32 = 0x0200;
     let mut f = CO_OPTIMIZED | CO_NEWLOCALS;
+    // CO_NESTED marks code compiled inside a function scope. The
+    // qualname records exactly that nesting ("outer.<locals>.inner",
+    // PEP 3155), so it is the compile-time signal we retained.
+    // (CPython 3.13 no longer sets CO_NOFREE — the 0x40 bit is dead.)
+    if c.qualname.contains("<locals>.") {
+        f |= CO_NESTED;
+    }
     if c.has_varargs {
         f |= CO_VARARGS;
     }
@@ -4285,9 +4690,6 @@ pub(crate) fn code_flags(c: &weavepy_compiler::CodeObject) -> u32 {
     }
     if c.is_async_generator {
         f |= CO_ASYNC_GENERATOR;
-    }
-    if c.freevars.is_empty() && c.cellvars.is_empty() {
-        f |= CO_NOFREE;
     }
     // `CO_FUTURE_*` bits recorded at compile time (RFC 0052) — what
     // lets `compile(..., dont_inherit=False)` inherit the caller's
@@ -6663,6 +7065,26 @@ pub(crate) fn validate_open_mode(mode: &str) -> Result<bool, RuntimeError> {
     Ok(binary)
 }
 
+/// Fire the PEP 578 `open(path, mode, flags)` event with FileIO's
+/// audit shape: the mode keeps only `x`/`r`/`w`/`a`/`+` (FileIO is
+/// always binary, so `'b'`/`'t'` never appear), and `path` is the
+/// object as passed (an `int` for the fd form).
+pub(crate) fn audit_open_event(file: &Object, mode: &str) -> Result<(), RuntimeError> {
+    if !crate::trace::any_audit_active() {
+        return Ok(());
+    }
+    let mut audit_mode = String::new();
+    for ch in ['x', 'r', 'w', 'a', '+'] {
+        if mode.contains(ch) {
+            audit_mode.push(ch);
+        }
+    }
+    crate::stdlib::sys::audit_event(
+        "open",
+        &[file.clone(), Object::from_str(audit_mode), Object::Int(0)],
+    )
+}
+
 pub(crate) fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
     use crate::object::{FileBackend, PyFile};
     use std::fs::OpenOptions;
@@ -6689,6 +7111,11 @@ pub(crate) fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(_) => true,
     };
     let is_fd = matches!(&args[0], Object::Int(_) | Object::Bool(_));
+    // PEP 578 — the `open` event fires from `FileIO.__init__` in
+    // CPython, before any syscall (including the fstat of an adopted
+    // fd) and before the `closefd` check, with FileIO's own mode
+    // string (no 'b'/'t': `open(x, "rb")` audits mode "r").
+    audit_open_event(&args[0], &mode)?;
     if !closefd && !is_fd {
         return Err(value_error("Cannot use closefd=False with file name"));
     }
@@ -7939,6 +8366,21 @@ pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
     use std::collections::BTreeSet;
     let mut names: BTreeSet<String> = BTreeSet::new();
     let obj = one(args, "dir")?;
+    // Set when `getattr(obj, '__class__')` would fail — an *unset*
+    // `__class__` slot (`__slots__ = ['__class__', …]`) hides the type
+    // from `object.__dir__` entirely (test_builtin test_dir).
+    let mut class_hidden = false;
+    // CPython's traceback type has its own `tb_dir`: exactly the four
+    // `tb_*` getsets, no object dunders (test_builtin test_dir asserts
+    // `len(dir(tb)) == 4`).
+    if matches!(obj, Object::Traceback(_)) {
+        return Ok(Object::new_list(
+            ["tb_frame", "tb_lasti", "tb_lineno", "tb_next"]
+                .into_iter()
+                .map(Object::from_static)
+                .collect(),
+        ));
+    }
     match obj {
         Object::Instance(inst) => {
             for k in inst.dict.borrow().keys() {
@@ -7946,10 +8388,16 @@ pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
                     names.insert(s.to_string());
                 }
             }
-            for t in inst.cls().mro.borrow().iter() {
-                for k in t.dict.borrow().keys() {
-                    if let Object::Str(s) = &k.0 {
-                        names.insert(s.to_string());
+            class_hidden = matches!(
+                inst.cls().lookup("__class__"),
+                Some(Object::SlotDescriptor(_))
+            ) && inst.slot_get("__class__").is_none();
+            if !class_hidden {
+                for t in inst.cls().mro.borrow().iter() {
+                    for k in t.dict.borrow().keys() {
+                        if let Object::Str(s) = &k.0 {
+                            names.insert(s.to_string());
+                        }
                     }
                 }
             }
@@ -8163,7 +8611,7 @@ pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
     // lookup rather than storing in the type dict. Every non-module
     // `dir()` walks an MRO ending at `object`, so CPython always lists
     // these (test_descrtut tut3 checks `dir(list)` verbatim).
-    if !matches!(obj, Object::Module(_)) {
+    if !matches!(obj, Object::Module(_)) && !class_hidden {
         for n in [
             "__class__",
             "__dir__",
@@ -8266,10 +8714,21 @@ fn b_chr(args: &[Object]) -> Result<Object, RuntimeError> {
             // a `WStr` for the surrogate range and a plain `Str` otherwise.
             Ok(Object::str_from_codepoints(vec![n]))
         }
+        // A bignum is out of chr's range by construction (`Long` never
+        // demotes when it fits i64): CPython 3.13 reports *ValueError*
+        // for any out-of-range int, however wide (test_builtin test_chr,
+        // `chr(2**1000)`).
+        Object::Long(_) => Err(value_error("chr() arg not in range(0x110000)")),
         // Anything with `__index__` (bool, numpy integer scalars — pandas'
         // merge code does `chr(ord("a") + np.int64(i))`); CPython parses the
         // argument with the `i` converter, which coerces via `__index__`.
-        other => b_chr(&[Object::Int(coerce_index_i64(other)?)]),
+        other => match coerce_index_i64(other) {
+            Ok(n) => b_chr(&[Object::Int(n)]),
+            Err(RuntimeError::PyException(e)) if e.type_name() == "OverflowError" => {
+                Err(value_error("chr() arg not in range(0x110000)"))
+            }
+            Err(e) => Err(e),
+        },
     }
 }
 
@@ -8421,6 +8880,73 @@ pub fn vm_intrinsic(name: &str) -> Option<Object> {
 /// given, otherwise `base ** exp`. Mirrors CPython's three-arg
 /// `pow` including the negative-exponent + mod case (the modular
 /// inverse).
+/// Bind a builtin's positional-or-keyword parameters clinic-style:
+/// `names` in declaration order, kwargs matched by name, duplicates and
+/// unknown names rejected with CPython's messages.
+fn bind_named_args(
+    fname: &str,
+    names: &[&str],
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Vec<Option<Object>>, RuntimeError> {
+    if args.len() > names.len() {
+        return Err(type_error(format!(
+            "{fname}() takes at most {} arguments ({} given)",
+            names.len(),
+            args.len()
+        )));
+    }
+    let mut slots: Vec<Option<Object>> = vec![None; names.len()];
+    for (i, a) in args.iter().enumerate() {
+        slots[i] = Some(a.clone());
+    }
+    for (k, v) in kwargs {
+        match names.iter().position(|n| n == k) {
+            Some(i) => {
+                if slots[i].is_some() {
+                    return Err(type_error(format!(
+                        "argument for {fname}() given by name ('{k}') and position ({})",
+                        i + 1
+                    )));
+                }
+                slots[i] = Some(v.clone());
+            }
+            None => {
+                return Err(type_error(format!(
+                    "{fname}() got an unexpected keyword argument '{k}'"
+                )))
+            }
+        }
+    }
+    Ok(slots)
+}
+
+/// `pow(base, exp, mod=None)` with clinic keyword binding (test_builtin
+/// test_pow calls `pow(0, exp=0)`).
+pub(crate) fn b_pow_kw(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
+    let slots = bind_named_args("pow", &["base", "exp", "mod"], args, kwargs)?;
+    let mut bound: Vec<Object> = Vec::new();
+    let names = ["base", "exp"];
+    for (i, name) in names.iter().enumerate() {
+        match &slots[i] {
+            Some(v) => bound.push(v.clone()),
+            None => {
+                return Err(type_error(format!(
+                    "pow() missing required argument: '{name}' (pos {})",
+                    i + 1
+                )))
+            }
+        }
+    }
+    if let Some(m) = &slots[2] {
+        bound.push(m.clone());
+    }
+    b_pow(&bound)
+}
+
 pub(crate) fn b_pow(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() < 2 || args.len() > 3 {
         return Err(type_error("pow() takes 2 or 3 arguments"));
@@ -8842,6 +9368,28 @@ pub(crate) fn b_divmod(args: &[Object]) -> Result<Object, RuntimeError> {
     let q = crate::binary_op(&args[0], &args[1], weavepy_compiler::BinOpKind::FloorDiv)?;
     let r = crate::binary_op(&args[0], &args[1], weavepy_compiler::BinOpKind::Mod)?;
     Ok(Object::new_tuple(vec![q, r]))
+}
+
+/// `round(number, ndigits=None)` with clinic keyword binding
+/// (test_builtin test_round calls `round(number=-8.0, ndigits=-1)`).
+pub(crate) fn b_round_kw(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
+    let slots = bind_named_args("round", &["number", "ndigits"], args, kwargs)?;
+    let mut bound: Vec<Object> = Vec::new();
+    match &slots[0] {
+        Some(v) => bound.push(v.clone()),
+        None => {
+            return Err(type_error(
+                "round() missing required argument: 'number' (pos 1)",
+            ))
+        }
+    }
+    if let Some(nd) = &slots[1] {
+        bound.push(nd.clone());
+    }
+    b_round(&bound)
 }
 
 pub(crate) fn b_round(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -11045,7 +11593,15 @@ pub(crate) fn dict_insert(
     };
     match old {
         // Replaced natively — genuine equality, no Python needed.
-        Some(old) => Ok(Some(old)),
+        Some(old) => {
+            // A value replaced by a *different* object is an effective
+            // mutation (PEP 509 / builtins-watch); re-storing the identical
+            // object is not (test_dict_version.test_setitem_same_value).
+            if !old.is_same(&value) {
+                crate::object::dict_mutation_event(d);
+            }
+            Ok(Some(old))
+        }
         None if deferred => {
             // Appended while a stored key still needed a Python comparison:
             // undo the append (`insert` places new keys last) and redo on
@@ -11062,6 +11618,7 @@ pub(crate) fn dict_insert(
             // (the "keys changed during iteration" trip-wire). Value
             // overwrites (the `Some` arm above) intentionally don't.
             crate::object::dict_watch_bump(d);
+            crate::object::dict_mutation_event(d);
             Ok(None)
         }
     }
@@ -11086,6 +11643,7 @@ pub(crate) fn dict_remove(
     match removed? {
         Some(entry) => {
             crate::object::dict_watch_bump(d);
+            crate::object::dict_mutation_event(d);
             Ok(Some(entry))
         }
         None if deferred => crate::object::dict_reentrant_remove(d, key),
@@ -11268,6 +11826,7 @@ fn dict_clear(args: &[Object]) -> Result<Object, RuntimeError> {
     let evicted: Vec<(DictKey, Object)> = d.borrow_mut().drain(..).collect();
     if !evicted.is_empty() {
         crate::object::dict_watch_bump(&d);
+        crate::object::dict_mutation_event(&d);
     }
     for (k, v) in evicted {
         queue_removed(k.0);
@@ -11373,6 +11932,7 @@ fn dict_setdefault(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     if !existed {
         crate::object::dict_watch_bump(&d);
+        crate::object::dict_mutation_event(&d);
     }
     Ok(value)
 }
@@ -11574,6 +12134,7 @@ fn dict_popitem(args: &[Object]) -> Result<Object, RuntimeError> {
     let popped = d.borrow_mut().pop();
     if let Some((k, v)) = popped {
         crate::object::dict_watch_bump(&d);
+        crate::object::dict_mutation_event(&d);
         Ok(Object::new_tuple(vec![k.0, v]))
     } else {
         Err(key_error("popitem(): dictionary is empty"))
@@ -12424,7 +12985,9 @@ fn bytes_needle_guarded(args: &[Object], arg: &Object) -> Result<Vec<u8>, Runtim
 
 /// Export the receiver's buffer (when it is a bytearray) for the
 /// lifetime of the returned guard.
-fn bytearray_receiver_guard(args: &[Object]) -> Option<crate::object::ByteArrayExportGuard> {
+pub(crate) fn bytearray_receiver_guard(
+    args: &[Object],
+) -> Option<crate::object::ByteArrayExportGuard> {
     match args.first() {
         Some(Object::ByteArray(cell)) => {
             Some(crate::object::ByteArrayExportGuard::new(cell.clone()))
@@ -14252,6 +14815,87 @@ pub(crate) fn file_flush(args: &[Object]) -> Result<Object, RuntimeError> {
     // (`test_io.test_io_after_close`): flush after close raises `ValueError`.
     file_check_open(&f)?;
     f.flush()?;
+    Ok(Object::None)
+}
+
+/// `TextIOWrapper.reconfigure(*, encoding, errors, newline, line_buffering,
+/// write_through)` on the collapsed native text stream. CPython semantics
+/// (`_pyio.TextIOWrapper.reconfigure`): an *absent* parameter keeps the
+/// current setting; `encoding=None` / `errors=None` also mean "unchanged"
+/// (except `errors` resets to `'strict'` when a new encoding arrives
+/// without one); an *explicit* `newline=None` selects universal-newline
+/// mode. The stdio streams are native `Object::File`s, and CPython's
+/// regrtest reconfigures them at startup
+/// (`sys.stdout.reconfigure(errors="backslashreplace")`).
+pub(crate) fn file_reconfigure(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
+    let f = file_self(args)?;
+    file_check_open(&f)?;
+    if args.len() > 1 {
+        return Err(type_error("reconfigure() takes 0 positional arguments"));
+    }
+    let as_opt_str = |k: &str, v: &Object| -> Result<Option<String>, RuntimeError> {
+        match v {
+            Object::None => Ok(None),
+            Object::Str(_) | Object::WStr(_) => Ok(Some(v.to_str())),
+            other => Err(type_error(format!(
+                "reconfigure() argument '{k}' must be str or None, not {}",
+                other.type_name_owned()
+            ))),
+        }
+    };
+    let mut encoding: Option<String> = None;
+    let mut errors: Option<String> = None;
+    let mut newline: Option<Option<String>> = None;
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "encoding" => encoding = as_opt_str(k, v)?,
+            "errors" => errors = as_opt_str(k, v)?,
+            "newline" => {
+                let nl = as_opt_str(k, v)?;
+                if let Some(nl) = &nl {
+                    if !matches!(nl.as_str(), "" | "\n" | "\r" | "\r\n") {
+                        return Err(value_error(format!("illegal newline value: {nl:?}")));
+                    }
+                }
+                newline = Some(nl);
+            }
+            "line_buffering" | "write_through" => {
+                if !matches!(v, Object::None) {
+                    f.set_extra_attr(k, Object::Bool(v.is_truthy()));
+                }
+            }
+            other => {
+                return Err(type_error(format!(
+                    "reconfigure() got an unexpected keyword argument '{other}'"
+                )))
+            }
+        }
+    }
+    // CPython flushes pending output before switching the codec state.
+    f.flush()?;
+    if let Some(enc) = encoding {
+        // The 'locale' pseudo-encoding resolves to the current locale's
+        // codeset, like `open(..., encoding='locale')`.
+        let resolved = if enc.eq_ignore_ascii_case("locale") {
+            crate::stdlib::locale_mod::current_codeset()
+        } else {
+            enc
+        };
+        f.set_encoding(&resolved);
+        // A new encoding without an explicit handler resets to 'strict'.
+        if errors.is_none() {
+            errors = Some("strict".to_owned());
+        }
+    }
+    if let Some(err) = errors {
+        *f.errors.borrow_mut() = Some(err);
+    }
+    if let Some(nl) = newline {
+        *f.newline.borrow_mut() = nl;
+    }
     Ok(Object::None)
 }
 

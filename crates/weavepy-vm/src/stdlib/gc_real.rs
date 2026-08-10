@@ -276,6 +276,11 @@ fn isenabled(_args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn get_objects(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let gen = generation_arg(args, kwargs)?;
+    // PEP 578: audits with the requested generation (None for all).
+    crate::stdlib::sys::audit_event(
+        "gc.get_objects",
+        &[gen.map_or(Object::None, |g| Object::Int(g as i64))],
+    )?;
     let objs = gc_trace::with_state(|s| s.snapshot(gen));
     // Deliberately *not* GC-tracked: the result is a transient snapshot, and
     // tracking it would let a previous call's leaked list show up in the next
@@ -285,15 +290,29 @@ fn get_objects(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, R
 }
 
 fn get_referrers(args: &[Object]) -> Result<Object, RuntimeError> {
+    crate::stdlib::sys::audit_event("gc.get_referrers", args)?;
     if args.is_empty() {
         return Ok(Object::new_list(Vec::new()));
     }
     let target_ids: Vec<_> = args.iter().map(id_of).collect();
     let mut referrers: Vec<Object> = Vec::new();
-    let snapshot = gc_trace::with_state(|s| s.snapshot(None));
+    let mut snapshot = gc_trace::with_state(|s| s.snapshot(None));
+    // CPython candidates include class `__dict__` objects (real dicts,
+    // referenced by their type via `tp_dict`). The collector's edge
+    // model flattens them into the type, so surface them here — trace's
+    // `file_module_function_of` walks code → function → class dict →
+    // class through `get_referrers` to recover a method's class name.
+    let extra: Vec<Object> = snapshot
+        .iter()
+        .filter_map(|c| match c {
+            Object::Type(t) => Some(Object::Dict(t.dict.clone())),
+            _ => None,
+        })
+        .collect();
+    snapshot.extend(extra);
     for candidate in snapshot {
         let mut hits = false;
-        gc_trace::traverse_object(&candidate, &mut |child| {
+        referrer_edges(&candidate, &mut |child| {
             if target_ids.iter().any(|t| *t == id_of(child)) {
                 hits = true;
             }
@@ -305,7 +324,21 @@ fn get_referrers(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::new_list(referrers))
 }
 
+/// The child edges `get_referrers` reports, following CPython's
+/// `tp_traverse` shape where it differs from the collector's model:
+/// `func_traverse` visits `func_code`, and `type_traverse` visits the
+/// `tp_dict` *object* (not its flattened contents).
+fn referrer_edges(obj: &Object, visit: &mut dyn FnMut(&Object)) {
+    gc_trace::traverse_object(obj, visit);
+    match obj {
+        Object::Function(f) => visit(&Object::Code(f.code.borrow().clone())),
+        Object::Type(t) => visit(&Object::Dict(t.dict.clone())),
+        _ => {}
+    }
+}
+
 fn get_referents(args: &[Object]) -> Result<Object, RuntimeError> {
+    crate::stdlib::sys::audit_event("gc.get_referents", args)?;
     let mut out: Vec<Object> = Vec::new();
     for arg in args {
         gc_trace::traverse_object(arg, &mut |child| out.push(child.clone()));

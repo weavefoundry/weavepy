@@ -7,9 +7,19 @@
 //! `marshal.dumps(...)` followed by `marshal.loads(...)` round-trips
 //! Python values cleanly.
 //!
+//! RFC 0060 brought the surface to CPython parity:
+//! * `version` argument (versions ≥ 3 share repeated objects through
+//!   `FLAG_REF`/`TYPE_REF`, which also makes recursive containers
+//!   marshallable);
+//! * `allow_code=` keyword on all four entry points;
+//! * interned strings round-trip their identity;
+//! * buffer-protocol inputs (memoryview, array) dump as bytes;
+//! * `load(f)` reads incrementally through `readinto`/`read`, leaving
+//!   the file position exactly past the value.
+//!
 //! Surface:
-//! * `dump(value, file)` / `dumps(value)` — serialise.
-//! * `load(file)` / `loads(bytes)` — deserialise.
+//! * `dump(value, file[, version])` / `dumps(value[, version])`.
+//! * `load(file)` / `loads(bytes)`.
 //! * `version` — the protocol version; always 4 for now.
 
 use crate::sync::Rc;
@@ -37,12 +47,10 @@ const CO_COROUTINE: u32 = 0x0080;
 const CO_ITERABLE_COROUTINE: u32 = 0x0100;
 const CO_ASYNC_GENERATOR: u32 = 0x0200;
 
-#[allow(dead_code)]
 const TYPE_NULL: u8 = b'0';
 const TYPE_NONE: u8 = b'N';
 const TYPE_FALSE: u8 = b'F';
 const TYPE_TRUE: u8 = b'T';
-#[allow(dead_code)]
 const TYPE_STOPITER: u8 = b'S';
 const TYPE_ELLIPSIS: u8 = b'.';
 const TYPE_INT: u8 = b'i';
@@ -56,12 +64,10 @@ const TYPE_BINARY_COMPLEX: u8 = b'y';
 const TYPE_LONG: u8 = b'l';
 const TYPE_STRING: u8 = b's';
 const TYPE_INTERNED: u8 = b't';
-#[allow(dead_code)]
 const TYPE_REF: u8 = b'r';
 const TYPE_TUPLE: u8 = b'(';
 const TYPE_LIST: u8 = b'[';
 const TYPE_DICT: u8 = b'{';
-#[allow(dead_code)]
 const TYPE_CODE: u8 = b'c';
 const TYPE_UNICODE: u8 = b'u';
 #[allow(dead_code)]
@@ -76,6 +82,9 @@ const TYPE_SHORT_ASCII_INTERNED: u8 = b'Z';
 
 const FLAG_REF: u8 = 0x80;
 
+/// The version WeavePy writes by default (CPython 3.4+).
+const MARSHAL_VERSION: i64 = 4;
+
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     let dict = Rc::new(RefCell::new(DictData::default()));
     {
@@ -88,11 +97,14 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("__doc__")),
             Object::from_static("Read and write WeavePy values in binary format."),
         );
-        d.insert(DictKey(Object::from_static("version")), Object::Int(4));
-        register(&mut d, "dumps", b_dumps);
-        register(&mut d, "loads", b_loads);
-        register(&mut d, "dump", b_dump);
-        register(&mut d, "load", b_load);
+        d.insert(
+            DictKey(Object::from_static("version")),
+            Object::Int(MARSHAL_VERSION),
+        );
+        register(&mut d, "dumps", dumps_kw);
+        register(&mut d, "loads", loads_kw);
+        register(&mut d, "dump", dump_kw);
+        register(&mut d, "load", load_kw);
     }
     Rc::new(PyModule {
         name: "marshal".to_owned(),
@@ -104,13 +116,13 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 fn register(
     d: &mut DictData,
     name: &'static str,
-    body: impl Fn(&[Object]) -> Result<Object, RuntimeError> + Send + Sync + 'static,
+    body: fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError>,
 ) {
     let bf = BuiltinFn {
         name,
         binds_instance: false,
-        call: Box::new(body),
-        call_kw: None,
+        call: Box::new(move |args| body(args, &[])),
+        call_kw: Some(Box::new(body)),
     };
     d.insert(
         DictKey(Object::from_static(name)),
@@ -120,52 +132,110 @@ fn register(
 
 // ---------- public API ----------
 
-pub fn b_dumps(args: &[Object]) -> Result<Object, RuntimeError> {
+/// The `allow_code=` keyword shared by all four entry points; any other
+/// keyword raises `TypeError` like CPython's argument clinic.
+fn allow_code_kw(kwargs: &[(String, Object)], who: &str) -> Result<bool, RuntimeError> {
+    let mut allow = true;
+    for (k, v) in kwargs {
+        if k == "allow_code" {
+            allow = v.is_truthy();
+        } else {
+            return Err(type_error(format!(
+                "{who}() got an unexpected keyword argument '{k}'"
+            )));
+        }
+    }
+    Ok(allow)
+}
+
+/// The optional positional `version` argument of `dump`/`dumps`.
+fn version_arg(arg: Option<&Object>) -> Result<i64, RuntimeError> {
+    match arg {
+        None | Some(Object::None) => Ok(MARSHAL_VERSION),
+        Some(Object::Int(v)) => Ok(*v),
+        Some(Object::Bool(b)) => Ok(i64::from(*b)),
+        Some(other) => Err(type_error(format!(
+            "marshal version must be int, not {}",
+            other.type_name()
+        ))),
+    }
+}
+
+fn dumps_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let value = args
         .first()
         .ok_or_else(|| type_error("dumps requires a value"))?;
-    let mut writer = MarshalWriter::default();
+    let version = version_arg(args.get(1))?;
+    crate::stdlib::sys::audit_event("marshal.dumps", &[value.clone(), Object::Int(version)])?;
+    let allow_code = allow_code_kw(kwargs, "dumps")?;
+    let mut writer = MarshalWriter::new(version, allow_code);
     writer.write_value(value)?;
     Ok(Object::new_bytes(writer.into_bytes()))
 }
 
-pub fn b_loads(args: &[Object]) -> Result<Object, RuntimeError> {
+fn loads_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let bytes = args
         .first()
         .and_then(|o| o.as_bytes_view())
         .ok_or_else(|| type_error("loads requires bytes-like"))?;
-    let mut reader = MarshalReader::new(&bytes);
+    crate::stdlib::sys::audit_event(
+        "marshal.loads",
+        std::slice::from_ref(args.first().expect("checked above")),
+    )?;
+    let allow_code = allow_code_kw(kwargs, "loads")?;
+    let mut reader = MarshalReader::from_bytes(&bytes, allow_code);
     reader.read_value()
 }
 
-fn b_dump(args: &[Object]) -> Result<Object, RuntimeError> {
+fn dump_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     if args.len() < 2 {
         return Err(type_error("dump() requires (value, file)"));
     }
-    let bytes = b_dumps(&args[..1])?;
-    let data = match &bytes {
-        Object::Bytes(b) => b.to_vec(),
-        _ => unreachable!(),
-    };
+    let version = version_arg(args.get(2))?;
+    crate::stdlib::sys::audit_event("marshal.dumps", &[args[0].clone(), Object::Int(version)])?;
+    let allow_code = allow_code_kw(kwargs, "dump")?;
+    let mut writer = MarshalWriter::new(version, allow_code);
+    writer.write_value(&args[0])?;
+    let data = writer.into_bytes();
     match &args[1] {
         Object::File(f) => {
             f.write_bytes(&data)?;
             Ok(Object::None)
         }
-        _ => Err(type_error("dump() expected a file-like object")),
+        // Any file-like object: route through its `write` method (the
+        // usual case is an `io.BytesIO`, test_no_allow_code).
+        other => {
+            let ptr = crate::vm_singletons::current_interpreter_ptr()
+                .ok_or_else(|| type_error("dump() expected a file-like object"))?;
+            let vm = unsafe { &mut *ptr };
+            let write = vm
+                .load_attr_public(other, "write")
+                .map_err(|_| type_error("marshal.dump() 2nd arg must have a write() method"))?;
+            vm.call_object(write, &[Object::new_bytes(data)], &[])?;
+            Ok(Object::None)
+        }
     }
 }
 
-fn b_load(args: &[Object]) -> Result<Object, RuntimeError> {
+fn load_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let f = args
         .first()
         .ok_or_else(|| type_error("load() requires a file"))?;
-    let bytes = match f {
-        Object::File(file) => file.read_bytes(None)?,
-        _ => return Err(type_error("load() expected a file-like object")),
-    };
-    let mut reader = MarshalReader::new(&bytes);
+    crate::stdlib::sys::audit_event("marshal.load", &[])?;
+    let allow_code = allow_code_kw(kwargs, "load")?;
+    let mut reader = MarshalReader::from_file(f.clone(), allow_code)?;
     reader.read_value()
+}
+
+/// Args-only entry kept for internal callers (`pycache`, frozen-code
+/// cache). Writes the default version-4 form.
+pub fn b_dumps(args: &[Object]) -> Result<Object, RuntimeError> {
+    dumps_kw(args, &[])
+}
+
+/// Args-only entry kept for internal callers.
+pub fn b_loads(args: &[Object]) -> Result<Object, RuntimeError> {
+    loads_kw(args, &[])
 }
 
 // ---------- writer ----------
@@ -177,13 +247,37 @@ fn b_load(args: &[Object]) -> Result<Object, RuntimeError> {
 /// (test_marshal `test_recursion_limit` / `test_loads_recursion`).
 const MAX_MARSHAL_STACK_DEPTH: usize = 2000;
 
-#[derive(Default)]
 struct MarshalWriter {
     buf: Vec<u8>,
     depth: usize,
+    version: i64,
+    allow_code: bool,
+    /// version ≥ 3: identity (`id()`) of every object already written,
+    /// mapped to its index in the reader's reference vector. A repeat
+    /// occurrence is written as `TYPE_REF idx` — this is what makes
+    /// recursive containers marshallable and preserves aliasing
+    /// (test_marshal.InstancingTestCase).
+    refs: std::collections::HashMap<u64, u32>,
+    /// Strong clones of every ref-registered object. Identity is the
+    /// allocation address, so a registered temporary (e.g. the tuples
+    /// `write_code` synthesizes) must stay alive for the whole dump or
+    /// a later allocation could reuse its address and produce a bogus
+    /// `TYPE_REF`.
+    keepalive: Vec<Object>,
 }
 
 impl MarshalWriter {
+    fn new(version: i64, allow_code: bool) -> Self {
+        Self {
+            buf: Vec::new(),
+            depth: 0,
+            version,
+            allow_code,
+            refs: std::collections::HashMap::new(),
+            keepalive: Vec::new(),
+        }
+    }
+
     fn into_bytes(self) -> Vec<u8> {
         self.buf
     }
@@ -196,11 +290,6 @@ impl MarshalWriter {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
 
-    #[allow(dead_code)]
-    fn write_long(&mut self, v: i64) {
-        self.buf.extend_from_slice(&v.to_le_bytes());
-    }
-
     fn write_value(&mut self, value: &Object) -> Result<(), RuntimeError> {
         // CPython `w_object`: depth-guard every value, containers included.
         self.depth += 1;
@@ -208,46 +297,122 @@ impl MarshalWriter {
             self.depth -= 1;
             return Err(value_error("object too deeply nested to marshal"));
         }
-        let r = self.write_value_inner(value);
+        let r = self.write_dispatch(value);
         self.depth -= 1;
         r
     }
 
-    fn write_value_inner(&mut self, value: &Object) -> Result<(), RuntimeError> {
+    fn write_dispatch(&mut self, value: &Object) -> Result<(), RuntimeError> {
+        // Singletons sit outside the ref machinery (CPython `w_object`).
         match value {
-            Object::None => self.write_byte(TYPE_NONE),
-            Object::Bool(b) => self.write_byte(if *b { TYPE_TRUE } else { TYPE_FALSE }),
+            Object::None => {
+                self.write_byte(TYPE_NONE);
+                return Ok(());
+            }
+            Object::Bool(b) => {
+                self.write_byte(if *b { TYPE_TRUE } else { TYPE_FALSE });
+                return Ok(());
+            }
+            // The `StopIteration` *type* has its own wire code (CPython
+            // uses it for the StopIteration ⇄ generator protocol;
+            // test_marshal.ExceptionTestCase).
+            Object::Type(t)
+                if Rc::ptr_eq(t, &crate::builtin_types::builtin_types().stop_iteration) =>
+            {
+                self.write_byte(TYPE_STOPITER);
+                return Ok(());
+            }
+            // `Ellipsis` (the value of `...`) is a singleton instance of
+            // the registry `ellipsis` type.
+            Object::Instance(inst)
+                if Rc::ptr_eq(
+                    &inst.cls(),
+                    &crate::builtin_types::builtin_types().ellipsis_,
+                ) =>
+            {
+                self.write_byte(TYPE_ELLIPSIS);
+                return Ok(());
+            }
+            _ => {}
+        }
+        let mut flag = 0u8;
+        if self.version >= 3 {
+            let id = crate::weakref_registry::id_of(value);
+            if let Some(&idx) = self.refs.get(&id) {
+                self.write_byte(TYPE_REF);
+                self.write_int(idx as i32);
+                return Ok(());
+            }
+            // Register *before* the children are written so a recursive
+            // container resolves to itself (CPython `w_ref`).
+            let idx = self.refs.len() as u32;
+            self.refs.insert(id, idx);
+            self.keepalive.push(value.clone());
+            flag = FLAG_REF;
+        }
+        self.write_body(value, flag)
+    }
+
+    fn write_body(&mut self, value: &Object, flag: u8) -> Result<(), RuntimeError> {
+        match value {
             Object::Int(i) => {
                 if let Ok(small) = i32::try_from(*i) {
-                    self.write_byte(TYPE_INT);
+                    self.write_byte(TYPE_INT | flag);
                     self.write_int(small);
                 } else {
-                    self.write_long_object(&BigInt::from(*i))?;
+                    self.write_long_object(&BigInt::from(*i), flag)?;
                 }
             }
-            Object::Long(b) => self.write_long_object(b)?,
+            Object::Long(b) => self.write_long_object(b, flag)?,
             Object::Float(f) => {
-                self.write_byte(TYPE_BINARY_FLOAT);
+                self.write_byte(TYPE_BINARY_FLOAT | flag);
                 // Canonical NaN bits on the wire — never WeavePy's identity
                 // tag (see `untag_nan`).
                 self.buf
                     .extend_from_slice(&crate::object::untag_nan(*f).to_le_bytes());
             }
             Object::Complex(c) => {
-                self.write_byte(TYPE_BINARY_COMPLEX);
+                self.write_byte(TYPE_BINARY_COMPLEX | flag);
                 self.buf
                     .extend_from_slice(&crate::object::untag_nan(c.real).to_le_bytes());
                 self.buf
                     .extend_from_slice(&crate::object::untag_nan(c.imag).to_le_bytes());
             }
             Object::Str(s) => {
+                // `sys.intern`ed strings keep their pooled identity across
+                // the round-trip via the `*_INTERNED` codes — version ≥ 3
+                // only, like CPython (testNoIntern dumps with version 2
+                // and expects a fresh instance back).
+                let interned = self.version >= 3 && crate::stdlib::sys::str_is_interned(value);
                 let bytes = s.as_bytes();
                 if bytes.is_ascii() && bytes.len() <= 255 {
-                    self.write_byte(TYPE_SHORT_ASCII);
+                    self.write_byte(
+                        if interned {
+                            TYPE_SHORT_ASCII_INTERNED
+                        } else {
+                            TYPE_SHORT_ASCII
+                        } | flag,
+                    );
                     self.buf.push(bytes.len() as u8);
                     self.buf.extend_from_slice(bytes);
+                } else if bytes.is_ascii() {
+                    self.write_byte(
+                        if interned {
+                            TYPE_ASCII_INTERNED
+                        } else {
+                            TYPE_ASCII
+                        } | flag,
+                    );
+                    self.write_int(bytes.len() as i32);
+                    self.buf.extend_from_slice(bytes);
                 } else {
-                    self.write_byte(TYPE_UNICODE);
+                    self.write_byte(
+                        if interned {
+                            TYPE_INTERNED
+                        } else {
+                            TYPE_UNICODE
+                        } | flag,
+                    );
                     self.write_int(bytes.len() as i32);
                     self.buf.extend_from_slice(bytes);
                 }
@@ -258,27 +423,36 @@ impl MarshalWriter {
                 // round-trip via `TYPE_UNICODE` (RFC 0033 parity).
                 let bytes =
                     crate::stdlib::codecs_mod::encode_codepoints(cps, "utf-8", "surrogatepass")?;
-                self.write_byte(TYPE_UNICODE);
+                self.write_byte(TYPE_UNICODE | flag);
                 self.write_int(bytes.len() as i32);
                 self.buf.extend_from_slice(&bytes);
             }
             Object::Bytes(data) => {
-                self.write_byte(TYPE_STRING);
+                self.write_byte(TYPE_STRING | flag);
                 self.write_int(data.len() as i32);
                 self.buf.extend_from_slice(data);
             }
             Object::ByteArray(data) => {
                 let bytes = data.borrow();
-                self.write_byte(TYPE_STRING);
+                self.write_byte(TYPE_STRING | flag);
+                self.write_int(bytes.len() as i32);
+                self.buf.extend_from_slice(&bytes);
+            }
+            // Buffer-protocol values (memoryview, array.array, …) dump as
+            // plain bytes, exactly like CPython's `w_object` buffer branch
+            // (test_marshal.BufferTestCase).
+            Object::MemoryView(mv) => {
+                let bytes = mv.to_bytes();
+                self.write_byte(TYPE_STRING | flag);
                 self.write_int(bytes.len() as i32);
                 self.buf.extend_from_slice(&bytes);
             }
             Object::Tuple(items) => {
                 if items.len() < 256 {
-                    self.write_byte(TYPE_SMALL_TUPLE);
+                    self.write_byte(TYPE_SMALL_TUPLE | flag);
                     self.buf.push(items.len() as u8);
                 } else {
-                    self.write_byte(TYPE_TUPLE);
+                    self.write_byte(TYPE_TUPLE | flag);
                     self.write_int(items.len() as i32);
                 }
                 for item in items.iter() {
@@ -287,14 +461,14 @@ impl MarshalWriter {
             }
             Object::List(items) => {
                 let items = items.borrow();
-                self.write_byte(TYPE_LIST);
+                self.write_byte(TYPE_LIST | flag);
                 self.write_int(items.len() as i32);
                 for item in items.iter() {
                     self.write_value(item)?;
                 }
             }
             Object::Dict(d) => {
-                self.write_byte(TYPE_DICT);
+                self.write_byte(TYPE_DICT | flag);
                 let d = d.borrow();
                 for (k, v) in d.iter() {
                     self.write_value(&k.0)?;
@@ -304,40 +478,37 @@ impl MarshalWriter {
             }
             Object::Set(s) => {
                 let s = s.borrow();
-                self.write_byte(TYPE_SET);
+                self.write_byte(TYPE_SET | flag);
                 self.write_int(s.len() as i32);
                 for k in s.iter() {
                     self.write_value(&k.0)?;
                 }
             }
             Object::FrozenSet(s) => {
-                self.write_byte(TYPE_FROZENSET);
+                self.write_byte(TYPE_FROZENSET | flag);
                 self.write_int(s.len() as i32);
                 for k in s.iter() {
                     self.write_value(&k.0)?;
                 }
             }
             Object::Code(co) => {
-                self.write_code(co)?;
-            }
-            // `Ellipsis` (the value of `...`) is a singleton instance of the
-            // registry `ellipsis` type. CPython marshals it as `TYPE_ELLIPSIS`;
-            // it shows up as a code constant in any module using `...` (stub
-            // bodies, typing, the many `test` fixtures `PyZipFile.writepy`
-            // compiles). The load side already reconstructs the singleton.
-            Object::Instance(inst)
-                if Rc::ptr_eq(
-                    &inst.cls(),
-                    &crate::builtin_types::builtin_types().ellipsis_,
-                ) =>
-            {
-                self.write_byte(TYPE_ELLIPSIS);
+                if !self.allow_code {
+                    return Err(value_error("unmarshallable object"));
+                }
+                self.write_code(co, flag)?;
             }
             other => {
-                return Err(value_error(format!(
-                    "marshal: unsupported value type '{}'",
-                    other.type_name()
-                )));
+                // Last resort: an instance exporting the buffer protocol
+                // (PEP 688 `__buffer__`, e.g. `array.array`) dumps as bytes.
+                if let Some(bytes) = instance_buffer_bytes(other) {
+                    self.write_byte(TYPE_STRING | flag);
+                    self.write_int(bytes.len() as i32);
+                    self.buf.extend_from_slice(&bytes);
+                    return Ok(());
+                }
+                // CPython's exact wording (test_unmarshallable matches it).
+                let _ = other;
+                return Err(value_error("unmarshallable object"));
             }
         }
         Ok(())
@@ -351,8 +522,8 @@ impl MarshalWriter {
     /// 15-bit digits (`PyLong_MARSHAL_SHIFT`) followed by each digit as a
     /// little-endian `short`, least-significant first. Byte-compatible
     /// with CPython 3.13's `marshal` (RFC 0033).
-    fn write_long_object(&mut self, b: &BigInt) -> Result<(), RuntimeError> {
-        self.write_byte(TYPE_LONG);
+    fn write_long_object(&mut self, b: &BigInt, flag: u8) -> Result<(), RuntimeError> {
+        self.write_byte(TYPE_LONG | flag);
         let (signed_count, digits15) = bigint_to_15bit(b);
         self.write_int(signed_count);
         for d in digits15 {
@@ -366,9 +537,25 @@ impl MarshalWriter {
     /// re-expressed through the CPython codec so the container, the
     /// location/exception tables, and `co_localsplus*` all match what
     /// CPython would write (RFC 0033).
-    fn write_code(&mut self, co: &CodeObject) -> Result<(), RuntimeError> {
+    fn write_code(&mut self, co: &CodeObject, flag: u8) -> Result<(), RuntimeError> {
+        // A pool slot holding a value with no constant representation
+        // (`code.replace(co_consts=(frozenset({int}),))`) marks the code
+        // object unmarshallable, like CPython's `w_object` failing on
+        // the underlying value (gh-106287).
+        fn has_unmarshallable(consts: &[weavepy_compiler::Constant]) -> bool {
+            use weavepy_compiler::Constant;
+            consts.iter().any(|c| match c {
+                Constant::Unmarshallable => true,
+                Constant::Tuple(xs) | Constant::FrozenSet(xs) => has_unmarshallable(xs),
+                Constant::Code(inner) => has_unmarshallable(&inner.constants),
+                _ => false,
+            })
+        }
+        if has_unmarshallable(&co.constants) {
+            return Err(value_error("unmarshallable object"));
+        }
         let cp = co.to_cpython();
-        self.write_byte(TYPE_CODE);
+        self.write_byte(TYPE_CODE | flag);
         self.write_int(co.arg_count as i32);
         self.write_int(co.posonly_count as i32);
         self.write_int(co.kwonly_count as i32);
@@ -395,6 +582,22 @@ impl MarshalWriter {
         self.write_value(&Object::new_bytes(cp.co_linetable.clone()))?;
         self.write_value(&Object::new_bytes(cp.co_exceptiontable.clone()))?;
         Ok(())
+    }
+}
+
+/// Buffer-protocol bytes of an arbitrary instance (PEP 688 `__buffer__`),
+/// through the live interpreter. `None` when the value has no buffer or
+/// no interpreter is active on this thread.
+fn instance_buffer_bytes(value: &Object) -> Option<Vec<u8>> {
+    if !matches!(value, Object::Instance(_)) {
+        return None;
+    }
+    let ptr = crate::vm_singletons::current_interpreter_ptr()?;
+    let vm = unsafe { &mut *ptr };
+    let globals = vm.builtins_dict();
+    match vm.memoryview_from_object_and_flags(value, 0x011C, &globals) {
+        Ok(Some(mv)) => mv.as_bytes_view(),
+        _ => None,
     }
 }
 
@@ -467,35 +670,66 @@ fn strs_to_tuple(items: &[String]) -> Object {
 
 // ---------- reader ----------
 
+/// Byte source for the reader: an in-memory buffer (`loads`, `.pyc`
+/// bodies) or a file-like object read incrementally through the
+/// interpreter (`load`), which leaves the stream position exactly past
+/// the value (test_multiple_dumps_and_loads).
+enum MarshalSrc<'a> {
+    Bytes {
+        bytes: &'a [u8],
+        pos: usize,
+    },
+    NativeFile {
+        file: Rc<PyFile>,
+    },
+    File {
+        file: Object,
+        readinto: Option<Object>,
+    },
+}
+
 struct MarshalReader<'a> {
-    bytes: &'a [u8],
-    pos: usize,
+    src: MarshalSrc<'a>,
     depth: usize,
+    allow_code: bool,
+    /// Objects registered by `FLAG_REF` in stream order; `None` marks a
+    /// reserved slot whose object is still being built (a `TYPE_REF`
+    /// into one is bad data).
+    refs: Vec<Option<Object>>,
 }
 
 impl<'a> MarshalReader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
+    fn from_bytes(bytes: &'a [u8], allow_code: bool) -> Self {
         Self {
-            bytes,
-            pos: 0,
+            src: MarshalSrc::Bytes { bytes, pos: 0 },
             depth: 0,
+            allow_code,
+            refs: Vec::new(),
         }
     }
 
-    fn read_byte(&mut self) -> Result<u8, RuntimeError> {
-        if self.pos >= self.bytes.len() {
-            // CPython `r_object`: EOF at an object boundary is
-            // EOFError, not ValueError (test_exceptions.testRaising).
-            return Err(RuntimeError::PyException(
-                crate::error::PyException::from_builtin(
-                    "EOFError",
-                    "EOF read where object expected",
-                ),
-            ));
-        }
-        let b = self.bytes[self.pos];
-        self.pos += 1;
-        Ok(b)
+    fn from_file(f: Object, allow_code: bool) -> Result<Self, RuntimeError> {
+        let src = match &f {
+            Object::File(file) => MarshalSrc::NativeFile { file: file.clone() },
+            other => {
+                // Prefer `readinto` — CPython's `r_string` does, and
+                // test_bad_reader instruments it to lie about the count.
+                let readinto = crate::vm_singletons::current_interpreter_ptr().and_then(|ptr| {
+                    let vm = unsafe { &mut *ptr };
+                    vm.load_attr_public(other, "readinto").ok()
+                });
+                MarshalSrc::File {
+                    file: f.clone(),
+                    readinto,
+                }
+            }
+        };
+        Ok(Self {
+            src,
+            depth: 0,
+            allow_code,
+            refs: Vec::new(),
+        })
     }
 
     /// CPython `marshal.c:r_string` raises EOFError("marshal data too
@@ -509,45 +743,132 @@ impl<'a> MarshalReader<'a> {
         ))
     }
 
-    fn read_int(&mut self) -> Result<i32, RuntimeError> {
-        if self.pos + 4 > self.bytes.len() {
-            return Err(Self::truncated_error());
+    /// Read exactly `n` bytes from the source. A stream that hands back
+    /// *more* than requested is corrupt (CPython raises ValueError,
+    /// test_bad_reader); one that hands back fewer is truncated.
+    fn take(&mut self, n: usize) -> Result<Vec<u8>, RuntimeError> {
+        match &mut self.src {
+            MarshalSrc::Bytes { bytes, pos } => {
+                if *pos + n > bytes.len() {
+                    return Err(Self::truncated_error());
+                }
+                let out = bytes[*pos..*pos + n].to_vec();
+                *pos += n;
+                Ok(out)
+            }
+            MarshalSrc::NativeFile { file } => {
+                let data = file.read_bytes(Some(n))?;
+                if data.len() < n {
+                    return Err(Self::truncated_error());
+                }
+                Ok(data)
+            }
+            MarshalSrc::File { file, readinto } => {
+                let ptr = crate::vm_singletons::current_interpreter_ptr()
+                    .ok_or_else(|| type_error("marshal.load() requires an active interpreter"))?;
+                let vm = unsafe { &mut *ptr };
+                if let Some(ri) = readinto.clone() {
+                    let ba = Rc::new(RefCell::new(vec![0u8; n]));
+                    let got = vm.call_object(ri, &[Object::ByteArray(ba.clone())], &[])?;
+                    let m = match got {
+                        Object::Int(m) if m >= 0 => m as usize,
+                        Object::None => 0,
+                        _ => return Err(value_error("readinto() returned an invalid length")),
+                    };
+                    if m > n {
+                        return Err(value_error("read() returned too much data"));
+                    }
+                    if m < n {
+                        return Err(Self::truncated_error());
+                    }
+                    return Ok(ba.borrow().clone());
+                }
+                let read = vm
+                    .load_attr_public(file, "read")
+                    .map_err(|_| type_error("marshal.load() arg must have a read() method"))?;
+                let data = vm.call_object(read, &[Object::Int(n as i64)], &[])?;
+                let bytes = data
+                    .as_bytes_view()
+                    .ok_or_else(|| type_error("read() returned non-bytes"))?;
+                if bytes.len() > n {
+                    return Err(value_error("read() returned too much data"));
+                }
+                if bytes.len() < n {
+                    return Err(Self::truncated_error());
+                }
+                Ok(bytes)
+            }
         }
-        let mut buf = [0u8; 4];
-        buf.copy_from_slice(&self.bytes[self.pos..self.pos + 4]);
-        self.pos += 4;
-        Ok(i32::from_le_bytes(buf))
+    }
+
+    fn read_byte(&mut self) -> Result<u8, RuntimeError> {
+        match self.take(1) {
+            Ok(b) => Ok(b[0]),
+            // EOF at an object boundary is EOFError with CPython's
+            // boundary message (test_exceptions.testRaising).
+            Err(_) => Err(RuntimeError::PyException(
+                crate::error::PyException::from_builtin(
+                    "EOFError",
+                    "EOF read where object expected",
+                ),
+            )),
+        }
+    }
+
+    fn read_int(&mut self) -> Result<i32, RuntimeError> {
+        let b = self.take(4)?;
+        Ok(i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
     fn read_long(&mut self) -> Result<i64, RuntimeError> {
-        if self.pos + 8 > self.bytes.len() {
-            return Err(Self::truncated_error());
-        }
+        let b = self.take(8)?;
         let mut buf = [0u8; 8];
-        buf.copy_from_slice(&self.bytes[self.pos..self.pos + 8]);
-        self.pos += 8;
+        buf.copy_from_slice(&b);
         Ok(i64::from_le_bytes(buf))
     }
 
     fn read_short(&mut self) -> Result<u16, RuntimeError> {
-        if self.pos + 2 > self.bytes.len() {
-            return Err(Self::truncated_error());
-        }
-        let v = u16::from_le_bytes([self.bytes[self.pos], self.bytes[self.pos + 1]]);
-        self.pos += 2;
-        Ok(v)
+        let b = self.take(2)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
     }
 
     fn read_n_bytes(&mut self, n: usize) -> Result<Vec<u8>, RuntimeError> {
-        if self.pos + n > self.bytes.len() {
-            return Err(Self::truncated_error());
-        }
-        let bytes = self.bytes[self.pos..self.pos + n].to_vec();
-        self.pos += n;
-        Ok(bytes)
+        self.take(n)
     }
 
     fn read_value(&mut self) -> Result<Object, RuntimeError> {
+        self.read_value_opt()?
+            .ok_or_else(|| value_error("bad marshal data (NULL object in marshal data)"))
+    }
+
+    /// Register `o` in the reference vector when its tag carried
+    /// `FLAG_REF`.
+    fn note_ref(&mut self, flag: bool, o: &Object) {
+        if flag {
+            self.refs.push(Some(o.clone()));
+        }
+    }
+
+    /// Reserve a reference slot (containers register *before* their
+    /// children so recursion resolves; tuples fill the slot after).
+    fn reserve_ref(&mut self, flag: bool) -> Option<usize> {
+        if flag {
+            self.refs.push(None);
+            Some(self.refs.len() - 1)
+        } else {
+            None
+        }
+    }
+
+    fn fill_ref(&mut self, idx: Option<usize>, o: &Object) {
+        if let Some(i) = idx {
+            self.refs[i] = Some(o.clone());
+        }
+    }
+
+    /// Read one value; `Ok(None)` is the `TYPE_NULL` sentinel that
+    /// terminates dict bodies.
+    fn read_value_opt(&mut self) -> Result<Option<Object>, RuntimeError> {
         // CPython `r_object`: depth-guard so malicious/deep input raises
         // instead of overflowing the native stack (test_loads_recursion).
         self.depth += 1;
@@ -560,29 +881,44 @@ impl<'a> MarshalReader<'a> {
         r
     }
 
-    fn read_value_inner(&mut self) -> Result<Object, RuntimeError> {
-        let tag = self.read_byte()?;
-        let tag = tag & !FLAG_REF;
-        match tag {
-            TYPE_NULL => Err(value_error("bad marshal data: NULL")),
-            TYPE_NONE => Ok(Object::None),
-            TYPE_TRUE => Ok(Object::Bool(true)),
-            TYPE_FALSE => Ok(Object::Bool(false)),
-            TYPE_ELLIPSIS => Ok(crate::vm_singletons::ellipsis()),
+    fn read_value_inner(&mut self) -> Result<Option<Object>, RuntimeError> {
+        let raw = self.read_byte()?;
+        let flag = raw & FLAG_REF != 0;
+        let tag = raw & !FLAG_REF;
+        let obj = match tag {
+            TYPE_NULL => return Ok(None),
+            TYPE_NONE => Object::None,
+            TYPE_TRUE => Object::Bool(true),
+            TYPE_FALSE => Object::Bool(false),
+            TYPE_ELLIPSIS => crate::vm_singletons::ellipsis(),
+            TYPE_STOPITER => {
+                Object::Type(crate::builtin_types::builtin_types().stop_iteration.clone())
+            }
+            TYPE_REF => {
+                let idx = self.read_int()?;
+                let resolved = usize::try_from(idx)
+                    .ok()
+                    .and_then(|i| self.refs.get(i).cloned())
+                    .flatten();
+                return match resolved {
+                    Some(o) => Ok(Some(o)),
+                    None => Err(value_error("bad marshal data (invalid reference)")),
+                };
+            }
             TYPE_INT => {
                 let v = self.read_int()?;
-                Ok(Object::Int(i64::from(v)))
+                Object::Int(i64::from(v))
             }
             TYPE_INT64 => {
                 let v = self.read_long()?;
-                Ok(Object::Int(v))
+                Object::Int(v)
             }
             TYPE_FLOAT => {
                 let len = self.read_byte()? as usize;
                 let bytes = self.read_n_bytes(len)?;
                 let s =
                     std::str::from_utf8(&bytes).map_err(|_| value_error("bad marshal float"))?;
-                Ok(crate::object::fresh_float(s.parse().unwrap_or(0.0)))
+                crate::object::fresh_float(s.parse().unwrap_or(0.0))
             }
             TYPE_BINARY_FLOAT => {
                 let bytes = self.read_n_bytes(8)?;
@@ -590,9 +926,7 @@ impl<'a> MarshalReader<'a> {
                 buf.copy_from_slice(&bytes);
                 // Fresh identity for a canonical NaN; exotic payloads kept
                 // verbatim (see `tag_unpacked_nan`).
-                Ok(Object::Float(crate::object::tag_unpacked_nan(
-                    f64::from_le_bytes(buf),
-                )))
+                Object::Float(crate::object::tag_unpacked_nan(f64::from_le_bytes(buf)))
             }
             TYPE_BINARY_COMPLEX => {
                 let real = self.read_n_bytes(8)?;
@@ -601,10 +935,10 @@ impl<'a> MarshalReader<'a> {
                 rb.copy_from_slice(&real);
                 let mut ib = [0u8; 8];
                 ib.copy_from_slice(&imag);
-                Ok(Object::Complex(Rc::new(PyComplex::new(
+                Object::Complex(Rc::new(PyComplex::new(
                     f64::from_le_bytes(rb),
                     f64::from_le_bytes(ib),
-                ))))
+                )))
             }
             TYPE_LONG => {
                 // Signed count of 15-bit little-endian digits (CPython
@@ -612,20 +946,41 @@ impl<'a> MarshalReader<'a> {
                 let signed_count = self.read_int()?;
                 let count = signed_count.unsigned_abs() as usize;
                 let mut value = BigInt::from(0);
+                let mut last_digit = 0u16;
                 for i in 0..count {
                     let digit = self.read_short()?;
+                    // 15-bit digits: anything larger is corrupt, and a
+                    // zero top digit is an unnormalized long — both are
+                    // ValueError in CPython (test_invalid_longs).
+                    if digit > 0x7FFF {
+                        return Err(value_error("bad marshal data (digit out of range in long)"));
+                    }
+                    last_digit = digit;
                     value += BigInt::from(digit) << (15 * i);
+                }
+                if count > 0 && last_digit == 0 {
+                    return Err(value_error("bad marshal data (unnormalized long data)"));
                 }
                 if signed_count < 0 {
                     value = -value;
                 }
-                Ok(Object::int_from_bigint(value))
+                Object::int_from_bigint(value)
             }
-            TYPE_CODE => self.read_code(),
+            TYPE_CODE => {
+                if !self.allow_code {
+                    return Err(value_error(
+                        "code objects are disallowed in restricted mode",
+                    ));
+                }
+                let idx = self.reserve_ref(flag);
+                let code = self.read_code()?;
+                self.fill_ref(idx, &code);
+                return Ok(Some(code));
+            }
             TYPE_STRING => {
                 let len = self.read_int()? as usize;
                 let bytes = self.read_n_bytes(len)?;
-                Ok(Object::new_bytes(bytes))
+                Object::new_bytes(bytes)
             }
             TYPE_UNICODE | TYPE_INTERNED | TYPE_ASCII | TYPE_ASCII_INTERNED => {
                 let len = self.read_int()? as usize;
@@ -633,78 +988,96 @@ impl<'a> MarshalReader<'a> {
                 // CPython reads unicode with surrogatepass, so WTF-8 bytes
                 // carrying lone surrogates rebuild an `Object::WStr`; pure
                 // UTF-8 folds back to `Object::Str`.
-                crate::stdlib::codecs_mod::decode_bytes_obj(&bytes, "utf-8", "surrogatepass")
-                    .map_err(|_| value_error("bad marshal string"))
+                let s =
+                    crate::stdlib::codecs_mod::decode_bytes_obj(&bytes, "utf-8", "surrogatepass")
+                        .map_err(|_| value_error("bad marshal string"))?;
+                if matches!(tag, TYPE_INTERNED | TYPE_ASCII_INTERNED) {
+                    intern_loaded(s)
+                } else {
+                    s
+                }
             }
             TYPE_SHORT_ASCII | TYPE_SHORT_ASCII_INTERNED => {
                 let len = self.read_byte()? as usize;
                 let bytes = self.read_n_bytes(len)?;
                 let s =
                     String::from_utf8(bytes).map_err(|_| value_error("bad marshal short ascii"))?;
-                Ok(Object::from_str(s))
+                if tag == TYPE_SHORT_ASCII_INTERNED {
+                    crate::stdlib::sys::intern_name(&s)
+                } else {
+                    Object::from_str(s)
+                }
             }
-            TYPE_TUPLE => {
-                let len = self.read_int()? as usize;
+            TYPE_TUPLE | TYPE_SMALL_TUPLE => {
+                let len = if tag == TYPE_TUPLE {
+                    self.read_int()? as usize
+                } else {
+                    self.read_byte()? as usize
+                };
+                let idx = self.reserve_ref(flag);
                 let mut items = Vec::with_capacity(len);
                 for _ in 0..len {
                     items.push(self.read_value()?);
                 }
-                Ok(Object::new_tuple(items))
-            }
-            TYPE_SMALL_TUPLE => {
-                let len = self.read_byte()? as usize;
-                let mut items = Vec::with_capacity(len);
-                for _ in 0..len {
-                    items.push(self.read_value()?);
-                }
-                Ok(Object::new_tuple(items))
+                let t = Object::new_tuple(items);
+                self.fill_ref(idx, &t);
+                return Ok(Some(t));
             }
             TYPE_LIST => {
                 let len = self.read_int()? as usize;
-                let mut items = Vec::with_capacity(len);
-                for _ in 0..len {
-                    items.push(self.read_value()?);
+                let list = Object::new_list(Vec::new());
+                // Registered before the elements so a recursive list
+                // resolves to itself (CPython `r_ref` for containers).
+                self.note_ref(flag, &list);
+                if let Object::List(l) = &list {
+                    for _ in 0..len {
+                        let item = self.read_value()?;
+                        l.borrow_mut().push(item);
+                    }
                 }
-                Ok(Object::new_list(items))
+                return Ok(Some(list));
             }
             TYPE_DICT => {
                 let dict = Object::new_dict();
+                self.note_ref(flag, &dict);
                 if let Object::Dict(d) = &dict {
-                    let mut d = d.borrow_mut();
                     loop {
-                        // Check next byte for sentinel without consuming.
-                        if self.pos >= self.bytes.len() {
+                        let Some(k) = self.read_value_opt()? else {
                             break;
-                        }
-                        if (self.bytes[self.pos] & !FLAG_REF) == TYPE_NULL {
-                            self.pos += 1;
-                            break;
-                        }
-                        let k = self.read_value()?;
+                        };
                         let v = self.read_value()?;
-                        d.insert(DictKey(k), v);
+                        d.borrow_mut().insert(DictKey(k), v);
                     }
                 }
-                Ok(dict)
+                return Ok(Some(dict));
             }
             TYPE_SET => {
                 let len = self.read_int()? as usize;
-                let mut items = Vec::with_capacity(len);
-                for _ in 0..len {
-                    items.push(self.read_value()?);
+                let set = Object::new_set_from(Vec::new());
+                self.note_ref(flag, &set);
+                if let Object::Set(s) = &set {
+                    for _ in 0..len {
+                        let item = self.read_value()?;
+                        s.borrow_mut().insert(DictKey(item));
+                    }
                 }
-                Ok(Object::new_set_from(items))
+                return Ok(Some(set));
             }
             TYPE_FROZENSET => {
                 let len = self.read_int()? as usize;
+                let idx = self.reserve_ref(flag);
                 let mut items = Vec::with_capacity(len);
                 for _ in 0..len {
                     items.push(self.read_value()?);
                 }
-                Ok(Object::new_frozenset_from(items))
+                let fs = Object::new_frozenset_from(items);
+                self.fill_ref(idx, &fs);
+                return Ok(Some(fs));
             }
-            other => Err(value_error(format!("marshal: unknown type tag {other:?}"))),
-        }
+            other => return Err(value_error(format!("marshal: unknown type tag {other:?}"))),
+        };
+        self.note_ref(flag, &obj);
+        Ok(Some(obj))
     }
 
     /// Read a `TYPE_CODE` body (the tag has already been consumed) and
@@ -777,8 +1150,18 @@ impl<'a> MarshalReader<'a> {
             is_iterable_coroutine: flags & CO_ITERABLE_COROUTINE != 0,
             future_flags: flags & weavepy_compiler::flags::PYCF_MASK,
             cp_cache: cpython_code::CpCache::default(),
+            wire: None,
         };
         Ok(Object::Code(Rc::new(co)))
+    }
+}
+
+/// Intern a loaded string when it decoded to a plain `str`; `WStr`
+/// (lone-surrogate) payloads pass through untouched.
+fn intern_loaded(s: Object) -> Object {
+    match &s {
+        Object::Str(_) => crate::stdlib::sys::intern_name(&s.to_str()),
+        _ => s,
     }
 }
 
@@ -818,14 +1201,14 @@ fn tuple_to_constants(o: &Object) -> Result<Vec<Constant>, RuntimeError> {
 
 /// Helper used by the import machinery (RFC 0019 `__pycache__`).
 pub fn dump_to_pyfile(value: &Object, file: &PyFile) -> Result<(), RuntimeError> {
-    let mut w = MarshalWriter::default();
+    let mut w = MarshalWriter::new(MARSHAL_VERSION, true);
     w.write_value(value)?;
     file.write_bytes(&w.into_bytes())?;
     Ok(())
 }
 
 pub fn load_from_bytes(bytes: &[u8]) -> Result<Object, RuntimeError> {
-    let mut r = MarshalReader::new(bytes);
+    let mut r = MarshalReader::from_bytes(bytes, true);
     r.read_value()
 }
 

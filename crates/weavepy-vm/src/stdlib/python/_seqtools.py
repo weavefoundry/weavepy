@@ -379,4 +379,17 @@ class _ZipIter:
         return tuple(result)
 
     def __reduce__(self):
-        return (zip, self._iters if self._iters is not None else ((),))
+        # CPython's `zip_reduce`/`zip_setstate`: strict mode rides in the
+        # third (state) slot so an unpickled strict zip still raises
+        # ValueError on mismatch (test_builtin test_zip_pickle_strict_fail).
+        # Reconstruct through type(self), not the `zip` builtin: the
+        # builtin's eager fast-path would hand back a plain native
+        # iterator, breaking `type(pickle.loads(d)) == type(orig)`
+        # (test_builtin check_iter_pickle) and dropping `__setstate__`.
+        iters = self._iters if self._iters is not None else ((),)
+        if self._strict:
+            return (type(self), iters, True)
+        return (type(self), iters)
+
+    def __setstate__(self, state):
+        self._strict = bool(state)

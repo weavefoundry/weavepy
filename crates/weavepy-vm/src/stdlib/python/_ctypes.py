@@ -776,7 +776,11 @@ class _CDataMeta(type):
         if isinstance(source, str):
             raise TypeError(
                 "a bytes-like object is required, not 'str'")
-        data = bytes(memoryview(source))
+        # Release the temporary view eagerly: CPython's refcounting drops
+        # its export the moment the C call returns, and test_frombuffer
+        # asserts the source is resizable again right after the copy.
+        with memoryview(source) as _mv:
+            data = bytes(_mv)
         if offset < 0:
             raise ValueError("offset cannot be negative")
         if len(data) - offset < info.size:
@@ -2422,6 +2426,11 @@ def _ffi_invoke(addr, restype, argtypes, flags, args):
 
 def _coerce_payload(code, value):
     if code == "O":
+        # `py_object.from_param` wraps the live object in a cparam
+        # (RFC 0060): unwrap it so the callee receives the object
+        # itself, not the marshalling wrapper.
+        if isinstance(value, _CArgObject):
+            return value._value
         if isinstance(value, _SimpleCData):
             return value.value
         return value

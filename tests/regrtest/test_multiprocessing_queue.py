@@ -1,7 +1,7 @@
 """RFC 0026 — multiprocessing.Queue and JoinableQueue.
 
 Multi-producer / multi-consumer correctness with threads (the
-cross-process path is exercised by `test_multiprocessing_spawn` and
+cross-process path is exercised by `test_multiprocessing_spawn_child` and
 the CPython `test_multiprocessing_*` suites).
 """
 

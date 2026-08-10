@@ -499,6 +499,13 @@ impl BuiltinTypes {
         install_gen_name_getsets(&async_generator_, "async generator");
         let frame_ = mk("frame", vec![object_.clone()]);
         let code_ = mk("code", vec![object_.clone()]);
+        // `copy.replace(code, …)` resolves `type(code).__replace__` and
+        // calls it unbound with the code object first (RFC 0060 /
+        // test_code.test_replace's copy.replace legs).
+        code_.dict.borrow_mut().insert(
+            DictKey(Object::from_static("__replace__")),
+            crate::builtins::code_dunder_replace_object(),
+        );
         let traceback_ = mk("traceback", vec![object_.clone()]);
         let cell_ = mk("cell", vec![object_.clone()]);
         let module_ = mk("module", vec![object_.clone()]);
@@ -2886,6 +2893,49 @@ pub fn install_type_dunders(type_: &Rc<TypeObject>) {
     fn type_mro_set(_args: &[Object]) -> Result<Object, RuntimeError> {
         Err(crate::error::attribute_error("readonly attribute"))
     }
+    fn type_bases_get(args: &[Object]) -> Result<Object, RuntimeError> {
+        let Some(Object::Type(ty)) = args.first() else {
+            return Err(crate::error::type_error(
+                "descriptor '__bases__' for 'type' objects doesn't apply to other objects",
+            ));
+        };
+        Ok(Object::new_tuple(
+            ty.bases
+                .borrow()
+                .iter()
+                .map(|b| Object::Type(b.clone()))
+                .collect(),
+        ))
+    }
+    fn type_bases_set(args: &[Object]) -> Result<Object, RuntimeError> {
+        let Some(Object::Type(ty)) = args.first() else {
+            return Err(crate::error::type_error(
+                "descriptor '__bases__' for 'type' objects doesn't apply to other objects",
+            ));
+        };
+        let value = args.get(1).cloned().unwrap_or(Object::None);
+        let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
+            crate::error::runtime_error("type.__bases__ setter requires an active interpreter")
+        })?;
+        // SAFETY: published by an enclosing VM frame live on this thread.
+        let interp = unsafe { &mut *ptr };
+        // Routes through `set_type_attr_direct` so the PEP 578
+        // `object.__setattr__` audit and the full `type_set_bases`
+        // MRO recomputation both run — `type.__dict__['__bases__']
+        // .__set__(C, …)` must be indistinguishable from
+        // `C.__bases__ = …` (test_audit test_monkeypatch).
+        interp.set_type_attr_direct(ty, "__bases__", value)?;
+        Ok(Object::None)
+    }
+    fn type_bases_del(args: &[Object]) -> Result<Object, RuntimeError> {
+        let name = match args.first() {
+            Some(Object::Type(ty)) => ty.name.clone(),
+            _ => "?".to_owned(),
+        };
+        Err(crate::error::type_error(format!(
+            "can't delete {name}.__bases__"
+        )))
+    }
     fn type_dunder_dict_get(args: &[Object]) -> Result<Object, RuntimeError> {
         let Some(Object::Type(ty)) = args.first() else {
             return Err(crate::error::type_error(
@@ -2942,6 +2992,10 @@ pub fn install_type_dunders(type_: &Rc<TypeObject>) {
         (
             "__mro__",
             mk_getset("__mro__", type_mro_get, type_mro_set, type_mro_set),
+        ),
+        (
+            "__bases__",
+            mk_getset("__bases__", type_bases_get, type_bases_set, type_bases_del),
         ),
         (
             "__dict__",
