@@ -48,6 +48,7 @@ pub mod os;
 pub mod os_process;
 pub mod posixsubprocess_mod;
 pub mod pyexpat_mod;
+#[cfg(unix)]
 pub mod resource_mod;
 pub mod select_mod;
 pub mod shutil_mod;
@@ -239,6 +240,11 @@ pub fn register_all(cache: &ModuleCache) {
     // RFC 0026 — POSIX-flavoured stdlib that user code (and the
     // multiprocessing rewrite) imports unconditionally.
     cache.register_builtin("fcntl", fcntl_mod::build);
+    // CPython has no `resource` module on Windows — every stdlib caller
+    // guards `import resource` with ImportError — and the non-unix stubs
+    // in `resource_mod` fail at call time anyway (e.g. regrtest's
+    // `adjust_rlimit_nofile` dying on `getrlimit`), so don't register it.
+    #[cfg(unix)]
     cache.register_builtin("resource", resource_mod::build);
     // RFC 0055 WS6 — real POSIX terminal control (CPython's termios is a
     // core C extension; `tty`/`pty` above are pure-Python over it).
