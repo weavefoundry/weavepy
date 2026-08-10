@@ -16,7 +16,7 @@ use cranelift_frontend::FunctionBuilderContext;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
 
-use crate::analyze::{analyze, JitVerdict};
+use crate::analyze::JitVerdict;
 use crate::ir::{CalleeSpanMeta, GlobalGuard, OsrEntry, RangeLoopMeta, ResolvedGlobal, TFunc};
 use crate::lower::build_function;
 use crate::runtime::{self, JitFrame, JitStatus};
@@ -136,7 +136,19 @@ impl JitEngine {
         code: &CodeObject,
         resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
     ) -> Result<CompiledFrame, JitVerdict> {
-        let tfunc = analyze(code, resolve)?;
+        self.compile_with_probe(code, resolve, &mut |_| None)
+    }
+
+    /// [`Self::compile`] with a pinned-list lane probe (RFC 0061 WS5):
+    /// `probe_list` reports the observed homogeneous element lane of a
+    /// subscripted local in the requesting activation.
+    pub fn compile_with_probe(
+        &mut self,
+        code: &CodeObject,
+        resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
+        probe_list: &mut dyn FnMut(u32) -> Option<JitType>,
+    ) -> Result<CompiledFrame, JitVerdict> {
+        let tfunc = crate::analyze::analyze_with_probe(code, resolve, probe_list)?;
         self.compile_tfunc(&tfunc)
     }
 
@@ -146,6 +158,22 @@ impl JitEngine {
         // call helper burned in (RFC 0059 WS3).
         if !tfunc.callee_spans.is_empty() && runtime::call_py_helper_addr() == 0 {
             return Err(JitVerdict::UnsupportedOpcode("CALL (no helper registered)"));
+        }
+        // RFC 0061 WS5 — likewise for the pinned-list helpers.
+        let has_list_ops = tfunc.blocks.iter().any(|b| {
+            b.stmts.iter().any(|s| {
+                matches!(
+                    s.op,
+                    crate::ir::TOp::ListGet { .. } | crate::ir::TOp::ListSet
+                )
+            })
+        });
+        if has_list_ops
+            && (runtime::list_get_helper_addr() == 0 || runtime::list_set_helper_addr() == 0)
+        {
+            return Err(JitVerdict::UnsupportedOpcode(
+                "SUBSCR (no list helper registered)",
+            ));
         }
         self.module.clear_context(&mut self.ctx);
 

@@ -194,6 +194,13 @@ struct Frame {
     /// for later resumptions. Set by `generator_send` when unparking a
     /// `Created` frame; consumed (reset) by `run_frame`'s entry event.
     gen_first_resume: bool,
+    /// RFC 0061 (WS3c): the generator-family activation's `FrameShell`,
+    /// kept across suspensions. A suspended frame survives inside the
+    /// generator object, so its shell — whose immutable fields (code,
+    /// locals, globals, …) never change for the same frame — can be
+    /// re-pushed on resume instead of rebuilt (eight `Arc` clones per
+    /// `next()`). `None` for ordinary frames, which run exactly once.
+    shell_cache: Option<Rc<crate::object::FrameShell>>,
 }
 
 impl Frame {
@@ -667,6 +674,19 @@ pub struct Interpreter {
     /// Recycled operand-stack vectors, same motivation. The operand
     /// stack is never shared, so every returned frame donates one.
     frame_stack_pool: RefCell<Vec<Vec<Object>>>,
+    /// RFC 0061 (WS3b) — recycled argument-staging vectors, kept apart
+    /// from [`Self::frame_stack_pool`]: staging vectors grow only to
+    /// the hottest call's argc, and handing such a small allocation
+    /// out as an operand stack would make every push in the new frame
+    /// re-grow it (the profile's `finish_grow` storm).
+    scratch_pool: RefCell<Vec<Vec<Object>>>,
+    /// RFC 0061 (WS3a) — recycled [`FrameShell`](crate::object::FrameShell)
+    /// allocations. Every Python call used to `Arc`-allocate a fresh
+    /// shell for the call-stack spine; a completed activation whose
+    /// shell nobody else observed (no materialised `PyFrame`, not a
+    /// generator's) donates the allocation back. Parked shells hold
+    /// only shared placeholder fields, so they pin no user objects.
+    frame_shell_pool: RefCell<Vec<Rc<crate::object::FrameShell>>>,
     /// RFC 0059 (WS2) — cooperative GIL hand-off countdown. A plain
     /// field (no atomic): only the GIL holder executes bytecode, and
     /// one interpreter drives one thread's frames, so a register
@@ -675,6 +695,12 @@ pub struct Interpreter {
     /// chains keep the ~[`crate::gil::GIL_CHECK_INTERVAL`]-opcode
     /// checkpoint cadence.
     gil_countdown: u32,
+    /// RFC 0061 (WS2b) — set while any observer (trace/profile/PEP 669
+    /// tool) is active on this thread. Fused-dispatch arms check it and
+    /// fall back to single-step semantics, so instrumentation sees the
+    /// exact per-instruction event stream. Refreshed from the dispatch
+    /// loop's [`crate::trace::ObserverSnapshot`] every iteration.
+    fuse_off: bool,
 }
 
 impl Default for Interpreter {
@@ -847,8 +873,11 @@ impl Default for Interpreter {
             globals_missing_hooks: RefCell::new(Vec::new()),
             internal_import_depth: 0,
             frame_locals_pool: RefCell::new(Vec::new()),
+            frame_shell_pool: RefCell::new(Vec::new()),
             frame_stack_pool: RefCell::new(Vec::new()),
+            scratch_pool: RefCell::new(Vec::new()),
             gil_countdown: crate::gil::GIL_CHECK_INTERVAL,
+            fuse_off: false,
         };
         // RFC 0025: publish the shared parts of this interpreter
         // (builtins / module cache / stdout / hooks) so workers
@@ -944,8 +973,11 @@ impl Interpreter {
             globals_missing_hooks: RefCell::new(Vec::new()),
             internal_import_depth: 0,
             frame_locals_pool: RefCell::new(Vec::new()),
+            frame_shell_pool: RefCell::new(Vec::new()),
             frame_stack_pool: RefCell::new(Vec::new()),
+            scratch_pool: RefCell::new(Vec::new()),
             gil_countdown: crate::gil::GIL_CHECK_INTERVAL,
+            fuse_off: false,
         }
     }
 
@@ -3796,26 +3828,66 @@ impl Interpreter {
     /// builtins mapping when the caller already has one — a Python
     /// function's cached `func_builtins` — and `None` for module /
     /// exec / class-body frames, which resolve from `globals` here.
-    /// Fetch a recycled fast-locals storage sized to `n` slots (all
-    /// `Unbound`), or allocate a fresh one on pool miss (RFC 0058 WS2).
-    fn pooled_locals(&self, n: usize) -> Rc<RefCell<Vec<Object>>> {
-        if let Some(rc) = self.frame_locals_pool.borrow_mut().pop() {
-            {
-                let mut v = rc.borrow_mut();
-                debug_assert!(v.is_empty());
-                v.resize(n, Object::Unbound);
-            }
-            return rc;
-        }
-        Rc::new(RefCell::new(vec![Object::Unbound; n]))
-    }
-
     /// Fetch a recycled operand-stack vector, or allocate one.
     fn pooled_stack(&self) -> Vec<Object> {
         self.frame_stack_pool
             .borrow_mut()
             .pop()
             .unwrap_or_else(|| Vec::with_capacity(16))
+    }
+
+    /// RFC 0061 (WS3b): args-first locals fill. The arguments *move*
+    /// into the leading slots and only the residual tail is written
+    /// `Unbound` — replacing the full `Unbound` fill that every
+    /// argument slot then overwrote (double write + drop per slot).
+    /// `args` is drained but keeps its allocation, so the caller can
+    /// hand the empty vector back through [`Self::recycle_scratch`].
+    fn pooled_locals_from_args(
+        &self,
+        args: &mut Vec<Object>,
+        n: usize,
+    ) -> Rc<RefCell<Vec<Object>>> {
+        debug_assert!(args.len() <= n);
+        if let Some(rc) = self.frame_locals_pool.borrow_mut().pop() {
+            {
+                let mut v = rc.borrow_mut();
+                debug_assert!(v.is_empty());
+                v.append(args);
+                v.resize(n, Object::Unbound);
+            }
+            return rc;
+        }
+        let mut v = Vec::with_capacity(n);
+        v.append(args);
+        v.resize(n, Object::Unbound);
+        Rc::new(RefCell::new(v))
+    }
+
+    /// RFC 0061 (WS3b): fetch a recycled argument-staging vector, or
+    /// allocate one. Deliberately a separate pool from
+    /// [`Self::pooled_stack`] — see the `scratch_pool` field docs.
+    fn pooled_scratch(&self) -> Vec<Object> {
+        self.scratch_pool
+            .borrow_mut()
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(8))
+    }
+
+    /// RFC 0061 (WS3b): return a drained argument-staging vector to
+    /// the scratch pool instead of freeing it — the profile's per-call
+    /// `malloc`/`free` pair for the `CALL` operand split.
+    fn recycle_scratch(&self, mut v: Vec<Object>) {
+        const POOL_CAP: usize = 64;
+        if v.capacity() == 0 {
+            return;
+        }
+        // Drop leftover values *before* borrowing the pool: their drop
+        // glue can run arbitrary code that must not observe the borrow.
+        v.clear();
+        let mut pool = self.scratch_pool.borrow_mut();
+        if pool.len() < POOL_CAP {
+            pool.push(v);
+        }
     }
 
     /// Return a finished frame's heap allocations to the pools. Called
@@ -3857,15 +3929,14 @@ impl Interpreter {
         globals: Rc<RefCell<DictData>>,
         builtins: Option<Rc<RefCell<DictData>>>,
     ) -> Frame {
-        let locals_rc = self.pooled_locals(code.varnames.len());
-        {
-            let mut locals = locals_rc.borrow_mut();
-            for (i, v) in positional.into_iter().enumerate() {
-                if i < locals.len() {
-                    locals[i] = v;
-                }
-            }
-        }
+        // RFC 0061 (WS3b): args-first fill; extras past the declared
+        // slots were never stored by the old slot-by-slot loop either
+        // (binding errors raise before frames are built).
+        let mut positional = positional;
+        let nlocals = code.varnames.len();
+        positional.truncate(nlocals);
+        let locals_rc = self.pooled_locals_from_args(&mut positional, nlocals);
+        self.recycle_scratch(positional);
         // Build cells: cellvars come first (fresh), then freevars
         // (provided by the caller via `closure`).
         let mut cells: Vec<Rc<RefCell<Object>>> =
@@ -3936,6 +4007,7 @@ impl Interpreter {
             cleanup_lasti: None,
             suppress_call_event: false,
             gen_first_resume: false,
+            shell_cache: None,
         }
     }
 
@@ -4049,6 +4121,12 @@ impl Interpreter {
         // only when something introspects it — tracing, `sys._getframe`,
         // traceback capture — via `ensure_top_py_frame`.
         let shell = self.push_frame_shell(frame);
+        // RFC 0061 (WS3c): a generator-family frame outlives this
+        // activation inside the generator object — pin its shell there
+        // so the next resume re-pushes it instead of rebuilding.
+        if shell.is_gen && frame.shell_cache.is_none() {
+            frame.shell_cache = Some(shell.clone());
+        }
         let mut py_frame_slot: Option<Rc<PyFrame>> = shell.materialized.borrow().clone();
         // Depth of the interpreter-wide handled-exception stack on entry.
         // Used on completion to discard any `PUSH_EXC_INFO` entries this
@@ -4130,6 +4208,7 @@ impl Interpreter {
             match crate::tier2::try_enter(self, frame) {
                 crate::tier2::JitEntry::Ran(v) => {
                     self.pop_frame_shell();
+                    self.recycle_frame_shell(shell);
                     return Ok(FrameOutcome::Returned(v));
                 }
                 // RFC 0059 WS3 — a native Python-to-Python call raised.
@@ -4165,6 +4244,12 @@ impl Interpreter {
         // computed instrumented set (`initialize_lines` port).
         let mut prev_pc: Option<usize> = None;
         let mut line_starts: Option<Vec<bool>> = None;
+        // RFC 0061 (WS1a): generation-cached observer facts. The two
+        // per-instruction consumers below (the line/opcode-event gate and
+        // the BRANCH/JUMP mask test) used to walk thread-locals and fold
+        // the monitoring tool table on every instruction; the snapshot
+        // re-derives only when an observer source actually changes.
+        let mut obs = crate::trace::ObserverSnapshot::new();
         let result = loop {
             // RFC 0039 (WS2) / RFC 0059 (WS2): cooperative GIL hand-off.
             // A plain interpreter-local countdown — one register
@@ -4316,7 +4401,10 @@ impl Interpreter {
             // `?`-escaping the whole frame.
             let mut trace_err: Option<RuntimeError> = None;
             let cur_pc = frame.pc as usize;
-            if crate::trace::any_observers_active() && !is_gen_bootstrap {
+            obs.refresh();
+            // RFC 0061 (WS2b): fused arms single-step under observation.
+            self.fuse_off = obs.any;
+            if obs.any && !is_gen_bootstrap {
                 let py_frame = self.ensure_top_py_frame(&mut py_frame_slot);
                 py_frame.lasti.set(frame.pc);
                 let line = py_frame.current_lineno();
@@ -4403,9 +4491,7 @@ impl Interpreter {
                 if trace_err.is_none()
                     && !at_resume
                     && !py_frame.trace_opcodes.get()
-                    && crate::trace::monitoring_union_mask()
-                        & crate::trace::event_mask(crate::trace::EVENT_INSTRUCTION)
-                        != 0
+                    && obs.mon_mask & crate::trace::event_mask(crate::trace::EVENT_INSTRUCTION) != 0
                 {
                     // The wire encoder fuses LOAD_CONST + RETURN_VALUE
                     // into one RETURN_CONST unit; the pair shares one
@@ -4559,10 +4645,7 @@ impl Interpreter {
                     // resolved destination (fall-through or target).
                     let bj_mask = crate::trace::event_mask(crate::trace::EVENT_BRANCH)
                         | crate::trace::event_mask(crate::trace::EVENT_JUMP);
-                    if instruction_ran
-                        && crate::trace::monitoring_union_mask() & bj_mask != 0
-                        && !is_gen_bootstrap
-                    {
+                    if instruction_ran && obs.mon_mask & bj_mask != 0 && !is_gen_bootstrap {
                         let op = frame.code.instructions.get(cur_pc).map(|i| i.op);
                         let ev = match op {
                             Some(
@@ -4700,7 +4783,7 @@ impl Interpreter {
                         // EXCEPTION_HANDLED event (`handle_exception`
                         // consumes `exc`). Only cloned on the observed
                         // path.
-                        let handled_arg = if crate::trace::monitoring_union_mask()
+                        let handled_arg = if crate::trace::monitoring_union_mask_cached()
                             & crate::trace::event_mask(crate::trace::EVENT_EXCEPTION_HANDLED)
                             != 0
                         {
@@ -4854,6 +4937,9 @@ impl Interpreter {
                 }
             }
         }
+        // RFC 0061 (WS3a): the spine popped its clone above and every
+        // local use of the shell is done — park the allocation.
+        self.recycle_frame_shell(shell);
         result
     }
 
@@ -4865,6 +4951,35 @@ impl Interpreter {
     /// refreshed `lasti` — its `back` link is refreshed lazily by the
     /// next materialisation walk.
     fn push_frame_shell(&self, frame: &mut Frame) -> Rc<crate::object::FrameShell> {
+        // RFC 0061 (WS3c): a generator-family resume re-pushes the shell
+        // it built on a previous entry. The identity-bearing fields
+        // (code, locals, cells, globals, builtins, namespaces) cannot
+        // have changed for the same frame; only the per-entry bits are
+        // refreshed. `gen_owner` is re-derived because the very first
+        // push happens *before* `RETURN_GENERATOR` creates the owner.
+        if let Some(cached) = &frame.shell_cache {
+            let materialized = frame.py_frame.clone();
+            if let Some(existing) = &materialized {
+                existing.lasti.set(frame.pc);
+                existing.invalidate_locals();
+                existing.on_stack.set(existing.on_stack.get() + 1);
+            }
+            let gen_owner = materialized
+                .as_ref()
+                .and_then(|py| py.gen_owner.borrow().clone())
+                .or_else(|| frame.gen_owner.clone());
+            *cached.gen_owner.borrow_mut() = gen_owner;
+            cached
+                .lasti
+                .store(frame.pc, std::sync::atomic::Ordering::Relaxed);
+            cached
+                .has_materialized
+                .store(materialized.is_some(), std::sync::atomic::Ordering::Relaxed);
+            *cached.materialized.borrow_mut() = materialized;
+            let shell = cached.clone();
+            self.frame_stack.borrow_mut().push(shell.clone());
+            return shell;
+        }
         let is_gen =
             frame.code.is_generator || frame.code.is_coroutine || frame.code.is_async_generator;
         let materialized = frame.py_frame.clone();
@@ -4872,6 +4987,33 @@ impl Interpreter {
             existing.lasti.set(frame.pc);
             existing.invalidate_locals();
             existing.on_stack.set(existing.on_stack.get() + 1);
+        }
+        let gen_owner = materialized
+            .as_ref()
+            .and_then(|py| py.gen_owner.borrow().clone())
+            .or_else(|| frame.gen_owner.clone());
+        // RFC 0061 (WS3a): reuse a recycled shell allocation when one is
+        // parked. The pool only ever holds sole-owner shells, so the
+        // `get_mut` is a formality — but a fresh allocation is always a
+        // correct fallback.
+        if let Some(mut pooled) = self.frame_shell_pool.borrow_mut().pop() {
+            if let Some(m) = Rc::get_mut(&mut pooled) {
+                m.code = frame.code.clone();
+                m.locals = frame.locals.clone();
+                m.cells = frame.cells.clone();
+                m.globals = frame.globals.clone();
+                m.builtins = frame.builtins.clone();
+                m.builtins_obj = frame.builtins_obj.clone();
+                m.class_namespace = frame.class_namespace.clone();
+                m.class_namespace_obj = frame.class_namespace_obj.clone();
+                m.is_gen = is_gen;
+                *m.gen_owner.borrow_mut() = gen_owner;
+                m.lasti = std::sync::atomic::AtomicU32::new(frame.pc);
+                m.has_materialized = std::sync::atomic::AtomicBool::new(materialized.is_some());
+                *m.materialized.borrow_mut() = materialized;
+                self.frame_stack.borrow_mut().push(pooled.clone());
+                return pooled;
+            }
         }
         let shell = Rc::new(crate::object::FrameShell {
             code: frame.code.clone(),
@@ -4883,18 +5025,45 @@ impl Interpreter {
             class_namespace: frame.class_namespace.clone(),
             class_namespace_obj: frame.class_namespace_obj.clone(),
             is_gen,
-            gen_owner: RefCell::new(
-                materialized
-                    .as_ref()
-                    .and_then(|py| py.gen_owner.borrow().clone())
-                    .or_else(|| frame.gen_owner.clone()),
-            ),
+            gen_owner: RefCell::new(gen_owner),
             lasti: std::sync::atomic::AtomicU32::new(frame.pc),
             has_materialized: std::sync::atomic::AtomicBool::new(materialized.is_some()),
             materialized: RefCell::new(materialized),
         });
         self.frame_stack.borrow_mut().push(shell.clone());
         shell
+    }
+
+    /// RFC 0061 (WS3a): park a completed activation's shell for reuse.
+    /// Only shells nothing else can observe qualify: not a generator's
+    /// (the generator object re-pushes it across suspensions), never
+    /// materialised (a `PyFrame`/traceback may hold it), and sole-owned
+    /// now that the spine popped its clone. Parked shells are scrubbed
+    /// to shared placeholders immediately — CPython frees the frame at
+    /// return, so nothing may stay pinned until reuse.
+    fn recycle_frame_shell(&self, mut shell: Rc<crate::object::FrameShell>) {
+        const FRAME_SHELL_POOL_CAP: usize = 64;
+        if shell.is_gen
+            || shell
+                .has_materialized
+                .load(std::sync::atomic::Ordering::Relaxed)
+            || self.frame_shell_pool.borrow().len() >= FRAME_SHELL_POOL_CAP
+        {
+            return;
+        }
+        if let Some(m) = Rc::get_mut(&mut shell) {
+            m.code = empty_code_placeholder();
+            m.locals = empty_locals_placeholder();
+            m.cells = crate::object::empty_cells();
+            m.globals = empty_dict_placeholder();
+            m.builtins = empty_dict_placeholder();
+            m.builtins_obj = None;
+            m.class_namespace = None;
+            m.class_namespace_obj = None;
+            *m.gen_owner.borrow_mut() = None;
+            *m.materialized.borrow_mut() = None;
+            self.frame_shell_pool.borrow_mut().push(shell);
+        }
     }
 
     /// Push an already-materialised `PyFrame` (event dispatch around
@@ -5214,6 +5383,37 @@ impl Interpreter {
         crate::error::unbound_local_error(format!(
             "cannot access local variable '{name}' where it is not associated with a value"
         ))
+    }
+
+    /// RFC 0061 (WS2b): the body of a `LOAD_FAST` — read local `arg`,
+    /// clone it, raise `UnboundLocalError` on `Unbound`. Shared by the
+    /// plain arm and every fused arm so error semantics can't diverge.
+    #[inline]
+    fn load_fast_value(frame: &Frame, arg: u32) -> Result<Object, RuntimeError> {
+        let v = frame
+            .locals
+            .borrow()
+            .get(arg as usize)
+            .cloned()
+            .ok_or_else(|| {
+                RuntimeError::Internal(format!(
+                    "bad local index {} (code {}, nlocals {}, varname {:?})",
+                    arg,
+                    frame.code.name,
+                    frame.locals.borrow().len(),
+                    frame.code.varnames.get(arg as usize)
+                ))
+            })?;
+        if matches!(v, Object::Unbound) {
+            let name = frame
+                .code
+                .varnames
+                .get(arg as usize)
+                .cloned()
+                .unwrap_or_default();
+            return Err(Self::unbound_local(&name));
+        }
+        Ok(v)
     }
 
     /// Error for reading/deleting an empty cell. Cellvars are still
@@ -5831,7 +6031,7 @@ impl Interpreter {
         from_pc: u32,
         to_pc: u32,
     ) -> Result<(), RuntimeError> {
-        if crate::trace::monitoring_union_mask() & crate::trace::event_mask(event_idx) == 0 {
+        if crate::trace::monitoring_union_mask_cached() & crate::trace::event_mask(event_idx) == 0 {
             return Ok(());
         }
         let args = [
@@ -5861,7 +6061,7 @@ impl Interpreter {
         event_idx: usize,
         arg: Object,
     ) -> Result<(), RuntimeError> {
-        if crate::trace::monitoring_union_mask() & crate::trace::event_mask(event_idx) == 0 {
+        if crate::trace::monitoring_union_mask_cached() & crate::trace::event_mask(event_idx) == 0 {
             return Ok(());
         }
         let pc = py_frame.lasti.get();
@@ -5935,13 +6135,24 @@ impl Interpreter {
         match ins.op {
             OpCode::Nop | OpCode::Resume => {}
             OpCode::LoadConst => {
-                let c = frame
-                    .code
-                    .constants
-                    .get(ins.arg as usize)
-                    .ok_or_else(|| RuntimeError::Internal("bad const index".to_owned()))?
-                    .clone();
-                frame.push(constant_to_object(c));
+                // RFC 0061 (WS2a): indexed clone from the per-code
+                // materialized table — no `Constant` deep-clone, no
+                // conversion, no string re-allocation per execution.
+                let table = code_const_objects(&frame.code);
+                let v = match table.get(ins.arg as usize) {
+                    Some(v) => v.clone(),
+                    None => {
+                        // Generic-slot fallback (see `code_const_objects`).
+                        let c = frame
+                            .code
+                            .constants
+                            .get(ins.arg as usize)
+                            .ok_or_else(|| RuntimeError::Internal("bad const index".to_owned()))?
+                            .clone();
+                        constant_to_object(c)
+                    }
+                };
+                frame.push(v);
             }
             OpCode::LoadName => {
                 let mut name = self.name_at(&frame.code, ins.arg)?;
@@ -5975,30 +6186,127 @@ impl Interpreter {
             // UnboundLocalError (CPython's NULL fast-local check). The
             // `name` attribute feeds NameError suggestion logic.
             OpCode::LoadFast => {
-                let v = frame
-                    .locals
-                    .borrow()
-                    .get(ins.arg as usize)
-                    .cloned()
-                    .ok_or_else(|| {
-                        RuntimeError::Internal(format!(
-                            "bad local index {} (code {}, nlocals {}, varname {:?})",
-                            ins.arg,
-                            frame.code.name,
-                            frame.locals.borrow().len(),
-                            frame.code.varnames.get(ins.arg as usize)
-                        ))
-                    })?;
-                if matches!(v, Object::Unbound) {
-                    let name = frame
-                        .code
-                        .varnames
-                        .get(ins.arg as usize)
-                        .cloned()
-                        .unwrap_or_default();
-                    return Err(Self::unbound_local(&name));
+                // RFC 0061 (WS2b): fused dispatch. The site's cache slot
+                // (unused by plain LOAD_FAST) memoizes a one-time look at
+                // the fall-through successor; fused arms run both
+                // instructions in one dispatch — and the LOAD_ATTR fusion
+                // reads the receiver *in place*, skipping its Arc
+                // round-trip through the operand stack entirely.
+                use weavepy_compiler::InlineCache as IC;
+                match frame.code.caches.get(cache_pc) {
+                    IC::FuseLoadFastLoadFast if !self.fuse_off => {
+                        let a = Self::load_fast_value(frame, ins.arg)?;
+                        frame.push(a);
+                        // `pc` already points at the second LOAD_FAST;
+                        // advance past it so a raise inside its read is
+                        // attributed to *its* pc (the `pc - 1` convention).
+                        let b_idx = frame
+                            .code
+                            .instructions
+                            .get(frame.pc as usize)
+                            .map(|i| i.arg)
+                            .unwrap_or(u32::MAX);
+                        frame.pc += 1;
+                        let b = Self::load_fast_value(frame, b_idx)?;
+                        frame.push(b);
+                    }
+                    IC::FuseLoadFastLoadConst if !self.fuse_off => {
+                        let a = Self::load_fast_value(frame, ins.arg)?;
+                        frame.push(a);
+                        let c_idx = frame
+                            .code
+                            .instructions
+                            .get(frame.pc as usize)
+                            .map(|i| i.arg)
+                            .unwrap_or(u32::MAX);
+                        frame.pc += 1;
+                        let table = code_const_objects(&frame.code);
+                        let v = match table.get(c_idx as usize) {
+                            Some(v) => v.clone(),
+                            None => {
+                                return Err(RuntimeError::Internal("bad const index".to_owned()))
+                            }
+                        };
+                        frame.push(v);
+                    }
+                    IC::FuseLoadFastLoadAttr if !self.fuse_off => {
+                        // Try the borrowed-receiver hit against the
+                        // LOAD_ATTR's own cache; any miss falls back to a
+                        // plain LOAD_FAST (the attr executes — and manages
+                        // its cache transitions — on the next dispatch).
+                        let attr_pc = frame.pc;
+                        let attr_ins = frame.code.instructions.get(attr_pc as usize).copied();
+                        let hit = match (frame.code.caches.get(attr_pc), attr_ins) {
+                            (
+                                IC::LoadAttrInstance {
+                                    type_id,
+                                    key_idx,
+                                    ver,
+                                },
+                                Some(attr_ins),
+                            ) => {
+                                let locals = frame.locals.borrow();
+                                match locals.get(ins.arg as usize) {
+                                    Some(Object::Instance(inst)) => {
+                                        let guard_ok = {
+                                            let cls = inst.class.borrow();
+                                            specialize::rc_id(&cls) == type_id
+                                                && cls.attr_version.get() == ver
+                                        };
+                                        if guard_ok {
+                                            let dict = inst.dict.borrow();
+                                            match dict.get_index(key_idx as usize) {
+                                                Some((k, v))
+                                                    if self.cached_slot_name_matches(
+                                                        &frame.code,
+                                                        attr_ins.arg,
+                                                        k,
+                                                    ) =>
+                                                {
+                                                    Some(v.clone())
+                                                }
+                                                _ => None,
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        };
+                        if let Some(v) = hit {
+                            frame.pc += 1;
+                            frame.push(v);
+                            specialize::record_hit(OpCode::LoadAttr as u8);
+                        } else {
+                            let v = Self::load_fast_value(frame, ins.arg)?;
+                            frame.push(v);
+                        }
+                    }
+                    IC::Empty => {
+                        // One-time fusion decision: the fall-through
+                        // successor is static, so the answer never changes.
+                        let marker = if fusion_enabled() {
+                            match frame.code.instructions.get(frame.pc as usize).map(|i| i.op) {
+                                Some(OpCode::LoadFast) => IC::FuseLoadFastLoadFast,
+                                Some(OpCode::LoadConst) => IC::FuseLoadFastLoadConst,
+                                Some(OpCode::LoadAttr) => IC::FuseLoadFastLoadAttr,
+                                _ => IC::FuseBlocked,
+                            }
+                        } else {
+                            IC::FuseBlocked
+                        };
+                        frame.code.caches.set(cache_pc, marker);
+                        let v = Self::load_fast_value(frame, ins.arg)?;
+                        frame.push(v);
+                    }
+                    _ => {
+                        let v = Self::load_fast_value(frame, ins.arg)?;
+                        frame.push(v);
+                    }
                 }
-                frame.push(v);
             }
             OpCode::StoreFast => {
                 let v = frame.pop()?;
@@ -6850,7 +7158,7 @@ impl Interpreter {
                 let kw_pairs: Vec<(String, Object)> = names.into_iter().zip(kw_values).collect();
                 // PEP 669 CALL for the keyword-call instruction.
                 let mon_call = crate::trace::any_observers_active()
-                    && crate::trace::monitoring_union_mask()
+                    && crate::trace::monitoring_union_mask_cached()
                         & crate::trace::event_mask(crate::trace::EVENT_CALL)
                         != 0;
                 if mon_call {
@@ -6895,7 +7203,7 @@ impl Interpreter {
                 // (same before-and-after gate as `dispatch_call`).
                 if mon_call
                     && !matches!(&callable, Object::Function(_))
-                    && crate::trace::monitoring_union_mask()
+                    && crate::trace::monitoring_union_mask_cached()
                         & crate::trace::event_mask(crate::trace::EVENT_CALL)
                         != 0
                 {
@@ -7095,7 +7403,7 @@ impl Interpreter {
                 // PEP 669 CALL / C_RETURN / C_RAISE for
                 // CALL_FUNCTION_EX, mirroring `dispatch_call`.
                 let mon_call = crate::trace::any_observers_active()
-                    && crate::trace::monitoring_union_mask()
+                    && crate::trace::monitoring_union_mask_cached()
                         & crate::trace::event_mask(crate::trace::EVENT_CALL)
                         != 0;
                 if mon_call {
@@ -7111,7 +7419,7 @@ impl Interpreter {
                 if mon_call
                     && !matches!(&callable, Object::Function(_))
                     && !matches!(&callable, Object::BoundMethod(bm) if matches!(bm.function, Object::Function(_)))
-                    && crate::trace::monitoring_union_mask()
+                    && crate::trace::monitoring_union_mask_cached()
                         & crate::trace::event_mask(crate::trace::EVENT_CALL)
                         != 0
                 {
@@ -18788,7 +19096,7 @@ impl Interpreter {
         // closed). The subiterator's own close above fires nothing,
         // matching CPython's no-resume close fast path.
         if crate::trace::any_observers_active()
-            && crate::trace::monitoring_union_mask()
+            && crate::trace::monitoring_union_mask_cached()
                 & crate::trace::event_mask(crate::trace::EVENT_LINE)
                 != 0
         {
@@ -20618,7 +20926,21 @@ impl Interpreter {
                     _ => return Ok(false),
                 };
                 specialize::record_specialize_attempt(op_idx);
-                let decision = specialize::attempt_specialize_compare_op(&a_peek, &b_peek, kind);
+                let mut decision =
+                    specialize::attempt_specialize_compare_op(&a_peek, &b_peek, kind);
+                // RFC 0061 (WS2b): an int compare whose fall-through
+                // successor is POP_JUMP_IF_* upgrades straight to the
+                // fused compare-and-branch marker (guards are identical,
+                // so it strictly subsumes `CompareOpInt`).
+                if matches!(decision, IC::CompareOpInt)
+                    && fusion_enabled()
+                    && matches!(
+                        frame.code.instructions.get(frame.pc as usize).map(|i| i.op),
+                        Some(OpCode::PopJumpIfTrue) | Some(OpCode::PopJumpIfFalse)
+                    )
+                {
+                    decision = IC::FuseCompareIntPopJump;
+                }
                 frame.code.caches.set(cache_pc, decision);
                 if matches!(decision, IC::Cooldown(_)) {
                     specialize::record_specialize_skip(op_idx);
@@ -20637,6 +20959,49 @@ impl Interpreter {
                 frame.stack.truncate(len - 2);
                 frame.push(Object::Bool(r));
                 specialize::record_hit(op_idx);
+                Ok(true)
+            }
+            IC::FuseCompareIntPopJump => {
+                // RFC 0061 (WS2b): compare-and-branch without the
+                // intermediate `Bool` touching the operand stack. Same
+                // operand guard as `CompareOpInt`; the branch itself is
+                // guard-free (the successor opcode is static).
+                let (a, b) = match (frame.peek_back(1), frame.peek_back(0)) {
+                    (Some(Object::Int(x)), Some(Object::Int(y))) => (*x, *y),
+                    _ => return self.deopt_compare_op(frame, cache_pc),
+                };
+                let r = compare_int(a, b, kind);
+                let len = frame.stack.len();
+                frame.stack.truncate(len - 2);
+                specialize::record_hit(op_idx);
+                if self.fuse_off {
+                    // Single-step under observation: push the Bool and
+                    // let the POP_JUMP arm run (and emit its branch
+                    // event) on the next dispatch.
+                    frame.push(Object::Bool(r));
+                    return Ok(true);
+                }
+                let succ = frame
+                    .code
+                    .instructions
+                    .get(frame.pc as usize)
+                    .copied()
+                    .ok_or_else(|| {
+                        RuntimeError::Internal("fused compare lost its jump".to_owned())
+                    })?;
+                frame.pc += 1;
+                let take = match succ.op {
+                    OpCode::PopJumpIfTrue => r,
+                    OpCode::PopJumpIfFalse => !r,
+                    _ => {
+                        return Err(RuntimeError::Internal(
+                            "fused compare successor is not a POP_JUMP".to_owned(),
+                        ))
+                    }
+                };
+                if take {
+                    frame.pc += succ.arg;
+                }
                 Ok(true)
             }
             IC::CompareOpFloat => {
@@ -21072,63 +21437,80 @@ impl Interpreter {
         use weavepy_compiler::InlineCache as IC;
         let cache = frame.code.caches.get(cache_pc);
         let op_idx = OpCode::LoadAttr as u8;
+        // RFC 0061 (WS4): every arm ends with the receiver off the stack, so
+        // pop it once up front (a move) instead of the per-arm
+        // `top().clone()` + later `pop()` pair — two Arc round-trips per
+        // attribute access on the hottest opcode family. Guards likewise
+        // read the class through a borrow instead of `cls()`'s Arc clone.
+        let receiver = frame.pop()?;
         match cache {
             IC::LoadAttrInstance {
                 type_id,
                 key_idx,
                 ver,
             } => {
-                let receiver = frame.top()?.clone();
                 if let Object::Instance(inst) = &receiver {
-                    let cls = inst.cls();
-                    if specialize::rc_id(&cls) == type_id && cls.attr_version.get() == ver {
-                        let dict = inst.dict.borrow();
-                        if let Some((k, v)) = dict.get_index(key_idx as usize) {
-                            if self.cached_slot_name_matches(&frame.code, name_idx, k) {
-                                let v = v.clone();
-                                drop(dict);
-                                frame.pop()?;
-                                specialize::record_hit(op_idx);
-                                return Ok(v);
+                    let guard_ok = {
+                        let cls = inst.class.borrow();
+                        specialize::rc_id(&cls) == type_id && cls.attr_version.get() == ver
+                    };
+                    if guard_ok {
+                        let hit = {
+                            let dict = inst.dict.borrow();
+                            match dict.get_index(key_idx as usize) {
+                                Some((k, v))
+                                    if self.cached_slot_name_matches(&frame.code, name_idx, k) =>
+                                {
+                                    Some(v.clone())
+                                }
+                                _ => None,
                             }
+                        };
+                        if let Some(v) = hit {
+                            specialize::record_hit(op_idx);
+                            return Ok(v);
                         }
                     }
                 }
-                self.deopt_load_attr_slow(frame, cache_pc, name_idx)
+                self.deopt_load_attr_taken(frame, cache_pc, name_idx, receiver)
             }
             IC::LoadAttrModule { module_id, key_idx } => {
-                let receiver = frame.top()?.clone();
                 if let Object::Module(m) = &receiver {
                     if specialize::rc_id(&m.dict) == module_id {
-                        let dict = m.dict.borrow();
-                        if let Some((k, v)) = dict.get_index(key_idx as usize) {
-                            if self.cached_slot_name_matches(&frame.code, name_idx, k) {
-                                let v = v.clone();
-                                drop(dict);
-                                frame.pop()?;
-                                specialize::record_hit(op_idx);
-                                return Ok(v);
+                        let hit = {
+                            let dict = m.dict.borrow();
+                            match dict.get_index(key_idx as usize) {
+                                Some((k, v))
+                                    if self.cached_slot_name_matches(&frame.code, name_idx, k) =>
+                                {
+                                    Some(v.clone())
+                                }
+                                _ => None,
                             }
+                        };
+                        if let Some(v) = hit {
+                            specialize::record_hit(op_idx);
+                            return Ok(v);
                         }
                     }
                 }
-                self.deopt_load_attr_slow(frame, cache_pc, name_idx)
+                self.deopt_load_attr_taken(frame, cache_pc, name_idx, receiver)
             }
             IC::LoadAttrSlot { type_id, ver } => {
-                let receiver = frame.top()?.clone();
                 if let Object::Instance(inst) = &receiver {
-                    let cls = inst.cls();
-                    if specialize::rc_id(&cls) == type_id && cls.attr_version.get() == ver {
+                    let guard_ok = {
+                        let cls = inst.class.borrow();
+                        specialize::rc_id(&cls) == type_id && cls.attr_version.get() == ver
+                    };
+                    if guard_ok {
                         // Read the slot side table directly; the class was
                         // validated at specialisation time (stock lookup, a
                         // genuine `__slots__` member descriptor for this
                         // name) and the version guard covers class-dict /
                         // MRO changes since.
-                        let code = frame.code.clone();
-                        let name = code.names.get(name_idx as usize).map(String::as_str);
+                        let name = frame.code.names.get(name_idx as usize).map(String::as_str);
                         if let Some(name) = name {
                             if let Some(v) = inst.slot_get(name) {
-                                frame.pop()?;
                                 specialize::record_hit(op_idx);
                                 return Ok(v);
                             }
@@ -21137,7 +21519,7 @@ impl Interpreter {
                         // AttributeError.
                     }
                 }
-                self.deopt_load_attr_slow(frame, cache_pc, name_idx)
+                self.deopt_load_attr_taken(frame, cache_pc, name_idx, receiver)
             }
             IC::LoadAttrMethod {
                 type_id,
@@ -21145,12 +21527,10 @@ impl Interpreter {
                 mro_idx,
                 key_idx,
             } => {
-                let receiver = frame.top()?.clone();
-                if let Object::Instance(inst) = &receiver {
-                    let cls = inst.cls();
+                let func = if let Object::Instance(inst) = &receiver {
+                    let cls = inst.class.borrow();
                     if specialize::rc_id(&cls) == type_id && cls.attr_version.get() == ver {
-                        let code = frame.code.clone();
-                        let name = code.names.get(name_idx as usize).map(String::as_str);
+                        let name = frame.code.names.get(name_idx as usize).map(String::as_str);
                         if let Some(name) = name {
                             // Per-instance shadow guard: an instance dict
                             // entry beats a non-data descriptor. The
@@ -21163,47 +21543,52 @@ impl Interpreter {
                                 !d.is_empty() && d.contains_key(&crate::object::StrKey(name))
                             };
                             if !shadowed {
-                                let func = {
-                                    let mro = cls.mro.borrow();
-                                    mro.get(mro_idx as usize).and_then(|owner| {
-                                        let od = owner.dict.borrow();
-                                        od.get_index(key_idx as usize).and_then(|(k, v)| {
-                                            // The slot must still hold this
-                                            // very name and a plain function
-                                            // (version guard makes churn
-                                            // rare, not impossible-to-miss).
-                                            match (&k.0, v) {
-                                                (Object::Str(s), Object::Function(_))
-                                                    if &**s == name =>
-                                                {
-                                                    Some(v.clone())
-                                                }
-                                                _ => None,
+                                let mro = cls.mro.borrow();
+                                mro.get(mro_idx as usize).and_then(|owner| {
+                                    let od = owner.dict.borrow();
+                                    od.get_index(key_idx as usize).and_then(|(k, v)| {
+                                        // The slot must still hold this
+                                        // very name and a plain function
+                                        // (version guard makes churn
+                                        // rare, not impossible-to-miss).
+                                        match (&k.0, v) {
+                                            (Object::Str(s), Object::Function(_))
+                                                if &**s == name =>
+                                            {
+                                                Some(v.clone())
                                             }
-                                        })
+                                            _ => None,
+                                        }
                                     })
-                                };
-                                if let Some(func) = func {
-                                    frame.pop()?;
-                                    specialize::record_hit(op_idx);
-                                    return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
-                                        receiver, func,
-                                    ))));
-                                }
+                                })
+                            } else {
+                                None
                             }
+                        } else {
+                            None
                         }
+                    } else {
+                        None
                     }
+                } else {
+                    None
+                };
+                if let Some(func) = func {
+                    specialize::record_hit(op_idx);
+                    // The receiver moves into the bound method — no clone.
+                    return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
+                        receiver, func,
+                    ))));
                 }
-                self.deopt_load_attr_slow(frame, cache_pc, name_idx)
+                self.deopt_load_attr_taken(frame, cache_pc, name_idx, receiver)
             }
             IC::LoadAttrType {
                 type_id,
                 key_idx,
                 ver,
             } => {
-                let receiver = frame.top()?.clone();
-                if let Object::Instance(inst) = &receiver {
-                    let cls = inst.cls();
+                let hit = if let Object::Instance(inst) = &receiver {
+                    let cls = inst.class.borrow();
                     if specialize::rc_id(&cls) == type_id && cls.attr_version.get() == ver {
                         // Per-instance shadow guard: an instance dict entry
                         // beats a plain class attribute. The specialised
@@ -21224,49 +21609,52 @@ impl Interpreter {
                             }
                         };
                         if shadowed {
-                            return self.deopt_load_attr_slow(frame, cache_pc, name_idx);
-                        }
-                        let dict = cls.dict.borrow();
-                        if let Some((k, v)) = dict.get_index(key_idx as usize) {
-                            if self.cached_slot_name_matches(&frame.code, name_idx, k) {
-                                let v = v.clone();
-                                drop(dict);
-                                frame.pop()?;
-                                specialize::record_hit(op_idx);
-                                // For function descriptors found on the
-                                // type we'd normally bind to the
-                                // instance — bail to the slow path
-                                // when the value is callable, so the
-                                // generic descriptor protocol runs.
-                                // (Bound-method specialization is RFC
-                                // 0022 territory.) `Instance` values are
-                                // deopted too: one could be a non-data
-                                // descriptor (`cached_property`) whose
-                                // `__get__` must run.
-                                if matches!(
-                                    v,
-                                    Object::Function(_)
-                                        | Object::Builtin(_)
-                                        | Object::Property(_)
-                                        | Object::ClassMethod(_)
-                                        | Object::StaticMethod(_)
-                                        | Object::SlotDescriptor(_)
-                                        | Object::Instance(_)
-                                ) {
-                                    // Push receiver back and deopt.
-                                    frame.push(receiver);
-                                    return self.deopt_load_attr_slow(frame, cache_pc, name_idx);
+                            None
+                        } else {
+                            let dict = cls.dict.borrow();
+                            match dict.get_index(key_idx as usize) {
+                                Some((k, v))
+                                    if self.cached_slot_name_matches(&frame.code, name_idx, k) =>
+                                {
+                                    Some(v.clone())
                                 }
-                                return Ok(v);
+                                _ => None,
                             }
                         }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(v) = hit {
+                    // For function descriptors found on the type we'd
+                    // normally bind to the instance — bail to the slow
+                    // path when the value is callable, so the generic
+                    // descriptor protocol runs. (Bound-method
+                    // specialization is RFC 0022 territory.) `Instance`
+                    // values are deopted too: one could be a non-data
+                    // descriptor (`cached_property`) whose `__get__`
+                    // must run.
+                    if !matches!(
+                        v,
+                        Object::Function(_)
+                            | Object::Builtin(_)
+                            | Object::Property(_)
+                            | Object::ClassMethod(_)
+                            | Object::StaticMethod(_)
+                            | Object::SlotDescriptor(_)
+                            | Object::Instance(_)
+                    ) {
+                        specialize::record_hit(op_idx);
+                        return Ok(v);
                     }
                 }
-                self.deopt_load_attr_slow(frame, cache_pc, name_idx)
+                self.deopt_load_attr_taken(frame, cache_pc, name_idx, receiver)
             }
             IC::Empty => {
                 let name = self.name_at(&frame.code, name_idx)?;
-                let obj = frame.pop()?;
+                let obj = receiver;
                 let result = self.load_attr(&obj, &name);
                 // Specialize *after* the generic lookup. The decision's
                 // dict-index probe hashes `name` into the instance dict and
@@ -21295,34 +21683,34 @@ impl Interpreter {
                     IC::Empty
                 };
                 frame.code.caches.set(cache_pc, next);
-                let obj = frame.pop()?;
                 let name = self.name_at(&frame.code, name_idx)?;
-                self.load_attr(&obj, &name)
+                self.load_attr(&receiver, &name)
             }
             _ => {
-                let obj = frame.pop()?;
                 let name = self.name_at(&frame.code, name_idx)?;
-                self.load_attr(&obj, &name)
+                self.load_attr(&receiver, &name)
             }
         }
     }
 
-    /// Deopt a `LOAD_ATTR` cache and run the generic handler.
+    /// Deopt a `LOAD_ATTR` cache and run the generic handler. The
+    /// receiver has already been popped by `specialized_load_attr`'s
+    /// shared prologue (RFC 0061 WS4).
     #[inline]
-    fn deopt_load_attr_slow(
+    fn deopt_load_attr_taken(
         &mut self,
         frame: &mut Frame,
         cache_pc: u32,
         name_idx: u32,
+        receiver: Object,
     ) -> Result<Object, RuntimeError> {
         specialize::record_miss(OpCode::LoadAttr as u8);
         frame
             .code
             .caches
             .set(cache_pc, weavepy_compiler::InlineCache::Cooldown(COOLDOWN));
-        let obj = frame.pop()?;
         let name = self.name_at(&frame.code, name_idx)?;
-        self.load_attr(&obj, &name)
+        self.load_attr(&receiver, &name)
     }
 
     /// Specialized `STORE_ATTR`. Stack discipline matches the
@@ -21338,16 +21726,22 @@ impl Interpreter {
         use weavepy_compiler::InlineCache as IC;
         let cache = frame.code.caches.get(cache_pc);
         let op_idx = OpCode::StoreAttr as u8;
+        // RFC 0061 (WS4): pop the receiver once (a move) instead of the
+        // per-arm `top().clone()` + later `pop()` pair; guards read the
+        // class through a borrow instead of `cls()`'s Arc clone.
+        let receiver = frame.pop()?;
         match cache {
             IC::StoreAttrInstance {
                 type_id,
                 key_idx,
                 ver,
             } => {
-                let receiver = frame.top()?.clone();
                 if let Object::Instance(inst) = &receiver {
-                    let cls = inst.cls();
-                    if specialize::rc_id(&cls) == type_id && cls.attr_version.get() == ver {
+                    let guard_ok = {
+                        let cls = inst.class.borrow();
+                        specialize::rc_id(&cls) == type_id && cls.attr_version.get() == ver
+                    };
+                    if guard_ok {
                         // Validate the cached index still holds *this* name:
                         // a `del` on an earlier attribute shift-renumbers
                         // every later slot (same guard as LOAD_ATTR).
@@ -21358,7 +21752,6 @@ impl Interpreter {
                             })
                         };
                         if name_ok {
-                            frame.pop()?;
                             let val = frame.pop()?;
                             // Mirror the slow path: a bound method stored
                             // on the instance must join the cycle collector
@@ -21387,13 +21780,15 @@ impl Interpreter {
                         }
                     }
                 }
-                self.deopt_store_attr_slow(frame, cache_pc, name_idx)
+                self.deopt_store_attr_taken(frame, cache_pc, name_idx, receiver)
             }
             IC::StoreAttrNewKey { type_id, ver } => {
-                let receiver = frame.top()?.clone();
                 if let Object::Instance(inst) = &receiver {
-                    let cls = inst.cls();
-                    if specialize::rc_id(&cls) == type_id && cls.attr_version.get() == ver {
+                    let guard_ok = {
+                        let cls = inst.class.borrow();
+                        specialize::rc_id(&cls) == type_id && cls.attr_version.get() == ver
+                    };
+                    if guard_ok {
                         // Validated at specialisation time (and guarded by
                         // `ver` since): stock `__setattr__`, no data
                         // descriptor for this name anywhere on the MRO,
@@ -21403,7 +21798,6 @@ impl Interpreter {
                         // by a single hash probe.
                         let code = frame.code.clone();
                         if let Some(name) = code.names.get(name_idx as usize) {
-                            frame.pop()?;
                             let val = frame.pop()?;
                             // Mirror `generic_setattr_instance`: a bound
                             // method escaping into an instance attribute
@@ -21435,13 +21829,15 @@ impl Interpreter {
                         }
                     }
                 }
-                self.deopt_store_attr_slow(frame, cache_pc, name_idx)
+                self.deopt_store_attr_taken(frame, cache_pc, name_idx, receiver)
             }
             IC::StoreAttrSlot { type_id, ver } => {
-                let receiver = frame.top()?.clone();
                 if let Object::Instance(inst) = &receiver {
-                    let cls = inst.cls();
-                    if specialize::rc_id(&cls) == type_id && cls.attr_version.get() == ver {
+                    let guard_ok = {
+                        let cls = inst.class.borrow();
+                        specialize::rc_id(&cls) == type_id && cls.attr_version.get() == ver
+                    };
+                    if guard_ok {
                         // The class was validated at specialisation time: a
                         // genuine `__slots__` member descriptor for this
                         // name on a stock-lookup class. The version guard
@@ -21452,7 +21848,6 @@ impl Interpreter {
                         // prompt-reaps).
                         let code = frame.code.clone();
                         if let Some(name) = code.names.get(name_idx as usize) {
-                            frame.pop()?;
                             let val = frame.pop()?;
                             inst.slot_set(name, val);
                             specialize::record_hit(op_idx);
@@ -21460,10 +21855,9 @@ impl Interpreter {
                         }
                     }
                 }
-                self.deopt_store_attr_slow(frame, cache_pc, name_idx)
+                self.deopt_store_attr_taken(frame, cache_pc, name_idx, receiver)
             }
             IC::Empty => {
-                let receiver = frame.top()?.clone();
                 let name = self.name_at(&frame.code, name_idx)?;
                 specialize::record_specialize_attempt(op_idx);
                 let decision = specialize::attempt_specialize_store_attr(&receiver, &name);
@@ -21473,9 +21867,8 @@ impl Interpreter {
                 } else {
                     specialize::record_specialize_success(op_idx);
                 }
-                let obj = frame.pop()?;
                 let val = frame.pop()?;
-                self.store_attr(&obj, &name, val)
+                self.store_attr(&receiver, &name, val)
             }
             IC::Cooldown(n) => {
                 let next = if n > 0 {
@@ -21484,37 +21877,36 @@ impl Interpreter {
                     IC::Empty
                 };
                 frame.code.caches.set(cache_pc, next);
-                let obj = frame.pop()?;
                 let val = frame.pop()?;
                 let name = self.name_at(&frame.code, name_idx)?;
-                self.store_attr(&obj, &name, val)
+                self.store_attr(&receiver, &name, val)
             }
             _ => {
-                let obj = frame.pop()?;
                 let val = frame.pop()?;
                 let name = self.name_at(&frame.code, name_idx)?;
-                self.store_attr(&obj, &name, val)
+                self.store_attr(&receiver, &name, val)
             }
         }
     }
 
-    /// Deopt a `STORE_ATTR` cache.
+    /// Deopt a `STORE_ATTR` cache. The receiver has already been popped
+    /// by `specialized_store_attr`'s shared prologue (RFC 0061 WS4).
     #[inline]
-    fn deopt_store_attr_slow(
+    fn deopt_store_attr_taken(
         &mut self,
         frame: &mut Frame,
         cache_pc: u32,
         name_idx: u32,
+        receiver: Object,
     ) -> Result<(), RuntimeError> {
         specialize::record_miss(OpCode::StoreAttr as u8);
         frame
             .code
             .caches
             .set(cache_pc, weavepy_compiler::InlineCache::Cooldown(COOLDOWN));
-        let obj = frame.pop()?;
         let val = frame.pop()?;
         let name = self.name_at(&frame.code, name_idx)?;
-        self.store_attr(&obj, &name, val)
+        self.store_attr(&receiver, &name, val)
     }
 
     /// Specialized `FOR_ITER`. Returns `Ok(true)` when the fast
@@ -29576,14 +29968,18 @@ impl Interpreter {
         use weavepy_compiler::InlineCache as IC;
         let op_idx = OpCode::Call as u8;
         let split_at = frame.stack.len().saturating_sub(argc);
-        let mut args: Vec<Object> = frame.stack.split_off(split_at);
+        // RFC 0061 (WS3b): stage the operands through a pooled vector
+        // (`drain` moves them without the fresh `split_off` allocation);
+        // the shared tail hands the emptied vector back to the pool.
+        let mut args: Vec<Object> = self.pooled_scratch();
+        args.extend(frame.stack.drain(split_at..));
         let callable = frame.pop()?;
         // PEP 669 CALL fires for every `CALL`-family instruction in
         // monitored code, before the target runs — with the operands
         // as seen at the call site (a zero-arg `super()` reports
         // MISSING, before the `__class__`/`self` injection below).
         let mon_call = crate::trace::any_observers_active()
-            && crate::trace::monitoring_union_mask()
+            && crate::trace::monitoring_union_mask_cached()
                 & crate::trace::event_mask(crate::trace::EVENT_CALL)
                 != 0;
         if mon_call {
@@ -29661,7 +30057,7 @@ impl Interpreter {
             };
             let code = frame.code.clone();
             let result = self.call_from_bytecode(&callable, &mut args, &frame.globals);
-            let still_on = crate::trace::monitoring_union_mask()
+            let still_on = crate::trace::monitoring_union_mask_cached()
                 & crate::trace::event_mask(crate::trace::EVENT_CALL)
                 != 0;
             match result {
@@ -29777,9 +30173,13 @@ impl Interpreter {
                     _ => {}
                 }
                 let f = f.clone();
-                let mut combined: Vec<Object> = Vec::with_capacity(args.len() + 1);
+                // RFC 0061 (WS3b): pooled receiver+args staging; the
+                // drained `args` goes straight back to the pool and
+                // `combined` is recycled by `make_frame`'s fill.
+                let mut combined: Vec<Object> = self.pooled_scratch();
                 combined.push(bm.receiver.clone());
                 combined.append(&mut args);
+                self.recycle_scratch(args);
                 drop(callable);
                 let r = self.call_python_owned(&f, combined, Vec::new())?;
                 frame.push(r);
@@ -29998,6 +30398,7 @@ impl Interpreter {
         // the call has returned and the operands are about to be dropped.
         self.reap_call_receiver(callable);
         self.reap_call_args(&mut args);
+        self.recycle_scratch(args);
         Ok(())
     }
 
@@ -30096,16 +30497,13 @@ impl Interpreter {
     fn run_py_exact_nofree(
         &mut self,
         f: &Rc<PyFunction>,
-        args: Vec<Object>,
+        mut args: Vec<Object>,
     ) -> Result<Object, RuntimeError> {
         let code = f.code();
-        let locals_rc = self.pooled_locals(code.varnames.len());
-        {
-            let mut locals = locals_rc.borrow_mut();
-            for (slot, v) in args.into_iter().enumerate() {
-                locals[slot] = v;
-            }
-        }
+        // RFC 0061 (WS3b): move the arguments straight into the leading
+        // locals slots and recycle the drained staging vector.
+        let locals_rc = self.pooled_locals_from_args(&mut args, code.varnames.len());
+        self.recycle_scratch(args);
         let mut frame = Frame {
             code,
             locals: locals_rc,
@@ -30125,6 +30523,7 @@ impl Interpreter {
             cleanup_lasti: None,
             suppress_call_event: false,
             gen_first_resume: false,
+            shell_cache: None,
         };
         self.run_frame(&mut frame)
     }
@@ -39182,6 +39581,67 @@ pub fn constant_to_object_public(c: Constant) -> Object {
     constant_to_object(c)
 }
 
+/// RFC 0061 (WS2b): `WEAVEPY_NO_FUSE=1` disables fused-dispatch marker
+/// installation — a bisection escape hatch; already-installed markers
+/// are inert because sites are only marked when this returns true.
+fn fusion_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WEAVEPY_NO_FUSE").is_none())
+}
+
+/// RFC 0061 (WS3a): shared placeholder fields for parked
+/// [`FrameShell`](crate::object::FrameShell)s. A pooled shell is
+/// unreachable by construction (the pool owns its only `Rc`), so the
+/// placeholders are never read or mutated through it — they exist only
+/// so parking pins no user objects and allocates nothing.
+fn empty_code_placeholder() -> Rc<CodeObject> {
+    static P: std::sync::OnceLock<Rc<CodeObject>> = std::sync::OnceLock::new();
+    P.get_or_init(|| Rc::new(CodeObject::default())).clone()
+}
+
+fn empty_locals_placeholder() -> Rc<RefCell<Vec<Object>>> {
+    static P: std::sync::OnceLock<Rc<RefCell<Vec<Object>>>> = std::sync::OnceLock::new();
+    P.get_or_init(|| Rc::new(RefCell::new(Vec::new()))).clone()
+}
+
+fn empty_dict_placeholder() -> Rc<RefCell<crate::object::DictData>> {
+    static P: std::sync::OnceLock<Rc<RefCell<crate::object::DictData>>> =
+        std::sync::OnceLock::new();
+    P.get_or_init(|| Rc::new(RefCell::new(crate::object::DictData::default())))
+        .clone()
+}
+
+/// RFC 0061 (WS2a): the per-code-object materialized constant table,
+/// living in the code object's [`weavepy_compiler::VmExt`] slot. Built
+/// once on first access; `LOAD_CONST` becomes an indexed `Object` clone
+/// instead of a per-execution `Constant` deep-clone (string constants
+/// allocated twice per execution before this).
+struct CodeConstObjects {
+    objects: Vec<Object>,
+}
+
+/// The materialized constants for `code`, built on first use. The
+/// returned reference is tied to the code object (the `OnceLock` pins
+/// the `Arc` for the code object's lifetime).
+#[inline]
+fn code_const_objects(code: &CodeObject) -> &[Object] {
+    let arc = code.vm_ext.0.get_or_init(|| {
+        std::sync::Arc::new(CodeConstObjects {
+            objects: code
+                .constants
+                .iter()
+                .map(|c| constant_to_object(c.clone()))
+                .collect(),
+        })
+    });
+    match arc.downcast_ref::<CodeConstObjects>() {
+        Some(t) => &t.objects,
+        // Another subsystem claimed the slot first (none exists today,
+        // but the slot is deliberately generic): fall back per-call.
+        None => &[],
+    }
+}
+
 fn constant_to_object(c: Constant) -> Object {
     match c {
         Constant::None => Object::None,
@@ -41616,6 +42076,83 @@ mod tests {
         assert!(osr >= 1, "range loop should enter via OSR");
         assert_eq!(deopts, 0, "clean OSR range kernel should not deopt");
         assert_eq!(out, "399980000\n");
+        assert_eq!(out, run(src));
+    }
+
+    // RFC 0061 WS5 — pinned-list subscript lanes.
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_list_int_sum_compiles_clean() {
+        // `xs[i]` on a homogeneous int list: the shape probe pins the
+        // lane, reads go through `wpjit_list_get`, and a clean kernel
+        // never deopts.
+        let src = "def ssum(xs, n):\n    t = 0\n    i = 0\n\
+                   \x20   while i < n:\n        t = t + xs[i]\n        i = i + 1\n\
+                   \x20   return t\n\
+                   xs = [x * 2 for x in range(30)]\n\
+                   r = 0\nk = 0\n\
+                   while k < 60:\n    r = ssum(xs, 30)\n    k = k + 1\n\
+                   print(r)\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the int-list kernel");
+        assert_eq!(deopts, 0, "clean int-list kernel should not deopt");
+        assert_eq!(out, "870\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_list_float_lane_and_store() {
+        // Float lane, plus `xs[i] = v` through `wpjit_list_set`: the
+        // list's contents after native execution must match the
+        // interpreter's exactly.
+        let src = "def scale(xs, n):\n    i = 0\n\
+                   \x20   while i < n:\n        xs[i] = xs[i] * 1.5\n        i = i + 1\n\
+                   \x20   return 0\n\
+                   xs = [float(x) for x in range(20)]\n\
+                   k = 0\n\
+                   while k < 60:\n    scale(xs, 20)\n    k = k + 1\n\
+                   print(xs[1])\nprint(xs[19])\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the float-list kernel");
+        assert_eq!(out, run(src), "float store diverged from interpreter");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_list_negative_index_and_bounds_deopt() {
+        // Negative indices resolve natively; an out-of-range access
+        // deopts and the interpreter raises the real IndexError.
+        let src = "def pick(xs, i):\n    return xs[i]\n\
+                   xs = [x for x in range(10)]\n\
+                   r = 0\nk = 0\n\
+                   while k < 60:\n    r = r + pick(xs, 0 - 1)\n    k = k + 1\n\
+                   print(r)\n\
+                   try:\n    pick(xs, 99)\nexcept IndexError:\n    print('bounds ok')\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the pick kernel");
+        assert!(deopts >= 1, "out-of-range subscript must deopt");
+        assert_eq!(out, "540\nbounds ok\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_list_heterogeneous_element_deopts() {
+        // The list goes heterogeneous *after* the compile: the per-
+        // access lane check in `wpjit_list_get` catches the str element
+        // and the interpreter finishes the concatenation-free path.
+        let src = "def pick(xs, i):\n    return xs[i]\n\
+                   xs = [x for x in range(10)]\n\
+                   k = 0\n\
+                   while k < 60:\n    pick(xs, 3)\n    k = k + 1\n\
+                   xs[3] = 'boom'\n\
+                   print(pick(xs, 3))\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the pick kernel");
+        assert!(deopts >= 1, "heterogeneous element must deopt");
+        assert_eq!(out, "boom\n");
         assert_eq!(out, run(src));
     }
 

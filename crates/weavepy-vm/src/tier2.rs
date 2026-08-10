@@ -120,6 +120,8 @@ impl JitState {
         // containing calls. Registered unconditionally (it only stores a
         // fn pointer) so late enabling, e.g. via the test hook, works.
         weavepy_jit::register_call_py_helper(wpjit_call_py);
+        // RFC 0061 WS5 — same for the pinned-list access helpers.
+        weavepy_jit::register_list_helpers(wpjit_list_get, wpjit_list_set);
         JitState {
             enabled,
             threshold,
@@ -135,13 +137,16 @@ impl JitState {
     /// frame's namespaces (used both to classify globals for analysis
     /// and to snapshot the guard expectations); `ret_lane_of` reports a
     /// candidate Python callee's stable scalar return lane (RFC 0059
-    /// WS3). Returns the compiled frame + guard snapshot + callee table
-    /// when one is available.
+    /// WS3); `probe_list` reports a subscripted local's observed element
+    /// lane in the requesting activation (RFC 0061 WS5). Returns the
+    /// compiled frame + guard snapshot + callee table when one is
+    /// available.
     fn get_compiled(
         &mut self,
         code: &Rc<CodeObject>,
         resolve_obj: &mut dyn FnMut(&str) -> Option<Object>,
         ret_lane_of: &mut dyn FnMut(&Rc<PyFunction>, &Rc<CodeObject>) -> Option<JitType>,
+        probe_list: &mut dyn FnMut(u32) -> Option<JitType>,
     ) -> Option<CompiledEntry> {
         let key = Rc::as_ptr(code).cast::<CodeObject>();
         {
@@ -212,7 +217,7 @@ impl JitState {
             }
             classify_global(obj.as_ref())
         };
-        let (tier, out) = match engine.compile(code, &mut classify) {
+        let (tier, out) = match engine.compile_with_probe(code, &mut classify, probe_list) {
             Ok(cf) => {
                 self.stats.frames_compiled += 1;
                 // Snapshot the exact objects the guards must keep
@@ -351,24 +356,45 @@ fn callee_ret_lane(
     lane
 }
 
+/// One activation's pinned lists (RFC 0061 WS5): slot bits tagged
+/// [`SlotTag::ListPin`] index this table, which pairs the list storage
+/// with the element lane the compile assumed.
+type PinTable = Vec<(Rc<GilRefCell<Vec<Object>>>, JitType)>;
+
 /// Reconstruct an [`Object`] from a `(bits, tag)` slot. `Boxed` never
 /// appears in locals or ordinary spills (the parked result travels
-/// through [`CallCtx::parked`]); map it defensively to `None`.
+/// through [`CallCtx::parked`]); map it defensively to `None`, likewise
+/// a `ListPin` reaching a context without pin-table access.
 fn unpack(bits: u64, tag: u32) -> Object {
     match SlotTag::from_raw(tag) {
         SlotTag::Int => Object::Int(bits as i64),
         SlotTag::Float => Object::Float(f64::from_bits(bits)),
         SlotTag::Bool => Object::Bool(bits != 0),
-        SlotTag::Boxed => Object::None,
+        SlotTag::Boxed | SlotTag::ListPin => Object::None,
+    }
+}
+
+/// As [`unpack`] with the activation's pin table at hand, so a
+/// [`SlotTag::ListPin`] slot rebuilds into its real list object
+/// (RFC 0061 WS5).
+fn unpack_pins(bits: u64, tag: u32, pins: &PinTable) -> Object {
+    match SlotTag::from_raw(tag) {
+        SlotTag::ListPin => pins
+            .get(bits as usize)
+            .map_or(Object::None, |(l, _)| Object::List(l.clone())),
+        _ => unpack(bits, tag),
     }
 }
 
 /// Reconstruct an [`Object`] from a slot whose lane is statically known.
-fn unpack_ty(bits: u64, ty: JitType) -> Object {
+fn unpack_ty(bits: u64, ty: JitType, pins: &PinTable) -> Object {
     match ty {
         JitType::Int => Object::Int(bits as i64),
         JitType::Float => Object::Float(f64::from_bits(bits)),
         JitType::Bool => Object::Bool(bits != 0),
+        JitType::ListInt | JitType::ListFloat => pins
+            .get(bits as usize)
+            .map_or(Object::None, |(l, _)| Object::List(l.clone())),
         JitType::Unknown => Object::None,
     }
 }
@@ -382,6 +408,50 @@ fn pack(obj: &Object, ty: JitType) -> Option<u64> {
         (JitType::Float, Object::Float(f)) => Some(f.to_bits()),
         _ => None,
     }
+}
+
+/// Entry-guard check for one managed local (RFC 0061 WS5): a scalar
+/// lane must pack; a pinned-list lane must hold a `list` whose *first*
+/// element matches the compiled element lane (an O(1) proxy for the
+/// probe's full scan — the access helpers re-validate per element, so
+/// a heterogeneous tail costs a deopt, never correctness).
+fn entry_local_ok(obj: &Object, ty: JitType) -> bool {
+    let Some(elem) = ty.elem_lane() else {
+        return pack(obj, ty).is_some();
+    };
+    let Object::List(l) = obj else {
+        return false;
+    };
+    matches!(
+        (l.borrow().first(), elem),
+        (None, _) | (Some(Object::Int(_)), JitType::Int) | (Some(Object::Float(_)), JitType::Float)
+    )
+}
+
+/// The compile-time shape probe (RFC 0061 WS5): report the element lane
+/// of local `slot` when it currently holds a homogeneous non-empty
+/// `int` or `float` list, `None` otherwise (an empty list has no
+/// evidence to predict a lane from).
+fn probe_list_lane(frame: &super::Frame, slot: u32) -> Option<JitType> {
+    let locals = frame.locals.borrow();
+    let Some(Object::List(l)) = locals.get(slot as usize) else {
+        return None;
+    };
+    let items = l.borrow();
+    let mut lane: Option<JitType> = None;
+    for it in items.iter() {
+        let t = match it {
+            Object::Int(_) => JitType::Int,
+            Object::Float(_) => JitType::Float,
+            _ => return None,
+        };
+        match lane {
+            None => lane = Some(t),
+            Some(cur) if cur == t => {}
+            Some(_) => return None,
+        }
+    }
+    lane
 }
 
 /// Bump the back-edge hot counter for a code object. Returns `true`
@@ -463,6 +533,9 @@ struct CallCtx {
     parked: Option<Object>,
     /// A raised callee's exception, parked for the `Raised` exit.
     raised: Option<RuntimeError>,
+    /// RFC 0061 WS5 — this activation's pinned lists, indexed by the
+    /// pin bits native code carries in `SlotTag::ListPin` slots.
+    pins: PinTable,
 }
 
 /// `true` while every burned-in resolution still holds: each guarded
@@ -553,7 +626,9 @@ unsafe extern "C" fn wpjit_call_py(
                     SlotTag::Int => JitType::Int,
                     SlotTag::Float => JitType::Float,
                     SlotTag::Bool => JitType::Bool,
-                    SlotTag::Boxed => JitType::Unknown,
+                    // A list-lane call result is rejected at emission;
+                    // `Unknown` never packs, forcing the boxed path.
+                    SlotTag::Boxed | SlotTag::ListPin => JitType::Unknown,
                 };
                 if let Some(bits) = pack(&v, expect) {
                     jf.ret_bits = bits;
@@ -565,6 +640,83 @@ unsafe extern "C" fn wpjit_call_py(
             CallStatus::Boxed as i64
         }
     }
+}
+
+/// The `wpjit_list_get` helper (RFC 0061 WS5): read one element of a
+/// pinned list. Returns `0` with the element's bits in
+/// [`JitFrame::ret_bits`], or non-zero to deopt — out of range, or the
+/// element no longer matches the pinned lane (aliased mutation through
+/// a callee). Never runs Python code and never drops a heap object.
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`].
+unsafe extern "C" fn wpjit_list_get(frame: *mut JitFrame, pin: i64, idx: i64) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    let Some((list, elem)) = ctx.pins.get(pin as usize) else {
+        return 1;
+    };
+    let items = list.borrow();
+    let len = items.len() as i64;
+    let i = if idx < 0 { idx + len } else { idx };
+    if i < 0 || i >= len {
+        return 1;
+    }
+    match (&items[i as usize], elem) {
+        (Object::Int(v), JitType::Int) => {
+            jf.ret_bits = *v as u64;
+            0
+        }
+        (Object::Float(f), JitType::Float) => {
+            jf.ret_bits = f.to_bits();
+            0
+        }
+        _ => 1,
+    }
+}
+
+/// The `wpjit_list_set` helper (RFC 0061 WS5): write one element of a
+/// pinned list. The value's bits are pre-staged in
+/// [`JitFrame::ret_bits`], interpreted per the pin's element lane.
+/// Deopts (non-zero) when out of range or when the displaced element
+/// is a heap object — replacing it here would drop it inside the
+/// helper, and the drop-site machinery (prompt reap, parked
+/// finalizers) belongs to the interpreter's store path.
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`].
+unsafe extern "C" fn wpjit_list_set(frame: *mut JitFrame, pin: i64, idx: i64) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    let Some((list, elem)) = ctx.pins.get(pin as usize) else {
+        return 1;
+    };
+    let v = match elem {
+        JitType::Int => Object::Int(jf.ret_bits as i64),
+        JitType::Float => Object::Float(f64::from_bits(jf.ret_bits)),
+        _ => return 1,
+    };
+    let mut items = list.borrow_mut();
+    let len = items.len() as i64;
+    let i = if idx < 0 { idx + len } else { idx };
+    if i < 0 || i >= len {
+        return 1;
+    }
+    let dst = &mut items[i as usize];
+    if !matches!(
+        dst,
+        Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
+    ) {
+        return 1;
+    }
+    *dst = v;
+    0
 }
 
 /// Offer a fresh frame (pc 0, empty stack) to the JIT. See [`JitEntry`].
@@ -580,7 +732,8 @@ pub(crate) fn try_enter(interp: &mut super::Interpreter, frame: &mut super::Fram
         let frame_ref: &super::Frame = frame;
         let mut resolve = |name: &str| resolve_plain_global(interp_ref, frame_ref, name);
         let mut ret_of = |f: &Rc<PyFunction>, c: &Rc<CodeObject>| callee_ret_lane(interp_ref, f, c);
-        st.get_compiled(&frame.code, &mut resolve, &mut ret_of)
+        let mut probe = |slot: u32| probe_list_lane(frame_ref, slot);
+        st.get_compiled(&frame.code, &mut resolve, &mut ret_of, &mut probe)
     });
     let Some(entry) = entry else {
         return JitEntry::Skip;
@@ -608,8 +761,7 @@ pub(crate) fn try_enter(interp: &mut super::Interpreter, frame: &mut super::Fram
             };
             let ok = locals
                 .get(slot as usize)
-                .and_then(|o| pack(o, ty))
-                .is_some();
+                .is_some_and(|o| entry_local_ok(o, ty));
             if !ok {
                 JIT.with(|cell| cell.borrow_mut().stats.entry_guard_failures += 1);
                 return JitEntry::Skip;
@@ -636,7 +788,8 @@ pub(crate) fn try_enter_osr(interp: &mut super::Interpreter, frame: &mut super::
         let frame_ref: &super::Frame = frame;
         let mut resolve = |name: &str| resolve_plain_global(interp_ref, frame_ref, name);
         let mut ret_of = |f: &Rc<PyFunction>, c: &Rc<CodeObject>| callee_ret_lane(interp_ref, f, c);
-        st.get_compiled(&frame.code, &mut resolve, &mut ret_of)
+        let mut probe = |slot: u32| probe_list_lane(frame_ref, slot);
+        st.get_compiled(&frame.code, &mut resolve, &mut ret_of, &mut probe)
     });
     let Some(entry) = entry else {
         return JitEntry::Skip;
@@ -667,7 +820,7 @@ pub(crate) fn try_enter_osr(interp: &mut super::Interpreter, frame: &mut super::
         let n_real = frame.code.varnames.len();
         for slot in 0..n_real {
             if let Some(ty) = cf.local_types.get(slot).copied().flatten() {
-                if locals.get(slot).and_then(|o| pack(o, ty)).is_none() {
+                if !locals.get(slot).is_some_and(|o| entry_local_ok(o, ty)) {
                     drop(locals);
                     return fail(&frame.code);
                 }
@@ -726,10 +879,21 @@ fn enter_compiled(
     let cf = &entry.cf;
     let n = cf.n_locals as usize;
     let mut locals_buf = vec![0u64; n];
+    // RFC 0061 WS5 — pin every list-lane local: the slot carries an
+    // index into `pins`, and the table (not the slot) keeps the list
+    // alive and reachable for the access helpers and the deopt rebuild.
+    let mut pins: PinTable = Vec::new();
     {
         let locals = frame.locals.borrow();
         for (slot, dst) in locals_buf.iter_mut().enumerate() {
             if let Some(ty) = cf.local_types[slot] {
+                if let Some(elem) = ty.elem_lane() {
+                    if let Some(Object::List(l)) = locals.get(slot) {
+                        *dst = pins.len() as u64;
+                        pins.push((l.clone(), elem));
+                    }
+                    continue;
+                }
                 *dst = locals.get(slot).and_then(|o| pack(o, ty)).unwrap_or(0);
             }
         }
@@ -751,6 +915,7 @@ fn enter_compiled(
         builtins: frame.builtins.clone(),
         parked: None,
         raised: None,
+        pins,
     };
     let mut jf = JitFrame {
         locals: locals_buf.as_mut_ptr(),
@@ -785,7 +950,7 @@ fn enter_compiled(
     });
 
     match status {
-        JitStatus::Returned => JitEntry::Ran(unpack(jf.ret_bits, jf.ret_tag)),
+        JitStatus::Returned => JitEntry::Ran(unpack_pins(jf.ret_bits, jf.ret_tag, &ctx.pins)),
         JitStatus::Deopt | JitStatus::Raised => {
             // Write back managed locals (synthetic range slots have no
             // interpreter home — they feed the iterator rebuild below),
@@ -796,12 +961,12 @@ fn enter_compiled(
                 for (slot, &bits) in locals_buf.iter().enumerate() {
                     if let Some(ty) = cf.local_types[slot] {
                         if let Some(dst) = locals.get_mut(slot) {
-                            *dst = unpack_ty(bits, ty);
+                            *dst = unpack_ty(bits, ty, &ctx.pins);
                         }
                     }
                 }
             }
-            rebuild_stack(frame, entry, &locals_buf, &spill, &tags, &jf);
+            rebuild_stack(frame, entry, &locals_buf, &spill, &tags, &jf, &ctx.pins);
             if matches!(status, JitStatus::Raised) {
                 // As though the CALL instruction just executed and
                 // raised: pc points past it (`handle_exception` uses
@@ -828,6 +993,7 @@ fn enter_compiled(
 /// live range iterators of enclosing rewritten loops (bottom), then the
 /// spilled temporaries with any *erased* callee objects re-inserted at
 /// their recorded interpreter-stack depths (RFC 0059 WS3).
+#[allow(clippy::too_many_arguments)]
 fn rebuild_stack(
     frame: &mut super::Frame,
     entry: &CompiledEntry,
@@ -835,6 +1001,7 @@ fn rebuild_stack(
     spill: &[u64],
     tags: &[u32],
     jf: &JitFrame,
+    pins: &PinTable,
 ) {
     let cf = &entry.cf;
     // RFC 0058 WS4 — iterators from the synthetic slots, outermost first.
@@ -869,7 +1036,7 @@ fn rebuild_stack(
                 .push(entry.callees[open[next].token as usize].0.clone());
             next += 1;
         }
-        frame.stack.push(unpack(spill[i], tags[i]));
+        frame.stack.push(unpack_pins(spill[i], tags[i], pins));
     }
     while next < open.len() {
         frame

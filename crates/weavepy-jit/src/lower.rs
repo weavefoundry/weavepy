@@ -61,6 +61,9 @@ struct Lowerer<'a, 'b> {
     call_tags_base: Value,
     /// Imported signature of the `wpjit_call_py` helper (lazy).
     call_sig: Option<SigRef>,
+    /// Imported signature shared by the `wpjit_list_get`/`_set` helpers
+    /// (RFC 0061 WS5, lazy).
+    list_sig: Option<SigRef>,
     /// The abstract operand stack: SSA value + lane.
     vstack: Vec<(Value, JitType)>,
 }
@@ -82,6 +85,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             call_args_base: dummy,
             call_tags_base: dummy,
             call_sig: None,
+            list_sig: None,
             vstack: Vec::new(),
         }
     }
@@ -98,6 +102,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             JitType::Int => SlotTag::Int as i64,
             JitType::Float => SlotTag::Float as i64,
             JitType::Bool => SlotTag::Bool as i64,
+            JitType::ListInt | JitType::ListFloat => SlotTag::ListPin as i64,
             JitType::Unknown => SlotTag::Int as i64,
         }
     }
@@ -335,7 +340,84 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 self.emit_int_to_float(depth, guarded, stmt.pc);
             }
             TOp::CallPy { token, argc, ret } => self.emit_call_py(token, argc, ret, stmt.pc),
+            TOp::ListGet { elem } => self.emit_list_get(elem, stmt.pc),
+            TOp::ListSet => self.emit_list_set(stmt.pc),
         }
+    }
+
+    /// RFC 0061 WS5 — pinned-list element read via the registered
+    /// `wpjit_list_get` helper. A non-zero status deopts at this pc
+    /// with both operands spilled (the pin reference rebuilds into the
+    /// real list object through its [`SlotTag::ListPin`] tag), so the
+    /// interpreter re-executes the subscript — and raises the exact
+    /// `IndexError`/`TypeError` itself when warranted.
+    fn emit_list_get(&mut self, elem: JitType, pc: u32) {
+        let trusted = MemFlags::trusted();
+        let snapshot = self.vstack.clone();
+        let (idx, _) = self.pop();
+        let (pin, _) = self.pop();
+        let sig = self.list_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::list_get_helper_addr() as i64);
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, pin, idx]);
+        let status = self.b.inst_results(call)[0];
+        let bad = self.b.ins().icmp_imm(IntCC::NotEqual, status, 0);
+        let cont = self.guard(bad, pc, &snapshot);
+        self.b.switch_to_block(cont);
+        let res = self
+            .b
+            .ins()
+            .load(Self::cl_ty(elem), trusted, self.frame_ptr, OFF_RET_BITS);
+        self.vstack.push((res, elem));
+    }
+
+    /// RFC 0061 WS5 — pinned-list element write. The value is staged
+    /// through `ret_bits` (dead between calls, same trick as the call
+    /// helper's out-slot) so one helper signature serves both ops.
+    fn emit_list_set(&mut self, pc: u32) {
+        let trusted = MemFlags::trusted();
+        let snapshot = self.vstack.clone();
+        let (idx, _) = self.pop();
+        let (pin, _) = self.pop();
+        let (val, _) = self.pop();
+        // Typed store: an F64 value lands as its bit pattern.
+        self.b
+            .ins()
+            .store(trusted, val, self.frame_ptr, OFF_RET_BITS);
+        let sig = self.list_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::list_set_helper_addr() as i64);
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, pin, idx]);
+        let status = self.b.inst_results(call)[0];
+        let bad = self.b.ins().icmp_imm(IntCC::NotEqual, status, 0);
+        let cont = self.guard(bad, pc, &snapshot);
+        self.b.switch_to_block(cont);
+    }
+
+    /// The shared `(frame, pin, idx) -> status` signature of the
+    /// pinned-list helpers (RFC 0061 WS5, lazy).
+    fn list_helper_sig(&mut self) -> SigRef {
+        if let Some(sig) = self.list_sig {
+            return sig;
+        }
+        let mut sig = Signature::new(self.b.func.signature.call_conv);
+        sig.params.push(AbiParam::new(self.ptr_ty)); // frame
+        sig.params.push(AbiParam::new(types::I64)); // pin
+        sig.params.push(AbiParam::new(types::I64)); // idx
+        sig.returns.push(AbiParam::new(types::I64)); // status
+        let r = self.b.import_signature(sig);
+        self.list_sig = Some(r);
+        r
     }
 
     /// Lower a native Python-to-Python call (RFC 0059 WS3): marshal the

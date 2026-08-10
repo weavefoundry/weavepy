@@ -53,6 +53,67 @@ fn observer_transition(was: bool, is: bool) {
         }
         _ => {}
     }
+    bump_observer_gen();
+}
+
+/// RFC 0061 (WS1a): monotonically bumped whenever any observer source —
+/// per-thread trace/profile hooks, the all-threads fallbacks, or a
+/// monitoring tool's event mask — changes. Hot paths cache derived
+/// observer state ([`ObserverSnapshot`], [`monitoring_union_mask_cached`])
+/// keyed by this generation, so the per-instruction cost is one relaxed
+/// load + compare instead of TLS walks and mask folds.
+static OBSERVER_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[inline]
+pub fn observer_gen() -> u64 {
+    OBSERVER_GEN.load(Ordering::Relaxed)
+}
+
+#[inline]
+fn bump_observer_gen() {
+    OBSERVER_GEN.fetch_add(1, Ordering::Release);
+}
+
+/// A generation-stamped cache of the two observer facts the eval loop
+/// needs per instruction: "is any observer active on this thread?" and
+/// "which PEP 669 events does any tool want?". Kept as a *local* in the
+/// dispatch loop (not on the `Interpreter`) because both derive from
+/// thread-local hook tables and an interpreter can be driven from
+/// different OS threads across C-API entries; a stack local can never
+/// outlive its thread.
+#[derive(Debug)]
+pub struct ObserverSnapshot {
+    gen: u64,
+    pub any: bool,
+    pub mon_mask: u32,
+}
+
+impl ObserverSnapshot {
+    /// A stale snapshot; the first [`Self::refresh`] derives.
+    pub fn new() -> Self {
+        Self {
+            gen: 0,
+            any: false,
+            mon_mask: 0,
+        }
+    }
+
+    /// One relaxed load + compare on the no-change path.
+    #[inline(always)]
+    pub fn refresh(&mut self) {
+        let g = observer_gen();
+        if g != self.gen {
+            self.gen = g;
+            self.any = any_observers_active();
+            self.mon_mask = monitoring_union_mask();
+        }
+    }
+}
+
+impl Default for ObserverSnapshot {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 thread_local! {
@@ -532,6 +593,28 @@ pub fn monitoring_event_name(event_idx: usize) -> &'static str {
 /// Union of every tool's active monitoring mask (global + local).
 pub fn monitoring_union_mask() -> u32 {
     MONITORING_TOOLS.with(|cell| cell.borrow().union_mask())
+}
+
+/// RFC 0061 (WS1a): generation-cached [`monitoring_union_mask`] for hot
+/// opcode arms that gate per-instruction events (BRANCH/JUMP,
+/// INSTRUCTION, the call-boundary PY_* probes). One thread-local read +
+/// one relaxed load on the no-change path; the borrow-and-fold only runs
+/// when an observer source actually changed.
+#[inline]
+pub fn monitoring_union_mask_cached() -> u32 {
+    thread_local! {
+        static CACHED: std::cell::Cell<(u64, u32)> = const { std::cell::Cell::new((0, 0)) };
+    }
+    CACHED.with(|c| {
+        let (gen, mask) = c.get();
+        let g = observer_gen();
+        if g == gen {
+            return mask;
+        }
+        let fresh = monitoring_union_mask();
+        c.set((g, fresh));
+        fresh
+    })
 }
 
 // The `sys.monitoring.DISABLE` / `MISSING` sentinels. Identity

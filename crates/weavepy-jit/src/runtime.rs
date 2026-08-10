@@ -88,6 +88,10 @@ pub enum SlotTag {
     /// embedder's side channel (a native call's unrepresentable
     /// result). Only ever appears in a deopt spill, never in locals.
     Boxed = 3,
+    /// RFC 0061 WS5 — the value is an index into the embedder's
+    /// per-entry pinned-object table (a pinned `list`). The embedder
+    /// rebuilds the real object from the table on deopt/return.
+    ListPin = 4,
 }
 
 impl SlotTag {
@@ -99,6 +103,7 @@ impl SlotTag {
             1 => SlotTag::Float,
             2 => SlotTag::Bool,
             3 => SlotTag::Boxed,
+            4 => SlotTag::ListPin,
             _ => SlotTag::Int,
         }
     }
@@ -202,4 +207,45 @@ pub fn register_call_py_helper(helper: CallPyHelper) {
 #[must_use]
 pub(crate) fn call_py_helper_addr() -> usize {
     CALL_PY_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// RFC 0061 WS5 — the embedder's pinned-list *read* helper. `pin`
+/// indexes the per-entry pinned-object table on the embedder context;
+/// `idx` is the (possibly negative) Python index. Returns `0` (Ok) with
+/// the element's bits written into [`JitFrame::ret_bits`], or non-zero
+/// when the access must deopt (out of range, or the element no longer
+/// matches the pinned lane — aliased mutation through a callee).
+///
+/// # Safety contract (for implementors)
+///
+/// Same as [`CallPyHelper`]: `frame`/`ctx` are the live buffers of the
+/// current native activation. The helper must not run Python code and
+/// must not unwind across the FFI boundary.
+pub type ListGetHelper = unsafe extern "C" fn(frame: *mut JitFrame, pin: i64, idx: i64) -> i64;
+
+/// RFC 0061 WS5 — the embedder's pinned-list *write* helper. The value
+/// to store is pre-staged in [`JitFrame::ret_bits`] (interpreted per
+/// the pin's element lane); returns `0` (Ok) or non-zero to deopt
+/// (out of range). Same safety contract as [`ListGetHelper`].
+pub type ListSetHelper = unsafe extern "C" fn(frame: *mut JitFrame, pin: i64, idx: i64) -> i64;
+
+static LIST_GET_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static LIST_SET_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide pinned-list helpers (RFC 0061 WS5). Must
+/// precede the first compile of a frame containing list ops; later
+/// calls must pass the same functions.
+pub fn register_list_helpers(get: ListGetHelper, set: ListSetHelper) {
+    LIST_GET_HELPER.store(get as usize, std::sync::atomic::Ordering::Release);
+    LIST_SET_HELPER.store(set as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn list_get_helper_addr() -> usize {
+    LIST_GET_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
+pub(crate) fn list_set_helper_addr() -> usize {
+    LIST_SET_HELPER.load(std::sync::atomic::Ordering::Acquire)
 }

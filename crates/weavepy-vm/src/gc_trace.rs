@@ -164,6 +164,14 @@ pub struct TrackedHandle {
     /// makes the filter admit *more* objects to the precise check — never
     /// fewer — so it can never cause a dead object to be missed.
     pub weak_clones: AtomicUsize,
+    /// RFC 0061 (WS1b): set (never cleared) when this handle leaves the
+    /// GC index (`untrack_id`, the collection rebuild's White purge). The
+    /// prompt-reap suspect probe reads it instead of a per-entry
+    /// `is_tracked` registry lookup — that lookup (`GcState::handle_for`)
+    /// was the hottest non-dispatch symbol on drop-heavy profiles. A
+    /// re-tracked object gets a *fresh* handle, so a set flag
+    /// definitively means "this handle is dead".
+    pub untracked: AtomicBool,
 }
 
 #[allow(non_upper_case_globals)]
@@ -186,6 +194,7 @@ impl TrackedHandle {
             finalized: AtomicBool::new(false),
             finalize_queued: AtomicBool::new(false),
             weak_clones: AtomicUsize::new(0),
+            untracked: AtomicBool::new(false),
         }
     }
 }
@@ -523,6 +532,9 @@ impl GcState {
         let Some(handle) = self.index.borrow_mut().remove(&id) else {
             return;
         };
+        // RFC 0061 (WS1b): let suspect probes see the removal without a
+        // registry lookup.
+        handle.untracked.store(true, Ordering::Release);
         // Purge any suspect-list clone of this handle in lock-step: the
         // suspect entry shares the same `Arc<TrackedHandle>`, so dropping
         // the index's Arc alone would leave the handle's strong `object`
@@ -1907,6 +1919,9 @@ impl GcState {
             let color = h.color.load(Ordering::Acquire);
             if color == color::White {
                 index.remove(&h.id);
+                // RFC 0061 (WS1b): mirror `untrack_id`'s flag so a stale
+                // suspect entry self-identifies as reclaimed.
+                h.untracked.store(true, Ordering::Release);
                 if fin.remove(&h.id).is_some() {
                     self.finalizable_count.fetch_sub(1, Ordering::AcqRel);
                 }
@@ -2865,8 +2880,13 @@ const SUSPECT_BUDGET: u8 = 64;
 /// Task machinery lets go, and with eager eviction the web stayed pinned
 /// by its collector handle until a full `gc.collect()`.)
 const DORMANT_STRIDE: u64 = 64;
-static SUSPECTS: parking_lot::Mutex<Vec<(Arc<TrackedHandle>, u8)>> =
-    parking_lot::Mutex::new(Vec::new());
+/// RFC 0061 (WS1b): keyed by [`ObjectId`] so `remove_suspect` (called in
+/// lock-step with every `untrack_id`) and enrollment dedup are O(1)
+/// map hits instead of linear scans of the list — `remove_suspect`'s
+/// `retain` was a measurable share of drop-heavy profiles (`list_ops`).
+type SuspectMap = indexmap::IndexMap<ObjectId, (Arc<TrackedHandle>, u8)>;
+static SUSPECTS: std::sync::LazyLock<parking_lot::Mutex<SuspectMap>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(SuspectMap::new()));
 static SUSPECT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Entries with probe budget remaining. When only dormant entries are
 /// left, [`has_suspects`] admits a sweep every [`DORMANT_STRIDE`]-th
@@ -2874,10 +2894,13 @@ static SUSPECT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomic
 static SUSPECT_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static SUSPECT_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Recompute the count gates from the locked suspect list.
-fn publish_suspect_counts(s: &[(Arc<TrackedHandle>, u8)]) {
+/// Recompute the count gates from the locked suspect map.
+fn publish_suspect_counts(s: &SuspectMap) {
     SUSPECT_COUNT.store(s.len(), Ordering::Release);
-    SUSPECT_ACTIVE.store(s.iter().filter(|(_, b)| *b > 0).count(), Ordering::Release);
+    SUSPECT_ACTIVE.store(
+        s.values().filter(|(_, b)| *b > 0).count(),
+        Ordering::Release,
+    );
 }
 
 /// Enroll a cascade-skipped tracked object for later deadness re-probes.
@@ -2889,7 +2912,7 @@ pub fn note_suspect(h: Arc<TrackedHandle>) {
         return;
     }
     let mut s = SUSPECTS.lock();
-    if s.iter().any(|(e, _)| e.id == h.id) {
+    if s.contains_key(&h.id) {
         return;
     }
     // Refresh the handle's cached weakref-clone upper bound once at
@@ -2913,18 +2936,18 @@ pub fn note_suspect(h: Arc<TrackedHandle>) {
         // re-probed, pinning the Timeout→Task→frame web the test_ssl
         // leak tests watch).
         match s
-            .iter()
+            .values()
             .enumerate()
             .min_by_key(|(_, (_, b))| *b)
             .map(|(i, _)| i)
         {
             Some(i) => {
-                s.swap_remove(i);
+                s.swap_remove_index(i);
             }
             None => return,
         }
     }
-    s.push((h, SUSPECT_BUDGET));
+    s.insert(h.id, (h, SUSPECT_BUDGET));
     publish_suspect_counts(&s);
 }
 
@@ -2960,8 +2983,9 @@ pub fn remove_suspect(id: ObjectId) {
         return;
     }
     let mut s = SUSPECTS.lock();
-    s.retain(|(h, _)| h.id != id);
-    publish_suspect_counts(&s);
+    if s.swap_remove(&id).is_some() {
+        publish_suspect_counts(&s);
+    }
 }
 
 /// Re-probe the suspect list: return the objects that are now dead in
@@ -2977,12 +3001,14 @@ pub fn take_dead_suspects() -> Vec<Object> {
         || SUSPECT_TICK
             .fetch_add(1, Ordering::Relaxed)
             .is_multiple_of(DORMANT_STRIDE);
-    s.retain_mut(|(h, budget)| {
+    s.retain(|_, (h, budget)| {
         // Dormant (aged-out) entries only pay on the stride tick.
         if *budget == 0 && !probe_dormant {
             return true;
         }
-        if !is_tracked(h.id) {
+        // RFC 0061 (WS1b): the handle self-identifies as reclaimed (set
+        // in lock-step with every index removal) — no registry lookup.
+        if h.untracked.load(Ordering::Acquire) {
             return false; // already reclaimed elsewhere
         }
         // Fast reject via the cached weakref-clone upper bound (refreshed

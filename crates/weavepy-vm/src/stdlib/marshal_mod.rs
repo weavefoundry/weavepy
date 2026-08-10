@@ -1126,6 +1126,7 @@ impl<'a> MarshalReader<'a> {
             qualname: co_qualname,
             filename: string_of(&filename, "co_filename")?,
             caches: CacheTable::with_len(decoded.instructions.len()),
+            vm_ext: weavepy_compiler::VmExt::default(),
             instructions: decoded.instructions,
             constants: tuple_to_constants(&consts)?,
             names: tuple_of_strings(&names, "co_names")?,
