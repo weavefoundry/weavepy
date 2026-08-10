@@ -116,6 +116,12 @@ class deque:
     # formatting and pickling both key off this).
     __module__ = "collections"
 
+    # CPython's C deque has no `tp_dictoffset`: plain deques reject
+    # attribute assignment, and a subclass may list '__dict__' in its
+    # own `__slots__` (test_deque DequeWithSlots). It *does* set
+    # `tp_weaklistoffset`, so weak references work (test_weakref).
+    __slots__ = ("_data", "_maxlen", "_state", "__weakref__")
+
     # CPython's C deque carries Py_TPFLAGS_SEQUENCE, so `case [..]:`
     # patterns match deques (PEP 634). WeavePy's VM reads the flag off
     # this private marker (the same key ABCMeta stows __abc_tpflags__
@@ -380,15 +386,20 @@ class deque:
         # object is memoized), so a self-referential deque round-trips
         # (test_deque.test_pickle_recursive). The internal `_data`/`_state`
         # slots must stay out of `state` or they'd double-apply the items.
+        # The base deque has no instance dict (C deque tp_dictoffset == 0);
+        # only a subclass that re-adds one contributes dict state.
         dictstate = {
             k: v
-            for k, v in self.__dict__.items()
+            for k, v in getattr(self, "__dict__", {}).items()
             if k not in ("_data", "_state", "_maxlen")
         } or None
         # Mirror `object.__getstate__`: subclass __slots__ values travel in
-        # the second half of a (dict, slots) pair.
+        # the second half of a (dict, slots) pair. The deque-internal slots
+        # stay out — the elements travel as list items instead.
         slotstate = {}
         for klass in type(self).__mro__:
+            if klass is deque:
+                continue
             slots = klass.__dict__.get("__slots__", ())
             if isinstance(slots, str):
                 slots = (slots,)

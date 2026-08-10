@@ -123,7 +123,23 @@ pub const MAGIC: &[u8; 4] = b"\xf3\x0d\x0d\x0a";
 ///   Rev-18 artifacts decode the tag as 0 (untagged), which loosens
 ///   handled-exception unwinding and corrupts `__context__` chains
 ///   (test_contextlib_async `test_exit_exception_chaining_reference`).
-pub const CACHE_TAG: &str = "weavepy-313-19";
+/// - rev `20`: RFC 0060 trace-fidelity: the `def` STORE carries the
+///   `def` statement's location (was the unset line, tracing as line
+///   1), and a decorated function's code starts at the first
+///   decorator line (`co_firstlineno` / 'call' event parity).
+/// - rev `21`: RFC 0060 trace-fidelity continued: function docstrings
+///   emit no code (no traced NOP on the docstring line), class
+///   `__doc__` stores carry the docstring statement's location, and
+///   all-constant tuple displays fold to one `LoadConst`.
+/// - rev `22`: RFC 0060 trace-fidelity continued: `break`/`continue`
+///   emit a located NOP (their line traces before an inlined
+///   `finally`), decorated classes start at the first decorator line,
+///   `except*` prologue/match/no-match blocks carry the clause's
+///   location while the PREP_RERAISE_STAR epilogue and named-exception
+///   unbinds are NO_LOCATION, and the plain-`except` handler-exit
+///   POP_EXCEPT/unbind are NO_LOCATION (CPython's flowgraph
+///   propagation semantics for trace events).
+pub const CACHE_TAG: &str = "weavepy-313-23";
 
 const HEADER_LEN: usize = 16;
 

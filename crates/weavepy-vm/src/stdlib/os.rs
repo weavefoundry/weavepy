@@ -100,10 +100,12 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             );
         }
         // CPython sets `os.supports_bytes_environ` True on POSIX (the raw
-        // environ block is bytes) and False on Windows. We model POSIX.
+        // environ block is bytes) and False on Windows, where the native
+        // environment is UTF-16. Match it per platform — regrtest's
+        // `setup_process` branches on this to pick `environb` vs `environ`.
         d.insert(
             DictKey(Object::from_static("supports_bytes_environ")),
-            Object::Bool(true),
+            Object::Bool(cfg!(unix)),
         );
         d.insert(
             DictKey(Object::from_static("path")),
@@ -1011,6 +1013,24 @@ fn env_cstring(o: Option<&Object>, what: &str) -> Result<std::ffi::CString, Runt
     std::ffi::CString::new(bytes).map_err(|_| crate::error::value_error("embedded null byte"))
 }
 
+/// Windows flavour of [`env_cstring`]: coerce to a Rust `String` for
+/// `std::env`, raising `ValueError` on an embedded NUL like CPython.
+/// Bytes are decoded as UTF-8 (WeavePy's filesystem encoding).
+#[cfg(not(unix))]
+fn env_string(o: Option<&Object>, what: &str) -> Result<String, RuntimeError> {
+    let bytes = match o {
+        Some(Object::Str(s)) => s.as_bytes().to_vec(),
+        Some(Object::Bytes(b)) => b.to_vec(),
+        Some(Object::ByteArray(b)) => b.borrow().clone(),
+        _ => return Err(type_error(format!("putenv() {what} must be str or bytes"))),
+    };
+    if bytes.contains(&0) {
+        return Err(crate::error::value_error("embedded null byte"));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| crate::error::value_error(format!("putenv() {what} is not valid UTF-8")))
+}
+
 fn os_putenv(args: &[Object]) -> Result<Object, RuntimeError> {
     #[cfg(unix)]
     {
@@ -1036,10 +1056,20 @@ fn os_putenv(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     #[cfg(not(unix))]
     {
-        let _ = args;
-        Err(crate::error::not_implemented_error(
-            "os.putenv() is only implemented on POSIX in WeavePy",
-        ))
+        // Windows: CPython implements putenv via the CRT's `_wputenv`;
+        // `std::env::set_var` (SetEnvironmentVariableW) equally edits the
+        // live process environment so children inherit the change. The
+        // validation mirrors the POSIX branch — and keeps `set_var` from
+        // panicking on an illegal name.
+        let name = env_string(args.first(), "name")?;
+        if name.is_empty() || name.contains('=') {
+            return Err(crate::error::value_error(
+                "illegal environment variable name",
+            ));
+        }
+        let value = env_string(args.get(1), "value")?;
+        std::env::set_var(name, value);
+        Ok(Object::None)
     }
 }
 
@@ -1056,10 +1086,14 @@ fn os_unsetenv(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     #[cfg(not(unix))]
     {
-        let _ = args;
-        Err(crate::error::not_implemented_error(
-            "os.unsetenv() is only implemented on POSIX in WeavePy",
-        ))
+        let name = env_string(args.first(), "name")?;
+        if name.is_empty() || name.contains('=') {
+            return Err(crate::error::value_error(
+                "illegal environment variable name",
+            ));
+        }
+        std::env::remove_var(name);
+        Ok(Object::None)
     }
 }
 

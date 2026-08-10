@@ -14,6 +14,7 @@
 import sys
 import _sre
 from types import GenericAlias as _GenericAlias
+from types import MappingProxyType as _MappingProxy
 from . import _parser
 from ._constants import error as PatternError
 
@@ -59,7 +60,14 @@ def _subject_len(string):
         n = len(string)
         _len_cache = (string, n)
         return n
-    return len(string)
+    try:
+        return len(string)
+    except TypeError:
+        # CPython `_sre` wording (test_re test_bug_40736).
+        raise TypeError(
+            "expected string or bytes-like object, got '%s'"
+            % type(string).__name__
+        ) from None
 
 
 def _plain_slice(string, s, e):
@@ -115,9 +123,32 @@ class Pattern:
         self.pattern = pattern
         self.flags = flags
         self.groups = groups
-        self.groupindex = groupindex
+        # Issue 14260: a non-modifiable mapping, like CPython's C getter.
+        self.groupindex = _MappingProxy(groupindex)
         # tuple: group number (1-based) -> name or None
         self._indexgroup = indexgroup
+
+    # CPython `_sre` pattern rich compare (bpo-35966): equal iff the
+    # pattern string/bytes and effective flags agree; hash must follow.
+    def __eq__(self, other):
+        if self is other:
+            return True
+        if not isinstance(other, Pattern):
+            return NotImplemented
+        return (
+            type(self.pattern) is type(other.pattern)
+            and self.pattern == other.pattern
+            and self.flags == other.flags
+        )
+
+    def __ne__(self, other):
+        r = self.__eq__(other)
+        if r is NotImplemented:
+            return r
+        return not r
+
+    def __hash__(self):
+        return hash((Pattern, self.pattern, self.flags))
 
     # -- internal --------------------------------------------------------
 
@@ -135,18 +166,25 @@ class Pattern:
         return _sre.exec(self._handle, string, pos, endpos, mode,
                          1 if must_advance else 0)
 
-    def _iter(self, string, pos, endpos):
-        pos, endpos = _clamp_span(string, pos, endpos)
-        must_advance = False
-        opos, oendpos = pos, endpos
-        while pos <= endpos:
-            r = self._exec(string, pos, endpos, _MODE_SEARCH, must_advance)
-            if r is None:
-                break
-            start, end = r[0], r[1]
-            yield Match(self, string, opos, oendpos, r)
-            must_advance = start == end
-            pos = end
+    def _iter(self, string, pos, endpos, guard=None):
+        # `guard` is a live buffer export pinning a mutable subject
+        # (bytearray) for the iterator's lifetime — CPython's scanner
+        # holds the buffer until exhaustion (test_re test_keep_buffer).
+        try:
+            pos, endpos = _clamp_span(string, pos, endpos)
+            must_advance = False
+            opos, oendpos = pos, endpos
+            while pos <= endpos:
+                r = self._exec(string, pos, endpos, _MODE_SEARCH, must_advance)
+                if r is None:
+                    break
+                start, end = r[0], r[1]
+                yield Match(self, string, opos, oendpos, r)
+                must_advance = start == end
+                pos = end
+        finally:
+            if guard is not None:
+                guard.release()
 
     # -- public matching API --------------------------------------------
 
@@ -190,7 +228,12 @@ class Pattern:
         return out
 
     def finditer(self, string, pos=0, endpos=None):
-        return self._iter(string, pos, endpos)
+        # Pin a mutable subject's buffer *eagerly* — before the lazy
+        # generator first runs — so resizing the bytearray between
+        # `finditer()` and the first `next()` raises BufferError just
+        # like CPython's scanner (test_re test_keep_buffer).
+        guard = memoryview(string) if isinstance(string, bytearray) else None
+        return self._iter(string, pos, endpos, guard)
 
     def sub(self, repl, string, count=0):
         return self._subx(repl, string, count)[0]
@@ -478,11 +521,15 @@ def _parse_template(pattern, repl):
 
 
 def _compile_template(pattern, repl):
-    key = (pattern._handle, repl)
     try:
+        key = (pattern._handle, repl)
         return _template_cache[key]
     except KeyError:
         pass
+    except TypeError:
+        # Unhashable replacement (bytearray, memoryview): parse
+        # per-call, matching CPython's uncached buffer path.
+        return _parser.parse_template(repl, pattern)
     template = _parser.parse_template(repl, pattern)
     if len(_template_cache) >= 512:
         _template_cache.clear()

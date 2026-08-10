@@ -59,7 +59,8 @@ __all__ = [
 __version__ = "2.2.1"
 
 
-class RegexFlag(enum.IntFlag):
+@enum.global_enum
+class RegexFlag(enum.IntFlag, boundary=enum.KEEP):
     NOFLAG = 0
     ASCII = A = _compiler.SRE_FLAG_ASCII # assume ascii "locale"
     IGNORECASE = I = _compiler.SRE_FLAG_IGNORECASE # ignore case
@@ -68,10 +69,10 @@ class RegexFlag(enum.IntFlag):
     MULTILINE = M = _compiler.SRE_FLAG_MULTILINE # make anchors look for newline
     DOTALL = S = _compiler.SRE_FLAG_DOTALL # make dot match newline
     VERBOSE = X = _compiler.SRE_FLAG_VERBOSE # ignore whitespace and comments
-    # sre extensions (experimental, don't rely on these)
+    # TEMPLATE (bit 0x1) was removed in Python 3.13; the bit stays unnamed.
     DEBUG = _compiler.SRE_FLAG_DEBUG # dump pattern after compilation
-
-globals().update(RegexFlag.__members__)
+    __str__ = object.__str__
+    _numeric_repr_ = hex
 
 # sre exception
 PatternError = error = _compiler.PatternError

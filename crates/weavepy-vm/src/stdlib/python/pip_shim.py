@@ -34,9 +34,20 @@ def _find_installed():
     Returns ``(filename, source, is_package)``; ``(None, None, False)``
     when nothing is installed. Zip entries (``ensurepip`` prepends the
     bundled wheel itself to ``sys.path``) are searched too.
+
+    The materialized stdlib tree is on ``sys.path`` (it is CPython's
+    ``{prefix}/lib/pythonX.Y``) and contains this very facade as
+    ``pip.py`` — skip it, or the dispatcher would exec itself forever.
     """
+    _self_dir = None
+    try:
+        _self_dir = _os.path.dirname(_os.path.abspath(__file__))
+    except NameError:
+        pass
     for _entry in _sys.path:
         if not _entry:
+            continue
+        if _self_dir is not None and _os.path.abspath(_entry) == _self_dir:
             continue
         if _os.path.isdir(_entry):
             _pkg = _os.path.join(_entry, 'pip', '__init__.py')

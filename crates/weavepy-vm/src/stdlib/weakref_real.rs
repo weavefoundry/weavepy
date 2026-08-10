@@ -1235,6 +1235,9 @@ pub(crate) fn supports_weakref(target: &Object) -> bool {
         // (test_memoryio.test_getbuffer_gc_collect takes a `weakref.ref`
         // to a `BytesIO.getbuffer()` view).
         | Object::MemoryView(_)
+        // Code objects carry weakref support in CPython
+        // (test_code.CodeWeakRefTest).
+        | Object::Code(_)
         | Object::SimpleNamespace(_) => return true,
         // Everything else — numbers, `str`/`bytes`, `tuple`/`list`/`dict`/
         // `frozenset`/`range`, slices, the descriptor and internal frame/

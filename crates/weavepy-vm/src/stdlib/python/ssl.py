@@ -858,6 +858,13 @@ class SSLContext:
         # for validity (CPython-shaped errors) and then unused.
         if path is None:
             raise TypeError("path should be a valid filesystem path")
+        # CPython opens through `_Py_fopen_obj`, which audits
+        # `open(path, "rb", 0)` with the literal C mode — not io.open's
+        # FileIO-shaped "r" (test_audit test_open expects "rb" here).
+        # A veto-ing hook aborts before the io.open below fires its own
+        # event, matching CPython's single-event stream in that case.
+        import sys as _sys
+        _sys.audit("open", path, "rb", 0)
         with open(path, "rb") as f:
             data = f.read()
         if b"DH PARAMETERS" not in data:

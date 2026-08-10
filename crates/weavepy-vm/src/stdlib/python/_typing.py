@@ -46,27 +46,20 @@ def _idfunc(*args):
     return args[-1]
 
 
-class _ImmutableTypeMeta(type):
-    """CPython's NoDefaultType is an immutable C static type: assigning
-    or deleting *class* attributes raises TypeError (test_no_attributes
-    checks `type(NoDefault).foo = 3`)."""
-
-    def __setattr__(cls, name, value):
-        raise TypeError(
-            f"cannot set {name!r} attribute of immutable type {cls.__name__!r}"
-        )
-
-    def __delattr__(cls, name):
-        raise TypeError(
-            f"cannot delete {name!r} attribute of immutable type {cls.__name__!r}"
-        )
-
-
 _no_default_singleton = None
 
 
-class NoDefaultType(metaclass=_ImmutableTypeMeta):
-    """The type of the NoDefault singleton."""
+class NoDefaultType:
+    """The type of the NoDefault singleton.
+
+    CPython's NoDefaultType is an immutable C static type: assigning or
+    deleting *class* attributes raises TypeError (test_no_attributes
+    checks `type(NoDefault).foo = 3`). The `__weave_immutable_type__`
+    marker (stripped at class creation) freezes the class natively while
+    keeping `type(NoDefaultType) is type`, matching CPython.
+    """
+
+    __weave_immutable_type__ = True
 
     def __new__(cls, *args, **kwargs):
         if args or kwargs:
@@ -754,7 +747,7 @@ class _TypeAliasModuleDescriptor:
         raise AttributeError("readonly attribute")
 
 
-class TypeAliasType(metaclass=_ImmutableTypeMeta):
+class TypeAliasType:
     """Type alias.
 
     Type aliases are created through the type statement::
@@ -780,6 +773,7 @@ class TypeAliasType(metaclass=_ImmutableTypeMeta):
     See PEP 695 for more information.
     """
 
+    __weave_immutable_type__ = True
     __module__ = "typing"
 
     def __new__(cls, name, value, *, type_params=None):

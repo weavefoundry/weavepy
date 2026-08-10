@@ -36,7 +36,9 @@ if support.is_apple:
 TESTFN_UNENCODABLE = None
 if os.name == 'nt':
     # skip win32s (0) or Windows 9x/ME (1)
-    if sys.getwindowsversion().platform >= 2:
+    # WeavePy: `sys.getwindowsversion()` isn't implemented; WeavePy only
+    # runs on NT-family Windows (platform >= 2), so assume it when absent.
+    if not hasattr(sys, 'getwindowsversion') or sys.getwindowsversion().platform >= 2:
         # Different kinds of characters from various languages to minimize the
         # probability that the whole name is encodable to MBCS (issue #9819)
         TESTFN_UNENCODABLE = TESTFN_ASCII + "-\u5171\u0141\u2661\u0363\uDC80"

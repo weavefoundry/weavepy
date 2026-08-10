@@ -109,3 +109,13 @@ notes = "C-accelerated multidict/yarl/_http_parser chain over RFC 0054 asyncio; 
 [packages.django]
 status = "pass"
 notes = "migrate + ORM CRUD + filter().count() + atomic() rollback + test-client request against the WS1 sqlite3 backend."
+
+# --- capstone (RFC 0057 WS8) ---------------------------------------------------
+
+[packages.pandas]
+status = "pass"
+notes = "full Cython _libs chain over the real numpy wheel: DataFrame ops, groupby/merge, DatetimeIndex (zoneinfo._zoneinfo), CSV round-trip, .str accessor."
+
+[packages.fastapi]
+status = "pass"
+notes = "pydantic-core + starlette over anyio: routing, validation errors, DI, async endpoints, OpenAPI schema via TestClient."

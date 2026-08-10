@@ -2066,6 +2066,14 @@ pub fn install_user_type(t: &Rc<TypeObject>) -> *mut PyTypeObject {
         | tpflags::READY
         | tpflags::HEAPTYPE
         | fast_subclass_flags(t);
+    if std::env::var_os("WEAVEPY_TRACE_TYPEPTR").is_some() {
+        eprintln!(
+            "[INSTALL_USER_TYPE] name={:?} flags={:#x} fast={:#x}",
+            t.name,
+            flags,
+            fast_subclass_flags(t)
+        );
+    }
     // RFC 0029 / 0045 (wave 5): inherit an *inline* C base's `tp_basicsize`
     // and inline-storage status (see [`inherit_inline_base_layout`]) so a VM
     // subclass of e.g. the `datetime` shell (pandas `NaTType`) or
@@ -2825,6 +2833,44 @@ pub unsafe extern "C" fn PyType_FromMetaclass(
         let tp_mro_box = build_type_ptr_tuple(&mro_for_c);
         if !tp_mro_box.is_null() {
             (*ty_ptr).tp_mro = tp_mro_box;
+        }
+        // Mirror CPython's `type_ready` lifecycle-slot fill for spec-built
+        // heap types: the spec's slots landed in the side `SlotTable`, but a
+        // stock extension reads `tp_new` / `tp_alloc` / `tp_free` straight
+        // off the struct. Cython 3.1's shared `_cyutility` builds its
+        // memoryview `Enum` via type specs and its `tp_new` calls
+        // `t->tp_alloc(t, 0)` directly — a NULL there is a jump to address
+        // zero (pandas ≥2.3 wheels link every `_libs` module against
+        // `_cyutility`). Spec slot wins; then the base struct's slot
+        // (CPython `inherit_slots`); then the `object` defaults.
+        let spec_new = leaked.slot_table.get(crate::slottable::Py_tp_new);
+        let spec_alloc = leaked.slot_table.get(crate::slottable::Py_tp_alloc);
+        let spec_free = leaked.slot_table.get(crate::slottable::Py_tp_free);
+        let base_ptr = (*ty_ptr).tp_base;
+        if !spec_new.is_null() {
+            (*ty_ptr).tp_new = spec_new.as_void();
+        } else if !base_ptr.is_null() && !(*base_ptr).tp_new.is_null() {
+            (*ty_ptr).tp_new = (*base_ptr).tp_new;
+        } else {
+            let new_fp: unsafe extern "C" fn(
+                *mut PyTypeObject,
+                *mut PyObject,
+                *mut PyObject,
+            ) -> *mut PyObject = crate::genericalloc::PyType_GenericNew;
+            (*ty_ptr).tp_new = new_fp as *mut c_void;
+        }
+        if !spec_alloc.is_null() {
+            (*ty_ptr).tp_alloc = spec_alloc.as_void();
+        } else {
+            let alloc_fp: unsafe extern "C" fn(*mut PyTypeObject, PySsizeT) -> *mut PyObject =
+                crate::genericalloc::PyType_GenericAlloc;
+            (*ty_ptr).tp_alloc = alloc_fp as *mut c_void;
+        }
+        if !spec_free.is_null() {
+            (*ty_ptr).tp_free = spec_free.as_void();
+        } else {
+            let free_fp: unsafe extern "C" fn(*mut c_void) = crate::memory::PyObject_Free;
+            (*ty_ptr).tp_free = free_fp as *mut c_void;
         }
     }
     ty_ptr as *mut PyObject

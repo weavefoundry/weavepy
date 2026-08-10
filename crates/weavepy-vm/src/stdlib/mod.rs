@@ -48,6 +48,7 @@ pub mod os;
 pub mod os_process;
 pub mod posixsubprocess_mod;
 pub mod pyexpat_mod;
+#[cfg(unix)]
 pub mod resource_mod;
 pub mod select_mod;
 pub mod shutil_mod;
@@ -65,6 +66,8 @@ pub mod sysconfig_native;
 pub mod tempfile_mod;
 #[cfg(unix)]
 pub mod termios_mod;
+pub mod testcapi_call;
+pub mod testcapi_monitoring;
 pub mod testinternalcapi_mod;
 pub mod thread;
 pub mod time;
@@ -73,6 +76,7 @@ pub mod tracemalloc_real;
 pub mod ucd;
 pub mod unicodedata_mod;
 pub mod weakref_mod;
+pub mod weave_frame_mod;
 pub mod zlib_mod;
 // RFC 0023 — drop-in stdlib parity.
 pub mod abc_mod;
@@ -134,6 +138,9 @@ pub fn register_all(cache: &ModuleCache) {
     // hung until `LONG_TIMEOUT`.
     cache.register_builtin("faulthandler", faulthandler_mod::build);
     cache.register_builtin("_testinternalcapi", testinternalcapi_mod::build);
+    // RFC 0060 — native primitives behind the frozen
+    // `_weave_frame_locals` module's PEP 667 `FrameLocalsProxy`.
+    cache.register_builtin("_weave_frame", weave_frame_mod::build);
     // RFC 0040 WS4 — the native core is `_signal`; the frozen `signal.py`
     // (CPython's) layers the `Signals`/`Handlers`/`Sigmasks` IntEnums and
     // the enum-coercing `signal`/`getsignal`/`pthread_sigmask` wrappers.
@@ -145,6 +152,13 @@ pub fn register_all(cache: &ModuleCache) {
     // verbatim `subprocess.Popen` driver.
     cache.register_builtin("_posixsubprocess", posixsubprocess_mod::build);
     cache.register_builtin("hashlib", hashlib_mod::build);
+    // RFC 0060 WS3 — CPython-shaped hash accelerator modules, importable
+    // individually and consulted by `hashlib.__get_builtin_constructor`.
+    cache.register_builtin("_md5", hashlib_mod::build_md5);
+    cache.register_builtin("_sha1", hashlib_mod::build_sha1);
+    cache.register_builtin("_sha2", hashlib_mod::build_sha2);
+    cache.register_builtin("_sha3", hashlib_mod::build_sha3);
+    cache.register_builtin("_blake2", hashlib_mod::build_blake2);
     cache.register_builtin("_operator", operator_accel::build);
     cache.register_builtin("_heapq", heapq_accel::build);
     cache.register_builtin("_bisect", bisect_accel::build);
@@ -226,6 +240,11 @@ pub fn register_all(cache: &ModuleCache) {
     // RFC 0026 — POSIX-flavoured stdlib that user code (and the
     // multiprocessing rewrite) imports unconditionally.
     cache.register_builtin("fcntl", fcntl_mod::build);
+    // CPython has no `resource` module on Windows — every stdlib caller
+    // guards `import resource` with ImportError — and the non-unix stubs
+    // in `resource_mod` fail at call time anyway (e.g. regrtest's
+    // `adjust_rlimit_nofile` dying on `getrlimit`), so don't register it.
+    #[cfg(unix)]
     cache.register_builtin("resource", resource_mod::build);
     // RFC 0055 WS6 — real POSIX terminal control (CPython's termios is a
     // core C extension; `tty`/`pty` above are pure-Python over it).
@@ -362,6 +381,14 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "_weave_frame_locals",
             source: include_str!("python/_weave_frame_locals.py"),
+            is_package: false,
+        },
+        // RFC 0060 WS1 — the `_testinternalcapi` instruction-sequence
+        // fixture (`new_instruction_sequence` / `assemble_code_object`,
+        // test_compiler_assemble). The native module delegates here.
+        FrozenSource {
+            name: "_weave_iseq",
+            source: include_str!("python/_weave_iseq.py"),
             is_package: false,
         },
         // RFC 0040 WS7 — CPython's pure-Python `io` reference implementation.
@@ -2430,39 +2457,108 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/test_regrtest.py"),
             is_package: false,
         },
+        // RFC 0060 — CPython 3.13's *verbatim* `test.libregrtest` package
+        // (from `vendor/cpython/Lib/test/libregrtest/`), replacing the
+        // RFC 0036 shim whose partial `result.py` shadowed the real one
+        // (`test_regrtest` imports `TestStats` at module scope).
         FrozenSource {
             name: "test.libregrtest",
-            source: include_str!("python/test_libregrtest_init.py"),
+            source: include_str!("python/test_libregrtest/__init__.py"),
             is_package: true,
         },
         FrozenSource {
-            name: "test.libregrtest.result",
-            source: include_str!("python/test_libregrtest_result.py"),
+            name: "test.libregrtest.cmdline",
+            source: include_str!("python/test_libregrtest/cmdline.py"),
             is_package: false,
         },
         FrozenSource {
-            name: "test.libregrtest.cmdline",
-            source: include_str!("python/test_libregrtest_cmdline.py"),
+            name: "test.libregrtest.filter",
+            source: include_str!("python/test_libregrtest/filter.py"),
             is_package: false,
         },
         FrozenSource {
             name: "test.libregrtest.findtests",
-            source: include_str!("python/test_libregrtest_findtests.py"),
+            source: include_str!("python/test_libregrtest/findtests.py"),
             is_package: false,
         },
         FrozenSource {
-            name: "test.libregrtest.save_env",
-            source: include_str!("python/test_libregrtest_save_env.py"),
-            is_package: false,
-        },
-        FrozenSource {
-            name: "test.libregrtest.single",
-            source: include_str!("python/test_libregrtest_single.py"),
+            name: "test.libregrtest.logger",
+            source: include_str!("python/test_libregrtest/logger.py"),
             is_package: false,
         },
         FrozenSource {
             name: "test.libregrtest.main",
-            source: include_str!("python/test_libregrtest_main.py"),
+            source: include_str!("python/test_libregrtest/main.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.libregrtest.pgo",
+            source: include_str!("python/test_libregrtest/pgo.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.libregrtest.refleak",
+            source: include_str!("python/test_libregrtest/refleak.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.libregrtest.result",
+            source: include_str!("python/test_libregrtest/result.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.libregrtest.results",
+            source: include_str!("python/test_libregrtest/results.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.libregrtest.run_workers",
+            source: include_str!("python/test_libregrtest/run_workers.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.libregrtest.runtests",
+            source: include_str!("python/test_libregrtest/runtests.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.libregrtest.save_env",
+            source: include_str!("python/test_libregrtest/save_env.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.libregrtest.setup",
+            source: include_str!("python/test_libregrtest/setup.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.libregrtest.single",
+            source: include_str!("python/test_libregrtest/single.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.libregrtest.testresult",
+            source: include_str!("python/test_libregrtest/testresult.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.libregrtest.tsan",
+            source: include_str!("python/test_libregrtest/tsan.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.libregrtest.utils",
+            source: include_str!("python/test_libregrtest/utils.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.libregrtest.win_utils",
+            source: include_str!("python/test_libregrtest/win_utils.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.libregrtest.worker",
+            source: include_str!("python/test_libregrtest/worker.py"),
             is_package: false,
         },
         FrozenSource {
@@ -2951,6 +3047,14 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/pdb_mod.py"),
             is_package: false,
         },
+        // CPython `Lib/trace.py` verbatim (RFC 0060 WS5): the
+        // `trace` CLI / Trace class ride on settrace, which WeavePy
+        // implements natively; `test.libregrtest.main` imports it too.
+        FrozenSource {
+            name: "trace",
+            source: include_str!("python/trace_mod.py"),
+            is_package: false,
+        },
         // RFC 0031 — PEP 684 sub-interpreters friendly frontend.
         FrozenSource {
             name: "interpreters",
@@ -3057,9 +3161,23 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/plistlib_mod.py"),
             is_package: false,
         },
+        // A real package (CPython `Lib/zoneinfo/`): pandas' Cython
+        // `tslibs.timezones` imports `zoneinfo._zoneinfo` directly.
         FrozenSource {
             name: "zoneinfo",
-            source: include_str!("python/zoneinfo_mod.py"),
+            source: include_str!("python/zoneinfo/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "zoneinfo._zoneinfo",
+            source: include_str!("python/zoneinfo/_zoneinfo.py"),
+            is_package: false,
+        },
+        // RFC 0060 — the C-accelerator-shaped `_zoneinfo` (module-state
+        // caches + weak-cache validation; `zoneinfo` adopts it at import).
+        FrozenSource {
+            name: "_zoneinfo",
+            source: include_str!("python/_zoneinfo_mod.py"),
             is_package: false,
         },
         // RFC 0023 — fill in the small but commonly-imported stdlib

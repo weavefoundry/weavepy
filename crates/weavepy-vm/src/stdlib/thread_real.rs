@@ -1099,6 +1099,15 @@ fn start_new_thread(args: &[Object]) -> Result<Object, RuntimeError> {
         .cloned()
         .unwrap_or_else(|| Object::new_tuple(Vec::new()));
     let kwargs = args.get(2).cloned();
+    // PEP 578: `(func, args, kwargs)` — kwargs is None when omitted.
+    crate::stdlib::sys::audit_event(
+        "_thread.start_new_thread",
+        &[
+            func.clone(),
+            argv.clone(),
+            kwargs.clone().unwrap_or(Object::None),
+        ],
+    )?;
 
     // Materialise positional args once on the parent thread (cheap
     // tuple-iteration), then move into the worker. `Object` is
@@ -1709,6 +1718,16 @@ fn start_joinable_thread(
         None | Some(Object::None) => true,
         Some(_) => true,
     };
+    // PEP 578: `(func, daemon, handle)` — matches CPython's
+    // `_thread.start_joinable_thread` "OiO" audit tuple.
+    crate::stdlib::sys::audit_event(
+        "_thread.start_joinable_thread",
+        &[
+            func.clone(),
+            Object::Int(i64::from(daemon)),
+            kw("handle").unwrap_or(Object::None),
+        ],
+    )?;
 
     let (handle_obj, state) = match kw("handle") {
         None | Some(Object::None) => {

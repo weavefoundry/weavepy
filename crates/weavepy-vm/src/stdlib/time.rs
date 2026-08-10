@@ -459,6 +459,12 @@ fn time_sleep(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Bool(b)) => f64::from(*b),
         _ => return Err(type_error("sleep expects a number")),
     };
+    // PEP 578: audits the *original* argument object, before the
+    // negative-value check (test_audit expects a `time.sleep -1` event).
+    crate::stdlib::sys::audit_event(
+        "time.sleep",
+        std::slice::from_ref(args.first().expect("checked above")),
+    )?;
     if secs.is_nan() || secs < 0.0 {
         // CPython raises ValueError for a negative sleep.
         return Err(crate::error::value_error(

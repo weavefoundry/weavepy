@@ -281,6 +281,12 @@ fn conn_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
 
     let isolation_level = parse_isolation_level(&isolation_level_obj)?;
 
+    // PEP 578: CPython's `pysqlite_connection_init` audits
+    // `sqlite3.connect(database)` before opening and
+    // `sqlite3.connect/handle(connection)` after — both module-level
+    // `connect()` and direct `Connection()` produce the pair.
+    crate::stdlib::sys::audit_event("sqlite3.connect", std::slice::from_ref(&database))?;
+
     let path = database_path(ip, &database)?;
     let c_path = std::ffi::CString::new(path).map_err(|_| value_error("embedded null byte"))?;
     let mut flags =
@@ -331,6 +337,7 @@ fn conn_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
         DictKey(Object::from_static(HANDLE_KEY)),
         Object::Int(handle),
     );
+    crate::stdlib::sys::audit_event("sqlite3.connect/handle", std::slice::from_ref(&args[0]))?;
     Ok(Object::None)
 }
 

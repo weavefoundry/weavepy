@@ -29,6 +29,37 @@ use std::thread::JoinHandle;
 /// shared-keys capacity stop using inline values.
 const INLINE_CAPACITY: usize = 30;
 
+/// Delegate a `_testinternalcapi` entry point to the frozen
+/// `_weave_iseq` helper module (the instruction-sequence fixture —
+/// `new_instruction_sequence` / `assemble_code_object`, RFC 0060 WS1).
+/// Runs through the live interpreter: the helper is plain Python.
+fn iseq_call(
+    name: &'static str,
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
+    let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
+        RuntimeError::Internal("_testinternalcapi: no running interpreter".to_owned())
+    })?;
+    // SAFETY: published by an enclosing VM frame still live on this
+    // thread; the GIL keeps the access exclusive.
+    let vm = unsafe { &mut *ptr };
+    let builtins = vm.builtins_dict();
+    let import_fn = builtins
+        .borrow()
+        .get(&DictKey(Object::from_static("__import__")))
+        .cloned()
+        .ok_or_else(|| RuntimeError::Internal("_testinternalcapi: no __import__".to_owned()))?;
+    let module = vm.call_object_with_globals(
+        &import_fn,
+        &[Object::from_static("_weave_iseq")],
+        &[],
+        &builtins,
+    )?;
+    let f = vm.load_attr_public(&module, name)?;
+    vm.call_object_with_globals(&f, args, kwargs, &builtins)
+}
+
 /// A raw, non-Python OS thread spawned by `_spawn_pthread_waiter` that simply
 /// blocks until `_end_spawned_pthread` releases it. It deliberately bypasses
 /// WeavePy's `_thread`/`threading` machinery so it is invisible to
@@ -334,6 +365,28 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         // thread, read straight off the RFC 0037 recursion guard.
         // `test.support.get_recursion_depth()`/`infinite_recursion()` use it
         // to size `sys.setrecursionlimit` windows (RFC 0048).
+        // RFC 0060 WS1 — the compiler assemble-stage fixtures
+        // (`test_compiler_assemble` via bytecode_helper's
+        // AssemblerTestCase). Implemented in the frozen `_weave_iseq`
+        // helper; these entries just delegate.
+        d.insert(
+            DictKey(Object::from_static("new_instruction_sequence")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "new_instruction_sequence",
+                binds_instance: false,
+                call: Box::new(|args| iseq_call("new_instruction_sequence", args, &[])),
+                call_kw: None,
+            })),
+        );
+        d.insert(
+            DictKey(Object::from_static("assemble_code_object")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "assemble_code_object",
+                binds_instance: false,
+                call: Box::new(|args| iseq_call("assemble_code_object", args, &[])),
+                call_kw: None,
+            })),
+        );
         d.insert(
             DictKey(Object::from_static("get_recursion_depth")),
             Object::Builtin(Rc::new(BuiltinFn {
@@ -427,11 +480,187 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             );
         }
     }
+    {
+        let mut d = dict.borrow_mut();
+        // RFC 0060 — rare-event counters (`test_optimizer.
+        // TestRareEventCounters`): live values of the five interpreter
+        // deopt-trigger counters, plus the reset the test's `setUp` calls.
+        d.insert(
+            DictKey(Object::from_static("get_rare_event_counters")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "get_rare_event_counters",
+                binds_instance: false,
+                call: Box::new(|_args| {
+                    let out = Rc::new(RefCell::new(DictData::default()));
+                    {
+                        let mut o = out.borrow_mut();
+                        let counts = crate::rare_events::snapshot();
+                        for (name, n) in crate::rare_events::NAMES.iter().zip(counts) {
+                            o.insert(DictKey(Object::from_static(name)), Object::Int(n as i64));
+                        }
+                    }
+                    Ok(Object::Dict(out))
+                }),
+                call_kw: None,
+            })),
+        );
+        d.insert(
+            DictKey(Object::from_static("reset_rare_event_counters")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "reset_rare_event_counters",
+                binds_instance: false,
+                call: Box::new(|_args| {
+                    crate::rare_events::reset();
+                    Ok(Object::None)
+                }),
+                call_kw: None,
+            })),
+        );
+        // `_PyInterpreterState_SetEvalFrameFunc` probes: install/remove the
+        // recording frame evaluator. Both count as a `set_eval_frame_func`
+        // rare event, exactly like CPython's C helpers.
+        d.insert(
+            DictKey(Object::from_static("set_eval_frame_record")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "set_eval_frame_record",
+                binds_instance: false,
+                call: Box::new(set_eval_frame_record),
+                call_kw: None,
+            })),
+        );
+        d.insert(
+            DictKey(Object::from_static("set_eval_frame_default")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "set_eval_frame_default",
+                binds_instance: false,
+                call: Box::new(|_args| {
+                    crate::trace::set_eval_frame_default();
+                    crate::rare_events::bump(crate::rare_events::SET_EVAL_FRAME_FUNC);
+                    Ok(Object::None)
+                }),
+                call_kw: None,
+            })),
+        );
+        // `_Py_normalize_path` (Python/fileutils.c) — lexical path
+        // normalization with posixpath.normpath semantics
+        // (`test_fileutils.test_capi_normalize_path`).
+        d.insert(
+            DictKey(Object::from_static("normalize_path")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "normalize_path",
+                binds_instance: false,
+                call: Box::new(normalize_path),
+                call_kw: None,
+            })),
+        );
+        // PEP 509 `ma_version_tag` probe, re-exported by the `_testcapi`
+        // shim for `test_dict_version`.
+        d.insert(
+            DictKey(Object::from_static("dict_get_version")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "dict_get_version",
+                binds_instance: false,
+                call: Box::new(dict_get_version),
+                call_kw: None,
+            })),
+        );
+        // PEP 590 vectorcall fixture types + heap-type factory
+        // (test_call.TestPEP590), re-exported by the `_testcapi` shim.
+        for (name, ty) in crate::stdlib::testcapi_call::method_descriptor_types() {
+            d.insert(DictKey(Object::from_static(name)), Object::Type(ty));
+        }
+        d.insert(
+            DictKey(Object::from_static("make_vectorcall_class")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "make_vectorcall_class",
+                binds_instance: false,
+                call: Box::new(crate::stdlib::testcapi_call::make_vectorcall_class),
+                call_kw: None,
+            })),
+        );
+        // PEP 669 C-API fire primitives (`PyMonitoring_EnterScope` /
+        // `PyMonitoring_Fire*Event`), re-exported by the `_testcapi`
+        // shim for test_monitoring.TestCApiEventGeneration.
+        crate::stdlib::testcapi_monitoring::install(&mut d);
+    }
     Rc::new(PyModule {
         name: "_testinternalcapi".to_owned(),
         filename: None,
         dict,
     })
+}
+
+/// `set_eval_frame_record(list)` — install the recording frame evaluator:
+/// until `set_eval_frame_default()`, every frame evaluation appends its
+/// code object to `list`.
+fn set_eval_frame_record(args: &[Object]) -> Result<Object, RuntimeError> {
+    match args.first() {
+        Some(l @ Object::List(_)) => {
+            crate::trace::set_eval_frame_record(l.clone());
+            crate::rare_events::bump(crate::rare_events::SET_EVAL_FRAME_FUNC);
+            Ok(Object::None)
+        }
+        _ => Err(crate::error::type_error(
+            "set_eval_frame_record expected a list",
+        )),
+    }
+}
+
+/// `_Py_normalize_path(path)` — CPython's C-side lexical normalization
+/// (`Python/fileutils.c`), asserted against `posixpath.normpath` for
+/// absolute inputs by `test_fileutils`. Straight port of the normpath
+/// algorithm: collapse slash runs and `.`, resolve `..` lexically, and
+/// keep exactly-two leading slashes distinct (POSIX implementation-
+/// defined `//` roots).
+fn normalize_path(args: &[Object]) -> Result<Object, RuntimeError> {
+    let Some(Object::Str(path)) = args.first() else {
+        return Err(crate::error::type_error("normalize_path expected str"));
+    };
+    let path: &str = path.as_ref();
+    if path.is_empty() {
+        return Ok(Object::from_static("."));
+    }
+    let initial_slashes = if path.starts_with('/') {
+        if path.starts_with("//") && !path.starts_with("///") {
+            2
+        } else {
+            1
+        }
+    } else {
+        0
+    };
+    let mut comps: Vec<&str> = Vec::new();
+    for comp in path.split('/') {
+        if comp.is_empty() || comp == "." {
+            continue;
+        }
+        if comp != ".." || (initial_slashes == 0 && comps.is_empty()) || comps.last() == Some(&"..")
+        {
+            comps.push(comp);
+        } else {
+            comps.pop();
+        }
+    }
+    let mut out = "/".repeat(initial_slashes);
+    out.push_str(&comps.join("/"));
+    if out.is_empty() {
+        out.push('.');
+    }
+    Ok(Object::from_str(out))
+}
+
+/// `dict_get_version(d)` — the dict's PEP 509 version tag (`test_dict_version`;
+/// dict subclasses carry their entries in the wrapped native payload).
+fn dict_get_version(args: &[Object]) -> Result<Object, RuntimeError> {
+    let d = match args.first() {
+        Some(Object::Dict(d)) => d.clone(),
+        Some(Object::Instance(inst)) => match inst.native.get() {
+            Some(Object::Dict(d)) => d.clone(),
+            _ => return Err(crate::error::type_error("expected dict")),
+        },
+        _ => return Err(crate::error::type_error("expected dict")),
+    };
+    Ok(Object::Int(crate::object::dict_version_get(&d) as i64))
 }
 
 /// `_PyTraceMalloc_GetTraceback(domain, ptr)` → most-recent-first frames

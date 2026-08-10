@@ -18,6 +18,8 @@
 use crate::sync::Rc;
 use crate::sync::RefCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use digest::Digest;
 use md5::Md5;
@@ -26,7 +28,7 @@ use sha2::{Sha224, Sha256, Sha384, Sha512};
 use sha3::digest::{ExtendableOutput, XofReader};
 use sha3::{Sha3_224, Sha3_256, Sha3_384, Sha3_512, Shake128, Shake256};
 
-use crate::error::{blocking_io_error, type_error, value_error, RuntimeError};
+use crate::error::{blocking_io_error, overflow_error, type_error, value_error, RuntimeError};
 use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
 use crate::types::{PyInstance, TypeObject};
@@ -196,38 +198,43 @@ impl AnyHasher {
     }
 }
 
-thread_local! {
-    static HASHER_REGISTRY: RefCell<HashMap<i64, Rc<RefCell<AnyHasher>>>> =
-        RefCell::new(HashMap::new());
-    static HASHER_NEXT_ID: RefCell<i64> = const { RefCell::new(1) };
-    static HASHER_CLASS: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
-    /// CPython's pure-Python `hashlib` exposes a `__builtin_constructor_cache`
-    /// dict that `new(name)` consults before its builtin table; `hmac`'s
-    /// string-name fallback and `test_hmac.test_with_fallback` rely on it.
-    /// We share one `dict` object between the module attribute and `new`.
-    static CTOR_CACHE: RefCell<Option<Rc<RefCell<DictData>>>> = const { RefCell::new(None) };
+// Process-global state (mirrors the `bz2`/`lzma` streaming objects):
+// hashers live in a registry keyed by an integer handle stored on the
+// instance, so a hasher created on one thread can be updated from
+// another under the GIL (test_hashlib.test_threaded_hashing).
+type HasherReg = Mutex<HashMap<i64, Rc<RefCell<AnyHasher>>>>;
+
+fn hasher_reg() -> &'static HasherReg {
+    static REG: OnceLock<HasherReg> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+static HASHER_NEXT_ID: AtomicI64 = AtomicI64::new(1);
+
+static HASHER_CLASS: Mutex<Option<Rc<TypeObject>>> = Mutex::new(None);
+
+/// CPython's pure-Python `hashlib` exposes a `__builtin_constructor_cache`
+/// dict that `new(name)` consults before its builtin table; `hmac`'s
+/// string-name fallback and `test_hmac.test_with_fallback` rely on it.
+/// We share one `dict` object between the module attribute and `new`.
+static CTOR_CACHE: Mutex<Option<Rc<RefCell<DictData>>>> = Mutex::new(None);
+
 fn register_hasher(state: AnyHasher) -> i64 {
-    let id = HASHER_NEXT_ID.with(|c| {
-        let mut v = c.borrow_mut();
-        let id = *v;
-        *v += 1;
-        id
-    });
-    HASHER_REGISTRY.with(|r| {
-        r.borrow_mut().insert(id, Rc::new(RefCell::new(state)));
-    });
+    let id = HASHER_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    hasher_reg()
+        .lock()
+        .unwrap()
+        .insert(id, Rc::new(RefCell::new(state)));
     id
 }
 
 fn lookup_hasher(id: i64) -> Result<Rc<RefCell<AnyHasher>>, RuntimeError> {
-    HASHER_REGISTRY.with(|r| {
-        r.borrow()
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| value_error("hashlib: stale hasher handle"))
-    })
+    hasher_reg()
+        .lock()
+        .unwrap()
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| value_error("hashlib: stale hasher handle"))
 }
 
 fn instance_handle(args: &[Object]) -> Result<i64, RuntimeError> {
@@ -248,11 +255,17 @@ fn instance_handle(args: &[Object]) -> Result<i64, RuntimeError> {
 }
 
 fn make_hasher_instance(state: AnyHasher) -> Object {
+    let inst = Rc::new(PyInstance::new(hasher_class()));
+    fill_hasher_instance(&inst, state);
+    Object::Instance(inst)
+}
+
+/// Bind a hasher state to an instance: register the state and store the
+/// handle plus the read-only metadata attributes on the instance dict.
+fn fill_hasher_instance(inst: &Rc<PyInstance>, state: AnyHasher) {
     let (name, digest_size, block_size) = (state.name(), state.digest_size(), state.block_size());
     let sha3 = state.sha3_params();
     let id = register_hasher(state);
-    let cls = hasher_class();
-    let inst = PyInstance::new(cls);
     {
         let mut d = inst.dict.borrow_mut();
         d.insert(DictKey(Object::from_static("_handle")), Object::Int(id));
@@ -283,12 +296,12 @@ fn make_hasher_instance(state: AnyHasher) -> Object {
             );
         }
     }
-    Object::Instance(Rc::new(inst))
 }
 
 fn hasher_class() -> Rc<TypeObject> {
-    HASHER_CLASS.with(|slot| {
-        if let Some(c) = slot.borrow().as_ref() {
+    {
+        let mut slot = HASHER_CLASS.lock().unwrap();
+        if let Some(c) = slot.as_ref() {
             return c.clone();
         }
         let bt = crate::builtin_types::builtin_types();
@@ -311,11 +324,22 @@ fn hasher_class() -> Rc<TypeObject> {
         method!("digest", hasher_digest);
         method!("hexdigest", hasher_hexdigest);
         method!("copy", hasher_copy);
-        let cls = TypeObject::new_user("hashlib._Hasher", vec![bt.object_.clone()], dict)
-            .expect("hasher class must linearise");
-        *slot.borrow_mut() = Some(cls.clone());
+        // Built-in (immutable) like CPython's HASH types: setting a class
+        // attribute raises "cannot set … attribute of immutable type"
+        // (test_hashlib.test_readonly_types).
+        let cls = TypeObject::new_with_flags(
+            "hashlib._Hasher",
+            vec![bt.object_.clone()],
+            dict,
+            crate::types::TypeFlags {
+                is_exception: false,
+                is_builtin: true,
+            },
+        )
+        .expect("hasher class must linearise");
+        *slot = Some(cls.clone());
         cls
-    })
+    }
 }
 
 fn hasher_repr(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -413,7 +437,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             algos_set(),
         );
         let cache = Rc::new(RefCell::new(DictData::default()));
-        CTOR_CACHE.with(|c| *c.borrow_mut() = Some(cache.clone()));
+        *CTOR_CACHE.lock().unwrap() = Some(cache.clone());
         d.insert(
             DictKey(Object::from_static("__builtin_constructor_cache")),
             Object::Dict(cache),
@@ -464,13 +488,15 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("shake_256")),
             b_kw("shake_256", make_shake_256),
         );
+        // BLAKE2 constructors are types (CPython `_blake2.blake2b`) so the
+        // parameter maxima live on the class.
         d.insert(
             DictKey(Object::from_static("blake2b")),
-            b_kw("blake2b", make_blake2b),
+            Object::Type(blake2b_class()),
         );
         d.insert(
             DictKey(Object::from_static("blake2s")),
-            b_kw("blake2s", make_blake2s),
+            Object::Type(blake2s_class()),
         );
         d.insert(
             DictKey(Object::from_static("pbkdf2_hmac")),
@@ -480,12 +506,82 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("file_digest")),
             b_kw("file_digest", file_digest),
         );
+        d.insert(
+            DictKey(Object::from_static("__get_builtin_constructor")),
+            b("__get_builtin_constructor", get_builtin_constructor_fn),
+        );
     }
     Rc::new(PyModule {
         name: "hashlib".to_owned(),
         filename: None,
         dict,
     })
+}
+
+/// Shared builder for the CPython-shaped accelerator modules (`_md5`,
+/// `_sha1`, `_sha2`, `_sha3`, `_blake2`): each exposes its constructors
+/// so `__get_builtin_constructor` can import and memoise them.
+fn accel_module(name: &'static str, ctors: &[(&'static str, Object)]) -> Rc<PyModule> {
+    let dict = Rc::new(RefCell::new(DictData::default()));
+    {
+        let mut d = dict.borrow_mut();
+        d.insert(
+            DictKey(Object::from_static("__name__")),
+            Object::from_static(name),
+        );
+        for (ctor_name, ctor) in ctors {
+            d.insert(DictKey(Object::from_static(ctor_name)), ctor.clone());
+        }
+    }
+    Rc::new(PyModule {
+        name: name.to_owned(),
+        filename: None,
+        dict,
+    })
+}
+
+pub fn build_md5(_cache: &ModuleCache) -> Rc<PyModule> {
+    accel_module("_md5", &[("md5", b_kw("md5", make_md5))])
+}
+
+pub fn build_sha1(_cache: &ModuleCache) -> Rc<PyModule> {
+    accel_module("_sha1", &[("sha1", b_kw("sha1", make_sha1))])
+}
+
+pub fn build_sha2(_cache: &ModuleCache) -> Rc<PyModule> {
+    accel_module(
+        "_sha2",
+        &[
+            ("sha224", b_kw("sha224", make_sha224)),
+            ("sha256", b_kw("sha256", make_sha256)),
+            ("sha384", b_kw("sha384", make_sha384)),
+            ("sha512", b_kw("sha512", make_sha512)),
+        ],
+    )
+}
+
+pub fn build_sha3(_cache: &ModuleCache) -> Rc<PyModule> {
+    accel_module(
+        "_sha3",
+        &[
+            ("sha3_224", b_kw("sha3_224", make_sha3_224)),
+            ("sha3_256", b_kw("sha3_256", make_sha3_256)),
+            ("sha3_384", b_kw("sha3_384", make_sha3_384)),
+            ("sha3_512", b_kw("sha3_512", make_sha3_512)),
+            ("shake_128", b_kw("shake_128", make_shake_128)),
+            ("shake_256", b_kw("shake_256", make_shake_256)),
+        ],
+    )
+}
+
+pub fn build_blake2(_cache: &ModuleCache) -> Rc<PyModule> {
+    accel_module(
+        "_blake2",
+        &[
+            ("blake2b", Object::Type(blake2b_class())),
+            ("blake2s", Object::Type(blake2s_class())),
+        ],
+    )
 }
 
 fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
@@ -513,19 +609,72 @@ fn b_kw(
     }))
 }
 
+/// CPython's exact clinic message for the `data`/`string` conflict.
+const CONFLICTING_DATA_STRING: &str = "'data' and 'string' are mutually exclusive and support \
+     for 'string' keyword parameter is slated for removal in a future version.";
+
+/// Clinic-faithful argument validation shared by every hash constructor:
+/// `<ctor>(data=b'', *, usedforsecurity=True, string=None, …extras)` with
+/// `data` also accepted positionally at `data_pos`. Error precedence
+/// matches CPython's clinic — duplicated `data` first, then unknown
+/// keywords, then the `data`/`string` conflict
+/// (test_hashlib.test_clinic_signature_errors). Returns the seed object.
+fn seed_arg_checked(
+    fname: &str,
+    data_pos: usize,
+    args: &[Object],
+    kwargs: &[(String, Object)],
+    extra_kws: &[&str],
+) -> Result<Option<Object>, RuntimeError> {
+    if args.len() > data_pos + 1 {
+        return Err(type_error(format!(
+            "{fname}() takes at most {} positional arguments ({} given)",
+            data_pos + 1,
+            args.len()
+        )));
+    }
+    let pos_data = args.get(data_pos);
+    let kw_data = kw(kwargs, "data");
+    if pos_data.is_some() && kw_data.is_some() {
+        return Err(type_error(format!(
+            "argument for {fname}() given by name ('data') and position ({})",
+            data_pos + 1
+        )));
+    }
+    for (k, _) in kwargs {
+        let known = k == "data"
+            || k == "string"
+            || k == "usedforsecurity"
+            || extra_kws.contains(&k.as_str());
+        if !known {
+            return Err(type_error(format!(
+                "{fname}() got an unexpected keyword argument '{k}'"
+            )));
+        }
+    }
+    let kw_string = kw(kwargs, "string");
+    if (pos_data.is_some() || kw_data.is_some()) && kw_string.is_some() {
+        return Err(type_error(CONFLICTING_DATA_STRING));
+    }
+    Ok(pos_data
+        .or(kw_data)
+        .or(kw_string)
+        .filter(|o| !matches!(o, Object::None))
+        .cloned())
+}
+
 /// The digest seed passed to a constructor: positional index 0, or the
-/// `data=`/`string=` keyword. `usedforsecurity=` and other keywords are
-/// ignored (we never link OpenSSL, so FIPS mode is moot).
-fn seed_arg(args: &[Object], kwargs: &[(String, Object)]) -> Result<Option<Vec<u8>>, RuntimeError> {
-    let obj = args.first().or_else(|| {
-        kwargs
-            .iter()
-            .find(|(k, _)| k == "data" || k == "string")
-            .map(|(_, v)| v)
-    });
-    match obj {
-        None | Some(Object::None) => Ok(None),
-        Some(o) => Ok(Some(bytes_of(o)?)),
+/// `data=`/`string=` keyword, validated with clinic precedence.
+/// `usedforsecurity=` is accepted and ignored (we never link OpenSSL, so
+/// FIPS mode is moot).
+fn seed_arg(
+    fname: &str,
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Option<Vec<u8>>, RuntimeError> {
+    match seed_arg_checked(fname, 0, args, kwargs, &[])? {
+        None => Ok(None),
+        Some(o) => Ok(Some(bytes_of(&o)?)),
     }
 }
 
@@ -552,46 +701,161 @@ fn algos_set() -> Object {
     )
 }
 
+/// The builtin constructor table by (lowercased) algorithm name.
+fn builtin_ctor_fn(
+    name: &str,
+) -> Option<fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError>> {
+    Some(match name {
+        "md5" => make_md5,
+        "sha1" => make_sha1,
+        "sha224" => make_sha224,
+        "sha256" => make_sha256,
+        "sha384" => make_sha384,
+        "sha512" => make_sha512,
+        "sha3_224" => make_sha3_224,
+        "sha3_256" => make_sha3_256,
+        "sha3_384" => make_sha3_384,
+        "sha3_512" => make_sha3_512,
+        "shake_128" => make_shake_128,
+        "shake_256" => make_shake_256,
+        "blake2b" => make_blake2b,
+        "blake2s" => make_blake2s,
+        _ => return None,
+    })
+}
+
 fn hash_new(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
-    let name = match args.first() {
+    // CPython: `new(name, data=b'', **kwargs)` — everything beyond `name`
+    // is forwarded verbatim to the resolved constructor, which owns the
+    // clinic validation (so blake2 parameters pass straight through:
+    // test_case_blake2b_all_parameters).
+    if args.len() > 2 {
+        return Err(type_error(format!(
+            "new() takes at most 2 positional arguments ({} given)",
+            args.len()
+        )));
+    }
+    if !args.is_empty() && kw(kwargs, "name").is_some() {
+        return Err(type_error(
+            "argument for new() given by name ('name') and position (1)",
+        ));
+    }
+    let name = match args.first().or_else(|| kw(kwargs, "name")) {
         Some(Object::Str(s)) => s.to_string(),
-        _ => match kwargs.iter().find(|(k, _)| k == "name") {
-            Some((_, Object::Str(s))) => s.to_string(),
-            _ => return Err(type_error("new() missing required argument 'name' (pos 1)")),
-        },
+        Some(_) => return Err(type_error("new() argument 'name' must be str")),
+        None => return Err(type_error("new() missing required argument 'name' (pos 1)")),
     };
-    // `new(name, data)` takes the seed at position 1, or via `data=`/`string=`.
-    let seed = args.get(1).cloned().or_else(|| {
-        kwargs
-            .iter()
-            .find(|(k, _)| k == "data" || k == "string")
-            .map(|(_, v)| v.clone())
-    });
-    let seed = seed.filter(|d| !matches!(d, Object::None));
+    let ctor_args = &args[usize::from(!args.is_empty())..];
+    let fwd: Vec<(String, Object)> = kwargs
+        .iter()
+        .filter(|(k, _)| k != "name")
+        .cloned()
+        .collect();
     // A name registered in `__builtin_constructor_cache` shadows the builtin
     // table (CPython's `__get_builtin_constructor` checks the cache first).
     if let Some(ctor) = cache_lookup(&name) {
+        if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+            // SAFETY: published by the enclosing VM frame on this thread.
+            let interp = unsafe { &mut *ptr };
+            return interp.call_object(ctor, ctor_args, &fwd);
+        }
         if let Object::Builtin(bf) = &ctor {
-            return match &seed {
-                Some(d) => (bf.call)(std::slice::from_ref(d)),
-                None => (bf.call)(&[]),
+            return match &bf.call_kw {
+                Some(f) => f(ctor_args, &fwd),
+                None => (bf.call)(ctor_args),
             };
         }
     }
-    let mut hasher = make_by_name(&name)?;
-    if let Some(data) = seed {
-        hasher.update(&bytes_of(&data)?);
+    match builtin_ctor_fn(&name.to_ascii_lowercase()) {
+        Some(ctor) => ctor(ctor_args, &fwd),
+        None => Err(value_error(format!("unsupported hash type {name}"))),
     }
-    Ok(make_hasher_instance(hasher))
 }
 
 /// Look a digest name up in the shared `__builtin_constructor_cache`.
 fn cache_lookup(name: &str) -> Option<Object> {
-    CTOR_CACHE.with(|c| {
-        c.borrow()
-            .as_ref()
-            .and_then(|cache| cache.borrow().get(&crate::object::StrKey(name)).cloned())
-    })
+    CTOR_CACHE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|cache| cache.borrow().get(&crate::object::StrKey(name)).cloned())
+}
+
+fn cache_insert(key: &str, value: Object) {
+    if let Some(cache) = CTOR_CACHE.lock().unwrap().as_ref() {
+        cache
+            .borrow_mut()
+            .insert(DictKey(Object::from_str(key.to_owned())), value);
+    }
+}
+
+/// CPython's `hashlib.__get_builtin_constructor`: consult the shared
+/// cache, then import the backing accelerator module — respecting
+/// `sys.modules` poisoning (`sys.modules['_md5'] = None` must raise
+/// ImportError → ValueError; test_get_builtin_constructor) — and memoise
+/// its constructors under both spellings.
+fn get_builtin_constructor_fn(args: &[Object]) -> Result<Object, RuntimeError> {
+    let name_obj = args.first().ok_or_else(|| {
+        type_error("__get_builtin_constructor() missing required argument 'name' (pos 1)")
+    })?;
+    if !matches!(name_obj, Object::Str(_)) {
+        // CPython trips over `'unsupported hash type ' + name` when the
+        // name isn't a str — a TypeError either way.
+        return Err(type_error(format!(
+            "can only concatenate str (not \"{}\") to str",
+            name_obj.type_name()
+        )));
+    }
+    let name = name_obj.to_str();
+    if let Some(c) = cache_lookup(&name) {
+        return Ok(c);
+    }
+    type Plan = (&'static str, &'static [(&'static str, &'static str)]);
+    let plan: Option<Plan> = match name.as_str() {
+        "SHA1" | "sha1" => Some(("_sha1", &[("SHA1", "sha1")])),
+        "MD5" | "md5" => Some(("_md5", &[("MD5", "md5")])),
+        "SHA224" | "sha224" | "SHA256" | "sha256" => {
+            Some(("_sha2", &[("SHA224", "sha224"), ("SHA256", "sha256")]))
+        }
+        "SHA384" | "sha384" | "SHA512" | "sha512" => {
+            Some(("_sha2", &[("SHA384", "sha384"), ("SHA512", "sha512")]))
+        }
+        "SHA3_224" | "sha3_224" | "SHA3_256" | "sha3_256" | "SHA3_384" | "sha3_384"
+        | "SHA3_512" | "sha3_512" | "SHAKE_128" | "shake_128" | "SHAKE_256" | "shake_256" => {
+            Some((
+                "_sha3",
+                &[
+                    ("SHA3_224", "sha3_224"),
+                    ("SHA3_256", "sha3_256"),
+                    ("SHA3_384", "sha3_384"),
+                    ("SHA3_512", "sha3_512"),
+                    ("SHAKE_128", "shake_128"),
+                    ("SHAKE_256", "shake_256"),
+                ],
+            ))
+        }
+        "blake2b" | "blake2s" => {
+            Some(("_blake2", &[("blake2b", "blake2b"), ("blake2s", "blake2s")]))
+        }
+        _ => None,
+    };
+    if let Some((module_name, entries)) = plan {
+        if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+            // SAFETY: published by the enclosing VM frame on this thread.
+            let interp = unsafe { &mut *ptr };
+            // ImportError → fall through (CPython: `except ImportError:
+            // pass` — the hash is reported unsupported below).
+            if let Ok(module) = interp.import_path(module_name) {
+                for (upper, lower) in entries {
+                    if let Ok(ctor) = interp.load_attr_public(&module, lower) {
+                        cache_insert(upper, ctor.clone());
+                        cache_insert(lower, ctor);
+                    }
+                }
+            }
+        }
+    }
+    cache_lookup(&name).ok_or_else(|| value_error(format!("unsupported hash type {name}")))
 }
 
 fn make_by_name(name: &str) -> Result<AnyHasher, RuntimeError> {
@@ -642,9 +906,61 @@ fn parse_blake2_params(
     max_key_salt_person: (usize, usize, usize),
 ) -> Result<Blake2Params, RuntimeError> {
     let (max_key, max_salt, max_person) = max_key_salt_person;
-    let int_kw = |name: &str, default: i64| -> i64 {
-        kw(kwargs, name).and_then(Object::as_i64).unwrap_or(default)
+    // Clinic validation (duplicated / unknown / conflicting keywords)
+    // runs before any parameter range checks; it also yields the seed.
+    let fname = if max_digest == 64 {
+        "blake2b"
+    } else {
+        "blake2s"
     };
+    let data = seed_arg_checked(
+        fname,
+        0,
+        args,
+        kwargs,
+        &[
+            "digest_size",
+            "key",
+            "salt",
+            "person",
+            "fanout",
+            "depth",
+            "leaf_size",
+            "node_offset",
+            "node_depth",
+            "inner_size",
+            "last_node",
+        ],
+    )?
+    .map(|o| bytes_of(&o))
+    .transpose()?;
+    // Integer parameter with clinic-style range enforcement. `hard_max`
+    // distinguishes a *representation* overflow (leaf_size ≥ 2**32,
+    // node_offset beyond the variant's offset width — OverflowError) from
+    // a mere out-of-range value (ValueError); CPython's `_blake2` does
+    // the same split (test_hashlib.check_blake2).
+    let int_param =
+        |name: &str, default: i64, min: i64, max: u64, hard: bool| -> Result<u64, RuntimeError> {
+            let Some(o) = kw(kwargs, name) else {
+                return Ok(default as u64);
+            };
+            let big = o
+                .as_bigint()
+                .ok_or_else(|| type_error(format!("'{name}' must be an integer")))?;
+            use num_traits::ToPrimitive;
+            if big < num_bigint::BigInt::from(min) {
+                return Err(value_error(format!(
+                    "{name} must be between {min} and {max}"
+                )));
+            }
+            match big.to_u64().filter(|v| *v <= max) {
+                Some(v) => Ok(v),
+                None if hard => Err(overflow_error(format!("{name} is out of range"))),
+                None => Err(value_error(format!(
+                    "{name} must be between {min} and {max}"
+                ))),
+            }
+        };
     let bytes_kw = |name: &str| -> Result<Vec<u8>, RuntimeError> {
         match kw(kwargs, name) {
             None => Ok(Vec::new()),
@@ -652,7 +968,11 @@ fn parse_blake2_params(
         }
     };
 
-    let digest_size = int_kw("digest_size", max_digest as i64);
+    let digest_size = match kw(kwargs, "digest_size") {
+        None => max_digest as i64,
+        // A value that doesn't even fit i64 is certainly out of range.
+        Some(o) => o.as_i64().unwrap_or(-1),
+    };
     if digest_size < 1 || digest_size as usize > max_digest {
         return Err(value_error(format!(
             "digest_size for {} must be between 1 and {max_digest} bytes",
@@ -681,24 +1001,23 @@ fn parse_blake2_params(
             "maximum person length is {max_person} bytes"
         )));
     }
-    let inner_size = int_kw("inner_size", 0);
-    if inner_size < 0 || inner_size as usize > max_digest {
-        return Err(value_error(format!(
-            "inner_size must be between 0 and {max_digest}"
-        )));
-    }
-    // The seed (`data`) is positional index 0 or the `data`/`string` keyword.
-    let data = seed_arg(args, kwargs)?;
+    let inner_size = int_param("inner_size", 0, 0, max_digest as u64, false)?;
+    // BLAKE2b carries a 64-bit node offset; BLAKE2s only 48 bits.
+    let max_offset: u64 = if max_digest == 64 {
+        u64::MAX
+    } else {
+        (1u64 << 48) - 1
+    };
     Ok(Blake2Params {
         digest_size: digest_size as usize,
         key,
         salt,
         person,
-        fanout: int_kw("fanout", 1).clamp(0, 255) as u8,
-        depth: int_kw("depth", 1).clamp(1, 255) as u8,
-        leaf_size: int_kw("leaf_size", 0) as u32,
-        node_offset: int_kw("node_offset", 0) as u64,
-        node_depth: int_kw("node_depth", 0).clamp(0, 255) as u8,
+        fanout: int_param("fanout", 1, 0, 255, false)? as u8,
+        depth: int_param("depth", 1, 1, 255, false)? as u8,
+        leaf_size: int_param("leaf_size", 0, 0, u64::from(u32::MAX), true)? as u32,
+        node_offset: int_param("node_offset", 0, 0, max_offset, true)?,
+        node_depth: int_param("node_depth", 0, 0, 255, false)? as u8,
         inner_size: inner_size as usize,
         last_node: kw(kwargs, "last_node")
             .map(Object::is_truthy)
@@ -707,7 +1026,8 @@ fn parse_blake2_params(
     })
 }
 
-fn make_blake2b(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+/// Build a configured BLAKE2b state from constructor arguments.
+fn blake2b_state(args: &[Object], kwargs: &[(String, Object)]) -> Result<AnyHasher, RuntimeError> {
     let p = parse_blake2_params(args, kwargs, 64, (64, 16, 16))?;
     let mut params = blake2b_simd::Params::new();
     params
@@ -732,13 +1052,11 @@ fn make_blake2b(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
     if let Some(d) = &p.data {
         state.update(d);
     }
-    Ok(make_hasher_instance(AnyHasher::Blake2b(
-        Box::new(state),
-        p.digest_size,
-    )))
+    Ok(AnyHasher::Blake2b(Box::new(state), p.digest_size))
 }
 
-fn make_blake2s(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+/// Build a configured BLAKE2s state from constructor arguments.
+fn blake2s_state(args: &[Object], kwargs: &[(String, Object)]) -> Result<AnyHasher, RuntimeError> {
     let p = parse_blake2_params(args, kwargs, 32, (32, 8, 8))?;
     let mut params = blake2s_simd::Params::new();
     params
@@ -763,10 +1081,111 @@ fn make_blake2s(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
     if let Some(d) = &p.data {
         state.update(d);
     }
-    Ok(make_hasher_instance(AnyHasher::Blake2s(
-        Box::new(state),
-        p.digest_size,
-    )))
+    Ok(AnyHasher::Blake2s(Box::new(state), p.digest_size))
+}
+
+/// The BLAKE2 constructors are *types* in CPython (`_blake2.blake2b`),
+/// with the parameter maxima exposed as class attributes
+/// (test_blake2b/test_blake2s assert `constructor.SALT_SIZE` etc).
+fn blake2_class(
+    name: &'static str,
+    sizes: (i64, i64, i64, i64),
+    init: fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError>,
+) -> Rc<TypeObject> {
+    let bt = crate::builtin_types::builtin_types();
+    let (salt, person, key, digest) = sizes;
+    let mut dict = DictData::default();
+    macro_rules! method {
+        ($name:literal, $body:expr) => {
+            dict.insert(
+                DictKey(Object::from_static($name)),
+                Object::Builtin(Rc::new(BuiltinFn {
+                    name: $name,
+                    binds_instance: true,
+                    call: Box::new($body),
+                    call_kw: None,
+                })),
+            );
+        };
+    }
+    dict.insert(
+        DictKey(Object::from_static("__init__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__init__",
+            binds_instance: true,
+            call: Box::new(move |args| init(args, &[])),
+            call_kw: Some(Box::new(init)),
+        })),
+    );
+    dict.insert(DictKey(Object::from_static("SALT_SIZE")), Object::Int(salt));
+    dict.insert(
+        DictKey(Object::from_static("PERSON_SIZE")),
+        Object::Int(person),
+    );
+    dict.insert(
+        DictKey(Object::from_static("MAX_KEY_SIZE")),
+        Object::Int(key),
+    );
+    dict.insert(
+        DictKey(Object::from_static("MAX_DIGEST_SIZE")),
+        Object::Int(digest),
+    );
+    method!("__repr__", hasher_repr);
+    method!("update", hasher_update);
+    method!("digest", hasher_digest);
+    method!("hexdigest", hasher_hexdigest);
+    method!("copy", hasher_copy);
+    TypeObject::new_with_flags(
+        name,
+        vec![bt.object_.clone()],
+        dict,
+        crate::types::TypeFlags {
+            is_exception: false,
+            is_builtin: true,
+        },
+    )
+    .expect("blake2 class must linearise")
+}
+
+fn blake2b_class() -> Rc<TypeObject> {
+    static CLS: OnceLock<Rc<TypeObject>> = OnceLock::new();
+    CLS.get_or_init(|| blake2_class("blake2b", (16, 16, 64, 64), blake2b_init))
+        .clone()
+}
+
+fn blake2s_class() -> Rc<TypeObject> {
+    static CLS: OnceLock<Rc<TypeObject>> = OnceLock::new();
+    CLS.get_or_init(|| blake2_class("blake2s", (8, 8, 32, 32), blake2s_init))
+        .clone()
+}
+
+fn blake2b_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    blake2_init_common(args, kwargs, blake2b_state)
+}
+
+fn blake2s_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    blake2_init_common(args, kwargs, blake2s_state)
+}
+
+fn blake2_init_common(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+    build: fn(&[Object], &[(String, Object)]) -> Result<AnyHasher, RuntimeError>,
+) -> Result<Object, RuntimeError> {
+    let Some(Object::Instance(inst)) = args.first() else {
+        return Err(type_error("expected blake2 instance"));
+    };
+    let state = build(&args[1..], kwargs)?;
+    fill_hasher_instance(inst, state);
+    Ok(Object::None)
+}
+
+fn make_blake2b(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    Ok(make_hasher_instance(blake2b_state(args, kwargs)?))
+}
+
+fn make_blake2s(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    Ok(make_hasher_instance(blake2s_state(args, kwargs)?))
 }
 
 fn make_sha3_224(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
@@ -822,7 +1241,7 @@ fn seeded(
     args: &[Object],
     kwargs: &[(String, Object)],
 ) -> Result<Object, RuntimeError> {
-    if let Some(bytes) = seed_arg(args, kwargs)? {
+    if let Some(bytes) = seed_arg(hasher.name(), args, kwargs)? {
         hasher.update(&bytes);
     }
     Ok(make_hasher_instance(hasher))

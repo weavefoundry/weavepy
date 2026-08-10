@@ -1738,6 +1738,15 @@ fn install_class_getitem(bt: &BuiltinTypes) {
 /// CPython's argument clinic does: `OverflowError` past the 32-bit range,
 /// `TypeError` for non-ints.
 fn buffer_flags_arg(arg: Option<&Object>) -> Result<i64, RuntimeError> {
+    // `int` subclasses (notably `inspect.BufferFlags`, an `enum.IntFlag`)
+    // coerce through their native payload, like clinic's `__index__` path.
+    let arg = match arg {
+        Some(Object::Instance(inst)) => match inst.native.get() {
+            Some(native @ (Object::Int(_) | Object::Long(_) | Object::Bool(_))) => Some(native),
+            _ => arg,
+        },
+        _ => arg,
+    };
     match arg {
         None => Err(type_error(
             "__buffer__() takes exactly one argument (0 given)",

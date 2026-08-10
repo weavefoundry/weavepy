@@ -11,6 +11,7 @@
 //! replace this with a proper type-slot-based object model.
 
 use crate::sync::Rc;
+use crate::sync::Weak;
 use crate::sync::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::fmt;
@@ -448,6 +449,18 @@ pub struct PyFrame {
     /// "cannot clear an executing frame" — the caller's own
     /// `frame_stack` can't see other threads' activations.
     pub on_stack: Cell<u32>,
+    /// PEP 667 `f_extra_locals`: keys stored *through* the
+    /// `FrameLocalsProxy` that don't name a fast local (including
+    /// non-string keys). Created lazily on first such store —
+    /// `test_frame.test_delete` distinguishes "before f_extra_locals
+    /// is created". RFC 0060.
+    pub extra_locals: RefCell<Option<Rc<RefCell<DictData>>>>,
+    /// Set by `frame.clear()`: the frame's references are gone, so
+    /// `f_locals` must present an empty mapping even though the cell
+    /// vector (shared with closures) still holds values. Mirrors
+    /// CPython clearing the cell slots out of `f_localsplus` while
+    /// the cell objects live on in the closures that captured them.
+    pub cleared: Cell<bool>,
 }
 
 impl fmt::Debug for PyFrame {
@@ -515,6 +528,11 @@ impl PyFrame {
         if self.is_module_scope {
             return Some(Object::Dict(self.globals.clone()));
         }
+        // A cleared frame holds no references: report an empty mapping
+        // even though the (closure-shared) cells still carry values.
+        if self.cleared.get() {
+            return Some(Object::new_dict());
+        }
         let mirror = self.locals_mirror.borrow().clone()?;
         let snapshot = mirror.borrow();
         let varnames = &self.code.varnames;
@@ -566,7 +584,137 @@ impl PyFrame {
                 }
             }
         }
+        // PEP 667: keys stored through the FrameLocalsProxy that don't
+        // name a fast local land in `f_extra_locals` and are part of
+        // every snapshot (`locals()`, `PyEval_GetFrameLocals`).
+        if let Some(extra) = self.extra_locals.borrow().as_ref() {
+            for (k, v) in extra.borrow().iter() {
+                d.insert(k.clone(), v.clone());
+            }
+        }
         Some(Object::Dict(Rc::new(RefCell::new(d))))
+    }
+
+    /// All user-visible fast-local names for this frame, in CPython's
+    /// `co_localsplusnames` order (varnames, then cellvars, then
+    /// freevars) without duplicates or compiler temporaries
+    /// (`.retval0`-style dot names). RFC 0060 — enumeration base for
+    /// the PEP 667 `FrameLocalsProxy`.
+    pub fn fast_names(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for name in self
+            .code
+            .varnames
+            .iter()
+            .chain(self.code.cellvars.iter())
+            .chain(self.code.freevars.iter())
+        {
+            if name.starts_with('.') || out.iter().any(|n| n == name) {
+                continue;
+            }
+            out.push(name.clone());
+        }
+        out
+    }
+
+    /// Whether `name` names a fast local (bound or not) of this frame.
+    /// Dot-names (a genexpr's `.0` argument, compiler temporaries) are
+    /// included: CPython's `FrameLocalsProxy` reads/writes them by key
+    /// even though they never appear in the enumeration
+    /// (`test_generators.test_modify_f_locals` replaces `.0`).
+    pub fn has_fast(&self, name: &str) -> bool {
+        self.code.varnames.iter().any(|n| n == name)
+            || self.code.cellvars.iter().any(|n| n == name)
+            || self.code.freevars.iter().any(|n| n == name)
+    }
+
+    /// Read a fast local by name, cell-aware. `None` when the name is
+    /// not a fast local of this frame or the slot is unbound (never
+    /// assigned, `del`eted, or wiped by `frame.clear()`).
+    pub fn fast_get(&self, name: &str) -> Option<Object> {
+        if self.cleared.get() {
+            return None;
+        }
+        // Cell variables (cellvars + freevars) live in the cell; the
+        // fast slot for a captured argument is Unbound after entry.
+        if let Some(idx) = self
+            .code
+            .cellvars
+            .iter()
+            .chain(self.code.freevars.iter())
+            .position(|n| n == name)
+        {
+            let v = self.cells.get(idx)?.borrow().clone();
+            return match v {
+                Object::Unbound => None,
+                other => Some(other),
+            };
+        }
+        let slot = self.code.varnames.iter().position(|n| n == name)?;
+        if let Some(mirror) = self.locals_mirror.borrow().as_ref() {
+            return match mirror.borrow().get(slot) {
+                Some(Object::Unbound) | None => None,
+                Some(other) => Some(other.clone()),
+            };
+        }
+        // Mirror severed (the frame returned and `take_ownership`
+        // froze a snapshot): serve reads from that snapshot.
+        if let Some(Object::Dict(d)) = self.locals_cache.borrow().as_ref() {
+            return d.borrow().get(&StrKey(name)).cloned();
+        }
+        None
+    }
+
+    /// Write a fast local by name, cell-aware. Returns `false` when
+    /// `name` is not a writable fast local of this frame (the caller
+    /// stores it in `f_extra_locals` instead).
+    pub fn fast_set(&self, name: &str, value: Object) -> bool {
+        if self.cleared.get() {
+            return false;
+        }
+        if let Some(idx) = self
+            .code
+            .cellvars
+            .iter()
+            .chain(self.code.freevars.iter())
+            .position(|n| n == name)
+        {
+            if let Some(cell) = self.cells.get(idx) {
+                *cell.borrow_mut() = value;
+                return true;
+            }
+            return false;
+        }
+        let Some(slot) = self.code.varnames.iter().position(|n| n == name) else {
+            return false;
+        };
+        if let Some(mirror) = self.locals_mirror.borrow().as_ref() {
+            let mut m = mirror.borrow_mut();
+            if slot < m.len() {
+                m[slot] = value;
+                return true;
+            }
+            return false;
+        }
+        if let Some(Object::Dict(d)) = self.locals_cache.borrow().as_ref() {
+            d.borrow_mut()
+                .insert(DictKey(Object::from_str(name)), value);
+            return true;
+        }
+        false
+    }
+
+    /// The `f_extra_locals` dict, creating it when `create` is set.
+    pub fn extra_locals_dict(&self, create: bool) -> Option<Rc<RefCell<DictData>>> {
+        if let Some(d) = self.extra_locals.borrow().as_ref() {
+            return Some(d.clone());
+        }
+        if !create {
+            return None;
+        }
+        let d = Rc::new(RefCell::new(DictData::default()));
+        *self.extra_locals.borrow_mut() = Some(d.clone());
+        Some(d)
     }
 
     /// Materialise the locals dict, caching the result. Subsequent
@@ -701,6 +849,11 @@ pub struct FrameShell {
     pub cells: Rc<Vec<Rc<RefCell<Object>>>>,
     pub globals: Rc<RefCell<DictData>>,
     pub builtins: Rc<RefCell<DictData>>,
+    /// Mapping-object `__builtins__` (see `Frame::builtins_obj`) — a
+    /// sandboxed exec/eval frame resolves builtin names by item access
+    /// on this object; `_PyEval_GetBuiltin`-style helpers (e.g.
+    /// `iterator.__reduce__`) must consult it too.
+    pub builtins_obj: Option<Object>,
     pub class_namespace: Option<Rc<RefCell<DictData>>>,
     pub class_namespace_obj: Option<Object>,
     /// Generator/coroutine/async-generator frame?
@@ -734,6 +887,7 @@ impl FrameShell {
             cells: py.cells.clone(),
             globals: py.globals.clone(),
             builtins: py.builtins.clone(),
+            builtins_obj: None,
             class_namespace: py.class_namespace.clone(),
             class_namespace_obj: py.class_namespace_obj.clone(),
             is_gen: py.code.is_generator || py.code.is_coroutine || py.code.is_async_generator,
@@ -773,6 +927,8 @@ impl FrameShell {
             trace_lines: Cell::new(true),
             trace_opcodes: Cell::new(false),
             on_stack: Cell::new(1),
+            extra_locals: RefCell::new(None),
+            cleared: Cell::new(false),
         });
         *self.materialized.borrow_mut() = Some(py.clone());
         self.has_materialized
@@ -2831,11 +2987,20 @@ pub(crate) fn dict_reentrant_insert(
         .raw_entry_mut_v1()
         .from_hash(probe.table_hash, |k| k.0.is_same(target))
     {
-        RawEntryMut::Occupied(mut e) => Ok(Some(e.insert(value))),
+        RawEntryMut::Occupied(mut e) => {
+            let same = e.get().is_same(&value);
+            let old = e.insert(value);
+            drop(m);
+            if !same {
+                dict_mutation_event(d);
+            }
+            Ok(Some(old))
+        }
         RawEntryMut::Vacant(e) => {
             e.insert_hashed_nocheck(probe.table_hash, DictKey(key), value);
             drop(m);
             dict_watch_bump(d);
+            dict_mutation_event(d);
             Ok(None)
         }
     }
@@ -2862,6 +3027,7 @@ pub(crate) fn dict_reentrant_setdefault(
             e.insert_hashed_nocheck(probe.table_hash, DictKey(key), default.clone());
             drop(m);
             dict_watch_bump(d);
+            dict_mutation_event(d);
             Ok(default)
         }
     }
@@ -2902,6 +3068,7 @@ pub(crate) fn dict_reentrant_remove(
                     let (k, v) = e.shift_remove_entry();
                     drop(m);
                     dict_watch_bump(d);
+                    dict_mutation_event(d);
                     Ok(Some((k.0, v)))
                 }
                 RawEntryMut::Vacant(_) => Ok(None),
@@ -3023,6 +3190,89 @@ pub(crate) fn dict_watch_bump(d: &RefCell<DictData>) {
             version.set(version.get() + 1);
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// PEP 509 dict version tags (RFC 0060).
+//
+// CPython stamps every dict with `ma_version_tag`, drawn from one global
+// monotonically increasing counter: fresh dicts get a unique tag and every
+// *effective* mutation (key added/removed, or a value replaced by a
+// different object — identity, not equality) draws a new one.
+// `_testcapi.dict_get_version` exposes it and `test_dict_version` asserts
+// the full semantics.
+//
+// WeavePy's `DictData` is a bare `IndexMap` with no room for a per-dict
+// field, so versions live in a side registry keyed by the dict's heap
+// address and assigned lazily: the first `dict_version_get` on a dict
+// registers it with a fresh tag; the centralized mutators
+// (`dict_insert`/`dict_remove`/`clear`/`popitem`/`setdefault` and the
+// reentrant variants) then advance registered dicts through
+// [`dict_version_bump`]. Unregistered dicts skip all bookkeeping — an
+// unobserved dict's next `dict_version_get` draws a fresh (hence changed
+// and unique) tag anyway, which is indistinguishable from eager stamping.
+//
+// The registry stores a `Weak` per entry: the weak count keeps the
+// allocation's address from being recycled while the entry exists, so a
+// present key always denotes the same dict. `PEP509_ACTIVE` gates the
+// mutator-side hook to a single relaxed load until the first
+// `dict_get_version` call (only test code ever calls it).
+// ---------------------------------------------------------------------------
+
+static PEP509_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The global version source. Starts at 1 so no dict ever reports tag 0
+/// (CPython reserves 0 for "never assigned").
+static PEP509_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+#[allow(clippy::type_complexity)]
+static PEP509_VERSIONS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<usize, (Weak<RefCell<DictData>>, u64)>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+fn pep509_next() -> u64 {
+    PEP509_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `_testcapi.dict_get_version(d)` — the dict's current PEP 509 tag,
+/// registering the dict for mutation tracking on first sight.
+pub fn dict_version_get(d: &Rc<RefCell<DictData>>) -> u64 {
+    PEP509_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+    let ptr = Rc::as_ptr(d) as usize;
+    let mut reg = PEP509_VERSIONS.lock();
+    if let Some((_, v)) = reg.get(&ptr) {
+        return *v;
+    }
+    // Bound the registry: entries whose dict died keep their address
+    // reserved (via the Weak) but serve no further purpose.
+    if reg.len() >= 4096 {
+        reg.retain(|_, (w, _)| w.strong_count() > 0);
+    }
+    let v = pep509_next();
+    reg.insert(ptr, (Rc::downgrade(d), v));
+    v
+}
+
+/// Advance a registered dict's PEP 509 tag after an effective mutation.
+/// One relaxed load when no `dict_get_version` call has ever happened.
+#[inline]
+pub(crate) fn dict_version_bump(d: &RefCell<DictData>) {
+    if !PEP509_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let ptr = std::ptr::from_ref::<RefCell<DictData>>(d) as usize;
+    let mut reg = PEP509_VERSIONS.lock();
+    if let Some(entry) = reg.get_mut(&ptr) {
+        entry.1 = pep509_next();
+    }
+}
+
+/// The shared post-mutation hook for the centralized dict mutators: feeds
+/// both the PEP 509 registry and the `builtin_dict` rare-event counter.
+/// Call only for *effective* changes (a key added or removed, or a value
+/// replaced by a non-identical object).
+#[inline]
+pub(crate) fn dict_mutation_event(d: &RefCell<DictData>) {
+    crate::rare_events::note_dict_mutation(d);
+    dict_version_bump(d);
 }
 
 impl Hash for DictKey {
@@ -3742,6 +3992,13 @@ pub struct PyFile {
     /// Text-mode codec (`open(..., encoding=...)`); `None` means the
     /// UTF-8 default.
     pub encoding: RefCell<Option<String>>,
+    /// The *verbatim* `encoding=` spelling for `.encoding` reporting.
+    /// CPython echoes the caller's string back exactly (`open(...,
+    /// encoding='utf-8').encoding == 'utf-8'`, test_tempfile
+    /// SpooledTemporaryFile), while [`Self::encoding`] collapses UTF-8
+    /// spellings to `None` for the codec fast path. `None` here means no
+    /// explicit encoding — report the locale codeset.
+    pub encoding_name: RefCell<Option<String>>,
     /// Text-mode error handler (`open(..., errors=...)`); `None` → "strict".
     pub errors: RefCell<Option<String>>,
     /// Text-mode newline policy (`open(..., newline=...)`). A `None` field
@@ -3864,6 +4121,7 @@ impl PyFile {
             backend: RefCell::new(backend),
             closed: RefCell::new(false),
             encoding: RefCell::new(None),
+            encoding_name: RefCell::new(None),
             errors: RefCell::new(None),
             newline: RefCell::new(None),
             name_override: RefCell::new(None),
@@ -4227,8 +4485,10 @@ impl PyFile {
                     IoKind::BufferedWriter => format!("<_io.BufferedWriter name={name}>"),
                     IoKind::BufferedRandom => format!("<_io.BufferedRandom name={name}>"),
                     _ => {
+                        // Echo the caller's exact `encoding=` spelling, as
+                        // CPython's TextIOWrapper repr does.
                         let enc = self
-                            .encoding
+                            .encoding_name
                             .borrow()
                             .clone()
                             .unwrap_or_else(|| "utf-8".to_owned());
@@ -4351,6 +4611,7 @@ impl PyFile {
     /// `None` fast path.
     pub fn set_encoding(&self, enc: &str) {
         let norm = enc.to_ascii_lowercase().replace(['-', '_'], "");
+        *self.encoding_name.borrow_mut() = Some(enc.to_owned());
         *self.encoding.borrow_mut() = if norm == "utf8" {
             None
         } else {
@@ -8598,7 +8859,14 @@ impl Object {
             Object::SlotDescriptor(sd) => {
                 format!("<member '{}' of '{}' objects>", sd.name, sd.class_name)
             }
-            Object::Frame(fr) => format!("<frame at 0x{:x}>", Rc::as_ptr(fr) as usize),
+            // CPython `frame_repr`: address, file, current line, code name.
+            Object::Frame(fr) => format!(
+                "<frame at 0x{:x}, file {}, line {}, code {}>",
+                Rc::as_ptr(fr) as usize,
+                Object::from_str(fr.code.filename.clone()).repr(),
+                fr.current_lineno(),
+                fr.code.name
+            ),
             Object::Traceback(tb) => format!("<traceback at 0x{:x}>", Rc::as_ptr(tb) as usize),
             Object::MemoryView(mv) => {
                 // A released view reprs distinctly (CPython `memory_repr`);
@@ -8899,6 +9167,80 @@ fn sets_equal(a: &SetData, b: &SetData) -> bool {
 /// filename, and the interior-mutable inline-cache table (CPython
 /// ignores `co_linetable` too, and warmed caches must not make an
 /// executed code object unequal to a fresh compile of the same source).
+/// `co_firstlineno` as the attribute surface reports it (first tracked
+/// line; module bodies always report 1).
+fn code_firstlineno(c: &CodeObject) -> u32 {
+    if c.name == "<module>" {
+        1
+    } else {
+        c.linetable.iter().copied().find(|l| *l > 0).unwrap_or(1)
+    }
+}
+
+/// The location table as `co_linetable` reports it: a pinned raw
+/// override wins, otherwise the encoded wire form.
+fn code_effective_linetable(c: &CodeObject) -> Vec<u8> {
+    if let Some(b) = c.wire.as_ref().and_then(|w| w.co_linetable.as_ref()) {
+        return b.clone();
+    }
+    c.to_cpython().co_linetable.clone()
+}
+
+/// The bytecode as `co_code` reports it: a pinned raw override wins,
+/// otherwise the encoded wire form.
+fn code_effective_code(c: &CodeObject) -> Vec<u8> {
+    if let Some(b) = c.wire.as_ref().and_then(|w| w.co_code.as_ref()) {
+        return b.clone();
+    }
+    c.to_cpython().co_code.clone()
+}
+
+/// The exception table as `co_exceptiontable` reports it.
+fn code_effective_exceptiontable(c: &CodeObject) -> Vec<u8> {
+    if let Some(b) = c.wire.as_ref().and_then(|w| w.co_exceptiontable.as_ref()) {
+        return b.clone();
+    }
+    c.to_cpython().co_exceptiontable.clone()
+}
+
+/// Value hash for code objects, consistent with `code_value_eq` (equal
+/// codes must land in the same set/dict bucket — CPython `code_hash`;
+/// test_marshal round-trips sets of code objects).
+pub(crate) fn code_value_hash(c: &CodeObject) -> i64 {
+    let mut lanes: Vec<i64> = vec![
+        py_str_hash(&c.name),
+        py_str_hash(&c.qualname),
+        i64::from(c.arg_count),
+        i64::from(c.posonly_count),
+        i64::from(c.kwonly_count),
+        i64::from(c.has_varargs)
+            | (i64::from(c.has_varkeywords) << 1)
+            | (i64::from(c.is_generator) << 2),
+        py_hash_bytes_slice(&code_effective_code(c)),
+        i64::from(code_firstlineno(c)),
+        py_hash_bytes_slice(&code_effective_linetable(c)),
+        py_hash_bytes_slice(&code_effective_exceptiontable(c)),
+    ];
+    for group in [&c.names, &c.varnames, &c.freevars, &c.cellvars] {
+        for n in group.iter() {
+            lanes.push(py_str_hash(n));
+        }
+    }
+    for k in c.constants.iter() {
+        // Consts hash through their runtime objects so numeric aliasing
+        // (0.0 vs -0.0) and nested code objects stay consistent with
+        // `const_eq`.
+        let o = crate::constant_to_object_public(k.clone());
+        lanes.push(py_hash_value(&o).unwrap_or_else(|| identity_hash(&o)));
+    }
+    let v = combine_tuple_hash(&lanes);
+    if v == -1 {
+        -2
+    } else {
+        v
+    }
+}
+
 fn code_value_eq(a: &CodeObject, b: &CodeObject) -> bool {
     use weavepy_compiler::Constant;
     fn const_eq(x: &Constant, y: &Constant) -> bool {
@@ -8915,11 +9257,29 @@ fn code_value_eq(a: &CodeObject, b: &CodeObject) -> bool {
         && a.has_varargs == b.has_varargs
         && a.has_varkeywords == b.has_varkeywords
         && a.is_generator == b.is_generator
-        && a.instructions == b.instructions
+        // Bytecode is compared through the encoded CPython wire form, not
+        // the internal instruction vectors: the compiler and the marshal
+        // decoder can pick different (equivalent) internal encodings for
+        // the same program, and CPython's code_richcompare works on the
+        // normalized wire stream anyway.
+        && code_effective_code(a) == code_effective_code(b)
         && a.names == b.names
         && a.varnames == b.varnames
         && a.freevars == b.freevars
         && a.cellvars == b.cellvars
+        // CPython's code_richcompare covers location and exception info
+        // too: replacing co_linetable/co_exceptiontable produces an
+        // *unequal* code object, and two otherwise-identical lambdas on
+        // different source lines differ (test_code.test_code_equality /
+        // test_code_hash_uses_firstlineno). Compared through the *encoded*
+        // wire tables (plus co_firstlineno, which the relative line deltas
+        // don't capture) so a marshal round-trip — whose per-instruction
+        // vectors are representationally different but semantically
+        // identical — still compares equal (test_marshal.testModule).
+        && code_firstlineno(a) == code_firstlineno(b)
+        && code_effective_linetable(a) == code_effective_linetable(b)
+        && code_effective_exceptiontable(a) == code_effective_exceptiontable(b)
+        && a.wire == b.wire
         && a.constants.len() == b.constants.len()
         && a.constants
             .iter()
@@ -9694,6 +10054,10 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
     match obj {
         Object::None => Some(PY_HASH_NONE),
         Object::Str(s) => Some(py_str_hash(s)),
+        // Code objects compare by value (`code_value_eq`), so they must
+        // also hash by value or value-equal codes land in different
+        // set/dict buckets (CPython `code_hash`).
+        Object::Code(c) => Some(code_value_hash(c)),
         // Surrogate-bearing string: hash the code-point sequence. Need only be
         // deterministic and self-consistent — a `WStr` never equals a `Str`
         // (disjoint by invariant), so cross-representation hash agreement is

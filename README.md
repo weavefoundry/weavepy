@@ -156,6 +156,34 @@ work.
 > STARTTLS deadlock), and a `datetime_CAPI` stand-in shadowing the
 > real capsule (segfaulting any extension doing `PyDateTime_IMPORT`,
 > e.g. orjson) — both fixed and re-measured.
+>
+> `RFC 0060` is the **conformance endgame wave**: the measured
+> whole-suite baseline moves to **515 of 548 files passing** (fail 27,
+> error 0, skip 6, timeout 0, `unexpected 0`; +14 net flips), and the
+> ecosystem lane grows to **29/29** with two capstones — **pandas**
+> (binary wheel, real numpy underneath) and **FastAPI** (pydantic v2
+> routes through `TestClient`). The wave lands the
+> `_testcapi`/`_testinternalcapi` fixture surface (vectorcall fixture
+> types un-gate `test_call`'s matrix, dict watchers, rare-event
+> counters, frame probes, `normalize_path`, and an instruction-sequence
+> assemble stage — `test_compiler_assemble` runs CPython-3.13 pseudo-op
+> streams through to *executable* code objects), a Python-constructible
+> `types.CodeType`, the full blake2/sha3/shake constructor surface,
+> `sys.orig_argv` over the WTF-8 argv bridge, PEP 578 audit-hook
+> blocking semantics, and retires the `test.libregrtest` shim for the
+> verbatim package. The capstones caught real engine bugs — a
+> `PyType_FromMetaclass` NULL-`tp_alloc` segfault, Cython's
+> `PyType_CheckExact` rejecting the `_ImmutableTypeMeta` metaclass
+> (retired for a truthful `Py_TPFLAGS_IMMUTABLETYPE`), `zoneinfo`
+> restructured as a real package, `str`-subclass `__slots__`, and a
+> `CALL_FUNCTION_EX` kwargs clone that defeated prompt reaping (an
+> `SSLContext` leak under asyncio timeouts). Flips include `test_call`,
+> `test_hashlib`, `test_re`, `test_ast`, `test_builtin`, `test_frame`,
+> `test_zoneinfo`, and the fixture-gated introspection rows; the
+> honestly-enumerated remainder (the `test_compile`/`test_peepholer`
+> codegen-stage cluster, `test_capi`'s fixture fractal, and the
+> unboxed-value identity legs of `test_marshal`) carries measured
+> reasons in `expectations.toml`.
 
 ## Repository layout
 

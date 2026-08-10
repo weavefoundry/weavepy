@@ -1794,7 +1794,22 @@ impl GcState {
                     .saturating_sub(1)
                     .saturating_sub(weak_clones);
                 if effective != 0 {
-                    // Still reachable from a survivor — keep it.
+                    // Still reachable from a survivor — keep it. But the
+                    // extra references may be Rust-side transients rather
+                    // than heap edges: an *automatic* collection can land
+                    // mid-teardown (asyncio cancellation), while the task
+                    // machinery still holds in-flight clones of a dying
+                    // child. The collection consumes the dead subgraph, so
+                    // the eval-loop cascade never walks it and the child is
+                    // pinned by its own handle forever once the transients
+                    // drop. Mirror that cascade's slack: enroll borderline
+                    // survivors for the suspect re-probe so they still die
+                    // at CPython's refcount timing (test_ssl
+                    // test_handshake_timeout_handler_leak with a mid-run
+                    // gen-0 collection).
+                    if effective <= 3 {
+                        note_suspect(h.clone());
+                    }
                     continue;
                 }
                 // Orphaned: fire its weakref callbacks (queued in 5d below),
@@ -2840,9 +2855,30 @@ pub fn has_any_finalizable() -> bool {
 /// `SSLContext` that test_ssl's leak tests watch via weakref.
 const SUSPECT_CAP: usize = 256;
 const SUSPECT_BUDGET: u8 = 64;
+/// Aged-out (budget-exhausted) suspects turn *dormant* rather than being
+/// forgotten: they are re-probed only every `DORMANT_STRIDE`-th sweep, so
+/// a long-lived skipped object costs two atomic loads per stride instead
+/// of per safe point — but an object whose last external reference dies
+/// *after* its budget ran out is still recovered. (test_ssl's
+/// handshake-timeout leak tests: the CancelledError web enrolls at
+/// cancellation, the event loop burns >64 drop safe points before the
+/// Task machinery lets go, and with eager eviction the web stayed pinned
+/// by its collector handle until a full `gc.collect()`.)
+const DORMANT_STRIDE: u64 = 64;
 static SUSPECTS: parking_lot::Mutex<Vec<(Arc<TrackedHandle>, u8)>> =
     parking_lot::Mutex::new(Vec::new());
 static SUSPECT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Entries with probe budget remaining. When only dormant entries are
+/// left, [`has_suspects`] admits a sweep every [`DORMANT_STRIDE`]-th
+/// safe point instead of every one.
+static SUSPECT_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static SUSPECT_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Recompute the count gates from the locked suspect list.
+fn publish_suspect_counts(s: &[(Arc<TrackedHandle>, u8)]) {
+    SUSPECT_COUNT.store(s.len(), Ordering::Release);
+    SUSPECT_ACTIVE.store(s.iter().filter(|(_, b)| *b > 0).count(), Ordering::Release);
+}
 
 /// Enroll a cascade-skipped tracked object for later deadness re-probes.
 /// Deduplicated; silently dropped when the list is full (the next full
@@ -2868,13 +2904,14 @@ pub fn note_suspect(h: Arc<TrackedHandle>) {
         Ordering::Release,
     );
     if s.len() >= SUSPECT_CAP {
-        // Full: evict the most-probed entry (lowest remaining budget) —
-        // it has had the most chances to die and is the closest to
-        // aging out anyway. Silently dropping the *new* suspect instead
-        // loses the one object whose last real reference just died
-        // (asyncio's wait_for cancellation chain arrived after ~200
-        // module-teardown stragglers and was never re-probed, pinning
-        // the Timeout→Task→frame web the test_ssl leak tests watch).
+        // Full: evict the most-probed entry (lowest remaining budget,
+        // dormant first) — it has had the most chances to die and is
+        // the closest to aging out anyway. Silently dropping the *new*
+        // suspect instead loses the one object whose last real
+        // reference just died (asyncio's wait_for cancellation chain
+        // arrived after ~200 module-teardown stragglers and was never
+        // re-probed, pinning the Timeout→Task→frame web the test_ssl
+        // leak tests watch).
         match s
             .iter()
             .enumerate()
@@ -2888,13 +2925,24 @@ pub fn note_suspect(h: Arc<TrackedHandle>) {
         }
     }
     s.push((h, SUSPECT_BUDGET));
-    SUSPECT_COUNT.store(s.len(), Ordering::Release);
+    publish_suspect_counts(&s);
 }
 
-/// Cheap gate for the eval loop's safe point.
+/// Cheap gate for the eval loop's safe point: always sweep while an
+/// *active* suspect is enrolled; with only dormant (aged-out) entries
+/// left, admit every [`DORMANT_STRIDE`]-th safe point so long-lived
+/// suspects cost two atomic loads per stride, not per drop.
 #[inline]
 pub fn has_suspects() -> bool {
-    SUSPECT_COUNT.load(Ordering::Relaxed) > 0
+    if SUSPECT_ACTIVE.load(Ordering::Relaxed) > 0 {
+        return true;
+    }
+    if SUSPECT_COUNT.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    SUSPECT_TICK
+        .fetch_add(1, Ordering::Relaxed)
+        .is_multiple_of(DORMANT_STRIDE)
 }
 
 /// Drop the suspect entry for `id`, if any. Called in lock-step with
@@ -2913,7 +2961,7 @@ pub fn remove_suspect(id: ObjectId) {
     }
     let mut s = SUSPECTS.lock();
     s.retain(|(h, _)| h.id != id);
-    SUSPECT_COUNT.store(s.len(), Ordering::Release);
+    publish_suspect_counts(&s);
 }
 
 /// Re-probe the suspect list: return the objects that are now dead in
@@ -2923,7 +2971,17 @@ pub fn remove_suspect(id: ObjectId) {
 pub fn take_dead_suspects() -> Vec<Object> {
     let mut out = Vec::new();
     let mut s = SUSPECTS.lock();
+    // With only dormant entries left, `has_suspects` already stride-gated
+    // this sweep; with actives present the stride ticks here instead.
+    let probe_dormant = SUSPECT_ACTIVE.load(Ordering::Relaxed) == 0
+        || SUSPECT_TICK
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(DORMANT_STRIDE);
     s.retain_mut(|(h, budget)| {
+        // Dormant (aged-out) entries only pay on the stride tick.
+        if *budget == 0 && !probe_dormant {
+            return true;
+        }
         if !is_tracked(h.id) {
             return false; // already reclaimed elsewhere
         }
@@ -2941,10 +2999,10 @@ pub fn take_dead_suspects() -> Vec<Object> {
                 return false;
             }
         }
-        *budget -= 1;
-        *budget > 0
+        *budget = budget.saturating_sub(1);
+        true
     });
-    SUSPECT_COUNT.store(s.len(), Ordering::Release);
+    publish_suspect_counts(&s);
     out
 }
 

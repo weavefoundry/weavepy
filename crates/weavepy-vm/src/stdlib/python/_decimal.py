@@ -375,25 +375,14 @@ _c_signal_repr_order = [Clamped, InvalidOperation, DivisionByZero, Inexact,
 
 # The C accelerator's core types are immutable (Py_TPFLAGS_IMMUTABLETYPE):
 # assigning attributes on Decimal/Context/SignalDictMixin/_ContextManager
-# raises TypeError, while heap subclasses stay mutable. `_immutable_classes`
-# is populated at the bottom of the module once all classes exist.
-_immutable_classes = ()
+# raises TypeError, while heap subclasses stay mutable. The
+# `__weave_immutable_type__` marker freezes the class natively (stripped
+# from the namespace at class creation) — unlike a metaclass emulation it
+# keeps `type(Decimal) is type`, which Cython-compiled callers check via
+# `PyType_CheckExact` (pandas `cdef type cDecimal = Decimal`).
 
-class _ImmutableTypeMeta(type):
-    def __setattr__(cls, name, value):
-        if cls in _immutable_classes:
-            raise TypeError("cannot set %r attribute of immutable type %r"
-                            % (name, cls.__name__))
-        type.__setattr__(cls, name, value)
-
-    def __delattr__(cls, name):
-        if cls in _immutable_classes:
-            raise TypeError("cannot delete %r attribute of immutable type %r"
-                            % (name, cls.__name__))
-        type.__delattr__(cls, name)
-
-class SignalDictMixin(metaclass=_ImmutableTypeMeta):
-    pass
+class SignalDictMixin:
+    __weave_immutable_type__ = True
 
 class SignalDict(SignalDictMixin, dict):
     """Flag/trap mapping of a Context, keyed by the nine signal classes.
@@ -598,9 +587,10 @@ def _str_to_int(s):
 # (because Decimals are not interoperable with floats).  See the notes in
 # numbers.py for more detail.
 
-class Decimal(object, metaclass=_ImmutableTypeMeta):
+class Decimal(object):
     """Floating-point class for decimal arithmetic."""
 
+    __weave_immutable_type__ = True
     __slots__ = ('_exp','_int','_sign', '_is_special')
     # Generally, the value of the Decimal instance is given by
     #  (-1)**_sign * _int * 10**_exp
@@ -4051,12 +4041,13 @@ _numbers.Number.register(Decimal)
 
 ##### Context class #######################################################
 
-class _ContextManager(object, metaclass=_ImmutableTypeMeta):
+class _ContextManager(object):
     """Context manager class to support localcontext().
 
       Sets a copy of the supplied context in __enter__() and restores
       the previous decimal context in __exit__()
     """
+    __weave_immutable_type__ = True
     def __new__(cls, *args, **kwargs):
         # Like the C accelerator's context-manager type: only
         # localcontext() creates instances (via object.__new__).
@@ -4069,7 +4060,7 @@ class _ContextManager(object, metaclass=_ImmutableTypeMeta):
     def __exit__(self, /, t, v, tb):
         setcontext(self.saved_context)
 
-class Context(object, metaclass=_ImmutableTypeMeta):
+class Context(object):
     """Contains the context for a Decimal instance.
 
     Contains:
@@ -4087,6 +4078,8 @@ class Context(object, metaclass=_ImmutableTypeMeta):
                     If 0, printed as 1e1
     clamp -  If 1, change exponents if too high (Default 0)
     """
+
+    __weave_immutable_type__ = True
 
     def __init__(self, /, prec=None, rounding=None, Emin=None, Emax=None,
                        capitals=None, clamp=None, flags=None, traps=None):
@@ -6624,6 +6617,3 @@ _PyHASH_NAN = sys.hash_info.nan
 _PyHASH_10INV = pow(10, _PyHASH_MODULUS - 2, _PyHASH_MODULUS)
 del sys
 
-# Freeze the core accelerator types (see _ImmutableTypeMeta above).
-# Heap subclasses created by user code stay mutable.
-_immutable_classes = (Decimal, Context, SignalDictMixin, _ContextManager)

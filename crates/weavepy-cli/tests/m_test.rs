@@ -6,6 +6,13 @@
 //! `-m test` entry point — argument parsing, discovery, per-module
 //! classification, the CPython-shaped summary, and the propagated exit
 //! code — never silently rots, without needing a CPython checkout.
+//!
+//! POSIX-only for now, like the regrtest CI jobs: running regrtest
+//! end-to-end needs the raw fd interface (`tempfile.gettempdir()`'s
+//! `os.open` write-probe is the first hit), which WeavePy has not
+//! implemented on Windows yet (`os.rs`'s `os_open_stub`). Ungate this
+//! when the Windows fd layer lands.
+#![cfg(unix)]
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -45,10 +52,13 @@ fn run_m_test(extra: &[&str]) -> (bool, String, String) {
 
 #[test]
 fn m_test_single_bundled_fixture_passes() {
-    let (ok, stdout, stderr) = run_m_test(&["--single", "test_unittest_machinery"]);
+    // NB: not `--single` — in CPython 3.13 regrtest that flag means "run
+    // the next test from the persisted `pynexttest` worklist", not "run
+    // this one named test". A positional name runs exactly that module.
+    let (ok, stdout, stderr) = run_m_test(&["test_unittest_machinery"]);
     assert!(
         ok,
-        "`weavepy -m test --single test_unittest_machinery` should exit 0\n\
+        "`weavepy -m test test_unittest_machinery` should exit 0\n\
          --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
     );
     assert!(
@@ -56,7 +66,7 @@ fn m_test_single_bundled_fixture_passes() {
         "expected a CPython-shaped SUCCESS summary, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("passed: 1"),
+        stdout.contains("1 test OK."),
         "expected exactly one passing module, got:\n{stdout}"
     );
 }
@@ -74,7 +84,7 @@ fn m_test_runs_multiple_named_modules() {
         "expected a SUCCESS summary, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("passed: 2"),
+        stdout.contains("2 tests OK."),
         "expected two passing modules, got:\n{stdout}"
     );
 }

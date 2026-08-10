@@ -180,7 +180,8 @@ def _code_from_spec(name, spec):
 
 
 def _get_module_details(mod_name, error=ImportError):
-    """Return ``(name, spec, code, filename)`` for ``mod_name``.
+    """Return ``(name, spec, code)`` for ``mod_name`` (CPython's private
+    contract — ``trace`` and ``pdb`` unpack exactly three values).
 
     Locates the module via ``importlib.util.find_spec`` (no execution of the
     target) and recovers its code object. A package redirects to its
@@ -230,8 +231,7 @@ def _get_module_details(mod_name, error=ImportError):
     code = _code_from_spec(mod_name, spec)
     if code is None:
         raise error("No code object available for %s" % mod_name)
-    filename = _resolve_filename(mod_name, spec)
-    return mod_name, spec, code, filename
+    return mod_name, spec, code
 
 
 class _Error(Exception):
@@ -280,7 +280,8 @@ def _run_module_code(code, init_globals=None, mod_name=None, mod_spec=None,
 def run_module(mod_name, init_globals=None, run_name=None, alter_sys=False):
     """Execute a module's code without importing it. Returns the resulting
     module globals dictionary."""
-    name, spec, code, filename = _get_module_details(mod_name)
+    name, spec, code = _get_module_details(mod_name)
+    filename = _resolve_filename(name, spec)
     if run_name is None:
         run_name = name
     pkg = name.rpartition(".")[0] or None
@@ -299,13 +300,14 @@ def _run_module_as_main(mod_name, alter_argv=True):
     located spec so a child process can reconstruct ``__main__`` faithfully."""
     try:
         if alter_argv or mod_name != "__main__":  # i.e. -m switch
-            name, spec, code, filename = _get_module_details(mod_name, _Error)
+            name, spec, code = _get_module_details(mod_name, _Error)
         else:  # i.e. directory or zipfile execution
-            name, spec, code, filename = _get_main_module_details(_Error)
+            name, spec, code = _get_main_module_details(_Error)
     except _Error as exc:
         msg = "%s: %s" % (sys.executable, exc)
         sys.exit(msg)
     main_globals = sys.modules["__main__"].__dict__
+    filename = _resolve_filename(name, spec)
     if alter_argv and sys.argv:
         sys.argv[0] = filename
     return _run_code(code, main_globals, None, "__main__", spec, None, filename)
@@ -345,7 +347,8 @@ def run_path(path_name, init_globals=None, run_name=None):
     # front of sys.path and locate its __main__.
     sys.path.insert(0, path_name)
     try:
-        name, spec, code, filename = _get_main_module_details()
+        name, spec, code = _get_main_module_details()
+        filename = _resolve_filename(name, spec)
         with _TempModule(run_name) as temp_module, _ModifiedArgv0(path_name):
             mod_globals = temp_module.module.__dict__
             return dict(_run_code(code, mod_globals, init_globals,

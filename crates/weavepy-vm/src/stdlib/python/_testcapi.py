@@ -22,6 +22,11 @@ from _testinternalcapi import (  # noqa: F401
     _end_spawned_pthread,
 )
 
+# PEP 509 dict version tag probe (`test_dict_version`): CPython's
+# `_testcapi.dict_get_version` wraps `PyDict_GetVersion`; ours reads the
+# native side-registry that stamps and advances the tags.
+from _testinternalcapi import dict_get_version  # noqa: F401
+
 # `Py_FatalError` trigger (test_faulthandler.test_fatal_error): dumps a
 # traceback to stderr and aborts the process. Native — it must never
 # return, and the dump comes from the interpreter's own frame registry.
@@ -368,3 +373,381 @@ def buffer_fill_info(source, readonly, flags):
     if readonly:
         return memoryview(bytes(source))
     return memoryview(bytearray(source))
+
+
+# ---------------------------------------------------------------------------
+# RFC 0060 — the METH_* calling-convention fixtures (test_call).
+#
+# CPython's C module exposes one function per calling convention, each
+# returning its bound `self` plus the arguments it received, with the C
+# argument-clinic error messages for misuse. The observable contract is
+# entirely about *shapes and messages*, so Python implementations with
+# manual checks reproduce it exactly; the vectorcall-specific types
+# (`MethodDescriptor*`, `make_vectorcall_class`) stay native because they
+# involve `type.__flags__` bits and args-tuple identity.
+# ---------------------------------------------------------------------------
+
+def _meth_self():
+    return sys.modules[__name__]
+
+
+def meth_varargs(*args, **kwargs):
+    if kwargs:
+        raise TypeError("meth_varargs() takes no keyword arguments")
+    return (_meth_self(), args)
+
+
+def meth_varargs_keywords(*args, **kwargs):
+    return (_meth_self(), args, kwargs)
+
+
+def meth_o(*args, **kwargs):
+    if kwargs:
+        raise TypeError("meth_o() takes no keyword arguments")
+    if len(args) != 1:
+        raise TypeError(
+            f"meth_o() takes exactly one argument ({len(args)} given)")
+    return (_meth_self(), args[0])
+
+
+def meth_noargs(*args, **kwargs):
+    if kwargs:
+        raise TypeError("meth_noargs() takes no keyword arguments")
+    if args:
+        raise TypeError(
+            f"meth_noargs() takes no arguments ({len(args)} given)")
+    return _meth_self()
+
+
+def meth_fastcall(*args, **kwargs):
+    if kwargs:
+        raise TypeError("meth_fastcall() takes no keyword arguments")
+    return (_meth_self(), args)
+
+
+def meth_fastcall_keywords(*args, **kwargs):
+    return (_meth_self(), args, kwargs)
+
+
+class MethInstance:
+    """Instance methods under each METH_* convention (self = instance)."""
+
+    def meth_varargs(self, *args, **kwargs):
+        if kwargs:
+            raise TypeError("meth_varargs() takes no keyword arguments")
+        return (self, args)
+
+    def meth_varargs_keywords(self, *args, **kwargs):
+        return (self, args, kwargs)
+
+    def meth_o(self, *args, **kwargs):
+        if kwargs:
+            raise TypeError("meth_o() takes no keyword arguments")
+        if len(args) != 1:
+            raise TypeError(
+                f"meth_o() takes exactly one argument ({len(args)} given)")
+        return (self, args[0])
+
+    def meth_noargs(self, *args, **kwargs):
+        if kwargs:
+            raise TypeError("meth_noargs() takes no keyword arguments")
+        if args:
+            raise TypeError(
+                f"meth_noargs() takes no arguments ({len(args)} given)")
+        return self
+
+    def meth_fastcall(self, *args, **kwargs):
+        if kwargs:
+            raise TypeError("meth_fastcall() takes no keyword arguments")
+        return (self, args)
+
+    def meth_fastcall_keywords(self, *args, **kwargs):
+        return (self, args, kwargs)
+
+
+class MethClass:
+    """Class methods under each METH_* convention (self = class)."""
+
+    @classmethod
+    def meth_varargs(cls, *args, **kwargs):
+        if kwargs:
+            raise TypeError("meth_varargs() takes no keyword arguments")
+        return (cls, args)
+
+    @classmethod
+    def meth_varargs_keywords(cls, *args, **kwargs):
+        return (cls, args, kwargs)
+
+    @classmethod
+    def meth_o(cls, *args, **kwargs):
+        if kwargs:
+            raise TypeError("meth_o() takes no keyword arguments")
+        if len(args) != 1:
+            raise TypeError(
+                f"meth_o() takes exactly one argument ({len(args)} given)")
+        return (cls, args[0])
+
+    @classmethod
+    def meth_noargs(cls, *args, **kwargs):
+        if kwargs:
+            raise TypeError("meth_noargs() takes no keyword arguments")
+        if args:
+            raise TypeError(
+                f"meth_noargs() takes no arguments ({len(args)} given)")
+        return cls
+
+    @classmethod
+    def meth_fastcall(cls, *args, **kwargs):
+        if kwargs:
+            raise TypeError("meth_fastcall() takes no keyword arguments")
+        return (cls, args)
+
+    @classmethod
+    def meth_fastcall_keywords(cls, *args, **kwargs):
+        return (cls, args, kwargs)
+
+
+class MethStatic:
+    """Static methods under each METH_* convention (self = None)."""
+
+    @staticmethod
+    def meth_varargs(*args, **kwargs):
+        if kwargs:
+            raise TypeError("meth_varargs() takes no keyword arguments")
+        return (None, args)
+
+    @staticmethod
+    def meth_varargs_keywords(*args, **kwargs):
+        return (None, args, kwargs)
+
+    @staticmethod
+    def meth_o(*args, **kwargs):
+        if kwargs:
+            raise TypeError("meth_o() takes no keyword arguments")
+        if len(args) != 1:
+            raise TypeError(
+                f"meth_o() takes exactly one argument ({len(args)} given)")
+        return (None, args[0])
+
+    @staticmethod
+    def meth_noargs(*args, **kwargs):
+        if kwargs:
+            raise TypeError("meth_noargs() takes no keyword arguments")
+        if args:
+            raise TypeError(
+                f"meth_noargs() takes no arguments ({len(args)} given)")
+        return None
+
+    @staticmethod
+    def meth_fastcall(*args, **kwargs):
+        if kwargs:
+            raise TypeError("meth_fastcall() takes no keyword arguments")
+        return (None, args)
+
+    @staticmethod
+    def meth_fastcall_keywords(*args, **kwargs):
+        return (None, args, kwargs)
+
+
+# The C-to-Python call probes. In CPython these route through
+# `PyObject_VectorcallDict` / `PyObject_Vectorcall` / `PyVectorcall_Call`
+# / `PyCFunction_Call`; WeavePy's single native call path *is* what those
+# APIs reach, so the probes reduce to plain calls with the same argument
+# splitting the C wrappers perform.
+
+def pyobject_fastcalldict(func, args, kwargs):
+    return func(*(args or ()), **(kwargs or {}))
+
+
+def pyobject_vectorcall(func, args, kwnames):
+    args = tuple(args or ())
+    kwnames = tuple(kwnames or ())
+    n = len(args) - len(kwnames)
+    if n < 0:
+        raise ValueError("kwnames longer than args")
+    return func(*args[:n], **dict(zip(kwnames, args[n:])))
+
+
+def pyvectorcall_call(func, args, kwargs=None):
+    return func(*args, **(kwargs or {}))
+
+
+def pycfunction_call(func, args, kwargs=None):
+    return func(*args, **(kwargs or {}))
+
+
+def has_vectorcall_flag(t):
+    """True when `type.__flags__` carries Py_TPFLAGS_HAVE_VECTORCALL."""
+    return bool(t.__flags__ & (1 << 11))
+
+
+def _vectorcall_overridden(*args, **kwargs):
+    return "overridden"
+
+
+def function_setvectorcall(f):
+    """`PyFunction_SetVectorcall`: after this, calling `f` returns
+    "overridden". WeavePy functions have no separate vectorcall pointer;
+    rebinding `__code__` changes the call result through the same single
+    dispatch path (and deopts call-site specializations, which is the
+    other property the tests probe)."""
+    f.__code__ = _vectorcall_overridden.__code__
+
+
+# The PEP 590 fixture types (native: `type.__flags__` bits +
+# args-tuple-identity `tp_call` need interpreter support).
+from _testinternalcapi import (  # noqa: F401
+    MethodDescriptorBase,
+    MethodDescriptorDerived,
+    MethodDescriptorNopGet,
+    MethodDescriptor2,
+    make_vectorcall_class,
+)
+
+
+# ---------------------------------------------------------------------------
+# RFC 0060 — frame C-API probes (CPython `Modules/_testcapi/frame.c`),
+# exercised by test_frame.TestCAPI.
+# ---------------------------------------------------------------------------
+
+import _weave_frame as _wframe
+
+
+def _check_frame(frame):
+    import types
+
+    if not isinstance(frame, types.FrameType):
+        raise TypeError("argument must be a frame")
+
+
+def frame_getlocals(frame):
+    _check_frame(frame)
+    return frame.f_locals
+
+
+def frame_getglobals(frame):
+    _check_frame(frame)
+    return frame.f_globals
+
+
+def frame_getbuiltins(frame):
+    _check_frame(frame)
+    return frame.f_builtins
+
+
+def frame_getlasti(frame):
+    _check_frame(frame)
+    return frame.f_lasti
+
+
+def frame_getgenerator(frame):
+    _check_frame(frame)
+    gen = _wframe.generator(frame)
+    if gen is None:
+        raise ValueError("frame has no generator")
+    return gen
+
+
+def frame_getvar(frame, name):
+    # PyFrame_GetVar: the name must be a str; a missing or unbound
+    # variable is a NameError.
+    _check_frame(frame)
+    if not isinstance(name, str):
+        raise TypeError("name must be a str")
+    try:
+        return frame.f_locals[name]
+    except KeyError:
+        raise NameError(f"variable {name!r} does not exist") from None
+
+
+def frame_getvarstring(frame, name):
+    return frame_getvar(frame, name.decode("utf-8"))
+
+
+def frame_new(code, globals, locals):
+    return _wframe.frame_new(code, globals, locals)
+
+
+class _UnraisableHookArgs:
+    """The shape `sys.unraisablehook` receives (CPython's
+    UnraisableHookArgs struct sequence)."""
+
+    __slots__ = ("exc_type", "exc_value", "exc_traceback", "err_msg", "object")
+
+    def __init__(self, exc_type, exc_value, exc_traceback, err_msg, obj):
+        self.exc_type = exc_type
+        self.exc_value = exc_value
+        self.exc_traceback = exc_traceback
+        self.err_msg = err_msg
+        self.object = obj
+
+
+def err_formatunraisable(exc, fmt=None, *args):
+    """`_PyErr_FormatUnraisable`: route `exc` through
+    `sys.unraisablehook` with a formatted message. Fires the PEP 578
+    `sys.unraisablehook` audit event with the resolved hook first
+    (test_audit test_unraisablehook)."""
+    import sys
+
+    err_msg = None
+    if fmt is not None:
+        err_msg = (fmt % args) if args else fmt
+    hookargs = _UnraisableHookArgs(
+        type(exc) if exc is not None else None,
+        exc,
+        getattr(exc, "__traceback__", None),
+        err_msg,
+        None,
+    )
+    hook = getattr(sys, "unraisablehook", None)
+    if hook is not None:
+        sys.audit("sys.unraisablehook", hook, hookargs)
+        hook(hookargs)
+        return None
+    sys.__unraisablehook__(hookargs)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# PEP 669 monitoring C-API fixtures (test_monitoring.TestCApiEventGeneration).
+# The fire primitives (`PyMonitoring_Fire*Event`) and scope management
+# (`PyMonitoring_EnterScope`/`ExitScope`) live in native code so that
+# firing a synthetic event does not itself generate interpreter events;
+# only the CodeLike container is Python. Its `_active` list is the
+# analogue of the C fixture's `monitoring_states` array: one per-state
+# bitmask of tools, snapshotted by `monitoring_enter_scope` and pruned
+# in place when a callback returns `sys.monitoring.DISABLE`.
+
+from _testinternalcapi import (  # noqa: F401
+    monitoring_enter_scope,
+    monitoring_exit_scope,
+    fire_event_py_start,
+    fire_event_py_resume,
+    fire_event_py_return,
+    fire_event_c_return,
+    fire_event_py_yield,
+    fire_event_call,
+    fire_event_line,
+    fire_event_jump,
+    fire_event_branch,
+    fire_event_py_throw,
+    fire_event_raise,
+    fire_event_c_raise,
+    fire_event_reraise,
+    fire_event_exception_handled,
+    fire_event_py_unwind,
+    fire_event_stop_iteration,
+)
+
+
+class CodeLike:
+    """`_testcapi.CodeLike`: a code-like object carrying PEP 669
+    monitoring state slots (`PyCodeLikeObject` in Modules/_testcapi/
+    monitoring.c)."""
+
+    def __init__(self, num_events):
+        self._num_events = num_events
+        self._active = [0] * num_events
+
+    def __repr__(self):
+        return f"CodeLike(num_events={self._num_events})"

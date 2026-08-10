@@ -140,12 +140,17 @@ def _install():
     environb = _Environ(data, encodebytes, bytes, encodebytes, bytes,
                         putenv, unsetenv)
 
+    # CPython's os.py: `supports_bytes_environ = (name != 'nt')`, and the
+    # bytes view (`environb`/`getenvb`) only exists where that's True.
+    supports_bytes_environ = _os.name != 'nt'
+
     _os.environ = environ
-    _os.environb = environb
+    if supports_bytes_environ:
+        _os.environb = environb
     # CPython exposes the class as `os._Environ`; rich's pretty-printer
     # keys a repr table on it (`os._Environ: lambda ...`).
     _os._Environ = _Environ
-    _os.supports_bytes_environ = True
+    _os.supports_bytes_environ = supports_bytes_environ
 
     def getenv(key, default=None):
         """Get an environment variable, return None if it doesn't exist.
@@ -162,7 +167,8 @@ def _install():
         return environb.get(key, default)
 
     _os.getenv = getenv
-    _os.getenvb = getenvb
+    if supports_bytes_environ:
+        _os.getenvb = getenvb
 
 
 # ---------------------------------------------------------------------------

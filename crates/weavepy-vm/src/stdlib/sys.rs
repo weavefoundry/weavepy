@@ -58,6 +58,22 @@ pub fn build_with_state(
                 call_kw: None,
             })),
         );
+        let fs_fallback_modname = frame_stack.clone();
+        d.insert(
+            DictKey(Object::from_static("_getframemodulename")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "_getframemodulename",
+                binds_instance: false,
+                call: Box::new(move |args| {
+                    if let Some(h) = crate::vm_singletons::current_thread_handles() {
+                        sys_getframemodulename(args, &h.frame_stack)
+                    } else {
+                        sys_getframemodulename(args, &fs_fallback_modname)
+                    }
+                }),
+                call_kw: None,
+            })),
+        );
         let es_fallback = exc_info_stack.clone();
         d.insert(
             DictKey(Object::from_static("exc_info")),
@@ -370,6 +386,24 @@ pub fn build_with_state(
             builtin("displayhook", sys_displayhook),
         );
 
+        // PEP 553 — `breakpointhook` / `__breakpointhook__`: the default
+        // hook honours $PYTHONBREAKPOINT ('0' → no-op, empty/unset →
+        // `pdb.set_trace`, otherwise a dotted callable path, warning on
+        // an unimportable value). `breakpoint()` dispatches through the
+        // live `sys.breakpointhook` binding (test_builtin
+        // TestBreakpoint).
+        for name in ["breakpointhook", "__breakpointhook__"] {
+            d.insert(
+                DictKey(Object::from_static(name)),
+                Object::Builtin(Rc::new(BuiltinFn {
+                    name: "breakpointhook",
+                    binds_instance: false,
+                    call: Box::new(|args| sys_breakpointhook_kw(args, &[])),
+                    call_kw: Some(Box::new(sys_breakpointhook_kw)),
+                })),
+            );
+        }
+
         // `sys.builtin_module_names` — exposed as a tuple for
         // user-introspection code (e.g. `importlib.util.find_spec`).
         // Only modules the VM builds *natively* belong here: names that
@@ -439,6 +473,20 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         d.insert(
             DictKey(Object::from_static("argv")),
             Object::List(cache.argv.clone()),
+        );
+        // PEP 587's `sys.orig_argv`: the process argv exactly as the
+        // interpreter received it (executable + options + script args),
+        // before option stripping produced `sys.argv`. Decoded through
+        // the RFC 0050 surrogateescape bridge — `std::env::args()`
+        // panics outright on non-UTF-8 argv (bpo-35883).
+        d.insert(
+            DictKey(Object::from_static("orig_argv")),
+            Object::new_list(
+                crate::os_args_bridged()
+                    .iter()
+                    .map(|a| crate::argv_str_to_object(a))
+                    .collect::<Vec<_>>(),
+            ),
         );
 
         // Static identity. Shaped like CPython's `sys.version`
@@ -1004,6 +1052,18 @@ pub(crate) fn intern_name(name: &str) -> Object {
     })
 }
 
+/// Is `o` the pooled (`sys.intern`) instance for its value? `marshal`
+/// writes such strings with the `*_INTERNED` type codes so a round-trip
+/// preserves the interned identity (RFC 0060, test_marshal.testIntern).
+pub(crate) fn str_is_interned(o: &Object) -> bool {
+    let Object::Str(_) = o else { return false };
+    INTERN_POOL.with(|pool| {
+        pool.borrow()
+            .get(&o.to_str())
+            .is_some_and(|pooled| pooled.is_same(o))
+    })
+}
+
 fn sys_intern(args: &[Object]) -> Result<Object, RuntimeError> {
     match args.first() {
         Some(s @ Object::Str(_)) => INTERN_POOL.with(|pool| {
@@ -1057,9 +1117,49 @@ fn sys_getframe(
     // RFC 0058: the spine holds cheap shells; the Python-visible
     // frame object is materialised on demand right here.
     match crate::object::materialize_stack_at(frame_stack, idx) {
-        Some(py) => Ok(Object::Frame(py)),
+        Some(py) => {
+            // PEP 578: `sys._getframe` audits with the frame object.
+            audit_event("sys._getframe", &[Object::Frame(py.clone())])?;
+            Ok(Object::Frame(py))
+        }
         None => Err(value_error("call stack is not deep enough")),
     }
+}
+
+/// `sys._getframemodulename(depth=0)` (3.12+): the `__name__` of the
+/// globals of the frame `depth` levels up, or `None` when the stack
+/// isn't that deep. Unlike `_getframe` it never raises for shallow
+/// stacks and doesn't materialise a frame object.
+fn sys_getframemodulename(
+    args: &[Object],
+    frame_stack: &crate::object::FrameStack,
+) -> Result<Object, RuntimeError> {
+    let depth = match args.first() {
+        Some(o) => match o {
+            Object::Int(d) => *d,
+            _ => return Err(type_error("depth must be an int")),
+        },
+        None => 0,
+    };
+    audit_event("sys._getframemodulename", &[Object::Int(depth)])?;
+    if depth < 0 {
+        return Ok(Object::None);
+    }
+    let len = frame_stack.borrow().len();
+    let depth = depth as usize;
+    if depth >= len {
+        return Ok(Object::None);
+    }
+    let idx = len - 1 - depth;
+    let Some(py) = crate::object::materialize_stack_at(frame_stack, idx) else {
+        return Ok(Object::None);
+    };
+    let name = py
+        .globals
+        .borrow()
+        .get(&crate::object::StrKey("__name__"))
+        .cloned();
+    Ok(name.unwrap_or(Object::None))
 }
 
 /// `sys.exception()` (PEP 3134 / 3.11+): the exception instance currently
@@ -1137,6 +1237,7 @@ fn sys_default_excepthook(args: &[Object]) -> Result<Object, RuntimeError> {
 // trade-off discussion).
 
 fn sys_settrace(args: &[Object]) -> Result<Object, RuntimeError> {
+    audit_event("sys.settrace", &[])?;
     let hook = args.first().cloned().unwrap_or(Object::None);
     crate::trace::set_trace_hook(hook);
     Ok(Object::None)
@@ -1144,8 +1245,32 @@ fn sys_settrace(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn sys_addaudithook(args: &[Object]) -> Result<Object, RuntimeError> {
     let hook = args.first().cloned().unwrap_or(Object::None);
+    // CPython fires `sys.addaudithook` *before* registering. An
+    // existing hook can veto the registration by raising RuntimeError
+    // (or a subclass) — the error is swallowed and the hook is simply
+    // not added (test_audit test_block_add_hook). Any other exception
+    // propagates to the caller.
+    if let Err(err) = audit_event("sys.addaudithook", &[]) {
+        if err_is_exception_named(&err, "RuntimeError") {
+            return Ok(Object::None);
+        }
+        return Err(err);
+    }
     crate::trace::add_audit_hook(hook);
     Ok(Object::None)
+}
+
+/// True when `err` is a Python exception whose class (or an MRO
+/// ancestor) is named `name`.
+pub(crate) fn err_is_exception_named(err: &RuntimeError, name: &str) -> bool {
+    let RuntimeError::PyException(pe) = err else {
+        return false;
+    };
+    match &pe.instance {
+        Object::Instance(i) => i.cls().mro.borrow().iter().any(|t| t.name == name),
+        Object::Type(t) => t.mro.borrow().iter().any(|t| t.name == name),
+        _ => false,
+    }
 }
 
 /// PEP 578 — `sys.audit(event, *args)`. Walks the registered audit
@@ -1164,29 +1289,35 @@ fn sys_audit(args: &[Object]) -> Result<Object, RuntimeError> {
         None => return Err(crate::error::type_error("sys.audit() missing event name")),
     };
     let rest: Vec<Object> = args.iter().skip(1).cloned().collect();
-    audit_event(&event, &rest);
+    audit_event(&event, &rest)?;
     Ok(Object::None)
 }
 
 /// Fire a PEP 578 audit event. Stdlib code (and the VM) calls this
 /// at documented event sites (`open`, `compile`, `exec`,
-/// `socket.connect`, `subprocess.Popen`, `import`, …). Hooks run
-/// out-of-band — exceptions raised by a hook are routed through
-/// `sys.unraisablehook` rather than back to the caller, matching
-/// CPython.
-pub fn audit_event(event: &str, args: &[Object]) {
+/// `socket.connect`, `subprocess.Popen`, `import`, …).
+///
+/// CPython semantics (`sys_audit_tstate`):
+/// - hooks fire in registration order;
+/// - the first exception a hook raises *aborts the audited
+///   operation* — it propagates to whoever fired the event (this is
+///   how hooks veto operations, e.g. test_audit's RuntimeError
+///   cascades);
+/// - tracing/profiling is disabled while a hook runs unless the hook
+///   object has a truthy `__cantrace__` attribute.
+pub fn audit_event(event: &str, args: &[Object]) -> Result<(), RuntimeError> {
     if !crate::trace::any_audit_active() {
-        return;
+        return Ok(());
     }
     let hooks = crate::trace::audit_hooks();
     if hooks.is_empty() {
-        return;
+        return Ok(());
     }
     let Some(_guard) = crate::trace::ReentryGuard::acquire() else {
-        return;
+        return Ok(());
     };
     let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() else {
-        return;
+        return Ok(());
     };
     // SAFETY: `ptr` was published by `publish_interpreter_ptr` from
     // a `&mut Interpreter` that is still on the call stack above us
@@ -1197,18 +1328,33 @@ pub fn audit_event(event: &str, args: &[Object]) {
     let interp = unsafe { &mut *ptr };
     let arg_tuple = Object::new_tuple(args.to_vec());
     let outer = interp.builtins_dict();
+    // `PyThreadState_EnterTracing`: hooks run untraced by default.
+    let _suppress = crate::trace::TracingSuppressGuard::enter();
     for hook in hooks {
+        let can_trace = match interp.load_attr_public(&hook, "__cantrace__") {
+            Ok(v) => v.is_truthy(),
+            Err(err) => {
+                if err_is_exception_named(&err, "AttributeError") {
+                    false
+                } else {
+                    return Err(err);
+                }
+            }
+        };
         let call_args = [Object::from_str(event.to_string()), arg_tuple.clone()];
-        // Errors are deliberately swallowed — PEP 578 says hook
-        // failures must not change the program's observable
-        // behaviour. CPython routes them through `sys.unraisablehook`;
-        // we do the same minus the user notification (which is a
-        // RFC 0026 follow-up).
-        let _ = interp.call_object_with_globals(&hook, &call_args, &[], &outer);
+        let result = if can_trace {
+            let _allow = crate::trace::TracingAllowGuard::enter();
+            interp.call_object_with_globals(&hook, &call_args, &[], &outer)
+        } else {
+            interp.call_object_with_globals(&hook, &call_args, &[], &outer)
+        };
+        result?;
     }
+    Ok(())
 }
 
 fn sys_setprofile(args: &[Object]) -> Result<Object, RuntimeError> {
+    audit_event("sys.setprofile", &[])?;
     let hook = args.first().cloned().unwrap_or(Object::None);
     crate::trace::set_profile_hook(hook);
     Ok(Object::None)
@@ -1227,11 +1373,11 @@ fn sys_setprofileallthreads(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn sys_gettrace(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(crate::trace::trace_hook().unwrap_or(Object::None))
+    Ok(crate::trace::trace_hook_raw().unwrap_or(Object::None))
 }
 
 fn sys_getprofile(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(crate::trace::profile_hook().unwrap_or(Object::None))
+    Ok(crate::trace::profile_hook_raw().unwrap_or(Object::None))
 }
 
 /// Best-effort CPython-shaped `sys.getsizeof` estimate. Shared with
@@ -1874,6 +2020,51 @@ fn sys_get_asyncgen_hooks(_args: &[Object]) -> Result<Object, RuntimeError> {
 /// Default `sys.displayhook`: if the value is None do nothing,
 /// otherwise print `repr(value)` and stash on
 /// `builtins._`. Matches CPython's reference implementation.
+/// PEP 553 default `sys.breakpointhook`. Mirrors CPython's
+/// `sysmodule.c:sys_breakpointhook`: consult `$PYTHONBREAKPOINT`
+/// (`os.environ` writes through to the process env, so
+/// `EnvironmentVarGuard` changes are visible here), resolve the dotted
+/// callable fresh on every call (so `unittest.mock.patch('pdb.set_trace')`
+/// intercepts), and warn `RuntimeWarning` on an unimportable value.
+fn sys_breakpointhook_kw(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
+    let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
+        crate::error::runtime_error("sys.breakpointhook requires a running interpreter")
+    })?;
+    // SAFETY: published by the enclosing VM frame on this thread.
+    let interp = unsafe { &mut *ptr };
+    let envar = std::env::var("PYTHONBREAKPOINT").unwrap_or_default();
+    if envar == "0" {
+        return Ok(Object::None);
+    }
+    let hookname = if envar.is_empty() {
+        "pdb.set_trace".to_owned()
+    } else {
+        envar.clone()
+    };
+    let (modname, funcname) = match hookname.rfind('.') {
+        Some(i) => (hookname[..i].to_owned(), hookname[i + 1..].to_owned()),
+        None => ("builtins".to_owned(), hookname.clone()),
+    };
+    let hook = if modname.is_empty() || funcname.is_empty() {
+        None
+    } else {
+        match interp.import_path(&modname) {
+            Ok(module) => interp.load_attr_public(&module, &funcname).ok(),
+            Err(_) => None,
+        }
+    };
+    let Some(hook) = hook else {
+        interp.warn_runtime_from_builtin(format!(
+            "Ignoring unimportable $PYTHONBREAKPOINT: \"{envar}\""
+        ))?;
+        return Ok(Object::None);
+    };
+    interp.call_object(hook, args, kwargs)
+}
+
 fn sys_displayhook(args: &[Object]) -> Result<Object, RuntimeError> {
     let value = args.first().cloned().unwrap_or(Object::None);
     if matches!(value, Object::None) {

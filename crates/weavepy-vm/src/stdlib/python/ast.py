@@ -53,6 +53,22 @@ class AST:
         return object.__new__(cls)
 
     def __init__(self, *args, **kwargs):
+        _ast_init(self, args, kwargs)
+
+    # CPython's C-level `ast_type_init` receives the CALL_FUNCTION_EX
+    # `**mapping` dict raw — non-str keys included — and matches field
+    # names by equality (test_ast test_non_str_kwarg). The VM routes
+    # class calls whose kwargs dict holds a non-str key here instead of
+    # rejecting them with "keywords must be strings".
+    __weave_raw_kwargs__ = True
+
+    def __weave_construct__(cls, args, kwargs):
+        self = cls.__new__(cls, *args)
+        _ast_init(self, args, kwargs)
+        return self
+
+
+def _ast_init(self, args, kwargs):
         cls = type(self)
         try:
             fields = cls._fields

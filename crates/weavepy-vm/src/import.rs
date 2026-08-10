@@ -313,7 +313,18 @@ impl ModuleCache {
             return None;
         }
         let rel: PathBuf = full_name.split('.').collect();
+        // The materialized stdlib tree also projects the bundled
+        // *third-party facades* (`numpy.py`, `packaging.py`, …) to disk,
+        // and in a venv the tree directory sits on `sys.path` ahead of
+        // site-packages. Those projections are identity labels for the
+        // frozen sources, not installations — a real `pip install numpy`
+        // in site-packages must win over them (RFC 0055 WS5), so the
+        // facade names skip tree-resident matches and keep scanning.
+        let skip_tree_facade = Self::is_third_party_facade(full_name);
         for dir in self.search_dirs() {
+            if skip_tree_facade && crate::stdlib_tree::contains(&dir) {
+                continue;
+            }
             // CPython's FileFinder probes the package directory before
             // the module file within each path entry, so `t4/__init__.py`
             // shadows a sibling `t4.py` (test_pkg.test_4).

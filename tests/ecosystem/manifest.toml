@@ -131,3 +131,15 @@ timeout_seconds = 900
 requirements = "django"
 probe = "probes/django_probe.py"
 timeout_seconds = 900
+
+# --- capstone (RFC 0058 WS8) -------------------------------------------------
+
+[packages.pandas]
+requirements = "pandas"
+probe = "probes/pandas_probe.py"
+timeout_seconds = 1200
+
+[packages.fastapi]
+requirements = "fastapi httpx"
+probe = "probes/fastapi_probe.py"
+timeout_seconds = 900

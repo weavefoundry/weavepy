@@ -866,6 +866,68 @@ pub extern "C" fn PyEval_GetBuiltins() -> *mut PyObject {
     })
 }
 
+// ---------------------------------------------------------------------------
+// RFC 0060 — PEP 667 frame C-API (test_frame.TestFrameCApi). The
+// "current frame" skips WeavePy's frozen ctypes machinery frames so a
+// `ctypes.pythonapi` call reports the *user* caller, like CPython's
+// C-implemented ctypes does naturally.
+// ---------------------------------------------------------------------------
+
+/// `PyEval_GetFrameLocals()` — an independent snapshot of the current
+/// frame's locals (function scopes: fresh dict; module scope: the
+/// namespace itself). New reference.
+#[no_mangle]
+pub extern "C" fn PyEval_GetFrameLocals() -> *mut PyObject {
+    crate::interp::with_interp_mut(|vm| match vm.capi_current_py_frame() {
+        Some(fr) => crate::object::into_owned(fr.locals_snapshot()),
+        None => ptr::null_mut(),
+    })
+    .unwrap_or(ptr::null_mut())
+}
+
+/// `PyEval_GetFrameGlobals()` — the current frame's globals dict.
+/// New reference.
+#[no_mangle]
+pub extern "C" fn PyEval_GetFrameGlobals() -> *mut PyObject {
+    crate::interp::with_interp_mut(|vm| match vm.capi_current_py_frame() {
+        Some(fr) => crate::object::into_owned(weavepy_vm::object::Object::Dict(fr.globals.clone())),
+        None => ptr::null_mut(),
+    })
+    .unwrap_or(ptr::null_mut())
+}
+
+/// `PyEval_GetFrameBuiltins()` — the current frame's builtins dict.
+/// New reference.
+#[no_mangle]
+pub extern "C" fn PyEval_GetFrameBuiltins() -> *mut PyObject {
+    crate::interp::with_interp_mut(|vm| match vm.capi_current_py_frame() {
+        Some(fr) => {
+            crate::object::into_owned(weavepy_vm::object::Object::Dict(fr.builtins.clone()))
+        }
+        None => ptr::null_mut(),
+    })
+    .unwrap_or(ptr::null_mut())
+}
+
+/// `PyFrame_GetLocals(frame)` — PEP 667: the write-through
+/// `FrameLocalsProxy` for function frames, the namespace mapping for
+/// module/class frames. New reference.
+#[no_mangle]
+pub unsafe extern "C" fn PyFrame_GetLocals(frame: *mut PyObject) -> *mut PyObject {
+    if frame.is_null() {
+        return ptr::null_mut();
+    }
+    let obj = unsafe { crate::object::clone_object(frame) };
+    let weavepy_vm::object::Object::Frame(fr) = obj else {
+        return ptr::null_mut();
+    };
+    crate::interp::with_interp_mut(|vm| match vm.frame_locals_view(fr.clone()) {
+        Ok(v) => crate::object::into_owned(v),
+        Err(_) => ptr::null_mut(),
+    })
+    .unwrap_or(ptr::null_mut())
+}
+
 /// Opaque non-NULL handle. numpy only uses the result as a key /
 /// liveness sentinel, never dereferencing the interpreter-state layout.
 #[no_mangle]

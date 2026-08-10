@@ -121,8 +121,13 @@ const CAT_UNI_NOT_LINEBREAK: u32 = 17;
 
 /// Guards against unbounded native recursion on pathological patterns
 /// (CPython uses a heap-allocated context stack; we recurse on the
-/// Rust stack and bail out with an error rather than crash).
-const MAX_DEPTH: u32 = 10_000;
+/// Rust stack, growing it in segments via `stacker`, and bail out
+/// with an error rather than crash). CPython has no comparable limit,
+/// so this must comfortably clear the linear-depth cases its suite
+/// exercises — `(x)*` over 50k characters, `(a|b)*?c` over 20k
+/// (test_re test_stack_overflow / test_bug_418626); the bound only
+/// exists to stop runaway exponential blowups eating all memory.
+const MAX_DEPTH: u32 = 200_000;
 
 // ---------------------------------------------------------------------------
 // Compiled-pattern registry
@@ -727,11 +732,13 @@ impl<'a> Matcher<'a> {
             AT_END_LINE => ptr == self.end || is_linebreak(s[ptr]),
             AT_END_STRING => ptr == self.end,
             AT_BOUNDARY => self.word_boundary(ptr, ascii_word),
-            AT_NON_BOUNDARY => !self.word_boundary(ptr, ascii_word),
+            // `\B` never matches an empty string (gh-80300, changed in
+            // CPython 3.12): both boundary forms fail there.
+            AT_NON_BOUNDARY => self.beginning != self.end && !self.word_boundary(ptr, ascii_word),
             AT_LOC_BOUNDARY => self.word_boundary(ptr, loc_word),
-            AT_LOC_NON_BOUNDARY => !self.word_boundary(ptr, loc_word),
+            AT_LOC_NON_BOUNDARY => self.beginning != self.end && !self.word_boundary(ptr, loc_word),
             AT_UNI_BOUNDARY => self.word_boundary(ptr, uni_word),
-            AT_UNI_NON_BOUNDARY => !self.word_boundary(ptr, uni_word),
+            AT_UNI_NON_BOUNDARY => self.beginning != self.end && !self.word_boundary(ptr, uni_word),
             _ => false,
         }
     }
@@ -949,7 +956,12 @@ impl<'a> Matcher<'a> {
                 "internal: regular expression recursion limit exceeded",
             ));
         }
-        let r = self.do_match_inner(pat, toplevel);
+        // Segmented stack growth: linear-depth backtracking (one native
+        // frame per repetition) must not overflow the OS stack before
+        // reaching MAX_DEPTH.
+        let r = stacker::maybe_grow(128 * 1024, 4 * 1024 * 1024, || {
+            self.do_match_inner(pat, toplevel)
+        });
         self.depth -= 1;
         r
     }
@@ -1690,6 +1702,24 @@ fn subject_to_vec(obj: &Object) -> Result<Vec<u32>, RuntimeError> {
                         | Object::MemoryView(_)
                 ) {
                     return subject_to_vec(&native);
+                }
+            }
+            // Any other buffer-protocol exporter (`array.array` —
+            // test_re test_empty_array): CPython's `_sre` takes the
+            // C-contiguous byte view.
+            if matches!(other, Object::Instance(_)) {
+                if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                    // SAFETY: published by an enclosing VM frame on
+                    // this thread; GIL-serialised.
+                    let vm = unsafe { &mut *ptr };
+                    let globals = vm.builtins_dict();
+                    if let Ok(Some(mv)) =
+                        vm.memoryview_from_object_and_flags(other, 0x011C, &globals)
+                    {
+                        if let Some(bytes) = mv.as_bytes_view() {
+                            return Ok(bytes.into_iter().map(u32::from).collect());
+                        }
+                    }
                 }
             }
             Err(type_error("expected string or bytes-like object"))

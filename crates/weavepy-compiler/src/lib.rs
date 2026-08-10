@@ -184,6 +184,28 @@ pub struct CodeObject {
     /// Memoised [`Self::to_cpython`] encoding (never compared, resets
     /// on clone).
     pub cp_cache: cpython_code::CpCache,
+    /// Raw CPython-wire overrides installed by `CodeType(...)` or
+    /// `code.replace(co_code=…)` (RFC 0060). `None` for compiler-produced
+    /// code objects; when set, the `co_code`/`co_linetable`/… attribute
+    /// surface reports these bytes verbatim instead of re-encoding the
+    /// instruction stream, so constructor/replace round-trips are exact.
+    pub wire: Option<Box<WireOverrides>>,
+}
+
+/// Raw CPython-3.13 wire fields pinned on a [`CodeObject`] by the
+/// `CodeType` constructor or `code.replace` (RFC 0060). Each `Some`
+/// field wins over the value derived from the instruction stream.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WireOverrides {
+    pub co_code: Option<Vec<u8>>,
+    pub co_linetable: Option<Vec<u8>>,
+    pub co_exceptiontable: Option<Vec<u8>>,
+    pub stacksize: Option<u32>,
+    pub flags: Option<u32>,
+    /// Set when the pinned `co_code` couldn't be decoded back into
+    /// WeavePy instructions. Executing such a code object raises
+    /// `SystemError` with this message (CPython: "unknown opcode N").
+    pub exec_error: Option<String>,
 }
 
 /// A per-instruction source-column span (PEP-657). `col`/`end_col` are
@@ -356,6 +378,7 @@ fn format_constant(c: &Constant) -> String {
         }
         Constant::Code(co) => format!("<code object {}>", co.name),
         Constant::Ellipsis => "Ellipsis".to_owned(),
+        Constant::Unmarshallable => "None".to_owned(),
     }
 }
 
@@ -390,6 +413,14 @@ pub enum Constant {
     FrozenSet(Vec<Constant>),
     Code(Box<CodeObject>),
     Ellipsis,
+    /// A `co_consts` slot holding a value the constant pool cannot
+    /// represent (a live type, a set of types, …), produced only by
+    /// `code.replace(co_consts=…)` / `types.CodeType(…)` with arbitrary
+    /// objects. Materialises as `None` at runtime; `marshal` refuses
+    /// code objects containing it ("unmarshallable object"), matching
+    /// CPython's `w_object` failing on the underlying value
+    /// (test_marshal `test_unmarshallable [code]`, gh-106287).
+    Unmarshallable,
 }
 
 impl PartialEq for Constant {
@@ -1038,6 +1069,12 @@ struct Compiler {
     /// handler-entry `PUSH_EXC_INFO` and synthetic cleanup blocks so
     /// they never surface as `'line'` trace events (RFC 0051 WS4).
     line_pinned: Option<u32>,
+    /// Column span accompanying a *nonzero* [`Self::line_pinned`]:
+    /// CPython's statement-level locations for synthetic cleanup carry
+    /// the full location of the anchoring statement, never a bare line
+    /// (co_positions None-counts are 0, 3 or 4 — test_code's
+    /// test_co_positions_artificial_instructions).
+    pinned_colspan: ColSpan,
     /// Source byte span `(start, end)` for the AST node currently being
     /// emitted. Drives PEP-657 column tracking in [`Self::emit`]. Updated
     /// at statement and expression granularity as the compiler descends.
@@ -1196,12 +1233,24 @@ enum FinallyKind {
     /// method on every exit path; re-deriving it via `LoadAttr` would
     /// route through `__getattribute__` (test_descr
     /// test_special_method_lookup).
-    WithExit { exit_idx: u32 },
+    /// `line`/`span` carry the `with` statement's own location: the
+    /// inlined `__exit__` call is stamped with it (CPython's L3 exit
+    /// block re-reports the `with` line when e.g. a `break` leaves the
+    /// body — test_sys_settrace test_early_exit_with).
+    WithExit {
+        exit_idx: u32,
+        line: u32,
+        span: (u32, u32),
+    },
     /// Synthetic frame for an `async with` block: emit
     /// `await <aexit_local>(None, None, None)`. Mirrors `WithExit`
     /// but awaits the `__aexit__` coroutine, so a `return`/`break`/
     /// `continue` out of an `async with` body still runs the exit.
-    AsyncWithExit { aexit_idx: u32 },
+    AsyncWithExit {
+        aexit_idx: u32,
+        line: u32,
+        span: (u32, u32),
+    },
 }
 
 struct FinallyFrame {
@@ -1263,6 +1312,7 @@ impl Compiler {
             line_index,
             current_line: 0,
             line_pinned: None,
+            pinned_colspan: ColSpan::default(),
             current_span: (0, 0),
             synthetic_jumps: HashSet::new(),
             exc_on_stack: 0,
@@ -1416,8 +1466,59 @@ impl Compiler {
         }
         let none_idx = self.co.intern_constant(Constant::None);
         let epilogue = self.next_offset();
-        self.emit(OpCode::LoadConst, none_idx);
-        self.emit(OpCode::ReturnValue, 0);
+        // NO_LOCATION: the implicit `return None` inherits the
+        // preceding instruction's line via the fall-through propagation
+        // below (CPython emits it location-free and propagates), not
+        // whatever `current_line` was left at — a multi-line unpack
+        // ends on its *last target's* line, not the statement head
+        // (test_trace_unpack_long_sequence).
+        self.emit_no_line(OpCode::LoadConst, none_idx);
+        self.emit_no_line(OpCode::ReturnValue, 0);
+        // A synthetic no-location run directly before the epilogue
+        // (the class-body tail: `__static_attributes__` /
+        // `__classcell__` stores, emitted with `line_pinned = 0`)
+        // belongs to the return sequence: CPython duplicates the whole
+        // tail into each predecessor block and propagates locations,
+        // so each path's copy carries *that path's* line. Extend the
+        // duplication below to cover it. Only straight-line code is
+        // eligible — a jump or a handler entry inside the run keeps
+        // the shared tail.
+        let mut tail_start = epilogue;
+        while tail_start > 0
+            && self.co.linetable[(tail_start - 1) as usize] == 0
+            && matches!(
+                self.co.instructions[(tail_start - 1) as usize].op,
+                OpCode::LoadConst | OpCode::StoreName | OpCode::LoadClosure
+            )
+        {
+            tail_start -= 1;
+        }
+        if self
+            .co
+            .exception_table
+            .iter()
+            .any(|h| h.handler >= tail_start && h.handler < epilogue)
+        {
+            tail_start = epilogue;
+        }
+        if tail_start < epilogue {
+            // A jump landing *inside* the run (past its start) would be
+            // orphaned by per-path duplication; keep the shared tail.
+            for i in 0..tail_start {
+                let ins = self.co.instructions[i as usize];
+                let target = match ins.op {
+                    OpCode::JumpForward | OpCode::PopJumpIfFalse | OpCode::PopJumpIfTrue => {
+                        i + 1 + ins.arg
+                    }
+                    OpCode::JumpBackward => (i + 1).saturating_sub(ins.arg),
+                    _ => continue,
+                };
+                if target > tail_start && target <= epilogue + 1 {
+                    tail_start = epilogue;
+                    break;
+                }
+            }
+        }
         // CPython duplicates the implicit `return None` into every
         // predecessor path (its cfg copies RETURN_CONST backward into
         // each basic block that jumps to it), so each return carries
@@ -1460,13 +1561,13 @@ impl Compiler {
             }
             t
         };
-        let jump_sites: Vec<u32> = (0..epilogue)
+        let jump_sites: Vec<u32> = (0..tail_start)
             .filter(|&i| {
                 let ins = self.co.instructions[i as usize];
                 matches!(
                     ins.op,
                     OpCode::JumpForward | OpCode::PopJumpIfFalse | OpCode::PopJumpIfTrue
-                ) && resolve(&self.co, self.co.linetable[i as usize], i + 1 + ins.arg) == epilogue
+                ) && resolve(&self.co, self.co.linetable[i as usize], i + 1 + ins.arg) == tail_start
             })
             .collect();
         if std::env::var_os("WP_DBG_FINISH").is_some() {
@@ -1482,25 +1583,75 @@ impl Compiler {
             }
         }
         for site in jump_sites {
-            let line = self.co.linetable[site as usize];
-            let col = self.co.coltable[site as usize];
+            let mut line = self.co.linetable[site as usize];
+            let mut col = self.co.coltable[site as usize];
+            // A NO_LOCATION jump site (e.g. the synthetic handler-exit
+            // hop after POP_EXCEPT): the copy inherits the predecessor
+            // block's last located instruction, as CPython's
+            // `propagate_line_numbers` + exit-line guarantee would —
+            // the `'return'` event reports the handler body's line,
+            // never `None`.
+            if line == 0 {
+                for k in (0..site).rev() {
+                    if self.co.linetable[k as usize] != 0 {
+                        line = self.co.linetable[k as usize];
+                        col = self.co.coltable[k as usize];
+                        break;
+                    }
+                }
+            }
             let copy = self.next_offset();
-            self.co.instructions.push(Instruction {
-                op: OpCode::LoadConst,
-                arg: none_idx,
-            });
-            self.co.instructions.push(Instruction {
-                op: OpCode::ReturnValue,
-                arg: 0,
-            });
-            self.co.linetable.push(line);
-            self.co.linetable.push(line);
-            self.co.coltable.push(col);
-            self.co.coltable.push(col);
+            for j in tail_start..=(epilogue + 1) {
+                self.co.instructions.push(self.co.instructions[j as usize]);
+                self.co.linetable.push(line);
+                self.co.coltable.push(col);
+            }
             self.patch_jump(site, copy);
         }
-        // Place freevars (in declaration order) at the end of the
-        // cells/freevars combined index space.
+        // Fall-through copy of the tail: propagate the preceding
+        // instruction's location into the no-location run (CPython's
+        // `propagate_line_numbers`), so `co_lines()` and the frame's
+        // `f_lineno` report the path's line at the implicit return.
+        for j in tail_start..=(epilogue + 1) {
+            let j = j as usize;
+            if self.co.linetable[j] == 0 && j > 0 {
+                self.co.linetable[j] = self.co.linetable[j - 1];
+                self.co.coltable[j] = self.co.coltable[j - 1];
+            }
+        }
+        // Place freevars at the end of the cells/freevars combined
+        // index space. CPython orders `co_freevars` alphabetically
+        // (symtable `dictbytype`), while emission used discovery
+        // order — sort here and remap every emitted deref index
+        // accordingly (test_builtin test_exec_closure hands
+        // `exec(code, closure=…)` a tuple built positionally against
+        // `co_freevars`).
+        if self.free_order.len() > 1 {
+            let mut sorted = self.free_order.clone();
+            sorted.sort_unstable();
+            if sorted != self.free_order {
+                let ncells = self.co.cellvars.len() as u32;
+                let remap: Vec<u32> = self
+                    .free_order
+                    .iter()
+                    .map(|n| ncells + sorted.iter().position(|s| s == n).unwrap() as u32)
+                    .collect();
+                for ins in self.co.instructions.iter_mut() {
+                    if matches!(
+                        ins.op,
+                        OpCode::LoadDeref
+                            | OpCode::StoreDeref
+                            | OpCode::DeleteDeref
+                            | OpCode::LoadClosure
+                            | OpCode::LoadClassdictOrDeref
+                    ) && ins.arg >= ncells
+                    {
+                        ins.arg = remap[(ins.arg - ncells) as usize];
+                    }
+                }
+                self.free_order = sorted;
+            }
+        }
         self.co.freevars = self.free_order.clone();
         // RFC 0021: size the inline-cache side-table to match the
         // emitted instruction stream so the VM can index into it
@@ -1513,11 +1664,17 @@ impl Compiler {
         let offset = self.co.instructions.len() as u32;
         self.co.instructions.push(Instruction { op, arg });
         if let Some(pin) = self.line_pinned {
-            // Pinned region: a fixed line (or 0 = "no line") with no
-            // column span — CPython's NO_LOCATION / statement-level
-            // locations for synthetic cleanup code.
+            // Pinned region: a fixed line (or 0 = "no line") — CPython's
+            // NO_LOCATION / statement-level locations for synthetic
+            // cleanup code. A real pinned line carries the anchoring
+            // statement's column span too: CPython never produces a
+            // line-with-no-columns location.
             self.co.linetable.push(pin);
-            self.co.coltable.push(ColSpan::default());
+            self.co.coltable.push(if pin == 0 {
+                ColSpan::default()
+            } else {
+                self.pinned_colspan
+            });
             return offset;
         }
         // An instruction's line is its *own* location's start line
@@ -1871,6 +2028,14 @@ impl Compiler {
         self.set_span(stmt.span);
         match &stmt.kind {
             StmtKind::Expr(e) => {
+                // CPython folds a constant expression statement into a
+                // bare NOP: the value never reaches `co_consts`
+                // (test_code's `optimize_away` doctest). Docstrings are
+                // pooled separately (`doc_slot`), so nothing is lost.
+                if !self.eval_mode && !self.interactive && matches!(e.kind, ExprKind::Constant(_)) {
+                    self.emit(OpCode::Nop, 0);
+                    return Ok(());
+                }
                 self.compile_expr(e)?;
                 // `eval` mode: the single top-level expression returns its
                 // value so `eval(compile(src, fn, "eval"))` yields it.
@@ -2349,6 +2514,10 @@ impl Compiler {
                 self.emit(OpCode::ReturnValue, 0);
             }
             StmtKind::Break => {
+                // CPython's codegen_break emits a located NOP so tracing
+                // reports the `break` line before any inlined `finally`
+                // body runs (test_sys_settrace test_break_through_finally).
+                self.emit(OpCode::Nop, 0);
                 let frame_top = self
                     .loop_stack
                     .last()
@@ -2389,6 +2558,8 @@ impl Compiler {
                     .push(site);
             }
             StmtKind::Continue => {
+                // Located NOP, mirroring codegen_continue (see Break above).
+                self.emit(OpCode::Nop, 0);
                 let frame_top = self.loop_stack.last().ok_or_else(|| {
                     CompileError::spanned("'continue' not properly in loop", stmt.span)
                 })?;
@@ -3486,10 +3657,27 @@ impl Compiler {
         returns: Option<&Expr>,
         is_async: bool,
     ) -> Result<(), CompileError> {
+        // The statement span was set by `compile_stmt` and starts at the
+        // `def` keyword (decorators are separate nodes); the final STORE
+        // carries it, like CPython's `compiler_nameop(c, LOC(s), …)`.
+        let def_span = self.current_span;
+        let def_line = self.current_line;
+        // A decorated function's code object starts at the *first
+        // decorator* (CPython: RESUME location / co_firstlineno point at
+        // `@dec`, so the 'call' trace event reports that line).
+        let entry_line = decorator_list
+            .first()
+            .map(|d| self.line_index.line_for(d.span.start.0))
+            .filter(|l| *l != 0);
         for d in decorator_list {
             self.compile_expr(d)?;
         }
-        self.build_function_object_inner(name, args, body, returns, is_async)?;
+        // MakeFunction (and the closing STORE below) belong to the `def`
+        // line, not to whatever line the last decorator expression ended
+        // on.
+        self.current_line = def_line;
+        self.current_span = def_span;
+        self.build_function_object_full(name, args, body, returns, is_async, entry_line)?;
         // Decorators apply innermost-first; each application CALL carries
         // the *decorator expression's* location (CPython points the
         // traceback at `@dec`, not at the `def` line).
@@ -3501,7 +3689,7 @@ impl Compiler {
         }
         let name_expr = Expr {
             kind: ExprKind::Name(name.to_owned()),
-            span: weavepy_lexer::Span::new(0, 0),
+            span: weavepy_lexer::Span::new(def_span.0, def_span.1),
         };
         self.compile_assign(&name_expr)
     }
@@ -3514,7 +3702,7 @@ impl Compiler {
         args: &AstArguments,
         body: &[Stmt],
     ) -> Result<(), CompileError> {
-        self.build_function_object_inner(name, args, body, None, false)
+        self.build_function_object_full(name, args, body, None, false, None)
     }
 
     fn build_function_object_inner(
@@ -3524,6 +3712,22 @@ impl Compiler {
         body: &[Stmt],
         returns: Option<&Expr>,
         is_async: bool,
+    ) -> Result<(), CompileError> {
+        self.build_function_object_full(name, args, body, returns, is_async, None)
+    }
+
+    /// `entry_line`: line the child code object *starts* at when it
+    /// differs from the enclosing statement's current line — the first
+    /// decorator's line for a decorated `def` (CPython points RESUME /
+    /// `co_firstlineno` there).
+    fn build_function_object_full(
+        &mut self,
+        name: &str,
+        args: &AstArguments,
+        body: &[Stmt],
+        returns: Option<&Expr>,
+        is_async: bool,
+        entry_line: Option<u32>,
     ) -> Result<(), CompileError> {
         // Fast-local slots follow CPython's order exactly:
         // positional-only, positional-or-keyword, keyword-only, then
@@ -3584,7 +3788,7 @@ impl Compiler {
         inner.co.has_varargs = args.vararg.is_some();
         inner.co.has_varkeywords = args.kwarg.is_some();
         inner.co.varnames = param_names.clone();
-        inner.current_line = self.current_line;
+        inner.current_line = entry_line.unwrap_or(self.current_line);
         // Methods compiled inside a class body get an implicit
         // `__class__` free variable so `super()` (and explicit
         // `__class__` references) work without arguments. A scope that
@@ -3692,7 +3896,16 @@ impl Compiler {
             _ => Constant::None,
         };
         inner.co.intern_constant(doc_slot);
-        for s in body {
+        // The docstring statement itself generates *no* code in a
+        // function body (CPython consumes it into `co_consts[0]`); a
+        // NOP here would fire a spurious `'line'` trace event on the
+        // docstring line (test_trace test_issue9936).
+        let stmts = if first_stmt_docstring(body).is_some() {
+            &body[1..]
+        } else {
+            body
+        };
+        for s in stmts {
             inner.compile_stmt(s)?;
         }
         let inner_code = inner.finish();
@@ -3787,9 +4000,24 @@ impl Compiler {
         body: &[Stmt],
         decorator_list: &[Expr],
     ) -> Result<(), CompileError> {
+        // Statement span (starts at `class`, decorators are separate
+        // nodes) — the final STORE carries it, like CPython's
+        // `compiler_nameop(c, LOC(s), …)`.
+        let class_span = self.current_span;
+        let class_line = self.current_line;
+        // A decorated class's body code starts at the *first decorator*
+        // (CPython: RESUME location / `co_firstlineno` /
+        // `__firstlineno__` point at `@dec`, so the class body's 'call'
+        // trace event reports that line).
+        let entry_line = decorator_list
+            .first()
+            .map(|d| self.line_index.line_for(d.span.start.0))
+            .filter(|l| *l != 0);
         for d in decorator_list {
             self.compile_expr(d)?;
         }
+        self.current_line = class_line;
+        self.current_span = class_span;
         self.emit(OpCode::LoadBuildClass, 0);
 
         // A `**kwds` in the class header (or a `*bases` splat) can't be
@@ -3804,7 +4032,7 @@ impl Compiler {
         // mangled for a private nested class).
         let display = self.display_name(name).to_owned();
         if has_kw_splat || has_starred_base {
-            self.build_class_body(name, body)?;
+            self.build_class_body(name, body, entry_line)?;
             let name_idx = self.co.intern_constant(Constant::Str(display.clone()));
             self.emit(OpCode::LoadConst, name_idx);
             self.emit(OpCode::BuildTuple, 2);
@@ -3817,7 +4045,7 @@ impl Compiler {
                 self.emit(OpCode::CallEx, 1);
             }
         } else {
-            self.build_class_body(name, body)?;
+            self.build_class_body(name, body, entry_line)?;
             let name_idx = self.co.intern_constant(Constant::Str(display));
             self.emit(OpCode::LoadConst, name_idx);
             for b in bases {
@@ -3848,13 +4076,20 @@ impl Compiler {
         }
         let name_expr = Expr {
             kind: ExprKind::Name(name.to_owned()),
-            span: weavepy_lexer::Span::new(0, 0),
+            span: weavepy_lexer::Span::new(class_span.0, class_span.1),
         };
         self.compile_assign(&name_expr)
     }
 
     /// Build the class-body function object and leave it on the stack.
-    fn build_class_body(&mut self, name: &str, body: &[Stmt]) -> Result<(), CompileError> {
+    /// `entry_line`: first decorator's line for a decorated class (the
+    /// child code object starts there — see `compile_class_def`).
+    fn build_class_body(
+        &mut self,
+        name: &str,
+        body: &[Stmt],
+        entry_line: Option<u32>,
+    ) -> Result<(), CompileError> {
         // `name` is the (possibly mangled) binding; the class's
         // *source* name drives `__name__`, `__qualname__`, and its own
         // mangling context.
@@ -3882,7 +4117,7 @@ impl Compiler {
         );
         inner.private = Some(Rc::from(name));
         inner.co.qualname = self.compute_child_qualname(name);
-        inner.current_line = self.current_line;
+        inner.current_line = entry_line.unwrap_or(self.current_line);
         // CPython only gives a class body the `__class__` closure cell —
         // and the trailing `__classcell__` store — when a method actually
         // needs it (references zero-arg `super()` or `__class__`); see
@@ -4064,9 +4299,9 @@ impl Compiler {
         // CPython's emission order — a `__prepare__` mapping with an
         // instrumented `__setitem__` observes it last (test_metaclass).
         {
-            let line_const = inner
-                .co
-                .intern_constant(Constant::Int(i64::from(self.current_line)));
+            let line_const = inner.co.intern_constant(Constant::Int(i64::from(
+                entry_line.unwrap_or(self.current_line),
+            )));
             let line_name = inner.co.intern_name("__firstlineno__");
             inner.emit(OpCode::LoadConst, line_const);
             inner.emit(OpCode::StoreName, line_name);
@@ -4079,11 +4314,18 @@ impl Compiler {
         // body — where the docstring lives in `co_consts[0]` — a class
         // body reserves that slot for the qualname, so it must be an
         // explicit store rather than a constant-slot convention.
+        let class_has_docstring = first_stmt_docstring(body).is_some();
         if let Some(doc) = first_stmt_docstring(body) {
             // `-OO` (optimize >= 2) strips class docstrings too.
             if self.params.optimize < 2 {
                 let doc_const = inner.co.intern_constant(Constant::Str(doc.to_owned()));
                 let doc_name = inner.co.intern_name("__doc__");
+                // CPython locates the `__doc__` store at the docstring
+                // statement, so tracing a class body fires a `'line'`
+                // event on the docstring line
+                // (test_class_creation_with_docstrings).
+                inner.set_line_from(body[0].span.start.0);
+                inner.set_span(body[0].span);
                 inner.emit(OpCode::LoadConst, doc_const);
                 inner.emit(OpCode::StoreName, doc_name);
             }
@@ -4098,9 +4340,25 @@ impl Compiler {
             inner.annotations_initialized = true;
         }
 
-        for s in body {
+        // The docstring statement was consumed by the `__doc__` store
+        // above; compiling it again would add a second traced NOP.
+        let stmts = if class_has_docstring {
+            &body[1..]
+        } else {
+            body
+        };
+        for s in stmts {
             inner.compile_stmt(s)?;
         }
+
+        // The class-body tail (`__static_attributes__` store,
+        // `__classcell__` store, implicit `return None`) is synthetic:
+        // CPython emits it with NO_LOCATION so a body ending in a
+        // branch join fires no extra `'line'` event and the `'return'`
+        // event reports the path's own last line
+        // (test_implicit_return_in_class). Pin line 0 through
+        // `finish()`.
+        inner.line_pinned = Some(0);
 
         // `__static_attributes__` (sorted names assigned through
         // `self.X` in any method body) — stored after the body runs,
@@ -4296,9 +4554,16 @@ impl Compiler {
                 }
                 Ok(())
             }
-            FinallyKind::WithExit { exit_idx } => {
+            FinallyKind::WithExit {
+                exit_idx,
+                line,
+                span,
+            } => {
                 // The bound `__exit__` was stashed at `exit_idx` by
                 // `compile_with`; call it directly (no `LoadAttr`).
+                // Located on the `with` statement itself (CPython).
+                self.current_line = *line;
+                self.current_span = *span;
                 self.emit(OpCode::LoadFast, *exit_idx);
                 let none_idx = self.co.intern_constant(Constant::None);
                 self.emit(OpCode::LoadConst, none_idx);
@@ -4315,9 +4580,16 @@ impl Compiler {
                 self.emit(OpCode::DeleteFast, *exit_idx);
                 Ok(())
             }
-            FinallyKind::AsyncWithExit { aexit_idx } => {
+            FinallyKind::AsyncWithExit {
+                aexit_idx,
+                line,
+                span,
+            } => {
                 // `await <aexit>(None, None, None)`. The bound coroutine
                 // method was stashed at `aexit_idx` by `compile_async_with`.
+                // Located on the `async with` statement itself (CPython).
+                self.current_line = *line;
+                self.current_span = *span;
                 self.emit(OpCode::LoadFast, *aexit_idx);
                 let none_idx = self.co.intern_constant(Constant::None);
                 self.emit(OpCode::LoadConst, none_idx);
@@ -4492,6 +4764,16 @@ impl Compiler {
             // non-`except*` branch for the rationale). No location, as
             // in the non-star branch.
             let push_exc_site = self.emit_no_line(OpCode::PushExcInfo, 0);
+            // CPython locates the whole match prologue on the first
+            // `except*` clause (BUILD_LIST/COPY carry its line), so the
+            // handler entry's first traced line is the clause — not
+            // whatever the normal-exit `finally` copy above left in
+            // `current_line` (test_sys_settrace
+            // test_try_except_star_exception_caught).
+            if let Some(h0) = handlers.first() {
+                self.set_span(h0.span);
+                self.set_line_from(h0.span.start.0);
+            }
             // Stack on entry: [exc]. Stash the original (for
             // PREP_RERAISE_STAR), the running remainder, and the
             // raised-collection list in synthetic locals.
@@ -4508,6 +4790,10 @@ impl Compiler {
 
             let none_idx = self.co.intern_constant(Constant::None);
             for h in handlers {
+                // Each clause's match sequence carries the clause's own
+                // location, starting from the remainder load.
+                self.set_span(h.span);
+                self.set_line_from(h.span.start.0);
                 // [.remaining]
                 self.emit(OpCode::LoadFast, rem_idx);
                 let ty = h
@@ -4569,14 +4855,30 @@ impl Compiler {
                 }
                 if let Some(stmts) = &unbind_stmts {
                     self.finally_stack.pop();
+                    // Fallthrough unbind carries the clause body's last
+                    // line (CPython), so no fresh `'line'` event fires on
+                    // normal clause exit.
+                    let saved_line = self.current_line;
+                    let saved_span = self.current_span;
+                    let saved_pin = self.line_pinned;
+                    let saved_col = self.pinned_colspan;
+                    self.line_pinned = Some(saved_line);
+                    self.pinned_colspan = self.resolve_colspan();
                     for s in stmts {
                         self.compile_stmt(s)?;
                     }
+                    self.line_pinned = saved_pin;
+                    self.pinned_colspan = saved_col;
+                    self.current_line = saved_line;
+                    self.current_span = saved_span;
                 }
                 let clause_body_end = self.next_offset();
                 self.co.instructions[push_match_site as usize].arg = clause_body_end;
-                self.emit(OpCode::PopExcept, 0);
-                let after_body = self.emit(OpCode::JumpForward, 0);
+                // Clause-exit hop: NO_LOCATION, like every other piece
+                // of the except* bookkeeping — a multi-line clause body
+                // must not re-trace the clause header on exit.
+                self.emit_no_line(OpCode::PopExcept, 0);
+                let after_body = self.emit_no_line(OpCode::JumpForward, 0);
                 self.synthetic_jumps.insert(after_body);
 
                 // Collector: an exception raised by the clause body
@@ -4599,15 +4901,25 @@ impl Compiler {
                 // [list]
                 self.emit(OpCode::PopTop, 0);
                 if let Some(stmts) = &unbind_stmts {
+                    // Escape-path unbind is NO_LOCATION in CPython —
+                    // tracing must not see it.
+                    let saved_pin = self.line_pinned;
+                    self.line_pinned = Some(0);
                     for s in stmts {
                         self.compile_stmt(s)?;
                     }
+                    self.line_pinned = saved_pin;
                 }
-                let after_collect = self.emit(OpCode::JumpForward, 0);
+                let after_collect = self.emit_no_line(OpCode::JumpForward, 0);
                 self.synthetic_jumps.insert(after_collect);
 
                 let skip_target = self.next_offset();
                 self.patch_jump(skip_body, skip_target);
+                // No-match path carries the clause's location (CPython's
+                // L3 POP_TOP/LIST_APPEND block) — already traced when the
+                // match check ran, so no fresh `'line'` event fires.
+                self.set_span(h.span);
+                self.set_line_from(h.span.start.0);
                 // matched is on stack still (was a None) — discard.
                 self.emit(OpCode::PopTop, 0);
                 let after_skip = self.next_offset();
@@ -4616,6 +4928,12 @@ impl Compiler {
             }
             // After all clauses: excs = raised + [remainder]; compute
             // the exception to propagate (None when fully handled).
+            // The whole PREP_RERAISE_STAR epilogue is NO_LOCATION in
+            // CPython (dis shows `--` for the L4..L7 blocks) — reaching
+            // it must not fire a `'line'` event, whatever line the last
+            // clause body left behind.
+            let star_epilogue_pin = self.line_pinned;
+            self.line_pinned = Some(0);
             self.emit(OpCode::LoadFast, raised_idx);
             self.emit(OpCode::LoadFast, rem_idx);
             // [list, rem]
@@ -4647,6 +4965,7 @@ impl Compiler {
             // [None] — discard, drop the original from exc_info.
             self.emit(OpCode::PopTop, 0);
             self.emit(OpCode::PopExcept, 0);
+            self.line_pinned = star_epilogue_pin;
             let saved = if pushed_finally {
                 self.finally_stack.pop()
             } else {
@@ -4658,7 +4977,10 @@ impl Compiler {
             if let Some(f) = saved {
                 self.finally_stack.push(f);
             }
-            let exit = self.emit(OpCode::JumpForward, 0);
+            // NO_LOCATION (CPython's `--` POP_EXCEPT/JUMP epilogue) —
+            // leaving the except* machinery must not re-fire the clause
+            // line left in `current_line` (test_try_except_star_nested).
+            let exit = self.emit_no_line(OpCode::JumpForward, 0);
             self.synthetic_jumps.insert(exit);
             // Shared finally-cleanup for exceptions escaping the
             // `except*` machinery — clause-internal raises are collected
@@ -4813,14 +5135,19 @@ impl Compiler {
                 let hbody_end = self.next_offset();
                 self.finally_stack.pop();
                 if let Some(stmts) = &unbind_stmts {
-                    // The fallthrough unbind (`e = None; del e`) carries
-                    // the handler body's end line (CPython) — pinning it
-                    // keeps the clause-header line from re-firing as a
-                    // `'line'` event on normal handler exit.
+                    // CPython emits the fallthrough unbind (`e = None;
+                    // del e`) NO_LOCATION; its flowgraph pass then copies
+                    // the location of the block's single jump predecessor
+                    // (e.g. the `if` that skipped a trailing `raise`), so
+                    // tracing never fires a fresh `'line'` event here —
+                    // notably not the handler body's *last* line when the
+                    // exit is reached by jumping over it
+                    // (test_no_tracing_of_named_except_cleanup). Emitting
+                    // with no location gives the same event stream.
                     let saved_line = self.current_line;
                     let saved_span = self.current_span;
                     let saved_pin = self.line_pinned;
-                    self.line_pinned = Some(saved_line);
+                    self.line_pinned = Some(0);
                     for s in stmts {
                         self.compile_stmt(s)?;
                     }
@@ -4828,7 +5155,9 @@ impl Compiler {
                     self.current_line = saved_line;
                     self.current_span = saved_span;
                 }
-                self.emit(OpCode::PopExcept, 0);
+                // Handler-exit POP_EXCEPT: NO_LOCATION in CPython (same
+                // propagation story as the unbind above — test_nested_try_if).
+                self.emit_no_line(OpCode::PopExcept, 0);
                 if let Some(stmts) = &unbind_stmts {
                     if hbody_end > hbody_start {
                         // Exception escaping the clause body: unbind the
@@ -4837,7 +5166,7 @@ impl Compiler {
                         // location-free (CPython NO_LOCATION): tracing
                         // must not see `'line'` events for it
                         // (test_no_tracing_of_named_except_cleanup).
-                        let over = self.emit(OpCode::JumpForward, 0);
+                        let over = self.emit_no_line(OpCode::JumpForward, 0);
                         self.synthetic_jumps.insert(over);
                         let saved_line = self.current_line;
                         let saved_span = self.current_span;
@@ -4890,7 +5219,11 @@ impl Compiler {
                 if let Some(f) = saved {
                     self.finally_stack.push(f);
                 }
-                let exit = self.emit(OpCode::JumpForward, 0);
+                // NO_LOCATION: the handler-exit hop must not fire a
+                // `'line'` event for whatever line the body ended on
+                // (CPython duplicates the after-try tail instead of
+                // jumping — test_nested_try_if).
+                let exit = self.emit_no_line(OpCode::JumpForward, 0);
                 self.synthetic_jumps.insert(exit);
                 handler_exit_jumps.push(exit);
             }
@@ -5102,7 +5435,11 @@ impl Compiler {
         let with_loop_depth = self.loop_stack.len();
         let with_frame_id = self.fresh_finally_id();
         self.finally_stack.push(FinallyFrame {
-            kind: FinallyKind::WithExit { exit_idx },
+            kind: FinallyKind::WithExit {
+                exit_idx,
+                line: with_line,
+                span: with_span,
+            },
             loop_depth_at_push: with_loop_depth,
             id: with_frame_id,
             pop_except_after: false,
@@ -6047,6 +6384,14 @@ impl Compiler {
                     // PEP 448: `(*a, b, *c)` — reuse the call-site splat
                     // lowering, which concatenates tuple segments.
                     self.compile_starred_args_tuple(items)?;
+                } else if let Some(folded) = fold_const_tuple(items) {
+                    // CPython's AST optimizer folds an all-constant tuple
+                    // display into a single constant: one `LoadConst` at
+                    // the tuple's own line — element lines never fire
+                    // `'line'` trace events (test_trace test_issue9936's
+                    // multi-line `return (1,\n2,\n3)`).
+                    let idx = self.co.intern_constant(folded);
+                    self.emit(OpCode::LoadConst, idx);
                 } else {
                     for x in items {
                         self.compile_expr(x)?;
@@ -6298,6 +6643,8 @@ impl Compiler {
         body: &[Stmt],
         orelse: &[Stmt],
     ) -> Result<(), CompileError> {
+        let stmt_line = self.current_line;
+        let stmt_span = self.current_span;
         self.compile_expr(iter)?;
         self.emit(OpCode::GetAiter, 0);
         let loop_top = self.next_offset();
@@ -6325,7 +6672,10 @@ impl Compiler {
         for s in body {
             self.compile_stmt(s)?;
         }
-        let back = self.emit(OpCode::JumpBackward, 0);
+        // CPython emits the async-for loop-closing jump NO_LOCATION
+        // (codegen_async_for) — it must not trace whatever line the
+        // body ended on (test_async_for_backwards_jump_has_no_line).
+        let back = self.emit_no_line(OpCode::JumpBackward, 0);
         self.patch_jump(back, loop_top);
         let frame = self.loop_stack.pop().expect("loop frame");
         // Register an exception-table handler covering only the
@@ -6350,6 +6700,11 @@ impl Compiler {
             push_lasti: false,
         });
         // Cleanup: pop aiter + exception, then run the `else` clause.
+        // Located on the `async for` statement (CPython): exhaustion —
+        // and an implicit function-ending return after it — report the
+        // loop's line, not the body's last line.
+        self.current_line = stmt_line;
+        self.current_span = stmt_span;
         self.emit(OpCode::EndAsyncFor, 0);
         for s in orelse {
             self.compile_stmt(s)?;
@@ -6408,6 +6763,8 @@ impl Compiler {
         self.finally_stack.push(FinallyFrame {
             kind: FinallyKind::AsyncWithExit {
                 aexit_idx: slot_idx,
+                line: with_line,
+                span: with_span,
             },
             loop_depth_at_push: awith_loop_depth,
             id: awith_frame_id,
@@ -7645,11 +8002,23 @@ fn emit_cmp_op(compiler: &mut Compiler, op: CmpOp) {
 fn clone_finally_frame(f: &FinallyFrame) -> FinallyFrame {
     let kind = match &f.kind {
         FinallyKind::Stmts(body) => FinallyKind::Stmts(body.clone()),
-        FinallyKind::WithExit { exit_idx } => FinallyKind::WithExit {
+        FinallyKind::WithExit {
+            exit_idx,
+            line,
+            span,
+        } => FinallyKind::WithExit {
             exit_idx: *exit_idx,
+            line: *line,
+            span: *span,
         },
-        FinallyKind::AsyncWithExit { aexit_idx } => FinallyKind::AsyncWithExit {
+        FinallyKind::AsyncWithExit {
+            aexit_idx,
+            line,
+            span,
+        } => FinallyKind::AsyncWithExit {
             aexit_idx: *aexit_idx,
+            line: *line,
+            span: *span,
         },
     };
     FinallyFrame {
@@ -9893,6 +10262,21 @@ fn bind_pattern_name(
     }
     stores.push(name.to_owned());
     Ok(())
+}
+
+/// Fold an all-constant tuple display (nested tuples included) into a
+/// pooled [`Constant::Tuple`], mirroring CPython's AST optimizer.
+/// Returns `None` when any element is non-constant.
+fn fold_const_tuple(items: &[Expr]) -> Option<Constant> {
+    let mut out = Vec::with_capacity(items.len());
+    for x in items {
+        match &x.kind {
+            ExprKind::Constant(c) => out.push(c.clone().into()),
+            ExprKind::Tuple(inner) => out.push(fold_const_tuple(inner)?),
+            _ => return None,
+        }
+    }
+    Some(Constant::Tuple(out))
 }
 
 /// Fold a literal-pattern expression (mapping key) to its constant value:
