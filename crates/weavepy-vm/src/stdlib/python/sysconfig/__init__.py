@@ -365,7 +365,6 @@ def _init_posix(vars):
 def _init_non_posix(vars):
     """Initialize the module as appropriate for NT"""
     # set basic install directories
-    import _winapi
     import _sysconfig
     vars['LIBDEST'] = get_path('stdlib')
     vars['BINLIBDEST'] = get_path('platstdlib')
@@ -376,6 +375,12 @@ def _init_non_posix(vars):
 
     vars['LIBDIR'] = _safe_realpath(os.path.join(get_config_var('installed_base'), 'libs'))
     if hasattr(sys, 'dllhandle'):
+        # WeavePy: CPython imports `_winapi` unconditionally above, but
+        # WeavePy doesn't ship that native module and never sets
+        # `sys.dllhandle`, so defer the import to this (dead) branch —
+        # otherwise every `sysconfig.get_config_var()` call on Windows
+        # dies with ModuleNotFoundError (e.g. `test.support` at import).
+        import _winapi
         dllhandle = _winapi.GetModuleFileName(sys.dllhandle)
         vars['LIBRARY'] = os.path.basename(_safe_realpath(dllhandle))
         vars['LDLIBRARY'] = vars['LIBRARY']
@@ -498,7 +503,9 @@ def _init_config_vars():
 
     if os.name == 'nt':
         _init_non_posix(_CONFIG_VARS)
-        _CONFIG_VARS['VPATH'] = sys._vpath
+        # WeavePy: CPython's sysmodule.c sets `sys._vpath` from the VPATH
+        # build macro; WeavePy doesn't define it, so fall back to ''.
+        _CONFIG_VARS['VPATH'] = getattr(sys, '_vpath', '')
     if os.name == 'posix':
         _init_posix(_CONFIG_VARS)
     if _HAS_USER_BASE:

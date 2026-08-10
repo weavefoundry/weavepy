@@ -7,7 +7,14 @@ from .runtests import RunTests
 from .utils import print_warning
 
 if MS_WINDOWS:
-    from .win_utils import WindowsLoadTracker
+    try:
+        from .win_utils import WindowsLoadTracker
+    except ImportError:
+        # WeavePy: `win_utils` rides the `_winapi`/`_overlapped`/`winreg`
+        # native modules, which WeavePy doesn't ship. Run without the
+        # Windows system-load tracker — only the optional "load avg:"
+        # log prefix disappears.
+        WindowsLoadTracker = None
 
 
 class Logger:
@@ -72,7 +79,7 @@ class Logger:
             self.test_count_width = len(self.test_count_text) - 1
 
     def start_load_tracker(self) -> None:
-        if not MS_WINDOWS:
+        if not MS_WINDOWS or WindowsLoadTracker is None:
             return
 
         try:
