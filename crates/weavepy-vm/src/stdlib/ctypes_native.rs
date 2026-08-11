@@ -327,8 +327,14 @@ extern "system" {
 }
 
 fn b_dlopen(args: &[Object]) -> Result<Object, RuntimeError> {
+    // CPython's `_ctypes.c` ORs RTLD_NOW into every dlopen mode: ctypes'
+    // DEFAULT_MODE is RTLD_LOCAL, which is 0 on Linux, and glibc rejects a
+    // mode carrying neither RTLD_LAZY nor RTLD_NOW with EINVAL ("invalid
+    // mode for dlopen()") — `import ctypes` itself dies at
+    // `pythonapi = PyDLL(None)` without this. (macOS tolerates 0.)
     #[cfg(unix)]
-    let mode = args.get(1).and_then(Object::as_i64).unwrap_or(rtld::LOCAL) as c_int;
+    let mode =
+        args.get(1).and_then(Object::as_i64).unwrap_or(rtld::LOCAL) as c_int | rtld::NOW as c_int;
     let handle = match arg(args, 0)? {
         Object::None => {
             #[cfg(unix)]

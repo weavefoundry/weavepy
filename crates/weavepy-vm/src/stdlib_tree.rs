@@ -288,6 +288,41 @@ fn pip_wheel_bytes() -> Vec<u8> {
     out
 }
 
+/// The interpreter's program path, symlink identity preserved.
+///
+/// CPython's getpath computes `program_full_path` from argv[0] (made
+/// absolute, PATH-searched when bare) and only then resolves symlinks
+/// as a *fallback* — the unresolved path is what venv detection keys
+/// on. `std::env::current_exe()` is wrong for that job on Linux: it
+/// reads `/proc/self/exe`, which the kernel pre-resolves, so a venv's
+/// `bin/python -> …/artifact/bin/weavepy` symlink loses its identity
+/// and `pyvenv.cfg` is never found (macOS returns the exec'd path and
+/// dodges this). Falls back to `current_exe()` when argv[0] is absent
+/// or doesn't name a real file (misleading custom argv0).
+pub(crate) fn program_exe() -> Option<PathBuf> {
+    let argv0 = std::env::args_os().next().map(PathBuf::from);
+    if let Some(argv0) = argv0 {
+        let candidate = if argv0.components().count() > 1 {
+            // Carries a separator: shell-style, relative to the cwd.
+            std::path::absolute(&argv0).ok()
+        } else {
+            // Bare name: PATH search, like a shell (and getpath).
+            std::env::var_os("PATH").and_then(|path| {
+                std::env::split_paths(&path)
+                    .filter(|d| !d.as_os_str().is_empty())
+                    .map(|d| d.join(&argv0))
+                    .find(|p| p.is_file())
+            })
+        };
+        if let Some(p) = candidate {
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    std::env::current_exe().ok()
+}
+
 fn resolve() -> Option<PathBuf> {
     if std::env::var_os("WEAVEPY_NO_STDLIB_TREE").is_some() {
         return None;
@@ -318,7 +353,7 @@ fn resolve() -> Option<PathBuf> {
             }
         }
     }
-    if let Ok(exe) = std::env::current_exe() {
+    if let Some(exe) = program_exe() {
         if let Some(found) = landmark_walk(&exe) {
             return Some(found);
         }
