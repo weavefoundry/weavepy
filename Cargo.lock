@@ -2754,6 +2754,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "weavepy-dist"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+]
+
+[[package]]
 name = "weavepy-jit"
 version = "0.0.0"
 dependencies = [

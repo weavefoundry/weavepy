@@ -1397,9 +1397,12 @@ fn waitpid_py(args: &[Object]) -> Result<Object, RuntimeError> {
 /// `_get_command()` — argv used by the spawn start-method.
 #[cfg(unix)]
 fn get_command(_args: &[Object]) -> Result<Object, RuntimeError> {
-    let exe = std::env::current_exe()
+    // Match sys.executable (CPython spawns via `spawn.get_executable()`):
+    // inside a venv the children must run the venv python, whose symlink
+    // identity `current_exe()` destroys on Linux.
+    let exe = crate::stdlib_tree::program_exe()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "weavepy".to_owned());
+        .unwrap_or_else(|| "weavepy".to_owned());
     Ok(Object::new_list(vec![
         Object::from_str(exe),
         Object::from_static("--multiprocessing-fork"),

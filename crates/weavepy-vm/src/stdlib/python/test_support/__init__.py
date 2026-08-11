@@ -115,15 +115,31 @@ TEST_HOME_DIR = os.path.dirname(TEST_SUPPORT_DIR)
 # `load_package_tests` hands unittest discovery as top_level_dir ("Path
 # must be within the project") — must point at *that* tree, not at the
 # materialized one, which carries only the support layer.
+#
+# Only redirect when TEST_HOME_DIR *lacks* the suite: if __file__ was
+# already attributed to an on-disk copy of the suite (the harness's
+# sanitized Lib shim), TEST_HOME_DIR is right as-is — hopping to another
+# alias of the same tree (the raw `vendor/cpython/Lib`) would hand
+# unittest discovery a top_level_dir that doesn't prefix the module
+# paths imported through the shim, tripping the very assertion above.
 try:
     _test_pkg = sys.modules["test"]
-    for _entry in list(getattr(_test_pkg, "__path__", [])):
+    if os.path.isfile(os.path.join(TEST_HOME_DIR, "test_import", "__init__.py")):
+        _graft_entries = []
+    else:
+        _graft_entries = list(getattr(_test_pkg, "__path__", []))
+    for _entry in _graft_entries:
         if _entry != TEST_HOME_DIR and os.path.isfile(
             os.path.join(_entry, "test_import", "__init__.py")
         ):
-            TEST_HOME_DIR = _entry
+            # abspath: the grafted __path__ entry can be relative (the
+            # harness inserts whatever string was on sys.path), and a
+            # relative STDLIB_DIR breaks tests that embed it in child
+            # interpreter fixtures — test_site's ._pth legs join it
+            # against the child exe dir and compare literally.
+            TEST_HOME_DIR = os.path.abspath(_entry)
             break
-    del _test_pkg, _entry
+    del _test_pkg, _graft_entries, _entry
 except (KeyError, NameError):
     pass
 STDLIB_DIR = os.path.dirname(TEST_HOME_DIR)

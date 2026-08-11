@@ -3,7 +3,6 @@
 # by abc.py to load everything else at startup.
 
 from _weakref import ref
-from types import GenericAlias
 
 __all__ = ['WeakSet']
 
@@ -202,4 +201,12 @@ class WeakSet:
     def __repr__(self):
         return repr(self.data)
 
-    __class_getitem__ = classmethod(GenericAlias)
+    # Deferred vs. CPython's module-level `from types import GenericAlias`:
+    # WeavePy's `abc` runs the pure-Python path (CPython's startup uses the
+    # C `_abc` and never imports this module), so a top-level import here
+    # would put `types` in every interpreter's startup set —
+    # test_site.test_startup_imports counts it (bpo-19218).
+    @classmethod
+    def __class_getitem__(cls, item):
+        from types import GenericAlias
+        return GenericAlias(cls, item)

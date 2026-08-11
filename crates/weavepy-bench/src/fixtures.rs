@@ -111,9 +111,50 @@ pub fn discover_fixtures() -> Vec<Fixture> {
         .collect()
 }
 
-/// Path to the baseline JSON tracked alongside the fixtures.
-pub fn baseline_path() -> PathBuf {
+/// Host platform key used to resolve the tracked baseline (RFC 0062
+/// WS3): `{os}-{arch}` from `std::env::consts`, e.g. `macos-aarch64`
+/// or `linux-x86_64`.
+pub fn platform_key() -> String {
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// Path to the per-platform baseline JSON for an explicit platform
+/// key (see [`platform_key`]).
+pub fn baseline_path_for(platform: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("baselines")
-        .join("bench.json")
+        .join(format!("bench-{platform}.json"))
+}
+
+/// Path to the baseline JSON for the host platform, tracked
+/// alongside the fixtures as `baselines/bench-{os}-{arch}.json`.
+pub fn baseline_path() -> PathBuf {
+    baseline_path_for(&platform_key())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn baseline_path_is_per_platform() {
+        let p = baseline_path_for("linux-x86_64");
+        assert!(p.ends_with("baselines/bench-linux-x86_64.json"), "{p:?}");
+    }
+
+    #[test]
+    fn host_baseline_path_uses_host_platform_key() {
+        let key = platform_key();
+        assert_eq!(
+            key,
+            format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+        );
+        let p = baseline_path();
+        assert!(
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n == format!("bench-{key}.json")),
+            "{p:?}"
+        );
+    }
 }

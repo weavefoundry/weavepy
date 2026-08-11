@@ -267,7 +267,7 @@ Options (and corresponding environment variables):
 -S     : don't imply 'import site' on initialization
 -u     : force the stdout and stderr streams to be unbuffered
 -v     : verbose (trace import statements); also PYTHONVERBOSE=x
--V     : print the WeavePy version number and exit (also --version)
+-V     : print the Python version number and exit (also --version)
 -W arg : warning control; arg is action:message:category:module:lineno
 -x     : skip first line of source, allowing use of non-Unix shebang
 -X opt : set implementation-specific option
@@ -723,7 +723,12 @@ fn real_main() -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     if cli.version {
-        println!("WeavePy {VERSION}");
+        // PyPy-style: lead with the CPython version the interpreter
+        // implements (tooling — pyenv, tox, CI matrices, weavepy-dist's
+        // `version` leg — parses `python -V` for `Python X.Y.Z`), then
+        // identify the implementation.
+        let (maj, min, mic) = weavepy_vm::stdlib::sys::PY_VERSION;
+        println!("Python {maj}.{min}.{mic} (WeavePy {VERSION})");
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -758,6 +763,21 @@ fn real_main() -> Result<ExitCode> {
                 extra_path.push(part);
             }
         }
+    }
+
+    // getpath's `._pth` layout override (RFC 0062 WS5): a `<exe>._pth`
+    // file next to the binary pins `sys.path` to exactly its entries
+    // and locks the interpreter down (no PYTHONPATH, no script-dir
+    // prepend, no site unless the file says `import site`) — CPython's
+    // embeddable-distribution mechanism, honoured on every platform.
+    if let Some((entries, import_site)) = read_pth_file() {
+        flags.pth_paths = Some(entries);
+        if !import_site {
+            flags.no_site = true;
+        }
+        flags.safe_path = true;
+        flags.no_user_site = true;
+        extra_path.clear();
     }
 
     if let Some(source) = cli.command.clone() {
@@ -853,6 +873,71 @@ fn parse_int_max_str_digits(value: &str, source: &str) -> i64 {
             &format!("{source}: invalid limit; must be >= 640 or 0 for unlimited."),
         ),
     }
+}
+
+/// Locate and parse the `._pth` file governing this executable
+/// (CPython getpath: `<exe>._pth`, plus the `<stem>._pth` spelling on
+/// Windows). Returns the absolutized `sys.path` entries and whether an
+/// `import site` line re-enables site processing. Comment lines start
+/// with `#`; other `import` lines are recognised but only `site` has
+/// an effect (matching getpath, which special-cases exactly that).
+fn read_pth_file() -> Option<(Vec<String>, bool)> {
+    let exe = std::env::current_exe().ok()?;
+    let mut with_suffix = exe.as_os_str().to_owned();
+    with_suffix.push("._pth");
+    let mut candidates = vec![PathBuf::from(with_suffix)];
+    if cfg!(windows) {
+        candidates.push(exe.with_extension("_pth"));
+    }
+    let pth = candidates.into_iter().find(|p| p.is_file())?;
+    let contents = std::fs::read_to_string(&pth).ok()?;
+    let exe_dir = exe.parent()?;
+    let mut entries = Vec::new();
+    let mut import_site = false;
+    for line in contents.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("import ") {
+            if rest.split(',').any(|m| m.trim() == "site") {
+                import_site = true;
+            }
+            continue;
+        }
+        entries.push(
+            lexical_abspath(&exe_dir.join(line))
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    Some((entries, import_site))
+}
+
+/// `os.path.abspath` without touching the filesystem: make absolute
+/// against the cwd, then collapse `.` and `..` components lexically
+/// (symlinks are *not* resolved — the ._pth expectations are computed
+/// with `abspath`, which is purely lexical too).
+fn lexical_abspath(p: &Path) -> PathBuf {
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        env::current_dir().map_or_else(|_| p.to_path_buf(), |cwd| cwd.join(p))
+    };
+    let mut out = PathBuf::new();
+    for comp in abs.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            // The joined input is always absolute, so a failed pop can
+            // only mean we're at the root — where `/..` collapses to
+            // `/`, exactly like `os.path.normpath`.
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Compose the runtime [`InterpreterFlags`] from the CLI table and
@@ -992,6 +1077,8 @@ fn build_flags(cli: &Cli, env: &EnvOverrides) -> InterpreterFlags {
         } else {
             env.hash_seed
         },
+        // Filled in by the `._pth` probe in `main` (RFC 0062 WS5).
+        pth_paths: None,
         io_encoding: env.io_encoding.clone(),
         io_errors: env.io_errors.clone(),
         utf8_mode: env.utf8_mode,

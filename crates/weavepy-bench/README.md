@@ -10,12 +10,28 @@ with `time.perf_counter_ns()` and print `WEAVEPY_BENCH_NS=<int>`, so
 startup / parse / import cost is excluded symmetrically (the dedicated
 `startup` fixture measures full subprocess wall time instead).
 
-The tracked baseline (`baselines/bench.json`) stores medians for both
-interpreters plus the WeavePy/CPython **ratio** per fixture and the
-suite geometric mean. `gate` compares ratios — host-independent,
-unlike absolute nanoseconds — and fails on regressions beyond a
-threshold, like the regrtest and ecosystem lanes' `--check`. CI runs
-`gate --pct=25` on ubuntu + macos (the `bench` job).
+Baselines are tracked **per platform** (RFC 0062 WS3) as
+`baselines/bench-{os}-{arch}.json`, resolved against the host's
+`std::env::consts::{OS, ARCH}` — e.g. `bench-macos-aarch64.json`,
+`bench-linux-x86_64.json`. Each file stores medians for both
+interpreters plus the WeavePy/CPython **ratio** per fixture, the
+suite geometric mean, and the platform it was measured on. `gate`
+compares ratios — host-independent, unlike absolute nanoseconds —
+and fails on regressions beyond a threshold, like the regrtest and
+ecosystem lanes' `--check`. CI runs `gate --pct=25` on ubuntu +
+macos (the `bench` job).
+
+Two per-platform guardrails:
+
+- If the host has **no** baseline file, `gate` fails with a message
+  naming the missing `bench-{os}-{arch}.json` — pass
+  `--allow-missing-baseline` to turn that into an advisory note with
+  exit 0 (what CI does on platforms whose baseline hasn't been
+  measured and committed yet).
+- Each baseline records the platform it was measured on, and `gate`
+  refuses a baseline whose recorded platform mismatches the host —
+  copying `bench-macos-aarch64.json` to `bench-linux-x86_64.json`
+  cannot silently gate Linux against macOS ratios.
 
 The crate is excluded from `default-members` so `cargo build` /
 `cargo test --workspace` doesn't pull it in. Opt in with
@@ -30,12 +46,17 @@ cargo build --release -p weavepy-cli -p weavepy-bench
 # Run all fixtures, print a markdown report (ratio column + geomean).
 cargo xbench run
 
-# Compare current ratios against the baseline; exit non-zero on
-# regression beyond 10% (default threshold).
+# Compare current ratios against the host platform's baseline; exit
+# non-zero on regression beyond 10% (default threshold).
 cargo xbench gate
 cargo xbench gate --pct=25
 
-# Refresh the baseline JSON tracked at `baselines/bench.json`.
+# Advisory mode: exit 0 with a note when the host platform has no
+# committed baseline (a present-but-foreign baseline still fails).
+cargo xbench gate --allow-missing-baseline
+
+# Refresh the host platform's baseline JSON tracked at
+# `baselines/bench-{os}-{arch}.json`.
 cargo xbench run --update-baseline
 
 # Point at explicit interpreters.
@@ -62,4 +83,6 @@ cargo xbench run --json
    ~25–65 ms.
 4. Run `cargo xbench run --update-baseline` and inspect the diff
    before committing. The gate fails fixtures that have no baseline
-   row, so the baseline refresh ships in the same change.
+   row, so the baseline refresh ships in the same change. (This only
+   refreshes the *host* platform's file; other platforms' baselines
+   are refreshed on their own hardware.)

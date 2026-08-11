@@ -9612,7 +9612,7 @@ fn str_self(args: &[Object]) -> Result<std::borrow::Cow<'_, str>, RuntimeError> 
 /// A `str`/`WStr` *argument* (not the receiver) as a bridged Rust string;
 /// `None` for any non-string object so callers can raise their own
 /// method-specific `TypeError`.
-fn str_arg_bridged(obj: &Object) -> Option<std::borrow::Cow<'_, str>> {
+pub(crate) fn str_arg_bridged(obj: &Object) -> Option<std::borrow::Cow<'_, str>> {
     match obj {
         Object::Str(s) => Some(std::borrow::Cow::Borrowed(s)),
         Object::WStr(cps) => Some(std::borrow::Cow::Owned(bridge_encode_cps(cps))),

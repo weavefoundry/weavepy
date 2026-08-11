@@ -288,6 +288,41 @@ fn pip_wheel_bytes() -> Vec<u8> {
     out
 }
 
+/// The interpreter's program path, symlink identity preserved.
+///
+/// CPython's getpath computes `program_full_path` from argv[0] (made
+/// absolute, PATH-searched when bare) and only then resolves symlinks
+/// as a *fallback* — the unresolved path is what venv detection keys
+/// on. `std::env::current_exe()` is wrong for that job on Linux: it
+/// reads `/proc/self/exe`, which the kernel pre-resolves, so a venv's
+/// `bin/python -> …/artifact/bin/weavepy` symlink loses its identity
+/// and `pyvenv.cfg` is never found (macOS returns the exec'd path and
+/// dodges this). Falls back to `current_exe()` when argv[0] is absent
+/// or doesn't name a real file (misleading custom argv0).
+pub(crate) fn program_exe() -> Option<PathBuf> {
+    let argv0 = std::env::args_os().next().map(PathBuf::from);
+    if let Some(argv0) = argv0 {
+        let candidate = if argv0.components().count() > 1 {
+            // Carries a separator: shell-style, relative to the cwd.
+            std::path::absolute(&argv0).ok()
+        } else {
+            // Bare name: PATH search, like a shell (and getpath).
+            std::env::var_os("PATH").and_then(|path| {
+                std::env::split_paths(&path)
+                    .filter(|d| !d.as_os_str().is_empty())
+                    .map(|d| d.join(&argv0))
+                    .find(|p| p.is_file())
+            })
+        };
+        if let Some(p) = candidate {
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    std::env::current_exe().ok()
+}
+
 fn resolve() -> Option<PathBuf> {
     if std::env::var_os("WEAVEPY_NO_STDLIB_TREE").is_some() {
         return None;
@@ -301,20 +336,58 @@ fn resolve() -> Option<PathBuf> {
             if home.is_empty() {
                 continue;
             }
-            let candidate = PathBuf::from(home).join("lib").join(LIB_DIR_NAME);
+            // CPython accepts `PYTHONHOME=<prefix>[:<exec_prefix>]`
+            // (`;` on Windows). The stdlib tree lives under the first
+            // component; the exec_prefix half only matters for
+            // platform-specific lib-dynload layouts WeavePy doesn't
+            // have (RFC 0062 WS5).
+            let sep = if cfg!(windows) { ';' } else { ':' };
+            let home = home.to_string_lossy().into_owned();
+            let prefix = home.split_once(sep).map_or(home.as_str(), |(p, _)| p);
+            if prefix.is_empty() {
+                continue;
+            }
+            let candidate = PathBuf::from(prefix).join("lib").join(LIB_DIR_NAME);
             if candidate.join(COMPLETE_MARKER).is_file() {
                 return Some(candidate);
             }
         }
     }
-    if let Ok(exe) = std::env::current_exe() {
-        let mut dir = exe.parent();
-        while let Some(d) = dir {
-            let candidate = d.join("lib").join(LIB_DIR_NAME);
-            if candidate.join(COMPLETE_MARKER).is_file() {
-                return Some(candidate);
+    if let Some(exe) = program_exe() {
+        if let Some(found) = landmark_walk(&exe) {
+            return Some(found);
+        }
+        // Venv chaining (RFC 0062 WS5): a venv interpreter is a
+        // symlink/copy whose own ancestors carry no stdlib. CPython's
+        // getpath reads pyvenv.cfg's `home` key (the base
+        // interpreter's bin directory) and resumes the landmark search
+        // from there; without this, a venv made from a relocatable
+        // artifact silently fell back to the materialize cache and
+        // `sys.base_prefix` pointed outside the installation.
+        if let Some(home) = venv_home_dir(&exe) {
+            let mut dir = Some(home.as_path());
+            while let Some(d) = dir {
+                let candidate = d.join("lib").join(LIB_DIR_NAME);
+                if candidate.join(COMPLETE_MARKER).is_file() {
+                    return Some(candidate);
+                }
+                dir = d.parent();
             }
-            dir = d.parent();
+        }
+        // Symlink chasing (RFC 0062 WS5): a bare symlink from outside
+        // the installation (`~/bin/python3 -> …/artifact/bin/weavepy`)
+        // has no pyvenv.cfg and its raw ancestors carry no landmark.
+        // getpath resolves symlinks on the program path before the
+        // prefix search; mirror that with a canonicalized retry so the
+        // artifact self-locates instead of materializing a decoy cache
+        // (whose foreign prefix also let the host Python's
+        // site-packages leak into `sys.path`).
+        if let Ok(real) = std::fs::canonicalize(&exe) {
+            if real != exe {
+                if let Some(found) = landmark_walk(&real) {
+                    return Some(found);
+                }
+            }
         }
     }
     // Cache fallback: materialize under the user cache directory.
@@ -325,6 +398,39 @@ fn resolve() -> Option<PathBuf> {
         return Some(lib);
     }
     materialize(&prefix).then_some(lib)
+}
+
+/// Walk `exe`'s ancestors for the installed-layout landmark
+/// (`{d}/lib/weavepy3.13/.weavepy-complete`).
+fn landmark_walk(exe: &Path) -> Option<PathBuf> {
+    let mut dir = exe.parent();
+    while let Some(d) = dir {
+        let candidate = d.join("lib").join(LIB_DIR_NAME);
+        if candidate.join(COMPLETE_MARKER).is_file() {
+            return Some(candidate);
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// The `home` value from the pyvenv.cfg governing `exe`, when `exe`
+/// lives inside a virtual environment (getpath's venv detection:
+/// pyvenv.cfg sits next to the binary or one directory up).
+fn venv_home_dir(exe: &Path) -> Option<PathBuf> {
+    let exe_dir = exe.parent()?;
+    let cfg = [
+        exe_dir.join("pyvenv.cfg"),
+        exe_dir.parent()?.join("pyvenv.cfg"),
+    ]
+    .into_iter()
+    .find(|p| p.is_file())?;
+    let contents = std::fs::read_to_string(cfg).ok()?;
+    contents.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        let value = value.trim();
+        (key.trim().eq_ignore_ascii_case("home") && !value.is_empty()).then(|| PathBuf::from(value))
+    })
 }
 
 fn cache_root() -> Option<PathBuf> {
@@ -421,7 +527,7 @@ fn materialize(prefix: &Path) -> bool {
             std::fs::write(
                 config_dir.join("Makefile"),
                 format!(
-                    "# Generated by WeavePy (RFC 0055); mirrors _sysconfigdata.\n\
+                    "# Generated by WeavePy (RFC 0055/0062); mirrors _sysconfigdata.\n\
                      VERSION=\t{version_short}\n\
                      ABIFLAGS=\t\n\
                      SOABI=\t{soabi}\n\
@@ -429,25 +535,59 @@ fn materialize(prefix: &Path) -> bool {
                      MULTIARCH=\t{multiarch}\n\
                      LIBRARY=\tlibpython{version_short}.a\n\
                      LDLIBRARY=\tlibpython{version_short}.a\n\
+                     CC=\t{cc}\n\
+                     CXX=\t{cxx}\n\
+                     CFLAGS=\t{cflags}\n\
+                     CCSHARED=\t{ccshared}\n\
+                     LDSHARED=\t{ldshared}\n\
+                     BLDSHARED=\t{ldshared}\n\
+                     LDCXXSHARED=\t{ldcxxshared}\n\
+                     OPT=\t{opt}\n\
+                     AR=\tar\n\
+                     ARFLAGS=\trcs\n\
                      Py_DEBUG=\t0\n\
                      Py_GIL_DISABLED=\t0\n",
                     soabi = crate::stdlib::sysconfig_native::SOABI,
                     ext_suffix = crate::stdlib::sysconfig_native::EXT_SUFFIX,
+                    cc = crate::stdlib::sysconfig_native::CC,
+                    cxx = crate::stdlib::sysconfig_native::CXX,
+                    cflags = crate::stdlib::sysconfig_native::CFLAGS,
+                    ccshared = crate::stdlib::sysconfig_native::CCSHARED,
+                    ldshared = crate::stdlib::sysconfig_native::LDSHARED,
+                    ldcxxshared = crate::stdlib::sysconfig_native::LDCXXSHARED,
+                    opt = crate::stdlib::sysconfig_native::OPT,
                 ),
             )?;
+            // RFC 0062 WS2 — the installable header surface. A real
+            // CPython install ships `{prefix}/include/python3.13/`
+            // with the full `Include/` tree plus the generated
+            // `pyconfig.h`; that directory is what `INCLUDEPY` points
+            // at and what setuptools hands to the compiler for an
+            // sdist's C extensions. Write the embedded stock tree
+            // (vendored, PSF-licensed) and the per-OS `pyconfig.h`.
             let include_dir = tmp_prefix
                 .join("include")
                 .join(format!("python{version_short}"));
-            std::fs::create_dir_all(&include_dir)?;
+            for (rel, contents) in crate::cpython_headers::CPYTHON_HEADERS {
+                let path: PathBuf = include_dir.join(rel.split('/').collect::<PathBuf>());
+                if let Some(dir) = path.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                std::fs::write(&path, contents)?;
+            }
             std::fs::write(
                 include_dir.join("pyconfig.h"),
-                "/* Generated by WeavePy (RFC 0055); mirrors _sysconfigdata. */\n\
-                 #define PY_VERSION_HEX 0x030d00f0\n\
-                 #define SIZEOF_VOID_P 8\n\
-                 #define WITH_DOC_STRINGS 1\n\
-                 /* #undef Py_DEBUG */\n\
-                 /* #undef Py_GIL_DISABLED */\n\
-                 /* #undef Py_TRACE_REFS */\n",
+                crate::cpython_headers::PYCONFIG_H.unwrap_or(
+                    // Non-POSIX targets (Windows) keep the pre-0062
+                    // stub until the MSVC wave lands.
+                    "/* Generated by WeavePy (RFC 0055); mirrors _sysconfigdata. */\n\
+                     #define PY_VERSION_HEX 0x030d00f0\n\
+                     #define SIZEOF_VOID_P 8\n\
+                     #define WITH_DOC_STRINGS 1\n\
+                     /* #undef Py_DEBUG */\n\
+                     /* #undef Py_GIL_DISABLED */\n\
+                     /* #undef Py_TRACE_REFS */\n",
+                ),
             )?;
         }
         // RFC 0055 WS2 — data files (venv activation scripts) and the

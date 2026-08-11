@@ -352,6 +352,14 @@ decl_static_type! {
     pub PyDictValues_Type;
     pub PyDictItems_Type;
     pub PySuper_Type;
+    // RFC 0062 WS2: types source-built extensions reference by address
+    // (wrapt's `_wrappers.c` reads `PyClassMethod_Type` for its
+    // descriptor handling; property/staticmethod are the natural
+    // siblings). All bridge to the real VM types.
+    pub PyClassMethod_Type;
+    pub PyStaticMethod_Type;
+    pub PyProperty_Type;
+    pub PyReversed_Type;
 }
 
 /// Initialise the static type table from the running interpreter's
@@ -410,6 +418,20 @@ pub fn init_static_types() {
     );
     install(&PyDictItems_Type, b"dict_items\0", bt.dict_items_.clone());
     install(&PySuper_Type, b"super\0", bt.super_.clone());
+    // RFC 0062 WS2 — descriptor types source-built extensions
+    // (wrapt) reference by address.
+    install(
+        &PyClassMethod_Type,
+        b"classmethod\0",
+        bt.classmethod_.clone(),
+    );
+    install(
+        &PyStaticMethod_Type,
+        b"staticmethod\0",
+        bt.staticmethod_.clone(),
+    );
+    install(&PyProperty_Type, b"property\0", bt.property_.clone());
+    install(&PyReversed_Type, b"reversed\0", bt.reversed_.clone());
     install(&PyFunction_Type, b"function\0", bt.function_.clone());
     install(&PyGen_Type, b"generator\0", bt.generator_.clone());
     install(&PyCoro_Type, b"coroutine\0", bt.coroutine_.clone());
@@ -501,6 +523,15 @@ pub fn init_static_types() {
         (*PyFunction_Type.as_ptr()).tp_descr_get = callable_descr_get as *mut c_void;
         (*PyCFunction_Type.as_ptr()).tp_descr_get = callable_descr_get as *mut c_void;
         (*PyMethodDescr_Type.as_ptr()).tp_descr_get = callable_descr_get as *mut c_void;
+        // RFC 0062 WS2: classmethod/staticmethod/property carry a *binding*
+        // `tp_descr_get` (CPython's `cm_descr_get`/`sm_descr_get`/
+        // `property_descr_get`). wrapt's C `FunctionWrapper.__get__` binds
+        // its wrapped descriptor through this slot; NULL here made a wrapped
+        // classmethod cross unbound and fail with "'classmethod' object is
+        // not callable".
+        (*PyClassMethod_Type.as_ptr()).tp_descr_get = descriptor_descr_get as *mut c_void;
+        (*PyStaticMethod_Type.as_ptr()).tp_descr_get = descriptor_descr_get as *mut c_void;
+        (*PyProperty_Type.as_ptr()).tp_descr_get = descriptor_descr_get as *mut c_void;
     }
 
     // RFC 0047 (wave 5): advertise `tp_call` on the callable built-in types.
@@ -739,6 +770,12 @@ pub fn type_for_object(o: &Object) -> *mut PyTypeObject {
         O::Function(_) => PyFunction_Type.as_ptr(),
         O::Builtin(_) => PyCFunction_Type.as_ptr(),
         O::BoundMethod(_) => PyMethod_Type.as_ptr(),
+        // RFC 0062 WS2: descriptor objects cross wearing their faithful
+        // types so an extension's `Py_TYPE(wrapped)->tp_descr_get` binds
+        // them (wrapt wrapping a classmethod/staticmethod/property).
+        O::ClassMethod(_) => PyClassMethod_Type.as_ptr(),
+        O::StaticMethod(_) => PyStaticMethod_Type.as_ptr(),
+        O::Property(_) => PyProperty_Type.as_ptr(),
         O::Generator(_) => PyGen_Type.as_ptr(),
         O::Iter(_) => PySeqIter_Type.as_ptr(),
         O::Coroutine(_) => PyCoro_Type.as_ptr(),
@@ -1495,6 +1532,89 @@ unsafe extern "C" fn callable_descr_get(
     r
 }
 
+/// `tp_descr_get` for the descriptor statics (`PyClassMethod_Type`,
+/// `PyStaticMethod_Type`, `PyProperty_Type`) — CPython's `cm_descr_get`
+/// / `sm_descr_get` / `property_descr_get`, expressed over the VM
+/// payloads (RFC 0062 WS2). wrapt's C `FunctionWrapper` resolves a
+/// wrapped descriptor via `Py_TYPE(wrapped)->tp_descr_get`; without
+/// this slot the raw classmethod/staticmethod object crossed unbound.
+unsafe extern "C" fn descriptor_descr_get(
+    descr: *mut PyObject,
+    obj: *mut PyObject,
+    type_: *mut PyObject,
+) -> *mut PyObject {
+    if descr.is_null() {
+        return ptr::null_mut();
+    }
+    let take_descr = || {
+        unsafe { crate::object::Py_IncRef(descr) };
+        descr
+    };
+    let d = unsafe { crate::object::clone_object(descr) };
+    match &d {
+        // `staticmethod.__get__` ignores the receiver entirely.
+        Object::StaticMethod(w) => crate::object::into_owned(w.func()),
+        // `classmethod.__get__` binds `__func__` to the owner *class*
+        // (falling back to `type(obj)` when no owner was supplied).
+        Object::ClassMethod(w) => {
+            let owner = if !type_.is_null() {
+                let o = unsafe { crate::object::clone_object(type_) };
+                if matches!(o, Object::None) {
+                    None
+                } else {
+                    Some(o)
+                }
+            } else {
+                None
+            };
+            let owner = owner.or_else(|| {
+                if obj.is_null() {
+                    return None;
+                }
+                let t = unsafe { crate::abstract_::PyObject_Type(obj) };
+                if t.is_null() {
+                    return None;
+                }
+                let o = unsafe { crate::object::clone_object(t) };
+                unsafe { crate::object::Py_DecRef(t) };
+                Some(o)
+            });
+            match owner {
+                Some(owner) => crate::object::into_owned(Object::BoundMethod(Rc::new(
+                    BoundMethod::new(owner, w.func()),
+                ))),
+                None => take_descr(),
+            }
+        }
+        // `property.__get__(None, type)` yields the property itself;
+        // otherwise call the getter with the instance.
+        Object::Property(p) => {
+            if obj.is_null() {
+                return take_descr();
+            }
+            let recv = unsafe { crate::object::clone_object(obj) };
+            if matches!(recv, Object::None) {
+                return take_descr();
+            }
+            let fget = p.fget();
+            if matches!(fget, Object::None) {
+                unsafe {
+                    crate::errors::PyErr_SetString(
+                        crate::errors::PyExc_AttributeError,
+                        c"unreadable attribute".as_ptr(),
+                    );
+                }
+                return ptr::null_mut();
+            }
+            let f = crate::object::into_owned(fget);
+            let r = unsafe { crate::abstract_::PyObject_CallOneArg(f, obj) };
+            unsafe { crate::object::Py_DecRef(f) };
+            r
+        }
+        _ => take_descr(),
+    }
+}
+
 /// Serialises synth-type creation so a class crossing concurrently mints
 /// exactly one type.
 static SYNTH_LOCK: Mutex<()> = Mutex::new(());
@@ -1825,6 +1945,12 @@ static STATIC_TYPE_TABLE: &[&StaticType] = &[
     &PyDictValues_Type,
     &PyDictItems_Type,
     &PySuper_Type,
+    // RFC 0062 WS2: descriptor types source-built extensions reference by
+    // address (wrapt). Membership keeps identity + bridge lookups working.
+    &PyClassMethod_Type,
+    &PyStaticMethod_Type,
+    &PyProperty_Type,
+    &PyReversed_Type,
 ];
 
 /// Borrow the bridged native type from a [`PyTypeObject`].

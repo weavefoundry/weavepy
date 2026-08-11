@@ -544,11 +544,13 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("maxsize")),
             Object::Int(i64::MAX),
         );
-        let executable = std::env::current_exe()
-            .ok()
-            .map_or(Object::from_static(""), |p| {
-                Object::from_str(p.to_string_lossy().into_owned())
-            });
+        // argv[0]-derived (like CPython's getpath), NOT current_exe():
+        // on Linux /proc/self/exe pre-resolves symlinks, and a venv's
+        // `bin/python` must keep its symlink identity here or venv
+        // detection (pyvenv.cfg next to the executable) never fires.
+        let executable = crate::stdlib_tree::program_exe().map_or(Object::from_static(""), |p| {
+            Object::from_str(p.to_string_lossy().into_owned())
+        });
         d.insert(
             DictKey(Object::from_static("executable")),
             executable.clone(),
@@ -579,7 +581,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             let prefix = crate::stdlib_tree::prefix()
                 .map(std::path::Path::to_path_buf)
                 .or_else(|| {
-                    std::env::current_exe().ok().and_then(|p| {
+                    crate::stdlib_tree::program_exe().and_then(|p| {
                         p.parent()
                             .and_then(|d| d.parent())
                             .map(std::path::Path::to_path_buf)
@@ -846,7 +848,9 @@ fn implementation_value() -> Object {
 /// Contents of the governing `pyvenv.cfg` (next to the executable's
 /// directory or one level up), or `None` outside a virtual environment.
 fn venv_cfg_contents() -> Option<String> {
-    let exe = std::env::current_exe().ok()?;
+    // argv[0]-derived: the venv executable is a symlink whose identity
+    // `current_exe()` destroys on Linux (see stdlib_tree::program_exe).
+    let exe = crate::stdlib_tree::program_exe()?;
     let exe_dir = exe.parent()?;
     let cfg = [
         exe_dir.join("pyvenv.cfg"),
@@ -878,7 +882,7 @@ fn venv_base_executable() -> Option<String> {
         }
     }
     let home = venv_cfg_lookup(&contents, "home")?;
-    let exe = std::env::current_exe().ok()?;
+    let exe = crate::stdlib_tree::program_exe()?;
     let base = std::path::Path::new(&home).join(exe.file_name()?);
     base.is_file().then(|| base.to_string_lossy().into_owned())
 }
@@ -903,8 +907,7 @@ pub(crate) fn stdlib_zip_path() -> Option<String> {
         })
         .or_else(|| crate::stdlib_tree::prefix().map(std::path::Path::to_path_buf))
         .or_else(|| {
-            std::env::current_exe()
-                .ok()
+            crate::stdlib_tree::program_exe()
                 .and_then(|p| Some(p.parent()?.parent()?.to_path_buf()))
         })?;
     let zip = base_prefix

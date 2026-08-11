@@ -95,12 +95,20 @@ impl Row {
     }
 }
 
-/// Top-level report shape. Persisted as `baselines/bench.json`.
+/// Top-level report shape. Persisted per platform as
+/// `baselines/bench-{os}-{arch}.json` (RFC 0062 WS3).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
     pub version: u32,
     pub host: String,
     pub created_at: String,
+    /// Platform the report was measured on, as `{os}-{arch}` (RFC
+    /// 0062 WS3). `gate` refuses to compare against a baseline whose
+    /// recorded platform mismatches the host, so a copied
+    /// per-platform file can't silently lie. `None` only in pre-v4
+    /// baselines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
     /// Geometric mean of the per-fixture WeavePy/CPython ratios
     /// (fixtures without a CPython column are excluded).
     #[serde(default)]
@@ -118,13 +126,40 @@ impl Report {
         };
         Self {
             // v3 (RFC 0059 WS5b): rows carry `max_rss_bytes` +
-            // `memory_ratio`. The gate reads v2 baselines too — the
-            // new fields are `Option` with serde defaults.
-            version: 3,
+            // `memory_ratio`. v4 (RFC 0062 WS3): top level carries
+            // `platform` and baselines are per-platform files.
+            // Older files still deserialize (new fields are `Option`
+            // with serde defaults) but `gate` refuses baselines
+            // without a platform stamp — see [`Self::check_platform`].
+            version: 4,
             host: hostname_or_unknown(),
             created_at: now_rfc3339(),
+            platform: Some(crate::fixtures::platform_key()),
             geomean_ratio,
             rows,
+        }
+    }
+
+    /// Refuse to gate against a baseline recorded on a different
+    /// platform (RFC 0062 WS3). Ratios are host-independent in
+    /// degree but not in kind — a foreign baseline silently shifts
+    /// the bar. A baseline without a recorded platform is refused
+    /// too: per-platform files only exist post-v4, so a missing
+    /// stamp means the file was copied or hand-edited.
+    pub fn check_platform(&self, host_platform: &str) -> Result<(), String> {
+        match &self.platform {
+            Some(p) if p == host_platform => Ok(()),
+            Some(p) => Err(format!(
+                "baseline platform mismatch: baseline was measured on '{p}' but this host \
+                 is '{host_platform}' — refusing to gate against foreign ratios. Record a \
+                 host baseline with `weavepy-bench run --update-baseline` and commit it as \
+                 baselines/bench-{host_platform}.json"
+            )),
+            None => Err(format!(
+                "baseline has no recorded platform (pre-v4 file?) — refusing to gate. \
+                 Re-record it with `weavepy-bench run --update-baseline` on a \
+                 {host_platform} host"
+            )),
         }
     }
 
@@ -358,6 +393,34 @@ mod tests {
         let regs = with_new.regressions(&baseline, 10.0);
         assert_eq!(regs.len(), 1);
         assert!(regs[0].contains("brand_new"));
+    }
+
+    #[test]
+    fn new_reports_stamp_host_platform() {
+        let report = Report::new(vec![]);
+        assert_eq!(
+            report.platform.as_deref(),
+            Some(crate::fixtures::platform_key().as_str())
+        );
+        assert_eq!(report.version, 4);
+    }
+
+    #[test]
+    fn gate_refuses_platform_mismatch() {
+        let mut baseline = Report::new(vec![row("a", 200.0, Some(100.0))]);
+        baseline.platform = Some("macos-aarch64".to_owned());
+        let err = baseline.check_platform("linux-x86_64").unwrap_err();
+        assert!(err.contains("macos-aarch64"), "{err}");
+        assert!(err.contains("linux-x86_64"), "{err}");
+        assert!(baseline.check_platform("macos-aarch64").is_ok());
+    }
+
+    #[test]
+    fn baseline_without_platform_refused() {
+        let mut baseline = Report::new(vec![]);
+        baseline.platform = None;
+        let err = baseline.check_platform("linux-x86_64").unwrap_err();
+        assert!(err.contains("no recorded platform"), "{err}");
     }
 
     #[test]

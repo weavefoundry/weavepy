@@ -4,12 +4,15 @@
 //!
 //! - `run` — runs all fixtures, prints a markdown report.
 //! - `run --json` — emits the report as JSON to stdout.
-//! - `run --update-baseline` — overwrites `baselines/bench.json`
-//!   with the run's results (requires the CPython column so the
-//!   baseline carries ratios).
+//! - `run --update-baseline` — overwrites the host platform's
+//!   `baselines/bench-{os}-{arch}.json` with the run's results
+//!   (requires the CPython column so the baseline carries ratios).
 //! - `gate` — runs the suite, compares WeavePy/CPython ratios (and
-//!   the suite geomean) against the baseline, and exits non-zero on
-//!   regressions beyond the threshold.
+//!   the suite geomean) against the host platform's baseline, and
+//!   exits non-zero on regressions beyond the threshold. Missing
+//!   per-platform baselines are an error unless
+//!   `--allow-missing-baseline` makes the gate advisory (RFC 0062
+//!   WS3).
 //!
 //! For maximum portability we hand-roll arg parsing rather than
 //! pull in `clap` — the tool has at most a handful of flags.
@@ -17,10 +20,10 @@
 use std::env;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use weavepy_bench::fixtures::baseline_path;
+use weavepy_bench::fixtures::{baseline_path, platform_key};
 use weavepy_bench::report::Report;
 use weavepy_bench::runner::{run_suite, RunOpts};
 
@@ -77,10 +80,14 @@ fn print_help() {
     eprintln!();
     eprintln!("FLAGS for `run`:");
     eprintln!("    --json                Print report as JSON.");
-    eprintln!("    --update-baseline     Overwrite baselines/bench.json.");
+    eprintln!("    --update-baseline     Overwrite the host platform's baseline");
+    eprintln!("                          (baselines/bench-{{os}}-{{arch}}.json).");
     eprintln!();
     eprintln!("FLAGS for `gate`:");
     eprintln!("    --pct=PCT             Regression threshold (default 10).");
+    eprintln!("    --allow-missing-baseline");
+    eprintln!("                          If the host platform has no baseline file, print");
+    eprintln!("                          an advisory note and exit 0 instead of failing.");
 }
 
 fn parse_common(opts: &mut RunOpts, arg: &str) -> bool {
@@ -145,12 +152,14 @@ fn cmd_run(args: &[String]) -> io::Result<()> {
 
 fn cmd_gate(args: &[String]) -> io::Result<bool> {
     let mut pct = 10.0_f64;
+    let mut allow_missing = false;
     let mut opts = RunOpts::default();
     for a in args {
         if parse_common(&mut opts, a) {
             continue;
         }
         match a.as_str() {
+            "--allow-missing-baseline" => allow_missing = true,
             x if x.starts_with("--pct=") => {
                 pct = x[6..].parse().unwrap_or(pct);
             }
@@ -159,11 +168,20 @@ fn cmd_gate(args: &[String]) -> io::Result<bool> {
             }
         }
     }
-    let baseline_bytes = fs::read_to_string(baseline_path())?;
-    let baseline: Report = serde_json::from_str(&baseline_bytes)?;
+    let host_platform = platform_key();
+    let baseline = load_baseline(&baseline_path(), &host_platform, allow_missing)?;
     let rows = run_suite(&opts)?;
     let report = Report::new(rows);
     println!("{}", report.to_markdown());
+    let Some(baseline) = baseline else {
+        println!("==============================================================");
+        println!("NOTE: no bench baseline for this platform ({host_platform}) —");
+        println!("the gate is advisory: nothing was compared, exiting 0.");
+        println!("Record one with `weavepy-bench run --update-baseline` and");
+        println!("commit baselines/bench-{host_platform}.json to make it strict.");
+        println!("==============================================================");
+        return Ok(true);
+    };
     let regs = report.regressions(&baseline, pct);
     if regs.is_empty() {
         println!("OK: no ratio regressions over {pct:.1}%");
@@ -174,5 +192,98 @@ fn cmd_gate(args: &[String]) -> io::Result<bool> {
             println!("  {r}");
         }
         Ok(false)
+    }
+}
+
+/// Load the host's per-platform baseline for `gate` (RFC 0062 WS3).
+///
+/// - Missing file + `allow_missing` → `Ok(None)` (advisory gate).
+/// - Missing file otherwise → a clear error naming the per-platform
+///   file and how to record one.
+/// - Present file whose recorded platform mismatches `host_platform`
+///   → error (a copied baseline must not silently gate).
+fn load_baseline(
+    path: &Path,
+    host_platform: &str,
+    allow_missing: bool,
+) -> io::Result<Option<Report>> {
+    if !path.is_file() {
+        if allow_missing {
+            return Ok(None);
+        }
+        return Err(io::Error::other(format!(
+            "no bench baseline for this platform: {} does not exist. Record one with \
+             `cargo run --release -p weavepy-bench -- run --update-baseline` on a \
+             {host_platform} host and commit it, or pass --allow-missing-baseline to \
+             make the gate advisory",
+            path.display()
+        )));
+    }
+    let bytes = fs::read_to_string(path)?;
+    let baseline: Report = serde_json::from_str(&bytes)?;
+    baseline
+        .check_platform(host_platform)
+        .map_err(io::Error::other)?;
+    Ok(Some(baseline))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A unique temp path that does not exist yet.
+    fn temp_json(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "weavepy-bench-test-{tag}-{}.json",
+            std::process::id()
+        ))
+    }
+
+    fn write_baseline(path: &Path, platform: &str) {
+        let mut report = Report::new(vec![]);
+        report.platform = Some(platform.to_owned());
+        fs::write(path, serde_json::to_string(&report).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn missing_baseline_is_an_error_by_default() {
+        let path = temp_json("missing-strict");
+        let err = load_baseline(&path, "linux-x86_64", false).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no bench baseline for this platform"), "{msg}");
+        assert!(
+            msg.contains(path.to_str().unwrap()),
+            "error should name the missing file: {msg}"
+        );
+        assert!(msg.contains("--allow-missing-baseline"), "{msg}");
+    }
+
+    #[test]
+    fn missing_baseline_allowed_yields_advisory_none() {
+        let path = temp_json("missing-advisory");
+        let loaded = load_baseline(&path, "linux-x86_64", true).unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn matching_platform_baseline_loads() {
+        let path = temp_json("match");
+        write_baseline(&path, "linux-x86_64");
+        let loaded = load_baseline(&path, "linux-x86_64", false).unwrap();
+        assert_eq!(loaded.unwrap().platform.as_deref(), Some("linux-x86_64"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn copied_baseline_from_other_platform_refused() {
+        let path = temp_json("mismatch");
+        write_baseline(&path, "macos-aarch64");
+        let err = load_baseline(&path, "linux-x86_64", false).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("platform mismatch"), "{msg}");
+        // --allow-missing-baseline must not paper over a *present*
+        // but foreign baseline.
+        assert!(load_baseline(&path, "linux-x86_64", true).is_err());
+        let _ = fs::remove_file(&path);
     }
 }

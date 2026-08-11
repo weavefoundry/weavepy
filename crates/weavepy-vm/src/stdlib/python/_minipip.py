@@ -4,6 +4,8 @@ Implements pip's CLI surface against PyPI (the real `https://pypi.org/`
 index) plus arbitrary PEP 503 simple indexes. Sub-commands::
 
     pip install <wheel-file>                   # local install
+    pip install <sdist.tar.gz>                 # local PEP 517 build
+    pip install --no-binary :all: <name>       # force source build
     pip install <name>[op<version>][extras]    # resolve + install
     pip install -r requirements.txt
     pip install -e <path>                      # editable / sdist install
@@ -151,8 +153,10 @@ def _find_wheel_on_index(name, index_url, python_version=None):
     return label, url
 
 
-def _find_sdist_on_index(name, index_url):
-    """Return the highest-version sdist URL for ``name`` (or ``(None, None)``)."""
+def _find_sdist_on_index(name, index_url, specifier=None):
+    """Return the highest-version sdist URL for ``name`` (or ``(None,
+    None)``), honouring an optional version *specifier* (RFC 0062:
+    `--no-binary` rows pin exact versions)."""
     candidates = []
     for label, url in _list_distributions(name, index_url):
         lower = label.lower()
@@ -171,6 +175,12 @@ def _find_sdist_on_index(name, index_url):
                 break
         else:
             version = tail
+        if specifier is not None:
+            try:
+                if not specifier.contains(version):
+                    continue
+            except Exception:
+                continue
         candidates.append((version, label, url))
     if not candidates:
         return None, None
@@ -464,6 +474,46 @@ def _data_prefix(zf):
 
 # --------------------------------------------------------------------- commands
 
+def _parse_no_binary(values):
+    """Parse pip's ``--no-binary`` syntax into ``(all, names)``.
+
+    Values may repeat and each value may be `:all:` or a
+    comma-separated package-name list (RFC 0062 WS2).
+    """
+    force_all = False
+    names = set()
+    for value in values or []:
+        for part in value.split(','):
+            part = part.strip()
+            if not part:
+                continue
+            if part == ':all:':
+                force_all = True
+            elif part == ':none:':
+                force_all = False
+                names.clear()
+            else:
+                names.add(canonicalize_name(part))
+    return force_all, names
+
+
+def _spec_forces_sdist(spec, no_binary_all, no_binary_names):
+    if no_binary_all:
+        return True
+    if not no_binary_names:
+        return False
+    try:
+        name = Requirement(spec).name
+    except InvalidRequirement:
+        name = re.split(r'[<>=!~ ]', spec, maxsplit=1)[0].strip()
+    return canonicalize_name(name) in no_binary_names
+
+
+def _is_local_sdist(path):
+    return os.path.isfile(path) and path.lower().endswith(
+        ('.tar.gz', '.tgz', '.zip'))
+
+
 def cmd_install(args):
     """``pip install ...``."""
     targets = list(args.packages or [])
@@ -482,18 +532,60 @@ def cmd_install(args):
         # (ensurepip passes it for altinstall trees).
         base = dest or _site_packages()
         dest = os.path.join(args.root, os.path.relpath(base, os.sep))
+    no_binary_all, no_binary_names = _parse_no_binary(
+        getattr(args, 'no_binary', []))
+    # Local sdist files install directly through the PEP 517 driver
+    # in every mode (`pip install ./pkg-1.0.tar.gz`, RFC 0062 WS2).
+    rc = 0
+    remaining = []
+    for spec in targets:
+        if _is_local_sdist(spec):
+            if not args.quiet:
+                print('Installing sdist: {}'.format(spec))
+            try:
+                _install_sdist(spec, dest=dest)
+            except Exception as exc:
+                print('ERROR: {}: {}'.format(spec, exc), file=sys.stderr)
+                rc = 1
+        else:
+            remaining.append(spec)
+    targets = remaining
+    if not targets:
+        return rc
     if getattr(args, 'no_index', False):
         # Offline mode: satisfy every target from `--find-links`
-        # directories (`ensurepip`'s bootstrap path). Wheels only.
+        # directories (`ensurepip`'s bootstrap path). Wheels, plus
+        # sdists for `--no-binary` targets (RFC 0062 WS2: the C-sdist
+        # proof rows run fully offline from the wheel cache).
         # Requires-Dist chains are resolved against the local cache
         # unless --no-deps: `install --no-index --find-links D requests`
         # must pull urllib3/idna/certifi/… exactly like online pip.
         plan = []
-        rc = 0
+        wheel_targets = []
         for spec in targets:
+            if _spec_forces_sdist(spec, no_binary_all, no_binary_names):
+                sdist = _find_sdist_in_links(spec, args.find_links)
+                if sdist is None:
+                    print('ERROR: no matching sdist for {!r} in {}'.format(
+                        spec, args.find_links), file=sys.stderr)
+                    rc = 1
+                    continue
+                if not args.quiet:
+                    print('Building sdist: {}'.format(sdist))
+                try:
+                    _install_sdist(sdist, dest=dest)
+                except Exception as exc:
+                    print('ERROR: {}: {}'.format(spec, exc), file=sys.stderr)
+                    rc = 1
+                continue
+            wheel_targets.append(spec)
+        # One shared resolve for every wheel target, so a direct pin
+        # (`pytest==8.3.5`) wins over another target's transitive
+        # Requires-Dist on the same project.
+        if wheel_targets:
             try:
                 plan.extend(
-                    _resolve_from_links(spec, args.find_links,
+                    _resolve_from_links(wheel_targets, args.find_links,
                                         follow_deps=not args.no_deps))
             except RuntimeError as exc:
                 print('ERROR: {}'.format(exc), file=sys.stderr)
@@ -508,7 +600,25 @@ def cmd_install(args):
             _install_wheel(wheel, dest=dest)
         return rc
     args.target = dest
-    rc = 0
+    # Online `--no-binary` targets skip the wheel resolver and take
+    # the index-sdist path directly (dependencies of a forced-sdist
+    # target are not followed — the callers that need this pin their
+    # requirement lists explicitly).
+    if no_binary_all or no_binary_names:
+        remaining = []
+        for spec in targets:
+            if _spec_forces_sdist(spec, no_binary_all, no_binary_names):
+                try:
+                    _install_sdist_spec(spec, index_url=args.index_url,
+                                        quiet=args.quiet, dest=args.target)
+                except Exception as exc:
+                    print('ERROR: {}: {}'.format(spec, exc), file=sys.stderr)
+                    rc = 1
+            else:
+                remaining.append(spec)
+        targets = remaining
+        if not targets:
+            return rc
     if args.no_deps:
         # Old behaviour: install each spec individually.
         for spec in targets:
@@ -574,30 +684,143 @@ def _find_wheel_in_links(spec, link_dirs):
     return best
 
 
-def _resolve_from_links(spec, link_dirs, *, follow_deps=True):
-    """Resolve *spec* (and, when *follow_deps*, its Requires-Dist
-    closure) against the ``--find-links`` directories.
+def _find_sdist_in_links(spec, link_dirs):
+    """Resolve *spec* to an sdist file inside the ``--find-links`` dirs
+    (RFC 0062 WS2: `--no-binary` targets in offline mode). Highest
+    version wins.
+    """
+    if _is_local_sdist(spec):
+        return spec
+    try:
+        req = Requirement(spec)
+        name = req.name
+        specifier = req.specifier
+    except InvalidRequirement:
+        name = re.split(r'[<>=!~ ]', spec, maxsplit=1)[0].strip()
+        specifier = None
+    canonical = canonicalize_name(name)
+    best = None
+    best_key = None
+    for d in link_dirs or []:
+        try:
+            entries = os.listdir(d)
+        except OSError:
+            continue
+        for entry in entries:
+            lower = entry.lower()
+            for ext in ('.tar.gz', '.tgz', '.zip'):
+                if lower.endswith(ext):
+                    stem = entry[:-len(ext)]
+                    break
+            else:
+                continue
+            # sdists are named `{name}-{version}`; the name half may
+            # use any PEP 503-equivalent spelling.
+            head, sep, version = stem.rpartition('-')
+            if not sep or canonicalize_name(head) != canonical:
+                continue
+            try:
+                key = Version(version)
+            except Exception:
+                continue
+            if specifier is not None and not specifier.contains(version):
+                continue
+            if best_key is None or key > best_key:
+                best = os.path.join(d, entry)
+                best_key = key
+    return best
+
+
+def _sdist_suffix(label):
+    """The full archive suffix of an sdist filename (`.tar.gz` must
+    survive intact; `os.path.splitext` would truncate it to `.gz`)."""
+    lower = label.lower()
+    for ext in ('.tar.gz', '.tgz', '.zip'):
+        if lower.endswith(ext):
+            return ext
+    return '.tar.gz'
+
+
+def _install_sdist_spec(spec, *, index_url, quiet=False, dest=None):
+    """Install *spec* from its index sdist, never a wheel
+    (`--no-binary`, RFC 0062 WS2)."""
+    specifier = None
+    try:
+        req = Requirement(spec)
+        name = req.name
+        specifier = req.specifier
+    except InvalidRequirement:
+        name = re.split(r'[<>=!~ ]', spec, maxsplit=1)[0].strip()
+    label, url = _find_sdist_on_index(name, index_url, specifier)
+    if url is None:
+        raise RuntimeError('no sdist found for {!r}'.format(name))
+    if not quiet:
+        print('Downloading sdist {}'.format(label))
+    blob = _http_get(url)
+    with tempfile.NamedTemporaryFile(
+            suffix=_sdist_suffix(label), delete=False) as tmp:
+        tmp.write(blob)
+        tmp_path = tmp.name
+    try:
+        _install_sdist(tmp_path, dest=dest)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def _resolve_from_links(specs, link_dirs, *, follow_deps=True):
+    """Resolve *specs* (a list of direct requirement strings — and,
+    when *follow_deps*, their Requires-Dist closures) against the
+    ``--find-links`` directories.
+
+    Direct requirements are resolved *first* and their picks win for
+    the whole plan: a transitive ``Requires-Dist`` for the same
+    project must reuse the directly-pinned wheel instead of
+    re-resolving to the newest cached version (pip parity — installing
+    ``pytest==8.3.5 pytest-cov`` from a cache that also holds a newer
+    pytest must not let pytest-cov's ``pytest>=7`` dep overwrite the
+    pin; RFC 0062 WS4 hit exactly this with the selftest test-dep
+    sets).
 
     Returns wheel paths in dependency-first order so imports work the
     moment each wheel lands. Raises ``RuntimeError`` when a needed
     wheel is missing from the cache.
     """
+    if isinstance(specs, str):
+        specs = [specs]
     ordered = []
     done = set()
+    pinned = {}
 
-    def visit(spec, extras, chain):
+    def parse(spec):
         try:
             req = Requirement(spec)
-            name, req_extras = req.name, set(req.extras)
+            return canonicalize_name(req.name), set(req.extras)
         except InvalidRequirement:
             name = re.split(r'[<>=!~ ;]', spec, maxsplit=1)[0].strip()
-            req_extras = set()
-        key = canonicalize_name(name)
+            return canonicalize_name(name), set()
+
+    direct = []
+    for spec in specs:
+        key, extras = parse(spec)
+        wheel = _find_wheel_in_links(spec, link_dirs)
+        if wheel is None:
+            raise RuntimeError(
+                'no matching wheel for {!r} in {}'.format(spec, link_dirs))
+        pinned.setdefault(key, wheel)
+        direct.append((spec, extras))
+
+    def visit(spec, extras, chain):
+        key, req_extras = parse(spec)
         if key in chain:  # dependency cycle (rare but legal)
             return
         if key in done:
             return
-        wheel = _find_wheel_in_links(spec, link_dirs)
+        wheel = pinned.get(key)
+        if wheel is None:
+            wheel = _find_wheel_in_links(spec, link_dirs)
         if wheel is None:
             raise RuntimeError(
                 'no matching wheel for {!r} in {}'.format(spec, link_dirs))
@@ -621,7 +844,8 @@ def _resolve_from_links(spec, link_dirs, *, follow_deps=True):
         done.add(key)
         ordered.append(wheel)
 
-    visit(spec, set(), frozenset())
+    for spec, extras in direct:
+        visit(spec, extras, frozenset())
     return ordered
 
 
@@ -746,7 +970,7 @@ def _install_spec(spec, *, index_url, quiet=False, dest=None,
             if not quiet:
                 print('Downloading sdist {}'.format(label))
             blob = _http_get(url)
-            with tempfile.NamedTemporaryFile(suffix=os.path.splitext(label)[1] or '.tar.gz',
+            with tempfile.NamedTemporaryFile(suffix=_sdist_suffix(label),
                                              delete=False) as tmp:
                 tmp.write(blob)
                 tmp_path = tmp.name
@@ -1073,6 +1297,16 @@ def main(argv=None):
                          help='resolve only; don\'t install')
     install.add_argument('--only-binary', action='store_true',
                          help='reject sdists (don\'t try PEP 517 builds)')
+    # RFC 0062 WS2 — force source builds. Accepts pip's syntax:
+    # `:all:` or a comma-separated package-name list; may repeat.
+    install.add_argument('--no-binary', action='append', default=[],
+                         metavar='NAMES',
+                         help='force sdist builds for NAMES (or :all:)')
+    # Accepted for real-pip CLI compatibility; the in-tree PEP 517
+    # driver never isolates builds (backends import from the live
+    # environment), so this is already the behavior.
+    install.add_argument('--no-build-isolation', action='store_true',
+                         help='(no-op: builds are never isolated)')
     install.add_argument('-t', '--target', default=None,
                          help='install into the given directory')
     install.add_argument('-e', '--editable', action='append', default=[],
