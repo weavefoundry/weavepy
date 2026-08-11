@@ -14,12 +14,22 @@ Registered under the platform-derived names `sysconfig` looks for
 import os
 import sys
 
-_prefix = getattr(sys, "prefix", "") or "/usr/local"
-_exec_prefix = getattr(sys, "exec_prefix", _prefix) or _prefix
-_version_short = "%d.%d" % sys.version_info[:2]
-_bindir = os.path.dirname(getattr(sys, "executable", "") or "") or os.path.join(
-    _prefix, "bin"
+# CPython's generated `_sysconfigdata` carries *configure-time* paths
+# — the base installation, not the running venv (`sysconfig` layers
+# venv awareness via its install schemes, not via these vars). Use
+# `base_prefix` so `INCLUDEPY`/`LIBDEST`/…, and therefore setuptools'
+# `get_python_inc()`, stay truthful inside venvs (RFC 0062 WS2).
+_prefix = (
+    getattr(sys, "base_prefix", "") or getattr(sys, "prefix", "") or "/usr/local"
 )
+_exec_prefix = (
+    getattr(sys, "base_exec_prefix", "") or getattr(sys, "exec_prefix", _prefix) or _prefix
+)
+_version_short = "%d.%d" % sys.version_info[:2]
+_base_executable = getattr(sys, "_base_executable", "") or getattr(
+    sys, "executable", ""
+)
+_bindir = os.path.dirname(_base_executable) or os.path.join(_prefix, "bin")
 # RFC 0055 WS1 — ABI identity. WeavePy's binary ABI loads stock
 # CPython 3.13 extensions, so EXT_SUFFIX/SOABI carry CPython's tags
 # (they must equal `_imp.extension_suffixes()[0]` — asserted by
@@ -43,6 +53,26 @@ _config_dir = os.path.join(
     else "config-" + _version_short,
 )
 
+# RFC 0062 WS2 — compiler variables for building C-extension sdists
+# against the installed `{prefix}/include/python3.13/` header tree.
+# setuptools' `customize_compiler()` reads CC/CXX/CFLAGS/CCSHARED/
+# LDSHARED/LDCXXSHARED/AR/ARFLAGS from here. Extensions never link a
+# libpython (same model as a static-libpython CPython): on macOS the
+# `-undefined dynamic_lookup` link defers `Py*` resolution to load
+# time, on Linux the weavepy binary exports its C-API via
+# `--export-dynamic`. Keep in sync with the Rust constants in
+# `sysconfig_native.rs` (mirrored into `config-3.13*/Makefile`).
+_is_macos = sys.platform == "darwin"
+_cflags = "-fno-strict-overflow -Wsign-compare -DNDEBUG -g -O3 -Wall"
+if _is_macos:
+    _ccshared = ""
+    _ldshared = "cc -bundle -undefined dynamic_lookup"
+    _ldcxxshared = "c++ -bundle -undefined dynamic_lookup"
+else:
+    _ccshared = "-fPIC"
+    _ldshared = "cc -shared"
+    _ldcxxshared = "c++ -shared"
+
 build_time_vars = {
     "ABIFLAGS": "",
     "AR": "ar",
@@ -50,7 +80,8 @@ build_time_vars = {
     "BINDIR": _bindir,
     "BINLIBDEST": os.path.join(_prefix, "lib", "python" + _version_short),
     "CC": "cc",
-    "CFLAGS": "",
+    "CCSHARED": _ccshared,
+    "CFLAGS": _cflags,
     "CONFINCLUDEPY": os.path.join(
         _prefix, "include", "python" + _version_short
     ),
@@ -59,10 +90,13 @@ build_time_vars = {
     "EXT_SUFFIX": _ext_suffix,
     "HOST_GNU_TYPE": "",
     "INCLUDEPY": os.path.join(_prefix, "include", "python" + _version_short),
+    "LDCXXSHARED": _ldcxxshared,
     "LDFLAGS": "",
     "LDLIBRARY": "libpython%s.a" % _version_short,
-    "LDSHARED": "cc -shared",
+    "LDSHARED": _ldshared,
+    "BLDSHARED": _ldshared,
     "LDVERSION": _version_short,
+    "OPT": "-DNDEBUG -g -O3 -Wall",
     "LIBDEST": os.path.join(_prefix, "lib", "python" + _version_short),
     "LIBDIR": os.path.join(_prefix, "lib"),
     "LIBRARY": "libpython%s.a" % _version_short,

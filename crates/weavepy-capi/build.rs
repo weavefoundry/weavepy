@@ -21,7 +21,7 @@ use std::process::Command;
 /// build-script flat (no globals).
 struct ExtensionBuild<'a> {
     cc: &'a str,
-    include_dir: &'a Path,
+    include_dirs: &'a [PathBuf],
     out_dir: &'a Path,
     target_os: &'a str,
     suffix: &'a str,
@@ -30,31 +30,49 @@ struct ExtensionBuild<'a> {
     env_var: &'a str,
 }
 
-/// Locate the host's stock CPython 3.13 include directory (the one
-/// containing `Python.h`) so the wave-1 binary-ABI proof can be compiled
-/// against the *real* headers. Returns `None` if no CPython 3.13 is
-/// installed or its `Python.h` is missing, in which case the proof
-/// fixture is skipped. Honours `WEAVEPY_STOCK_PYTHON` to override the
-/// interpreter used for the probe.
-fn stock_python_include() -> Option<String> {
+/// The stock CPython 3.13 include directories the binary-ABI proof
+/// fixtures compile against.
+///
+/// RFC 0062 WS2 vendored the stock `Include/` tree into
+/// `include/cpython313/` (plus per-OS generated `pyconfig.h`
+/// variants), so the default is fully hermetic: stage the right
+/// `pyconfig.h` under `OUT_DIR` and compile against
+/// `[staged, tree]`. `WEAVEPY_STOCK_PYTHON` still overrides with a
+/// host interpreter's headers for cross-validation against a real
+/// CPython install.
+fn stock_python_include(manifest_dir: &Path, out_dir: &Path) -> Option<Vec<PathBuf>> {
     println!("cargo:rerun-if-env-changed=WEAVEPY_STOCK_PYTHON");
-    let interp = env::var("WEAVEPY_STOCK_PYTHON").unwrap_or_else(|_| "python3.13".to_owned());
-    let out = Command::new(&interp)
-        .arg("-c")
-        .arg("import sysconfig; print(sysconfig.get_path('include'))")
-        .output()
-        .ok()?;
-    if !out.status.success() {
+    if let Ok(interp) = env::var("WEAVEPY_STOCK_PYTHON") {
+        let out = Command::new(&interp)
+            .arg("-c")
+            .arg("import sysconfig; print(sysconfig.get_path('include'))")
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let inc = String::from_utf8(out.stdout).ok()?.trim().to_owned();
+        if !inc.is_empty() && Path::new(&inc).join("Python.h").is_file() {
+            return Some(vec![PathBuf::from(inc)]);
+        }
         return None;
     }
-    let inc = String::from_utf8(out.stdout).ok()?.trim().to_owned();
-    if inc.is_empty() {
+    let tree = manifest_dir.join("include").join("cpython313");
+    if !tree.join("Python.h").is_file() {
         return None;
     }
-    if !Path::new(&inc).join("Python.h").is_file() {
-        return None;
-    }
-    Some(inc)
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let pyconfig = match target_os.as_str() {
+        "macos" => "pyconfig-macos.h",
+        "linux" | "freebsd" | "android" => "pyconfig-linux.h",
+        _ => return None,
+    };
+    let pyconfig_src = manifest_dir.join("include").join("pyconfig").join(pyconfig);
+    println!("cargo:rerun-if-changed={}", pyconfig_src.display());
+    let staged = out_dir.join("stock-include");
+    std::fs::create_dir_all(&staged).ok()?;
+    std::fs::copy(&pyconfig_src, staged.join("pyconfig.h")).ok()?;
+    Some(vec![staged, tree])
 }
 
 fn main() {
@@ -106,7 +124,7 @@ fn main() {
     fn build_extension(opts: ExtensionBuild<'_>) {
         let ExtensionBuild {
             cc,
-            include_dir,
+            include_dirs,
             out_dir,
             target_os,
             suffix,
@@ -124,11 +142,11 @@ fn main() {
             .arg("-fPIC")
             .arg("-fvisibility=default")
             .arg("-O0")
-            .arg("-Wno-error")
-            .arg(format!("-I{}", include_dir.display()))
-            .arg(src)
-            .arg("-o")
-            .arg(&dylib);
+            .arg("-Wno-error");
+        for dir in include_dirs {
+            cmd.arg(format!("-I{}", dir.display()));
+        }
+        cmd.arg(src).arg("-o").arg(&dylib);
         if target_os == "macos" {
             cmd.arg("-undefined").arg("dynamic_lookup");
         }
@@ -147,11 +165,11 @@ fn main() {
         }
     }
 
-    let weavepy_inc = manifest_dir.join("include");
+    let weavepy_inc = vec![manifest_dir.join("include")];
     let smalltest_src = workspace_root.join("tests/capi_ext/_smalltest.c");
     build_extension(ExtensionBuild {
         cc: &cc,
-        include_dir: &weavepy_inc,
+        include_dirs: &weavepy_inc,
         out_dir: &out_dir,
         target_os: &target_os,
         suffix,
@@ -162,7 +180,7 @@ fn main() {
     let ndarray_src = workspace_root.join("tests/capi_ext/_ndarray.c");
     build_extension(ExtensionBuild {
         cc: &cc,
-        include_dir: &weavepy_inc,
+        include_dirs: &weavepy_inc,
         out_dir: &out_dir,
         target_os: &target_os,
         suffix,
@@ -173,7 +191,7 @@ fn main() {
     let numpylike_src = workspace_root.join("tests/capi_ext/_numpylike.c");
     build_extension(ExtensionBuild {
         cc: &cc,
-        include_dir: &weavepy_inc,
+        include_dirs: &weavepy_inc,
         out_dir: &out_dir,
         target_os: &target_os,
         suffix,
@@ -204,13 +222,19 @@ fn main() {
     //     present, so a bare CI host still builds and the stock proofs
     //     self-skip.
     // ----------------------------------------------------------------
-    match stock_python_include() {
-        Some(inc) => {
-            println!("cargo:rustc-env=WEAVEPY_STOCK_PYTHON_INCLUDE={inc}");
-            let stock_inc = PathBuf::from(&inc);
+    match stock_python_include(&manifest_dir, out_dir.parent().unwrap_or(&out_dir)) {
+        Some(stock_inc) => {
+            println!(
+                "cargo:rustc-env=WEAVEPY_STOCK_PYTHON_INCLUDE={}",
+                stock_inc
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(":")
+            );
             build_extension(ExtensionBuild {
                 cc: &cc,
-                include_dir: &stock_inc,
+                include_dirs: &stock_inc,
                 out_dir: &out_dir,
                 target_os: &target_os,
                 suffix,
@@ -220,7 +244,7 @@ fn main() {
             });
             build_extension(ExtensionBuild {
                 cc: &cc,
-                include_dir: &stock_inc,
+                include_dirs: &stock_inc,
                 out_dir: &out_dir,
                 target_os: &target_os,
                 suffix,
@@ -230,7 +254,7 @@ fn main() {
             });
             build_extension(ExtensionBuild {
                 cc: &cc,
-                include_dir: &stock_inc,
+                include_dirs: &stock_inc,
                 out_dir: &out_dir,
                 target_os: &target_os,
                 suffix,
@@ -244,7 +268,7 @@ fn main() {
             // `inherit_slots` proof), plus the Cython C-API runtime tail.
             build_extension(ExtensionBuild {
                 cc: &cc,
-                include_dir: &stock_inc,
+                include_dirs: &stock_inc,
                 out_dir: &out_dir,
                 target_os: &target_os,
                 suffix,
@@ -259,7 +283,7 @@ fn main() {
             // size-check — the exact ABI surface pandas' `tslibs` uses.
             build_extension(ExtensionBuild {
                 cc: &cc,
-                include_dir: &stock_inc,
+                include_dirs: &stock_inc,
                 out_dir: &out_dir,
                 target_os: &target_os,
                 suffix,
@@ -275,7 +299,7 @@ fn main() {
             // PyObject_Vectorcall, PyGILState_*, PyInterpreterState_Get).
             build_extension(ExtensionBuild {
                 cc: &cc,
-                include_dir: &stock_inc,
+                include_dirs: &stock_inc,
                 out_dir: &out_dir,
                 target_os: &target_os,
                 suffix,

@@ -910,6 +910,12 @@ static FORCE_LINK: &[FnPtr] = &[
     addr_static!(types::PyDictValues_Type),
     addr_static!(types::PyDictItems_Type),
     addr_static!(types::PySuper_Type),
+    // RFC 0062 WS2: descriptor types referenced by address from
+    // source-built extensions (wrapt reads PyClassMethod_Type).
+    addr_static!(types::PyClassMethod_Type),
+    addr_static!(types::PyStaticMethod_Type),
+    addr_static!(types::PyProperty_Type),
+    addr_static!(types::PyReversed_Type),
     // ----------------------------------------------------------------
     // RFC 0047 (wave 5): the *real* Cython-output tail. A genuine
     // `cythonize`d `.so` (and pandas, ~70% Cython) links a faithful

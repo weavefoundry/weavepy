@@ -1,15 +1,33 @@
-# Ecosystem conformance matrix (RFC 0055 WS5).
+# Ecosystem conformance matrix (RFC 0055 WS5; RFC 0062 WS2/WS4 fields).
 #
 # Each `[packages.<name>]` row is graded independently:
 #   requirements     — space-separated pip requirement strings
+#   no_binary        — comma/space-separated package names forced through
+#                      pip's *sdist* path (a real source build; the named
+#                      requirement must be `==`-pinned). RFC 0062 WS2.
 #   probe            — smoke-probe file, relative to this directory;
 #                      exit 0 = pass. Probes assert real behaviour, not
 #                      just import.
 #   timeout_seconds  — optional per-row wall budget (venv + install +
 #                      probe); default comes from the runner (600 s).
 #
+# An optional `[packages.<name>.selftest]` sub-table (RFC 0062 WS4) runs
+# the package's own pytest suite after the probe passes (only with
+# `--selftests`; graded against `selftest_status` baseline rows):
+#   source           — `==`-pinned requirement whose sdist carries the
+#                      test suite
+#   requirements     — extra test-only deps installed into the same venv
+#   command          — pytest target path inside the extracted sdist
+#                      root; whitespace-split, so it may carry
+#                      collection-level flags (`--ignore=…`)
+#   deselect         — array of `pytest --deselect` arguments; every
+#                      entry carries an inline comment naming the
+#                      measured failure class
+#   timeout_seconds  — optional budget for the selftest stage alone
+#                      (default 600 s)
+#
 # Run with:
-#   cargo run -p weavepy-conformance -- ecosystem
+#   cargo run -p weavepy-conformance -- ecosystem [--selftests]
 # Offline lane (CI): populate a wheel cache first —
 #   python3 tools/ecosystem_fetch.py --dest target/ecosystem-wheels
 #   cargo run -p weavepy-conformance -- ecosystem --wheels target/ecosystem-wheels
@@ -22,13 +40,75 @@ probe = "probes/six_probe.py"
 requirements = "attrs"
 probe = "probes/attrs_probe.py"
 
+[packages.attrs.selftest]
+source = "attrs==26.1.0"
+requirements = "pytest==8.4.2 hypothesis==6.165.2"
+# Measured 2026-08: the suite cannot finish inside any sane budget —
+# hypothesis @given loops woven through the core files (test_make,
+# test_funcs, test_dunders) are interpreter-speed-bound under WeavePy
+# (tests/test_funcs.py::TestAsDict::test_recurse_property alone ran
+# >5 min without completing). Baselined `selftest_status = "skip"` in
+# expectations.toml, which keeps the stage from running; the spec stays
+# so the row re-measures the moment the baseline flips.
+command = "tests"
+timeout_seconds = 2400
+
 [packages.click]
 requirements = "click"
 probe = "probes/click_probe.py"
 
+[packages.click.selftest]
+source = "click==8.4.2"
+# pytest 9 turns its parametrize-iterator deprecation into a collection
+# error under click's `filterwarnings = ["error"]`; pin the 8.x line the
+# suite was released against.
+requirements = "pytest==8.4.2"
+# --ignore: tests/test_types.py fails at *import* (module-level
+# `open(tempdir + "\udcff")` — WeavePy raises TypeError instead of
+# OSError for lone-surrogate filenames), which --deselect cannot reach.
+command = "tests --ignore=tests/test_types.py"
+# Measured 2026-08: 1606 passed, 13 failed in four classes, all
+# deselected below.
+deselect = [
+    # Class 1: CliRunner stdin echo — feeding "-"/piped stdin through
+    # click's testing BytesIOCopy loses the echoed input under WeavePy.
+    "tests/test_chain.py::test_pipeline[args0-foo\\nbar-expect0]",
+    "tests/test_chain.py::test_pipeline[args1-foo \\n bar-expect1]",
+    "tests/test_chain.py::test_pipeline[args2-foo \\n bar-expect2]",
+    "tests/test_testing.py::test_runner",
+    "tests/test_testing.py::test_echo_stdin_stream",
+    "tests/test_testing.py::test_runner_with_stream",
+    "tests/test_utils.py::test_open_file",
+    # Class 2: engine bug — TextIOWrapper.write() raises
+    # "TypeError: write() argument must be str, not str" for the str
+    # returned by re.sub() inside click's strip_ansi.
+    "tests/test_testing.py::test_isolation_stderr_errors",
+    "tests/test_testing.py::test_isolation_flushes_unflushed_stderr",
+    # Class 3: importlib.metadata package-name resolution gaps break
+    # click's version_option auto-detection.
+    "tests/test_basic.py::test_version_option_resolves_import_name_to_distribution",
+    "tests/test_basic.py::test_version_option_ambiguous_import_name_errors",
+    "tests/test_basic.py::test_version_option_unknown_package_errors",
+    # Class 4: LazyFile atomic-write path — FileNotFoundError for the
+    # temp file rename in click's lazy file handling.
+    "tests/test_arguments.py::test_file_args",
+]
+timeout_seconds = 1200
+
 [packages.jinja2]
 requirements = "jinja2 markupsafe"
 probe = "probes/jinja2_probe.py"
+
+[packages.jinja2.selftest]
+source = "jinja2==3.1.6"
+requirements = "pytest==8.4.2"
+# --ignore: test_async*.py import trio at module level, and trio cannot
+# import under WeavePy (socket module lacks SOMAXCONN — engine gap).
+command = "tests --ignore=tests/test_async.py --ignore=tests/test_async_filters.py"
+# (RFC 0062 WS5 removed the former five-row deselect list: all were
+# one failure class — `_string.formatter_parser()` rejecting str
+# *subclasses* (Markup) — fixed subtype-inclusive in the engine.)
+timeout_seconds = 1200
 
 [packages.requests]
 requirements = "requests"
@@ -38,6 +118,29 @@ probe = "probes/requests_probe.py"
 requirements = "python-dateutil"
 probe = "probes/dateutil_probe.py"
 
+[packages.dateutil.selftest]
+source = "python-dateutil==2.9.0.post0"
+# pytest 8.3.x: 8.4 added PytestRemovedIn10Warning for the generator
+# that test_isoparser.py passes to parametrize, and the suite's
+# `filterwarnings = error` turns it into a collection error. (Not
+# pytest-cov, though upstream runs with it: the in-tree pip resolves
+# pytest-cov's `pytest` dependency to the newest cached wheel *in the
+# same install as the ==8.3.5 pin*, clobbering it.)
+# -W: tests/conftest.py applies pytest-cov's `no_cover` marker; without
+# the plugin the unknown-mark warning would be escalated to an error by
+# the suite's `filterwarnings = error` (cmdline -W outranks ini).
+requirements = "pytest==8.3.5 six==1.17.0 hypothesis==6.165.2 freezegun==1.5.5"
+command = "tests -W ignore::pytest.PytestUnknownMarkWarning"
+# Engine gap (hypothesis-found, measured 2026-08: 2030 passed, 1
+# failed): for pre-epoch datetimes (e.g. 1901-12-13T12:45:52Z),
+# `dt.astimezone()` and `tz.gettz("")`/tzlocal disagree on tzname() —
+# WeavePy's local-zone name resolution diverges from CPython before
+# time_t 0.
+deselect = [
+    "tests/property/test_tz_prop.py::test_gettz_returns_local",
+]
+timeout_seconds = 2400
+
 [packages.typing_extensions]
 requirements = "typing_extensions"
 probe = "probes/typing_extensions_probe.py"
@@ -45,6 +148,23 @@ probe = "probes/typing_extensions_probe.py"
 [packages.packaging]
 requirements = "packaging"
 probe = "probes/packaging_probe.py"
+
+[packages.packaging.selftest]
+source = "packaging==26.3"
+requirements = "pytest==8.4.2 pretend==1.0.9 hypothesis==6.165.2 tomli_w==1.2.0"
+# Two enumerated trims, both interpreter-speed-bound (measured
+# 2026-08), neither a correctness signal:
+# --ignore=tests/property — upstream's hypothesis property-fuzz lanes
+#   (already deselected by upstream's own `-m "not property"` addopts;
+#   ignoring the directory also skips their costly collection).
+# --ignore=tests/test_version.py — its cartesian version-ordering
+#   parametrize matrix needs >50 min of interpreter time under WeavePy
+#   (zero failures observed through the first ~70% before we stopped
+#   waiting). The remaining 16 files — 10,898 tests — all pass in
+#   ~7 min, and version semantics stay covered by test_specifiers
+#   (2031), test_requirements (5332), and test_ranges (330).
+command = "tests --ignore=tests/property --ignore=tests/test_version.py"
+timeout_seconds = 1200
 
 [packages.pytest]
 requirements = "pytest"
@@ -142,4 +262,37 @@ timeout_seconds = 1200
 [packages.fastapi]
 requirements = "fastapi httpx"
 probe = "probes/fastapi_probe.py"
+timeout_seconds = 900
+
+# --- source-build proof rows (RFC 0062 WS2) ----------------------------------
+#
+# `no_binary` forces the pinned package through pip's sdist path: the
+# harness serves the tarball from a loopback PEP 503 index, so the
+# in-tree pip's wheel-missing fallback drives a *real* C compile through
+# `_pep517` + setuptools against the installed header tree. The probes
+# assert the *compiled* module is the one wired in — a silent
+# pure-Python fallback fails the row.
+
+[packages.markupsafe_sdist]
+requirements = "setuptools markupsafe==3.0.3"
+no_binary = "markupsafe"
+probe = "probes/markupsafe_sdist_probe.py"
+timeout_seconds = 900
+
+[packages.markupsafe_sdist.selftest]
+source = "markupsafe==3.0.3"
+requirements = "pytest==8.4.2"
+command = "tests"
+# Engine gap (measured 2026-08: 78 passed, 1 failed): the compiled
+# `_escape_inner` gets a str-*subclass* argument (`str(ReferenceStr)`
+# deliberately returns a non-plain str) and the C-ABI bridge fails to
+# marshal it as a unicode — "returned NULL without setting an
+# exception". Same shell-type residue RFC 0062's future-work section
+# tracks; the `_native` leg of the identical test passes.
+deselect = ["tests/test_escape.py::test_subclass[markupsafe._speedups]"]
+
+[packages.wrapt_sdist]
+requirements = "setuptools wrapt==2.3.0"
+no_binary = "wrapt"
+probe = "probes/wrapt_sdist_probe.py"
 timeout_seconds = 900

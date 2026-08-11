@@ -1,10 +1,19 @@
-# Ecosystem conformance baseline (RFC 0055 WS5).
+# Ecosystem conformance baseline (RFC 0055 WS5; RFC 0062 WS3+WS4).
 #
 # One row per manifest package. Statuses:
 #   pass — venv + install + probe all succeed
 #   fail — known divergence; the run reports it as "expected fail" and a
 #          flip to pass shows up as an improvement to ratchet
 #   skip — do not run (e.g. needs network features we don't emulate yet)
+#
+# Per-OS overrides (RFC 0062 WS3): `status_macos` / `status_linux` /
+# `status_windows` (and matching `reason_*`) replace `status`/`reason`
+# on that host OS only. Unknown suffixes are a load error.
+#
+# Self-test tier (RFC 0062 WS4): rows whose manifest entry carries a
+# `[packages.X.selftest]` table are also graded on `selftest_status`
+# (default "pass"; same per-OS suffix scheme), reported independently
+# of the probe status.
 #
 # `notes` is free-form context for humans. The runner exits non-zero on
 # any status that differs from this file (unless --no-check).
@@ -14,6 +23,8 @@ status = "pass"
 
 [packages.attrs]
 status = "pass"
+selftest_status = "skip"
+selftest_reason = "measured 2026-08: the suite exceeds its 2400s budget (killed at 2402.8s well short of completion) — hypothesis @given loops are woven through the core files (test_make, test_funcs, test_dunders), so there is no honest property-lane trim like packaging's; interpreter-speed-bound, not a correctness signal. The RFC 0062 acceptance fail-row allowance lands here; revisit when the interpreter is faster or upstream splits its property lanes."
 
 [packages.click]
 status = "pass"
@@ -119,3 +130,13 @@ notes = "full Cython _libs chain over the real numpy wheel: DataFrame ops, group
 [packages.fastapi]
 status = "pass"
 notes = "pydantic-core + starlette over anyio: routing, validation errors, DI, async endpoints, OpenAPI schema via TestClient."
+
+# --- sdist proof rows (RFC 0062 WS2 via WS3) ----------------------------------
+
+[packages.markupsafe_sdist]
+status = "pass"
+notes = "C sdist built through the local-index no_binary lane; probe asserts the compiled _speedups leg is live. Selftest measured 2026-08: 78/79 pass after the WS5 engine fixes (formatter_parser str-subclass, %(name)s non-dict mappings); the one deselect is enumerated in the manifest."
+
+[packages.wrapt_sdist]
+status = "pass"
+notes = "C sdist built through the local-index no_binary lane; probe asserts the compiled _wrappers leg is live (the _PyReversed_Type / PyModule_GetDef / PyType_GetModule export gaps this row first surfaced are fixed in weavepy-capi)."

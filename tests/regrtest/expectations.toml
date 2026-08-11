@@ -31,6 +31,13 @@
 # test_dictviews, test_descrtut, test_dynamic, test_enumerate) with no
 # regressions; a handful of correct-but-slow rows gained per-test
 # budget headroom for parallel-sweep load.
+#
+# RFC 0062 (distribution wave) added optional per-OS override keys:
+# `status_<os>`, `reason_<os>`, and `timeout_seconds_<os>` where <os>
+# is one of `macos`, `linux`, `windows` (std::env::consts::OS). At
+# load time `<key>_<host_os>` wins over the plain `<key>`; the base
+# `status` stays mandatory, and an unrecognized suffix on one of these
+# keys (e.g. `status_ubuntu`) is a hard load error.
 
 timeout_seconds = 60
 
@@ -1073,8 +1080,8 @@ status = "pass"
 reason = "measured (RFC 0040 WS4): passes end-to-end — 57 run, 0 fail / 0 error / 12 skip (sigtimedwait/sigwaitinfo not built, pidfd, Windows-only, and the 'walltime'/system-bug skips). The full POSIX signal surface landed: SIGINT's startup default_int_handler (KeyboardInterrupt, identical object as getsignal(SIGINT)); an interruptible time.sleep (nanosleep loop servicing tripped handlers on EINTR per PEP 475); pthread_sigmask round-trips + sigpending + sigwait routed onto the VM-main thread; os.kill(getpid(), sig) delivered via pthread_kill to the VM-main thread so a self-directed signal isn't absorbed by the parked process-initial thread; strsignal() ValueError on out-of-range; _thread.interrupt_main raising 'Signal N ignored due to race condition' during finalization; the set_wakeup_fd surface incl. warn_on_full_buffer and the async-handler write-error report routed through sys.unraisablehook → sys.stderr (WakeupSignalTests/WakeupSocketSignalTests); and an unhandled top-level KeyboardInterrupt re-raising SIGINT under SIG_DFL so the process dies by the signal (exit_sigint, returncode == -SIGINT)."
 
 [tests."cpython/Lib/test/test_site.py"]
-status = "fail"
-reason = "measured (RFC 0049 wave-5 full-suite baseline): AttributeError: module 'site' has no attribute 'enablerlcompleter'"
+status = "pass"
+reason = "measured (RFC 0062 WS5): 42 run, 0 fail / 4 skip. The wave-5 first-failure (site.enablerlcompleter) had already landed; this wave fixed the three residual clusters: startup-import hygiene (os.environ shim now imports from _collections_abc like CPython's os.py, and _weakrefset defers `types` to __class_getitem__, so `-I -c pass` no longer carries the collections cluster — bpo-19218), and getpath's `._pth` layout override (a `<exe>._pth` file pins sys.path to exactly its entries with site/PYTHONPATH/script-dir suppressed unless `import site` is listed)."
 
 [tests."cpython/Lib/test/test_slice.py"]
 status = "pass"

@@ -49,9 +49,13 @@ fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeErro
 /// Implements the same surface as `_string.formatter_parser` so
 /// `string.Formatter.parse` can call into us.
 fn formatter_parser(args: &[Object]) -> Result<Object, RuntimeError> {
-    let s = match args.first() {
-        Some(Object::Str(s)) => s.to_string(),
-        _ => return Err(type_error("formatter_parser() argument must be str")),
+    // Subtype-inclusive like CPython's `PyUnicode_Check`: a `str`
+    // *subclass* (markupsafe's `Markup`, whose `.format` feeds itself
+    // through `string.Formatter`) parses like the str it wraps
+    // (RFC 0062 WS5).
+    let s = match args.first().and_then(crate::builtins::str_arg_bridged) {
+        Some(s) => s.into_owned(),
+        None => return Err(type_error("formatter_parser() argument must be str")),
     };
     let mut out: Vec<Object> = Vec::new();
     let bytes = s.as_bytes();
@@ -163,9 +167,9 @@ fn split_field(field: &str) -> (String, String, Option<char>) {
 /// Parse `obj.attr[idx][2]` into the leading name + an iterator of
 /// (is_attr, value) pairs. Matches CPython's `_string.formatter_field_name_split`.
 fn formatter_field_name_split(args: &[Object]) -> Result<Object, RuntimeError> {
-    let s = match args.first() {
-        Some(Object::Str(s)) => s.to_string(),
-        _ => {
+    let s = match args.first().and_then(crate::builtins::str_arg_bridged) {
+        Some(s) => s.into_owned(),
+        None => {
             return Err(type_error(
                 "formatter_field_name_split() argument must be str",
             ))

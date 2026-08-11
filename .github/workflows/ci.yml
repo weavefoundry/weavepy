@@ -115,10 +115,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     # RFC 0058 — the benchmark lane. Gates on WeavePy/CPython *ratios*
-    # against baselines/bench.json (host-independent, unlike absolute
-    # times); the 25% threshold absorbs shared-runner noise. The
-    # markdown report lands in the job summary so every PR shows its
-    # ratio table.
+    # against the per-platform baselines/bench-{os}-{arch}.json (RFC
+    # 0062 WS3; host-independent, unlike absolute times); the 25%
+    # threshold absorbs shared-runner noise. The markdown report lands
+    # in the job summary so every PR shows its ratio table.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -129,9 +129,15 @@ jobs:
       - name: Build weavepy CLI + bench harness
         run: cargo build --release -p weavepy-cli -p weavepy-bench
       - name: Run bench gate
+        # Linux has no committed per-platform baseline yet, so the gate
+        # is advisory there (--allow-missing-baseline prints a note and
+        # exits 0). It graduates to strict once a measured
+        # bench-linux-x86_64.json is committed — drop the flag then.
+        # macOS gates strictly against bench-macos-aarch64.json.
         run: |
           target/release/weavepy-bench gate --pct=25 \
             --weavepy=target/release/weavepy \
+            ${{ matrix.os == 'ubuntu-latest' && '--allow-missing-baseline' || '' }} \
             | tee bench-report.md
       - name: Append bench report to job summary
         if: always()
@@ -147,6 +153,75 @@ jobs:
           name: bench-report-${{ matrix.os }}
           path: bench-report.md
           if-no-files-found: warn
+
+  ecosystem:
+    name: ecosystem (blocking, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    # RFC 0062 WS3 — the ecosystem lane in CI. Installs the manifest's
+    # packages from an offline wheel cache into venvs running under the
+    # built weavepy, runs each row's probe (and package self-tests),
+    # and gates on tests/ecosystem/expectations.toml. Blocking, same
+    # policy as regrtest. The host CPython is only used by the wheel
+    # fetcher (pip download needs a real Python); the runners' system
+    # cc covers source builds.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Cache ecosystem wheels
+        uses: actions/cache@v4
+        with:
+          path: target/ecosystem-wheels
+          key: ecosystem-wheels-${{ runner.os }}-${{ hashFiles('tests/ecosystem/manifest.toml') }}
+      - name: Build weavepy CLI
+        run: cargo build --release -p weavepy-cli
+      - name: Fetch ecosystem wheels (no-op on cache hit)
+        run: python3 tools/ecosystem_fetch.py --dest target/ecosystem-wheels
+      - name: Run ecosystem harness
+        run: |
+          cargo run --release -p weavepy-conformance -- ecosystem \
+            --wheels target/ecosystem-wheels \
+            --selftests \
+            --check
+
+  dist-check:
+    name: dist check (blocking, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    # RFC 0062 — builds the relocatable artifact from the release CLI
+    # and runs `weavepy-dist check` against it (boot, stdlib, venv +
+    # pip smoke). The pip leg reuses the offline wheel cache from the
+    # ecosystem job's actions/cache key.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Cache ecosystem wheels
+        uses: actions/cache@v4
+        with:
+          path: target/ecosystem-wheels
+          key: ecosystem-wheels-${{ runner.os }}-${{ hashFiles('tests/ecosystem/manifest.toml') }}
+      - name: Build weavepy CLI
+        run: cargo build --release -p weavepy-cli
+      - name: Fetch ecosystem wheels (no-op on cache hit)
+        run: python3 tools/ecosystem_fetch.py --dest target/ecosystem-wheels
+      - name: Run dist check
+        run: |
+          cargo run --release -p weavepy-dist -- check \
+            --wheels target/ecosystem-wheels
 
   conformance:
     name: cpython conformance (non-blocking)

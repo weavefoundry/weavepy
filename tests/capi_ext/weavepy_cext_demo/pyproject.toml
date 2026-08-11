@@ -1,0 +1,16 @@
+# RFC 0062 WS2 — the bundled C-extension sdist fixture.
+#
+# A minimal, dependency-free source distribution with a real compiled
+# extension, used to prove the source-build path end-to-end: the
+# installed `{prefix}/include/python3.13/` header tree, the
+# compiler-truthful sysconfig vars, a PEP 517 build through real
+# setuptools, and the ExtensionFileLoader import of the result.
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "weavepy-cext-demo"
+version = "1.0.0"
+description = "WeavePy C-extension source-build proof fixture (RFC 0062)"
+requires-python = ">=3.13"

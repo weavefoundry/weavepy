@@ -773,7 +773,62 @@ fn cpython_lib_dir(file: &RegrtestFile) -> Option<String> {
     while lib_dir.file_name().and_then(|n| n.to_str()) != Some("test") {
         lib_dir = lib_dir.parent()?;
     }
-    Some(lib_dir.parent()?.display().to_string())
+    Some(sanitized_lib_dir(lib_dir.parent()?))
+}
+
+/// Guard against site hooks living next to the vendored `test` package.
+///
+/// A dev machine often points `vendor/cpython/Lib` at a *live* install
+/// (a Homebrew stdlib symlink). Homebrew ships `sitecustomize.py`
+/// there, and since the lib dir lands on every child interpreter's
+/// `sys.path` (via `WEAVEPY_CPYTHON_LIB`), `site` would import it at
+/// each startup — dragging `re` + Homebrew site-packages into pristine
+/// `-I` children and failing test_site's `test_startup_imports`. When
+/// hooks are present, mirror the lib dir through a shim directory of
+/// per-entry symlinks that omits only the hook files, so module
+/// resolution (`sched`, `tabnanny`, … resolve from the vendored Lib)
+/// matches a clean checkout. Clean checkouts (CI) are returned
+/// unchanged.
+fn sanitized_lib_dir(lib_dir: &Path) -> String {
+    let raw = lib_dir.display().to_string();
+    if !lib_dir.join("sitecustomize.py").is_file() && !lib_dir.join("usercustomize.py").is_file() {
+        return raw;
+    }
+    #[cfg(unix)]
+    {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::hash::DefaultHasher::new();
+        raw.hash(&mut h);
+        // "v2": the mirror shim (a stale v1 shim held only `test`).
+        let shim = std::env::temp_dir().join(format!("weavepy-cpython-lib-v2-{:016x}", h.finish()));
+        let done = shim.join(".weavepy-shim-complete");
+        if !done.is_file() {
+            // Populate a staging dir, then rename into place so parallel
+            // workers never observe a half-built shim; the loser of the
+            // rename race just discards its staging copy.
+            let stage = shim.with_extension(format!("stage-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&stage);
+            if std::fs::create_dir_all(&stage).is_ok() {
+                if let Ok(entries) = std::fs::read_dir(lib_dir) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name();
+                        if name == "sitecustomize.py" || name == "usercustomize.py" {
+                            continue;
+                        }
+                        let _ = std::os::unix::fs::symlink(entry.path(), stage.join(&name));
+                    }
+                }
+                let _ = std::fs::File::create(stage.join(".weavepy-shim-complete"));
+                if std::fs::rename(&stage, &shim).is_err() {
+                    let _ = std::fs::remove_dir_all(&stage);
+                }
+            }
+        }
+        if done.is_file() {
+            return shim.display().to_string();
+        }
+    }
+    raw
 }
 
 fn libregrtest_bootstrap(file: &RegrtestFile) -> Option<String> {
@@ -1211,7 +1266,23 @@ mod simple_toml {
 
     use super::{Expectations, ExpectedEntry, TestStatus};
 
+    /// OS suffixes recognised on per-test override keys (RFC 0062
+    /// WS3): `status_<os>` / `reason_<os>` / `timeout_seconds_<os>`.
+    /// These are exactly the `std::env::consts::OS` values for the
+    /// platforms CI runs on; anything else on one of those key stems
+    /// is a hard load error (typo protection).
+    const OS_SUFFIXES: &[&str] = &["macos", "linux", "windows"];
+
+    /// Key stems that accept a per-OS suffix.
+    const OVERRIDABLE_KEYS: &[&str] = &["status", "reason", "timeout_seconds"];
+
     pub(super) fn parse(body: &str) -> Result<Expectations, String> {
+        parse_for_os(body, std::env::consts::OS)
+    }
+
+    /// Parse with an explicit host-OS suffix — the seam the unit
+    /// tests use to exercise override resolution on every platform.
+    fn parse_for_os(body: &str, host_os: &str) -> Result<Expectations, String> {
         let mut top = Expectations::default();
         let mut current_section: Option<String> = None;
         let mut current_table: BTreeMap<String, String> = BTreeMap::new();
@@ -1222,7 +1293,12 @@ mod simple_toml {
                 continue;
             }
             if line.starts_with('[') && line.ends_with(']') {
-                flush(&mut top, current_section.take(), &mut current_table)?;
+                flush(
+                    &mut top,
+                    current_section.take(),
+                    &mut current_table,
+                    host_os,
+                )?;
                 let header = &line[1..line.len() - 1];
                 current_section = Some(header.to_owned());
                 continue;
@@ -1237,7 +1313,7 @@ mod simple_toml {
                 top.timeout_seconds = Some(n);
             }
         }
-        flush(&mut top, current_section, &mut current_table)?;
+        flush(&mut top, current_section, &mut current_table, host_os)?;
         Ok(top)
     }
 
@@ -1245,6 +1321,7 @@ mod simple_toml {
         top: &mut Expectations,
         section: Option<String>,
         table: &mut BTreeMap<String, String>,
+        host_os: &str,
     ) -> Result<(), String> {
         let Some(section) = section else {
             table.clear();
@@ -1255,9 +1332,38 @@ mod simple_toml {
             .ok_or_else(|| format!("unknown section [{section}]"))?;
         // `tests."bundled/foo.py"` → `bundled/foo.py`
         let label = strip_quotes(raw_label.trim()).to_owned();
-        let status = table
+
+        // RFC 0062 WS3: validate per-OS suffixes up front so a typo
+        // like `status_ubuntu` fails the load instead of silently
+        // never applying. Keys that don't start with an overridable
+        // stem keep today's behaviour (ignored).
+        for key in table.keys() {
+            for stem in OVERRIDABLE_KEYS {
+                if let Some(suffix) = key.strip_prefix(&format!("{stem}_")) {
+                    if !OS_SUFFIXES.contains(&suffix) {
+                        return Err(format!(
+                            "[tests.{label}] unknown OS suffix on key {key:?} \
+                             (expected one of: {})",
+                            OS_SUFFIXES.join(", ")
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Resolution: `<key>_<host_os>` wins over `<key>`.
+        let resolve = |stem: &str| -> Option<&String> {
+            table
+                .get(&format!("{stem}_{host_os}"))
+                .or_else(|| table.get(stem))
+        };
+
+        let base_status = table
             .get("status")
             .ok_or_else(|| format!("[tests.{label}] missing status"))?;
+        let status = table
+            .get(&format!("status_{host_os}"))
+            .unwrap_or(base_status);
         let status = match status.as_str() {
             "pass" => TestStatus::Pass,
             "fail" => TestStatus::Fail,
@@ -1266,8 +1372,8 @@ mod simple_toml {
             "timeout" => TestStatus::Timeout,
             other => return Err(format!("[tests.{label}] bad status {other:?}")),
         };
-        let reason = table.get("reason").cloned();
-        let timeout_seconds = match table.get("timeout_seconds") {
+        let reason = resolve("reason").cloned();
+        let timeout_seconds = match resolve("timeout_seconds") {
             Some(v) => Some(
                 v.parse::<u64>()
                     .map_err(|_| format!("[tests.{label}] bad timeout_seconds {v:?}"))?,
@@ -1353,6 +1459,115 @@ mod simple_toml {
                 exp.tests["cpython/Lib/test/test_grammar.py"].timeout_seconds,
                 None
             );
+        }
+
+        // Shared fixture for the per-OS override tests (RFC 0062 WS3).
+        const OVERRIDE_BODY: &str = "\
+            [tests.\"cpython/Lib/test/test_example.py\"]\n\
+            status = \"pass\"\n\
+            reason = \"base reason\"\n\
+            timeout_seconds = 60\n\
+            status_linux = \"fail\"\n\
+            reason_linux = \"linux-only breakage\"\n\
+            timeout_seconds_linux = 120\n\
+        ";
+
+        #[test]
+        fn os_override_applies_on_matching_host() {
+            let exp = parse_for_os(OVERRIDE_BODY, "linux").unwrap();
+            let entry = &exp.tests["cpython/Lib/test/test_example.py"];
+            assert_eq!(entry.status, TestStatus::Fail);
+            assert_eq!(entry.reason.as_deref(), Some("linux-only breakage"));
+            assert_eq!(entry.timeout_seconds, Some(120));
+        }
+
+        #[test]
+        fn base_applies_on_other_hosts() {
+            for host in ["macos", "windows"] {
+                let exp = parse_for_os(OVERRIDE_BODY, host).unwrap();
+                let entry = &exp.tests["cpython/Lib/test/test_example.py"];
+                assert_eq!(entry.status, TestStatus::Pass, "host {host}");
+                assert_eq!(entry.reason.as_deref(), Some("base reason"));
+                assert_eq!(entry.timeout_seconds, Some(60));
+            }
+        }
+
+        #[test]
+        fn os_override_without_base_optional_keys() {
+            // Overrides resolve independently per key: a lone
+            // `reason_macos` / `timeout_seconds_macos` applies on
+            // macOS and leaves other hosts at `None`.
+            let body = "\
+                [tests.\"bundled/t.py\"]\n\
+                status = \"pass\"\n\
+                reason_macos = \"darwin quirk\"\n\
+                timeout_seconds_macos = 90\n\
+            ";
+            let mac = parse_for_os(body, "macos").unwrap();
+            assert_eq!(
+                mac.tests["bundled/t.py"].reason.as_deref(),
+                Some("darwin quirk")
+            );
+            assert_eq!(mac.tests["bundled/t.py"].timeout_seconds, Some(90));
+
+            let linux = parse_for_os(body, "linux").unwrap();
+            assert_eq!(linux.tests["bundled/t.py"].reason, None);
+            assert_eq!(linux.tests["bundled/t.py"].timeout_seconds, None);
+        }
+
+        #[test]
+        fn unknown_os_suffix_is_a_hard_error() {
+            for bad_key in ["status_ubuntu", "reason_darwin", "timeout_seconds_win"] {
+                let body =
+                    format!("[tests.\"bundled/t.py\"]\nstatus = \"pass\"\n{bad_key} = \"x\"\n");
+                let err = parse_for_os(&body, "linux").unwrap_err();
+                assert!(
+                    err.contains(bad_key),
+                    "error should name the bad key {bad_key}: {err}"
+                );
+                assert!(err.contains("unknown OS suffix"), "{err}");
+            }
+        }
+
+        #[test]
+        fn unrelated_unknown_keys_still_ignored() {
+            // Non-overridable keys keep the pre-RFC-0062 behaviour:
+            // silently ignored rather than rejected.
+            let body = "\
+                [tests.\"bundled/t.py\"]\n\
+                status = \"pass\"\n\
+                some_future_key = \"whatever\"\n\
+            ";
+            let exp = parse_for_os(body, "linux").unwrap();
+            assert_eq!(exp.get("bundled/t.py"), Some(TestStatus::Pass));
+        }
+
+        #[test]
+        fn status_override_requires_base_status() {
+            // A row with only `status_linux` is malformed on every
+            // host — the base `status` stays mandatory so the file
+            // loads identically everywhere.
+            let body = "[tests.\"bundled/t.py\"]\nstatus_linux = \"fail\"\n";
+            for host in ["linux", "macos"] {
+                let err = parse_for_os(body, host).unwrap_err();
+                assert!(err.contains("missing status"), "host {host}: {err}");
+            }
+        }
+
+        #[test]
+        fn bad_status_value_in_override_rejected() {
+            let body = "\
+                [tests.\"bundled/t.py\"]\n\
+                status = \"pass\"\n\
+                status_linux = \"flaky\"\n\
+            ";
+            let err = parse_for_os(body, "linux").unwrap_err();
+            assert!(err.contains("bad status"), "{err}");
+            // On a non-matching host the bad value is never resolved,
+            // but the suffix itself is still validated (it's a known
+            // OS, so the row loads with the base status).
+            let exp = parse_for_os(body, "macos").unwrap();
+            assert_eq!(exp.get("bundled/t.py"), Some(TestStatus::Pass));
         }
     }
 }

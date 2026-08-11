@@ -10,12 +10,17 @@
 //! and imports are excluded from the loop metric. (The dedicated
 //! `startup` fixture measures full subprocess wall time instead.)
 //!
-//! The tracked baseline (`baselines/bench.json`) stores WeavePy and
-//! CPython medians plus the WeavePy/CPython **ratio** per fixture and
-//! the suite geometric mean. `gate` compares ratios — which are
-//! host-independent, unlike absolute nanoseconds — and fails on
-//! regressions beyond a threshold, exactly like the regrtest and
-//! ecosystem lanes' `--check`.
+//! The tracked baselines are per platform (RFC 0062 WS3):
+//! `baselines/bench-{os}-{arch}.json`, resolved against the host's
+//! `std::env::consts::{OS, ARCH}`. Each file stores WeavePy and
+//! CPython medians plus the WeavePy/CPython **ratio** per fixture,
+//! the suite geometric mean, and the platform it was measured on.
+//! `gate` compares ratios — which are host-independent, unlike
+//! absolute nanoseconds — and fails on regressions beyond a
+//! threshold, exactly like the regrtest and ecosystem lanes'
+//! `--check`. It refuses baselines whose recorded platform
+//! mismatches the host, and a missing per-platform file is an error
+//! unless `--allow-missing-baseline` makes the gate advisory.
 //!
 //! ## Adding a fixture
 //!
@@ -24,9 +29,9 @@
 //! 2. Add `"foo"` to [`fixtures::FIXTURES`] and a `default_work`
 //!    entry sized so the CPython leg takes ~50–300 ms.
 //! 3. Run `cargo run --release -p weavepy-bench -- run
-//!    --update-baseline` and inspect the diff in
-//!    `baselines/bench.json` before committing. The gate fails on
-//!    fixtures that have no baseline row (the RFC 0049 "no
+//!    --update-baseline` and inspect the diff in the host's
+//!    `baselines/bench-{os}-{arch}.json` before committing. The gate
+//!    fails on fixtures that have no baseline row (the RFC 0049 "no
 //!    unmeasured rows" rule applied to speed).
 
 pub mod fixtures;

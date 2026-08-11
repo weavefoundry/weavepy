@@ -28,6 +28,7 @@ use weavepy_compiler::{
 pub mod builtin_docs_data;
 pub mod builtin_types;
 pub mod builtins;
+pub mod cpython_headers;
 pub mod descr_registry;
 pub mod error;
 pub mod ext_loader;
@@ -585,6 +586,12 @@ pub struct InterpreterFlags {
     /// `-X faulthandler` / `PYTHONFAULTHANDLER` (dev mode also turns it
     /// on) — install the fatal-signal traceback dumper at startup.
     pub faulthandler: bool,
+    /// getpath's `._pth` mode (RFC 0062 WS5): when a `<exe>._pth` file
+    /// sits next to the executable, `sys.path` becomes *exactly* these
+    /// (already absolutized) entries — replacing the zip/stdlib seeds
+    /// and suppressing every other path source. The CLI parses the
+    /// file and pairs this with `no_site`/`safe_path` as CPython does.
+    pub pth_paths: Option<Vec<String>>,
 }
 
 /// The effective `LC_CTYPE` locale name, resolved the way `setlocale(LC_CTYPE,
@@ -1050,6 +1057,15 @@ impl Interpreter {
     /// user code runs.
     pub fn apply_run_options(&mut self, opts: &InterpreterFlags) {
         let flags = &opts;
+        // `._pth` layout override (RFC 0062 WS5): the file's entries
+        // *are* `sys.path` — drop the zip/stdlib seeds `new()` pushed.
+        if let Some(entries) = &flags.pth_paths {
+            let mut path = self.cache.path.borrow_mut();
+            path.clear();
+            for entry in entries {
+                path.push(Object::from_str(entry.clone()));
+            }
+        }
         // `-O`/`-OO`: the interpreter-wide optimization level every
         // internal compile (imports, exec/eval, `compile(...,
         // optimize=-1)`) resolves against (RFC 0052).
@@ -38012,9 +38028,19 @@ pub(crate) fn percent_format_with(
     // Leftover positional arguments are an error (mapping args are exempt:
     // a dict may legitimately carry keys the template never references —
     // dict subclass instances included, e.g. `"integer" % DictWrapper(…)`
-    // in Django's `Field.db_type`).
-    let value_is_mapping =
-        matches!(value, Object::Dict(_)) || matches!(value.native_value(), Some(Object::Dict(_)));
+    // in Django's `Field.db_type`). CPython's exemption is
+    // `PyMapping_Check && !tuple && !str` (unicode_format's `dict`
+    // flag), so *any* non-tuple/non-str instance whose class offers
+    // `__getitem__` qualifies — markupsafe's `_MarkupEscapeHelper`
+    // (`Markup('%(k)s') % {...}` wraps the dict in a plain class) is
+    // the RFC 0062 WS4 motivator.
+    let value_is_mapping = matches!(value, Object::Dict(_))
+        || matches!(value.native_value(), Some(Object::Dict(_)))
+        || matches!(value, Object::Instance(inst)
+            if !matches!(
+                value.native_value(),
+                Some(Object::Tuple(_) | Object::Str(_) | Object::WStr(_))
+            ) && inst.cls().lookup("__getitem__").is_some());
     if !value_is_mapping && idx < positional.len() {
         return Err(type_error(format!(
             "not all arguments converted during {} formatting",

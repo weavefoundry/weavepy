@@ -150,6 +150,13 @@ enum Cmd {
         #[arg(long, value_name = "BIN")]
         weavepy: Option<PathBuf>,
 
+        /// Also run each row's upstream test suite (the RFC 0062 WS4
+        /// self-test tier) after its probe passes, graded against the
+        /// baseline's `selftest_status` rows. Off by default so the
+        /// quick lane stays quick; CI passes it.
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        selftests: bool,
+
         /// Keep the scratch venvs around for post-mortem.
         #[arg(long, action = clap::ArgAction::SetTrue)]
         keep_venvs: bool,
@@ -270,6 +277,7 @@ fn real_main() -> Result<()> {
             timeout,
             wheels,
             weavepy,
+            selftests,
             keep_venvs,
             check,
             no_check,
@@ -283,6 +291,7 @@ fn real_main() -> Result<()> {
                 timeout,
                 wheels,
                 weavepy,
+                selftests,
                 keep_venvs,
                 strict: check && !no_check,
             },
@@ -298,6 +307,7 @@ struct EcosystemArgs {
     timeout: Option<u64>,
     wheels: Option<PathBuf>,
     weavepy: Option<PathBuf>,
+    selftests: bool,
     keep_venvs: bool,
     strict: bool,
 }
@@ -351,6 +361,7 @@ fn cmd_ecosystem(workspace: &Path, report_dir: &Path, args: EcosystemArgs) -> Re
         weavepy,
         wheels: args.wheels,
         timeout: Duration::from_secs(args.timeout.unwrap_or(ecosystem::DEFAULT_ROW_TIMEOUT_SECS)),
+        selftests: args.selftests,
         keep_venvs: args.keep_venvs,
         scratch_dir,
         probe_env,

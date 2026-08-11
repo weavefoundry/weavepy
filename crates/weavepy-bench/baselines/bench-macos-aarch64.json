@@ -1,6 +1,7 @@
 {
-  "version": 3,
+  "version": 4,
   "host": "unknown",
+  "platform": "macos-aarch64",
   "created_at": "ts=1786352866",
   "geomean_ratio": 8.407741671174728,
   "rows": [

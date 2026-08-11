@@ -13,9 +13,13 @@ Surface::
     build_sdist(src_dir)        -> path to a fresh .tar.gz
     metadata_for(src_dir)       -> METADATA text
 
-Compiled C/C++ extensions are out of scope — those need a real
-toolchain plus the per-backend extension build dance. For now,
-attempting to build such a package raises :class:`BuildBackendError`.
+Compiled C/C++ extensions build through a *real* backend (RFC 0062
+WS2: the installed `{prefix}/include/python3.13/` header tree plus the
+compiler-truthful `sysconfig` vars make `setuptools.build_meta`
+compile them like on CPython). The in-tree fallback below remains
+pure-Python-only; when a tree declares extensions and no real backend
+can build it, :func:`build_wheel` raises :class:`BuildBackendError`
+instead of silently producing a wheel without the compiled module.
 """
 
 import io
@@ -86,6 +90,33 @@ def _backend_name(pyproject: dict) -> str:
 # are expected to install `setuptools` / `flit_core` first.
 # ---------------------------------------------------------------------
 
+def _register_cp_identity():
+    """Teach the build backend's `packaging`/`wheel` that WeavePy
+    builds cp-ABI extensions (RFC 0062 WS2).
+
+    `packaging.tags.interpreter_name()` maps known implementation
+    names to short tags (cpython→cp, pypy→pp) and passes unknown ones
+    through. setuptools' vendored `wheel` computes the ABI tag with an
+    ``impl in ("cp", "pp")`` guard, while vendored `packaging`
+    special-cases any ``cpython-*`` SOABI — so an unknown
+    implementation makes the two disagree and `bdist_wheel` aborts
+    with "would build wheel with unsupported tag". Registering
+    ``weavepy → cp`` makes every consumer agree on ``cp313-cp313``,
+    which is truthful: the extension was compiled against the
+    installed CPython 3.13 headers and the cp313 binary ABI.
+
+    Only modules already imported are patched (eagerly importing
+    'packaging.tags' here would cache WeavePy's own facade ahead of
+    the backend's vendored copy); the caller retries a failed build
+    once after the backend has lazily loaded its copies.
+    """
+    for name, mod in list(sys.modules.items()):
+        if name == 'packaging.tags' or name.endswith('.packaging.tags'):
+            table = getattr(mod, 'INTERPRETER_SHORT_NAMES', None)
+            if isinstance(table, dict):
+                table.setdefault('weavepy', 'cp')
+
+
 def _import_backend(spec: str):
     mod_name, _, attr = spec.partition(':')
     if not mod_name:
@@ -99,26 +130,80 @@ def _import_backend(spec: str):
     return mod
 
 
+def _declares_extensions(src_dir: str, pyproject: dict) -> bool:
+    """Conservatively detect that the source tree declares compiled
+    extension modules, so a failed real-backend build must not fall
+    back to the pure-Python wheel builder (RFC 0062 WS2: the silent
+    fallback used to "install" C packages whose extension then failed
+    at import time).
+    """
+    # setuptools ≥ 74 accepts ext-modules in pyproject.toml.
+    tool = pyproject.get('tool', {})
+    if isinstance(tool, dict):
+        st = tool.get('setuptools', {})
+        if isinstance(st, dict) and st.get('ext-modules'):
+            return True
+    for name in ('setup.py', 'setup.cfg'):
+        path = os.path.join(src_dir, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                text = f.read()
+        except OSError:
+            continue
+        if re.search(r'\bext_modules\b|\bcffi_modules\b|\bExtension\s*\(', text):
+            return True
+    return False
+
+
 def build_wheel(src_dir: str) -> str:
     """Build a wheel out of ``src_dir``; return the path to the .whl."""
     pyproject = _load_pyproject(src_dir)
     backend_spec = _backend_name(pyproject)
+    _register_cp_identity()
     backend = _import_backend(backend_spec)
     out_dir = tempfile.mkdtemp(prefix='weavepy-wheel-')
+    has_extensions = _declares_extensions(src_dir, pyproject)
+    backend_err = None
     if backend is not None and hasattr(backend, 'build_wheel'):
-        try:
-            cwd = os.getcwd()
-            os.chdir(src_dir)
+        # Up to two attempts: the backend lazily imports its vendored
+        # `packaging`/`wheel` copies during the first build_wheel call,
+        # so the cp-identity registration can only reach them after a
+        # tag-mismatch failure — patch and retry once.
+        for attempt in (0, 1):
+            _register_cp_identity()
             try:
-                wheel_name = backend.build_wheel(out_dir)
-            finally:
-                os.chdir(cwd)
-            return os.path.join(out_dir, wheel_name)
-        except Exception as exc:
-            # Fall through to the in-tree fallback.
-            err = exc
-        finally:
-            pass
+                cwd = os.getcwd()
+                os.chdir(src_dir)
+                try:
+                    wheel_name = backend.build_wheel(out_dir)
+                finally:
+                    os.chdir(cwd)
+                return os.path.join(out_dir, wheel_name)
+            except Exception as exc:
+                # Remember the real backend's failure; whether we may
+                # fall through to the pure fallback depends on the
+                # project shape.
+                backend_err = exc
+                if attempt == 0 and 'unsupported tag' in str(exc):
+                    continue
+                break
+    if has_extensions:
+        # The tree declares C/C++ extensions. The pure fallback would
+        # produce an importable-looking wheel whose compiled module is
+        # simply missing — fail loudly instead, naming the real cause.
+        if backend_err is not None:
+            raise BuildBackendError(
+                'building {!r} (declares compiled extensions) via {!r} '
+                'failed: {}: {}'.format(
+                    os.path.basename(src_dir), backend_spec,
+                    type(backend_err).__name__, backend_err))
+        raise BuildBackendError(
+            '{!r} declares compiled extensions but the build backend '
+            '{!r} is not importable; install it (e.g. `pip install '
+            'setuptools`) and retry'.format(
+                os.path.basename(src_dir), backend_spec))
     # Fallback: trivial wheel builder for pure-Python projects.
     try:
         return _fallback_build_wheel(src_dir, out_dir, pyproject)

@@ -7,17 +7,18 @@ members = [
     "crates/weavepy-cli",
     "crates/weavepy-compiler",
     "crates/weavepy-conformance",
+    "crates/weavepy-dist",
     "crates/weavepy-jit",
     "crates/weavepy-lexer",
     "crates/weavepy-parser",
     "crates/weavepy-vm",
     "vendor/expat-sys",
 ]
-# `weavepy-conformance` and `weavepy-bench` are development tools that shell
-# out to `python3` and aren't useful to publish or to compile by default.
+# `weavepy-conformance`, `weavepy-bench`, and `weavepy-dist` are development
+# tools that aren't useful to publish or to compile by default.
 # Keep them out of `default-members` so `cargo build/test --workspace`
 # stays light; opt in explicitly via `-p weavepy-conformance` /
-# `-p weavepy-bench`.
+# `-p weavepy-bench` / `-p weavepy-dist`.
 default-members = [
     "crates/weavepy",
     "crates/weavepy-capi",

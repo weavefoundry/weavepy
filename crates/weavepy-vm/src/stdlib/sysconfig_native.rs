@@ -62,6 +62,38 @@ pub const SOABI: &str = if cfg!(target_os = "macos") {
     ""
 };
 
+/// RFC 0062 WS2 — compiler variables for building C-extension sdists
+/// against the installed header tree. These are what setuptools'
+/// `customize_compiler()` consumes; the frozen `_weave_sysconfigdata`
+/// carries the same values per-platform (keep the two in sync), and
+/// `stdlib_tree::materialize` mirrors them into the on-disk
+/// `config-3.13*/Makefile`.
+///
+/// Like a static-libpython CPython, extensions do *not* link a
+/// libpython: symbols resolve from the process at load time (macOS
+/// `-undefined dynamic_lookup`; Linux `-Wl,--export-dynamic` on the
+/// binary — both landed with RFC 0043).
+pub const CC: &str = "cc";
+pub const CXX: &str = "c++";
+pub const CFLAGS: &str = "-fno-strict-overflow -Wsign-compare -DNDEBUG -g -O3 -Wall";
+pub const OPT: &str = "-DNDEBUG -g -O3 -Wall";
+pub const CCSHARED: &str = if cfg!(target_os = "macos") {
+    // Mach-O objects are position-independent by construction.
+    ""
+} else {
+    "-fPIC"
+};
+pub const LDSHARED: &str = if cfg!(target_os = "macos") {
+    "cc -bundle -undefined dynamic_lookup"
+} else {
+    "cc -shared"
+};
+pub const LDCXXSHARED: &str = if cfg!(target_os = "macos") {
+    "c++ -bundle -undefined dynamic_lookup"
+} else {
+    "c++ -shared"
+};
+
 fn config_vars_dict() -> Object {
     let mut d = DictData::default();
     d.insert(

@@ -10,9 +10,16 @@
 //! 2. installs the requirements through the in-tree `pip`
 //!    (`python -m pip install …`; `--wheels DIR` switches to the offline
 //!    `--no-index --find-links` lane, so CI can run against a cache
-//!    populated by `tools/ecosystem_fetch.py`),
+//!    populated by `tools/ecosystem_fetch.py`). Rows carrying a
+//!    `no_binary` field (RFC 0062 WS2) force the named packages through
+//!    pip's *sdist* path — a real C compile — via a loopback PEP 503
+//!    index that only offers the source tarball (see [`local_index`]),
 //! 3. runs the probe in a subprocess under a wall budget,
-//! 4. grades the outcome against `tests/ecosystem/expectations.toml` and
+//! 4. optionally (RFC 0062 WS4, `--selftests`) runs the package's *own*
+//!    pytest suite out of its pinned sdist, graded independently of the
+//!    probe against `selftest_status` baseline rows,
+//! 5. grades the outcome against `tests/ecosystem/expectations.toml`
+//!    (per-OS `status_<os>` overrides land with RFC 0062 WS3) and
 //!    writes `ecosystem.md` / `ecosystem.json` next to the regrtest
 //!    reports.
 //!
@@ -33,9 +40,41 @@ use serde::Serialize;
 /// Default per-row wall budget (venv + install + probe), in seconds.
 pub const DEFAULT_ROW_TIMEOUT_SECS: u64 = 600;
 
+/// Default wall budget for a row's self-test stage alone, in seconds.
+pub const DEFAULT_SELFTEST_TIMEOUT_SECS: u64 = 600;
+
+/// The per-OS override suffixes the expectations format accepts
+/// (RFC 0062 WS3). Anything else after `status_`/`reason_` is a typo and
+/// must fail the load rather than silently grade with the base value.
+const KNOWN_OS_SUFFIXES: &[&str] = &["macos", "linux", "windows"];
+
 // ---------------------------------------------------------------------------
 // Manifest
 // ---------------------------------------------------------------------------
+
+/// One `[packages.<name>.selftest]` sub-table (RFC 0062 WS4): run the
+/// package's own pytest suite out of its pinned sdist after the probe
+/// passes.
+#[derive(Debug, Clone)]
+pub struct SelftestSpec {
+    /// Exact-pinned pip requirement whose sdist carries the test suite
+    /// (`attrs==26.1.0`). Pinning keeps the row hermetic and the offline
+    /// cache deterministic.
+    pub source: String,
+    /// Extra test-only requirements installed into the row's venv.
+    pub requirements: Vec<String>,
+    /// pytest target path inside the extracted sdist root (e.g.
+    /// `tests`), whitespace-split into arguments so a row can carry
+    /// collection-level flags (`--ignore=…` — needed when a test module
+    /// fails at *import* time, which `--deselect` cannot reach).
+    pub command: String,
+    /// `pytest --deselect` arguments — the measured, enumerated escapes.
+    /// Every entry carries an inline manifest comment naming the failure
+    /// class.
+    pub deselect: Vec<String>,
+    /// Optional wall budget for the self-test stage alone.
+    pub timeout_seconds: Option<u64>,
+}
 
 /// One `[packages.<name>]` row of `tests/ecosystem/manifest.toml`.
 #[derive(Debug, Clone)]
@@ -44,10 +83,15 @@ pub struct ManifestRow {
     pub name: String,
     /// pip requirement strings, in install order.
     pub requirements: Vec<String>,
+    /// Package names (comma/space separated in the manifest) forced to
+    /// install from their sdist — the RFC 0062 WS2 source-build proof.
+    pub no_binary: Vec<String>,
     /// Probe file path, relative to the manifest's directory.
     pub probe: String,
     /// Optional per-row override of the wall budget.
     pub timeout_seconds: Option<u64>,
+    /// Optional upstream-test-suite spec (RFC 0062 WS4).
+    pub selftest: Option<SelftestSpec>,
 }
 
 /// Parsed `manifest.toml`.
@@ -63,37 +107,180 @@ impl Manifest {
     pub fn load(path: &Path) -> Result<Self> {
         let body = fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let tables = simple_tables::parse(&body, "packages")
-            .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", path.display()))?;
+        Self::from_body(&body, path.parent().unwrap_or(Path::new(".")))
+            .map_err(|e| anyhow::anyhow!("failed to parse {}: {e:#}", path.display()))
+    }
+
+    fn from_body(body: &str, base_dir: &Path) -> Result<Self> {
+        let tables = simple_tables::parse(body, "packages").map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        // Split main rows from `.selftest` sub-tables, preserving order.
         let mut rows = Vec::new();
+        let mut selftests: BTreeMap<String, SelftestSpec> = BTreeMap::new();
         for (name, kv) in tables {
-            let requirements = kv
+            if let Some(parent) = name.strip_suffix(".selftest") {
+                selftests.insert(parent.to_owned(), Self::parse_selftest(parent, &kv)?);
+                continue;
+            }
+            if let Some((parent, sub)) = name.split_once('.') {
+                anyhow::bail!("[packages.{parent}.{sub}] unknown sub-table (only .selftest)");
+            }
+            let requirements: Vec<String> = kv
                 .get("requirements")
+                .and_then(simple_tables::Value::as_str)
                 .map(|v| v.split_whitespace().map(str::to_owned).collect())
                 .unwrap_or_default();
+            let no_binary = match kv.get("no_binary").and_then(simple_tables::Value::as_str) {
+                Some(v) => {
+                    let names: Vec<String> = v
+                        .split([',', ' '])
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                    // Typo protection: every no_binary name must match a
+                    // row requirement, and that requirement must be
+                    // exact-pinned so the sdist lane is deterministic.
+                    for pkg in &names {
+                        let req = requirements
+                            .iter()
+                            .find(|r| normalize_name(requirement_name(r)) == normalize_name(pkg))
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "[packages.{name}] no_binary {pkg:?} matches no requirement"
+                                )
+                            })?;
+                        if parse_pinned_requirement(req).is_none() {
+                            anyhow::bail!(
+                                "[packages.{name}] no_binary requirement {req:?} must be \
+                                 pinned with `==`"
+                            );
+                        }
+                    }
+                    names
+                }
+                None => Vec::new(),
+            };
             let probe = kv
                 .get("probe")
-                .cloned()
+                .and_then(simple_tables::Value::as_str)
+                .map(str::to_owned)
                 .ok_or_else(|| anyhow::anyhow!("[packages.{name}] missing probe"))?;
-            let timeout_seconds =
-                match kv.get("timeout_seconds") {
-                    Some(v) => Some(v.parse::<u64>().map_err(|_| {
-                        anyhow::anyhow!("[packages.{name}] bad timeout_seconds {v:?}")
-                    })?),
-                    None => None,
-                };
+            let timeout_seconds = parse_timeout(&kv, &format!("packages.{name}"))?;
             rows.push(ManifestRow {
                 name,
                 requirements,
+                no_binary,
                 probe,
                 timeout_seconds,
+                selftest: None,
             });
         }
+
+        for (parent, spec) in selftests {
+            let row = rows.iter_mut().find(|r| r.name == parent).ok_or_else(|| {
+                anyhow::anyhow!("[packages.{parent}.selftest] has no [packages.{parent}] row")
+            })?;
+            row.selftest = Some(spec);
+        }
+
         Ok(Self {
             rows,
-            base_dir: path.parent().unwrap_or(Path::new(".")).to_path_buf(),
+            base_dir: base_dir.to_path_buf(),
         })
     }
+
+    fn parse_selftest(parent: &str, kv: &simple_tables::Table) -> Result<SelftestSpec> {
+        let section = format!("packages.{parent}.selftest");
+        let source = kv
+            .get("source")
+            .and_then(simple_tables::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow::anyhow!("[{section}] missing source"))?;
+        if parse_pinned_requirement(&source).is_none() {
+            anyhow::bail!("[{section}] source {source:?} must be pinned with `==`");
+        }
+        let requirements = kv
+            .get("requirements")
+            .and_then(simple_tables::Value::as_str)
+            .map(|v| v.split_whitespace().map(str::to_owned).collect())
+            .unwrap_or_default();
+        let command = kv
+            .get("command")
+            .and_then(simple_tables::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow::anyhow!("[{section}] missing command"))?;
+        let deselect = match kv.get("deselect") {
+            Some(simple_tables::Value::List(items)) => items.clone(),
+            Some(simple_tables::Value::Str(_)) => {
+                anyhow::bail!("[{section}] deselect must be an array of strings")
+            }
+            None => Vec::new(),
+        };
+        let timeout_seconds = parse_timeout(kv, &section)?;
+        Ok(SelftestSpec {
+            source,
+            requirements,
+            command,
+            deselect,
+            timeout_seconds,
+        })
+    }
+}
+
+fn parse_timeout(kv: &simple_tables::Table, section: &str) -> Result<Option<u64>> {
+    match kv
+        .get("timeout_seconds")
+        .and_then(simple_tables::Value::as_str)
+    {
+        Some(v) => Ok(Some(v.parse::<u64>().map_err(|_| {
+            anyhow::anyhow!("[{section}] bad timeout_seconds {v:?}")
+        })?)),
+        None => Ok(None),
+    }
+}
+
+/// Base project name of a pip requirement string
+/// (`attrs[dev]==26.1.0; marker` → `attrs`).
+fn requirement_name(spec: &str) -> &str {
+    let end = spec
+        .find(|c: char| "<>=!~[;( ".contains(c))
+        .unwrap_or(spec.len());
+    &spec[..end]
+}
+
+/// PEP 503 name normalization — the same rule as the in-tree pip's
+/// `_normalize` (runs of `-_.` collapse to `-`, lowercase).
+fn normalize_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut dash = false;
+    for c in name.chars() {
+        if matches!(c, '-' | '_' | '.') {
+            if !dash {
+                out.push('-');
+            }
+            dash = true;
+        } else {
+            out.push(c.to_ascii_lowercase());
+            dash = false;
+        }
+    }
+    out
+}
+
+/// Split an exact-pinned requirement (`name==version`, extras allowed)
+/// into `(name, version)`. Returns `None` for anything else — the sdist
+/// lanes require exact pins.
+fn parse_pinned_requirement(spec: &str) -> Option<(String, String)> {
+    let (head, version) = spec.split_once("==")?;
+    let version = version.trim();
+    if version.is_empty() || version.contains(['<', '>', '!', '~', ',']) {
+        return None;
+    }
+    let name = requirement_name(head.trim());
+    if name.is_empty() {
+        return None;
+    }
+    Some((name.to_owned(), version.to_owned()))
 }
 
 // ---------------------------------------------------------------------------
@@ -127,10 +314,24 @@ impl RowStatus {
     }
 }
 
+/// One `[packages.<name>]` baseline row, already resolved against the
+/// host OS (RFC 0062 WS3: `status_<os>`/`reason_<os>` override the base
+/// keys; same scheme for the WS4 `selftest_status`/`selftest_reason`).
+#[derive(Debug, Clone)]
+pub struct ExpectationRow {
+    pub status: RowStatus,
+    pub reason: Option<String>,
+    /// Expected self-test outcome. `None` means "no explicit row" — the
+    /// grader defaults to `pass` whenever a manifest selftest spec
+    /// exists.
+    pub selftest_status: Option<RowStatus>,
+    pub selftest_reason: Option<String>,
+}
+
 /// Parsed `expectations.toml` — `[packages.<name>] status = "…"` rows.
 #[derive(Debug, Default)]
 pub struct EcosystemExpectations {
-    pub rows: BTreeMap<String, (RowStatus, Option<String>)>,
+    pub rows: BTreeMap<String, ExpectationRow>,
 }
 
 impl EcosystemExpectations {
@@ -140,18 +341,72 @@ impl EcosystemExpectations {
         }
         let body = fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let tables = simple_tables::parse(&body, "packages")
-            .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", path.display()))?;
+        Self::from_body(&body, std::env::consts::OS)
+            .map_err(|e| anyhow::anyhow!("failed to parse {}: {e:#}", path.display()))
+    }
+
+    /// Parse and resolve against `host_os` (`std::env::consts::OS`
+    /// spelling: `macos` / `linux` / `windows`). Split out from `load`
+    /// so the override resolution is unit-testable per OS.
+    fn from_body(body: &str, host_os: &str) -> Result<Self> {
+        let tables = simple_tables::parse(body, "packages").map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut rows = BTreeMap::new();
         for (name, kv) in tables {
-            let status = kv
-                .get("status")
-                .and_then(|s| RowStatus::parse(s))
+            validate_os_suffixes(&name, &kv)?;
+            let status = resolve_for_os(&kv, "status", host_os)
+                .and_then(RowStatus::parse)
                 .ok_or_else(|| anyhow::anyhow!("[packages.{name}] missing/bad status"))?;
-            rows.insert(name, (status, kv.get("reason").cloned()));
+            let reason = resolve_for_os(&kv, "reason", host_os).map(str::to_owned);
+            let selftest_status = match resolve_for_os(&kv, "selftest_status", host_os) {
+                Some(s) => Some(RowStatus::parse(s).ok_or_else(|| {
+                    anyhow::anyhow!("[packages.{name}] bad selftest_status {s:?}")
+                })?),
+                None => None,
+            };
+            let selftest_reason =
+                resolve_for_os(&kv, "selftest_reason", host_os).map(str::to_owned);
+            rows.insert(
+                name,
+                ExpectationRow {
+                    status,
+                    reason,
+                    selftest_status,
+                    selftest_reason,
+                },
+            );
         }
         Ok(Self { rows })
     }
+}
+
+/// Resolve `<base>_<host_os>` over plain `<base>` (RFC 0062 WS3).
+fn resolve_for_os<'t>(kv: &'t simple_tables::Table, base: &str, host_os: &str) -> Option<&'t str> {
+    kv.get(&format!("{base}_{host_os}"))
+        .and_then(simple_tables::Value::as_str)
+        .or_else(|| kv.get(base).and_then(simple_tables::Value::as_str))
+}
+
+/// Reject `status_freebsd`-style typos at load time. Only keys with one
+/// of the overridable bases are checked; free-form keys (`notes`) stay
+/// legal.
+fn validate_os_suffixes(name: &str, kv: &simple_tables::Table) -> Result<()> {
+    // Longest bases first so `selftest_status_x` is attributed to
+    // `selftest_status`, not misparsed via a shorter base.
+    const BASES: &[&str] = &["selftest_status", "selftest_reason", "status", "reason"];
+    for key in kv.keys() {
+        for base in BASES {
+            if let Some(suffix) = key.strip_prefix(&format!("{base}_")) {
+                if !KNOWN_OS_SUFFIXES.contains(&suffix) {
+                    anyhow::bail!(
+                        "[packages.{name}] unknown OS suffix in {key:?} \
+                         (expected one of: macos, linux, windows)"
+                    );
+                }
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -167,6 +422,8 @@ pub struct EcosystemOptions {
     pub wheels: Option<PathBuf>,
     /// Default per-row wall budget.
     pub timeout: Duration,
+    /// Run the RFC 0062 WS4 self-test tier after each passing probe.
+    pub selftests: bool,
     /// Keep the scratch venvs around for post-mortem.
     pub keep_venvs: bool,
     /// Scratch root for venvs (defaults to a temp dir).
@@ -191,10 +448,14 @@ pub struct RowReport {
     pub name: String,
     pub status: RowStatus,
     pub expected: Option<RowStatus>,
-    /// True when `status` disagrees with a recorded expectation.
+    /// True when `status` *or* `selftest` disagrees with the baseline.
     pub unexpected: bool,
     pub stage: Option<FailStage>,
     pub reason: Option<String>,
+    /// Self-test outcome (`None` = no spec / probe failed / tier off).
+    pub selftest: Option<RowStatus>,
+    pub selftest_expected: Option<RowStatus>,
+    pub selftest_reason: Option<String>,
     pub duration_secs: f64,
 }
 
@@ -206,25 +467,45 @@ pub struct EcosystemSummary {
     pub failed: usize,
     pub skipped: usize,
     pub unexpected: usize,
+    pub selftest_passed: usize,
+    pub selftest_failed: usize,
+    pub selftest_skipped: usize,
 }
 
 impl EcosystemSummary {
     pub fn from_reports(reports: &[RowReport]) -> Self {
+        let count = |s: RowStatus| reports.iter().filter(|r| r.status == s).count();
+        let st_count = |s: RowStatus| reports.iter().filter(|r| r.selftest == Some(s)).count();
         Self {
             total: reports.len(),
-            passed: reports
-                .iter()
-                .filter(|r| r.status == RowStatus::Pass)
-                .count(),
-            failed: reports
-                .iter()
-                .filter(|r| r.status == RowStatus::Fail)
-                .count(),
-            skipped: reports
-                .iter()
-                .filter(|r| r.status == RowStatus::Skip)
-                .count(),
+            passed: count(RowStatus::Pass),
+            failed: count(RowStatus::Fail),
+            skipped: count(RowStatus::Skip),
             unexpected: reports.iter().filter(|r| r.unexpected).count(),
+            selftest_passed: st_count(RowStatus::Pass),
+            selftest_failed: st_count(RowStatus::Fail),
+            selftest_skipped: st_count(RowStatus::Skip),
+        }
+    }
+}
+
+/// What [`run_row`] measured, before grading against expectations.
+struct RowOutcome {
+    status: RowStatus,
+    stage: Option<FailStage>,
+    reason: Option<String>,
+    selftest: Option<RowStatus>,
+    selftest_reason: Option<String>,
+}
+
+impl RowOutcome {
+    fn fail(stage: FailStage, reason: String) -> Self {
+        Self {
+            status: RowStatus::Fail,
+            stage: Some(stage),
+            reason: Some(reason),
+            selftest: None,
+            selftest_reason: None,
         }
     }
 }
@@ -238,12 +519,10 @@ pub fn run_all(
 ) -> Vec<RowReport> {
     let mut reports = Vec::with_capacity(manifest.rows.len());
     for row in &manifest.rows {
-        let expected = expectations.rows.get(&row.name).map(|(s, _)| *s);
+        let exp_row = expectations.rows.get(&row.name);
+        let expected = exp_row.map(|e| e.status);
         if expected == Some(RowStatus::Skip) {
-            let reason = expectations
-                .rows
-                .get(&row.name)
-                .and_then(|(_, r)| r.clone());
+            let reason = exp_row.and_then(|e| e.reason.clone());
             eprintln!("[ecosystem] {} … skip (baseline)", row.name);
             reports.push(RowReport {
                 name: row.name.clone(),
@@ -252,34 +531,73 @@ pub fn run_all(
                 unexpected: false,
                 stage: None,
                 reason,
+                selftest: None,
+                selftest_expected: None,
+                selftest_reason: None,
                 duration_secs: 0.0,
             });
             continue;
         }
+
+        // The self-test tier grades independently of the probe: an
+        // absent baseline row defaults to expected-pass (same discipline
+        // as probe rows), and an explicit `selftest_status = "skip"`
+        // keeps the stage from running at all.
+        let selftest_expected = if opts.selftests {
+            row.selftest.as_ref().map(|_| {
+                exp_row
+                    .and_then(|e| e.selftest_status)
+                    .unwrap_or(RowStatus::Pass)
+            })
+        } else {
+            None
+        };
+        let run_selftest = matches!(selftest_expected, Some(s) if s != RowStatus::Skip);
+
         eprintln!("[ecosystem] {} …", row.name);
         let started = Instant::now();
-        let (status, stage, reason) = run_row(manifest, row, opts);
+        let mut outcome = run_row(manifest, row, opts, run_selftest);
         let duration = started.elapsed();
-        let unexpected = match expected {
-            Some(exp) => exp != status,
+        if selftest_expected == Some(RowStatus::Skip) {
+            outcome.selftest = Some(RowStatus::Skip);
+            outcome.selftest_reason = exp_row.and_then(|e| e.selftest_reason.clone());
+        }
+        let probe_diverged = match expected {
+            Some(exp) => exp != outcome.status,
             // An unlisted row is treated as expected-pass: a red row must
             // be baselined explicitly with a measured reason.
-            None => status != RowStatus::Pass,
+            None => outcome.status != RowStatus::Pass,
+        };
+        // The self-test only grades when the stage actually ran (a probe
+        // failure already flags the row; skipping double-jeopardy keeps
+        // the report readable).
+        let selftest_diverged = match (outcome.selftest, selftest_expected) {
+            (Some(actual), Some(exp)) => actual != exp,
+            _ => false,
+        };
+        let unexpected = probe_diverged || selftest_diverged;
+        let selftest_note = match outcome.selftest {
+            Some(s) => format!(", selftest {}", s.as_str()),
+            None => String::new(),
         };
         eprintln!(
-            "[ecosystem] {} → {}{} ({:.1}s)",
+            "[ecosystem] {} → {}{}{} ({:.1}s)",
             row.name,
-            status.as_str(),
+            outcome.status.as_str(),
+            selftest_note,
             if unexpected { " [UNEXPECTED]" } else { "" },
             duration.as_secs_f64(),
         );
         reports.push(RowReport {
             name: row.name.clone(),
-            status,
+            status: outcome.status,
             expected,
             unexpected,
-            stage,
-            reason,
+            stage: outcome.stage,
+            reason: outcome.reason,
+            selftest: outcome.selftest,
+            selftest_expected,
+            selftest_reason: outcome.selftest_reason,
             duration_secs: duration.as_secs_f64(),
         });
     }
@@ -290,7 +608,8 @@ fn run_row(
     manifest: &Manifest,
     row: &ManifestRow,
     opts: &EcosystemOptions,
-) -> (RowStatus, Option<FailStage>, Option<String>) {
+    run_selftest: bool,
+) -> RowOutcome {
     let budget = row
         .timeout_seconds
         .map(Duration::from_secs)
@@ -299,7 +618,7 @@ fn run_row(
 
     let venv_dir = opts.scratch_dir.join(format!("venv-{}", row.name));
     let _ = fs::remove_dir_all(&venv_dir);
-    let cleanup = VenvCleanup {
+    let cleanup = ScratchCleanup {
         dir: venv_dir.clone(),
         keep: opts.keep_venvs,
     };
@@ -314,47 +633,58 @@ fn run_row(
     match out {
         Ok(o) if o.success => {}
         Ok(o) => {
-            return (
-                RowStatus::Fail,
-                Some(FailStage::Venv),
-                Some(trim_reason(&format!("venv creation failed: {}", o.tail()))),
+            return RowOutcome::fail(
+                FailStage::Venv,
+                trim_reason(&format!("venv creation failed: {}", o.tail())),
             )
         }
         Err(TimedOut) => {
-            return (
-                RowStatus::Fail,
-                Some(FailStage::Timeout),
-                Some("venv creation exceeded the wall budget".to_owned()),
+            return RowOutcome::fail(
+                FailStage::Timeout,
+                "venv creation exceeded the wall budget".to_owned(),
             )
         }
     }
 
     let python = venv_python(&venv_dir);
 
-    // 2. install
-    if !row.requirements.is_empty() {
+    // 2. install — requirements matched by `no_binary` go through the
+    //    sdist lane (a loopback index that only offers the tarball, so
+    //    pip's own wheel-missing fallback compiles it from source);
+    //    everything else through the normal wheel lane first, so build
+    //    prerequisites like setuptools are in place before the compile.
+    let (sdist_reqs, wheel_reqs): (Vec<&String>, Vec<&String>) =
+        row.requirements.iter().partition(|r| {
+            row.no_binary
+                .iter()
+                .any(|p| normalize_name(p) == normalize_name(requirement_name(r)))
+        });
+    if !wheel_reqs.is_empty() {
         let mut cmd = Command::new(&python);
         cmd.args(["-m", "pip", "install", "--quiet"]);
         if let Some(wheels) = &opts.wheels {
             cmd.arg("--no-index").arg("--find-links").arg(wheels);
         }
-        cmd.args(&row.requirements);
+        cmd.args(&wheel_reqs);
         match run_with_deadline(&mut cmd, deadline) {
             Ok(o) if o.success => {}
             Ok(o) => {
-                return (
-                    RowStatus::Fail,
-                    Some(FailStage::Install),
-                    Some(trim_reason(&format!("pip install failed: {}", o.tail()))),
+                return RowOutcome::fail(
+                    FailStage::Install,
+                    trim_reason(&format!("pip install failed: {}", o.tail())),
                 )
             }
             Err(TimedOut) => {
-                return (
-                    RowStatus::Fail,
-                    Some(FailStage::Timeout),
-                    Some("pip install exceeded the wall budget".to_owned()),
+                return RowOutcome::fail(
+                    FailStage::Timeout,
+                    "pip install exceeded the wall budget".to_owned(),
                 )
             }
+        }
+    }
+    for spec in &sdist_reqs {
+        if let Err(outcome) = install_from_sdist(spec, &python, &venv_dir, opts, deadline) {
+            return outcome;
         }
     }
 
@@ -365,30 +695,326 @@ fn run_row(
     for (k, v) in &opts.probe_env {
         cmd.env(k, v);
     }
-    let result = match run_with_deadline(&mut cmd, deadline) {
-        Ok(o) if o.success => (RowStatus::Pass, None, None),
-        Ok(o) => (
-            RowStatus::Fail,
-            Some(FailStage::Probe),
-            Some(trim_reason(&format!("probe failed: {}", o.tail()))),
-        ),
-        Err(TimedOut) => (
-            RowStatus::Fail,
-            Some(FailStage::Timeout),
-            Some("probe exceeded the wall budget".to_owned()),
-        ),
+    match run_with_deadline(&mut cmd, deadline) {
+        Ok(o) if o.success => {}
+        Ok(o) => {
+            return RowOutcome::fail(
+                FailStage::Probe,
+                trim_reason(&format!("probe failed: {}", o.tail())),
+            )
+        }
+        Err(TimedOut) => {
+            return RowOutcome::fail(
+                FailStage::Timeout,
+                "probe exceeded the wall budget".to_owned(),
+            )
+        }
+    }
+
+    // 4. self-test (RFC 0062 WS4) — its own wall budget, graded
+    //    independently of the probe.
+    let (selftest, selftest_reason) = match (run_selftest, &row.selftest) {
+        (true, Some(spec)) => {
+            let (status, reason) = run_selftest_stage(spec, &python, &venv_dir, opts);
+            (Some(status), reason)
+        }
+        _ => (None, None),
     };
+
     drop(cleanup);
-    result
+    RowOutcome {
+        status: RowStatus::Pass,
+        stage: None,
+        reason: None,
+        selftest,
+        selftest_reason,
+    }
 }
 
-/// RAII scratch-venv removal (skipped with `--keep-venvs`).
-struct VenvCleanup {
+/// Force `spec` (an exact-pinned requirement) through pip's sdist install
+/// path — the RFC 0062 WS2 source-build proof.
+///
+/// The in-tree pip has no `--no-binary` flag (its `--only-binary` is the
+/// *opposite* toggle), and `pip install <path>` only accepts `.whl`
+/// files. What it *does* support is `--index-url`, plus a genuine sdist
+/// fallback whenever the index offers no compatible wheel. So the
+/// harness obtains the sdist itself and serves it from a loopback
+/// PEP 503 index that carries nothing else — pip then walks its real
+/// `sdist → _pep517 → setuptools → cc` lane end-to-end.
+fn install_from_sdist(
+    spec: &str,
+    python: &Path,
+    venv_dir: &Path,
+    opts: &EcosystemOptions,
+    deadline: Instant,
+) -> std::result::Result<(), RowOutcome> {
+    let sdist_dir = venv_dir.join("sdist-cache");
+    if let Err(e) = fs::create_dir_all(&sdist_dir) {
+        return Err(RowOutcome::fail(
+            FailStage::Install,
+            format!("failed to create {}: {e}", sdist_dir.display()),
+        ));
+    }
+    let sdist = obtain_sdist(spec, python, opts, &sdist_dir, deadline).map_err(|e| {
+        RowOutcome::fail(
+            FailStage::Install,
+            trim_reason(&format!("sdist fetch failed: {e}")),
+        )
+    })?;
+    // The in-tree pip spools index downloads to a temp file named with
+    // `os.path.splitext(label)[1]`, which reduces `*.tar.gz` to a bare
+    // `.gz` that `_pep517.extract_sdist` rejects. Serving the tarball
+    // under the equivalent `.tgz` name — accepted by both pip's index
+    // matcher and the extractor — keeps the flow inside pip's
+    // supported surface.
+    if let Some(stem) = sdist
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_suffix(".tar.gz"))
+    {
+        let tgz = sdist.with_file_name(format!("{stem}.tgz"));
+        if let Err(e) = fs::rename(&sdist, &tgz) {
+            return Err(RowOutcome::fail(
+                FailStage::Install,
+                format!("failed to rename {} to .tgz: {e}", sdist.display()),
+            ));
+        }
+    }
+
+    let index = local_index::LocalIndex::serve(sdist_dir).map_err(|e| {
+        RowOutcome::fail(
+            FailStage::Install,
+            format!("local index failed to start: {e}"),
+        )
+    })?;
+    let mut cmd = Command::new(python);
+    cmd.args([
+        "-m",
+        "pip",
+        "install",
+        "--quiet",
+        "--no-deps",
+        "--index-url",
+    ])
+    .arg(index.url())
+    .arg(spec);
+    match run_with_deadline(&mut cmd, deadline) {
+        Ok(o) if o.success => Ok(()),
+        Ok(o) => Err(RowOutcome::fail(
+            FailStage::Install,
+            trim_reason(&format!("sdist install failed: {}", o.tail())),
+        )),
+        Err(TimedOut) => Err(RowOutcome::fail(
+            FailStage::Timeout,
+            "sdist install exceeded the wall budget".to_owned(),
+        )),
+    }
+}
+
+/// Run one row's upstream test suite (RFC 0062 WS4): fetch + extract the
+/// pinned sdist, install the test-only requirements into the same venv,
+/// and run pytest from the sdist root. Exit 0 grades `pass`; anything
+/// else is a `fail` carrying the tail of the pytest output.
+fn run_selftest_stage(
+    spec: &SelftestSpec,
+    python: &Path,
+    venv_dir: &Path,
+    opts: &EcosystemOptions,
+) -> (RowStatus, Option<String>) {
+    let budget = spec
+        .timeout_seconds
+        .unwrap_or(DEFAULT_SELFTEST_TIMEOUT_SECS);
+    let deadline = Instant::now() + Duration::from_secs(budget);
+    let fail = |msg: String| (RowStatus::Fail, Some(trim_reason_to(&msg, 4000)));
+
+    // 1. obtain the source sdist
+    let scratch = venv_dir.join("selftest");
+    if let Err(e) = fs::create_dir_all(&scratch) {
+        return fail(format!("failed to create {}: {e}", scratch.display()));
+    }
+    let sdist = match obtain_sdist(&spec.source, python, opts, &scratch, deadline) {
+        Ok(p) => p,
+        Err(e) => return fail(format!("selftest sdist fetch failed: {e}")),
+    };
+
+    // 2. extract it (tar.gz per the sdist contract)
+    let extract_dir = scratch.join("src");
+    if let Err(e) = fs::create_dir_all(&extract_dir) {
+        return fail(format!("failed to create {}: {e}", extract_dir.display()));
+    }
+    let out = run_with_deadline(
+        Command::new("tar")
+            .arg("-xzf")
+            .arg(&sdist)
+            .arg("-C")
+            .arg(&extract_dir),
+        deadline,
+    );
+    match out {
+        Ok(o) if o.success => {}
+        Ok(o) => return fail(format!("sdist extract failed: {}", o.tail())),
+        Err(TimedOut) => return fail("sdist extract exceeded the selftest budget".to_owned()),
+    }
+    let sdist_root = match single_subdir(&extract_dir) {
+        Some(d) => d,
+        None => {
+            return fail(format!(
+                "sdist {} did not extract to a single root directory",
+                sdist.display()
+            ))
+        }
+    };
+
+    // 3. test-only requirements into the same venv
+    if !spec.requirements.is_empty() {
+        let mut cmd = Command::new(python);
+        cmd.args(["-m", "pip", "install", "--quiet"]);
+        if let Some(wheels) = &opts.wheels {
+            cmd.arg("--no-index").arg("--find-links").arg(wheels);
+        }
+        cmd.args(&spec.requirements);
+        match run_with_deadline(&mut cmd, deadline) {
+            Ok(o) if o.success => {}
+            Ok(o) => return fail(format!("selftest deps install failed: {}", o.tail())),
+            Err(TimedOut) => {
+                return fail("selftest deps install exceeded the selftest budget".to_owned())
+            }
+        }
+    }
+
+    // 4. the suite itself, from the sdist root so relative test paths
+    //    and conftest discovery match upstream's own invocation. The
+    //    venv python must be spawned by *absolute* path — with
+    //    `current_dir` set, a scratch-relative program path would
+    //    resolve against the sdist root and fail to spawn — but NOT
+    //    canonicalized: resolving the `bin/python` symlink lands on the
+    //    base `weavepy` binary and loses the venv identity (pyvenv.cfg
+    //    discovery is executable-path based).
+    let python = std::path::absolute(python).unwrap_or_else(|_| python.to_path_buf());
+    let mut cmd = Command::new(&python);
+    cmd.args(["-m", "pytest"])
+        .args(spec.command.split_whitespace())
+        .args(["-q", "-p", "no:cacheprovider"]);
+    for d in &spec.deselect {
+        cmd.arg("--deselect").arg(d);
+    }
+    cmd.current_dir(&sdist_root);
+    for (k, v) in &opts.probe_env {
+        cmd.env(k, v);
+    }
+    match run_with_deadline(&mut cmd, deadline) {
+        Ok(o) if o.success => (RowStatus::Pass, None),
+        Ok(o) => fail(format!("selftest failed: {}", o.tail_n(50))),
+        Err(TimedOut) => fail(format!("selftest exceeded the {budget}s selftest budget")),
+    }
+}
+
+/// The single directory an sdist extracts to (`<name>-<version>/`).
+fn single_subdir(dir: &Path) -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    (dirs.len() == 1).then(|| dirs.remove(0))
+}
+
+/// In-venv sdist downloader. The in-tree pip's `download` subcommand only
+/// fetches wheels (no `--no-binary`), so the online lane asks PyPI's JSON
+/// API directly through the venv's own urllib — same interpreter, same
+/// TLS stack pip itself uses.
+const SDIST_FETCH_SCRIPT: &str = r#"
+import json, os, sys, urllib.request
+
+name, version, dest = sys.argv[1], sys.argv[2], sys.argv[3]
+url = "https://pypi.org/pypi/{}/{}/json".format(name, version)
+with urllib.request.urlopen(url) as resp:
+    data = json.load(resp)
+entry = next((u for u in data["urls"] if u["packagetype"] == "sdist"), None)
+if entry is None:
+    sys.exit("no sdist published for {}=={}".format(name, version))
+target = os.path.join(dest, entry["filename"])
+with urllib.request.urlopen(entry["url"]) as resp, open(target, "wb") as f:
+    f.write(resp.read())
+print(target)
+"#;
+
+/// Materialize the sdist for an exact-pinned requirement into `dest`.
+///
+/// Offline (`--wheels DIR`): the tarball must already be in the cache
+/// (`tools/ecosystem_fetch.py` downloads sdists for `no_binary` and
+/// selftest rows). Online: fetched via [`SDIST_FETCH_SCRIPT`].
+fn obtain_sdist(
+    spec: &str,
+    python: &Path,
+    opts: &EcosystemOptions,
+    dest: &Path,
+    deadline: Instant,
+) -> std::result::Result<PathBuf, String> {
+    let (name, version) = parse_pinned_requirement(spec)
+        .ok_or_else(|| format!("requirement {spec:?} must be pinned with `==`"))?;
+
+    if let Some(wheels) = &opts.wheels {
+        let found = find_sdist_in_dir(wheels, &name, &version)
+            .ok_or_else(|| format!("{name}-{version}.tar.gz not in {}", wheels.display()))?;
+        let target = dest.join(found.file_name().unwrap_or_default());
+        return match fs::copy(&found, &target) {
+            Ok(_) => Ok(target),
+            Err(e) => Err(format!("failed to copy {}: {e}", found.display())),
+        };
+    }
+
+    let mut cmd = Command::new(python);
+    cmd.arg("-c")
+        .arg(SDIST_FETCH_SCRIPT)
+        .arg(&name)
+        .arg(&version)
+        .arg(dest);
+    match run_with_deadline(&mut cmd, deadline) {
+        Ok(o) if o.success => {
+            let path = o
+                .combined
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .map(|l| PathBuf::from(l.trim()))
+                .filter(|p| p.is_file())
+                .ok_or_else(|| format!("sdist download reported no path: {}", o.tail()))?;
+            Ok(path)
+        }
+        Ok(o) => Err(format!("sdist download failed: {}", o.tail())),
+        Err(TimedOut) => Err("sdist download exceeded the wall budget".to_owned()),
+    }
+}
+
+/// Find `<name>-<version>.tar.gz` (PEP 503-normalized name match) in a
+/// wheel-cache directory.
+fn find_sdist_in_dir(dir: &Path, name: &str, version: &str) -> Option<PathBuf> {
+    let want = normalize_name(name);
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let fname = entry.file_name();
+        let fname = fname.to_string_lossy();
+        let Some(stem) = fname.strip_suffix(".tar.gz") else {
+            continue;
+        };
+        let Some((base, ver)) = stem.rsplit_once('-') else {
+            continue;
+        };
+        if normalize_name(base) == want && ver.eq_ignore_ascii_case(version) {
+            return Some(entry.path());
+        }
+    }
+    None
+}
+
+/// RAII scratch-dir removal (skipped with `--keep-venvs`).
+struct ScratchCleanup {
     dir: PathBuf,
     keep: bool,
 }
 
-impl Drop for VenvCleanup {
+impl Drop for ScratchCleanup {
     fn drop(&mut self) {
         if !self.keep {
             let _ = fs::remove_dir_all(&self.dir);
@@ -408,6 +1034,8 @@ struct TimedOut;
 
 struct CmdOutput {
     success: bool,
+    /// Exit code when the child terminated normally (`None` = signal).
+    code: Option<i32>,
     combined: String,
 }
 
@@ -415,9 +1043,22 @@ impl CmdOutput {
     /// Last ~12 lines of output — enough to state a reason without
     /// pasting an install log into the baseline.
     fn tail(&self) -> String {
+        self.tail_n(12)
+    }
+
+    fn tail_n(&self, n: usize) -> String {
         let lines: Vec<&str> = self.combined.lines().collect();
-        let start = lines.len().saturating_sub(12);
-        lines[start..].join("\n")
+        let start = lines.len().saturating_sub(n);
+        let tail = lines[start..].join("\n");
+        if tail.trim().is_empty() {
+            // A silent nonzero exit (e.g. a crash) would otherwise
+            // produce an empty, undebuggable reason.
+            return match self.code {
+                Some(c) => format!("(no output; exit code {c})"),
+                None => "(no output; killed by signal)".to_owned(),
+            };
+        }
+        tail
     }
 }
 
@@ -434,6 +1075,7 @@ fn run_with_deadline(cmd: &mut Command, deadline: Instant) -> Result<CmdOutput, 
         Err(e) => {
             return Ok(CmdOutput {
                 success: false,
+                code: None,
                 combined: format!("failed to spawn: {e}"),
             })
         }
@@ -474,6 +1116,7 @@ fn run_with_deadline(cmd: &mut Command, deadline: Instant) -> Result<CmdOutput, 
                 }
                 return Ok(CmdOutput {
                     success: status.success(),
+                    code: status.code(),
                     combined,
                 });
             }
@@ -495,6 +1138,7 @@ fn run_with_deadline(cmd: &mut Command, deadline: Instant) -> Result<CmdOutput, 
                 let _ = join(err_thread);
                 return Ok(CmdOutput {
                     success: false,
+                    code: None,
                     combined: "wait failed".to_owned(),
                 });
             }
@@ -503,11 +1147,14 @@ fn run_with_deadline(cmd: &mut Command, deadline: Instant) -> Result<CmdOutput, 
 }
 
 fn trim_reason(s: &str) -> String {
-    const MAX: usize = 2000;
-    if s.len() <= MAX {
+    trim_reason_to(s, 2000)
+}
+
+fn trim_reason_to(s: &str, max: usize) -> String {
+    if s.len() <= max {
         return s.to_owned();
     }
-    let mut cut = MAX;
+    let mut cut = max;
     while !s.is_char_boundary(cut) {
         cut -= 1;
     }
@@ -529,16 +1176,31 @@ pub fn report_to_markdown(reports: &[RowReport]) -> String {
         "{} rows — {} pass / {} fail / {} skip ({} unexpected)",
         summary.total, summary.passed, summary.failed, summary.skipped, summary.unexpected,
     );
+    let selftests_ran =
+        summary.selftest_passed + summary.selftest_failed + summary.selftest_skipped;
+    if selftests_ran > 0 {
+        let _ = writeln!(
+            out,
+            "selftests: {} pass / {} fail / {} skip",
+            summary.selftest_passed, summary.selftest_failed, summary.selftest_skipped,
+        );
+    }
     let _ = writeln!(out);
-    let _ = writeln!(out, "| package | status | expected | time | reason |");
-    let _ = writeln!(out, "|---|---|---|---|---|");
+    let _ = writeln!(
+        out,
+        "| package | status | expected | selftest | time | reason |"
+    );
+    let _ = writeln!(out, "|---|---|---|---|---|---|");
     for r in reports {
-        let reason = r
-            .reason
-            .as_deref()
-            .unwrap_or("")
-            .replace('|', "\\|")
-            .replace('\n', " ⏎ ");
+        let mut reason = r.reason.clone().unwrap_or_default();
+        if let Some(st_reason) = &r.selftest_reason {
+            if !reason.is_empty() {
+                reason.push_str(" ⏎ ");
+            }
+            reason.push_str("selftest: ");
+            reason.push_str(st_reason);
+        }
+        let reason = reason.replace('|', "\\|").replace('\n', " ⏎ ");
         let reason = if reason.len() > 200 {
             let mut cut = 200;
             while !reason.is_char_boundary(cut) {
@@ -548,13 +1210,26 @@ pub fn report_to_markdown(reports: &[RowReport]) -> String {
         } else {
             reason
         };
+        let selftest_cell = match r.selftest {
+            Some(s) => format!(
+                "{}{}",
+                s.as_str(),
+                if r.selftest_expected.is_some() && r.selftest != r.selftest_expected {
+                    " ⚠"
+                } else {
+                    ""
+                }
+            ),
+            None => "—".to_owned(),
+        };
         let _ = writeln!(
             out,
-            "| {} | {}{} | {} | {:.1}s | {} |",
+            "| {} | {}{} | {} | {} | {:.1}s | {} |",
             r.name,
             r.status.as_str(),
             if r.unexpected { " ⚠" } else { "" },
             r.expected.map(|e| e.as_str()).unwrap_or("—"),
+            selftest_cell,
             r.duration_secs,
             reason,
         );
@@ -563,24 +1238,186 @@ pub fn report_to_markdown(reports: &[RowReport]) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Loopback PEP 503 index
+// ---------------------------------------------------------------------------
+
+/// A tiny PEP 503 "simple index" served from a local directory over a
+/// loopback socket, alive for the duration of one `pip install`.
+///
+/// This is how the harness forces the in-tree pip down its *sdist*
+/// install path (RFC 0062 WS2): the CLI has no `--no-binary` flag, but
+/// `--index-url` is a supported knob and pip falls back to an sdist
+/// whenever the index offers no compatible wheel — an index that only
+/// carries the tarball is exactly that situation, with zero private-API
+/// reach-ins.
+mod local_index {
+    use std::io::{Read as _, Write as _};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    pub(super) struct LocalIndex {
+        addr: SocketAddr,
+        stop: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl LocalIndex {
+        pub(super) fn serve(dir: PathBuf) -> std::io::Result<Self> {
+            let listener = TcpListener::bind(("127.0.0.1", 0))?;
+            let addr = listener.local_addr()?;
+            // Non-blocking accept so the thread can observe the stop
+            // flag instead of parking in `accept()` forever.
+            listener.set_nonblocking(true)?;
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_thread = Arc::clone(&stop);
+            let handle = std::thread::spawn(move || {
+                while !stop_thread.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let _ = handle_conn(stream, &dir);
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Ok(Self {
+                addr,
+                stop,
+                handle: Some(handle),
+            })
+        }
+
+        pub(super) fn url(&self) -> String {
+            format!("http://{}/", self.addr)
+        }
+    }
+
+    impl Drop for LocalIndex {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    fn handle_conn(mut stream: TcpStream, dir: &Path) -> std::io::Result<()> {
+        // BSD-family accepted sockets inherit the listener's
+        // non-blocking flag; reads want to block (with a cap).
+        stream.set_nonblocking(false)?;
+        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk)?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 64 * 1024 {
+                break;
+            }
+        }
+        let request = String::from_utf8_lossy(&buf);
+        let path = request
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .unwrap_or("/")
+            .to_owned();
+
+        let (status, ctype, body): (&str, &str, Vec<u8>) = if path.ends_with('/') {
+            // Any project page lists every artifact in the directory;
+            // pip's own filename normalization filters by name.
+            let mut html = String::from("<!DOCTYPE html><html><body>\n");
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for e in entries.flatten() {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    html.push_str(&format!("<a href=\"/files/{name}\">{name}</a><br>\n"));
+                }
+            }
+            html.push_str("</body></html>\n");
+            ("200 OK", "text/html", html.into_bytes())
+        } else if let Some(fname) = path.strip_prefix("/files/") {
+            // Basename only — no path traversal out of the sdist dir.
+            let fname = fname.rsplit('/').next().unwrap_or(fname);
+            match std::fs::read(dir.join(fname)) {
+                Ok(bytes) => ("200 OK", "application/octet-stream", bytes),
+                Err(_) => ("404 Not Found", "text/plain", b"not found".to_vec()),
+            }
+        } else {
+            ("404 Not Found", "text/plain", b"not found".to_vec())
+        };
+
+        let header = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(header.as_bytes())?;
+        stream.write_all(&body)?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Minimal TOML-subset parser (same dialect as the regrtest baseline:
-// `[prefix."name"]` sections of `key = "value"` pairs, `#` comments).
+// `[prefix."name"]` sections of `key = "value"` pairs, `#` comments —
+// extended for RFC 0062 with `key = ["a", "b"]` string arrays, which may
+// span lines so deselect entries can carry inline reason comments).
 // ---------------------------------------------------------------------------
 
 mod simple_tables {
     use std::collections::BTreeMap;
 
-    type Table = BTreeMap<String, String>;
+    /// A parsed value: a bare string or an array of strings.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) enum Value {
+        Str(String),
+        List(Vec<String>),
+    }
+
+    impl Value {
+        pub(super) fn as_str(&self) -> Option<&str> {
+            match self {
+                Value::Str(s) => Some(s),
+                Value::List(_) => None,
+            }
+        }
+    }
+
+    pub(super) type Table = BTreeMap<String, Value>;
 
     /// Parse `[<prefix>.<name>]` sections into `(name, key→value)` rows,
-    /// preserving section order.
+    /// preserving section order. Sub-table headers keep their dotted
+    /// name (`[packages.x.selftest]` → `"x.selftest"`).
     pub(super) fn parse(body: &str, prefix: &str) -> Result<Vec<(String, Table)>, String> {
         let mut rows: Vec<(String, Table)> = Vec::new();
         let mut current: Option<String> = None;
         let mut table = Table::new();
+        // A `key = [` array whose closing bracket hasn't arrived yet.
+        let mut pending: Option<(String, String, usize)> = None;
 
         for (lineno, raw) in body.lines().enumerate() {
             let line = strip_comment(raw).trim().to_owned();
+            if let Some((key, mut acc, start_line)) = pending.take() {
+                acc.push(' ');
+                acc.push_str(&line);
+                if brackets_balanced(&acc) {
+                    let items = parse_list(&acc, start_line)?;
+                    if current.is_some() {
+                        table.insert(key, Value::List(items));
+                    }
+                } else {
+                    pending = Some((key, acc, start_line));
+                }
+                continue;
+            }
             if line.is_empty() {
                 continue;
             }
@@ -594,10 +1431,30 @@ mod simple_tables {
                 current = Some(strip_quotes(name.trim()).to_owned());
                 continue;
             }
-            let (k, v) = parse_kv(&line, lineno)?;
-            if current.is_some() {
-                table.insert(k, v);
+            let (k, v) = line
+                .split_once('=')
+                .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
+                .ok_or_else(|| format!("line {}: expected key = value", lineno + 1))?;
+            if v.starts_with('[') {
+                if brackets_balanced(&v) {
+                    let items = parse_list(&v, lineno)?;
+                    if current.is_some() {
+                        table.insert(k, Value::List(items));
+                    }
+                } else {
+                    pending = Some((k, v, lineno));
+                }
+                continue;
             }
+            if current.is_some() {
+                table.insert(k, Value::Str(unescape(strip_quotes(&v))));
+            }
+        }
+        if let Some((key, _, start_line)) = pending {
+            return Err(format!(
+                "line {}: unterminated array for key {key:?}",
+                start_line + 1
+            ));
         }
         flush(&mut rows, current, &mut table);
         Ok(rows)
@@ -611,11 +1468,66 @@ mod simple_tables {
         }
     }
 
-    fn parse_kv(line: &str, lineno: usize) -> Result<(String, String), String> {
-        let (k, v) = line
-            .split_once('=')
-            .ok_or_else(|| format!("line {}: expected key = value", lineno + 1))?;
-        Ok((k.trim().to_owned(), strip_quotes(v.trim()).to_owned()))
+    /// Bracket balance outside quoted strings — decides whether a
+    /// multi-line array has closed yet. Brackets *inside* strings (e.g.
+    /// pytest parametrize ids like `test_x[a-b]`) don't count.
+    fn brackets_balanced(s: &str) -> bool {
+        let mut depth = 0i64;
+        let mut in_str = false;
+        for c in s.chars() {
+            match c {
+                '"' => in_str = !in_str,
+                '[' if !in_str => depth += 1,
+                ']' if !in_str => depth -= 1,
+                _ => {}
+            }
+        }
+        depth == 0
+    }
+
+    /// Parse a balanced `[ "a", "b" ]` string-array literal.
+    fn parse_list(s: &str, lineno: usize) -> Result<Vec<String>, String> {
+        let inner = s
+            .trim()
+            .strip_prefix('[')
+            .and_then(|t| t.strip_suffix(']'))
+            .ok_or_else(|| format!("line {}: malformed array {s:?}", lineno + 1))?;
+        let mut items = Vec::new();
+        let mut element = String::new();
+        let mut in_str = false;
+        for c in inner.chars() {
+            match c {
+                '"' => {
+                    in_str = !in_str;
+                    element.push(c);
+                }
+                ',' if !in_str => {
+                    push_element(&mut items, &mut element, lineno)?;
+                }
+                _ => element.push(c),
+            }
+        }
+        push_element(&mut items, &mut element, lineno)?;
+        Ok(items)
+    }
+
+    fn push_element(
+        items: &mut Vec<String>,
+        element: &mut String,
+        lineno: usize,
+    ) -> Result<(), String> {
+        let trimmed = element.trim();
+        if !trimmed.is_empty() {
+            if !(trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2) {
+                return Err(format!(
+                    "line {}: array element {trimmed:?} must be a quoted string",
+                    lineno + 1
+                ));
+            }
+            items.push(unescape(strip_quotes(trimmed)));
+        }
+        element.clear();
+        Ok(())
     }
 
     fn strip_comment(line: &str) -> &str {
@@ -636,5 +1548,281 @@ mod simple_tables {
         s.strip_prefix('"')
             .and_then(|t| t.strip_suffix('"'))
             .unwrap_or(s)
+    }
+
+    /// Decode the TOML basic-string escapes the baseline dialect needs.
+    /// Pytest parametrize ids may contain a literal backslash-n (pytest's
+    /// own escaping of a newline in a parameter), written `\\n` in the
+    /// manifest. Unknown escapes pass through verbatim.
+    fn unescape(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('\\') => out.push('\\'),
+                Some('"') => out.push('"'),
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        }
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- manifest parsing ---------------------------------------------------
+
+    const MANIFEST_BODY: &str = r#"
+[packages.markupsafe_sdist]
+requirements = "setuptools markupsafe==3.0.3"
+no_binary = "markupsafe"
+probe = "probes/markupsafe_sdist_probe.py"
+
+[packages.attrs]
+requirements = "attrs"
+probe = "probes/attrs_probe.py"
+
+[packages.attrs.selftest]
+source = "attrs==26.1.0"
+requirements = "pytest hypothesis"
+command = "tests"
+deselect = [
+    "tests/test_mypy.py",            # needs mypy plugin machinery
+    "tests/test_abc.py::test_x[a-b]",# parametrized id with brackets
+]
+timeout_seconds = 900
+"#;
+
+    #[test]
+    fn manifest_parses_no_binary_and_selftest() {
+        let m = Manifest::from_body(MANIFEST_BODY, Path::new(".")).unwrap();
+        assert_eq!(m.rows.len(), 2);
+
+        let sdist_row = &m.rows[0];
+        assert_eq!(sdist_row.name, "markupsafe_sdist");
+        assert_eq!(sdist_row.no_binary, vec!["markupsafe"]);
+        assert!(sdist_row.selftest.is_none());
+
+        let attrs = &m.rows[1];
+        assert!(attrs.no_binary.is_empty());
+        let st = attrs.selftest.as_ref().expect("selftest spec");
+        assert_eq!(st.source, "attrs==26.1.0");
+        assert_eq!(st.requirements, vec!["pytest", "hypothesis"]);
+        assert_eq!(st.command, "tests");
+        assert_eq!(
+            st.deselect,
+            vec!["tests/test_mypy.py", "tests/test_abc.py::test_x[a-b]"]
+        );
+        assert_eq!(st.timeout_seconds, Some(900));
+    }
+
+    #[test]
+    fn manifest_rejects_unpinned_no_binary() {
+        let body = r#"
+[packages.x]
+requirements = "markupsafe"
+no_binary = "markupsafe"
+probe = "p.py"
+"#;
+        let err = Manifest::from_body(body, Path::new(".")).unwrap_err();
+        assert!(err.to_string().contains("pinned"), "{err}");
+    }
+
+    #[test]
+    fn manifest_rejects_no_binary_without_requirement() {
+        let body = r#"
+[packages.x]
+requirements = "setuptools"
+no_binary = "markupsafe"
+probe = "p.py"
+"#;
+        let err = Manifest::from_body(body, Path::new(".")).unwrap_err();
+        assert!(err.to_string().contains("matches no requirement"), "{err}");
+    }
+
+    #[test]
+    fn manifest_rejects_unknown_subtable() {
+        let body = r#"
+[packages.x]
+requirements = "attrs"
+probe = "p.py"
+
+[packages.x.extras]
+key = "v"
+"#;
+        let err = Manifest::from_body(body, Path::new(".")).unwrap_err();
+        assert!(err.to_string().contains("unknown sub-table"), "{err}");
+    }
+
+    #[test]
+    fn manifest_rejects_orphan_selftest() {
+        let body = r#"
+[packages.x.selftest]
+source = "x==1.0"
+command = "tests"
+"#;
+        let err = Manifest::from_body(body, Path::new(".")).unwrap_err();
+        assert!(err.to_string().contains("has no [packages.x] row"), "{err}");
+    }
+
+    #[test]
+    fn manifest_rejects_unpinned_selftest_source() {
+        let body = r#"
+[packages.x]
+requirements = "attrs"
+probe = "p.py"
+
+[packages.x.selftest]
+source = "attrs>=26"
+command = "tests"
+"#;
+        let err = Manifest::from_body(body, Path::new(".")).unwrap_err();
+        assert!(err.to_string().contains("pinned"), "{err}");
+    }
+
+    #[test]
+    fn no_binary_accepts_comma_and_space_separation() {
+        let body = r#"
+[packages.x]
+requirements = "markupsafe==3.0.3 wrapt==2.3.0"
+no_binary = "markupsafe, wrapt"
+probe = "p.py"
+"#;
+        let m = Manifest::from_body(body, Path::new(".")).unwrap();
+        assert_eq!(m.rows[0].no_binary, vec!["markupsafe", "wrapt"]);
+    }
+
+    #[test]
+    fn strings_decode_backslash_escapes() {
+        // Pytest parametrize ids can contain a literal backslash-n
+        // (pytest's escaping of a newline parameter), written `\\n`.
+        let body = r#"
+[packages.x]
+requirements = "click==8.4.2"
+probe = "p.py"
+
+[packages.x.selftest]
+source = "click==8.4.2"
+requirements = "pytest==8.4.2"
+command = "tests"
+deselect = ["tests/test_chain.py::test_pipeline[args0-foo\\nbar-expect0]"]
+"#;
+        let m = Manifest::from_body(body, Path::new(".")).unwrap();
+        let st = m.rows[0].selftest.as_ref().unwrap();
+        assert_eq!(
+            st.deselect,
+            vec![r"tests/test_chain.py::test_pipeline[args0-foo\nbar-expect0]"]
+        );
+    }
+
+    // -- requirement helpers --------------------------------------------
+
+    #[test]
+    fn requirement_helpers() {
+        assert_eq!(requirement_name("attrs[dev]==26.1.0; extra"), "attrs");
+        assert_eq!(normalize_name("Python_dateutil.x"), "python-dateutil-x");
+        assert_eq!(
+            parse_pinned_requirement("MarkupSafe==3.0.3"),
+            Some(("MarkupSafe".to_owned(), "3.0.3".to_owned()))
+        );
+        assert_eq!(parse_pinned_requirement("markupsafe>=3"), None);
+        assert_eq!(parse_pinned_requirement("markupsafe"), None);
+    }
+
+    // -- expectations: per-OS override resolution (RFC 0062 WS3) ---------
+
+    #[test]
+    fn expectations_os_override_resolution_order() {
+        let body = r#"
+[packages.x]
+status = "pass"
+status_linux = "fail"
+reason_linux = "linux-only divergence"
+selftest_status = "pass"
+selftest_status_linux = "fail"
+selftest_reason_linux = "suite red on linux"
+"#;
+        // On linux the suffixed keys win…
+        let exp = EcosystemExpectations::from_body(body, "linux").unwrap();
+        let row = &exp.rows["x"];
+        assert_eq!(row.status, RowStatus::Fail);
+        assert_eq!(row.reason.as_deref(), Some("linux-only divergence"));
+        assert_eq!(row.selftest_status, Some(RowStatus::Fail));
+        assert_eq!(row.selftest_reason.as_deref(), Some("suite red on linux"));
+
+        // …while every other OS resolves to the base keys.
+        let exp = EcosystemExpectations::from_body(body, "macos").unwrap();
+        let row = &exp.rows["x"];
+        assert_eq!(row.status, RowStatus::Pass);
+        assert_eq!(row.reason, None);
+        assert_eq!(row.selftest_status, Some(RowStatus::Pass));
+        assert_eq!(row.selftest_reason, None);
+    }
+
+    #[test]
+    fn expectations_suffix_only_row_needs_base_status() {
+        // A row with only `status_linux` has no status on other hosts —
+        // that's a load error there (the base key is required).
+        let body = r#"
+[packages.x]
+status_linux = "fail"
+"#;
+        assert!(EcosystemExpectations::from_body(body, "linux").is_ok());
+        let err = EcosystemExpectations::from_body(body, "macos").unwrap_err();
+        assert!(err.to_string().contains("missing/bad status"), "{err}");
+    }
+
+    #[test]
+    fn expectations_reject_unknown_os_suffix() {
+        for key in [
+            "status_freebsd",
+            "reason_osx",
+            "selftest_status_win32",
+            "selftest_reason_darwin",
+        ] {
+            let body = format!("[packages.x]\nstatus = \"pass\"\n{key} = \"fail\"\n");
+            let err = EcosystemExpectations::from_body(&body, "macos").unwrap_err();
+            assert!(
+                err.to_string().contains("unknown OS suffix"),
+                "{key}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn expectations_keep_free_form_keys_legal() {
+        let body = r#"
+[packages.x]
+status = "pass"
+notes = "prose for humans"
+"#;
+        let exp = EcosystemExpectations::from_body(body, "macos").unwrap();
+        assert_eq!(exp.rows["x"].status, RowStatus::Pass);
+    }
+
+    #[test]
+    fn expectations_selftest_status_default_is_absent() {
+        let body = "[packages.x]\nstatus = \"pass\"\n";
+        let exp = EcosystemExpectations::from_body(body, "macos").unwrap();
+        // The pass-if-spec-exists default is applied at grading time,
+        // not load time — an absent key stays absent here.
+        assert_eq!(exp.rows["x"].selftest_status, None);
     }
 }

@@ -9,6 +9,7 @@ from _packaging import (
 __all__ = [
     'Tag', 'compatible_tags', 'sys_tags', 'cpython_tags',
     'parse_tag', 'INTERPRETER_SHORT_NAMES',
+    'interpreter_name', 'interpreter_version',
 ]
 
 
@@ -18,6 +19,22 @@ INTERPRETER_SHORT_NAMES = {
     'graalpy': 'gp',
     'weavepy': 'cp',  # WeavePy claims CPython ABI compatibility.
 }
+
+
+def interpreter_name():
+    """The running interpreter's short tag name (RFC 0062 WS2:
+    setuptools' vendored ``wheel`` calls this to pick the wheel's
+    implementation/ABI tags — WeavePy maps to ``cp`` because built
+    extensions target the cp313 binary ABI)."""
+    import sys
+    name = sys.implementation.name
+    return INTERPRETER_SHORT_NAMES.get(name) or name
+
+
+def interpreter_version(*, warn=False):
+    """The running interpreter's version tag digits (e.g. ``313``)."""
+    import sys
+    return ''.join(map(str, sys.version_info[:2]))
 
 
 class Tag:

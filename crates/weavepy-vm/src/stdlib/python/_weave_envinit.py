@@ -19,7 +19,11 @@ exactly as the stdlib does.
 
 import os as _os
 import sys as _sys
-from collections.abc import Mapping, MutableMapping
+# CPython's os.py imports from `_collections_abc`, not `collections.abc`:
+# pulling the full `collections` package here would drag
+# itertools/keyword/operator/reprlib into *every* startup
+# (test_site.test_startup_imports counts them).
+from _collections_abc import Mapping, MutableMapping
 
 
 class _Environ(MutableMapping):
