@@ -9,8 +9,11 @@
 //!   (requires the CPython column so the baseline carries ratios).
 //! - `gate` — runs the suite, compares WeavePy/CPython ratios (and
 //!   the suite geomean) against the host platform's baseline, and
-//!   exits non-zero on regressions beyond the threshold. Missing
-//!   per-platform baselines are an error unless
+//!   exits non-zero on regressions beyond the threshold. Regressed
+//!   fixtures are re-measured once first — a regression must survive
+//!   the retry to fail the gate, which rejects one-off noise
+//!   excursions on shared CI runners without loosening the threshold.
+//!   Missing per-platform baselines are an error unless
 //!   `--allow-missing-baseline` makes the gate advisory (RFC 0062
 //!   WS3).
 //!
@@ -23,9 +26,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use weavepy_bench::fixtures::{baseline_path, platform_key};
+use weavepy_bench::fixtures::{baseline_path, discover_fixtures, platform_key};
 use weavepy_bench::report::Report;
-use weavepy_bench::runner::{run_suite, RunOpts};
+use weavepy_bench::runner::{resolve_python, resolve_weavepy, run_one, run_suite, RunOpts};
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -171,7 +174,7 @@ fn cmd_gate(args: &[String]) -> io::Result<bool> {
     let host_platform = platform_key();
     let baseline = load_baseline(&baseline_path(), &host_platform, allow_missing)?;
     let rows = run_suite(&opts)?;
-    let report = Report::new(rows);
+    let mut report = Report::new(rows);
     println!("{}", report.to_markdown());
     let Some(baseline) = baseline else {
         println!("==============================================================");
@@ -182,7 +185,64 @@ fn cmd_gate(args: &[String]) -> io::Result<bool> {
         println!("==============================================================");
         return Ok(true);
     };
-    let regs = report.regressions(&baseline, pct);
+    let mut regs = report.regressions(&baseline, pct);
+
+    // Shared CI runners take multi-second noise excursions that land
+    // squarely on whichever fixture is running (observed: deltablue
+    // jumping +51% on one macos-latest run while the suite geomean sat
+    // *below* baseline). Re-measure just the regressed fixtures once
+    // and keep the better measurement of the two: noise only inflates
+    // ratios, so the minimum is the truer estimate, while a genuine
+    // regression reproduces on the retry and still fails the gate.
+    let retry_names = report.regressed_fixture_names(&baseline, pct);
+    if !retry_names.is_empty() {
+        println!(
+            "RETRY: re-measuring {} regressed fixture(s) to reject one-off runner noise: {}",
+            retry_names.len(),
+            retry_names.join(", ")
+        );
+        let weavepy = resolve_weavepy(&opts)?;
+        let python = if opts.include_cpython {
+            Some(resolve_python(&opts)?)
+        } else {
+            None
+        };
+        let mut rows = report.rows;
+        for fix in discover_fixtures() {
+            if !retry_names.contains(&fix.name) {
+                continue;
+            }
+            let retry = run_one(&fix, &opts, &weavepy, python.as_deref())?;
+            let slot = rows
+                .iter_mut()
+                .find(|r| r.name == fix.name)
+                .expect("regressed fixture has a report row");
+            let better = match (retry.ratio, slot.ratio) {
+                (Some(nr), Some(or)) => nr < or,
+                _ => retry.weavepy.median_ns < slot.weavepy.median_ns,
+            };
+            match (slot.ratio, retry.ratio) {
+                (Some(or), Some(nr)) => println!(
+                    "  {}: {:.2}× -> {:.2}× on retry ({})",
+                    fix.name,
+                    or,
+                    nr,
+                    if better { "kept retry" } else { "kept original" }
+                ),
+                _ => println!(
+                    "  {}: re-measured ({})",
+                    fix.name,
+                    if better { "kept retry" } else { "kept original" }
+                ),
+            }
+            if better {
+                *slot = retry;
+            }
+        }
+        report = Report::new(rows);
+        regs = report.regressions(&baseline, pct);
+    }
+
     if regs.is_empty() {
         println!("OK: no ratio regressions over {pct:.1}%");
         Ok(true)

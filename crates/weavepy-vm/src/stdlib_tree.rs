@@ -582,15 +582,21 @@ fn materialize(prefix: &Path) -> bool {
                 ),
             )?;
             // RFC 0062 WS2 — the installable header surface. A real
-            // CPython install ships `{prefix}/include/python3.13/`
-            // with the full `Include/` tree plus the generated
-            // `pyconfig.h`; that directory is what `INCLUDEPY` points
-            // at and what setuptools hands to the compiler for an
-            // sdist's C extensions. Write the embedded stock tree
-            // (vendored, PSF-licensed) and the per-OS `pyconfig.h`.
-            let include_dir = tmp_prefix
-                .join("include")
-                .join(format!("python{version_short}"));
+            // CPython install ships the full `Include/` tree plus the
+            // generated `pyconfig.h` under `{prefix}/include/python3.13/`
+            // on POSIX and directly under `{prefix}\Include` on Windows
+            // (RFC 0063 WS6 — sysconfig's `nt` scheme and therefore
+            // `INCLUDEPY` resolve there, with no versioned subdir).
+            // That directory is what setuptools hands to the compiler
+            // for an sdist's C extensions. Write the embedded stock
+            // tree (vendored, PSF-licensed) and the per-OS `pyconfig.h`.
+            let include_dir = if cfg!(windows) {
+                tmp_prefix.join("Include")
+            } else {
+                tmp_prefix
+                    .join("include")
+                    .join(format!("python{version_short}"))
+            };
             for (rel, contents) in crate::cpython_headers::CPYTHON_HEADERS {
                 let path: PathBuf = include_dir.join(rel.split('/').collect::<PathBuf>());
                 if let Some(dir) = path.parent() {

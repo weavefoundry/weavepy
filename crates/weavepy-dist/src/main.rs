@@ -25,9 +25,10 @@
 //! WS6): `weavepy.exe` plus `python.exe`/`python3.exe`/`python3.13.exe`
 //! sit at the *prefix root* as real file copies — no `bin/`, no symlinks
 //! anywhere in the artifact — and the default format is `zip` (written
-//! by bsdtar's `tar -a`). `lib/` and `include/` are unchanged; the
-//! RFC 0053 landmark walk finds `{prefix}/lib/weavepy3.13` from the
-//! exe's own directory, so nothing else moves.
+//! by bsdtar's `tar -a`). Headers live at `{prefix}\Include` (CPython's
+//! NT shape, where sysconfig's `nt` scheme points); `lib/` is unchanged
+//! and the RFC 0053 landmark walk finds `{prefix}/lib/weavepy3.13` from
+//! the exe's own directory, so nothing else moves.
 //!
 //! Rather than reimplementing the stdlib writer, `build` runs the packaged
 //! binary itself with `WEAVEPY_STDLIB_CACHE` pointed at a fresh directory,
@@ -203,6 +204,7 @@ fn resolve_workspace(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(p) = explicit {
         return p
             .canonicalize()
+            .map(strip_verbatim)
             .with_context(|| format!("--workspace path does not exist: {}", p.display()));
     }
     let compiled_from = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -244,6 +246,29 @@ fn exe_name(base: &str) -> String {
     }
 }
 
+/// `Path::canonicalize` on Windows returns `\\?\`-prefixed verbatim
+/// paths. NT's verbatim syntax turns off `/`-as-separator, which breaks
+/// CPython-shaped consumers: sysconfig's install schemes join with `/`
+/// (`{base}/Lib/site-packages`), so `python -m venv` under a `\\?\`
+/// prefix fails — on stock CPython too. Real installs never see `\\?\`
+/// paths; strip the prefix so the interpreter under check is handed the
+/// path shape users actually produce. No-op on non-Windows and for
+/// paths (UNC shares, device paths) that have no plain spelling.
+fn strip_verbatim(p: PathBuf) -> PathBuf {
+    if !cfg!(windows) {
+        return p;
+    }
+    let Some(s) = p.to_str() else { return p };
+    let Some(rest) = s.strip_prefix(r"\\?\") else {
+        return p;
+    };
+    // `\\?\C:\...` → `C:\...`; leave `\\?\UNC\...` and friends alone.
+    if rest.len() >= 3 && rest.as_bytes()[1] == b':' && rest.as_bytes()[2] == b'\\' {
+        return PathBuf::from(rest);
+    }
+    p
+}
+
 // ---------------------------------------------------------------------------
 // build
 // ---------------------------------------------------------------------------
@@ -273,6 +298,7 @@ fn build_artifact(workspace: &Path, weavepy: &Path, out: &Path, format: Format) 
         .with_context(|| format!("failed to create {}", cache.display()))?;
     let cache = cache
         .canonicalize()
+        .map(strip_verbatim)
         .with_context(|| format!("failed to canonicalize {}", cache.display()))?;
 
     let env = scrubbed_env(&cache);
@@ -295,6 +321,7 @@ fn build_artifact(workspace: &Path, weavepy: &Path, out: &Path, format: Format) 
     let printed = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     let prefix = PathBuf::from(&printed)
         .canonicalize()
+        .map(strip_verbatim)
         .with_context(|| format!("binary printed a non-existent sys.prefix: {printed:?}"))?;
     if !prefix.starts_with(&cache) {
         bail!(
@@ -480,9 +507,10 @@ fn artifact_readme(name: &str) -> String {
              .venv\\Scripts\\python.exe -m pip install <package>\n\
              ```\n\
              \n\
-             The CPython 3.13 C header set ships under `include/python3.13`,\n\
-             but building or loading C extensions on Windows is not supported\n\
-             yet (it needs a `python313.dll` for extensions to link against).\n\
+             The CPython 3.13 C header set ships under `Include\\` (the CPython\n\
+             Windows convention), but building or loading C extensions on\n\
+             Windows is not supported yet (it needs a `python313.dll` for\n\
+             extensions to link against).\n\
              \n\
              ## License\n\
              \n\
@@ -631,6 +659,7 @@ fn cmd_check(
         .with_context(|| format!("failed to create {}", scratch.display()))?;
     let scratch = scratch
         .canonicalize()
+        .map(strip_verbatim)
         .with_context(|| format!("failed to canonicalize {}", scratch.display()))?;
 
     let result = run_check(workspace, artifact, weavepy, wheels, &scratch);
@@ -656,6 +685,7 @@ fn run_check(
         Some(path) => {
             if path.is_dir() {
                 path.canonicalize()
+                    .map(strip_verbatim)
                     .with_context(|| format!("failed to canonicalize {}", path.display()))?
             } else if path.is_file() {
                 extract_archive(&path, scratch)?
@@ -671,6 +701,7 @@ fn run_check(
     };
     let prefix = prefix
         .canonicalize()
+        .map(strip_verbatim)
         .with_context(|| format!("failed to canonicalize {}", prefix.display()))?;
     eprintln!("checking artifact prefix {}", prefix.display());
 
