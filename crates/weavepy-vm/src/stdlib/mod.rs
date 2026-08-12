@@ -3267,6 +3267,13 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/ntpath_mod.py"),
             is_package: false,
         },
+        // On Windows `urllib.request` does `from nturl2path import …` at
+        // module scope, so pip cannot even import without it (RFC 0063).
+        FrozenSource {
+            name: "nturl2path",
+            source: include_str!("python/nturl2path.py"),
+            is_package: false,
+        },
         FrozenSource {
             name: "textwrap",
             source: include_str!("python/textwrap_mod.py"),
