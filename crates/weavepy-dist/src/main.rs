@@ -920,10 +920,11 @@ fn leg_venv(
                 name: "venv",
                 status: LegStatus::Fail,
                 detail: format!(
-                    "`python3 -m venv` exited {}\n{}\n{}",
+                    "`python3 -m venv` exited {}\n{}\n{}{}",
                     out.status,
                     String::from_utf8_lossy(&out.stdout),
                     String::from_utf8_lossy(&out.stderr),
+                    venv_failure_diagnostics(venv_python, env),
                 ),
             }
         }
@@ -942,6 +943,49 @@ fn leg_venv(
         "venv",
         run_captured(venv_python, &["-c", VENV_SCRIPT], &env, None),
     )
+}
+
+/// `python -m venv` bootstraps pip through `subprocess.check_output`,
+/// so the ensurepip child's traceback is captured and discarded — the
+/// `CalledProcessError` venv prints carries only the exit status. When
+/// creation fails and the venv interpreter was already copied in, re-run
+/// the two commands the half-built venv can still answer and append
+/// their output, so a CI-only failure is diagnosable from the leg
+/// detail alone.
+fn venv_failure_diagnostics(venv_python: &Path, env: &[(OsString, OsString)]) -> String {
+    if !venv_python.is_file() {
+        return format!(
+            "\n(no diagnostics: {} does not exist — venv creation failed before the interpreter copy)",
+            venv_python.display()
+        );
+    }
+    const IDENTITY: &str = "import sys, sysconfig\n\
+         print('executable:', sys.executable)\n\
+         print('prefix:', sys.prefix)\n\
+         print('base_prefix:', sys.base_prefix)\n\
+         print('path:', sys.path)\n\
+         print('purelib:', sysconfig.get_paths()['purelib'])";
+    let probes: [(&str, &[&str]); 2] = [
+        ("identity", &["-c", IDENTITY]),
+        (
+            "ensurepip",
+            &["-m", "ensurepip", "--upgrade", "--default-pip"],
+        ),
+    ];
+    let mut detail = String::new();
+    for (label, args) in probes {
+        detail.push_str(&format!("\n--- diagnostic: venv python {label} ---\n"));
+        match run_captured(venv_python, args, env, None) {
+            Err(err) => detail.push_str(&format!("failed to spawn: {err:#}\n")),
+            Ok(out) => detail.push_str(&format!(
+                "exit: {}\nstdout:\n{}\nstderr:\n{}\n",
+                out.status,
+                String::from_utf8_lossy(&out.stdout).trim_end(),
+                String::from_utf8_lossy(&out.stderr).trim_end(),
+            )),
+        }
+    }
+    detail
 }
 
 fn leg_pip(venv_python: &Path, wheels: &Path, env: &[(OsString, OsString)]) -> Leg {
