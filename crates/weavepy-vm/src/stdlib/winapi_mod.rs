@@ -90,6 +90,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         reg("GetCurrentProcess", win_get_current_process);
         reg("GetExitCodeProcess", win_get_exit_code_process);
         reg("GetFileType", win_get_file_type);
+        reg("GetLongPathName", win_get_long_path_name);
         reg("GetModuleFileName", win_get_module_file_name);
         reg("GetStdHandle", win_get_std_handle);
         reg("ExitProcess", win_exit_process);
@@ -318,6 +319,30 @@ fn win_get_file_type(args: &[Object], _kw: &[(String, Object)]) -> Result<Object
         }
     }
     Ok(Object::Int(i64::from(ty)))
+}
+
+/// `GetLongPathName(path)` — expand 8.3 short components (`RUNNER~1`)
+/// to their long spellings. venv's `_same_path` (gh-90329) calls this
+/// to recognize a short and a long spelling of the same executable
+/// path, guarded only by `except OSError` — so the name must exist.
+fn win_get_long_path_name(
+    args: &[Object],
+    _kw: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
+    let path = str_arg(args.first(), "GetLongPathName", "path")?;
+    let wpath = wide(&path);
+    // CPython's pattern: size probe (returns the required length
+    // including the NUL), then fill.
+    let needed = unsafe { fs::GetLongPathNameW(wpath.as_ptr(), std::ptr::null_mut(), 0) };
+    if needed == 0 {
+        return Err(nt_support::last_win32_error_to_py(Some(&path)));
+    }
+    let mut buf = vec![0u16; needed as usize];
+    let n = unsafe { fs::GetLongPathNameW(wpath.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+    if n == 0 || n as usize >= buf.len() {
+        return Err(nt_support::last_win32_error_to_py(Some(&path)));
+    }
+    Ok(Object::from_str(nt_support::from_wide(&buf[..n as usize])))
 }
 
 fn win_get_module_file_name(
@@ -1750,6 +1775,7 @@ fn constants() -> Vec<(&'static str, i64)> {
         ("DUPLICATE_CLOSE_SOURCE", 0x0000_0001),
         ("DUPLICATE_SAME_ACCESS", 0x0000_0002),
         // Win32 error codes.
+        ("ERROR_ACCESS_DENIED", 5),
         ("ERROR_ALREADY_EXISTS", 183),
         ("ERROR_BROKEN_PIPE", 109),
         ("ERROR_IO_PENDING", 997),
@@ -1760,6 +1786,7 @@ fn constants() -> Vec<(&'static str, i64)> {
         ("ERROR_OPERATION_ABORTED", 995),
         ("ERROR_PIPE_BUSY", 231),
         ("ERROR_PIPE_CONNECTED", 535),
+        ("ERROR_PRIVILEGE_NOT_HELD", 1314),
         ("ERROR_SEM_TIMEOUT", 121),
         // File flags and access.
         ("FILE_FLAG_FIRST_PIPE_INSTANCE", 0x0008_0000),
