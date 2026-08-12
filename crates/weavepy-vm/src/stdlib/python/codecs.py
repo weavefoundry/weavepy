@@ -51,6 +51,19 @@ unicode_escape_encode = _codecs.unicode_escape_encode
 unicode_escape_decode = _codecs.unicode_escape_decode
 readbuffer_encode = _codecs.readbuffer_encode
 
+# Windows-only code-page entry points (RFC 0063). CPython's
+# `from _codecs import *` picks these up only on win32 builds, where
+# `encodings/mbcs.py` and `encodings/oem.py` import them from here.
+try:
+    mbcs_encode = _codecs.mbcs_encode
+    mbcs_decode = _codecs.mbcs_decode
+    oem_encode = _codecs.oem_encode
+    oem_decode = _codecs.oem_decode
+    code_page_encode = _codecs.code_page_encode
+    code_page_decode = _codecs.code_page_decode
+except AttributeError:
+    pass
+
 
 _USER_CODECS = {}
 _ERROR_HANDLERS = {}

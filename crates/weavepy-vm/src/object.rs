@@ -4541,8 +4541,16 @@ impl PyFile {
             }
             #[cfg(windows)]
             FileBackend::Disk(f) => {
-                use std::os::windows::io::AsRawHandle;
-                Some(f.as_raw_handle() as i64)
+                // RFC 0063: the CRT fd model. Python-visible descriptors on
+                // Windows are CRT fds (CPython opens through `_wopen` and
+                // exposes the fd), never raw HANDLEs — `msvcrt.get_osfhandle
+                // (f.fileno())`, `os.fstat(f.fileno())`, and `mmap(f.fileno())`
+                // all consume the CRT domain. The registry mints one fd per
+                // handle on first use and transfers handle ownership to it;
+                // the close path (below) releases through the fd.
+                crate::stdlib::nt_support::fileno_for_disk_file(f)
+                    .ok()
+                    .map(i64::from)
             }
             #[cfg(not(any(unix, windows)))]
             FileBackend::Disk(_) => None,
@@ -5524,7 +5532,26 @@ impl PyFile {
                         return Err(std::io::Error::last_os_error());
                     }
                 }
-                #[cfg(not(unix))]
+                #[cfg(windows)]
+                {
+                    // RFC 0063: mirror the Unix detach-then-close discipline
+                    // in the CRT fd model. `close_disk_file` defuses the
+                    // `File`'s checked drop (`into_raw_handle`) and releases
+                    // through the adopted CRT fd when `fileno()` minted one
+                    // (the fd owns the handle), else `CloseHandle` directly.
+                    // A stale handle/fd reports like Unix's `EBADF` instead
+                    // of double closing.
+                    use std::os::windows::io::IntoRawHandle;
+                    if self.closefd.get() {
+                        crate::stdlib::nt_support::close_disk_file(f)?;
+                    } else {
+                        // `closefd=False`: the caller keeps ownership; detach
+                        // without closing (the registry entry, if any, stays
+                        // keyed to the still-live handle).
+                        let _ = f.into_raw_handle();
+                    }
+                }
+                #[cfg(not(any(unix, windows)))]
                 {
                     // No portable raw-fd detach here; closing is unavoidable.
                     drop(f);
@@ -6391,6 +6418,34 @@ impl Drop for PyFile {
                         unsafe {
                             libc::close(fd);
                         }
+                    }
+                }
+            }
+        }
+        #[cfg(windows)]
+        {
+            // RFC 0063: the Windows twin of the Unix drop path above —
+            // detach the handle from the `File`, then release through the
+            // adopted CRT fd (when `fileno()` minted one) or `CloseHandle`,
+            // swallowing stale-descriptor errors like CPython's plain-int
+            // fd model does.
+            let Ok(mut backend) = self.backend.try_borrow_mut() else {
+                return;
+            };
+            if matches!(&*backend, FileBackend::Disk(_)) {
+                let old = std::mem::replace(
+                    &mut *backend,
+                    FileBackend::MemBytes {
+                        data: Rc::new(RefCell::new(Vec::new())),
+                        pos: 0,
+                    },
+                );
+                if let FileBackend::Disk(f) = old {
+                    if self.closefd.get() {
+                        let _ = crate::stdlib::nt_support::close_disk_file(f);
+                    } else {
+                        use std::os::windows::io::IntoRawHandle;
+                        let _ = f.into_raw_handle();
                     }
                 }
             }

@@ -38,6 +38,20 @@
 # load time `<key>_<host_os>` wins over the plain `<key>`; the base
 # `status` stays mandatory, and an unrecognized suffix on one of these
 # keys (e.g. `status_ubuntu`) is a hard load error.
+#
+# RFC 0063 (Windows wave, WS7) added the top-level `measured_os` stamp
+# below: the list of OSes (same std::env::consts::OS spelling as the
+# suffix keys) whose rows are *measured* baselines. On a host OS not in
+# the stamp, `--check` still prints the full report and writes results,
+# but unexpected results only emit an advisory NOTE and exit 0 — the
+# gate stays advisory until a CI-measured baseline for that OS is
+# transplanted into `status_<os>` rows and the OS name is added to the
+# stamp, flipping the lane to blocking. A missing stamp means "all OSes
+# measured" (pre-RFC-0063 behaviour). Windows rows seeded in this wave
+# are limited to files that are POSIX-only by construction (CPython
+# itself skips them on NT); everything else gets measured by CI first.
+
+measured_os = ["macos", "linux"]
 
 timeout_seconds = 60
 
@@ -484,6 +498,8 @@ reason = "measured (RFC 0057 WS10): full suite OK — fatal-signal re-raise forc
 [tests."cpython/Lib/test/test_fcntl.py"]
 status = "pass"
 reason = "measured (RFC 0040 WS1): passes end-to-end (12 run, 4 skip). The `test_lockf_{exclusive,share}` cases drive a `multiprocessing.get_context('spawn')` child that unpickles the test function from `test.test_fcntl`; they were failing because the spawn child rebinds `sys.path` in `spawn.prepare()` (`sys.path = data['sys_path']`) and WeavePy's import loader read a stale cached path snapshot. The loader now consults the live `sys.modules['sys'].path` (CPython-faithful), so the child resolves on-disk submodules and the lockf BlockingIOError round-trips."
+status_windows = "skip"
+reason_windows = "POSIX-only module (no fcntl on Windows); CPython skips this file on NT (RFC 0063 seeded skip)."
 
 [tests."cpython/Lib/test/test_file_eintr.py"]
 status = "fail"
@@ -516,6 +532,8 @@ reason = "measured (RFC 0038 WS-B): passes end-to-end (frozen `fnmatch` over the
 [tests."cpython/Lib/test/test_fork1.py"]
 status = "fail"
 reason = "measured (RFC 0049 wave-5 full-suite baseline): AssertionError: process 57266 exited with code 1, but exit code 42 is expected"
+status_windows = "skip"
+reason_windows = "POSIX-only (os.fork does not exist on Windows); CPython skips this file on NT (RFC 0063 seeded skip)."
 
 [tests."cpython/Lib/test/test_format.py"]
 status = "pass"
@@ -677,6 +695,8 @@ reason = "measured (RFC 0040 WS7 — acceptance bar met): passes end-to-end — 
 [tests."cpython/Lib/test/test_ioctl.py"]
 status = "pass"
 reason = "measured (RFC 0055 WS6): os.openpty unlocked the pty-backed legs; fcntl.ioctl masks a negative code to its 32-bit pattern like CPython's bitwise unsigned-int converter."
+status_windows = "skip"
+reason_windows = "POSIX-only (fcntl.ioctl over pty/termios fds; no fcntl on Windows); CPython skips this file on NT (RFC 0063 seeded skip)."
 
 [tests."cpython/Lib/test/test_ipaddress.py"]
 status = "pass"
@@ -713,6 +733,8 @@ reason = "RFC 0037: added the missing arg-syntax SyntaxErrors (duplicate paramet
 [tests."cpython/Lib/test/test_kqueue.py"]
 status = "pass"
 reason = "RFC 0039 WS6: native libc-backed select.kqueue/kevent"
+status_windows = "skip"
+reason_windows = "BSD-only kernel queue (select.kqueue never exists on Windows); CPython skips this file on NT (RFC 0063 seeded skip)."
 
 [tests."cpython/Lib/test/test_linecache.py"]
 status = "pass"
@@ -800,6 +822,8 @@ reason = "RFC 0050 WS3: passes (36 tests, 1 cpython_only skip). Frozen _multibyt
 [tests."cpython/Lib/test/test_multiprocessing_fork.py"]
 status = "skip"
 reason = "measured (RFC 0040 WS5): faithful skip — CPython's own `test_multiprocessing_fork/__init__.py` raises `unittest.SkipTest(\"test may crash on macOS (bpo-33725)\")` at import on `sys.platform == 'darwin'`, and WeavePy reproduces that skip identically (verified: the module raises the same SkipTest on this macOS host). `fork` in a threaded runtime is documented-unsafe (the RFC Non-goals and CPython both gate it off here); the `spawn` and `forkserver` variants — the default/safe paths that share the entire `multiprocessing` package + `_multiprocessing` core — both pass end-to-end (413 run, 0F/0E). On a Linux grading host the `fork` start method runs the same package over the RFC 0025 shared-`Arc` heap clone; the macOS skip is the CPython-matching outcome here."
+status_windows = "skip"
+reason_windows = "POSIX-only start method (the fork start method does not exist on Windows — spawn is the only NT start method); CPython skips this file on NT (RFC 0063 seeded skip)."
 
 [tests."cpython/Lib/test/test_multiprocessing_forkserver.py"]
 status = "pass"
@@ -918,6 +942,8 @@ reason = "measured (RFC 0057 WS10): 28 tests OK — the posonly-as-keyword TypeE
 [tests."cpython/Lib/test/test_posix.py"]
 status = "pass"
 reason = "RFC 0040 WS1/WS4: passes in the canonical subprocess mode (178 run, 0F/0E, 99 skip). Landed: os.pipe2 honouring O_NONBLOCK/O_CLOEXEC via host libc O_* values (macOS differs from Linux), signal.raise_signal delivering real signals unconditionally (setsigdef kills the child), posix_spawn setsigmask preserved by capturing+restoring the inherited signal mask on the VM thread, and a pre-main C constructor (proc_init) that re-closes any inherited-closed standard fd the Rust runtime's sanitize_standard_fds reopened to /dev/null (test_close_file)."
+status_windows = "skip"
+reason_windows = "POSIX-only module (no posix module on Windows — os routes through nt); CPython skips this file on NT (RFC 0063 seeded skip)."
 
 [tests."cpython/Lib/test/test_posixpath.py"]
 status = "pass"
@@ -951,6 +977,8 @@ reason = "measured (RFC 0053 WS5): verbatim `pstats.py` (SortKey enum, `stream=`
 [tests."cpython/Lib/test/test_pty.py"]
 status = "pass"
 reason = "measured (RFC 0055 WS6): native termios + os.openpty/os.login_tty — pty.fork(), spawn, and the SmallPtyTests all pass."
+status_windows = "skip"
+reason_windows = "POSIX-only module (pty requires termios/os.openpty, neither exists on Windows); CPython skips this file on NT (RFC 0063 seeded skip)."
 
 [tests."cpython/Lib/test/test_pulldom.py"]
 status = "pass"
@@ -1215,6 +1243,8 @@ reason = "measured (RFC 0040 WS7/WS8 + deterministic-finalization arc): passes e
 [tests."cpython/Lib/test/test_termios.py"]
 status = "pass"
 reason = "measured (RFC 0055 WS6): native termios builtin (tcgetattr/tcsetattr/tcdrain/tcflush/tcflow/winsize over libc) with CPython's error type and VMIN/VTIME int-vs-bytes cc semantics."
+status_windows = "skip"
+reason_windows = "POSIX-only module (no termios on Windows); CPython skips this file on NT (RFC 0063 seeded skip)."
 
 [tests."cpython/Lib/test/test_textwrap.py"]
 status = "pass"

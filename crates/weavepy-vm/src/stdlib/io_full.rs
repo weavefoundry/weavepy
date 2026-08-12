@@ -401,7 +401,28 @@ fn file_from_fd(fd_obj: &Object, mode: &str, name: String) -> Result<Object, Run
         }
         Ok(Object::File(Rc::new(pyfile)))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use crate::object::{FileBackend, PyFile};
+        let fd = i32::try_from(fd).map_err(|_| value_error("file descriptor out of range"))?;
+        // RFC 0063: the fd is a CRT descriptor (`os.open` mints them via
+        // `_wsopen_s`). `owning_file_from_fd` validates it
+        // (`_get_osfhandle` rejects stale fds with the EBADF story,
+        // mirroring CPython's up-front `fstat` probe), wraps the
+        // underlying handle as a `File`, and records the adoption in the
+        // registry so the eventual close releases through `_close(fd)` —
+        // never a double `CloseHandle`.
+        let f = crate::stdlib::nt_support::owning_file_from_fd(fd)
+            .map_err(|e| crate::error::io_error_to_py(&e))?;
+        let from_bare_fd = name.is_empty();
+        let display = if from_bare_fd { fd.to_string() } else { name };
+        let pyfile = PyFile::new(display, mode, FileBackend::Disk(f));
+        if from_bare_fd {
+            pyfile.name_is_fd.set(true);
+        }
+        Ok(Object::File(Rc::new(pyfile)))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (mode, name);
         Err(crate::error::runtime_error(

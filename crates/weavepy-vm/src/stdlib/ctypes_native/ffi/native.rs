@@ -20,8 +20,9 @@
 //!   stubs live in the normal `.text` segment there is no runtime code
 //!   generation and therefore no W^X / `MAP_JIT` handling to worry about.
 //!
-//! Only unix `aarch64` and `x86_64` have an ABI implementation (the x86-64
-//! gate is System V, which is not the Windows x64 convention); on any other
+//! Unix `aarch64`/`x86_64` and Windows `x86_64` have an ABI implementation
+//! (the unix x86-64 gate is System V; the Windows one is the Microsoft x64
+//! "Win64" convention, shared by the -gnu and -msvc targets); on any other
 //! target [`SUPPORTED`] is `false` and both entry points degrade cleanly
 //! (the frozen `_ctypes.py` treats a missing closure back-end as "callbacks
 //! are Python-callable only").
@@ -39,7 +40,7 @@ struct RawCall {
     fpr: *const u64,      // +16  -> up to 8 FP registers (low 64 bits each)
     stack: *const u64,    // +24  -> overflow stack words (may be null if 0)
     stack_words: u64,     // +32
-    nfpr: u64,            // +40  -> # FP regs used (x86-64 variadic `al`)
+    nfpr: u64,            // +40  -> # FP regs used (SysV variadic `al`; Win64 ignores it)
     ret_gpr: *mut u64,    // +48  -> receives x0 / rax
     ret_fpr: *mut u64,    // +56  -> receives d0 / xmm0
 }
@@ -88,6 +89,8 @@ impl ClosureRegs {
 mod abi {
     /// Integer/pointer argument registers: x0..x7.
     pub(super) const NGPR: usize = 8;
+    /// FP argument registers: d0..d7.
+    pub(super) const NFPR: usize = 8;
     /// Bytes between consecutive trampoline stubs (`adr`+`b` = 8 bytes).
     pub(super) const STUB_SIZE: usize = 8;
     /// `adr x17, .` yields the stub base itself, so no bias.
@@ -188,6 +191,8 @@ core::arch::global_asm!(
 mod abi {
     /// Integer/pointer argument registers: rdi, rsi, rdx, rcx, r8, r9.
     pub(super) const NGPR: usize = 6;
+    /// FP argument registers: xmm0..xmm7.
+    pub(super) const NFPR: usize = 8;
     /// Bytes between consecutive trampoline stubs (padded to 16).
     pub(super) const STUB_SIZE: usize = 16;
     /// `lea r11, [rip]` yields the address *after* the 7-byte `lea`.
@@ -297,30 +302,186 @@ core::arch::global_asm!(
 );
 
 // ================================================================
-// Shared machinery (aarch64 + x86-64)
+// x86-64 Windows (Microsoft x64, a.k.a. Win64) — Intel syntax.
+//
+// One convention covers both `-gnu` and `-msvc` targets (and stdcall ==
+// cdecl on Win64, so `FUNCFLAG_STDCALL` needs no distinct gate — see
+// Modules/_ctypes/callproc.c, which compiles a single path on _WIN64).
+// The asm avoids MSVC-only assembler directives (no `.seh_*` unwind
+// tables, mirroring the unix gates' lack of CFI): the local verification
+// toolchain is windows-gnu via zig/LLVM.
 // ================================================================
 
-#[cfg(all(unix, any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod abi {
+    /// Integer/pointer argument registers: rcx, rdx, r8, r9. Win64 argument
+    /// slots are *positional* — argument `i` (i < 4) consumes slot `i` of
+    /// both files at once, whatever its class (`assign_slots` enforces
+    /// this) — so NGPR == NFPR == 4.
+    pub(super) const NGPR: usize = 4;
+    /// FP argument registers: xmm0..xmm3 (positional, see above).
+    pub(super) const NFPR: usize = 4;
+    /// Bytes between consecutive trampoline stubs (padded to 16).
+    pub(super) const STUB_SIZE: usize = 16;
+    /// `lea r11, [rip]` yields the address *after* the 7-byte `lea`.
+    pub(super) const LEA_BIAS: usize = 7;
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+core::arch::global_asm!(
+    ".p2align 4",
+    ".globl {gate}",
+    "{gate}:",
+    "  push rbp",
+    "  mov rbp, rsp",
+    "  push rbx",
+    "  push r12",
+    "  mov rbx, rcx",      // rbx = &RawCall (Win64: first arg in rcx)
+    "  mov r12, [rbx+32]", // stack_words
+    // Overflow area + the 32-byte shadow space the Win64 ABI makes the
+    // caller allocate on *every* call, then round so rsp stays 16-byte
+    // aligned at the `call` (entry rsp ≡ 8 mod 16; the three pushes
+    // above restore 16-alignment).
+    "  lea rax, [r12*8 + 32]",
+    "  add rax, 15",
+    "  and rax, -16",
+    "  sub rsp, rax",
+    // Stack arguments (the 5th onward) live in 8-byte slots immediately
+    // above the shadow space: [rsp+32], [rsp+40], ...
+    "  mov r10, [rbx+24]", // stack src
+    "  xor r11, r11",
+    "3:",
+    "  cmp r11, r12",
+    "  jae 4f",
+    "  mov rax, [r10 + r11*8]",
+    "  mov [rsp + 32 + r11*8], rax",
+    "  add r11, 1",
+    "  jmp 3b",
+    "4:",
+    "  mov rax, [rbx+16]", // fpr src (only 4 argument XMM regs on Win64)
+    "  movsd xmm0, [rax+0]",
+    "  movsd xmm1, [rax+8]",
+    "  movsd xmm2, [rax+16]",
+    "  movsd xmm3, [rax+24]",
+    "  mov r10, [rbx+8]", // gpr src
+    "  mov rcx, [r10+0]",
+    "  mov rdx, [r10+8]",
+    "  mov r8,  [r10+16]",
+    "  mov r9,  [r10+24]",
+    // No `al` FP count here: that is SysV varargs protocol. Win64 varargs
+    // instead need FP args mirrored into the GPR file, which the slot
+    // assigner does before we ever get here (see ffi.rs `assign_slots`).
+    "  mov r11, [rbx+0]", // fnptr
+    "  call r11",
+    "  mov r10, [rbx+48]", // ret_gpr (integer/pointer result: rax)
+    "  mov [r10], rax",
+    "  mov r10, [rbx+56]", // ret_fpr (float/double result: xmm0)
+    "  movsd [r10], xmm0",
+    "  lea rsp, [rbp-16]",
+    "  pop r12",
+    "  pop rbx",
+    "  pop rbp",
+    "  ret",
+    gate = sym wp_ffi_call_gate,
+);
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+core::arch::global_asm!(
+    ".p2align 4",
+    ".globl {pool}",
+    "{pool}:",
+    ".rept {n}",
+    "  .p2align 4",     // fixed 16-byte stub stride regardless of jmp encoding
+    "  lea r11, [rip]", // r11 = stub base + 7
+    "  jmp 9f",
+    ".endr",
+    ".p2align 4",
+    "9:",
+    // Incoming frame: [rsp] = return address, [rsp+8..40) = the 32-byte
+    // shadow (register-home) space our caller allocated, stack args from
+    // [rsp+40]. After `push rbp` those become rbp+8 / rbp+16..48 / rbp+48.
+    "  push rbp",
+    "  mov rbp, rsp",
+    "  sub rsp, 96",
+    // Home the integer argument registers into the caller's shadow space
+    // (that is exactly what the ABI reserves it for), giving a contiguous
+    // gpr image at rbp+16.
+    "  mov [rbp+16], rcx",
+    "  mov [rbp+24], rdx",
+    "  mov [rbp+32], r8",
+    "  mov [rbp+40], r9",
+    "  movsd [rsp+48], xmm0", // spill FP args into locals
+    "  movsd [rsp+56], xmm1",
+    "  movsd [rsp+64], xmm2",
+    "  movsd [rsp+72], xmm3",
+    // wp_cl_dispatch takes six arguments; on Win64 the 5th and 6th go in
+    // the two stack slots above our own outgoing shadow space
+    // ([rsp+0..32) belongs to the dispatch call).
+    "  mov rcx, r11",       // stub_addr
+    "  lea rdx, [rbp+16]",  // gpr
+    "  lea r8,  [rsp+48]",  // fpr
+    "  lea r9,  [rbp+48]",  // incoming stack args
+    "  lea rax, [rsp+80]",  // ret_gpr
+    "  mov [rsp+32], rax",
+    "  lea rax, [rsp+88]",  // ret_fpr
+    "  mov [rsp+40], rax",
+    "  call {dispatch}",
+    "  mov rax, [rsp+80]",
+    "  movsd xmm0, [rsp+88]",
+    "  mov rsp, rbp",
+    "  pop rbp",
+    "  ret",
+    pool = sym wp_cl_pool,
+    dispatch = sym wp_cl_dispatch,
+    n = const POOL_SIZE,
+);
+
+// ================================================================
+// Shared machinery (unix aarch64 / x86-64 + windows x86-64)
+// ================================================================
+
+#[cfg(any(
+    all(unix, any(target_arch = "aarch64", target_arch = "x86_64")),
+    all(windows, target_arch = "x86_64")
+))]
 use core::sync::atomic::{AtomicPtr, Ordering};
-#[cfg(all(unix, any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(any(
+    all(unix, any(target_arch = "aarch64", target_arch = "x86_64")),
+    all(windows, target_arch = "x86_64")
+))]
 use std::sync::Mutex;
 
 /// Number of pre-allocated closure trampolines. ctypes callbacks are few in
 /// practice; freed slots are recycled ([`free_trampoline`]) so this bounds
 /// *live* callbacks, not total ever created.
-#[cfg(all(unix, any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(any(
+    all(unix, any(target_arch = "aarch64", target_arch = "x86_64")),
+    all(windows, target_arch = "x86_64")
+))]
 pub(super) const POOL_SIZE: usize = 1024;
 
-#[cfg(all(unix, any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(any(
+    all(unix, any(target_arch = "aarch64", target_arch = "x86_64")),
+    all(windows, target_arch = "x86_64")
+))]
 pub(super) const NGPR_ARG: usize = abi::NGPR;
-#[cfg(all(unix, any(target_arch = "aarch64", target_arch = "x86_64")))]
-pub(super) const NFPR_ARG: usize = 8;
-#[cfg(all(unix, any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(any(
+    all(unix, any(target_arch = "aarch64", target_arch = "x86_64")),
+    all(windows, target_arch = "x86_64")
+))]
+pub(super) const NFPR_ARG: usize = abi::NFPR;
+#[cfg(any(
+    all(unix, any(target_arch = "aarch64", target_arch = "x86_64")),
+    all(windows, target_arch = "x86_64")
+))]
 pub(super) const SUPPORTED: bool = true;
 
 // Defined by the `global_asm!` blocks above (their `sym` operands resolve
 // these names in this module's scope).
-#[cfg(all(unix, any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(any(
+    all(unix, any(target_arch = "aarch64", target_arch = "x86_64")),
+    all(windows, target_arch = "x86_64")
+))]
 extern "C" {
     fn wp_ffi_call_gate(call: *const RawCall);
     fn wp_cl_pool();
@@ -328,14 +489,17 @@ extern "C" {
 
 /// Execute a real C ABI call. `gpr`/`fpr` hold the integer and FP register
 /// files (only the ABI-relevant prefix is consumed); `stack` holds any
-/// overflow words; `nfpr` is the FP-register count for x86-64 variadic
-/// calls. Returns `(x0/rax, d0/xmm0)`.
+/// overflow words; `nfpr` is the FP-register count for SysV x86-64 variadic
+/// calls (the Win64 gate ignores it). Returns `(x0/rax, d0/xmm0)`.
 ///
 /// # Safety
 /// `fnptr` must be a valid function whose real C signature matches the
 /// register/stack placement the caller performed; pointer arguments must
 /// outlive the call.
-#[cfg(all(unix, any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(any(
+    all(unix, any(target_arch = "aarch64", target_arch = "x86_64")),
+    all(windows, target_arch = "x86_64")
+))]
 pub(super) unsafe fn raw_call(
     fnptr: usize,
     gpr: &[u64; 8],
@@ -365,29 +529,44 @@ pub(super) unsafe fn raw_call(
 
 /// Per-slot user-data pointers (leaked `ClosureData`), read lock-free by the
 /// trampoline dispatch path.
-#[cfg(all(unix, any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(any(
+    all(unix, any(target_arch = "aarch64", target_arch = "x86_64")),
+    all(windows, target_arch = "x86_64")
+))]
 static SLOT_DATA: [AtomicPtr<c_void>; POOL_SIZE] =
     [const { AtomicPtr::new(std::ptr::null_mut()) }; POOL_SIZE];
 
-#[cfg(all(unix, any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(any(
+    all(unix, any(target_arch = "aarch64", target_arch = "x86_64")),
+    all(windows, target_arch = "x86_64")
+))]
 struct AllocState {
     next: usize,
     free: Vec<usize>,
 }
-#[cfg(all(unix, any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(any(
+    all(unix, any(target_arch = "aarch64", target_arch = "x86_64")),
+    all(windows, target_arch = "x86_64")
+))]
 static ALLOC: Mutex<AllocState> = Mutex::new(AllocState {
     next: 0,
     free: Vec::new(),
 });
 
-#[cfg(all(unix, any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(any(
+    all(unix, any(target_arch = "aarch64", target_arch = "x86_64")),
+    all(windows, target_arch = "x86_64")
+))]
 fn pool_base() -> usize {
     wp_cl_pool as *const () as usize
 }
 
 /// Bind `userdata` to a free trampoline slot and return its C-callable code
 /// address, or `None` if the pool is exhausted.
-#[cfg(all(unix, any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(any(
+    all(unix, any(target_arch = "aarch64", target_arch = "x86_64")),
+    all(windows, target_arch = "x86_64")
+))]
 pub(super) fn alloc_trampoline(userdata: *mut c_void) -> Option<usize> {
     let slot = {
         let mut st = ALLOC.lock().unwrap();
@@ -408,7 +587,10 @@ pub(super) fn alloc_trampoline(userdata: *mut c_void) -> Option<usize> {
 /// Release the trampoline at `code_addr`, returning the `userdata` pointer
 /// previously bound (so the caller can reclaim it). Returns `None` if the
 /// address is not a live trampoline in this pool.
-#[cfg(all(unix, any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(any(
+    all(unix, any(target_arch = "aarch64", target_arch = "x86_64")),
+    all(windows, target_arch = "x86_64")
+))]
 pub(super) fn free_trampoline(code_addr: usize) -> Option<*mut c_void> {
     let base = pool_base();
     if code_addr < base {
@@ -433,7 +615,10 @@ pub(super) fn free_trampoline(code_addr: usize) -> Option<*mut c_void> {
 /// Trampoline dispatch entry (called from the shared spill routine). Recovers
 /// the slot from the stub's self-reported address, loads the bound
 /// `ClosureData`, and hands the register-file image to the Rust marshaller.
-#[cfg(all(unix, any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(any(
+    all(unix, any(target_arch = "aarch64", target_arch = "x86_64")),
+    all(windows, target_arch = "x86_64")
+))]
 extern "C" fn wp_cl_dispatch(
     stub_addr: usize,
     gpr: *const u64,
@@ -463,16 +648,28 @@ extern "C" fn wp_cl_dispatch(
 // Unsupported architectures: clean, no-asm fallbacks.
 // ================================================================
 
-#[cfg(not(all(unix, any(target_arch = "aarch64", target_arch = "x86_64"))))]
+#[cfg(not(any(
+    all(unix, any(target_arch = "aarch64", target_arch = "x86_64")),
+    all(windows, target_arch = "x86_64")
+)))]
 pub(super) const NGPR_ARG: usize = 8;
-#[cfg(not(all(unix, any(target_arch = "aarch64", target_arch = "x86_64"))))]
+#[cfg(not(any(
+    all(unix, any(target_arch = "aarch64", target_arch = "x86_64")),
+    all(windows, target_arch = "x86_64")
+)))]
 pub(super) const NFPR_ARG: usize = 8;
-#[cfg(not(all(unix, any(target_arch = "aarch64", target_arch = "x86_64"))))]
+#[cfg(not(any(
+    all(unix, any(target_arch = "aarch64", target_arch = "x86_64")),
+    all(windows, target_arch = "x86_64")
+)))]
 pub(super) const SUPPORTED: bool = false;
 
 /// # Safety
 /// Never called: [`SUPPORTED`] is `false`, so every call site is guarded.
-#[cfg(not(all(unix, any(target_arch = "aarch64", target_arch = "x86_64"))))]
+#[cfg(not(any(
+    all(unix, any(target_arch = "aarch64", target_arch = "x86_64")),
+    all(windows, target_arch = "x86_64")
+)))]
 pub(super) unsafe fn raw_call(
     _fnptr: usize,
     _gpr: &[u64; 8],
@@ -483,12 +680,18 @@ pub(super) unsafe fn raw_call(
     (0, 0)
 }
 
-#[cfg(not(all(unix, any(target_arch = "aarch64", target_arch = "x86_64"))))]
+#[cfg(not(any(
+    all(unix, any(target_arch = "aarch64", target_arch = "x86_64")),
+    all(windows, target_arch = "x86_64")
+)))]
 pub(super) fn alloc_trampoline(_userdata: *mut c_void) -> Option<usize> {
     None
 }
 
-#[cfg(not(all(unix, any(target_arch = "aarch64", target_arch = "x86_64"))))]
+#[cfg(not(any(
+    all(unix, any(target_arch = "aarch64", target_arch = "x86_64")),
+    all(windows, target_arch = "x86_64")
+)))]
 pub(super) fn free_trampoline(_code_addr: usize) -> Option<*mut c_void> {
     None
 }

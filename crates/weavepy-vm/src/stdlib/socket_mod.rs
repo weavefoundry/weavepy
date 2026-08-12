@@ -52,8 +52,11 @@ use crate::error::{
 /// socket. Carrying `EBADF` (rather than a bare message) lets callers that
 /// branch on `errno` — `asyncore`'s `_DISCONNECTED` set, `selectors`,
 /// `ssl` teardown — treat it as a graceful disconnect, matching CPython.
+/// `py_errno::EBADF` rather than `libc::EBADF`: identical on POSIX, and on
+/// Windows it's the CRT value 9 that CPython raises for a closed Python
+/// socket on every platform (`sock_fd` is -1 → `EBADF`, socketmodule.c).
 fn closed_socket_error() -> RuntimeError {
-    os_error_with_errno(libc::EBADF, "Bad file descriptor")
+    os_error_with_errno(crate::py_errno::EBADF, "Bad file descriptor")
 }
 use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
@@ -239,6 +242,12 @@ pub(crate) fn raw_fd_for_handle(handle: i64) -> Option<i64> {
 // ---- module entry ----
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
+    // CPython performs WSAStartup once when `_socket` is imported
+    // (PyInit__socket, socketmodule.c) — not lazily on first use — so any
+    // Winsock call made right after import (getaddrinfo, select on a
+    // pre-existing SOCKET, …) finds the stack initialized. Mirror that.
+    #[cfg(windows)]
+    winsock::ensure_started();
     let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
@@ -431,6 +440,8 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 Object::Int(i64::from(val)),
             );
         }
+        // On non-unix these are the ws2tcpip.h values — they are passed
+        // straight into Winsock's `getaddrinfo` hints.
         #[cfg(not(unix))]
         {
             d.insert(DictKey(Object::from_static("AI_PASSIVE")), Object::Int(1));
@@ -447,19 +458,39 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 DictKey(Object::from_static("AI_ADDRCONFIG")),
                 Object::Int(0x0400),
             );
+            d.insert(DictKey(Object::from_static("AI_ALL")), Object::Int(0x0100));
+            d.insert(
+                DictKey(Object::from_static("AI_V4MAPPED")),
+                Object::Int(0x0800),
+            );
         }
 
-        // getnameinfo flags.
-        d.insert(
-            DictKey(Object::from_static("NI_NUMERICHOST")),
-            Object::Int(1),
-        );
-        d.insert(
-            DictKey(Object::from_static("NI_NUMERICSERV")),
-            Object::Int(2),
-        );
-        d.insert(DictKey(Object::from_static("NI_NAMEREQD")), Object::Int(4));
-        d.insert(DictKey(Object::from_static("NI_DGRAM")), Object::Int(16));
+        // getnameinfo flags — like AI_*, these reach the resolver verbatim,
+        // so publish the platform's own numbering (ws2tcpip.h on Windows,
+        // where NI_NUMERICHOST is 2 and NI_NUMERICSERV is 8).
+        #[cfg(windows)]
+        for (name, val) in [
+            ("NI_NOFQDN", 0x01),
+            ("NI_NUMERICHOST", 0x02),
+            ("NI_NAMEREQD", 0x04),
+            ("NI_NUMERICSERV", 0x08),
+            ("NI_DGRAM", 0x10),
+        ] {
+            d.insert(DictKey(Object::from_static(name)), Object::Int(val));
+        }
+        #[cfg(not(windows))]
+        {
+            d.insert(
+                DictKey(Object::from_static("NI_NUMERICHOST")),
+                Object::Int(1),
+            );
+            d.insert(
+                DictKey(Object::from_static("NI_NUMERICSERV")),
+                Object::Int(2),
+            );
+            d.insert(DictKey(Object::from_static("NI_NAMEREQD")), Object::Int(4));
+            d.insert(DictKey(Object::from_static("NI_DGRAM")), Object::Int(16));
+        }
 
         // Sentinels.
         d.insert(DictKey(Object::from_static("INADDR_ANY")), Object::Int(0));
@@ -501,7 +532,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 
         // Module-level functions.
         for (name, body) in module_functions() {
-            d.insert(DictKey(Object::from_static(name)), b(name, *body));
+            d.insert(DictKey(Object::from_static(name)), b(name, body));
         }
         // `getaddrinfo(host, port, family=0, type=0, proto=0, flags=0)` is
         // routinely called with keyword arguments (e.g. CPython's bundled
@@ -548,9 +579,10 @@ fn gaierror_class() -> Rc<TypeObject> {
 
 /// Build a raised `socket.gaierror(code, msg)` the way CPython's
 /// `set_gaierror` does: `args = (code, msg)` with `errno`/`strerror`
-/// populated so `str(e)` renders `[Errno code] msg`. Only the unix
-/// `getaddrinfo` path raises it.
-#[cfg(unix)]
+/// populated so `str(e)` renders `[Errno code] msg`. The message source
+/// is `gai_strerror` on POSIX and `FormatMessageW` on Windows (where
+/// ws2tcpip.h's gai_strerror is itself a FormatMessage wrapper).
+#[cfg(any(unix, windows))]
 fn gaierror(code: i32, msg: String) -> crate::error::RuntimeError {
     let exc = crate::builtin_types::make_exception_with_class(gaierror_class(), &msg);
     if let Object::Instance(inst) = &exc {
@@ -619,7 +651,8 @@ fn socket_methods() -> Vec<(&'static str, Object)> {
             )
         };
     }
-    vec![
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut methods = vec![
         // `__init__` is kwargs-aware: `socket(family=..., type=..., proto=...,
         // fileno=...)` is idiomatic CPython (e.g. asyncio's `_connect_sock`).
         (
@@ -646,8 +679,6 @@ fn socket_methods() -> Vec<(&'static str, Object)> {
         m!("recv_into", sock_recv_into),
         m!("recvfrom", sock_recvfrom),
         m!("recvfrom_into", sock_recvfrom_into),
-        m!("sendmsg", sock_sendmsg),
-        m!("recvmsg", sock_recvmsg),
         m!("setblocking", sock_setblocking),
         m!("getblocking", sock_getblocking),
         m!("settimeout", sock_settimeout),
@@ -667,7 +698,14 @@ fn socket_methods() -> Vec<(&'static str, Object)> {
         m!("family_get", sock_family_attr),
         m!("type_get", sock_type_attr),
         m!("proto_get", sock_proto_attr),
-    ]
+    ];
+    // `sendmsg`/`recvmsg` exist only where CMSG ancillary data does:
+    // CPython compiles them under `#ifdef CMSG_LEN` (socketmodule.c), so on
+    // Windows the names are simply *absent* — `hasattr` gates like
+    // `multiprocessing.reduction.HAVE_SEND_HANDLE` rely on that signal.
+    #[cfg(unix)]
+    methods.extend([m!("sendmsg", sock_sendmsg), m!("recvmsg", sock_recvmsg)]);
+    methods
 }
 
 fn extract_self(args: &[Object]) -> Result<Rc<PyInstance>, RuntimeError> {
@@ -805,6 +843,55 @@ fn run_pending_signals_after_eintr() -> Result<(), RuntimeError> {
     Ok(())
 }
 
+/// Bounded readiness wait on one SOCKET via Winsock `select()` — the
+/// Windows twin of the `libc::poll` loop in `sock_accept` (CPython's
+/// `internal_select`, socketmodule.c). GIL released for the wait; `0`
+/// ready descriptors at the deadline surfaces as `socket.timeout`,
+/// a `SOCKET_ERROR` as the WSA-code `OSError` via the WS1 error bridge.
+#[cfg(windows)]
+fn wait_readable_win(
+    sock: windows_sys::Win32::Networking::WinSock::SOCKET,
+    timeout: Duration,
+) -> Result<(), RuntimeError> {
+    use windows_sys::Win32::Networking::WinSock as ws;
+    let mut fds = ws::FD_SET {
+        fd_count: 1,
+        fd_array: [0; 64],
+    };
+    fds.fd_array[0] = sock;
+    // Round the timeout *up* so we wait at least the requested span.
+    let mut us = timeout.as_micros();
+    if u128::from(timeout.subsec_nanos()) % 1_000 != 0 {
+        us += 1;
+    }
+    let us = us.min(i32::MAX as u128 * 1_000_000);
+    let tv = ws::TIMEVAL {
+        tv_sec: (us / 1_000_000) as i32,
+        tv_usec: (us % 1_000_000) as i32,
+    };
+    let n = crate::gil::allow_threads_then(|| {
+        // SAFETY: `fds` and `tv` outlive the call; nfds is ignored on
+        // Windows; NULL write/except sets are allowed.
+        unsafe {
+            ws::select(
+                0,
+                &raw mut fds,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &raw const tv,
+            )
+        }
+    });
+    match n {
+        0 => Err(timeout_error("timed out")),
+        ws::SOCKET_ERROR => Err(crate::stdlib::nt_support::win32_error_to_py(
+            unsafe { ws::WSAGetLastError() },
+            None,
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Drive a blocking *single-syscall* socket op, retrying on `EINTR` after
 /// running pending Python signal handlers (PEP 475 — "Retry system calls
 /// failing with EINTR"). A signal that interrupts a blocking `accept`/`recv`/
@@ -825,6 +912,9 @@ fn blocking_socket_io<R>(
     state: &Rc<RefCell<SocketState>>,
     mut f: impl FnMut(&Socket) -> std::io::Result<R>,
 ) -> Result<R, RuntimeError> {
+    // The only retry arm is the unix EINTR case (Winsock waits are already
+    // signal-aware), so on Windows every pass through the body returns.
+    #[cfg_attr(windows, allow(clippy::never_loop))]
     loop {
         match socket_call_once(state, &mut f)? {
             Ok(v) => return Ok(v),
@@ -1134,6 +1224,23 @@ fn sock_accept(args: &[Object]) -> Result<Object, RuntimeError> {
                         }
                     }
                 }
+            }
+        }
+    }
+    // Winsock twin of the readiness wait above: `select()` on the single
+    // listening SOCKET (CPython's `internal_select`, socketmodule.c, which
+    // uses select on Windows where there is no poll).
+    #[cfg(windows)]
+    {
+        let timeout = state.borrow().timeout;
+        if let Some(t) = timeout {
+            if !t.is_zero() {
+                let sock = {
+                    let b = state.borrow();
+                    let s = b.inner.as_ref().ok_or_else(closed_socket_error)?;
+                    raw_fd_of(s).ok_or_else(|| os_error("socket has no file descriptor"))?
+                };
+                wait_readable_win(sock as windows_sys::Win32::Networking::WinSock::SOCKET, t)?;
             }
         }
     }
@@ -1610,16 +1717,6 @@ fn sock_recvmsg(args: &[Object]) -> Result<Object, RuntimeError> {
         Object::Int(msg_flags),
         Object::None,
     ]))
-}
-
-#[cfg(not(unix))]
-fn sock_sendmsg(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(os_error("sendmsg is not supported on this platform"))
-}
-
-#[cfg(not(unix))]
-fn sock_recvmsg(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(os_error("recvmsg is not supported on this platform"))
 }
 
 /// Snapshot the raw fd of `state`, dropping the borrow before the syscall
@@ -2108,16 +2205,62 @@ fn sock_set_inheritable(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
-/// Non-POSIX stub: there is no `FD_CLOEXEC` (Windows uses
-/// `HANDLE_FLAG_INHERIT`, which the libc crate does not expose). CPython
+/// PEP 446 inheritability on Windows: a SOCKET is a kernel HANDLE, so the
+/// inheritable bit is `HANDLE_FLAG_INHERIT` read/written through
+/// `GetHandleInformation`/`SetHandleInformation` — exactly CPython's
+/// `sock_get_inheritable`/`sock_set_inheritable` (socketmodule.c).
+#[cfg(windows)]
+fn sock_get_inheritable(args: &[Object]) -> Result<Object, RuntimeError> {
+    use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE_FLAG_INHERIT};
+    let state = state_of(args)?;
+    let handle = {
+        let b = state.borrow();
+        let sock = b.inner.as_ref().ok_or_else(closed_socket_error)?;
+        raw_fd_of(sock).ok_or_else(closed_socket_error)?
+    };
+    let mut flags = 0u32;
+    let ok =
+        unsafe { GetHandleInformation(handle as usize as *mut std::ffi::c_void, &raw mut flags) };
+    if ok == 0 {
+        return Err(crate::stdlib::nt_support::last_win32_error_to_py(None));
+    }
+    Ok(Object::Bool(flags & HANDLE_FLAG_INHERIT != 0))
+}
+
+#[cfg(windows)]
+fn sock_set_inheritable(args: &[Object]) -> Result<Object, RuntimeError> {
+    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+    let state = state_of(args)?;
+    let inheritable = args
+        .get(1)
+        .is_some_and(super::super::object::Object::is_truthy);
+    let handle = {
+        let b = state.borrow();
+        let sock = b.inner.as_ref().ok_or_else(closed_socket_error)?;
+        raw_fd_of(sock).ok_or_else(closed_socket_error)?
+    };
+    let ok = unsafe {
+        SetHandleInformation(
+            handle as usize as *mut std::ffi::c_void,
+            HANDLE_FLAG_INHERIT,
+            if inheritable { HANDLE_FLAG_INHERIT } else { 0 },
+        )
+    };
+    if ok == 0 {
+        return Err(crate::stdlib::nt_support::last_win32_error_to_py(None));
+    }
+    Ok(Object::None)
+}
+
+/// Stub for targets with neither `FD_CLOEXEC` nor Win32 handles. CPython
 /// creates sockets non-inheritable by default, so report that.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn sock_get_inheritable(args: &[Object]) -> Result<Object, RuntimeError> {
     let _ = state_of(args)?;
     Ok(Object::Bool(false))
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn sock_set_inheritable(args: &[Object]) -> Result<Object, RuntimeError> {
     let _ = state_of(args)?;
     Ok(Object::None)
@@ -2162,11 +2305,56 @@ fn sock_detach(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Int(fd))
 }
 
-/// `socket.dup()` — duplicate the underlying fd (real `dup(2)`) and wrap
-/// it in a fresh `socket` object that shares the family/type/proto. The
-/// duplicate is an independent fd: closing one leaves the other usable,
-/// matching CPython's `socket.dup()`.
+/// Duplicate a raw socket descriptor. POSIX: a real `dup(2)`. Windows:
+/// CPython's `dup_socket` (socketmodule.c) — a SOCKET is *not* a CRT fd,
+/// so the duplicate goes through `WSADuplicateSocketW` into a
+/// `WSAPROTOCOL_INFOW` consumed by `WSASocketW(FROM_PROTOCOL_INFO, …)`,
+/// created non-inheritable (`WSA_FLAG_NO_HANDLE_INHERIT`, PEP 446).
 #[cfg(unix)]
+fn dup_raw_fd(fd: i64) -> Result<i64, RuntimeError> {
+    let dup = unsafe { libc::dup(fd as i32) };
+    if dup < 0 {
+        return Err(io_error_to_py(&std::io::Error::last_os_error()));
+    }
+    Ok(i64::from(dup))
+}
+
+#[cfg(windows)]
+fn dup_raw_fd(fd: i64) -> Result<i64, RuntimeError> {
+    use windows_sys::Win32::Networking::WinSock as ws;
+    let mut info: ws::WSAPROTOCOL_INFOW = unsafe { std::mem::zeroed() };
+    let pid = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessId() };
+    let rc = unsafe { ws::WSADuplicateSocketW(fd as ws::SOCKET, pid, &raw mut info) };
+    if rc != 0 {
+        return Err(crate::stdlib::nt_support::win32_error_to_py(
+            unsafe { ws::WSAGetLastError() },
+            None,
+        ));
+    }
+    let dup = unsafe {
+        ws::WSASocketW(
+            ws::FROM_PROTOCOL_INFO,
+            ws::FROM_PROTOCOL_INFO,
+            ws::FROM_PROTOCOL_INFO,
+            &raw const info,
+            0,
+            ws::WSA_FLAG_NO_HANDLE_INHERIT,
+        )
+    };
+    if dup == ws::INVALID_SOCKET {
+        return Err(crate::stdlib::nt_support::win32_error_to_py(
+            unsafe { ws::WSAGetLastError() },
+            None,
+        ));
+    }
+    Ok(dup as i64)
+}
+
+/// `socket.dup()` — duplicate the underlying descriptor (see
+/// [`dup_raw_fd`]) and wrap it in a fresh `socket` object that shares the
+/// family/type/proto. The duplicate is independent: closing one leaves
+/// the other usable, matching CPython's `socket.dup()`.
+#[cfg(any(unix, windows))]
 fn sock_dup(args: &[Object]) -> Result<Object, RuntimeError> {
     let state = state_of(args)?;
     let (family, kind, proto) = {
@@ -2177,11 +2365,7 @@ fn sock_dup(args: &[Object]) -> Result<Object, RuntimeError> {
         let b = state.borrow();
         let sock = b.inner.as_ref().ok_or_else(closed_socket_error)?;
         let fd = raw_fd_of(sock).ok_or_else(|| os_error("socket has no file descriptor"))?;
-        let dup = unsafe { libc::dup(fd as i32) };
-        if dup < 0 {
-            return Err(io_error_to_py(&std::io::Error::last_os_error()));
-        }
-        i64::from(dup)
+        dup_raw_fd(fd)?
     };
     let inner = wrap_fd_socket(new_fd)?;
     let new_state = Rc::new(RefCell::new(SocketState {
@@ -2215,13 +2399,11 @@ fn sock_dup(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Instance(inst))
 }
 
-/// On non-Unix platforms WeavePy has no `dup(2)`-backed fd duplication, so
-/// `socket.dup()` is unsupported (mirrors the `#[cfg(not(unix))]` stubs used
-/// elsewhere in this module and in `select`).
-#[cfg(not(unix))]
+/// No descriptor-duplication primitive on other targets.
+#[cfg(not(any(unix, windows)))]
 fn sock_dup(args: &[Object]) -> Result<Object, RuntimeError> {
     let _ = state_of(args)?;
-    Err(os_error("socket.dup is only supported on Unix"))
+    Err(os_error("socket.dup is not supported on this platform"))
 }
 
 fn sock_makefile(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -2578,8 +2760,9 @@ fn extract_bytes(arg: Option<&Object>) -> Result<Vec<u8>, RuntimeError> {
 
 // ---- module-level functions ----
 
-fn module_functions() -> &'static [(&'static str, fn(&[Object]) -> Result<Object, RuntimeError>)] {
-    &[
+fn module_functions() -> Vec<(&'static str, fn(&[Object]) -> Result<Object, RuntimeError>)> {
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut fns: Vec<(&'static str, fn(&[Object]) -> Result<Object, RuntimeError>)> = vec![
         ("gethostname", mod_gethostname),
         ("gethostbyname", mod_gethostbyname),
         ("gethostbyname_ex", mod_gethostbyname_ex),
@@ -2602,44 +2785,38 @@ fn module_functions() -> &'static [(&'static str, fn(&[Object]) -> Result<Object
         ("ntohl", mod_htonl),
         ("getdefaulttimeout", mod_getdefaulttimeout),
         ("setdefaulttimeout", mod_setdefaulttimeout),
-        // Ancillary-data sizing helpers (functions, not constants, exactly
-        // like CPython's `socket` module). Needed by `reduction.recvfds`.
-        ("CMSG_LEN", mod_cmsg_len),
+    ];
+    // Ancillary-data sizing helpers (functions, not constants, exactly
+    // like CPython's `socket` module). Needed by `reduction.recvfds`.
+    // Absent on Windows, matching CPython's `#ifdef CMSG_LEN` gating.
+    #[cfg(unix)]
+    fns.extend([
+        (
+            "CMSG_LEN",
+            mod_cmsg_len as fn(&[Object]) -> Result<Object, RuntimeError>,
+        ),
         ("CMSG_SPACE", mod_cmsg_space),
-    ]
+    ]);
+    fns
 }
 
 /// `socket.CMSG_LEN(length)` — bytes an ancillary-data item of `length`
 /// payload occupies, including the `cmsghdr` (but not the trailing pad).
+#[cfg(unix)]
 fn mod_cmsg_len(args: &[Object]) -> Result<Object, RuntimeError> {
-    #[cfg(unix)]
-    {
-        let length = cmsg_size_arg(args.first())?;
-        Ok(Object::Int(i64::from(unsafe { libc::CMSG_LEN(length) })))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = args;
-        Err(os_error("CMSG_LEN is not supported on this platform"))
-    }
+    let length = cmsg_size_arg(args.first())?;
+    Ok(Object::Int(i64::from(unsafe { libc::CMSG_LEN(length) })))
 }
 
 /// `socket.CMSG_SPACE(length)` — bytes to allocate in a control buffer for
 /// one ancillary-data item of `length` payload, including alignment pad.
+#[cfg(unix)]
 fn mod_cmsg_space(args: &[Object]) -> Result<Object, RuntimeError> {
-    #[cfg(unix)]
-    {
-        let length = cmsg_size_arg(args.first())?;
-        Ok(Object::Int(i64::from(unsafe { libc::CMSG_SPACE(length) })))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = args;
-        Err(os_error("CMSG_SPACE is not supported on this platform"))
-    }
+    let length = cmsg_size_arg(args.first())?;
+    Ok(Object::Int(i64::from(unsafe { libc::CMSG_SPACE(length) })))
 }
 
-#[allow(dead_code)]
+#[cfg(unix)]
 fn cmsg_size_arg(arg: Option<&Object>) -> Result<u32, RuntimeError> {
     match arg {
         Some(Object::Int(n)) if *n >= 0 => Ok(*n as u32),
@@ -3015,11 +3192,121 @@ fn mod_getaddrinfo(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::new_list(out))
 }
 
-/// Non-POSIX fallback resolver over `std::net::ToSocketAddrs` (the
-/// Windows libc crate exposes no `addrinfo` surface). Loses the hint
-/// fidelity of the libc path (`AI_PASSIVE` wildcards, `AI_CANONNAME`)
-/// but resolves names/ports correctly — the pre-RFC-0054 behavior.
-#[cfg(not(unix))]
+/// Windows arm (RFC 0063 WS4): the same call over Winsock's own
+/// `getaddrinfo` (ANSI — host/service are idna/ASCII by the time they
+/// reach the resolver, exactly the encoding CPython feeds its
+/// `getaddrinfo` on Windows), restoring `AI_PASSIVE` wildcard and
+/// `AI_CANONNAME` fidelity that the previous `ToSocketAddrs`
+/// approximation lost. Mirrors the unix arm above, with windows-sys
+/// types and the WSA error domain.
+#[cfg(windows)]
+fn mod_getaddrinfo(args: &[Object]) -> Result<Object, RuntimeError> {
+    use std::ffi::{CStr, CString};
+    use windows_sys::Win32::Networking::WinSock as ws;
+    let nul_err = || value_error("getaddrinfo: embedded null character in argument");
+    let host: Option<CString> = match args.first() {
+        Some(Object::Str(s)) => Some(CString::new(s.as_bytes()).map_err(|_| nul_err())?),
+        Some(Object::Bytes(b)) => Some(CString::new(&b[..]).map_err(|_| nul_err())?),
+        Some(Object::None) | None => None,
+        _ => return Err(type_error("getaddrinfo: host must be str, bytes, or None")),
+    };
+    let service: Option<CString> = match args.get(1) {
+        Some(Object::Int(n)) => Some(CString::new(n.to_string()).expect("digits have no NUL")),
+        Some(Object::Str(s)) => Some(CString::new(s.as_bytes()).map_err(|_| nul_err())?),
+        Some(Object::Bytes(b)) => Some(CString::new(&b[..]).map_err(|_| nul_err())?),
+        Some(Object::None) | None => None,
+        _ => {
+            return Err(type_error(
+                "getaddrinfo: port must be int, str, bytes, or None",
+            ))
+        }
+    };
+    // `as_i64` unwraps IntEnum members too, like the unix arm.
+    let int_at = |i: usize| args.get(i).and_then(Object::as_i64).unwrap_or(0) as i32;
+    let (family, kind, proto, flags) = (int_at(2), int_at(3), int_at(4), int_at(5));
+
+    let hints = ws::ADDRINFOA {
+        ai_flags: flags,
+        // AF_UNSPEC is 0 on Windows too, so family passes through as-is.
+        ai_family: family,
+        ai_socktype: kind,
+        ai_protocol: proto,
+        ..Default::default()
+    };
+    let host_ptr = host
+        .as_ref()
+        .map_or(std::ptr::null(), |c| c.as_ptr().cast::<u8>());
+    let serv_ptr = service
+        .as_ref()
+        .map_or(std::ptr::null(), |c| c.as_ptr().cast::<u8>());
+    let mut res: *mut ws::ADDRINFOA = std::ptr::null_mut();
+    let res_ptr = std::ptr::addr_of_mut!(res);
+    let rc = crate::gil::allow_threads_then(|| unsafe {
+        ws::getaddrinfo(host_ptr, serv_ptr, &raw const hints, res_ptr)
+    });
+    if rc != 0 {
+        // Winsock's getaddrinfo returns the WSA error code directly
+        // (WSAHOST_NOT_FOUND, …); CPython raises gaierror with
+        // gai_strerror text, which on Windows *is* FormatMessage.
+        return Err(gaierror(rc, crate::stdlib::nt_support::format_message(rc)));
+    }
+
+    let mut out = Vec::new();
+    let mut cur = res;
+    while !cur.is_null() {
+        // SAFETY: `cur` walks the linked list Winsock just handed us; it
+        // stays valid until the `freeaddrinfo` below.
+        let ai = unsafe { &*cur };
+        cur = ai.ai_next;
+        let addr_tuple = match ai.ai_family {
+            f if f == i32::from(ws::AF_INET) => {
+                // Winsock allocates `ai_addr` with full sockaddr alignment;
+                // the SOCKADDR type is only declared 2-byte aligned.
+                #[allow(clippy::cast_ptr_alignment)]
+                let sin = unsafe { &*ai.ai_addr.cast::<ws::SOCKADDR_IN>() };
+                let ip =
+                    std::net::Ipv4Addr::from(u32::from_be(unsafe { sin.sin_addr.S_un.S_addr }));
+                Object::new_tuple(vec![
+                    Object::from_str(ip.to_string()),
+                    Object::Int(i64::from(u16::from_be(sin.sin_port))),
+                ])
+            }
+            f if f == i32::from(ws::AF_INET6) => {
+                #[allow(clippy::cast_ptr_alignment)] // see AF_INET arm above
+                let sin6 = unsafe { &*ai.ai_addr.cast::<ws::SOCKADDR_IN6>() };
+                let ip = std::net::Ipv6Addr::from(unsafe { sin6.sin6_addr.u.Byte });
+                Object::new_tuple(vec![
+                    Object::from_str(ip.to_string()),
+                    Object::Int(i64::from(u16::from_be(sin6.sin6_port))),
+                    Object::Int(i64::from(u32::from_be(sin6.sin6_flowinfo))),
+                    Object::Int(i64::from(unsafe { sin6.Anonymous.sin6_scope_id })),
+                ])
+            }
+            _ => continue,
+        };
+        let canonname = if ai.ai_canonname.is_null() {
+            Object::from_static("")
+        } else {
+            let c = unsafe { CStr::from_ptr(ai.ai_canonname.cast()) };
+            Object::from_str(c.to_string_lossy().into_owned())
+        };
+        out.push(Object::new_tuple(vec![
+            Object::Int(i64::from(ai.ai_family)),
+            Object::Int(i64::from(ai.ai_socktype)),
+            Object::Int(i64::from(ai.ai_protocol)),
+            canonname,
+            addr_tuple,
+        ]));
+    }
+    unsafe { ws::freeaddrinfo(res) };
+    Ok(Object::new_list(out))
+}
+
+/// Fallback resolver over `std::net::ToSocketAddrs` for targets with
+/// neither libc nor Winsock `addrinfo`. Loses the hint fidelity of the
+/// native paths (`AI_PASSIVE` wildcards, `AI_CANONNAME`) but resolves
+/// names/ports correctly — the pre-RFC-0054 behavior.
+#[cfg(not(any(unix, windows)))]
 fn mod_getaddrinfo(args: &[Object]) -> Result<Object, RuntimeError> {
     let host = match args.first() {
         Some(Object::Str(s)) => s.to_string(),
@@ -3111,6 +3398,7 @@ fn mod_getaddrinfo_kw(
     mod_getaddrinfo(&positional)
 }
 
+#[cfg(not(windows))]
 fn mod_getnameinfo(args: &[Object]) -> Result<Object, RuntimeError> {
     let addr_obj = match args.first() {
         Some(o) => o,
@@ -3131,6 +3419,98 @@ fn mod_getnameinfo(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::new_tuple(vec![
         Object::from_str(host),
         Object::from_str(port.to_string()),
+    ]))
+}
+
+/// `getnameinfo(sockaddr, flags)` over Winsock (RFC 0063 WS4), following
+/// CPython's `socket_getnameinfo` (socketmodule.c): the numeric host is
+/// first re-parsed through `getaddrinfo(…, AI_NUMERICHOST)` to build the
+/// binary sockaddr (patching in the 4-tuple's flowinfo/scope-id for
+/// IPv6), which is then handed to `getnameinfo` with the caller's flags.
+#[cfg(windows)]
+fn mod_getnameinfo(args: &[Object]) -> Result<Object, RuntimeError> {
+    use std::ffi::{CStr, CString};
+    use windows_sys::Win32::Networking::WinSock as ws;
+    let tup = match args.first() {
+        Some(Object::Tuple(t)) => t,
+        Some(_) => return Err(type_error("getnameinfo: address must be tuple")),
+        None => return Err(type_error("getnameinfo: missing argument")),
+    };
+    let host = match tup.first() {
+        Some(Object::Str(s)) => s.to_string(),
+        _ => return Err(type_error("getnameinfo: address[0] must be str")),
+    };
+    let port = match tup.get(1) {
+        Some(Object::Int(n)) => *n as u16,
+        _ => return Err(type_error("getnameinfo: address[1] must be int")),
+    };
+    let flowinfo = tup.get(2).and_then(Object::as_i64).unwrap_or(0) as u32;
+    let scope_id = tup.get(3).and_then(Object::as_i64).unwrap_or(0) as u32;
+    let flags = args.get(1).and_then(Object::as_i64).unwrap_or(0) as i32;
+
+    let c_host = CString::new(host)
+        .map_err(|_| value_error("getnameinfo: embedded null character in argument"))?;
+    let c_serv = CString::new(port.to_string()).expect("digits have no NUL");
+    let hints = ws::ADDRINFOA {
+        ai_flags: ws::AI_NUMERICHOST as i32,
+        ai_family: i32::from(ws::AF_UNSPEC),
+        // SOCK_DGRAM keeps the resolver from returning one row per
+        // socktype (CPython does the same).
+        ai_socktype: ws::SOCK_DGRAM,
+        ..Default::default()
+    };
+    let mut res: *mut ws::ADDRINFOA = std::ptr::null_mut();
+    let res_ptr = std::ptr::addr_of_mut!(res);
+    let host_ptr = c_host.as_ptr().cast::<u8>();
+    let serv_ptr = c_serv.as_ptr().cast::<u8>();
+    let rc = crate::gil::allow_threads_then(|| unsafe {
+        ws::getaddrinfo(host_ptr, serv_ptr, &raw const hints, res_ptr)
+    });
+    if rc != 0 {
+        return Err(gaierror(rc, crate::stdlib::nt_support::format_message(rc)));
+    }
+
+    // SAFETY: rc == 0 guarantees a non-null, valid result chain until
+    // the `freeaddrinfo` below.
+    let ai = unsafe { &*res };
+    if i32::from(ws::AF_INET6) == ai.ai_family {
+        // The 4-tuple's flowinfo/scope-id aren't expressible in the
+        // numeric host string; CPython patches them into the sockaddr.
+        // Winsock allocates `ai_addr` with full sockaddr alignment.
+        #[allow(clippy::cast_ptr_alignment)]
+        let sin6 = unsafe { &mut *ai.ai_addr.cast::<ws::SOCKADDR_IN6>() };
+        sin6.sin6_flowinfo = flowinfo.to_be();
+        sin6.Anonymous.sin6_scope_id = scope_id;
+    }
+    let mut hostbuf = [0u8; ws::NI_MAXHOST as usize];
+    let mut servbuf = [0u8; ws::NI_MAXSERV as usize];
+    let (ai_addr, ai_addrlen) = (ai.ai_addr, ai.ai_addrlen);
+    let host_out = hostbuf.as_mut_ptr();
+    let serv_out = servbuf.as_mut_ptr();
+    let rc = crate::gil::allow_threads_then(|| unsafe {
+        ws::getnameinfo(
+            ai_addr,
+            ai_addrlen as ws::socklen_t,
+            host_out,
+            ws::NI_MAXHOST,
+            serv_out,
+            ws::NI_MAXSERV,
+            flags,
+        )
+    });
+    unsafe { ws::freeaddrinfo(res) };
+    if rc != 0 {
+        return Err(gaierror(rc, crate::stdlib::nt_support::format_message(rc)));
+    }
+    let decode = |buf: &[u8]| -> String {
+        // SAFETY: getnameinfo NUL-terminates within the buffer on success.
+        unsafe { CStr::from_ptr(buf.as_ptr().cast()) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    Ok(Object::new_tuple(vec![
+        Object::from_str(decode(&hostbuf)),
+        Object::from_str(decode(&servbuf)),
     ]))
 }
 

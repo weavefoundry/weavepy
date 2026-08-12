@@ -7,7 +7,7 @@
 //! weavepy-0.0.0+gabc1234-aarch64-apple-darwin/
 //! ├── bin/
 //! │   ├── weavepy                  # the release binary
-//! │   ├── python3.13 -> weavepy    # POSIX symlinks (copies on Windows)
+//! │   ├── python3.13 -> weavepy    # POSIX symlinks
 //! │   ├── python3    -> weavepy
 //! │   └── python     -> weavepy
 //! ├── lib/
@@ -21,15 +21,25 @@
 //! └── LICENSE-{APACHE,MIT}
 //! ```
 //!
+//! On Windows the artifact takes CPython's NT shape instead (RFC 0063
+//! WS6): `weavepy.exe` plus `python.exe`/`python3.exe`/`python3.13.exe`
+//! sit at the *prefix root* as real file copies — no `bin/`, no symlinks
+//! anywhere in the artifact — and the default format is `zip` (written
+//! by bsdtar's `tar -a`). `lib/` and `include/` are unchanged; the
+//! RFC 0053 landmark walk finds `{prefix}/lib/weavepy3.13` from the
+//! exe's own directory, so nothing else moves.
+//!
 //! Rather than reimplementing the stdlib writer, `build` runs the packaged
 //! binary itself with `WEAVEPY_STDLIB_CACHE` pointed at a fresh directory,
 //! so `stdlib_tree::materialize()` writes the exact tree the binary's
 //! embedded sources expect — one writer, one layout, no drift — then moves
-//! that tree into the staging root and adds the `bin/` shims.
+//! that tree into the staging root and adds the `bin/` shims (the
+//! root-level exe copies on Windows).
 //!
 //! `check` is the falsifiability half: it extracts the artifact (or builds
 //! one) into a scratch prefix and runs a smoke matrix through
-//! `bin/python3` — the shim, deliberately — under a scrubbed environment
+//! `bin/python3` (`{prefix}\python3.exe` on Windows) — the shim,
+//! deliberately — under a scrubbed environment
 //! (no `WEAVEPYHOME`/`PYTHONHOME`/`PYTHONPATH`/`VIRTUAL_ENV`/`WEAVEPY_*`,
 //! and `WEAVEPY_STDLIB_CACHE` pointed at an empty decoy directory so a
 //! materialize fallback shows up as a check failure instead of silently
@@ -42,10 +52,13 @@
 //! 3. `stdlib`   — spot-checks crossing native/frozen boundaries:
 //!    sqlite3, ssl, zlib, decimal, json, hashlib.
 //! 4. `venv`     — `python3 -m venv` then the venv python chains back to
-//!    the artifact prefix.
+//!    the artifact prefix (`venv/bin/python`; `venv\Scripts\python.exe`
+//!    on Windows).
 //! 5. `pip`      — offline `pip install` in the venv (needs `--wheels`).
 //! 6. `cext`     — compile + import a minimal C extension against the
-//!    shipped headers via the `sysconfig` compiler vars (unix, needs cc).
+//!    shipped headers via the `sysconfig` compiler vars (unix, needs cc;
+//!    SKIP on Windows — C builds await the python313.dll wave, RFC 0063
+//!    Non-goals).
 //! 7. `decoy-cache` — the decoy stdlib cache stayed empty, proving every
 //!    leg ran off the artifact tree itself.
 
@@ -88,14 +101,14 @@ enum Cmd {
         out: Option<PathBuf>,
 
         /// Artifact format.
-        #[arg(long, value_enum, default_value_t = Format::TarGz)]
+        #[arg(long, value_enum, default_value_t = Format::host_default())]
         format: Format,
     },
 
     /// Boot an artifact on a clean scratch prefix and run the smoke matrix.
     Check {
-        /// Tarball or directory to check. When omitted, a fresh `dir`
-        /// artifact is built into the scratch area first.
+        /// Archive (tar.gz or zip) or directory to check. When omitted,
+        /// a fresh `dir` artifact is built into the scratch area first.
         #[arg(long, value_name = "PATH")]
         artifact: Option<PathBuf>,
 
@@ -120,8 +133,29 @@ enum Format {
     /// A gzip tarball created with the system `tar` (preserves symlinks
     /// and modes).
     TarGz,
+    /// A zip archive, also created with the system `tar`: `-a` makes
+    /// bsdtar pick the format from the `.zip` extension. GNU tar has no
+    /// zip writer, but zip is only the default where bsdtar *is* the
+    /// system tar (Windows 10+ and the GitHub runners ship it; macOS
+    /// too) — on GNU/Linux, `tar.gz` remains the supported archive.
+    Zip,
     /// A plain directory tree.
     Dir,
+}
+
+impl Format {
+    /// The host's conventional archive format: zip on Windows (the NT
+    /// artifact has no symlinks to preserve and zip is what Windows
+    /// users unpack natively — RFC 0063 WS6), gzip tarball elsewhere.
+    /// The builder always packages the host target, so `cfg!(windows)`
+    /// is the right switch.
+    const fn host_default() -> Self {
+        if cfg!(windows) {
+            Format::Zip
+        } else {
+            Format::TarGz
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -214,8 +248,8 @@ fn exe_name(base: &str) -> String {
 // build
 // ---------------------------------------------------------------------------
 
-/// Assemble the artifact. Returns the tarball path (`Format::TarGz`) or the
-/// staging directory (`Format::Dir`).
+/// Assemble the artifact. Returns the archive path (`Format::TarGz`,
+/// `Format::Zip`) or the staging directory (`Format::Dir`).
 fn build_artifact(workspace: &Path, weavepy: &Path, out: &Path, format: Format) -> Result<PathBuf> {
     let name = artifact_name(workspace);
     std::fs::create_dir_all(out).with_context(|| format!("failed to create {}", out.display()))?;
@@ -278,30 +312,49 @@ fn build_artifact(workspace: &Path, weavepy: &Path, out: &Path, format: Format) 
     std::fs::remove_dir_all(&cache)
         .with_context(|| format!("failed to clean up {}", cache.display()))?;
 
-    // bin/weavepy + the PEP 394-ish shim names.
-    let bin_dir = staging.join("bin");
-    std::fs::create_dir_all(&bin_dir)
-        .with_context(|| format!("failed to create {}", bin_dir.display()))?;
-    let dest = bin_dir.join(exe_name("weavepy"));
-    std::fs::copy(weavepy, &dest)
-        .with_context(|| format!("failed to copy {} to {}", weavepy.display(), dest.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("failed to chmod {}", dest.display()))?;
-    }
-    for shim in ["python3", "python", "python3.13"] {
+    if cfg!(windows) {
+        // RFC 0063 WS6 — the NT artifact is CPython-shaped at the root:
+        // `python.exe` and friends sit directly in the prefix (no
+        // `bin/`), all as real file copies — NTFS symlinks need
+        // privileges, so nothing in the artifact may depend on them.
+        // The landmark walk starts at the exe's own directory, so
+        // `{prefix}/lib/weavepy3.13` is found on the first probe.
+        for name in ["weavepy", "python", "python3", "python3.13"] {
+            let dest = staging.join(exe_name(name));
+            std::fs::copy(weavepy, &dest).with_context(|| {
+                format!("failed to copy {} to {}", weavepy.display(), dest.display())
+            })?;
+        }
+    } else {
+        // bin/weavepy + the PEP 394-ish shim names.
+        let bin_dir = staging.join("bin");
+        std::fs::create_dir_all(&bin_dir)
+            .with_context(|| format!("failed to create {}", bin_dir.display()))?;
+        let dest = bin_dir.join(exe_name("weavepy"));
+        std::fs::copy(weavepy, &dest).with_context(|| {
+            format!("failed to copy {} to {}", weavepy.display(), dest.display())
+        })?;
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink("weavepy", bin_dir.join(shim))
-                .with_context(|| format!("failed to symlink bin/{shim}"))?;
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
+                .with_context(|| format!("failed to chmod {}", dest.display()))?;
         }
-        #[cfg(not(unix))]
-        {
-            let shim_dest = bin_dir.join(exe_name(shim));
-            std::fs::copy(&dest, &shim_dest)
-                .with_context(|| format!("failed to copy bin shim {}", shim_dest.display()))?;
+        for shim in ["python3", "python", "python3.13"] {
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink("weavepy", bin_dir.join(shim))
+                    .with_context(|| format!("failed to symlink bin/{shim}"))?;
+            }
+            // Unreachable on Windows (the cfg!(windows) arm above owns
+            // that layout); kept for hypothetical non-unix, non-Windows
+            // hosts so the build still produces runnable shims.
+            #[cfg(not(unix))]
+            {
+                let shim_dest = bin_dir.join(exe_name(shim));
+                std::fs::copy(&dest, &shim_dest)
+                    .with_context(|| format!("failed to copy bin shim {}", shim_dest.display()))?;
+            }
         }
     }
 
@@ -318,26 +371,47 @@ fn build_artifact(workspace: &Path, weavepy: &Path, out: &Path, format: Format) 
         Format::Dir => Ok(staging),
         Format::TarGz => {
             let tarball = out.join(format!("{name}.tar.gz"));
-            if tarball.exists() {
-                std::fs::remove_file(&tarball)
-                    .with_context(|| format!("failed to remove stale {}", tarball.display()))?;
-            }
             // The system tar preserves symlinks and modes; the Rust
             // stdlib has no tar writer and we keep this crate dep-light.
-            let status = std::process::Command::new("tar")
-                .arg("-czf")
-                .arg(&tarball)
-                .arg("-C")
-                .arg(out)
-                .arg(&name)
-                .status()
-                .context("failed to spawn `tar` — is it on PATH?")?;
-            if !status.success() {
-                bail!("`tar -czf` exited with {status}");
-            }
+            create_archive(&tarball, &["-czf"], out, &name)?;
             Ok(tarball)
         }
+        Format::Zip => {
+            let archive = out.join(format!("{name}.zip"));
+            // `tar -a -cf x.zip …` — bsdtar (the system tar on Windows
+            // 10+, the GitHub runners, and macOS) autodetects the zip
+            // output format from the extension. Same dep-light story
+            // as TarGz: one external tool, already on PATH.
+            create_archive(&archive, &["-a", "-cf"], out, &name)?;
+            Ok(archive)
+        }
     }
+}
+
+/// Create `archive` by invoking the system `tar` with `flags` (e.g.
+/// `-czf` or `-a -cf`), archiving `root` relative to `dir`, replacing
+/// any stale file first.
+fn create_archive(archive: &Path, flags: &[&str], dir: &Path, root: &str) -> Result<()> {
+    if archive.exists() {
+        std::fs::remove_file(archive)
+            .with_context(|| format!("failed to remove stale {}", archive.display()))?;
+    }
+    let status = std::process::Command::new("tar")
+        .args(flags)
+        .arg(archive)
+        .arg("-C")
+        .arg(dir)
+        .arg(root)
+        .status()
+        .context("failed to spawn `tar` — is it on PATH?")?;
+    if !status.success() {
+        bail!(
+            "`tar {} {}` exited with {status}",
+            flags.join(" "),
+            archive.display()
+        );
+    }
+    Ok(())
 }
 
 /// `weavepy-{version}+g{git_short}-{target_triple}`.
@@ -373,48 +447,92 @@ fn target_triple() -> String {
 }
 
 fn artifact_readme(name: &str) -> String {
-    format!(
-        "# {name}\n\
-         \n\
-         A relocatable build of WeavePy, a Python 3.13-compatible interpreter.\n\
-         \n\
-         ## Usage\n\
-         \n\
-         Extract this directory anywhere and run the interpreter directly:\n\
-         \n\
-         ```sh\n\
-         ./bin/python3\n\
-         ```\n\
-         \n\
-         Optionally put it on your PATH:\n\
-         \n\
-         ```sh\n\
-         export PATH=\"$PWD/bin:$PATH\"\n\
-         ```\n\
-         \n\
-         `bin/weavepy` is the real binary; `python`, `python3`, and\n\
-         `python3.13` are symlinks to it (copies on Windows). The layout is\n\
-         self-locating — no environment variables are required.\n\
-         \n\
-         ## Packaging\n\
-         \n\
-         Virtual environments and pip work out of the box (a pip wheel is\n\
-         bundled):\n\
-         \n\
-         ```sh\n\
-         ./bin/python3 -m venv .venv\n\
-         .venv/bin/python -m pip install <package>\n\
-         ```\n\
-         \n\
-         The CPython 3.13 C header set ships under `include/python3.13`\n\
-         (what `sysconfig.get_paths()[\"include\"]` reports), so building\n\
-         C extensions from source — `pip install --no-binary` of sdists —\n\
-         works with a C compiler on PATH.\n\
-         \n\
-         ## License\n\
-         \n\
-         MIT OR Apache-2.0 — see `LICENSE-MIT` and `LICENSE-APACHE`.\n"
-    )
+    // The builder always packages the host target, so the README
+    // describes the layout this artifact actually has — the POSIX
+    // `bin/` shims, or the RFC 0063 WS6 exe-at-root NT shape — and
+    // mentions the sibling layout only in passing.
+    if cfg!(windows) {
+        format!(
+            "# {name}\n\
+             \n\
+             A relocatable build of WeavePy, a Python 3.13-compatible interpreter.\n\
+             \n\
+             ## Usage\n\
+             \n\
+             Extract this directory anywhere and run the interpreter directly:\n\
+             \n\
+             ```bat\n\
+             .\\python3.exe\n\
+             ```\n\
+             \n\
+             `weavepy.exe` is the real binary; `python.exe`, `python3.exe`, and\n\
+             `python3.13.exe` are copies of it at the artifact root — the CPython\n\
+             Windows convention (POSIX artifacts use `bin/` symlinks instead).\n\
+             The layout is self-locating — no environment variables are required.\n\
+             \n\
+             ## Packaging\n\
+             \n\
+             Virtual environments and pip work out of the box (a pip wheel is\n\
+             bundled):\n\
+             \n\
+             ```bat\n\
+             .\\python3.exe -m venv .venv\n\
+             .venv\\Scripts\\python.exe -m pip install <package>\n\
+             ```\n\
+             \n\
+             The CPython 3.13 C header set ships under `include/python3.13`,\n\
+             but building or loading C extensions on Windows is not supported\n\
+             yet (it needs a `python313.dll` for extensions to link against).\n\
+             \n\
+             ## License\n\
+             \n\
+             MIT OR Apache-2.0 — see `LICENSE-MIT` and `LICENSE-APACHE`.\n"
+        )
+    } else {
+        format!(
+            "# {name}\n\
+             \n\
+             A relocatable build of WeavePy, a Python 3.13-compatible interpreter.\n\
+             \n\
+             ## Usage\n\
+             \n\
+             Extract this directory anywhere and run the interpreter directly:\n\
+             \n\
+             ```sh\n\
+             ./bin/python3\n\
+             ```\n\
+             \n\
+             Optionally put it on your PATH:\n\
+             \n\
+             ```sh\n\
+             export PATH=\"$PWD/bin:$PATH\"\n\
+             ```\n\
+             \n\
+             `bin/weavepy` is the real binary; `python`, `python3`, and\n\
+             `python3.13` are symlinks to it (Windows artifacts instead place\n\
+             `python.exe` and friends at the archive root). The layout is\n\
+             self-locating — no environment variables are required.\n\
+             \n\
+             ## Packaging\n\
+             \n\
+             Virtual environments and pip work out of the box (a pip wheel is\n\
+             bundled):\n\
+             \n\
+             ```sh\n\
+             ./bin/python3 -m venv .venv\n\
+             .venv/bin/python -m pip install <package>\n\
+             ```\n\
+             \n\
+             The CPython 3.13 C header set ships under `include/python3.13`\n\
+             (what `sysconfig.get_paths()[\"include\"]` reports), so building\n\
+             C extensions from source — `pip install --no-binary` of sdists —\n\
+             works with a C compiler on PATH.\n\
+             \n\
+             ## License\n\
+             \n\
+             MIT OR Apache-2.0 — see `LICENSE-MIT` and `LICENSE-APACHE`.\n"
+        )
+    }
 }
 
 /// Move each entry of `from` into `to`, preferring `fs::rename` and falling
@@ -540,7 +658,7 @@ fn run_check(
                 path.canonicalize()
                     .with_context(|| format!("failed to canonicalize {}", path.display()))?
             } else if path.is_file() {
-                extract_tarball(&path, scratch)?
+                extract_archive(&path, scratch)?
             } else {
                 bail!("--artifact path does not exist: {}", path.display());
             }
@@ -556,7 +674,15 @@ fn run_check(
         .with_context(|| format!("failed to canonicalize {}", prefix.display()))?;
     eprintln!("checking artifact prefix {}", prefix.display());
 
-    let python3 = prefix.join("bin").join(exe_name("python3"));
+    // The interpreter's place mirrors the layout `build_artifact` wrote
+    // for this host: `{prefix}/python3.exe` at the prefix root on
+    // Windows (RFC 0063 WS6 — no `bin/`), `{prefix}/bin/python3`
+    // elsewhere.
+    let python3 = if cfg!(windows) {
+        prefix.join(exe_name("python3"))
+    } else {
+        prefix.join("bin").join(exe_name("python3"))
+    };
     if !python3.exists() {
         bail!(
             "artifact has no {} — not a WeavePy prefix?",
@@ -594,9 +720,15 @@ fn run_check(
         &[],
     ));
 
-    // Leg 4: venv.
+    // Leg 4: venv. The venv's interpreter follows the platform scheme
+    // (`sysconfig`'s `venv` vs `nt_venv`): `bin/python` on POSIX,
+    // `Scripts\python.exe` on Windows.
     let venv_dir = scratch.join("venv");
-    let venv_python = venv_dir.join("bin").join(exe_name("python"));
+    let venv_python = if cfg!(windows) {
+        venv_dir.join("Scripts").join(exe_name("python"))
+    } else {
+        venv_dir.join("bin").join(exe_name("python"))
+    };
     let venv_leg = leg_venv(&python3, &venv_dir, &venv_python, &prefix, &env);
     let venv_ok = venv_leg.status == LegStatus::Pass;
     legs.push(venv_leg);
@@ -631,7 +763,9 @@ fn run_check(
         Leg {
             name: "cext",
             status: LegStatus::Skip,
-            detail: "C-build leg is POSIX-only in this wave".to_owned(),
+            // A static exe has nothing for a .pyd's PE import table to
+            // resolve against; C builds await the python313.dll wave.
+            detail: "C builds are a Windows non-goal (RFC 0063)".to_owned(),
         }
     });
 
@@ -650,21 +784,24 @@ fn run_check(
     Ok(())
 }
 
-/// Extract a tarball into `<scratch>/extract` and return the single
-/// top-level directory inside it.
-fn extract_tarball(tarball: &Path, scratch: &Path) -> Result<PathBuf> {
+/// Extract an archive into `<scratch>/extract` and return the single
+/// top-level directory inside it. Plain `-xf` handles both artifact
+/// formats: tar sniffs gzip from the file contents, and bsdtar (the
+/// system tar everywhere zip artifacts exist — see `Format::Zip`)
+/// sniffs zip the same way.
+fn extract_archive(archive: &Path, scratch: &Path) -> Result<PathBuf> {
     let extract = scratch.join("extract");
     std::fs::create_dir_all(&extract)
         .with_context(|| format!("failed to create {}", extract.display()))?;
     let status = std::process::Command::new("tar")
-        .arg("-xzf")
-        .arg(tarball)
+        .arg("-xf")
+        .arg(archive)
         .arg("-C")
         .arg(&extract)
         .status()
         .context("failed to spawn `tar` — is it on PATH?")?;
     if !status.success() {
-        bail!("`tar -xzf {}` exited with {status}", tarball.display());
+        bail!("`tar -xf {}` exited with {status}", archive.display());
     }
     let mut dirs: Vec<PathBuf> = Vec::new();
     for entry in std::fs::read_dir(&extract)
@@ -679,7 +816,7 @@ fn extract_tarball(tarball: &Path, scratch: &Path) -> Result<PathBuf> {
         [single] => Ok(single.clone()),
         other => bail!(
             "expected exactly one top-level directory in {}, found {}",
-            tarball.display(),
+            archive.display(),
             other.len()
         ),
     }
@@ -1001,8 +1138,11 @@ assert prefix == expect, f"sys.prefix={sys.prefix!r} != {expect!r}"
 base = os.path.realpath(sys.base_prefix)
 assert base == expect, f"sys.base_prefix={sys.base_prefix!r} != {expect!r}"
 exe_dir = os.path.realpath(os.path.dirname(sys.executable))
-assert exe_dir == os.path.join(expect, "bin"), (
-    f"sys.executable={sys.executable!r} not under {expect!r}/bin"
+# NT artifacts put the exe at the prefix root (RFC 0063 WS6); POSIX
+# artifacts keep it under bin/.
+want_exe_dir = expect if os.name == "nt" else os.path.join(expect, "bin")
+assert exe_dir == want_exe_dir, (
+    f"sys.executable={sys.executable!r} not in {want_exe_dir!r}"
 )
 stdlib = os.path.realpath(sys._stdlib_dir)
 want_stdlib = os.path.join(expect, "lib", "weavepy3.13")

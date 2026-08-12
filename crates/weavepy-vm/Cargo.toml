@@ -73,6 +73,11 @@ crossbeam-utils       = { workspace = true }
 weavepy-jit           = { workspace = true, optional = true }
 stacker = "0.1.24"
 
+# RFC 0063 — the Windows wave: Win32 bindings for the NT-native
+# stdlib core. Only present in Windows builds.
+[target.'cfg(windows)'.dependencies]
+windows-sys           = { workspace = true }
+
 [features]
 default = []
 # Compile the tier-2 JIT integration (pulls in Cranelift). Off by

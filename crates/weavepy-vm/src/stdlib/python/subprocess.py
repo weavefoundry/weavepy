@@ -14,8 +14,17 @@ CPython's `subprocess._execute_child`.
 reads/writes (CPython's POSIX `_communicate`), so it never deadlocks on
 large output and honours `timeout`.
 
-Where `_posixsubprocess` is unavailable (non-POSIX targets), we fall back
-to the legacy `_subprocess.spawn` primitive so the surface still works.
+On Windows (`os.name == "nt"`, RFC 0063 WS2) the CPython `_mswindows` arm
+runs instead: `_winapi.CreateProcess` with a `STARTUPINFO`, inheritable
+handle duplicates and an optional `lpAttributeList["handle_list"]`,
+`_winapi.WaitForSingleObject` for waiting, and reader/writer threads for
+`communicate()`. Its methods are defined at the *end* of `Popen` inside an
+`if _mswindows:` block so they override the POSIX/portable definitions on
+nt while leaving them untouched everywhere else.
+
+Where `_posixsubprocess` is unavailable (non-POSIX, non-NT targets), we
+fall back to the legacy `_subprocess.spawn` primitive so the surface still
+works.
 
 Surface: `Popen`, `run`, `call`, `check_call`, `check_output`,
 `getoutput`, `getstatusoutput`, `CompletedProcess`, `CalledProcessError`,
@@ -33,6 +42,65 @@ import builtins
 import warnings
 
 _mswindows = (os.name == "nt")
+
+if _mswindows:
+    # CPython Lib/subprocess.py `_mswindows` prologue. The constant
+    # re-exports, STARTUPINFO and Handle live in one block here (CPython
+    # splits them around its exception classes); `__all__` is extended at
+    # the bottom of this module, after `__all__` is defined.
+    import msvcrt
+    import _winapi
+    from _winapi import (CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP,
+                         STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+                         STD_ERROR_HANDLE, SW_HIDE,
+                         STARTF_USESTDHANDLES, STARTF_USESHOWWINDOW,
+                         STARTF_FORCEONFEEDBACK, STARTF_FORCEOFFFEEDBACK,
+                         ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS,
+                         HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS,
+                         NORMAL_PRIORITY_CLASS, REALTIME_PRIORITY_CLASS,
+                         CREATE_NO_WINDOW, DETACHED_PROCESS,
+                         CREATE_DEFAULT_ERROR_MODE, CREATE_BREAKAWAY_FROM_JOB)
+
+    class STARTUPINFO:
+        def __init__(self, *, dwFlags=0, hStdInput=None, hStdOutput=None,
+                     hStdError=None, wShowWindow=0, lpAttributeList=None):
+            self.dwFlags = dwFlags
+            self.hStdInput = hStdInput
+            self.hStdOutput = hStdOutput
+            self.hStdError = hStdError
+            self.wShowWindow = wShowWindow
+            self.lpAttributeList = lpAttributeList or {"handle_list": []}
+
+        def copy(self):
+            attr_list = self.lpAttributeList.copy()
+            if 'handle_list' in attr_list:
+                attr_list['handle_list'] = list(attr_list['handle_list'])
+
+            return STARTUPINFO(dwFlags=self.dwFlags,
+                               hStdInput=self.hStdInput,
+                               hStdOutput=self.hStdOutput,
+                               hStdError=self.hStdError,
+                               wShowWindow=self.wShowWindow,
+                               lpAttributeList=attr_list)
+
+    class Handle(int):
+        closed = False
+
+        def Close(self, CloseHandle=_winapi.CloseHandle):
+            if not self.closed:
+                self.closed = True
+                CloseHandle(self)
+
+        def Detach(self):
+            if not self.closed:
+                self.closed = True
+                return int(self)
+            raise ValueError("already closed")
+
+        def __repr__(self):
+            return "%s(%d)" % (self.__class__.__name__, int(self))
+
+        __del__ = Close
 
 try:
     import _posixsubprocess
@@ -384,6 +452,15 @@ def _cleanup():
                 pass
 
 
+if _mswindows:
+    # On Windows the kernel frees the process once `Popen._handle` is
+    # closed, which `Handle.__del__` does when the Popen instance is
+    # finalized — there is no zombie to reap. CPython disables the
+    # bookkeeping by setting `_active = None`; `_cleanup()` above already
+    # no-ops in that case.
+    _active = None
+
+
 # ----------------------------------------------------------------------
 # Popen.
 # ----------------------------------------------------------------------
@@ -447,7 +524,11 @@ class Popen:
             self.encoding = encoding = _text_encoding()
         self.args = args
 
-        if not _mswindows:
+        if _mswindows:
+            if preexec_fn is not None:
+                raise ValueError("preexec_fn is not supported on Windows "
+                                 "platforms")
+        else:
             # These two are Windows-only knobs; on POSIX CPython rejects them
             # up front rather than silently ignoring (test_invalid_args).
             if startupinfo is not None:
@@ -474,7 +555,9 @@ class Popen:
         if umask is None:
             umask = -1
 
-        if pass_fds and not close_fds:
+        # POSIX-only: CPython keeps this warning in its POSIX branch; on
+        # Windows pass_fds is rejected by _execute_child instead.
+        if not _mswindows and pass_fds and not close_fds:
             warnings.warn("pass_fds overriding close_fds.", RuntimeWarning)
             close_fds = True
 
@@ -482,6 +565,18 @@ class Popen:
          c2pread, c2pwrite,
          errread, errwrite,
          to_close) = self._get_handles(stdin, stdout, stderr)
+
+        # We wrap OS handles *before* launching the child, otherwise a
+        # quickly terminating child could make our fds unwrappable
+        # (see #8458). On Windows the parent-side pipe ends are `Handle`s;
+        # detach each into a CRT file descriptor the io module can own.
+        if _mswindows:
+            if p2cwrite != -1:
+                p2cwrite = msvcrt.open_osfhandle(p2cwrite.Detach(), 0)
+            if c2pread != -1:
+                c2pread = msvcrt.open_osfhandle(c2pread.Detach(), 0)
+            if errread != -1:
+                errread = msvcrt.open_osfhandle(errread.Detach(), 0)
 
         try:
             if p2cwrite != -1:
@@ -513,7 +608,10 @@ class Popen:
             if not self._closed_child_pipe_fds:
                 for fd in to_close:
                     try:
-                        os.close(fd)
+                        if _mswindows and isinstance(fd, Handle):
+                            fd.Close()
+                        else:
+                            os.close(fd)
                     except OSError:
                         pass
             raise
@@ -914,7 +1012,10 @@ class Popen:
         """Wait for child to terminate; set and return :attr:`returncode`."""
         if self.returncode is not None:
             return self.returncode
-        if not _HAVE_FORK_EXEC:
+        # `_subprocess.spawn` fallback dispatch — non-POSIX *and* non-NT
+        # only. On Windows `self._handle` is a `Handle` and `_wait` below
+        # (overridden by the `if _mswindows:` block) drives WaitForSingleObject.
+        if not _mswindows and not _HAVE_FORK_EXEC:
             res = self._handle["wait"](timeout) if timeout is not None else self._handle["wait"]()
             self.returncode = res
             return res
@@ -1339,6 +1440,428 @@ class Popen:
             obj_repr = obj_repr[:76] + "...>"
         return obj_repr
 
+    if _mswindows:
+        #
+        # Windows methods (CPython Lib/subprocess.py `_mswindows` arm,
+        # RFC 0063 WS2). Defined *after* the POSIX/portable definitions so
+        # that, on nt, they override them; every other platform keeps the
+        # definitions above untouched.
+        #
+        def _get_handles(self, stdin, stdout, stderr):
+            """Construct and return tuple with IO objects:
+            p2cread, p2cwrite, c2pread, c2pwrite, errread, errwrite,
+            plus the set of child-side handles the parent must close once
+            the child is launched (MS Windows version)."""
+            if stdin is None and stdout is None and stderr is None:
+                return (-1, -1, -1, -1, -1, -1, set())
+
+            p2cread, p2cwrite = -1, -1
+            c2pread, c2pwrite = -1, -1
+            errread, errwrite = -1, -1
+
+            # The inheritable child-side duplicates. WeavePy's __init__/
+            # _execute_child thread a `to_close` set through instead of
+            # CPython's positional p2cread/c2pwrite/errwrite closes, so the
+            # Windows arm collects the `_make_inheritable` results here;
+            # `_close_pipe_fds` (below) closes them after CreateProcess.
+            to_close = set()
+            # Handles to destroy if pipe setup itself fails partway —
+            # CPython's `_on_error_fd_closer` context manager, written out
+            # inline to avoid a contextlib dependency in this module.
+            err_close_fds = []
+            try:
+                if stdin is None:
+                    p2cread = _winapi.GetStdHandle(_winapi.STD_INPUT_HANDLE)
+                    if p2cread is None:
+                        p2cread, _ = _winapi.CreatePipe(None, 0)
+                        p2cread = Handle(p2cread)
+                        err_close_fds.append(p2cread)
+                        _winapi.CloseHandle(_)
+                elif stdin == PIPE:
+                    p2cread, p2cwrite = _winapi.CreatePipe(None, 0)
+                    p2cread, p2cwrite = Handle(p2cread), Handle(p2cwrite)
+                    err_close_fds.extend((p2cread, p2cwrite))
+                elif stdin == DEVNULL:
+                    p2cread = msvcrt.get_osfhandle(self._get_devnull())
+                elif isinstance(stdin, int):
+                    p2cread = msvcrt.get_osfhandle(stdin)
+                else:
+                    # Assuming file-like object
+                    p2cread = msvcrt.get_osfhandle(stdin.fileno())
+                p2cread = self._make_inheritable(p2cread)
+                to_close.add(p2cread)
+
+                if stdout is None:
+                    c2pwrite = _winapi.GetStdHandle(_winapi.STD_OUTPUT_HANDLE)
+                    if c2pwrite is None:
+                        _, c2pwrite = _winapi.CreatePipe(None, 0)
+                        c2pwrite = Handle(c2pwrite)
+                        err_close_fds.append(c2pwrite)
+                        _winapi.CloseHandle(_)
+                elif stdout == PIPE:
+                    c2pread, c2pwrite = _winapi.CreatePipe(None, 0)
+                    c2pread, c2pwrite = Handle(c2pread), Handle(c2pwrite)
+                    err_close_fds.extend((c2pread, c2pwrite))
+                elif stdout == DEVNULL:
+                    c2pwrite = msvcrt.get_osfhandle(self._get_devnull())
+                elif isinstance(stdout, int):
+                    c2pwrite = msvcrt.get_osfhandle(stdout)
+                else:
+                    # Assuming file-like object
+                    c2pwrite = msvcrt.get_osfhandle(stdout.fileno())
+                c2pwrite = self._make_inheritable(c2pwrite)
+                to_close.add(c2pwrite)
+
+                if stderr is None:
+                    errwrite = _winapi.GetStdHandle(_winapi.STD_ERROR_HANDLE)
+                    if errwrite is None:
+                        _, errwrite = _winapi.CreatePipe(None, 0)
+                        errwrite = Handle(errwrite)
+                        err_close_fds.append(errwrite)
+                        _winapi.CloseHandle(_)
+                elif stderr == PIPE:
+                    errread, errwrite = _winapi.CreatePipe(None, 0)
+                    errread, errwrite = Handle(errread), Handle(errwrite)
+                    err_close_fds.extend((errread, errwrite))
+                elif stderr == STDOUT:
+                    errwrite = c2pwrite
+                elif stderr == DEVNULL:
+                    errwrite = msvcrt.get_osfhandle(self._get_devnull())
+                elif isinstance(stderr, int):
+                    errwrite = msvcrt.get_osfhandle(stderr)
+                else:
+                    # Assuming file-like object
+                    errwrite = msvcrt.get_osfhandle(stderr.fileno())
+                errwrite = self._make_inheritable(errwrite)
+                to_close.add(errwrite)
+            except:
+                # Also close the inheritable duplicates already made (CPython
+                # leaves those to Handle.__del__; closing eagerly is safe —
+                # they are private to us).
+                err_close_fds.extend(to_close)
+                if self._devnull is not None:
+                    err_close_fds.append(self._devnull)
+                    self._devnull = None
+                for fd in err_close_fds:
+                    try:
+                        if isinstance(fd, Handle):
+                            fd.Close()
+                        else:
+                            os.close(fd)
+                    except OSError:
+                        pass
+                raise
+
+            return (p2cread, p2cwrite,
+                    c2pread, c2pwrite,
+                    errread, errwrite,
+                    to_close)
+
+        def _make_inheritable(self, handle):
+            """Return a duplicate of handle, which is inheritable"""
+            h = _winapi.DuplicateHandle(
+                _winapi.GetCurrentProcess(), handle,
+                _winapi.GetCurrentProcess(), 0, 1,
+                _winapi.DUPLICATE_SAME_ACCESS)
+            return Handle(h)
+
+        def _filter_handle_list(self, handle_list):
+            """Filter out console handles that can't be used
+            in lpAttributeList["handle_list"] and make sure the list
+            isn't empty. This also removes duplicate handles."""
+            # An handle with it's lowest two bits set might be a special console
+            # handle that if passed in lpAttributeList["handle_list"], will
+            # cause it to fail.
+            return list({handle for handle in handle_list
+                         if handle & 0x3 != 0x3
+                         or _winapi.GetFileType(handle) !=
+                            _winapi.FILE_TYPE_CHAR})
+
+        def _execute_child(self, args, executable, preexec_fn, close_fds,
+                           pass_fds, cwd, env, startupinfo, creationflags,
+                           shell, p2cread, p2cwrite, c2pread, c2pwrite,
+                           errread, errwrite, unused_restore_signals,
+                           unused_gid, unused_gids, unused_uid, unused_umask,
+                           unused_start_new_session, unused_process_group,
+                           to_close):
+            """Execute program (MS Windows version)"""
+
+            assert not pass_fds, "pass_fds not supported on Windows."
+
+            if isinstance(args, str):
+                pass
+            elif isinstance(args, bytes):
+                if shell:
+                    raise TypeError('bytes args is not allowed on Windows')
+                args = list2cmdline([args])
+            elif isinstance(args, os.PathLike):
+                if shell:
+                    raise TypeError('path-like args is not allowed when '
+                                    'shell is true')
+                args = list2cmdline([args])
+            else:
+                args = list2cmdline(args)
+
+            if executable is not None:
+                executable = os.fsdecode(executable)
+
+            # Process startup details
+            if startupinfo is None:
+                startupinfo = STARTUPINFO()
+            else:
+                # bpo-34044: Copy STARTUPINFO since it is modified below,
+                # so the caller can reuse it multiple times.
+                startupinfo = startupinfo.copy()
+
+            use_std_handles = -1 not in (p2cread, c2pwrite, errwrite)
+            if use_std_handles:
+                startupinfo.dwFlags |= _winapi.STARTF_USESTDHANDLES
+                startupinfo.hStdInput = p2cread
+                startupinfo.hStdOutput = c2pwrite
+                startupinfo.hStdError = errwrite
+
+            attribute_list = startupinfo.lpAttributeList
+            have_handle_list = bool(attribute_list and
+                                    "handle_list" in attribute_list and
+                                    attribute_list["handle_list"])
+
+            # If we were given an handle_list or need to create one
+            if have_handle_list or (use_std_handles and close_fds):
+                if attribute_list is None:
+                    attribute_list = startupinfo.lpAttributeList = {}
+                handle_list = attribute_list["handle_list"] = \
+                    list(attribute_list.get("handle_list", []))
+
+                if use_std_handles:
+                    handle_list += [int(p2cread), int(c2pwrite), int(errwrite)]
+
+                handle_list[:] = self._filter_handle_list(handle_list)
+
+                if handle_list:
+                    if not close_fds:
+                        warnings.warn("startupinfo.lpAttributeList['handle_list'] "
+                                      "overriding close_fds", RuntimeWarning)
+
+                    # When using the handle_list we always request to inherit
+                    # handles but the only handles that will be inherited are
+                    # the ones in the handle_list
+                    close_fds = False
+
+            if shell:
+                startupinfo.dwFlags |= _winapi.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = _winapi.SW_HIDE
+                if not executable:
+                    # gh-101283: without a fully-qualified path, before Windows
+                    # checks the system directories, it first looks in the
+                    # application directory, and also the current directory if
+                    # NeedCurrentDirectoryForExePathW(ExeName) is true, so try
+                    # to avoid executing unqualified "cmd.exe".
+                    comspec = os.environ.get('ComSpec')
+                    if not comspec:
+                        system_root = os.environ.get('SystemRoot', '')
+                        comspec = os.path.join(system_root, 'System32', 'cmd.exe')
+                        if not os.path.isabs(comspec):
+                            raise FileNotFoundError('shell not found: neither %ComSpec% nor %SystemRoot% is set')
+                    if os.path.isabs(comspec):
+                        executable = comspec
+                else:
+                    comspec = executable
+
+                args = '{} /c "{}"'.format(comspec, args)
+
+            if cwd is not None:
+                cwd = os.fsdecode(cwd)
+
+            sys_audit = getattr(sys, "audit", None)
+            if sys_audit is not None:
+                try:
+                    sys_audit("subprocess.Popen", executable, args, cwd, env)
+                except Exception:
+                    pass
+
+            # Start the process. The env dict is handed straight to
+            # _winapi.CreateProcess, which builds the environment block.
+            try:
+                hp, ht, pid, tid = _winapi.CreateProcess(executable, args,
+                                         # no special security
+                                         None, None,
+                                         int(not close_fds),
+                                         creationflags,
+                                         env,
+                                         cwd,
+                                         startupinfo)
+            finally:
+                # Child is launched. Close the parent's copy of those pipe
+                # handles that only the child should have open.  You need
+                # to make sure that no handles to the write end of the
+                # output pipe are maintained in this process or else the
+                # pipe will not close when the child process exits and the
+                # ReadFile will hang.
+                self._close_pipe_fds(to_close, p2cread, p2cwrite,
+                                     c2pread, c2pwrite, errread, errwrite)
+
+            # Retain the process handle, but close the thread handle
+            self._child_created = True
+            self._handle = Handle(hp)
+            self.pid = pid
+            _winapi.CloseHandle(ht)
+
+        def _close_pipe_fds(self, to_close, p2cread, p2cwrite,
+                            c2pread, c2pwrite, errread, errwrite):
+            # Windows version: the child-side ends are the inheritable
+            # `Handle` duplicates collected in `to_close` (p2cread, c2pwrite,
+            # errwrite when != -1); the child now owns its copies.
+            for handle in to_close:
+                try:
+                    handle.Close()
+                except OSError:
+                    pass
+            devnull_fd = self._devnull
+            if devnull_fd is not None:
+                try:
+                    os.close(devnull_fd)
+                except OSError:
+                    pass
+            # Prevent a double close of these handles/fds from __init__
+            # on error.
+            self._closed_child_pipe_fds = True
+
+        def _internal_poll(self, _deadstate=None,
+                _WaitForSingleObject=_winapi.WaitForSingleObject,
+                _WAIT_OBJECT_0=_winapi.WAIT_OBJECT_0,
+                _GetExitCodeProcess=_winapi.GetExitCodeProcess):
+            """Check if child process has terminated.  Returns returncode
+            attribute.
+
+            This method is called by __del__, so it can only refer to objects
+            in its local scope.
+
+            """
+            if self.returncode is None:
+                if _WaitForSingleObject(self._handle, 0) == _WAIT_OBJECT_0:
+                    self.returncode = _GetExitCodeProcess(self._handle)
+            return self.returncode
+
+        def _wait(self, timeout):
+            """Internal implementation of wait() on Windows."""
+            if timeout is None:
+                timeout_millis = _winapi.INFINITE
+            elif timeout <= 0:
+                timeout_millis = 0
+            else:
+                timeout_millis = int(timeout * 1000)
+            if self.returncode is None:
+                # API note: Returns immediately if timeout_millis == 0.
+                result = _winapi.WaitForSingleObject(self._handle,
+                                                     timeout_millis)
+                if result == _winapi.WAIT_TIMEOUT:
+                    raise TimeoutExpired(self.args, timeout)
+                self.returncode = _winapi.GetExitCodeProcess(self._handle)
+            return self.returncode
+
+        def _readerthread(self, fh, buffer):
+            buffer.append(fh.read())
+            fh.close()
+
+        def _writerthread(self, input):
+            self._stdin_write(input)
+
+        def _communicate(self, input, endtime, orig_timeout):
+            # Start reader threads feeding into a list hanging off of this
+            # object, unless they've already been started.
+            if self.stdout and not hasattr(self, "_stdout_buff"):
+                self._stdout_buff = []
+                self.stdout_thread = \
+                        _threading.Thread(target=self._readerthread,
+                                          args=(self.stdout, self._stdout_buff))
+                self.stdout_thread.daemon = True
+                self.stdout_thread.start()
+            if self.stderr and not hasattr(self, "_stderr_buff"):
+                self._stderr_buff = []
+                self.stderr_thread = \
+                        _threading.Thread(target=self._readerthread,
+                                          args=(self.stderr, self._stderr_buff))
+                self.stderr_thread.daemon = True
+                self.stderr_thread.start()
+
+            # Start writer thread to send input to stdin, unless already
+            # started.  The thread writes input and closes stdin when done,
+            # or continues in the background on timeout.
+            if self.stdin and not hasattr(self, "_stdin_thread"):
+                self._stdin_thread = \
+                        _threading.Thread(target=self._writerthread,
+                                          args=(input,))
+                self._stdin_thread.daemon = True
+                self._stdin_thread.start()
+
+            # Wait for the writer thread, or time out.  If we time out, the
+            # thread remains writing and the fd left open in case the user
+            # calls communicate again.
+            if hasattr(self, "_stdin_thread"):
+                self._stdin_thread.join(self._remaining_time(endtime))
+                if self._stdin_thread.is_alive():
+                    raise TimeoutExpired(self.args, orig_timeout)
+
+            # Wait for the reader threads, or time out.  If we time out, the
+            # threads remain reading and the fds left open in case the user
+            # calls communicate again.
+            if self.stdout is not None:
+                self.stdout_thread.join(self._remaining_time(endtime))
+                if self.stdout_thread.is_alive():
+                    raise TimeoutExpired(self.args, orig_timeout)
+            if self.stderr is not None:
+                self.stderr_thread.join(self._remaining_time(endtime))
+                if self.stderr_thread.is_alive():
+                    raise TimeoutExpired(self.args, orig_timeout)
+
+            # Collect the output from and close both pipes, now that we know
+            # both have been read successfully.
+            stdout = None
+            stderr = None
+            if self.stdout:
+                stdout = self._stdout_buff
+                self.stdout.close()
+            if self.stderr:
+                stderr = self._stderr_buff
+                self.stderr.close()
+
+            # All data exchanged.  Translate lists into strings.
+            stdout = stdout[0] if stdout else None
+            stderr = stderr[0] if stderr else None
+
+            return (stdout, stderr)
+
+        def send_signal(self, sig):
+            """Send a signal to the process."""
+            # Don't signal a process that we know has already died.
+            if self.returncode is not None:
+                return
+            if sig == signal.SIGTERM:
+                self.terminate()
+            elif sig == signal.CTRL_C_EVENT:
+                os.kill(self.pid, signal.CTRL_C_EVENT)
+            elif sig == signal.CTRL_BREAK_EVENT:
+                os.kill(self.pid, signal.CTRL_BREAK_EVENT)
+            else:
+                raise ValueError("Unsupported signal: {}".format(sig))
+
+        def terminate(self):
+            """Terminates the process."""
+            # Don't terminate a process that we know has already died.
+            if self.returncode is not None:
+                return
+            try:
+                _winapi.TerminateProcess(self._handle, 1)
+            except PermissionError:
+                # ERROR_ACCESS_DENIED (winerror 5) is received when the
+                # process already died.
+                rc = _winapi.GetExitCodeProcess(self._handle)
+                if rc == _winapi.STILL_ACTIVE:
+                    raise
+                self.returncode = rc
+
+        kill = terminate
+
 
 class _DummyLock:
     """A no-op lock used when `threading` is unavailable."""
@@ -1376,9 +1899,17 @@ def run(*popenargs, input=None, capture_output=False, timeout=None,
     with Popen(*popenargs, **kwargs) as process:
         try:
             stdout, stderr = process.communicate(input, timeout=timeout)
-        except TimeoutExpired:
+        except TimeoutExpired as exc:
             process.kill()
-            stdout, stderr = process.communicate()
+            if _mswindows:
+                # Windows accumulates the output in a single blocking
+                # read() call run on child threads, with the timeout
+                # being done in a join() on those threads.  communicate()
+                # _after_ kill() is required to collect that and add it
+                # to the exception.
+                exc.stdout, exc.stderr = process.communicate()
+            else:
+                stdout, stderr = process.communicate()
             raise
         except:  # noqa: E722 - re-raise after cleanup, like CPython.
             process.kill()
@@ -1482,3 +2013,19 @@ __all__ = [
     "getstatusoutput", "CalledProcessError", "TimeoutExpired",
     "SubprocessError", "CompletedProcess", "PIPE", "DEVNULL", "STDOUT",
 ]
+
+if _mswindows:
+    # CPython extends __all__ with the Windows constant re-exports right
+    # after importing them; WeavePy defines __all__ at the bottom of the
+    # module, so the extension lives here instead.
+    __all__.extend(["CREATE_NEW_CONSOLE", "CREATE_NEW_PROCESS_GROUP",
+                    "STD_INPUT_HANDLE", "STD_OUTPUT_HANDLE",
+                    "STD_ERROR_HANDLE", "SW_HIDE",
+                    "STARTF_USESTDHANDLES", "STARTF_USESHOWWINDOW",
+                    "STARTF_FORCEONFEEDBACK", "STARTF_FORCEOFFFEEDBACK",
+                    "STARTUPINFO",
+                    "ABOVE_NORMAL_PRIORITY_CLASS", "BELOW_NORMAL_PRIORITY_CLASS",
+                    "HIGH_PRIORITY_CLASS", "IDLE_PRIORITY_CLASS",
+                    "NORMAL_PRIORITY_CLASS", "REALTIME_PRIORITY_CLASS",
+                    "CREATE_NO_WINDOW", "DETACHED_PROCESS",
+                    "CREATE_DEFAULT_ERROR_MODE", "CREATE_BREAKAWAY_FROM_JOB"])

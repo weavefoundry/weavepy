@@ -140,6 +140,34 @@ parking_lot           = "0.12"
 crossbeam-channel     = "0.5"
 crossbeam-utils       = "0.8"
 
+# RFC 0063 — the Windows wave: NT-native stdlib core (`_winapi`,
+# `msvcrt`, `winreg`, `_overlapped`, the CRT fd model, Winsock
+# `select`). Target-scoped to Windows builds only; the feature list
+# is the union of the Win32 namespaces those modules consume.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Environment",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 # RFC 0032 — tier-2 JIT backend (Cranelift). Only compiled when the
 # `jit` feature is enabled (off by default); CI exercises it via
 # `--all-features`. MSRV floor for these is Rust 1.93.

@@ -406,36 +406,9 @@ pub fn build_with_state(
 
         // `sys.builtin_module_names` — exposed as a tuple for
         // user-introspection code (e.g. `importlib.util.find_spec`).
-        // Only modules the VM builds *natively* belong here: names that
-        // ship as frozen Python source (random, json, re, …) must not
-        // appear, because stdlib consumers take membership as "no
-        // Python source exists" (`pyclbr._readmodule` early-returns an
-        // empty tree for them — `test_pyclbr.test_others`).
         d.insert(
             DictKey(Object::from_static("builtin_module_names")),
-            Object::new_tuple(
-                [
-                    "_csv",
-                    "_datetime",
-                    "_socket",
-                    "_subprocess",
-                    "_thread",
-                    "_weakref",
-                    "binascii",
-                    "errno",
-                    "gc",
-                    "hashlib",
-                    "math",
-                    "os",
-                    "pyexpat",
-                    "sys",
-                    "time",
-                    "zlib",
-                ]
-                .iter()
-                .map(|s| Object::from_static(s))
-                .collect(),
-            ),
+            builtin_module_names_value(),
         );
         // sys.gettrace/getprofile stubs (no actual tracing yet).
     }
@@ -512,6 +485,33 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("platform")),
             Object::from_static(host_platform()),
         );
+        // RFC 0063 WS1 — the Windows identity surface.
+        #[cfg(windows)]
+        {
+            // CPython's `sys.winver` is the version tag its registry keys
+            // and DLL name carry (Python/sysmodule.c sets it from
+            // MS_DLL_ID); `sysconfig`/`venv`/pip read it on Windows.
+            d.insert(
+                DictKey(Object::from_static("winver")),
+                Object::from_static("3.13"),
+            );
+            // CPython publishes the HMODULE of python3xx.dll here. WeavePy
+            // is a static executable with no python DLL (RFC 0063
+            // Non-goals: the `python313.dll` restructure is its own wave),
+            // so the handle is 0.
+            d.insert(DictKey(Object::from_static("dllhandle")), Object::Int(0));
+            d.insert(
+                DictKey(Object::from_static("getwindowsversion")),
+                builtin("getwindowsversion", sys_getwindowsversion),
+            );
+            // PEP 529: WeavePy's filesystem encoding is permanently UTF-8.
+            // CPython's switch re-enables the pre-3.6 mbcs mode, which
+            // WeavePy never had — accept the call and do nothing.
+            d.insert(
+                DictKey(Object::from_static("_enablelegacywindowsfsencoding")),
+                builtin("_enablelegacywindowsfsencoding", |_| Ok(Object::None)),
+            );
+        }
         // CPython-on-macOS build detail: the framework name when built
         // as a macOS framework, `""` otherwise (the common case, and
         // ours). `pydoc`/`platform`/`site` read it unconditionally.
@@ -914,6 +914,106 @@ pub(crate) fn stdlib_zip_path() -> Option<String> {
         .join("lib")
         .join(format!("python{}{}.zip", PY_VERSION.0, PY_VERSION.1));
     Some(zip.to_string_lossy().into_owned())
+}
+
+/// `sys.builtin_module_names` — the per-OS truthful inventory (RFC 0063
+/// WS1). Only modules `register_all` (`stdlib/mod.rs`) builds *natively*
+/// belong here: names that ship as frozen Python source (random, json,
+/// re, …) must not appear, because stdlib consumers take membership as
+/// "no Python source exists" (`pyclbr._readmodule` early-returns an
+/// empty tree for them — `test_pyclbr.test_others`). The registration
+/// table itself isn't enumerable from here without widening `mod.rs`,
+/// so this list mirrors it by hand — keep the two in sync.
+///
+/// Two deliberate exceptions, matching CPython's *observable* contract:
+/// `posix` (unix) and `nt` (Windows) are listed even though WeavePy's
+/// are frozen shims over the native `os`, because `Lib/os.py` itself
+/// detects the platform via `'posix' in sys.builtin_module_names` /
+/// `'nt' in ...` — those membership probes are the load-bearing
+/// consumers. Sorted, as CPython's tuple is.
+fn builtin_module_names_value() -> Object {
+    let mut names: Vec<&'static str> = vec![
+        "_abc",
+        "_ast",
+        "_asyncio",
+        "_bisect",
+        "_blake2",
+        "_bz2",
+        "_codecs",
+        "_contextvars",
+        "_csv",
+        "_ctypes_native",
+        "_functools",
+        "_gzip",
+        "_heapq",
+        "_https",
+        "_imp",
+        "_io",
+        "_itertools",
+        "_json",
+        "_locale",
+        "_lzma",
+        "_md5",
+        "_multiprocessing",
+        "_operator",
+        "_random",
+        "_sha1",
+        "_sha2",
+        "_sha3",
+        "_signal",
+        "_socket",
+        "_sqlite3",
+        "_sre",
+        "_ssl",
+        "_statistics",
+        "_string",
+        "_struct",
+        "_subprocess",
+        "_symtable",
+        "_sysconfig",
+        "_testinternalcapi",
+        "_thread",
+        "_tokenize_core",
+        "_tracemalloc",
+        "_warnings",
+        "_weakref",
+        "_weave_frame",
+        "_xxsubinterpreters",
+        "atexit",
+        "binascii",
+        "cmath",
+        "errno",
+        "faulthandler",
+        "gc",
+        "hashlib",
+        "marshal",
+        "math",
+        "mmap",
+        "os",
+        "pyexpat",
+        "select",
+        "sys",
+        "time",
+        "unicodedata",
+        "zlib",
+    ];
+    // POSIX-only registrations (`#[cfg(unix)]` in `register_all`), plus
+    // the `posix` shim exception documented above.
+    #[cfg(unix)]
+    names.extend([
+        "_posixshmem",
+        "_posixsubprocess",
+        "fcntl",
+        "posix",
+        "resource",
+        "termios",
+    ]);
+    // The RFC 0063 Windows-native quartet (`#[cfg(windows)]` in
+    // `register_all`), plus the `nt` shim exception documented above.
+    #[cfg(windows)]
+    names.extend(["_overlapped", "_winapi", "msvcrt", "nt", "winreg"]);
+    names.sort_unstable();
+    Object::new_tuple(names.into_iter().map(Object::from_static).collect())
 }
 
 fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
@@ -1463,6 +1563,95 @@ pub(crate) const SYS_FLAGS_FIELDS: &[&str] = &[
 /// (RFC 0055 WS1: `test_venv`'s zip-path probe and `test_embed`'s
 /// first failure were both this attribute).
 const VERSION_INFO_FIELDS: &[&str] = &["major", "minor", "micro", "releaselevel", "serial"];
+
+/// The visible (tuple-indexed) fields of `sys.getwindowsversion()` —
+/// CPython's `windows_version_fields` has `n_in_sequence = 5`; the
+/// remaining five members are attribute-only.
+#[cfg(windows)]
+const WINDOWS_VERSION_VISIBLE: [&str; 5] = ["major", "minor", "build", "platform", "service_pack"];
+
+/// `sys.getwindowsversion()` — the 10-member struct sequence of
+/// `Python/sysmodule.c`'s `sys_getwindowsversion_impl`. Sourced from
+/// ntdll's `RtlGetVersion` rather than `GetVersionExW`: the latter lies
+/// under the compatibility-manifest shims (an unmanifested process is
+/// told "6.2" forever), which is the same problem CPython works around
+/// by re-reading kernel32.dll's version resource. RtlGetVersion reports
+/// the true version, so `platform_version` comes from the same call.
+#[cfg(windows)]
+fn sys_getwindowsversion(_args: &[Object]) -> Result<Object, RuntimeError> {
+    use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOEXW;
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn RtlGetVersion(info: *mut OSVERSIONINFOEXW) -> i32;
+    }
+    let mut info: OSVERSIONINFOEXW = unsafe { std::mem::zeroed() };
+    info.dwOSVersionInfoSize = std::mem::size_of::<OSVERSIONINFOEXW>() as u32;
+    // NTSTATUS 0 == STATUS_SUCCESS; the call cannot fail for a
+    // correctly-sized buffer, but stay honest anyway.
+    if unsafe { RtlGetVersion(&raw mut info) } != 0 {
+        return Err(crate::error::os_error("RtlGetVersion failed"));
+    }
+    let ty = crate::stdlib::os::struct_seq_type_layout(
+        "getwindowsversion",
+        "sys",
+        [
+            "major",
+            "minor",
+            "build",
+            "platform",
+            "service_pack",
+            "service_pack_major",
+            "service_pack_minor",
+            "suite_mask",
+            "product_type",
+            "platform_version",
+        ]
+        .iter()
+        .map(|f| Some(*f))
+        .collect(),
+        WINDOWS_VERSION_VISIBLE.len(),
+    );
+    let visible = vec![
+        Object::Int(i64::from(info.dwMajorVersion)),
+        Object::Int(i64::from(info.dwMinorVersion)),
+        Object::Int(i64::from(info.dwBuildNumber)),
+        Object::Int(i64::from(info.dwPlatformId)),
+        Object::from_str(crate::stdlib::nt_support::from_wide_nul(&info.szCSDVersion)),
+    ];
+    let obj = crate::stdlib::os::struct_seq_instance(ty, &WINDOWS_VERSION_VISIBLE, visible);
+    // The five hidden named members (attribute-only, exactly like
+    // `time.struct_time`'s `tm_zone`/`tm_gmtoff` extras): fill them
+    // straight into the instance dict, which bypasses the readonly
+    // `__setattr__` guard the struct-seq type installs.
+    if let Object::Instance(inst) = &obj {
+        let mut d = inst.dict.borrow_mut();
+        d.insert(
+            DictKey(Object::from_static("service_pack_major")),
+            Object::Int(i64::from(info.wServicePackMajor)),
+        );
+        d.insert(
+            DictKey(Object::from_static("service_pack_minor")),
+            Object::Int(i64::from(info.wServicePackMinor)),
+        );
+        d.insert(
+            DictKey(Object::from_static("suite_mask")),
+            Object::Int(i64::from(info.wSuiteMask)),
+        );
+        d.insert(
+            DictKey(Object::from_static("product_type")),
+            Object::Int(i64::from(info.wProductType)),
+        );
+        d.insert(
+            DictKey(Object::from_static("platform_version")),
+            Object::new_tuple(vec![
+                Object::Int(i64::from(info.dwMajorVersion)),
+                Object::Int(i64::from(info.dwMinorVersion)),
+                Object::Int(i64::from(info.dwBuildNumber)),
+            ]),
+        );
+    }
+    Ok(obj)
+}
 
 fn version_info_value() -> Object {
     let ty = crate::stdlib::os::struct_seq_type("version_info", "sys", VERSION_INFO_FIELDS);

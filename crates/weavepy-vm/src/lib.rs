@@ -43,6 +43,7 @@ pub mod import;
 pub mod linejump;
 pub mod object;
 pub mod proc_init;
+pub mod py_errno;
 pub mod pycache;
 pub mod rare_events;
 pub mod recursion;

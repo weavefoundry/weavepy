@@ -1,0 +1,4 @@
+# cmd.exe batch files must keep CRLF line endings (CPython ships them
+# that way; LF-only .bat files trip cmd.exe parsing edge cases). This
+# overrides the repo-root `* text=auto eol=lf` for this directory.
+*.bat text eol=crlf

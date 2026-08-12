@@ -28,6 +28,7 @@ pub mod csv_mod;
 pub mod datetime_mod;
 pub mod errno_mod;
 pub mod faulthandler_mod;
+#[cfg(unix)]
 pub mod fcntl_mod;
 pub mod functools_mod;
 pub mod gc_mod;
@@ -43,9 +44,19 @@ pub mod json_accel;
 pub mod lzma_mod;
 pub mod marshal_mod;
 pub mod math;
+// RFC 0063 — the Windows wave: shared NT plumbing (CRT fd layer,
+// winerror bridge) plus the native module quartet the frozen Windows
+// stdlib consumes.
+#[cfg(windows)]
+pub mod msvcrt_mod;
+#[cfg(windows)]
+pub(crate) mod nt_support;
 pub mod operator_accel;
 pub mod os;
 pub mod os_process;
+#[cfg(windows)]
+pub mod overlapped_mod;
+#[cfg(unix)]
 pub mod posixsubprocess_mod;
 pub mod pyexpat_mod;
 #[cfg(unix)]
@@ -77,6 +88,10 @@ pub mod ucd;
 pub mod unicodedata_mod;
 pub mod weakref_mod;
 pub mod weave_frame_mod;
+#[cfg(windows)]
+pub mod winapi_mod;
+#[cfg(windows)]
+pub mod winreg_mod;
 pub mod zlib_mod;
 // RFC 0023 — drop-in stdlib parity.
 pub mod abc_mod;
@@ -149,8 +164,22 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("_socket", socket_mod::build);
     cache.register_builtin("_subprocess", subprocess_mod::build);
     // RFC 0040 WS2 — the CPython-faithful fork+exec primitive behind the
-    // verbatim `subprocess.Popen` driver.
+    // verbatim `subprocess.Popen` driver. POSIX-only, like CPython: on
+    // Windows `import _posixsubprocess` must fail so portable code
+    // (and the frozen `subprocess.py`) takes the `_winapi` arm
+    // (RFC 0063 truthful-inventory rule).
+    #[cfg(unix)]
     cache.register_builtin("_posixsubprocess", posixsubprocess_mod::build);
+    // RFC 0063 — the Windows-native quartet the frozen Windows stdlib
+    // (subprocess, multiprocessing, shutil, asyncio.windows_events,
+    // platform, mimetypes) imports. Windows-only, like CPython.
+    #[cfg(windows)]
+    {
+        cache.register_builtin("_winapi", winapi_mod::build);
+        cache.register_builtin("msvcrt", msvcrt_mod::build);
+        cache.register_builtin("winreg", winreg_mod::build);
+        cache.register_builtin("_overlapped", overlapped_mod::build);
+    }
     cache.register_builtin("hashlib", hashlib_mod::build);
     // RFC 0060 WS3 — CPython-shaped hash accelerator modules, importable
     // individually and consulted by `hashlib.__get_builtin_constructor`.
@@ -208,7 +237,10 @@ pub fn register_all(cache: &ModuleCache) {
     // `xmlrpc` serializer the `multiprocessing.managers` server process uses.
     cache.register_builtin("pyexpat", pyexpat_mod::build);
     // RFC 0040 (WS5): shm_open/shm_unlink core for `multiprocessing`'s
-    // resource_tracker + shared_memory.
+    // resource_tracker + shared_memory. POSIX-only, like CPython: the
+    // frozen `shared_memory.py` selects its NT arm off the
+    // ImportError (RFC 0063).
+    #[cfg(unix)]
     cache.register_builtin("_posixshmem", multiprocessing_mod::build_posixshmem);
     // RFC 0041 WS-datetime: `datetime` is now CPython's verbatim shim over the
     // bundled pure-Python `_pydatetime`. The old constants-only native
@@ -238,7 +270,11 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("atexit", atexit_mod::build);
     cache.register_builtin("_https", https_mod::build);
     // RFC 0026 — POSIX-flavoured stdlib that user code (and the
-    // multiprocessing rewrite) imports unconditionally.
+    // multiprocessing rewrite) imports unconditionally. POSIX-only
+    // since RFC 0063: CPython has no `fcntl` on Windows and portable
+    // code keys off the ImportError; the old always-registered stub
+    // module sent it down the wrong branch.
+    #[cfg(unix)]
     cache.register_builtin("fcntl", fcntl_mod::build);
     // CPython has no `resource` module on Windows — every stdlib caller
     // guards `import resource` with ImportError — and the non-unix stubs
@@ -1500,6 +1536,20 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "encodings.undefined",
             source: include_str!("python/encodings/undefined.py"),
+            is_package: false,
+        },
+        // RFC 0063 — the ANSI/OEM code-page codecs. CPython ships these
+        // unconditionally; on non-Windows the `from codecs import
+        // mbcs_encode …` line raises ImportError and `codecs.lookup`
+        // treats the module as a miss (exactly CPython's behaviour).
+        FrozenSource {
+            name: "encodings.mbcs",
+            source: include_str!("python/encodings/mbcs.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.oem",
+            source: include_str!("python/encodings/oem.py"),
             is_package: false,
         },
         FrozenSource {

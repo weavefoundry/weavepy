@@ -599,6 +599,104 @@ pub fn io_error_to_py_named(err: &std::io::Error, filename: Option<&str>) -> Run
     io_error_to_py_named2(err, filename, None)
 }
 
+/// Build a CPython-shaped `OSError` (subclassed per PEP 3151 by
+/// errno) directly from its parts. This is the shared constructor for
+/// paths where `std::io::Error` can't carry the truth: the Windows
+/// CRT errno domain, and Win32 failures where `.winerror` must be
+/// preserved alongside the errmap-translated errno (RFC 0063).
+pub fn os_error_from_parts(
+    errno: i32,
+    strerror: String,
+    filename: Option<&str>,
+    filename2: Option<&str>,
+    winerror: Option<i64>,
+) -> RuntimeError {
+    // Mirror `OSError.__str__`: the Windows form renders the original
+    // Win32 code (`[WinError 5] Access is denied: 'path'`); the POSIX
+    // form renders the errno.
+    let suffix = match (filename, filename2) {
+        (Some(f), Some(f2)) => format!(": '{f}' -> '{f2}'"),
+        (Some(f), None) => format!(": '{f}'"),
+        (None, _) => String::new(),
+    };
+    let message = match winerror {
+        Some(w) => format!("[WinError {w}] {strerror}{suffix}"),
+        None => format!("[Errno {errno}] {strerror}{suffix}"),
+    };
+    let mut runtime = oserror_for_errno(errno, message);
+    if let RuntimeError::PyException(ref mut exc) = runtime {
+        if let crate::object::Object::Instance(inst) = &exc.instance {
+            use crate::object::Object;
+            inst.slot_set("errno", Object::Int(i64::from(errno)));
+            inst.slot_set(
+                "args",
+                Object::new_tuple(vec![
+                    Object::Int(i64::from(errno)),
+                    Object::from_str(strerror.clone()),
+                ]),
+            );
+            inst.slot_set("strerror", Object::from_str(strerror));
+            if let Some(w) = winerror {
+                inst.slot_set("winerror", Object::Int(w));
+            }
+            if let Some(f) = filename {
+                inst.slot_set("filename", Object::from_str(f.to_owned()));
+            }
+            if let Some(f2) = filename2 {
+                inst.slot_set("filename2", Object::from_str(f2.to_owned()));
+            }
+        }
+    }
+    runtime
+}
+
+/// The PEP 3151 `OSError`-subclass choice for an errno, using the
+/// CPython-truthful cross-platform constants (`py_errno`) — on
+/// Windows the socket family compares against the `WSAE*` values,
+/// exactly like `Objects/exceptions.c` after its `WSAE` redefines.
+fn oserror_for_errno(n: i32, message: String) -> RuntimeError {
+    use crate::py_errno as e;
+    if n == e::EISDIR {
+        is_a_directory_error(message)
+    } else if n == e::ENOTDIR {
+        not_a_directory_error(message)
+    } else if n == e::EAGAIN || n == e::EWOULDBLOCK || n == e::EINPROGRESS || n == e::EALREADY {
+        blocking_io_error(message)
+    } else if n == e::EINTR {
+        interrupted_error(message)
+    } else if n == e::ECONNREFUSED {
+        connection_refused_error(message)
+    } else if n == e::ECONNRESET {
+        connection_reset_error(message)
+    } else if n == e::ECONNABORTED {
+        connection_aborted_error(message)
+    } else if n == e::EPIPE || crate::is_eshutdown(n) {
+        broken_pipe_error(message)
+    } else if n == e::ECHILD {
+        child_process_error(message)
+    } else if n == e::EEXIST {
+        file_exists_error(message)
+    } else if n == e::ENOENT {
+        file_not_found_error(message)
+    } else if n == e::EACCES || n == eperm_value() {
+        permission_error(message)
+    } else if n == e::ETIMEDOUT {
+        timeout_error(message)
+    } else {
+        os_error(message)
+    }
+}
+
+#[cfg(unix)]
+fn eperm_value() -> i32 {
+    libc::EPERM
+}
+
+#[cfg(windows)]
+fn eperm_value() -> i32 {
+    1 // CRT EPERM
+}
+
 /// As [`io_error_to_py_named`], but for two-path syscalls (`rename`, `link`,
 /// `symlink`, `replace`): populates `.filename` *and* `.filename2` and renders
 /// `[Errno N] strerror: 'src' -> 'dst'`, matching CPython's `OSError.__str__`.
@@ -611,6 +709,21 @@ pub fn io_error_to_py_named2(
         AlreadyExists, BrokenPipe, ConnectionAborted, ConnectionRefused, ConnectionReset,
         Interrupted, NotFound, PermissionDenied, TimedOut, WouldBlock,
     };
+    // On Windows, `raw_os_error` is a *Win32* code (`GetLastError`
+    // domain): translate through CPython's errmap, preserve the
+    // original on `.winerror`, and take strerror from
+    // `FormatMessageW` — the CPython-on-Windows shape (RFC 0063).
+    #[cfg(windows)]
+    if let Some(w) = err.raw_os_error() {
+        use crate::stdlib::nt_support;
+        return os_error_from_parts(
+            nt_support::winerror_to_errno(w),
+            nt_support::format_message(w),
+            filename,
+            filename2,
+            Some(i64::from(w)),
+        );
+    }
     let errno = err.raw_os_error();
     // CPython's `strerror` is the bare OS message; Rust appends a
     // " (os error N)" decoration we strip so the text matches CPython.
