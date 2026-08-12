@@ -907,7 +907,9 @@ fn error_string_for(code: c_int) -> Option<String> {
 /// Raise `ExpatError` for the parser's current error state (`set_error`).
 fn set_error(st: &StateRef, code: c_int) -> RuntimeError {
     let parser = st.borrow().parser();
-    // SAFETY: live parser handle.
+    // SAFETY: live parser handle. `XML_Size` is u64 on unix builds but u32 on
+    // windows-gnu, so a lossless `From` conversion isn't portable here.
+    #[allow(clippy::cast_lossless)]
     let (lineno, column) = unsafe {
         (
             ex::XML_GetCurrentLineNumber(parser) as i64,
@@ -1261,19 +1263,23 @@ fn parser_type() -> Rc<TypeObject> {
         // Live position / error attributes (pyexpat.c getsets).
         getset(&cls, "CurrentLineNumber", |args| {
             let p = state_of_args(args)?.borrow().parser();
-            Ok(Object::Int(
-                unsafe { ex::XML_GetCurrentLineNumber(p) } as i64
-            ))
+            // `XML_Size` is u64 on unix builds but u32 on windows-gnu.
+            #[allow(clippy::cast_lossless)]
+            let line = unsafe { ex::XML_GetCurrentLineNumber(p) } as i64;
+            Ok(Object::Int(line))
         });
         getset(&cls, "CurrentColumnNumber", |args| {
             let p = state_of_args(args)?.borrow().parser();
-            Ok(Object::Int(
-                unsafe { ex::XML_GetCurrentColumnNumber(p) } as i64
-            ))
+            #[allow(clippy::cast_lossless)] // XML_Size width differs per platform
+            let col = unsafe { ex::XML_GetCurrentColumnNumber(p) } as i64;
+            Ok(Object::Int(col))
         });
         getset(&cls, "CurrentByteIndex", |args| {
             let p = state_of_args(args)?.borrow().parser();
-            Ok(Object::Int(unsafe { ex::XML_GetCurrentByteIndex(p) } as i64))
+            // `XML_Index` is c_long: i64 on unix hosts, i32 on windows-gnu.
+            #[allow(clippy::cast_lossless, clippy::unnecessary_cast)]
+            let idx = unsafe { ex::XML_GetCurrentByteIndex(p) } as i64;
+            Ok(Object::Int(idx))
         });
         getset(&cls, "ErrorCode", |args| {
             let p = state_of_args(args)?.borrow().parser();
@@ -1281,19 +1287,21 @@ fn parser_type() -> Rc<TypeObject> {
         });
         getset(&cls, "ErrorLineNumber", |args| {
             let p = state_of_args(args)?.borrow().parser();
-            Ok(Object::Int(
-                unsafe { ex::XML_GetCurrentLineNumber(p) } as i64
-            ))
+            #[allow(clippy::cast_lossless)] // XML_Size width differs per platform
+            let line = unsafe { ex::XML_GetCurrentLineNumber(p) } as i64;
+            Ok(Object::Int(line))
         });
         getset(&cls, "ErrorColumnNumber", |args| {
             let p = state_of_args(args)?.borrow().parser();
-            Ok(Object::Int(
-                unsafe { ex::XML_GetCurrentColumnNumber(p) } as i64
-            ))
+            #[allow(clippy::cast_lossless)] // XML_Size width differs per platform
+            let col = unsafe { ex::XML_GetCurrentColumnNumber(p) } as i64;
+            Ok(Object::Int(col))
         });
         getset(&cls, "ErrorByteIndex", |args| {
             let p = state_of_args(args)?.borrow().parser();
-            Ok(Object::Int(unsafe { ex::XML_GetCurrentByteIndex(p) } as i64))
+            #[allow(clippy::cast_lossless, clippy::unnecessary_cast)] // c_long width differs
+            let idx = unsafe { ex::XML_GetCurrentByteIndex(p) } as i64;
+            Ok(Object::Int(idx))
         });
         cls
     })
@@ -1886,9 +1894,12 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         unsafe {
             let mut f = ex::XML_GetFeatureList();
             while !f.is_null() && !(*f).name.is_null() && (*f).feature != 0 {
+                // Feature values are c_long: i64 on unix hosts, i32 on windows-gnu.
+                #[allow(clippy::cast_lossless, clippy::unnecessary_cast)]
+                let value = (*f).value as i64;
                 features.push(Object::new_tuple(vec![
                     Object::from_str(cstr((*f).name)),
-                    Object::Int((*f).value as i64),
+                    Object::Int(value),
                 ]));
                 f = f.add(1);
             }

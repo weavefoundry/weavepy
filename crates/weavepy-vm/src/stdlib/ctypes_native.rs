@@ -114,15 +114,23 @@ fn code_info(code: char) -> Option<(usize, usize)> {
     })
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(windows)]
+fn long_double_info() -> (usize, usize) {
+    // MSVC defines `long double` == `double` on every architecture, and
+    // that is the ABI of the system DLLs and of CPython on Windows
+    // (`sizeof(c_longdouble) == 8` there). mingw-gcc's 80-bit long double
+    // is a different, non-system ABI we deliberately don't model.
+    (8, 8)
+}
+#[cfg(all(not(windows), target_arch = "x86_64"))]
 fn long_double_info() -> (usize, usize) {
     (16, 16)
 }
-#[cfg(all(target_arch = "x86", not(target_arch = "x86_64")))]
+#[cfg(all(not(windows), target_arch = "x86"))]
 fn long_double_info() -> (usize, usize) {
     (12, 4)
 }
-#[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+#[cfg(all(not(windows), not(any(target_arch = "x86_64", target_arch = "x86"))))]
 fn long_double_info() -> (usize, usize) {
     // aarch64 (incl. Apple silicon), arm, etc.: long double == double.
     (8, 8)
@@ -317,10 +325,15 @@ mod rtld {
     pub(super) const LAZY: i64 = 0;
 }
 
+// The NT loader is natively wide: the `W` entry points take the path
+// as-is, while the `A` variants round-trip it through the ANSI code page
+// and mangle anything outside it. CPython's `load_library` (callproc.c)
+// is `LoadLibraryExW`-based for the same reason. Symbol *names* stay
+// ANSI — `GetProcAddress` has no wide variant.
 #[cfg(windows)]
 extern "system" {
-    fn LoadLibraryA(name: *const c_char) -> *mut c_void;
-    fn GetModuleHandleA(name: *const c_char) -> *mut c_void;
+    fn LoadLibraryW(name: *const u16) -> *mut c_void;
+    fn GetModuleHandleW(name: *const u16) -> *mut c_void;
     fn GetProcAddress(handle: *mut c_void, name: *const c_char) -> *mut c_void;
     fn FreeLibrary(handle: *mut c_void) -> i32;
     fn GetLastError() -> u32;
@@ -343,33 +356,38 @@ fn b_dlopen(args: &[Object]) -> Result<Object, RuntimeError> {
             }
             #[cfg(windows)]
             unsafe {
-                GetModuleHandleA(std::ptr::null())
+                GetModuleHandleW(std::ptr::null())
             }
         }
         Object::Str(s) => {
-            let cname = CString::new(s.as_bytes())
-                .map_err(|_| value_error("dlopen: embedded NUL in name"))?;
             #[cfg(unix)]
-            unsafe {
-                libc::dlopen(cname.as_ptr(), mode)
+            {
+                let cname = CString::new(s.as_bytes())
+                    .map_err(|_| value_error("dlopen: embedded NUL in name"))?;
+                unsafe { libc::dlopen(cname.as_ptr(), mode) }
             }
             #[cfg(windows)]
-            unsafe {
-                LoadLibraryA(cname.as_ptr())
+            {
+                let wname = super::nt_support::wide(s);
+                unsafe { LoadLibraryW(wname.as_ptr()) }
             }
         }
         // CPython accepts a bytes path and hands it to dlopen() verbatim
         // (no decoding) — test_dlerror exercises undecodable names.
         Object::Bytes(b) => {
-            let cname = CString::new(b.to_vec())
-                .map_err(|_| value_error("dlopen: embedded NUL in name"))?;
             #[cfg(unix)]
-            unsafe {
-                libc::dlopen(cname.as_ptr(), mode)
+            {
+                let cname = CString::new(b.to_vec())
+                    .map_err(|_| value_error("dlopen: embedded NUL in name"))?;
+                unsafe { libc::dlopen(cname.as_ptr(), mode) }
             }
             #[cfg(windows)]
-            unsafe {
-                LoadLibraryA(cname.as_ptr())
+            {
+                // No byte-path concept exists on NT (CPython's Windows
+                // `LoadLibrary` requires str); decode lossily into the
+                // wide API rather than reject outright.
+                let wname = super::nt_support::wide(&String::from_utf8_lossy(b));
+                unsafe { LoadLibraryW(wname.as_ptr()) }
             }
         }
         other => {
@@ -440,9 +458,12 @@ fn last_dlerror() -> Option<String> {
 
 #[cfg(windows)]
 fn last_dlerror() -> Option<String> {
+    // `FormatMessageW` text, the same strerror source the rest of the NT
+    // runtime uses — CPython's ctypes shows e.g. "Could not find module
+    // '...'" here, not a bare error number.
     match unsafe { GetLastError() } {
         0 => None,
-        code => Some(format!("Win32 error {code}")),
+        code => Some(super::nt_support::format_message(code as i32)),
     }
 }
 
@@ -476,6 +497,59 @@ fn b_set_errno(args: &[Object]) -> Result<Object, RuntimeError> {
 /// (see `ffi::swap_ctypes_errno`).
 pub(super) fn ctypes_errno_replace(new: i32) -> i32 {
     CTYPES_ERRNO.with(|e| e.replace(new))
+}
+
+// ----------------------------------------------------------------
+// ctypes private LastError (Windows; swapped around USE_LASTERROR calls)
+// ----------------------------------------------------------------
+//
+// The exactly-parallel mechanism to the private errno above: CPython
+// keeps both in one per-thread array (Modules/_ctypes/callproc.c
+// `_ctypes_get_errobj` — errno in `space[0]`, LastError in `space[1]`),
+// and `get_last_error`/`set_last_error` read/write the *private* copy,
+// never the thread's real `GetLastError()` state.
+
+#[cfg(windows)]
+thread_local! {
+    static CTYPES_LAST_ERROR: Cell<u32> = const { Cell::new(0) };
+}
+
+#[cfg(windows)]
+fn b_get_last_error(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::Int(i64::from(CTYPES_LAST_ERROR.with(|e| e.get()))))
+}
+
+#[cfg(windows)]
+fn b_set_last_error(args: &[Object]) -> Result<Object, RuntimeError> {
+    // CPython parses the new value as an unsigned DWORD ("I"); negative
+    // Python ints arrive here two's-complement-truncated, matching that.
+    let new = arg_i64(args, 0)? as u32;
+    let old = CTYPES_LAST_ERROR.with(|e| e.replace(new));
+    Ok(Object::Int(i64::from(old)))
+}
+
+/// Atomically read-and-replace ctypes' private per-thread LastError,
+/// returning the previous value. Used by the FFI bridge's `USE_LASTERROR`
+/// swap (see `ffi::swap_ctypes_last_error`).
+#[cfg(windows)]
+pub(super) fn ctypes_last_error_replace(new: u32) -> u32 {
+    CTYPES_LAST_ERROR.with(|e| e.replace(new))
+}
+
+/// `format_error(code_or_None) -> str` — the message text for a Win32
+/// error code; with `None`, the calling thread's *real* `GetLastError()`
+/// (CPython's `format_error`, callproc.c — note the asymmetry with
+/// `get_last_error`, which reads the ctypes-private copy).
+#[cfg(windows)]
+fn b_format_error(args: &[Object]) -> Result<Object, RuntimeError> {
+    let code = match args.first() {
+        None | Some(Object::None) => (unsafe { GetLastError() }) as i32,
+        Some(o) => o
+            .as_i64()
+            .ok_or_else(|| type_error("format_error: code must be an int or None"))?
+            as i32,
+    };
+    Ok(Object::from_str(super::nt_support::format_message(code)))
 }
 
 // ----------------------------------------------------------------
@@ -632,6 +706,14 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         register(&mut d, "dlerror", b_dlerror);
         register(&mut d, "get_errno", b_get_errno);
         register(&mut d, "set_errno", b_set_errno);
+        // The LastError trio backing the frozen `_ctypes.py`'s nt-only
+        // surface (FormatError / get_last_error / set_last_error).
+        #[cfg(windows)]
+        {
+            register(&mut d, "get_last_error", b_get_last_error);
+            register(&mut d, "set_last_error", b_set_last_error);
+            register(&mut d, "format_error", b_format_error);
+        }
         register(&mut d, "unraisable", b_unraisable);
         register(&mut d, "configure_view", b_configure_view);
         #[cfg(target_os = "macos")]

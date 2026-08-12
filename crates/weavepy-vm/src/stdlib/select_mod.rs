@@ -1,12 +1,14 @@
-//! The `select` built-in module (RFC 0039 WS6).
+//! The `select` built-in module (RFC 0039 WS6; Windows arm RFC 0063 WS4).
 //!
 //! Faithful, `libc`-backed I/O multiplexing primitives:
 //!
-//!   * `select.select(rlist, wlist, xlist, timeout=None)` — over `poll(2)`,
-//!     returning the *original* objects that are ready (CPython maps the
-//!     ready descriptors back to the passed-in file objects).
+//!   * `select.select(rlist, wlist, xlist, timeout=None)` — over `poll(2)`
+//!     on POSIX and Winsock `select()` on Windows, returning the *original*
+//!     objects that are ready (CPython maps the ready descriptors back to
+//!     the passed-in file objects).
 //!   * `select.poll()` — a real `poll(2)` object
-//!     (`register`/`modify`/`unregister`/`poll`).
+//!     (`register`/`modify`/`unregister`/`poll`) — POSIX only, so
+//!     `hasattr(select, 'poll')` stays truthful on NT.
 //!   * `select.kqueue()` / `select.kevent(...)` + the `KQ_*` constants
 //!     on macOS/BSD — over `kqueue(2)`/`kevent(2)`.
 //!
@@ -25,13 +27,15 @@
 use crate::sync::Rc;
 use crate::sync::RefCell;
 
-#[cfg(unix)]
+#[cfg(not(windows))]
+use crate::error::os_error;
+#[cfg(any(unix, windows))]
 use crate::error::type_error;
-use crate::error::{os_error, RuntimeError};
+use crate::error::RuntimeError;
 use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::time::{Duration, Instant};
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
@@ -138,7 +142,7 @@ fn poll_constants() -> Vec<(&'static str, i64)> {
 
 /// Run any pending OS-signal handlers on the main thread, propagating a
 /// handler that raises. No-op (and cheap) when nothing is tripped.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn service_pending_signals() -> Result<(), RuntimeError> {
     if !crate::stdlib::signal_mod::signals_pending() {
         return Ok(());
@@ -159,8 +163,22 @@ fn service_pending_signals() -> Result<(), RuntimeError> {
 /// CPython's pure `EINTR` loop — the main thread waits in short slices
 /// and re-checks tripped signals between them. Short enough that a
 /// handler runs promptly; long enough that idle wakeup cost is small.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const SIGNAL_POLL_SLICE: Duration = Duration::from_millis(20);
+
+/// Whether a multiplexer failure is the interrupted-syscall case the
+/// retry loop must absorb (PEP 475). POSIX reports `EINTR`; Winsock's
+/// equivalent is `WSAEINTR` (only reachable via the obsolete
+/// `WSACancelBlockingCall`, but CPython's `select` still loops on it).
+#[cfg(unix)]
+fn is_eintr(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(libc::EINTR)
+}
+
+#[cfg(windows)]
+fn is_eintr(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(windows_sys::Win32::Networking::WinSock::WSAEINTR)
+}
 
 /// Drive a blocking multiplexing syscall to readiness with the GIL
 /// released. `poll_once(slice)` performs exactly one syscall waiting up
@@ -175,7 +193,7 @@ const SIGNAL_POLL_SLICE: Duration = Duration::from_millis(20);
 /// main thread (no Python signal handlers run there) we block for the
 /// whole remaining time in one call. A zero `timeout` still performs one
 /// non-blocking syscall.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn blocking_retry(
     timeout: Option<Duration>,
     mut poll_once: impl FnMut(Option<Duration>) -> std::io::Result<usize>,
@@ -206,7 +224,7 @@ fn blocking_retry(
                     return Ok(0);
                 }
             }
-            Err(e) if e.raw_os_error() == Some(libc::EINTR) => {
+            Err(e) if is_eintr(&e) => {
                 if on_main {
                     service_pending_signals()?;
                 }
@@ -214,6 +232,18 @@ fn blocking_retry(
                     return Ok(0);
                 }
             }
+            // On Windows the raw code is a `WSAGetLastError()` value: route
+            // it through the WS1 error bridge so `.winerror`/`.errno`/
+            // `.strerror` carry the CPython shape (the Winsock 10000-range
+            // passes through `winerror_to_errno` untranslated).
+            #[cfg(windows)]
+            Err(e) => {
+                return Err(crate::stdlib::nt_support::win32_error_to_py(
+                    e.raw_os_error().unwrap_or(0),
+                    None,
+                ))
+            }
+            #[cfg(not(windows))]
             Err(e) => return Err(crate::error::io_error_to_py(&e)),
         }
     }
@@ -242,8 +272,10 @@ fn timeout_to_poll_ms(remaining: Option<Duration>) -> libc::c_int {
 // ---------------------------------------------------------------------------
 
 /// Resolve a file descriptor from an int (or bool), or — for any other
-/// object — its `fileno()` method (CPython's `PyObject_AsFileDescriptor`).
-#[cfg(unix)]
+/// object — its `fileno()` method (CPython's `PyObject_AsFileDescriptor`,
+/// which returns a C `int` on Windows too — a `SOCKET` is a kernel handle
+/// and kernel handle values fit in 32 bits).
+#[cfg(any(unix, windows))]
 fn fd_of(obj: &Object) -> Result<i32, RuntimeError> {
     match obj {
         Object::Int(n) => Ok(*n as i32),
@@ -269,7 +301,7 @@ fn fd_of(obj: &Object) -> Result<i32, RuntimeError> {
 /// are walked by *index*, re-reading length and releasing the borrow
 /// around each `fileno()` call, so a `fileno()` that mutates the list
 /// is observed exactly like CPython (`test_select.test_select_mutated`).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn collect_fd_objects(arg: Option<&Object>) -> Result<Vec<(i32, Object)>, RuntimeError> {
     match arg {
         None | Some(Object::None) => Ok(Vec::new()),
@@ -304,7 +336,7 @@ fn collect_fd_objects(arg: Option<&Object>) -> Result<Vec<(i32, Object)>, Runtim
 
 /// `select.select` timeout is in *seconds* (float/int) or `None`.
 /// CPython rejects negative timeouts with `ValueError`.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn parse_secs(arg: Option<&Object>) -> Result<Option<Duration>, RuntimeError> {
     match arg {
         None | Some(Object::None) => Ok(None),
@@ -407,7 +439,163 @@ fn select_select(args: &[Object]) -> Result<Object, RuntimeError> {
     ]))
 }
 
-#[cfg(not(unix))]
+/// Winsock `select()` arm (RFC 0063 WS4), mirroring CPython's
+/// `selectmodule.c` on Windows: only SOCKETs are accepted — there is no
+/// up-front validity check possible (no `fcntl`), so a non-socket value
+/// surfaces as the kernel's `WSAENOTSOCK` from `select()` itself.
+#[cfg(windows)]
+fn select_select(args: &[Object]) -> Result<Object, RuntimeError> {
+    use windows_sys::Win32::Networking::WinSock as ws;
+
+    // CPython redefines FD_SETSIZE to 512 *before* including <winsock2.h>
+    // (selectmodule.c: `#define FD_SETSIZE 512`), growing fd_set's embedded
+    // array — on Winsock, fd_set is a count + array of SOCKETs, and the
+    // first argument of select() is ignored, so a bigger array Just Works.
+    // windows-sys bakes the default 64-slot layout into its FD_SET struct,
+    // so we replicate the trick: a layout-identical repr(C) struct with a
+    // 512-slot array, passed to select() as *mut FD_SET.
+    const PY_FD_SETSIZE: usize = 512;
+    #[repr(C)]
+    struct FdSet {
+        fd_count: u32,
+        fd_array: [ws::SOCKET; PY_FD_SETSIZE],
+    }
+    impl FdSet {
+        fn new() -> Self {
+            FdSet {
+                fd_count: 0,
+                fd_array: [0; PY_FD_SETSIZE],
+            }
+        }
+        /// Winsock's FD_SET macro semantics: skip a SOCKET already in the
+        /// set. Capacity was validated against the *list* lengths up
+        /// front (like CPython's seq2set), so this never overflows.
+        fn add(&mut self, s: ws::SOCKET) {
+            let n = self.fd_count as usize;
+            if !self.fd_array[..n].contains(&s) {
+                self.fd_array[n] = s;
+                self.fd_count += 1;
+            }
+        }
+        fn contains(&self, s: ws::SOCKET) -> bool {
+            self.fd_array[..self.fd_count as usize].contains(&s)
+        }
+        /// CPython passes NULL for an empty set (`imax ? &ifdset : NULL`).
+        fn as_arg(&mut self) -> *mut ws::FD_SET {
+            if self.fd_count == 0 {
+                std::ptr::null_mut()
+            } else {
+                std::ptr::from_mut(self).cast()
+            }
+        }
+    }
+
+    let rlist = collect_fd_objects(args.first())?;
+    let wlist = collect_fd_objects(args.get(1))?;
+    let xlist = collect_fd_objects(args.get(2))?;
+    let timeout = parse_secs(args.get(3))?;
+
+    // CPython's seq2set bounds each *list* (pre-dedup) at FD_SETSIZE.
+    for list in [&rlist, &wlist, &xlist] {
+        if list.len() > PY_FD_SETSIZE {
+            return Err(crate::error::value_error(
+                "too many file descriptors in select()",
+            ));
+        }
+    }
+
+    if rlist.is_empty() && wlist.is_empty() && xlist.is_empty() {
+        // Winsock select() rejects three empty sets with WSAEINVAL, so
+        // CPython substitutes a plain Sleep(timeout) — and with a NULL
+        // timeout returns immediately with n = 0 (select_select_impl's
+        // `#ifdef MS_WINDOWS` arm). The sleep goes through blocking_retry
+        // so the main thread stays signal-responsive.
+        if let Some(t) = timeout {
+            blocking_retry(Some(t), |slice| {
+                if let Some(s) = slice {
+                    std::thread::sleep(s);
+                }
+                Ok(0)
+            })?;
+        }
+        return Ok(Object::new_tuple(vec![
+            Object::new_list(Vec::new()),
+            Object::new_list(Vec::new()),
+            Object::new_list(Vec::new()),
+        ]));
+    }
+
+    // Sign-extending a bogus negative "fd" is fine: it can't name a real
+    // SOCKET, so select() reports it as WSAENOTSOCK, exactly like CPython.
+    let socks = |list: &[(i32, Object)]| -> Vec<ws::SOCKET> {
+        list.iter().map(|(fd, _)| *fd as ws::SOCKET).collect()
+    };
+    let (rfds, wfds, xfds) = (socks(&rlist), socks(&wlist), socks(&xlist));
+
+    let mut rset = FdSet::new();
+    let mut wset = FdSet::new();
+    let mut xset = FdSet::new();
+
+    blocking_retry(timeout, |slice| {
+        // select() consumes the sets in place; rebuild them per attempt.
+        rset = FdSet::new();
+        wset = FdSet::new();
+        xset = FdSet::new();
+        for &s in &rfds {
+            rset.add(s);
+        }
+        for &s in &wfds {
+            wset.add(s);
+        }
+        for &s in &xfds {
+            xset.add(s);
+        }
+        let tv = slice.map(dur_to_timeval);
+        let tvp = tv.as_ref().map_or(std::ptr::null(), std::ptr::from_ref);
+        // SAFETY: the sets are layout-identical to fd_set (see FdSet), the
+        // pointers outlive the call, and nfds is ignored on Windows.
+        let n = unsafe { ws::select(0, rset.as_arg(), wset.as_arg(), xset.as_arg(), tvp) };
+        if n == ws::SOCKET_ERROR {
+            Err(std::io::Error::from_raw_os_error(unsafe {
+                ws::WSAGetLastError()
+            }))
+        } else {
+            Ok(n as usize)
+        }
+    })?;
+
+    // Map ready SOCKETs back to the *original* objects, preserving input
+    // order (CPython's set2list). On an overall timeout select() left the
+    // sets empty, so all three sublists come back empty.
+    let ready = |list: &[(i32, Object)], set: &FdSet| -> Vec<Object> {
+        list.iter()
+            .filter(|(fd, _)| set.contains(*fd as ws::SOCKET))
+            .map(|(_, o)| o.clone())
+            .collect()
+    };
+    Ok(Object::new_tuple(vec![
+        Object::new_list(ready(&rlist, &rset)),
+        Object::new_list(ready(&wlist, &wset)),
+        Object::new_list(ready(&xlist, &xset)),
+    ]))
+}
+
+/// Convert a wait slice to a Winsock `TIMEVAL`, rounding up so we wait
+/// *at least* the requested span (mirrors `timeout_to_poll_ms`).
+#[cfg(windows)]
+fn dur_to_timeval(d: Duration) -> windows_sys::Win32::Networking::WinSock::TIMEVAL {
+    let mut us = d.as_micros();
+    if u128::from(d.subsec_nanos()) % 1_000 != 0 {
+        us += 1;
+    }
+    let us = us.min(i32::MAX as u128 * 1_000_000);
+    windows_sys::Win32::Networking::WinSock::TIMEVAL {
+        tv_sec: (us / 1_000_000) as i32,
+        tv_usec: (us % 1_000_000) as i32,
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn select_select(_args: &[Object]) -> Result<Object, RuntimeError> {
     Err(os_error("select.select is unavailable on this platform"))
 }

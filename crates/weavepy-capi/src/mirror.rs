@@ -1148,9 +1148,9 @@ pub unsafe fn sync_set_used(p: *mut PyObject) {
     }
 }
 
-/// Re-publish the macro-visible size of a dict/set mirror after it may
-/// have been mutated in place through the C boundary. A cheap no-op for
-/// any pointer that isn't one of those two faithful mirrors (the
+/// Re-publish the macro-visible state of a dict/set/list mirror after it
+/// may have been mutated in place through the C boundary. A cheap no-op
+/// for any pointer that isn't one of those faithful mirrors (the
 /// [`is_mirror`] magic check gates the type comparison), so it is safe to
 /// sprinkle over the generic call path.
 ///
@@ -1164,6 +1164,14 @@ pub unsafe fn sync_container_size(p: *mut PyObject) {
         unsafe { sync_dict_ma_used(p) };
     } else if unsafe { is_faithful_set(p) } {
         unsafe { sync_set_used(p) };
+    } else if unsafe { is_faithful_list(p) } {
+        // A seeded list mutated by a VM method call issued from *inside* a
+        // C frame (`lg_inclusion_list.remove(...)` in Cython-compiled
+        // charset_normalizer 3.5.0) never reaches the outermost-boundary
+        // [`flush_seeded_lists`] before the extension's next inlined
+        // `PyList_GET_ITEM`/`Py_SIZE` macro read — so re-publish this one
+        // list here. Fingerprint-gated, so an unmutated list stays free.
+        unsafe { sync_list_ob_item(p) };
     }
 }
 

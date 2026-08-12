@@ -33,8 +33,9 @@ pub const ACCESS_WRITE: i64 = 2;
 pub const ACCESS_COPY: i64 = 3;
 
 /// Only the no-`mremap()` resize fallback raises SystemError; Linux
-/// resizes in place.
-#[cfg(not(target_os = "linux"))]
+/// resizes in place and Windows raises a deferred-support OSError
+/// (RFC 0063).
+#[cfg(not(any(target_os = "linux", windows)))]
 fn system_error(message: &str) -> RuntimeError {
     RuntimeError::PyException(crate::error::PyException::from_builtin(
         "SystemError",
@@ -267,7 +268,7 @@ pub struct MmapRegion {
     /// Windows keeps the `memmap2` mapping alive here; Unix owns a raw
     /// region released in `Drop`.
     #[cfg(windows)]
-    _win_backing: Option<WinBacking>,
+    win_backing: Option<WinBacking>,
 }
 
 #[cfg(windows)]
@@ -344,9 +345,10 @@ struct MmapState {
     access: i64,
     /// File offset the mapping starts at (repr / resize / size).
     offset: i64,
-    /// The dup'ed file descriptor (`-1` for anonymous or `trackfd=False`).
-    /// Only the unix `size`/`resize` paths read it back.
-    #[cfg_attr(windows, allow(dead_code))]
+    /// The file descriptor (`-1` for anonymous or `trackfd=False`).
+    /// On unix it is a dup the mapping owns (closed by `mm_close`); on
+    /// Windows it is the caller's CRT fd, held non-owning so `size()`
+    /// can re-derive a metadata view (RFC 0063 fd model).
     fd: i32,
     /// The `mmap(2)` flags actually used (only the Linux `resize` path
     /// consults it, for the shared-anonymous-grow guard).
@@ -652,31 +654,74 @@ fn mm_new(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runtim
 
     #[cfg(windows)]
     {
-        // Windows keeps the previous memmap2-backed shim: `tagname` is
-        // accepted for signature parity; `offset` must be 0.
+        // Windows arm (memmap2-backed): `tagname` is accepted for
+        // signature parity only; non-zero `offset` is deferred along
+        // with `resize` (RFC 0063 "mmap residuals").
         let access = match &slots[3] {
             Some(o) => coerce_index_i64(o)?,
             None => ACCESS_DEFAULT,
         };
+        let offset = match &slots[4] {
+            Some(o) => coerce_index_i64(o)?,
+            None => 0,
+        };
         if !(ACCESS_DEFAULT..=ACCESS_COPY).contains(&access) {
             return Err(value_error("mmap invalid access parameter."));
         }
+        if offset < 0 {
+            return Err(overflow_error("memory mapped offset must be positive"));
+        }
+        if offset != 0 {
+            // CPython maps at any allocation-granularity offset via
+            // CreateFileMapping/MapViewOfFile; deferred (RFC 0063).
+            return Err(crate::error::os_error(
+                "mmap: non-zero offset is not supported on Windows in WeavePy yet (RFC 0063)",
+            ));
+        }
         let _ = trackfd;
-        let backing = if fileno == -1 {
+        let fd = fileno as i32;
+        let mut map_size = map_size;
+        let backing = if fd == -1 {
             let map = memmap2::MmapMut::map_anon(map_size as usize)
                 .map_err(|e| crate::error::os_error(format!("mmap_anon: {e}")))?;
             WinBacking::Write(map)
         } else {
-            let file = file_from_fileno(fileno);
-            let file_ref = std::mem::ManuallyDrop::new(file);
-            if access == ACCESS_READ {
-                let map = unsafe { memmap2::Mmap::map(&*file_ref) }
-                    .map_err(|e| crate::error::os_error(format!("mmap: {e}")))?;
-                WinBacking::Read(map)
-            } else {
-                let map = unsafe { memmap2::MmapMut::map_mut(&*file_ref) }
-                    .map_err(|e| crate::error::os_error(format!("mmap: {e}")))?;
-                WinBacking::Write(map)
+            // RFC 0063 fd model: the Python-visible integer is a CRT fd,
+            // not a HANDLE (CPython's mmapmodule.c bridges through
+            // `_get_osfhandle` the same way). `file_view_from_fd` hands
+            // back a non-owning `ManuallyDrop<File>` view — the fd stays
+            // the handle's sole owner, and the view is never dropped as
+            // an owner, so no double close can occur. The view only has
+            // to outlive the map*() calls themselves: CreateFileMapping
+            // takes its own reference on the file handle, so the
+            // resulting mapping stays valid independently of the fd.
+            let file = crate::stdlib::nt_support::file_view_from_fd(fd)
+                .map_err(|e| crate::error::io_error_to_py(&e))?;
+            // CPython's `new_mmap_object` length rules: length 0 means
+            // "the whole file" (empty files rejected). A length past
+            // EOF — which CPython satisfies by growing the file — is
+            // deferred along with `resize` (RFC 0063).
+            let file_len = file
+                .metadata()
+                .map_err(|e| crate::error::io_error_to_py(&e))?
+                .len();
+            if map_size == 0 {
+                if file_len == 0 {
+                    return Err(value_error("cannot mmap an empty file"));
+                }
+                map_size = file_len as i64;
+            } else if map_size as u64 > file_len {
+                return Err(value_error("mmap length is greater than file size"));
+            }
+            let mut opts = memmap2::MmapOptions::new();
+            opts.len(map_size as usize);
+            let os_err = |e: std::io::Error| crate::error::io_error_to_py(&e);
+            match access {
+                ACCESS_READ => WinBacking::Read(unsafe { opts.map(&*file) }.map_err(os_err)?),
+                // Copy-on-write, like the unix MAP_PRIVATE arm: writes
+                // stay in the private copy, never reach the file.
+                ACCESS_COPY => WinBacking::Write(unsafe { opts.map_copy(&*file) }.map_err(os_err)?),
+                _ => WinBacking::Write(unsafe { opts.map_mut(&*file) }.map_err(os_err)?),
             }
         };
         let (ptr, len) = match &backing {
@@ -687,16 +732,19 @@ fn mm_new(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runtim
             ptr: AtomicPtr::new(ptr),
             len: AtomicUsize::new(len),
             readonly: access == ACCESS_READ,
-            _win_backing: Some(backing),
+            win_backing: Some(backing),
         };
         let id = alloc_state(MmapState {
             region: Rc::new(region),
             pos: 0,
             access,
             offset: 0,
-            fd: -1,
+            // The CRT fd, kept (not dup'ed — the caller stays the owner,
+            // unlike the unix `trackfd` dup) so `size()` can re-derive a
+            // metadata view for file-backed maps.
+            fd,
             flags: 0,
-            trackfd: false,
+            trackfd: true,
         });
         let inst = Rc::new(PyInstance::new(cls.clone()));
         inst.dict
@@ -704,16 +752,6 @@ fn mm_new(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runtim
             .insert(DictKey(Object::from_static("_id")), Object::Int(id as i64));
         Ok(Object::Instance(inst))
     }
-}
-
-#[cfg(windows)]
-fn file_from_fileno(fileno: i64) -> std::fs::File {
-    use std::os::windows::io::{FromRawHandle, RawHandle};
-    // On Windows the integer passed in is the underlying OS HANDLE
-    // (as produced by `msvcrt._get_osfhandle(fd)` on the Python side).
-    // SAFETY: caller must pass a live handle; `ManuallyDrop` keeps it
-    // alive past this function.
-    unsafe { std::fs::File::from_raw_handle(fileno as isize as RawHandle) }
 }
 
 // ---------------------------------------------------------------------------
@@ -904,6 +942,19 @@ fn mm_size(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     #[cfg(windows)]
     {
+        // CPython's `mmap_size_method` Windows arm: file-backed maps
+        // report the live *file* size (GetFileSizeEx on the backing
+        // handle — Modules/mmapmodule.c); anonymous maps report the
+        // region length. The metadata view is non-owning (RFC 0063 fd
+        // model), so a stale fd surfaces as EBADF, like unix's fstat(-1).
+        if st.fd >= 0 {
+            let view = crate::stdlib::nt_support::file_view_from_fd(st.fd)
+                .map_err(|e| crate::error::io_error_to_py(&e))?;
+            let meta = view
+                .metadata()
+                .map_err(|e| crate::error::io_error_to_py(&e))?;
+            return Ok(Object::Int(meta.len() as i64));
+        }
         Ok(Object::Int(st.region.byte_len() as i64))
     }
 }
@@ -942,6 +993,18 @@ fn mm_flush(args: &[Object]) -> Result<Object, RuntimeError> {
         } == -1
         {
             return Err(errno_error());
+        }
+    }
+    #[cfg(windows)]
+    {
+        // memmap2's flush is exactly CPython's `mmap_flush_method` pair:
+        // FlushViewOfFile on the requested range, then FlushFileBuffers
+        // on the backing handle (Modules/mmapmodule.c). Read-only and
+        // copy-on-write maps already returned above, so the remaining
+        // backing is the shared-writable mapping.
+        if let Some(WinBacking::Write(map)) = &st.region.win_backing {
+            map.flush_range(offset as usize, size as usize)
+                .map_err(|e| crate::error::io_error_to_py(&e))?;
         }
     }
     Ok(Object::None)
@@ -1236,7 +1299,22 @@ fn mm_resize(args: &[Object]) -> Result<Object, RuntimeError> {
         st.region.len.store(new_size as usize, Ordering::Relaxed);
         Ok(Object::None)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        let _ = new_size;
+        drop(st);
+        // CPython resizes Windows maps for real (UnmapViewOfFile +
+        // SetFilePointer/SetEndOfFile + a fresh CreateFileMapping —
+        // Modules/mmapmodule.c `mmap_resize_method`); WeavePy's
+        // memmap2-backed map can't remap in place, so full support is
+        // deferred (RFC 0063 "mmap residuals"). OSError — not the
+        // no-mremap SystemError — so callers see a catchable,
+        // documented failure rather than an internal-error shape.
+        Err(crate::error::os_error(
+            "mmap: resizing is not supported on Windows in WeavePy yet (RFC 0063)",
+        ))
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = new_size;
         drop(st);

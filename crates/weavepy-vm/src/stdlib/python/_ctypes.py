@@ -106,6 +106,62 @@ if _sys.platform == "darwin":
         return _nat.dyld_shared_cache_contains_path(path)
 
 
+if _sys.platform == "win32":
+    # The nt-only surface ctypes/__init__.py imports inside its
+    # `_os.name == "nt"` branches. All of it mirrors CPython's
+    # Modules/_ctypes/callproc.c module methods.
+
+    def get_last_error():
+        """Return ctypes' *private* per-thread copy of ``LastError`` —
+        the value the most recent ``use_last_error=True`` foreign call
+        swapped out (callproc.c ``get_last_error`` reads ``space[1]``,
+        never the thread's live ``GetLastError()``)."""
+        return _nat.get_last_error()
+
+    def set_last_error(value):
+        """Set the private per-thread ``LastError`` copy, returning the
+        previous value (it will be swapped *in* as the real ``LastError``
+        for the next ``use_last_error=True`` foreign call)."""
+        return _nat.set_last_error(value)
+
+    def FormatError(code=None):
+        """Message text for a Win32 error code (``FormatMessageW``); with
+        no argument, the calling thread's real ``GetLastError()`` — exactly
+        CPython's ``format_error`` (callproc.c)."""
+        return _nat.format_error(code)
+
+    def _check_HRESULT(result):
+        # CPython's check_hresult (callproc.c) raises via
+        # PyErr_SetFromWindowsErr when FAILED(hr) — i.e. the HRESULT is
+        # negative as a signed 32-bit int — and returns the value
+        # otherwise. We raise the same WinError-shaped OSError (winerror
+        # carries the HRESULT). Divergence note: ctypes' *COMError* (an
+        # HRESULT failure returned by a COM method call through a
+        # FUNCFLAG_HRESULT prototype) does not exist in WeavePy; OleDLL
+        # results route through this checker and get OSError instead.
+        if result < 0:
+            raise OSError(None, FormatError(result).strip(), None, result)
+        return result
+
+    def CopyComPointer(src, dst):
+        """CPython implements this in Modules/_ctypes/callproc.c for COM
+        interop (AddRef the source, store it through ``dst``). WeavePy has
+        no COM object model, so this is a documented stub."""
+        raise NotImplementedError(
+            "COM pointers are not supported by WeavePy")
+
+    def LoadLibrary(name, load_flags=0):
+        """CPython's ``load_library`` (``LoadLibraryExW``-based,
+        callproc.c). ``load_flags`` is ctypes' ``winmode``; the native
+        loader currently applies plain ``LoadLibraryW`` default search
+        semantics and ignores the flag bits (RFC 0063 documents the
+        divergence)."""
+        return _nat.dlopen(name, load_flags)
+
+    def FreeLibrary(handle):
+        _nat.dlclose(handle)
+
+
 # ---------------------------------------------------------------------------
 # StgInfo — per-type storage info (CPython's StgInfo struct)
 # ---------------------------------------------------------------------------
@@ -2421,7 +2477,15 @@ def _ffi_invoke(addr, restype, argtypes, flags, args):
     raw = _nat.call_function(addr, rcode, codes, payloads, int(flags), n_fixed)
     if restype is None:
         return None
-    return _wrap_result(restype, raw)
+    result = _wrap_result(restype, raw)
+    # CPython's GetResult (callproc.c): a restype carrying _check_retval_
+    # (ctypes.HRESULT -> _check_HRESULT) has the converted result passed
+    # through the checker, whose return value replaces it — this is how
+    # OleDLL turns FAILED HRESULTs into exceptions, before errcheck runs.
+    checker = getattr(restype, "_check_retval_", None)
+    if checker is not None:
+        result = checker(result)
+    return result
 
 
 def _coerce_payload(code, value):

@@ -81,6 +81,19 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         register(&mut d, "unicode_escape_encode", b_unicode_escape_encode);
         register(&mut d, "unicode_escape_decode", b_unicode_escape_decode);
 
+        // RFC 0063 WS6 — Windows-only code-page codecs, exactly the surface
+        // CPython's `_codecs` grows on win32 (`encodings/mbcs.py` and
+        // `encodings/oem.py` import these through `codecs`).
+        #[cfg(windows)]
+        {
+            register(&mut d, "code_page_encode", nt_code_page::b_code_page_encode);
+            register(&mut d, "code_page_decode", nt_code_page::b_code_page_decode);
+            register(&mut d, "mbcs_encode", nt_code_page::b_mbcs_encode);
+            register(&mut d, "mbcs_decode", nt_code_page::b_mbcs_decode);
+            register(&mut d, "oem_encode", nt_code_page::b_oem_encode);
+            register(&mut d, "oem_decode", nt_code_page::b_oem_decode);
+        }
+
         d.insert(
             DictKey(Object::from_static("BOM")),
             Object::new_bytes(vec![0xEF, 0xBB, 0xBF]),
@@ -2217,4 +2230,487 @@ fn b_unicode_escape_decode(args: &[Object]) -> Result<Object, RuntimeError> {
         emit_deprecation(&msg)?;
     }
     Ok(Object::new_tuple(vec![obj, Object::Int(consumed as i64)]))
+}
+
+// ---------- Windows code-page codecs (RFC 0063 WS6) ----------
+//
+// CPython-on-Windows exposes `_codecs.code_page_encode`/`code_page_decode`
+// plus the `mbcs_*` (CP_ACP) and `oem_*` (CP_OEMCP) wrappers; the frozen
+// `encodings/mbcs.py` and `encodings/oem.py` modules build their codecs on
+// top of these. The conversion engine is `MultiByteToWideChar` /
+// `WideCharToMultiByte`, with CPython's two-phase strategy: a strict
+// whole-buffer pass first, then a per-character pass that runs the error
+// handler (`Objects/unicodeobject.c` `decode_code_page_errors` /
+// `encode_code_page_errors`).
+#[cfg(windows)]
+mod nt_code_page {
+    use super::{
+        arg_bytes, arg_errors, arg_final, arg_text_codepoints, dec_tuple, enc_tuple, type_error,
+        value_error, Object, RuntimeError,
+    };
+    use windows_sys::Win32::Foundation::{
+        GetLastError, ERROR_INVALID_FLAGS, ERROR_NO_UNICODE_TRANSLATION,
+    };
+    use windows_sys::Win32::Globalization::{
+        GetOEMCP, IsDBCSLeadByteEx, MultiByteToWideChar, WideCharToMultiByte, CP_OEMCP, CP_UTF7,
+        CP_UTF8, MB_ERR_INVALID_CHARS, WC_NO_BEST_FIT_CHARS,
+    };
+
+    const CP_ACP: u32 = 0;
+    const DECODE_REASON: &str =
+        "No mapping for the Unicode character exists in the target code page.";
+    const ENCODE_REASON: &str = "invalid character";
+
+    /// CPython `code_page_name`: `CP_ACP` reports as `"mbcs"`, `CP_OEMCP`
+    /// resolves to the concrete OEM code page, everything else is `cp%u`.
+    fn code_page_name(cp: u32) -> String {
+        if cp == CP_ACP {
+            return "mbcs".to_owned();
+        }
+        let cp = if cp == CP_OEMCP {
+            unsafe { GetOEMCP() }
+        } else {
+            cp
+        };
+        format!("cp{cp}")
+    }
+
+    /// UTF-16 units → code points (surrogate pairs combined, lone
+    /// surrogates preserved for the `WStr` path).
+    fn utf16_to_cps(w: &[u16]) -> Vec<u32> {
+        let mut out = Vec::with_capacity(w.len());
+        let mut i = 0;
+        while i < w.len() {
+            let u = w[i];
+            if (0xD800..0xDC00).contains(&u)
+                && i + 1 < w.len()
+                && (0xDC00..0xE000).contains(&w[i + 1])
+            {
+                let cp = 0x10000 + ((u32::from(u) - 0xD800) << 10) + (u32::from(w[i + 1]) - 0xDC00);
+                out.push(cp);
+                i += 2;
+            } else {
+                out.push(u32::from(u));
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// Code points → UTF-16 units (lone surrogates pass through so the
+    /// per-character error path sees them and can raise/escape).
+    fn cps_to_utf16(cps: &[u32]) -> Vec<u16> {
+        let mut out = Vec::with_capacity(cps.len());
+        for &cp in cps {
+            if cp >= 0x10000 {
+                let v = cp - 0x10000;
+                out.push(0xD800 + (v >> 10) as u16);
+                out.push(0xDC00 + (v & 0x3FF) as u16);
+            } else {
+                out.push(cp as u16);
+            }
+        }
+        out
+    }
+
+    fn mb_to_wc(cp: u32, flags: u32, bytes: &[u8]) -> Result<Vec<u16>, u32> {
+        debug_assert!(!bytes.is_empty());
+        unsafe {
+            let n = MultiByteToWideChar(
+                cp,
+                flags,
+                bytes.as_ptr(),
+                bytes.len() as i32,
+                std::ptr::null_mut(),
+                0,
+            );
+            if n <= 0 {
+                return Err(GetLastError());
+            }
+            let mut buf = vec![0u16; n as usize];
+            let n2 = MultiByteToWideChar(
+                cp,
+                flags,
+                bytes.as_ptr(),
+                bytes.len() as i32,
+                buf.as_mut_ptr(),
+                n,
+            );
+            if n2 <= 0 {
+                return Err(GetLastError());
+            }
+            buf.truncate(n2 as usize);
+            Ok(buf)
+        }
+    }
+
+    /// One `WideCharToMultiByte` round trip; `used_default` reports whether
+    /// the system substituted the code page's default character (CPython's
+    /// "-2 → run the error handler" signal).
+    fn wc_to_mb(cp: u32, wide: &[u16], used_default: &mut bool) -> Result<Vec<u8>, u32> {
+        debug_assert!(!wide.is_empty());
+        // CP_UTF7/CP_UTF8 reject WC_NO_BEST_FIT_CHARS and the default-char
+        // out-params (ERROR_INVALID_FLAGS); CPython special-cases them the
+        // same way.
+        let plain = cp == CP_UTF7 || cp == CP_UTF8;
+        unsafe {
+            let flags = if plain { 0 } else { WC_NO_BEST_FIT_CHARS };
+            // `BOOL` out-param; windows-sys defines it as `i32`.
+            let mut used: i32 = 0;
+            let pused: *mut i32 = if plain {
+                std::ptr::null_mut()
+            } else {
+                &raw mut used
+            };
+            let n = WideCharToMultiByte(
+                cp,
+                flags,
+                wide.as_ptr(),
+                wide.len() as i32,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            );
+            if n <= 0 {
+                let err = GetLastError();
+                if err == ERROR_INVALID_FLAGS && !plain {
+                    // Code page without WC_NO_BEST_FIT_CHARS support: retry
+                    // flagless, like CPython's encode_code_page_strict.
+                    return wc_to_mb_flagless(cp, wide);
+                }
+                return Err(err);
+            }
+            let mut buf = vec![0u8; n as usize];
+            let n2 = WideCharToMultiByte(
+                cp,
+                flags,
+                wide.as_ptr(),
+                wide.len() as i32,
+                buf.as_mut_ptr(),
+                n,
+                std::ptr::null(),
+                pused,
+            );
+            if n2 <= 0 {
+                return Err(GetLastError());
+            }
+            buf.truncate(n2 as usize);
+            *used_default = used != 0;
+            Ok(buf)
+        }
+    }
+
+    fn wc_to_mb_flagless(cp: u32, wide: &[u16]) -> Result<Vec<u8>, u32> {
+        unsafe {
+            let n = WideCharToMultiByte(
+                cp,
+                0,
+                wide.as_ptr(),
+                wide.len() as i32,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            );
+            if n <= 0 {
+                return Err(GetLastError());
+            }
+            let mut buf = vec![0u8; n as usize];
+            let n2 = WideCharToMultiByte(
+                cp,
+                0,
+                wide.as_ptr(),
+                wide.len() as i32,
+                buf.as_mut_ptr(),
+                n,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            );
+            if n2 <= 0 {
+                return Err(GetLastError());
+            }
+            buf.truncate(n2 as usize);
+            Ok(buf)
+        }
+    }
+
+    /// CPython `decode_code_page_errors`: walk the input DBCS-sequence by
+    /// DBCS-sequence, running the error handler on undecodable bytes.
+    /// Returns `(code points, bytes consumed)` — with `final=False` an
+    /// incomplete trailing sequence is left unconsumed.
+    fn decode_errors(
+        cp: u32,
+        bytes: &[u8],
+        errors: &str,
+        final_: bool,
+    ) -> Result<(Vec<u32>, usize), RuntimeError> {
+        let name = code_page_name(cp);
+        let mut out: Vec<u32> = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            let insize = if unsafe { IsDBCSLeadByteEx(cp, bytes[i]) } != 0 {
+                2
+            } else {
+                1
+            };
+            if i + insize > bytes.len() {
+                // Truncated multibyte sequence at the end of the input.
+                if !final_ {
+                    break;
+                }
+                match errors {
+                    "strict" => {
+                        return Err(crate::error::unicode_decode_error(
+                            &name,
+                            bytes,
+                            i,
+                            bytes.len(),
+                            DECODE_REASON,
+                        ));
+                    }
+                    "ignore" => {}
+                    "replace" => out.push(0xFFFD),
+                    "surrogateescape" => {
+                        for &b in &bytes[i..] {
+                            out.push(0xDC00 + u32::from(b));
+                        }
+                    }
+                    "backslashreplace" => {
+                        for &b in &bytes[i..] {
+                            for c in format!("\\x{b:02x}").chars() {
+                                out.push(c as u32);
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(crate::error::lookup_error(format!(
+                            "unknown error handler name '{errors}'"
+                        )));
+                    }
+                }
+                i = bytes.len();
+                break;
+            }
+            match mb_to_wc(cp, MB_ERR_INVALID_CHARS, &bytes[i..i + insize]) {
+                Ok(w) => {
+                    out.extend(utf16_to_cps(&w));
+                    i += insize;
+                }
+                Err(_) => {
+                    // CPython reports a one-byte error range and resumes
+                    // after the failing byte.
+                    match errors {
+                        "strict" => {
+                            return Err(crate::error::unicode_decode_error(
+                                &name,
+                                bytes,
+                                i,
+                                i + 1,
+                                DECODE_REASON,
+                            ));
+                        }
+                        "ignore" => {}
+                        "replace" => out.push(0xFFFD),
+                        "surrogateescape" => out.push(0xDC00 + u32::from(bytes[i])),
+                        "backslashreplace" => {
+                            for c in format!("\\x{:02x}", bytes[i]).chars() {
+                                out.push(c as u32);
+                            }
+                        }
+                        _ => {
+                            return Err(crate::error::lookup_error(format!(
+                                "unknown error handler name '{errors}'"
+                            )));
+                        }
+                    }
+                    i += 1;
+                }
+            }
+        }
+        Ok((out, i))
+    }
+
+    pub(super) fn decode_impl(
+        cp: u32,
+        bytes: &[u8],
+        errors: &str,
+        final_: bool,
+    ) -> Result<(Object, usize), RuntimeError> {
+        if bytes.is_empty() {
+            return Ok((Object::from_static(""), 0));
+        }
+        // Strict whole-buffer pass. `MB_ERR_INVALID_CHARS` is rejected by
+        // CP_UTF7 (ERROR_INVALID_FLAGS) — CPython treats UTF-7 decoding
+        // through its own codec, so a flagless retry is a fair fallback.
+        let flags = if cp == CP_UTF7 {
+            0
+        } else {
+            MB_ERR_INVALID_CHARS
+        };
+        // An incomplete trailing DBCS sequence makes the strict pass fail
+        // with ERROR_NO_UNICODE_TRANSLATION, so the per-sequence path below
+        // handles both genuine mojibake and `final=False` truncation.
+        match mb_to_wc(cp, flags, bytes) {
+            Ok(w) => {
+                // The strict pass decoded everything — but with
+                // `final=False` a trailing lead byte must stay buffered even
+                // if the code page happens to also map it standalone.
+                if !final_ && unsafe { IsDBCSLeadByteEx(cp, bytes[bytes.len() - 1]) } != 0 {
+                    let (cps, consumed) = decode_errors(cp, bytes, errors, final_)?;
+                    return Ok((Object::str_from_codepoints(cps), consumed));
+                }
+                Ok((Object::str_from_codepoints(utf16_to_cps(&w)), bytes.len()))
+            }
+            Err(e) if e == ERROR_NO_UNICODE_TRANSLATION => {
+                let (cps, consumed) = decode_errors(cp, bytes, errors, final_)?;
+                Ok((Object::str_from_codepoints(cps), consumed))
+            }
+            Err(e) => Err(crate::stdlib::nt_support::win32_error_to_py(e as i32, None)),
+        }
+    }
+
+    /// CPython `encode_code_page_errors`: encode character by character,
+    /// running the error handler wherever the code page has no mapping.
+    fn encode_errors(cp: u32, cps: &[u32], errors: &str) -> Result<Vec<u8>, RuntimeError> {
+        let name = code_page_name(cp);
+        let mut out: Vec<u8> = Vec::with_capacity(cps.len());
+        for (pos, &cp_ch) in cps.iter().enumerate() {
+            let wide = cps_to_utf16(&[cp_ch]);
+            let is_surrogate = (0xD800..0xE000).contains(&cp_ch);
+            let encoded = if is_surrogate {
+                None
+            } else {
+                let mut used_default = false;
+                match wc_to_mb(cp, &wide, &mut used_default) {
+                    Ok(b) if !used_default => Some(b),
+                    _ => None,
+                }
+            };
+            match encoded {
+                Some(b) => out.extend_from_slice(&b),
+                None => match errors {
+                    "strict" => {
+                        return Err(crate::error::unicode_encode_error_obj(
+                            &name,
+                            Object::str_from_codepoints(cps.to_vec()),
+                            pos,
+                            pos + 1,
+                            ENCODE_REASON,
+                        ));
+                    }
+                    "ignore" => {}
+                    "replace" => out.push(b'?'),
+                    "backslashreplace" => {
+                        let esc = if cp_ch <= 0xFF {
+                            format!("\\x{cp_ch:02x}")
+                        } else if cp_ch <= 0xFFFF {
+                            format!("\\u{cp_ch:04x}")
+                        } else {
+                            format!("\\U{cp_ch:08x}")
+                        };
+                        out.extend_from_slice(esc.as_bytes());
+                    }
+                    "xmlcharrefreplace" => {
+                        out.extend_from_slice(format!("&#{cp_ch};").as_bytes());
+                    }
+                    "surrogateescape" if (0xDC80..=0xDCFF).contains(&cp_ch) => {
+                        out.push((cp_ch - 0xDC00) as u8);
+                    }
+                    "surrogateescape" => {
+                        return Err(crate::error::unicode_encode_error_obj(
+                            &name,
+                            Object::str_from_codepoints(cps.to_vec()),
+                            pos,
+                            pos + 1,
+                            ENCODE_REASON,
+                        ));
+                    }
+                    _ => {
+                        return Err(crate::error::lookup_error(format!(
+                            "unknown error handler name '{errors}'"
+                        )));
+                    }
+                },
+            }
+        }
+        Ok(out)
+    }
+
+    pub(super) fn encode_impl(cp: u32, cps: &[u32], errors: &str) -> Result<Vec<u8>, RuntimeError> {
+        if cps.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Lone surrogates can't survive the Win32 wide round trip; they must
+        // take the per-character path (which raises or escapes them).
+        let has_lone_surrogate = cps.iter().any(|&c| (0xD800..0xE000).contains(&c));
+        if !has_lone_surrogate {
+            let wide = cps_to_utf16(cps);
+            let mut used_default = false;
+            if let Ok(b) = wc_to_mb(cp, &wide, &mut used_default) {
+                if !used_default {
+                    return Ok(b);
+                }
+            }
+        }
+        encode_errors(cp, cps, errors)
+    }
+
+    /// The `code_page` int argument of `code_page_encode`/`code_page_decode`.
+    fn arg_code_page(args: &[Object], idx: usize, name: &str) -> Result<u32, RuntimeError> {
+        match args.get(idx) {
+            Some(Object::Int(i)) => {
+                u32::try_from(*i).map_err(|_| value_error(format!("invalid code page number {i}")))
+            }
+            Some(o) => Err(type_error(format!(
+                "{name}() argument 'code_page' must be int, not {}",
+                o.type_name()
+            ))),
+            None => Err(type_error(format!("{name}() missing required argument"))),
+        }
+    }
+
+    pub(super) fn b_code_page_encode(args: &[Object]) -> Result<Object, RuntimeError> {
+        let cp = arg_code_page(args, 0, "code_page_encode")?;
+        let cps = arg_text_codepoints(args, 1, "code_page_encode")?;
+        let errors = arg_errors(args, 2);
+        Ok(enc_tuple(encode_impl(cp, &cps, &errors)?, cps.len()))
+    }
+
+    pub(super) fn b_code_page_decode(args: &[Object]) -> Result<Object, RuntimeError> {
+        let cp = arg_code_page(args, 0, "code_page_decode")?;
+        let bytes = arg_bytes(args, 1, "code_page_decode")?;
+        let errors = arg_errors(args, 2);
+        let final_ = arg_final(args, 3);
+        let (text, consumed) = decode_impl(cp, &bytes, &errors, final_)?;
+        Ok(dec_tuple(text, consumed))
+    }
+
+    pub(super) fn b_mbcs_encode(args: &[Object]) -> Result<Object, RuntimeError> {
+        let cps = arg_text_codepoints(args, 0, "mbcs_encode")?;
+        let errors = arg_errors(args, 1);
+        Ok(enc_tuple(encode_impl(CP_ACP, &cps, &errors)?, cps.len()))
+    }
+
+    pub(super) fn b_mbcs_decode(args: &[Object]) -> Result<Object, RuntimeError> {
+        let bytes = arg_bytes(args, 0, "mbcs_decode")?;
+        let errors = arg_errors(args, 1);
+        let final_ = arg_final(args, 2);
+        let (text, consumed) = decode_impl(CP_ACP, &bytes, &errors, final_)?;
+        Ok(dec_tuple(text, consumed))
+    }
+
+    pub(super) fn b_oem_encode(args: &[Object]) -> Result<Object, RuntimeError> {
+        let cps = arg_text_codepoints(args, 0, "oem_encode")?;
+        let errors = arg_errors(args, 1);
+        Ok(enc_tuple(encode_impl(CP_OEMCP, &cps, &errors)?, cps.len()))
+    }
+
+    pub(super) fn b_oem_decode(args: &[Object]) -> Result<Object, RuntimeError> {
+        let bytes = arg_bytes(args, 0, "oem_decode")?;
+        let errors = arg_errors(args, 1);
+        let final_ = arg_final(args, 2);
+        let (text, consumed) = decode_impl(CP_OEMCP, &bytes, &errors, final_)?;
+        Ok(dec_tuple(text, consumed))
+    }
 }

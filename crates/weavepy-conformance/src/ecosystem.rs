@@ -332,6 +332,15 @@ pub struct ExpectationRow {
 #[derive(Debug, Default)]
 pub struct EcosystemExpectations {
     pub rows: BTreeMap<String, ExpectationRow>,
+    /// RFC 0063 WS7: the OSes this baseline was *measured* on
+    /// (top-level `measured_os = ["macos", "linux"]`, spelled like
+    /// `std::env::consts::OS` — the same names the per-OS suffix keys
+    /// use). On a host OS not in the stamp, a `--check` run still
+    /// prints the full report and writes results, but unexpected rows
+    /// are advisory (a NOTE line, exit 0) until a measured baseline
+    /// for that OS lands and its name joins the stamp. `None` (no
+    /// stamp) means "all OSes measured" — pre-RFC-0063 behaviour.
+    pub measured_os: Option<Vec<String>>,
 }
 
 impl EcosystemExpectations {
@@ -349,6 +358,7 @@ impl EcosystemExpectations {
     /// spelling: `macos` / `linux` / `windows`). Split out from `load`
     /// so the override resolution is unit-testable per OS.
     fn from_body(body: &str, host_os: &str) -> Result<Self> {
+        let measured_os = parse_measured_os(body)?;
         let tables = simple_tables::parse(body, "packages").map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut rows = BTreeMap::new();
         for (name, kv) in tables {
@@ -375,8 +385,92 @@ impl EcosystemExpectations {
                 },
             );
         }
-        Ok(Self { rows })
+        Ok(Self { rows, measured_os })
     }
+
+    /// RFC 0063 WS7: `true` when `host_os` has a measured baseline in
+    /// this file — the `measured_os` stamp names it, or the file has no
+    /// stamp at all (missing stamp ≡ "all OSes measured").
+    pub fn os_is_measured(&self, host_os: &str) -> bool {
+        match &self.measured_os {
+            Some(stamp) => stamp.iter().any(|os| os == host_os),
+            None => true,
+        }
+    }
+}
+
+/// Extract the top-level `measured_os = ["macos", "linux"]` stamp
+/// (RFC 0063 WS7). Only the region *before* the first `[packages…]`
+/// section header is scanned (TOML top-level keys must precede
+/// sections). Single-line string arrays only — the stamp is a short
+/// list of OS names, each validated against [`KNOWN_OS_SUFFIXES`] so a
+/// typo is a load error rather than a silently-always-advisory gate.
+fn parse_measured_os(body: &str) -> Result<Option<Vec<String>>> {
+    for (lineno, raw) in body.lines().enumerate() {
+        let line = simple_tables::strip_comment(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            break;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        if k.trim() != "measured_os" {
+            continue;
+        }
+        let v = v.trim();
+        if !v.starts_with('[') || !v.ends_with(']') {
+            anyhow::bail!(
+                "line {}: measured_os must be a single-line array of strings",
+                lineno + 1
+            );
+        }
+        let names = simple_tables::parse_list(v, lineno).map_err(|e| anyhow::anyhow!("{e}"))?;
+        for os in &names {
+            if !KNOWN_OS_SUFFIXES.contains(&os.as_str()) {
+                anyhow::bail!(
+                    "unknown OS {os:?} in measured_os (expected one of: macos, linux, windows)"
+                );
+            }
+        }
+        return Ok(Some(names));
+    }
+    Ok(None)
+}
+
+/// RFC 0063 WS7 — resolve the `--check` gate against the `measured_os`
+/// stamp for the current host. Returns `true` when unexpected rows
+/// should fail the run (measured host); on an unmeasured host it prints
+/// a clearly-labelled advisory NOTE instead and returns `false`, so the
+/// caller exits 0 with the full report/artifacts already written.
+pub fn strict_gate_blocks(
+    expectations: &EcosystemExpectations,
+    summary: &EcosystemSummary,
+) -> bool {
+    strict_gate_blocks_for_os(expectations, summary, std::env::consts::OS)
+}
+
+/// Host-OS-explicit seam for [`strict_gate_blocks`], unit-testable on
+/// every platform.
+fn strict_gate_blocks_for_os(
+    expectations: &EcosystemExpectations,
+    summary: &EcosystemSummary,
+    host_os: &str,
+) -> bool {
+    if summary.unexpected == 0 {
+        return false;
+    }
+    if expectations.os_is_measured(host_os) {
+        return true;
+    }
+    eprintln!(
+        "NOTE: {host_os} is not in measured_os; {} unexpected result(s) reported, \
+         gate is advisory until a measured baseline lands (RFC 0063)",
+        summary.unexpected
+    );
+    false
 }
 
 /// Resolve `<base>_<host_os>` over plain `<base>` (RFC 0062 WS3).
@@ -1486,7 +1580,7 @@ mod simple_tables {
     }
 
     /// Parse a balanced `[ "a", "b" ]` string-array literal.
-    fn parse_list(s: &str, lineno: usize) -> Result<Vec<String>, String> {
+    pub(super) fn parse_list(s: &str, lineno: usize) -> Result<Vec<String>, String> {
         let inner = s
             .trim()
             .strip_prefix('[')
@@ -1530,7 +1624,7 @@ mod simple_tables {
         Ok(())
     }
 
-    fn strip_comment(line: &str) -> &str {
+    pub(super) fn strip_comment(line: &str) -> &str {
         // A `#` inside a quoted string stays; the baseline dialect only
         // uses full-line or trailing comments outside quotes.
         let mut in_str = false;
@@ -1824,5 +1918,115 @@ notes = "prose for humans"
         // The pass-if-spec-exists default is applied at grading time,
         // not load time — an absent key stays absent here.
         assert_eq!(exp.rows["x"].selftest_status, None);
+    }
+
+    // -- measured_os stamp (RFC 0063 WS7) ---------------------------------
+
+    #[test]
+    fn expectations_measured_os_stamp_parses() {
+        let body = r#"
+# header comment
+measured_os = ["macos", "linux"]
+
+[packages.x]
+status = "pass"
+"#;
+        let exp = EcosystemExpectations::from_body(body, "macos").unwrap();
+        assert_eq!(
+            exp.measured_os,
+            Some(vec!["macos".to_owned(), "linux".to_owned()])
+        );
+        // Rows still parse as before.
+        assert_eq!(exp.rows["x"].status, RowStatus::Pass);
+    }
+
+    #[test]
+    fn expectations_missing_stamp_means_all_measured() {
+        let body = "[packages.x]\nstatus = \"pass\"\n";
+        let exp = EcosystemExpectations::from_body(body, "windows").unwrap();
+        assert_eq!(exp.measured_os, None);
+        for host in ["macos", "linux", "windows"] {
+            assert!(exp.os_is_measured(host), "host {host}");
+        }
+    }
+
+    #[test]
+    fn expectations_stamp_resolves_per_host() {
+        let body = "measured_os = [\"macos\", \"linux\"]\n";
+        let exp = EcosystemExpectations::from_body(body, "windows").unwrap();
+        assert!(exp.os_is_measured("macos"));
+        assert!(exp.os_is_measured("linux"));
+        assert!(!exp.os_is_measured("windows"));
+    }
+
+    #[test]
+    fn expectations_stamp_rejects_unknown_os() {
+        let err =
+            EcosystemExpectations::from_body("measured_os = [\"darwin\"]\n", "macos").unwrap_err();
+        assert!(err.to_string().contains("unknown OS"), "{err}");
+    }
+
+    #[test]
+    fn expectations_stamp_only_read_from_top_level() {
+        // A `measured_os` key *inside* a section is not the stamp — it
+        // stays an ignored free-form row key.
+        let body = r#"
+[packages.x]
+status = "pass"
+measured_os = ["macos"]
+"#;
+        let exp = EcosystemExpectations::from_body(body, "windows").unwrap();
+        assert_eq!(exp.measured_os, None);
+        assert!(exp.os_is_measured("windows"));
+    }
+
+    // -- measured_os advisory gate (RFC 0063 WS7) --------------------------
+
+    fn summary_with_unexpected(n: usize) -> EcosystemSummary {
+        EcosystemSummary {
+            total: n,
+            passed: 0,
+            failed: n,
+            skipped: 0,
+            unexpected: n,
+            selftest_passed: 0,
+            selftest_failed: 0,
+            selftest_skipped: 0,
+        }
+    }
+
+    #[test]
+    fn gate_blocks_on_measured_host_and_advises_elsewhere() {
+        let exp = EcosystemExpectations {
+            measured_os: Some(vec!["macos".to_owned(), "linux".to_owned()]),
+            ..EcosystemExpectations::default()
+        };
+        assert!(strict_gate_blocks_for_os(
+            &exp,
+            &summary_with_unexpected(1),
+            "linux"
+        ));
+        assert!(!strict_gate_blocks_for_os(
+            &exp,
+            &summary_with_unexpected(1),
+            "windows"
+        ));
+        // No unexpected rows → never blocks, measured or not.
+        assert!(!strict_gate_blocks_for_os(
+            &exp,
+            &summary_with_unexpected(0),
+            "linux"
+        ));
+    }
+
+    #[test]
+    fn gate_blocks_everywhere_without_stamp() {
+        let exp = EcosystemExpectations::default();
+        for host in ["macos", "linux", "windows"] {
+            assert!(
+                strict_gate_blocks_for_os(&exp, &summary_with_unexpected(1), host),
+                "host {host}"
+            );
+        }
     }
 }

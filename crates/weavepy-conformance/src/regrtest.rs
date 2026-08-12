@@ -151,6 +151,17 @@ pub struct Expectations {
     /// Per-test wall-clock budget. Honoured only when present.
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
+    /// RFC 0063 WS7: the OSes this baseline was *measured* on
+    /// (top-level `measured_os = ["macos", "linux"]`, spelled like
+    /// `std::env::consts::OS` — the same names the per-OS suffix keys
+    /// use). On a host OS not in the stamp, a `--check` run still
+    /// prints the full report and writes results, but unexpected
+    /// results are advisory (a NOTE line, exit 0) until a measured
+    /// baseline for that OS lands and its name joins the stamp.
+    /// `None` (no stamp in the file) means "all OSes measured" —
+    /// the pre-RFC-0063 behaviour.
+    #[serde(default)]
+    pub measured_os: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,6 +200,47 @@ impl Expectations {
     pub fn get(&self, label: &str) -> Option<TestStatus> {
         self.tests.get(label).map(|e| e.status)
     }
+
+    /// RFC 0063 WS7: `true` when `host_os` has a measured baseline in
+    /// this file — i.e. the `measured_os` stamp names it, or the file
+    /// carries no stamp at all (missing stamp ≡ "all OSes measured",
+    /// preserving pre-RFC-0063 behaviour).
+    pub fn os_is_measured(&self, host_os: &str) -> bool {
+        match &self.measured_os {
+            Some(stamp) => stamp.iter().any(|os| os == host_os),
+            None => true,
+        }
+    }
+}
+
+/// RFC 0063 WS7 — resolve the `--check` gate against the `measured_os`
+/// stamp for the current host. Returns `true` when unexpected results
+/// should fail the run (measured host); on an unmeasured host it prints
+/// a clearly-labelled advisory NOTE instead and returns `false`, so the
+/// caller exits 0 with the full report/artifacts already written.
+pub fn strict_gate_blocks(expectations: &Expectations, summary: &RegrtestSummary) -> bool {
+    strict_gate_blocks_for_os(expectations, summary, std::env::consts::OS)
+}
+
+/// Host-OS-explicit seam for [`strict_gate_blocks`], unit-testable on
+/// every platform.
+fn strict_gate_blocks_for_os(
+    expectations: &Expectations,
+    summary: &RegrtestSummary,
+    host_os: &str,
+) -> bool {
+    if summary.unexpected == 0 {
+        return false;
+    }
+    if expectations.os_is_measured(host_os) {
+        return true;
+    }
+    eprintln!(
+        "NOTE: {host_os} is not in measured_os; {} unexpected result(s) reported, \
+         gate is advisory until a measured baseline lands (RFC 0063)",
+        summary.unexpected
+    );
+    false
 }
 
 /// A single bundled test file scheduled for execution.
@@ -1311,6 +1363,8 @@ mod simple_toml {
                     .parse()
                     .map_err(|_| format!("line {}: bad timeout", lineno + 1))?;
                 top.timeout_seconds = Some(n);
+            } else if k == "measured_os" {
+                top.measured_os = Some(parse_measured_os(&v, lineno)?);
             }
         }
         flush(&mut top, current_section, &mut current_table, host_os)?;
@@ -1390,6 +1444,49 @@ mod simple_toml {
         );
         table.clear();
         Ok(())
+    }
+
+    /// Parse the top-level `measured_os = ["macos", "linux"]` stamp
+    /// (RFC 0063 WS7). Single-line string arrays only — the stamp is a
+    /// short list of OS names. Names are validated against the same
+    /// [`OS_SUFFIXES`] set as the per-test override keys, so a typo
+    /// (`measured_os = ["darwin"]`) is a hard load error rather than a
+    /// silently-always-advisory gate.
+    fn parse_measured_os(v: &str, lineno: usize) -> Result<Vec<String>, String> {
+        let inner = v
+            .trim()
+            .strip_prefix('[')
+            .and_then(|t| t.strip_suffix(']'))
+            .ok_or_else(|| {
+                format!(
+                    "line {}: measured_os must be a single-line array of strings",
+                    lineno + 1
+                )
+            })?;
+        let mut out = Vec::new();
+        for item in inner.split(',') {
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            let name = strip_quotes(item);
+            if name.len() == item.len() {
+                return Err(format!(
+                    "line {}: measured_os entry {item:?} must be a quoted string",
+                    lineno + 1
+                ));
+            }
+            if !OS_SUFFIXES.contains(&name) {
+                return Err(format!(
+                    "line {}: unknown OS {name:?} in measured_os \
+                     (expected one of: {})",
+                    lineno + 1,
+                    OS_SUFFIXES.join(", ")
+                ));
+            }
+            out.push(name.to_owned());
+        }
+        Ok(out)
     }
 
     fn parse_kv(line: &str, lineno: usize) -> Result<(String, String), String> {
@@ -1554,6 +1651,60 @@ mod simple_toml {
             }
         }
 
+        // -- measured_os stamp (RFC 0063 WS7) ---------------------------
+
+        #[test]
+        fn measured_os_stamp_parses() {
+            let body = "\
+                measured_os = [\"macos\", \"linux\"]\n\
+                timeout_seconds = 5\n\
+                \n\
+                [tests.\"bundled/t.py\"]\n\
+                status = \"pass\"\n\
+            ";
+            let exp = parse_for_os(body, "macos").unwrap();
+            assert_eq!(
+                exp.measured_os,
+                Some(vec!["macos".to_owned(), "linux".to_owned()])
+            );
+            // The rest of the file still parses as before.
+            assert_eq!(exp.timeout_seconds, Some(5));
+            assert_eq!(exp.get("bundled/t.py"), Some(TestStatus::Pass));
+        }
+
+        #[test]
+        fn missing_measured_os_stamp_means_all_measured() {
+            let body = "[tests.\"bundled/t.py\"]\nstatus = \"pass\"\n";
+            let exp = parse_for_os(body, "windows").unwrap();
+            assert_eq!(exp.measured_os, None);
+            for host in ["macos", "linux", "windows"] {
+                assert!(exp.os_is_measured(host), "host {host}");
+            }
+        }
+
+        #[test]
+        fn measured_os_stamp_resolves_per_host() {
+            let body = "measured_os = [\"macos\", \"linux\"]\n";
+            let exp = parse_for_os(body, "windows").unwrap();
+            assert!(exp.os_is_measured("macos"));
+            assert!(exp.os_is_measured("linux"));
+            assert!(!exp.os_is_measured("windows"));
+        }
+
+        #[test]
+        fn measured_os_rejects_unknown_os_names() {
+            for bad in ["measured_os = [\"darwin\"]", "measured_os = [\"ubuntu\"]"] {
+                let err = parse_for_os(bad, "linux").unwrap_err();
+                assert!(err.contains("unknown OS"), "{bad}: {err}");
+            }
+        }
+
+        #[test]
+        fn measured_os_rejects_non_array_values() {
+            let err = parse_for_os("measured_os = \"macos\"\n", "linux").unwrap_err();
+            assert!(err.contains("array"), "{err}");
+        }
+
         #[test]
         fn bad_status_value_in_override_rejected() {
             let body = "\
@@ -1631,5 +1782,68 @@ mod tests {
             expected: None,
         };
         assert!(!r.matches_expectation());
+    }
+
+    // -- measured_os advisory gate (RFC 0063 WS7) -----------------------
+
+    fn summary_with_unexpected(n: usize) -> RegrtestSummary {
+        RegrtestSummary {
+            total: n,
+            unexpected: n,
+            ..RegrtestSummary::default()
+        }
+    }
+
+    #[test]
+    fn gate_blocks_on_measured_host() {
+        let exp = Expectations {
+            measured_os: Some(vec!["macos".to_owned(), "linux".to_owned()]),
+            ..Expectations::default()
+        };
+        for host in ["macos", "linux"] {
+            assert!(
+                strict_gate_blocks_for_os(&exp, &summary_with_unexpected(2), host),
+                "host {host}"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_is_advisory_on_unmeasured_host() {
+        let exp = Expectations {
+            measured_os: Some(vec!["macos".to_owned(), "linux".to_owned()]),
+            ..Expectations::default()
+        };
+        assert!(!strict_gate_blocks_for_os(
+            &exp,
+            &summary_with_unexpected(2),
+            "windows"
+        ));
+    }
+
+    #[test]
+    fn gate_blocks_everywhere_without_stamp() {
+        // Missing stamp ≡ "all OSes measured" — pre-RFC-0063 behaviour.
+        let exp = Expectations::default();
+        for host in ["macos", "linux", "windows"] {
+            assert!(
+                strict_gate_blocks_for_os(&exp, &summary_with_unexpected(1), host),
+                "host {host}"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_never_blocks_without_unexpected() {
+        let exp = Expectations {
+            measured_os: Some(vec!["macos".to_owned()]),
+            ..Expectations::default()
+        };
+        for host in ["macos", "windows"] {
+            assert!(
+                !strict_gate_blocks_for_os(&exp, &summary_with_unexpected(0), host),
+                "host {host}"
+            );
+        }
     }
 }

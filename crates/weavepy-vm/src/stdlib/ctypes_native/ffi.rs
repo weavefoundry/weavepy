@@ -14,7 +14,9 @@
 //!   function at `addr`. `rcode` is the return type's ctypes format code
 //!   (or `None` for `void`); `codes[i]`/`payloads[i]` are the format code
 //!   and already-coerced Python value for argument `i`; `flags` carries
-//!   the `FUNCFLAG_*` bits (only `USE_ERRNO` is honoured here).
+//!   the `FUNCFLAG_*` bits (`USE_ERRNO` is honoured everywhere,
+//!   `USE_LASTERROR` on Windows; the rest are calling-convention markers
+//!   that need no work on the supported ABIs — Win64 stdcall == cdecl).
 //! * `create_closure(callable, rcode, argcodes)` — build a C-callable
 //!   trampoline that, when invoked from C, marshals the C arguments back
 //!   into Python, calls `callable`, and marshals the result out. Returns
@@ -38,11 +40,14 @@
 //! callback direction.
 
 // On targets without a native back-end ([`native::SUPPORTED`] is false —
-// e.g. Windows) the closure-marshalling half of this module is only
-// reachable through the assembly trampolines that aren't compiled there,
-// so it trips `dead_code` under `-D warnings`.
+// e.g. aarch64-windows) the closure-marshalling half of this module is
+// only reachable through the assembly trampolines that aren't compiled
+// there, so it trips `dead_code` under `-D warnings`.
 #![cfg_attr(
-    not(all(unix, any(target_arch = "aarch64", target_arch = "x86_64"))),
+    not(any(
+        all(unix, any(target_arch = "aarch64", target_arch = "x86_64")),
+        all(windows, target_arch = "x86_64")
+    )),
     allow(dead_code)
 )]
 
@@ -74,15 +79,18 @@ fn wchar_size() -> usize {
 }
 
 /// `long double` is platform-dependent. On AArch64/ARM it is identical to
-/// `double` (8 bytes), so we can marshal it as `f64`. On x86 it is the
-/// 80-bit extended type, which cannot round-trip through a Python float,
-/// so we decline it (callers get a clear error).
+/// `double` (8 bytes), so we can marshal it as `f64`. The same holds on
+/// Windows, where MSVC (the ABI of the system DLLs and of CPython, which
+/// reports `sizeof(c_longdouble) == 8` there) defines `long double` ==
+/// `double` on every architecture. On unix x86 it is the 80-bit extended
+/// type, which cannot round-trip through a Python float, so we decline it
+/// (callers get a clear error).
 fn classify_longdouble() -> Option<Cls> {
-    #[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
+    #[cfg(any(target_arch = "aarch64", target_arch = "arm", windows))]
     {
         Some(Cls::F64)
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "arm")))]
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "arm", windows)))]
     {
         None
     }
@@ -171,13 +179,22 @@ enum Slot {
 /// registers, so calling a true variadic like `PyBytes_FromFormat` with
 /// register-passed extras hands the callee garbage. Elsewhere (x86-64
 /// SysV, Windows x64, Linux aarch64) variadic args use the ordinary slots.
+///
+/// On Windows the Microsoft x64 convention assigns slots by *position*,
+/// not by class: argument `i` (i < 4) burns register slot `i` of both
+/// files at once (rcx/rdx/r8/r9 for integers, xmm0..3 for floats — an FP
+/// argument in position 1 lands in xmm1 and leaves rdx dead), and the
+/// 5th argument onward goes to 8-byte stack slots above the 32-byte
+/// shadow space (which the call gate owns, so `Slot::Stack(0)` is still
+/// the first overflow word here).
 fn assign_slots(classes: &[Cls], variadic_from: usize) -> Vec<Slot> {
     let apple_arm64_variadic_stack = cfg!(all(
         any(target_os = "macos", target_os = "ios"),
         target_arch = "aarch64"
     ));
-    let mut ngrn = 0usize; // next general register number
-    let mut nsrn = 0usize; // next SIMD/FP register number
+    let win64_positional = cfg!(windows);
+    let mut ngrn = 0usize; // next general register number (Win64: next position)
+    let mut nsrn = 0usize; // next SIMD/FP register number (Win64: unused)
     let mut nstk = 0usize; // next stack word
     let mut out = Vec::with_capacity(classes.len());
     for (i, &c) in classes.iter().enumerate() {
@@ -186,28 +203,43 @@ fn assign_slots(classes: &[Cls], variadic_from: usize) -> Vec<Slot> {
             nstk += 1;
             continue;
         }
-        let slot = match c {
-            Cls::F32 | Cls::F64 => {
-                if nsrn < native::NFPR_ARG {
-                    let s = Slot::Fpr(nsrn);
-                    nsrn += 1;
-                    s
-                } else {
-                    let s = Slot::Stack(nstk);
-                    nstk += 1;
-                    s
+        let slot = if win64_positional {
+            if ngrn < native::NGPR_ARG {
+                let pos = ngrn;
+                ngrn += 1;
+                match c {
+                    Cls::F32 | Cls::F64 => Slot::Fpr(pos),
+                    _ => Slot::Gpr(pos),
                 }
+            } else {
+                let s = Slot::Stack(nstk);
+                nstk += 1;
+                s
             }
-            // Int / Ptr / (Void never reaches here as an argument).
-            _ => {
-                if ngrn < native::NGPR_ARG {
-                    let s = Slot::Gpr(ngrn);
-                    ngrn += 1;
-                    s
-                } else {
-                    let s = Slot::Stack(nstk);
-                    nstk += 1;
-                    s
+        } else {
+            match c {
+                Cls::F32 | Cls::F64 => {
+                    if nsrn < native::NFPR_ARG {
+                        let s = Slot::Fpr(nsrn);
+                        nsrn += 1;
+                        s
+                    } else {
+                        let s = Slot::Stack(nstk);
+                        nstk += 1;
+                        s
+                    }
+                }
+                // Int / Ptr / (Void never reaches here as an argument).
+                _ => {
+                    if ngrn < native::NGPR_ARG {
+                        let s = Slot::Gpr(ngrn);
+                        ngrn += 1;
+                        s
+                    } else {
+                        let s = Slot::Stack(nstk);
+                        nstk += 1;
+                        s
+                    }
                 }
             }
         };
@@ -488,6 +520,24 @@ fn swap_ctypes_errno() {
 }
 
 // ----------------------------------------------------------------
+// ctypes private LastError swap (FUNCFLAG_USE_LASTERROR, Windows)
+// ----------------------------------------------------------------
+
+/// Swap the thread's real Win32 `LastError` with ctypes' private per-thread
+/// copy — the exactly-parallel mechanism to [`swap_ctypes_errno`] for
+/// `FUNCFLAG_USE_LASTERROR`. CPython keeps both values in one per-thread
+/// array (`Modules/_ctypes/callproc.c` `_ctypes_get_errobj`: errno in
+/// `space[0]`, LastError in `space[1]`) and swaps each symmetrically around
+/// the foreign call.
+#[cfg(windows)]
+fn swap_ctypes_last_error() {
+    use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+    let real = unsafe { GetLastError() };
+    let saved = super::ctypes_last_error_replace(real);
+    unsafe { SetLastError(saved) };
+}
+
+// ----------------------------------------------------------------
 // call_function
 // ----------------------------------------------------------------
 
@@ -520,6 +570,14 @@ pub(super) fn b_call_function(args: &[Object]) -> Result<Object, RuntimeError> {
     let flags = args.get(4).and_then(Object::as_i64).unwrap_or(0);
     const FUNCFLAG_USE_ERRNO: i64 = 0x8;
     let use_errno = (flags & FUNCFLAG_USE_ERRNO) != 0;
+    // FUNCFLAG_USE_LASTERROR is meaningful on Windows only (GetLastError is
+    // a Win32 concept); elsewhere the bit is accepted and ignored, exactly
+    // like CPython's non-MS_WIN32 build of `_call_function_pointer`.
+    #[cfg(windows)]
+    let use_last_error = {
+        const FUNCFLAG_USE_LASTERROR: i64 = 0x10;
+        (flags & FUNCFLAG_USE_LASTERROR) != 0
+    };
 
     let n = codes.len();
     // Index of the first *variadic* argument (args past the declared
@@ -564,6 +622,17 @@ pub(super) fn b_call_function(args: &[Object]) -> Result<Object, RuntimeError> {
             Slot::Fpr(r) => {
                 fpr[r] = bits;
                 nfpr = nfpr.max(r as u64 + 1);
+                // Win64 varargs rule ("Varargs" in the x64 calling
+                // convention doc): an FP argument to a variadic or
+                // unprototyped function must be duplicated in the
+                // positionally-corresponding integer register, because the
+                // callee's va_arg walks the GPR home area. We don't know
+                // the callee's real prototype here, so always mirror — for
+                // a prototyped callee the shadowed GPR slot is simply dead
+                // (this is what libffi's win64 port does too).
+                if cfg!(windows) {
+                    gpr[r] = bits;
+                }
             }
             Slot::Stack(_) => stack.push(bits),
         }
@@ -573,7 +642,19 @@ pub(super) fn b_call_function(args: &[Object]) -> Result<Object, RuntimeError> {
         if use_errno {
             swap_ctypes_errno();
         }
+        // The LastError swap nests *inside* the errno swap, immediately
+        // around the call (callproc.c `_call_function_pointer`): no
+        // intervening code may run between the callee returning and the
+        // swap-out, or a stray Win32 call would clobber what it set.
+        #[cfg(windows)]
+        if use_last_error {
+            swap_ctypes_last_error();
+        }
         let r = native::raw_call(addr, &gpr, &fpr, &stack, nfpr);
+        #[cfg(windows)]
+        if use_last_error {
+            swap_ctypes_last_error();
+        }
         if use_errno {
             swap_ctypes_errno();
         }

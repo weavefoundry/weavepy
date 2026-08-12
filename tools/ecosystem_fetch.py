@@ -130,6 +130,16 @@ def main() -> int:
         plats = [f"macosx_11_0_{machine}", "macosx_10_9_universal2"]
     elif sys.platform.startswith("linux"):
         plats = [f"manylinux2014_{machine}", f"manylinux_2_17_{machine}"]
+    elif sys.platform == "win32":
+        # RFC 0063: the Windows CI lane. Without a binary platform tag,
+        # `--platform any` alone can't fetch compiled wheels (markupsafe,
+        # numpy, pydantic-core, ...). `platform.machine()` reports the
+        # WMI spelling (AMD64/ARM64), not the wheel-tag one.
+        plats = [
+            {"AMD64": "win_amd64", "ARM64": "win_arm64", "x86": "win32"}.get(
+                machine, f"win_{machine.lower()}"
+            )
+        ]
     else:
         plats = []
     seen = set()

@@ -17,6 +17,17 @@
 #
 # `notes` is free-form context for humans. The runner exits non-zero on
 # any status that differs from this file (unless --no-check).
+#
+# measured_os stamp (RFC 0063 WS7): the top-level list below names the
+# OSes (std::env::consts::OS spelling, same as the suffix keys) whose
+# rows are *measured* baselines. On a host OS not in the stamp, --check
+# still prints the full report and writes results, but unexpected rows
+# only emit an advisory NOTE and exit 0 — the gate stays advisory until
+# a CI-measured Windows baseline is transplanted into status_windows
+# rows and "windows" joins the stamp, flipping the lane to blocking. A
+# missing stamp means "all OSes measured" (pre-RFC-0063 behaviour).
+
+measured_os = ["macos", "linux"]
 
 [packages.six]
 status = "pass"

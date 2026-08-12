@@ -291,6 +291,9 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("pipe")),
             builtin("pipe", os_pipe),
         );
+        // `os.openpty` is POSIX-only in CPython (no pty on NT); the name must
+        // not exist on Windows so `hasattr` probes take the fallback branch.
+        #[cfg(unix)]
         d.insert(
             DictKey(Object::from_static("openpty")),
             builtin("openpty", os_openpty),
@@ -394,20 +397,31 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("waitstatus_to_exitcode")),
             builtin("waitstatus_to_exitcode", os_waitstatus_to_exitcode),
         );
-        d.insert(
-            DictKey(Object::from_static("set_blocking")),
-            builtin("set_blocking", os_set_blocking),
-        );
-        d.insert(
-            DictKey(Object::from_static("get_blocking")),
-            builtin("get_blocking", os_get_blocking),
-        );
-        // Common signal numbers — match libc on POSIX.
-        d.insert(DictKey(Object::from_static("SIGTERM")), Object::Int(15));
-        d.insert(DictKey(Object::from_static("SIGKILL")), Object::Int(9));
-        d.insert(DictKey(Object::from_static("SIGINT")), Object::Int(2));
-        d.insert(DictKey(Object::from_static("SIGHUP")), Object::Int(1));
-        d.insert(DictKey(Object::from_static("WNOHANG")), Object::Int(1));
+        // `os.get_blocking`/`os.set_blocking` are Unix-only in CPython
+        // (`O_NONBLOCK` has no CRT-fd analogue); asyncio's proactor path never
+        // calls them on Windows, and their absence is the documented signal.
+        #[cfg(unix)]
+        {
+            d.insert(
+                DictKey(Object::from_static("set_blocking")),
+                builtin("set_blocking", os_set_blocking),
+            );
+            d.insert(
+                DictKey(Object::from_static("get_blocking")),
+                builtin("get_blocking", os_get_blocking),
+            );
+        }
+        // Common signal numbers — match libc on POSIX. CPython's `os` never
+        // exports `SIG*` (they live in `signal`) nor `WNOHANG` on Windows, so
+        // these WeavePy conveniences stay Unix-only.
+        #[cfg(unix)]
+        {
+            d.insert(DictKey(Object::from_static("SIGTERM")), Object::Int(15));
+            d.insert(DictKey(Object::from_static("SIGKILL")), Object::Int(9));
+            d.insert(DictKey(Object::from_static("SIGINT")), Object::Int(2));
+            d.insert(DictKey(Object::from_static("SIGHUP")), Object::Int(1));
+            d.insert(DictKey(Object::from_static("WNOHANG")), Object::Int(1));
+        }
 
         // RFC 0040 WS1: POSIX process & fd primitives (fork/exec*/
         // posix_spawn/wait*/W*/closerange/setsid/register_at_fork/…).
@@ -421,22 +435,27 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("get_exec_path")),
             builtin("get_exec_path", os_get_exec_path),
         );
-        d.insert(
-            DictKey(Object::from_static("getuid")),
-            builtin("getuid", os_getuid),
-        );
-        d.insert(
-            DictKey(Object::from_static("getgid")),
-            builtin("getgid", os_getgid),
-        );
-        d.insert(
-            DictKey(Object::from_static("geteuid")),
-            builtin("geteuid", os_getuid),
-        );
-        d.insert(
-            DictKey(Object::from_static("getegid")),
-            builtin("getegid", os_getgid),
-        );
+        // uid/gid getters are POSIX-only surface: CPython's `nt` module has no
+        // `getuid` (code probes `hasattr(os, 'getuid')` to detect Unix).
+        #[cfg(unix)]
+        {
+            d.insert(
+                DictKey(Object::from_static("getuid")),
+                builtin("getuid", os_getuid),
+            );
+            d.insert(
+                DictKey(Object::from_static("getgid")),
+                builtin("getgid", os_getgid),
+            );
+            d.insert(
+                DictKey(Object::from_static("geteuid")),
+                builtin("geteuid", os_getuid),
+            );
+            d.insert(
+                DictKey(Object::from_static("getegid")),
+                builtin("getegid", os_getgid),
+            );
+        }
         // Real-/effective-id setters. Beyond letting privilege-dropping code
         // run, their mere presence flips CPython's `skipIf(hasattr(os,
         // 'setreuid'))` guards (test_subprocess.test_user_error /
@@ -484,6 +503,9 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("chmod")),
             builtin_kw("chmod", os_chmod),
         );
+        // `os.fchmod` is Unix-only in CPython (`HAVE_FCHMOD`); on Windows even
+        // `os.chmod(fd, …)` is a TypeError (the path converter rejects fds).
+        #[cfg(unix)]
         d.insert(
             DictKey(Object::from_static("fchmod")),
             builtin("fchmod", os_fchmod),
@@ -561,7 +583,37 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
                 Object::Int(i64::from(libc::O_ACCMODE)),
             );
         }
-        #[cfg(not(unix))]
+        // Windows: the CRT's `_open`/`_wsopen_s` flag values (fcntl.h), which
+        // differ from every POSIX platform's. CPython's `nt` publishes exactly
+        // this set (posixmodule.c `all_ins`): the shared O_* core plus the
+        // CRT-only text/binary/inheritance/lifetime bits. There is no
+        // `O_NONBLOCK`/`O_CLOEXEC`/`O_NOCTTY` on Windows.
+        #[cfg(windows)]
+        {
+            use crate::stdlib::nt_support::crt;
+            for (name, v) in [
+                ("O_RDONLY", crt::O_RDONLY),
+                ("O_WRONLY", crt::O_WRONLY),
+                ("O_RDWR", crt::O_RDWR),
+                ("O_CREAT", crt::O_CREAT),
+                ("O_EXCL", crt::O_EXCL),
+                ("O_TRUNC", crt::O_TRUNC),
+                ("O_APPEND", crt::O_APPEND),
+                ("O_TEXT", crt::O_TEXT),
+                ("O_BINARY", crt::O_BINARY),
+                ("O_NOINHERIT", crt::O_NOINHERIT),
+                ("O_TEMPORARY", crt::O_TEMPORARY),
+                ("O_SHORT_LIVED", crt::O_SHORT_LIVED),
+                ("O_RANDOM", crt::O_RANDOM),
+                ("O_SEQUENTIAL", crt::O_SEQUENTIAL),
+            ] {
+                d.insert(
+                    DictKey(Object::from_static(name)),
+                    Object::Int(i64::from(v)),
+                );
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             d.insert(DictKey(Object::from_static("O_RDONLY")), Object::Int(0));
             d.insert(DictKey(Object::from_static("O_WRONLY")), Object::Int(1));
@@ -611,13 +663,18 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         d.insert(DictKey(Object::from_static("R_OK")), Object::Int(4));
         d.insert(DictKey(Object::from_static("W_OK")), Object::Int(2));
         d.insert(DictKey(Object::from_static("X_OK")), Object::Int(1));
-        d.insert(DictKey(Object::from_static("EX_OK")), Object::Int(0));
-        d.insert(DictKey(Object::from_static("EX_USAGE")), Object::Int(64));
-        d.insert(DictKey(Object::from_static("EX_DATAERR")), Object::Int(65));
-        d.insert(DictKey(Object::from_static("EX_NOINPUT")), Object::Int(66));
-        d.insert(DictKey(Object::from_static("EX_SOFTWARE")), Object::Int(70));
-        d.insert(DictKey(Object::from_static("EX_OSERR")), Object::Int(71));
-        d.insert(DictKey(Object::from_static("EX_IOERR")), Object::Int(74));
+        // `EX_*` come from `<sysexits.h>`, which Windows lacks — CPython only
+        // exposes them where the header defines them, so gate to Unix.
+        #[cfg(unix)]
+        {
+            d.insert(DictKey(Object::from_static("EX_OK")), Object::Int(0));
+            d.insert(DictKey(Object::from_static("EX_USAGE")), Object::Int(64));
+            d.insert(DictKey(Object::from_static("EX_DATAERR")), Object::Int(65));
+            d.insert(DictKey(Object::from_static("EX_NOINPUT")), Object::Int(66));
+            d.insert(DictKey(Object::from_static("EX_SOFTWARE")), Object::Int(70));
+            d.insert(DictKey(Object::from_static("EX_OSERR")), Object::Int(71));
+            d.insert(DictKey(Object::from_static("EX_IOERR")), Object::Int(74));
+        }
         // macOS `fcopyfile(3)` fast clone. CPython exposes `posix._fcopyfile`
         // plus the `_COPYFILE_*` flag bits; `shutil.copyfile` uses them for a
         // zero-copy reflink on APFS/HFS+ (`test_shutil.TestZeroCopyMACOS`, and
@@ -663,6 +720,49 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             d.insert(
                 DictKey(Object::from_static("pathconf_names")),
                 build_pathconf_names(),
+            );
+        }
+
+        // RFC 0063 WS1 — the NT-only surface CPython's `nt` module exports on
+        // Windows (posixmodule.c under `MS_WINDOWS`). Portable code probes
+        // these with `hasattr` (`shutil.disk_usage`, `webbrowser`,
+        // `getpass.getuser`), and `ntpath` imports the `_get*` fast paths.
+        #[cfg(windows)]
+        {
+            d.insert(
+                DictKey(Object::from_static("getlogin")),
+                builtin("getlogin", os_getlogin),
+            );
+            d.insert(
+                DictKey(Object::from_static("startfile")),
+                builtin_kw("startfile", os_startfile),
+            );
+            // `os.fsync` (CRT `_commit`). Registered Windows-only for now: the
+            // POSIX build never exposed `fsync`, and adding it there would
+            // change the measured host surface outside this wave's scope.
+            d.insert(
+                DictKey(Object::from_static("fsync")),
+                builtin("fsync", os_fsync),
+            );
+            d.insert(
+                DictKey(Object::from_static("_getfullpathname")),
+                builtin("_getfullpathname", nt_getfullpathname),
+            );
+            d.insert(
+                DictKey(Object::from_static("_getfinalpathname")),
+                builtin("_getfinalpathname", nt_getfinalpathname),
+            );
+            d.insert(
+                DictKey(Object::from_static("_getvolumepathname")),
+                builtin("_getvolumepathname", nt_getvolumepathname),
+            );
+            d.insert(
+                DictKey(Object::from_static("_getdiskusage")),
+                builtin("_getdiskusage", nt_getdiskusage),
+            );
+            d.insert(
+                DictKey(Object::from_static("_path_splitroot_ex")),
+                builtin("_path_splitroot_ex", nt_path_splitroot_ex),
             );
         }
 
@@ -959,7 +1059,15 @@ fn initial_environ() -> Object {
     // round-trip through `os.environ` / `os.environb`
     // (test_subprocess.test_undecodable_env).
     for (k, v) in std::env::vars_os() {
-        d.insert(DictKey(fsdecode_osstr(&k)), fsdecode_osstr(&v));
+        // Windows environment names are case-insensitive; CPython's `os.py`
+        // normalises them by wrapping `nt.environ` in an `_Environ` whose
+        // `encodekey` is `str.upper`, so every visible key is upper-cased at
+        // snapshot time. Match that here since WeavePy's `os` is native.
+        #[cfg(windows)]
+        let key = Object::from_str(k.to_string_lossy().to_uppercase());
+        #[cfg(not(windows))]
+        let key = fsdecode_osstr(&k);
+        d.insert(DictKey(key), fsdecode_osstr(&v));
     }
     Object::Dict(Rc::new(RefCell::new(d)))
 }
@@ -1515,6 +1623,7 @@ fn os_makedirs_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object
 /// `os.path.split` for a POSIX path string: returns `(head, tail)` where
 /// `tail` is the last component and `head` keeps its trailing separators
 /// stripped (unless it is all separators). Mirrors `posixpath.split`.
+#[cfg(not(windows))]
 fn posix_split(p: &str) -> (&str, &str) {
     match p.rfind('/') {
         Some(i) => {
@@ -1528,6 +1637,69 @@ fn posix_split(p: &str) -> (&str, &str) {
             (head, tail)
         }
         None => ("", p),
+    }
+}
+
+/// `ntpath.splitdrive`: peel the drive letter (`C:`), UNC share
+/// (`\\server\share`), or device/verbatim prefix (`\\?\C:`, `\\.\pipe`)
+/// off the front so the split below never treats it as a component.
+#[cfg(windows)]
+fn nt_splitdrive(p: &str) -> (&str, &str) {
+    let is_sep = |c: char| c == '\\' || c == '/';
+    let b = p.as_bytes();
+    if b.len() >= 2 {
+        if is_sep(b[0] as char) && is_sep(b[1] as char) {
+            // `\\server\share` / `\\?\C:` — the drive runs through the
+            // second component (ntpath.splitroot's UNC arm); a path
+            // with no second component is all drive.
+            let rest = &p[2..];
+            if let Some(i) = rest.find(is_sep) {
+                if let Some(j) = rest[i + 1..].find(is_sep) {
+                    let cut = 2 + i + 1 + j;
+                    return (&p[..cut], &p[cut..]);
+                }
+            }
+            return (p, "");
+        }
+        if b[1] == b':' && b[0].is_ascii_alphabetic() {
+            return (&p[..2], &p[2..]);
+        }
+    }
+    ("", p)
+}
+
+/// `ntpath.split`: like [`posix_split`] but with both separators and the
+/// drive/UNC prefix kept attached to `head` (never split into, never
+/// stripped down to nothing — `C:\` stays `C:\`).
+#[cfg(windows)]
+fn nt_split(p: &str) -> (&str, &str) {
+    let is_sep = |c: char| c == '\\' || c == '/';
+    let (drive, rest) = nt_splitdrive(p);
+    let i = rest.rfind(is_sep).map_or(0, |i| i + 1);
+    let (head, tail) = rest.split_at(i);
+    let trimmed = head.trim_end_matches(is_sep);
+    let head_len = if trimmed.is_empty() {
+        head.len()
+    } else {
+        trimmed.len()
+    };
+    (&p[..drive.len() + head_len], tail)
+}
+
+/// `os.path.split` for the host platform, as `os.makedirs`' recursion
+/// requires: CPython's `makedirs` splits with `os.path.split`, so on
+/// Windows the backslash-separated paths every `os.path.normpath`
+/// consumer produces (sysconfig hands venv `{base}\Lib\site-packages`)
+/// must split on `\` too, or the parent chain is never created and the
+/// leaf `mkdir` dies with ERROR_PATH_NOT_FOUND.
+fn host_path_split(p: &str) -> (&str, &str) {
+    #[cfg(windows)]
+    {
+        nt_split(p)
+    }
+    #[cfg(not(windows))]
+    {
+        posix_split(p)
     }
 }
 
@@ -1550,9 +1722,9 @@ fn makedirs_recursive(
     mode: u32,
     exist_ok: bool,
 ) -> Result<(), (std::io::Error, String)> {
-    let (mut head, mut tail) = posix_split(name);
+    let (mut head, mut tail) = host_path_split(name);
     if tail.is_empty() {
-        let (h, t) = posix_split(head);
+        let (h, t) = host_path_split(head);
         head = h;
         tail = t;
     }
@@ -1718,7 +1890,34 @@ fn os_urandom(args: &[Object]) -> Result<Object, RuntimeError> {
         fill_os_random(&mut out).map_err(|e| crate::error::io_error_to_py(&e))?;
         Ok(Object::new_bytes(out))
     }
-    #[cfg(not(unix))]
+    // Windows: the system-preferred CSPRNG, exactly CPython's
+    // `_PyOS_URandom` → `BCryptGenRandom(NULL, …,
+    // BCRYPT_USE_SYSTEM_PREFERRED_RNG)` (Python/bootstrap_hash.c).
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Security::Cryptography::{
+            BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        };
+        let mut out = vec![0u8; n];
+        // BCryptGenRandom takes a u32 length; chunk absurdly large requests.
+        for chunk in out.chunks_mut(1 << 30) {
+            let status = unsafe {
+                BCryptGenRandom(
+                    std::ptr::null_mut(),
+                    chunk.as_mut_ptr(),
+                    chunk.len() as u32,
+                    BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+                )
+            };
+            if status != 0 {
+                return Err(crate::error::os_error(format!(
+                    "BCryptGenRandom failed (NTSTATUS 0x{status:08X})"
+                )));
+            }
+        }
+        Ok(Object::new_bytes(out))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let mut out = vec![0u8; n];
         for (i, b) in out.iter_mut().enumerate() {
@@ -1754,7 +1953,22 @@ fn os_close_fd(fd: i64) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
-#[cfg(not(unix))]
+/// Windows: close the CRT fd with `_close` (which closes the owned handle,
+/// CPython's `os_close_impl`) and drop any registry entry naming it so a
+/// `Disk`-backed stream that minted this fd doesn't double-close.
+#[cfg(windows)]
+fn os_close_fd(fd: i64) -> Result<Object, RuntimeError> {
+    use crate::stdlib::nt_support::{self, crt};
+    let fd = i32::try_from(fd).map_err(|_| value_error("file descriptor out of range"))?;
+    let rc = unsafe { crt::_close(fd) };
+    if rc != 0 {
+        return Err(nt_support::last_crt_error_to_py(None));
+    }
+    nt_support::forget_fd(fd);
+    Ok(Object::None)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn os_close_fd(_fd: i64) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
@@ -1821,7 +2035,46 @@ fn os_open_stub(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
     Ok(Object::Int(i64::from(fd)))
 }
 
-#[cfg(not(unix))]
+/// Windows `os.open` — CPython's `os_open_impl` on the CRT-fd model: the
+/// flag bits are the CRT's own values (published as `os.O_*` above) and the
+/// open goes through `_wsopen_s` with `_SH_DENYNO` sharing.
+#[cfg(windows)]
+fn os_open_stub(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    use crate::stdlib::nt_support::{crt, crt_error_to_py, wide};
+    let p = path_arg_or_kw(args, 0, "path", kwargs, "open")?;
+    let flags = int_arg_or_kw(args, 1, "flags", kwargs)
+        .ok_or_else(|| crate::error::type_error("open() flags must be an int".to_owned()))?;
+    // `mode` feeds the CRT pmode (only `_S_IREAD`/`_S_IWRITE` matter); CPython
+    // passes it through untranslated.
+    let mode = int_arg_or_kw(args, 2, "mode", kwargs).unwrap_or(0o777) as i32;
+    // No `openat` on NT — CPython rejects a non-None `dir_fd` the same way.
+    reject_dir_fd(kwargs, "open")?;
+    if p.as_bytes().contains(&0) {
+        return Err(value_error("embedded null byte"));
+    }
+    // PEP 446: descriptors Python creates are non-inheritable — CPython's
+    // `os_open_impl` ORs in `O_NOINHERIT` (the CRT spelling of `O_CLOEXEC`).
+    let mut oflags = flags as i32 | crt::O_NOINHERIT;
+    // CPython initialises the CRT with the *binary* default fmode
+    // (`_Py_InitializeCore` / config->legacy_windows_fs_encoding path sets
+    // `_set_fmode(_O_BINARY)`), so an `os.open` with no explicit text bit
+    // yields a binary fd. WeavePy doesn't flip the process-global CRT
+    // default; passing `O_BINARY` explicitly when no text/binary bit is set
+    // is behaviourally identical and keeps the CRT state untouched.
+    if oflags & (crt::O_TEXT | crt::O_WTEXT | crt::O_U16TEXT | crt::O_U8TEXT | crt::O_BINARY) == 0 {
+        oflags |= crt::O_BINARY;
+    }
+    let wpath = wide(&p);
+    let mut fd: i32 = -1;
+    // `_wsopen_s` returns the errno directly (not through the TLS `errno`).
+    let err = unsafe { crt::_wsopen_s(&raw mut fd, wpath.as_ptr(), oflags, crt::SH_DENYNO, mode) };
+    if err != 0 {
+        return Err(crt_error_to_py(err, Some(&p)));
+    }
+    Ok(Object::Int(i64::from(fd)))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn os_open_stub(_args: &[Object], _kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     Err(crate::error::not_implemented_error(
         "os.open(): raw fd interface is not implemented in WeavePy yet",
@@ -1866,7 +2119,23 @@ fn open_flag_bits() -> (i64, i64, i64, i64, i64, i64) {
     )
 }
 
-#[cfg(not(unix))]
+// Windows: the CRT flag values, agreeing with the `os.O_*` constants the
+// module publishes (an `opener` that forwards to `os.open` must see the
+// same bits `_wsopen_s` understands).
+#[cfg(windows)]
+fn open_flag_bits() -> (i64, i64, i64, i64, i64, i64) {
+    use crate::stdlib::nt_support::crt;
+    (
+        i64::from(crt::O_WRONLY),
+        i64::from(crt::O_RDWR),
+        i64::from(crt::O_CREAT),
+        i64::from(crt::O_EXCL),
+        i64::from(crt::O_TRUNC),
+        i64::from(crt::O_APPEND),
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
 fn open_flag_bits() -> (i64, i64, i64, i64, i64, i64) {
     (1, 2, 64, 128, 512, 1024)
 }
@@ -1976,7 +2245,55 @@ fn os_fdopen(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
     )
 }
 
-#[cfg(not(unix))]
+/// Windows `os.fdopen` — adopt a CRT fd into a `Disk`-backed `PyFile`. The
+/// registry entry recorded by `owning_file_from_fd` routes the eventual
+/// close back through `_close(fd)` (the fd owns the handle, RFC 0063).
+#[cfg(windows)]
+fn os_fdopen(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    use crate::object::{FileBackend, PyFile};
+    // CPython 3.12+: a `bool` fd raises a `RuntimeWarning` before anything
+    // else (mirrors the Unix arm).
+    if matches!(args.first(), Some(Object::Bool(_))) {
+        warn_bool_as_fd()?;
+    }
+    let fd = args
+        .first()
+        .and_then(crate::object::Object::as_i64)
+        .ok_or_else(|| crate::error::type_error("fdopen() fd must be an int".to_owned()))?;
+    let fd = i32::try_from(fd).map_err(|_| value_error("file descriptor out of range"))?;
+    // CPython's `io.open(fd, …)` fstats the descriptor and raises
+    // `OSError(EBADF)` for an invalid fd; `_get_osfhandle` inside
+    // `owning_file_from_fd` performs the equivalent validation.
+    let file = crate::stdlib::nt_support::owning_file_from_fd(fd)
+        .map_err(|_| crate::stdlib::nt_support::crt_error_to_py(crate::py_errno::EBADF, None))?;
+    let mode = match args.get(1) {
+        Some(Object::Str(s)) => s.to_string(),
+        None => "r".to_owned(),
+        Some(_) => {
+            return Err(crate::error::type_error(
+                "fdopen() mode must be str".to_owned(),
+            ))
+        }
+    };
+    let pf = PyFile::new(format!("<fdopen fd={fd}>"), mode, FileBackend::Disk(file));
+    pf.no_name.set(true);
+    let kw = |name: &str| kwargs.iter().find(|(k, _)| k == name).map(|(_, v)| v);
+    let buffering = args.get(2).or_else(|| kw("buffering"));
+    let encoding = args.get(3).or_else(|| kw("encoding"));
+    let errors = args.get(4).or_else(|| kw("errors"));
+    let newline = args.get(5).or_else(|| kw("newline"));
+    let binary = pf.binary;
+    crate::stdlib::io_full::finish_open(
+        Object::File(Rc::new(pf)),
+        buffering,
+        encoding,
+        errors,
+        newline,
+        binary,
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
 fn os_fdopen(_args: &[Object], _kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     Err(crate::error::not_implemented_error(
         "os.fdopen(): raw fd interface is not implemented in WeavePy yet",
@@ -2090,13 +2407,65 @@ fn os_fstat(args: &[Object]) -> Result<Object, RuntimeError> {
         let meta = f.metadata().map_err(|e| crate::error::io_error_to_py(&e))?;
         Ok(stat_result_from_meta(&meta))
     }
-    #[cfg(not(unix))]
+    // Windows: classify the fd's handle first (CPython's `_Py_fstat` does
+    // `GetFileType` and synthesises `S_IFIFO`/`S_IFCHR` for pipes/console
+    // handles, where `GetFileInformationByHandle` would fail), then read the
+    // real metadata through a non-owning `File` view for disk files.
+    #[cfg(windows)]
+    {
+        use crate::stdlib::nt_support;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_CHAR, FILE_TYPE_PIPE};
+        let fd = i32::try_from(fd).map_err(|_| value_error("file descriptor out of range"))?;
+        let Some(ftype) = nt_support::file_type_of_fd(fd) else {
+            return Err(nt_support::crt_error_to_py(crate::py_errno::EBADF, None));
+        };
+        match ftype {
+            FILE_TYPE_PIPE => Ok(stat_result_synthetic(0o010_666)), // S_IFIFO
+            FILE_TYPE_CHAR => Ok(stat_result_synthetic(0o020_666)), // S_IFCHR
+            _ => {
+                let view = nt_support::file_view_from_fd(fd)
+                    .map_err(|_| nt_support::crt_error_to_py(crate::py_errno::EBADF, None))?;
+                let meta = view
+                    .metadata()
+                    .map_err(|e| crate::error::io_error_to_py(&e))?;
+                Ok(stat_result_from_meta(&meta))
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = fd;
         Err(crate::error::not_implemented_error(
             "os.fstat is only supported on Unix",
         ))
     }
+}
+
+/// A `stat_result` for handles that have no filesystem identity (pipes,
+/// console fds): only `st_mode` is meaningful, everything else is zero —
+/// the shape CPython's `_Py_attribute_data_to_stat` produces for them.
+#[cfg(windows)]
+fn stat_result_synthetic(mode: i64) -> Object {
+    use crate::types::PyInstance;
+    let ty = stat_result_type();
+    let inst = PyInstance::new(ty);
+    {
+        let mut d = inst.dict.borrow_mut();
+        d.insert(DictKey(Object::from_static("st_mode")), Object::Int(mode));
+        for f in [
+            "st_ino", "st_dev", "st_nlink", "st_uid", "st_gid", "st_size",
+        ] {
+            d.insert(DictKey(Object::from_static(f)), Object::Int(0));
+        }
+        for f in ["st_atime", "st_mtime", "st_ctime"] {
+            d.insert(DictKey(Object::from_static(f)), Object::Float(0.0));
+        }
+        for f in ["st_atime_ns", "st_mtime_ns", "st_ctime_ns"] {
+            d.insert(DictKey(Object::from_static(f)), Object::Int(0));
+        }
+    }
+    stat_seq_finish(&inst);
+    Object::Instance(Rc::new(inst))
 }
 
 /// `os.lstat(path, *, dir_fd=None)` — `stat` on the link itself. `dir_fd` is
@@ -2321,6 +2690,23 @@ fn stat_result_from_meta(meta: &std::fs::Metadata) -> Object {
         d.insert(
             DictKey(Object::from_static("st_ctime_ns")),
             Object::Int((ctime * 1e9) as i64),
+        );
+    }
+    // Windows-only extras CPython adds to `stat_result` (posixmodule.c's
+    // `STRUCT_STAT` under `MS_WINDOWS`): the raw `dwFileAttributes` word —
+    // `ntpath.isjunction`/`stat.FILE_ATTRIBUTE_*` consumers read it — and the
+    // reparse tag (0 here: `std::fs::Metadata` doesn't surface the tag, and 0
+    // is what CPython reports for non-reparse-point files).
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        d.insert(
+            DictKey(Object::from_static("st_file_attributes")),
+            Object::Int(i64::from(meta.file_attributes())),
+        );
+        d.insert(
+            DictKey(Object::from_static("st_reparse_tag")),
+            Object::Int(0),
         );
     }
     drop(d);
@@ -3518,7 +3904,53 @@ fn os_kill(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
-#[cfg(not(unix))]
+/// Windows `os.kill` — CPython's `os_kill_impl` under `MS_WINDOWS`: the two
+/// console-control "signals" (`CTRL_C_EVENT`/`CTRL_BREAK_EVENT`) route to
+/// `GenerateConsoleCtrlEvent(sig, pid)`; anything else terminates the target
+/// via `OpenProcess` + `TerminateProcess(handle, sig)`.
+#[cfg(windows)]
+fn os_kill(args: &[Object]) -> Result<Object, RuntimeError> {
+    use crate::stdlib::nt_support::last_win32_error_to_py;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Console::{
+        GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT, CTRL_C_EVENT,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, TerminateProcess, PROCESS_ALL_ACCESS,
+    };
+    let pid = match args.first().and_then(Object::as_i64) {
+        Some(p) => p,
+        None => return Err(type_error("kill() pid must be int")),
+    };
+    let sig = match args.get(1).and_then(Object::as_i64) {
+        Some(s) => s,
+        None => return Err(type_error("kill() signal must be int")),
+    };
+    if sig == i64::from(CTRL_C_EVENT) || sig == i64::from(CTRL_BREAK_EVENT) {
+        if unsafe { GenerateConsoleCtrlEvent(sig as u32, pid as u32) } == 0 {
+            return Err(last_win32_error_to_py(None));
+        }
+        return Ok(Object::None);
+    }
+    // SAFETY: plain Win32 calls; the handle is closed on every path.
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid as u32) };
+    if handle.is_null() {
+        return Err(last_win32_error_to_py(None));
+    }
+    let ok = unsafe { TerminateProcess(handle, sig as u32) };
+    let err = if ok == 0 {
+        Some(last_win32_error_to_py(None))
+    } else {
+        None
+    };
+    unsafe { CloseHandle(handle) };
+    match err {
+        Some(e) => Err(e),
+        None => Ok(Object::None),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn os_kill(_args: &[Object]) -> Result<Object, RuntimeError> {
     Err(crate::error::not_implemented_error(
         "os.kill() is only implemented on POSIX in WeavePy",
@@ -3548,7 +3980,36 @@ fn os_system(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Int(i64::from(status)))
 }
 
-#[cfg(not(unix))]
+/// Windows `os.system` — CPython calls the CRT's wide `_wsystem` and
+/// returns its result (the `cmd.exe` exit code) directly.
+#[cfg(windows)]
+fn os_system(args: &[Object]) -> Result<Object, RuntimeError> {
+    // Not part of nt_support's audited CRT block (os.system is the only
+    // consumer); declared here like CPython keeps `_wsystem` local to
+    // posixmodule.c.
+    unsafe extern "C" {
+        fn _wsystem(command: *const u16) -> i32;
+    }
+    let command = match args.first() {
+        Some(Object::Str(s)) => s.to_string(),
+        Some(Object::Bytes(b)) => String::from_utf8_lossy(b).into_owned(),
+        _ => {
+            return Err(type_error(
+                "system() argument must be str or bytes, not None",
+            ))
+        }
+    };
+    if command.as_bytes().contains(&0) {
+        return Err(crate::error::value_error("embedded null byte"));
+    }
+    let wcmd = crate::stdlib::nt_support::wide(&command);
+    // Release the GIL: the child shell can run arbitrarily long and may
+    // itself be a WeavePy re-invocation that needs the lock.
+    let status = crate::gil::allow_threads_then(|| unsafe { _wsystem(wcmd.as_ptr()) });
+    Ok(Object::Int(i64::from(status)))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn os_system(_args: &[Object]) -> Result<Object, RuntimeError> {
     Err(crate::error::not_implemented_error(
         "os.system() is only implemented on POSIX in WeavePy",
@@ -3591,7 +4052,41 @@ fn os_waitpid(args: &[Object]) -> Result<Object, RuntimeError> {
     ]))
 }
 
-#[cfg(not(unix))]
+/// Windows `os.waitpid` — the `pid` is a process *handle* returned by
+/// `os.spawnv(P_NOWAIT, …)`, and the wait is the CRT's `_cwait`
+/// (posixmodule.c `os_waitpid_impl` under `MS_WINDOWS`). The returned
+/// status is the exit code shifted left 8 bits, so the portable
+/// `os.waitstatus_to_exitcode(status)` (`status >> 8`) recovers it.
+#[cfg(windows)]
+fn os_waitpid(args: &[Object]) -> Result<Object, RuntimeError> {
+    unsafe extern "C" {
+        fn _cwait(termstat: *mut i32, prochandle: isize, action: i32) -> isize;
+    }
+    let pid = match args.first() {
+        Some(Object::Int(p)) => *p,
+        _ => return Err(type_error("waitpid() pid must be int")),
+    };
+    let options = match args.get(1) {
+        Some(Object::Int(o)) => *o as i32,
+        Some(Object::None) | None => 0,
+        _ => return Err(type_error("waitpid() options must be int")),
+    };
+    let mut status: i32 = 0;
+    let status_ptr: *mut i32 = &raw mut status;
+    // Release the GIL across the blocking wait, mirroring the Unix arm
+    // (`_cwait` ignores `action`, but CPython passes it through too).
+    let rc =
+        crate::gil::allow_threads_then(|| unsafe { _cwait(status_ptr, pid as isize, options) });
+    if rc == -1 {
+        return Err(crate::stdlib::nt_support::last_crt_error_to_py(None));
+    }
+    Ok(Object::new_tuple(vec![
+        Object::Int(rc as i64),
+        Object::Int(i64::from(status) << 8),
+    ]))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn os_waitpid(_args: &[Object]) -> Result<Object, RuntimeError> {
     Err(crate::error::not_implemented_error(
         "os.waitpid() is only implemented on POSIX in WeavePy",
@@ -3627,7 +4122,19 @@ fn os_waitstatus_to_exitcode(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
-#[cfg(not(unix))]
+/// Windows `os.waitstatus_to_exitcode` — the inverse of `os.waitpid`'s
+/// `<< 8` encoding: CPython's Windows arm is simply `status >> 8`.
+#[cfg(windows)]
+fn os_waitstatus_to_exitcode(args: &[Object]) -> Result<Object, RuntimeError> {
+    let status = match args.first() {
+        Some(Object::Int(s)) => *s,
+        Some(Object::Bool(b)) => i64::from(*b),
+        _ => return Err(type_error("an integer is required")),
+    };
+    Ok(Object::Int(status >> 8))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn os_waitstatus_to_exitcode(_args: &[Object]) -> Result<Object, RuntimeError> {
     Err(crate::error::not_implemented_error(
         "os.waitstatus_to_exitcode() is only implemented on POSIX in WeavePy",
@@ -3668,12 +4175,8 @@ fn os_set_blocking(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
-#[cfg(not(unix))]
-fn os_set_blocking(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(crate::error::not_implemented_error(
-        "os.set_blocking() is only implemented on POSIX in WeavePy",
-    ))
-}
+// No non-Unix arm: the registration is `#[cfg(unix)]` (CPython's `nt` has no
+// `set_blocking`/`get_blocking` — `O_NONBLOCK` has no CRT-fd analogue).
 
 /// `os.get_blocking(fd)` — `True` if `fd` is in blocking mode (i.e.
 /// `O_NONBLOCK` is clear).
@@ -3690,13 +4193,6 @@ fn os_get_blocking(args: &[Object]) -> Result<Object, RuntimeError> {
         ));
     }
     Ok(Object::Bool(flags & libc::O_NONBLOCK == 0))
-}
-
-#[cfg(not(unix))]
-fn os_get_blocking(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(crate::error::not_implemented_error(
-        "os.get_blocking() is only implemented on POSIX in WeavePy",
-    ))
 }
 
 fn os_pipe(_args: &[Object]) -> Result<Object, RuntimeError> {
@@ -3730,7 +4226,44 @@ fn os_pipe(_args: &[Object]) -> Result<Object, RuntimeError> {
             Object::Int(i64::from(fds[1])),
         ]))
     }
-    #[cfg(not(unix))]
+    // Windows: CPython's `os_pipe_impl` — an anonymous pipe from
+    // `CreatePipe` (NULL security attributes ⇒ non-inheritable handles,
+    // PEP 446), each end adopted into a CRT fd with `O_NOINHERIT`.
+    #[cfg(windows)]
+    {
+        use crate::stdlib::nt_support::{crt, last_crt_error_to_py, last_win32_error_to_py};
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Pipes::CreatePipe;
+        let mut read: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut write: *mut std::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: plain Win32/CRT calls; on every failure path the handles
+        // that haven't been adopted by a CRT fd are closed exactly once.
+        unsafe {
+            if CreatePipe(&raw mut read, &raw mut write, std::ptr::null(), 0) == 0 {
+                return Err(last_win32_error_to_py(None));
+            }
+            let rfd = crt::_open_osfhandle(read as crt::intptr_t, crt::O_RDONLY | crt::O_NOINHERIT);
+            if rfd < 0 {
+                let e = last_crt_error_to_py(None);
+                CloseHandle(read);
+                CloseHandle(write);
+                return Err(e);
+            }
+            let wfd =
+                crt::_open_osfhandle(write as crt::intptr_t, crt::O_WRONLY | crt::O_NOINHERIT);
+            if wfd < 0 {
+                let e = last_crt_error_to_py(None);
+                crt::_close(rfd); // closes `read` (the fd owns it)
+                CloseHandle(write);
+                return Err(e);
+            }
+            Ok(Object::new_tuple(vec![
+                Object::Int(i64::from(rfd)),
+                Object::Int(i64::from(wfd)),
+            ]))
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         Err(crate::error::not_implemented_error(
             "os.pipe() is only implemented on POSIX in WeavePy",
@@ -3738,8 +4271,9 @@ fn os_pipe(_args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
+// POSIX-only (no pty on NT); the registration is `#[cfg(unix)]`.
+#[cfg(unix)]
 fn os_openpty(_args: &[Object]) -> Result<Object, RuntimeError> {
-    #[cfg(unix)]
     {
         let mut master: libc::c_int = -1;
         let mut slave: libc::c_int = -1;
@@ -3768,12 +4302,6 @@ fn os_openpty(_args: &[Object]) -> Result<Object, RuntimeError> {
             Object::Int(i64::from(master)),
             Object::Int(i64::from(slave)),
         ]))
-    }
-    #[cfg(not(unix))]
-    {
-        Err(crate::error::not_implemented_error(
-            "os.openpty() is only implemented on POSIX in WeavePy",
-        ))
     }
 }
 
@@ -3838,7 +4366,27 @@ fn os_dup(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         Ok(Object::Int(i64::from(new)))
     }
-    #[cfg(not(unix))]
+    // Windows: CRT `_dup`, then clear the duplicate handle's inheritance
+    // flag — CPython's `os.dup` goes through `_Py_dup`, which makes the new
+    // descriptor non-inheritable (PEP 446). `_dup` itself duplicates the
+    // handle *inheritable*, so the explicit clear is load-bearing.
+    #[cfg(windows)]
+    {
+        use crate::stdlib::nt_support::{crt, last_crt_error_to_py, last_win32_error_to_py};
+        use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+        let new = unsafe { crt::_dup(fd) };
+        if new < 0 {
+            return Err(last_crt_error_to_py(None));
+        }
+        let handle = unsafe { crt::_get_osfhandle(new) };
+        if unsafe { SetHandleInformation(handle as *mut std::ffi::c_void, HANDLE_FLAG_INHERIT, 0) }
+            == 0
+        {
+            return Err(last_win32_error_to_py(None));
+        }
+        Ok(Object::Int(i64::from(new)))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = fd;
         Err(crate::error::not_implemented_error(
@@ -3886,7 +4434,25 @@ fn os_dup2(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runti
         }
         Ok(Object::Int(i64::from(new)))
     }
-    #[cfg(not(unix))]
+    // Windows: CRT `_dup2` (0 on success), then set the target handle's
+    // inheritance to match `inheritable` — CPython's `os_dup2_impl` calls
+    // `_Py_set_inheritable` on `fd2` after the dup.
+    #[cfg(windows)]
+    {
+        use crate::stdlib::nt_support::{crt, last_crt_error_to_py, last_win32_error_to_py};
+        use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+        let rc = unsafe { crt::_dup2(fd, newfd) };
+        if rc != 0 {
+            return Err(last_crt_error_to_py(None));
+        }
+        let handle = unsafe { crt::_get_osfhandle(newfd) };
+        let flag = if inheritable { HANDLE_FLAG_INHERIT } else { 0 };
+        if unsafe { SetHandleInformation(handle as _, HANDLE_FLAG_INHERIT, flag) } == 0 {
+            return Err(last_win32_error_to_py(None));
+        }
+        Ok(Object::Int(i64::from(newfd)))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (fd, newfd, inheritable);
         Err(crate::error::not_implemented_error(
@@ -3921,7 +4487,17 @@ fn os_lseek(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         Ok(Object::Int(off as i64))
     }
-    #[cfg(not(unix))]
+    // Windows: the CRT's 64-bit seek (`_lseeki64`), CPython's `os_lseek_impl`.
+    #[cfg(windows)]
+    {
+        use crate::stdlib::nt_support::{crt, last_crt_error_to_py};
+        let off = unsafe { crt::_lseeki64(fd, pos, how) };
+        if off < 0 {
+            return Err(last_crt_error_to_py(None));
+        }
+        Ok(Object::Int(off))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (fd, pos, how);
         Err(crate::error::not_implemented_error(
@@ -3966,7 +4542,37 @@ fn os_truncate(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         Ok(Object::None)
     }
-    #[cfg(not(unix))]
+    // Windows has no path `truncate(2)`: CPython opens the file write-only
+    // and sizes it with `_chsize_s` (posixmodule.c `os_truncate_impl` under
+    // `MS_WINDOWS`).
+    #[cfg(windows)]
+    {
+        use crate::stdlib::nt_support::{crt, crt_error_to_py, wide};
+        if p.as_bytes().contains(&0) {
+            return Err(value_error("embedded null byte"));
+        }
+        let wpath = wide(&p);
+        let mut fd: i32 = -1;
+        let err = unsafe {
+            crt::_wsopen_s(
+                &raw mut fd,
+                wpath.as_ptr(),
+                crt::O_WRONLY | crt::O_BINARY | crt::O_NOINHERIT,
+                crt::SH_DENYNO,
+                0,
+            )
+        };
+        if err != 0 {
+            return Err(crt_error_to_py(err, Some(&p)));
+        }
+        let rc = unsafe { crt::_chsize_s(fd, length) };
+        unsafe { crt::_close(fd) };
+        if rc != 0 {
+            return Err(crt_error_to_py(rc, Some(&p)));
+        }
+        Ok(Object::None)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (p, length);
         Err(crate::error::not_implemented_error(
@@ -4009,7 +4615,18 @@ fn os_ftruncate(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         Ok(Object::None)
     }
-    #[cfg(not(unix))]
+    // Windows: `_chsize_s` (CPython's `os_ftruncate_impl`); it returns the
+    // errno directly rather than setting the TLS `errno`.
+    #[cfg(windows)]
+    {
+        use crate::stdlib::nt_support::{crt, crt_error_to_py};
+        let rc = unsafe { crt::_chsize_s(fd, length) };
+        if rc != 0 {
+            return Err(crt_error_to_py(rc, None));
+        }
+        Ok(Object::None)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (fd, length);
         Err(crate::error::not_implemented_error(
@@ -4036,7 +4653,24 @@ fn os_get_inheritable(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         Ok(Object::Bool(flags & libc::FD_CLOEXEC == 0))
     }
-    #[cfg(not(unix))]
+    // Windows: inheritance lives on the *handle* — CPython's
+    // `_Py_get_inheritable` reads `GetHandleInformation`'s
+    // `HANDLE_FLAG_INHERIT` bit for the fd's OS handle.
+    #[cfg(windows)]
+    {
+        use crate::stdlib::nt_support::{crt, crt_error_to_py, last_win32_error_to_py};
+        use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE_FLAG_INHERIT};
+        let handle = unsafe { crt::_get_osfhandle(fd) };
+        if handle == -1 || handle == -2 {
+            return Err(crt_error_to_py(crate::py_errno::EBADF, None));
+        }
+        let mut flags: u32 = 0;
+        if unsafe { GetHandleInformation(handle as _, &raw mut flags) } == 0 {
+            return Err(last_win32_error_to_py(None));
+        }
+        Ok(Object::Bool(flags & HANDLE_FLAG_INHERIT != 0))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = fd;
         Err(crate::error::not_implemented_error(
@@ -4078,7 +4712,23 @@ fn os_set_inheritable(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         Ok(Object::None)
     }
-    #[cfg(not(unix))]
+    // Windows: `SetHandleInformation(HANDLE_FLAG_INHERIT, …)` on the fd's
+    // handle (CPython's `_Py_set_inheritable`).
+    #[cfg(windows)]
+    {
+        use crate::stdlib::nt_support::{crt, crt_error_to_py, last_win32_error_to_py};
+        use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+        let handle = unsafe { crt::_get_osfhandle(fd) };
+        if handle == -1 || handle == -2 {
+            return Err(crt_error_to_py(crate::py_errno::EBADF, None));
+        }
+        let flag = if inheritable { HANDLE_FLAG_INHERIT } else { 0 };
+        if unsafe { SetHandleInformation(handle as _, HANDLE_FLAG_INHERIT, flag) } == 0 {
+            return Err(last_win32_error_to_py(None));
+        }
+        Ok(Object::None)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (fd, inheritable);
         Err(crate::error::not_implemented_error(
@@ -4097,7 +4747,14 @@ fn os_isatty(args: &[Object]) -> Result<Object, RuntimeError> {
         let r = unsafe { libc::isatty(fd as i32) };
         Ok(Object::Bool(r != 0))
     }
-    #[cfg(not(unix))]
+    // Windows: the CRT's `_isatty` (true for any character device — console,
+    // NUL — exactly like CPython's `os_isatty_impl`).
+    #[cfg(windows)]
+    {
+        let r = unsafe { crate::stdlib::nt_support::crt::_isatty(fd as i32) };
+        Ok(Object::Bool(r != 0))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = fd;
         Ok(Object::Bool(false))
@@ -4136,7 +4793,26 @@ fn os_device_encoding(args: &[Object]) -> Result<Object, RuntimeError> {
             Ok(Object::from_str(codeset))
         }
     }
-    #[cfg(not(unix))]
+    // Windows: CPython's `_Py_device_encoding` — `None` for a non-tty; for a
+    // console fd, `'cp%d'` of the input code page on fd 0 and the output
+    // code page on fds 1/2.
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{GetConsoleCP, GetConsoleOutputCP};
+        if unsafe { crate::stdlib::nt_support::crt::_isatty(fd) } == 0 {
+            return Ok(Object::None);
+        }
+        let cp = match fd {
+            0 => unsafe { GetConsoleCP() },
+            1 | 2 => unsafe { GetConsoleOutputCP() },
+            _ => 0,
+        };
+        if cp == 0 {
+            return Ok(Object::None);
+        }
+        Ok(Object::from_str(format!("cp{cp}")))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = fd;
         Ok(Object::None)
@@ -4183,7 +4859,26 @@ fn os_read(args: &[Object]) -> Result<Object, RuntimeError> {
             return Ok(Object::new_bytes(buf));
         }
     }
-    #[cfg(not(unix))]
+    // Windows: the CRT's `_read` on the fd (CPython's `os_read_impl` →
+    // `_Py_read`). The count parameter is 32-bit, so clamp a larger request
+    // like `_PY_READ_MAX`; a short read is normal and the caller loops.
+    #[cfg(windows)]
+    {
+        let mut buf = vec![0u8; n];
+        let want = u32::try_from(n.min(i32::MAX as usize)).expect("clamped to i32::MAX");
+        let ptr = buf.as_mut_ptr();
+        // Release the GIL like the Unix arm: a pipe read can block
+        // indefinitely and peer threads must keep running.
+        let r = crate::gil::allow_threads_then(|| unsafe {
+            crate::stdlib::nt_support::crt::_read(fd, ptr.cast(), want)
+        });
+        if r < 0 {
+            return Err(crate::stdlib::nt_support::last_crt_error_to_py(None));
+        }
+        buf.truncate(r as usize);
+        Ok(Object::new_bytes(buf))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (fd, n);
         Err(crate::error::not_implemented_error(
@@ -4254,7 +4949,21 @@ fn os_write(args: &[Object]) -> Result<Object, RuntimeError> {
             return Ok(Object::Int(r as i64));
         }
     }
-    #[cfg(not(unix))]
+    // Windows: the CRT's `_write` (CPython's `os_write_impl` → `_Py_write`).
+    // 32-bit count: a longer buffer is written partially and the caller's
+    // write loop (io, subprocess) resumes from the returned count.
+    #[cfg(windows)]
+    {
+        let want = u32::try_from(data.len().min(i32::MAX as usize)).expect("clamped to i32::MAX");
+        let r = crate::gil::allow_threads_then(|| unsafe {
+            crate::stdlib::nt_support::crt::_write(fd, data.as_ptr().cast(), want)
+        });
+        if r < 0 {
+            return Err(crate::stdlib::nt_support::last_crt_error_to_py(None));
+        }
+        Ok(Object::Int(i64::from(r)))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (fd, data);
         Err(crate::error::not_implemented_error(
@@ -4336,7 +5045,50 @@ fn os_times(args: &[Object]) -> Result<Object, RuntimeError> {
     ))
 }
 
-#[cfg(not(unix))]
+/// Windows `os.times` — CPython's `os_times_impl` under `MS_WINDOWS`:
+/// `GetProcessTimes` kernel/user FILETIMEs (100ns units) for `system`/`user`;
+/// the children and elapsed slots are 0 (NT doesn't aggregate child times).
+#[cfg(windows)]
+fn os_times(args: &[Object]) -> Result<Object, RuntimeError> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    require_no_args(args, "times")?;
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let (mut create, mut exit, mut kernel, mut user) = (zero, zero, zero, zero);
+    // SAFETY: the pseudo-handle from GetCurrentProcess is always valid.
+    let ok = unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &raw mut create,
+            &raw mut exit,
+            &raw mut kernel,
+            &raw mut user,
+        )
+    };
+    if ok == 0 {
+        return Err(crate::stdlib::nt_support::last_win32_error_to_py(None));
+    }
+    let secs = |ft: &FILETIME| {
+        let ticks = (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime);
+        ticks as f64 * 1e-7
+    };
+    Ok(struct_seq_instance(
+        times_result_type(),
+        &TIMES_FIELDS,
+        vec![
+            Object::Float(secs(&user)),
+            Object::Float(secs(&kernel)),
+            Object::Float(0.0),
+            Object::Float(0.0),
+            Object::Float(0.0),
+        ],
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn os_times(args: &[Object]) -> Result<Object, RuntimeError> {
     require_no_args(args, "times")?;
     let zero = || Object::Float(0.0);
@@ -4379,7 +5131,36 @@ fn os_get_terminal_size(args: &[Object]) -> Result<Object, RuntimeError> {
             i64::from(ws.ws_row),
         ))
     }
-    #[cfg(not(unix))]
+    // Windows: `GetConsoleScreenBufferInfo` on the fd's handle, raising
+    // `OSError` when it isn't a console (CPython's `os_get_terminal_size_impl`
+    // — the frozen `shutil.get_terminal_size` catches that and falls back).
+    #[cfg(windows)]
+    {
+        use crate::stdlib::nt_support::{crt, crt_error_to_py, last_win32_error_to_py};
+        use windows_sys::Win32::System::Console::{
+            GetConsoleScreenBufferInfo, CONSOLE_SCREEN_BUFFER_INFO,
+        };
+        let fd = match args.first() {
+            Some(Object::Int(n)) => *n as i32,
+            Some(Object::Bool(b)) => i32::from(*b),
+            None | Some(Object::None) => 1, // stdout
+            _ => return Err(type_error("an integer is required")),
+        };
+        let handle = unsafe { crt::_get_osfhandle(fd) };
+        if handle == -1 || handle == -2 {
+            return Err(crt_error_to_py(crate::py_errno::EBADF, None));
+        }
+        // SAFETY: `info` is plain-old-data filled by the call on success.
+        let mut info: CONSOLE_SCREEN_BUFFER_INFO = unsafe { std::mem::zeroed() };
+        if unsafe { GetConsoleScreenBufferInfo(handle as _, &raw mut info) } == 0 {
+            return Err(last_win32_error_to_py(None));
+        }
+        Ok(make_terminal_size(
+            i64::from(info.srWindow.Right - info.srWindow.Left + 1),
+            i64::from(info.srWindow.Bottom - info.srWindow.Top + 1),
+        ))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = args;
         Ok(make_terminal_size(80, 24))
@@ -4408,28 +5189,18 @@ fn os_get_exec_path(_args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::new_list(parts))
 }
 
+// POSIX-only surface (the registrations are `#[cfg(unix)]`; CPython's `nt`
+// module has no uid/gid notion at all).
+#[cfg(unix)]
 fn os_getuid(args: &[Object]) -> Result<Object, RuntimeError> {
     require_no_args(args, "getuid")?;
-    #[cfg(unix)]
-    {
-        Ok(Object::Int(i64::from(unsafe { libc::getuid() })))
-    }
-    #[cfg(not(unix))]
-    {
-        Ok(Object::Int(0))
-    }
+    Ok(Object::Int(i64::from(unsafe { libc::getuid() })))
 }
 
+#[cfg(unix)]
 fn os_getgid(args: &[Object]) -> Result<Object, RuntimeError> {
     require_no_args(args, "getgid")?;
-    #[cfg(unix)]
-    {
-        Ok(Object::Int(i64::from(unsafe { libc::getgid() })))
-    }
-    #[cfg(not(unix))]
-    {
-        Ok(Object::Int(0))
-    }
+    Ok(Object::Int(i64::from(unsafe { libc::getgid() })))
 }
 
 /// Shared id-converter for the `set*id` family. CPython routes these through
@@ -4552,7 +5323,18 @@ fn os_umask(args: &[Object]) -> Result<Object, RuntimeError> {
         let old = unsafe { libc::umask(mask as libc::mode_t) };
         Ok(Object::Int(i64::from(old)))
     }
-    #[cfg(not(unix))]
+    // Windows: CPython exposes `os.umask` via the CRT's `_umask` (only the
+    // `_S_IWRITE` bit is meaningful there, but the returned previous mask
+    // must round-trip).
+    #[cfg(windows)]
+    {
+        unsafe extern "C" {
+            fn _umask(pmode: i32) -> i32;
+        }
+        let old = unsafe { _umask(mask as i32) };
+        Ok(Object::Int(i64::from(old)))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = mask;
         Ok(Object::Int(0))
@@ -4582,7 +5364,31 @@ fn os_symlink(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
             .map_err(|e| crate::error::io_error_to_py_named2(&e, Some(&src), Some(&dst)))?;
         Ok(Object::None)
     }
-    #[cfg(not(unix))]
+    // Windows: file and directory links are distinct object types
+    // (`CreateSymbolicLinkW` flag), selected by `target_is_directory` —
+    // exactly CPython's `os_symlink_impl` under `MS_WINDOWS`.
+    #[cfg(windows)]
+    {
+        let target_is_directory = match args.get(2).or_else(|| {
+            kwargs
+                .iter()
+                .find(|(k, _)| k == "target_is_directory")
+                .map(|(_, v)| v)
+        }) {
+            None | Some(Object::None) => false,
+            Some(Object::Bool(b)) => *b,
+            Some(Object::Int(n)) => *n != 0,
+            Some(_) => return Err(type_error("symlink() target_is_directory must be bool")),
+        };
+        let res = if target_is_directory {
+            std::os::windows::fs::symlink_dir(&src, &dst)
+        } else {
+            std::os::windows::fs::symlink_file(&src, &dst)
+        };
+        res.map_err(|e| crate::error::io_error_to_py_named2(&e, Some(&src), Some(&dst)))?;
+        Ok(Object::None)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (src, dst);
         Err(crate::error::not_implemented_error(
@@ -4605,7 +5411,8 @@ fn os_link(args: &[Object]) -> Result<Object, RuntimeError> {
 /// best-effort `lchmod` behaviour on Linux).
 /// `os.fchmod(fd, mode)` — change the permission bits of an open file
 /// descriptor (`posix.fchmod`; `test_posix.test_fchmod_file`). A thin
-/// wrapper over `fchmod(2)`.
+/// wrapper over `fchmod(2)`. Unix-only, like CPython (`HAVE_FCHMOD`).
+#[cfg(unix)]
 fn os_fchmod(args: &[Object]) -> Result<Object, RuntimeError> {
     let fd = match args.first() {
         Some(Object::Int(n)) => *n,
@@ -4615,29 +5422,24 @@ fn os_fchmod(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Int(m)) => *m,
         _ => return Err(type_error("fchmod() mode must be int")),
     };
-    #[cfg(unix)]
-    {
-        // SAFETY: plain syscall on a caller-supplied descriptor.
-        let rc = unsafe { libc::fchmod(fd as libc::c_int, mode as libc::mode_t) };
-        if rc != 0 {
-            return Err(crate::error::io_error_to_py(
-                &std::io::Error::last_os_error(),
-            ));
-        }
-        Ok(Object::None)
+    // SAFETY: plain syscall on a caller-supplied descriptor.
+    let rc = unsafe { libc::fchmod(fd as libc::c_int, mode as libc::mode_t) };
+    if rc != 0 {
+        return Err(crate::error::io_error_to_py(
+            &std::io::Error::last_os_error(),
+        ));
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (fd, mode);
-        Err(crate::error::not_implemented_error("fchmod is POSIX-only"))
-    }
+    Ok(Object::None)
 }
 
 fn os_chmod(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     reject_dir_fd(kwargs, "chmod")?;
     // CPython's `os.chmod` accepts an open file descriptor in place of a path
     // and dispatches to `fchmod(2)` (`test_posix.test_fchmod_file` calls
-    // `posix.chmod(fd, mode)`).
+    // `posix.chmod(fd, mode)`) — but only where `HAVE_FCHMOD`; on Windows the
+    // path converter rejects the fd form, so an int falls through to the path
+    // conversion below and raises `TypeError` there, matching CPython.
+    #[cfg(unix)]
     if let Some(Object::Int(_)) = args.first() {
         return os_fchmod(args);
     }
@@ -4679,7 +5481,25 @@ fn os_chmod(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runt
         std::fs::set_permissions(&p, perms).map_err(|e| path_io_err(&e, args.first(), &p))?;
         Ok(Object::None)
     }
-    #[cfg(not(unix))]
+    // Windows: the only chmod-able bit is FILE_ATTRIBUTE_READONLY, driven by
+    // the owner-write bit — CPython's `os_chmod_impl` sets the attribute iff
+    // `!(mode & _S_IWRITE)`. `follow_symlinks` is accepted-and-ignored like
+    // CPython's default there (the attribute lives on the target).
+    #[cfg(windows)]
+    {
+        let _ = follow;
+        let mut perms = std::fs::metadata(&p)
+            .map_err(|e| path_io_err(&e, args.first(), &p))?
+            .permissions();
+        // Clearing readonly is exactly the requested operation here, not an
+        // oversight (the clippy lint guards accidental world-writability,
+        // which has no NT analogue).
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(mode & 0o200 == 0);
+        std::fs::set_permissions(&p, perms).map_err(|e| path_io_err(&e, args.first(), &p))?;
+        Ok(Object::None)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (p, mode, follow);
         Ok(Object::None)
@@ -4745,7 +5565,80 @@ fn os_utime(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runt
         }
         Ok(Object::None)
     }
-    #[cfg(not(unix))]
+    // Windows has no `utimensat`: CPython's `os_utime_impl` opens the file
+    // with `FILE_WRITE_ATTRIBUTES` (+ `FILE_FLAG_BACKUP_SEMANTICS` so
+    // directories open too, + `OPEN_REPARSE_POINT` when not following
+    // symlinks) and calls `SetFileTime`.
+    #[cfg(windows)]
+    {
+        use crate::stdlib::nt_support::{last_win32_error_to_py, wide};
+        use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, SetFileTime, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
+            OPEN_EXISTING,
+        };
+        use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
+        // Nanoseconds-since-epoch → FILETIME (100ns ticks since 1601-01-01).
+        const EPOCH_DELTA_100NS: i64 = 116_444_736_000_000_000;
+        let to_filetime = |ns: i64| {
+            let ticks = (ns.div_euclid(100) + EPOCH_DELTA_100NS) as u64;
+            FILETIME {
+                dwLowDateTime: (ticks & 0xFFFF_FFFF) as u32,
+                dwHighDateTime: (ticks >> 32) as u32,
+            }
+        };
+        let (aft, mft) = if let Some(ns_obj) = ns {
+            let (a, m) = utime_pair_int(&ns_obj, "ns")?;
+            (to_filetime(a), to_filetime(m))
+        } else if let Some(t_obj) = times {
+            let (a, m) = utime_pair_float(&t_obj, "times")?;
+            (to_filetime((a * 1e9) as i64), to_filetime((m * 1e9) as i64))
+        } else {
+            // SAFETY: plain out-param fill.
+            let mut now = FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            };
+            unsafe { GetSystemTimeAsFileTime(&raw mut now) };
+            (now, now)
+        };
+        let mut flags = FILE_FLAG_BACKUP_SEMANTICS;
+        if !dir_entry_follow(kwargs) {
+            flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+        }
+        if p.as_bytes().contains(&0) {
+            return Err(value_error("embedded null character in path"));
+        }
+        let wpath = wide(&p);
+        // SAFETY: `wpath` outlives the call; the handle is closed on every path.
+        let handle = unsafe {
+            CreateFileW(
+                wpath.as_ptr(),
+                FILE_WRITE_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                flags,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(last_win32_error_to_py(Some(&p)));
+        }
+        let ok = unsafe { SetFileTime(handle, std::ptr::null(), &raw const aft, &raw const mft) };
+        let err = if ok == 0 {
+            Some(last_win32_error_to_py(Some(&p)))
+        } else {
+            None
+        };
+        unsafe { CloseHandle(handle) };
+        match err {
+            Some(e) => Err(e),
+            None => Ok(Object::None),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (times, ns);
         std::fs::metadata(&p).map_err(|e| crate::error::io_error_to_py(&e))?;
@@ -4768,7 +5661,7 @@ fn reject_dir_fd(kwargs: &[(String, Object)], func: &str) -> Result<(), RuntimeE
 
 /// Split a 2-element `(atime, mtime)` int/tuple-or-list into a pair of i64
 /// nanoseconds for `os.utime(ns=…)`.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn utime_pair_int(o: &Object, name: &str) -> Result<(i64, i64), RuntimeError> {
     let (a, b) = utime_pair(o, name)?;
     let to_i = |x: &Object| {
@@ -4780,7 +5673,7 @@ fn utime_pair_int(o: &Object, name: &str) -> Result<(i64, i64), RuntimeError> {
 
 /// Split a 2-element `(atime, mtime)` float-seconds tuple-or-list for
 /// `os.utime(times=…)`.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn utime_pair_float(o: &Object, name: &str) -> Result<(f64, f64), RuntimeError> {
     let (a, b) = utime_pair(o, name)?;
     let to_f = |x: &Object| {
@@ -4792,7 +5685,7 @@ fn utime_pair_float(o: &Object, name: &str) -> Result<(f64, f64), RuntimeError> 
     Ok((to_f(&a)?, to_f(&b)?))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn utime_pair(o: &Object, name: &str) -> Result<(Object, Object), RuntimeError> {
     // CPython requires a *tuple* of exactly two items for both `times` and `ns`
     // — a list (or any other sequence) raises TypeError, and a wrong arity too
@@ -4823,6 +5716,342 @@ fn secs_to_timespec(s: f64) -> libc::timespec {
     libc::timespec {
         tv_sec: sec as libc::time_t,
         tv_nsec: nsec.clamp(0, 999_999_999) as _,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RFC 0063 WS1 — the NT-only `os`/`nt` surface (posixmodule.c, MS_WINDOWS).
+// ---------------------------------------------------------------------------
+
+/// `os.getlogin()` on Windows — `GetUserNameW` (CPython's `os_getlogin_impl`
+/// under `MS_WINDOWS`; the POSIX branch reads the controlling tty instead).
+#[cfg(windows)]
+fn os_getlogin(args: &[Object]) -> Result<Object, RuntimeError> {
+    use windows_sys::Win32::System::WindowsProgramming::GetUserNameW;
+    require_no_args(args, "getlogin")?;
+    // UNLEN (256) + NUL, the buffer CPython sizes too.
+    let mut buf = [0u16; 257];
+    let mut len = buf.len() as u32;
+    // SAFETY: `len` tells the API the buffer capacity; it returns the
+    // written length including the terminator.
+    if unsafe { GetUserNameW(buf.as_mut_ptr(), &raw mut len) } == 0 {
+        return Err(crate::stdlib::nt_support::last_win32_error_to_py(None));
+    }
+    let n = len.saturating_sub(1) as usize;
+    Ok(Object::from_str(crate::stdlib::nt_support::from_wide(
+        &buf[..n],
+    )))
+}
+
+/// `os.startfile(filepath, operation='open', arguments='', cwd=None,
+/// show_cmd=1)` — `ShellExecuteW`, mirroring CPython's `os_startfile_impl`.
+#[cfg(windows)]
+fn os_startfile(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    use crate::stdlib::nt_support::wide;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    let path = path_arg_or_kw(args, 0, "filepath", kwargs, "startfile")?;
+    let kw = |name: &str| {
+        kwargs
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+    };
+    let str_arg = |o: Option<Object>, what: &str, default: &str| match o {
+        None | Some(Object::None) => Ok(default.to_owned()),
+        Some(Object::Str(s)) => Ok(s.to_string()),
+        Some(other) => Err(type_error(format!(
+            "startfile() {what} must be str, not {}",
+            other.type_name()
+        ))),
+    };
+    let operation = str_arg(
+        args.get(1).cloned().or_else(|| kw("operation")),
+        "operation",
+        "open",
+    )?;
+    let arguments = str_arg(
+        args.get(2).cloned().or_else(|| kw("arguments")),
+        "arguments",
+        "",
+    )?;
+    let cwd = match args.get(3).cloned().or_else(|| kw("cwd")) {
+        None | Some(Object::None) => None,
+        Some(o) => Some(path_to_string(&o, "startfile")?),
+    };
+    let show_cmd = match args.get(4).cloned().or_else(|| kw("show_cmd")) {
+        None | Some(Object::None) => 1,
+        Some(o) => {
+            o.as_i64()
+                .ok_or_else(|| type_error("startfile() show_cmd must be int"))? as i32
+        }
+    };
+    let wpath = wide(&path);
+    let wop = wide(&operation);
+    let wargs = (!arguments.is_empty()).then(|| wide(&arguments));
+    let wcwd = cwd.as_deref().map(wide);
+    // SAFETY: every wide buffer outlives the call; NULL selects the default.
+    let rc = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            wop.as_ptr(),
+            wpath.as_ptr(),
+            wargs.as_ref().map_or(std::ptr::null(), |w| w.as_ptr()),
+            wcwd.as_ref().map_or(std::ptr::null(), |w| w.as_ptr()),
+            show_cmd,
+        )
+    };
+    // The fake-HINSTANCE result encodes failure as a value <= 32, with the
+    // real Win32 error in `GetLastError` — exactly what CPython checks.
+    if rc as isize <= 32 {
+        return Err(crate::stdlib::nt_support::last_win32_error_to_py(Some(
+            &path,
+        )));
+    }
+    Ok(Object::None)
+}
+
+/// `os.fsync(fd)` on Windows — the CRT's `_commit` (which is
+/// `FlushFileBuffers` on the fd's handle), CPython's `os_fsync_impl`.
+#[cfg(windows)]
+fn os_fsync(args: &[Object]) -> Result<Object, RuntimeError> {
+    let fd = match args.first() {
+        Some(Object::Int(i)) => *i as i32,
+        Some(Object::Bool(b)) => {
+            warn_bool_as_fd()?;
+            i32::from(*b)
+        }
+        _ => return Err(type_error("fsync() arg must be int")),
+    };
+    let rc = unsafe { crate::stdlib::nt_support::crt::_commit(fd) };
+    if rc != 0 {
+        return Err(crate::stdlib::nt_support::last_crt_error_to_py(None));
+    }
+    Ok(Object::None)
+}
+
+/// Resolve an NT path helper argument preserving the `str`/`bytes` flavour
+/// (these mirror CPython's `path_t`-converted `nt._get*` helpers, which
+/// return the same type they were given).
+#[cfg(windows)]
+fn nt_path_arg(args: &[Object], func: &str) -> Result<(String, bool), RuntimeError> {
+    let obj = args
+        .first()
+        .ok_or_else(|| type_error(format!("{func}() requires a path argument")))?;
+    let resolved = resolve_fspath_obj(obj, func)?;
+    let want_bytes = matches!(resolved, Object::Bytes(_));
+    let p = match &resolved {
+        Object::Str(s) => s.to_string(),
+        Object::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+        _ => unreachable!("resolve_fspath_obj returns str/bytes"),
+    };
+    if p.as_bytes().contains(&0) {
+        return Err(value_error("embedded null character"));
+    }
+    Ok((p, want_bytes))
+}
+
+/// Re-encode an NT path helper result in the caller's flavour.
+#[cfg(windows)]
+fn nt_path_result(s: String, want_bytes: bool) -> Object {
+    if want_bytes {
+        Object::new_bytes(s.into_bytes())
+    } else {
+        Object::from_str(s)
+    }
+}
+
+/// `nt._getfullpathname(path)` — `GetFullPathNameW`; `ntpath.abspath`'s fast
+/// path (the pure-Python fallback only runs when this name is missing).
+#[cfg(windows)]
+fn nt_getfullpathname(args: &[Object]) -> Result<Object, RuntimeError> {
+    use crate::stdlib::nt_support::{from_wide, last_win32_error_to_py, wide};
+    use windows_sys::Win32::Storage::FileSystem::GetFullPathNameW;
+    let (p, want_bytes) = nt_path_arg(args, "_getfullpathname")?;
+    let wpath = wide(&p);
+    let mut buf = vec![0u16; 1024];
+    loop {
+        // SAFETY: the out-buffer is sized by `buf`; a return value larger
+        // than the capacity is the needed size (retry), 0 is failure.
+        let n = unsafe {
+            GetFullPathNameW(
+                wpath.as_ptr(),
+                buf.len() as u32,
+                buf.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        if n == 0 {
+            return Err(last_win32_error_to_py(Some(&p)));
+        }
+        if (n as usize) <= buf.len() {
+            return Ok(nt_path_result(from_wide(&buf[..n as usize]), want_bytes));
+        }
+        buf.resize(n as usize, 0);
+    }
+}
+
+/// `nt._getfinalpathname(path)` — open the file (backup semantics so
+/// directories work) and ask `GetFinalPathNameByHandleW` for the resolved
+/// DOS-style name; `ntpath.realpath`'s primary resolution step.
+#[cfg(windows)]
+fn nt_getfinalpathname(args: &[Object]) -> Result<Object, RuntimeError> {
+    use crate::stdlib::nt_support::{from_wide, last_win32_error_to_py, wide};
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFinalPathNameByHandleW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    let (p, want_bytes) = nt_path_arg(args, "_getfinalpathname")?;
+    let wpath = wide(&p);
+    // SAFETY: `wpath` outlives the call; the handle is closed on every path.
+    let handle = unsafe {
+        CreateFileW(
+            wpath.as_ptr(),
+            0, // attribute access only
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(last_win32_error_to_py(Some(&p)));
+    }
+    let mut buf = vec![0u16; 1024];
+    loop {
+        // 0 = FILE_NAME_NORMALIZED | VOLUME_NAME_DOS, CPython's flags.
+        let n = unsafe { GetFinalPathNameByHandleW(handle, buf.as_mut_ptr(), buf.len() as u32, 0) };
+        if n == 0 {
+            let e = last_win32_error_to_py(Some(&p));
+            unsafe { CloseHandle(handle) };
+            return Err(e);
+        }
+        if (n as usize) <= buf.len() {
+            unsafe { CloseHandle(handle) };
+            return Ok(nt_path_result(from_wide(&buf[..n as usize]), want_bytes));
+        }
+        buf.resize(n as usize, 0);
+    }
+}
+
+/// `nt._getvolumepathname(path)` — `GetVolumePathNameW`, the mount point of
+/// the volume containing `path` (`ntpath.ismount`).
+#[cfg(windows)]
+fn nt_getvolumepathname(args: &[Object]) -> Result<Object, RuntimeError> {
+    use crate::stdlib::nt_support::{from_wide_nul, last_win32_error_to_py, wide};
+    use windows_sys::Win32::Storage::FileSystem::GetVolumePathNameW;
+    let (p, want_bytes) = nt_path_arg(args, "_getvolumepathname")?;
+    let wpath = wide(&p);
+    // The mount point is never longer than the input path; CPython sizes the
+    // buffer the same way (with a MAX_PATH floor).
+    let mut buf = vec![0u16; wpath.len().max(260)];
+    // SAFETY: the out-buffer is sized by `buf`.
+    if unsafe { GetVolumePathNameW(wpath.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } == 0 {
+        return Err(last_win32_error_to_py(Some(&p)));
+    }
+    Ok(nt_path_result(from_wide_nul(&buf), want_bytes))
+}
+
+/// `nt._getdiskusage(path)` — `GetDiskFreeSpaceExW`, returning the
+/// `(total, free)` pair the frozen `shutil.disk_usage` expects on nt.
+#[cfg(windows)]
+fn nt_getdiskusage(args: &[Object]) -> Result<Object, RuntimeError> {
+    use crate::stdlib::nt_support::{last_win32_error_to_py, wide};
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let (p, _) = nt_path_arg(args, "_getdiskusage")?;
+    let wpath = wide(&p);
+    let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
+    // SAFETY: three plain out-params.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wpath.as_ptr(),
+            &raw mut avail,
+            &raw mut total,
+            &raw mut free,
+        )
+    };
+    if ok == 0 {
+        return Err(last_win32_error_to_py(Some(&p)));
+    }
+    Ok(Object::new_tuple(vec![
+        Object::Int(total as i64),
+        Object::Int(free as i64),
+    ]))
+}
+
+/// The `(drive_end, root_end)` byte offsets of `ntpath.splitroot(p)`. All
+/// decision bytes are ASCII (`\\ / : ? u n c`), so the offsets always land
+/// on UTF-8 boundaries and the caller can slice either flavour with them.
+/// Port of posixmodule.c's `os__path_splitroot_ex_impl`.
+#[cfg(windows)]
+fn nt_splitroot_indices(s: &[u8]) -> (usize, usize) {
+    let is_sep = |b: u8| b == b'\\' || b == b'/';
+    if s.first().copied().is_some_and(is_sep) {
+        if s.get(1).copied().is_some_and(is_sep) {
+            // UNC (`\\server\share`) or extended UNC (`\\?\UNC\server\share`):
+            // the drive runs through the share component.
+            let start = if s.len() >= 8
+                && s[2] == b'?'
+                && is_sep(s[3])
+                && s[4].eq_ignore_ascii_case(&b'u')
+                && s[5].eq_ignore_ascii_case(&b'n')
+                && s[6].eq_ignore_ascii_case(&b'c')
+                && is_sep(s[7])
+            {
+                8
+            } else {
+                2
+            };
+            let Some(index) = (start..s.len()).find(|&i| is_sep(s[i])) else {
+                return (s.len(), s.len());
+            };
+            let Some(index2) = (index + 1..s.len()).find(|&i| is_sep(s[i])) else {
+                return (s.len(), s.len());
+            };
+            (index2, index2 + 1)
+        } else {
+            // Relative to the current drive's root (`\path`).
+            (0, 1)
+        }
+    } else if s.get(1) == Some(&b':') {
+        if s.get(2).copied().is_some_and(is_sep) {
+            (2, 3) // absolute drive path (`C:\path`)
+        } else {
+            (2, 2) // drive-relative (`C:path`)
+        }
+    } else {
+        (0, 0)
+    }
+}
+
+/// `nt._path_splitroot_ex(path)` → `(drive, root, tail)`, preserving the
+/// argument's `str`/`bytes` flavour; `ntpath.splitroot`'s fast path.
+#[cfg(windows)]
+fn nt_path_splitroot_ex(args: &[Object]) -> Result<Object, RuntimeError> {
+    let obj = args
+        .first()
+        .ok_or_else(|| type_error("_path_splitroot_ex() requires a path argument"))?;
+    let resolved = resolve_fspath_obj(obj, "_path_splitroot_ex")?;
+    match &resolved {
+        Object::Str(s) => {
+            let full = s.to_string();
+            let (d, r) = nt_splitroot_indices(full.as_bytes());
+            Ok(Object::new_tuple(vec![
+                Object::from_str(full[..d].to_owned()),
+                Object::from_str(full[d..r].to_owned()),
+                Object::from_str(full[r..].to_owned()),
+            ]))
+        }
+        Object::Bytes(b) => {
+            let (d, r) = nt_splitroot_indices(b);
+            Ok(Object::new_tuple(vec![
+                Object::new_bytes(b[..d].to_vec()),
+                Object::new_bytes(b[d..r].to_vec()),
+                Object::new_bytes(b[r..].to_vec()),
+            ]))
+        }
+        _ => unreachable!("resolve_fspath_obj returns str/bytes"),
     }
 }
 
@@ -6314,5 +7543,44 @@ mod tests {
         assert_eq!(normpath_lexical("a/./b"), format!("a{sep}b"));
         assert_eq!(normpath_lexical("a/b/../c"), format!("a{sep}c"));
         assert_eq!(normpath_lexical("./"), ".");
+    }
+
+    // `os.makedirs`' split must be `ntpath.split` on Windows: sysconfig
+    // normpaths every install-scheme path to backslashes, so venv hands
+    // `makedirs` `{env}\Lib\site-packages` — a `/`-only split sees one
+    // giant leaf, skips parent creation, and the leaf `mkdir` dies with
+    // ERROR_PATH_NOT_FOUND (the RFC 0063 dist-check venv leg).
+    #[cfg(windows)]
+    #[test]
+    fn nt_split_mirrors_ntpath() {
+        assert_eq!(
+            nt_split(r"C:\venv\Lib\site-packages"),
+            (r"C:\venv\Lib", "site-packages")
+        );
+        assert_eq!(nt_split(r"C:\venv/Lib"), (r"C:\venv", "Lib"));
+        assert_eq!(nt_split(r"C:\x\"), (r"C:\x", ""));
+        assert_eq!(nt_split(r"C:\"), (r"C:\", ""));
+        assert_eq!(nt_split("C:x"), ("C:", "x"));
+        assert_eq!(nt_split("rel"), ("", "rel"));
+        assert_eq!(nt_split(r"a\b"), ("a", "b"));
+        assert_eq!(
+            nt_split(r"\\server\share\dir\f"),
+            (r"\\server\share\dir", "f")
+        );
+        assert_eq!(nt_split(r"\\server\share"), (r"\\server\share", ""));
+        assert_eq!(nt_split(r"\\?\C:\x\y"), (r"\\?\C:\x", "y"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn nt_splitdrive_mirrors_ntpath() {
+        assert_eq!(nt_splitdrive(r"C:\x"), ("C:", r"\x"));
+        assert_eq!(
+            nt_splitdrive(r"\\server\share\x"),
+            (r"\\server\share", r"\x")
+        );
+        assert_eq!(nt_splitdrive(r"\\?\C:\x"), (r"\\?\C:", r"\x"));
+        assert_eq!(nt_splitdrive(r"\x\y"), ("", r"\x\y"));
+        assert_eq!(nt_splitdrive("rel"), ("", "rel"));
     }
 }

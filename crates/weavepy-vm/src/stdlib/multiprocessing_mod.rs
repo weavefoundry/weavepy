@@ -37,10 +37,13 @@
 //! - `_get_command()` — the launcher arg vector (`weavepy
 //!   --multiprocessing-fork PAYLOAD_FD …`) used by the spawn child.
 //!
-//! The implementation is POSIX-only; Windows ports can swap the
-//! `socketpair`/`fork`/`shm_open` paths for `CreateProcess`/named
-//! pipes/CreateFileMapping later. Today's CPython compatibility target
-//! is also POSIX, so this isn't blocking parity.
+//! The Connection/SharedMemory/spawn surface is POSIX-only. On
+//! Windows (RFC 0063 WS2) only [`SemLock`] is provided natively —
+//! over `CreateSemaphoreW`/`WaitForSingleObjectEx`/`ReleaseSemaphore`
+//! per CPython's `MS_WINDOWS` branches in
+//! `Modules/_multiprocessing/semaphore.c` — because the frozen
+//! `multiprocessing` win32 branches route everything else through
+//! `_winapi` (named pipes, `CreateProcess`, `CreateFileMapping`).
 //!
 //! Each primitive is exposed to Python as a [`Object::SimpleNamespace`]
 //! whose dict carries Rust closures stamped with `BuiltinFn`. State
@@ -53,17 +56,66 @@ use crate::object::{DictData, DictKey, Object, PyModule};
 use crate::sync::Rc;
 use crate::sync::RefCell;
 
-/// On non-POSIX hosts we still want to satisfy `import
-/// _multiprocessing` — but every method raises
-/// `NotImplementedError("requires POSIX")` so the user gets a clear
-/// signal instead of a confusing `AttributeError` later.
-#[cfg(not(unix))]
+/// On hosts that are neither POSIX nor NT we still want to satisfy
+/// `import _multiprocessing` — the module is almost empty so the user
+/// gets a clear `AttributeError` naming the missing primitive.
+#[cfg(not(any(unix, windows)))]
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     let dict = Rc::new(RefCell::new(DictData::default()));
     dict.borrow_mut().insert(
         DictKey(Object::from_static("__name__")),
         Object::from_static("_multiprocessing"),
     );
+    Rc::new(PyModule {
+        name: "_multiprocessing".to_owned(),
+        filename: None,
+        dict,
+    })
+}
+
+/// The NT `_multiprocessing` (RFC 0063 WS2). CPython's Windows module
+/// exports exactly `SemLock` + the kind/limit constants — no
+/// `sem_unlink` (that's `#ifndef MS_WINDOWS` in
+/// `Modules/_multiprocessing/semaphore.c`; the frozen callers guard on
+/// platform), no `_posixshmem` surface (shared memory on NT goes
+/// through `_winapi.CreateFileMapping` in the frozen layer), and no
+/// Connection/Pipe (frozen `connection.py`'s win32 branch is built on
+/// `_winapi` named pipes).
+#[cfg(windows)]
+pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
+    let dict = Rc::new(RefCell::new(DictData::default()));
+    {
+        let mut d = dict.borrow_mut();
+        d.insert(
+            DictKey(Object::from_static("__name__")),
+            Object::from_static("_multiprocessing"),
+        );
+        d.insert(
+            DictKey(Object::from_static("__doc__")),
+            Object::from_static(
+                "Low-level multiprocessing primitives (NT arm). Used by \
+                 the frozen `multiprocessing` module to back `Process`, \
+                 `Pool`, `Queue`, etc. (RFC 0063)",
+            ),
+        );
+        d.insert(
+            DictKey(Object::from_static("SemLock")),
+            Object::Type(nt_semlock_type()),
+        );
+        // Same shape as the unix arm: kind selectors consumed by
+        // `multiprocessing/synchronize.py`, plus the placeholder
+        // `flags` entry the unix arm publishes.
+        d.insert(DictKey(Object::from_static("flags")), Object::Int(0));
+        d.insert(
+            DictKey(Object::from_static("RECURSIVE_MUTEX")),
+            Object::Int(0),
+        );
+        d.insert(DictKey(Object::from_static("SEMAPHORE")), Object::Int(1));
+        d.insert(
+            DictKey(Object::from_static("SEM_VALUE_MAX")),
+            Object::Int(NT_SEM_VALUE_MAX),
+        );
+    }
     Rc::new(PyModule {
         name: "_multiprocessing".to_owned(),
         filename: None,
@@ -826,6 +878,513 @@ fn service_pending_signals() -> Result<(), RuntimeError> {
 /// `block=`/`timeout=` by keyword.
 #[cfg(unix)]
 fn b_dyn_kw(
+    name: &'static str,
+    body: impl Fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError>
+        + Send
+        + Sync
+        + Clone
+        + 'static,
+) -> Object {
+    Object::Builtin(Rc::new(BuiltinFn::with_kwargs(name, body)))
+}
+
+// ---------------------------------------------------------------------
+// SemLock — NT arm (RFC 0063 WS2)
+// ---------------------------------------------------------------------
+
+// A port of the `MS_WINDOWS` branches of CPython's
+// `Modules/_multiprocessing/semaphore.c`: a kernel semaphore from
+// `CreateSemaphoreW`, waited on with `WaitForSingleObjectEx` and
+// posted with `ReleaseSemaphore`. Both kinds (SEMAPHORE and
+// RECURSIVE_MUTEX) are the same kernel object; the recursive mutex is
+// the maxvalue==1 semaphore plus the per-process `count`/`last_tid`
+// bookkeeping that lets the owning thread re-enter without touching
+// the kernel (semaphore.c's `ISMINE` fast path).
+
+#[cfg(windows)]
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+#[cfg(windows)]
+use std::sync::Arc;
+
+#[cfg(windows)]
+use crate::error::{
+    assertion_error, overflow_error, runtime_error, type_error, value_error, RuntimeError,
+};
+#[cfg(windows)]
+use crate::object::BuiltinFn;
+#[cfg(windows)]
+use crate::stdlib::nt_support::{last_win32_error_to_py, win32_error_to_py};
+#[cfg(windows)]
+use crate::types::{PyInstance, TypeFlags, TypeObject};
+
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, ERROR_TOO_MANY_POSTS, HANDLE, WAIT_FAILED, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{
+    CreateSemaphoreW, ReleaseSemaphore, WaitForSingleObjectEx, INFINITE,
+};
+
+/// `RECURSIVE_MUTEX` kind (matches `multiprocessing/synchronize.py`).
+#[cfg(windows)]
+const NT_RECURSIVE_MUTEX_KIND: i64 = 0;
+
+/// `SemLock.SEM_VALUE_MAX` — semaphore.c defines it as `LONG_MAX` on
+/// Windows (`LONG` is 32-bit there regardless of pointer width).
+#[cfg(windows)]
+const NT_SEM_VALUE_MAX: i64 = 2_147_483_647;
+
+/// Shared state behind an NT `SemLock`. The `HANDLE` is stored as
+/// `isize` so the struct is `Send`/`Sync` without an unsafe impl —
+/// kernel object access is inherently thread-safe. `count`/`last_tid`
+/// are the per-process recursive-mutex bookkeeping (semaphore.c keeps
+/// them as plain C fields under the GIL; atomics keep us honest when
+/// the GIL is dropped across waits).
+#[cfg(windows)]
+struct NtSemInner {
+    handle: isize,
+    kind: i64,
+    maxvalue: i64,
+    /// Kept only as the Python-visible attribute: the OS object is
+    /// unnamed (CPython passes `NULL` to `CreateSemaphoreW`; children
+    /// get the semaphore via handle duplication in `reduction.py`,
+    /// never by name).
+    name: Option<String>,
+    count: AtomicI64,
+    last_tid: AtomicU64,
+}
+
+#[cfg(windows)]
+impl Drop for NtSemInner {
+    fn drop(&mut self) {
+        // semaphore.c `semlock_dealloc`: `SEM_CLOSE(self->handle)`,
+        // i.e. `CloseHandle`. `_rebuild`-adopted handles are owned too
+        // (the duplicate minted by reduction.py belongs to us).
+        unsafe { CloseHandle(self.handle as HANDLE) };
+    }
+}
+
+#[cfg(windows)]
+thread_local! {
+    static NT_SEMLOCK_TYPE: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
+}
+
+/// The `_multiprocessing.SemLock` type (NT arm). Built lazily so
+/// `type(sl).__name__ == 'SemLock'` and the class attributes
+/// (`SEM_VALUE_MAX`, `_rebuild`) resolve — same shape as the unix arm.
+#[cfg(windows)]
+fn nt_semlock_type() -> Rc<TypeObject> {
+    NT_SEMLOCK_TYPE.with(|cell| {
+        if let Some(t) = cell.borrow().clone() {
+            return t;
+        }
+        let mut d = DictData::default();
+        d.insert(
+            DictKey(Object::from_static("__module__")),
+            Object::from_static("_multiprocessing"),
+        );
+        d.insert(
+            DictKey(Object::from_static("__new__")),
+            nt_b_dyn("__new__", nt_semlock_new),
+        );
+        d.insert(
+            DictKey(Object::from_static("__init__")),
+            nt_b_dyn("__init__", |_| Ok(Object::None)),
+        );
+        // Accessed via the class (`SemLock._rebuild(...)`), so a plain
+        // builtin behaves like a staticmethod (no instance binding).
+        d.insert(
+            DictKey(Object::from_static("_rebuild")),
+            nt_b_dyn("_rebuild", nt_semlock_rebuild),
+        );
+        d.insert(
+            DictKey(Object::from_static("SEM_VALUE_MAX")),
+            Object::Int(NT_SEM_VALUE_MAX),
+        );
+        let t = TypeObject::new_with_flags(
+            "SemLock",
+            vec![crate::builtin_types::builtin_types().object_.clone()],
+            d,
+            TypeFlags {
+                is_exception: false,
+                is_builtin: true,
+            },
+        )
+        .expect("SemLock type");
+        *cell.borrow_mut() = Some(t.clone());
+        t
+    })
+}
+
+#[cfg(windows)]
+fn nt_sem_arg_int(args: &[Object], idx: usize, what: &str) -> Result<i64, RuntimeError> {
+    match args.get(idx) {
+        Some(Object::Int(n)) => Ok(*n),
+        Some(Object::Bool(b)) => Ok(i64::from(*b)),
+        _ => Err(type_error(format!("SemLock() {what} must be an int"))),
+    }
+}
+
+/// `_multiprocessing.SemLock(kind, value, maxvalue, name, unlink)` —
+/// NT arm. semaphore.c's `SEM_CREATE(name, value, maxvalue)` is
+/// `CreateSemaphoreW(NULL, value, maxvalue, NULL)`: the OS object is
+/// deliberately *unnamed* (children receive it by handle duplication,
+/// see `reduction.py`), so `name`/`unlink` only feed the Python-level
+/// attribute and are otherwise ignored.
+#[cfg(windows)]
+fn nt_semlock_new(args: &[Object]) -> Result<Object, RuntimeError> {
+    // args[0] is the class object (SemLock); the constructor params
+    // follow it.
+    let kind = nt_sem_arg_int(args, 1, "kind")?;
+    let value = nt_sem_arg_int(args, 2, "value")?;
+    let maxvalue = nt_sem_arg_int(args, 3, "maxvalue")?;
+    if kind != NT_RECURSIVE_MUTEX_KIND && kind != 1 {
+        // semaphore.c semlock_new: "unrecognized kind".
+        return Err(value_error("unrecognized kind"));
+    }
+    if !(0..=NT_SEM_VALUE_MAX).contains(&value) || !(1..=NT_SEM_VALUE_MAX).contains(&maxvalue) {
+        return Err(value_error("semaphore initial value out of range"));
+    }
+    let name = match args.get(4) {
+        Some(Object::Str(s)) => s.to_string(),
+        _ => return Err(type_error("SemLock() name must be a str")),
+    };
+    let handle = unsafe {
+        CreateSemaphoreW(
+            std::ptr::null(),
+            value as i32,
+            maxvalue as i32,
+            std::ptr::null(),
+        )
+    };
+    if handle.is_null() {
+        return Err(last_win32_error_to_py(None));
+    }
+    let inner = Arc::new(NtSemInner {
+        handle: handle as isize,
+        kind,
+        maxvalue,
+        name: Some(name),
+        count: AtomicI64::new(0),
+        last_tid: AtomicU64::new(0),
+    });
+    Ok(nt_make_semlock_instance(&inner))
+}
+
+/// `SemLock._rebuild(handle, kind, maxvalue, name)` — reconstruct in a
+/// `spawn`ed child. On NT the handle arriving here was already
+/// duplicated into this process by `reduction.py`
+/// (`DuplicateHandle`/`steal_handle`), so we simply adopt the int.
+#[cfg(windows)]
+fn nt_semlock_rebuild(args: &[Object]) -> Result<Object, RuntimeError> {
+    let handle = match args.first() {
+        Some(Object::Int(n)) => *n,
+        _ => return Err(type_error("SemLock._rebuild() handle must be an int")),
+    };
+    let kind = nt_sem_arg_int(args, 1, "kind")?;
+    let maxvalue = nt_sem_arg_int(args, 2, "maxvalue")?;
+    let name = match args.get(3) {
+        Some(Object::Str(s)) => Some(s.to_string()),
+        _ => None,
+    };
+    let inner = Arc::new(NtSemInner {
+        handle: handle as isize,
+        kind,
+        maxvalue,
+        name,
+        count: AtomicI64::new(0),
+        last_tid: AtomicU64::new(0),
+    });
+    Ok(nt_make_semlock_instance(&inner))
+}
+
+/// Build the Python-visible `SemLock` instance: attributes plus the
+/// method closures that capture the shared [`NtSemInner`]. Mirrors the
+/// unix arm's surface exactly (synchronize.py drives both the same
+/// way).
+#[cfg(windows)]
+fn nt_make_semlock_instance(inner: &Arc<NtSemInner>) -> Object {
+    let dict = Rc::new(RefCell::new(DictData::default()));
+    {
+        let mut d = dict.borrow_mut();
+        d.insert(
+            DictKey(Object::from_static("handle")),
+            Object::Int(inner.handle as i64),
+        );
+        d.insert(
+            DictKey(Object::from_static("kind")),
+            Object::Int(inner.kind),
+        );
+        d.insert(
+            DictKey(Object::from_static("maxvalue")),
+            Object::Int(inner.maxvalue),
+        );
+        d.insert(
+            DictKey(Object::from_static("name")),
+            match &inner.name {
+                Some(n) => Object::from_str(n.clone()),
+                None => Object::None,
+            },
+        );
+        let a = inner.clone();
+        d.insert(
+            DictKey(Object::from_static("acquire")),
+            nt_b_dyn_kw("acquire", move |args, kwargs| {
+                nt_sem_acquire(&a, args, kwargs)
+            }),
+        );
+        let r = inner.clone();
+        d.insert(
+            DictKey(Object::from_static("release")),
+            nt_b_dyn("release", move |_| nt_sem_release(&r)),
+        );
+        let gv = inner.clone();
+        d.insert(
+            DictKey(Object::from_static("_get_value")),
+            nt_b_dyn("_get_value", move |_| nt_sem_get_value(&gv)),
+        );
+        let ct = inner.clone();
+        d.insert(
+            DictKey(Object::from_static("_count")),
+            nt_b_dyn("_count", move |_| {
+                Ok(Object::Int(ct.count.load(Ordering::SeqCst)))
+            }),
+        );
+        let im = inner.clone();
+        d.insert(
+            DictKey(Object::from_static("_is_mine")),
+            nt_b_dyn("_is_mine", move |_| {
+                let me = crate::gil::current_thread_id();
+                Ok(Object::Bool(
+                    im.last_tid.load(Ordering::SeqCst) == me && im.count.load(Ordering::SeqCst) > 0,
+                ))
+            }),
+        );
+        let iz = inner.clone();
+        d.insert(
+            DictKey(Object::from_static("_is_zero")),
+            nt_b_dyn("_is_zero", move |_| nt_sem_is_zero(&iz)),
+        );
+        // No fork on NT, but synchronize.py calls this from
+        // `__setstate__`-adjacent paths portably; semaphore.c compiles
+        // it unconditionally too.
+        let af = inner.clone();
+        d.insert(
+            DictKey(Object::from_static("_after_fork")),
+            nt_b_dyn("_after_fork", move |_| {
+                af.count.store(0, Ordering::SeqCst);
+                Ok(Object::None)
+            }),
+        );
+        let en = inner.clone();
+        d.insert(
+            DictKey(Object::from_static("__enter__")),
+            nt_b_dyn_kw("__enter__", move |args, kwargs| {
+                nt_sem_acquire(&en, args, kwargs)
+            }),
+        );
+        let ex = inner.clone();
+        d.insert(
+            DictKey(Object::from_static("__exit__")),
+            nt_b_dyn("__exit__", move |_| {
+                nt_sem_release(&ex)?;
+                Ok(Object::None)
+            }),
+        );
+    }
+    let inst = Rc::new(PyInstance {
+        class: crate::sync::RefCell::new(nt_semlock_type()),
+        dict,
+        native: std::sync::OnceLock::new(),
+        inline_values: crate::sync::Cell::new(true),
+        slots: crate::sync::RefCell::new(None),
+        hash_cache: crate::sync::Cell::new(None),
+        finalize_ran: crate::sync::Cell::new(false),
+        c_body: crate::types::CBody::default(),
+    });
+    Object::Instance(inst)
+}
+
+/// semaphore.c's acquire timeout shaping: non-blocking → 0ms, `None` →
+/// `INFINITE`, else seconds→ms rounded to nearest with negatives
+/// clamped to 0 and near-`DWORD`-max rejected as `OverflowError`.
+#[cfg(windows)]
+fn nt_timeout_msecs(block: bool, timeout: Option<f64>) -> Result<u32, RuntimeError> {
+    if !block {
+        return Ok(0);
+    }
+    match timeout {
+        None => Ok(INFINITE),
+        Some(t) => {
+            let ms = (t * 1000.0).max(0.0);
+            if ms >= f64::from(u32::MAX) - 0.5 {
+                return Err(overflow_error("timeout is too large"));
+            }
+            Ok((ms + 0.5) as u32)
+        }
+    }
+}
+
+/// `SemLock.acquire(block=True, timeout=None)` — NT arm.
+///
+/// Divergence from semaphore.c: CPython's main thread waits with
+/// `WaitForMultipleObjectsEx` on `{semaphore, _PyOS_SigintEvent()}` so
+/// a console Ctrl-C can interrupt the wait with `EINTR`. WeavePy has
+/// no cross-visible sigint event object, so we issue a plain
+/// `WaitForSingleObjectEx`; Ctrl-C is serviced by the eval loop's
+/// pending-signal check once the wait returns.
+#[cfg(windows)]
+fn nt_sem_acquire(
+    inner: &Arc<NtSemInner>,
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
+    let mut block_obj = args.first().cloned();
+    let mut timeout_obj = args.get(1).cloned();
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "block" | "blocking" => block_obj = Some(v.clone()),
+            "timeout" => timeout_obj = Some(v.clone()),
+            other => {
+                return Err(type_error(format!(
+                    "acquire() got an unexpected keyword argument '{other}'"
+                )))
+            }
+        }
+    }
+    let block = match block_obj {
+        None | Some(Object::None) => true,
+        Some(Object::Bool(b)) => b,
+        Some(Object::Int(i)) => i != 0,
+        Some(_) => true,
+    };
+    let timeout: Option<f64> = match timeout_obj {
+        None | Some(Object::None) => None,
+        Some(Object::Float(f)) => Some(f),
+        Some(Object::Int(i)) => Some(i as f64),
+        Some(_) => None,
+    };
+    let full_msecs = nt_timeout_msecs(block, timeout)?;
+    let me = crate::gil::current_thread_id();
+    // Recursive-mutex re-entry: already mine → just bump the count
+    // (semaphore.c's `ISMINE` shortcut).
+    if inner.kind == NT_RECURSIVE_MUTEX_KIND
+        && inner.last_tid.load(Ordering::SeqCst) == me
+        && inner.count.load(Ordering::SeqCst) > 0
+    {
+        inner.count.fetch_add(1, Ordering::SeqCst);
+        return Ok(Object::Bool(true));
+    }
+    // Uncontended fast path *without* dropping the GIL — semaphore.c
+    // probes with a zero timeout before `Py_BEGIN_ALLOW_THREADS`.
+    let handle = inner.handle;
+    if unsafe { WaitForSingleObjectEx(handle as HANDLE, 0, 0) } == WAIT_OBJECT_0 {
+        inner.last_tid.store(me, Ordering::SeqCst);
+        inner.count.fetch_add(1, Ordering::SeqCst);
+        return Ok(Object::Bool(true));
+    }
+    // Contended: drop the GIL for the real wait (semaphore.c wraps
+    // exactly this region in ALLOW_THREADS).
+    let res = crate::gil::allow_threads_then(move || unsafe {
+        WaitForSingleObjectEx(handle as HANDLE, full_msecs, 0)
+    });
+    match res {
+        WAIT_TIMEOUT => Ok(Object::Bool(false)),
+        WAIT_OBJECT_0 => {
+            inner.last_tid.store(me, Ordering::SeqCst);
+            inner.count.fetch_add(1, Ordering::SeqCst);
+            Ok(Object::Bool(true))
+        }
+        WAIT_FAILED => Err(last_win32_error_to_py(None)),
+        _ => Err(runtime_error(
+            "WaitForSingleObject() or WaitForMultipleObjects() gave unrecognized value",
+        )),
+    }
+}
+
+/// `SemLock.release()` — NT arm.
+#[cfg(windows)]
+fn nt_sem_release(inner: &Arc<NtSemInner>) -> Result<Object, RuntimeError> {
+    let me = crate::gil::current_thread_id();
+    if inner.kind == NT_RECURSIVE_MUTEX_KIND {
+        if !(inner.last_tid.load(Ordering::SeqCst) == me && inner.count.load(Ordering::SeqCst) > 0)
+        {
+            return Err(assertion_error(
+                "attempt to release recursive lock not owned by thread",
+            ));
+        }
+        if inner.count.load(Ordering::SeqCst) > 1 {
+            inner.count.fetch_sub(1, Ordering::SeqCst);
+            return Ok(Object::None);
+        }
+    }
+    // The kernel enforces maxvalue for us: over-releasing fails with
+    // ERROR_TOO_MANY_POSTS, which semaphore.c maps to ValueError.
+    if unsafe { ReleaseSemaphore(inner.handle as HANDLE, 1, std::ptr::null_mut()) } == 0 {
+        let code = unsafe { GetLastError() };
+        if code == ERROR_TOO_MANY_POSTS {
+            return Err(value_error("semaphore or lock released too many times"));
+        }
+        return Err(win32_error_to_py(code as i32, None));
+    }
+    inner.count.fetch_sub(1, Ordering::SeqCst);
+    Ok(Object::None)
+}
+
+/// `SemLock._get_value()` — NT arm. Windows has no `sem_getvalue`;
+/// semaphore.c's `_GetSemaphoreValue` probe-acquires with a zero
+/// timeout and lets `ReleaseSemaphore`'s previous-count out-param
+/// report the value (the undo restores it): acquired → previous + 1,
+/// timed out → 0.
+#[cfg(windows)]
+fn nt_sem_get_value(inner: &Arc<NtSemInner>) -> Result<Object, RuntimeError> {
+    let handle = inner.handle as HANDLE;
+    match unsafe { WaitForSingleObjectEx(handle, 0, 0) } {
+        WAIT_OBJECT_0 => {
+            let mut previous: i32 = 0;
+            if unsafe { ReleaseSemaphore(handle, 1, &mut previous) } == 0 {
+                return Err(last_win32_error_to_py(None));
+            }
+            Ok(Object::Int(i64::from(previous) + 1))
+        }
+        WAIT_TIMEOUT => Ok(Object::Int(0)),
+        _ => Err(last_win32_error_to_py(None)),
+    }
+}
+
+/// `SemLock._is_zero()` — NT arm: zero-timeout probe; a successful
+/// acquire proves the value was non-zero and is immediately undone
+/// (semaphore.c `semlock_iszero`, MS_WINDOWS branch).
+#[cfg(windows)]
+fn nt_sem_is_zero(inner: &Arc<NtSemInner>) -> Result<Object, RuntimeError> {
+    let handle = inner.handle as HANDLE;
+    if unsafe { WaitForSingleObjectEx(handle, 0, 0) } == WAIT_TIMEOUT {
+        return Ok(Object::Bool(true));
+    }
+    unsafe { ReleaseSemaphore(handle, 1, std::ptr::null_mut()) };
+    Ok(Object::Bool(false))
+}
+
+/// NT twin of [`b_dyn`] (the unix builders are `#[cfg(unix)]`).
+#[cfg(windows)]
+fn nt_b_dyn(
+    name: &'static str,
+    body: impl Fn(&[Object]) -> Result<Object, RuntimeError> + Send + Sync + 'static,
+) -> Object {
+    Object::Builtin(Rc::new(BuiltinFn {
+        name,
+        binds_instance: false,
+        call: Box::new(body),
+        call_kw: None,
+    }))
+}
+
+/// NT twin of [`b_dyn_kw`] — `SemLock.acquire` accepts
+/// `block=`/`timeout=` by keyword.
+#[cfg(windows)]
+fn nt_b_dyn_kw(
     name: &'static str,
     body: impl Fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError>
         + Send

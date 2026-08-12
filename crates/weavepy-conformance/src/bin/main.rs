@@ -391,7 +391,10 @@ fn cmd_ecosystem(workspace: &Path, report_dir: &Path, args: EcosystemArgs) -> Re
         report_dir.display()
     );
 
-    if args.strict && summary.unexpected > 0 {
+    // RFC 0063 WS7: on a host OS outside the baseline's `measured_os`
+    // stamp the gate is advisory — the helper prints the NOTE line and
+    // returns false, so the run exits 0 with the reports still written.
+    if args.strict && ecosystem::strict_gate_blocks(&expectations, &summary) {
         anyhow::bail!(
             "{} ecosystem regression(s) — see {}",
             summary.unexpected,
@@ -557,7 +560,10 @@ fn cmd_regrtest(workspace: &Path, report_dir: &Path, args: RegrtestArgs<'_>) -> 
         report_dir.display()
     );
 
-    if args.strict && summary.unexpected > 0 {
+    // RFC 0063 WS7: on a host OS outside the baseline's `measured_os`
+    // stamp the gate is advisory — the helper prints the NOTE line and
+    // returns false, so the run exits 0 with the reports still written.
+    if args.strict && regrtest::strict_gate_blocks(&expectations, &summary) {
         anyhow::bail!(
             "{} regrtest regression(s) — see {}",
             summary.unexpected,

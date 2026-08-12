@@ -205,7 +205,10 @@ pub(crate) fn run(argv: Vec<String>) -> Result<ExitCode> {
         report_dir.display()
     );
 
-    if !cli.no_check && summary.unexpected > 0 {
+    // RFC 0063 WS7: on a host OS outside the baseline's `measured_os`
+    // stamp the gate is advisory — the helper prints the NOTE line and
+    // returns false, so the run exits 0 with the reports still written.
+    if !cli.no_check && weavepy_conformance::regrtest::strict_gate_blocks(&expectations, &summary) {
         return Ok(ExitCode::from(1));
     }
     Ok(ExitCode::SUCCESS)

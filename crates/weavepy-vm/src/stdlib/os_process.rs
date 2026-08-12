@@ -6,21 +6,26 @@
 //! `os` surface gaps (`environb`, `device_encoding`) that `test_os`
 //! probes.
 //!
-//! Everything here is gated to `unix`; the non-POSIX arms raise
-//! `NotImplementedError`, matching the existing `os` primitives in
-//! `os.rs`. Tracks CPython 3.13's `posixmodule.c`.
+//! The POSIX-only surface is gated to `unix` so those names don't exist in
+//! the module dict elsewhere (RFC 0063: CPython-on-Windows exports none of
+//! them). Windows gets its own arms for the portable subset plus the CRT
+//! `spawnv` family. Tracks CPython 3.13's `posixmodule.c`.
 
 #![allow(clippy::unnecessary_wraps)]
 
-use super::os::{builtin, builtin_kw};
+use super::os::builtin;
 #[cfg(unix)]
+use super::os::builtin_kw;
+#[cfg(any(unix, windows))]
 use crate::error::value_error;
 use crate::error::{type_error, RuntimeError};
 use crate::object::{DictData, DictKey, Object};
-// Only the unix-gated helpers (`env_mapping_dict`, `environb_snapshot`)
-// need these; an unconditional import trips `-D warnings` on Windows.
-#[cfg(unix)]
+// Only the unix/windows-gated helpers (`env_mapping_dict`,
+// `environb_snapshot`) need these; an unconditional import trips
+// `-D warnings` on other targets.
+#[cfg(any(unix, windows))]
 use crate::sync::{Rc, RefCell};
+#[cfg(unix)]
 use parking_lot::Mutex;
 
 #[cfg(unix)]
@@ -33,64 +38,106 @@ pub(super) fn register(d: &mut DictData) {
             d.insert(DictKey(Object::from_static($name)), builtin($name, $f));
         };
     }
+    #[cfg_attr(not(unix), allow(unused_macros))]
     macro_rules! reg_kw {
         ($name:literal, $f:expr) => {
             d.insert(DictKey(Object::from_static($name)), builtin_kw($name, $f));
         };
     }
+    #[cfg_attr(not(any(unix, windows)), allow(unused_macros))]
     macro_rules! con {
         ($name:literal, $v:expr) => {
             d.insert(DictKey(Object::from_static($name)), Object::Int($v));
         };
     }
 
-    // --- process creation / replacement ---
-    reg!("fork", os_fork);
+    // RFC 0063 WS1: everything POSIX-only is gated so the names simply do
+    // not exist in the `nt` module dict — CPython-on-Windows exports none of
+    // them, and code in the wild feature-detects with `hasattr(os, 'fork')`
+    // etc., so a raising stub would be worse than absence.
+    #[cfg(unix)]
+    {
+        // --- process creation / replacement ---
+        reg!("fork", os_fork);
+        reg!("execv", os_execv);
+        reg!("execve", os_execve);
+        reg!("execvp", os_execvp);
+        reg!("execvpe", os_execvpe);
+        reg_kw!("posix_spawn", os_posix_spawn);
+        reg_kw!("posix_spawnp", os_posix_spawnp);
+        reg_kw!("register_at_fork", register_at_fork_kw);
+
+        // --- waiting ---
+        reg!("wait", os_wait);
+        reg!("wait3", os_wait3);
+        reg!("wait4", os_wait4);
+
+        // --- W* status macros ---
+        reg!("WIFEXITED", w_ifexited);
+        reg!("WEXITSTATUS", w_exitstatus);
+        reg!("WIFSIGNALED", w_ifsignaled);
+        reg!("WTERMSIG", w_termsig);
+        reg!("WIFSTOPPED", w_ifstopped);
+        reg!("WSTOPSIG", w_stopsig);
+        reg!("WIFCONTINUED", w_ifcontinued);
+        reg!("WCOREDUMP", w_coredump);
+
+        // --- process groups / sessions ---
+        reg!("setsid", os_setsid);
+        reg!("getsid", os_getsid);
+        reg!("setpgid", os_setpgid);
+        reg!("getpgid", os_getpgid);
+        reg!("getpgrp", os_getpgrp);
+        reg!("setpgrp", os_setpgrp);
+        reg!("tcgetpgrp", os_tcgetpgrp);
+        reg!("tcsetpgrp", os_tcsetpgrp);
+        reg!("killpg", os_killpg);
+
+        // --- fd helpers / ids ---
+        reg!("pipe2", os_pipe2);
+        reg!("setuid", os_setuid);
+        reg!("setgid", os_setgid);
+        reg!("setegid", os_setegid);
+        reg!("seteuid", os_seteuid);
+        reg!("setgroups", os_setgroups);
+
+        // `sched_yield` is `HAVE_SCHED_H` surface — absent on Windows.
+        reg!("sched_yield", os_sched_yield);
+
+        // --- W* / wait option constants ---
+        con!("WUNTRACED", i64::from(WUNTRACED));
+        con!("WCONTINUED", i64::from(WCONTINUED));
+
+        // --- posix_spawn file-action selectors (CPython's own enum, 0/1/2) ---
+        con!("POSIX_SPAWN_OPEN", 0);
+        con!("POSIX_SPAWN_CLOSE", 1);
+        con!("POSIX_SPAWN_DUP2", 2);
+
+        // --- sysexits-style exit codes (`<sysexits.h>`, absent on NT) ---
+        con!("EX_OK", 0);
+        con!("EX_USAGE", 64);
+        con!("EX_DATAERR", 65);
+        con!("EX_NOINPUT", 66);
+        con!("EX_NOUSER", 67);
+        con!("EX_NOHOST", 68);
+        con!("EX_UNAVAILABLE", 69);
+        con!("EX_SOFTWARE", 70);
+        con!("EX_OSERR", 71);
+        con!("EX_OSFILE", 72);
+        con!("EX_CANTCREAT", 73);
+        con!("EX_IOERR", 74);
+        con!("EX_TEMPFAIL", 75);
+        con!("EX_PROTOCOL", 76);
+        con!("EX_NOPERM", 77);
+        con!("EX_CONFIG", 78);
+    }
+
+    // --- portable surface (real Windows arms below) ---
     reg!("_exit", os_exit_now);
     reg!("abort", os_abort);
-    reg!("execv", os_execv);
-    reg!("execve", os_execve);
-    reg!("execvp", os_execvp);
-    reg!("execvpe", os_execvpe);
-    reg_kw!("posix_spawn", os_posix_spawn);
-    reg_kw!("posix_spawnp", os_posix_spawnp);
-    reg_kw!("register_at_fork", register_at_fork_kw);
-
-    // --- waiting ---
-    reg!("wait", os_wait);
-    reg!("wait3", os_wait3);
-    reg!("wait4", os_wait4);
-
-    // --- W* status macros ---
-    reg!("WIFEXITED", w_ifexited);
-    reg!("WEXITSTATUS", w_exitstatus);
-    reg!("WIFSIGNALED", w_ifsignaled);
-    reg!("WTERMSIG", w_termsig);
-    reg!("WIFSTOPPED", w_ifstopped);
-    reg!("WSTOPSIG", w_stopsig);
-    reg!("WIFCONTINUED", w_ifcontinued);
-    reg!("WCOREDUMP", w_coredump);
-
-    // --- process groups / sessions ---
-    reg!("setsid", os_setsid);
-    reg!("getsid", os_getsid);
-    reg!("setpgid", os_setpgid);
-    reg!("getpgid", os_getpgid);
-    reg!("getpgrp", os_getpgrp);
-    reg!("setpgrp", os_setpgrp);
-    reg!("tcgetpgrp", os_tcgetpgrp);
-    reg!("tcsetpgrp", os_tcsetpgrp);
-    reg!("killpg", os_killpg);
-    reg!("getppid", os_getppid);
-
-    // --- fd helpers ---
     reg!("closerange", os_closerange);
-    reg!("pipe2", os_pipe2);
-    reg!("setuid", os_setuid);
-    reg!("setgid", os_setgid);
-    reg!("setegid", os_setegid);
-    reg!("seteuid", os_seteuid);
-    reg!("setgroups", os_setgroups);
+    reg!("getppid", os_getppid);
+    reg!("device_encoding", os_device_encoding);
 
     // --- affinity / scheduling ---
     // CPU affinity is a Linux-only surface; CPython doesn't expose
@@ -102,14 +149,7 @@ pub(super) fn register(d: &mut DictData) {
         reg!("sched_getaffinity", os_sched_getaffinity);
         reg!("sched_setaffinity", os_sched_setaffinity);
     }
-    reg!("sched_yield", os_sched_yield);
 
-    // --- small surface gaps test_os probes ---
-    reg!("device_encoding", os_device_encoding);
-
-    // --- W* / wait option constants ---
-    con!("WUNTRACED", i64::from(WUNTRACED));
-    con!("WCONTINUED", i64::from(WCONTINUED));
     #[cfg(target_os = "linux")]
     {
         con!("WEXITED", i64::from(libc::WEXITED));
@@ -119,11 +159,6 @@ pub(super) fn register(d: &mut DictData) {
         con!("P_PID", i64::from(libc::P_PID));
         con!("P_PGID", i64::from(libc::P_PGID));
     }
-
-    // --- posix_spawn file-action selectors (CPython's own enum, 0/1/2) ---
-    con!("POSIX_SPAWN_OPEN", 0);
-    con!("POSIX_SPAWN_CLOSE", 1);
-    con!("POSIX_SPAWN_DUP2", 2);
 
     // --- dynamic-loader (`dlopen(3)`) mode flags ---
     // CPython's `posix`/`os` expose the `RTLD_*` bits used by `ctypes` and by
@@ -142,23 +177,19 @@ pub(super) fn register(d: &mut DictData) {
         con!("RTLD_DEEPBIND", i64::from(libc::RTLD_DEEPBIND));
     }
 
-    // --- sysexits-style exit codes (CPython exposes these) ---
-    con!("EX_OK", 0);
-    con!("EX_USAGE", 64);
-    con!("EX_DATAERR", 65);
-    con!("EX_NOINPUT", 66);
-    con!("EX_NOUSER", 67);
-    con!("EX_NOHOST", 68);
-    con!("EX_UNAVAILABLE", 69);
-    con!("EX_SOFTWARE", 70);
-    con!("EX_OSERR", 71);
-    con!("EX_OSFILE", 72);
-    con!("EX_CANTCREAT", 73);
-    con!("EX_IOERR", 74);
-    con!("EX_TEMPFAIL", 75);
-    con!("EX_PROTOCOL", 76);
-    con!("EX_NOPERM", 77);
-    con!("EX_CONFIG", 78);
+    // --- Windows-only: the CRT spawn family (posixmodule.c `os_spawnv_impl`/
+    // `os_spawnve_impl` under `HAVE_WSPAWNV`) plus its `P_*` mode constants
+    // (`process.h` values). `os.waitpid` accepts the P_NOWAIT handle.
+    #[cfg(windows)]
+    {
+        reg!("spawnv", os_spawnv);
+        reg!("spawnve", os_spawnve);
+        con!("P_WAIT", 0);
+        con!("P_NOWAIT", 1);
+        con!("P_OVERLAY", 2);
+        con!("P_NOWAITO", 3);
+        con!("P_DETACH", 4);
+    }
 
     // `environb` — a bytes-keyed/-valued view of the environment. CPython
     // builds it lazily from the raw `environ` block; we snapshot at import
@@ -174,13 +205,9 @@ pub(super) fn register(d: &mut DictData) {
 
 #[cfg(unix)]
 const WUNTRACED: libc::c_int = libc::WUNTRACED;
-// `WUNTRACED` is a POSIX `wait`-option flag with no Windows analogue; expose the
-// canonical value so `os.WUNTRACED` still resolves (mirrors `WCONTINUED`).
-#[cfg(not(unix))]
-const WUNTRACED: libc::c_int = 0x2;
 #[cfg(target_os = "linux")]
 const WCONTINUED: libc::c_int = libc::WCONTINUED;
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 const WCONTINUED: libc::c_int = 0x10;
 
 // ---------------------------------------------------------------------------
@@ -202,7 +229,7 @@ fn obj_to_cstring(o: &Object, what: &str) -> Result<CString, RuntimeError> {
     CString::new(bytes).map_err(|_| value_error(format!("{what}: embedded null byte")))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn obj_to_int(o: &Object, what: &str) -> Result<i64, RuntimeError> {
     // `as_i64` also unwraps int subclasses (e.g. `signal.Signals` enum
     // members), matching CPython's `__index__` coercion for these args.
@@ -355,7 +382,7 @@ fn obj_to_env_bytes(o: &Object, what: &str) -> Result<Vec<u8>, RuntimeError> {
 /// `os.environb`), whose canonical bytes-keyed store lives in the `_data`
 /// instance attribute. Returns `None` for anything else (e.g. a sequence of
 /// `KEY=VALUE` strings), letting the caller fall back to the sequence path.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn env_mapping_dict(env: &Object) -> Option<Rc<RefCell<DictData>>> {
     match env {
         Object::Dict(d) => Some(d.clone()),
@@ -594,13 +621,6 @@ pub fn process_is_multithreaded() -> bool {
     false
 }
 
-#[cfg(not(unix))]
-fn os_fork(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(crate::error::not_implemented_error(
-        "os.fork() requires POSIX",
-    ))
-}
-
 #[cfg(unix)]
 fn os_exit_now(args: &[Object]) -> Result<Object, RuntimeError> {
     let code = args
@@ -610,7 +630,21 @@ fn os_exit_now(args: &[Object]) -> Result<Object, RuntimeError> {
     unsafe { libc::_exit(code as libc::c_int) }
 }
 
-#[cfg(not(unix))]
+/// Windows `os._exit` — the CRT's `_exit`, which (unlike `exit`) skips
+/// atexit handlers and stdio flushing, matching CPython's `os__exit_impl`.
+#[cfg(windows)]
+fn os_exit_now(args: &[Object]) -> Result<Object, RuntimeError> {
+    unsafe extern "C" {
+        fn _exit(code: i32) -> !;
+    }
+    let code = match args.first() {
+        Some(Object::Int(n)) => *n,
+        _ => 0,
+    };
+    unsafe { _exit(code as i32) }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn os_exit_now(args: &[Object]) -> Result<Object, RuntimeError> {
     let code = match args.first() {
         Some(Object::Int(n)) => *n,
@@ -751,29 +785,149 @@ fn resolve_path(file: &[u8], env: &Object) -> Vec<Vec<u8>> {
     out
 }
 
-#[cfg(not(unix))]
-fn os_execv(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(crate::error::not_implemented_error(
-        "os.execv requires POSIX",
-    ))
+// ---------------------------------------------------------------------------
+// Windows spawn family — the CRT's `_wspawnv`/`_wspawnve` (posixmodule.c
+// `os_spawnv_impl`/`os_spawnve_impl` under `HAVE_WSPAWNV`). `distutils`-era
+// build tooling and `test_os.SpawnTests` drive these; `subprocess` does not
+// (it uses `_winapi.CreateProcess`).
+// ---------------------------------------------------------------------------
+
+/// Collect `argv` (a tuple/list of str) into NUL-terminated wide strings.
+/// CPython rejects an empty argv and an empty `argv[0]` with `ValueError`.
+#[cfg(windows)]
+fn spawn_wide_argv(argv: &Object, what: &str) -> Result<Vec<Vec<u16>>, RuntimeError> {
+    let items: Vec<Object> = match argv {
+        Object::Tuple(t) => t.to_vec(),
+        Object::List(l) => l.borrow().to_vec(),
+        _ => {
+            return Err(type_error(format!(
+                "{what}() arg 2 must be a tuple or list"
+            )))
+        }
+    };
+    if items.is_empty() {
+        return Err(value_error(format!("{what}() arg 2 cannot be empty")));
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        let s = match item {
+            Object::Str(s) => s.to_string(),
+            _ => {
+                return Err(type_error(format!(
+                    "{what}() arg 2 must contain only strings"
+                )))
+            }
+        };
+        if i == 0 && s.is_empty() {
+            return Err(value_error(format!(
+                "{what}() arg 2 first element cannot be empty"
+            )));
+        }
+        if s.as_bytes().contains(&0) {
+            return Err(value_error("embedded null character"));
+        }
+        out.push(crate::stdlib::nt_support::wide(&s));
+    }
+    Ok(out)
 }
-#[cfg(not(unix))]
-fn os_execve(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(crate::error::not_implemented_error(
-        "os.execve requires POSIX",
-    ))
+
+/// Shared implementation for `os.spawnv`/`os.spawnve` on Windows.
+#[cfg(windows)]
+fn spawnv_impl(args: &[Object], with_env: bool, what: &str) -> Result<Object, RuntimeError> {
+    use crate::stdlib::nt_support::{last_crt_error_to_py, wide};
+    unsafe extern "C" {
+        fn _wspawnv(mode: i32, cmdname: *const u16, argv: *const *const u16) -> isize;
+        fn _wspawnve(
+            mode: i32,
+            cmdname: *const u16,
+            argv: *const *const u16,
+            envp: *const *const u16,
+        ) -> isize;
+    }
+    let mode = args
+        .first()
+        .and_then(Object::as_i64)
+        .ok_or_else(|| type_error(format!("{what}() mode must be int")))?;
+    let path = match args.get(1) {
+        Some(Object::Str(s)) => s.to_string(),
+        Some(Object::Bytes(b)) => String::from_utf8_lossy(b).into_owned(),
+        _ => return Err(type_error(format!("{what}() arg 2 must be str"))),
+    };
+    if path.as_bytes().contains(&0) {
+        return Err(value_error("embedded null character"));
+    }
+    let argv = args
+        .get(2)
+        .ok_or_else(|| type_error(format!("{what}(): missing argv")))?;
+    let wargv = spawn_wide_argv(argv, what)?;
+    let mut argv_ptrs: Vec<*const u16> = wargv.iter().map(|w| w.as_ptr()).collect();
+    argv_ptrs.push(std::ptr::null());
+    let wpath = wide(&path);
+    // `P_OVERLAY` replaces the current process, which would tear the VM down
+    // mid-instruction; CPython permits it, but a truthful "not yet" beats a
+    // corrupted interpreter (RFC 0063 truthful-inventory rule).
+    if mode == 2 {
+        return Err(crate::error::not_implemented_error(
+            "os.spawn*: P_OVERLAY is not supported in WeavePy yet",
+        ));
+    }
+    let rc = if with_env {
+        let env = args
+            .get(3)
+            .ok_or_else(|| type_error("spawnve(): missing env"))?;
+        let env_dict =
+            env_mapping_dict(env).ok_or_else(|| type_error("spawnve() arg 4 must be a mapping"))?;
+        let mut wenv: Vec<Vec<u16>> = Vec::new();
+        for (k, v) in env_dict.borrow().iter() {
+            let key = match &k.0 {
+                Object::Str(s) => s.to_string(),
+                Object::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+                _ => return Err(type_error("spawnve() env keys must be str")),
+            };
+            let val = match v {
+                Object::Str(s) => s.to_string(),
+                Object::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+                _ => return Err(type_error("spawnve() env values must be str")),
+            };
+            if key.contains('=') || key.contains('\0') || val.contains('\0') {
+                return Err(value_error("illegal environment variable name"));
+            }
+            wenv.push(wide(&format!("{key}={val}")));
+        }
+        let mut env_ptrs: Vec<*const u16> = wenv.iter().map(|w| w.as_ptr()).collect();
+        env_ptrs.push(std::ptr::null());
+        // SAFETY: NUL-terminated wide argv/envp arrays built above outlive
+        // the call. Release the GIL: P_WAIT blocks until the child exits.
+        crate::gil::allow_threads_then(|| unsafe {
+            _wspawnve(
+                mode as i32,
+                wpath.as_ptr(),
+                argv_ptrs.as_ptr(),
+                env_ptrs.as_ptr(),
+            )
+        })
+    } else {
+        // SAFETY: as above.
+        crate::gil::allow_threads_then(|| unsafe {
+            _wspawnv(mode as i32, wpath.as_ptr(), argv_ptrs.as_ptr())
+        })
+    };
+    if rc == -1 {
+        return Err(last_crt_error_to_py(Some(&path)));
+    }
+    // P_WAIT yields the exit code; P_NOWAIT* a process handle `os.waitpid`
+    // can consume — both returned as-is, like CPython.
+    Ok(Object::Int(rc as i64))
 }
-#[cfg(not(unix))]
-fn os_execvp(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(crate::error::not_implemented_error(
-        "os.execvp requires POSIX",
-    ))
+
+#[cfg(windows)]
+fn os_spawnv(args: &[Object]) -> Result<Object, RuntimeError> {
+    spawnv_impl(args, false, "spawnv")
 }
-#[cfg(not(unix))]
-fn os_execvpe(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(crate::error::not_implemented_error(
-        "os.execvpe requires POSIX",
-    ))
+
+#[cfg(windows)]
+fn os_spawnve(args: &[Object]) -> Result<Object, RuntimeError> {
+    spawnv_impl(args, true, "spawnve")
 }
 
 // ---------------------------------------------------------------------------
@@ -1027,19 +1181,6 @@ fn posix_spawn_impl(
     Ok(Object::Int(i64::from(pid)))
 }
 
-#[cfg(not(unix))]
-fn os_posix_spawn(_args: &[Object], _kw: &[(String, Object)]) -> Result<Object, RuntimeError> {
-    Err(crate::error::not_implemented_error(
-        "os.posix_spawn requires POSIX",
-    ))
-}
-#[cfg(not(unix))]
-fn os_posix_spawnp(_args: &[Object], _kw: &[(String, Object)]) -> Result<Object, RuntimeError> {
-    Err(crate::error::not_implemented_error(
-        "os.posix_spawnp requires POSIX",
-    ))
-}
-
 // ---------------------------------------------------------------------------
 // wait family
 // ---------------------------------------------------------------------------
@@ -1142,27 +1283,8 @@ fn build_rusage(ru: &libc::rusage) -> Object {
     ])
 }
 
-#[cfg(not(unix))]
-fn os_wait(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(crate::error::not_implemented_error(
-        "os.wait requires POSIX",
-    ))
-}
-#[cfg(not(unix))]
-fn os_wait3(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(crate::error::not_implemented_error(
-        "os.wait3 requires POSIX",
-    ))
-}
-#[cfg(not(unix))]
-fn os_wait4(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(crate::error::not_implemented_error(
-        "os.wait4 requires POSIX",
-    ))
-}
-
 // ---------------------------------------------------------------------------
-// W* status macros
+// W* status macros (POSIX-only, like the registrations above)
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
@@ -1174,46 +1296,35 @@ fn status_arg(args: &[Object]) -> Result<libc::c_int, RuntimeError> {
     }
 }
 
+#[cfg(unix)]
 macro_rules! wmacro {
     ($name:ident, bool, $libc:ident) => {
         fn $name(args: &[Object]) -> Result<Object, RuntimeError> {
-            #[cfg(unix)]
-            {
-                Ok(Object::Bool(libc::$libc(status_arg(args)?)))
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = args;
-                Err(crate::error::not_implemented_error(
-                    "W* status macros require POSIX",
-                ))
-            }
+            Ok(Object::Bool(libc::$libc(status_arg(args)?)))
         }
     };
     ($name:ident, int, $libc:ident) => {
         fn $name(args: &[Object]) -> Result<Object, RuntimeError> {
-            #[cfg(unix)]
-            {
-                Ok(Object::Int(i64::from(libc::$libc(status_arg(args)?))))
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = args;
-                Err(crate::error::not_implemented_error(
-                    "W* status macros require POSIX",
-                ))
-            }
+            Ok(Object::Int(i64::from(libc::$libc(status_arg(args)?))))
         }
     };
 }
 
+#[cfg(unix)]
 wmacro!(w_ifexited, bool, WIFEXITED);
+#[cfg(unix)]
 wmacro!(w_exitstatus, int, WEXITSTATUS);
+#[cfg(unix)]
 wmacro!(w_ifsignaled, bool, WIFSIGNALED);
+#[cfg(unix)]
 wmacro!(w_termsig, int, WTERMSIG);
+#[cfg(unix)]
 wmacro!(w_ifstopped, bool, WIFSTOPPED);
+#[cfg(unix)]
 wmacro!(w_stopsig, int, WSTOPSIG);
+#[cfg(unix)]
 wmacro!(w_ifcontinued, bool, WIFCONTINUED);
+#[cfg(unix)]
 wmacro!(w_coredump, bool, WCOREDUMP);
 
 // ---------------------------------------------------------------------------
@@ -1331,29 +1442,52 @@ fn os_killpg(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
-#[cfg(not(unix))]
-mod nonunix_pg {
-    use super::{Object, RuntimeError};
-    macro_rules! ni {
-        ($n:ident) => {
-            pub(super) fn $n(_a: &[Object]) -> Result<Object, RuntimeError> {
-                Err(crate::error::not_implemented_error("requires POSIX"))
-            }
-        };
+/// Windows `os.getppid` — CPython 3.13's `win32_getppid` (posixmodule.c):
+/// `NtQueryInformationProcess(ProcessBasicInformation)` on the current
+/// process, whose `InheritedFromUniqueProcessId` slot is the parent pid.
+#[cfg(windows)]
+fn os_getppid(_args: &[Object]) -> Result<Object, RuntimeError> {
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // The workspace `windows-sys` feature set doesn't include `Wdk`, so bind
+    // the ntdll export directly (CPython links it the same way).
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtQueryInformationProcess(
+            process_handle: *mut core::ffi::c_void,
+            process_information_class: i32,
+            process_information: *mut core::ffi::c_void,
+            process_information_length: u32,
+            return_length: *mut u32,
+        ) -> i32;
     }
-    ni!(os_setsid);
-    ni!(os_getsid);
-    ni!(os_setpgid);
-    ni!(os_getpgid);
-    ni!(os_getpgrp);
-    ni!(os_setpgrp);
-    ni!(os_getppid);
-    ni!(os_tcgetpgrp);
-    ni!(os_tcsetpgrp);
-    ni!(os_killpg);
+    const PROCESS_BASIC_INFORMATION_CLASS: i32 = 0;
+    // PROCESS_BASIC_INFORMATION: six pointer-sized slots; index 5 is
+    // InheritedFromUniqueProcessId (the layout NtQueryInformationProcess has
+    // filled since NT 3.5 — CPython reads the same struct).
+    let mut info = [0usize; 6];
+    let mut ret_len: u32 = 0;
+    // SAFETY: `info` is exactly the size the query writes.
+    let status = unsafe {
+        NtQueryInformationProcess(
+            GetCurrentProcess(),
+            PROCESS_BASIC_INFORMATION_CLASS,
+            info.as_mut_ptr().cast(),
+            std::mem::size_of_val(&info) as u32,
+            &raw mut ret_len,
+        )
+    };
+    if status != 0 {
+        return Err(crate::error::os_error(format!(
+            "NtQueryInformationProcess failed (NTSTATUS 0x{status:08X})"
+        )));
+    }
+    Ok(Object::Int(info[5] as i64))
 }
-#[cfg(not(unix))]
-use nonunix_pg::*;
+
+#[cfg(not(any(unix, windows)))]
+fn os_getppid(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Err(crate::error::not_implemented_error("requires POSIX"))
+}
 
 // ---------------------------------------------------------------------------
 // uid/gid setters (POSIX)
@@ -1396,25 +1530,6 @@ fn os_setgroups(_args: &[Object]) -> Result<Object, RuntimeError> {
     // Rarely needed; accept and no-op-validate to keep privilege-drop code paths working.
     Ok(Object::None)
 }
-
-#[cfg(not(unix))]
-mod nonunix_ids {
-    use super::{Object, RuntimeError};
-    macro_rules! ni {
-        ($n:ident) => {
-            pub(super) fn $n(_a: &[Object]) -> Result<Object, RuntimeError> {
-                Err(crate::error::not_implemented_error("requires POSIX"))
-            }
-        };
-    }
-    ni!(os_setuid);
-    ni!(os_setgid);
-    ni!(os_seteuid);
-    ni!(os_setegid);
-    ni!(os_setgroups);
-}
-#[cfg(not(unix))]
-use nonunix_ids::*;
 
 // ---------------------------------------------------------------------------
 // fd helpers
@@ -1483,16 +1598,39 @@ fn os_pipe2(args: &[Object]) -> Result<Object, RuntimeError> {
     ]))
 }
 
-#[cfg(not(unix))]
+/// Windows `os.closerange` — CRT `_close` per fd, ignoring failures like
+/// CPython's `os_closerange_impl` (which suppresses per-fd errors under
+/// `_Py_BEGIN_SUPPRESS_IPH` too). Each closed fd is also dropped from the
+/// nt_support registry so `Disk`-backed streams don't double-close.
+#[cfg(windows)]
+fn os_closerange(args: &[Object]) -> Result<Object, RuntimeError> {
+    use crate::stdlib::nt_support::{self, crt};
+    let lo = obj_to_int(
+        args.first()
+            .ok_or_else(|| type_error("closerange: fd_low"))?,
+        "fd_low",
+    )? as i32;
+    let hi = obj_to_int(
+        args.get(1)
+            .ok_or_else(|| type_error("closerange: fd_high"))?,
+        "fd_high",
+    )? as i32;
+    for fd in lo..hi {
+        // Probe validity first: `_close` on an unopened CRT fd trips the UCRT
+        // invalid-parameter handler in debug CRTs; `_get_osfhandle` is the
+        // benign check (-1 = not open).
+        if unsafe { crt::_get_osfhandle(fd) } != -1 {
+            unsafe { crt::_close(fd) };
+            nt_support::forget_fd(fd);
+        }
+    }
+    Ok(Object::None)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn os_closerange(_args: &[Object]) -> Result<Object, RuntimeError> {
     Err(crate::error::not_implemented_error(
         "os.closerange requires POSIX",
-    ))
-}
-#[cfg(not(unix))]
-fn os_pipe2(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(crate::error::not_implemented_error(
-        "os.pipe2 requires POSIX",
     ))
 }
 
@@ -1529,13 +1667,10 @@ fn os_sched_setaffinity(_args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
+// `sched_yield` is `HAVE_SCHED_H`-only in CPython; absent on Windows.
 #[cfg(unix)]
 fn os_sched_yield(_args: &[Object]) -> Result<Object, RuntimeError> {
     unsafe { libc::sched_yield() };
-    Ok(Object::None)
-}
-#[cfg(not(unix))]
-fn os_sched_yield(_args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
@@ -1556,7 +1691,32 @@ fn os_device_encoding(args: &[Object]) -> Result<Object, RuntimeError> {
     // A tty: CPython returns the locale encoding (UTF-8 in our locale model).
     Ok(Object::from_static("UTF-8"))
 }
-#[cfg(not(unix))]
+/// Windows `os.device_encoding` — CPython's `_Py_device_encoding`: `None`
+/// for a non-tty fd; for a console fd, `'cp%d'` of `GetConsoleCP()` on
+/// stdin (fd 0) and `GetConsoleOutputCP()` on stdout/stderr.
+#[cfg(windows)]
+fn os_device_encoding(args: &[Object]) -> Result<Object, RuntimeError> {
+    use windows_sys::Win32::System::Console::{GetConsoleCP, GetConsoleOutputCP};
+    let fd = obj_to_int(
+        args.first()
+            .ok_or_else(|| type_error("device_encoding: fd"))?,
+        "fd",
+    )? as i32;
+    if unsafe { crate::stdlib::nt_support::crt::_isatty(fd) } == 0 {
+        return Ok(Object::None);
+    }
+    let cp = match fd {
+        0 => unsafe { GetConsoleCP() },
+        1 | 2 => unsafe { GetConsoleOutputCP() },
+        _ => 0,
+    };
+    if cp == 0 {
+        return Ok(Object::None);
+    }
+    Ok(Object::from_str(format!("cp{cp}")))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn os_device_encoding(_args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
@@ -1582,25 +1742,28 @@ fn os_str_bytes(s: &std::ffi::OsStr) -> Vec<u8> {
 // register_at_fork
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 #[derive(Clone, Copy)]
-#[cfg_attr(not(unix), allow(dead_code))]
 enum AtForkPhase {
     Before,
     Parent,
     Child,
 }
 
+#[cfg(unix)]
 struct AtForkHandlers {
     before: Vec<Object>,
     after_in_parent: Vec<Object>,
     after_in_child: Vec<Object>,
 }
 
+#[cfg(unix)]
 static ATFORK: Mutex<Option<AtForkHandlers>> = Mutex::new(None);
 
 /// `os.register_at_fork(*, before=None, after_in_parent=None,
 /// after_in_child=None)` — record callables fired around `os.fork()` and
 /// the `multiprocessing` fork start method.
+#[cfg(unix)]
 pub(super) fn register_at_fork_kw(
     args: &[Object],
     kwargs: &[(String, Object)],

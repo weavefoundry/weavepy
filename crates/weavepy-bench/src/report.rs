@@ -263,32 +263,8 @@ impl Report {
                 ));
                 continue;
             };
-            match (new.ratio, old.ratio) {
-                (Some(nr), Some(or)) if or > 0.0 => {
-                    if nr > or * factor {
-                        out.push(format!(
-                            "{}: ratio {:.2}× -> {:.2}× vs CPython ({:+.1}%)",
-                            new.name,
-                            or,
-                            nr,
-                            100.0 * (nr - or) / or,
-                        ));
-                    }
-                }
-                _ => {
-                    if old.weavepy.median_ns > 0.0
-                        && new.weavepy.median_ns > old.weavepy.median_ns * factor
-                    {
-                        out.push(format!(
-                            "{}: median {} -> {} ({:+.1}%; absolute fallback — no ratio in baseline)",
-                            new.name,
-                            format_ns(old.weavepy.median_ns),
-                            format_ns(new.weavepy.median_ns),
-                            100.0 * (new.weavepy.median_ns - old.weavepy.median_ns)
-                                / old.weavepy.median_ns,
-                        ));
-                    }
-                }
+            if let Some(msg) = row_regression(new, old, factor) {
+                out.push(msg);
             }
         }
         if let (Some(ng), Some(og)) = (self.geomean_ratio, baseline.geomean_ratio) {
@@ -302,6 +278,54 @@ impl Report {
             }
         }
         out
+    }
+
+    /// Names of fixtures whose row fails the same per-row test as
+    /// [`Self::regressions`] — what `gate`'s noise-rejection retry
+    /// re-measures. Excludes the geomean entry (not a fixture) and
+    /// missing-baseline rows (re-running can't produce a baseline).
+    pub fn regressed_fixture_names(&self, baseline: &Report, pct_threshold: f64) -> Vec<String> {
+        let factor = 1.0 + pct_threshold / 100.0;
+        self.rows
+            .iter()
+            .filter(|new| {
+                baseline
+                    .rows
+                    .iter()
+                    .find(|r| r.name == new.name)
+                    .is_some_and(|old| row_regression(new, old, factor).is_some())
+            })
+            .map(|r| r.name.clone())
+            .collect()
+    }
+}
+
+/// The per-fixture gate test: `Some(description)` when `new` regressed
+/// past `factor` against the baseline row `old`. Ratios compare when
+/// both rows carry one (host-independent); otherwise the absolute
+/// WeavePy median is the fallback.
+fn row_regression(new: &Row, old: &Row, factor: f64) -> Option<String> {
+    match (new.ratio, old.ratio) {
+        (Some(nr), Some(or)) if or > 0.0 => (nr > or * factor).then(|| {
+            format!(
+                "{}: ratio {:.2}× -> {:.2}× vs CPython ({:+.1}%)",
+                new.name,
+                or,
+                nr,
+                100.0 * (nr - or) / or,
+            )
+        }),
+        _ => (old.weavepy.median_ns > 0.0
+            && new.weavepy.median_ns > old.weavepy.median_ns * factor)
+            .then(|| {
+                format!(
+                    "{}: median {} -> {} ({:+.1}%; absolute fallback — no ratio in baseline)",
+                    new.name,
+                    format_ns(old.weavepy.median_ns),
+                    format_ns(new.weavepy.median_ns),
+                    100.0 * (new.weavepy.median_ns - old.weavepy.median_ns) / old.weavepy.median_ns,
+                )
+            }),
     }
 }
 

@@ -118,6 +118,12 @@ pub fn deliver_to_vm_main(_sig: i32) -> Option<i32> {
 /// callable (`default_int_handler`), matching CPython.
 const SIGINT: i32 = 2;
 
+/// SIGBREAK — the Windows-only Ctrl-Break signal (the CRT's value 21;
+/// CPython exposes it in `Modules/signalmodule.c`'s `#ifdef SIGBREAK`
+/// arm). `CTRL_BREAK_EVENT` console events map onto it.
+#[cfg(windows)]
+const SIGBREAK: i32 = 21;
+
 /// Slots in the tripped-signal flag array. Sized one past the largest
 /// signal number we accept, so `signum` indexes directly.
 const TRIP_SLOTS: usize = 65;
@@ -369,19 +375,157 @@ pub fn install_startup_dispositions() {
     }
 }
 
-/// No-op on non-Unix targets (Windows uses a different signal model).
-#[cfg(not(unix))]
+/// The Windows twin of the unix `handler_trampoline` body: trip the
+/// per-signal atomic (+ the hot gate) and poke the wakeup fd. Called
+/// from the `SetConsoleCtrlHandler` trampoline (which Windows runs on a
+/// freshly injected OS thread) and from the CRT `signal()` trampoline,
+/// so it confines itself to exactly the state the unix async-signal
+/// handler touches. The one divergence is deliberate: CPython's
+/// `trip_signal` writes the wakeup byte with Winsock `send()` on
+/// Windows because `signal.set_wakeup_fd` there only accepts a SOCKET
+/// (Modules/signalmodule.c `#ifdef MS_WINDOWS`).
+#[cfg(windows)]
+fn trip_signal_win(signum: i32) {
+    if signum >= 1 && (signum as usize) < TRIP_SLOTS {
+        TRIPPED[signum as usize].store(true, Ordering::Release);
+        ANY_TRIPPED.store(true, Ordering::Release);
+        crate::hot_gates::set(crate::hot_gates::SIGNALS);
+    }
+    let fd = WAKEUP_FD.load(Ordering::Relaxed);
+    if fd >= 0 {
+        use windows_sys::Win32::Networking::WinSock::{send, WSAGetLastError, WSAEWOULDBLOCK};
+        let byte = [signum as u8];
+        let rc = unsafe { send(fd as usize, byte.as_ptr(), 1, 0) };
+        if rc < 0 {
+            // Same reporting contract as the unix trampoline: record the
+            // first failure (a WSAE* code, which doubles as an errno value
+            // on Windows) unless it's a full non-blocking buffer the user
+            // opted out of hearing about.
+            let err = unsafe { WSAGetLastError() };
+            let is_full = err == WSAEWOULDBLOCK;
+            if WAKEUP_WARN_ON_FULL.load(Ordering::Relaxed) || !is_full {
+                let _ = WAKEUP_WRITE_ERRNO.compare_exchange(
+                    0,
+                    err,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                );
+            }
+        }
+    }
+}
+
+/// Console-control trampoline (RFC 0063 WS1). CPython's Windows arm in
+/// `Modules/signalmodule.c` reaches SIGINT/SIGBREAK through the CRT's
+/// own console handler; WeavePy registers its own
+/// `SetConsoleCtrlHandler` routine so `CTRL_C_EVENT`/`CTRL_BREAK_EVENT`
+/// delivery doesn't depend on CRT handler ordering (the reliability
+/// `_winapi`/`subprocess` consumers expect). Windows runs this on a new
+/// OS thread, so only the trip atomics + wakeup send are touched (plus
+/// one short handler-table lock — a real Mutex is fine here, unlike in
+/// a POSIX async-signal context). Returning TRUE consumes the event so
+/// the process survives; a `SIG_DFL` disposition returns FALSE so the
+/// OS default action (termination) still runs, matching CPython where a
+/// defaulted SIGINT/SIGBREAK kills the process.
+#[cfg(windows)]
+unsafe extern "system" fn console_ctrl_trampoline(ctrl_type: u32) -> i32 {
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
+    let sig = match ctrl_type {
+        CTRL_C_EVENT => SIGINT,
+        CTRL_BREAK_EVENT => SIGBREAK,
+        // Other events (CLOSE/LOGOFF/SHUTDOWN) take the system default.
+        _ => return 0,
+    };
+    if matches!(handler_for(sig), Object::Int(0)) {
+        return 0;
+    }
+    trip_signal_win(sig);
+    1
+}
+
+/// The UCRT's `signal()` — the C-level disposition mechanism on
+/// Windows, declared locally (this module is its only consumer).
+/// Handlers travel as `usize`: the `SIG_DFL`(0)/`SIG_IGN`(1) sentinels
+/// or a function pointer; `SIG_ERR` is `usize::MAX`.
+#[cfg(windows)]
+mod crt_signal {
+    pub(super) const SIG_DFL: usize = 0;
+    pub(super) const SIG_IGN: usize = 1;
+    unsafe extern "C" {
+        pub(super) fn signal(sig: i32, handler: usize) -> usize;
+    }
+}
+
+/// CRT-level handler trampoline. The UCRT resets the disposition to
+/// `SIG_DFL` before invoking the handler (SysV semantics), so re-arm
+/// first — CPython's `signal_handler` does the same under `MS_WINDOWS`
+/// (Modules/signalmodule.c) — then trip the shared atomics.
+#[cfg(windows)]
+extern "C" fn crt_signal_trampoline(signum: i32) {
+    unsafe {
+        crt_signal::signal(signum, crt_signal_trampoline as *const () as usize);
+    }
+    trip_signal_win(signum);
+}
+
+/// Windows startup dispositions (RFC 0063 WS1). Two cooperating layers,
+/// documented because CPython's arrangement is easy to misread: the CRT
+/// `signal()` chain is the *disposition* mechanism (it is what CPython's
+/// `PyOS_setsig` compiles down to on Windows, and it is the only thing
+/// that covers synchronous `raise()` deliveries), while our
+/// `SetConsoleCtrlHandler` trampoline owns Ctrl-C/Ctrl-Break *console*
+/// events directly. Both funnel into the same tripped-flag atomics the
+/// dispatch loop drains, so a console SIGINT and a `raise(SIGINT)` are
+/// indistinguishable downstream — exactly the observable behaviour of
+/// CPython's `Modules/signalmodule.c` Windows arm.
+#[cfg(windows)]
+pub fn install_startup_dispositions() {
+    // Seed the handler table (SIGINT -> default_int_handler) so a
+    // console Ctrl-C raises KeyboardInterrupt even in a script that
+    // never imports `signal`.
+    let _ = handlers();
+    static CONSOLE_HANDLER: std::sync::Once = std::sync::Once::new();
+    CONSOLE_HANDLER.call_once(|| unsafe {
+        windows_sys::Win32::System::Console::SetConsoleCtrlHandler(
+            Some(console_ctrl_trampoline),
+            1,
+        );
+    });
+    // Arm the CRT chain for SIGINT so `raise(SIGINT)` / CRT-internal
+    // dispatch reaches the same atomics.
+    set_os_disposition(SIGINT, OsDisposition::Trip);
+}
+
+/// Install the C-level disposition for `signum` via the UCRT's
+/// `signal()`. `SIG_ERR` (an out-of-set signum) is ignored here:
+/// callers validate against the Windows signal set first, matching
+/// CPython's ValueError-before-CRT ordering in `signal_signal_impl`.
+#[cfg(windows)]
+fn set_os_disposition(signum: i32, disp: OsDisposition) {
+    let handler = match disp {
+        OsDisposition::Default => crt_signal::SIG_DFL,
+        OsDisposition::Ignore => crt_signal::SIG_IGN,
+        OsDisposition::Trip => crt_signal_trampoline as *const () as usize,
+    };
+    unsafe {
+        crt_signal::signal(signum, handler);
+    }
+}
+
+/// No-op on targets with neither the POSIX nor the NT signal model.
+#[cfg(not(any(unix, windows)))]
 pub fn install_startup_dispositions() {}
 
-/// No-op on non-Unix targets (Windows uses a different signal model).
+/// No-op on non-Unix targets (Windows console events arrive on their
+/// own injected thread; there is no process signal mask to manage).
 #[cfg(not(unix))]
 pub fn block_async_signals_current_thread() {}
 
-/// No-op on non-Unix targets (Windows uses a different signal model).
+/// No-op on non-Unix targets (see [`block_async_signals_current_thread`]).
 #[cfg(not(unix))]
 pub fn unblock_async_signals_current_thread() {}
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn set_os_disposition(_signum: i32, _disp: OsDisposition) {}
 
 /// Process-global handler table. CPython installs `default_int_handler`
@@ -674,6 +818,13 @@ fn signal_signal(args: &[Object]) -> Result<Object, RuntimeError> {
             &std::io::Error::from_raw_os_error(libc::EINVAL),
         ));
     }
+    // CPython's Windows arm (`signal_signal_impl`) rejects any signal
+    // outside the C90+SIGBREAK set with ValueError *before* touching
+    // the CRT — whose `signal()` would otherwise return SIG_ERR.
+    #[cfg(windows)]
+    if !posix_signals().iter().any(|&(_, v)| v == sig) {
+        return Err(value_error("invalid signal value"));
+    }
     set_os_disposition(sig, disp);
     Ok(set_handler(sig, handler))
 }
@@ -904,7 +1055,21 @@ fn raise_signal(args: &[Object]) -> Result<Object, RuntimeError> {
             libc::raise(sig as libc::c_int);
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // CPython's `signal_raise_signal_impl` calls C `raise()` on
+        // Windows too: the CRT runs the installed C-level handler chain
+        // (our `crt_signal_trampoline` trips the shared atomics) and a
+        // SIG_DFL disposition performs the default action, exactly like
+        // the unix arm above. The tripped flag is then drained by the
+        // dispatch loop / blocking-call re-entry paths — the same
+        // deliver-pending route the unix arm relies on.
+        let rc = unsafe { crate::stdlib::nt_support::crt::raise(sig) };
+        if rc != 0 {
+            return Err(crate::stdlib::nt_support::last_crt_error_to_py(None));
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         trip_signal(sig);
     }
@@ -985,7 +1150,11 @@ fn set_wakeup_fd(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object,
     WAKEUP_WARN_ON_FULL.store(warn_on_full_buffer, Ordering::Release);
     // Clear any stale recorded write error when the wakeup fd changes.
     WAKEUP_WRITE_ERRNO.store(0, Ordering::Release);
-    let _ = &WAKEUP_FD_IS_SOCKET; // reserved for the Windows send() path
+    // On Windows the fd is always a SOCKET — CPython's `set_wakeup_fd`
+    // only accepts sockets there and writes with Winsock `send()`
+    // (`trip_signal_win`) — so the is-socket flag stays unread; on unix
+    // it is reserved for the send(MSG_DONTWAIT) socket path.
+    let _ = &WAKEUP_FD_IS_SOCKET;
     let prev = WAKEUP_FD.swap(fd, Ordering::AcqRel);
     Ok(Object::Int(i64::from(prev)))
 }
