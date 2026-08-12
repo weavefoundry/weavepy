@@ -315,15 +315,15 @@ fn row_regression(new: &Row, old: &Row, factor: f64) -> Option<String> {
                 100.0 * (nr - or) / or,
             )
         }),
-        _ => (old.weavepy.median_ns > 0.0 && new.weavepy.median_ns > old.weavepy.median_ns * factor)
+        _ => (old.weavepy.median_ns > 0.0
+            && new.weavepy.median_ns > old.weavepy.median_ns * factor)
             .then(|| {
                 format!(
                     "{}: median {} -> {} ({:+.1}%; absolute fallback — no ratio in baseline)",
                     new.name,
                     format_ns(old.weavepy.median_ns),
                     format_ns(new.weavepy.median_ns),
-                    100.0 * (new.weavepy.median_ns - old.weavepy.median_ns)
-                        / old.weavepy.median_ns,
+                    100.0 * (new.weavepy.median_ns - old.weavepy.median_ns) / old.weavepy.median_ns,
                 )
             }),
     }

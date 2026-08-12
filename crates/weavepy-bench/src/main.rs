@@ -227,12 +227,20 @@ fn cmd_gate(args: &[String]) -> io::Result<bool> {
                     fix.name,
                     or,
                     nr,
-                    if better { "kept retry" } else { "kept original" }
+                    if better {
+                        "kept retry"
+                    } else {
+                        "kept original"
+                    }
                 ),
                 _ => println!(
                     "  {}: re-measured ({})",
                     fix.name,
-                    if better { "kept retry" } else { "kept original" }
+                    if better {
+                        "kept retry"
+                    } else {
+                        "kept original"
+                    }
                 ),
             }
             if better {

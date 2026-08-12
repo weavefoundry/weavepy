@@ -1623,6 +1623,7 @@ fn os_makedirs_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object
 /// `os.path.split` for a POSIX path string: returns `(head, tail)` where
 /// `tail` is the last component and `head` keeps its trailing separators
 /// stripped (unless it is all separators). Mirrors `posixpath.split`.
+#[cfg(not(windows))]
 fn posix_split(p: &str) -> (&str, &str) {
     match p.rfind('/') {
         Some(i) => {
@@ -1636,6 +1637,69 @@ fn posix_split(p: &str) -> (&str, &str) {
             (head, tail)
         }
         None => ("", p),
+    }
+}
+
+/// `ntpath.splitdrive`: peel the drive letter (`C:`), UNC share
+/// (`\\server\share`), or device/verbatim prefix (`\\?\C:`, `\\.\pipe`)
+/// off the front so the split below never treats it as a component.
+#[cfg(windows)]
+fn nt_splitdrive(p: &str) -> (&str, &str) {
+    let is_sep = |c: char| c == '\\' || c == '/';
+    let b = p.as_bytes();
+    if b.len() >= 2 {
+        if is_sep(b[0] as char) && is_sep(b[1] as char) {
+            // `\\server\share` / `\\?\C:` — the drive runs through the
+            // second component (ntpath.splitroot's UNC arm); a path
+            // with no second component is all drive.
+            let rest = &p[2..];
+            if let Some(i) = rest.find(is_sep) {
+                if let Some(j) = rest[i + 1..].find(is_sep) {
+                    let cut = 2 + i + 1 + j;
+                    return (&p[..cut], &p[cut..]);
+                }
+            }
+            return (p, "");
+        }
+        if b[1] == b':' && b[0].is_ascii_alphabetic() {
+            return (&p[..2], &p[2..]);
+        }
+    }
+    ("", p)
+}
+
+/// `ntpath.split`: like [`posix_split`] but with both separators and the
+/// drive/UNC prefix kept attached to `head` (never split into, never
+/// stripped down to nothing — `C:\` stays `C:\`).
+#[cfg(windows)]
+fn nt_split(p: &str) -> (&str, &str) {
+    let is_sep = |c: char| c == '\\' || c == '/';
+    let (drive, rest) = nt_splitdrive(p);
+    let i = rest.rfind(is_sep).map_or(0, |i| i + 1);
+    let (head, tail) = rest.split_at(i);
+    let trimmed = head.trim_end_matches(is_sep);
+    let head_len = if trimmed.is_empty() {
+        head.len()
+    } else {
+        trimmed.len()
+    };
+    (&p[..drive.len() + head_len], tail)
+}
+
+/// `os.path.split` for the host platform, as `os.makedirs`' recursion
+/// requires: CPython's `makedirs` splits with `os.path.split`, so on
+/// Windows the backslash-separated paths every `os.path.normpath`
+/// consumer produces (sysconfig hands venv `{base}\Lib\site-packages`)
+/// must split on `\` too, or the parent chain is never created and the
+/// leaf `mkdir` dies with ERROR_PATH_NOT_FOUND.
+fn host_path_split(p: &str) -> (&str, &str) {
+    #[cfg(windows)]
+    {
+        nt_split(p)
+    }
+    #[cfg(not(windows))]
+    {
+        posix_split(p)
     }
 }
 
@@ -1658,9 +1722,9 @@ fn makedirs_recursive(
     mode: u32,
     exist_ok: bool,
 ) -> Result<(), (std::io::Error, String)> {
-    let (mut head, mut tail) = posix_split(name);
+    let (mut head, mut tail) = host_path_split(name);
     if tail.is_empty() {
-        let (h, t) = posix_split(head);
+        let (h, t) = host_path_split(head);
         head = h;
         tail = t;
     }
@@ -7479,5 +7543,44 @@ mod tests {
         assert_eq!(normpath_lexical("a/./b"), format!("a{sep}b"));
         assert_eq!(normpath_lexical("a/b/../c"), format!("a{sep}c"));
         assert_eq!(normpath_lexical("./"), ".");
+    }
+
+    // `os.makedirs`' split must be `ntpath.split` on Windows: sysconfig
+    // normpaths every install-scheme path to backslashes, so venv hands
+    // `makedirs` `{env}\Lib\site-packages` — a `/`-only split sees one
+    // giant leaf, skips parent creation, and the leaf `mkdir` dies with
+    // ERROR_PATH_NOT_FOUND (the RFC 0063 dist-check venv leg).
+    #[cfg(windows)]
+    #[test]
+    fn nt_split_mirrors_ntpath() {
+        assert_eq!(
+            nt_split(r"C:\venv\Lib\site-packages"),
+            (r"C:\venv\Lib", "site-packages")
+        );
+        assert_eq!(nt_split(r"C:\venv/Lib"), (r"C:\venv", "Lib"));
+        assert_eq!(nt_split(r"C:\x\"), (r"C:\x", ""));
+        assert_eq!(nt_split(r"C:\"), (r"C:\", ""));
+        assert_eq!(nt_split("C:x"), ("C:", "x"));
+        assert_eq!(nt_split("rel"), ("", "rel"));
+        assert_eq!(nt_split(r"a\b"), ("a", "b"));
+        assert_eq!(
+            nt_split(r"\\server\share\dir\f"),
+            (r"\\server\share\dir", "f")
+        );
+        assert_eq!(nt_split(r"\\server\share"), (r"\\server\share", ""));
+        assert_eq!(nt_split(r"\\?\C:\x\y"), (r"\\?\C:\x", "y"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn nt_splitdrive_mirrors_ntpath() {
+        assert_eq!(nt_splitdrive(r"C:\x"), ("C:", r"\x"));
+        assert_eq!(
+            nt_splitdrive(r"\\server\share\x"),
+            (r"\\server\share", r"\x")
+        );
+        assert_eq!(nt_splitdrive(r"\\?\C:\x"), (r"\\?\C:", r"\x"));
+        assert_eq!(nt_splitdrive(r"\x\y"), ("", r"\x\y"));
+        assert_eq!(nt_splitdrive("rel"), ("", "rel"));
     }
 }
