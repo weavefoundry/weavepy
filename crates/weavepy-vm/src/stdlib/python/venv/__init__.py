@@ -327,54 +327,20 @@ class EnvBuilder:
             exename = os.path.basename(context.env_exe)
             exe_stem = os.path.splitext(exename)[0]
             exe_d = '_d' if os.path.normcase(exe_stem).endswith('_d') else ''
-            if sysconfig.is_python_build():
-                scripts = dirname
-            else:
-                scripts = os.path.join(os.path.dirname(__file__),
-                                       'scripts', 'nt')
-            if not sysconfig.get_config_var("Py_GIL_DISABLED"):
-                python_exe = os.path.join(dirname, f'python{exe_d}.exe')
-                pythonw_exe = os.path.join(dirname, f'pythonw{exe_d}.exe')
-                link_sources = {
-                    'python.exe': python_exe,
-                    f'python{exe_d}.exe': python_exe,
-                    'pythonw.exe': pythonw_exe,
-                    f'pythonw{exe_d}.exe': pythonw_exe,
-                }
-                python_exe = os.path.join(scripts, f'venvlauncher{exe_d}.exe')
-                pythonw_exe = os.path.join(scripts, f'venvwlauncher{exe_d}.exe')
-                copy_sources = {
-                    'python.exe': python_exe,
-                    f'python{exe_d}.exe': python_exe,
-                    'pythonw.exe': pythonw_exe,
-                    f'pythonw{exe_d}.exe': pythonw_exe,
-                }
-            else:
-                exe_t = f'3.{sys.version_info[1]}t'
-                python_exe = os.path.join(dirname, f'python{exe_t}{exe_d}.exe')
-                pythonw_exe = os.path.join(dirname, f'pythonw{exe_t}{exe_d}.exe')
-                link_sources = {
-                    'python.exe': python_exe,
-                    f'python{exe_d}.exe': python_exe,
-                    f'python{exe_t}.exe': python_exe,
-                    f'python{exe_t}{exe_d}.exe': python_exe,
-                    'pythonw.exe': pythonw_exe,
-                    f'pythonw{exe_d}.exe': pythonw_exe,
-                    f'pythonw{exe_t}.exe': pythonw_exe,
-                    f'pythonw{exe_t}{exe_d}.exe': pythonw_exe,
-                }
-                python_exe = os.path.join(scripts, f'venvlaunchert{exe_d}.exe')
-                pythonw_exe = os.path.join(scripts, f'venvwlaunchert{exe_d}.exe')
-                copy_sources = {
-                    'python.exe': python_exe,
-                    f'python{exe_d}.exe': python_exe,
-                    f'python{exe_t}.exe': python_exe,
-                    f'python{exe_t}{exe_d}.exe': python_exe,
-                    'pythonw.exe': pythonw_exe,
-                    f'pythonw{exe_d}.exe': pythonw_exe,
-                    f'pythonw{exe_t}.exe': pythonw_exe,
-                    f'pythonw{exe_t}{exe_d}.exe': pythonw_exe,
-                }
+            # WeavePy: CPython points copy_sources at the `venvlauncher.exe`
+            # assets its own Windows build compiles into venv\scripts\nt;
+            # WeavePy ships no launcher assets. Like python-build-standalone,
+            # the venv gets a real copy of the single static interpreter
+            # executable itself — startup resolves the venv by chasing
+            # pyvenv.cfg's `home=` key, so no launcher indirection is needed.
+            base_exe = context.executable
+            link_sources = {
+                'python.exe': base_exe,
+                f'python{exe_d}.exe': base_exe,
+                'pythonw.exe': base_exe,
+                f'pythonw{exe_d}.exe': base_exe,
+            }
+            copy_sources = dict(link_sources)
 
             do_copies = True
             if self.symlinks:

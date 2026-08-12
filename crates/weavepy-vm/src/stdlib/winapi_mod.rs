@@ -176,6 +176,11 @@ fn obj_to_usize(o: &Object) -> Option<usize> {
         Object::Bool(b) => u64::from(*b),
         Object::Int(i) => *i as u64,
         Object::Long(b) => b.to_u64().or_else(|| b.to_i64().map(|v| v as u64))?,
+        // An `int` subclass instance (subprocess.py's `Handle`) wraps its
+        // primitive value — CPython's HANDLE converter is `PyLong_AsVoidPtr`,
+        // which accepts these. The wrapped value is always a primitive, so
+        // this recurses exactly once.
+        Object::Instance(inst) => return inst.native.get().and_then(obj_to_usize),
         _ => return None,
     };
     Some(bits as usize)
