@@ -42,7 +42,10 @@ probe = "probes/attrs_probe.py"
 
 [packages.attrs.selftest]
 source = "attrs==26.1.0"
-requirements = "pytest==8.4.2 hypothesis==6.165.2"
+# hypothesis repinned 6.165.2 -> 6.155.7 (2026-08): 6.165.2 was removed
+# from PyPI, which cold wheel caches (e.g. the new Windows CI lane)
+# surface as a resolution error; warm POSIX caches masked it.
+requirements = "pytest==8.4.2 hypothesis==6.155.7"
 # Measured 2026-08: the suite cannot finish inside any sane budget —
 # hypothesis @given loops woven through the core files (test_make,
 # test_funcs, test_dunders) are interpreter-speed-bound under WeavePy
@@ -129,7 +132,7 @@ source = "python-dateutil==2.9.0.post0"
 # -W: tests/conftest.py applies pytest-cov's `no_cover` marker; without
 # the plugin the unknown-mark warning would be escalated to an error by
 # the suite's `filterwarnings = error` (cmdline -W outranks ini).
-requirements = "pytest==8.3.5 six==1.17.0 hypothesis==6.165.2 freezegun==1.5.5"
+requirements = "pytest==8.3.5 six==1.17.0 hypothesis==6.155.7 freezegun==1.5.5"
 command = "tests -W ignore::pytest.PytestUnknownMarkWarning"
 # Engine gap (hypothesis-found, measured 2026-08: 2030 passed, 1
 # failed): for pre-epoch datetimes (e.g. 1901-12-13T12:45:52Z),
@@ -151,7 +154,7 @@ probe = "probes/packaging_probe.py"
 
 [packages.packaging.selftest]
 source = "packaging==26.3"
-requirements = "pytest==8.4.2 pretend==1.0.9 hypothesis==6.165.2 tomli_w==1.2.0"
+requirements = "pytest==8.4.2 pretend==1.0.9 hypothesis==6.155.7 tomli_w==1.2.0"
 # Two enumerated trims, both interpreter-speed-bound (measured
 # 2026-08), neither a correctness signal:
 # --ignore=tests/property — upstream's hypothesis property-fuzz lanes
