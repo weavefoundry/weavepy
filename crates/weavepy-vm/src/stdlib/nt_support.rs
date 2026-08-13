@@ -222,8 +222,9 @@ pub(crate) fn winerror_to_errno(winerror: i32) -> i32 {
 
 /// `FormatMessageW` for a Win32 (or Winsock) error code, with
 /// CPython's trims: trailing CR/LF/dot whitespace removed. Falls back
-/// to the CPython shape for unknown codes.
-pub(crate) fn format_message(winerror: i32) -> String {
+/// to the CPython shape for unknown codes. `pub`: also the strerror
+/// source for the extension loader's `ImportError` (RFC 0064 WS2).
+pub fn format_message(winerror: i32) -> String {
     use windows_sys::Win32::System::Diagnostics::Debug::{
         FormatMessageW, FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS,
     };

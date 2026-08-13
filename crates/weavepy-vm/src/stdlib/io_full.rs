@@ -108,6 +108,16 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             );
         }
 
+        // `_WindowsConsoleIO` (RFC 0064 WS4) — Windows only, exactly as
+        // CPython's `_io` omits it elsewhere (`hasattr(_io,
+        // '_WindowsConsoleIO')` is how `_pyio` and test_winconsoleio
+        // detect the platform).
+        #[cfg(windows)]
+        d.insert(
+            DictKey(Object::from_static("_WindowsConsoleIO")),
+            Object::Type(crate::stdlib::win_console::windows_console_io_type()),
+        );
+
         // CPython exposes the buffer-size default and a couple of
         // module-level constants. Keep parity for code that reads
         // `_io.DEFAULT_BUFFER_SIZE`.

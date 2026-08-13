@@ -764,6 +764,16 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
                 DictKey(Object::from_static("_path_splitroot_ex")),
                 builtin("_path_splitroot_ex", nt_path_splitroot_ex),
             );
+            // RFC 0064 WS2 — `os.add_dll_directory` (PEP 578-audited
+            // `AddDllDirectory`). Binary wheels' `__init__` shims call it
+            // to make vendored dependent DLLs resolvable by the loader
+            // flags the extension loader passes (`LOAD_LIBRARY_SEARCH_
+            // DEFAULT_DIRS` honours these cookies; `PATH`/CWD are not
+            // searched — bpo-36085).
+            d.insert(
+                DictKey(Object::from_static("add_dll_directory")),
+                builtin_kw("add_dll_directory", os_add_dll_directory),
+            );
         }
 
         // `os.supports_follow_symlinks` must hold the *function objects* that
@@ -5827,6 +5837,151 @@ fn os_fsync(args: &[Object]) -> Result<Object, RuntimeError> {
         return Err(crate::stdlib::nt_support::last_crt_error_to_py(None));
     }
     Ok(Object::None)
+}
+
+/// `os.add_dll_directory(path)` — RFC 0064 WS2, CPython's
+/// `Lib/os.py` + `nt._add_dll_directory`: fire the PEP 578
+/// `os.add_dll_directory` audit event, register the directory with
+/// the loader (`AddDllDirectory`), and hand back an
+/// `_AddedDllDirectory` whose `close()` (also `__exit__`) removes it
+/// again. The API itself rejects relative/nonexistent paths, which
+/// surfaces as the CPython-shaped `OSError`.
+#[cfg(windows)]
+fn os_add_dll_directory(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
+    use crate::stdlib::nt_support::wide;
+    use windows_sys::Win32::System::LibraryLoader::AddDllDirectory;
+    let path = path_arg_or_kw(args, 0, "path", kwargs, "add_dll_directory")?;
+    crate::stdlib::sys::audit_event("os.add_dll_directory", &[Object::from_str(path.clone())])?;
+    let wpath = wide(&path);
+    // SAFETY: `wpath` is NUL-terminated UTF-16 and outlives the call.
+    let cookie = unsafe { AddDllDirectory(wpath.as_ptr()) };
+    if cookie.is_null() {
+        return Err(crate::stdlib::nt_support::last_win32_error_to_py(Some(
+            &path,
+        )));
+    }
+    Ok(build_added_dll_directory(path, cookie as usize as i64))
+}
+
+/// The shared `_AddedDllDirectory` type: `close()`, context-manager
+/// protocol, and CPython's repr (`<AddedDllDirectory('C:\\dir')>`,
+/// `<AddedDllDirectory()>` once closed). State lives on the instance
+/// (`_path`, `_cookie`); `close()` mirrors CPython in calling
+/// `RemoveDllDirectory` unconditionally, so a double close raises
+/// `OSError` exactly as a stale cookie does there.
+#[cfg(windows)]
+fn added_dll_directory_type() -> Rc<crate::types::TypeObject> {
+    use crate::object::BuiltinFn;
+    use crate::types::TypeObject;
+    thread_local! {
+        static CLS: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
+    }
+    fn self_dict(args: &[Object]) -> Option<Rc<RefCell<DictData>>> {
+        match args.first() {
+            Some(Object::Instance(i)) => Some(i.dict.clone()),
+            _ => None,
+        }
+    }
+    fn close_impl(args: &[Object]) -> Result<Object, RuntimeError> {
+        use windows_sys::Win32::System::LibraryLoader::RemoveDllDirectory;
+        let dict = self_dict(args)
+            .ok_or_else(|| type_error("close() requires an _AddedDllDirectory instance"))?;
+        let cookie = dict
+            .borrow()
+            .get(&DictKey(Object::from_static("_cookie")))
+            .and_then(Object::as_i64)
+            .unwrap_or(0);
+        // SAFETY: the cookie came from `AddDllDirectory`; the API
+        // validates it and fails on anything stale.
+        let ok = unsafe { RemoveDllDirectory(cookie as usize as *mut std::ffi::c_void) };
+        if ok == 0 {
+            return Err(crate::stdlib::nt_support::last_win32_error_to_py(None));
+        }
+        dict.borrow_mut()
+            .insert(DictKey(Object::from_static("_path")), Object::None);
+        Ok(Object::None)
+    }
+    CLS.with(|slot| {
+        if let Some(c) = slot.borrow().as_ref() {
+            return c.clone();
+        }
+        let bt = crate::builtin_types::builtin_types();
+        let mut dict = DictData::default();
+        dict.insert(
+            DictKey(Object::from_static("close")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "close",
+                binds_instance: true,
+                call: Box::new(close_impl),
+                call_kw: None,
+            })),
+        );
+        dict.insert(
+            DictKey(Object::from_static("__enter__")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "__enter__",
+                binds_instance: true,
+                call: Box::new(|args| Ok(args.first().cloned().unwrap_or(Object::None))),
+                call_kw: None,
+            })),
+        );
+        dict.insert(
+            DictKey(Object::from_static("__exit__")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "__exit__",
+                binds_instance: true,
+                call: Box::new(|args| {
+                    close_impl(args)?;
+                    Ok(Object::Bool(false))
+                }),
+                call_kw: None,
+            })),
+        );
+        dict.insert(
+            DictKey(Object::from_static("__repr__")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "__repr__",
+                binds_instance: true,
+                call: Box::new(|args| {
+                    let path = self_dict(args)
+                        .and_then(|d| {
+                            d.borrow()
+                                .get(&DictKey(Object::from_static("_path")))
+                                .cloned()
+                        })
+                        .unwrap_or(Object::None);
+                    Ok(match path {
+                        Object::None => Object::from_static("<AddedDllDirectory()>"),
+                        p => Object::from_str(format!("<AddedDllDirectory({})>", p.repr())),
+                    })
+                }),
+                call_kw: None,
+            })),
+        );
+        let cls = TypeObject::new_user("_AddedDllDirectory", vec![bt.object_.clone()], dict)
+            .expect("_AddedDllDirectory type");
+        *slot.borrow_mut() = Some(cls.clone());
+        cls
+    })
+}
+
+/// Mint one `_AddedDllDirectory` instance for [`os_add_dll_directory`].
+#[cfg(windows)]
+fn build_added_dll_directory(path: String, cookie: i64) -> Object {
+    use crate::types::PyInstance;
+    let inst = Rc::new(PyInstance::new(added_dll_directory_type()));
+    {
+        let mut d = inst.dict.borrow_mut();
+        d.insert(
+            DictKey(Object::from_static("_path")),
+            Object::from_str(path),
+        );
+        d.insert(DictKey(Object::from_static("_cookie")), Object::Int(cookie));
+    }
+    Object::Instance(inst)
 }
 
 /// Resolve an NT path helper argument preserving the `str`/`bytes` flavour

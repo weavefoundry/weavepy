@@ -470,11 +470,20 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         // compiler tokens are tagged `WeavePy`; `python_implementation()`
         // still reports `CPython` (no PyPy/Jython/IronPython marker), so
         // implementation-gated stdlib tests behave as on CPython.
+        //
+        // On Windows the compiler token also carries CPython's MSC arch
+        // tag (`64 bit (AMD64)` / `64 bit (ARM64)`): that substring is
+        // what `sysconfig.get_platform()` sniffs to answer `win-amd64`
+        // — the value setuptools bakes into wheel tags and build dirs
+        // (RFC 0064 WS3). Without it the platform reads as `win32`.
         d.insert(
             DictKey(Object::from_static("version")),
             Object::from_str(format!(
-                "{}.{}.{} (WeavePy) [WeavePy]",
-                PY_VERSION.0, PY_VERSION.1, PY_VERSION.2
+                "{}.{}.{} (WeavePy) [WeavePy{}]",
+                PY_VERSION.0,
+                PY_VERSION.1,
+                PY_VERSION.2,
+                version_arch_tag()
             )),
         );
         d.insert(
@@ -495,11 +504,18 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
                 DictKey(Object::from_static("winver")),
                 Object::from_static("3.13"),
             );
-            // CPython publishes the HMODULE of python3xx.dll here. WeavePy
-            // is a static executable with no python DLL (RFC 0063
-            // Non-goals: the `python313.dll` restructure is its own wave),
-            // so the handle is 0.
-            d.insert(DictKey(Object::from_static("dllhandle")), Object::Int(0));
+            // CPython publishes the HMODULE of python3xx.dll here. Since
+            // RFC 0064 the runtime ships as a real `python313.dll` loaded
+            // by the `weavepy.exe` shim, so the handle is the module's:
+            // nonzero whenever this interpreter is running out of the DLL
+            // (the shipped configuration), 0 in a statically-linked
+            // embedder (e.g. Rust test harnesses) — the truthful answer
+            // for a process with no Python DLL. `ctypes.pythonapi`
+            // constructs against this handle.
+            d.insert(
+                DictKey(Object::from_static("dllhandle")),
+                Object::Int(python_dll_handle()),
+            );
             d.insert(
                 DictKey(Object::from_static("getwindowsversion")),
                 builtin("getwindowsversion", sys_getwindowsversion),
@@ -794,6 +810,22 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         filename: None,
         dict,
     })
+}
+
+/// CPython's NT compiler-bracket arch suffix (`[MSC v.19xx 64 bit
+/// (AMD64)]`), reduced to the part `sysconfig.get_platform()` and
+/// `platform.architecture()` actually sniff. Empty off Windows —
+/// POSIX `get_platform()` reads `os.uname()`, not `sys.version`.
+const fn version_arch_tag() -> &'static str {
+    if cfg!(all(windows, target_arch = "x86_64")) {
+        " 64 bit (AMD64)"
+    } else if cfg!(all(windows, target_arch = "aarch64")) {
+        " 64 bit (ARM64)"
+    } else if cfg!(all(windows, target_arch = "x86")) {
+        " 32 bit (Intel)"
+    } else {
+        ""
+    }
 }
 
 fn host_platform() -> &'static str {
@@ -1569,6 +1601,36 @@ const VERSION_INFO_FIELDS: &[&str] = &["major", "minor", "micro", "releaselevel"
 /// remaining five members are attribute-only.
 #[cfg(windows)]
 const WINDOWS_VERSION_VISIBLE: [&str; 5] = ["major", "minor", "build", "platform", "service_pack"];
+
+/// The `HMODULE` of `python313.dll` when this interpreter is running
+/// out of the runtime DLL (RFC 0064 WS1: the shipped exe is a shim
+/// that loads it), 0 when statically linked (embedder test harnesses).
+/// `GetModuleHandleW` peeks at the process's loaded-module list
+/// without loading anything and without taking a reference.
+#[cfg(windows)]
+fn python_dll_handle() -> i64 {
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    // "python313.dll" as static UTF-16, NUL-terminated.
+    const NAME: &[u16] = &[
+        b'p' as u16,
+        b'y' as u16,
+        b't' as u16,
+        b'h' as u16,
+        b'o' as u16,
+        b'n' as u16,
+        b'3' as u16,
+        b'1' as u16,
+        b'3' as u16,
+        b'.' as u16,
+        b'd' as u16,
+        b'l' as u16,
+        b'l' as u16,
+        0,
+    ];
+    // SAFETY: NAME is a valid NUL-terminated UTF-16 string.
+    let handle = unsafe { GetModuleHandleW(NAME.as_ptr()) };
+    handle as usize as i64
+}
 
 /// `sys.getwindowsversion()` — the 10-member struct sequence of
 /// `Python/sysmodule.c`'s `sys_getwindowsversion_impl`. Sourced from

@@ -90,16 +90,18 @@ fn main() {
     }
     src.push_str("];\n");
 
-    // The one generated-per-platform file in a real install. Windows
-    // ships CPython's static `PC/pyconfig.h`, which is out of scope
-    // this wave (RFC 0062 non-goal); the empty string means "keep the
-    // pre-0062 stub".
+    // The one generated-per-platform file in a real install. POSIX
+    // variants are real autoconf outputs; the Windows variant mirrors
+    // CPython's hand-maintained `PC/pyconfig.h` (no autoconf on NT),
+    // including the `python313.lib` MSVC autolink pragma (RFC 0064
+    // WS3). `None` (other platforms) keeps the pre-0062 stub.
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let pyconfig = match target_os.as_str() {
         "macos" => Some(capi_include.join("pyconfig").join("pyconfig-macos.h")),
         "linux" | "freebsd" | "android" => {
             Some(capi_include.join("pyconfig").join("pyconfig-linux.h"))
         }
+        "windows" => Some(capi_include.join("pyconfig").join("pyconfig-windows.h")),
         _ => None,
     };
     match pyconfig {

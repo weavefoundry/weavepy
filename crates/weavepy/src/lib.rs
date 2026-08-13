@@ -47,12 +47,19 @@ fn load_extension(
     let interp_ptr: *mut vm::Interpreter = interp;
     match capi::load_extension_module(interp_ptr, &path, full_name) {
         Ok(module) => Ok(Some(module)),
-        Err(err) => Err(vm::RuntimeError::PyException(
-            vm::PyException::from_builtin(
-                "ImportError",
-                format!("could not load extension '{full_name}': {err}"),
-            ),
-        )),
+        Err(err) => {
+            // The Windows load-failure variant is already CPython's
+            // exact ImportError text ("DLL load failed while
+            // importing X: …" — RFC 0064 WS2); surface it verbatim.
+            // Other failures keep the WeavePy-prefixed shape.
+            let message = match &err {
+                capi::loader::LoadError::DllLoadFailed { .. } => err.to_string(),
+                _ => format!("could not load extension '{full_name}': {err}"),
+            };
+            Err(vm::RuntimeError::PyException(
+                vm::PyException::from_builtin("ImportError", message),
+            ))
+        }
     }
 }
 

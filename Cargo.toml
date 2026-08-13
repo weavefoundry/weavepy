@@ -11,6 +11,7 @@ members = [
     "crates/weavepy-jit",
     "crates/weavepy-lexer",
     "crates/weavepy-parser",
+    "crates/weavepy-pylib",
     "crates/weavepy-vm",
     "vendor/expat-sys",
 ]
@@ -26,6 +27,7 @@ default-members = [
     "crates/weavepy-compiler",
     "crates/weavepy-lexer",
     "crates/weavepy-parser",
+    "crates/weavepy-pylib",
     "crates/weavepy-vm",
 ]
 
@@ -49,6 +51,7 @@ categories = ["compilers", "development-tools", "parser-implementations"]
 # Internal crates (path deps so the workspace builds without publishing).
 weavepy             = { path = "crates/weavepy",             version = "0.0.0" }
 weavepy-capi        = { path = "crates/weavepy-capi",        version = "0.0.0" }
+weavepy-cli         = { path = "crates/weavepy-cli",         version = "0.0.0" }
 weavepy-compiler    = { path = "crates/weavepy-compiler",    version = "0.0.0" }
 weavepy-conformance = { path = "crates/weavepy-conformance", version = "0.0.0" }
 weavepy-jit         = { path = "crates/weavepy-jit",         version = "0.0.0" }
