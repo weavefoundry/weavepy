@@ -61,9 +61,13 @@ struct Lowerer<'a, 'b> {
     call_tags_base: Value,
     /// Imported signature of the `wpjit_call_py` helper (lazy).
     call_sig: Option<SigRef>,
-    /// Imported signature shared by the `wpjit_list_get`/`_set` helpers
-    /// (RFC 0061 WS5, lazy).
+    /// Imported signature shared by the `wpjit_list_get`/`_set` and
+    /// `wpjit_attr_get`/`_set` helpers — all `(frame, i64, i64) -> i64`
+    /// (RFC 0061/0065 WS5, lazy).
     list_sig: Option<SigRef>,
+    /// Imported signature shared by the `wpjit_list_len`/`_append`
+    /// helpers — `(frame, pin) -> i64` (RFC 0065 WS5, lazy).
+    pin_sig: Option<SigRef>,
     /// The abstract operand stack: SSA value + lane.
     vstack: Vec<(Value, JitType)>,
 }
@@ -86,6 +90,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             call_tags_base: dummy,
             call_sig: None,
             list_sig: None,
+            pin_sig: None,
             vstack: Vec::new(),
         }
     }
@@ -103,6 +108,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             JitType::Float => SlotTag::Float as i64,
             JitType::Bool => SlotTag::Bool as i64,
             JitType::ListInt | JitType::ListFloat => SlotTag::ListPin as i64,
+            JitType::Obj => SlotTag::ObjPin as i64,
             JitType::Unknown => SlotTag::Int as i64,
         }
     }
@@ -342,7 +348,139 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             TOp::CallPy { token, argc, ret } => self.emit_call_py(token, argc, ret, stmt.pc),
             TOp::ListGet { elem } => self.emit_list_get(elem, stmt.pc),
             TOp::ListSet => self.emit_list_set(stmt.pc),
+            TOp::ListLen => self.emit_list_len(stmt.pc),
+            TOp::ListAppend => self.emit_list_append(stmt.pc),
+            TOp::AttrGet { site, out } => self.emit_attr_get(site, out, stmt.pc),
+            TOp::AttrSet { site } => self.emit_attr_set(site, stmt.pc),
         }
+    }
+
+    /// RFC 0065 WS5 — pinned-list length via `wpjit_list_len`. The
+    /// helper returns the length directly (never negative in a correct
+    /// build); a negative return is a defensive pin-table miss that
+    /// deopts at the `CALL` pc with the pin spilled, where the
+    /// enclosing `len` span rebuilds the interpreter's
+    /// `[len, list]` stack shape.
+    fn emit_list_len(&mut self, pc: u32) {
+        let snapshot = self.vstack.clone();
+        let (pin, _) = self.pop();
+        let sig = self.pin_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::list_len_helper_addr() as i64);
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, pin]);
+        let len = self.b.inst_results(call)[0];
+        let bad = self.b.ins().icmp_imm(IntCC::SignedLessThan, len, 0);
+        let cont = self.guard(bad, pc, &snapshot);
+        self.b.switch_to_block(cont);
+        self.vstack.push((len, JitType::Int));
+    }
+
+    /// RFC 0065 WS5 — pinned-list append via `wpjit_list_append`. The
+    /// value is staged through `ret_bits` (same trick as `ListSet`);
+    /// the analyzer guaranteed its lane matches the pinned element
+    /// lane. A non-zero status (defensive) deopts at the `CALL` pc,
+    /// where the enclosing method span rebuilds the receiver as the
+    /// bound `list.append` and the interpreter re-executes the call.
+    fn emit_list_append(&mut self, pc: u32) {
+        let trusted = MemFlags::trusted();
+        let snapshot = self.vstack.clone();
+        let (val, _) = self.pop();
+        let (pin, _) = self.pop();
+        self.b
+            .ins()
+            .store(trusted, val, self.frame_ptr, OFF_RET_BITS);
+        let sig = self.pin_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::list_append_helper_addr() as i64);
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, pin]);
+        let status = self.b.inst_results(call)[0];
+        let bad = self.b.ins().icmp_imm(IntCC::NotEqual, status, 0);
+        let cont = self.guard(bad, pc, &snapshot);
+        self.b.switch_to_block(cont);
+        // `append` returns `None`, which the following `POP_TOP`
+        // consumes — neither ever exists on the native stack.
+    }
+
+    /// RFC 0065 WS5 — pinned-instance attribute read via
+    /// `wpjit_attr_get`. A non-zero status deopts at this pc with the
+    /// receiver spilled (its `ObjPin` tag rebuilds the real instance),
+    /// so the interpreter re-executes the `LOAD_ATTR` generically.
+    fn emit_attr_get(&mut self, site: u32, out: JitType, pc: u32) {
+        let trusted = MemFlags::trusted();
+        let snapshot = self.vstack.clone();
+        let (pin, _) = self.pop();
+        let sig = self.list_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::attr_get_helper_addr() as i64);
+        let sitev = self.b.ins().iconst(types::I64, i64::from(site));
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, pin, sitev]);
+        let status = self.b.inst_results(call)[0];
+        let bad = self.b.ins().icmp_imm(IntCC::NotEqual, status, 0);
+        let cont = self.guard(bad, pc, &snapshot);
+        self.b.switch_to_block(cont);
+        let res = self
+            .b
+            .ins()
+            .load(Self::cl_ty(out), trusted, self.frame_ptr, OFF_RET_BITS);
+        self.vstack.push((res, out));
+    }
+
+    /// RFC 0065 WS5 — pinned-instance attribute write via
+    /// `wpjit_attr_set`. The value is staged through `ret_bits`; a
+    /// non-zero status deopts at this pc with `[value, receiver]`
+    /// spilled, so the interpreter re-executes the `STORE_ATTR`.
+    fn emit_attr_set(&mut self, site: u32, pc: u32) {
+        let trusted = MemFlags::trusted();
+        let snapshot = self.vstack.clone();
+        let (pin, _) = self.pop();
+        let (val, _) = self.pop();
+        self.b
+            .ins()
+            .store(trusted, val, self.frame_ptr, OFF_RET_BITS);
+        let sig = self.list_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::attr_set_helper_addr() as i64);
+        let sitev = self.b.ins().iconst(types::I64, i64::from(site));
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, pin, sitev]);
+        let status = self.b.inst_results(call)[0];
+        let bad = self.b.ins().icmp_imm(IntCC::NotEqual, status, 0);
+        let cont = self.guard(bad, pc, &snapshot);
+        self.b.switch_to_block(cont);
+    }
+
+    /// The shared `(frame, pin) -> i64` signature of the pinned-list
+    /// length/append helpers (RFC 0065 WS5, lazy).
+    fn pin_helper_sig(&mut self) -> SigRef {
+        if let Some(sig) = self.pin_sig {
+            return sig;
+        }
+        let mut sig = Signature::new(self.b.func.signature.call_conv);
+        sig.params.push(AbiParam::new(self.ptr_ty)); // frame
+        sig.params.push(AbiParam::new(types::I64)); // pin
+        sig.returns.push(AbiParam::new(types::I64)); // len / status
+        let r = self.b.import_signature(sig);
+        self.pin_sig = Some(r);
+        r
     }
 
     /// RFC 0061 WS5 — pinned-list element read via the registered

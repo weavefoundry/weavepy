@@ -29,7 +29,7 @@
 //! contract the granular gates had), and every consumer performs an
 //! `Acquire` read of the precise gate before touching queue payloads.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Parked `__del__` requests exist on some thread's queue
 /// (`vm_singletons::PENDING_FINALIZERS`).
@@ -50,10 +50,44 @@ pub const FINALIZING: u32 = 1 << 5;
 /// their thread-local precision behind the shared hint).
 static HOT: AtomicU32 = AtomicU32::new(0);
 
+/// RFC 0065 (WS1): the dispatch loop's *generation* word. Bumped by
+/// every mutation that can change the loop prologue's decisions —
+/// hot-gate bits ([`set`]/[`clear`] below), observer registration
+/// (`trace::bump_observer_gen`), the GC finalizable/suspect
+/// population transitions (`gc_trace`), and frame materialization
+/// (`FrameShell::materialize`). The dispatch loop caches a snapshot
+/// of the prologue's inputs keyed by this generation: while the
+/// generation is unchanged *and* the snapshot says "quiet" (no
+/// pending work, no finalizables, no suspects, no observers, no
+/// materialized frame), the loop runs one relaxed load + compare per
+/// instruction instead of the full ten-plus-probe prologue.
+///
+/// Same producer/consumer discipline as [`HOT`]: a spurious bump is
+/// always safe (one cold re-snapshot); a missed bump is never
+/// allowed, which each producer guarantees by bumping inside the
+/// same critical section that publishes its state change. `Relaxed`
+/// suffices — cross-thread visibility rides the GIL hand-off, whose
+/// lock is a full barrier (the granular gates' existing contract).
+static LOOP_GEN: AtomicU64 = AtomicU64::new(1);
+
 /// One relaxed load — the dispatch loop's entire pending-work probe.
 #[inline]
 pub fn load() -> u32 {
     HOT.load(Ordering::Relaxed)
+}
+
+/// The current loop generation (RFC 0065 WS1).
+#[inline]
+pub fn loop_gen() -> u64 {
+    LOOP_GEN.load(Ordering::Relaxed)
+}
+
+/// Invalidate every dispatch loop's cached prologue snapshot
+/// (RFC 0065 WS1). Cheap (one relaxed RMW); call from any mutation
+/// site whose state the loop prologue consults.
+#[inline]
+pub fn bump_loop_gen() {
+    LOOP_GEN.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Raise `bits`. Producers call this *after* publishing the work the
@@ -61,6 +95,7 @@ pub fn load() -> u32 {
 #[inline]
 pub fn set(bits: u32) {
     HOT.fetch_or(bits, Ordering::Relaxed);
+    bump_loop_gen();
 }
 
 /// Lower `bits`. Consumers call this *before* draining, then re-`set`
@@ -72,4 +107,5 @@ pub fn set(bits: u32) {
 #[inline]
 pub fn clear(bits: u32) {
     HOT.fetch_and(!bits, Ordering::Relaxed);
+    bump_loop_gen();
 }

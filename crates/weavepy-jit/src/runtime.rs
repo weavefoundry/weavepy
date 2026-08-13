@@ -92,6 +92,10 @@ pub enum SlotTag {
     /// per-entry pinned-object table (a pinned `list`). The embedder
     /// rebuilds the real object from the table on deopt/return.
     ListPin = 4,
+    /// RFC 0065 WS5 — the value is an index into the embedder's
+    /// per-entry pinned-object table (a pinned *instance* receiver).
+    /// Same reconstruction contract as [`SlotTag::ListPin`].
+    ObjPin = 5,
 }
 
 impl SlotTag {
@@ -104,6 +108,7 @@ impl SlotTag {
             2 => SlotTag::Bool,
             3 => SlotTag::Boxed,
             4 => SlotTag::ListPin,
+            5 => SlotTag::ObjPin,
             _ => SlotTag::Int,
         }
     }
@@ -248,4 +253,77 @@ pub(crate) fn list_get_helper_addr() -> usize {
 #[must_use]
 pub(crate) fn list_set_helper_addr() -> usize {
     LIST_SET_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// RFC 0065 WS5 — the embedder's pinned-list *length* helper. Returns
+/// the list's length (always `>= 0`), or a negative value on a
+/// pin-table miss (defensive — deopts). Never runs Python code and
+/// never drops a heap object; same safety contract as
+/// [`ListGetHelper`].
+pub type ListLenHelper = unsafe extern "C" fn(frame: *mut JitFrame, pin: i64) -> i64;
+
+/// RFC 0065 WS5 — the embedder's pinned-list *append* helper. The
+/// value to append is pre-staged in [`JitFrame::ret_bits`],
+/// interpreted per the pin's element lane; returns `0` (Ok) or
+/// non-zero to deopt (defensive). Same safety contract as
+/// [`ListGetHelper`].
+pub type ListAppendHelper = unsafe extern "C" fn(frame: *mut JitFrame, pin: i64) -> i64;
+
+static LIST_LEN_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static LIST_APPEND_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide pinned-list length/append helpers
+/// (RFC 0065 WS5). Must precede the first compile of a frame
+/// containing `ListLen`/`ListAppend` ops.
+pub fn register_list_extra_helpers(len: ListLenHelper, append: ListAppendHelper) {
+    LIST_LEN_HELPER.store(len as usize, std::sync::atomic::Ordering::Release);
+    LIST_APPEND_HELPER.store(append as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn list_len_helper_addr() -> usize {
+    LIST_LEN_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
+pub(crate) fn list_append_helper_addr() -> usize {
+    LIST_APPEND_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// RFC 0065 WS5 — the embedder's pinned-instance attribute *read*
+/// helper. `pin` indexes the pinned-object table; `site` indexes the
+/// compiled frame's attribute-site table (name, class fingerprint,
+/// dict index, value lane). Returns `0` (Ok) with the value's bits in
+/// [`JitFrame::ret_bits`], or non-zero to deopt (class changed, dict
+/// reshaped, value left its lane). Never runs Python code; same
+/// safety contract as [`CallPyHelper`].
+pub type AttrGetHelper = unsafe extern "C" fn(frame: *mut JitFrame, pin: i64, site: i64) -> i64;
+
+/// RFC 0065 WS5 — the embedder's pinned-instance attribute *write*
+/// helper. The value is pre-staged in [`JitFrame::ret_bits`]
+/// (interpreted per the site's lane); returns `0` (Ok) or non-zero to
+/// deopt — including when the *displaced* value is a heap object,
+/// whose drop belongs to the interpreter's store path. Same safety
+/// contract as [`AttrGetHelper`].
+pub type AttrSetHelper = unsafe extern "C" fn(frame: *mut JitFrame, pin: i64, site: i64) -> i64;
+
+static ATTR_GET_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ATTR_SET_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide pinned-instance attribute helpers
+/// (RFC 0065 WS5). Must precede the first compile of a frame
+/// containing `AttrGet`/`AttrSet` ops.
+pub fn register_attr_helpers(get: AttrGetHelper, set: AttrSetHelper) {
+    ATTR_GET_HELPER.store(get as usize, std::sync::atomic::Ordering::Release);
+    ATTR_SET_HELPER.store(set as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn attr_get_helper_addr() -> usize {
+    ATTR_GET_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
+pub(crate) fn attr_set_helper_addr() -> usize {
+    ATTR_SET_HELPER.load(std::sync::atomic::Ordering::Acquire)
 }

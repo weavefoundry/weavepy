@@ -72,6 +72,9 @@ pub fn observer_gen() -> u64 {
 #[inline]
 fn bump_observer_gen() {
     OBSERVER_GEN.fetch_add(1, Ordering::Release);
+    // RFC 0065 (WS1): observer changes also invalidate the dispatch
+    // loop's quiet-path snapshot.
+    crate::hot_gates::bump_loop_gen();
 }
 
 /// A generation-stamped cache of the two observer facts the eval loop

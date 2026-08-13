@@ -31,6 +31,14 @@ pub enum JitType {
     ListInt,
     /// RFC 0061 WS5 — a pinned `list` of `float` elements.
     ListFloat,
+    /// RFC 0065 WS5 — a *pinned* instance receiver. Like the list pins,
+    /// the machine value is an `i64` index into the embedder's
+    /// per-entry pinned-object table; attribute access goes through the
+    /// registered `wpjit_attr_get`/`_set` helpers, which re-validate
+    /// the receiver's shape (type identity + attr-version, instance-
+    /// dict hit, expected value lane) per access and deopt on any
+    /// surprise.
+    Obj,
     /// Anything the JIT can't represent. Its presence as an operand to a
     /// supported opcode makes the enclosing region non-JITable.
     Unknown,
@@ -57,6 +65,16 @@ impl JitType {
     #[must_use]
     pub fn is_list(self) -> bool {
         matches!(self, JitType::ListInt | JitType::ListFloat)
+    }
+
+    /// `true` for any *pinned* lane (RFC 0061/0065 WS5): the machine
+    /// value is a pin-table index, meaningless outside its own
+    /// activation — it cannot be marshaled as a call argument or
+    /// returned across a frame boundary.
+    #[inline]
+    #[must_use]
+    pub fn is_pinned(self) -> bool {
+        matches!(self, JitType::ListInt | JitType::ListFloat | JitType::Obj)
     }
 
     /// A pinned list's element lane, or `None` for non-list lanes.

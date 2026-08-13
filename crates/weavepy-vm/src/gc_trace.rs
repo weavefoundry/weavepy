@@ -490,6 +490,10 @@ impl GcState {
             if index.contains_key(&new_id) {
                 return;
             }
+            // RFC 0065 (WS4): publish to the miss-filter *before* the
+            // insert becomes observable (we hold the index borrow, so
+            // no prober can race past a fresh registration).
+            TRACKED_FILTER.insert(new_id);
             let handle = Arc::new(TrackedHandle::new(obj, 0));
             index.insert(new_id, handle.clone());
             // Enroll finalizable objects in the dedicated prompt-finalization
@@ -506,8 +510,12 @@ impl GcState {
                     Ordering::Release,
                 );
                 let mut fin = self.finalizable.borrow_mut();
-                if fin.insert(new_id, handle.clone()).is_none() {
-                    self.finalizable_count.fetch_add(1, Ordering::AcqRel);
+                if fin.insert(new_id, handle.clone()).is_none()
+                    && self.finalizable_count.fetch_add(1, Ordering::AcqRel) == 0
+                {
+                    // RFC 0065 (WS1): 0→1 population transition — kick
+                    // dispatch loops off the quiet path.
+                    crate::hot_gates::bump_loop_gen();
                 }
             }
             let mut gens = self.generations.borrow_mut();
@@ -561,8 +569,12 @@ impl GcState {
         }
         // Drop the finalizable-index entry in lock-step with the main index so
         // the cheap prompt-finalization scan never sees a reclaimed object.
-        if self.finalizable.borrow_mut().remove(&id).is_some() {
-            self.finalizable_count.fetch_sub(1, Ordering::AcqRel);
+        if self.finalizable.borrow_mut().remove(&id).is_some()
+            && self.finalizable_count.fetch_sub(1, Ordering::AcqRel) == 1
+        {
+            // RFC 0065 (WS1): population reached zero — dispatch loops
+            // may re-enter the quiet path.
+            crate::hot_gates::bump_loop_gen();
         }
         // O(1) removal via the handle's cached `slot`. The index is the
         // dedupe authority, so exactly one handle existed for `id`, and
@@ -716,8 +728,11 @@ impl GcState {
             let clones = crate::weakref_registry::strong_clone_count(id);
             h.weak_clones.store(clones, Ordering::Release);
             let mut fin = self.finalizable.borrow_mut();
-            if fin.insert(id, h).is_none() {
-                self.finalizable_count.fetch_add(1, Ordering::AcqRel);
+            if fin.insert(id, h).is_none()
+                && self.finalizable_count.fetch_add(1, Ordering::AcqRel) == 0
+            {
+                // RFC 0065 (WS1): 0→1 population transition.
+                crate::hot_gates::bump_loop_gen();
             }
         }
     }
@@ -894,11 +909,21 @@ impl GcState {
     }
 
     pub fn is_tracked(&self, id: ObjectId) -> bool {
+        // RFC 0065 (WS4): usually-miss probe — two relaxed loads
+        // instead of the index borrow. A stale filter bit (untracked
+        // id) just takes the precise path.
+        if !TRACKED_FILTER.may_contain(id) {
+            return false;
+        }
         self.index.borrow().contains_key(&id)
     }
 
     /// O(1) handle lookup by object id (any generation or frozen).
     pub fn handle_for(&self, id: ObjectId) -> Option<Arc<TrackedHandle>> {
+        // RFC 0065 (WS4): see `is_tracked`.
+        if !TRACKED_FILTER.may_contain(id) {
+            return None;
+        }
         self.index.borrow().get(&id).cloned()
     }
 
@@ -1922,8 +1947,11 @@ impl GcState {
                 // RFC 0061 (WS1b): mirror `untrack_id`'s flag so a stale
                 // suspect entry self-identifies as reclaimed.
                 h.untracked.store(true, Ordering::Release);
-                if fin.remove(&h.id).is_some() {
-                    self.finalizable_count.fetch_sub(1, Ordering::AcqRel);
+                if fin.remove(&h.id).is_some()
+                    && self.finalizable_count.fetch_sub(1, Ordering::AcqRel) == 1
+                {
+                    // RFC 0065 (WS1): population reached zero.
+                    crate::hot_gates::bump_loop_gen();
                 }
                 continue;
             }
@@ -2464,6 +2492,17 @@ fn run_finalizer(obj: &Object) {
 fn has_finalizer(obj: &Object) -> bool {
     match obj {
         Object::Instance(inst) => inst.cls().lookup("__del__").is_some(),
+        // RFC 0065 (WS4, item 3) tried gating this on "close can run
+        // user code" (empty exception table ⇒ skip enrollment) so
+        // `yield`-loop workloads could reach the fully-quiet dispatch
+        // path. Measured: a decisive regression — long-lived suspended
+        // generators that stop enrolling *here* enroll as **active
+        // suspects** instead, and an active suspect vetoes the quiet
+        // path outright (finalizable population only demotes it to the
+        // still-fast fin-quiet mode). jitloop lost its entire quiet-
+        // path win (236ms → 314ms). Left as-is per the RFC's fallback
+        // clause; the split would need an active-suspect exemption
+        // co-designed with the suspects machinery first.
         Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => !g.is_finished(),
         _ => false,
     }
@@ -2488,6 +2527,13 @@ fn has_finalizer(obj: &Object) -> bool {
 /// never dropped (statics have no drop glue); process teardown
 /// finalizes survivors via [`GcState::finalization_candidates`].
 static GC_STATE: std::sync::LazyLock<GcState> = std::sync::LazyLock::new(GcState::new);
+
+/// RFC 0065 (WS4): insert-only miss-filter over the tracked-object
+/// index. Maintained at [`GcState::track`]; consulted by the
+/// usually-miss `is_tracked`/`handle_for` probes on the drop paths.
+/// Process-global like the state it mirrors; survives fork (bits for
+/// vanished objects are harmless false positives).
+static TRACKED_FILTER: crate::hot_filter::AtomicBloom = crate::hot_filter::AtomicBloom::new();
 
 /// Run a closure with the shared, process-global GC state.
 pub fn with_state<R>(f: impl FnOnce(&GcState) -> R) -> R {
@@ -2620,8 +2666,11 @@ pub fn track_prompt_reclaim(obj: Object) {
         let handle = s.index.borrow().get(&id).cloned();
         if let Some(h) = handle {
             let mut fin = s.finalizable.borrow_mut();
-            if fin.insert(id, h).is_none() {
-                s.finalizable_count.fetch_add(1, Ordering::AcqRel);
+            if fin.insert(id, h).is_none()
+                && s.finalizable_count.fetch_add(1, Ordering::AcqRel) == 0
+            {
+                // RFC 0065 (WS1): 0→1 population transition.
+                crate::hot_gates::bump_loop_gen();
             }
         }
     });
@@ -2893,6 +2942,10 @@ static SUSPECT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomic
 /// safe point instead of every one.
 static SUSPECT_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static SUSPECT_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// RFC 0065 (WS4): insert-only miss-filter over ever-enrolled suspect
+/// ids, so the per-`untrack_id` [`remove_suspect`] probe skips the map
+/// lock for the overwhelming never-enrolled majority.
+static SUSPECT_FILTER: crate::hot_filter::AtomicBloom = crate::hot_filter::AtomicBloom::new();
 
 /// Recompute the count gates from the locked suspect map.
 fn publish_suspect_counts(s: &SuspectMap) {
@@ -2901,6 +2954,22 @@ fn publish_suspect_counts(s: &SuspectMap) {
         s.values().filter(|(_, b)| *b > 0).count(),
         Ordering::Release,
     );
+    // RFC 0065 (WS1): population changes invalidate the dispatch
+    // loops' quiet-path snapshots (the quiet predicate consults
+    // `suspects_present`).
+    crate::hot_gates::bump_loop_gen();
+}
+
+/// RFC 0065 (WS1): *active*-population probe for the dispatch loop's
+/// quiet predicate, with no dormant-stride tick side effect. While an
+/// active (budget-remaining) suspect is enrolled the loop must stay
+/// on the full prologue so the per-drop re-probe cadence holds;
+/// dormant (aged-out) entries are instead re-probed from the quiet
+/// loop's GIL-checkpoint cadence via [`has_suspects`] +
+/// [`take_dead_suspects`].
+#[inline]
+pub fn active_suspects_present() -> bool {
+    SUSPECT_ACTIVE.load(Ordering::Relaxed) > 0
 }
 
 /// Enroll a cascade-skipped tracked object for later deadness re-probes.
@@ -2915,6 +2984,9 @@ pub fn note_suspect(h: Arc<TrackedHandle>) {
     if s.contains_key(&h.id) {
         return;
     }
+    // RFC 0065 (WS4): publish to the miss-filter before the enrollment
+    // becomes observable (we hold the map lock).
+    SUSPECT_FILTER.insert(h.id);
     // Refresh the handle's cached weakref-clone upper bound once at
     // enrollment so the re-probe loop can fast-reject live suspects with
     // two atomic loads instead of a registry lookup per safe point (see
@@ -2980,6 +3052,13 @@ pub fn has_suspects() -> bool {
 /// `test_io.test_error_through_destructor`) to a later safe point.
 pub fn remove_suspect(id: ObjectId) {
     if SUSPECT_COUNT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    // RFC 0065 (WS4): with a resident (typically dormant) suspect
+    // population this is called for *every* `untrack_id` — probe the
+    // insert-only filter before taking the map lock; a never-enrolled
+    // id answers with two relaxed loads.
+    if !SUSPECT_FILTER.may_contain(id) {
         return;
     }
     let mut s = SUSPECTS.lock();

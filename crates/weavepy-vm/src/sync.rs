@@ -462,8 +462,32 @@ impl<T: Copy> GilCell<T> {
     /// dominated its cost.
     #[track_caller]
     pub fn get(&self) -> T {
-        // BISECT-B: pre-wave guard path
-        *self.borrow()
+        // RFC 0065 (WS2): the documented fast path, restored. Debug
+        // builds keep the checked `borrow()` route so misuse (a `get`
+        // racing a live same-thread `borrow_mut`) still surfaces as a
+        // panic under `cargo test`; release builds read the payload
+        // directly under the owner lock — no borrow-counter RMWs, no
+        // guard construction, no `LIVE_CELL_GUARDS` thread-local
+        // touches.
+        #[cfg(debug_assertions)]
+        {
+            *self.borrow()
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            self.lock_acquire();
+            // SAFETY: the owner lock is held, so no other thread can
+            // touch the payload; a `T: Copy` read cannot re-enter
+            // Python, so no GIL hand-off (and thus no cross-thread
+            // mutation) can occur while the lock is held. A same-thread
+            // outstanding `&mut T` cannot exist mid-`get` because the
+            // interpreter never suspends between a `borrow_mut` and its
+            // guard drop without going through a call boundary, and
+            // `Copy` cells are never borrowed across call boundaries.
+            let v = unsafe { *self.data.get() };
+            self.lock_release();
+            v
+        }
     }
 
     /// Replace the inner value with `value`. Equivalent to
@@ -471,8 +495,19 @@ impl<T: Copy> GilCell<T> {
     /// [`Self::get`] for why that's sound.
     #[track_caller]
     pub fn set(&self, value: T) {
-        // BISECT-B: pre-wave guard path
-        *self.borrow_mut() = value;
+        // RFC 0065 (WS2): symmetric fast path; see `get`.
+        #[cfg(debug_assertions)]
+        {
+            *self.borrow_mut() = value;
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            self.lock_acquire();
+            // SAFETY: as in `get`; the write is a plain `Copy` store
+            // under the owner lock.
+            unsafe { *self.data.get() = value };
+            self.lock_release();
+        }
     }
 }
 

@@ -23,10 +23,25 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use weavepy_compiler::{BinOpKind, CodeObject, CompareKind, Constant, OpCode, UnaryKind};
 
 use crate::ir::{
-    ArithKind, BlockId, CalleeSpanMeta, CmpKind, GlobalGuard, OsrEntry, RangeLoopMeta,
-    ResolvedGlobal, TBlock, TFunc, TOp, TStmt, TTerm,
+    ArithKind, AttrSiteMeta, BlockId, CalleeSpanMeta, CmpKind, GlobalGuard, MethodSpanMeta,
+    OsrEntry, RangeLoopMeta, ResolvedGlobal, TBlock, TFunc, TOp, TStmt, TTerm,
 };
 use crate::value::JitType;
+
+/// The embedder's shape probes (RFC 0061/0065 WS5), bundled so the
+/// inference and emission passes share one source of truth.
+pub(crate) struct Probes<'a> {
+    /// Element lane of a local currently holding a homogeneous `int`/
+    /// `float` list (`Some(Unknown)` = an *empty* list: definitely a
+    /// list, but with no lane evidence — only `append` can pin it).
+    pub list: &'a mut dyn FnMut(u32) -> Option<JitType>,
+    /// `(slot, name, store)` → the scalar value lane of an eligible
+    /// instance-dict attribute on the local currently in `slot`
+    /// (RFC 0065 WS5). Eligibility mirrors the tier-1 inline-cache
+    /// predicate: no `__getattr__`/`__getattribute__`, no shadowing
+    /// data descriptor, name present in the instance dict.
+    pub attr: &'a mut dyn FnMut(u32, &str, bool) -> Option<JitType>,
+}
 
 /// Why a code object could not be compiled by the v1 JIT. Carried back
 /// to the VM so it can mark the frame `NotJitable` and stop retrying.
@@ -134,6 +149,33 @@ pub fn analyze_with_probe(
     resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
     probe_list: &mut dyn FnMut(u32) -> Option<JitType>,
 ) -> Result<TFunc, JitVerdict> {
+    analyze_with_probes(code, resolve, probe_list, &mut |_, _, _| None)
+}
+
+/// [`analyze_with_probe`] with an attribute-site probe (RFC 0065 WS5).
+/// `probe_attr(slot, name, store)` reports the observed scalar value
+/// lane of an instance-dict attribute on the local currently in
+/// `slot`, or `None` when the receiver shape is ineligible. Like the
+/// list probe it is only a prediction: the embedder snapshots a guard
+/// fingerprint per site and its access helpers re-validate per access.
+pub fn analyze_with_probes(
+    code: &CodeObject,
+    resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
+    probe_list: &mut dyn FnMut(u32) -> Option<JitType>,
+    probe_attr: &mut dyn FnMut(u32, &str, bool) -> Option<JitType>,
+) -> Result<TFunc, JitVerdict> {
+    let mut probes = Probes {
+        list: probe_list,
+        attr: probe_attr,
+    };
+    analyze_impl(code, resolve, &mut probes)
+}
+
+fn analyze_impl(
+    code: &CodeObject,
+    resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
+    probes: &mut Probes<'_>,
+) -> Result<TFunc, JitVerdict> {
     if code.is_generator || code.is_coroutine || code.is_async_generator || code.is_class_body {
         return Err(JitVerdict::UnsupportedSignature);
     }
@@ -172,7 +214,7 @@ pub fn analyze_with_probe(
                 &mut local_types,
                 &mut ret_lane,
                 &mut changed,
-                probe_list,
+                probes,
             )?;
         }
         if !changed {
@@ -199,6 +241,9 @@ pub fn analyze_with_probe(
     let mut out = EmitOut {
         max_stack: 0,
         callee_spans: Vec::new(),
+        len_spans: Vec::new(),
+        method_spans: Vec::new(),
+        attr_sites: Vec::new(),
         max_call_args: 0,
     };
     for &bi in &reachable {
@@ -210,6 +255,7 @@ pub fn analyze_with_probe(
             ret_lane,
             &compact,
             &mut out,
+            probes,
         )?;
         blocks.push(tb);
     }
@@ -259,6 +305,9 @@ pub fn analyze_with_probe(
         global_guards: plan.guards,
         range_loops: plan.loops,
         callee_spans: out.callee_spans,
+        len_spans: out.len_spans,
+        method_spans: out.method_spans,
+        attr_sites: out.attr_sites,
         osr_entries,
         max_call_args: out.max_call_args,
         ret_lane: ret_lane.filter(|t| t.is_representable()),
@@ -414,6 +463,7 @@ fn plan_rewrite(
             ResolvedGlobal::ConstInt(_)
             | ResolvedGlobal::ConstFloat(_)
             | ResolvedGlobal::ConstBool(_)
+            | ResolvedGlobal::LenBuiltin
             | ResolvedGlobal::PyFunc { .. } => {
                 let name = &code.names[item.arg as usize];
                 if !plan.guards.iter().any(|g| g.name == *name) {
@@ -660,12 +710,22 @@ fn assigned_out(code: &CodeObject, b: &RawBlock, assigned_in: &HashSet<u32>) -> 
     out
 }
 
+/// What a callee marker stands for (RFC 0065 WS5): a burned-in Python
+/// function, or the erased `len` builtin (lowered to `ListLen`, never
+/// a real call).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MarkKind {
+    Py,
+    Len,
+}
+
 /// A `LOAD_GLOBAL`-resolved Python callee riding the *abstract* stack
 /// between its load and its `CALL` (RFC 0059 WS3). The object itself
 /// never reaches the native stack — the marker only carries what the
 /// `CALL` site and the deopt metadata need.
 #[derive(Clone, Copy)]
 struct CalleeMark {
+    kind: MarkKind,
     token: u32,
     arg_count: u32,
     is_self: bool,
@@ -681,11 +741,21 @@ struct CalleeMark {
 /// live-in inference (`src` is the slot of an as-yet-untyped load) and
 /// an optional callee marker (`ty` is `Unknown` when `callee` is set —
 /// the marker is consumed by `CALL`, never by a value op).
+///
+/// RFC 0065 WS5 adds two more flavours: `recv` marks a pinned-list
+/// receiver of an erased `.append` load (the native value stays the
+/// pin; the interpreter holds the bound method), and `poison` marks
+/// `append`'s `None` result, which exists only on the interpreter
+/// stack and may only be consumed by an immediate `POP_TOP`.
 #[derive(Clone, Copy)]
 struct SE {
     ty: JitType,
     src: Option<u32>,
     callee: Option<CalleeMark>,
+    /// `Some(load_pc)` when this is a `.append` receiver (the
+    /// `LOAD_ATTR`'s pc, for the method-span deopt metadata).
+    recv: Option<u32>,
+    poison: bool,
 }
 
 impl SE {
@@ -694,7 +764,14 @@ impl SE {
             ty,
             src: None,
             callee: None,
+            recv: None,
+            poison: false,
         }
+    }
+
+    /// `true` when a plain value operation may consume this entry.
+    fn is_plain(&self) -> bool {
+        self.callee.is_none() && self.recv.is_none() && !self.poison
     }
 }
 
@@ -718,7 +795,7 @@ fn infer_block(
     local_types: &mut [Option<JitType>],
     ret_lane: &mut Option<JitType>,
     changed: &mut bool,
-    probe_list: &mut dyn FnMut(u32) -> Option<JitType>,
+    probes: &mut Probes<'_>,
 ) -> Result<(), JitVerdict> {
     let mut stack: Vec<SE> = Vec::new();
     for i in b.start..(b.end - 1) {
@@ -730,7 +807,7 @@ fn infer_block(
             local_types,
             *ret_lane,
             changed,
-            probe_list,
+            probes,
         )?;
     }
     // Terminator stack-shape validation.
@@ -739,7 +816,7 @@ fn infer_block(
     match ins.op {
         OpCode::ReturnValue => {
             let v = *stack.last().ok_or(JitVerdict::StackUnderflow)?;
-            if v.callee.is_some() {
+            if !v.is_plain() {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
             }
             merge_ret_lane(ret_lane, v.ty, changed);
@@ -761,10 +838,14 @@ fn infer_block(
                 return Err(JitVerdict::NonEmptyBoundaryStack);
             }
             let c = stack[0];
-            // RFC 0061 WS5 — a pinned list's truth is its length, which
-            // the pin-index machine value cannot express.
-            if c.ty.is_list() {
-                return Err(JitVerdict::UnsupportedOpcode("truth test on list"));
+            if !c.is_plain() {
+                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+            }
+            // RFC 0061/0065 WS5 — a pinned value's truth (list length,
+            // instance `__bool__`) is not expressible on the pin-index
+            // machine value.
+            if c.ty.is_pinned() {
+                return Err(JitVerdict::UnsupportedOpcode("truth test on pinned value"));
             }
             if !c.ty.is_representable() && c.src.is_none() {
                 return Err(JitVerdict::TypeUnknown);
@@ -780,7 +861,7 @@ fn infer_block(
                 local_types,
                 *ret_lane,
                 changed,
-                probe_list,
+                probes,
             )?;
             if !stack.is_empty() {
                 return Err(JitVerdict::NonEmptyBoundaryStack);
@@ -824,7 +905,7 @@ fn step_abstract(
     local_types: &mut [Option<JitType>],
     ret_lane: Option<JitType>,
     changed: &mut bool,
-    probe_list: &mut dyn FnMut(u32) -> Option<JitType>,
+    probes: &mut Probes<'_>,
 ) -> Result<(), JitVerdict> {
     let ins = code.instructions[i];
     // RFC 0058 WS4 — rewritten range-loop pcs.
@@ -868,9 +949,8 @@ fn step_abstract(
                     // RFC 0059 WS3: the callee rides the abstract stack
                     // as a marker until its CALL consumes it.
                     stack.push(SE {
-                        ty: JitType::Unknown,
-                        src: None,
                         callee: Some(CalleeMark {
+                            kind: MarkKind::Py,
                             token,
                             arg_count,
                             is_self,
@@ -878,6 +958,24 @@ fn step_abstract(
                             load_pc: i as u32,
                             interp_depth: 0,
                         }),
+                        ..SE::known(JitType::Unknown)
+                    });
+                    return Ok(());
+                }
+                // RFC 0065 WS5: `len` rides the abstract stack the same
+                // way; its CALL lowers to `ListLen`, never a real call.
+                Some(ResolvedGlobal::LenBuiltin) => {
+                    stack.push(SE {
+                        callee: Some(CalleeMark {
+                            kind: MarkKind::Len,
+                            token: 0,
+                            arg_count: 1,
+                            is_self: false,
+                            ret: Some(JitType::Int),
+                            load_pc: i as u32,
+                            interp_depth: 0,
+                        }),
+                        ..SE::known(JitType::Unknown)
                     });
                     return Ok(());
                 }
@@ -894,19 +992,24 @@ fn step_abstract(
             stack.push(SE::known(ty));
         }
         OpCode::LoadFast => {
+            // `src` is kept even for typed loads: RFC 0065 WS5 attribute
+            // sites need the slot the receiver was loaded from. All
+            // other consumers only read `src` when `ty` is `Unknown`.
             let slot = ins.arg as usize;
-            match local_types.get(slot).copied().flatten() {
-                Some(t) => stack.push(SE::known(t)),
-                None => stack.push(SE {
-                    ty: JitType::Unknown,
-                    src: Some(ins.arg),
-                    callee: None,
-                }),
-            }
+            let ty = local_types
+                .get(slot)
+                .copied()
+                .flatten()
+                .unwrap_or(JitType::Unknown);
+            stack.push(SE {
+                ty,
+                src: Some(ins.arg),
+                ..SE::known(JitType::Unknown)
+            });
         }
         OpCode::StoreFast => {
             let v = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
-            if v.callee.is_some() {
+            if !v.is_plain() {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
             }
             if v.ty.is_representable() {
@@ -917,7 +1020,7 @@ fn step_abstract(
             let kind = bin_kind(ins.arg)?;
             let b = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             let a = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
-            if a.callee.is_some() || b.callee.is_some() {
+            if !a.is_plain() || !b.is_plain() {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
             }
             let (a, b) = resolve_pair(a, b, local_types, changed);
@@ -928,7 +1031,7 @@ fn step_abstract(
             let _ = cmp_kind(ins.arg)?;
             let b = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             let a = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
-            if a.callee.is_some() || b.callee.is_some() {
+            if !a.is_plain() || !b.is_plain() {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
             }
             let (a, b) = resolve_pair(a, b, local_types, changed);
@@ -938,27 +1041,89 @@ fn step_abstract(
         OpCode::UnaryOp => {
             let kind = unary_kind(ins.arg)?;
             let a = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
-            if a.callee.is_some() {
+            if !a.is_plain() {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
             }
             let res = unary_result_type(kind, a.ty)?;
             stack.push(SE::known(res));
         }
+        // RFC 0065 WS5 — attribute load: either the erased `.append`
+        // method load on a pinned list (the receiver stays on the
+        // abstract stack, re-marked), or a scalar attribute read on a
+        // pinned instance receiver.
+        OpCode::LoadAttr => {
+            let name = code
+                .names
+                .get(ins.arg as usize)
+                .ok_or(JitVerdict::UnsupportedOpcode("LOAD_ATTR bad name"))?
+                .as_str();
+            let recv = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            if !recv.is_plain() {
+                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+            }
+            infer_load_attr(name, recv, i, stack, local_types, changed, probes)?;
+        }
+        // RFC 0065 WS5 — scalar attribute write on a pinned instance
+        // receiver. Stack is `[.., value, receiver]`.
+        OpCode::StoreAttr => {
+            let name = code
+                .names
+                .get(ins.arg as usize)
+                .ok_or(JitVerdict::UnsupportedOpcode("STORE_ATTR bad name"))?
+                .as_str();
+            let recv = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            let val = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            if !recv.is_plain() || !val.is_plain() {
+                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+            }
+            let Some(slot) = obj_recv_slot(&recv) else {
+                if !recv.ty.is_representable() {
+                    // Transient — a later iteration may type it.
+                    return Ok(());
+                }
+                return Err(JitVerdict::UnsupportedOpcode("STORE_ATTR receiver"));
+            };
+            let lane = (probes.attr)(slot, name, true)
+                .ok_or(JitVerdict::UnsupportedOpcode("STORE_ATTR shape"))?;
+            set_local(local_types, slot, JitType::Obj, changed)?;
+            if val.ty.is_representable() {
+                if val.ty != lane {
+                    return Err(JitVerdict::UnsupportedOpcode("STORE_ATTR (value lane)"));
+                }
+            } else if let Some(vs) = val.src {
+                set_local(local_types, vs, lane, changed)?;
+            }
+        }
         // RFC 0059 WS3 — a Python-to-Python call: the marker beneath the
         // arguments names the callee. Nested calls compose (an inner
         // call's marker sits above the outer one and is consumed first).
+        // RFC 0065 WS5 adds the `len(list)` and `list.append(v)` shapes.
         OpCode::Call => {
             let argc = ins.arg as usize;
             if stack.len() < argc + 1 {
                 return Err(JitVerdict::StackUnderflow);
             }
+            let mut args: Vec<SE> = Vec::with_capacity(argc);
             for _ in 0..argc {
                 let v = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
-                if v.callee.is_some() {
+                if !v.is_plain() {
                     return Err(JitVerdict::UnsupportedOpcode("CALL (callee as argument)"));
                 }
+                args.push(v);
             }
             let f = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            if f.recv.is_some() {
+                // `x.append(v)` — the receiver rode the stack re-marked.
+                if argc != 1 {
+                    return Err(JitVerdict::UnsupportedOpcode("append (arity)"));
+                }
+                infer_append(&f, &args[0], local_types, changed)?;
+                stack.push(SE {
+                    poison: true,
+                    ..SE::known(JitType::Unknown)
+                });
+                return Ok(());
+            }
             let Some(mark) = f.callee else {
                 return Err(JitVerdict::UnsupportedOpcode("CALL"));
             };
@@ -966,6 +1131,26 @@ fn step_abstract(
             // calls would chronically deopt, so they disqualify instead.
             if mark.arg_count as usize != argc {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (arity)"));
+            }
+            if mark.kind == MarkKind::Len {
+                // `len(x)` on a pinned list → an `int`, no real call.
+                let arg = &args[0];
+                if arg.ty.is_list() {
+                    // fine
+                } else if !arg.ty.is_representable() {
+                    if let Some(slot) = arg.src {
+                        let elem = (probes.list)(slot)
+                            .ok_or(JitVerdict::UnsupportedOpcode("len (argument shape)"))?;
+                        let lty = JitType::list_of(elem)
+                            .ok_or(JitVerdict::UnsupportedOpcode("len (elem lane)"))?;
+                        set_local(local_types, slot, lty, changed)?;
+                    }
+                    // No src: transient — tolerate for this iteration.
+                } else {
+                    return Err(JitVerdict::UnsupportedOpcode("len (argument lane)"));
+                }
+                stack.push(SE::known(JitType::Int));
+                return Ok(());
             }
             let ret = if mark.is_self { ret_lane } else { mark.ret };
             stack.push(SE::known(ret.unwrap_or(JitType::Unknown)));
@@ -979,13 +1164,18 @@ fn step_abstract(
                 return Ok(());
             }
             let v = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
-            if v.callee.is_some() {
+            // RFC 0065 WS5 — `append`'s `None` result exists only on
+            // the interpreter stack; this pop consumes it silently.
+            if v.poison {
+                return Ok(());
+            }
+            if !v.is_plain() {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
             }
         }
         OpCode::CopyTop => {
             let v = *stack.last().ok_or(JitVerdict::StackUnderflow)?;
-            if v.callee.is_some() {
+            if !v.is_plain() {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
             }
             stack.push(v);
@@ -1000,7 +1190,7 @@ fn step_abstract(
             }
             // A marker's recorded interp-stack position must stay fixed
             // between load and call; reordering it disqualifies.
-            if stack[len - 1].callee.is_some() || stack[len - 2].callee.is_some() {
+            if !stack[len - 1].is_plain() || !stack[len - 2].is_plain() {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
             }
             stack.swap(len - 1, len - 2);
@@ -1011,18 +1201,14 @@ fn step_abstract(
         OpCode::BinarySubscr => {
             let idx = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             let cont = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
-            if idx.callee.is_some() || cont.callee.is_some() {
+            if !idx.is_plain() || !cont.is_plain() {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
             }
             check_subscr_index(&idx, local_types, changed)?;
-            let elem = resolve_list_container(&cont, local_types, changed, probe_list)?;
+            let elem = resolve_list_container(&cont, local_types, changed, probes)?;
             stack.push(match elem {
                 Some(l) => SE::known(l),
-                None => SE {
-                    ty: JitType::Unknown,
-                    src: None,
-                    callee: None,
-                },
+                None => SE::known(JitType::Unknown),
             });
         }
         // RFC 0061 WS5 — pinned-list element write. The stored value's
@@ -1032,11 +1218,11 @@ fn step_abstract(
             let idx = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             let cont = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             let val = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
-            if idx.callee.is_some() || cont.callee.is_some() || val.callee.is_some() {
+            if !idx.is_plain() || !cont.is_plain() || !val.is_plain() {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
             }
             check_subscr_index(&idx, local_types, changed)?;
-            let elem = resolve_list_container(&cont, local_types, changed, probe_list)?;
+            let elem = resolve_list_container(&cont, local_types, changed, probes)?;
             if let Some(el) = elem {
                 if val.ty.is_representable() {
                     if val.ty != el {
@@ -1081,7 +1267,7 @@ fn resolve_list_container(
     cont: &SE,
     local_types: &mut [Option<JitType>],
     changed: &mut bool,
-    probe_list: &mut dyn FnMut(u32) -> Option<JitType>,
+    probes: &mut Probes<'_>,
 ) -> Result<Option<JitType>, JitVerdict> {
     if let Some(el) = cont.ty.elem_lane() {
         return Ok(Some(el));
@@ -1090,15 +1276,132 @@ fn resolve_list_container(
         return Err(JitVerdict::UnsupportedOpcode("subscript container lane"));
     }
     if let Some(slot) = cont.src {
-        let Some(elem) = probe_list(slot) else {
+        let Some(elem) = (probes.list)(slot) else {
             return Err(JitVerdict::UnsupportedOpcode("subscript container shape"));
         };
+        // `Some(Unknown)` = an empty list: no lane evidence, and any
+        // subscript on it would raise anyway.
         let list_ty =
             JitType::list_of(elem).ok_or(JitVerdict::UnsupportedOpcode("subscript elem lane"))?;
         set_local(local_types, slot, list_ty, changed)?;
         return Ok(Some(elem));
     }
     Ok(None)
+}
+
+/// RFC 0065 WS5 — the receiver slot of an attribute access: an
+/// `Obj`-lane (or as-yet-untyped) local load. `None` when the receiver
+/// has no local provenance or wears an incompatible concrete lane.
+fn obj_recv_slot(recv: &SE) -> Option<u32> {
+    match recv.ty {
+        JitType::Obj => recv.src,
+        JitType::Unknown => recv.src,
+        _ => None,
+    }
+}
+
+/// RFC 0065 WS5 — infer one `LOAD_ATTR`. Order of resolution:
+///
+/// 1. `.append` on a (known or probed) list receiver → re-mark the
+///    receiver in place; the following `CALL 1` lowers to `ListAppend`.
+/// 2. Any other name on an instance receiver whose probe reports an
+///    eligible scalar instance-dict attribute → pin the slot as `Obj`
+///    and push the value lane (lowered to `AttrGet`).
+/// 3. Anything else disqualifies (a transient untyped receiver is
+///    tolerated for a later iteration).
+fn infer_load_attr(
+    name: &str,
+    recv: SE,
+    i: usize,
+    stack: &mut Vec<SE>,
+    local_types: &mut [Option<JitType>],
+    changed: &mut bool,
+    probes: &mut Probes<'_>,
+) -> Result<(), JitVerdict> {
+    if name == "append" {
+        if recv.ty.is_list() {
+            stack.push(SE {
+                recv: Some(i as u32),
+                ..recv
+            });
+            return Ok(());
+        }
+        if !recv.ty.is_representable() {
+            if let Some(slot) = recv.src {
+                match (probes.list)(slot) {
+                    // Empty list: definitely a list, lane pinned by the
+                    // appended value at the CALL.
+                    Some(JitType::Unknown) => {
+                        stack.push(SE {
+                            recv: Some(i as u32),
+                            ..recv
+                        });
+                        return Ok(());
+                    }
+                    Some(elem) => {
+                        let lty = JitType::list_of(elem)
+                            .ok_or(JitVerdict::UnsupportedOpcode("append (elem lane)"))?;
+                        set_local(local_types, slot, lty, changed)?;
+                        stack.push(SE {
+                            ty: lty,
+                            recv: Some(i as u32),
+                            ..recv
+                        });
+                        return Ok(());
+                    }
+                    // Not a list — fall through to the attribute path
+                    // (an instance attribute literally named "append").
+                    None => {}
+                }
+            }
+        }
+    }
+    let Some(slot) = obj_recv_slot(&recv) else {
+        if !recv.ty.is_representable() {
+            // Transient — tolerate; emission bails if never resolved.
+            stack.push(SE::known(JitType::Unknown));
+            return Ok(());
+        }
+        return Err(JitVerdict::UnsupportedOpcode("LOAD_ATTR receiver"));
+    };
+    let Some(lane) = (probes.attr)(slot, name, false) else {
+        return Err(JitVerdict::UnsupportedOpcode("LOAD_ATTR shape"));
+    };
+    set_local(local_types, slot, JitType::Obj, changed)?;
+    stack.push(SE::known(lane));
+    Ok(())
+}
+
+/// RFC 0065 WS5 — infer one `list.append(v)` call: the value lane must
+/// match the pinned element lane exactly; an untyped receiver (empty
+/// list) is pinned *by* the value's lane.
+fn infer_append(
+    recv: &SE,
+    val: &SE,
+    local_types: &mut [Option<JitType>],
+    changed: &mut bool,
+) -> Result<(), JitVerdict> {
+    if let Some(elem) = recv.ty.elem_lane() {
+        if val.ty.is_representable() {
+            if val.ty != elem {
+                return Err(JitVerdict::UnsupportedOpcode("append (value lane)"));
+            }
+        } else if let Some(vs) = val.src {
+            set_local(local_types, vs, elem, changed)?;
+        }
+        return Ok(());
+    }
+    // Receiver lane pending (empty-list probe): pin it from the value.
+    if val.ty.is_representable() {
+        let lty =
+            JitType::list_of(val.ty).ok_or(JitVerdict::UnsupportedOpcode("append (value lane)"))?;
+        if let Some(slot) = recv.src {
+            set_local(local_types, slot, lty, changed)?;
+        }
+    }
+    // Both untyped: transient; a later iteration resolves or emission
+    // bails.
+    Ok(())
 }
 
 /// If exactly one operand is an untyped live-in load and the other is a
@@ -1268,23 +1571,41 @@ fn unary_kind(arg: u32) -> Result<UnaryKind, JitVerdict> {
 
 /// One emission-stack entry: a native lane, or an open callee marker
 /// (present on the *interpreter's* stack but never the native one).
+/// RFC 0065 WS5 adds `src` (receiver-slot provenance for attribute
+/// sites), `recv` (an erased `.append` receiver: native holds the pin,
+/// the interpreter holds the bound method), and `poison` (`append`'s
+/// `None` result: on the interpreter stack only, consumed by
+/// `POP_TOP`).
 #[derive(Clone, Copy)]
 struct ESlot {
     ty: JitType,
     callee: Option<CalleeMark>,
+    src: Option<u32>,
+    recv: Option<u32>,
+    poison: bool,
 }
 
 impl ESlot {
     fn val(ty: JitType) -> ESlot {
-        ESlot { ty, callee: None }
+        ESlot {
+            ty,
+            callee: None,
+            src: None,
+            recv: None,
+            poison: false,
+        }
+    }
+
+    fn is_plain(&self) -> bool {
+        self.callee.is_none() && self.recv.is_none() && !self.poison
     }
 }
 
 /// Pop an emission-stack value that must be a plain lane (not a callee
-/// marker).
+/// marker, an `.append` receiver, or `append`'s poison result).
 fn pop_val(stack: &mut Vec<ESlot>) -> Result<JitType, JitVerdict> {
     let s = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
-    if s.callee.is_some() {
+    if !s.is_plain() {
         return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
     }
     Ok(s.ty)
@@ -1294,10 +1615,19 @@ fn pop_val(stack: &mut Vec<ESlot>) -> Result<JitType, JitVerdict> {
 struct EmitOut {
     max_stack: u32,
     callee_spans: Vec<CalleeSpanMeta>,
+    /// RFC 0065 WS5 — erased `len` builtins (guard-snapshot object,
+    /// `live_to` = pc after the `CALL`).
+    len_spans: Vec<CalleeSpanMeta>,
+    /// RFC 0065 WS5 — erased `.append` bound-method receivers.
+    method_spans: Vec<MethodSpanMeta>,
+    /// RFC 0065 WS5 — burned-in attribute-access sites, in `site`
+    /// token order.
+    attr_sites: Vec<AttrSiteMeta>,
     max_call_args: u32,
 }
 
 /// Emit the typed IR for one block, with all local types now known.
+#[allow(clippy::too_many_arguments)]
 fn emit_block(
     code: &CodeObject,
     b: &RawBlock,
@@ -1306,6 +1636,7 @@ fn emit_block(
     ret_lane: Option<JitType>,
     compact: &HashMap<usize, BlockId>,
     out: &mut EmitOut,
+    probes: &mut Probes<'_>,
 ) -> Result<TBlock, JitVerdict> {
     let mut stack: Vec<ESlot> = Vec::new();
     let mut stmts: Vec<TStmt> = Vec::new();
@@ -1320,6 +1651,7 @@ fn emit_block(
             &mut stack,
             &mut stmts,
             out,
+            probes,
         )?;
     }
 
@@ -1330,7 +1662,7 @@ fn emit_block(
             // Lowering pops the return value off its own type stack at
             // the `Return` terminator; no statement is emitted here.
             let top = stack.last().ok_or(JitVerdict::StackUnderflow)?;
-            if top.callee.is_some() {
+            if !top.is_plain() {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
             }
             TTerm::Return
@@ -1370,6 +1702,7 @@ fn emit_block(
                 &mut stack,
                 &mut stmts,
                 out,
+                probes,
             )?;
             TTerm::Jump(compact[&block_succ(b, 0)])
         }
@@ -1400,12 +1733,16 @@ fn emit_instr(
     stack: &mut Vec<ESlot>,
     stmts: &mut Vec<TStmt>,
     out: &mut EmitOut,
+    probes: &mut Probes<'_>,
 ) -> Result<(), JitVerdict> {
     let ins = code.instructions[i];
     let pc = i as u32;
     let EmitOut {
         max_stack,
         callee_spans,
+        len_spans,
+        method_spans,
+        attr_sites,
         max_call_args,
     } = out;
     // Note: `max_stack` counts markers too — a harmless overestimate of
@@ -1466,8 +1803,8 @@ fn emit_instr(
                         .filter(|l| (l.live_from as usize) <= i && i < l.live_to as usize)
                         .count() as u32;
                     stack.push(ESlot {
-                        ty: JitType::Unknown,
                         callee: Some(CalleeMark {
+                            kind: MarkKind::Py,
                             token,
                             arg_count,
                             is_self,
@@ -1475,6 +1812,29 @@ fn emit_instr(
                             load_pc: pc,
                             interp_depth: n_iters + stack.len() as u32,
                         }),
+                        ..ESlot::val(JitType::Unknown)
+                    });
+                    return Ok(());
+                }
+                // RFC 0065 WS5: `len` rides the interpreter stack the
+                // same way; the `CALL` lowers to `ListLen`.
+                Some(ResolvedGlobal::LenBuiltin) => {
+                    let n_iters = plan
+                        .loops
+                        .iter()
+                        .filter(|l| (l.live_from as usize) <= i && i < l.live_to as usize)
+                        .count() as u32;
+                    stack.push(ESlot {
+                        callee: Some(CalleeMark {
+                            kind: MarkKind::Len,
+                            token: 0,
+                            arg_count: 1,
+                            is_self: false,
+                            ret: Some(JitType::Int),
+                            load_pc: pc,
+                            interp_depth: n_iters + stack.len() as u32,
+                        }),
+                        ..ESlot::val(JitType::Unknown)
                     });
                     return Ok(());
                 }
@@ -1498,7 +1858,17 @@ fn emit_instr(
                 .copied()
                 .flatten()
                 .ok_or(JitVerdict::TypeUnknown)?;
-            push(TOp::LoadLocal(ins.arg), Some(ty), stack, stmts);
+            // Push manually so the slot provenance rides along (RFC
+            // 0065 WS5 attribute sites re-probe by slot).
+            stmts.push(TStmt {
+                pc,
+                op: TOp::LoadLocal(ins.arg),
+            });
+            stack.push(ESlot {
+                src: Some(ins.arg),
+                ..ESlot::val(ty)
+            });
+            *max_stack = (*max_stack).max(stack.len() as u32);
         }
         OpCode::StoreFast => {
             pop_val(stack)?;
@@ -1593,41 +1963,171 @@ fn emit_instr(
                 _ => return Err(JitVerdict::UnsupportedOpcode("UNARY_OP lane")),
             }
         }
+        // RFC 0065 WS5 — attribute load: erased `.append` method load
+        // (re-mark the receiver in place; no native op), or a pinned-
+        // instance scalar attribute read (an `AttrGet` site).
+        OpCode::LoadAttr => {
+            let name = code
+                .names
+                .get(ins.arg as usize)
+                .ok_or(JitVerdict::UnsupportedOpcode("LOAD_ATTR bad name"))?
+                .as_str();
+            let top = stack.last().copied().ok_or(JitVerdict::StackUnderflow)?;
+            if !top.is_plain() {
+                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+            }
+            if name == "append" && top.ty.is_list() {
+                let last = stack.len() - 1;
+                stack[last].recv = Some(pc);
+                return Ok(());
+            }
+            if top.ty != JitType::Obj {
+                return Err(JitVerdict::UnsupportedOpcode("LOAD_ATTR receiver"));
+            }
+            let slot = top.src.ok_or(JitVerdict::UnsupportedOpcode(
+                "LOAD_ATTR (receiver provenance)",
+            ))?;
+            let lane = (probes.attr)(slot, name, false)
+                .ok_or(JitVerdict::UnsupportedOpcode("LOAD_ATTR shape"))?;
+            stack.pop();
+            let site = attr_sites.len() as u32;
+            attr_sites.push(AttrSiteMeta {
+                slot,
+                name: name.to_owned(),
+                lane,
+                store: false,
+            });
+            push(TOp::AttrGet { site, out: lane }, Some(lane), stack, stmts);
+        }
+        // RFC 0065 WS5 — pinned-instance scalar attribute write (an
+        // `AttrSet` site). Stack is `[.., value, receiver]`.
+        OpCode::StoreAttr => {
+            let name = code
+                .names
+                .get(ins.arg as usize)
+                .ok_or(JitVerdict::UnsupportedOpcode("STORE_ATTR bad name"))?
+                .as_str();
+            let recv = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            if !recv.is_plain() || recv.ty != JitType::Obj {
+                return Err(JitVerdict::UnsupportedOpcode("STORE_ATTR receiver"));
+            }
+            let slot = recv.src.ok_or(JitVerdict::UnsupportedOpcode(
+                "STORE_ATTR (receiver provenance)",
+            ))?;
+            let lane = (probes.attr)(slot, name, true)
+                .ok_or(JitVerdict::UnsupportedOpcode("STORE_ATTR shape"))?;
+            let val = pop_val(stack)?;
+            if val != lane {
+                return Err(JitVerdict::UnsupportedOpcode("STORE_ATTR (value lane)"));
+            }
+            let site = attr_sites.len() as u32;
+            attr_sites.push(AttrSiteMeta {
+                slot,
+                name: name.to_owned(),
+                lane,
+                store: true,
+            });
+            // Native stack order matches the interpreter: value below,
+            // receiver on top. Lowering pops receiver then value.
+            stack.push(recv);
+            push(TOp::AttrSet { site }, None, stack, stmts);
+            stack.pop();
+        }
         // RFC 0059 WS3 — Python-to-Python call: pop the scalar args and
         // the callee marker, close the deopt span, and emit `CallPy`.
+        // RFC 0065 WS5 adds the `len(list)` and `list.append(v)` shapes.
         OpCode::Call => {
             let argc = ins.arg as usize;
             if stack.len() < argc + 1 {
                 return Err(JitVerdict::StackUnderflow);
             }
+            let mut arg_tys: Vec<JitType> = Vec::with_capacity(argc);
             for _ in 0..argc {
-                let ty = pop_val(stack)?;
-                if !ty.is_representable() {
-                    return Err(JitVerdict::TypeUnknown);
-                }
-                // RFC 0061 WS5 — a pin index is meaningless outside this
-                // activation; a pinned list cannot be marshaled as a
-                // scalar call argument.
-                if ty.is_list() {
-                    return Err(JitVerdict::UnsupportedOpcode("CALL (list argument)"));
-                }
+                arg_tys.push(pop_val(stack)?);
             }
             let f = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            // `x.append(v)` — the pin stayed on the native stack under
+            // the argument; no callee object was ever native.
+            if let Some(load_pc) = f.recv {
+                if argc != 1 {
+                    return Err(JitVerdict::UnsupportedOpcode("append (arity)"));
+                }
+                let elem =
+                    f.ty.elem_lane()
+                        .ok_or(JitVerdict::UnsupportedOpcode("append (receiver lane)"))?;
+                if arg_tys[0] != elem {
+                    return Err(JitVerdict::UnsupportedOpcode("append (value lane)"));
+                }
+                // The receiver's bottom-based native-stack index equals
+                // its spill index: everything below it that carries a
+                // native value (markers don't).
+                let native_index = stack.iter().filter(|s| s.callee.is_none()).count() as u32;
+                method_spans.push(MethodSpanMeta {
+                    native_index,
+                    live_from: load_pc,
+                    live_to: pc + 1,
+                });
+                // Re-model the operands for the statement, then emit:
+                // `ListAppend` pops the value and the pin natively.
+                stack.push(ESlot::val(f.ty));
+                stack.push(ESlot::val(elem));
+                push(TOp::ListAppend, None, stack, stmts);
+                stack.pop();
+                stack.pop();
+                // `append` returns `None` — interpreter-stack only.
+                stack.push(ESlot {
+                    poison: true,
+                    ..ESlot::val(JitType::Unknown)
+                });
+                *max_stack = (*max_stack).max(stack.len() as u32);
+                return Ok(());
+            }
             let Some(mark) = f.callee else {
                 return Err(JitVerdict::UnsupportedOpcode("CALL"));
             };
             if mark.arg_count as usize != argc {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (arity)"));
             }
+            // `len(x)` on a pinned list — no real call, no deopt-able
+            // argument window (only loads can produce a list value).
+            if mark.kind == MarkKind::Len {
+                if !arg_tys[0].is_list() {
+                    return Err(JitVerdict::UnsupportedOpcode("len (argument lane)"));
+                }
+                len_spans.push(CalleeSpanMeta {
+                    token: 0,
+                    live_from: mark.load_pc,
+                    live_to: pc + 1,
+                    interp_depth: mark.interp_depth,
+                });
+                // Re-model the pin for the statement (ListLen pops it).
+                stack.push(ESlot::val(arg_tys[0]));
+                push(TOp::ListLen, None, stack, stmts);
+                stack.pop();
+                stack.push(ESlot::val(JitType::Int));
+                *max_stack = (*max_stack).max(stack.len() as u32);
+                return Ok(());
+            }
+            for &ty in &arg_tys {
+                if !ty.is_representable() {
+                    return Err(JitVerdict::TypeUnknown);
+                }
+                // RFC 0061/0065 WS5 — a pin index is meaningless outside
+                // this activation; a pinned value cannot be marshaled as
+                // a scalar call argument.
+                if ty.is_pinned() {
+                    return Err(JitVerdict::UnsupportedOpcode("CALL (pinned argument)"));
+                }
+            }
             let ret = match if mark.is_self { ret_lane } else { mark.ret } {
                 Some(t) if t.is_representable() => t,
                 _ => return Err(JitVerdict::TypeUnknown),
             };
-            // RFC 0061 WS5 — a pin index is only meaningful within its
-            // own activation's pinned-object table; a callee's returned
-            // list cannot cross the boundary as one.
-            if ret.is_list() {
-                return Err(JitVerdict::UnsupportedOpcode("CALL (list return)"));
+            // RFC 0061/0065 WS5 — a pin index is only meaningful within
+            // its own activation's pinned-object table; a callee's
+            // returned value cannot cross the boundary as one.
+            if ret.is_pinned() {
+                return Err(JitVerdict::UnsupportedOpcode("CALL (pinned return)"));
             }
             callee_spans.push(CalleeSpanMeta {
                 token: mark.token,
@@ -1648,15 +2148,26 @@ fn emit_instr(
             );
         }
         OpCode::PopTop => {
+            // RFC 0065 WS5 — `append`'s poison result never existed on
+            // the native stack; consume it silently.
+            if stack.last().is_some_and(|s| s.poison) {
+                stack.pop();
+                return Ok(());
+            }
             pop_val(stack)?;
             push(TOp::Pop, None, stack, stmts);
         }
         OpCode::CopyTop => {
             let t = *stack.last().ok_or(JitVerdict::StackUnderflow)?;
-            if t.callee.is_some() {
+            if !t.is_plain() {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
             }
-            push(TOp::Dup, Some(t.ty), stack, stmts);
+            // Manual push: the copy keeps the slot provenance so an
+            // augmented attribute assignment (`p.a += 1`, which dups
+            // the receiver) still knows its receiver slot.
+            stmts.push(TStmt { pc, op: TOp::Dup });
+            stack.push(t);
+            *max_stack = (*max_stack).max(stack.len() as u32);
         }
         OpCode::Swap => {
             if ins.arg != 2 {
@@ -1666,7 +2177,7 @@ fn emit_instr(
             if len < 2 {
                 return Err(JitVerdict::StackUnderflow);
             }
-            if stack[len - 1].callee.is_some() || stack[len - 2].callee.is_some() {
+            if !stack[len - 1].is_plain() || !stack[len - 2].is_plain() {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
             }
             stack.swap(len - 1, len - 2);

@@ -17,7 +17,10 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
 
 use crate::analyze::JitVerdict;
-use crate::ir::{CalleeSpanMeta, GlobalGuard, OsrEntry, RangeLoopMeta, ResolvedGlobal, TFunc};
+use crate::ir::{
+    AttrSiteMeta, CalleeSpanMeta, GlobalGuard, MethodSpanMeta, OsrEntry, RangeLoopMeta,
+    ResolvedGlobal, TFunc, TOp,
+};
 use crate::lower::build_function;
 use crate::runtime::{self, JitFrame, JitStatus};
 use crate::value::JitType;
@@ -49,6 +52,13 @@ pub struct CompiledFrame {
     /// Erased Python callees (RFC 0059 WS3), for rebuilding the callee
     /// object on the interpreter stack after a mid-arguments deopt.
     pub callee_spans: Vec<CalleeSpanMeta>,
+    /// RFC 0065 WS5 — erased `len` builtins (see [`TFunc::len_spans`]).
+    pub len_spans: Vec<CalleeSpanMeta>,
+    /// RFC 0065 WS5 — erased bound-method receivers (`list.append`).
+    pub method_spans: Vec<MethodSpanMeta>,
+    /// RFC 0065 WS5 — burned-in attribute-access sites; the embedder
+    /// snapshots one guard fingerprint per site before first entry.
+    pub attr_sites: Vec<AttrSiteMeta>,
     /// Loop-header pcs enterable mid-frame via `entry_pc` (OSR).
     pub osr_entries: Vec<OsrEntry>,
     /// Widest `CallPy` argument count, for sizing the marshal buffers.
@@ -148,7 +158,21 @@ impl JitEngine {
         resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
         probe_list: &mut dyn FnMut(u32) -> Option<JitType>,
     ) -> Result<CompiledFrame, JitVerdict> {
-        let tfunc = crate::analyze::analyze_with_probe(code, resolve, probe_list)?;
+        self.compile_with_probes(code, resolve, probe_list, &mut |_, _, _| None)
+    }
+
+    /// [`Self::compile_with_probe`] with an attribute-site probe
+    /// (RFC 0065 WS5): `probe_attr(slot, name, store)` reports the
+    /// observed scalar value lane of an eligible instance-dict
+    /// attribute on the local currently in `slot`.
+    pub fn compile_with_probes(
+        &mut self,
+        code: &CodeObject,
+        resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
+        probe_list: &mut dyn FnMut(u32) -> Option<JitType>,
+        probe_attr: &mut dyn FnMut(u32, &str, bool) -> Option<JitType>,
+    ) -> Result<CompiledFrame, JitVerdict> {
+        let tfunc = crate::analyze::analyze_with_probes(code, resolve, probe_list, probe_attr)?;
         self.compile_tfunc(&tfunc)
     }
 
@@ -161,12 +185,9 @@ impl JitEngine {
         }
         // RFC 0061 WS5 — likewise for the pinned-list helpers.
         let has_list_ops = tfunc.blocks.iter().any(|b| {
-            b.stmts.iter().any(|s| {
-                matches!(
-                    s.op,
-                    crate::ir::TOp::ListGet { .. } | crate::ir::TOp::ListSet
-                )
-            })
+            b.stmts
+                .iter()
+                .any(|s| matches!(s.op, TOp::ListGet { .. } | TOp::ListSet))
         });
         if has_list_ops
             && (runtime::list_get_helper_addr() == 0 || runtime::list_set_helper_addr() == 0)
@@ -174,6 +195,29 @@ impl JitEngine {
             return Err(JitVerdict::UnsupportedOpcode(
                 "SUBSCR (no list helper registered)",
             ));
+        }
+        // RFC 0065 WS5 — the length/append and attribute helpers.
+        let has_list_extra = tfunc.blocks.iter().any(|b| {
+            b.stmts
+                .iter()
+                .any(|s| matches!(s.op, TOp::ListLen | TOp::ListAppend))
+        });
+        if has_list_extra
+            && (runtime::list_len_helper_addr() == 0 || runtime::list_append_helper_addr() == 0)
+        {
+            return Err(JitVerdict::UnsupportedOpcode(
+                "len/append (no helper registered)",
+            ));
+        }
+        let has_attr_ops = tfunc.blocks.iter().any(|b| {
+            b.stmts
+                .iter()
+                .any(|s| matches!(s.op, TOp::AttrGet { .. } | TOp::AttrSet { .. }))
+        });
+        if has_attr_ops
+            && (runtime::attr_get_helper_addr() == 0 || runtime::attr_set_helper_addr() == 0)
+        {
+            return Err(JitVerdict::UnsupportedOpcode("ATTR (no helper registered)"));
         }
         self.module.clear_context(&mut self.ctx);
 
@@ -220,6 +264,9 @@ impl JitEngine {
             global_guards: tfunc.global_guards.clone(),
             range_loops: tfunc.range_loops.clone(),
             callee_spans: tfunc.callee_spans.clone(),
+            len_spans: tfunc.len_spans.clone(),
+            method_spans: tfunc.method_spans.clone(),
+            attr_sites: tfunc.attr_sites.clone(),
             osr_entries: tfunc.osr_entries.clone(),
             max_call_args: tfunc.max_call_args,
             ret_lane: tfunc.ret_lane,

@@ -29,15 +29,16 @@ mod lower;
 mod runtime;
 mod value;
 
-pub use analyze::{analyze, analyze_with_probe, JitVerdict};
+pub use analyze::{analyze, analyze_with_probe, analyze_with_probes, JitVerdict};
 pub use engine::{CompiledFrame, JitEngine};
 pub use ir::{
-    ArithKind, BlockId, CalleeSpanMeta, CmpKind, GlobalGuard, OsrEntry, RangeLoopMeta,
-    ResolvedGlobal, TBlock, TFunc, TOp, TStmt, TTerm,
+    ArithKind, AttrSiteMeta, BlockId, CalleeSpanMeta, CmpKind, GlobalGuard, MethodSpanMeta,
+    OsrEntry, RangeLoopMeta, ResolvedGlobal, TBlock, TFunc, TOp, TStmt, TTerm,
 };
 pub use runtime::{
-    register_call_py_helper, register_list_helpers, CallPyHelper, CallStatus, JitFrame, JitStatus,
-    ListGetHelper, ListSetHelper, SlotTag,
+    register_attr_helpers, register_call_py_helper, register_list_extra_helpers,
+    register_list_helpers, AttrGetHelper, AttrSetHelper, CallPyHelper, CallStatus, JitFrame,
+    JitStatus, ListAppendHelper, ListGetHelper, ListLenHelper, ListSetHelper, SlotTag,
 };
 pub use value::JitType;
 
@@ -45,7 +46,9 @@ pub use value::JitType;
 #[derive(Debug)]
 pub enum CompileOutcome {
     /// The code object compiled; the engine cached the native function.
-    Compiled(CompiledFrame),
+    /// Boxed: the frame metadata (spans, sites, guards) dwarfs the
+    /// verdict arm.
+    Compiled(Box<CompiledFrame>),
     /// The code object is outside the JITable subset. The caller should
     /// record this verdict and stop re-attempting compilation.
     NotJitable(JitVerdict),
