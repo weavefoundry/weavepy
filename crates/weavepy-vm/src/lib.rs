@@ -38,6 +38,7 @@ pub mod frozen_code_cache;
 pub mod frozen_table;
 pub mod gc_trace;
 pub mod gil;
+pub mod hot_filter;
 pub mod hot_gates;
 pub mod import;
 pub mod linejump;
@@ -4267,6 +4268,27 @@ impl Interpreter {
         // the monitoring tool table on every instruction; the snapshot
         // re-derives only when an observer source actually changes.
         let mut obs = crate::trace::ObserverSnapshot::new();
+        // RFC 0065 (WS1): the quiet loop. The full per-instruction
+        // prologue below (pending-work probes, prompt-finalization
+        // gates, observer bookkeeping, materialized-frame `lasti`
+        // syncing, async-exc/signal/finalizing delivery) is only
+        // *entered* while at least one of its inputs is live. All of
+        // those inputs bump `hot_gates::LOOP_GEN` when they change, so
+        // the loop caches one snapshot keyed by that generation:
+        // while the generation is unchanged and the snapshot says
+        // "quiet", each instruction pays the GIL countdown, one
+        // relaxed generation load + compare, one relaxed `lasti`
+        // store (so mid-instruction materialization — `sys._getframe`
+        // from a callee — still reads a current pc), and `step`.
+        // `WEAVEPY_NO_QUIET=1` pins every iteration to the full
+        // prologue for bisection, mirroring `WEAVEPY_NO_FUSE`.
+        let quiet_off = {
+            static NO_QUIET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *NO_QUIET.get_or_init(|| std::env::var_os("WEAVEPY_NO_QUIET").is_some())
+        };
+        let mut loop_snap_gen: u64 = 0; // stale → first iteration derives
+        let mut loop_quiet = false;
+        let mut loop_fin_quiet = false;
         let result = loop {
             // RFC 0039 (WS2) / RFC 0059 (WS2): cooperative GIL hand-off.
             // A plain interpreter-local countdown — one register
@@ -4277,354 +4299,440 @@ impl Interpreter {
             self.gil_countdown = self.gil_countdown.wrapping_sub(1);
             if self.gil_countdown == 0 {
                 self.gil_countdown = crate::gil::GIL_CHECK_INTERVAL;
-                crate::gil::yield_checkpoint();
-            }
-            // RFC 0059 (WS2): the unified eval-breaker word. One relaxed
-            // load answers "is *any* deferred work pending?" for the six
-            // subsystems that used to probe independently every
-            // instruction (parked finalizers, C-ext drops, deferred
-            // ResourceWarnings, async exceptions, signals, finalizing).
-            // Each bit-guarded arm below re-checks its subsystem's
-            // precise gate, so a stale-set bit is harmless.
-            let hot = crate::hot_gates::load();
-            // RFC 0040 (GC arc): prompt finalization. Between bytecodes — a
-            // safe point with no outstanding container borrows — run `__del__`
-            // and fire callback-weakrefs for any object whose last reference
-            // dropped during the previous instruction, matching CPython's
-            // refcount-driven `tp_dealloc` timing. Two gates keep this free in
-            // the common case: a finalizable object must be live *and* the
-            // previous instruction must have dropped a reference (`take_maybe_
-            // _dead`, made variant-precise by RFC 0059 WS1b), so a hot loop
-            // that neither allocates `__del__` objects nor drops heap-graph
-            // references pays only the relaxed loads.
-            let any_finalizable = gc_trace::has_any_finalizable();
-            if (any_finalizable || gc_trace::has_suspects()) && gc_trace::take_maybe_dead() {
-                if any_finalizable {
-                    self.drain_prompt_finalizers();
-                }
-                // Re-probe cascade-skipped suspects (see `note_suspect`): a
-                // Rust-side transient that pinned one during its cascade has
-                // typically died by now, and CPython would have freed the
-                // object (and everything it anchors) at that instant.
-                if gc_trace::has_suspects() {
+                // RFC 0065 (WS1): the quiet paths skip the per-
+                // instruction suspect probes, so aged-out (dormant)
+                // suspects are instead re-probed on this ~128-
+                // instruction cadence. `has_suspects` keeps its
+                // dormant-stride admission, so a dormant-only
+                // population pays two relaxed loads here and a real
+                // probe only every DORMANT_STRIDE-th checkpoint.
+                if (loop_quiet || loop_fin_quiet) && gc_trace::has_suspects() {
                     for obj in gc_trace::take_dead_suspects() {
                         self.reap_dead_subgraph(obj);
                     }
                 }
-            } else if hot & crate::hot_gates::PENDING_FINALIZERS != 0
-                && crate::vm_singletons::has_pending_finalizers()
-            {
-                // An *untracked* finalizable instance freed by a plain `Rc`
-                // drop (its container temporary died between bytecodes — a
-                // `for k, v in d.items()` loop rebinding its tuple, dropping
-                // the overwritten value) parks its `__del__` via
-                // `PyInstance::drop`'s resurrection net. It never appears in
-                // the finalizable index, so the gate above stays cold; run
-                // the parked finalizers here to keep CPython's refcount
-                // timing (`test_dict.test_oob_indexing_dictiter_iternextitem`
-                // clears the dict from such a `__del__` mid-iteration).
-                self.run_pending_finalizers();
+                crate::gil::yield_checkpoint();
             }
-            // RFC 0047 (wave 5): reap objects whose last C-side reference
-            // was dropped *inside* an extension call since the previous
-            // instruction (a Cython setter decref'ing the old value of a
-            // `cdef` field). CPython would have run their dealloc chains in
-            // the call itself; the capi boundary parks them instead, and
-            // this between-bytecodes safe point — the first moment with no
-            // extension frame live — runs the refcount-guarded reap so
-            // weakrefs to anything that died clear before the next
-            // instruction can observe them. Gated on one thread-local read.
-            //
-            // Crucially, the drain waits for `cext_call_active()` to clear:
-            // bytecode a C extension re-enters (a Cython module-exec, a
-            // `PyObject_Call` back into Python) hits this safe point too,
-            // where every parked escaped subgraph would just be re-parked
-            // by `reap_dead_subgraph`'s C-frame guard after an O(subgraph)
-            // escape scan — re-scanning the whole queue on *every bytecode*
-            // of the re-entered code (pandas' import runs minutes long
-            // under that quadratic churn). Draining only at depth 0 runs
-            // each parked object through the cascade exactly once.
-            // Probe order matters: `has_pending_cext_drops` is one
-            // relaxed load when empty (the overwhelming case), while
-            // `cext_call_active` is a thread-local read — so ask
-            // "is there anything to do" before "may we do it".
-            if hot & crate::hot_gates::PENDING_CEXT != 0
-                && crate::vm_singletons::has_pending_cext_drops()
-                && !crate::vm_singletons::cext_call_active()
-            {
-                static REAP_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                let reap_trace =
-                    *REAP_TRACE.get_or_init(|| std::env::var_os("WEAVEPY_REAP_TRACE").is_some());
-                for dropped in crate::vm_singletons::drain_pending_cext_drops() {
-                    if reap_trace {
-                        let dead = Self::is_refcount_dead(&dropped, 1);
-                        let sc = gc_trace::strong_count_for(&dropped);
-                        eprintln!(
-                            "[CEXT-REAP] {} id={:#x} sc={} dead={}",
-                            dropped.type_name_owned(),
-                            crate::weakref_registry::id_of(&dropped),
-                            sc,
-                            dead
-                        );
-                    }
-                    // Straight to the cascade: `prompt_reap_dropped`'s
-                    // fast-path early return would plain-drop an untracked,
-                    // finalizer-free container — but a C-dropped container
-                    // (the old `blocks` tuple) is queued here precisely
-                    // because its *tracked children* (Cython `Block`s) need
-                    // the cascade to clear their weakrefs.
-                    self.reap_dead_subgraph(dropped);
-                }
+            // RFC 0065 (WS1): re-derive the prologue snapshot only when
+            // a prologue input changed. The observer snapshot refresh
+            // rides the same generation (observer mutation bumps it).
+            let lgen = crate::hot_gates::loop_gen();
+            if lgen != loop_snap_gen {
+                loop_snap_gen = lgen;
+                obs.refresh();
+                self.fuse_off = obs.any;
+                let base_quiet = !quiet_off
+                    && crate::hot_gates::load() == 0
+                    && !gc_trace::active_suspects_present()
+                    && !obs.any
+                    && !shell
+                        .has_materialized
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                // Graded: fully quiet when no finalizable object exists
+                // anywhere; "fin-quiet" — everything cold except the
+                // CPython-timing-bearing prompt-finalization probe —
+                // when the only live input is the finalizable
+                // population (in practice ≥ 1 in any real program: the
+                // ABC machinery keeps a weakref-callback-enrolled type
+                // alive for the process lifetime).
+                let fin_live = gc_trace::has_any_finalizable();
+                loop_quiet = base_quiet && !fin_live;
+                loop_fin_quiet = base_quiet && fin_live;
             }
-            // RFC 0040 (WS7): surface any "unclosed file" `ResourceWarning`
-            // queued by a `PyFile` destructor since the previous instruction.
-            // Same between-bytecodes safe point as prompt finalization; gated on
-            // a single relaxed atomic load so the common (empty) case is free.
-            if hot & crate::hot_gates::RESOURCE_WARNINGS != 0
-                && crate::vm_singletons::has_pending_resource_warnings()
-            {
-                self.drain_pending_resource_warnings();
-            }
-            // Mirror the live `pc` into the shell so `f_lineno` reads
-            // correctly when user code introspects via `sys._getframe`
-            // (materialisation copies it). The locals need no per-step
-            // sync: any snapshot shares the live storage, and a
-            // materialised `f_locals` dict refreshes itself on access.
-            shell
-                .lasti
-                .store(frame.pc, std::sync::atomic::Ordering::Relaxed);
-            if shell
-                .has_materialized
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
-                // Something materialised the real frame (possibly from
-                // inside an instruction): keep its `lasti` cell in sync
-                // exactly as the eager path used to.
-                self.ensure_top_py_frame(&mut py_frame_slot)
-                    .lasti
-                    .set(frame.pc);
-            }
-            // Fire a 'line' event when the source line changes.
-            // Fast path: skip the line-table read entirely when no
-            // observer is active. The generator-creation bootstrap
-            // (`RETURN_GENERATOR`) fires no line events either.
-            //
-            // A trace callback that *raises* must have its exception
-            // propagate inside the traced frame — catchable by this
-            // frame's own `try/except` and carrying this frame in its
-            // traceback exactly once (CPython `call_trace` failure;
-            // `test_settrace_error`). Park the error and feed it
-            // through the same arm as `step`'s `Err` below instead of
-            // `?`-escaping the whole frame.
-            let mut trace_err: Option<RuntimeError> = None;
-            let cur_pc = frame.pc as usize;
-            obs.refresh();
-            // RFC 0061 (WS2b): fused arms single-step under observation.
-            self.fuse_off = obs.any;
-            if obs.any && !is_gen_bootstrap {
-                let py_frame = self.ensure_top_py_frame(&mut py_frame_slot);
-                py_frame.lasti.set(frame.pc);
-                let line = py_frame.current_lineno();
-                // RFC 0051 (WS4): CPython 3.13 line-event semantics.
-                // A `'line'` event fires when execution reaches an
-                // instruction in the instrumented set (line starts, jump
-                // targets, exception-handler entries — see
-                // `linejump::line_event_starts`) *and* the previously
-                // executed instruction was on a different line (or was
-                // the frame-entry RESUME / a fresh (re)entry, which
-                // never suppresses). Additionally, `sys.settrace` fires
-                // for every *backward* jump landing on the same line
-                // (CPython `sys_trace_jump_func`), which is what makes a
-                // one-line `while` loop re-report its line every
-                // iteration.
-                let starts = line_starts
-                    .get_or_insert_with(|| crate::linejump::line_event_starts(&frame.code));
-                let marked = starts.get(cur_pc).copied().unwrap_or(false);
-                let prev_line = prev_pc.map(|p| frame.code.linetable.get(p).copied().unwrap_or(0));
-                let prev_op = prev_pc.and_then(|p| frame.code.instructions.get(p).map(|i| i.op));
-                // NO_LOCATION instructions (line 0 — e.g. handler-exit
-                // POP_EXCEPT, the except* PREP_RERAISE_STAR epilogue) are
-                // transparent for line-change detection: CPython compares
-                // against the last *located* line, so passing through
-                // them must not re-fire the same line's event.
-                let cmp_prev_line = match prev_line {
-                    Some(0) => py_frame.last_line.get(),
-                    other => other,
-                };
-                let head_fire = marked
-                    && match (cmp_prev_line, prev_op) {
-                        (None, _) => true,
-                        (_, Some(OpCode::Resume)) => true,
-                        (Some(pl), _) => pl != line,
-                    };
-                let jump_fire = matches!(
-                    (prev_pc, prev_op),
-                    (Some(p), Some(OpCode::JumpBackward)) if p > cur_pc
-                ) && prev_line == Some(line);
-                if line != 0 && (head_fire || jump_fire) {
-                    py_frame.last_line.set(Some(line));
-                    // `f_trace_lines = False` suppresses the callback but the
-                    // line bookkeeping above still advances (mirrors CPython,
-                    // which keeps tracking the line for later re-enable).
-                    if py_frame.trace_lines.get() {
-                        match self.fire_line_event(&py_frame) {
-                            Ok(()) => {
-                                // The callback may have set `f_lineno` (RFC
-                                // 0050 — debugger "set next statement").
-                                // Apply the validated plan to the live frame
-                                // and re-dispatch at the target. CPython
-                                // marks the *target* as the previously
-                                // executed instruction (`frame_setlineno`
-                                // sets `instr_ptr = dest`), so the target
-                                // itself does not fire a fresh line event.
-                                if py_frame.pending_jump.get().is_some() {
-                                    self.apply_pending_jump(frame, &py_frame);
-                                    prev_pc = Some(frame.pc as usize);
-                                    continue;
-                                }
+            let cur_pc: usize;
+            let mut instruction_ran = false;
+            let watch_drops: bool;
+            let stack_before: usize;
+            let op_before: Option<OpCode>;
+            let stepped = if loop_quiet || loop_fin_quiet {
+                // The quiet paths: nothing is pending, nobody is
+                // watching. Semantically identical to the full prologue
+                // with the corresponding gates cold — each gate's
+                // producer bumps the loop generation before its gate
+                // can read hot, so the full prologue resumes on the
+                // very next instruction.
+                if loop_fin_quiet {
+                    // The one live subsystem: prompt finalization. Same
+                    // probe order and cadence as the full prologue's
+                    // finalizable arm (`take_maybe_dead` gate, then the
+                    // finalizer drain, then the stride-gated suspect
+                    // re-probe), and the same drop-watch bookkeeping in
+                    // the shared tail below.
+                    if gc_trace::take_maybe_dead() {
+                        self.drain_prompt_finalizers();
+                        if gc_trace::has_suspects() {
+                            for obj in gc_trace::take_dead_suspects() {
+                                self.reap_dead_subgraph(obj);
                             }
-                            Err(e) => trace_err = Some(e),
                         }
                     }
+                    watch_drops = true;
+                    stack_before = frame.stack.len();
+                    op_before = frame.code.instructions.get(frame.pc as usize).map(|i| i.op);
+                } else {
+                    watch_drops = false;
+                    stack_before = 0;
+                    op_before = None;
                 }
-                // A `'line'` callback may have just enabled opcode tracing
-                // (bdb's `stepinstr`); CPython then fires the `'opcode'`
-                // event for this same instruction before it runs. The
-                // frame-entry RESUME carries no opcode event.
-                let at_resume = matches!(
-                    frame.code.instructions.get(cur_pc).map(|i| i.op),
-                    Some(OpCode::Resume)
-                );
-                if trace_err.is_none() && !at_resume && py_frame.trace_opcodes.get() {
-                    if let Err(e) = self.fire_opcode_event(&py_frame) {
-                        trace_err = Some(e);
+                cur_pc = frame.pc as usize;
+                shell
+                    .lasti
+                    .store(frame.pc, std::sync::atomic::Ordering::Relaxed);
+                instruction_ran = true;
+                self.step(frame)
+            } else {
+                // RFC 0059 (WS2): the unified eval-breaker word. One relaxed
+                // load answers "is *any* deferred work pending?" for the six
+                // subsystems that used to probe independently every
+                // instruction (parked finalizers, C-ext drops, deferred
+                // ResourceWarnings, async exceptions, signals, finalizing).
+                // Each bit-guarded arm below re-checks its subsystem's
+                // precise gate, so a stale-set bit is harmless.
+                let hot = crate::hot_gates::load();
+                // RFC 0040 (GC arc): prompt finalization. Between bytecodes — a
+                // safe point with no outstanding container borrows — run `__del__`
+                // and fire callback-weakrefs for any object whose last reference
+                // dropped during the previous instruction, matching CPython's
+                // refcount-driven `tp_dealloc` timing. Two gates keep this free in
+                // the common case: a finalizable object must be live *and* the
+                // previous instruction must have dropped a reference (`take_maybe_
+                // _dead`, made variant-precise by RFC 0059 WS1b), so a hot loop
+                // that neither allocates `__del__` objects nor drops heap-graph
+                // references pays only the relaxed loads.
+                let any_finalizable = gc_trace::has_any_finalizable();
+                if (any_finalizable || gc_trace::has_suspects()) && gc_trace::take_maybe_dead() {
+                    if any_finalizable {
+                        self.drain_prompt_finalizers();
+                    }
+                    // Re-probe cascade-skipped suspects (see `note_suspect`): a
+                    // Rust-side transient that pinned one during its cascade has
+                    // typically died by now, and CPython would have freed the
+                    // object (and everything it anchors) at that instant.
+                    if gc_trace::has_suspects() {
+                        for obj in gc_trace::take_dead_suspects() {
+                            self.reap_dead_subgraph(obj);
+                        }
+                    }
+                } else if hot & crate::hot_gates::PENDING_FINALIZERS != 0
+                    && crate::vm_singletons::has_pending_finalizers()
+                {
+                    // An *untracked* finalizable instance freed by a plain `Rc`
+                    // drop (its container temporary died between bytecodes — a
+                    // `for k, v in d.items()` loop rebinding its tuple, dropping
+                    // the overwritten value) parks its `__del__` via
+                    // `PyInstance::drop`'s resurrection net. It never appears in
+                    // the finalizable index, so the gate above stays cold; run
+                    // the parked finalizers here to keep CPython's refcount
+                    // timing (`test_dict.test_oob_indexing_dictiter_iternextitem`
+                    // clears the dict from such a `__del__` mid-iteration).
+                    self.run_pending_finalizers();
+                }
+                // RFC 0047 (wave 5): reap objects whose last C-side reference
+                // was dropped *inside* an extension call since the previous
+                // instruction (a Cython setter decref'ing the old value of a
+                // `cdef` field). CPython would have run their dealloc chains in
+                // the call itself; the capi boundary parks them instead, and
+                // this between-bytecodes safe point — the first moment with no
+                // extension frame live — runs the refcount-guarded reap so
+                // weakrefs to anything that died clear before the next
+                // instruction can observe them. Gated on one thread-local read.
+                //
+                // Crucially, the drain waits for `cext_call_active()` to clear:
+                // bytecode a C extension re-enters (a Cython module-exec, a
+                // `PyObject_Call` back into Python) hits this safe point too,
+                // where every parked escaped subgraph would just be re-parked
+                // by `reap_dead_subgraph`'s C-frame guard after an O(subgraph)
+                // escape scan — re-scanning the whole queue on *every bytecode*
+                // of the re-entered code (pandas' import runs minutes long
+                // under that quadratic churn). Draining only at depth 0 runs
+                // each parked object through the cascade exactly once.
+                // Probe order matters: `has_pending_cext_drops` is one
+                // relaxed load when empty (the overwhelming case), while
+                // `cext_call_active` is a thread-local read — so ask
+                // "is there anything to do" before "may we do it".
+                if hot & crate::hot_gates::PENDING_CEXT != 0
+                    && crate::vm_singletons::has_pending_cext_drops()
+                    && !crate::vm_singletons::cext_call_active()
+                {
+                    static REAP_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    let reap_trace = *REAP_TRACE
+                        .get_or_init(|| std::env::var_os("WEAVEPY_REAP_TRACE").is_some());
+                    for dropped in crate::vm_singletons::drain_pending_cext_drops() {
+                        if reap_trace {
+                            let dead = Self::is_refcount_dead(&dropped, 1);
+                            let sc = gc_trace::strong_count_for(&dropped);
+                            eprintln!(
+                                "[CEXT-REAP] {} id={:#x} sc={} dead={}",
+                                dropped.type_name_owned(),
+                                crate::weakref_registry::id_of(&dropped),
+                                sc,
+                                dead
+                            );
+                        }
+                        // Straight to the cascade: `prompt_reap_dropped`'s
+                        // fast-path early return would plain-drop an untracked,
+                        // finalizer-free container — but a C-dropped container
+                        // (the old `blocks` tuple) is queued here precisely
+                        // because its *tracked children* (Cython `Block`s) need
+                        // the cascade to clear their weakrefs.
+                        self.reap_dead_subgraph(dropped);
                     }
                 }
-                // PEP 669 INSTRUCTION fires for every executed
-                // instruction (except the frame-entry RESUME) when a
-                // tool subscribed — independent of `f_trace_opcodes`,
-                // which routes through `fire_opcode_event` above and
-                // already fired the monitoring event there.
-                if trace_err.is_none()
-                    && !at_resume
-                    && !py_frame.trace_opcodes.get()
-                    && obs.mon_mask & crate::trace::event_mask(crate::trace::EVENT_INSTRUCTION) != 0
+                // RFC 0040 (WS7): surface any "unclosed file" `ResourceWarning`
+                // queued by a `PyFile` destructor since the previous instruction.
+                // Same between-bytecodes safe point as prompt finalization; gated on
+                // a single relaxed atomic load so the common (empty) case is free.
+                if hot & crate::hot_gates::RESOURCE_WARNINGS != 0
+                    && crate::vm_singletons::has_pending_resource_warnings()
                 {
-                    // The wire encoder fuses LOAD_CONST + RETURN_VALUE
-                    // into one RETURN_CONST unit; the pair shares one
-                    // instruction offset, so only its first half fires
-                    // (CPython executes a single instruction there).
-                    let fused_tail = cur_pc > 0
-                        && frame.code.cpython_lasti(cur_pc as u32)
-                            == frame.code.cpython_lasti(cur_pc as u32 - 1);
-                    if !fused_tail {
-                        if let Err(e) = self.fire_monitoring_event(
-                            &py_frame,
-                            crate::trace::EVENT_INSTRUCTION,
-                            Object::None,
-                        ) {
+                    self.drain_pending_resource_warnings();
+                }
+                // Mirror the live `pc` into the shell so `f_lineno` reads
+                // correctly when user code introspects via `sys._getframe`
+                // (materialisation copies it). The locals need no per-step
+                // sync: any snapshot shares the live storage, and a
+                // materialised `f_locals` dict refreshes itself on access.
+                shell
+                    .lasti
+                    .store(frame.pc, std::sync::atomic::Ordering::Relaxed);
+                if shell
+                    .has_materialized
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    // Something materialised the real frame (possibly from
+                    // inside an instruction): keep its `lasti` cell in sync
+                    // exactly as the eager path used to.
+                    self.ensure_top_py_frame(&mut py_frame_slot)
+                        .lasti
+                        .set(frame.pc);
+                }
+                // Fire a 'line' event when the source line changes.
+                // Fast path: skip the line-table read entirely when no
+                // observer is active. The generator-creation bootstrap
+                // (`RETURN_GENERATOR`) fires no line events either.
+                //
+                // A trace callback that *raises* must have its exception
+                // propagate inside the traced frame — catchable by this
+                // frame's own `try/except` and carrying this frame in its
+                // traceback exactly once (CPython `call_trace` failure;
+                // `test_settrace_error`). Park the error and feed it
+                // through the same arm as `step`'s `Err` below instead of
+                // `?`-escaping the whole frame.
+                let mut trace_err: Option<RuntimeError> = None;
+                cur_pc = frame.pc as usize;
+                // RFC 0061 (WS2b): fused arms single-step under observation.
+                // (The snapshot itself refreshes at the RFC 0065 generation
+                // gate above; re-assert `fuse_off` per instruction on this
+                // path because a sibling thread's quiet loop may have
+                // published its own — unobserved — snapshot in between.)
+                self.fuse_off = obs.any;
+                if obs.any && !is_gen_bootstrap {
+                    let py_frame = self.ensure_top_py_frame(&mut py_frame_slot);
+                    py_frame.lasti.set(frame.pc);
+                    let line = py_frame.current_lineno();
+                    // RFC 0051 (WS4): CPython 3.13 line-event semantics.
+                    // A `'line'` event fires when execution reaches an
+                    // instruction in the instrumented set (line starts, jump
+                    // targets, exception-handler entries — see
+                    // `linejump::line_event_starts`) *and* the previously
+                    // executed instruction was on a different line (or was
+                    // the frame-entry RESUME / a fresh (re)entry, which
+                    // never suppresses). Additionally, `sys.settrace` fires
+                    // for every *backward* jump landing on the same line
+                    // (CPython `sys_trace_jump_func`), which is what makes a
+                    // one-line `while` loop re-report its line every
+                    // iteration.
+                    let starts = line_starts
+                        .get_or_insert_with(|| crate::linejump::line_event_starts(&frame.code));
+                    let marked = starts.get(cur_pc).copied().unwrap_or(false);
+                    let prev_line =
+                        prev_pc.map(|p| frame.code.linetable.get(p).copied().unwrap_or(0));
+                    let prev_op =
+                        prev_pc.and_then(|p| frame.code.instructions.get(p).map(|i| i.op));
+                    // NO_LOCATION instructions (line 0 — e.g. handler-exit
+                    // POP_EXCEPT, the except* PREP_RERAISE_STAR epilogue) are
+                    // transparent for line-change detection: CPython compares
+                    // against the last *located* line, so passing through
+                    // them must not re-fire the same line's event.
+                    let cmp_prev_line = match prev_line {
+                        Some(0) => py_frame.last_line.get(),
+                        other => other,
+                    };
+                    let head_fire = marked
+                        && match (cmp_prev_line, prev_op) {
+                            (None, _) => true,
+                            (_, Some(OpCode::Resume)) => true,
+                            (Some(pl), _) => pl != line,
+                        };
+                    let jump_fire = matches!(
+                        (prev_pc, prev_op),
+                        (Some(p), Some(OpCode::JumpBackward)) if p > cur_pc
+                    ) && prev_line == Some(line);
+                    if line != 0 && (head_fire || jump_fire) {
+                        py_frame.last_line.set(Some(line));
+                        // `f_trace_lines = False` suppresses the callback but the
+                        // line bookkeeping above still advances (mirrors CPython,
+                        // which keeps tracking the line for later re-enable).
+                        if py_frame.trace_lines.get() {
+                            match self.fire_line_event(&py_frame) {
+                                Ok(()) => {
+                                    // The callback may have set `f_lineno` (RFC
+                                    // 0050 — debugger "set next statement").
+                                    // Apply the validated plan to the live frame
+                                    // and re-dispatch at the target. CPython
+                                    // marks the *target* as the previously
+                                    // executed instruction (`frame_setlineno`
+                                    // sets `instr_ptr = dest`), so the target
+                                    // itself does not fire a fresh line event.
+                                    if py_frame.pending_jump.get().is_some() {
+                                        self.apply_pending_jump(frame, &py_frame);
+                                        prev_pc = Some(frame.pc as usize);
+                                        continue;
+                                    }
+                                }
+                                Err(e) => trace_err = Some(e),
+                            }
+                        }
+                    }
+                    // A `'line'` callback may have just enabled opcode tracing
+                    // (bdb's `stepinstr`); CPython then fires the `'opcode'`
+                    // event for this same instruction before it runs. The
+                    // frame-entry RESUME carries no opcode event.
+                    let at_resume = matches!(
+                        frame.code.instructions.get(cur_pc).map(|i| i.op),
+                        Some(OpCode::Resume)
+                    );
+                    if trace_err.is_none() && !at_resume && py_frame.trace_opcodes.get() {
+                        if let Err(e) = self.fire_opcode_event(&py_frame) {
                             trace_err = Some(e);
                         }
                     }
+                    // PEP 669 INSTRUCTION fires for every executed
+                    // instruction (except the frame-entry RESUME) when a
+                    // tool subscribed — independent of `f_trace_opcodes`,
+                    // which routes through `fire_opcode_event` above and
+                    // already fired the monitoring event there.
+                    if trace_err.is_none()
+                        && !at_resume
+                        && !py_frame.trace_opcodes.get()
+                        && obs.mon_mask & crate::trace::event_mask(crate::trace::EVENT_INSTRUCTION)
+                            != 0
+                    {
+                        // The wire encoder fuses LOAD_CONST + RETURN_VALUE
+                        // into one RETURN_CONST unit; the pair shares one
+                        // instruction offset, so only its first half fires
+                        // (CPython executes a single instruction there).
+                        let fused_tail = cur_pc > 0
+                            && frame.code.cpython_lasti(cur_pc as u32)
+                                == frame.code.cpython_lasti(cur_pc as u32 - 1);
+                        if !fused_tail {
+                            if let Err(e) = self.fire_monitoring_event(
+                                &py_frame,
+                                crate::trace::EVENT_INSTRUCTION,
+                                Object::None,
+                            ) {
+                                trace_err = Some(e);
+                            }
+                        }
+                    }
                 }
-            }
-            // RFC 0039: service pending signals (`_thread.interrupt_main`,
-            // `signal.raise_signal`) on the main thread — the Rust
-            // analogue of CPython's `PyErr_CheckSignals`. The probe is a
-            // single relaxed load, so the no-signal path — i.e. nearly
-            // always — stays free. Feeding any handler-raised error
-            // through the same arm as `step`'s `Err` keeps it catchable
-            // by a surrounding `try/except`, exactly as CPython.
-            // RFC 0040 (GC arc): note whether this instruction can drop the
-            // last reference to a finalizable object, so the next safe point's
-            // prompt-finalization sweep runs only when warranted. Gated on a
-            // live finalizable so non-`__del__` workloads pay nothing. A
-            // dropped reference shows up either as the operand stack shrinking
-            // (`POP_TOP`, every `STORE_*`/`*_SUBSCR`, `POP_EXCEPT`, `END_FOR`,
-            // a net-consuming `CALL`, …) or as one of the stack-neutral
-            // `DELETE_*`-name opcodes.
-            let watch_drops = gc_trace::has_any_finalizable();
-            let stack_before = if watch_drops { frame.stack.len() } else { 0 };
-            let op_before = if watch_drops {
-                frame.code.instructions.get(frame.pc as usize).map(|i| i.op)
-            } else {
-                None
-            };
-            // `PyThreadState_SetAsyncExc`: an exception scheduled for this
-            // thread from another thread (or itself) is raised here, at the
-            // next instruction boundary — CPython's eval-breaker async-exc
-            // delivery. The probe is one relaxed load; the map lock is only
-            // taken while an exception is pending somewhere in the process.
-            let async_exc =
-                if hot & crate::hot_gates::ASYNC_EXC != 0 && crate::gil::async_exc_pending() {
-                    crate::gil::take_async_exc(crate::vm_singletons::current_worker_thread_id())
+                // RFC 0039: service pending signals (`_thread.interrupt_main`,
+                // `signal.raise_signal`) on the main thread — the Rust
+                // analogue of CPython's `PyErr_CheckSignals`. The probe is a
+                // single relaxed load, so the no-signal path — i.e. nearly
+                // always — stays free. Feeding any handler-raised error
+                // through the same arm as `step`'s `Err` keeps it catchable
+                // by a surrounding `try/except`, exactly as CPython.
+                // RFC 0040 (GC arc): note whether this instruction can drop the
+                // last reference to a finalizable object, so the next safe point's
+                // prompt-finalization sweep runs only when warranted. Gated on a
+                // live finalizable so non-`__del__` workloads pay nothing. A
+                // dropped reference shows up either as the operand stack shrinking
+                // (`POP_TOP`, every `STORE_*`/`*_SUBSCR`, `POP_EXCEPT`, `END_FOR`,
+                // a net-consuming `CALL`, …) or as one of the stack-neutral
+                // `DELETE_*`-name opcodes.
+                watch_drops = gc_trace::has_any_finalizable();
+                stack_before = if watch_drops { frame.stack.len() } else { 0 };
+                op_before = if watch_drops {
+                    frame.code.instructions.get(frame.pc as usize).map(|i| i.op)
                 } else {
                     None
                 };
-            let mut instruction_ran = false;
-            // An error injected *before* the instruction runs (raising
-            // trace callback, async exc, signal handler) is attributed to
-            // the instruction that was about to execute: advance `pc` past
-            // it so `handle_exception`'s `pc - 1` convention finds the
-            // right protected range and traceback line. Without this, an
-            // error injected at the first instruction of a `try` body
-            // escapes the `try` (test_sys_settrace
-            // no_jump_to_non_integers catches the setter's ValueError
-            // *inside* the traced frame).
-            let stepped = if hot & crate::hot_gates::FINALIZING != 0
-                && crate::vm_singletons::is_finalizing()
-                && crate::vm_singletons::current_thread_is_spawned_worker()
-            {
-                // CPython kills daemon threads at their first eval-breaker
-                // check once `Py_Finalize` begins (`tstate_must_exit`): the
-                // thread unwinds without executing another instruction.
-                // Scoped to threads *WeavePy spawned*: a foreign host thread
-                // running its own embedded interpreter (parallel `run_source`
-                // calls in `cargo test`) has no tstate in the finalizing
-                // runtime and must keep executing — the global `FINALIZING`
-                // flag flipping mid-run otherwise raised a spurious silent
-                // SystemExit in the *other* interpreter (flaky
-                // `run_empty_source_succeeds`).
-                // SystemExit is the silent form everywhere it can surface —
-                // `threading.excepthook` and the `_thread` spawn shim both
-                // swallow it — so the daemon dies without spraying a
-                // traceback over the half-torn-down stderr
-                // (test_io.test_daemon_threads_shutdown_stderr_deadlock).
-                frame.pc += 1;
-                Err(crate::stdlib::thread_real::silent_system_exit())
-            } else if let Some(e) = trace_err {
-                frame.pc += 1;
-                Err(e)
-            } else if let Some(exc) = async_exc {
-                frame.pc += 1;
-                Err(match Self::normalize_exception(exc, None) {
-                    Ok(pe) => RuntimeError::PyException(pe),
-                    Err(e) => e,
-                })
-            } else if hot & crate::hot_gates::SIGNALS != 0
-                && crate::stdlib::signal_mod::signals_pending()
-                && crate::gil::is_main_thread()
-            {
-                let py_frame = self.ensure_top_py_frame(&mut py_frame_slot);
-                match self.run_pending_signals(&py_frame) {
-                    Ok(()) => {
-                        instruction_ran = true;
-                        self.step(frame)
+                // `PyThreadState_SetAsyncExc`: an exception scheduled for this
+                // thread from another thread (or itself) is raised here, at the
+                // next instruction boundary — CPython's eval-breaker async-exc
+                // delivery. The probe is one relaxed load; the map lock is only
+                // taken while an exception is pending somewhere in the process.
+                let async_exc =
+                    if hot & crate::hot_gates::ASYNC_EXC != 0 && crate::gil::async_exc_pending() {
+                        crate::gil::take_async_exc(crate::vm_singletons::current_worker_thread_id())
+                    } else {
+                        None
+                    };
+                // An error injected *before* the instruction runs (raising
+                // trace callback, async exc, signal handler) is attributed to
+                // the instruction that was about to execute: advance `pc` past
+                // it so `handle_exception`'s `pc - 1` convention finds the
+                // right protected range and traceback line. Without this, an
+                // error injected at the first instruction of a `try` body
+                // escapes the `try` (test_sys_settrace
+                // no_jump_to_non_integers catches the setter's ValueError
+                // *inside* the traced frame).
+                if hot & crate::hot_gates::FINALIZING != 0
+                    && crate::vm_singletons::is_finalizing()
+                    && crate::vm_singletons::current_thread_is_spawned_worker()
+                {
+                    // CPython kills daemon threads at their first eval-breaker
+                    // check once `Py_Finalize` begins (`tstate_must_exit`): the
+                    // thread unwinds without executing another instruction.
+                    // Scoped to threads *WeavePy spawned*: a foreign host thread
+                    // running its own embedded interpreter (parallel `run_source`
+                    // calls in `cargo test`) has no tstate in the finalizing
+                    // runtime and must keep executing — the global `FINALIZING`
+                    // flag flipping mid-run otherwise raised a spurious silent
+                    // SystemExit in the *other* interpreter (flaky
+                    // `run_empty_source_succeeds`).
+                    // SystemExit is the silent form everywhere it can surface —
+                    // `threading.excepthook` and the `_thread` spawn shim both
+                    // swallow it — so the daemon dies without spraying a
+                    // traceback over the half-torn-down stderr
+                    // (test_io.test_daemon_threads_shutdown_stderr_deadlock).
+                    frame.pc += 1;
+                    Err(crate::stdlib::thread_real::silent_system_exit())
+                } else if let Some(e) = trace_err {
+                    frame.pc += 1;
+                    Err(e)
+                } else if let Some(exc) = async_exc {
+                    frame.pc += 1;
+                    Err(match Self::normalize_exception(exc, None) {
+                        Ok(pe) => RuntimeError::PyException(pe),
+                        Err(e) => e,
+                    })
+                } else if hot & crate::hot_gates::SIGNALS != 0
+                    && crate::stdlib::signal_mod::signals_pending()
+                    && crate::gil::is_main_thread()
+                {
+                    let py_frame = self.ensure_top_py_frame(&mut py_frame_slot);
+                    match self.run_pending_signals(&py_frame) {
+                        Ok(()) => {
+                            instruction_ran = true;
+                            self.step(frame)
+                        }
+                        Err(e) => {
+                            frame.pc += 1;
+                            Err(e)
+                        }
                     }
-                    Err(e) => {
-                        frame.pc += 1;
-                        Err(e)
-                    }
+                } else {
+                    instruction_ran = true;
+                    self.step(frame)
                 }
-            } else {
-                instruction_ran = true;
-                self.step(frame)
-            };
-            // The instruction at `cur_pc` executed (or raised while
-            // executing): it becomes the "previously executed"
-            // instruction for line-event suppression. Errors injected
-            // *before* execution (a raising trace callback, an async
-            // exc) leave `prev_pc` untouched.
+            }; // end of the RFC 0065 quiet/full prologue fork
+               // The instruction at `cur_pc` executed (or raised while
+               // executing): it becomes the "previously executed"
+               // instruction for line-event suppression. Errors injected
+               // *before* execution (a raising trace callback, an async
+               // exc) leave `prev_pc` untouched.
             if instruction_ran {
                 prev_pc = Some(cur_pc);
             }
@@ -5402,25 +5510,47 @@ impl Interpreter {
         ))
     }
 
+    /// RFC 0065 (WS3): is the raw locals slot discipline disabled?
+    /// `WEAVEPY_NO_LOCALS_FAST=1` restores the full `GilCell` borrow
+    /// protocol on the `LOAD_FAST`/`STORE_FAST` family for bisection.
+    #[inline]
+    fn locals_fast_off() -> bool {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *OFF.get_or_init(|| std::env::var_os("WEAVEPY_NO_LOCALS_FAST").is_some())
+    }
+
     /// RFC 0061 (WS2b): the body of a `LOAD_FAST` — read local `arg`,
     /// clone it, raise `UnboundLocalError` on `Unbound`. Shared by the
     /// plain arm and every fused arm so error semantics can't diverge.
+    ///
+    /// RFC 0065 (WS3): the read is a raw indexed access, not a
+    /// `GilCell` borrow. Soundness: every access to the locals storage
+    /// (this one, the cold `f_locals`/generator paths, cross-thread
+    /// introspection) happens under the GIL; no reference derived from
+    /// the raw pointer outlives the accessor expression; `Object::
+    /// clone` is an `Arc` bump that cannot re-enter the interpreter;
+    /// and the vector never *grows* during an activation (arity is
+    /// settled at call setup; `frame.clear()` may empty it, which the
+    /// bounds-checked `.get` handles). The `GilCell` keeps guarding
+    /// every cold consumer — both sides address the same allocation.
     #[inline]
     fn load_fast_value(frame: &Frame, arg: u32) -> Result<Object, RuntimeError> {
-        let v = frame
-            .locals
-            .borrow()
-            .get(arg as usize)
-            .cloned()
-            .ok_or_else(|| {
-                RuntimeError::Internal(format!(
-                    "bad local index {} (code {}, nlocals {}, varname {:?})",
-                    arg,
-                    frame.code.name,
-                    frame.locals.borrow().len(),
-                    frame.code.varnames.get(arg as usize)
-                ))
-            })?;
+        let v = if Self::locals_fast_off() {
+            frame.locals.borrow().get(arg as usize).cloned()
+        } else {
+            // SAFETY: see the method docs — GIL-serialized, non-
+            // escaping, non-re-entrant, bounds-checked.
+            unsafe { (&*frame.locals.as_ptr()).get(arg as usize).cloned() }
+        };
+        let v = v.ok_or_else(|| {
+            RuntimeError::Internal(format!(
+                "bad local index {} (code {}, nlocals {}, varname {:?})",
+                arg,
+                frame.code.name,
+                frame.locals.borrow().len(),
+                frame.code.varnames.get(arg as usize)
+            ))
+        })?;
         if matches!(v, Object::Unbound) {
             let name = frame
                 .code
@@ -6262,7 +6392,13 @@ impl Interpreter {
                                 },
                                 Some(attr_ins),
                             ) => {
-                                let locals = frame.locals.borrow();
+                                // SAFETY: RFC 0065 (WS3) — see
+                                // `load_fast_value`; the shared raw
+                                // reference to the receiver slot never
+                                // escapes this match arm, and the arm
+                                // only reads other cells (class/dict),
+                                // never this locals storage.
+                                let locals = unsafe { &*frame.locals.as_ptr() };
                                 match locals.get(ins.arg as usize) {
                                     Some(Object::Instance(inst)) => {
                                         let guard_ok = {
@@ -6328,12 +6464,25 @@ impl Interpreter {
             OpCode::StoreFast => {
                 let v = frame.pop()?;
                 let slot = ins.arg as usize;
-                let old = {
+                let old = if Self::locals_fast_off() {
                     let mut locals = frame.locals.borrow_mut();
                     if slot < locals.len() {
                         Some(std::mem::replace(&mut locals[slot], v))
                     } else {
                         None
+                    }
+                } else {
+                    // SAFETY: RFC 0065 (WS3) — see `load_fast_value`;
+                    // the exclusive raw reference lives only for the
+                    // bounds-checked in-place swap (the displaced value
+                    // is dropped *after* it dies, below).
+                    unsafe {
+                        let locals = &mut *frame.locals.as_ptr();
+                        if slot < locals.len() {
+                            Some(std::mem::replace(&mut locals[slot], v))
+                        } else {
+                            None
+                        }
                     }
                 };
                 if let Some(old) = old {
@@ -42180,6 +42329,149 @@ mod tests {
         assert!(compiled >= 1, "JIT never compiled the pick kernel");
         assert!(deopts >= 1, "heterogeneous element must deopt");
         assert_eq!(out, "boom\n");
+        assert_eq!(out, run(src));
+    }
+
+    // RFC 0065 WS5 — list len/append and instance-attribute lanes.
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_len_on_pinned_list_compiles_clean() {
+        // `len(xs)` on a pinned int list lowers to `ListLen` behind the
+        // burned-in `len` identity guard; a clean kernel never deopts.
+        let src = "def total(xs, n):\n    s = 0\n    i = 0\n\
+                   \x20   while i < n:\n        s = s + len(xs)\n        i = i + 1\n\
+                   \x20   return s\n\
+                   xs = [1, 2, 3]\n\
+                   r = 0\nk = 0\n\
+                   while k < 60:\n    r = total(xs, 10)\n    k = k + 1\n\
+                   print(r)\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the len kernel");
+        assert_eq!(deopts, 0, "clean len kernel should not deopt");
+        assert_eq!(out, "30\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_list_append_grows_and_len_agrees() {
+        // `xs.append(v)` on a pinned int list runs through
+        // `wpjit_list_append`; the receiver enters as a fresh list each
+        // call so the lane stays homogeneous, and `len` reads back the
+        // grown length natively.
+        let src = "def grow(xs, n):\n    i = 0\n\
+                   \x20   while i < n:\n        xs.append(i * 2)\n        i = i + 1\n\
+                   \x20   return len(xs)\n\
+                   r = 0\nk = 0\n\
+                   while k < 60:\n    xs = [0]\n    r = r + grow(xs, 10)\n    k = k + 1\n\
+                   print(r)\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the append kernel");
+        assert_eq!(deopts, 0, "clean append kernel should not deopt");
+        assert_eq!(out, "660\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_append_pins_lane_of_empty_list() {
+        // The receiver enters *empty* — no element evidence — so the
+        // append value's lane (int) pins the container type.
+        let src = "def fill(xs, n):\n    i = 0\n\
+                   \x20   while i < n:\n        xs.append(i)\n        i = i + 1\n\
+                   \x20   return len(xs)\n\
+                   r = 0\nk = 0\n\
+                   while k < 60:\n    xs = []\n    r = r + fill(xs, 10)\n    k = k + 1\n\
+                   print(r)\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the empty-list kernel");
+        assert_eq!(out, "600\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_attr_scalar_roundtrip_compiles_clean() {
+        // `p.x = p.x + p.y` on a pinned instance: both loads and the
+        // store go through the burned-in attribute sites (class
+        // identity + attr-version + indexed dict hit) and a stable
+        // shape never deopts.
+        let src = "class P:\n    def __init__(self):\n        self.x = 0\n        self.y = 1\n\
+                   def move(p, n):\n    i = 0\n\
+                   \x20   while i < n:\n        p.x = p.x + p.y\n        i = i + 1\n\
+                   \x20   return p.x\n\
+                   p = P()\n\
+                   r = 0\nk = 0\n\
+                   while k < 60:\n    r = move(p, 10)\n    k = k + 1\n\
+                   print(r)\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the attr kernel");
+        assert_eq!(deopts, 0, "stable attr shape should not deopt");
+        assert_eq!(out, "600\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_attr_float_lane_matches_interpreter() {
+        // Float-valued attributes take the float lane end to end.
+        let src = "class A:\n    def __init__(self):\n        self.v = 0.5\n\
+                   def spin(a, n):\n    i = 0\n\
+                   \x20   while i < n:\n        a.v = a.v * 1.01 + 0.1\n        i = i + 1\n\
+                   \x20   return a.v\n\
+                   a = A()\n\
+                   r = 0.0\nk = 0\n\
+                   while k < 60:\n    r = spin(a, 5)\n    k = k + 1\n\
+                   print(r)\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the float attr kernel");
+        assert_eq!(out, run(src), "float attr lane diverged from interpreter");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_attr_dict_reshape_deopts() {
+        // `del p.x` then re-adding it shifts the attribute's index in
+        // the instance dict; the per-access name re-check catches the
+        // stale index and the interpreter finishes exactly.
+        let src = "class P:\n    def __init__(self):\n        self.x = 1\n        self.y = 2\n\
+                   def get(p, n):\n    s = 0\n    i = 0\n\
+                   \x20   while i < n:\n        s = s + p.x\n        i = i + 1\n\
+                   \x20   return s\n\
+                   p = P()\n\
+                   k = 0\n\
+                   while k < 60:\n    get(p, 10)\n    k = k + 1\n\
+                   del p.x\np.x = 7\n\
+                   print(get(p, 10))\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the reshape kernel");
+        assert!(deopts >= 1, "stale dict index must deopt");
+        assert_eq!(out, "70\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_attr_class_mutation_stays_exact() {
+        // Mutating the class after compilation bumps `attr_version`;
+        // the site guard fails and the generic path takes over — the
+        // result must stay identical to plain interpretation.
+        let src = "class P:\n    def __init__(self):\n        self.x = 1\n\
+                   def get(p, n):\n    s = 0\n    i = 0\n\
+                   \x20   while i < n:\n        s = s + p.x\n        i = i + 1\n\
+                   \x20   return s\n\
+                   p = P()\n\
+                   k = 0\n\
+                   while k < 60:\n    get(p, 10)\n    k = k + 1\n\
+                   P.z = 99\n\
+                   print(get(p, 10))\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert!(
+            compiled >= 1,
+            "JIT never compiled the class-mutation kernel"
+        );
+        assert_eq!(out, "10\n");
         assert_eq!(out, run(src));
     }
 

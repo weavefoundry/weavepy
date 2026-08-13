@@ -122,6 +122,37 @@ pub enum TOp {
     /// `ret_bits`), and calls `wpjit_list_set`. Out-of-range deopts at
     /// this pc; the interpreter re-executes the store and raises.
     ListSet,
+    /// RFC 0065 WS5 — `len(x)` on a pinned list: pops the pin
+    /// reference, calls the registered `wpjit_list_len` helper, and
+    /// pushes the `int` length. The helper returns a negative value
+    /// only on a pin-table miss (defensive — cannot happen by
+    /// construction), which deopts at this pc.
+    ListLen,
+    /// RFC 0065 WS5 — `x.append(v)` on a pinned list: pops the value
+    /// (staged through the frame's `ret_bits`, interpreted per the
+    /// pin's element lane) and the pin reference, and calls
+    /// `wpjit_list_append`. The analyzer guarantees the value's lane
+    /// matches the pinned element lane, so the append preserves the
+    /// pinned shape; a non-zero status (defensive) deopts at this pc,
+    /// where the interpreter re-executes the `CALL`.
+    ListAppend,
+    /// RFC 0065 WS5 — `LOAD_ATTR` on a pinned instance: pops the pin
+    /// reference, calls the registered `wpjit_attr_get` helper with
+    /// `site` (an index into [`TFunc::attr_sites`]), and pushes the
+    /// `out`-lane result. The helper re-validates the burned-in shape
+    /// (class identity + attr-version, indexed instance-dict hit with
+    /// name match, value lane) and deopts at this pc on any surprise,
+    /// so the interpreter re-executes the attribute load generically —
+    /// descriptors, `__getattr__`, and `AttributeError` all behave
+    /// exactly as tier 1.
+    AttrGet { site: u32, out: JitType },
+    /// RFC 0065 WS5 — `STORE_ATTR` on a pinned instance: pops the pin
+    /// reference and the value (staged through `ret_bits`), and calls
+    /// `wpjit_attr_set` with `site`. The helper additionally requires
+    /// the *displaced* dict value to be a scalar (dropping a heap
+    /// object belongs to the interpreter's store path); any surprise
+    /// deopts at this pc and the interpreter re-executes the store.
+    AttrSet { site: u32 },
 }
 
 /// One IR statement: a [`TOp`] tagged with its originating bytecode pc
@@ -192,6 +223,10 @@ pub enum ResolvedGlobal {
     ConstFloat(u64),
     /// A `bool` global, burned in as a constant.
     ConstBool(bool),
+    /// RFC 0065 WS5 — the canonical builtin `len`, recognized as a
+    /// pinned-list length callee (lowered to [`TOp::ListLen`], never a
+    /// real call).
+    LenBuiltin,
     /// RFC 0059 WS3 — a plain Python function, callable natively through
     /// the `wpjit_call_py` helper. `token` indexes the embedder's callee
     /// table (parallel to resolution order); `arg_count` is the callee's
@@ -238,6 +273,43 @@ pub struct CalleeSpanMeta {
     /// accounting for enclosing erased entities (range iterators and
     /// outer callee spans).
     pub interp_depth: u32,
+}
+
+/// Deopt-reconstruction metadata for one erased *method receiver*
+/// (RFC 0065 WS5): between a `LOAD_ATTR append` on a pinned list and
+/// its `CALL`, the *interpreter's* operand stack holds the bound
+/// `list.append` method where the native stack holds the raw list pin.
+/// A side exit at a pc in `(live_from, live_to)` must rebuild the
+/// spilled entry at native-stack index `native_index` as the bound
+/// method (via a fresh attribute load on the pinned list) instead of
+/// the bare list. `live_to` is the pc *after* the `CALL`, so a
+/// (defensive) deopt at the `CALL` itself is still inside the span.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MethodSpanMeta {
+    /// Bottom-based index of the receiver in the native operand stack
+    /// (equal to its index in the deopt spill).
+    pub native_index: u32,
+    /// The `LOAD_ATTR` pc (exclusive — the receiver is a plain list
+    /// before it executes).
+    pub live_from: u32,
+    /// The pc after the `CALL` (exclusive).
+    pub live_to: u32,
+}
+
+/// One burned-in attribute-access site (RFC 0065 WS5). The embedder
+/// re-probes each site after compilation to snapshot the concrete
+/// guard fingerprint (class identity, attr-version, dict index) that
+/// its `wpjit_attr_get`/`_set` helpers re-validate per access.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AttrSiteMeta {
+    /// The local slot the receiver was loaded from (probe key).
+    pub slot: u32,
+    /// The attribute name.
+    pub name: String,
+    /// The value lane the site was typed with.
+    pub lane: JitType,
+    /// `true` for a `STORE_ATTR` site.
+    pub store: bool,
 }
 
 /// One OSR entry point (RFC 0059 WS3b): a backward-jump target block
@@ -294,6 +366,18 @@ pub struct TFunc {
     /// Erased Python callees (RFC 0059 WS3), ascending `live_from`, for
     /// deopt stack reconstruction during argument computation.
     pub callee_spans: Vec<CalleeSpanMeta>,
+    /// RFC 0065 WS5 — erased `len` builtins riding the interpreter
+    /// stack between their `LOAD_GLOBAL` and `CALL`. Same
+    /// reconstruction contract as [`Self::callee_spans`], except the
+    /// re-inserted object is the guard snapshot's `len` (the `token`
+    /// field is unused) and `live_to` is the pc *after* the `CALL`.
+    pub len_spans: Vec<CalleeSpanMeta>,
+    /// RFC 0065 WS5 — erased bound-method receivers (`list.append`),
+    /// for rewriting the spilled receiver on a mid-span deopt.
+    pub method_spans: Vec<MethodSpanMeta>,
+    /// RFC 0065 WS5 — burned-in attribute-access sites, indexed by
+    /// [`TOp::AttrGet`]/[`TOp::AttrSet`]'s `site`.
+    pub attr_sites: Vec<AttrSiteMeta>,
     /// OSR entry points (RFC 0059 WS3b): backward-jump target blocks
     /// enterable via `entry_pc`.
     pub osr_entries: Vec<OsrEntry>,
@@ -326,6 +410,10 @@ impl TOp {
                 | TOp::CallPy { .. }
                 | TOp::ListGet { .. }
                 | TOp::ListSet
+                | TOp::ListLen
+                | TOp::ListAppend
+                | TOp::AttrGet { .. }
+                | TOp::AttrSet { .. }
         )
     }
 }

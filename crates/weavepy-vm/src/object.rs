@@ -933,6 +933,10 @@ impl FrameShell {
         *self.materialized.borrow_mut() = Some(py.clone());
         self.has_materialized
             .store(true, std::sync::atomic::Ordering::Release);
+        // RFC 0065 (WS1): a freshly materialized frame must kick its
+        // dispatch loop off the quiet path so the per-instruction
+        // `lasti`-cell sync resumes.
+        crate::hot_gates::bump_loop_gen();
         py
     }
 

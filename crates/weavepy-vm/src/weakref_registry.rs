@@ -252,6 +252,9 @@ impl WeakRefRegistry {
         let mut g = self.inner.borrow_mut();
         g.version = g.version.wrapping_add(1);
         g.filter.insert(slot.target_id);
+        // RFC 0065 (WS4): publish to the lock-free miss-filter before
+        // the registration becomes observable (we hold the borrow).
+        WEAKREF_FILTER.insert(slot.target_id);
         let entry = g.slots.entry(slot.target_id).or_default();
         entry.retain(|w| w.strong_count() > 0);
         entry.push(Arc::downgrade(&slot));
@@ -389,6 +392,15 @@ impl WeakRefRegistry {
 static REGISTRY: std::sync::LazyLock<WeakRefRegistry> =
     std::sync::LazyLock::new(WeakRefRegistry::new);
 
+/// RFC 0065 (WS4): insert-only miss-filter over every id a weakref was
+/// ever registered for. The prompt-reap drop paths ask "is anything
+/// watching this object?" for *every* dropped container; the
+/// overwhelming "no" answer is two relaxed loads here instead of the
+/// registry cell's borrow protocol. Stale bits (dead referents) are
+/// false positives that take the precise path — never a correctness
+/// change.
+static WEAKREF_FILTER: crate::hot_filter::AtomicBloom = crate::hot_filter::AtomicBloom::new();
+
 /// Run a closure with the process-global weakref registry. Used by
 /// helper free functions in this module.
 pub fn with_registry<R>(f: impl FnOnce(&WeakRefRegistry) -> R) -> R {
@@ -430,12 +442,20 @@ pub fn queue_callbacks(cleared: Vec<(Arc<WeakRefSlot>, Option<Object>)>) {
 
 /// Convenience: weakref count for `id` in the current thread.
 pub fn count_for(id: ObjectId) -> usize {
+    // RFC 0065 (WS4): usually-miss probe — skip the registry borrow.
+    if !WEAKREF_FILTER.may_contain(id) {
+        return 0;
+    }
     with_registry(|r| r.count(id))
 }
 
 /// Convenience: count of registry-held strong clones of `id` in the
 /// current thread. Used by the cycle collector's refcount accounting.
 pub fn strong_clone_count(id: ObjectId) -> usize {
+    // RFC 0065 (WS4): see `count_for`.
+    if !WEAKREF_FILTER.may_contain(id) {
+        return 0;
+    }
     with_registry(|r| r.strong_clone_count(id))
 }
 

@@ -22,6 +22,9 @@ pub const FIXTURES: &[&str] = &[
     "sumvm",
     "nested_loops",
     "jitloop",
+    // RFC 0065 WS5 — method/attr kernels in the JITable subset for
+    // the measured `--jit` column.
+    "jitkernels",
     // RFC 0058 additions — call/attr/subscript/str/dict shape
     // diversity so the suite can't be gamed by one fast path.
     "deltablue",
@@ -57,6 +60,7 @@ pub fn default_work(name: &str) -> u32 {
         "sumvm" => 2_000_000,
         "nested_loops" => 120,
         "jitloop" => 1_000,
+        "jitkernels" => 2_000,
         "deltablue" => 50,
         "float_math" => 100_000,
         "spectral_norm" => 100,
