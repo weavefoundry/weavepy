@@ -473,14 +473,20 @@ methodology (symmetric subprocess harness, 5 samples, medians).
 started from (geomean 8.64×); "after" is the refreshed committed
 baseline. The committed run uses the JIT-featured binary (so the
 `--jit` column lands in the same `bench.json`); the CI-shaped
-non-JIT binary measured 7.26–7.37× on the same suite back to back,
-within noise of the committed 7.41×.
+non-JIT binary measured 7.26–7.43× on the same suite back to back.
+One row is deliberately *not* ratcheted: deltablue improved −25% on
+the dev machine (26.96× → 20.16×) but the shared `macos-latest`
+runner still measures ~25.5×, so the committed row keeps main's
+CI-flavored 26.96× measurement (the gate compares CI runs against
+this file; committing the dev-machine number would fail every CI
+leg on machine skew, not regression). The committed geomean is
+therefore 7.52× — exactly what the PR's CI leg measured.
 
 ### Headline
 
 | Metric | Pre-wave | After |
 |---|---|---|
-| Bench suite geomean vs CPython | 11.64× → 9.92× → 8.51× → **8.64×** (waves 1–3) | **7.41×** (−14% wall clock at the geomean) |
+| Bench suite geomean vs CPython | 11.64× → 9.92× → 8.51× → **8.64×** (waves 1–3) | **7.52×** committed (−13% at the geomean; 7.26–7.43× measured on the dev machine) |
 | `--jit` column in the committed baseline | every row `jit: null` | **every row measured** (first release-over-release tier-2 record) |
 | New `jitkernels` fixture (append/len/attr kernels) | — | 306.8ms interpreted → **26.2ms** under `WEAVEPY_JIT=1` (11.7×; **0.74× CPython**, i.e. faster than CPython) |
 | Numeric kernels under `WEAVEPY_JIT=1` | `jitloop` 0.06× CPython (RFC 0061) | `sumvm` **0.04×**, `nested_loops` **0.04×**, `jitloop` **0.06×** CPython |
@@ -490,8 +496,9 @@ within noise of the committed 7.41×.
 | Gates | — | `cargo fmt` / `clippy --all-features -D warnings` / `cargo test --workspace --all-targets --all-features` + doc tests (0 failures) / `bench gate --pct=25` OK |
 
 The headline acceptance target (interpreted geomean ≤ 7.0×) was
-**missed**: the wave lands at 7.41× committed (7.26× on the CI-shaped
-binary), a 14% cut against the ≥ 19% target. The shortfall is WS4.3:
+**missed**: the wave lands at 7.52× committed (7.26× measured on the
+dev machine with the CI-shaped binary), a 13% cut against the ≥ 19%
+target. The shortfall is WS4.3:
 the finalizable-cadence split regressed generator workloads when
 combined with the WS1 quiet path (suspended generators became active
 suspects, defeating the quiet predicate) and was reverted rather than
@@ -512,7 +519,7 @@ lesson recorded below.
 | nested_loops | 5.59× | 4.60× | −18% | 2.20ms | **0.04×** |
 | jitloop | 4.64× | 3.80× | −18% | 3.62ms | **0.06×** |
 | jitkernels | *(new)* | 8.67× | new | 26.2ms | **0.74×** |
-| deltablue | 26.96× | 20.16× | −25% | 1.02s | 21.07× |
+| deltablue | 26.96× | 26.96× *(kept, see above)* | −25% dev-machine only | 1.02s | 21.07× |
 | float_math | 15.35× | 14.39× | −6% | 579.7ms | 14.64× |
 | spectral_norm | 10.69× | 8.36× | −22% | 271.5ms | 8.79× |
 | json_bench | 5.22× | 5.25× | +1% | 228.1ms | 5.25× |
@@ -526,8 +533,8 @@ lesson recorded below.
 
 No fixture regressed beyond noise (worst: json_bench +1%,
 pidigits +1%). The biggest wins cluster exactly where the wave
-aimed: call-heavy (`fib` −30%, `call_overhead` −22%,
-`deltablue` −25%) and attribute/local-heavy (`attr_access` −20%,
+aimed: call-heavy (`fib` −30%, `call_overhead` −22%, deltablue −25%
+on the dev machine) and attribute/local-heavy (`attr_access` −20%,
 `fannkuch` −27%) fixtures, which is the prologue + locals + GilCell
 tax coming off every interpreted instruction.
 
@@ -562,9 +569,9 @@ never run outside the interpreter.
 
 ### Acceptance checklist
 
-1. Interpreted geomean ≤ 7.0×: **missed** — 7.41× committed
-   (7.26× CI-shaped binary), −14% vs the −19% target; WS4.3's
-   reverted share is the identified gap.
+1. Interpreted geomean ≤ 7.0×: **missed** — 7.52× committed
+   (7.26× dev-machine, CI-shaped binary), −13% vs the −19% target;
+   WS4.3's reverted share is the identified gap.
 2. No fixture regresses > 5%: **met** (worst +1%).
 3. `--jit` column measured, no `jit: null` rows; append/len +
    attribute lanes compile, run natively, and deopt correctly under
