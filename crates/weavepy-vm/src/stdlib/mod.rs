@@ -49,8 +49,13 @@ pub mod math;
 // stdlib consumes.
 #[cfg(windows)]
 pub mod msvcrt_mod;
+// `pub` (not `pub(crate)`): `weavepy-capi`'s extension loader reuses
+// the `format_message` strerror source for CPython's "DLL load failed
+// while importing …" ImportError shape (RFC 0064 WS2).
 #[cfg(windows)]
-pub(crate) mod nt_support;
+pub mod nt_support;
+// `_WindowsConsoleIO` + the ReadConsoleW/WriteConsoleW byte bridge
+// the PyFile stdio monolith reroutes through (RFC 0064 WS4).
 pub mod operator_accel;
 pub mod os;
 pub mod os_process;
@@ -88,6 +93,8 @@ pub mod ucd;
 pub mod unicodedata_mod;
 pub mod weakref_mod;
 pub mod weave_frame_mod;
+#[cfg(windows)]
+pub(crate) mod win_console;
 #[cfg(windows)]
 pub mod winapi_mod;
 #[cfg(windows)]

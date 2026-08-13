@@ -1,0 +1,33 @@
+[package]
+name = "weavepy-pylib"
+description = "The WeavePy runtime as a CPython-ABI shared library (python313.dll on Windows)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+readme.workspace       = true
+keywords.workspace     = true
+categories.workspace   = true
+
+# RFC 0064 WS1: the library artifact is named for the CPython ABI it
+# implements — `python313.dll` on Windows (what every `.pyd`'s PE
+# import table references), `libpython313.{so,dylib}` elsewhere
+# (built for workspace honesty, not shipped — see the RFC Non-goals).
+[lib]
+name = "python313"
+crate-type = ["cdylib"]
+
+[dependencies]
+weavepy-cli = { workspace = true }
+libc        = { workspace = true }
+
+[features]
+default = []
+# Mirror of the CLI's `jit` feature so a JIT-enabled distribution can
+# build a JIT-enabled DLL.
+jit = ["weavepy-cli/jit"]
+
+[lints]
+workspace = true

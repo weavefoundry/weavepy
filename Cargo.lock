@@ -2709,6 +2709,7 @@ dependencies = [
  "weavepy",
  "weavepy-compiler",
  "weavepy-vm",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2727,6 +2728,7 @@ dependencies = [
  "weavepy-conformance",
  "weavepy-parser",
  "weavepy-vm",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2792,6 +2794,14 @@ dependencies = [
  "unicode-normalization",
  "unicode_names2",
  "weavepy-lexer",
+]
+
+[[package]]
+name = "weavepy-pylib"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "weavepy-cli",
 ]
 
 [[package]]

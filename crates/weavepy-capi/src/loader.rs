@@ -3,10 +3,17 @@
 //! Given a path to a shared library (`.so` / `.dylib` / `.pyd`)
 //! and a fully-qualified module name, this module:
 //!
-//! 1. Calls [`libloading::Library::new`] to load the library into
-//!    the process. Symbols the extension imports (everything in
-//!    `Python.h`) resolve against the host `weavepy` binary, which
-//!    statically links this crate.
+//! 1. Loads the library into the process. On POSIX that is
+//!    [`libloading::Library::new`] (dlopen), and the extension's
+//!    C-API imports resolve against the host `weavepy` binary,
+//!    which statically links this crate. On Windows (RFC 0064 WS2)
+//!    it is `LoadLibraryExW` with CPython's `dynload_win.c` flags —
+//!    `LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_
+//!    DLL_LOAD_DIR`, so a wheel's `.pyd` resolves vendored
+//!    dependent DLLs from its own directory and `AddDllDirectory`
+//!    cookies but never from `PATH`/CWD (bpo-36085) — and the
+//!    C-API imports resolve against the already-loaded
+//!    `python313.dll` (RFC 0064 WS1).
 //! 2. Looks up `PyInit_<leaf-name>`. The leaf name is the
 //!    last `.`-delimited component of the module name, matching
 //!    CPython's convention.
@@ -43,6 +50,11 @@ pub struct LoadedLibrary {
 pub enum LoadError {
     #[error("dlopen failed: {0}")]
     Dlopen(String),
+    /// Windows load failure, pre-shaped as CPython's
+    /// `Python/dynload_win.c` ImportError text (the message tooling
+    /// and users pattern-match on). The caller surfaces it verbatim.
+    #[error("DLL load failed while importing {leaf}: {message}")]
+    DllLoadFailed { leaf: String, message: String },
     #[error("missing init symbol {0}")]
     MissingInit(String),
     #[error("init function returned NULL{}", .pending.as_deref().map(|s| format!(": {s}")).unwrap_or_default())]
@@ -65,10 +77,9 @@ pub fn load_extension_module(
     if trace_loader {
         eprintln!("[LOADER] dlopen path={path:?} module={module_name}");
     }
-    let lib =
-        unsafe { Library::new(path) }.map_err(|e| LoadError::Dlopen(format!("{path:?}: {e}")))?;
-
     let leaf = module_name.rsplit('.').next().unwrap_or(module_name);
+    let lib = open_extension_library(path, leaf)?;
+
     let init_name = format!("PyInit_{leaf}");
     let init: Symbol<PyInitFn> = unsafe {
         lib.get(init_name.as_bytes())
@@ -175,6 +186,54 @@ pub fn load_extension_module(
     Ok(result)
 }
 
+/// Load the shared library with the platform's CPython semantics.
+///
+/// POSIX: plain dlopen (`RTLD_NOW | RTLD_LOCAL`, libloading's
+/// default, matching CPython's `dlopenflags` default).
+#[cfg(not(windows))]
+fn open_extension_library(path: &Path, _leaf: &str) -> Result<Library, LoadError> {
+    unsafe { Library::new(path) }.map_err(|e| LoadError::Dlopen(format!("{path:?}: {e}")))
+}
+
+/// Windows: `LoadLibraryExW` with CPython's `dynload_win.c` flag set,
+/// and failures shaped as CPython's `ImportError` message with the
+/// `FormatMessageW` strerror (via the RFC 0063 error bridge).
+#[cfg(windows)]
+fn open_extension_library(path: &Path, leaf: &str) -> Result<Library, LoadError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::System::LibraryLoader::{
+        LoadLibraryExW, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+    };
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `wide` is a valid NUL-terminated UTF-16 path; the flag
+    // combination is the one CPython passes for absolute .pyd paths.
+    let handle = unsafe {
+        LoadLibraryExW(
+            wide.as_ptr(),
+            std::ptr::null_mut(),
+            LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+        )
+    };
+    if handle.is_null() {
+        // SAFETY: trivially safe; reads this thread's last-error slot.
+        let code = unsafe { GetLastError() } as i32;
+        return Err(LoadError::DllLoadFailed {
+            leaf: leaf.to_owned(),
+            message: weavepy_vm::stdlib::nt_support::format_message(code),
+        });
+    }
+    // SAFETY: `handle` is a live HMODULE we own; libloading's Drop
+    // would FreeLibrary it, but the caller leaks the Library for the
+    // process lifetime (extension modules are never unloaded).
+    // (libloading spells HMODULE as `isize`; windows-sys as a pointer.)
+    Ok(unsafe { libloading::os::windows::Library::from_raw(handle as isize) }.into())
+}
+
 /// Helper used by the higher-level frozen importlib stub. Returns
 /// `Some(module)` on success; `None` if `path` doesn't exist.
 pub fn try_load(
@@ -231,7 +290,10 @@ pub fn extension_suffixes() -> &'static [&'static str] {
             ".so",
         ]
     } else if cfg!(target_os = "windows") {
-        &[".pyd", ".dll"]
+        // The tagged name is what wheels actually install
+        // (`EXT_SUFFIX` = `.cp313-win_amd64.pyd`); bare `.pyd` and
+        // `.dll` are the CPython fallbacks (RFC 0064 WS2).
+        &[".cp313-win_amd64.pyd", ".pyd", ".dll"]
     } else {
         &[".so"]
     }

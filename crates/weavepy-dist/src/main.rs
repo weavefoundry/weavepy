@@ -25,10 +25,14 @@
 //! WS6): `weavepy.exe` plus `python.exe`/`python3.exe`/`python3.13.exe`
 //! sit at the *prefix root* as real file copies — no `bin/`, no symlinks
 //! anywhere in the artifact — and the default format is `zip` (written
-//! by bsdtar's `tar -a`). Headers live at `{prefix}\Include` (CPython's
-//! NT shape, where sysconfig's `nt` scheme points); `lib/` is unchanged
-//! and the RFC 0053 landmark walk finds `{prefix}/lib/weavepy3.13` from
-//! the exe's own directory, so nothing else moves.
+//! by bsdtar's `tar -a`). The exes are thin shims over `python313.dll`,
+//! which also sits at the prefix root (RFC 0064 WS1), with its MSVC
+//! import library at `{prefix}\libs\python313.lib` (WS3 — setuptools'
+//! `library_dirs` convention). Headers live at `{prefix}\Include`
+//! (CPython's NT shape, where sysconfig's `nt` scheme points); `lib/`
+//! is unchanged and the RFC 0053 landmark walk finds
+//! `{prefix}/lib/weavepy3.13` from the exe's own directory, so nothing
+//! else moves.
 //!
 //! Rather than reimplementing the stdlib writer, `build` runs the packaged
 //! binary itself with `WEAVEPY_STDLIB_CACHE` pointed at a fresh directory,
@@ -57,9 +61,9 @@
 //!    on Windows).
 //! 5. `pip`      — offline `pip install` in the venv (needs `--wheels`).
 //! 6. `cext`     — compile + import a minimal C extension against the
-//!    shipped headers via the `sysconfig` compiler vars (unix, needs cc;
-//!    SKIP on Windows — C builds await the python313.dll wave, RFC 0063
-//!    Non-goals).
+//!    shipped headers: unix via the `sysconfig` compiler vars (needs cc),
+//!    Windows via MSVC `cl /LD` against `libs\python313.lib` (RFC 0064
+//!    WS3; SKIP when no toolchain is installed).
 //! 7. `decoy-cache` — the decoy stdlib cache stayed empty, proving every
 //!    leg ran off the artifact tree itself.
 
@@ -230,12 +234,38 @@ fn resolve_weavepy(workspace: &Path, explicit: Option<&Path>) -> Result<PathBuf>
     };
     if !path.is_file() {
         bail!(
-            "weavepy binary not found at {} — build it with `cargo build --release -p weavepy-cli` \
+            "weavepy binary not found at {} — build it with `cargo build --release -p weavepy-cli{}` \
              or pass --weavepy",
-            path.display()
+            path.display(),
+            if cfg!(windows) { " -p weavepy-pylib" } else { "" },
         );
     }
     Ok(path)
+}
+
+/// The runtime DLL and its MSVC import library, which must sit next
+/// to the exe being packaged (cargo writes all three into
+/// `target/<profile>/` — RFC 0064 WS1/WS3). The exe is a thin shim
+/// over the DLL, so a Windows artifact without it would not even
+/// start; the import library is what `pip install` of a C sdist
+/// links (`{prefix}\libs\python313.lib`, setuptools' convention).
+#[cfg(windows)]
+fn resolve_windows_runtime(weavepy: &Path) -> Result<(PathBuf, PathBuf)> {
+    let dir = weavepy
+        .parent()
+        .context("weavepy binary path has no parent directory")?;
+    let dll = dir.join("python313.dll");
+    // rustc names the cdylib's import library `python313.dll.lib`.
+    let implib = dir.join("python313.dll.lib");
+    if !dll.is_file() || !implib.is_file() {
+        bail!(
+            "python313.dll / python313.dll.lib not found next to {} — the Windows exe is a \
+             shim over the runtime DLL (RFC 0064); build both with \
+             `cargo build --release -p weavepy-cli -p weavepy-pylib`",
+            weavepy.display()
+        );
+    }
+    Ok((dll, implib))
 }
 
 fn exe_name(base: &str) -> String {
@@ -350,6 +380,32 @@ fn build_artifact(workspace: &Path, weavepy: &Path, out: &Path, format: Format) 
             let dest = staging.join(exe_name(name));
             std::fs::copy(weavepy, &dest).with_context(|| {
                 format!("failed to copy {} to {}", weavepy.display(), dest.display())
+            })?;
+        }
+        // RFC 0064 WS3 — the binary ABI. `python313.dll` sits beside
+        // the exes at the prefix root (the shim's first probe and
+        // where a `.pyd`'s PE import resolves from), and the MSVC
+        // import library ships as `libs\python313.lib` — the exact
+        // path setuptools' `library_dirs` convention
+        // (`{sys.base_exec_prefix}\libs`) and pyconfig.h's autolink
+        // pragma expect.
+        #[cfg(windows)]
+        {
+            let (dll, implib) = resolve_windows_runtime(weavepy)?;
+            let dll_dest = staging.join("python313.dll");
+            std::fs::copy(&dll, &dll_dest).with_context(|| {
+                format!("failed to copy {} to {}", dll.display(), dll_dest.display())
+            })?;
+            let libs_dir = staging.join("libs");
+            std::fs::create_dir_all(&libs_dir)
+                .with_context(|| format!("failed to create {}", libs_dir.display()))?;
+            let implib_dest = libs_dir.join("python313.lib");
+            std::fs::copy(&implib, &implib_dest).with_context(|| {
+                format!(
+                    "failed to copy {} to {}",
+                    implib.display(),
+                    implib_dest.display()
+                )
             })?;
         }
     } else {
@@ -492,9 +548,9 @@ fn artifact_readme(name: &str) -> String {
              .\\python3.exe\n\
              ```\n\
              \n\
-             `weavepy.exe` is the real binary; `python.exe`, `python3.exe`, and\n\
-             `python3.13.exe` are copies of it at the artifact root — the CPython\n\
-             Windows convention (POSIX artifacts use `bin/` symlinks instead).\n\
+             The exes are thin shims over `python313.dll` at the artifact root —\n\
+             the runtime itself, and what C extensions link against (the CPython\n\
+             Windows convention; POSIX artifacts use `bin/` symlinks instead).\n\
              The layout is self-locating — no environment variables are required.\n\
              \n\
              ## Packaging\n\
@@ -507,10 +563,10 @@ fn artifact_readme(name: &str) -> String {
              .venv\\Scripts\\python.exe -m pip install <package>\n\
              ```\n\
              \n\
-             The CPython 3.13 C header set ships under `Include\\` (the CPython\n\
-             Windows convention), but building or loading C extensions on\n\
-             Windows is not supported yet (it needs a `python313.dll` for\n\
-             extensions to link against).\n\
+             Building C extensions from source needs MSVC (Visual Studio Build\n\
+             Tools): the CPython 3.13 header set ships under `Include\\` and the\n\
+             import library under `libs\\python313.lib`, the paths setuptools\n\
+             uses by convention.\n\
              \n\
              ## License\n\
              \n\
@@ -779,25 +835,18 @@ fn run_check(
         (Some(wheels), true) => leg_pip(&venv_python, wheels, &env),
     });
 
-    // Leg 6: C-extension build (unix only, needs a C compiler).
-    legs.push(if cfg!(unix) {
-        if which("cc").is_some() {
-            leg_cext(&python3, scratch, &env)
-        } else {
-            Leg {
-                name: "cext",
-                status: LegStatus::Skip,
-                detail: "no `cc` on PATH".to_owned(),
-            }
-        }
-    } else {
+    // Leg 6: C-extension build (needs a C toolchain: `cc` on unix,
+    // MSVC on Windows — the Windows script discovers MSVC itself via
+    // `cl` on PATH or vswhere/vcvars64 and exits 2 when there is
+    // none, RFC 0064 WS3).
+    legs.push(if cfg!(unix) && which("cc").is_none() {
         Leg {
             name: "cext",
             status: LegStatus::Skip,
-            // A static exe has nothing for a .pyd's PE import table to
-            // resolve against; C builds await the python313.dll wave.
-            detail: "C builds are a Windows non-goal (RFC 0063)".to_owned(),
+            detail: "no `cc` on PATH".to_owned(),
         }
+    } else {
+        leg_cext(&python3, scratch, &env)
     });
 
     // Leg 7: the decoy cache must still be empty — anything in it means
@@ -1046,8 +1095,13 @@ fn leg_cext(python3: &Path, scratch: &Path, env: &[(OsString, OsString)]) -> Leg
             detail: format!("failed to create {}: {err}", cext_dir.display()),
         };
     }
+    let script = if cfg!(windows) {
+        CEXT_SCRIPT_NT
+    } else {
+        CEXT_SCRIPT
+    };
     let script_path = scratch.join("cext_build_check.py");
-    if let Err(err) = std::fs::write(&script_path, CEXT_SCRIPT) {
+    if let Err(err) = std::fs::write(&script_path, script) {
         return Leg {
             name: "cext",
             status: LegStatus::Fail,
@@ -1060,7 +1114,25 @@ fn leg_cext(python3: &Path, scratch: &Path, env: &[(OsString, OsString)]) -> Leg
         cext_dir.as_os_str().to_owned(),
     ));
     let script_arg = script_path.display().to_string();
-    grade_output("cext", run_captured(python3, &[&script_arg], &env, None))
+    let result = run_captured(python3, &[&script_arg], &env, None);
+    // Exit 2 is the Windows script's "no MSVC toolchain" sentinel —
+    // a machine without Visual Studio skips the leg rather than
+    // failing the whole check.
+    if let Ok(out) = &result {
+        if out.status.code() == Some(2) {
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            return Leg {
+                name: "cext",
+                status: LegStatus::Skip,
+                detail: stdout
+                    .lines()
+                    .last()
+                    .unwrap_or("no MSVC toolchain")
+                    .to_owned(),
+            };
+        }
+    }
+    grade_output("cext", result)
 }
 
 fn leg_decoy(decoy: &Path) -> Leg {
@@ -1337,6 +1409,120 @@ run(
 )
 mod_path = os.path.join(scratch, "_weavepy_dist_cext" + ext_suffix)
 run(shlex.split(ldshared) + [obj, "-o", mod_path])
+
+sys.path.insert(0, scratch)
+import _weavepy_dist_cext
+
+assert _weavepy_dist_cext.add(20, 22) == 42
+print("cext ok:", mod_path)
+"#;
+
+/// The Windows twin of [`CEXT_SCRIPT`] (RFC 0064 WS3): same inline
+/// module, but built with MSVC `cl /LD` against the shipped
+/// `Include\` headers and linked against `libs\python313.lib` (found
+/// via the pyconfig.h autolink pragma + `/LIBPATH`, exactly what
+/// setuptools does). MSVC is discovered the way setuptools' msvc
+/// module does it — `cl` already on PATH, else vswhere →
+/// `vcvars64.bat` env capture. Exit 2 = no toolchain (the leg SKIPs).
+const CEXT_SCRIPT_NT: &str = r#"
+import os, subprocess, sys, sysconfig
+
+scratch = os.environ["WEAVEPY_DIST_CEXT_DIR"]
+includepy = sysconfig.get_config_var("INCLUDEPY")
+ext_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".pyd"
+libs = os.path.join(sys.base_exec_prefix, "libs")
+assert includepy and os.path.isfile(os.path.join(includepy, "Python.h")), (
+    f"no Python.h under INCLUDEPY={includepy!r}"
+)
+assert os.path.isfile(os.path.join(libs, "python313.lib")), (
+    f"no python313.lib under {libs!r}"
+)
+
+
+def msvc_env():
+    """Env with cl.exe reachable, or None if no MSVC install exists."""
+    from shutil import which
+    if which("cl"):
+        return dict(os.environ)
+    vswhere = os.path.join(
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+        "Microsoft Visual Studio", "Installer", "vswhere.exe",
+    )
+    if not os.path.isfile(vswhere):
+        return None
+    proc = subprocess.run(
+        [vswhere, "-latest", "-products", "*",
+         "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+         "-property", "installationPath"],
+        capture_output=True, text=True,
+    )
+    lines = [l.strip() for l in proc.stdout.splitlines() if l.strip()]
+    if proc.returncode != 0 or not lines:
+        return None
+    vcvars = os.path.join(lines[0], "VC", "Auxiliary", "Build", "vcvars64.bat")
+    if not os.path.isfile(vcvars):
+        return None
+    # Capture the env vcvars64 sets up (setuptools' _get_vc_env trick).
+    probe = subprocess.run(
+        ["cmd", "/S", "/C", f'"{vcvars}" >NUL 2>&1 && set'],
+        capture_output=True, text=True,
+    )
+    if probe.returncode != 0:
+        return None
+    env = {}
+    for line in probe.stdout.splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            env[key] = value
+    return env if env else None
+
+
+env = msvc_env()
+if env is None:
+    print("no MSVC toolchain (cl not on PATH, vswhere found no VC tools)")
+    sys.exit(2)
+
+SOURCE = r'''
+#define PY_SSIZE_T_CLEAN
+#include <Python.h>
+
+static PyObject *
+add(PyObject *self, PyObject *args)
+{
+    Py_ssize_t a, b;
+    if (!PyArg_ParseTuple(args, "nn", &a, &b))
+        return NULL;
+    return PyLong_FromSsize_t(a + b);
+}
+
+static PyMethodDef methods[] = {
+    {"add", add, METH_VARARGS, "add two ints"},
+    {NULL, NULL, 0, NULL}
+};
+
+static struct PyModuleDef module = {
+    PyModuleDef_HEAD_INIT, "_weavepy_dist_cext", NULL, -1, methods
+};
+
+PyMODINIT_FUNC
+PyInit__weavepy_dist_cext(void)
+{
+    return PyModule_Create(&module);
+}
+'''
+
+src = os.path.join(scratch, "_weavepy_dist_cext.c")
+with open(src, "w") as f:
+    f.write(SOURCE)
+
+mod_path = os.path.join(scratch, "_weavepy_dist_cext" + ext_suffix)
+cmd = [
+    "cl", "/nologo", "/LD", "/O2", "/W3",
+    "/I", includepy, src,
+    "/link", "/LIBPATH:" + libs, "/OUT:" + mod_path,
+]
+proc = subprocess.run(cmd, capture_output=True, text=True, cwd=scratch, env=env)
+assert proc.returncode == 0, "%r failed:\n%s\n%s" % (cmd, proc.stdout, proc.stderr)
 
 sys.path.insert(0, scratch)
 import _weavepy_dist_cext

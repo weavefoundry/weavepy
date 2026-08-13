@@ -25,7 +25,6 @@
 //! `<workspace>/vendor/cpython-tests/`) when present.
 
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -122,7 +121,7 @@ struct Cli {
     stream: bool,
 }
 
-pub(crate) fn run(argv: Vec<String>) -> Result<ExitCode> {
+pub(crate) fn run(argv: Vec<String>) -> Result<i32> {
     let cli = Cli::parse_from(argv);
     let workspace = resolve_workspace(cli.workspace.as_deref())?;
     let report_dir = cli
@@ -209,9 +208,9 @@ pub(crate) fn run(argv: Vec<String>) -> Result<ExitCode> {
     // stamp the gate is advisory — the helper prints the NOTE line and
     // returns false, so the run exits 0 with the reports still written.
     if !cli.no_check && weavepy_conformance::regrtest::strict_gate_blocks(&expectations, &summary) {
-        return Ok(ExitCode::from(1));
+        return Ok(1);
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(0)
 }
 
 fn resolve_workspace(explicit: Option<&Path>) -> Result<PathBuf> {

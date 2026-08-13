@@ -5685,6 +5685,14 @@ impl PyFile {
                 return Err(os_error("not readable"));
             }
             (FileBackend::Stdin, None) => {
+                // RFC 0064 WS4 — a real console reads through the
+                // UTF-16 bridge (`ReadConsoleW` + Ctrl-Z EOF), so
+                // interactive input carries the full Unicode range
+                // regardless of the console codepage.
+                #[cfg(windows)]
+                if let Some(result) = crate::stdlib::win_console::stdin_console_read(None) {
+                    return result;
+                }
                 // Raw bytes (not `read_to_string`, which would reject non-UTF-8
                 // binary data piped to `sys.stdin.buffer`). Text-mode callers
                 // decode the result via `decode_text`.
@@ -5693,6 +5701,10 @@ impl PyFile {
                     .map_err(|e| os_error(format!("read: {e}")))?;
             }
             (FileBackend::Stdin, Some(n)) => {
+                #[cfg(windows)]
+                if let Some(result) = crate::stdlib::win_console::stdin_console_read(Some(n)) {
+                    return result;
+                }
                 // Read up to `n` bytes, looping past short reads (pipes deliver
                 // data in fragments) until we have `n` or hit EOF — matching
                 // `BufferedReader.read(n)`. Honouring `n` (instead of draining
@@ -6020,6 +6032,14 @@ impl PyFile {
                 s.len()
             }
             FileBackend::Stdout(sink) => {
+                // RFC 0064 WS4 — a real console gets the UTF-16 bridge
+                // (`WriteConsoleW`), so the full Unicode range renders
+                // regardless of the console codepage; redirected fds
+                // keep the byte sink below.
+                #[cfg(windows)]
+                if let Some(result) = crate::stdlib::win_console::console_write(1, data) {
+                    return result;
+                }
                 let mut s = sink.borrow_mut();
                 let n = s
                     .write(data)
@@ -6035,6 +6055,10 @@ impl PyFile {
                 n
             }
             FileBackend::Stderr(sink) => {
+                #[cfg(windows)]
+                if let Some(result) = crate::stdlib::win_console::console_write(2, data) {
+                    return result;
+                }
                 let mut s = sink.borrow_mut();
                 let n = s
                     .write(data)

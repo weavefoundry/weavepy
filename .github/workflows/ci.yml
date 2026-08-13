@@ -48,6 +48,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # `cargo test` compiles weavepy-pylib's source into a unit-test
+      # harness but never emits the cdylib artifact, so build it
+      # explicitly: the windows_dll integration battery (RFC 0064 WS5)
+      # needs target/debug/python313.dll next to the shim exe.
+      - run: cargo build -p weavepy-pylib
       - run: cargo test --workspace --all-targets --all-features
       - run: cargo test --workspace --doc
 
@@ -90,8 +95,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build weavepy CLI
-        run: cargo build --release -p weavepy-cli
+      - name: Build weavepy CLI + runtime library
+        # weavepy-pylib builds python313.dll — on Windows the exe is a
+        # thin shim over it (RFC 0064 WS1), so the DLL must sit next to
+        # the exe. Building it on all three OSes keeps the cdylib
+        # honest everywhere.
+        run: cargo build --release -p weavepy-cli -p weavepy-pylib
       - name: Run bundled regrtests (subprocess, parallel)
         shell: bash
         run: |
@@ -134,8 +143,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - name: Build weavepy CLI + bench harness
-        run: cargo build --release -p weavepy-cli -p weavepy-bench
+      - name: Build weavepy CLI + runtime library + bench harness
+        # weavepy-pylib: python313.dll, the runtime the Windows shim
+        # exe loads (RFC 0064 WS1).
+        run: cargo build --release -p weavepy-cli -p weavepy-pylib -p weavepy-bench
       - name: Run bench gate
         # Linux and Windows have no committed per-platform baseline
         # yet, so the gate is advisory there (--allow-missing-baseline
@@ -194,8 +205,10 @@ jobs:
         with:
           path: target/ecosystem-wheels
           key: ecosystem-wheels-${{ runner.os }}-${{ hashFiles('tests/ecosystem/manifest.toml') }}
-      - name: Build weavepy CLI
-        run: cargo build --release -p weavepy-cli
+      - name: Build weavepy CLI + runtime library
+        # weavepy-pylib: python313.dll, the runtime the Windows shim
+        # exe loads (RFC 0064 WS1).
+        run: cargo build --release -p weavepy-cli -p weavepy-pylib
       - name: Fetch ecosystem wheels (no-op on cache hit)
         # `python`, not `python3`: setup-python exposes both on
         # ubuntu/macos (same 3.13 interpreter) but only `python` on
@@ -234,8 +247,11 @@ jobs:
         with:
           path: target/ecosystem-wheels
           key: ecosystem-wheels-${{ runner.os }}-${{ hashFiles('tests/ecosystem/manifest.toml') }}
-      - name: Build weavepy CLI
-        run: cargo build --release -p weavepy-cli
+      - name: Build weavepy CLI + runtime library
+        # weavepy-pylib: python313.dll — the Windows artifact ships it
+        # at the prefix root with libs\python313.lib (RFC 0064 WS3),
+        # and the builder refuses to package a shim exe without it.
+        run: cargo build --release -p weavepy-cli -p weavepy-pylib
       - name: Fetch ecosystem wheels (no-op on cache hit)
         # `python`, not `python3`: setup-python exposes both on
         # ubuntu/macos (same 3.13 interpreter) but only `python` on

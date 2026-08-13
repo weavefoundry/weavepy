@@ -2286,8 +2286,9 @@ fn iobase_readlines(args: &[Object]) -> Result<Object, RuntimeError> {
 
 /// Extract a writable byte buffer (`bytearray` or a writable, contiguous
 /// `memoryview` over one) as `(storage, start, capacity)` — the argument shape
-/// CPython's `readinto`/`readinto1` accept.
-fn readinto_writable_buffer(
+/// CPython's `readinto`/`readinto1` accept. `pub(crate)`:
+/// `_WindowsConsoleIO.readinto` (RFC 0064 WS4) shares it.
+pub(crate) fn readinto_writable_buffer(
     arg: Option<&Object>,
 ) -> Result<(Rc<RefCell<Vec<u8>>>, usize, usize), RuntimeError> {
     match arg {
