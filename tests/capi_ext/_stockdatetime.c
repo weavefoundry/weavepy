@@ -122,6 +122,87 @@ static PyObject *sd_checks(PyObject *self, PyObject *o) {
                          PyDateTime_CheckExact(o), PyDelta_Check(o));
 }
 
+/* ---- RFC 0066 WS2: Python methods on the capsule's *type slots* ----
+ * The RFC 0062 header-proof discovery: calling a Python-visible method
+ * on `PyDateTimeAPI->DateType` itself (not on an instance) must answer
+ * through the bridged `datetime.date` class. These run BEFORE any
+ * datetime instance crosses VM->C, so they prove the eager capsule-time
+ * bridge wiring. */
+
+static PyObject *sd_type_today_is_date(PyObject *self, PyObject *args) {
+    (void)self;
+    (void)args;
+    if (PyDateTimeAPI == NULL) {
+        Py_RETURN_NONE;
+    }
+    PyObject *o = PyObject_CallMethod((PyObject *)PyDateTimeAPI->DateType, "today", NULL);
+    if (!o) {
+        return NULL;
+    }
+    int ok = PyDate_Check(o);
+    Py_DECREF(o);
+    return PyBool_FromLong(ok);
+}
+
+static PyObject *sd_type_fromordinal(PyObject *self, PyObject *args) {
+    (void)self;
+    int n;
+    if (!PyArg_ParseTuple(args, "i", &n)) {
+        return NULL;
+    }
+    PyObject *o = PyObject_CallMethod((PyObject *)PyDateTimeAPI->DateType, "fromordinal", "i", n);
+    if (!o) {
+        return NULL;
+    }
+    PyObject *r = Py_BuildValue("(iii)", PyDateTime_GET_YEAR(o), PyDateTime_GET_MONTH(o),
+                                PyDateTime_GET_DAY(o));
+    Py_DECREF(o);
+    return r;
+}
+
+static PyObject *sd_type_min_year(PyObject *self, PyObject *args) {
+    (void)self;
+    (void)args;
+    PyObject *o = PyObject_GetAttrString((PyObject *)PyDateTimeAPI->DateType, "min");
+    if (!o) {
+        return NULL;
+    }
+    long y = PyDateTime_GET_YEAR(o);
+    Py_DECREF(o);
+    return PyLong_FromLong(y);
+}
+
+static PyObject *sd_type_delta_resolution_us(PyObject *self, PyObject *args) {
+    (void)self;
+    (void)args;
+    PyObject *o = PyObject_GetAttrString((PyObject *)PyDateTimeAPI->DeltaType, "resolution");
+    if (!o) {
+        return NULL;
+    }
+    long us = PyDateTime_DELTA_GET_MICROSECONDS(o);
+    Py_DECREF(o);
+    return PyLong_FromLong(us);
+}
+
+static PyObject *sd_type_strptime(PyObject *self, PyObject *args) {
+    (void)self;
+    const char *s, *fmt;
+    if (!PyArg_ParseTuple(args, "ss", &s, &fmt)) {
+        return NULL;
+    }
+    PyObject *o =
+        PyObject_CallMethod((PyObject *)PyDateTimeAPI->DateTimeType, "strptime", "ss", s, fmt);
+    if (!o) {
+        return NULL;
+    }
+    PyObject *r =
+        Py_BuildValue("(iiiiii)", PyDateTime_GET_YEAR(o), PyDateTime_GET_MONTH(o),
+                      PyDateTime_GET_DAY(o), PyDateTime_DATE_GET_HOUR(o),
+                      PyDateTime_DATE_GET_MINUTE(o), PyDateTime_DATE_GET_SECOND(o));
+    Py_DECREF(o);
+    return r;
+}
+
 /* ---- the __Pyx_ImportType size-check path ----
  * Reads `Py_TYPE`-style `tp_basicsize` straight off the class objects the
  * `datetime` module exports, exactly as Cython's generated
@@ -169,6 +250,15 @@ static PyMethodDef sd_methods[] = {
     {"construct_delta", sd_construct_delta, METH_VARARGS, "PyDelta_FromDSU + read"},
     {"checks", sd_checks, METH_O, "PyDate_Check/PyDateTime_Check/PyDelta_Check via capsule"},
     {"module_basicsizes", sd_module_basicsizes, METH_NOARGS, "tp_basicsize size-check path"},
+    {"type_today_is_date", sd_type_today_is_date, METH_NOARGS,
+     "CallMethod(DateType, 'today') answers via the bridged class"},
+    {"type_fromordinal", sd_type_fromordinal, METH_VARARGS,
+     "CallMethod(DateType, 'fromordinal', n) then macro read-back"},
+    {"type_min_year", sd_type_min_year, METH_NOARGS, "GetAttr(DateType, 'min') data attribute"},
+    {"type_delta_resolution_us", sd_type_delta_resolution_us, METH_NOARGS,
+     "GetAttr(DeltaType, 'resolution') data attribute"},
+    {"type_strptime", sd_type_strptime, METH_VARARGS,
+     "CallMethod(DateTimeType, 'strptime', s, fmt)"},
     {NULL, NULL, 0, NULL},
 };
 

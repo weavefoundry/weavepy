@@ -872,7 +872,23 @@ fn sanitized_lib_dir(lib_dir: &Path) -> String {
                 }
                 let _ = std::fs::File::create(stage.join(".weavepy-shim-complete"));
                 if std::fs::rename(&stage, &shim).is_err() {
-                    let _ = std::fs::remove_dir_all(&stage);
+                    if done.is_file() {
+                        // Lost the race to a parallel worker — its copy
+                        // is as good.
+                        let _ = std::fs::remove_dir_all(&stage);
+                    } else {
+                        // A marker-less shim squats the path: the tmp
+                        // cleaner unlinks files it hasn't seen used in
+                        // days (the marker, entry symlinks) without
+                        // removing the directory, and a bare `rename`
+                        // can never repair that — the harness would
+                        // silently fall back to the raw (hook-bearing)
+                        // lib dir. Replace the husk wholesale.
+                        let _ = std::fs::remove_dir_all(&shim);
+                        if std::fs::rename(&stage, &shim).is_err() {
+                            let _ = std::fs::remove_dir_all(&stage);
+                        }
+                    }
                 }
             }
         }
@@ -881,6 +897,38 @@ fn sanitized_lib_dir(lib_dir: &Path) -> String {
         }
     }
     raw
+}
+
+/// Directory holding the compiled C-API test fixtures (`_testbuffer`,
+/// RFC 0066 WS1) staged for `sys.path`. The dylib is built by
+/// `build.rs` into `OUT_DIR`; stage it under a content-stable temp shim
+/// so parallel workers share one copy and the bootstrap can reference a
+/// plain directory. `None` when the fixture wasn't built (no stock
+/// headers / no cc) — `test_buffer` then keeps skipping its
+/// `TestBufferProtocol` class exactly as before.
+fn capi_fixtures_dir() -> Option<String> {
+    let built = option_env!("WEAVEPY_REGRTEST_TESTBUFFER_EXTENSION")?;
+    let built = Path::new(built);
+    if !built.is_file() {
+        return None;
+    }
+    let file_name = built.file_name()?;
+    use std::hash::{Hash, Hasher};
+    let mut h = std::hash::DefaultHasher::new();
+    built.display().to_string().hash(&mut h);
+    let shim = std::env::temp_dir().join(format!("weavepy-capi-fixtures-{:016x}", h.finish()));
+    let staged = shim.join(file_name);
+    if !staged.is_file() {
+        let stage = shim.with_extension(format!("stage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&stage);
+        std::fs::create_dir_all(&stage).ok()?;
+        std::fs::copy(built, stage.join(file_name)).ok()?;
+        if std::fs::rename(&stage, &shim).is_err() {
+            // Lost the race to a parallel worker — its copy is as good.
+            let _ = std::fs::remove_dir_all(&stage);
+        }
+    }
+    staged.is_file().then(|| shim.display().to_string())
 }
 
 fn libregrtest_bootstrap(file: &RegrtestFile) -> Option<String> {
@@ -893,6 +941,12 @@ fn libregrtest_bootstrap(file: &RegrtestFile) -> Option<String> {
         .replace('/', ".");
     let lib_dir = cpython_lib_dir(file)?;
     let path = file.path.display().to_string();
+    // Compiled C-API fixtures (`_testbuffer`, RFC 0066 WS1): appended to
+    // the tail of `sys.path` so they can never shadow the stdlib.
+    let fixtures = match capi_fixtures_dir() {
+        Some(dir) => format!("sys.path.append({dir:?})\n"),
+        None => String::new(),
+    };
     Some(format!(
         r#"
 import sys, os
@@ -906,6 +960,7 @@ except ValueError:
     pass
 sys.path.insert(0, _lib)
 del _lib
+{fixtures}
 sys.argv = [{path:?}]
 import unittest
 # Run inside a fresh scratch working directory, like libregrtest's per-worker

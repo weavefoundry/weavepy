@@ -182,6 +182,19 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("_is_main_interpreter")),
             b("_is_main_interpreter", is_main_interpreter),
         );
+        // PEP 562 module `__getattr__`: `_thread._local` resolves lazily
+        // to the frozen `_threading_local.local` (the same class
+        // `threading.local` already falls back to, so identity holds:
+        // `_thread._local is threading.local`). CPython exposes the C
+        // thread-local type under this name and gevent's `_hub_local`
+        // reads and subclasses `_thread._local` directly, without the
+        // `threading` fallback dance. Lazy because `_threading_local`
+        // is a frozen Python module: importing it eagerly here would
+        // recurse into the import machinery mid-`build()`.
+        d.insert(
+            DictKey(Object::from_static("__getattr__")),
+            b("__getattr__", module_getattr),
+        );
     }
     // Every native `_thread` function reports `__module__ == "_thread"`
     // (CPython attributes a C module's functions to that module). The
@@ -215,6 +228,34 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         filename: None,
         dict,
     })
+}
+
+/// PEP 562 `__getattr__(name)` for the `_thread` module (see `build`).
+fn module_getattr(args: &[Object]) -> Result<Object, RuntimeError> {
+    let name = match args.first() {
+        Some(Object::Str(s)) => s.to_string(),
+        _ => return Err(type_error("module __getattr__ expects a string")),
+    };
+    if name == "_local" {
+        let ptr = crate::vm_singletons::current_interpreter_ptr()
+            .ok_or_else(|| runtime_error("_thread._local: no active interpreter"))?;
+        let interp = unsafe { &mut *ptr };
+        let module = interp.import_path("_threading_local")?;
+        if let Object::Module(m) = &module {
+            if let Some(local) = m
+                .dict
+                .borrow()
+                .get(&DictKey(Object::from_static("local")))
+                .cloned()
+            {
+                return Ok(local);
+            }
+        }
+        return Err(runtime_error("_threading_local.local is missing"));
+    }
+    Err(crate::error::attribute_error(format!(
+        "module '_thread' has no attribute '{name}'"
+    )))
 }
 
 fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {

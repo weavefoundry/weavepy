@@ -65,6 +65,16 @@ pub fn current_depth() -> usize {
     DEPTH.with(|d| d.get())
 }
 
+/// Overwrite the calling thread's live depth — RFC 0066 WS4 only.
+/// A greenlet switch parks the departing greenlet's whole native stack
+/// (its activations keep their [`Guard`]s alive, un-dropped) and enters
+/// the target's; the per-thread counter must follow, or depth from one
+/// greenlet's stack would throttle another's. Restored symmetrically on
+/// every switch, so guards stay balanced per stack.
+pub(crate) fn set_depth(depth: usize) {
+    DEPTH.with(|d| d.set(depth));
+}
+
 /// Set a new process-wide limit. Returns `Err(current_depth)` if the
 /// requested limit isn't strictly above the calling thread's current
 /// depth — CPython raises `RecursionError` in that case so a program

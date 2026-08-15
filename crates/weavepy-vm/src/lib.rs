@@ -4066,6 +4066,14 @@ impl Interpreter {
         frame: &mut Frame,
         sent: Option<Object>,
     ) -> Result<FrameOutcome, RuntimeError> {
+        // RFC 0066 WS4: no segmented-stack growth on a greenlet's
+        // dedicated stack — a `stacker` segment allocated there would
+        // outlive its greenlet being parked/torn down out of band.
+        // Greenlet stacks are simply large (lazily committed); the
+        // recursion guard below still limits depth.
+        if crate::stdlib::greenlet_native::on_greenlet_stack() {
+            return self.run_until_yield_or_return_impl(frame, sent);
+        }
         // 512 KiB red zone — debug-build activations have large native
         // frames (the dispatch loop plus un-inlined helpers), and the
         // next growth check only happens at the *next* Python call.
@@ -10711,14 +10719,18 @@ impl Interpreter {
                         .map(|s| Object::Int(s as i64))
                         .collect(),
                 )),
-                "suboffsets" => Ok(Object::new_tuple(vec![])),
-                // For a 1-D view C- and F-contiguity coincide; a multi-dim
-                // view is only F-contiguous when it is also 1-element-wide,
-                // so the simple `ndim <= 1 && c_contiguous` rule matches
-                // CPython for everything `cast`/slicing can produce here.
+                // CPython reports an all `-1` tuple only for views that
+                // actually carry suboffsets; everything else is `()`.
+                "suboffsets" => Ok(Object::new_tuple(
+                    mv.suboffsets
+                        .borrow()
+                        .iter()
+                        .map(|&s| Object::Int(s as i64))
+                        .collect(),
+                )),
                 "c_contiguous" => Ok(Object::Bool(mv.is_c_contiguous())),
-                "contiguous" => Ok(Object::Bool(mv.is_c_contiguous())),
-                "f_contiguous" => Ok(Object::Bool(mv.is_c_contiguous() && mv.ndim() <= 1)),
+                "contiguous" => Ok(Object::Bool(mv.is_c_contiguous() || mv.is_f_contiguous())),
+                "f_contiguous" => Ok(Object::Bool(mv.is_f_contiguous())),
                 _ => {
                     if let Some(m) = self.lookup_method(obj, name) {
                         return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
@@ -12654,6 +12666,18 @@ impl Interpreter {
                 }
                 Ok(attr.clone())
             }
+            // RFC 0066 WS3: a foreign descriptor found in a class MRO
+            // binds through its C type's `tp_descr_get`. pybind11 wraps
+            // every registered method in a C `instancemethod` and
+            // `setattr`s it onto the class; the wrapper's `tp_descr_get`
+            // yields the bound method (instance access) or the plain
+            // function (class access). A foreign type with no
+            // `tp_descr_get` is not a descriptor — the value passes
+            // through unchanged, CPython's plain class attribute.
+            Object::Foreign(soul) => match crate::foreign::descr_get(soul, instance, owner)? {
+                Some(bound) => Ok(bound),
+                None => Ok(attr.clone()),
+            },
             _ => Ok(attr.clone()),
         }
     }
@@ -15252,10 +15276,23 @@ impl Interpreter {
                 "isinstance() argument 2 cannot be a parameterized generic",
             ));
         }
-        // Structured matchers the builtin already understands: PEP 604 unions
-        // (`int | str`) and bare `None` (legacy `isinstance(x, None)` ⇒
-        // `type(None)` check).
-        if matches!(classinfo, Object::None) || crate::is_pep604_union(classinfo).is_some() {
+        // PEP 604 union (`int | str`): CPython's `union_instancecheck`
+        // recurses per member through the *full* isinstance machinery, so
+        // ABC `__instancecheck__` hooks fire — `isinstance(7,
+        // numbers.Integral | np.integer)` is True through Integral's
+        // virtual registration even though `int` is not in its MRO
+        // (scipy's `check_random_state` spells the classinfo exactly
+        // this way; the structural matcher below returned False).
+        if let Some(members) = crate::is_pep604_union(classinfo) {
+            for m in &members {
+                if self.do_isinstance_call(obj, m, globals)?.is_truthy() {
+                    return Ok(Object::Bool(true));
+                }
+            }
+            return Ok(Object::Bool(false));
+        }
+        // Bare `None` (legacy `isinstance(x, None)` ⇒ `type(None)` check).
+        if matches!(classinfo, Object::None) {
             return Ok(Object::Bool(builtins::matches_classinfo(obj, classinfo)?));
         }
         // PEP 3119: a `__instancecheck__` defined on `type(classinfo)`
@@ -21801,7 +21838,10 @@ impl Interpreter {
                     // specialization is RFC 0022 territory.) `Instance`
                     // values are deopted too: one could be a non-data
                     // descriptor (`cached_property`) whose `__get__`
-                    // must run.
+                    // must run. `Foreign` values are deopted as well: a
+                    // C-API descriptor (pybind11 `instancemethod`,
+                    // getset, ...) must have its `tp_descr_get` run to
+                    // bind the receiver.
                     if !matches!(
                         v,
                         Object::Function(_)
@@ -21811,6 +21851,7 @@ impl Interpreter {
                             | Object::StaticMethod(_)
                             | Object::SlotDescriptor(_)
                             | Object::Instance(_)
+                            | Object::Foreign(_)
                     ) {
                         specialize::record_hit(op_idx);
                         return Ok(v);
@@ -23244,6 +23285,43 @@ impl Interpreter {
         }
     }
 
+    /// The default `type.__getattribute__` body (`type_getattro`), with
+    /// **no metaclass dispatch** — RFC 0066 WS3. The C bridge wires this
+    /// onto the exported `PyType_Type` struct: pybind11's metaclass
+    /// `tp_getattro` chains to `PyType_Type.tp_getattro(cls, name)`
+    /// directly, and routing that through full dispatch would re-enter
+    /// the metaclass override and recurse.
+    pub fn type_getattr_default(
+        &mut self,
+        ty: &Rc<TypeObject>,
+        name: &str,
+    ) -> Result<Object, RuntimeError> {
+        self.load_attr_type(ty, name)
+    }
+
+    /// The default `type.__setattr__` body (`type_setattro`), with no
+    /// metaclass dispatch — the write-side twin of
+    /// [`Self::type_getattr_default`]. pybind11's metaclass `tp_setattro`
+    /// (every `class_::def`) chains to `PyType_Type.tp_setattro`.
+    pub fn type_setattr_default(
+        &mut self,
+        ty: &Rc<TypeObject>,
+        name: &str,
+        value: Object,
+    ) -> Result<(), RuntimeError> {
+        self.set_type_attr_direct(ty, name, value)
+    }
+
+    /// The default `type.__delattr__` body (`type_setattro` with a NULL
+    /// value in CPython), again with no metaclass dispatch.
+    pub fn type_delattr_default(
+        &mut self,
+        ty: &Rc<TypeObject>,
+        name: &str,
+    ) -> Result<(), RuntimeError> {
+        self.del_type_attr_direct(ty, name)
+    }
+
     /// CPython `PyObject_GenericSetAttr` — the `object.__setattr__` /
     /// `object.__delattr__` slot body, exposed for the C-API bridge. A `value`
     /// of `None` is the delete form (`PyObject_GenericSetAttr(o, name, NULL)`).
@@ -23944,6 +24022,10 @@ impl Interpreter {
         self.binary_subscr_basic(container, index)
     }
 
+    // `self` is only consumed by the recursive normalisation call today,
+    // but the receiver keeps the signature aligned with the other subscript
+    // paths (and future arms will need interpreter state).
+    #[allow(clippy::self_only_used_in_recursion)]
     fn binary_subscr_basic(
         &self,
         container: &Object,
@@ -24182,24 +24264,23 @@ impl Interpreter {
                     ));
                 }
                 let shape = mv.shape_dims();
-                if shape.len() == 1 {
-                    // 1-D: index by element, honouring stride + format so a
-                    // `cast('i')` view yields ints, `cast('d')` yields floats,
-                    // etc. (CPython `memory_subscript` -> `unpack_single`).
-                    let itemsize = mv.itemsize.get().max(1);
-                    let idx = normalize_index(*i, shape[0])?;
-                    let stride0 = mv.stride_bytes()[0];
-                    let off = (mv.start.get() as isize + idx as isize * stride0) as usize;
-                    let fmt = mv_format_char(&mv.format.borrow());
-                    return mv
-                        .buffer
-                        .with_read(|all| mv_unpack_single(fmt, &all[off..off + itemsize]));
+                // CPython `memory_item`: integer indexing is 1-D only —
+                // 0-dim is a TypeError, deeper views NotImplementedError.
+                if shape.is_empty() {
+                    return Err(type_error("invalid indexing of 0-dim memory"));
                 }
-                // Multi-dimensional integer indexing is not yet a sub-view;
-                // fall back to the flat byte read used previously.
-                let bytes = mv.to_bytes();
-                let idx = normalize_index(*i, bytes.len())?;
-                Ok(Object::Int(i64::from(bytes[idx])))
+                if shape.len() > 1 {
+                    return Err(mv_not_implemented(
+                        "multi-dimensional sub-views are not implemented",
+                    ));
+                }
+                // 1-D: index by element, honouring stride + format so a
+                // `cast('i')` view yields ints, `cast('d')` yields floats,
+                // etc. (CPython `memory_subscript` -> `unpack_single`).
+                let idx = mv_lookup_dimension(*i, shape[0], 0)?;
+                let fmt = mv_adjust_fmt(&mv.format.borrow())?;
+                mv.read_element(&[idx], |b| mv_unpack_single(fmt, b))
+                    .unwrap_or_else(|| Err(value_error("memoryview: invalid buffer access")))
             }
             // Multi-dimensional element access: `m[i, j]` on a
             // `cast(shape=…)` view (CPython `memory_subscript` →
@@ -24208,34 +24289,63 @@ impl Interpreter {
             // released ValueError afterwards (gh-92888,
             // test_memoryview.test_use_released_memory).
             (Object::MemoryView(mv), Object::Tuple(t)) => {
-                let mut idxs = Vec::with_capacity(t.len());
-                for k in t.iter() {
-                    idxs.push(crate::builtins::coerce_index_i64(k)?);
-                }
                 if mv.released.get() {
                     return Err(value_error(
                         "operation forbidden on released memoryview object",
                     ));
                 }
                 let shape = mv.shape_dims();
-                if idxs.len() != shape.len() {
+                // 0-dim: only the empty tuple unpacks the scalar (CPython
+                // `memory_subscript`'s `ndim == 0` branch runs first).
+                if shape.is_empty() {
+                    if t.is_empty() {
+                        let fmt = mv_adjust_fmt(&mv.format.borrow())?;
+                        return mv
+                            .read_element(&[], |b| mv_unpack_single(fmt, b))
+                            .unwrap_or_else(|| {
+                                Err(value_error("memoryview: invalid buffer access"))
+                            });
+                    }
+                    return Err(type_error("invalid indexing of 0-dim memory"));
+                }
+                // A tuple of all slices is CPython's unimplemented
+                // multi-dimensional slicing; a mixed tuple is an invalid key.
+                if !t.is_empty() && t.iter().all(|k| matches!(k, Object::Slice(_))) {
+                    return Err(mv_not_implemented(
+                        "multi-dimensional slicing is not implemented",
+                    ));
+                }
+                if t.iter().any(|k| matches!(k, Object::Slice(_))) {
+                    return Err(type_error("memoryview: invalid slice key"));
+                }
+                let mut idxs = Vec::with_capacity(t.len());
+                for k in t.iter() {
+                    idxs.push(mv_coerce_index(k)?);
+                }
+                if mv.released.get() {
+                    return Err(value_error(
+                        "operation forbidden on released memoryview object",
+                    ));
+                }
+                // Under-indexing is CPython's unimplemented sub-view;
+                // over-indexing is the TypeError from `ptr_from_tuple`.
+                if idxs.len() < shape.len() {
+                    return Err(mv_not_implemented("sub-views are not implemented"));
+                }
+                if idxs.len() > shape.len() {
                     return Err(type_error(format!(
                         "cannot index {}-dimension view with {}-element tuple",
                         shape.len(),
                         idxs.len()
                     )));
                 }
-                let strides = mv.stride_bytes();
-                let mut off = mv.start.get() as isize;
-                for ((&i, &dim), &stride) in idxs.iter().zip(&shape).zip(&strides) {
-                    let idx = normalize_index(i, dim)?;
-                    off += idx as isize * stride;
+                let mut norm = Vec::with_capacity(idxs.len());
+                for (d, (&i, &dim)) in idxs.iter().zip(&shape).enumerate() {
+                    norm.push(mv_lookup_dimension(i, dim, d)?);
                 }
-                let itemsize = mv.itemsize.get().max(1);
-                let off = off as usize;
-                let fmt = mv_format_char(&mv.format.borrow());
-                mv.buffer
-                    .with_read(|all| mv_unpack_single(fmt, &all[off..off + itemsize]))
+                let fmt = mv_adjust_fmt(&mv.format.borrow())?;
+                mv.read_element(&norm, |b| mv_unpack_single(fmt, b))
+                    .unwrap_or_else(|| Err(value_error("memoryview: invalid buffer access")))
             }
             (Object::MemoryView(mv), Object::Slice(slc)) => {
                 if mv.released.get() || mv.restricted.get() {
@@ -24243,12 +24353,41 @@ impl Interpreter {
                         "operation forbidden on released memoryview object",
                     ));
                 }
+                if mv.shape_dims().is_empty() {
+                    return Err(type_error("invalid indexing of 0-dim memory"));
+                }
                 // `mv[i:j:k]` is a *sub-view* sharing the same buffer, not a
                 // copy — so `mv[::-1]`/`mv[::2]` stay non-contiguous and a
                 // later `tobytes()`/buffer export reflects the stride. Slicing
                 // adjusts the first dimension; trailing dimensions (from
                 // `cast(shape=…)`) ride along unchanged.
                 mv_slice_subview(mv, slc)
+            }
+            // `m[...]` on a 0-dim view is the identity (CPython returns a new
+            // reference to the view itself); any other key on a memoryview is
+            // the invalid-slice-key TypeError.
+            (Object::MemoryView(mv), other) => {
+                if mv.released.get() {
+                    return Err(value_error(
+                        "operation forbidden on released memoryview object",
+                    ));
+                }
+                if crate::vm_singletons::is_ellipsis(other) {
+                    if mv.shape_dims().is_empty() {
+                        return Ok(Object::MemoryView(mv.clone()));
+                    }
+                    return Err(type_error("memoryview: invalid slice key"));
+                }
+                if mv.shape_dims().is_empty() {
+                    return Err(type_error("invalid indexing of 0-dim memory"));
+                }
+                // A non-slice, non-index key may still be an `__index__`
+                // carrier (e.g. numpy integer) — try that before failing.
+                if let Some(res) = crate::builtins::try_coerce_index_i64(other) {
+                    let idx = res?;
+                    return self.binary_subscr_basic(container, &Object::Int(idx));
+                }
+                Err(type_error("memoryview: invalid slice key"))
             }
             (Object::MappingProxy(d), key) => {
                 // Borrow released before the KeyError repr (see Dict arm).
@@ -24522,18 +24661,22 @@ impl Interpreter {
                         "operation forbidden on released memoryview object",
                     ));
                 }
+                // CPython `memory_ass_sub` runs `adjust_fmt` *before* the
+                // read-only check: an unsupported format raises
+                // NotImplementedError even on a read-only view.
+                let fmt = mv_adjust_fmt(&mv.format.borrow())?;
                 if mv.readonly.get() {
                     return Err(type_error("cannot modify read-only memory"));
                 }
                 let shape = mv.shape_dims();
-                if shape.len() != 1 {
-                    return Err(type_error(
-                        "memoryview: assignment to multi-dimensional view is not supported",
-                    ));
+                if shape.is_empty() {
+                    return Err(type_error("invalid indexing of 0-dim memory"));
+                }
+                if shape.len() > 1 {
+                    return Err(mv_not_implemented("sub-views are not implemented"));
                 }
                 let itemsize = mv.itemsize.get().max(1);
-                let idx = normalize_index(*i, shape[0])?;
-                let fmt = mv_format_char(&mv.format.borrow());
+                let idx = mv_lookup_dimension(*i, shape[0], 0)?;
                 let mut packed = vec![0u8; itemsize];
                 mv_pack_single(fmt, &value, &mut packed)?;
                 // The value's `__index__`/`__float__` may have released the
@@ -24543,10 +24686,8 @@ impl Interpreter {
                         "operation forbidden on released memoryview object",
                     ));
                 }
-                let stride0 = mv.stride_bytes()[0];
-                let off = (mv.start.get() as isize + idx as isize * stride0) as usize;
-                mv.buffer
-                    .with_write(|all| all[off..off + itemsize].copy_from_slice(&packed))
+                let _ = itemsize;
+                mv.write_element(&[idx], &packed)
                     .ok_or_else(|| type_error("cannot modify read-only memory"))
             }
             (Object::MemoryView(mv), Object::Slice(slc)) => {
@@ -24561,13 +24702,19 @@ impl Interpreter {
                         "operation forbidden on released memoryview object",
                     ));
                 }
+                // Unsupported formats refuse before the read-only check
+                // (CPython `memory_ass_sub` -> `adjust_fmt`).
+                let _ = mv_adjust_fmt(&mv.format.borrow())?;
                 if mv.readonly.get() {
                     return Err(type_error("cannot modify read-only memory"));
                 }
                 let shape = mv.shape_dims();
-                if shape.len() != 1 {
-                    return Err(type_error(
-                        "memoryview: assignment to multi-dimensional view is not supported",
+                if shape.is_empty() {
+                    return Err(type_error("invalid indexing of 0-dim memory"));
+                }
+                if shape.len() > 1 {
+                    return Err(mv_not_implemented(
+                        "memoryview assignments are currently restricted to ndim = 1",
                     ));
                 }
                 let itemsize = mv.itemsize.get();
@@ -24580,6 +24727,16 @@ impl Interpreter {
                         if src.released.get() {
                             return Err(value_error(
                                 "operation forbidden on released memoryview object",
+                            ));
+                        }
+                        // CPython `copy_single` -> `equiv_structure`: the
+                        // source view must match format and itemsize exactly
+                        // ('B' vs 'b' differs — test_ndarray_slice_invalid).
+                        if *src.format.borrow() != *mv.format.borrow()
+                            || src.itemsize.get() != itemsize
+                        {
+                            return Err(value_error(
+                                "memoryview assignment: lvalue and rvalue have different structures",
                             ));
                         }
                         src.to_bytes()
@@ -24599,55 +24756,77 @@ impl Interpreter {
                         "memoryview assignment: lvalue and rvalue have different structures",
                     ));
                 }
-                let stride0 = mv.stride_bytes()[0];
-                let base = mv.start.get() as isize;
-                mv.buffer
-                    .with_write(|d| {
-                        for k in 0..slicelen {
-                            let elem = start_i + k * step;
-                            let off = (base + elem as isize * stride0) as usize;
-                            let s = k as usize * itemsize;
-                            d[off..off + itemsize].copy_from_slice(&src[s..s + itemsize]);
-                        }
-                    })
-                    .ok_or_else(|| type_error("cannot modify read-only memory"))
+                for k in 0..slicelen {
+                    let elem = (start_i + k * step).max(0) as usize;
+                    let s = k as usize * itemsize;
+                    mv.write_element(&[elem], &src[s..s + itemsize])
+                        .ok_or_else(|| type_error("cannot modify read-only memory"))?;
+                }
+                Ok(())
             }
             // Multi-dimensional element assignment: `m[i, j] = x` on a
             // `cast(shape=…)` view. Indices coerce first; a released view
             // (including one released *by* an `__index__`, gh-92888) then
             // refuses with ValueError.
             (Object::MemoryView(mv), Object::Tuple(t))
-                if !t.is_empty() && !t.iter().any(|k| matches!(k, Object::Slice(_))) =>
+                if !t.iter().any(|k| matches!(k, Object::Slice(_))) =>
             {
+                if mv.released.get() {
+                    return Err(value_error(
+                        "operation forbidden on released memoryview object",
+                    ));
+                }
+                // Format check precedes the read-only check
+                // (CPython `memory_ass_sub` -> `adjust_fmt`).
+                let _ = mv_adjust_fmt(&mv.format.borrow())?;
+                if mv.readonly.get() {
+                    return Err(type_error("cannot modify read-only memory"));
+                }
+                let shape = mv.shape_dims();
+                // 0-dim scalar assignment: `m[()] = x` packs in place
+                // (CPython `memory_ass_sub`'s `ndim == 0` branch).
+                if shape.is_empty() {
+                    if !t.is_empty() {
+                        return Err(type_error("invalid indexing of 0-dim memory"));
+                    }
+                    let itemsize = mv.itemsize.get().max(1);
+                    let fmt = mv_adjust_fmt(&mv.format.borrow())?;
+                    let mut packed = vec![0u8; itemsize];
+                    mv_pack_single(fmt, &value, &mut packed)?;
+                    if mv.released.get() {
+                        return Err(value_error(
+                            "operation forbidden on released memoryview object",
+                        ));
+                    }
+                    return mv
+                        .write_element(&[], &packed)
+                        .ok_or_else(|| type_error("cannot modify read-only memory"));
+                }
                 let mut idxs = Vec::with_capacity(t.len());
                 for k in t.iter() {
-                    idxs.push(crate::builtins::coerce_index_i64(k)?);
+                    idxs.push(mv_coerce_index(k)?);
                 }
                 if mv.released.get() {
                     return Err(value_error(
                         "operation forbidden on released memoryview object",
                     ));
                 }
-                if mv.readonly.get() {
-                    return Err(type_error("cannot modify read-only memory"));
+                if idxs.len() < shape.len() {
+                    return Err(mv_not_implemented("sub-views are not implemented"));
                 }
-                let shape = mv.shape_dims();
-                if idxs.len() != shape.len() {
+                if idxs.len() > shape.len() {
                     return Err(type_error(format!(
                         "cannot index {}-dimension view with {}-element tuple",
                         shape.len(),
                         idxs.len()
                     )));
                 }
-                let strides = mv.stride_bytes();
-                let mut off = mv.start.get() as isize;
-                for ((&i, &dim), &stride) in idxs.iter().zip(&shape).zip(&strides) {
-                    let idx = normalize_index(i, dim)?;
-                    off += idx as isize * stride;
+                let mut norm = Vec::with_capacity(idxs.len());
+                for (d, (&i, &dim)) in idxs.iter().zip(&shape).enumerate() {
+                    norm.push(mv_lookup_dimension(i, dim, d)?);
                 }
                 let itemsize = mv.itemsize.get().max(1);
-                let off = off as usize;
-                let fmt = mv_format_char(&mv.format.borrow());
+                let fmt = mv_adjust_fmt(&mv.format.borrow())?;
                 let mut packed = vec![0u8; itemsize];
                 mv_pack_single(fmt, &value, &mut packed)?;
                 // Re-check: the value conversion may have released the view.
@@ -24656,8 +24835,7 @@ impl Interpreter {
                         "operation forbidden on released memoryview object",
                     ));
                 }
-                mv.buffer
-                    .with_write(|all| all[off..off + itemsize].copy_from_slice(&packed))
+                mv.write_element(&norm, &packed)
                     .ok_or_else(|| type_error("cannot modify read-only memory"))
             }
             // A tuple key of all-slices is CPython's unimplemented
@@ -24668,19 +24846,54 @@ impl Interpreter {
             (Object::MemoryView(_), Object::Tuple(t))
                 if !t.is_empty() && t.iter().all(|k| matches!(k, Object::Slice(_))) =>
             {
-                Err(RuntimeError::PyException(crate::error::PyException::new(
-                    crate::builtin_types::make_exception_with_class(
-                        crate::builtin_types::builtin_types()
-                            .not_implemented_error
-                            .clone(),
-                        "memoryview slice assignments are currently restricted to ndim = 1",
-                    ),
+                Err(mv_not_implemented(
+                    "memoryview slice assignments are currently restricted to ndim = 1",
+                ))
+            }
+            (Object::MemoryView(mv), other) => {
+                if mv.released.get() {
+                    return Err(value_error(
+                        "operation forbidden on released memoryview object",
+                    ));
+                }
+                // Format check precedes the read-only check
+                // (CPython `memory_ass_sub` -> `adjust_fmt`).
+                let _ = mv_adjust_fmt(&mv.format.borrow())?;
+                if mv.readonly.get() {
+                    return Err(type_error("cannot modify read-only memory"));
+                }
+                // `m[...] = x` on a 0-dim view packs the scalar in place,
+                // exactly like `m[()] = x` (CPython `memory_ass_sub`).
+                if crate::vm_singletons::is_ellipsis(other) {
+                    if mv.shape_dims().is_empty() {
+                        let itemsize = mv.itemsize.get().max(1);
+                        let fmt = mv_adjust_fmt(&mv.format.borrow())?;
+                        let mut packed = vec![0u8; itemsize];
+                        mv_pack_single(fmt, &value, &mut packed)?;
+                        if mv.released.get() {
+                            return Err(value_error(
+                                "operation forbidden on released memoryview object",
+                            ));
+                        }
+                        return mv
+                            .write_element(&[], &packed)
+                            .ok_or_else(|| type_error("cannot modify read-only memory"));
+                    }
+                    return Err(type_error("memoryview: invalid slice key"));
+                }
+                if mv.shape_dims().is_empty() {
+                    return Err(type_error("invalid indexing of 0-dim memory"));
+                }
+                // An `__index__` carrier indexes like the plain int.
+                if let Some(res) = crate::builtins::try_coerce_index_i64(other) {
+                    let idx = res?;
+                    return self.store_subscr(container, &Object::Int(idx), value, globals);
+                }
+                Err(type_error(format!(
+                    "memoryview: invalid slice key: {}",
+                    other.type_name()
                 )))
             }
-            (Object::MemoryView(_), other) => Err(type_error(format!(
-                "memoryview: invalid slice key: {}",
-                other.type_name()
-            ))),
             // A list *does* support assignment; a bad index type is the
             // "indices must be integers or slices" TypeError (matching the
             // read path), not "does not support item assignment".
@@ -26265,6 +26478,14 @@ impl Interpreter {
                     )));
                     self.call(&bound, args, kwargs, outer_globals)
                 } else {
+                    if std::env::var_os("WEAVEPY_TRACE_NOTCALL").is_some() {
+                        eprintln!(
+                            "[NOTCALL] instance of {} nargs={}\n{}",
+                            inst.cls().name,
+                            args.len(),
+                            std::backtrace::Backtrace::force_capture()
+                        );
+                    }
                     Err(type_error(format!(
                         "'{}' object is not callable",
                         inst.cls().error_tp_name()
@@ -26295,10 +26516,28 @@ impl Interpreter {
                 }
                 Ok(result)
             }
-            _ => Err(type_error(format!(
-                "'{}' object is not callable",
-                callable.type_name()
-            ))),
+            // A foreign proxy — an object the extension minted itself,
+            // opaque to the VM — is called through its own C `tp_call`
+            // (CPython semantics exactly). pybind11 wraps every method in
+            // a C `instancemethod` (RFC 0066 WS3); one resolved off a
+            // mirrored class dict (`__repr__` of a classic `py::enum_`,
+            // repr'd by `m.def` while rendering a default argument)
+            // reaches this dispatch as a plain foreign value.
+            Object::Foreign(s) => crate::foreign::call(s, args, kwargs),
+            _ => {
+                if std::env::var_os("WEAVEPY_TRACE_NOTCALL").is_some() {
+                    eprintln!(
+                        "[NOTCALL] catch-all {} nargs={}\n{}",
+                        callable.type_name(),
+                        args.len(),
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                }
+                Err(type_error(format!(
+                    "'{}' object is not callable",
+                    callable.type_name()
+                )))
+            }
         }
     }
 
@@ -28730,12 +28969,37 @@ impl Interpreter {
     /// Allocate an instance of `cls`, then run the `__new__` /
     /// `__init__` two-phase initialisation. The descriptor protocol
     /// gives us classmethod binding for `__new__` for free.
-    fn instantiate(
+    ///
+    /// Public for the C-API bridge: `PyType_Type.tp_call` (CPython's
+    /// `type_call`, invoked directly off the exported struct by e.g.
+    /// pybind11's `pybind11_meta_call`) is exactly this default
+    /// `type.__call__` body — it must *not* re-dispatch through a
+    /// metaclass `__call__`, whose C body is the caller.
+    pub fn instantiate(
         &mut self,
         cls: Rc<TypeObject>,
         args: &[Object],
         kwargs: &[(String, Object)],
     ) -> Result<Object, RuntimeError> {
+        // CPython's `type_call`: `type(name, bases, ns)` — or any
+        // metaclass called with the three-argument form — builds a new
+        // class, not an instance. The C-API bridge routes
+        // `PyType_Type.tp_call` here, and Cython-compiled *plain*
+        // `class` statements create their classes exactly this way
+        // (`__Pyx_Py3MetaclassCreate` → `PyObject_Call(&PyType_Type,
+        // (name, bases, ns))`); without this branch the call fell
+        // through to the one-argument `type(x)` builtin and the "class"
+        // came back as `type(name)` == `str` (sqlalchemy's cyextension
+        // `ImmutableDictBase`).
+        {
+            let bt = builtin_types();
+            if cls.is_subclass_of(&bt.type_) && args.len() == 3 {
+                return self.winner_aware_dynamic_type_call(cls, args, kwargs);
+            }
+            if Rc::ptr_eq(&cls, &bt.type_) && args.len() != 1 {
+                return Err(type_error("type() takes 1 or 3 arguments"));
+            }
+        }
         // Built-in conversion types route to the underlying builtin
         // function so `int("3")`, `range(5)`, `list(xs)` keep working.
         if cls.flags.is_builtin {
@@ -29166,9 +29430,20 @@ impl Interpreter {
         // `object.__new__` (gated on `Py_TPFLAGS_IS_ABSTRACT`); we check
         // the observable `__abstractmethods__` set instead so the rule
         // holds for `abc.ABCMeta` / `_py_abc.ABCMeta` and any metaclass
-        // that populates it.
+        // that populates it. Faithfulness cuts the other way too
+        // (RFC 0066 WS6): *only* `object.__new__` carries the check — a
+        // class whose allocator is inherited from a native base runs
+        // `dict.__new__` / `PyType_GenericNew` / `BaseException_new`
+        // instead, and CPython instantiates it even with a non-empty
+        // `__abstractmethods__`. matplotlib relies on this:
+        // `RcParams(MutableMapping, dict)` never implements the abstract
+        // `__delitem__` (dict's, later in the MRO, serves at runtime).
         if let Some(msg) = &plan.abstract_error {
-            return Err(type_error(msg.clone()));
+            let native_allocator = !matches!(plan.native, crate::types::NativeKind::Plain)
+                || plan.seeds_exception_args;
+            if !native_allocator {
+                return Err(type_error(msg.clone()));
+            }
         }
 
         // A `type` subclass without its own `__new__` (typing's
@@ -35788,12 +36063,74 @@ pub(crate) fn normalize_index_msg(
     Ok(idx as usize)
 }
 
-/// The significant single-character code of a memoryview/struct format,
-/// dropping a leading native/standard byte-order prefix. `memoryview.cast`
-/// only admits native single-char formats, so byte order is always native.
-pub(crate) fn mv_format_char(fmt: &str) -> char {
-    let s = fmt.strip_prefix(['@', '=', '<', '>', '!']).unwrap_or(fmt);
-    s.chars().next().unwrap_or('B')
+/// Build a `NotImplementedError` (CPython raises these for memoryview
+/// element access on unsupported formats and multi-dimensional sub-views).
+pub(crate) fn mv_not_implemented(msg: impl Into<String>) -> RuntimeError {
+    RuntimeError::PyException(crate::error::PyException::new(
+        crate::builtin_types::make_exception_with_class(
+            crate::builtin_types::builtin_types()
+                .not_implemented_error
+                .clone(),
+            msg.into(),
+        ),
+    ))
+}
+
+/// CPython `memoryobject.c:lookup_dimension`: bounds-check index `i`
+/// against `dim` entries on 0-based dimension `d`, raising the IndexError
+/// that names the **1-based** dimension (test_buffer asserts on the text).
+pub(crate) fn mv_lookup_dimension(i: i64, dim: usize, d: usize) -> Result<usize, RuntimeError> {
+    let n = dim as i64;
+    let mut idx = i;
+    if idx < 0 {
+        idx += n;
+    }
+    if idx < 0 || idx >= n {
+        return Err(crate::error::index_error(format!(
+            "index out of bounds on dimension {}",
+            d + 1
+        )));
+    }
+    Ok(idx as usize)
+}
+
+/// Memoryview index coercion — CPython uses
+/// `PyNumber_AsSsize_t(key, PyExc_IndexError)`, so an int too large for an
+/// index raises IndexError (not OverflowError).
+pub(crate) fn mv_coerce_index(k: &Object) -> Result<i64, RuntimeError> {
+    crate::builtins::coerce_index_i64(k).map_err(|e| {
+        let overflow = if let RuntimeError::PyException(pe) = &e {
+            if let Object::Instance(inst) = &pe.instance {
+                inst.cls()
+                    .is_subclass_of(&crate::builtin_types::builtin_types().overflow_error)
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if overflow {
+            crate::error::index_error("cannot fit 'int' into an index-sized integer")
+        } else {
+            e
+        }
+    })
+}
+
+/// CPython `memoryobject.c:adjust_fmt`: element access (indexing, `tolist`,
+/// iteration, assignment) admits only a *native* single-character format —
+/// an optional leading `'@'` followed by one code. Standard-size prefixes
+/// (`'='`, `'<'`, `'>'`, `'!'`) and multi-member struct formats raise
+/// `NotImplementedError` exactly like CPython (test_buffer exercises both).
+pub(crate) fn mv_adjust_fmt(fmt: &str) -> Result<char, RuntimeError> {
+    let s = fmt.strip_prefix('@').unwrap_or(fmt);
+    let mut it = s.chars();
+    if let (Some(c), None) = (it.next(), it.next()) {
+        return Ok(c);
+    }
+    Err(mv_not_implemented(format!(
+        "memoryview: unsupported format {fmt}"
+    )))
 }
 
 /// Unpack every element of a 1-D memoryview into Python scalars, honouring
@@ -35803,23 +36140,26 @@ pub(crate) fn mv_element_objects(
     mv: &crate::object::PyMemoryView,
 ) -> Result<Vec<Object>, RuntimeError> {
     let shape = mv.shape_dims();
-    let n = shape.first().copied().unwrap_or(0);
-    let itemsize = mv.itemsize.get().max(1);
-    let stride0 = mv
-        .stride_bytes()
-        .first()
-        .copied()
-        .unwrap_or(itemsize as isize);
-    let base = mv.start.get() as isize;
-    let fmt = mv_format_char(&mv.format.borrow());
-    mv.buffer.with_read(|all| {
-        let mut out = Vec::with_capacity(n);
-        for i in 0..n {
-            let off = (base + i as isize * stride0) as usize;
-            out.push(mv_unpack_single(fmt, &all[off..off + itemsize])?);
-        }
-        Ok(out)
-    })
+    // CPython `memory_iter`: only 1-D views iterate; 0-dim raises TypeError
+    // via the sequence protocol, deeper views NotImplementedError.
+    if shape.is_empty() {
+        return Err(type_error("invalid indexing of 0-dim memory"));
+    }
+    if shape.len() > 1 {
+        return Err(mv_not_implemented(
+            "multi-dimensional sub-views are not implemented",
+        ));
+    }
+    let n = shape[0];
+    let fmt = mv_adjust_fmt(&mv.format.borrow())?;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let item = mv
+            .read_element(&[i], |b| mv_unpack_single(fmt, b))
+            .unwrap_or_else(|| Err(value_error("memoryview: invalid buffer access")))?;
+        out.push(item);
+    }
+    Ok(out)
 }
 
 /// Unpack one native-endian element (`bytes.len() == itemsize`) into a
@@ -35850,10 +36190,10 @@ pub(crate) fn mv_unpack_single(fmt: char, bytes: &[u8]) -> Result<Object, Runtim
         'e' => Object::Float(crate::object::tag_unpacked_nan(f16_bits_to_f64(
             u16::from_ne_bytes(a2()),
         ))),
-        _ => {
-            return Err(type_error(
-                "memoryview: format not supported for element access",
-            ))
+        other => {
+            return Err(mv_not_implemented(format!(
+                "memoryview: format {other} not supported"
+            )))
         }
     })
 }
@@ -35887,10 +36227,15 @@ pub(crate) fn mv_pack_single(
             _ => Err(bad_type()),
         }
     };
+    // CPython `fix_error_int`: a conversion raising OverflowError (e.g.
+    // `float(2**1025)`) is reported as the ValueError "invalid value for
+    // format", a TypeError as "invalid type" (test_memoryview_assign).
     let as_f64 = |v: &Object| -> Result<f64, RuntimeError> {
-        match crate::builtins::coerce_f64_opt(v)? {
-            Some(f) => Ok(f),
-            None => Err(bad_type()),
+        match crate::builtins::coerce_f64_opt(v) {
+            Ok(Some(f)) => Ok(f),
+            Ok(None) => Err(bad_type()),
+            Err(e) if is_type_error(&e) => Err(bad_type()),
+            Err(_) => Err(bad_val()),
         }
     };
     macro_rules! pack_int {
@@ -35931,8 +36276,11 @@ pub(crate) fn mv_pack_single(
             };
             out[0] = u8::from(truth);
         }
+        // CPython `pack_single` 'c': non-bytes is the type error, bytes of
+        // the wrong length the value error (`m.cast('c')[0] = b'\xff\xff'`).
         'c' => match value {
             Object::Bytes(b) if b.len() == 1 => out[0] = b[0],
+            Object::Bytes(_) => return Err(bad_val()),
             _ => return Err(bad_type()),
         },
         // Raw bytes observe canonical NaN bits — strip the identity tag.
@@ -35951,10 +36299,13 @@ pub(crate) fn mv_pack_single(
             })?;
             out[..2].copy_from_slice(&bits.to_ne_bytes());
         }
-        _ => {
-            return Err(type_error(
-                "memoryview: format not supported for element access",
-            ))
+        // CPython `pack_single` reaches unknown codes only after
+        // `adjust_fmt` passed a single character; it raises
+        // NotImplementedError for them (test_memoryview_assign, fmt 'xL').
+        other => {
+            return Err(mv_not_implemented(format!(
+                "memoryview: format {other} not supported"
+            )))
         }
     }
     Ok(())

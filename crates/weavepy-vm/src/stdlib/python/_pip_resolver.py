@@ -144,13 +144,19 @@ def _filtered_requires(metadata: dict, extras: set, env: dict) -> list:
 class Resolver:
     """Walk a graph of requirements, producing a flat install plan."""
 
-    def __init__(self, downloader, lookup, env=None):
+    def __init__(self, downloader, lookup, env=None, satisfied=None):
         self.downloader = downloader
         self.lookup = lookup
         self.env = env or default_environment()
         self.index = _ProjectIndex(lookup)
         # name -> (version, filename, url, requirement, extras)
         self.plan = {}
+        # Canonical name -> version string for distributions the runtime
+        # itself provides (RFC 0066 WS4: the bundled native greenlet).
+        # These never enter the plan: an index candidate could only be a
+        # cp313 binary wheel that cannot work here.
+        self.satisfied = {canonicalize_name(k): v
+                          for k, v in (satisfied or {}).items()}
 
     def resolve(self, requirements):
         """Resolve every requirement in ``requirements`` recursively.
@@ -175,6 +181,14 @@ class Resolver:
         if req.marker is not None and not req.marker.evaluate(self.env):
             return
         key = canonicalize_name(req.name)
+        if key in self.satisfied:
+            bundled = self.satisfied[key]
+            if req.specifier.contains(bundled, prereleases=True):
+                return
+            raise ResolutionError(
+                '{} is bundled with this interpreter at version {} and '
+                'cannot be replaced (requested {})'.format(
+                    req.name, bundled, req.specifier))
         if key in self.plan:
             entry = self.plan[key]
             if not req.specifier.contains(entry['version'], prereleases=True):

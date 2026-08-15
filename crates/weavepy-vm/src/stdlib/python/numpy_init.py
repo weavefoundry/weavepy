@@ -25,6 +25,7 @@ that:
 """
 
 import math as _math
+import struct as _struct
 import sys as _sys
 
 
@@ -203,8 +204,214 @@ else:
     _CoreNDArray = _core.NDArray
 
 
+def _contig_strides(shape, itemsize, order):
+    strides = [0] * len(shape)
+    if order == 'F':
+        acc = itemsize
+        for i, dim in enumerate(shape):
+            strides[i] = acc
+            acc *= dim
+    else:
+        acc = itemsize
+        for i in range(len(shape) - 1, -1, -1):
+            strides[i] = acc
+            acc *= shape[i]
+    return strides
+
+
+class _BufferArray:
+    """numpy-style buffer-backed array: ``ndarray(buffer=…, shape=…,
+    strides=…, dtype=…, offset=…, order=…)``.
+
+    CPython's test_buffer uses real numpy as a strided-addressing oracle
+    (metadata + ``tolist``/``tobytes`` + slice assignment); this pure
+    implementation covers exactly that surface. All element access goes
+    through ``struct`` at computed byte offsets, so negative strides and
+    arbitrary offsets work.
+    """
+
+    def __init__(self, buffer=None, shape=None, strides=None, dtype='B',
+                 offset=0, order='C'):
+        self._buf = buffer
+        self._fmt = str(dtype)
+        self._itemsize = _struct.calcsize(self._fmt)
+        self._shape = tuple(int(s) for s in (shape if shape is not None else ()))
+        if strides is None:
+            strides = _contig_strides(self._shape, self._itemsize, order)
+        self._strides = tuple(int(s) for s in strides)
+        self._offset = int(offset)
+
+    @property
+    def itemsize(self):
+        return self._itemsize
+
+    @property
+    def ndim(self):
+        return len(self._shape)
+
+    @property
+    def shape(self):
+        return self._shape
+
+    @property
+    def strides(self):
+        return self._strides
+
+    @property
+    def size(self):
+        n = 1
+        for dim in self._shape:
+            n *= dim
+        return n
+
+    def _addr(self, index):
+        a = self._offset
+        for i, s in zip(index, self._strides):
+            a += i * s
+        return a
+
+    def _read(self, index):
+        v = _struct.unpack_from(self._fmt, self._buf, self._addr(index))
+        return v[0] if len(v) == 1 else v
+
+    def _write(self, index, value):
+        if not isinstance(value, tuple):
+            value = (value,)
+        _struct.pack_into(self._fmt, self._buf, self._addr(index), *value)
+
+    def _indices(self, order='C'):
+        if not self._shape:
+            yield ()
+            return
+        if 0 in self._shape:
+            return
+        dims = range(len(self._shape))
+        axes = list(dims) if order == 'C' else list(reversed(dims))
+        index = [0] * len(self._shape)
+        while True:
+            yield tuple(index)
+            for ax in reversed(axes):
+                index[ax] += 1
+                if index[ax] < self._shape[ax]:
+                    break
+                index[ax] = 0
+            else:
+                return
+
+    def tolist(self):
+        if not self._shape:
+            return self._read(())
+
+        def build(prefix, dim):
+            if dim == len(self._shape):
+                return self._read(prefix)
+            return [build(prefix + (i,), dim + 1)
+                    for i in range(self._shape[dim])]
+
+        return build((), 0)
+
+    def tobytes(self, order='C'):
+        if order not in ('C', 'F', 'A', None):
+            raise ValueError("order must be 'C', 'F' or 'A'")
+        if order in ('A', None):
+            # numpy: 'A' means Fortran order when the array is
+            # F-contiguous, C order otherwise.
+            f_strides = tuple(_contig_strides(self._shape, self._itemsize, 'F'))
+            order = 'F' if self._strides == f_strides else 'C'
+        out = bytearray()
+        for index in self._indices(order):
+            a = self._addr(index)
+            out += bytes(self._buf[a:a + self._itemsize])
+        return bytes(out)
+
+    def __getitem__(self, key):
+        if not isinstance(key, tuple):
+            key = (key,)
+        if len(key) > len(self._shape):
+            raise IndexError('too many indices for array')
+        offset = self._offset
+        shape = []
+        strides = []
+        for dim, k in enumerate(key):
+            if isinstance(k, slice):
+                start, stop, step = k.indices(self._shape[dim])
+                # NB: the module-level `max` is numpy's reduction, not the
+                # builtin — keep this arithmetic-only.
+                n = (stop - start + (step - (1 if step > 0 else -1))) // step
+                if n < 0:
+                    n = 0
+                offset += start * self._strides[dim]
+                shape.append(n)
+                strides.append(self._strides[dim] * step)
+            else:
+                i = int(k)
+                if i < 0:
+                    i += self._shape[dim]
+                if not 0 <= i < self._shape[dim]:
+                    raise IndexError('index out of bounds')
+                offset += i * self._strides[dim]
+        shape.extend(self._shape[len(key):])
+        strides.extend(self._strides[len(key):])
+        if not shape and all(not isinstance(k, slice) for k in key):
+            if len(key) == len(self._shape):
+                v = _struct.unpack_from(self._fmt, self._buf, offset)
+                return v[0] if len(v) == 1 else v
+        view = _BufferArray.__new__(_BufferArray)
+        view._buf = self._buf
+        view._fmt = self._fmt
+        view._itemsize = self._itemsize
+        view._shape = tuple(shape)
+        view._strides = tuple(strides)
+        view._offset = offset
+        return view
+
+    def __setitem__(self, key, value):
+        dst = self[key]
+        if not isinstance(dst, _BufferArray):
+            # Scalar destination: `key` fully indexed the array.
+            if not isinstance(key, tuple):
+                key = (key,)
+            index = tuple(
+                int(k) if int(k) >= 0 else int(k) + self._shape[d]
+                for d, k in enumerate(key)
+            )
+            self._write(index, value)
+            return
+        if isinstance(value, _BufferArray):
+            if dst._shape != value._shape:
+                raise ValueError('shape mismatch in assignment')
+            # Snapshot the source first so overlapping views behave like a
+            # copy (matching what the callers can rely on for non-overlap).
+            items = [value._read(ix) for ix in value._indices()]
+            for ix, item in zip(dst._indices(), items):
+                dst._write(ix, item)
+        else:
+            items = list(value)
+            for ix, item in zip(dst._indices(), items):
+                dst._write(ix, item)
+
+    def __len__(self):
+        if not self._shape:
+            raise TypeError('len() of unsized object')
+        return self._shape[0]
+
+    def __repr__(self):
+        return f'_BufferArray(shape={self._shape}, dtype={self._fmt!r})'
+
+
 class ndarray(_CoreNDArray):
     """N-dimensional array; delegates to ``_numpylike.ndarray``."""
+
+    def __new__(cls, *args, **kwargs):
+        # numpy's buffer-backed constructor form: hand back a strided
+        # pure-Python view over the caller's buffer (test_buffer uses
+        # this as its numpy oracle).
+        if 'buffer' in kwargs:
+            return _BufferArray(**kwargs)
+        try:
+            return super().__new__(cls)
+        except TypeError:
+            return super().__new__(cls, *args, **kwargs)
 
     @property
     def T(self):

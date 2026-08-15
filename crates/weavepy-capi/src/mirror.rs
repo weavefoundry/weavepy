@@ -519,6 +519,29 @@ pub fn mirror_out_with_type(obj: Object, ty: *mut PyTypeObject) -> *mut PyObject
             return interned_str_mirror(&text, ty, obj);
         }
     }
+    // RFC 0066 WS7: `bytes` crossings *always* mint through the canonical
+    // pin cache, not just while marshaling arguments. On CPython an
+    // attribute read like `o.data` hands back a pointer whose storage the
+    // owner keeps alive, so generated code (Cython) extracts the interior
+    // buffer (`char* rawval = PyBytes_AS_STRING(t)`) and DECREFs the
+    // temporary before the buffer's last use. An unpinned per-crossing
+    // mirror dies on that DECREF — msgpack's `Packer._pack` then read the
+    // `ExtType.data` payload out of freed memory (right length, all
+    // zeros). A pinned box survives a zero C refcount (until swept), so
+    // the borrowed interior pointer stays valid while the VM value is
+    // reachable — the exact lifetime the extension assumes. Bytes are
+    // immutable and keyed by `Rc` identity, so the wider scope can never
+    // serve stale contents.
+    if std::ptr::eq(ty, types::PyBytes_Type.as_ptr()) {
+        if let Some(key) = scalar_pin_key(&obj) {
+            if let Some(p) = cached_scalar_pin(key, ty) {
+                return p;
+            }
+            let p = mirror_out_fresh(obj, ty);
+            register_scalar_pin(key, p);
+            return p;
+        }
+    }
     // RFC 0047 (wave 5): while marshaling VM arguments into a C call,
     // immutable hashable scalars mint through the canonical pin cache so a
     // callee that stores the pointer *borrowed* (pandas' khash hashtables)
@@ -534,6 +557,19 @@ pub fn mirror_out_with_type(obj: Object, ty: *mut PyTypeObject) -> *mut PyObject
             return p;
         }
     }
+    mirror_out_fresh(obj, ty)
+}
+
+/// Mint a fresh, never-shared mirror, bypassing every canonical-box and
+/// pin cache. The *staging* creators (`PyBytes_FromStringAndSize(NULL,
+/// n)`, `_PyBytes_Resize`) must come through here: their caller fills the
+/// body in place through `PyBytes_AS_STRING`, and the read-back adoption
+/// *replaces* the prefix `Rc` — which would break the pin cache's
+/// key-liveness invariant (the dropped `Rc`'s heap address can be reused
+/// by the next staging buffer, and the cache would serve the previous
+/// call's box: orjson's second `dumps` returned the first call's JSON).
+pub fn mirror_out_unpinned(obj: Object) -> *mut PyObject {
+    let ty = types::type_for_object(&obj);
     mirror_out_fresh(obj, ty)
 }
 
@@ -1250,6 +1286,24 @@ unsafe fn tuple_native_shared(p: *mut PyObject) -> Object {
     let rebuilt = unsafe { read_tuple(p) };
     unsafe {
         (*pre).obj = rebuilt.clone();
+        // The snapshot *owns* a reference to each recorded pointer (taken
+        // below, released here / in `free_mirror`). Raw pointer values were
+        // not enough: `_testbuffer`'s `pack_from_list` frees its per-loop
+        // offset int and the very next `PyLong_FromSsize_t` reuses the same
+        // heap address, so a pointer-only comparison saw "unchanged" slots
+        // and replayed the stale converted tuple (ABA), silently packing
+        // every item at the first offset. Owning the pointers pins them, so
+        // a recycled address can never masquerade as an unchanged slot.
+        if !(*pre).aux_ptr.is_null() && (*pre).aux_size > 0 {
+            let old_n = (*pre).aux_size / std::mem::size_of::<*mut PyObject>();
+            let old_slots = (*pre).aux_ptr as *mut *mut PyObject;
+            for i in 0..old_n {
+                let e = *old_slots.add(i);
+                if !e.is_null() {
+                    crate::object::Py_DecRef(e);
+                }
+            }
+        }
         if (*pre).aux_ptr.is_null() || (*pre).aux_size != want {
             if !(*pre).aux_ptr.is_null() && (*pre).aux_size > 0 {
                 let old_layout =
@@ -1263,6 +1317,13 @@ unsafe fn tuple_native_shared(p: *mut PyObject) -> Object {
             (*pre).aux_size = want;
         }
         ptr::copy_nonoverlapping(base as *const u8, (*pre).aux_ptr, want);
+        let slots = (*pre).aux_ptr as *mut *mut PyObject;
+        for i in 0..n {
+            let e = *slots.add(i);
+            if !e.is_null() {
+                crate::object::Py_IncRef(e);
+            }
+        }
     }
     rebuilt
 }
@@ -1313,6 +1374,20 @@ pub unsafe fn is_faithful_method(p: *mut PyObject) -> bool {
     }
     let head = unsafe { &*p };
     !head.ob_type.is_null() && std::ptr::eq(head.ob_type, crate::types::PyMethod_Type.as_ptr())
+}
+
+/// True iff `p` is a faithful **builtin function** mirror
+/// (`PyCFunction_Type`). Used by [`free_mirror`] to release the owned
+/// `m_self` a `PyCFunction_NewEx`-minted builtin carries (RFC 0066 WS3).
+///
+/// # Safety
+/// `p` must be non-null and readable for `[prefix .. head + 16]`.
+pub unsafe fn is_faithful_cfunction(p: *mut PyObject) -> bool {
+    if !unsafe { is_mirror(p) } {
+        return false;
+    }
+    let head = unsafe { &*p };
+    !head.ob_type.is_null() && std::ptr::eq(head.ob_type, crate::types::PyCFunction_Type.as_ptr())
 }
 
 /// True iff `p` is a faithful **slice** mirror — a mirror whose advertised
@@ -3471,6 +3546,18 @@ pub unsafe fn free_mirror(p: *mut PyObject) {
                 }
             }
         }
+        // The aux slot-pointer snapshot owns one reference per recorded
+        // pointer (ABA guard, see `tuple_native_shared`); release those too.
+        if !aux_ptr.is_null() && aux_size > 0 {
+            let sn = aux_size / std::mem::size_of::<*mut PyObject>();
+            let slots = aux_ptr as *mut *mut PyObject;
+            for i in 0..sn {
+                let elem = unsafe { *slots.add(i) };
+                if !elem.is_null() {
+                    unsafe { crate::object::Py_DecRef(elem) };
+                }
+            }
+        }
     }
 
     // RFC 0047 (wave 5): a faithful bound method owns one reference to each
@@ -3483,6 +3570,18 @@ pub unsafe fn free_mirror(p: *mut PyObject) {
         if !func.is_null() {
             unsafe { crate::object::Py_DecRef(func) };
         }
+        if !recv.is_null() {
+            unsafe { crate::object::Py_DecRef(recv) };
+        }
+    }
+
+    // RFC 0066 WS3: a faithful `PyCFunction` mirror minted for a
+    // `PyCFunction_NewEx` builtin owns one reference to its `m_self`
+    // (materialised in `fill_body` from the sidecar). NULL for every
+    // method-table builtin — a no-op there.
+    if unsafe { is_faithful_cfunction(p) } {
+        let cf = p as *mut layout::PyCFunctionObject;
+        let recv = unsafe { (*cf).m_self };
         if !recv.is_null() {
             unsafe { crate::object::Py_DecRef(recv) };
         }
@@ -3821,9 +3920,9 @@ unsafe fn fill_body(
                 // (CPython parity: an object stored into and read back out
                 // of a C container `is` itself; pandas'
                 // `test_np_max_nested_tuples` asserts `arr.max() is arr[2]`).
-                // The buffer holds raw pointer values, not owned references
-                // (`free_mirror`'s decref pass is list-gated; the generic
-                // aux `dealloc` releases the block itself).
+                // The snapshot owns one reference per recorded pointer (see
+                // `tuple_native_shared`'s ABA rationale); `free_mirror`'s
+                // tuple pass and re-snapshots release them.
                 if !t.is_empty() {
                     let bytes = t.len() * std::mem::size_of::<*mut PyObject>();
                     let buf_layout =
@@ -3832,6 +3931,13 @@ unsafe fn fill_body(
                     assert!(!buf.is_null(), "tuple seed allocation failed");
                     unsafe {
                         ptr::copy_nonoverlapping(base as *const u8, buf, bytes);
+                        let slots = buf as *mut *mut PyObject;
+                        for i in 0..t.len() {
+                            let e = *slots.add(i);
+                            if !e.is_null() {
+                                crate::object::Py_IncRef(e);
+                            }
+                        }
                     }
                     *aux_ptr = buf;
                     *aux_size = bytes;
@@ -3903,6 +4009,35 @@ unsafe fn fill_body(
                 (*cf).m_module = ptr::null_mut();
                 (*cf).m_weakreflist = ptr::null_mut();
                 (*cf).vectorcall = ptr::null_mut();
+            }
+            // RFC 0066 WS3: a builtin minted by `PyCFunction_NewEx` carries
+            // the caller's real `PyMethodDef*` and bound `self`, and stock
+            // extensions read both straight off the struct — pybind11's
+            // `initialize_generic` does `PyCFunction_GET_SELF(sibling)` to
+            // recover its `function_record` capsule for overload chaining,
+            // failing module init on NULL. Populated on *every* mint, so the
+            // fields survive VM round-trips; `m_self` is an owned reference
+            // released in `free_mirror`.
+            if let Some((self_obj, ml)) = crate::module::cfunction_extra(obj) {
+                unsafe {
+                    if ml != 0 {
+                        (*cf).m_ml = ml as *mut layout::PyMethodDef;
+                    }
+                    if let Some(s) = self_obj {
+                        (*cf).m_self = crate::object::into_owned(s);
+                    }
+                }
+            } else {
+                // A VM-native builtin (`object.__init__`, method-table
+                // installs, …) has no C-level receiver. Advertise `None`
+                // rather than NULL: CPython's NULL means "unbound
+                // PyCFunction", a state stock CPython never hands out
+                // through attribute lookup — pybind11's overload-chaining
+                // sibling probe hard-fails on it, but treats a non-capsule
+                // `m_self` as a plain non-chainable function (exactly what
+                // an inherited VM builtin is). The immortal singleton makes
+                // `free_mirror`'s decref a no-op.
+                unsafe { (*cf).m_self = crate::singletons::none_ptr() };
             }
             let _ = (aux_ptr, aux_size);
         }

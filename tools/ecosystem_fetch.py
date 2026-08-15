@@ -77,7 +77,11 @@ def load_manifest(manifest_path: Path):
             selftest = row.get("selftest")
             if selftest:
                 group.extend(selftest.get("requirements", "").split())
-                sdist_reqs.append(selftest["source"])
+                # `mode = "installed"` selftests (RFC 0066 WS5) run out of
+                # the wheel already fetched via `requirements`; only sdist
+                # selftests carry a `source` tarball to cache.
+                if "source" in selftest:
+                    sdist_reqs.append(selftest["source"])
             if group:
                 wheel_groups.append(group)
         return wheel_groups, sdist_reqs
@@ -127,7 +131,12 @@ def main() -> int:
 
     machine = platform.machine()
     if sys.platform == "darwin":
-        plats = [f"macosx_11_0_{machine}", "macosx_10_9_universal2"]
+        # Heavy-native wheels (scipy, matplotlib) tag against newer macOS
+        # deployment targets; offer every major tag from 11.0 up so pip can
+        # pick whatever the project ships.
+        plats = [
+            f"macosx_{v}_{machine}" for v in ("11_0", "12_0", "13_0", "14_0", "15_0")
+        ] + ["macosx_10_9_universal2", "macosx_10_13_universal2"]
     elif sys.platform.startswith("linux"):
         plats = [f"manylinux2014_{machine}", f"manylinux_2_17_{machine}"]
     elif sys.platform == "win32":

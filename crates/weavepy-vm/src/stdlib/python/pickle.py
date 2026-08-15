@@ -69,9 +69,22 @@ except ImportError:
                 raise ValueError(
                     "operation forbidden on released PickleBuffer object")
             if not view.contiguous:
+                # CPython's picklebuf_raw message (test_picklebuffer greps
+                # for "non-contiguous").
                 raise BufferError(
-                    "PickleBuffer can not be converted to a contiguous buffer")
-            return view.cast("B")
+                    "cannot extract raw buffer from non-contiguous buffer")
+            if view.ndim <= 1 or view.c_contiguous:
+                return view.cast("B")
+            # F-contiguous (and not C): the raw view presents the bytes in
+            # *memory* order. `cast` is C-contiguous-only (a CPython
+            # restriction we share), so snapshot the memory order instead.
+            # This loses CPython's zero-copy write coupling, which the
+            # pickle serialisation paths (read-only) never rely on — but
+            # the pickler keys its opcode choice (bytes vs bytearray,
+            # READONLY_BUFFER) off `raw().readonly`, so writability must
+            # survive the snapshot.
+            data = view.tobytes(order='F')
+            return memoryview(data if view.readonly else bytearray(data))
 
         def release(self):
             if self._view is not None:

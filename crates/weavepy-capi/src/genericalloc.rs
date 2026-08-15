@@ -64,6 +64,55 @@ pub unsafe extern "C" fn PyType_GenericAlloc(
         );
     }
 
+    // RFC 0066 WS3: a stock extension may allocate instances of a static
+    // type it has never `PyType_Ready`d — f2py's generated module init
+    // builds every `fortran` routine object via `PyObject_New(...,
+    // &PyFortran_Type)` with nothing readying the type first. CPython
+    // allocates fine off the un-readied struct (the layout is the
+    // extension's own), but our legacy-box fallback would overlay the
+    // Rust payload exactly where the extension's fields live and cross
+    // into the VM as `None` (scipy.linalg imported 623 broken LAPACK
+    // routines). Ready it on demand so it takes the faithful inline-body
+    // path below. Gated on declared inline fields — head-only foreign
+    // types keep the historical legacy box.
+    if unsafe { (*ty).tp_basicsize } as usize > std::mem::size_of::<PyObject>()
+        && !crate::types::is_weavepy_owned_type(ty)
+        && !crate::types::is_readied_type(ty)
+    {
+        unsafe { crate::types::PyType_Ready(ty) };
+    }
+
+    // RFC 0066 WS3: allocating an instance of `type` (or a metaclass —
+    // any `type` subclass) mints a **type object**, and the caller will
+    // treat the memory as a `PyHeapTypeObject`: pybind11's
+    // `make_new_python_type`/`make_default_metaclass` call
+    // `metaclass->tp_alloc(metaclass, 0)`, write `tp_name`/`tp_base`/
+    // `tp_flags`/... straight into the struct, and hand it to
+    // `PyType_Ready`. A legacy `PyObjectBox` here is memory corruption —
+    // the Rust payload sits exactly where `tp_name`..`tp_as_number` live,
+    // so every field the extension did *not* write reads as payload bytes
+    // (scipy's `_highspy._core` crashed in `inherit_slots` on a garbage
+    // `tp_as_number`). Hand back a faithful zeroed block, exactly
+    // CPython's `type_new` contract. Left unregistered: until
+    // `PyType_Ready` bridges it, the pointer classifies as foreign.
+    if is_type_metatype(ty) {
+        let basicsize = unsafe { (*ty).tp_basicsize };
+        let itemsize = unsafe { (*ty).tp_itemsize };
+        let total = basicsize.max(std::mem::size_of::<PyObject>() as PySsizeT)
+            + nitems.max(0) * itemsize.max(0);
+        let raw = unsafe { crate::memory::PyObject_Calloc(1, total as usize) } as *mut PyObject;
+        if raw.is_null() {
+            crate::errors::set_runtime_error("PyType_GenericAlloc: out of memory");
+            return ptr::null_mut();
+        }
+        unsafe {
+            (*raw).ob_refcnt = 1;
+            (*raw).ob_type = ty;
+            crate::object::Py_IncRef(ty as *mut PyObject);
+        }
+        return raw;
+    }
+
     // RFC 0045 (wave 3): an inline-storage type (`tp_basicsize >
     // sizeof(PyObject)`) gets a faithful `tp_basicsize`-wide body whose
     // fields live at their declared offsets — the `PyArrayObject` shape —
@@ -178,6 +227,32 @@ pub unsafe extern "C" fn PyType_GenericAlloc(
         }
     }
     raw as *mut PyObject
+}
+
+/// True iff instances of `ty` are *type objects*: `ty` is `type` itself
+/// or a subclass of it (a metaclass). Decided by the fast-subclass flag
+/// CPython stamps in `inherit_special`, with a bounded `tp_base`-chain
+/// walk as fallback for a hand-rolled metaclass readied before its flags
+/// were flattened.
+fn is_type_metatype(ty: *mut PyTypeObject) -> bool {
+    let type_ty = crate::types::PyType_Type.as_ptr();
+    if std::ptr::eq(ty, type_ty) {
+        return true;
+    }
+    if unsafe { (*ty).tp_flags } & crate::layout::tpflags::TYPE_SUBCLASS != 0 {
+        return true;
+    }
+    let mut base = unsafe { (*ty).tp_base };
+    for _ in 0..64 {
+        if base.is_null() {
+            return false;
+        }
+        if std::ptr::eq(base, type_ty) {
+            return true;
+        }
+        base = unsafe { (*base).tp_base };
+    }
+    false
 }
 
 /// `PyType_GenericNew(type, args, kwds)` — default `tp_new`. Calls

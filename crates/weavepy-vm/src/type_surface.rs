@@ -1785,6 +1785,17 @@ fn buffer_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
             .ok_or_else(|| type_error("__buffer__() missing self"))?,
     );
     let flags = buffer_flags_arg(args.get(1))?;
+    // gh-126980: `PyBUF_READ`/`PyBUF_WRITE` are `PyMemoryView_FromMemory`
+    // access modes, not getbuffer flags — CPython's `PyObject_GetBuffer`
+    // rejects them with `PyErr_BadInternalCall()` (SystemError).
+    if flags == 0x100 || flags == 0x200 {
+        return Err(RuntimeError::PyException(
+            crate::error::PyException::from_builtin(
+                "SystemError",
+                "bad argument to internal function",
+            ),
+        ));
+    }
     match &recv {
         Object::Bytes(b) => {
             if flags & PYBUF_WRITABLE != 0 {

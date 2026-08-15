@@ -951,7 +951,7 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             _ => None,
         },
         Object::MemoryView(_) => match name {
-            "tobytes" => Some(method("tobytes", memoryview_tobytes)),
+            "tobytes" => Some(method_kw("tobytes", memoryview_tobytes)),
             "tolist" => Some(method("tolist", memoryview_tolist)),
             "toreadonly" => Some(method("toreadonly", memoryview_toreadonly)),
             "release" => Some(method("release", memoryview_release)),
@@ -976,6 +976,62 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
                 "__release_buffer__",
                 crate::type_surface::release_buffer_builtin,
             )),
+            // WeavePy-private: retype a view with an exporter's element
+            // format without `cast`'s native-single-char restriction. The
+            // pure-Python `array` module uses it so `memoryview(array('u',…))`
+            // carries format 'u'/itemsize 4 exactly like CPython's C export
+            // (struct can't unpack 'u', which is what makes the comparison
+            // semantics of test_buffer's deprecated-u-code test work).
+            "_weavepy_with_format" => Some(method("_weavepy_with_format", |args| {
+                let mv = memoryview_self(args)?;
+                let (Some(Object::Str(fmt)), Some(itemsize)) = (
+                    args.get(1),
+                    args.get(2).and_then(crate::builtins::try_coerce_index_i64),
+                ) else {
+                    return Err(type_error(
+                        "_weavepy_with_format(format, itemsize) expected (str, int)",
+                    ));
+                };
+                let itemsize = itemsize?.max(1) as usize;
+                let nbytes = mv.len.get();
+                if nbytes % itemsize != 0 {
+                    return Err(value_error(
+                        "memoryview: length is not a multiple of itemsize",
+                    ));
+                }
+                let out = mv.shallow_clone();
+                *out.format.borrow_mut() = fmt.to_string();
+                out.itemsize.set(itemsize);
+                let dims = vec![nbytes / itemsize];
+                *out.strides.borrow_mut() = crate::object::c_contiguous_strides(&dims, itemsize);
+                *out.shape.borrow_mut() = dims;
+                out.zero_dim.set(false);
+                Ok(Object::MemoryView(Rc::new(out)))
+            })),
+            // Bound `mv.__eq__(x)` runs CPython `memory_richcompare`: a
+            // non-exporter (or one whose getbuffer refuses the FULL_RO
+            // request) yields NotImplemented, not False
+            // (test_buffer.test_ndarray_getbuf asserts on the sentinel).
+            "__eq__" => Some(method("__eq__", |args| {
+                let mv = memoryview_self(args)?;
+                let other = args
+                    .get(1)
+                    .ok_or_else(|| type_error("__eq__ expected 1 argument, got 0"))?;
+                Ok(match memoryview_eq_option(&mv, other) {
+                    Some(eq) => Object::Bool(eq),
+                    None => crate::vm_singletons::not_implemented(),
+                })
+            })),
+            "__ne__" => Some(method("__ne__", |args| {
+                let mv = memoryview_self(args)?;
+                let other = args
+                    .get(1)
+                    .ok_or_else(|| type_error("__ne__ expected 1 argument, got 0"))?;
+                Ok(match memoryview_eq_option(&mv, other) {
+                    Some(eq) => Object::Bool(!eq),
+                    None => crate::vm_singletons::not_implemented(),
+                })
+            })),
             // Bound `mv.__hash__()` must run the full `memory_hash`
             // protocol (exporter pre-hash, re-entrancy guard, cache) — the
             // same path as `hash(mv)` (test_memoryview.test_hash_use_after_free
@@ -4199,6 +4255,59 @@ fn code_replace(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
         }
     }
     Ok(Object::Code(Rc::new(nc)))
+}
+
+/// Build a metadata-only VM code object from a **C-minted** (foreign)
+/// `PyCodeObject`'s fields — RFC 0066 WS3. Cython creates one real code
+/// object per `def` during module init and stores it as the cyfunction's
+/// `__code__`; when that value crosses into the VM it must be a genuine
+/// `types.CodeType` instance, because `inspect`'s function-like probe is
+/// `isinstance(f.__code__, types.CodeType)` — an opaque foreign proxy
+/// fails it and `inspect.signature` falls through to the
+/// `__text_signature__` path and raises ("no signature found for
+/// builtin", scipy's `_transition_to_rng` decorator over
+/// `Rotation.random` at `scipy.spatial.transform._rotation_cy` init).
+/// The object carries the introspection surface (names, counts, flags,
+/// varnames) and is deliberately not executable.
+#[allow(clippy::too_many_arguments)]
+pub fn foreign_code_object(
+    name: String,
+    qualname: String,
+    filename: String,
+    firstlineno: u32,
+    arg_count: u32,
+    posonly_count: u32,
+    kwonly_count: u32,
+    flags: u32,
+    varnames: Vec<String>,
+) -> Object {
+    const CO_VARARGS: u32 = 0x0004;
+    const CO_VARKEYWORDS: u32 = 0x0008;
+    const CO_GENERATOR: u32 = 0x0020;
+    const CO_COROUTINE: u32 = 0x0080;
+    const CO_ITERABLE_COROUTINE: u32 = 0x0100;
+    const CO_ASYNC_GENERATOR: u32 = 0x0200;
+    let mut nc = weavepy_compiler::CodeObject {
+        name,
+        qualname,
+        filename,
+        varnames,
+        arg_count,
+        posonly_count,
+        kwonly_count,
+        has_varargs: flags & CO_VARARGS != 0,
+        has_varkeywords: flags & CO_VARKEYWORDS != 0,
+        is_generator: flags & CO_GENERATOR != 0,
+        is_coroutine: flags & CO_COROUTINE != 0,
+        is_iterable_coroutine: flags & CO_ITERABLE_COROUTINE != 0,
+        is_async_generator: flags & CO_ASYNC_GENERATOR != 0,
+        ..Default::default()
+    };
+    nc.linetable = vec![firstlineno.max(1)];
+    let w = nc.wire.get_or_insert_with(Default::default);
+    w.co_code = Some(Vec::new());
+    w.exec_error = Some("cannot execute foreign bytecode".to_owned());
+    Object::Code(Rc::new(nc))
 }
 
 /// Pin raw CPython `co_code` bytes on `nc` (RFC 0060 — `CodeType(...)` /
@@ -12684,7 +12793,14 @@ fn bytes_decode_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Objec
 /// Call an instance's PEP 688 `__buffer__` and hand back the exported
 /// memoryview (`None` when the object doesn't export one, or the export
 /// fails). Used for structural buffer comparisons.
-pub(crate) fn buffer_exported_view(obj: &Object) -> Option<Rc<crate::object::PyMemoryView>> {
+/// Whether `obj` is a VM instance whose class implements the PEP 688
+/// buffer protocol (`__buffer__`). Used by the C-API bridge's
+/// `PyObject_CheckBuffer` without actually invoking the exporter.
+pub fn has_buffer_dunder(obj: &Object) -> bool {
+    crate::instance_method(obj, "__buffer__").is_some()
+}
+
+pub fn buffer_exported_view(obj: &Object) -> Option<Rc<crate::object::PyMemoryView>> {
     let method = crate::instance_method(obj, "__buffer__")?;
     let ptr = crate::vm_singletons::current_interpreter_ptr()?;
     // SAFETY: published by an enclosing VM frame still live on this thread;
@@ -15460,12 +15576,110 @@ fn memoryview_self(args: &[Object]) -> Result<Rc<crate::object::PyMemoryView>, R
     }
 }
 
-fn memoryview_tobytes(args: &[Object]) -> Result<Object, RuntimeError> {
+/// CPython `memory_richcompare` for EQ: `Some(eq)` when both sides expose a
+/// buffer, `None` (→ NotImplemented) when the other side has no buffer or its
+/// `bf_getbuffer` refuses the FULL_RO request (a `_testbuffer.ndarray` built
+/// with restricted `getbuf=` flags does exactly that). Released views compare
+/// by identity, like CPython's `BASE_INACCESSIBLE` branch.
+fn memoryview_eq_option(mv: &Rc<crate::object::PyMemoryView>, other: &Object) -> Option<bool> {
+    use crate::object::PyMemoryView;
+    if mv.released.get() {
+        return Some(matches!(other, Object::MemoryView(b) if Rc::ptr_eq(mv, b)));
+    }
+    match other {
+        Object::MemoryView(b) => {
+            if b.released.get() {
+                return Some(false);
+            }
+            Some(mv.buffer_eq(b))
+        }
+        Object::Bytes(b) => {
+            let view = PyMemoryView::from_bytes(b.clone());
+            Some(mv.buffer_eq(&view))
+        }
+        Object::ByteArray(b) => {
+            let view = PyMemoryView::from_bytearray(b.clone());
+            Some(mv.buffer_eq(&view))
+        }
+        other => {
+            if let Some(b) = buffer_exported_view(other) {
+                return Some(mv.buffer_eq(&b));
+            }
+            match crate::foreign::get_buffer_obj(other) {
+                Ok(Object::MemoryView(b)) => Some(mv.buffer_eq(&b)),
+                _ => None,
+            }
+        }
+    }
+}
+
+fn memoryview_tobytes(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
     let mv = memoryview_self(args)?;
     if mv.released.get() {
         return Err(value_error("memoryview: released"));
     }
-    Ok(Object::Bytes(Rc::from(mv.to_bytes().into_boxed_slice())))
+    // `tobytes(order=None)`: 'C'/None gather row-major, 'F' column-major,
+    // 'A' follows the view's own layout ('F' only when Fortran-contiguous).
+    let mut order: Option<Object> = args.get(1).cloned();
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "order" => order = Some(v.clone()),
+            other => {
+                return Err(type_error(format!(
+                    "'{other}' is an invalid keyword argument for tobytes()"
+                )))
+            }
+        }
+    }
+    let order_ch = match &order {
+        None | Some(Object::None) => 'C',
+        Some(Object::Str(s)) => match &**s {
+            "C" | "F" | "A" => s.chars().next().unwrap(),
+            _ => return Err(value_error("order must be 'C', 'F' or 'A'")),
+        },
+        Some(other) => {
+            return Err(type_error(format!(
+                "tobytes() argument 'order' must be str or None, not {}",
+                other.type_name()
+            )))
+        }
+    };
+    let fortran = match order_ch {
+        'F' => true,
+        'A' => mv.is_f_contiguous() && !mv.is_c_contiguous(),
+        _ => false,
+    };
+    if !fortran {
+        return Ok(Object::Bytes(Rc::from(mv.to_bytes().into_boxed_slice())));
+    }
+    // Fortran gather: first index varies fastest.
+    let shape = mv.shape_dims();
+    let total: usize = shape.iter().product();
+    let itemsize = mv.itemsize.get().max(1);
+    let mut out = Vec::with_capacity(total * itemsize);
+    let mut idx = vec![0usize; shape.len()];
+    for _ in 0..total {
+        let ok = mv
+            .read_element(&idx, |b| -> Result<Object, RuntimeError> {
+                out.extend_from_slice(b);
+                Ok(Object::None)
+            })
+            .is_some();
+        if !ok {
+            return Err(value_error("memoryview: invalid buffer access"));
+        }
+        for d in 0..shape.len() {
+            idx[d] += 1;
+            if idx[d] < shape[d] {
+                break;
+            }
+            idx[d] = 0;
+        }
+    }
+    Ok(Object::Bytes(Rc::from(out.into_boxed_slice())))
 }
 
 fn memoryview_tolist(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -15475,45 +15689,33 @@ fn memoryview_tolist(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     // CPython `memoryview.tolist` unpacks elements per the view's format
     // (`'l'` → ints, `'d'` → floats, …), nesting one list per dimension.
+    // Non-native / multi-member formats raise NotImplementedError
+    // (`adjust_fmt` parity).
     let shape = mv.shape_dims();
-    let strides = mv.stride_bytes();
-    let itemsize = mv.itemsize.get().max(1);
-    let fmt = crate::mv_format_char(&mv.format.borrow());
+    let fmt = crate::mv_adjust_fmt(&mv.format.borrow())?;
+    // Recurse one dimension per level, accumulating the multi-index;
+    // `read_element` resolves each leaf (linear- or suboffset-addressed).
     fn build(
-        all: &[u8],
+        mv: &crate::object::PyMemoryView,
         shape: &[usize],
-        strides: &[isize],
-        off: isize,
-        itemsize: usize,
+        prefix: &mut Vec<usize>,
         fmt: char,
     ) -> Result<Object, RuntimeError> {
         if shape.is_empty() {
-            let o = off as usize;
-            return crate::mv_unpack_single(fmt, &all[o..o + itemsize]);
+            return mv
+                .read_element(prefix, |b| crate::mv_unpack_single(fmt, b))
+                .unwrap_or_else(|| Err(value_error("memoryview: invalid buffer access")));
         }
         let mut out = Vec::with_capacity(shape[0]);
         for i in 0..shape[0] {
-            out.push(build(
-                all,
-                &shape[1..],
-                &strides[1..],
-                off + i as isize * strides[0],
-                itemsize,
-                fmt,
-            )?);
+            prefix.push(i);
+            let item = build(mv, &shape[1..], prefix, fmt);
+            prefix.pop();
+            out.push(item?);
         }
         Ok(Object::new_list(out))
     }
-    mv.buffer.with_read(|all| {
-        build(
-            all,
-            &shape,
-            &strides,
-            mv.start.get() as isize,
-            itemsize,
-            fmt,
-        )
-    })
+    build(&mv, &shape, &mut Vec::new(), fmt)
 }
 
 fn memoryview_release(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -15611,6 +15813,12 @@ fn memoryview_cast(args: &[Object], kwargs: &[(String, Object)]) -> Result<Objec
             }
         }
     }
+    if args.len() > 3 {
+        return Err(type_error(format!(
+            "cast expected at most 2 arguments, got {}",
+            args.len() - 1
+        )));
+    }
     // CPython restricts casts to C-contiguous views (`mv[::2].cast(...)`
     // raises `TypeError: memoryview: casts are restricted to C-contiguous
     // views`).
@@ -15619,23 +15827,78 @@ fn memoryview_cast(args: &[Object], kwargs: &[(String, Object)]) -> Result<Objec
             "memoryview: casts are restricted to C-contiguous views",
         ));
     }
-    let Some(Object::Str(fmt)) = &format else {
-        return Err(type_error("memoryview: cast format must be a string"));
-    };
-    // Native itemsizes (CPython `get_native_fmtchar`): 1 for B/b/c, 2 for
-    // h/H/e, 4 for i/I/f, sizeof(long) for l/L, 8 for q/Q/d/n/N/P.
-    let itemsize = match fmt.as_ref() {
-        "B" | "b" | "c" | "?" => 1,
-        "h" | "H" | "e" => 2,
-        "i" | "I" | "f" => 4,
-        "l" | "L" => std::mem::size_of::<std::os::raw::c_long>(),
-        "q" | "Q" | "d" | "n" | "N" | "P" => 8,
-        _ => {
-            return Err(value_error(
-                "memoryview: destination format must be a native single character format prefixed with an optional '@'",
+    // CPython `memory_cast`: a multi-dimensional (or explicitly reshaped)
+    // view with a zero in its shape is C-contiguous by the definition above
+    // but casts over it are undefined, so they are refused up front.
+    let cur_shape = mv.shape_dims();
+    if (shape.is_some() || cur_shape.len() != 1) && cur_shape.contains(&0) {
+        return Err(type_error(
+            "memoryview: cannot cast view with zeros in shape or strides",
+        ));
+    }
+    // Shape argument validation runs before the format checks
+    // (CPython `memory_cast_impl` validates `shape` before `cast_to_1D`).
+    let shape_items: Option<Vec<Object>> = match &shape {
+        None => None,
+        Some(Object::List(items)) => Some(items.borrow().clone()),
+        Some(Object::Tuple(items)) => Some(items.to_vec()),
+        Some(_) => {
+            return Err(type_error(
+                "memoryview.cast(): shape must be a list or a tuple",
             ))
         }
     };
+    if let Some(items) = &shape_items {
+        if items.len() > 64 {
+            return Err(value_error(
+                "memoryview: number of dimensions must not exceed 64",
+            ));
+        }
+        if cur_shape.len() != 1 && items.len() != 1 {
+            return Err(type_error("memoryview: cast must be 1D -> ND or ND -> 1D"));
+        }
+    }
+    let Some(Object::Str(fmt)) = &format else {
+        return Err(type_error("memoryview: cast format must be a string"));
+    };
+    // Destination format: an optional '@' followed by one native code
+    // (CPython `get_native_fmtchar`). Native itemsizes: 1 for B/b/c/?,
+    // 2 for h/H/e, 4 for i/I/f, sizeof(long) for l/L, 8 for q/Q/d/n/N/P.
+    let dest_body = fmt.strip_prefix('@').unwrap_or(fmt);
+    let bad_dest = || {
+        value_error(
+            "memoryview: destination format must be a native single character format prefixed with an optional '@'",
+        )
+    };
+    let destchar = {
+        let mut it = dest_body.chars();
+        match (it.next(), it.next()) {
+            (Some(c), None) => c,
+            _ => return Err(bad_dest()),
+        }
+    };
+    let itemsize = match destchar {
+        'B' | 'b' | 'c' | '?' => 1,
+        'h' | 'H' | 'e' => 2,
+        'i' | 'I' | 'f' => 4,
+        'l' | 'L' => std::mem::size_of::<std::os::raw::c_long>(),
+        'q' | 'Q' | 'd' | 'n' | 'N' | 'P' => 8,
+        _ => return Err(bad_dest()),
+    };
+    // CPython `cast_to_1D`: at least one side of the cast must be a byte
+    // format (B, b, or c); a non-native source format counts as non-byte.
+    let is_byte = |c: char| matches!(c, 'B' | 'b' | 'c');
+    let src_byte = {
+        let src_fmt = mv.format.borrow();
+        let body = src_fmt.strip_prefix('@').unwrap_or(&src_fmt);
+        let mut it = body.chars();
+        matches!((it.next(), it.next()), (Some(c), None) if is_byte(c))
+    };
+    if !src_byte && !is_byte(destchar) {
+        return Err(type_error(
+            "memoryview: cannot cast between two non-byte formats",
+        ));
+    }
     let nbytes = mv.len.get();
     if nbytes % itemsize != 0 {
         return Err(type_error(
@@ -15644,31 +15907,46 @@ fn memoryview_cast(args: &[Object], kwargs: &[(String, Object)]) -> Result<Objec
     }
     // Build the new shape. With no explicit `shape`, cast yields a flat
     // `[nbytes / itemsize]` 1-D view; an explicit shape must agree on size.
-    let dims: Vec<usize> = match shape {
+    let dims: Vec<usize> = match shape_items {
         None => vec![nbytes / itemsize],
-        Some(shape_obj) => {
-            let items: Vec<Object> = match &shape_obj {
-                Object::List(items) => items.borrow().clone(),
-                Object::Tuple(items) => items.to_vec(),
-                _ => {
-                    return Err(type_error(
-                        "memoryview.cast(): shape must be a list or a tuple",
-                    ))
-                }
-            };
+        Some(items) => {
             let mut dims = Vec::with_capacity(items.len());
+            let mut prod: usize = 1;
             for d in &items {
-                match d.as_i64() {
-                    Some(n) if n >= 0 => dims.push(n as usize),
+                // CPython `cast_to_ND`: only real ints pass (TypeError),
+                // `PyLong_AsSsize_t` overflow propagates OverflowError,
+                // non-positive dims and a product exceeding SSIZE_MAX are
+                // ValueErrors.
+                let n = match d {
+                    Object::Bool(b) => i64::from(*b),
+                    Object::Int(n) => *n,
+                    Object::Long(b) => b.to_i64().ok_or_else(|| {
+                        crate::error::overflow_error("Python int too large to convert to C ssize_t")
+                    })?,
                     _ => {
                         return Err(type_error(
                             "memoryview.cast(): elements of shape must be integers",
                         ))
                     }
+                };
+                if n <= 0 {
+                    return Err(value_error(
+                        "memoryview.cast(): elements of shape must be integers > 0",
+                    ));
                 }
+                prod = prod
+                    .checked_mul(n as usize)
+                    .filter(|&p| isize::try_from(p).is_ok())
+                    .ok_or_else(|| value_error("memoryview.cast(): product(shape) > SSIZE_MAX"))?;
+                dims.push(n as usize);
             }
-            let prod: usize = dims.iter().product::<usize>().saturating_mul(itemsize);
-            if prod != nbytes {
+            let total = prod
+                .checked_mul(itemsize)
+                .filter(|&t| isize::try_from(t).is_ok())
+                .ok_or_else(|| {
+                    value_error("memoryview.cast(): product(shape) * itemsize > SSIZE_MAX")
+                })?;
+            if total != nbytes {
                 return Err(type_error(
                     "memoryview: product(shape) * itemsize != buffer size",
                 ));
@@ -15679,14 +15957,17 @@ fn memoryview_cast(args: &[Object], kwargs: &[(String, Object)]) -> Result<Objec
     // A fresh view over the *same* buffer (shares the export); the original
     // `mv` is left untouched, matching CPython's non-mutating `cast`.
     let cast = mv.shallow_clone();
+    let zero_dim = dims.is_empty();
     *cast.format.borrow_mut() = fmt.to_string();
     cast.itemsize.set(itemsize);
     *cast.strides.borrow_mut() = crate::object::c_contiguous_strides(&dims, itemsize);
     *cast.shape.borrow_mut() = dims;
-    // Casting a 0-dim view (a ctypes Structure export) always yields a
-    // regular 1-D view (CPython `memory_cast`: `ndim` becomes
-    // `len(shape)`), so `mv.cast('B')[:] = data` works (test_io byteslike).
-    cast.zero_dim.set(false);
+    // `ndim` becomes `len(shape)` (CPython `memory_cast`): casting a 0-dim
+    // view (a ctypes Structure export) to a flat format yields a regular
+    // 1-D view so `mv.cast('B')[:] = data` works (test_io byteslike), and
+    // an explicit empty shape (`m.cast('I', shape=())`) yields a 0-dim
+    // scalar view (test_buffer.test_memoryview_cast).
+    cast.zero_dim.set(zero_dim);
     Ok(Object::MemoryView(Rc::new(cast)))
 }
 

@@ -1,0 +1,17 @@
+Metadata-Version: 2.1
+Name: greenlet
+Version: 3.2.0
+Summary: Lightweight in-process concurrent programming (WeavePy's bundled native implementation).
+Home-page: https://greenlet.readthedocs.io/
+License: MIT AND Python-2.0
+Classifier: Programming Language :: Python :: 3.13
+Requires-Python: >=3.9
+Description-Content-Type: text/x-rst
+
+This is WeavePy's bundled greenlet distribution (RFC 0066 WS4): the
+upstream API implemented natively inside the interpreter over real
+stack switching. A pip-installed cp313 greenlet wheel cannot work
+under WeavePy (its hand-written assembly switches CPython's C stack),
+so this dist-info marks the requirement as satisfied for
+importlib.metadata, pip's resolver, and dependents such as
+SQLAlchemy's asyncio extension.

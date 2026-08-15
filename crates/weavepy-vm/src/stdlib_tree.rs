@@ -84,6 +84,28 @@ const DATA_FILES: &[(&str, &str)] = &[
         "pydoc_data/_pydoc.css",
         include_str!("stdlib/python/pydoc_data/_pydoc.css"),
     ),
+    // RFC 0066 WS4: the bundled greenlet's dist-info. The stdlib tree
+    // is a `sys.path` entry, so importlib.metadata (and pip listing)
+    // sees the bundled native greenlet as an installed distribution —
+    // dependents like SQLAlchemy's asyncio extension probe exactly
+    // this. The version must agree with `_greenlet.GREENLET_VERSION`
+    // and the directory name below.
+    (
+        "greenlet-3.2.0.dist-info/METADATA",
+        include_str!("stdlib/python/greenlet_dist_info/METADATA"),
+    ),
+    (
+        "greenlet-3.2.0.dist-info/INSTALLER",
+        include_str!("stdlib/python/greenlet_dist_info/INSTALLER"),
+    ),
+    (
+        "greenlet-3.2.0.dist-info/top_level.txt",
+        include_str!("stdlib/python/greenlet_dist_info/top_level.txt"),
+    ),
+    (
+        "greenlet-3.2.0.dist-info/RECORD",
+        include_str!("stdlib/python/greenlet_dist_info/RECORD"),
+    ),
 ];
 
 /// The bundled pip wheel's filename. The version must agree with

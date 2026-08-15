@@ -114,6 +114,7 @@ pub mod genericalloc;
 pub mod getset;
 pub mod inherit;
 pub mod instance;
+pub mod instancemethod;
 pub mod interp;
 pub mod layout;
 pub mod lifecycle;

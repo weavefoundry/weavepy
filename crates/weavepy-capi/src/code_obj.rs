@@ -179,6 +179,64 @@ unsafe extern "C" fn code_dealloc(obj: *mut PyObject) {
     unsafe { alloc::dealloc(base, layout) };
 }
 
+/// Decode a facade code object into a genuine VM `types.CodeType`
+/// instance (RFC 0066 WS3), or `None` when `p` is not one. `inspect`'s
+/// function-like probe (`isinstance(f.__code__, types.CodeType)`) must
+/// pass for a cyfunction's `__code__` — see
+/// [`weavepy_vm::builtins::foreign_code_object`]. Called from
+/// [`crate::object::clone_object`] at the C→VM crossing; the C-side
+/// facade object itself is untouched (Cython keeps writing
+/// `_co_firsttraceable` and `Py_DECREF`ing through its own pointer).
+pub(crate) unsafe fn native_code_object(p: *mut PyObject) -> Option<weavepy_vm::object::Object> {
+    use weavepy_vm::object::Object;
+    let ty = unsafe { (*p).ob_type };
+    if ty.is_null() || !std::ptr::eq(ty, PyCode_Type.as_ptr()) {
+        return None;
+    }
+    let base = p as *mut u8;
+    let read_int =
+        |off: usize| unsafe { ptr::read_unaligned(base.add(off) as *const c_int) }.max(0) as u32;
+    let read_str = |off: usize| -> String {
+        let o = unsafe { ptr::read_unaligned(base.add(off) as *const *mut PyObject) };
+        if o.is_null() {
+            return String::new();
+        }
+        match unsafe { crate::object::clone_object(o) } {
+            Object::Str(s) => s.to_string(),
+            _ => String::new(),
+        }
+    };
+    let varnames = {
+        let o =
+            unsafe { ptr::read_unaligned(base.add(OFF_LOCALSPLUSNAMES) as *const *mut PyObject) };
+        if o.is_null() {
+            Vec::new()
+        } else {
+            match unsafe { crate::object::clone_object(o) } {
+                Object::Tuple(t) => t
+                    .iter()
+                    .map(|it| match it {
+                        Object::Str(s) => s.to_string(),
+                        _ => String::new(),
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            }
+        }
+    };
+    Some(weavepy_vm::builtins::foreign_code_object(
+        read_str(OFF_NAME),
+        read_str(OFF_QUALNAME),
+        read_str(OFF_FILENAME),
+        read_int(OFF_FIRSTLINENO),
+        read_int(OFF_ARGCOUNT),
+        read_int(OFF_POSONLY),
+        read_int(OFF_KWONLY),
+        read_int(OFF_FLAGS),
+        varnames,
+    ))
+}
+
 /// `PyUnstable_Code_NewWithPosOnlyArgs` — the 3.13 public code-object
 /// constructor Cython emits for every function in `__Pyx_CreateCodeObjects`.
 /// We retain the metadata fields (names, filename, qualname, consts) and
@@ -385,5 +443,34 @@ pub unsafe extern "C" fn PyFrame_New(
 /// no-op (returns success).
 #[no_mangle]
 pub unsafe extern "C" fn PyTraceBack_Here(_frame: *mut PyObject) -> c_int {
+    0
+}
+
+/// `PyFrame_GetCode(frame)` — a *new reference* to the frame's code
+/// object, never NULL per CPython's contract. WeavePy's facade frames
+/// carry no code, so mint an empty one (RFC 0066 WS3; pybind11's
+/// traceback formatter walks frames through this accessor).
+#[no_mangle]
+pub unsafe extern "C" fn PyFrame_GetCode(_frame: *mut PyObject) -> *mut PyObject {
+    unsafe {
+        PyCode_NewEmpty(
+            b"<weavepy>\0".as_ptr() as *const c_char,
+            b"<frame>\0".as_ptr() as *const c_char,
+            0,
+        )
+    }
+}
+
+/// `PyFrame_GetBack(frame)` — NULL means "outermost frame" (a valid,
+/// non-error answer); facade frames carry no chain.
+#[no_mangle]
+pub unsafe extern "C" fn PyFrame_GetBack(_frame: *mut PyObject) -> *mut PyObject {
+    ptr::null_mut()
+}
+
+/// `PyFrame_GetLineNumber(frame)` — facade frames have no position; 0
+/// mirrors the "no line" answer callers already handle.
+#[no_mangle]
+pub unsafe extern "C" fn PyFrame_GetLineNumber(_frame: *mut PyObject) -> c_int {
     0
 }

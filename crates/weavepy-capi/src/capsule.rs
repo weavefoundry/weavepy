@@ -612,6 +612,11 @@ fn try_install_well_known_capsule(
         // located, which keeps the function-pointer constructors usable.
         crate::datetime_api::ensure_datetime_bridge();
         crate::datetime_api::fill_utc_singleton();
+        // RFC 0066 WS2: wire the six shells' bridges to the live classes
+        // now, while the `datetime` module is known-imported — so the
+        // importing extension can call Python methods on the capsule's
+        // type slots (`DateType.today()`) before any instance crossing.
+        crate::datetime_api::wire_shell_bridges();
         let name = match CString::new("datetime.datetime_CAPI") {
             Ok(s) => s,
             Err(_) => return None,

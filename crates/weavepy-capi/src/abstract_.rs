@@ -99,6 +99,18 @@ pub unsafe extern "C" fn PyObject_Repr(o: *mut PyObject) -> *mut PyObject {
         }) {
             Some(Ok(s)) => return crate::object::into_owned(Object::from_str(s)),
             Some(Err(e)) => {
+                if std::env::var_os("WEAVEPY_TRACE_REPRERR").is_some() {
+                    if let Object::Instance(i) = &obj {
+                        let r = i.cls().lookup("__repr__");
+                        eprintln!(
+                            "[REPRERR] instance of {} repr_lookup={:?} err={e:?}",
+                            i.cls().name,
+                            r.as_ref().map(|x| x.type_name_owned()),
+                        );
+                    } else {
+                        eprintln!("[REPRERR] obj={} err={e:?}", obj.type_name());
+                    }
+                }
                 crate::errors::set_pending_from_runtime(e);
                 return ptr::null_mut();
             }
@@ -487,6 +499,17 @@ fn attr_lookup(o: &Object, key: &str) -> Option<Object> {
             // Cython's class-creation path — e.g. `EnumType.__prepare__`
             // fetched while building a `class X(Enum)` inside a `.pyx`.
             let raw = t.lookup(key)?;
+            // A member/getset found in the class's own MRO serves
+            // *instances*; on the class itself the metatype's data
+            // descriptor wins (`C.__dict__` is `type.__dict__['__dict__']
+            // .__get__(C)` → a mappingproxy, not the raw
+            // member_descriptor). Defer to the VM's full `LOAD_ATTR`
+            // (RFC 0066 WS6: zope.interface's C `implementedBy` does
+            // `PyObject_GetItem(PyObject_GetAttr(cls, "__dict__"), …)`
+            // and subscripted the raw descriptor).
+            if matches!(raw, Object::SlotDescriptor(_)) {
+                return None;
+            }
             Some(bind_type_attr(t, raw))
         }
         Object::Instance(inst) => {
@@ -824,6 +847,55 @@ unsafe fn sync_arg_container_sizes(args: *mut PyObject) {
     }
 }
 
+/// Dispatch a *foreign* callable — an object the extension minted itself,
+/// whose callable protocol lives in its own `tp_call` slot — exactly like
+/// CPython's `_PyObject_MakeTpCall`: straight through the slot, no VM
+/// round-trip. pybind11's `instancemethod` wrapper (around every
+/// registered method) and its capsule-bearing `cpp_function`s chain
+/// `tp_call` → `PyObject_Call` → `tp_call` entirely at this level;
+/// cloning them into the VM yields an opaque proxy the VM cannot call
+/// (RFC 0066 WS6 — matplotlib `_image`'s classic `py::enum_`, whose
+/// `__int__`/`__eq__`/`__repr__` all resolve to such wrappers while
+/// `m.def` renders a default argument).
+///
+/// Returns `None` when `callable` is VM-owned, has no `tp_call`, or the
+/// slot is the VM-forwarding bridge (`synth_tp_call` would re-enter the
+/// caller). `args` may be NULL (a fresh empty tuple is minted); `kwargs`
+/// may be NULL.
+unsafe fn foreign_tp_call(
+    callable: *mut PyObject,
+    args: *mut PyObject,
+    kwargs: *mut PyObject,
+) -> Option<*mut PyObject> {
+    if crate::object::is_weavepy_owned(callable) {
+        return None;
+    }
+    let tp = unsafe { (*callable).ob_type } as *mut crate::types::PyTypeObject;
+    if tp.is_null() {
+        return None;
+    }
+    let tp_call = unsafe { (*tp).tp_call };
+    if tp_call.is_null() || crate::types::is_synth_call_slot(tp_call) {
+        return None;
+    }
+    let f: unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut PyObject) -> *mut PyObject =
+        unsafe { std::mem::transmute(tp_call) };
+    // `tp_call` requires a real (possibly empty) args tuple.
+    let (args_owned, args_ptr) = if args.is_null() {
+        (
+            true,
+            crate::object::into_owned(Object::new_tuple(Vec::new())),
+        )
+    } else {
+        (false, args)
+    };
+    let r = unsafe { f(callable, args_ptr, kwargs) };
+    if args_owned {
+        unsafe { crate::object::Py_DecRef(args_ptr) };
+    }
+    Some(r)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn PyObject_Call(
     callable: *mut PyObject,
@@ -833,6 +905,10 @@ pub unsafe extern "C" fn PyObject_Call(
     if callable.is_null() {
         crate::errors::set_type_error("PyObject_Call: callable is NULL");
         return ptr::null_mut();
+    }
+    if let Some(r) = unsafe { foreign_tp_call(callable, args, kwargs) } {
+        unsafe { sync_arg_container_sizes(args) };
+        return r;
     }
     let target = unsafe { crate::object::clone_object(callable) };
     let arg_vec = if args.is_null() {
@@ -894,6 +970,19 @@ pub unsafe extern "C" fn PyObject_CallOneArg(
 ) -> *mut PyObject {
     if callable.is_null() {
         return ptr::null_mut();
+    }
+    if !crate::object::is_weavepy_owned(callable) {
+        let args = unsafe { crate::containers::PyTuple_New(1) };
+        unsafe {
+            crate::object::Py_IncRef(arg);
+            crate::containers::PyTuple_SetItem(args, 0, arg);
+        }
+        let r = unsafe { foreign_tp_call(callable, args, ptr::null_mut()) };
+        unsafe { crate::object::Py_DecRef(args) };
+        if let Some(r) = r {
+            unsafe { crate::mirror::sync_container_size(arg) };
+            return r;
+        }
     }
     let target = unsafe { crate::object::clone_object(callable) };
     let arg_obj = if arg.is_null() {
@@ -990,6 +1079,14 @@ fn invoke_callable(
             if let Some(call) = attr_lookup(&other, "__call__") {
                 invoke_callable_inner(call, args, kwargs)
             } else {
+                if std::env::var_os("WEAVEPY_TRACE_NOTCALL").is_some() {
+                    eprintln!(
+                        "[NOTCALL] capi invoke_callable {} nargs={}\n{}",
+                        type_name(&other),
+                        args.len(),
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                }
                 Err(weavepy_vm::error::type_error(format!(
                     "'{}' object is not callable",
                     type_name(&other)

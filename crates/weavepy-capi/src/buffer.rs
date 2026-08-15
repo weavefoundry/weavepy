@@ -46,7 +46,7 @@ use crate::slottable::{slot_table_for, Py_bf_getbuffer, Py_bf_releasebuffer};
 /// Layout of `Py_buffer` in `Python.h`. Field order matches CPython
 /// 3.13 exactly.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct Py_buffer {
     pub buf: *mut std::ffi::c_void,
     pub obj: *mut PyObject,
@@ -111,10 +111,38 @@ pub(crate) struct BufferInternal {
     /// so the array would read freed memory (observed as corrupted
     /// datetime/period/interval data on protocol-5 round-trips).
     pub keepalive: Option<Object>,
+    /// Export pin for a VM memoryview exporter — bumps the view's `exports`
+    /// count for the C buffer's lifetime, dropped on `PyBuffer_Release`.
+    pub export_pin: Option<ExportPin>,
     pub shape: Box<[PySsizeT]>,
     pub strides: Box<[PySsizeT]>,
     pub suboffsets: Box<[PySsizeT]>,
     pub format: Box<[u8]>,
+}
+
+/// A `PyObject_GetBuffer` over a VM `memoryview` counts as an export of
+/// that view (CPython `memory_getbuf` bumps `self->exports`), so
+/// `m.release()` raises BufferError while a C consumer (a
+/// `_testbuffer.ndarray` re-exporter, say) still holds the buffer.
+pub(crate) struct ExportPin(weavepy_vm::sync::Rc<weavepy_vm::object::PyMemoryView>);
+
+impl ExportPin {
+    pub(crate) fn new(mv: &weavepy_vm::sync::Rc<weavepy_vm::object::PyMemoryView>) -> Self {
+        mv.exports.set(mv.exports.get() + 1);
+        ExportPin(mv.clone())
+    }
+}
+
+impl Drop for ExportPin {
+    fn drop(&mut self) {
+        self.0.exports.set(self.0.exports.get().saturating_sub(1));
+    }
+}
+
+impl std::fmt::Debug for ExportPin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<export pin>")
+    }
 }
 
 // ----------------------------------------------------------------
@@ -384,10 +412,11 @@ pub unsafe extern "C" fn PyObject_CheckBuffer(o: *mut PyObject) -> c_int {
     if !unsafe { foreign_bf_getbuffer(head.ob_type) }.is_null() {
         return 1;
     }
-    matches!(
-        unsafe { crate::object::clone_object(o) },
+    let obj = unsafe { crate::object::clone_object(o) };
+    (matches!(
+        obj,
         Object::Bytes(_) | Object::ByteArray(_) | Object::MemoryView(_)
-    )
+    ) || weavepy_vm::builtins::has_buffer_dunder(&obj))
     .into()
 }
 
@@ -413,6 +442,10 @@ struct NativeExport {
     format: Vec<u8>,
     shape: Vec<PySsizeT>,
     strides: Vec<PySsizeT>,
+    /// PEP 3118 suboffsets (empty = no indirection). Only a memoryview
+    /// over a suboffsets-carrying C exporter re-exports these; the
+    /// consumer must have requested `PyBUF_INDIRECT`.
+    suboffsets: Vec<PySsizeT>,
     readonly: c_int,
     /// Clone of the exporter (or its inner backing) that keeps `ptr` valid.
     keepalive: Object,
@@ -440,6 +473,7 @@ fn describe_native_export(obj: &Object) -> Result<NativeExport, ()> {
             format: b"B".to_vec(),
             shape: vec![b.len() as PySsizeT],
             strides: vec![1],
+            suboffsets: Vec::new(),
             readonly: 1,
             keepalive: obj.clone(),
         },
@@ -455,6 +489,7 @@ fn describe_native_export(obj: &Object) -> Result<NativeExport, ()> {
                 format: b"B".to_vec(),
                 shape: vec![len as PySsizeT],
                 strides: vec![1],
+                suboffsets: Vec::new(),
                 readonly: 0,
                 keepalive: obj.clone(),
             }
@@ -475,7 +510,11 @@ fn describe_native_export(obj: &Object) -> Result<NativeExport, ()> {
             // a typed view's `itemsize`/`format` self-consistent with the
             // dimensions a consumer reads back.
             let stored_shape = mv.shape.borrow();
-            let (shape, strides) = if stored_shape.is_empty() {
+            let (shape, strides) = if mv.zero_dim.get() {
+                // 0-dim scalar view: ndim stays 0 (empty shape/strides), so
+                // a re-export through C reads back `ndim == 0` like CPython.
+                (Vec::new(), Vec::new())
+            } else if stored_shape.is_empty() {
                 let n = len.checked_div(itemsize).unwrap_or(0);
                 (vec![n as PySsizeT], vec![itemsize as PySsizeT])
             } else {
@@ -501,11 +540,24 @@ fn describe_native_export(obj: &Object) -> Result<NativeExport, ()> {
                 format,
                 shape,
                 strides,
+                suboffsets: mv
+                    .suboffsets
+                    .borrow()
+                    .iter()
+                    .map(|&s| s as PySsizeT)
+                    .collect(),
                 readonly: c_int::from(mv.readonly.get()),
                 keepalive: obj.clone(),
             }
         }
-        _ => {
+        other => {
+            // A PEP 688 exporter (`array.array`, a user class with
+            // `__buffer__`) crossing into C: take its view and export that —
+            // the memoryview pins the storage, so the export stays valid
+            // (test_buffer builds `_testbuffer.ndarray(array.array(...))`).
+            if let Some(mv) = weavepy_vm::builtins::buffer_exported_view(other) {
+                return describe_native_export(&Object::MemoryView(mv));
+            }
             // CPython's `PyObject_GetBuffer` raises *TypeError* for a
             // non-exporter (abstract.c), which is what e.g.
             // `urllib.parse.parse_qsl(object())` asserts on.
@@ -533,6 +585,46 @@ fn fill_native_buffer(
     if (flags & PYBUF_WRITABLE) != 0 && export.readonly != 0 {
         crate::errors::set_buffer_error("Object is not writable");
         return -1;
+    }
+    // A suboffsets-carrying view can only be exported to a consumer that
+    // accepts indirection (CPython memoryobject.c `memory_getbuf`).
+    let has_suboffsets = export.suboffsets.iter().any(|&s| s >= 0);
+    if has_suboffsets && (flags & PYBUF_INDIRECT) != PYBUF_INDIRECT {
+        crate::errors::set_buffer_error("underlying buffer requires suboffsets");
+        return -1;
+    }
+    if let Object::MemoryView(mv) = obj {
+        // CPython `memory_getbuf`: PyBUF_SIMPLE|PyBUF_FORMAT (and
+        // WRITABLE|FORMAT) make no sense — a raw request must drop the
+        // format (test_ndarray_getbuf drives every flag combination).
+        if (flags & PYBUF_FORMAT) != 0 && (flags & PYBUF_ND) != PYBUF_ND {
+            crate::errors::set_buffer_error(
+                "memoryview: cannot cast to unsigned bytes if the format flag is present",
+            );
+            return -1;
+        }
+        // Without a strides request the exporter must be C-contiguous
+        // (a raw block hands out `buf..buf+len` linearly).
+        if (flags & 0x0010) == 0 && !mv.is_c_contiguous() {
+            crate::errors::set_buffer_error("memoryview: underlying buffer is not C-contiguous");
+            return -1;
+        }
+        // Explicit contiguity requests (CPython `PyBuffer_IsContiguous`
+        // gating in `memory_getbuf`).
+        if (flags & 0x0020) != 0 && !mv.is_c_contiguous() {
+            crate::errors::set_buffer_error("memoryview: underlying buffer is not C-contiguous");
+            return -1;
+        }
+        if (flags & 0x0040) != 0 && !mv.is_f_contiguous() {
+            crate::errors::set_buffer_error(
+                "memoryview: underlying buffer is not Fortran contiguous",
+            );
+            return -1;
+        }
+        if (flags & 0x0080) != 0 && !mv.is_c_contiguous() && !mv.is_f_contiguous() {
+            crate::errors::set_buffer_error("memoryview: underlying buffer is not contiguous");
+            return -1;
+        }
     }
 
     let len = export.len;
@@ -564,12 +656,20 @@ fn fill_native_buffer(
     } else {
         Box::new([])
     };
-    let suboffsets_box: Box<[PySsizeT]> = Box::new([]);
+    let suboffsets_box: Box<[PySsizeT]> = if has_suboffsets {
+        export.suboffsets.into_boxed_slice()
+    } else {
+        Box::new([])
+    };
 
     // Heap up the internal block — the release path relies on it.
     let internal = Box::new(BufferInternal {
         owned_buf: None,
         keepalive: Some(export.keepalive),
+        export_pin: match obj {
+            Object::MemoryView(mv) => Some(ExportPin::new(mv)),
+            _ => None,
+        },
         shape: shape_box,
         strides: strides_box,
         suboffsets: suboffsets_box,
@@ -584,7 +684,11 @@ fn fill_native_buffer(
         (*view).len = len as PySsizeT;
         (*view).itemsize = export.itemsize as PySsizeT;
         (*view).readonly = export.readonly;
-        (*view).ndim = if want_shape { ndim as c_int } else { 0 };
+        // Without PyBUF_ND the export is a flat byte block: CPython
+        // (`PyBuffer_FillInfo`, `memory_getbuf`) reports `ndim = 1` with
+        // NULL shape (test_ndarray_getbuf checks `nd.ndim == 1` for
+        // SIMPLE/WRITABLE requests).
+        (*view).ndim = if want_shape { ndim as c_int } else { 1 };
         (*view).format = if want_format {
             internal_ref.format.as_ptr() as *mut c_char
         } else {
@@ -600,7 +704,11 @@ fn fill_native_buffer(
         } else {
             ptr::null_mut()
         };
-        (*view).suboffsets = ptr::null_mut();
+        (*view).suboffsets = if internal_ref.suboffsets.is_empty() {
+            ptr::null_mut()
+        } else {
+            internal_ref.suboffsets.as_mut_ptr()
+        };
         (*view).internal = internal_ptr as *mut std::ffi::c_void;
         crate::object::Py_IncRef(exporter);
     }
@@ -649,6 +757,7 @@ pub unsafe extern "C" fn PyBuffer_FillInfo(
     let internal = Box::new(BufferInternal {
         owned_buf: None,
         keepalive: None,
+        export_pin: None,
         shape: shape_box,
         strides: strides_box,
         suboffsets: Box::new([]),
@@ -663,7 +772,9 @@ pub unsafe extern "C" fn PyBuffer_FillInfo(
         (*view).len = len;
         (*view).itemsize = 1;
         (*view).readonly = readonly;
-        (*view).ndim = if want_shape { 1 } else { 0 };
+        // CPython `PyBuffer_FillInfo` always reports `ndim = 1` (shape stays
+        // NULL for simple requests).
+        (*view).ndim = 1;
         (*view).format = if (flags & PYBUF_FORMAT) != 0 {
             internal_ref.format.as_ptr() as *mut c_char
         } else {
@@ -702,65 +813,75 @@ pub unsafe extern "C" fn PyBuffer_IsContiguous(view: *const Py_buffer, order: c_
         return 0;
     }
     let v = unsafe { &*view };
-    if v.ndim == 0 {
-        return 1;
-    }
-    if v.shape.is_null() {
+    // CPython: any suboffsets array (even all-negative) is non-contiguous.
+    if !v.suboffsets.is_null() {
         return 0;
     }
-    let ndim = v.ndim as isize;
-    let shape = unsafe { std::slice::from_raw_parts(v.shape, ndim as usize) };
-    let strides_slice = if v.strides.is_null() {
-        None
-    } else {
-        Some(unsafe { std::slice::from_raw_parts(v.strides, ndim as usize) })
-    };
-    let order = order as u8;
-    let order = if order == b'A' {
-        // Try both.
-        return c_int::from(
-            check_contiguous(shape, strides_slice, v.itemsize, true)
-                || check_contiguous(shape, strides_slice, v.itemsize, false),
-        );
-    } else {
-        order
-    };
-    c_int::from(check_contiguous(
-        shape,
-        strides_slice,
-        v.itemsize,
-        order == b'C',
-    ))
+    match order as u8 {
+        b'C' => c_int::from(unsafe { view_is_c_contiguous(v) }),
+        b'F' => c_int::from(unsafe { view_is_f_contiguous(v) }),
+        b'A' => c_int::from(unsafe { view_is_c_contiguous(v) || view_is_f_contiguous(v) }),
+        _ => 0,
+    }
 }
 
-fn check_contiguous(
-    shape: &[PySsizeT],
-    strides: Option<&[PySsizeT]>,
-    itemsize: PySsizeT,
-    c_order: bool,
-) -> bool {
-    let strides = match strides {
-        Some(s) => s,
-        None => {
-            // No strides → treat as C-contiguous.
-            return c_order;
+/// CPython 3.13 `_IsCContiguous` (abstract.c): a zero-length buffer or
+/// `strides == NULL` is C-contiguous by definition; axes of length 0/1
+/// impose no stride constraint (`dim > 1` gate).
+unsafe fn view_is_c_contiguous(v: &Py_buffer) -> bool {
+    if v.len == 0 {
+        return true;
+    }
+    if v.strides.is_null() || v.shape.is_null() || v.ndim <= 0 {
+        return true;
+    }
+    let n = v.ndim as usize;
+    let shape = unsafe { std::slice::from_raw_parts(v.shape, n) };
+    let strides = unsafe { std::slice::from_raw_parts(v.strides, n) };
+    let mut sd = v.itemsize;
+    for i in (0..n).rev() {
+        let dim = shape[i];
+        if dim > 1 && strides[i] != sd {
+            return false;
         }
-    };
-    let mut sd = itemsize;
-    if c_order {
-        for i in (0..shape.len()).rev() {
-            if shape[i] > 1 && strides[i] != sd {
-                return false;
-            }
-            sd *= shape[i];
+        sd *= dim;
+    }
+    true
+}
+
+/// CPython 3.13 `_IsFortranContiguous` (abstract.c): with
+/// `strides == NULL` (C-contiguous packing) the view is
+/// Fortran-contiguous only when it is effectively 1-D; strided views
+/// skip axes of length 0/1 (`dim > 1` gate).
+unsafe fn view_is_f_contiguous(v: &Py_buffer) -> bool {
+    if v.len == 0 {
+        return true;
+    }
+    if v.strides.is_null() {
+        if v.ndim <= 1 {
+            return true;
         }
-    } else {
-        for i in 0..shape.len() {
-            if shape[i] > 1 && strides[i] != sd {
-                return false;
-            }
-            sd *= shape[i];
+        if v.shape.is_null() {
+            return true;
         }
+        // Effectively 1-D: at most one axis longer than 1.
+        let n = v.ndim as usize;
+        let shape = unsafe { std::slice::from_raw_parts(v.shape, n) };
+        return shape.iter().filter(|&&d| d > 1).count() <= 1;
+    }
+    if v.shape.is_null() || v.ndim <= 0 {
+        return true;
+    }
+    let n = v.ndim as usize;
+    let shape = unsafe { std::slice::from_raw_parts(v.shape, n) };
+    let strides = unsafe { std::slice::from_raw_parts(v.strides, n) };
+    let mut sd = v.itemsize;
+    for i in 0..n {
+        let dim = shape[i];
+        if dim > 1 && strides[i] != sd {
+            return false;
+        }
+        sd *= dim;
     }
     true
 }
@@ -783,10 +904,19 @@ pub unsafe extern "C" fn PyBuffer_ToContiguous(
     if v.len > len {
         return -1;
     }
-    if v.ndim == 0 || v.shape.is_null() || v.strides.is_null() {
+    // CPython `PyBuffer_ToContiguous`: a buffer that is already contiguous
+    // in the requested order is copied *verbatim* — crucially, order 'A' on
+    // an F-contiguous buffer keeps the Fortran layout (test_buffer's
+    // `verify` reconstructs Fortran ndarrays from exactly these bytes).
+    if unsafe { PyBuffer_IsContiguous(src, order) } != 0 {
         unsafe { ptr::copy_nonoverlapping(v.buf as *const u8, buf as *mut u8, v.len as usize) };
         return 0;
     }
+    if v.ndim == 0 || v.shape.is_null() {
+        unsafe { ptr::copy_nonoverlapping(v.buf as *const u8, buf as *mut u8, v.len as usize) };
+        return 0;
+    }
+    // A non-contiguous 'A' request gathers in C order (CPython: `order = 'C'`).
     walk_strided(v, buf as *mut u8, order as u8 == b'F')
 }
 
@@ -807,29 +937,68 @@ pub unsafe extern "C" fn PyBuffer_FromContiguous(
     if v.len < len {
         return -1;
     }
-    if v.ndim == 0 || v.shape.is_null() || v.strides.is_null() {
+    // Mirror of `PyBuffer_ToContiguous`: an already-contiguous destination
+    // takes the flat bytes verbatim in its own layout.
+    if unsafe { PyBuffer_IsContiguous(view, order) } != 0 {
+        unsafe { ptr::copy_nonoverlapping(buf as *const u8, v.buf as *mut u8, len as usize) };
+        return 0;
+    }
+    if v.ndim == 0 || v.shape.is_null() {
         unsafe { ptr::copy_nonoverlapping(buf as *const u8, v.buf as *mut u8, len as usize) };
         return 0;
     }
     walk_strided_into(v, buf as *const u8, order as u8 == b'F')
 }
 
+/// Element pointer at `indices` per PEP 3118: add `index * stride` per
+/// dimension, dereferencing through `suboffsets[d]` when non-negative
+/// (PIL-style indirect buffers) — CPython's `PyBuffer_GetPointer`.
+fn strided_element_ptr(v: &Py_buffer, indices: &[isize]) -> *mut u8 {
+    let ndim = indices.len();
+    // NULL strides means C-contiguous layout (PEP 3118) — synthesize the
+    // stride table so an ND-only export still walks correctly
+    // (test_py_buffer_to_contiguous requests 'F' from a PyBUF_ND view).
+    let synthesized: Vec<PySsizeT>;
+    let strides: &[PySsizeT] = if v.strides.is_null() {
+        let shape = unsafe { std::slice::from_raw_parts(v.shape, ndim) };
+        let mut s = vec![0; ndim];
+        let mut acc = v.itemsize;
+        for d in (0..ndim).rev() {
+            s[d] = acc;
+            acc *= shape[d].max(1);
+        }
+        synthesized = s;
+        &synthesized
+    } else {
+        unsafe { std::slice::from_raw_parts(v.strides, ndim) }
+    };
+    let suboffsets = if v.suboffsets.is_null() {
+        None
+    } else {
+        Some(unsafe { std::slice::from_raw_parts(v.suboffsets, ndim) })
+    };
+    let mut p = v.buf as *mut u8;
+    for d in 0..ndim {
+        p = unsafe { p.offset(indices[d] * strides[d] as isize) };
+        if let Some(so) = suboffsets {
+            if so[d] >= 0 {
+                p = unsafe { (*(p as *mut *mut u8)).offset(so[d] as isize) };
+            }
+        }
+    }
+    p
+}
+
 fn walk_strided(v: &Py_buffer, dst: *mut u8, fortran: bool) -> c_int {
     let ndim = v.ndim as usize;
     let shape = unsafe { std::slice::from_raw_parts(v.shape, ndim) };
-    let strides = unsafe { std::slice::from_raw_parts(v.strides, ndim) };
     let itemsize = v.itemsize as usize;
     let total: usize = shape.iter().map(|s| *s as usize).product();
     let mut indices = vec![0_isize; ndim];
     for n in 0..total {
-        // Compute element offset in the source.
-        let mut offset: isize = 0;
-        for d in 0..ndim {
-            offset += indices[d] * strides[d] as isize;
-        }
         unsafe {
             ptr::copy_nonoverlapping(
-                (v.buf as *const u8).offset(offset),
+                strided_element_ptr(v, &indices) as *const u8,
                 dst.add(n * itemsize),
                 itemsize,
             );
@@ -859,19 +1028,14 @@ fn walk_strided(v: &Py_buffer, dst: *mut u8, fortran: bool) -> c_int {
 fn walk_strided_into(v: &Py_buffer, src: *const u8, fortran: bool) -> c_int {
     let ndim = v.ndim as usize;
     let shape = unsafe { std::slice::from_raw_parts(v.shape, ndim) };
-    let strides = unsafe { std::slice::from_raw_parts(v.strides, ndim) };
     let itemsize = v.itemsize as usize;
     let total: usize = shape.iter().map(|s| *s as usize).product();
     let mut indices = vec![0_isize; ndim];
     for n in 0..total {
-        let mut offset: isize = 0;
-        for d in 0..ndim {
-            offset += indices[d] * strides[d] as isize;
-        }
         unsafe {
             ptr::copy_nonoverlapping(
                 src.add(n * itemsize),
-                (v.buf as *mut u8).offset(offset),
+                strided_element_ptr(v, &indices),
                 itemsize,
             );
         }
@@ -1062,19 +1226,39 @@ mod tests {
         assert_eq!(strides[2], 8 * 3 * 4);
     }
 
+    fn contiguity_view(
+        shape: &mut [PySsizeT],
+        strides: &mut [PySsizeT],
+        itemsize: PySsizeT,
+    ) -> Py_buffer {
+        let mut v: Py_buffer = unsafe { std::mem::zeroed() };
+        v.ndim = shape.len() as c_int;
+        v.itemsize = itemsize;
+        v.len = shape.iter().product::<PySsizeT>() * itemsize;
+        v.shape = shape.as_mut_ptr();
+        v.strides = strides.as_mut_ptr();
+        v
+    }
+
     #[test]
     fn check_contiguous_recognises_c_order() {
-        let shape = [3 as PySsizeT, 4];
-        let strides = [4 * 4 as PySsizeT, 4];
-        assert!(check_contiguous(&shape, Some(&strides), 4, true));
-        assert!(!check_contiguous(&shape, Some(&strides), 4, false));
+        let mut shape = [3 as PySsizeT, 4];
+        let mut strides = [4 * 4 as PySsizeT, 4];
+        let v = contiguity_view(&mut shape, &mut strides, 4);
+        unsafe {
+            assert!(view_is_c_contiguous(&v));
+            assert!(!view_is_f_contiguous(&v));
+        }
     }
 
     #[test]
     fn check_contiguous_recognises_f_order() {
-        let shape = [3 as PySsizeT, 4];
-        let strides = [4 as PySsizeT, 3 * 4];
-        assert!(!check_contiguous(&shape, Some(&strides), 4, true));
-        assert!(check_contiguous(&shape, Some(&strides), 4, false));
+        let mut shape = [3 as PySsizeT, 4];
+        let mut strides = [4 as PySsizeT, 3 * 4];
+        let v = contiguity_view(&mut shape, &mut strides, 4);
+        unsafe {
+            assert!(!view_is_c_contiguous(&v));
+            assert!(view_is_f_contiguous(&v));
+        }
     }
 }

@@ -1,5 +1,8 @@
 """Ecosystem probe: sqlalchemy — Core table create/insert/select over
-sqlite3, then a declarative ORM model with session commit + query."""
+sqlite3, then a declarative ORM model with session commit + query, then
+(RFC 0066 WS4) the asyncio extension: AsyncSession over aiosqlite rides
+`greenlet_spawn`, the Python -> C -> Python stack-switch shape the
+bundled native greenlet exists for."""
 
 import sqlalchemy
 from sqlalchemy import (
@@ -57,5 +60,31 @@ with Session(orm_engine) as session:
     assert rust.year == 2015, rust.year
     count = session.query(Language).filter(Language.year < 2000).count()
     assert count == 1, count
+
+# --- asyncio extension (greenlet_spawn) -----------------------------------
+import asyncio
+
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+
+
+async def async_leg():
+    aengine = create_async_engine("sqlite+aiosqlite://")
+    async with aengine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    async with AsyncSession(aengine) as session:
+        session.add_all(
+            [Language(name="haskell", year=1990), Language(name="go", year=2009)]
+        )
+        await session.commit()
+    async with AsyncSession(aengine) as session:
+        result = await session.execute(
+            select(Language).where(Language.year < 2000).order_by(Language.name)
+        )
+        names = [lang.name for lang in result.scalars()]
+        assert names == ["haskell"], names
+    await aengine.dispose()
+
+
+asyncio.run(async_leg())
 
 print("sqlalchemy ok", sqlalchemy.__version__)

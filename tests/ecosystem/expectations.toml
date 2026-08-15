@@ -67,7 +67,7 @@ notes = "route + test-client request/response, session cookie round-trip (werkze
 
 [packages.sqlalchemy]
 status = "pass"
-notes = "Core table create/insert/select + declarative ORM session over the RFC 0056 WS1 sqlite3."
+notes = "Core table create/insert/select + declarative ORM session over the RFC 0056 WS1 sqlite3; RFC 0066 WS4 adds the AsyncSession leg over aiosqlite (greenlet_spawn on the bundled native greenlet)."
 
 [packages.httpx]
 status = "pass"
@@ -96,7 +96,9 @@ status = "pass"
 
 [packages.numpy]
 status = "pass"
-notes = "PyPI binary wheel (not source build): dtype arithmetic, broadcasting, linalg.norm, memoryview round-trip."
+notes = "PyPI binary wheel (not source build), pinned 2.5.2 (RFC 0066 WS5): dtype arithmetic, broadcasting, linalg.norm, memoryview round-trip."
+selftest_status = "fail"
+selftest_reason = "measured 2026-08 (RFC 0066 WS5 capstone census, per-module): 30/66 `numpy._core` test modules pass clean (13575 tests), 23 modules carry 268 failures, 12 crash (SIGBUS/SEGV): test_array_coercion (C-stack exhaustion in recursive sequence discovery — test_pathological_self_containing), test_multiarray, test_datetime, test_dtype, test_ufunc, test_scalarmath, test_scalarinherit, test_stringdtype, test_protocols, test_regression, test_defchararray, test_hashtable. The wave landed the collection unblocker (PyType_Ready inherits the metatype from Py_TYPE(tp_base) per CPython's type_ready_set_type, fixing the sfloat test DType's cast-spec registration); the lane is also interpreter-speed-bound — `--pyargs numpy._core` pytest collection alone measures ~31 min (36240 tests) against the 2400s budget, so the graded run times out before the census is even reachable. Full-suite (`--pyargs numpy`) not attempted separately: it strictly contains the _core lane whose collection alone exceeds the budget. The crash/failure census is the wave-4 worklist."
 
 [packages.markupsafe]
 status = "pass"
@@ -151,3 +153,29 @@ notes = "C sdist built through the local-index no_binary lane; probe asserts the
 [packages.wrapt_sdist]
 status = "pass"
 notes = "C sdist built through the local-index no_binary lane; probe asserts the compiled _wrappers leg is live (the _PyReversed_Type / PyModule_GetDef / PyType_GetModule export gaps this row first surfaced are fixed in weavepy-capi)."
+
+# --- heavy-native stack (RFC 0066 WS3) ----------------------------------------
+
+[packages.scipy]
+status = "pass"
+notes = "measured 2026-08: linalg (LU/eig/f2py LAPACK), sparse CSR + spsolve, optimize (pybind11 _highspy HiGHS linprog + minimize), integrate.quad, stats.norm rvs/fit (PEP 604 union isinstance over ABC members), fft (pybind11 pocketfft), ndimage. First pybind11 rows: instancemethod type, TSS, interpreter-state identity, heap-type metaclass allocation, faithful PyCFunction m_self/m_ml, cyfunction __code__ as genuine types.CodeType."
+
+[packages.pillow]
+status = "pass"
+notes = "measured 2026-08: draw primitives, geometry ops, PNG/JPEG encoder round-trips through PyArg_ParseTuple y*/y#/z# and true-aliasing PyBytes_AsString, raw byte access, numpy interop, EXIF."
+
+[packages.lxml]
+status = "pass"
+notes = "measured 2026-08: etree round-trip, namespaced XPath, XSLT (spec-struct protocol slots incl. tp_descr_get), iterparse, lxml.html rewrite, XMLSchema validation, deepcopy/pickle."
+
+[packages.greenlet]
+status = "pass"
+notes = "measured 2026-08 (RFC 0066 WS4): the bundled native greenlet over real stack switching — producer/consumer ping-pong, exception + GreenletExit plumbing, gr_frame, contextvars isolation, deep recursion on the dedicated stack, dist-info visibility."
+
+[packages.matplotlib]
+status = "pass"
+notes = "measured 2026-08 (RFC 0066 WS6 stretch): Agg figure render + PNG round-trip + savefig buffer. Landed on the way: CPython-faithful abstract-instantiation gate (native allocator bypasses __abstractmethods__), PyType_Type.tp_call for pybind11_meta_call, __class__ cell for methods that locally bind super, foreign tp_call fast path (pybind11 instancemethod repr during m.def default-arg registration), LoadAttrType inline-cache deopt for foreign descriptors (FT2Font.get_sfnt lost self on the second dispatch), math index coercion driving nb_index on foreign numpy scalars (bezier _comb via np.vectorize)."
+
+[packages.gevent]
+status = "fail"
+reason = "measured 2026-08 (RFC 0066 WS6 stretch): import fails in gevent._gevent_c_greenlet_primitives — its Cython modules PyGreenlet_Import the greenlet._greenlet._C_API capsule (PyGreenlet_New/Switch/Throw/GetCurrent + PyGreenlet_Type), which the WS4 native greenlet does not yet export (PyCapsule_GetPointer: not a capsule). The RFC scopes the capsule surface as stretch; full gevent is the wave-4 headline row."

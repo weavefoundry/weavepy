@@ -468,6 +468,17 @@ pub fn current_thread_handles() -> Option<ThreadHandles> {
     CURRENT_THREAD_HANDLES.with(|cell| cell.borrow().last().cloned())
 }
 
+/// RFC 0066 WS4 — swap the *entire* handles stack, returning the old
+/// one. Greenlet switches use this: handle guards live on whichever
+/// native stack pushed them, so once greenlets multiplex several
+/// native stacks over one OS thread, the single thread-local LIFO
+/// would interleave pushes from different stacks and pop the wrong
+/// entries. Swapping the vector at every switch keeps each greenlet's
+/// pushes/pops perfectly nested on its own stack.
+pub fn swap_thread_handles_stack(new: Vec<ThreadHandles>) -> Vec<ThreadHandles> {
+    CURRENT_THREAD_HANDLES.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), new))
+}
+
 /// Scope guard returned by [`activate_thread_handles`]. Pops the
 /// most-recently-pushed handles on drop.
 #[derive(Debug)]

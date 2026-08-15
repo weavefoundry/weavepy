@@ -453,6 +453,16 @@ fn index_bigint(o: &Object) -> Result<num_bigint::BigInt, RuntimeError> {
             }
         }
     }
+    // A foreign extension scalar (numpy int64, …) drives its C type's
+    // `nb_index` through the bridge — matplotlib's bezier `_comb` feeds
+    // `math.comb` numpy integers via `np.vectorize`.
+    if let Object::Foreign(s) = o {
+        if let Ok(r) = crate::foreign::as_index(s) {
+            if let Some(bi) = r.as_bigint() {
+                return Ok(bi);
+            }
+        }
+    }
     Err(type_error(format!(
         "'{}' object cannot be interpreted as an integer",
         o.type_name()

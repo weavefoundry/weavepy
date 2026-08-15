@@ -26,6 +26,7 @@ use crate::datetime_api as dt;
 use crate::errors;
 use crate::gc_bridge;
 use crate::genericalloc;
+use crate::instancemethod;
 use crate::lifecycle;
 use crate::memory;
 use crate::memoryview;
@@ -798,6 +799,9 @@ static FORCE_LINK: &[FnPtr] = &[
     addr!(wave4::PyObject_GetOptionalAttr),
     addr!(wave4::PyObject_Print),
     addr!(wave4::PyMethod_New),
+    // RFC 0066 WS3: pybind11's method wrapper (instancemethod.rs).
+    addr!(instancemethod::PyInstanceMethod_New),
+    addr!(instancemethod::PyInstanceMethod_Function),
     // wave4.rs — import / sys / eval
     addr!(wave4::PyImport_Import),
     addr!(wave4::PySys_GetObject),
@@ -916,6 +920,9 @@ static FORCE_LINK: &[FnPtr] = &[
     addr_static!(types::PyStaticMethod_Type),
     addr_static!(types::PyProperty_Type),
     addr_static!(types::PyReversed_Type),
+    // RFC 0066 WS3: pybind11 references `PyInstanceMethod_Type` by
+    // address (its dlopen failed on the missing data symbol).
+    addr_static!(types::PyInstanceMethod_Type),
     // ----------------------------------------------------------------
     // RFC 0047 (wave 5): the *real* Cython-output tail. A genuine
     // `cythonize`d `.so` (and pandas, ~70% Cython) links a faithful
@@ -931,12 +938,25 @@ static FORCE_LINK: &[FnPtr] = &[
     addr!(code_obj::PyUnstable_Code_New),
     addr!(code_obj::PyCode_NewEmpty),
     addr!(code_obj::PyFrame_New),
+    addr!(code_obj::PyFrame_GetCode),
+    addr!(code_obj::PyFrame_GetBack),
+    addr!(code_obj::PyFrame_GetLineNumber),
     addr!(code_obj::PyTraceBack_Here),
     addr_static!(code_obj::PyCode_Type),
     addr_static!(code_obj::PyFrame_Type),
     addr_static!(code_obj::PyTraceBack_Type),
     // pystate.rs — faithful thread/interpreter state
     addr!(pystate::PyThreadState_GetUnchecked),
+    addr!(pystate::PyThreadState_New),
+    addr!(pystate::PyThreadState_DeleteCurrent),
+    // RFC 0066 WS3: CPython TSS API (pybind11 internals TLS keys).
+    addr!(pystate::PyThread_tss_create),
+    addr!(pystate::PyThread_tss_delete),
+    addr!(pystate::PyThread_tss_set),
+    addr!(pystate::PyThread_tss_get),
+    addr!(pystate::PyThread_tss_is_created),
+    addr!(pystate::PyThread_tss_alloc),
+    addr!(pystate::PyThread_tss_free),
     addr!(pystate::PyInterpreterState_GetID),
     addr!(pystate::PyGC_Enable),
     addr!(pystate::PyGC_Disable),

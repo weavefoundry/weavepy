@@ -928,12 +928,18 @@ pub unsafe extern "C" fn PyFrame_GetLocals(frame: *mut PyObject) -> *mut PyObjec
     .unwrap_or(ptr::null_mut())
 }
 
-/// Opaque non-NULL handle. numpy only uses the result as a key /
-/// liveness sentinel, never dereferencing the interpreter-state layout.
+/// Opaque non-NULL handle, **identical** to [`crate::abi313::
+/// PyInterpreterState_Get`]'s. WeavePy hosts a single interpreter from
+/// C's point of view, and extensions compare the two by address to
+/// detect sub-interpreters: numpy warns ("NumPy was imported from a
+/// Python sub-interpreter"), and pybind11's `ensure_internals` flips its
+/// `has_seen_non_main_interpreter` flag — sending every later
+/// `get_internals()` down a per-interpreter TLS path that dereferences
+/// `PyThreadState.interp` and failed with "get_internals: get_pp()
+/// returned nullptr" (scipy's `_highspy._core` init). RFC 0066 WS3.
 #[no_mangle]
 pub extern "C" fn PyInterpreterState_Main() -> *mut c_void {
-    static MAIN_STATE: u8 = 0;
-    &MAIN_STATE as *const u8 as *mut c_void
+    unsafe { crate::abi313::PyInterpreterState_Get() }
 }
 
 // ---------------------------------------------------------------------------
