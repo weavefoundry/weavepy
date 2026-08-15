@@ -193,14 +193,83 @@ pub unsafe extern "C" fn PyThreadState_DeleteCurrent() {}
 // `-undefined dynamic_lookup`, so a missing symbol binds to NULL
 // *silently* and the first call jumps to address zero — the exact crash
 // scipy's `_highspy._core` init hit. Faithful shape: CPython's
-// `Py_tss_t` is `{ int _is_initialized; pthread_key_t _key; }` on POSIX.
+// `Py_tss_t` is `{ int _is_initialized; pthread_key_t _key; }` on POSIX
+// (`thread_pthread.h`) and `{ int _is_initialized; DWORD _key; }` on
+// Windows (`thread_nt.h`, keys from `TlsAlloc`).
 // ---------------------------------------------------------------------------
 
-/// CPython's `Py_tss_t` (POSIX layout).
+/// The native key half of CPython's `Py_tss_t`.
+#[cfg(windows)]
+type NativeTssKey = u32; // DWORD from TlsAlloc
+#[cfg(not(windows))]
+type NativeTssKey = libc::pthread_key_t;
+
+/// CPython's `Py_tss_t` (platform layout, see module comment).
 #[repr(C)]
 pub struct PyTssT {
     is_initialized: c_int,
-    key: libc::pthread_key_t,
+    key: NativeTssKey,
+}
+
+#[cfg(windows)]
+mod win_tls {
+    pub const TLS_OUT_OF_INDEXES: u32 = 0xFFFF_FFFF;
+    #[link(name = "kernel32")]
+    extern "system" {
+        pub fn TlsAlloc() -> u32;
+        pub fn TlsFree(dw_tls_index: u32) -> i32;
+        pub fn TlsSetValue(dw_tls_index: u32, lp_tls_value: *mut core::ffi::c_void) -> i32;
+        pub fn TlsGetValue(dw_tls_index: u32) -> *mut core::ffi::c_void;
+    }
+}
+
+fn native_tss_create(key: &mut NativeTssKey) -> bool {
+    #[cfg(windows)]
+    {
+        let k = unsafe { win_tls::TlsAlloc() };
+        if k == win_tls::TLS_OUT_OF_INDEXES {
+            return false;
+        }
+        *key = k;
+        true
+    }
+    #[cfg(not(windows))]
+    {
+        unsafe { libc::pthread_key_create(key, None) == 0 }
+    }
+}
+
+fn native_tss_delete(key: NativeTssKey) {
+    #[cfg(windows)]
+    unsafe {
+        win_tls::TlsFree(key);
+    }
+    #[cfg(not(windows))]
+    unsafe {
+        libc::pthread_key_delete(key);
+    }
+}
+
+fn native_tss_set(key: NativeTssKey, value: *mut c_void) -> bool {
+    #[cfg(windows)]
+    {
+        unsafe { win_tls::TlsSetValue(key, value) != 0 }
+    }
+    #[cfg(not(windows))]
+    {
+        unsafe { libc::pthread_setspecific(key, value) == 0 }
+    }
+}
+
+fn native_tss_get(key: NativeTssKey) -> *mut c_void {
+    #[cfg(windows)]
+    {
+        unsafe { win_tls::TlsGetValue(key) }
+    }
+    #[cfg(not(windows))]
+    {
+        unsafe { libc::pthread_getspecific(key) as *mut c_void }
+    }
 }
 
 /// `PyThread_tss_create(key)` — 0 on success. Idempotent on an
@@ -214,7 +283,7 @@ pub unsafe extern "C" fn PyThread_tss_create(key: *mut PyTssT) -> c_int {
         if (*key).is_initialized != 0 {
             return 0;
         }
-        if libc::pthread_key_create(&mut (*key).key, None) != 0 {
+        if !native_tss_create(&mut (*key).key) {
             return -1;
         }
         (*key).is_initialized = 1;
@@ -230,7 +299,7 @@ pub unsafe extern "C" fn PyThread_tss_delete(key: *mut PyTssT) {
     }
     unsafe {
         if (*key).is_initialized != 0 {
-            libc::pthread_key_delete((*key).key);
+            native_tss_delete((*key).key);
             (*key).is_initialized = 0;
             (*key).key = 0;
         }
@@ -243,7 +312,7 @@ pub unsafe extern "C" fn PyThread_tss_set(key: *mut PyTssT, value: *mut c_void) 
     if key.is_null() || unsafe { (*key).is_initialized } == 0 {
         return -1;
     }
-    if unsafe { libc::pthread_setspecific((*key).key, value) } != 0 {
+    if !native_tss_set(unsafe { (*key).key }, value) {
         return -1;
     }
     0
@@ -255,7 +324,7 @@ pub unsafe extern "C" fn PyThread_tss_get(key: *mut PyTssT) -> *mut c_void {
     if key.is_null() || unsafe { (*key).is_initialized } == 0 {
         return ptr::null_mut();
     }
-    unsafe { libc::pthread_getspecific((*key).key) as *mut c_void }
+    native_tss_get(unsafe { (*key).key })
 }
 
 /// `PyThread_tss_is_created(key)`.
