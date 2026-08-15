@@ -156,6 +156,16 @@ pub struct ForeignHooks {
     /// Release an owned `PyObject*` minted by [`Self::object_to_owned_ptr`]
     /// (a plain `Py_DECREF`).
     pub release_object_ptr: fn(usize),
+    /// `Py_TYPE(descr)->tp_descr_get(descr, obj, owner)` — bind a foreign
+    /// descriptor found in a class MRO (RFC 0066 WS3). `instance` is the
+    /// VM `None` for class access (crossing as C `NULL`, per CPython's
+    /// `type_getattro`). Returns `Ok(None)` when the foreign type carries
+    /// no `tp_descr_get`, in which case the caller uses the descriptor
+    /// value unchanged — CPython's plain class attribute. pybind11 wraps
+    /// every registered method in a C `instancemethod` whose `tp_descr_get`
+    /// yields the bound method; without this hook such attributes crossed
+    /// unbound and calls lost `self`.
+    pub descr_get: fn(usize, &Object, &Object) -> Result<Option<Object>, RuntimeError>,
 }
 
 static HOOKS: OnceLock<ForeignHooks> = OnceLock::new();
@@ -335,4 +345,19 @@ pub fn get_buffer(s: &PyForeignSoul) -> Result<Object, RuntimeError> {
 
 pub fn get_buffer_obj(obj: &Object) -> Result<Object, RuntimeError> {
     (hooks()?.get_buffer_obj)(obj)
+}
+
+/// Bind a foreign descriptor through its C type's `tp_descr_get`
+/// (RFC 0066 WS3). `Ok(None)` ⇒ the foreign type is not a descriptor
+/// (no slot) and the caller should use the value unchanged. Absent
+/// bridge (pure-VM build) ⇒ `Ok(None)` for the same pass-through.
+pub fn descr_get(
+    s: &PyForeignSoul,
+    instance: &Object,
+    owner: &Object,
+) -> Result<Option<Object>, RuntimeError> {
+    match hooks() {
+        Ok(h) => (h.descr_get)(s.ptr, instance, owner),
+        Err(_) => Ok(None),
+    }
 }

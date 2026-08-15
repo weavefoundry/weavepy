@@ -880,6 +880,21 @@ def _read_requirements(path):
     return out
 
 
+def _bundled_distributions():
+    """Distributions the interpreter itself provides (RFC 0066 WS4).
+
+    A pip-installed cp313 greenlet wheel cannot work under WeavePy
+    (its assembly switches CPython's C stack); the native bundled
+    implementation satisfies the requirement instead, exactly like the
+    ``greenlet-<version>.dist-info`` in the stdlib tree says.
+    """
+    try:
+        import _greenlet
+        return {'greenlet': _greenlet.GREENLET_VERSION}
+    except ImportError:
+        return {}
+
+
 def _install_with_resolver(specs, *, index_url, quiet=False, dest=None,
                             dry_run=False, allow_sdist=True):
     """Resolve dependencies then install in dependency order."""
@@ -913,7 +928,8 @@ def _install_with_resolver(specs, *, index_url, quiet=False, dest=None,
             raise RuntimeError('invalid requirement {!r}: {}'.format(s, exc))
     downloader = lambda url: _http_get(url)
     lookup = lambda name: _list_distributions(name, index_url)
-    resolver = _pip_resolver.Resolver(downloader, lookup)
+    resolver = _pip_resolver.Resolver(downloader, lookup,
+                                      satisfied=_bundled_distributions())
     plan = resolver.resolve(reqs)
     if not quiet:
         print('Resolved {} package(s):'.format(len(plan)))
@@ -958,6 +974,12 @@ def _install_spec(spec, *, index_url, quiet=False, dest=None,
         name = req.name
     except InvalidRequirement:
         name = re.split(r'[<>=!~ ]', spec, maxsplit=1)[0].strip()
+    bundled = _bundled_distributions()
+    if name.lower().replace('_', '-') in bundled:
+        if not quiet:
+            print('Requirement already satisfied: {} (bundled {})'.format(
+                name, bundled[name.lower().replace('_', '-')]))
+        return
     if not quiet:
         print('Looking up {} on {}'.format(name, index_url))
     label, url = _find_wheel_on_index(name, index_url)

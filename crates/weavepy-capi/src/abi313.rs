@@ -570,8 +570,9 @@ pub unsafe extern "C" fn _PyBytes_Resize(pv: *mut *mut PyObject, newsize: PySsiz
     // The caller keeps writing through the inlined `PyBytes_AS_STRING`
     // macro after a resize (orjson's growing output writer), so the
     // replacement must be buffer-authoritative too — a fresh, never-shared
-    // mirror whose `ob_sval` is adopted on read-back.
-    let fresh = crate::mirror::mirror_out(Object::Bytes(v.into()));
+    // mirror (outside the scalar-pin cache, see `mirror_out_unpinned`)
+    // whose `ob_sval` is adopted on read-back.
+    let fresh = crate::mirror::mirror_out_unpinned(Object::Bytes(v.into()));
     if !fresh.is_null() && unsafe { crate::mirror::is_mirror(fresh) } {
         unsafe { (*crate::mirror::prefix_of(fresh)).bytes_buffer = true };
     }

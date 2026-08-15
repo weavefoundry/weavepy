@@ -57,6 +57,22 @@ struct Field {
     count: usize,
 }
 
+/// Unpack one element's worth of `fmt` from `buf` (which must be
+/// exactly `calcsize(fmt)` bytes). Used by memoryview's rich
+/// comparison, which unpacks elements per each view's full
+/// struct-syntax format and compares the *values* (CPython
+/// `memory_richcompare` → `struct_get_unpacker`, RFC 0066 WS1).
+pub(crate) fn unpack_element(fmt: &str, buf: &[u8]) -> Result<Vec<Object>, RuntimeError> {
+    let cf = CompiledFormat::parse(fmt)?;
+    if buf.len() != cf.size {
+        return Err(struct_error(format!(
+            "unpack requires a buffer of {} bytes",
+            cf.size
+        )));
+    }
+    cf.unpack(buf)
+}
+
 /// A pre-compiled format string ready for repeated pack/unpack.
 #[derive(Debug, Clone)]
 struct CompiledFormat {
@@ -415,12 +431,15 @@ fn encode_one(
             Ok(())
         }
         'c' => {
+            // CPython: only a length-1 bytes object packs — a str (even of
+            // length 1) or bytearray is a struct.error
+            // (test_memoryview_struct_module asserts struct and memoryview
+            // agree on refusing 'a').
             let bytes = match value {
                 Object::Bytes(b) if b.len() == 1 => b.to_vec(),
-                Object::Str(s) if s.len() == 1 => s.as_bytes().to_vec(),
                 _ => {
                     return Err(struct_error(
-                        "argument for 'c' must be a 1-byte bytes/str".to_owned(),
+                        "char format requires a bytes object of length 1".to_owned(),
                     ))
                 }
             };

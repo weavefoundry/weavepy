@@ -282,6 +282,7 @@ pub fn install_dunder_shims(table: &SlotTable, type_name: String) -> Vec<(String
         "__setitem__",
         &name,
     );
+    install_delitem(&mut out, table, ids::Py_mp_ass_subscript, &name);
 
     // Type-level protocol.
     install_repr(&mut out, table, ids::Py_tp_repr, "__repr__", &name);
@@ -765,6 +766,54 @@ fn install_obj_obj_arg(
         mname,
         Object::Builtin(Rc::new(BuiltinFn {
             name: static_name,
+            binds_instance: true,
+            call: Box::new(f),
+            call_kw: None,
+        })),
+    ));
+}
+
+/// `__delitem__` from `mp_ass_subscript`: CPython's slot wrapper calls the
+/// same C function with a NULL value pointer (`del nd[k]` on a
+/// `_testbuffer.ndarray` reaches `ndarray_ass_subscript(self, key, NULL)`,
+/// which raises its own TypeError — test_buffer.test_ndarray_index_invalid).
+fn install_delitem(
+    out: &mut Vec<(String, Object)>,
+    table: &SlotTable,
+    slot_id: c_int,
+    type_name: &Rc<str>,
+) {
+    let slot = table.get(slot_id);
+    if slot.is_null() {
+        return;
+    }
+    let tn = type_name.clone();
+    let f = move |args: &[Object]| -> Result<Object, RuntimeError> {
+        let func: ObjObjArgProc = unsafe { slot.cast() };
+        if args.len() != 2 {
+            return Err(type_error(format!(
+                "__delitem__() takes 2 args ({} given)",
+                args.len()
+            )));
+        }
+        let self_p = crate::object::into_owned(args[0].clone());
+        let key_p = crate::object::into_owned(args[1].clone());
+        let r =
+            crate::interp::ensure_active(|| unsafe { func(self_p, key_p, std::ptr::null_mut()) });
+        unsafe {
+            crate::object::Py_DecRef(self_p);
+            crate::object::Py_DecRef(key_p);
+        }
+        let _ = tn;
+        if r < 0 {
+            return Err(take_pending_or_default());
+        }
+        Ok(Object::None)
+    };
+    out.push((
+        "__delitem__".to_string(),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__delitem__",
             binds_instance: true,
             call: Box::new(f),
             call_kw: None,

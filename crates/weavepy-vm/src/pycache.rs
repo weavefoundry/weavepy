@@ -139,7 +139,13 @@ pub const MAGIC: &[u8; 4] = b"\xf3\x0d\x0d\x0a";
 ///   unbinds are NO_LOCATION, and the plain-`except` handler-exit
 ///   POP_EXCEPT/unbind are NO_LOCATION (CPython's flowgraph
 ///   propagation semantics for trace events).
-pub const CACHE_TAG: &str = "weavepy-313-23";
+/// - rev `24`: RFC 0066 WS6: a class body now owns the implicit
+///   `__class__` cell when a method *locally binds and loads* `super`
+///   (CPython symtable's "Special-case super" —
+///   matplotlib `_mathtext.Parser.subsuper`); previously the method's
+///   claimed freevar dangled and the class assembled with a bad cell
+///   index.
+pub const CACHE_TAG: &str = "weavepy-313-24";
 
 const HEADER_LEN: usize = 16;
 

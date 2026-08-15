@@ -818,6 +818,145 @@ fn class_is_datetime(t: &Rc<TypeObject>) -> bool {
     )
 }
 
+/// The `datetime`-module class name a minted shell stands for, decided
+/// by pointer identity against the six global shell slots. `None` for
+/// every pointer that is not one of the shells (the common case — this
+/// is called from [`crate::object::clone_object`]'s bridge-miss path,
+/// so it must be cheap and must never dereference `p`).
+fn shell_name_for_ptr(p: *mut PyTypeObject) -> Option<&'static str> {
+    if !DT_READY.load(Ordering::Acquire) {
+        return None;
+    }
+    let u = p as usize;
+    if u == 0 {
+        return None;
+    }
+    if u == PTR_DATE.load(Ordering::Relaxed) {
+        Some("date")
+    } else if u == PTR_DATETIME.load(Ordering::Relaxed) {
+        Some("datetime")
+    } else if u == PTR_TIME.load(Ordering::Relaxed) {
+        Some("time")
+    } else if u == PTR_DELTA.load(Ordering::Relaxed) {
+        Some("timedelta")
+    } else if u == PTR_TZINFO.load(Ordering::Relaxed) {
+        Some("tzinfo")
+    } else if u == PTR_TIMEZONE.load(Ordering::Relaxed) {
+        Some("timezone")
+    } else {
+        None
+    }
+}
+
+/// Resolve a faithful datetime *shell* back to the live Python-visible
+/// class (RFC 0066 WS2).
+///
+/// The shells' `bridge` is wired lazily by [`faithful_type_for_class`]
+/// — i.e. only after a datetime class or instance has crossed VM→C at
+/// least once. C code that does `PyDateTime_IMPORT` and immediately
+/// calls a method **on the capsule's type slot** (`PyObject_CallMethod(
+/// (PyObject *)PyDateTimeAPI->DateType, "today", NULL)`, the RFC 0062
+/// header-proof discovery) reaches [`crate::object::clone_object`] with
+/// an unbridged shell, which used to proxy it as an opaque foreign
+/// object — so the attribute protocol (and with it every classmethod)
+/// was unreachable. This resolver closes that hole: identify the shell
+/// by pointer, return its bridge if already wired, otherwise find the
+/// class on the already-imported `datetime` module (a non-executing
+/// module-cache read, same discipline as [`fill_utc_singleton`]) and
+/// wire the bridge through [`faithful_type_for_class`].
+///
+/// Returns `None` for non-shell pointers (cheap pointer compares only)
+/// and when `datetime` is not importable in the active interpreter.
+pub fn resolve_shell_class(p: *mut PyTypeObject) -> Option<Rc<TypeObject>> {
+    let name = shell_name_for_ptr(p)?;
+    // Resolve against the **current** interpreter's `datetime` module
+    // first — importing it if this interpreter has not yet (CPython's
+    // `PyDateTime_IMPORT` implies the module import, and this resolver
+    // only runs on C→VM re-entry paths where running the frozen import
+    // is as safe as `do_getattr`'s `load_attr_public`). The shell's
+    // `bridge` is process-global and wired once, to whichever
+    // interpreter's class crossed first — under the test harness's
+    // interpreter-per-case model that class may belong to a long-gone
+    // interpreter, and answering the attribute protocol through it
+    // would hand back a class whose builtins have foreign identity
+    // (`isinstance(x, int)` inside `_pydatetime` then fails).
+    let trace = std::env::var_os("WEAVEPY_TRACE_DTSHELL").is_some();
+    let cls = crate::interp::with_interp_mut(|interp| {
+        if trace {
+            eprintln!(
+                "[DTSHELL] resolving {name}: interp={:p} cached={}",
+                std::ptr::from_ref(interp),
+                interp.module_cache().get("datetime").is_some()
+            );
+        }
+        let module = match interp.module_cache().get("datetime") {
+            Some(m @ Object::Module(_)) => m,
+            _ => match interp.import_path("datetime") {
+                Ok(m) => m,
+                Err(e) => {
+                    if trace {
+                        eprintln!("[DTSHELL] import datetime failed: {e:?}");
+                    }
+                    return None;
+                }
+            },
+        };
+        match module {
+            Object::Module(m) => m
+                .dict
+                .borrow()
+                .get(&DictKey(Object::from_static(name)))
+                .cloned(),
+            _ => None,
+        }
+    })
+    .flatten();
+    if trace {
+        eprintln!("[DTSHELL] {name} -> {}", cls.is_some());
+    }
+    if let Some(Object::Type(t)) = cls {
+        if class_is_datetime(&t) {
+            // Wires `dt_identity` + the shell's `bridge` (idempotent).
+            faithful_type_for_class(&t);
+            return Some(t);
+        }
+    }
+    // Fallback: a previously-wired bridge (e.g. no active interpreter on
+    // this thread, or `datetime` not in this interpreter's module cache).
+    // Safe: `p` is one of our own shells, which carry the extended
+    // layout with the trailing `bridge` field.
+    let bridge = unsafe { (*p).bridge };
+    if !bridge.is_null() {
+        return Some(unsafe { (*bridge).clone() });
+    }
+    None
+}
+
+/// Eagerly wire all six shell bridges to the live `datetime` classes
+/// (RFC 0066 WS2). Called from the capsule-import path right after
+/// [`ensure_datetime_bridge`], where the `datetime` module is known to
+/// be imported (CPython's `PyCapsule_Import("datetime.datetime_CAPI")`
+/// imports the module as step one, and ours does too) — so a stock
+/// extension can call Python methods on the capsule's type slots
+/// straight after `PyDateTime_IMPORT`, before any instance crossing.
+/// Best-effort: a missing class leaves that shell to the lazy
+/// [`resolve_shell_class`] path.
+pub fn wire_shell_bridges() {
+    for slot in [
+        &PTR_DATE,
+        &PTR_DATETIME,
+        &PTR_TIME,
+        &PTR_DELTA,
+        &PTR_TZINFO,
+        &PTR_TIMEZONE,
+    ] {
+        let p = slot.load(Ordering::Relaxed);
+        if p != 0 {
+            let _ = resolve_shell_class(p as *mut PyTypeObject);
+        }
+    }
+}
+
 /// The global faithful shell for a `datetime` class name (post-mint).
 fn ptr_for_name(name: &str) -> Option<*mut PyTypeObject> {
     let p = match name {

@@ -452,6 +452,43 @@ fn fwd_release_object_ptr(p: usize) {
     unsafe { crate::object::Py_DecRef(p as *mut PyObject) };
 }
 
+/// Bind a foreign descriptor through its C type's `tp_descr_get`
+/// (RFC 0066 WS3). VM `None` for `instance` crosses as C `NULL`, exactly
+/// CPython's `type_getattro` class-access convention. `Ok(None)` when the
+/// foreign type carries no `tp_descr_get` — the caller passes the value
+/// through unchanged.
+fn fwd_descr_get(
+    p: usize,
+    instance: &Object,
+    owner: &Object,
+) -> Result<Option<Object>, RuntimeError> {
+    let descr = p as *mut PyObject;
+    let ty = unsafe { (*descr).ob_type };
+    if ty.is_null() {
+        return Ok(None);
+    }
+    let slot = unsafe { (*ty).tp_descr_get };
+    if slot.is_null() {
+        return Ok(None);
+    }
+    let f: unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut PyObject) -> *mut PyObject =
+        unsafe { std::mem::transmute(slot) };
+    let obj_ptr = if matches!(instance, Object::None) {
+        std::ptr::null_mut()
+    } else {
+        crate::object::into_owned(instance.clone())
+    };
+    let owner_ptr = crate::object::into_owned(owner.clone());
+    let raw = c_call(|| unsafe { f(descr, obj_ptr, owner_ptr) });
+    unsafe {
+        if !obj_ptr.is_null() {
+            crate::object::Py_DecRef(obj_ptr);
+        }
+        crate::object::Py_DecRef(owner_ptr);
+    }
+    unwrap(raw).map(Some)
+}
+
 /// Install the foreign-object bridge into the VM. Idempotent.
 pub fn install() {
     foreign::install(ForeignHooks {
@@ -481,5 +518,6 @@ pub fn install() {
         steal_object: fwd_steal_object,
         object_to_owned_ptr: fwd_object_to_owned_ptr,
         release_object_ptr: fwd_release_object_ptr,
+        descr_get: fwd_descr_get,
     });
 }

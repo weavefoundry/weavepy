@@ -52,15 +52,34 @@ const KNOWN_OS_SUFFIXES: &[&str] = &["macos", "linux", "windows"];
 // Manifest
 // ---------------------------------------------------------------------------
 
+/// Where a row's upstream suite runs from (RFC 0066 WS5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SelftestMode {
+    /// Fetch + extract the pinned `source` sdist and run pytest from its
+    /// root — the RFC 0062 WS4 shape.
+    #[default]
+    Sdist,
+    /// Run pytest from a neutral empty cwd against the *installed*
+    /// package (`--pyargs`). For packages whose sdist cannot be tested
+    /// unbuilt (numpy: the sdist tree would shadow the wheel and its
+    /// C modules are only present post-build).
+    Installed,
+}
+
 /// One `[packages.<name>.selftest]` sub-table (RFC 0062 WS4): run the
 /// package's own pytest suite out of its pinned sdist after the probe
 /// passes.
 #[derive(Debug, Clone)]
 pub struct SelftestSpec {
+    /// Suite location strategy (RFC 0066 WS5): `sdist` (default) or
+    /// `installed`.
+    pub mode: SelftestMode,
     /// Exact-pinned pip requirement whose sdist carries the test suite
     /// (`attrs==26.1.0`). Pinning keeps the row hermetic and the offline
-    /// cache deterministic.
-    pub source: String,
+    /// cache deterministic. Required in `sdist` mode; forbidden in
+    /// `installed` mode (the suite ships inside the row's own wheel, so
+    /// the pin lives on the row requirement instead).
+    pub source: Option<String>,
     /// Extra test-only requirements installed into the row's venv.
     pub requirements: Vec<String>,
     /// pytest target path inside the extracted sdist root (e.g.
@@ -191,13 +210,27 @@ impl Manifest {
 
     fn parse_selftest(parent: &str, kv: &simple_tables::Table) -> Result<SelftestSpec> {
         let section = format!("packages.{parent}.selftest");
+        let mode = match kv.get("mode").and_then(simple_tables::Value::as_str) {
+            None | Some("sdist") => SelftestMode::Sdist,
+            Some("installed") => SelftestMode::Installed,
+            Some(m) => anyhow::bail!("[{section}] bad mode {m:?} (sdist|installed)"),
+        };
         let source = kv
             .get("source")
             .and_then(simple_tables::Value::as_str)
-            .map(str::to_owned)
-            .ok_or_else(|| anyhow::anyhow!("[{section}] missing source"))?;
-        if parse_pinned_requirement(&source).is_none() {
-            anyhow::bail!("[{section}] source {source:?} must be pinned with `==`");
+            .map(str::to_owned);
+        match (mode, &source) {
+            (SelftestMode::Sdist, None) => anyhow::bail!("[{section}] missing source"),
+            (SelftestMode::Installed, Some(_)) => anyhow::bail!(
+                "[{section}] source is meaningless with mode = \"installed\" \
+                 (pin the row requirement instead)"
+            ),
+            _ => {}
+        }
+        if let Some(source) = &source {
+            if parse_pinned_requirement(source).is_none() {
+                anyhow::bail!("[{section}] source {source:?} must be pinned with `==`");
+            }
         }
         let requirements = kv
             .get("requirements")
@@ -218,6 +251,7 @@ impl Manifest {
         };
         let timeout_seconds = parse_timeout(kv, &section)?;
         Ok(SelftestSpec {
+            mode,
             source,
             requirements,
             command,
@@ -907,8 +941,10 @@ fn install_from_sdist(
 
 /// Run one row's upstream test suite (RFC 0062 WS4): fetch + extract the
 /// pinned sdist, install the test-only requirements into the same venv,
-/// and run pytest from the sdist root. Exit 0 grades `pass`; anything
-/// else is a `fail` carrying the tail of the pytest output.
+/// and run pytest from the sdist root. `mode = "installed"` (RFC 0066
+/// WS5) skips the sdist stages and runs pytest from a neutral empty cwd
+/// against the installed package (`--pyargs`). Exit 0 grades `pass`;
+/// anything else is a `fail` carrying the tail of the pytest output.
 fn run_selftest_stage(
     spec: &SelftestSpec,
     python: &Path,
@@ -921,41 +957,57 @@ fn run_selftest_stage(
     let deadline = Instant::now() + Duration::from_secs(budget);
     let fail = |msg: String| (RowStatus::Fail, Some(trim_reason_to(&msg, 4000)));
 
-    // 1. obtain the source sdist
     let scratch = venv_dir.join("selftest");
     if let Err(e) = fs::create_dir_all(&scratch) {
         return fail(format!("failed to create {}: {e}", scratch.display()));
     }
-    let sdist = match obtain_sdist(&spec.source, python, opts, &scratch, deadline) {
-        Ok(p) => p,
-        Err(e) => return fail(format!("selftest sdist fetch failed: {e}")),
-    };
 
-    // 2. extract it (tar.gz per the sdist contract)
-    let extract_dir = scratch.join("src");
-    if let Err(e) = fs::create_dir_all(&extract_dir) {
-        return fail(format!("failed to create {}: {e}", extract_dir.display()));
-    }
-    let out = run_with_deadline(
-        Command::new("tar")
-            .arg("-xzf")
-            .arg(&sdist)
-            .arg("-C")
-            .arg(&extract_dir),
-        deadline,
-    );
-    match out {
-        Ok(o) if o.success => {}
-        Ok(o) => return fail(format!("sdist extract failed: {}", o.tail())),
-        Err(TimedOut) => return fail("sdist extract exceeded the selftest budget".to_owned()),
-    }
-    let sdist_root = match single_subdir(&extract_dir) {
-        Some(d) => d,
-        None => {
-            return fail(format!(
-                "sdist {} did not extract to a single root directory",
-                sdist.display()
-            ))
+    // 1.+2. locate the suite: extract the pinned sdist (sdist mode), or
+    // an empty neutral cwd so pytest collects nothing but the `--pyargs`
+    // target from site-packages (installed mode — a source tree in cwd
+    // would shadow the built wheel).
+    let suite_cwd = match spec.mode {
+        SelftestMode::Installed => {
+            let neutral = scratch.join("cwd");
+            if let Err(e) = fs::create_dir_all(&neutral) {
+                return fail(format!("failed to create {}: {e}", neutral.display()));
+            }
+            neutral
+        }
+        SelftestMode::Sdist => {
+            let source = spec.source.as_deref().expect("sdist mode carries source");
+            let sdist = match obtain_sdist(source, python, opts, &scratch, deadline) {
+                Ok(p) => p,
+                Err(e) => return fail(format!("selftest sdist fetch failed: {e}")),
+            };
+            let extract_dir = scratch.join("src");
+            if let Err(e) = fs::create_dir_all(&extract_dir) {
+                return fail(format!("failed to create {}: {e}", extract_dir.display()));
+            }
+            let out = run_with_deadline(
+                Command::new("tar")
+                    .arg("-xzf")
+                    .arg(&sdist)
+                    .arg("-C")
+                    .arg(&extract_dir),
+                deadline,
+            );
+            match out {
+                Ok(o) if o.success => {}
+                Ok(o) => return fail(format!("sdist extract failed: {}", o.tail())),
+                Err(TimedOut) => {
+                    return fail("sdist extract exceeded the selftest budget".to_owned())
+                }
+            }
+            match single_subdir(&extract_dir) {
+                Some(d) => d,
+                None => {
+                    return fail(format!(
+                        "sdist {} did not extract to a single root directory",
+                        sdist.display()
+                    ))
+                }
+            }
         }
     };
 
@@ -977,13 +1029,13 @@ fn run_selftest_stage(
     }
 
     // 4. the suite itself, from the sdist root so relative test paths
-    //    and conftest discovery match upstream's own invocation. The
-    //    venv python must be spawned by *absolute* path — with
-    //    `current_dir` set, a scratch-relative program path would
-    //    resolve against the sdist root and fail to spawn — but NOT
-    //    canonicalized: resolving the `bin/python` symlink lands on the
-    //    base `weavepy` binary and loses the venv identity (pyvenv.cfg
-    //    discovery is executable-path based).
+    //    and conftest discovery match upstream's own invocation (or the
+    //    neutral cwd in installed mode). The venv python must be spawned
+    //    by *absolute* path — with `current_dir` set, a scratch-relative
+    //    program path would resolve against the suite cwd and fail to
+    //    spawn — but NOT canonicalized: resolving the `bin/python`
+    //    symlink lands on the base `weavepy` binary and loses the venv
+    //    identity (pyvenv.cfg discovery is executable-path based).
     let python = std::path::absolute(python).unwrap_or_else(|_| python.to_path_buf());
     let mut cmd = Command::new(&python);
     cmd.args(["-m", "pytest"])
@@ -992,7 +1044,7 @@ fn run_selftest_stage(
     for d in &spec.deselect {
         cmd.arg("--deselect").arg(d);
     }
-    cmd.current_dir(&sdist_root);
+    cmd.current_dir(&suite_cwd);
     for (k, v) in &opts.probe_env {
         cmd.env(k, v);
     }
@@ -1717,7 +1769,8 @@ timeout_seconds = 900
         let attrs = &m.rows[1];
         assert!(attrs.no_binary.is_empty());
         let st = attrs.selftest.as_ref().expect("selftest spec");
-        assert_eq!(st.source, "attrs==26.1.0");
+        assert_eq!(st.mode, SelftestMode::Sdist);
+        assert_eq!(st.source.as_deref(), Some("attrs==26.1.0"));
         assert_eq!(st.requirements, vec!["pytest", "hypothesis"]);
         assert_eq!(st.command, "tests");
         assert_eq!(
@@ -1789,6 +1842,56 @@ command = "tests"
 "#;
         let err = Manifest::from_body(body, Path::new(".")).unwrap_err();
         assert!(err.to_string().contains("pinned"), "{err}");
+    }
+
+    #[test]
+    fn manifest_parses_installed_mode_selftest() {
+        let body = r#"
+[packages.numpy]
+requirements = "numpy==2.5.2"
+probe = "p.py"
+
+[packages.numpy.selftest]
+mode = "installed"
+requirements = "pytest hypothesis"
+command = "--pyargs numpy._core"
+"#;
+        let m = Manifest::from_body(body, Path::new(".")).unwrap();
+        let st = m.rows[0].selftest.as_ref().expect("selftest spec");
+        assert_eq!(st.mode, SelftestMode::Installed);
+        assert_eq!(st.source, None);
+        assert_eq!(st.command, "--pyargs numpy._core");
+    }
+
+    #[test]
+    fn manifest_rejects_installed_mode_with_source() {
+        let body = r#"
+[packages.x]
+requirements = "attrs"
+probe = "p.py"
+
+[packages.x.selftest]
+mode = "installed"
+source = "attrs==26.1.0"
+command = "--pyargs attrs"
+"#;
+        let err = Manifest::from_body(body, Path::new(".")).unwrap_err();
+        assert!(err.to_string().contains("meaningless"), "{err}");
+    }
+
+    #[test]
+    fn manifest_rejects_unknown_selftest_mode() {
+        let body = r#"
+[packages.x]
+requirements = "attrs"
+probe = "p.py"
+
+[packages.x.selftest]
+mode = "wheelhouse"
+command = "tests"
+"#;
+        let err = Manifest::from_body(body, Path::new(".")).unwrap_err();
+        assert!(err.to_string().contains("bad mode"), "{err}");
     }
 
     #[test]

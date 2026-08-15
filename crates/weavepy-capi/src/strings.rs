@@ -346,11 +346,12 @@ pub unsafe extern "C" fn PyBytes_FromStringAndSize(s: *const c_char, n: PySsizeT
     if s.is_null() {
         // CPython contract: an *uninitialised* buffer the caller fills
         // through `PyBytes_AS_STRING` before exposing the object (orjson's
-        // `dumps` writer). Mint a fresh, never-shared mirror and mark it
-        // buffer-authoritative so the C-side writes to `ob_sval` are
-        // adopted when the object crosses back into the VM.
+        // `dumps` writer). Mint a fresh, never-shared mirror — explicitly
+        // outside the scalar-pin cache, see `mirror_out_unpinned` — and
+        // mark it buffer-authoritative so the C-side writes to `ob_sval`
+        // are adopted when the object crosses back into the VM.
         let rc: Rc<[u8]> = vec![0u8; len].into();
-        let p = crate::mirror::mirror_out(Object::Bytes(rc));
+        let p = crate::mirror::mirror_out_unpinned(Object::Bytes(rc));
         if !p.is_null() && unsafe { crate::mirror::is_mirror(p) } {
             unsafe { (*crate::mirror::prefix_of(p)).bytes_buffer = true };
         }
@@ -365,6 +366,20 @@ pub unsafe extern "C" fn PyBytes_FromStringAndSize(s: *const c_char, n: PySsizeT
 pub unsafe extern "C" fn PyBytes_AsString(o: *mut PyObject) -> *mut c_char {
     if o.is_null() {
         return ptr::null_mut();
+    }
+    // A faithful bytes *mirror* hands out its real inline `ob_sval` —
+    // CPython's contract is that the returned pointer aliases the object's
+    // storage, and extensions write through it: Pillow's `_encode` fills a
+    // `PyBytes_FromStringAndSize(NULL, n)` staging buffer via the
+    // `PyBytes_AsString` *function* (not the macro), then `_PyBytes_Resize`s
+    // it. Returning a detached pinned copy silently discarded the encoder's
+    // output (all-zero IDAT chunks in every PNG save).
+    if unsafe { crate::mirror::is_mirror(o) }
+        && !unsafe { (*o).ob_type }.is_null()
+        && std::ptr::eq(unsafe { (*o).ob_type }, crate::types::PyBytes_Type.as_ptr())
+    {
+        let bo = o as *mut crate::layout::PyBytesObject;
+        return unsafe { std::ptr::addr_of_mut!((*bo).ob_sval) as *mut c_char };
     }
     match unsafe { crate::object::clone_object_value(o) } {
         Object::Bytes(b) => {
@@ -1294,6 +1309,26 @@ pub unsafe extern "C" fn PyUnicode_EncodeFSDefault(o: *mut PyObject) -> *mut PyO
 /// the codecs registry is a future RFC.
 #[no_mangle]
 pub unsafe extern "C" fn PyUnicode_AsASCIIString(o: *mut PyObject) -> *mut PyObject {
+    if o.is_null() {
+        return ptr::null_mut();
+    }
+    // Non-ASCII input is a UnicodeEncodeError, not silent UTF-8
+    // (test_buffer's `get_contiguous(nd, PyBUF_READ, '\u2007')`).
+    if let Object::Str(s) = unsafe { crate::object::clone_object_value(o) } {
+        if let Some(pos) = s.chars().position(|c| !c.is_ascii()) {
+            crate::errors::set_pending(
+                Some(
+                    weavepy_vm::builtin_types::builtin_types()
+                        .unicode_encode_error
+                        .clone(),
+                ),
+                Object::from_str(format!(
+                    "'ascii' codec can't encode character in position {pos}: ordinal not in range(128)"
+                )),
+            );
+            return ptr::null_mut();
+        }
+    }
     unsafe { PyUnicode_AsUTF8String(o) }
 }
 

@@ -4170,7 +4170,18 @@ impl Compiler {
             for s in body {
                 collect_inner_free(s, &self.bindings, &mut needed);
             }
-            needed.contains("super") || needed.contains("__class__")
+            needed.contains("super")
+                || needed.contains("__class__")
+                // `collect_inner_free` misses one shape CPython's symtable
+                // special-cases ("Special-case super: it counts as a use of
+                // __class__", symtable.c): a method that *locally binds*
+                // `super` and loads it — `sub = super = None; … if super is
+                // None` (matplotlib `_mathtext.Parser.subsuper`). The method
+                // side (`method_references_class` in `build_function_object`)
+                // claims the `__class__` freevar for exactly that shape, so
+                // the class must own the cell or the claim dangles ("bad
+                // cell index" at runtime).
+                || class_body_defs_claim_class_cell(body)
         };
         if needs_class_closure {
             inner.co.cellvars.push("__class__".to_owned());
@@ -8631,6 +8642,47 @@ fn method_references_class(body: &[Stmt]) -> bool {
         collect_decls(s, &mut globals, &mut nonlocals, &mut assigned);
     }
     nonlocals.contains("__class__")
+}
+
+/// `True` when a `def` compiled directly inside a class body (at any
+/// block-statement depth — `if`/`for`/`with`/`try`/`match` arms still
+/// compile at class scope) will claim the implicit `__class__` free
+/// variable. This mirrors the exact predicate `build_function_object`
+/// applies per method (`method_references_class`), so the class-side
+/// cell decision can never disagree with a child's claim. Nested
+/// classes provide their own `__class__` cell, so they are opaque.
+fn class_body_defs_claim_class_cell(body: &[Stmt]) -> bool {
+    body.iter().any(|s| match &s.kind {
+        StmtKind::FunctionDef { body: fbody, .. }
+        | StmtKind::AsyncFunctionDef { body: fbody, .. } => method_references_class(fbody),
+        StmtKind::ClassDef { .. } => false,
+        StmtKind::If { body, orelse, .. } | StmtKind::While { body, orelse, .. } => {
+            class_body_defs_claim_class_cell(body) || class_body_defs_claim_class_cell(orelse)
+        }
+        StmtKind::For { body, orelse, .. } | StmtKind::AsyncFor { body, orelse, .. } => {
+            class_body_defs_claim_class_cell(body) || class_body_defs_claim_class_cell(orelse)
+        }
+        StmtKind::With { body, .. } | StmtKind::AsyncWith { body, .. } => {
+            class_body_defs_claim_class_cell(body)
+        }
+        StmtKind::Try {
+            body,
+            handlers,
+            orelse,
+            finalbody,
+        } => {
+            class_body_defs_claim_class_cell(body)
+                || handlers
+                    .iter()
+                    .any(|h| class_body_defs_claim_class_cell(&h.body))
+                || class_body_defs_claim_class_cell(orelse)
+                || class_body_defs_claim_class_cell(finalbody)
+        }
+        StmtKind::Match { cases, .. } => cases
+            .iter()
+            .any(|c| class_body_defs_claim_class_cell(&c.body)),
+        _ => false,
+    })
 }
 
 /// The docstring of a body, per CPython's rule: the first statement is a

@@ -207,6 +207,16 @@ pub fn attempt_specialize_load_attr(obj: &Object, name: &str) -> InlineCache {
             // `LoadAttrType` shape (descriptor or class attribute).
             let class_dict = cls.dict.borrow();
             if let Some(idx) = class_dict.index_of_key_str(name) {
+                // A foreign value on the class may be a C-API descriptor
+                // (pybind11 `instancemethod`, getset, ...) whose
+                // `tp_descr_get` must bind the receiver — the fast path
+                // would hand it back raw, so don't specialize.
+                if matches!(
+                    class_dict.get_index(idx as usize),
+                    Some((_, Object::Foreign(_)))
+                ) {
+                    return InlineCache::Cooldown(COOLDOWN);
+                }
                 return InlineCache::LoadAttrType {
                     type_id: rc_id(&cls),
                     key_idx: idx,

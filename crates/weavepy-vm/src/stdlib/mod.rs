@@ -105,6 +105,7 @@ pub mod abc_mod;
 pub mod atexit_mod;
 pub mod contextvars_mod;
 pub mod ctypes_native;
+pub mod greenlet_native;
 pub mod https_mod;
 pub mod io_full;
 pub mod locale_mod;
@@ -268,6 +269,8 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("_locale", locale_mod::build);
     cache.register_builtin("_abc", abc_mod::build);
     cache.register_builtin("_contextvars", contextvars_mod::build);
+    // RFC 0066 WS4: native greenlets over real stack switching.
+    cache.register_builtin("_greenlet", greenlet_native::build);
     // RFC 0046 (wave 5): native primitive layer behind the frozen `_ctypes`
     // reimplementation (memory peek/poke, dlopen/dlsym, platform C type
     // sizes, libffi call bridge) that backs the verbatim CPython `ctypes`
@@ -3398,6 +3401,17 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             name: "_numpy_pure",
             source: include_str!("python/_numpy_pure.py"),
             is_package: false,
+        },
+        // RFC 0066 WS4: the bundled greenlet distribution — a thin
+        // facade over the native `_greenlet` module. A pip-installed
+        // cp313 greenlet wheel can never work under WeavePy (it
+        // hand-switches CPython's C stack), so the bundled package is
+        // the one true greenlet; the matching dist-info ships in the
+        // stdlib tree so importlib.metadata sees it installed.
+        FrozenSource {
+            name: "greenlet",
+            source: include_str!("python/greenlet_init.py"),
+            is_package: true,
         },
         FrozenSource {
             name: "numpy",

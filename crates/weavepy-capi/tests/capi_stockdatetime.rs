@@ -83,9 +83,17 @@ fn load() -> Option<(MutexGuard<'static, ()>, Interpreter, Object)> {
 
 fn call(interp: &mut Interpreter, module: &Object, name: &str, args: &[Object]) -> Object {
     let f = lookup(module, name).unwrap_or_else(|| panic!("module missing `{name}`"));
-    interp
-        .call_object(f, args, &[])
-        .unwrap_or_else(|e| panic!("calling `{name}` failed: {e:?}"))
+    match interp.call_object(f, args, &[]) {
+        Ok(v) => v,
+        Err(e) => {
+            if let weavepy_vm::error::RuntimeError::PyException(exc) = &e {
+                if let Ok(args) = interp.load_attr_public(&exc.instance, "args") {
+                    panic!("calling `{name}` failed: {e:?} args={args:?}");
+                }
+            }
+            panic!("calling `{name}` failed: {e:?}")
+        }
+    }
 }
 
 /// Construct a `datetime`-module instance (`date`, `datetime`, …) by
@@ -245,6 +253,56 @@ fn stockdatetime_capsule_constructors() {
         &[Object::Int(7), Object::Int(8), Object::Int(9)],
     ));
     assert_eq!(td, vec![7, 8, 9]);
+}
+
+/// RFC 0066 WS2: Python methods answer on the capsule's *type slots*
+/// themselves. These run first thing after module load — no datetime
+/// instance has crossed VM→C yet, so they prove the capsule-time bridge
+/// wiring (`wire_shell_bridges`), not the lazy per-crossing path.
+#[test]
+fn stockdatetime_type_slot_methods() {
+    let Some((_lock, mut interp, module)) = load() else {
+        return;
+    };
+    // The RFC 0062 header-proof discovery, verbatim:
+    // PyObject_CallMethod((PyObject *)PyDateTimeAPI->DateType, "today", NULL).
+    assert!(matches!(
+        call(&mut interp, &module, "type_today_is_date", &[]),
+        Object::Bool(true)
+    ));
+    // Classmethod with an argument + macro read-back of the result:
+    // date.fromordinal(730120) == date(2000, 1, 1).
+    assert_eq!(
+        int_tuple(call(
+            &mut interp,
+            &module,
+            "type_fromordinal",
+            &[Object::Int(730_120)]
+        )),
+        vec![2000, 1, 1]
+    );
+    // Data attributes on the type slots.
+    assert!(matches!(
+        call(&mut interp, &module, "type_min_year", &[]),
+        Object::Int(1)
+    ));
+    assert!(matches!(
+        call(&mut interp, &module, "type_delta_resolution_us", &[]),
+        Object::Int(1)
+    ));
+    // A classmethod on DateTimeType that itself runs real Python code.
+    assert_eq!(
+        int_tuple(call(
+            &mut interp,
+            &module,
+            "type_strptime",
+            &[
+                Object::from_static("2021-03-14 09:30:15"),
+                Object::from_static("%Y-%m-%d %H:%M:%S"),
+            ],
+        )),
+        vec![2021, 3, 14, 9, 30, 15]
+    );
 }
 
 /// `PyDate_Check`/`PyDateTime_Check`/`PyDelta_Check` via the capsule type

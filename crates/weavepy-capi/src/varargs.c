@@ -250,6 +250,29 @@ static PyObject *fetch_arg(PyObject *args, int index) {
 static int parse_group(fmt_state *st, PyObject *arg, va_list *ap);
 static int count_group_units(const char *p);
 
+/* The `s*`/`z*`/`y*`/`w*` units fill a caller-owned `Py_buffer` through
+ * the buffer protocol (CPython's `getbuffer`). Pillow's codec loop is
+ * the canonical consumer — `ImagingDecoder.decode` parses its bytes
+ * argument with "y*". `s*`/`z*` additionally accept a str (a read-only
+ * view over its UTF-8 bytes), `z*` maps None to a NULL buffer, and `w*`
+ * demands a writable exporter. The caller releases the view with
+ * `PyBuffer_Release`, exactly the CPython contract. */
+static int parse_star_buffer(char unit, PyObject *arg, va_list *ap) {
+    Py_buffer *view = va_arg(*ap, Py_buffer *);
+    if (unit == 'z' && arg == Py_None) {
+        return PyBuffer_FillInfo(view, NULL, NULL, 0, 1, PyBUF_SIMPLE);
+    }
+    if ((unit == 's' || unit == 'z') && PyUnicode_Check(arg)) {
+        Py_ssize_t len = 0;
+        const char *p = PyUnicode_AsUTF8AndSize(arg, &len);
+        if (p == NULL) {
+            return -1;
+        }
+        return PyBuffer_FillInfo(view, arg, (void *)p, len, 1, PyBUF_SIMPLE);
+    }
+    return PyObject_GetBuffer(arg, view, unit == 'w' ? PyBUF_WRITABLE : PyBUF_SIMPLE);
+}
+
 /* Convert a single format unit into the va_arg destination(s).
  * Returns 0 on success, -1 on failure (with an exception set). */
 static int parse_one(fmt_state *st, PyObject *arg, va_list *ap) {
@@ -269,6 +292,8 @@ static int parse_one(fmt_state *st, PyObject *arg, va_list *ap) {
 
     /* The 's#'/'y#'/'z#' family takes both a buffer pointer and a length. */
     bool has_len_flag = (st->fmt[1] == '#');
+    /* The 's*'/'z*'/'y*'/'w*' family fills a caller-owned `Py_buffer`. */
+    bool has_buf_flag = (st->fmt[1] == '*');
 
     switch (unit) {
         case 'i': {
@@ -370,7 +395,26 @@ static int parse_one(fmt_state *st, PyObject *arg, va_list *ap) {
             return 0;
         }
         case 's': case 'z': {
+            if (has_buf_flag) {
+                if (parse_star_buffer(unit, arg, ap) != 0) return -1;
+                st->fmt += 2;
+                return 0;
+            }
             const char **dest = va_arg(*ap, const char **);
+            /* `z`/`z#` map None to a NULL pointer (CPython `convertsimple`);
+             * Pillow's jpeg encoder parses its optional comment/EXIF tail
+             * with "…Oz#y#" and passes None when absent. */
+            if (unit == 'z' && arg == Py_None) {
+                *dest = NULL;
+                if (has_len_flag) {
+                    Py_ssize_t *plen = va_arg(*ap, Py_ssize_t *);
+                    *plen = 0;
+                    st->fmt += 2;
+                } else {
+                    st->fmt++;
+                }
+                return 0;
+            }
             if (has_len_flag) {
                 Py_ssize_t *plen = va_arg(*ap, Py_ssize_t *);
                 if (_WeavePy_Arg_StringAndSize(arg, dest, plen) != 0) return -1;
@@ -382,6 +426,11 @@ static int parse_one(fmt_state *st, PyObject *arg, va_list *ap) {
             return 0;
         }
         case 'y': {
+            if (has_buf_flag) {
+                if (parse_star_buffer(unit, arg, ap) != 0) return -1;
+                st->fmt += 2;
+                return 0;
+            }
             const char **dest = va_arg(*ap, const char **);
             if (has_len_flag) {
                 Py_ssize_t *plen = va_arg(*ap, Py_ssize_t *);
@@ -392,6 +441,16 @@ static int parse_one(fmt_state *st, PyObject *arg, va_list *ap) {
                 st->fmt++;
             }
             return 0;
+        }
+        case 'w': {
+            /* Only `w*` exists in CPython 3.13 (writable buffer). */
+            if (has_buf_flag) {
+                if (parse_star_buffer(unit, arg, ap) != 0) return -1;
+                st->fmt += 2;
+                return 0;
+            }
+            PyErr_SetString(PyExc_SystemError, "invalid use of 'w' format unit");
+            return -1;
         }
         case 'p': {
             int *dest = va_arg(*ap, int *);
@@ -617,14 +676,16 @@ static int parse_args_from(PyObject *args, const char *fmt, va_list *ap) {
      * format like numpy's `"(iO!O!iO)"` demands 5 args when the caller
      * legitimately passes 1 (the state tuple). Track paren depth and
      * count only depth-0 units. */
+    int max_slots = 0;
     {
         int level = 0;
+        int optional = 0;
         for (const char *p = fmt; *p; p++) {
             char c = *p;
-            if (level == 0 && c == '|') break;
+            if (level == 0 && c == '|') { optional = 1; continue; }
             if (c == ':' || c == ';') break;
             if (c == '(') {
-                if (level == 0) min_required++;
+                if (level == 0) { if (!optional) min_required++; max_slots++; }
                 level++;
                 continue;
             }
@@ -632,13 +693,25 @@ static int parse_args_from(PyObject *args, const char *fmt, va_list *ap) {
                 if (level > 0) level--;
                 continue;
             }
+            /* CPython `vgetargs1`: every alphabetic unit is one argument,
+             * except the `e` encoding prefix (its trailing `s`/`t` is the
+             * counted unit). Modifiers like `#`, `!`, `&`, `*` consume
+             * extra C varargs but no extra Python arguments. */
             if (level > 0) continue;
-            if (isalpha((unsigned char)c)) min_required++;
-            if (c == '#') min_required--; /* `#` is paired with the previous unit */
+            if (isalpha((unsigned char)c) && c != 'e') { if (!optional) min_required++; max_slots++; }
         }
     }
     if (n_args < 0 || n_args < min_required) {
         PyErr_SetString(PyExc_TypeError, "function requires more arguments than were given");
+        return 0;
+    }
+    /* CPython `vgetargs1`: surplus positional arguments are a TypeError
+     * ("function takes at most N arguments (M given)") — `_testbuffer`'s
+     * `get_contiguous(1,2,3,4,5)` and `staticarray(1,2,3)` rely on it. */
+    if (n_args > max_slots) {
+        PyErr_Format(PyExc_TypeError,
+                     "function takes at most %d argument%s (%d given)",
+                     max_slots, max_slots == 1 ? "" : "s", n_args);
         return 0;
     }
 
@@ -787,6 +860,15 @@ static int parse_args_kw_from(PyObject *args, PyObject *kwargs, const char *fmt,
          * together after the call). */
         _WeavePy_Arg_Tether(args ? args : kwargs, arg);
         slot_idx++;
+    }
+
+    /* CPython `vgetargskeywords`: surplus positional arguments are a
+     * TypeError (`staticarray(1, 2, 3)` with a "|O" format must refuse). */
+    if (positional_idx < n_args) {
+        PyErr_Format(PyExc_TypeError,
+                     "function takes at most %d positional argument%s (%d given)",
+                     positional_idx, positional_idx == 1 ? "" : "s", n_args);
+        return 0;
     }
 
     /* Detect the CPython "invalid keyword argument" TypeError, with its

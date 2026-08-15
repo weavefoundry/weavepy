@@ -354,6 +354,22 @@ pub fn into_owned(obj: Object) -> *mut PyObject {
         unsafe { Py_IncRef(p) };
         return p;
     }
+    // RFC 0066 WS6: a module crosses into C as one *stable, immortal*
+    // box per module (keyed by native `Rc` identity), never a fresh
+    // per-crossing box. Extensions routinely keep *borrowed* module
+    // handles past the owning reference: pybind11's chained accessor
+    // (`py::module_::import("builtins").attr("int")` held in a local,
+    // matplotlib's ft2font init) stores just a borrowed handle while
+    // the temporary that owned the module is decref'd at the end of
+    // the statement — safe on CPython where modules sit in
+    // `sys.modules` effectively forever, a dangling pointer with
+    // per-crossing boxes. Modules are process-immortal here too, so
+    // one immortal box is the faithful representation (and module
+    // pointer identity across crossings now holds, as extensions
+    // expect).
+    if let Object::Module(m) = &obj {
+        return stable_module_box(m);
+    }
     // Faithful built-in types cross into C as layout-faithful mirrors
     // (RFC 0043) so a stock extension's *inlined* field reads land on
     // real CPython-shaped memory. Everything else keeps the legacy
@@ -425,6 +441,40 @@ pub fn into_owned(obj: Object) -> *mut PyObject {
     });
     let raw = Box::into_raw(boxed) as *mut PyObject;
     register_minted(raw);
+    raw
+}
+
+/// One immortal box per module, keyed by the module's native `Rc`
+/// identity (see the `Object::Module` arm of [`into_owned`]). The map
+/// holds the boxes for the process lifetime — exactly the lifetime of
+/// the modules themselves.
+static MODULE_BOXES: std::sync::Mutex<Option<std::collections::HashMap<usize, usize>>> =
+    std::sync::Mutex::new(None);
+
+fn stable_module_box(m: &weavepy_vm::sync::Rc<weavepy_vm::object::PyModule>) -> *mut PyObject {
+    let key = weavepy_vm::sync::Rc::as_ptr(m) as usize;
+    if let Ok(g) = MODULE_BOXES.lock() {
+        if let Some(&p) = g.as_ref().and_then(|map| map.get(&key)) {
+            // Immortal: no refcount traffic.
+            return p as *mut PyObject;
+        }
+    }
+    let module = Object::Module(m.clone());
+    let boxed = Box::new(PyObjectBox {
+        head: PyObject {
+            ob_refcnt: IMMORTAL_REFCNT,
+            ob_type: crate::types::type_for_object(&module),
+        },
+        payload: PayloadCell::from_object(module),
+    });
+    let raw = Box::into_raw(boxed) as *mut PyObject;
+    register_minted(raw);
+    if let Ok(mut g) = MODULE_BOXES.lock() {
+        // A racing thread may have minted its own box; last write wins
+        // and both stay valid (immortal, never freed).
+        g.get_or_insert_with(std::collections::HashMap::new)
+            .insert(key, raw as usize);
+    }
     raw
 }
 
@@ -632,6 +682,20 @@ pub unsafe fn clone_object(p: *mut PyObject) -> Object {
     // classes carrying `ob_type == &PyArrayDTypeMeta_Type`) would
     // otherwise fail this check and be opaquely proxied as a foreign
     // `'object'` — breaking `cls.__mro__`, `isinstance(x, cls)`, etc.
+    // RFC 0066 WS2: a faithful datetime type *shell* resolves to the
+    // **current interpreter's** live `datetime` class, so the attribute
+    // protocol — `DateType.today()`, `DeltaType.resolution`, … — answers
+    // through the bridged VM class instead of an opaque foreign proxy.
+    // Checked BEFORE the generic `bridge_type` read: the shell's `bridge`
+    // is process-global and wired to whichever interpreter's class
+    // crossed first, which under an interpreter-per-test host hands back
+    // a class whose builtins have foreign identity (`isinstance(x, int)`
+    // inside `_pydatetime` then fails). Cheap for every other pointer:
+    // six pointer compares behind a ready-flag load.
+    if let Some(t) = crate::datetime_api::resolve_shell_class(p as *mut crate::types::PyTypeObject)
+    {
+        return Object::Type(t);
+    }
     if let Some(t) = unsafe { crate::types::bridge_type(p as *mut crate::types::PyTypeObject) } {
         return Object::Type(t);
     }
@@ -648,6 +712,12 @@ pub unsafe fn clone_object(p: *mut PyObject) -> Object {
         // value rather than proxying the pointer.
         if crate::mypyc_tail::is_raw_long(p) {
             return unsafe { crate::mypyc_tail::decode_raw_long(p) };
+        }
+        // RFC 0066 WS3: a C-minted facade code object (a cyfunction's
+        // `__code__`) decodes into a genuine `types.CodeType` instance —
+        // `inspect.signature` needs the isinstance to pass.
+        if let Some(code) = unsafe { crate::code_obj::native_code_object(p) } {
+            return code;
         }
         return unsafe { crate::foreign::wrap_foreign(p) };
     }

@@ -486,7 +486,14 @@ class array:
         try:
             return mv.cast(self._typecode)
         except (ValueError, TypeError):
-            return mv
+            # 'u'/'w' are real CPython export formats that `cast` refuses
+            # (struct doesn't know them). Retype the raw view so the format
+            # survives — comparisons must see 'u', not 'B'
+            # (test_buffer.test_memoryview_compare_special_cases_…_u_type_code).
+            try:
+                return mv._weavepy_with_format(self._typecode, self._itemsize)
+            except (AttributeError, ValueError, TypeError):
+                return mv
 
     # -- container protocol ---------------------------------------------
 

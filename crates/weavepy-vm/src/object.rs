@@ -1175,6 +1175,16 @@ pub trait SharedMemBuffer: std::fmt::Debug + Send + Sync {
     fn data_ptr(&self) -> *mut u8;
     /// Whether the region is read-only (an `ACCESS_READ` mapping).
     fn is_readonly(&self) -> bool;
+    /// Called when a memoryview over the region is explicitly `release()`d,
+    /// with the region's current strong count (`holders`). A C-buffer
+    /// region counts these and forwards to `PyBuffer_Release` once every
+    /// remaining holder is a released view (CPython releases the
+    /// `_PyManagedBuffer` as soon as its export count hits zero, without
+    /// waiting for GC — `_testbuffer.ndarray.pop()` depends on it). Plain
+    /// mmap/shared-memory regions don't care.
+    fn on_view_release(&self, holders: usize) {
+        let _ = holders;
+    }
 }
 
 /// Backing buffer for a [`PyMemoryView`].
@@ -1257,6 +1267,14 @@ pub struct PyMemoryView {
     /// C-contiguous strides for `shape`". A negative stride (from a
     /// `seq[::-1]`-style slice) marks the view non-contiguous.
     pub strides: RefCell<Vec<isize>>,
+    /// PEP 3118 suboffsets, in bytes. Empty means "no indirection"
+    /// (CPython's all-`-1` case). An entry `>= 0` marks a PIL-style
+    /// indirect dimension: after adding `index * stride`, the pointer at
+    /// that address is dereferenced and `suboffsets[dim]` added. Only a
+    /// [`MemoryViewBuffer::Shared`] backing (a live C exporter's memory)
+    /// can carry suboffsets — element access chases raw pointers, which
+    /// may land outside the root allocation.
+    pub suboffsets: RefCell<Vec<isize>>,
     /// The object the buffer was exported from — CPython's `mv.obj`
     /// (`view->obj`). `None` when unknown; the attribute getter then
     /// reconstructs a bytes-like from the backing buffer.
@@ -1301,6 +1319,7 @@ impl PyMemoryView {
             itemsize: Cell::new(1),
             shape: RefCell::new(Vec::new()),
             strides: RefCell::new(Vec::new()),
+            suboffsets: RefCell::new(Vec::new()),
             exporter: RefCell::new(None),
             zero_dim: Cell::new(false),
             hash: Cell::new(-1),
@@ -1325,6 +1344,7 @@ impl PyMemoryView {
             itemsize: Cell::new(1),
             shape: RefCell::new(Vec::new()),
             strides: RefCell::new(Vec::new()),
+            suboffsets: RefCell::new(Vec::new()),
             exporter: RefCell::new(None),
             zero_dim: Cell::new(false),
             hash: Cell::new(-1),
@@ -1350,6 +1370,7 @@ impl PyMemoryView {
             itemsize: Cell::new(1),
             shape: RefCell::new(Vec::new()),
             strides: RefCell::new(Vec::new()),
+            suboffsets: RefCell::new(Vec::new()),
             exporter: RefCell::new(None),
             zero_dim: Cell::new(false),
             hash: Cell::new(-1),
@@ -1381,6 +1402,7 @@ impl PyMemoryView {
             itemsize: Cell::new(itemsize),
             shape: RefCell::new(Vec::new()),
             strides: RefCell::new(Vec::new()),
+            suboffsets: RefCell::new(Vec::new()),
             exporter: RefCell::new(None),
             zero_dim: Cell::new(false),
             hash: Cell::new(-1),
@@ -1413,6 +1435,7 @@ impl PyMemoryView {
             itemsize: Cell::new(self.itemsize.get()),
             shape: RefCell::new(self.shape.borrow().clone()),
             strides: RefCell::new(self.strides.borrow().clone()),
+            suboffsets: RefCell::new(self.suboffsets.borrow().clone()),
             exporter: RefCell::new(self.exporter.borrow().clone()),
             zero_dim: Cell::new(self.zero_dim.get()),
             // A fresh object: the hash cache and re-entrancy guard are
@@ -1441,8 +1464,21 @@ impl PyMemoryView {
     /// view unusable. Idempotent.
     pub fn release(&self) {
         if !self.released.replace(true) {
-            if let MemoryViewBuffer::ByteArray(b) = &self.buffer {
-                bytearray_export_release(b);
+            // Drop the exporter reference now: CPython's `memory_release`
+            // decrefs `view.obj` immediately, and test_buffer's chained
+            // release test relies on the exporter deallocating (and thus
+            // releasing *its* consumed buffers) before outer views exit.
+            *self.exporter.borrow_mut() = None;
+            match &self.buffer {
+                MemoryViewBuffer::ByteArray(b) => bytearray_export_release(b),
+                // Notify the shared region so it can release its underlying
+                // export as soon as no *unreleased* view remains
+                // (`_testbuffer.ndarray` counts exports and refuses
+                // `push`/`pop` until they drop).
+                MemoryViewBuffer::Shared(r) => {
+                    r.on_view_release(Rc::strong_count(r));
+                }
+                MemoryViewBuffer::Bytes(_) => {}
             }
         }
     }
@@ -1475,15 +1511,153 @@ impl PyMemoryView {
         self.shape_dims().len()
     }
 
+    /// True when any dimension carries a PEP 3118 suboffset (a PIL-style
+    /// indirect view over a C exporter) — element access must chase
+    /// pointers instead of computing a linear byte offset.
+    pub fn has_suboffsets(&self) -> bool {
+        self.suboffsets.borrow().iter().any(|&s| s >= 0)
+    }
+
     /// True when the elements sit back-to-back in C (row-major) order, so a
     /// plain `[start..start+nbytes]` slice yields them. Anything with a
-    /// negative or gapped stride (e.g. `mv[::-1]`, `mv[::2]`) is not.
+    /// negative or gapped stride (e.g. `mv[::-1]`, `mv[::2]`) or with
+    /// suboffsets is not.
     pub fn is_c_contiguous(&self) -> bool {
+        if self.has_suboffsets() {
+            return false;
+        }
         let stored = self.strides.borrow();
         if stored.is_empty() {
             return true; // derived strides are C-contiguous by construction
         }
-        *stored == c_contiguous_strides(&self.shape_dims(), self.itemsize.get().max(1))
+        drop(stored);
+        // CPython `_IsCContiguous`: zero-length buffers are trivially
+        // contiguous; axes of length 0/1 impose no stride constraint.
+        let shape = self.shape_dims();
+        if shape.iter().product::<usize>() == 0 {
+            return true;
+        }
+        let strides = self.stride_bytes();
+        let mut sd = self.itemsize.get().max(1) as isize;
+        for d in (0..shape.len()).rev() {
+            let dim = shape[d];
+            if dim > 1 && strides[d] != sd {
+                return false;
+            }
+            sd *= dim as isize;
+        }
+        true
+    }
+
+    /// Fortran (column-major) contiguity, per CPython's
+    /// `_IsFortranContiguous`: the *first* axis has stride
+    /// `itemsize`, each later axis multiplies up. Axes of length 0/1
+    /// impose no constraint.
+    pub fn is_f_contiguous(&self) -> bool {
+        if self.has_suboffsets() {
+            return false;
+        }
+        let shape = self.shape_dims();
+        if shape.iter().product::<usize>() == 0 {
+            return true;
+        }
+        let strides = self.stride_bytes();
+        let mut sd = self.itemsize.get().max(1) as isize;
+        for (d, &dim) in shape.iter().enumerate() {
+            if dim > 1 && strides[d] != sd {
+                return false;
+            }
+            sd *= dim as isize;
+        }
+        true
+    }
+
+    /// Linear byte offset (into the backing buffer) of the element at the
+    /// already-normalized multi-index `idxs`. Only meaningful when the
+    /// view has no suboffsets.
+    fn element_linear_offset(&self, idxs: &[usize]) -> usize {
+        let strides = self.stride_bytes();
+        let mut off = self.start.get() as isize;
+        for (d, &i) in idxs.iter().enumerate() {
+            off += i as isize * strides[d];
+        }
+        off.max(0) as usize
+    }
+
+    /// PEP 3118 `PyBuffer_GetPointer` for an indirect (suboffsets) view:
+    /// walk each dimension adding `index * stride`, dereferencing through
+    /// the stored pointer (plus `suboffsets[dim]`) whenever the dimension
+    /// is indirect. Requires a `Shared` backing — the pointers reference
+    /// live C exporter memory outside the linear window model.
+    fn element_indirect_ptr(&self, idxs: &[usize]) -> Option<*mut u8> {
+        let MemoryViewBuffer::Shared(s) = &self.buffer else {
+            return None;
+        };
+        let strides = self.stride_bytes();
+        let subs = self.suboffsets.borrow();
+        let mut ptr = unsafe { s.data_ptr().add(self.start.get()) };
+        for (d, &i) in idxs.iter().enumerate() {
+            ptr = unsafe { ptr.offset(i as isize * strides[d]) };
+            if subs.get(d).copied().unwrap_or(-1) >= 0 {
+                // The exporter stores a pointer at this element address; the
+                // address is only guaranteed byte-aligned, so read unaligned.
+                let deref = unsafe { ptr.cast::<*mut u8>().read_unaligned() };
+                if deref.is_null() {
+                    return None;
+                }
+                ptr = unsafe { deref.offset(subs[d]) };
+            }
+        }
+        Some(ptr)
+    }
+
+    /// Pass the `itemsize` bytes of the element at (normalized)
+    /// multi-index `idxs` to `f`. Handles both linear (strided) and
+    /// indirect (suboffsets) views. `None` means the address could not be
+    /// resolved (out-of-window offset or a NULL indirect pointer) — an
+    /// exporter-side inconsistency, not a user error.
+    pub fn read_element<R>(&self, idxs: &[usize], f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        let itemsize = self.itemsize.get().max(1);
+        if self.has_suboffsets() {
+            let ptr = self.element_indirect_ptr(idxs)?;
+            let slice = unsafe { std::slice::from_raw_parts(ptr, itemsize) };
+            return Some(f(slice));
+        }
+        let off = self.element_linear_offset(idxs);
+        self.buffer.with_read(|all| {
+            if off + itemsize <= all.len() {
+                Some(f(&all[off..off + itemsize]))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Write `data` (exactly `itemsize` bytes) over the element at
+    /// (normalized) multi-index `idxs`. `None` means the backing is
+    /// read-only or the address could not be resolved.
+    pub fn write_element(&self, idxs: &[usize], data: &[u8]) -> Option<()> {
+        if self.has_suboffsets() {
+            if let MemoryViewBuffer::Shared(s) = &self.buffer {
+                if s.is_readonly() {
+                    return None;
+                }
+            }
+            let ptr = self.element_indirect_ptr(idxs)?;
+            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len()) };
+            return Some(());
+        }
+        let off = self.element_linear_offset(idxs);
+        self.buffer
+            .with_write(|all| {
+                if off + data.len() <= all.len() {
+                    all[off..off + data.len()].copy_from_slice(data);
+                    true
+                } else {
+                    false
+                }
+            })
+            .and_then(|ok| ok.then_some(()))
     }
 
     /// Materialise the view's elements in C order. Contiguous views take the
@@ -1498,34 +1672,23 @@ impl PyMemoryView {
             return self.buffer.with_read(|all| all[start..end].to_vec());
         }
         let shape = self.shape_dims();
-        let strides = self.stride_bytes();
         let total: usize = shape.iter().product();
         let mut out = Vec::with_capacity(total * itemsize);
-        let base = self.start.get() as isize;
-        let gather = |buf: &[u8], out: &mut Vec<u8>| {
-            let mut index = vec![0usize; shape.len()];
-            for _ in 0..total {
-                let mut off = base;
-                for (d, &i) in index.iter().enumerate() {
-                    off += (i as isize) * strides[d];
+        let mut index = vec![0usize; shape.len()];
+        for _ in 0..total {
+            // `read_element` handles both linear (strided) and indirect
+            // (suboffsets) addressing; unresolvable elements are skipped,
+            // matching the old out-of-window behaviour.
+            self.read_element(&index, |b| out.extend_from_slice(b));
+            // Increment the multi-index (last axis fastest = C order).
+            for d in (0..shape.len()).rev() {
+                index[d] += 1;
+                if index[d] < shape[d] {
+                    break;
                 }
-                if off >= 0 {
-                    let off = off as usize;
-                    if off + itemsize <= buf.len() {
-                        out.extend_from_slice(&buf[off..off + itemsize]);
-                    }
-                }
-                // Increment the multi-index (last axis fastest = C order).
-                for d in (0..shape.len()).rev() {
-                    index[d] += 1;
-                    if index[d] < shape[d] {
-                        break;
-                    }
-                    index[d] = 0;
-                }
+                index[d] = 0;
             }
-        };
-        self.buffer.with_read(|buf| gather(buf, &mut out));
+        }
         out
     }
 
@@ -1538,18 +1701,64 @@ impl PyMemoryView {
         f.strip_prefix('@').unwrap_or(&f).to_owned()
     }
 
-    /// `memoryview == memoryview` per CPython's `memory_richcompare`: equal
-    /// only when the normalized format, itemsize, ndim and shape all match
-    /// *and* the materialised elements are byte-identical. (Released views
-    /// are handled by the caller as identity comparison.)
+    /// `memoryview == memoryview` per CPython's `memory_richcompare`:
+    /// equal when ndim and shape match and each element's *unpacked
+    /// value* compares equal. Formats may differ (`'<i'` vs `'>h'` with
+    /// the same values are equal); multi-member struct formats compare
+    /// as tuples; float comparison is by value, so NaN elements are
+    /// never equal (CPython `unpack_cmp` / `struct_get_unpacker`).
+    /// (Released views are handled by the caller as identity
+    /// comparison.)
     pub fn buffer_eq(&self, other: &PyMemoryView) -> bool {
         if self.released.get() || other.released.get() {
             return false;
         }
-        self.norm_format() == other.norm_format()
-            && self.itemsize.get() == other.itemsize.get()
-            && self.shape_dims() == other.shape_dims()
-            && self.to_bytes() == other.to_bytes()
+        let shape = self.shape_dims();
+        if shape != other.shape_dims() || self.zero_dim.get() != other.zero_dim.get() {
+            return false;
+        }
+        let fmt_a = self.norm_format();
+        let fmt_b = other.norm_format();
+        // Byte fast path: identical unsigned-byte views compare by raw
+        // content (the only format whose value order equals byte order
+        // regardless of layout).
+        if fmt_a == "B" && fmt_b == "B" {
+            return self.to_bytes() == other.to_bytes();
+        }
+        let total: usize = shape.iter().product();
+        let mut index = vec![0usize; shape.len()];
+        for _ in 0..total {
+            let va = self.read_element(&index, |b| {
+                crate::stdlib::struct_mod::unpack_element(&fmt_a, b)
+            });
+            let vb = other.read_element(&index, |b| {
+                crate::stdlib::struct_mod::unpack_element(&fmt_b, b)
+            });
+            let (Some(Ok(va)), Some(Ok(vb))) = (va, vb) else {
+                // Unresolvable address or a format the struct module
+                // can't unpack — CPython returns NotImplemented, which
+                // grades as "not equal" here.
+                return false;
+            };
+            if va.len() != vb.len() {
+                return false;
+            }
+            if !va
+                .iter()
+                .zip(&vb)
+                .all(|(x, y)| x.is_same(y) || x.eq_value(y))
+            {
+                return false;
+            }
+            for d in (0..shape.len()).rev() {
+                index[d] += 1;
+                if index[d] < shape[d] {
+                    break;
+                }
+                index[d] = 0;
+            }
+        }
+        true
     }
 
     /// `memoryview == bytes`/`bytearray`. A bytes-like exposes a 1-D `"B"`,
@@ -7788,9 +7997,30 @@ impl Object {
                 if a.released.get() {
                     return false;
                 }
-                match crate::builtins::buffer_exported_view(other) {
-                    Some(b) => a.buffer_eq(&b),
-                    None => false,
+                if let Some(b) = crate::builtins::buffer_exported_view(other) {
+                    return a.buffer_eq(&b);
+                }
+                // A C-extension exporter (`_testbuffer.ndarray`, numpy)
+                // crosses as an `Instance` wearing its C class and exports
+                // through `bf_getbuffer`, not a PEP 688 `__buffer__` — take
+                // its buffer via the C-API bridge and compare values.
+                match crate::foreign::get_buffer_obj(other) {
+                    Ok(Object::MemoryView(b)) => a.buffer_eq(&b),
+                    _ => false,
+                }
+            }
+            // A C-extension exporter (`_testbuffer.ndarray`, numpy):
+            // CPython's `memory_richcompare` takes the other operand's
+            // buffer and compares element values, so `memoryview == nd`
+            // works for any exporter (test_buffer's compare matrix).
+            (Object::MemoryView(a), Object::Foreign(soul))
+            | (Object::Foreign(soul), Object::MemoryView(a)) => {
+                if a.released.get() {
+                    return false;
+                }
+                match crate::foreign::get_buffer(soul) {
+                    Ok(Object::MemoryView(b)) => a.buffer_eq(&b),
+                    _ => false,
                 }
             }
             // `slice` objects compare as the `(start, stop, step)` triple
@@ -8165,12 +8395,25 @@ impl Object {
                     Ok(false)
                 }
             },
-            Object::MemoryView(mv) => match item {
-                Object::Int(i) => Ok(*i >= 0 && *i <= 255 && mv.to_bytes().contains(&(*i as u8))),
-                _ => Err(type_error(
-                    "a bytes-like object is required for memoryview membership",
-                )),
-            },
+            // CPython has no `sq_contains` for memoryview, so `x in m` walks
+            // the sequence protocol: released views raise ValueError, 0-dim
+            // TypeError, deeper views NotImplementedError, and a 1-D view
+            // compares its unpacked elements by value (`1.0 in m` works for
+            // a float view — test_buffer.test_memoryview_sequence).
+            Object::MemoryView(mv) => {
+                if mv.released.get() {
+                    return Err(crate::value_error(
+                        "operation forbidden on released memoryview object",
+                    ));
+                }
+                let elems = crate::mv_element_objects(mv)?;
+                for x in &elems {
+                    if member_eq(x, item)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
             // A built-in-subclass instance (`class C(dict)`, …) contains
             // through its wrapped native payload — the receiver-side
             // analogue of CPython dispatching `sq_contains` on the base.

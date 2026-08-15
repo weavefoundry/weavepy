@@ -77,7 +77,11 @@ def load_manifest(manifest_path: Path):
             selftest = row.get("selftest")
             if selftest:
                 group.extend(selftest.get("requirements", "").split())
-                sdist_reqs.append(selftest["source"])
+                # `mode = "installed"` selftests (RFC 0066 WS5) run out of
+                # the wheel already fetched via `requirements`; only sdist
+                # selftests carry a `source` tarball to cache.
+                if "source" in selftest:
+                    sdist_reqs.append(selftest["source"])
             if group:
                 wheel_groups.append(group)
         return wheel_groups, sdist_reqs
@@ -127,9 +131,23 @@ def main() -> int:
 
     machine = platform.machine()
     if sys.platform == "darwin":
-        plats = [f"macosx_11_0_{machine}", "macosx_10_9_universal2"]
+        # Heavy-native wheels (scipy, matplotlib) tag against newer macOS
+        # deployment targets; offer every major tag from 11.0 up so pip can
+        # pick whatever the project ships.
+        plats = [
+            f"macosx_{v}_{machine}" for v in ("11_0", "12_0", "13_0", "14_0", "15_0")
+        ] + ["macosx_10_9_universal2", "macosx_10_13_universal2"]
     elif sys.platform.startswith("linux"):
-        plats = [f"manylinux2014_{machine}", f"manylinux_2_17_{machine}"]
+        # Heavy-native wheels moved past manylinux2014: numpy 2.3+ and
+        # scipy 1.16+ ship manylinux_2_28 (and newer) only, so a
+        # 2014/2_17-only ladder can't see them (`numpy==2.5.2` resolved
+        # nothing on the ubuntu CI lane). Offer the glibc ladder up
+        # through the runner's own floor; pip picks the newest tag the
+        # project ships.
+        plats = [f"manylinux2014_{machine}"] + [
+            f"manylinux_{v}_{machine}"
+            for v in ("2_17", "2_24", "2_27", "2_28", "2_31", "2_34", "2_35")
+        ]
     elif sys.platform == "win32":
         # RFC 0063: the Windows CI lane. Without a binary platform tag,
         # `--platform any` alone can't fetch compiled wheels (markupsafe,

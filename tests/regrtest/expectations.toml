@@ -198,8 +198,8 @@ status = "pass"
 reason = "RFC 0041 WS-containers: native `_bisect` accelerator (faithful port of Modules/_bisectmodule.c) wired into the frozen `bisect`; both C and pure-Python variants pass, including key= and the sys.maxsize `test_large_range` midpoint-overflow case"
 
 [tests."cpython/Lib/test/test_buffer.py"]
-status = "fail"
-reason = "RFC 0057 WS10: the Python-level PEP 688 surface now passes (memoryview._from_flags, __release_buffer__ dispatch with CPython's restricted-view semantics, strict __buffer__ returns, _testcapi.testBuf/buffer_fill_info) — 91/95 pass. The 4 residual errors need the PyBUF_* constants from CPython's `_testbuffer` C module; providing it requires a real multi-dim ndarray (a stub would regress pickletester/test_picklebuffer, and a truthy ndarray un-skips the ~70-test multi-dimensional TestBufferProtocol class, which needs full multi-dim buffer support). Left for a dedicated workstream."
+status = "pass"
+reason = "measured (RFC 0066 WS1): 95 run, OK — CPython's own `Modules/_testbuffer.c` is compiled by the conformance build script and staged onto sys.path, un-skipping the full multi-dimensional TestBufferProtocol matrix. Backed by aliasing memoryviews over C exporters (CBufferRegion write-through), PyBUF_INDIRECT/suboffset element access, CPython-faithful contiguity classification, value-based cross-exporter comparison, cast/tolist/tobytes(order=) semantics, and vgetargs1-faithful max-positional-arg validation in PyArg_ParseTuple."
 
 [tests."cpython/Lib/test/test_builtin.py"]
 status = "pass"

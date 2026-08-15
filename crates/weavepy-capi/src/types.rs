@@ -360,6 +360,11 @@ decl_static_type! {
     pub PyStaticMethod_Type;
     pub PyProperty_Type;
     pub PyReversed_Type;
+    // RFC 0066 WS3: `instancemethod` — pybind11 wraps every registered
+    // method in one (`PYBIND11_INSTANCE_METHOD_NEW`) and identity-checks
+    // the type by address. Instances carry CPython's faithful 24-byte
+    // layout (see `crate::instancemethod`).
+    pub PyInstanceMethod_Type;
 }
 
 /// Initialise the static type table from the running interpreter's
@@ -501,6 +506,15 @@ pub fn init_static_types() {
     );
     install_synth(&PyModuleDef_Type, b"moduledef\0", "moduledef");
     install_synth(&PySeqIter_Type, b"iterator\0", "iterator");
+    // RFC 0066 WS3: pybind11's method wrapper. The synthetic bridge gives
+    // `type(im)` identity; the faithful layout + protocol slots live in
+    // `crate::instancemethod`.
+    install_synth(
+        &PyInstanceMethod_Type,
+        b"instancemethod\0",
+        "instancemethod",
+    );
+    crate::instancemethod::init_type_slots();
 
     // RFC 0047 (wave 5): wire the iteration protocol (`tp_iter` → self,
     // `tp_iternext` → `PyIter_Next`) onto the iterator umbrella type and the
@@ -532,6 +546,20 @@ pub fn init_static_types() {
         (*PyClassMethod_Type.as_ptr()).tp_descr_get = descriptor_descr_get as *mut c_void;
         (*PyStaticMethod_Type.as_ptr()).tp_descr_get = descriptor_descr_get as *mut c_void;
         (*PyProperty_Type.as_ptr()).tp_descr_get = descriptor_descr_get as *mut c_void;
+        // RFC 0066 WS3: `type`'s attribute slots. pybind11's metaclass
+        // reads `PyType_Type.tp_getattro` / `tp_setattro` straight off
+        // the struct and chains to them from its own overrides; NULL was
+        // a jump through address zero. The shims run the VM's default
+        // (non-dispatching) `type.__getattribute__` / `type.__setattr__`
+        // bodies, so the chain cannot recurse into the override.
+        (*PyType_Type.as_ptr()).tp_getattro = type_generic_getattro as *mut c_void;
+        (*PyType_Type.as_ptr()).tp_setattro = type_generic_setattro as *mut c_void;
+        // RFC 0066 WS6: `type`'s call slot. pybind11's metaclass `tp_call`
+        // (`pybind11_meta_call`, the entry point of *every* pybind11 class
+        // instantiation) chains to `PyType_Type.tp_call(type, args, kwargs)`
+        // read straight off the struct; NULL was a jump through address
+        // zero the moment matplotlib's font manager built `ft2font.FT2Font`.
+        (*PyType_Type.as_ptr()).tp_call = type_tp_call as *mut c_void;
     }
 
     // RFC 0047 (wave 5): advertise `tp_call` on the callable built-in types.
@@ -1023,6 +1051,75 @@ unsafe extern "C" fn synth_tp_call(
 ) -> *mut PyObject {
     unsafe { crate::abstract_::PyObject_Call(o, a, k) }
 }
+/// `PyType_Type.tp_call` — CPython's `type_call` (the *default*
+/// `type.__call__` body: `tp_new` + conditional `tp_init`), reachable
+/// when an extension invokes the slot directly off the exported static
+/// struct. The only known caller is pybind11's `pybind11_meta_call`,
+/// which is itself the metaclass `__call__` — so this body must run the
+/// default construction sequence and never re-dispatch through the
+/// metaclass, or the pair would recurse. The VM equivalent of that
+/// sequence is `Interpreter::instantiate`, which resolves the mirrored
+/// class's (shimmed) `__new__`/`__init__` through the normal MRO
+/// machinery.
+unsafe extern "C" fn type_tp_call(
+    ty: *mut PyObject,
+    args: *mut PyObject,
+    kwds: *mut PyObject,
+) -> *mut PyObject {
+    crate::interp::ensure_active(|| {
+        let cls = unsafe { crate::object::clone_object(ty) };
+        let Object::Type(cls) = cls else {
+            crate::errors::set_type_error("type_call: self is not a type");
+            return ptr::null_mut();
+        };
+        let arg_vec: Vec<Object> = if args.is_null() {
+            Vec::new()
+        } else {
+            match unsafe { crate::object::clone_object(args) } {
+                Object::Tuple(items) => items.iter().cloned().collect(),
+                other => vec![other],
+            }
+        };
+        let kw_pairs: Vec<(String, Object)> = if kwds.is_null() {
+            Vec::new()
+        } else {
+            match unsafe { crate::object::clone_object(kwds) } {
+                Object::Dict(rc) => rc
+                    .borrow()
+                    .iter()
+                    .filter_map(|(k, v)| match &k.0 {
+                        Object::Str(s) => Some((s.to_string(), v.clone())),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
+        if std::env::var_os("WEAVEPY_TRACE_CALL").is_some() {
+            eprintln!(
+                "[TYPE_TP_CALL] cls={} nargs={} nkw={}",
+                cls.name,
+                arg_vec.len(),
+                kw_pairs.len()
+            );
+        }
+        let result = crate::interp::with_interp_mut(|interp| {
+            interp.instantiate(cls.clone(), &arg_vec, &kw_pairs)
+        });
+        match result {
+            Some(Ok(v)) => crate::object::into_owned(v),
+            Some(Err(err)) => {
+                crate::errors::set_pending_from_runtime(err);
+                ptr::null_mut()
+            }
+            None => {
+                crate::errors::set_type_error("type_call: no active interpreter");
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
 unsafe extern "C" fn synth_tp_repr(o: *mut PyObject) -> *mut PyObject {
     unsafe { crate::abstract_::PyObject_Repr(o) }
 }
@@ -1035,6 +1132,13 @@ unsafe extern "C" fn synth_tp_str(o: *mut PyObject) -> *mut PyObject {
 /// synth bridge → PyObject_Repr → foreign tp_repr` cycle.
 pub(crate) fn is_synth_repr_str_slot(slot: *mut c_void) -> bool {
     slot == synth_tp_repr as *mut c_void || slot == synth_tp_str as *mut c_void
+}
+
+/// True when `slot` is the VM-forwarding call bridge. `PyObject_Call`'s
+/// direct foreign `tp_call` dispatch consults this to break the
+/// `PyObject_Call → synth_tp_call → PyObject_Call` cycle.
+pub(crate) fn is_synth_call_slot(slot: *mut c_void) -> bool {
+    slot == synth_tp_call as *mut c_void
 }
 unsafe extern "C" fn synth_tp_hash(o: *mut PyObject) -> crate::object::PyHashT {
     unsafe { crate::abstract_::PyObject_Hash(o) }
@@ -1615,6 +1719,93 @@ unsafe extern "C" fn descriptor_descr_get(
     }
 }
 
+/// `PyType_Type.tp_getattro` — CPython's `type_getattro` **default
+/// body**, with no metaclass dispatch (RFC 0066 WS3).
+///
+/// pybind11's metaclass `tp_getattro` (`pybind11_meta_getattro`) handles
+/// its instancemethod special case and then chains to
+/// `PyType_Type.tp_getattro(cls, name)` read *directly off the struct*;
+/// a NULL slot was a jump to address zero the first time a pybind11
+/// module touched an attribute of one of its own classes (scipy's
+/// `_highspy._core` registering `ObjSense`). Routing the chain through
+/// full `PyObject_GetAttr` would dispatch the metaclass override again
+/// and recurse — so this calls the VM's non-dispatching default.
+unsafe extern "C" fn type_generic_getattro(o: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    if o.is_null() || name.is_null() {
+        return ptr::null_mut();
+    }
+    let obj = unsafe { crate::object::clone_object(o) };
+    if let Object::Type(ty) = &obj {
+        let key = match unsafe { crate::object::clone_object(name) } {
+            Object::Str(s) => s.to_string(),
+            _ => {
+                crate::errors::set_type_error("attribute name must be string");
+                return ptr::null_mut();
+            }
+        };
+        if let Some(res) = crate::interp::ensure_active(|| {
+            crate::interp::with_interp_mut(|interp| interp.type_getattr_default(ty, &key))
+        }) {
+            return match res {
+                Ok(v) => crate::object::into_owned(v),
+                Err(e) => {
+                    crate::errors::set_pending_from_runtime(e);
+                    ptr::null_mut()
+                }
+            };
+        }
+    }
+    // Not a bridged type (or no interpreter): full dispatch is safe.
+    unsafe { crate::abstract_::PyObject_GetAttr(o, name) }
+}
+
+/// `PyType_Type.tp_setattro` — CPython's `type_setattro` default body
+/// (NULL `value` deletes), no metaclass dispatch. pybind11's
+/// `pybind11_meta_setattro` chains here for every `class_::def`.
+unsafe extern "C" fn type_generic_setattro(
+    o: *mut PyObject,
+    name: *mut PyObject,
+    value: *mut PyObject,
+) -> c_int {
+    if o.is_null() || name.is_null() {
+        return -1;
+    }
+    let obj = unsafe { crate::object::clone_object(o) };
+    if let Object::Type(ty) = &obj {
+        let key = match unsafe { crate::object::clone_object(name) } {
+            Object::Str(s) => s.to_string(),
+            _ => {
+                crate::errors::set_type_error("attribute name must be string");
+                return -1;
+            }
+        };
+        let val = if value.is_null() {
+            None
+        } else {
+            Some(unsafe { crate::object::clone_object(value) })
+        };
+        if let Some(res) = crate::interp::ensure_active(|| {
+            crate::interp::with_interp_mut(|interp| match val.clone() {
+                Some(v) => interp.type_setattr_default(ty, &key, v),
+                None => interp.type_delattr_default(ty, &key),
+            })
+        }) {
+            return match res {
+                Ok(()) => 0,
+                Err(e) => {
+                    crate::errors::set_pending_from_runtime(e);
+                    -1
+                }
+            };
+        }
+    }
+    if value.is_null() {
+        unsafe { crate::abstract_::PyObject_SetAttr(o, name, ptr::null_mut()) }
+    } else {
+        unsafe { crate::abstract_::PyObject_SetAttr(o, name, value) }
+    }
+}
+
 /// Serialises synth-type creation so a class crossing concurrently mints
 /// exactly one type.
 static SYNTH_LOCK: Mutex<()> = Mutex::new(());
@@ -1951,6 +2142,9 @@ static STATIC_TYPE_TABLE: &[&StaticType] = &[
     &PyStaticMethod_Type,
     &PyProperty_Type,
     &PyReversed_Type,
+    // RFC 0066 WS3: membership resolves `type(im)` for the foreign
+    // instancemethod proxies pybind11 mints.
+    &PyInstanceMethod_Type,
 ];
 
 /// Borrow the bridged native type from a [`PyTypeObject`].
@@ -2998,8 +3192,200 @@ pub unsafe extern "C" fn PyType_FromMetaclass(
             let free_fp: unsafe extern "C" fn(*mut c_void) = crate::memory::PyObject_Free;
             (*ty_ptr).tp_free = free_fp as *mut c_void;
         }
+        // RFC 0066 WS3: publish every remaining protocol slot onto the
+        // faithful struct — stock extensions read them directly.
+        publish_spec_struct_slots(ty_ptr, &leaked.slot_table);
     }
     ty_ptr as *mut PyObject
+}
+
+/// Write a spec-built type's protocol slots from the side [`SlotTable`]
+/// onto the faithful `PyTypeObject` struct — the direct `tp_*` function
+/// pointers plus heap-allocated `tp_as_*` method suites.
+///
+/// CPython's `PyType_FromMetaclass` stores every `Py_tp_*` spec slot in
+/// the heap type's struct (with embedded suites), and stock extension
+/// code reads them back *directly* off `Py_TYPE(x)`. Cython's
+/// `__Pyx_PyObject_LookupSpecial` — the `with`/`for`/operator
+/// special-method protocol — binds a method found via `_PyType_Lookup`
+/// through `Py_TYPE(res)->tp_descr_get`: lxml's `XSLT.__init__` looks up
+/// `_ErrorLog.__exit__` (a CyFunction, whose spec-built type carries
+/// `Py_tp_descr_get`) this way. With the struct slot left NULL the
+/// CyFunction crossed *unbound*, `__exit__` was called with the exception
+/// triple only, and `self` arrived as `None` — crashing in
+/// `_ErrorLog_disconnect`. The side table remains the canonical source
+/// for the VM's dunder synthesis; this is purely the C-visible view.
+///
+/// Lifecycle slots (`tp_new`/`tp_alloc`/`tp_free`/`tp_dealloc`) are
+/// managed by the caller and skipped here.
+unsafe fn publish_spec_struct_slots(ty: *mut PyTypeObject, t: &SlotTable) {
+    use crate::slottable as ids;
+    unsafe fn set(dst: *mut *mut c_void, t: &SlotTable, id: c_int) {
+        let p = t.get(id).as_void();
+        if !p.is_null() && unsafe { (*dst).is_null() } {
+            unsafe { *dst = p };
+        }
+    }
+    unsafe {
+        let tr = &mut *ty;
+        set(&mut tr.tp_call, t, ids::Py_tp_call);
+        set(&mut tr.tp_init, t, ids::Py_tp_init);
+        set(&mut tr.tp_iter, t, ids::Py_tp_iter);
+        set(&mut tr.tp_iternext, t, ids::Py_tp_iternext);
+        set(&mut tr.tp_richcompare, t, ids::Py_tp_richcompare);
+        set(&mut tr.tp_getattro, t, ids::Py_tp_getattro);
+        set(&mut tr.tp_setattro, t, ids::Py_tp_setattro);
+        set(&mut tr.tp_descr_get, t, ids::Py_tp_descr_get);
+        set(&mut tr.tp_descr_set, t, ids::Py_tp_descr_set);
+        set(&mut tr.tp_hash, t, ids::Py_tp_hash);
+        set(&mut tr.tp_repr, t, ids::Py_tp_repr);
+        set(&mut tr.tp_str, t, ids::Py_tp_str);
+        set(&mut tr.tp_traverse, t, ids::Py_tp_traverse);
+        set(&mut tr.tp_clear, t, ids::Py_tp_clear);
+        set(&mut tr.tp_getattr, t, ids::Py_tp_getattr);
+        set(&mut tr.tp_setattr, t, ids::Py_tp_setattr);
+
+        // Number suite.
+        let nb_ids = [
+            ids::Py_nb_add,
+            ids::Py_nb_subtract,
+            ids::Py_nb_multiply,
+            ids::Py_nb_remainder,
+            ids::Py_nb_divmod,
+            ids::Py_nb_power,
+            ids::Py_nb_negative,
+            ids::Py_nb_positive,
+            ids::Py_nb_absolute,
+            ids::Py_nb_bool,
+            ids::Py_nb_invert,
+            ids::Py_nb_lshift,
+            ids::Py_nb_rshift,
+            ids::Py_nb_and,
+            ids::Py_nb_xor,
+            ids::Py_nb_or,
+            ids::Py_nb_int,
+            ids::Py_nb_float,
+            ids::Py_nb_inplace_add,
+            ids::Py_nb_inplace_subtract,
+            ids::Py_nb_inplace_multiply,
+            ids::Py_nb_inplace_remainder,
+            ids::Py_nb_inplace_power,
+            ids::Py_nb_inplace_lshift,
+            ids::Py_nb_inplace_rshift,
+            ids::Py_nb_inplace_and,
+            ids::Py_nb_inplace_xor,
+            ids::Py_nb_inplace_or,
+            ids::Py_nb_floor_divide,
+            ids::Py_nb_true_divide,
+            ids::Py_nb_inplace_floor_divide,
+            ids::Py_nb_inplace_true_divide,
+            ids::Py_nb_index,
+            ids::Py_nb_matrix_multiply,
+            ids::Py_nb_inplace_matrix_multiply,
+        ];
+        if tr.tp_as_number.is_null() && nb_ids.iter().any(|&id| !t.get(id).is_null()) {
+            let mut n: crate::layout::PyNumberMethods = std::mem::zeroed();
+            n.nb_add = t.get(ids::Py_nb_add).as_void();
+            n.nb_subtract = t.get(ids::Py_nb_subtract).as_void();
+            n.nb_multiply = t.get(ids::Py_nb_multiply).as_void();
+            n.nb_remainder = t.get(ids::Py_nb_remainder).as_void();
+            n.nb_divmod = t.get(ids::Py_nb_divmod).as_void();
+            n.nb_power = t.get(ids::Py_nb_power).as_void();
+            n.nb_negative = t.get(ids::Py_nb_negative).as_void();
+            n.nb_positive = t.get(ids::Py_nb_positive).as_void();
+            n.nb_absolute = t.get(ids::Py_nb_absolute).as_void();
+            n.nb_bool = t.get(ids::Py_nb_bool).as_void();
+            n.nb_invert = t.get(ids::Py_nb_invert).as_void();
+            n.nb_lshift = t.get(ids::Py_nb_lshift).as_void();
+            n.nb_rshift = t.get(ids::Py_nb_rshift).as_void();
+            n.nb_and = t.get(ids::Py_nb_and).as_void();
+            n.nb_xor = t.get(ids::Py_nb_xor).as_void();
+            n.nb_or = t.get(ids::Py_nb_or).as_void();
+            n.nb_int = t.get(ids::Py_nb_int).as_void();
+            n.nb_float = t.get(ids::Py_nb_float).as_void();
+            n.nb_inplace_add = t.get(ids::Py_nb_inplace_add).as_void();
+            n.nb_inplace_subtract = t.get(ids::Py_nb_inplace_subtract).as_void();
+            n.nb_inplace_multiply = t.get(ids::Py_nb_inplace_multiply).as_void();
+            n.nb_inplace_remainder = t.get(ids::Py_nb_inplace_remainder).as_void();
+            n.nb_inplace_power = t.get(ids::Py_nb_inplace_power).as_void();
+            n.nb_inplace_lshift = t.get(ids::Py_nb_inplace_lshift).as_void();
+            n.nb_inplace_rshift = t.get(ids::Py_nb_inplace_rshift).as_void();
+            n.nb_inplace_and = t.get(ids::Py_nb_inplace_and).as_void();
+            n.nb_inplace_xor = t.get(ids::Py_nb_inplace_xor).as_void();
+            n.nb_inplace_or = t.get(ids::Py_nb_inplace_or).as_void();
+            n.nb_floor_divide = t.get(ids::Py_nb_floor_divide).as_void();
+            n.nb_true_divide = t.get(ids::Py_nb_true_divide).as_void();
+            n.nb_inplace_floor_divide = t.get(ids::Py_nb_inplace_floor_divide).as_void();
+            n.nb_inplace_true_divide = t.get(ids::Py_nb_inplace_true_divide).as_void();
+            n.nb_index = t.get(ids::Py_nb_index).as_void();
+            n.nb_matrix_multiply = t.get(ids::Py_nb_matrix_multiply).as_void();
+            n.nb_inplace_matrix_multiply = t.get(ids::Py_nb_inplace_matrix_multiply).as_void();
+            tr.tp_as_number = Box::into_raw(Box::new(n)) as *mut c_void;
+        }
+
+        // Sequence suite.
+        let sq_ids = [
+            ids::Py_sq_length,
+            ids::Py_sq_concat,
+            ids::Py_sq_repeat,
+            ids::Py_sq_item,
+            ids::Py_sq_ass_item,
+            ids::Py_sq_contains,
+            ids::Py_sq_inplace_concat,
+            ids::Py_sq_inplace_repeat,
+        ];
+        if tr.tp_as_sequence.is_null() && sq_ids.iter().any(|&id| !t.get(id).is_null()) {
+            let mut s: crate::layout::PySequenceMethods = std::mem::zeroed();
+            s.sq_length = t.get(ids::Py_sq_length).as_void();
+            s.sq_concat = t.get(ids::Py_sq_concat).as_void();
+            s.sq_repeat = t.get(ids::Py_sq_repeat).as_void();
+            s.sq_item = t.get(ids::Py_sq_item).as_void();
+            s.sq_ass_item = t.get(ids::Py_sq_ass_item).as_void();
+            s.sq_contains = t.get(ids::Py_sq_contains).as_void();
+            s.sq_inplace_concat = t.get(ids::Py_sq_inplace_concat).as_void();
+            s.sq_inplace_repeat = t.get(ids::Py_sq_inplace_repeat).as_void();
+            tr.tp_as_sequence = Box::into_raw(Box::new(s)) as *mut c_void;
+        }
+
+        // Mapping suite.
+        let mp_ids = [
+            ids::Py_mp_length,
+            ids::Py_mp_subscript,
+            ids::Py_mp_ass_subscript,
+        ];
+        if tr.tp_as_mapping.is_null() && mp_ids.iter().any(|&id| !t.get(id).is_null()) {
+            let mut m: crate::layout::PyMappingMethods = std::mem::zeroed();
+            m.mp_length = t.get(ids::Py_mp_length).as_void();
+            m.mp_subscript = t.get(ids::Py_mp_subscript).as_void();
+            m.mp_ass_subscript = t.get(ids::Py_mp_ass_subscript).as_void();
+            tr.tp_as_mapping = Box::into_raw(Box::new(m)) as *mut c_void;
+        }
+
+        // Async suite.
+        let am_ids = [
+            ids::Py_am_await,
+            ids::Py_am_aiter,
+            ids::Py_am_anext,
+            ids::Py_am_send,
+        ];
+        if tr.tp_as_async.is_null() && am_ids.iter().any(|&id| !t.get(id).is_null()) {
+            let mut a: crate::layout::PyAsyncMethods = std::mem::zeroed();
+            a.am_await = t.get(ids::Py_am_await).as_void();
+            a.am_aiter = t.get(ids::Py_am_aiter).as_void();
+            a.am_anext = t.get(ids::Py_am_anext).as_void();
+            a.am_send = t.get(ids::Py_am_send).as_void();
+            tr.tp_as_async = Box::into_raw(Box::new(a)) as *mut c_void;
+        }
+
+        // Buffer suite.
+        let bf_ids = [ids::Py_bf_getbuffer, ids::Py_bf_releasebuffer];
+        if tr.tp_as_buffer.is_null() && bf_ids.iter().any(|&id| !t.get(id).is_null()) {
+            let mut b: crate::layout::PyBufferProcs = std::mem::zeroed();
+            b.bf_getbuffer = t.get(ids::Py_bf_getbuffer).as_void();
+            b.bf_releasebuffer = t.get(ids::Py_bf_releasebuffer).as_void();
+            tr.tp_as_buffer = Box::into_raw(Box::new(b)) as *mut c_void;
+        }
+    }
 }
 
 /// `PyType_GetSlot(ty, slot)` — fetch a slot pointer from `ty`'s
@@ -3522,9 +3908,32 @@ pub unsafe extern "C" fn PyType_Ready(t: *mut PyTypeObject) -> c_int {
     // &PyArrayDTypeMeta_Type)` — a direct `ob_type` pointer compare — so
     // overwriting it with `&PyType_Type` made every DType fail
     // validation ("provided object … is not a DType").
+    //
+    // RFC 0066 WS5: the fill must be `Py_TYPE(tp_base)`, not a bare
+    // `&PyType_Type`. numpy's `_ScaledFloatTestDType` is a *static*
+    // DType class declared `PyVarObject_HEAD_INIT(NULL, 0)` with
+    // `tp_base = &PyArrayDescr_Type` — it inherits its metaclass
+    // (`PyArrayDTypeMeta_Type`, PyArrayDescr_Type's own `ob_type`)
+    // through the ready, exactly CPython's `type_ready_set_type`.
+    // Filling `&PyType_Type` failed the cast-spec validation
+    // ("ArrayMethod provided object … is not a DType").
     unsafe {
         if (*t).head.ob_type.is_null() {
-            (*t).head.ob_type = PyType_Type.as_ptr();
+            let declared_base = (*t).tp_base;
+            let base = if declared_base.is_null() {
+                base_for_c.unwrap_or(std::ptr::null_mut())
+            } else {
+                declared_base
+            };
+            let mut meta = if base.is_null() {
+                std::ptr::null_mut()
+            } else {
+                (*base).head.ob_type
+            };
+            if meta.is_null() {
+                meta = PyType_Type.as_ptr();
+            }
+            (*t).head.ob_type = meta;
         }
         (*t).head.ob_refcnt = IMMORTAL_REFCNT;
         (*t).tp_flags |= PY_TPFLAGS_READY;

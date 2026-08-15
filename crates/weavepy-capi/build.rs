@@ -307,6 +307,22 @@ fn main() {
                 name: "_abi3check",
                 env_var: "WEAVEPY_CAPI_ABI3CHECK_EXTENSION",
             });
+            // `_testbuffer.c` — RFC 0066 WS1: CPython's own
+            // `Modules/_testbuffer.c`, verbatim — the PEP 3118 spec
+            // exporter (`ndarray` with the full PyBUF flag matrix incl.
+            // suboffsets, `staticarray`) that `test_buffer` and
+            // pickletester's out-of-band legs import. Compiled against
+            // the stock headers so its inlined macros are CPython's.
+            build_extension(ExtensionBuild {
+                cc: &cc,
+                include_dirs: &stock_inc,
+                out_dir: &out_dir,
+                target_os: &target_os,
+                suffix,
+                src: &workspace_root.join("tests/capi_ext/_testbuffer.c"),
+                name: "_testbuffer",
+                env_var: "WEAVEPY_CAPI_TESTBUFFER_EXTENSION",
+            });
         }
         None => {
             println!(

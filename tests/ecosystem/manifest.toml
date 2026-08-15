@@ -14,11 +14,19 @@
 # An optional `[packages.<name>.selftest]` sub-table (RFC 0062 WS4) runs
 # the package's own pytest suite after the probe passes (only with
 # `--selftests`; graded against `selftest_status` baseline rows):
+#   mode             — "sdist" (default): run out of the extracted
+#                      `source` tarball; "installed" (RFC 0066 WS5): run
+#                      pytest from a neutral empty cwd against the
+#                      *installed* package (`--pyargs`) — for suites that
+#                      ship inside the wheel and whose sdist cannot be
+#                      tested unbuilt (numpy). `source` is forbidden
+#                      here; the pin lives on the row requirement.
 #   source           — `==`-pinned requirement whose sdist carries the
-#                      test suite
+#                      test suite (sdist mode only)
 #   requirements     — extra test-only deps installed into the same venv
 #   command          — pytest target path inside the extracted sdist
-#                      root; whitespace-split, so it may carry
+#                      root (or `--pyargs <module>` in installed mode);
+#                      whitespace-split, so it may carry
 #                      collection-level flags (`--ignore=…`)
 #   deselect         — array of `pytest --deselect` arguments; every
 #                      entry carries an inline comment naming the
@@ -180,7 +188,9 @@ requirements = "flask"
 probe = "probes/flask_probe.py"
 
 [packages.sqlalchemy]
-requirements = "sqlalchemy"
+# aiosqlite backs the AsyncSession leg (RFC 0066 WS4): the asyncio
+# extension's `greenlet_spawn` rides the bundled native greenlet.
+requirements = "sqlalchemy aiosqlite"
 probe = "probes/sqlalchemy_probe.py"
 
 [packages.httpx]
@@ -211,10 +221,23 @@ probe = "probes/rich_probe.py"
 requirements = "tqdm"
 probe = "probes/tqdm_probe.py"
 
+# Pinned (RFC 0066 WS5): the row doubles as the heavy-native selftest
+# capstone, so the suite under test must be deterministic.
 [packages.numpy]
-requirements = "numpy"
+requirements = "numpy==2.5.2"
 probe = "probes/numpy_probe.py"
 timeout_seconds = 900
+
+# numpy's sdist cannot be tested unbuilt (its C modules only exist
+# post-build, and an extracted source tree in cwd would shadow the
+# installed wheel), hence installed mode. Scope: `numpy._core` — the
+# C-API/ufunc/dtype heart of the suite; the full-suite attempt is
+# recorded in the expectations notes.
+[packages.numpy.selftest]
+mode = "installed"
+requirements = "pytest==8.4.2 hypothesis==6.155.7"
+command = "--pyargs numpy._core"
+timeout_seconds = 2400
 
 [packages.markupsafe]
 requirements = "markupsafe"
@@ -265,6 +288,50 @@ timeout_seconds = 1200
 [packages.fastapi]
 requirements = "fastapi httpx"
 probe = "probes/fastapi_probe.py"
+timeout_seconds = 900
+
+# --- heavy-native stack (RFC 0066 WS3) ---------------------------------------
+
+[packages.scipy]
+requirements = "scipy numpy"
+probe = "probes/scipy_probe.py"
+timeout_seconds = 1200
+
+[packages.pillow]
+requirements = "pillow numpy"
+probe = "probes/pillow_probe.py"
+timeout_seconds = 900
+
+[packages.lxml]
+requirements = "lxml"
+probe = "probes/lxml_probe.py"
+
+# RFC 0066 WS4: the bundled native greenlet. Installs nothing — a pip
+# cp313 greenlet wheel cannot work under WeavePy (its assembly switches
+# CPython's C stack); the probe exercises the bundled `_greenlet` over
+# real stack switching, plus the dist-info visibility contract.
+[packages.greenlet]
+requirements = ""
+probe = "probes/greenlet_probe.py"
+timeout_seconds = 900
+
+# --- stretch rows (RFC 0066 WS6) ----------------------------------------------
+#
+# Landed measured whatever their color (the RFC 0056 stretch
+# discipline): a red row with a precise reason is the next wave's
+# worklist.
+
+[packages.matplotlib]
+requirements = "matplotlib numpy pillow"
+probe = "probes/matplotlib_probe.py"
+timeout_seconds = 1200
+
+# gevent's compiled Cython modules bind the greenlet C-API capsule
+# (`greenlet._C_API` / PyGreenlet_Import) plus their own event-loop
+# extensions; the row measures how far the WS4 native greenlet carries.
+[packages.gevent]
+requirements = "gevent"
+probe = "probes/gevent_probe.py"
 timeout_seconds = 900
 
 # --- source-build proof rows (RFC 0062 WS2) ----------------------------------

@@ -75,11 +75,16 @@ pub struct MethodEntry {
 }
 
 impl MethodEntry {
-    /// Bind this method as a free function (used inside a module
-    /// dict). Type-bound methods get bound separately via the bound-
-    /// method machinery.
-    pub fn bind(&self) -> Object {
-        wrap_c_function(self.name.clone(), self.func, self.flags, None)
+    /// Bind this method as a module-level function: CPython builds
+    /// these with `m_self = module` (`_add_methods_to_object`), and
+    /// stateful extensions read their per-module state straight off
+    /// that self (zope.interface's `implementedBy` does
+    /// `PyModule_GetState(self)->…` unchecked — handing it `None`
+    /// is a segfault). The captured strong `Rc` makes a
+    /// module → dict → builtin → module cycle, which is fine: modules
+    /// are process-immortal (they sit in `sys.modules`).
+    pub fn bind(&self, module: Object) -> Object {
+        wrap_c_function(self.name.clone(), self.func, self.flags, Some(module))
     }
 
     /// Bind this method as an unbound class member: invocations
@@ -542,18 +547,22 @@ pub unsafe extern "C" fn PyModule_Create2(def: *mut PyModuleDef, _api: c_int) ->
         );
         d.insert(DictKey(Object::from_static("__loader__")), Object::None);
         d.insert(DictKey(Object::from_static("__spec__")), Object::None);
-        if !def_ref.m_methods.is_null() {
-            let entries = unsafe { collect_methods(def_ref.m_methods) };
-            for e in entries {
-                d.insert(DictKey(Object::from_str(e.name.clone())), e.bind());
-            }
-        }
     }
     let module = Rc::new(PyModule {
         name,
         filename: None,
         dict,
     });
+    // Methods bind *after* the module exists so each carries the module
+    // as its `m_self` (CPython's `_add_methods_to_object` contract).
+    if !def_ref.m_methods.is_null() {
+        let entries = unsafe { collect_methods(def_ref.m_methods) };
+        let mut d = module.dict.borrow_mut();
+        for e in entries {
+            let bound = e.bind(Object::Module(module.clone()));
+            d.insert(DictKey(Object::from_str(e.name.clone())), bound);
+        }
+    }
     // PEP 3121: a single-phase extension that declares `m_size > 0` (pandas'
     // vendored ujson) allocates per-module state here and writes into it via
     // `PyModule_GetState`. Key the block by the module's native `Rc` identity
@@ -740,7 +749,11 @@ pub unsafe fn run_multiphase_init(
                         p.ty.as_ref()
                             .map(|t| t.name.clone())
                             .unwrap_or_else(|| "?".to_owned());
-                    format!("{ty}: {}", p.value.to_str())
+                    // pybind11's module-init catch-all masks the real
+                    // failure behind ImportError("initialization failed")
+                    // chained via `raise_from` — surface the cause chain,
+                    // it's the only diagnostic the extension left behind.
+                    format!("{ty}: {}{}", p.value.to_str(), cause_chain_suffix(&p.value))
                 })
                 .unwrap_or_else(|| format!("Py_mod_exec slot returned {rc}"));
             if trace {
@@ -764,6 +777,33 @@ pub unsafe fn run_multiphase_init(
         }
     }
     Ok(module)
+}
+
+/// Render an exception's `__cause__`/`__context__` chain as a `"; caused
+/// by …"` suffix for multi-phase-init error strings (depth-capped).
+fn cause_chain_suffix(value: &Object) -> String {
+    let mut out = String::new();
+    let mut cur = value.clone();
+    for _ in 0..8 {
+        let next = match &cur {
+            Object::Instance(inst) => inst
+                .slot_get("__cause__")
+                .filter(|c| !matches!(c, Object::None))
+                .or_else(|| {
+                    inst.slot_get("__context__")
+                        .filter(|c| !matches!(c, Object::None))
+                }),
+            _ => None,
+        };
+        match next {
+            Some(c) => {
+                out.push_str(&format!("; caused by {}: {}", c.type_name(), c.to_str()));
+                cur = c;
+            }
+            None => break,
+        }
+    }
+    out
 }
 
 /// `PyModule_FromDefAndSpec2(def, spec, api_version)` — PEP 489 phase 1
@@ -1026,6 +1066,14 @@ pub unsafe extern "C" fn PyModule_AddType(
     if ty.is_null() {
         return -1;
     }
+    // CPython's `PyModule_AddType` readies the type first
+    // (`Modules/../Objects/moduleobject.c` → `PyType_Ready`). A classic
+    // static type registered *only* through `PyModule_AddType` (e.g.
+    // `_testbuffer.staticarray`) relies on this — without it the type
+    // crosses unbridged and proxies as a non-callable foreign 'object'.
+    if unsafe { crate::types::PyType_Ready(ty) } < 0 {
+        return -1;
+    }
     // The type pointer is itself the PyObject we want to install
     // (PyTypeObject extends PyObject).
     let name_ptr = unsafe { (*ty).tp_name };
@@ -1063,7 +1111,8 @@ pub unsafe extern "C" fn PyModule_AddFunctions(m: *mut PyObject, defs: *mut PyMe
     let entries = unsafe { collect_methods(defs) };
     let mut d = module.dict.borrow_mut();
     for e in entries {
-        d.insert(DictKey(Object::from_str(e.name.clone())), e.bind());
+        let bound = e.bind(Object::Module(module.clone()));
+        d.insert(DictKey(Object::from_str(e.name.clone())), bound);
     }
     0
 }
@@ -1286,6 +1335,47 @@ pub unsafe extern "C" fn PyDescr_NewClassMethod(
     crate::object::into_owned(Object::ClassMethod(MethodWrapper::new(callable)))
 }
 
+/// Sidecar for [`PyCFunction_NewEx`]-minted builtins (RFC 0066 WS3): the
+/// caller's real `PyMethodDef*` and the bound `self`, keyed by the
+/// `Rc<BuiltinFn>` data pointer. `BuiltinFn` captures `self` only inside
+/// its call closures, so the faithful `PyCFunctionObject` mirror body
+/// cannot recover it from the VM object alone — yet stock extensions
+/// read both fields straight off the struct: pybind11's
+/// `initialize_generic` does `PyCFunction_GET_SELF(sibling)` (the
+/// capsule holding its `function_record` chain) on every overload def,
+/// and fails module init outright on NULL. Each entry pins a clone of
+/// the builtin so the key `Rc` can never be dropped and its address
+/// reused.
+struct CFuncExtra {
+    /// Keeps the keyed `Rc<BuiltinFn>` alive for the life of the entry.
+    _pinned: Object,
+    /// The `self` passed to `PyCFunction_NewEx` (`None` for C NULL).
+    self_obj: Option<Object>,
+    /// The caller's `PyMethodDef*` (owned by the extension, stable).
+    ml: usize,
+}
+
+thread_local! {
+    static CFUNC_EXTRAS: std::cell::RefCell<std::collections::HashMap<usize, CFuncExtra>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn cfunc_extra_key(callable: &Object) -> Option<usize> {
+    match callable {
+        Object::Builtin(rc) => Some(Rc::as_ptr(rc) as *const () as usize),
+        _ => None,
+    }
+}
+
+/// Look up the faithful-struct extras for a builtin crossing into C:
+/// `(self, PyMethodDef*)`. Consulted by the mirror's `fill_body` every
+/// time a `PyCFunctionObject` body is minted, so the fields survive any
+/// number of VM round-trips (each crossing mints a fresh mirror).
+pub(crate) fn cfunction_extra(obj: &Object) -> Option<(Option<Object>, usize)> {
+    let key = cfunc_extra_key(obj)?;
+    CFUNC_EXTRAS.with(|t| t.borrow().get(&key).map(|e| (e.self_obj.clone(), e.ml)))
+}
+
 /// `PyCFunction_NewEx(ml, self, module)` — build a builtin function/method
 /// object from a single `PyMethodDef`, binding `self` (NULL → unbound). The
 /// `module` owner is informational under WeavePy's model. Used by
@@ -1314,7 +1404,19 @@ pub unsafe extern "C" fn PyCFunction_NewEx(
     } else {
         Some(unsafe { crate::object::clone_object(self_) })
     };
-    let callable = wrap_c_function(name, entry.ml_meth, entry.ml_flags, self_obj);
+    let callable = wrap_c_function(name, entry.ml_meth, entry.ml_flags, self_obj.clone());
+    if let Some(key) = cfunc_extra_key(&callable) {
+        CFUNC_EXTRAS.with(|t| {
+            t.borrow_mut().insert(
+                key,
+                CFuncExtra {
+                    _pinned: callable.clone(),
+                    self_obj,
+                    ml: ml as usize,
+                },
+            );
+        });
+    }
     crate::object::into_owned(callable)
 }
 

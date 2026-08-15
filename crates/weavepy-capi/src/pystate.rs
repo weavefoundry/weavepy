@@ -38,6 +38,7 @@ const OFF_INTERP: usize = 16; // PyInterpreterState *interp
 const OFF_C_RECURSION_REMAINING: usize = 52; // int c_recursion_remaining
 const OFF_CURRENT_EXCEPTION: usize = 112; // PyObject *current_exception
 const OFF_EXC_INFO: usize = 120; // _PyErr_StackItem *exc_info
+const OFF_GILSTATE_COUNTER: usize = 136; // int gilstate_counter
 const OFF_DELETE_LATER: usize = 168; // PyObject *delete_later
 
 /// Initial `c_recursion_remaining`. mypyc's `Py_TRASHCAN_BEGIN` expansion
@@ -100,6 +101,25 @@ fn store_ptr() -> *mut TStateStore {
                     body.add(OFF_C_RECURSION_REMAINING) as *mut i32,
                     C_RECURSION_BUDGET,
                 );
+                // RFC 0066 WS3: `tstate->interp` must be the same live
+                // handle `PyInterpreterState_Get`/`_Main` return. pybind11's
+                // `get_python_state_dict` reads it *directly*
+                // (`PyThreadState_GetUnchecked()->interp`) to reach
+                // `PyInterpreterState_GetDict`; a zeroed slot made internals
+                // bootstrap fail and crash scipy's `_highspy._core` init.
+                ptr::write_unaligned(
+                    body.add(OFF_INTERP) as *mut *mut c_void,
+                    crate::abi313::PyInterpreterState_Get(),
+                );
+                // RFC 0066 WS3: a thread bound to its state starts at
+                // `gilstate_counter == 1` (CPython's
+                // `_PyGILState_NoteThreadState`). pybind11's
+                // `gil_scoped_acquire` inc/decs the field *directly*, and
+                // treats a decrement that reaches 0 as "this guard created
+                // the thread state and must delete it" — from a zeroed
+                // slot, the very first guard pair aborted with
+                // "scoped_acquire::dec_ref(): internal error!".
+                ptr::write_unaligned(body.add(OFF_GILSTATE_COUNTER) as *mut c_int, 1);
             }
         }
         store
@@ -146,6 +166,193 @@ pub fn delete_later_slot() -> *mut *mut PyObject {
 pub unsafe extern "C" fn PyThreadState_GetUnchecked() -> *mut PyThreadState {
     crate::interp::ensure_initialised();
     current_threadstate()
+}
+
+/// `PyThreadState_New(interp)` — hand back the calling thread's faithful
+/// per-thread body (RFC 0066 WS3). CPython mints a fresh tstate bound to
+/// the interpreter; WeavePy's per-thread store *is* that state, and the
+/// callers (pybind11's `gil_scoped_acquire` bootstrap for threads it
+/// created itself) only pair it with `PyThreadState_DeleteCurrent`.
+#[no_mangle]
+pub unsafe extern "C" fn PyThreadState_New(_interp: *mut c_void) -> *mut PyThreadState {
+    crate::interp::ensure_initialised();
+    current_threadstate()
+}
+
+/// `PyThreadState_DeleteCurrent()` — the per-thread body is a
+/// thread-local reclaimed with the OS thread; explicit deletion is a
+/// sound no-op.
+#[no_mangle]
+pub unsafe extern "C" fn PyThreadState_DeleteCurrent() {}
+
+// ---------------------------------------------------------------------------
+// PyThread_tss_* — CPython's TSS (thread-specific storage) API
+// (RFC 0066 WS3). pybind11's `internals` constructor creates a TSS key
+// through `PYBIND11_TLS_KEY_CREATE` (= `PyThread_tss_create`) and every
+// `gil_scoped_acquire` reads it back. The extension links with
+// `-undefined dynamic_lookup`, so a missing symbol binds to NULL
+// *silently* and the first call jumps to address zero — the exact crash
+// scipy's `_highspy._core` init hit. Faithful shape: CPython's
+// `Py_tss_t` is `{ int _is_initialized; pthread_key_t _key; }` on POSIX
+// (`thread_pthread.h`) and `{ int _is_initialized; DWORD _key; }` on
+// Windows (`thread_nt.h`, keys from `TlsAlloc`).
+// ---------------------------------------------------------------------------
+
+/// The native key half of CPython's `Py_tss_t`.
+#[cfg(windows)]
+type NativeTssKey = u32; // DWORD from TlsAlloc
+#[cfg(not(windows))]
+type NativeTssKey = libc::pthread_key_t;
+
+/// CPython's `Py_tss_t` (platform layout, see module comment).
+#[repr(C)]
+pub struct PyTssT {
+    is_initialized: c_int,
+    key: NativeTssKey,
+}
+
+#[cfg(windows)]
+mod win_tls {
+    pub const TLS_OUT_OF_INDEXES: u32 = 0xFFFF_FFFF;
+    #[link(name = "kernel32")]
+    extern "system" {
+        pub fn TlsAlloc() -> u32;
+        pub fn TlsFree(dw_tls_index: u32) -> i32;
+        pub fn TlsSetValue(dw_tls_index: u32, lp_tls_value: *mut core::ffi::c_void) -> i32;
+        pub fn TlsGetValue(dw_tls_index: u32) -> *mut core::ffi::c_void;
+    }
+}
+
+fn native_tss_create(key: &mut NativeTssKey) -> bool {
+    #[cfg(windows)]
+    {
+        let k = unsafe { win_tls::TlsAlloc() };
+        if k == win_tls::TLS_OUT_OF_INDEXES {
+            return false;
+        }
+        *key = k;
+        true
+    }
+    #[cfg(not(windows))]
+    {
+        unsafe { libc::pthread_key_create(key, None) == 0 }
+    }
+}
+
+fn native_tss_delete(key: NativeTssKey) {
+    #[cfg(windows)]
+    unsafe {
+        win_tls::TlsFree(key);
+    }
+    #[cfg(not(windows))]
+    unsafe {
+        libc::pthread_key_delete(key);
+    }
+}
+
+fn native_tss_set(key: NativeTssKey, value: *mut c_void) -> bool {
+    #[cfg(windows)]
+    {
+        unsafe { win_tls::TlsSetValue(key, value) != 0 }
+    }
+    #[cfg(not(windows))]
+    {
+        unsafe { libc::pthread_setspecific(key, value) == 0 }
+    }
+}
+
+fn native_tss_get(key: NativeTssKey) -> *mut c_void {
+    #[cfg(windows)]
+    {
+        unsafe { win_tls::TlsGetValue(key) }
+    }
+    #[cfg(not(windows))]
+    {
+        unsafe { libc::pthread_getspecific(key) as *mut c_void }
+    }
+}
+
+/// `PyThread_tss_create(key)` — 0 on success. Idempotent on an
+/// already-created key, per CPython.
+#[no_mangle]
+pub unsafe extern "C" fn PyThread_tss_create(key: *mut PyTssT) -> c_int {
+    if key.is_null() {
+        return -1;
+    }
+    unsafe {
+        if (*key).is_initialized != 0 {
+            return 0;
+        }
+        if !native_tss_create(&mut (*key).key) {
+            return -1;
+        }
+        (*key).is_initialized = 1;
+    }
+    0
+}
+
+/// `PyThread_tss_delete(key)` — no-op on a never-created key, per CPython.
+#[no_mangle]
+pub unsafe extern "C" fn PyThread_tss_delete(key: *mut PyTssT) {
+    if key.is_null() {
+        return;
+    }
+    unsafe {
+        if (*key).is_initialized != 0 {
+            native_tss_delete((*key).key);
+            (*key).is_initialized = 0;
+            (*key).key = 0;
+        }
+    }
+}
+
+/// `PyThread_tss_set(key, value)` — 0 on success.
+#[no_mangle]
+pub unsafe extern "C" fn PyThread_tss_set(key: *mut PyTssT, value: *mut c_void) -> c_int {
+    if key.is_null() || unsafe { (*key).is_initialized } == 0 {
+        return -1;
+    }
+    if !native_tss_set(unsafe { (*key).key }, value) {
+        return -1;
+    }
+    0
+}
+
+/// `PyThread_tss_get(key)` — NULL when unset or the key was never created.
+#[no_mangle]
+pub unsafe extern "C" fn PyThread_tss_get(key: *mut PyTssT) -> *mut c_void {
+    if key.is_null() || unsafe { (*key).is_initialized } == 0 {
+        return ptr::null_mut();
+    }
+    native_tss_get(unsafe { (*key).key })
+}
+
+/// `PyThread_tss_is_created(key)`.
+#[no_mangle]
+pub unsafe extern "C" fn PyThread_tss_is_created(key: *mut PyTssT) -> c_int {
+    if key.is_null() {
+        return 0;
+    }
+    (unsafe { (*key).is_initialized } != 0) as c_int
+}
+
+/// `PyThread_tss_alloc()` — a zeroed (not-created) key, freed with
+/// [`PyThread_tss_free`].
+#[no_mangle]
+pub unsafe extern "C" fn PyThread_tss_alloc() -> *mut PyTssT {
+    unsafe { libc::calloc(1, std::mem::size_of::<PyTssT>()) as *mut PyTssT }
+}
+
+/// `PyThread_tss_free(key)` — delete then release.
+#[no_mangle]
+pub unsafe extern "C" fn PyThread_tss_free(key: *mut PyTssT) {
+    if key.is_null() {
+        return;
+    }
+    unsafe {
+        PyThread_tss_delete(key);
+        libc::free(key as *mut c_void);
+    }
 }
 
 /// `PyInterpreterState_GetID(interp)` — WeavePy is single-interpreter, so

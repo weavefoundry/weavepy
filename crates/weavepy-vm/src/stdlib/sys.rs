@@ -1552,6 +1552,14 @@ pub(crate) fn sizeof_estimate(o: &Object) -> i64 {
         Object::FrozenSet(s) => 216 + (s.len() as i64) * 16,
         // CPython: `sys.getsizeof(cell)` is 40 on 64-bit builds.
         Object::Cell(_) => 40,
+        // CPython `memoryobject.c`: sizeof(PyMemoryViewObject) embeds one
+        // shape/strides/suboffsets triple, plus one more per extra
+        // dimension (test_buffer.test_memoryview_sizeof pins the layout).
+        Object::MemoryView(mv) => {
+            let ptr = std::mem::size_of::<usize>() as i64;
+            let ndim = mv.shape_dims().len().max(1) as i64;
+            18 * ptr + 3 * ptr * ndim
+        }
         _ => 16,
     }
 }

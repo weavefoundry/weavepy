@@ -72,6 +72,10 @@ crossbeam-utils       = { workspace = true }
 # RFC 0032 — tier-2 Cranelift JIT, behind the (default-off) `jit` feature.
 weavepy-jit           = { workspace = true, optional = true }
 stacker = "0.1.24"
+# RFC 0066 WS4: dedicated native stacks for greenlets (aarch64/x86_64
+# switching with guard pages — the same contract as upstream greenlet's
+# platform switch files, already audited in the wasmtime ecosystem).
+corosensei = "0.3"
 
 # RFC 0063 — the Windows wave: Win32 bindings for the NT-native
 # stdlib core. Only present in Windows builds.
