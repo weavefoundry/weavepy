@@ -417,11 +417,7 @@ impl JitState {
 
     /// Resolve one burned-in callee to its native entry, when its code
     /// is compiled and shape-eligible for a direct native call.
-    fn resolve_native_callee(
-        &self,
-        obj: &Object,
-        fcode: &Rc<CodeObject>,
-    ) -> Option<NativeCallee> {
+    fn resolve_native_callee(&self, obj: &Object, fcode: &Rc<CodeObject>) -> Option<NativeCallee> {
         let Object::Function(pf) = obj else {
             return None;
         };
@@ -521,12 +517,7 @@ fn native_callable(cf: &CompiledFrame, code: &CodeObject) -> bool {
     if !cf.livein.iter().all(|&s| (s as usize) < argc) {
         return false;
     }
-    if cf
-        .local_types
-        .iter()
-        .flatten()
-        .any(|t| !scalar_lane_ty(*t))
-    {
+    if cf.local_types.iter().flatten().any(|t| !scalar_lane_ty(*t)) {
         return false;
     }
     code.cellvars.is_empty() && code.freevars.is_empty()
@@ -1089,8 +1080,8 @@ unsafe fn try_native_call(
     // self-call (same snapshot, same namespaces) is covered by the
     // caller's own discipline — validated at entry, revalidated after
     // every dirty call, and only native code ran since.
-    let same_ns = StdRc::ptr_eq(&nc.snap, &ctx.guard_snapshot)
-        && Rc::ptr_eq(&nc.func.globals, &ctx.globals);
+    let same_ns =
+        StdRc::ptr_eq(&nc.snap, &ctx.guard_snapshot) && Rc::ptr_eq(&nc.func.globals, &ctx.globals);
     if !same_ns
         && !guards_hold(
             interp,
@@ -1343,14 +1334,7 @@ fn finish_deopted_callee(
         shell_cache: None,
     };
     rebuild_stack(
-        interp,
-        &mut frame,
-        &entry,
-        locals_buf,
-        spill,
-        tags,
-        njf,
-        &nctx.pins,
+        interp, &mut frame, &entry, locals_buf, spill, tags, njf, &nctx.pins,
     );
     if raised.is_some() {
         // As though the raising CALL just executed: pc points past it

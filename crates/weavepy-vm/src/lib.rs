@@ -42908,7 +42908,10 @@ mod tests {
                    while k < 10:\n    r = fib(12)\n    k = k + 1\n\
                    print(r)\n";
         let (out, calls, _fallbacks, deopts) = run_jit_native(src);
-        assert!(calls >= 1, "self-recursive fib never took the native call path");
+        assert!(
+            calls >= 1,
+            "self-recursive fib never took the native call path"
+        );
         assert_eq!(deopts, 0, "clean fib should not deopt a native callee");
         assert_eq!(out, "144\n");
         assert_eq!(out, run(src));
