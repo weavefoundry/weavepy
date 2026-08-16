@@ -290,6 +290,44 @@ pub(crate) fn list_append_helper_addr() -> usize {
     LIST_APPEND_HELPER.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// RFC 0067 WS2 — the embedder's eval-breaker poll. Called from loop
+/// headers every `JIT_POLL_STRIDE` iterations: the embedder performs
+/// its cooperative GIL hand-off inline (no interpreter state needed)
+/// and returns non-zero iff pending work *requires* the interpreter
+/// (signals, parked finalizers, async exceptions, finalization,
+/// observer installation) — the caller then takes the standard deopt
+/// exit at the loop-header pc so the interpreter's prologue handles
+/// the work with full fidelity.
+///
+/// # Safety contract (for implementors)
+///
+/// Same as [`ListGetHelper`]: `frame` is the live buffer of the
+/// current native activation. The helper may block (GIL hand-off) but
+/// must not run Python code and must not unwind across the FFI
+/// boundary.
+pub type PollHelper = unsafe extern "C" fn(frame: *mut JitFrame) -> i64;
+
+/// How many loop iterations run between two `PollHelper` calls. A
+/// tight native loop covers a stride in single-digit microseconds —
+/// far inside the 5 ms GIL switch interval — and the quiet-path cost
+/// is one register decrement + predictable branch per iteration.
+pub const JIT_POLL_STRIDE: i64 = 1024;
+
+static POLL_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide eval-breaker poll helper (RFC 0067 WS2).
+/// Should precede the first compile; frames compiled while it is
+/// unregistered (e.g. this crate's standalone unit tests) simply emit
+/// no polls — a liveness property, never a correctness one.
+pub fn register_poll_helper(poll: PollHelper) {
+    POLL_HELPER.store(poll as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn poll_helper_addr() -> usize {
+    POLL_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// RFC 0065 WS5 — the embedder's pinned-instance attribute *read*
 /// helper. `pin` indexes the pinned-object table; `site` indexes the
 /// compiled frame's attribute-site table (name, class fingerprint,

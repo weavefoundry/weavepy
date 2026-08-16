@@ -35,10 +35,11 @@ pub struct RunOpts {
     pub warmup: bool,
     /// Whether to also time the host CPython for comparison.
     pub include_cpython: bool,
-    /// Also collect a WeavePy column with `WEAVEPY_JIT=1`. Requires
-    /// the `weavepy` binary to have been built with the `jit`
-    /// feature; without it the column just repeats the interpreter.
-    pub include_jit: bool,
+    /// Also collect a WeavePy column with `WEAVEPY_JIT=0` (RFC 0067
+    /// WS4). The default binary ships with the tier-2 JIT on, so the
+    /// gated `weavepy` column measures the JIT; this extra column
+    /// keeps interpreter-only progress a measured, reported number.
+    pub include_interp: bool,
     /// Explicit path to the host Python. When `None`, `python3.13`
     /// is preferred and `python3` is the fallback.
     pub python_path: Option<String>,
@@ -55,7 +56,7 @@ impl Default for RunOpts {
             samples: 5,
             warmup: true,
             include_cpython: true,
-            include_jit: false,
+            include_interp: false,
             python_path: None,
             weavepy_path: None,
         }
@@ -119,12 +120,12 @@ pub fn run_one(
     python: Option<&str>,
 ) -> io::Result<Row> {
     let weavepy_samples = collect_samples(weavepy.as_os_str(), fix, opts, &[])?;
-    let jit = if opts.include_jit {
+    let interp = if opts.include_interp {
         Some(runset(&collect_samples(
             weavepy.as_os_str(),
             fix,
             opts,
-            &[("WEAVEPY_JIT", "1")],
+            &[("WEAVEPY_JIT", "0")],
         )?))
     } else {
         None
@@ -143,7 +144,7 @@ pub fn run_one(
         fix.work,
         runset(&weavepy_samples),
         cpython,
-        jit,
+        interp,
     ))
 }
 
@@ -202,7 +203,13 @@ fn time_subprocess(
 ) -> io::Result<Sample> {
     let mut cmd = Command::new(interp);
     cmd.arg(&fix.path)
-        .env("WEAVEPY_BENCH_WORK", fix.work.to_string());
+        .env("WEAVEPY_BENCH_WORK", fix.work.to_string())
+        // The default column must measure the shipped configuration:
+        // an exported `WEAVEPY_JIT=0` (or a stats run's
+        // `WEAVEPY_VM_STATS=1`) in the invoking shell would silently
+        // skew it. The interp column re-adds its override below.
+        .env_remove("WEAVEPY_JIT")
+        .env_remove("WEAVEPY_VM_STATS");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }

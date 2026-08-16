@@ -24,7 +24,9 @@ weavepy-cli = { workspace = true }
 libc        = { workspace = true }
 
 [features]
-default = []
+# RFC 0067 WS3 — the runtime DLL ships with the tier-2 JIT on by
+# default, mirroring the CLI.
+default = ["jit"]
 # Mirror of the CLI's `jit` feature so a JIT-enabled distribution can
 # build a JIT-enabled DLL.
 jit = ["weavepy-cli/jit"]

@@ -62,10 +62,10 @@ cargo xbench run --update-baseline
 # Point at explicit interpreters.
 cargo xbench run --weavepy=target/release/weavepy --python=python3.13
 
-# Add a WEAVEPY_JIT=1 column (reported, never gated). The binary must
-# be built with the tier-2 JIT compiled in:
-cargo build --release -p weavepy-cli --features weavepy-cli/jit
-cargo xbench run --jit
+# Add a WEAVEPY_JIT=0 interpreter-only column (reported, never gated).
+# The default binary ships with the tier-2 JIT on (RFC 0067), so the
+# gated WeavePy column already measures the JIT:
+cargo xbench run --interp
 
 # Print the report as JSON instead of markdown.
 cargo xbench run --json

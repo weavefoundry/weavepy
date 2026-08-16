@@ -68,6 +68,13 @@ struct Lowerer<'a, 'b> {
     /// Imported signature shared by the `wpjit_list_len`/`_append`
     /// helpers — `(frame, pin) -> i64` (RFC 0065 WS5, lazy).
     pin_sig: Option<SigRef>,
+    /// RFC 0067 WS2 — imported `(frame) -> i64` signature of the
+    /// eval-breaker poll helper (lazy).
+    poll_sig: Option<SigRef>,
+    /// RFC 0067 WS2 — the per-activation poll countdown register.
+    /// `Some` only when the embedder registered a poll helper and the
+    /// function has loop headers to instrument.
+    poll_countdown: Option<Variable>,
     /// The abstract operand stack: SSA value + lane.
     vstack: Vec<(Value, JitType)>,
 }
@@ -91,6 +98,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             call_sig: None,
             list_sig: None,
             pin_sig: None,
+            poll_sig: None,
+            poll_countdown: None,
             vstack: Vec::new(),
         }
     }
@@ -149,6 +158,20 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .map(|_| self.b.create_block())
             .collect();
 
+        // RFC 0067 WS2 — the poll countdown. Seeded once per
+        // activation; every loop-header visit decrements it and calls
+        // the embedder's poll helper on expiry (GIL hand-off inline,
+        // deopt at the header only for interpreter-required work).
+        // Skipped entirely when the embedder registered no helper
+        // (this crate's standalone unit tests) or the function has no
+        // loops to instrument.
+        if runtime::poll_helper_addr() != 0 && !self.tfunc.osr_entries.is_empty() {
+            let var = self.b.declare_var(types::I64);
+            let seed = self.b.ins().iconst(types::I64, runtime::JIT_POLL_STRIDE);
+            self.b.def_var(var, seed);
+            self.poll_countdown = Some(var);
+        }
+
         // Declare + initialise a variable per managed local.
         self.vars = vec![None; self.tfunc.n_locals as usize];
         for slot in 0..self.tfunc.local_types.len() {
@@ -197,6 +220,22 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     }
 
     fn emit_block(&mut self, bi: usize) {
+        // RFC 0067 WS2 — instrument loop headers with the eval-breaker
+        // poll. Headers are exactly the OSR-enterable blocks (backward-
+        // jump targets with an empty boundary stack), so a pending-work
+        // deopt here resumes the interpreter in a state the existing
+        // spill/rebuild machinery already describes.
+        if let Some(cd_var) = self.poll_countdown {
+            if let Some(header_pc) = self
+                .tfunc
+                .osr_entries
+                .iter()
+                .find(|e| e.block == bi)
+                .map(|e| e.pc)
+            {
+                self.emit_poll(cd_var, header_pc);
+            }
+        }
         let block = self.tfunc.blocks[bi].clone();
         for stmt in &block.stmts {
             self.emit_stmt(*stmt);
@@ -466,6 +505,55 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let bad = self.b.ins().icmp_imm(IntCC::NotEqual, status, 0);
         let cont = self.guard(bad, pc, &snapshot);
         self.b.switch_to_block(cont);
+    }
+
+    /// RFC 0067 WS2 — the loop-header poll: decrement the countdown;
+    /// on expiry call the embedder's poll helper (which performs the
+    /// GIL hand-off inline), reset the countdown, and take the
+    /// standard deopt exit at the header pc iff the helper reports
+    /// interpreter-required pending work. The boundary stack is empty
+    /// at every header, so the deopt snapshot is empty and the
+    /// embedder's range-loop metadata rebuilds any live iterators.
+    fn emit_poll(&mut self, cd_var: Variable, header_pc: u32) {
+        let cd = self.b.use_var(cd_var);
+        let next = self.b.ins().iadd_imm(cd, -1);
+        self.b.def_var(cd_var, next);
+        let poll_b = self.b.create_block();
+        let cont_b = self.b.create_block();
+        let expired = self.b.ins().icmp_imm(IntCC::Equal, next, 0);
+        self.b.ins().brif(expired, poll_b, &[], cont_b, &[]);
+
+        self.b.switch_to_block(poll_b);
+        let seed = self.b.ins().iconst(types::I64, runtime::JIT_POLL_STRIDE);
+        self.b.def_var(cd_var, seed);
+        let sig = self.poll_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::poll_helper_addr() as i64);
+        let call = self.b.ins().call_indirect(sig, helper, &[self.frame_ptr]);
+        let pending = self.b.inst_results(call)[0];
+        let exit_b = self.b.create_block();
+        let has_work = self.b.ins().icmp_imm(IntCC::NotEqual, pending, 0);
+        self.b.ins().brif(has_work, exit_b, &[], cont_b, &[]);
+        self.b.switch_to_block(exit_b);
+        self.emit_exit(header_pc, &[], JitStatus::Deopt);
+
+        self.b.switch_to_block(cont_b);
+    }
+
+    /// The imported `(frame) -> i64` signature of the eval-breaker
+    /// poll helper (RFC 0067 WS2, lazy).
+    fn poll_helper_sig(&mut self) -> SigRef {
+        if let Some(sig) = self.poll_sig {
+            return sig;
+        }
+        let mut sig = Signature::new(self.b.func.signature.call_conv);
+        sig.params.push(AbiParam::new(self.ptr_ty)); // frame
+        sig.returns.push(AbiParam::new(types::I64)); // pending?
+        let r = self.b.import_signature(sig);
+        self.poll_sig = Some(r);
+        r
     }
 
     /// The shared `(frame, pin) -> i64` signature of the pinned-list

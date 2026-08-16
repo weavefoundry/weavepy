@@ -21,7 +21,8 @@ weavepy-vm       = { workspace = true }
 thiserror        = { workspace = true }
 
 [features]
-default = []
+# RFC 0067 WS3 — the tier-2 JIT ships in the default build.
+default = ["jit"]
 # RFC 0032 — forward the tier-2 JIT feature down to the VM.
 jit = ["weavepy-vm/jit"]
 

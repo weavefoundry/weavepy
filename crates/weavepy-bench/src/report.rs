@@ -52,9 +52,14 @@ pub struct Row {
     pub weavepy: RunSet,
     #[serde(default)]
     pub cpython: Option<RunSet>,
-    /// Optional `WEAVEPY_JIT=1` column (reported, never gated).
+    /// Optional `WEAVEPY_JIT=0` column (RFC 0067 WS4; reported,
+    /// never gated). The gated `weavepy` column measures the default
+    /// binary — which ships with the tier-2 JIT — so this column is
+    /// how interpreter-only progress stays a measured number.
+    /// (Pre-v5 baselines carried a `jit` column instead; v5
+    /// re-recorded them, so old files simply lack this field.)
     #[serde(default)]
-    pub jit: Option<RunSet>,
+    pub interp: Option<RunSet>,
     /// `weavepy.median_ns / cpython.median_ns`.
     #[serde(default)]
     pub ratio: Option<f64>,
@@ -70,7 +75,7 @@ impl Row {
         work: u32,
         weavepy: RunSet,
         cpython: Option<RunSet>,
-        jit: Option<RunSet>,
+        interp: Option<RunSet>,
     ) -> Self {
         let ratio = cpython
             .as_ref()
@@ -88,7 +93,7 @@ impl Row {
             work,
             weavepy,
             cpython,
-            jit,
+            interp,
             ratio,
             memory_ratio,
         }
@@ -128,10 +133,13 @@ impl Report {
             // v3 (RFC 0059 WS5b): rows carry `max_rss_bytes` +
             // `memory_ratio`. v4 (RFC 0062 WS3): top level carries
             // `platform` and baselines are per-platform files.
+            // v5 (RFC 0067 WS4): `weavepy` measures the default
+            // binary (JIT on); the optional extra column is `interp`
+            // (`WEAVEPY_JIT=0`), replacing v4's `jit` column.
             // Older files still deserialize (new fields are `Option`
             // with serde defaults) but `gate` refuses baselines
             // without a platform stamp — see [`Self::check_platform`].
-            version: 4,
+            version: 5,
             host: hostname_or_unknown(),
             created_at: now_rfc3339(),
             platform: Some(crate::fixtures::platform_key()),
@@ -167,7 +175,7 @@ impl Report {
     /// without `--json`.
     pub fn to_markdown(&self) -> String {
         use std::fmt::Write;
-        let has_jit = self.rows.iter().any(|r| r.jit.is_some());
+        let has_interp = self.rows.iter().any(|r| r.interp.is_some());
         let mut out = String::new();
         let _ = writeln!(
             out,
@@ -181,10 +189,10 @@ impl Report {
         } else {
             ("", "")
         };
-        if has_jit {
+        if has_interp {
             let _ = writeln!(
                 out,
-                "| fixture | work | WeavePy | WeavePy+JIT | CPython | ×CPython (lower is better) |{rss_head}"
+                "| fixture | work | WeavePy | WeavePy (interp) | CPython | ×CPython (lower is better) |{rss_head}"
             );
             let _ = writeln!(out, "|---|---|---|---|---|---|{rss_bars}");
         } else {
@@ -217,15 +225,15 @@ impl Report {
             } else {
                 String::new()
             };
-            if has_jit {
-                let jit = match &r.jit {
+            if has_interp {
+                let interp = match &r.interp {
                     Some(j) => format_ns(j.median_ns),
                     None => "-".to_owned(),
                 };
                 let _ = writeln!(
                     out,
                     "| {} | {} | {} | {} | {} | {} |{rss_cells}",
-                    r.name, r.work, wp, jit, cp, ratio
+                    r.name, r.work, wp, interp, cp, ratio
                 );
             } else {
                 let _ = writeln!(
@@ -426,7 +434,7 @@ mod tests {
             report.platform.as_deref(),
             Some(crate::fixtures::platform_key().as_str())
         );
-        assert_eq!(report.version, 4);
+        assert_eq!(report.version, 5);
     }
 
     #[test]

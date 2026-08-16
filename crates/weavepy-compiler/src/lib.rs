@@ -143,6 +143,52 @@ impl std::fmt::Debug for VmExt {
     }
 }
 
+/// RFC 0067 — a "the tier-2 JIT measured this code as not jitable"
+/// hint, denormalized onto the code object so the per-activation
+/// tier-up probe for never-compilable code (kwargs / defaults /
+/// generator shapes — the bulk of call-heavy workloads) is one
+/// relaxed atomic load instead of a thread-local borrow plus a
+/// pointer-keyed hash lookup on every call. Purely an optimization
+/// gate: unset means "ask the tier cache", set means "skip tier-up".
+/// The flag is monotonic (unset → set only). Like [`VmExt`], it does
+/// not follow clones (a `replace()`d code object may change shape),
+/// never participates in equality, and is not serialized.
+#[derive(Default)]
+pub struct JitHint(std::sync::atomic::AtomicBool);
+
+impl JitHint {
+    #[must_use]
+    pub fn is_not_jitable(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn mark_not_jitable(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Clone for JitHint {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for JitHint {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for JitHint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.is_not_jitable() {
+            "JitHint(not-jitable)"
+        } else {
+            "JitHint(unset)"
+        })
+    }
+}
+
 /// A compiled Python code object. Mirrors the subset of
 /// `PyCodeObject` we need to emulate.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -164,6 +210,8 @@ pub struct CodeObject {
     pub caches: CacheTable,
     /// RFC 0061 (WS2a): VM-owned derived state (see [`VmExt`]).
     pub vm_ext: VmExt,
+    /// RFC 0067: tier-2 "not jitable" fast-out hint (see [`JitHint`]).
+    pub jit_hint: JitHint,
     pub constants: Vec<Constant>,
     /// Names referenced by `LOAD_NAME` / `LOAD_GLOBAL` / `STORE_NAME` etc.
     pub names: Vec<String>,

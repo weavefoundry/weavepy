@@ -3292,6 +3292,17 @@ impl Interpreter {
         if crate::vm_singletons::has_pending_resource_warnings() {
             self.drain_pending_resource_warnings();
         }
+        // RFC 0067 — the `WEAVEPY_VM_STATS=1` shutdown print: dispatch/
+        // specialization counters plus the tier-2 JIT block (native
+        // entries, deopts, and the WS1 call-path counters). Emitted
+        // here because the stats are thread-local to the VM thread.
+        if std::env::var_os("WEAVEPY_VM_STATS").is_some() {
+            let snap = crate::specialize::snapshot();
+            eprint!("{}", crate::specialize::format_stats_markdown(&snap));
+            if let Some(md) = jit_stats_markdown() {
+                eprint!("{md}");
+            }
+        }
     }
 
     /// Call `obj.__del__()` if present, routing any raised exception
@@ -4049,6 +4060,46 @@ impl Interpreter {
                 ))
             }
         }
+    }
+
+    /// RFC 0067 WS1 — finish a materialized JIT-callee frame in the
+    /// interpreter. `frame` is positioned at its deopt state (locals
+    /// written back, operand stack rebuilt, `pc` set); the entry
+    /// `'call'` event is suppressed because the frame is a
+    /// continuation, not a fresh activation. A parked exception (a
+    /// native `Raised` exit) runs the frame's exception machinery
+    /// first, exactly as the dispatch site does for a top-level native
+    /// frame: a handler positions `pc` and execution resumes below; no
+    /// handler propagates with this frame's traceback entry appended
+    /// by `handle_exception`.
+    #[cfg(feature = "jit")]
+    fn run_deopted_frame(
+        &mut self,
+        frame: &mut Frame,
+        raised: Option<RuntimeError>,
+    ) -> Result<Object, RuntimeError> {
+        if let Some(err) = raised {
+            let exc = match err {
+                RuntimeError::PyException(exc) => exc,
+                other => return Err(other),
+            };
+            let shell = self.push_frame_shell(frame);
+            let handled = self.handle_exception(frame, exc);
+            self.pop_frame_shell();
+            self.recycle_frame_shell(shell);
+            match handled {
+                Ok(Some(())) => {}
+                Ok(None) => {
+                    return Err(RuntimeError::Internal(
+                        "handle_exception returned no disposition for a JIT-raised frame"
+                            .to_owned(),
+                    ))
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        frame.suppress_call_event = true;
+        self.run_frame(frame)
     }
 
     /// Run the frame until it yields, returns, or starts a generator.
@@ -42824,6 +42875,170 @@ mod tests {
         );
         assert_eq!(out, "10\n");
         assert_eq!(out, run(src));
+    }
+
+    // RFC 0067 WS1/WS2 — native-to-native calls and the eval-breaker
+    // poll.
+
+    /// Like [`run_jit`], but returns the native-call fast-path
+    /// counters instead: `(stdout, native_calls, fallbacks,
+    /// native_deopts)`.
+    #[cfg(feature = "jit")]
+    fn run_jit_native(src: &str) -> (String, u64, u64, u64) {
+        let src = src.to_owned();
+        std::thread::spawn(move || {
+            crate::tier2::force_enable_for_test(2);
+            let out = run(&src);
+            let (calls, fallbacks, deopts) = crate::tier2::native_call_stats_for_test();
+            (out, calls, fallbacks, deopts)
+        })
+        .join()
+        .expect("jit worker thread")
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_native_self_recursive_fib() {
+        // The RFC 0067 poster child: once `fib` is compiled, its
+        // recursive calls stay native — no interpreter frame, no
+        // re-binding, no guard re-resolution per call.
+        let src = "def fib(n):\n    if n < 2:\n        return n\n\
+                   \x20   return fib(n - 1) + fib(n - 2)\n\
+                   r = 0\nk = 0\n\
+                   while k < 10:\n    r = fib(12)\n    k = k + 1\n\
+                   print(r)\n";
+        let (out, calls, _fallbacks, deopts) = run_jit_native(src);
+        assert!(calls >= 1, "self-recursive fib never took the native call path");
+        assert_eq!(deopts, 0, "clean fib should not deopt a native callee");
+        assert_eq!(out, "144\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_native_cross_function_call() {
+        // `outer`'s native loop calls a *different* compiled function
+        // through the generation-cached native table. (The `< 0`
+        // checks give the analyzer int evidence for the parameters —
+        // the tier-2 subset types locals from use, not from probes.)
+        let src = "def add(a, b):\n    if a < 0:\n        return 0\n\
+                   \x20   if b < 0:\n        return 0\n\
+                   \x20   return a + b\n\
+                   def outer(n):\n    t = 0\n    i = 0\n\
+                   \x20   while i < n:\n        t = add(t, i)\n        i = i + 1\n\
+                   \x20   return t\n\
+                   k = 0\nwhile k < 10:\n    add(1, 2)\n    k = k + 1\n\
+                   r = 0\nk = 0\n\
+                   while k < 10:\n    r = outer(100)\n    k = k + 1\n\
+                   print(r)\n";
+        let (out, calls, _fallbacks, deopts) = run_jit_native(src);
+        assert!(calls >= 1, "cross-function call never went native");
+        assert_eq!(deopts, 0, "clean add callee should not deopt");
+        assert_eq!(out, "4950\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_native_callee_deopt_materializes_exactly() {
+        // The nested callee overflows i64 mid-multiplication: its
+        // native activation deopts, is materialized into a real frame,
+        // and the interpreter finishes with the exact bigint.
+        let src = "def mul(a, b):\n    if a < 0:\n        return 0\n\
+                   \x20   if b < 0:\n        return 0\n\
+                   \x20   return a * b\n\
+                   k = 0\nwhile k < 10:\n    mul(2, 3)\n    k = k + 1\n\
+                   def spin(n):\n    t = 1\n    i = 0\n\
+                   \x20   while i < n:\n        t = mul(t, 3)\n        i = i + 1\n\
+                   \x20   return t\n\
+                   print(spin(50))\n";
+        let (out, calls, _fallbacks, deopts) = run_jit_native(src);
+        assert!(calls >= 1, "mul never took the native call path");
+        assert!(deopts >= 1, "the i64 overflow must deopt the native callee");
+        assert_eq!(out, run(src), "bigint overflow diverged from interpreter");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_native_callee_raise_propagates() {
+        // The nested native callee divides by zero on the last
+        // iteration: the materialized frame raises, the exception
+        // unwinds through the native caller, and the module-level
+        // handler catches the real ZeroDivisionError.
+        let src = "def div(a, b):\n    if a < 0:\n        return 0\n\
+                   \x20   if b < 0:\n        return 0\n\
+                   \x20   return a // b\n\
+                   k = 0\nwhile k < 10:\n    div(9, 3)\n    k = k + 1\n\
+                   def spin(n):\n    t = 0\n    i = 0\n\
+                   \x20   while i < n:\n        t = t + div(10, n - i - 1)\n        i = i + 1\n\
+                   \x20   return t\n\
+                   try:\n    spin(5)\nexcept ZeroDivisionError:\n    print('zde ok')\n\
+                   print(div(10, 2))\n";
+        let (out, calls, _fallbacks, _deopts) = run_jit_native(src);
+        assert!(calls >= 1, "div never took the native call path");
+        assert_eq!(out, "zde ok\n5\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_native_recursion_limit_matches_interpreter() {
+        // The native fast path charges the same recursion tick as the
+        // interpreter, and on overflow routes through the interpreter
+        // so RecursionError fires at the same depth with full fidelity.
+        let src = "import sys\nsys.setrecursionlimit(100)\n\
+                   def down(n):\n    if n == 0:\n        return 0\n\
+                   \x20   return down(n - 1)\n\
+                   k = 0\nwhile k < 10:\n    down(5)\n    k = k + 1\n\
+                   try:\n    down(100000)\nexcept RecursionError:\n    print('rec ok')\n";
+        let (out, calls, _fallbacks, _deopts) = run_jit_native(src);
+        assert!(calls >= 1, "down never took the native call path");
+        assert_eq!(out, "rec ok\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_native_lane_mismatch_falls_back() {
+        // `dbl` compiled for int arguments; the native caller passes a
+        // float — the argument-lane check rejects the fast path and
+        // the interpreter call stays exact.
+        let src = "def dbl(x):\n    if x < 0:\n        return 0\n\
+                   \x20   return x + x\n\
+                   k = 0\nwhile k < 10:\n    dbl(3)\n    k = k + 1\n\
+                   def spin(n):\n    t = 0.0\n    i = 0\n\
+                   \x20   while i < n:\n        t = t + dbl(0.5)\n        i = i + 1\n\
+                   \x20   return t\n\
+                   r = 0.0\nk = 0\n\
+                   while k < 10:\n    r = spin(20)\n    k = k + 1\n\
+                   print(r)\n";
+        let (out, _calls, fallbacks, _deopts) = run_jit_native(src);
+        assert!(fallbacks >= 1, "float-for-int argument must fall back");
+        assert_eq!(out, "20.0\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_poll_observes_cross_thread_flag() {
+        // RFC 0067 WS2 — the spin-on-a-flag idiom. `done` burns into
+        // the native loop as a constant `False`; the worker thread can
+        // only run at all because the loop's poll hands off the GIL,
+        // and the rebind is observed because the poll revalidates the
+        // activation's guards (bounding staleness to one stride). If
+        // either half regresses, the loop runs to its 2e9 bound and
+        // prints False instead of hanging the suite.
+        let src = "import threading\nimport time\n\
+                   done = False\n\
+                   def worker():\n    global done\n    time.sleep(0.2)\n    done = True\n\
+                   t = threading.Thread(target=worker)\nt.start()\n\
+                   def spin(limit):\n    i = 0\n\
+                   \x20   while i < limit:\n        if done:\n            break\n        i = i + 1\n\
+                   \x20   return i\n\
+                   r = spin(2000000000)\nt.join()\n\
+                   print(r < 2000000000)\n";
+        let (out, _compiled, _deopts) = run_jit(src);
+        assert_eq!(out, "True\n", "native loop failed to observe the flag");
     }
 
     #[test]

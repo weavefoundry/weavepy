@@ -184,6 +184,24 @@ work.
 > codegen-stage cluster, `test_capi`'s fixture fractal, and the
 > unboxed-value identity legs of `test_marshal`) carries measured
 > reasons in `expectations.toml`.
+>
+> `RFC 0067` (performance wave 5) makes the tier-2 Cranelift JIT the
+> **default execution mode**: `cargo build -p weavepy-cli` now ships
+> it, `WEAVEPY_JIT=0` restores the pure interpreter, and the bench
+> gate measures the shipped configuration. The wave lands
+> **native-to-native calls** — a compiled callee is entered directly
+> with marshaled scalars (no interpreter frame, no argument binding,
+> no guard re-resolution), with deopt/raise materializing the exact
+> interpreter frame mid-flight — and the **native eval breaker**: a
+> countdown poll at loop back edges and call sites that hands off the
+> GIL, services signals/finalizers promptly, and revalidates burned-in
+> globals so a cross-thread rebind (the spin-on-a-flag idiom) is
+> observed within one stride. Measured on the committed macOS-aarch64
+> baseline: suite geomean **3.33× CPython** (from wave 4's 8.04×),
+> with `fib` under the default JIT 6.2× faster than interpreted
+> (retiring wave 4's JIT call regression) and the loop kernels
+> (`sumvm`/`nested_loops`/`jitloop`) at 0.05× — 20× faster than
+> CPython.
 
 ## Repository layout
 
@@ -287,7 +305,8 @@ corpus layout, and the now-live CPython `regrtest`-style runner (RFC
    compatibility is rejected.
 2. **Performance second, but seriously.** Once a feature is correct, the
    architecture should make it fast: tiered execution, inline caches,
-   specialization, and a JIT are all on the long-term roadmap.
+   specialization, and — since RFC 0067 — a Cranelift-backed tier-2 JIT
+   that ships on by default (`WEAVEPY_JIT=0` opts out at runtime).
 3. **Modern, safe foundation.** Written in safe Rust where possible, with
    `unsafe` confined to small, well-audited boundaries (object header layout,
    FFI to native extensions, etc.).

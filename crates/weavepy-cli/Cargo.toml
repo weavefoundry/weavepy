@@ -40,9 +40,10 @@ tracing-subscriber = { workspace = true }
 windows-sys = { workspace = true }
 
 [features]
-default = []
-# RFC 0032 — build the `weavepy` binary with the tier-2 JIT compiled in
-# (still gated at runtime by `WEAVEPY_JIT=1`).
+# RFC 0067 WS3 — the `weavepy` binary ships with the tier-2 JIT on by
+# default (runtime opt-out: `WEAVEPY_JIT=0`).
+default = ["jit"]
+# RFC 0032 — build the `weavepy` binary with the tier-2 JIT compiled in.
 jit = ["weavepy/jit", "weavepy-vm/jit"]
 
 [lints]
