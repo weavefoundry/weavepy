@@ -35,9 +35,8 @@ default-members = [
 version = "0.0.0"
 edition = "2021"
 # RFC 0032 — the tier-2 Cranelift JIT (`weavepy-jit`, behind the `jit`
-# feature) pulls in Cranelift 0.132, whose MSRV is 1.93. The JIT is
-# off by default, but CI builds it via `--all-features`, so the
-# workspace floor moves with it.
+# feature) pulls in Cranelift 0.132, whose MSRV is 1.93. The JIT ships
+# in default builds (RFC 0067), so the workspace floor moves with it.
 rust-version = "1.93"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/weavefoundry/weavepy"
@@ -172,7 +171,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 # RFC 0032 — tier-2 JIT backend (Cranelift). Only compiled when the
-# `jit` feature is enabled (off by default); CI exercises it via
+# `jit` feature is enabled (on by default since RFC 0067); CI exercises it via
 # `--all-features`. MSRV floor for these is Rust 1.93.
 cranelift-codegen     = "0.132"
 cranelift-frontend    = "0.132"

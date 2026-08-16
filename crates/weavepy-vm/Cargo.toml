@@ -83,10 +83,11 @@ corosensei = "0.3"
 windows-sys           = { workspace = true }
 
 [features]
-default = []
-# Compile the tier-2 JIT integration (pulls in Cranelift). Off by
-# default; CI exercises it via `--all-features`. Activated at runtime
-# by `WEAVEPY_JIT=1`.
+# RFC 0067 WS3 — the tier-2 JIT ships in the default build. Runtime
+# opt-out via `WEAVEPY_JIT=0`; build-time opt-out via
+# `--no-default-features` for size-constrained embedders.
+default = ["jit"]
+# Compile the tier-2 JIT integration (pulls in Cranelift).
 jit = ["dep:weavepy-jit"]
 
 [lints]

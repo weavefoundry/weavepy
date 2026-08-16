@@ -37,8 +37,9 @@ pub use ir::{
 };
 pub use runtime::{
     register_attr_helpers, register_call_py_helper, register_list_extra_helpers,
-    register_list_helpers, AttrGetHelper, AttrSetHelper, CallPyHelper, CallStatus, JitFrame,
-    JitStatus, ListAppendHelper, ListGetHelper, ListLenHelper, ListSetHelper, SlotTag,
+    register_list_helpers, register_poll_helper, AttrGetHelper, AttrSetHelper, CallPyHelper,
+    CallStatus, JitFrame, JitStatus, ListAppendHelper, ListGetHelper, ListLenHelper, ListSetHelper,
+    PollHelper, SlotTag, JIT_POLL_STRIDE,
 };
 pub use value::JitType;
 

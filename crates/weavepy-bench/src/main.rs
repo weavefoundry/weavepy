@@ -78,8 +78,9 @@ fn print_help() {
     eprintln!("    --python=PATH         Host CPython (default: python3.13, then python3).");
     eprintln!("    --no-cpython          Skip the host CPython column (absolute-only mode).");
     eprintln!("    --samples=N           Timing samples per fixture (default 5).");
-    eprintln!("    --jit                 Add a WEAVEPY_JIT=1 column (reported, not gated;");
-    eprintln!("                          the binary must be built with --features jit).");
+    eprintln!("    --interp              Add a WEAVEPY_JIT=0 column (reported, not gated).");
+    eprintln!("                          The default binary ships with the JIT on, so the");
+    eprintln!("                          gated WeavePy column already measures the JIT.");
     eprintln!();
     eprintln!("FLAGS for `run`:");
     eprintln!("    --json                Print report as JSON.");
@@ -96,7 +97,7 @@ fn print_help() {
 fn parse_common(opts: &mut RunOpts, arg: &str) -> bool {
     match arg {
         "--no-cpython" => opts.include_cpython = false,
-        "--jit" => opts.include_jit = true,
+        "--interp" => opts.include_interp = true,
         x if x.starts_with("--samples=") => {
             opts.samples = x[10..].parse().unwrap_or(opts.samples);
         }

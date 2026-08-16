@@ -98,4 +98,68 @@ if hasattr(__import__("signal"), "setitimer"):
         signal.setitimer(signal.ITIMER_REAL, 0.0)
         signal.signal(signal.SIGALRM, old)
 
+
+# 5. RFC 0067 WS2 — the same guarantees inside the tier-2 JIT's
+#    *native* loops (the default build ships with the JIT on). This
+#    kernel is deliberately JIT-shaped: typed int locals, a burnable
+#    global flag, no calls. The handler rebinds the guarded global;
+#    the native loop's eval-breaker poll must deopt for the pending
+#    signal and observe the rebind. The huge bound only matters when
+#    the machinery is broken (the loop then completes and the assert
+#    fires) — the healthy path exits within one poll stride.
+if hasattr(__import__("signal"), "setitimer"):
+    import signal
+
+    alrm_hit = False
+
+    def _on_alrm(s, f):
+        global alrm_hit
+        alrm_hit = True
+
+    def native_spin(limit):
+        i = 0
+        while i < limit:
+            if alrm_hit:
+                return i
+            i = i + 1
+        return i
+
+    old = signal.signal(signal.SIGALRM, _on_alrm)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, 0.05)
+        r = native_spin(4000000000)
+        assert r < 4000000000, "SIGALRM never interrupted the native loop"
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, old)
+
+
+# 6. RFC 0067 WS2 — KeyboardInterrupt *into* a native loop: a second
+#    thread trips SIGINT while the main thread spins in a JIT-shaped
+#    kernel with no early exit. The only way out before the bound is
+#    the eval breaker servicing the signal (default handler raises
+#    KeyboardInterrupt at the loop's deopt point) — which also proves
+#    the poll hands off the GIL, or the poking thread could never run.
+def ki_spin(limit):
+    i = 0
+    while i < limit:
+        i = i + 1
+    return i
+
+
+def _poke_ki():
+    time.sleep(0.05)
+    _thread.interrupt_main()
+
+
+_t = threading.Thread(target=_poke_ki)
+_t.start()
+_ki_raised = False
+try:
+    ki_spin(4000000000)
+except KeyboardInterrupt:
+    _ki_raised = True
+_t.join()
+assert _ki_raised, "KeyboardInterrupt never landed in the native loop"
+
 print("ok")
