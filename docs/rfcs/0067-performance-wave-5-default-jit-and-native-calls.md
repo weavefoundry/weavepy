@@ -433,16 +433,27 @@ default ÷ CPython):
   Future work.
 - **Interpreted column within noise of wave 4** (committed
   alongside; `fib` interp 189.3ms vs the wave-4 committed shape).
+- **Deopt backoff (landed post-review, macOS bench-gate regression)**:
+  `deltablue` exposed compiled frames whose activations chronically
+  side-exit (747 deopts across 6 compiled frames — marshal-in +
+  native entry + frame materialization per call, all to finish in
+  the interpreter anyway), costing ~4% against `WEAVEPY_JIT=0`. A
+  per-code deopt budget (64, sized like the OSR failure budget)
+  retires such code to `Tier::NotJitable` + `JitHint`, exactly as an
+  analyzer rejection would; `deltablue` under the default JIT now
+  measures at parity with the interpreter, and its healthy compiled
+  frames keep their native entries.
 
 Conformance and tests, all under the default (JIT-on) build:
 
-- `cargo test --workspace` green (156 vm lib tests including the
-  seven new WS1/WS2 tests: native self-recursion with advancing
+- `cargo test --workspace` green (157 vm lib tests including the
+  eight new WS1/WS2 tests: native self-recursion with advancing
   fast-path counters, cross-function native calls through the
   generation-cached table, deopt-mid-callee (i64 overflow → exact
   bigint), raise-mid-callee (ZeroDivisionError through a native
   caller), recursion-limit parity, argument-lane-mismatch fallback,
-  and cross-thread flag observation through the poll).
+  cross-thread flag observation through the poll, and chronic-deopt
+  retirement at exactly the budget).
 - The bundled regrtest sweep and bench gate pass; the sweep now
   *is* the blocking JIT configuration (RFC 0065's advisory sweep
   graduated). `tests/regrtest/test_eval_breaker.py` grew two

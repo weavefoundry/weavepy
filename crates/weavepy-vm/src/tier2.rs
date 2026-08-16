@@ -124,6 +124,15 @@ struct CacheEntry {
     /// guards + locals on every back edge while it keeps failing, so a
     /// chronically unenterable loop stops polling after a budget.
     osr_failures: u32,
+    /// Native side exits taken by this code's compiled frame. Healthy
+    /// compiled code exits by *returning* (deopt is exceptional — a
+    /// type-lane surprise or invalidated guard), so a frame that keeps
+    /// deopting is paying marshal-in + native entry + frame
+    /// materialization on every activation for nothing. Past
+    /// [`DEOPT_BUDGET`] the code is retired to [`Tier::NotJitable`]
+    /// (and its `jit_hint` set) exactly as if the analyzer had
+    /// rejected it.
+    deopts: u32,
     /// RFC 0067 WS1 — the resolved native-callee table, stamped with
     /// the compile generation it was resolved at. A later compile
     /// (which may flip a `None` slot to `Some`) invalidates it by
@@ -136,6 +145,15 @@ struct CacheEntry {
 
 /// Give up on OSR for a code object after this many failed validations.
 const OSR_FAILURE_BUDGET: u32 = 64;
+
+/// Retire a compiled code object after this many native side exits.
+/// Sized like [`OSR_FAILURE_BUDGET`]: far above anything a legitimate
+/// phase change produces (a guard invalidation deopts each active
+/// frame *once*, then recompilation or the interpreter takes over),
+/// far below the thousands of exits a shape-unstable hot function
+/// (deltablue's method-heavy kernel) racks up when every native entry
+/// ends in a materializing bail-out.
+pub(crate) const DEOPT_BUDGET: u32 = 64;
 
 /// JIT counters surfaced through `WEAVEPY_VM_STATS`.
 #[derive(Default, Clone)]
@@ -242,6 +260,7 @@ impl JitState {
                 counter: 0,
                 tier: Tier::Cold,
                 osr_failures: 0,
+                deopts: 0,
                 native: None,
                 _code: code.clone(),
             });
@@ -451,6 +470,7 @@ impl JitState {
             counter: 0,
             tier: Tier::Cold,
             osr_failures: 0,
+            deopts: 0,
             native: None,
             _code: code.clone(),
         });
@@ -1938,6 +1958,21 @@ fn enter_compiled(
         st.stats.native_entries += 1;
         if matches!(status, JitStatus::Deopt) {
             st.stats.deopts += 1;
+            // Deopt backoff: a compiled frame whose activations keep
+            // side-exiting is a net loss (marshal-in + native entry +
+            // frame materialization per call, all to end up in the
+            // interpreter anyway). Past the budget, retire the code
+            // exactly as an analyzer rejection would — the `jit_hint`
+            // fast-out then gates every later activation and back
+            // edge, and `Tier::NotJitable` stops recompilation.
+            let key = Rc::as_ptr(&frame.code).cast::<CodeObject>();
+            if let Some(ce) = st.cache.get_mut(&key) {
+                ce.deopts += 1;
+                if ce.deopts >= DEOPT_BUDGET {
+                    ce.tier = Tier::NotJitable;
+                    frame.code.jit_hint.mark_not_jitable();
+                }
+            }
         }
     });
 

@@ -42334,6 +42334,33 @@ mod tests {
 
     #[cfg(feature = "jit")]
     #[test]
+    fn jit_chronic_deopt_retires_code() {
+        // Deopt backoff: a kernel whose *every* native activation side-
+        // exits (the accumulator overflows i64 on the second add) is a
+        // net loss — after `DEOPT_BUDGET` exits the code must be retired
+        // to the interpreter instead of paying marshal-in + native entry
+        // + frame materialization on all 500 calls (deltablue's
+        // pathology, macOS bench-gate regression on PR #64).
+        let src = "def spin(a):\n    if a < 0:\n        return 0\n\
+                   \x20   t = 0\n    i = 0\n\
+                   \x20   while i < 60:\n        t = t + a\n        i = i + 1\n\
+                   \x20   return t\n\
+                   r = 0\nk = 0\n\
+                   while k < 500:\n    r = spin(9223372036854775000)\n    k = k + 1\n\
+                   print(r)\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the kernel");
+        assert_eq!(
+            deopts,
+            u64::from(crate::tier2::DEOPT_BUDGET),
+            "chronic deopts must stop exactly at the retirement budget"
+        );
+        assert_eq!(out, "553402322211286500000\n");
+        assert_eq!(out, run(src), "retired path diverged from the interpreter");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
     fn jit_param_type_change_skips_native_entry() {
         // A kernel tiered up on int arguments must not enter native code
         // when later called with a float — the parameter entry guard has
