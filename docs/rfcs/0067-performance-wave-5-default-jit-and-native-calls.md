@@ -443,6 +443,17 @@ default ÷ CPython):
   analyzer rejection would; `deltablue` under the default JIT now
   measures at parity with the interpreter, and its healthy compiled
   frames keep their native entries.
+- **Baseline ratios are the acceptance envelope** (landed
+  post-review, macOS bench-gate flakes): the schema-v5 re-record had
+  silently adopted this host's tighter ratios on fixtures the wave
+  doesn't touch (`fannkuch` 10.48→8.81, `startup` 2.24→1.91), and
+  CI's shared runners sit up to ~25% above a quiet host on exactly
+  those — the whole gate threshold. The committed baseline now
+  carries the previously accepted ratio forward for unchanged
+  fixtures, keeps the ratchet where the wave improved things (with
+  CI-measured headroom on `fib`), and gates the wave's guarantee
+  through the recomputed suite geomean (see the bench README's
+  "Refreshing the baseline").
 
 Conformance and tests, all under the default (JIT-on) build:
 

@@ -86,3 +86,24 @@ cargo xbench run --json
    row, so the baseline refresh ships in the same change. (This only
    refreshes the *host* platform's file; other platforms' baselines
    are refreshed on their own hardware.)
+
+## Refreshing the baseline
+
+A committed baseline `ratio` is the **acceptance envelope**, not the
+best measurement the baseline host ever produced. CI's shared runners
+measure ratios up to ~25% above a quiet baseline host on
+interpreter-bound fixtures — about the entire gate threshold — so a
+refresh that adopts tighter host numbers on fixtures a change didn't
+touch silently converts cross-machine skew into gate flakes.
+
+When refreshing after a perf change, inspect the per-fixture ratio
+diff and:
+
+- **Keep the old (looser) ratio** for fixtures the change doesn't
+  affect — never tighten their gate as a side effect.
+- **Adopt the new ratio** for fixtures the change genuinely improved
+  (that ratchet is the point of the refresh), leaving headroom for
+  the ratios CI actually reports on its runners.
+- The stored `geomean_ratio` should be recomputed from the committed
+  per-row ratios; the geomean gate is the suite-level ratchet that
+  catches a broad regression even under loose per-fixture envelopes.
