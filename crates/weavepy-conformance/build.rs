@@ -60,48 +60,75 @@ fn main() {
         println!("cargo:rustc-link-arg-bins=-Wl,--export-dynamic");
     }
 
-    let src = workspace_root.join("tests/capi_ext/_testbuffer.c");
-    if !src.is_file() {
-        return;
-    }
-    println!("cargo:rerun-if-changed={}", src.display());
     let Some(include_dirs) = stock_python_include(&capi_dir, &out_dir) else {
         println!(
             "cargo:warning=stock CPython 3.13 headers not found; \
-             regrtest runs without the _testbuffer fixture"
+             regrtest runs without the compiled C-API fixtures"
         );
         return;
     };
+    let internal_include = capi_dir.join("include").join("cpython313").join("internal");
 
     let suffix = if target_os == "windows" { "dll" } else { "so" };
     let cc = env::var("CC").unwrap_or_else(|_| "cc".to_owned());
-    let dylib = out_dir.join(format!("_testbuffer.{suffix}"));
-    let mut cmd = Command::new(&cc);
-    cmd.arg("-shared")
-        .arg("-fPIC")
-        .arg("-fvisibility=default")
-        .arg("-O0")
-        .arg("-Wno-error");
-    for dir in &include_dirs {
-        cmd.arg(format!("-I{}", dir.display()));
+
+    // (source file, needs Py_BUILD_CORE_MODULE + the internal headers).
+    // `_testsinglephase` / `_testmultiphase` (RFC 0068 WS4) are CPython's
+    // extension-loader fixtures — test_importlib's extension suite scans
+    // `sys.path` for the actual files.
+    let fixtures: [(&str, bool); 3] = [
+        ("_testbuffer", false),
+        ("_testsinglephase", true),
+        ("_testmultiphase", true),
+    ];
+    let mut built: Vec<String> = Vec::new();
+    for (name, core_module) in fixtures {
+        let src = workspace_root.join(format!("tests/capi_ext/{name}.c"));
+        if !src.is_file() {
+            continue;
+        }
+        println!("cargo:rerun-if-changed={}", src.display());
+        let dylib = out_dir.join(format!("{name}.{suffix}"));
+        let mut cmd = Command::new(&cc);
+        cmd.arg("-shared")
+            .arg("-fPIC")
+            .arg("-fvisibility=default")
+            .arg("-O0")
+            .arg("-Wno-error");
+        for dir in &include_dirs {
+            cmd.arg(format!("-I{}", dir.display()));
+        }
+        if core_module {
+            cmd.arg("-DPy_BUILD_CORE_MODULE")
+                .arg(format!("-I{}", internal_include.display()))
+                .arg(format!(
+                    "-I{}",
+                    workspace_root.join("tests/capi_ext").display()
+                ));
+        }
+        cmd.arg(&src).arg("-o").arg(&dylib);
+        if target_os == "macos" {
+            cmd.arg("-undefined").arg("dynamic_lookup");
+        }
+        match cmd.output() {
+            Ok(out) if out.status.success() => {
+                built.push(dylib.display().to_string());
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                println!("cargo:warning={name} cc failed: {stderr}");
+            }
+            Err(err) => {
+                println!("cargo:warning=could not run cc for {name}: {err}");
+            }
+        }
     }
-    cmd.arg(&src).arg("-o").arg(&dylib);
-    if target_os == "macos" {
-        cmd.arg("-undefined").arg("dynamic_lookup");
-    }
-    match cmd.output() {
-        Ok(out) if out.status.success() => {
-            println!(
-                "cargo:rustc-env=WEAVEPY_REGRTEST_TESTBUFFER_EXTENSION={}",
-                dylib.display()
-            );
-        }
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            println!("cargo:warning=_testbuffer cc failed: {stderr}");
-        }
-        Err(err) => {
-            println!("cargo:warning=could not run cc for _testbuffer: {err}");
-        }
+    if !built.is_empty() {
+        // Kept under the historical name; regrtest stages every listed
+        // fixture into the shared shim directory.
+        println!(
+            "cargo:rustc-env=WEAVEPY_REGRTEST_TESTBUFFER_EXTENSION={}",
+            built.join(";")
+        );
     }
 }

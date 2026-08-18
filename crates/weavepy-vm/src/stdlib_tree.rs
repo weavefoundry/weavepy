@@ -48,6 +48,25 @@ const COMPLETE_MARKER: &str = ".weavepy-complete";
 /// `venv.EnvBuilder.setup_scripts` relative to `venv.__file__`.
 /// Paths are relative to the stdlib dir, `/`-separated.
 const DATA_FILES: &[(&str, &str)] = &[
+    // (`os.py` is projected by its frozen-source registration now —
+    // the startup import stays native, but a fresh `import os`
+    // executes the source like CPython post-startup.)
+    // RFC 0068 WS4 — `importlib._bootstrap[_external]` are NOT frozen
+    // under their dotted names (importlib/__init__ aliases the frozen
+    // `_frozen_importlib*` modules into sys.modules; a second frozen
+    // execution would mint duplicate classes with the wrong
+    // `__module__`). The source files still must exist on disk for
+    // `importlib/__init__`'s ImportError fallback and test_importlib's
+    // "Source" variant, which blocks the frozen names and re-imports
+    // importlib from disk.
+    (
+        "importlib/_bootstrap.py",
+        include_str!("stdlib/python/importlib_bootstrap.py"),
+    ),
+    (
+        "importlib/_bootstrap_external.py",
+        include_str!("stdlib/python/importlib_bootstrap_external.py"),
+    ),
     (
         "venv/scripts/common/activate",
         include_str!("stdlib/python/venv/scripts/common/activate"),
@@ -483,13 +502,14 @@ fn cache_root() -> Option<PathBuf> {
     }
     #[cfg(target_os = "macos")]
     {
-        let home = std::env::var_os("HOME")?;
-        Some(
-            PathBuf::from(home)
-                .join("Library")
-                .join("Caches")
-                .join("weavepy"),
-        )
+        if let Some(home) = std::env::var_os("HOME") {
+            return Some(
+                PathBuf::from(home)
+                    .join("Library")
+                    .join("Caches")
+                    .join("weavepy"),
+            );
+        }
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -498,14 +518,25 @@ fn cache_root() -> Option<PathBuf> {
                 return Some(PathBuf::from(xdg).join("weavepy"));
             }
         }
-        let home = std::env::var_os("HOME")?;
-        Some(PathBuf::from(home).join(".cache").join("weavepy"))
+        if let Some(home) = std::env::var_os("HOME") {
+            return Some(PathBuf::from(home).join(".cache").join("weavepy"));
+        }
     }
     #[cfg(windows)]
     {
-        let base = std::env::var_os("LOCALAPPDATA")?;
-        Some(PathBuf::from(base).join("weavepy"))
+        if let Some(base) = std::env::var_os("LOCALAPPDATA") {
+            return Some(PathBuf::from(base).join("weavepy"));
+        }
     }
+    // No home directory in the environment (e.g. a test that scrubs
+    // `HOME` — test_pdb's `run_pdb_script(remove_home=True)` re-execs
+    // `sys.executable`): fall back to a per-uid tmp cache so the stdlib
+    // still materializes and `-m NAME` resolution keeps working.
+    #[cfg(unix)]
+    let per_user = format!("weavepy-{}", unsafe { libc::getuid() });
+    #[cfg(not(unix))]
+    let per_user = "weavepy".to_owned();
+    Some(std::env::temp_dir().join(per_user))
 }
 
 /// Extract the embedded stdlib into `{prefix}/lib/weavepy3.13`.

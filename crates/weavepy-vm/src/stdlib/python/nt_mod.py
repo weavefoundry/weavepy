@@ -8,7 +8,10 @@ Python shim so that ``import nt`` works for code (notably ``shutil`` and
 ``posix`` shim used on POSIX hosts.
 """
 
-import os as _os
+# The native surface under its internal alias, *not* `import os`: a
+# fresh source import of `os.py` runs `from nt import *` while the
+# `os` entry in sys.modules is still half-initialized.
+import _weave_posix as _os
 import sys as _sys
 
 # CPython only builds the ``nt`` module on Windows; on POSIX hosts
@@ -25,6 +28,10 @@ for _name in dir(_os):
         continue
     globals()[_name] = getattr(_os, _name)
     _names.append(_name)
+
+# `os.py` re-imports `_exit` explicitly (`from nt import _exit`); the
+# underscore loop above skipped it.
+_exit = _os._exit
 
 
 # Access-mode constants (also exposed by ``os``; kept here so ``from nt import

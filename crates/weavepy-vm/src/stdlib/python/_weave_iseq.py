@@ -82,14 +82,26 @@ def _effect(op, arg):
         return _EFFECT_FALLBACK.get(op, 0)
 
 
+_HAS_TARGET = set(_opcode.hasjrel) | set(getattr(_opcode, "hasjabs", ())) | set(
+    _opcode.hasexc
+)
+_HAS_TARGET |= {op for op in (_JUMP, _JUMP_NO_INTERRUPT) if op is not None}
+
+
 class InstructionSequence:
-    """A CPython-shaped instruction sequence: ``addop`` appends
-    ``(op, arg, line, end_line, col, end_col)`` rows; ``use_label(v)``
-    binds label id ``v`` to the *next* instruction index."""
+    """CPython's ``InstructionSequence`` (Python/instruction_sequence.c):
+    ``addop`` appends ``(op, arg, line, end_line, col, end_col)`` rows
+    (CPython's clinic wrapper stores its positional location args in this
+    struct order); ``use_label(v)`` binds label id ``v`` to the *next*
+    instruction index. ``get_instructions()`` applies the label map —
+    jump/setup args become instruction indices — exactly once, like
+    ``_PyInstructionSequence_ApplyLabelMap``."""
 
     def __init__(self):
         self._insts = []
         self._labelmap = {}
+        self._next_free_label = 0
+        self._nested = []
 
     def use_label(self, label):
         self._labelmap[int(label)] = len(self._insts)
@@ -97,9 +109,79 @@ class InstructionSequence:
     def addop(self, op, arg, line, end_line, col, end_col):
         self._insts.append((int(op), int(arg), line, end_line, col, end_col))
 
+    def new_label(self):
+        lbl = self._next_free_label
+        self._next_free_label += 1
+        return lbl
+
+    def add_nested(self, nested):
+        if not isinstance(nested, InstructionSequence):
+            raise TypeError(
+                f"expected an instruction sequence, not {type(nested).__name__}"
+            )
+        self._nested.append(nested)
+
+    def get_nested(self):
+        return list(self._nested)
+
+    def _apply_label_map(self):
+        # Like _PyInstructionSequence_ApplyLabelMap: a no-op when no
+        # labels were ever bound (args are already instruction indices).
+        if self._labelmap is None:
+            return
+        labelmap = self._labelmap
+        if labelmap:
+            for i, row in enumerate(self._insts):
+                if row[0] in _HAS_TARGET:
+                    self._insts[i] = (row[0], labelmap[row[1]]) + row[2:]
+        self._labelmap = None
+
+    def get_instructions(self):
+        self._apply_label_map()
+        out = []
+        for op, arg, line, end_line, col, end_col in self._insts:
+            shown = arg if op in _HAS_ARG else None
+            out.append((op, shown, line, end_line, col, end_col))
+        return out
+
 
 def new_instruction_sequence():
     return InstructionSequence()
+
+
+def optimize_cfg(seq, consts, nlocals):
+    """``_PyCompile_OptimizeCfg``: build a CFG from ``seq``, run the full
+    flowgraph pass pipeline (ported in ``_weave_flowgraph``), and return
+    the optimized sequence. ``consts`` is mutated in place (a list)."""
+    import _weave_flowgraph as _fg
+
+    if not isinstance(seq, InstructionSequence):
+        raise ValueError("expected an instruction sequence")
+    if not isinstance(consts, list):
+        raise TypeError("expected a list of constants")
+    seq._apply_label_map()
+    rows = [
+        (op, arg, (line, end_line, col, end_col))
+        for (op, arg, line, end_line, col, end_col) in seq._insts
+    ]
+    out_rows = _fg.optimize_cfg_rows(rows, consts, int(nlocals))
+    result = InstructionSequence()
+    for op, arg, loc in out_rows:
+        result.addop(op, arg, loc[0], loc[1], loc[2], loc[3])
+    result._labelmap = None  # already resolved to instruction indices
+    return result
+
+
+def compiler_codegen(ast_obj, filename, optimize, compile_mode=0):
+    """``_PyCompile_CodeGen``: run the codegen stage (ported in
+    ``_weave_codegen``) over an AST, returning ``(seq, metadata)``."""
+    import sys
+
+    import _weave_codegen as _cg
+
+    return _cg.compiler_codegen(
+        sys.modules[__name__], ast_obj, filename, int(optimize), int(compile_mode)
+    )
 
 
 def _index_map(mapping):

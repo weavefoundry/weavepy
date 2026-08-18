@@ -520,6 +520,7 @@ pub fn id_of(obj: &Object) -> ObjectId {
         Object::Traceback(t) => Rc::as_ptr(t) as usize as u64,
         Object::MemoryView(m) => Rc::as_ptr(m) as usize as u64,
         Object::MappingProxy(d) => Rc::as_ptr(d) as usize as u64,
+        Object::MappingProxyObj(o) => Rc::as_ptr(o) as usize as u64,
         Object::DictView(v) => Rc::as_ptr(v) as usize as u64,
         Object::SimpleNamespace(d) => Rc::as_ptr(d) as usize as u64,
         Object::LazyIter(l) => Rc::as_ptr(l) as usize as u64,

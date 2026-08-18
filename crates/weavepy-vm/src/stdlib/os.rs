@@ -41,6 +41,18 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("__doc__")),
             Object::from_static("OS routines for the host platform."),
         );
+        // CPython 3.13 ships `os` frozen *with* a real `__file__`
+        // (`.../os.py`); test_import's from-import error shapes embed
+        // it (`cannot import name 'x' from 'os' (…/os.py)`). The
+        // materialized tree carries a verbatim `os.py` for exactly
+        // this identity (never executed — the built-in registry
+        // resolves `os` first).
+        if let Some(dir) = crate::stdlib_tree::stdlib_dir() {
+            d.insert(
+                DictKey(Object::from_static("__file__")),
+                Object::from_str(dir.join("os.py").to_string_lossy().into_owned()),
+            );
+        }
 
         d.insert(
             DictKey(Object::from_static("sep")),
@@ -120,6 +132,12 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         d.insert(
             DictKey(Object::from_static("getcwd")),
             builtin("getcwd", os_getcwd),
+        );
+        // `os._get_exports_list(module)` — CPython's os.py helper; the
+        // verbatim `socket.py` extends its `__all__` with it (RFC 0068 WS8).
+        d.insert(
+            DictKey(Object::from_static("_get_exports_list")),
+            builtin("_get_exports_list", os_get_exports_list),
         );
         d.insert(
             DictKey(Object::from_static("getcwdb")),
@@ -351,6 +369,15 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         d.insert(
             DictKey(Object::from_static("write")),
             builtin("write", os_write),
+        );
+        // CPython exposes `os.sendfile` on Linux/macOS/FreeBSD but never on
+        // Windows, and `socket.py`/`asyncio` feature-detect it with
+        // `hasattr(os, 'sendfile')` — gate the registration (like `uname`)
+        // so the attribute is simply absent where the syscall is.
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+        d.insert(
+            DictKey(Object::from_static("sendfile")),
+            builtin_kw("sendfile", os_sendfile),
         );
         d.insert(
             DictKey(Object::from_static("get_terminal_size")),
@@ -1084,15 +1111,57 @@ fn initial_environ() -> Object {
 
 fn os_getcwd(args: &[Object]) -> Result<Object, RuntimeError> {
     require_no_args(args, "getcwd")?;
-    let cwd = std::env::current_dir().map_err(|e| os_error(format!("getcwd: {e}")))?;
+    let cwd = std::env::current_dir().map_err(getcwd_error)?;
     Ok(Object::from_str(cwd.to_string_lossy().into_owned()))
+}
+
+/// CPython's `os._get_exports_list(module)`: `list(module.__all__)`, or
+/// the non-underscore names from the module dict when `__all__` is absent.
+fn os_get_exports_list(args: &[Object]) -> Result<Object, RuntimeError> {
+    let Some(Object::Module(m)) = args.first() else {
+        return Err(crate::error::type_error(
+            "_get_exports_list() argument must be a module",
+        ));
+    };
+    let dict = m.dict.borrow();
+    if let Some(all) = dict.get(&DictKey(Object::from_static("__all__"))) {
+        if let Object::List(items) = all {
+            return Ok(Object::new_list(items.borrow().clone()));
+        }
+        if let Object::Tuple(items) = all {
+            return Ok(Object::new_list(items.to_vec()));
+        }
+    }
+    let mut names: Vec<Object> = dict
+        .keys()
+        .filter_map(|k| match &k.0 {
+            Object::Str(s) if !s.starts_with('_') => Some(k.0.clone()),
+            _ => None,
+        })
+        .collect();
+    names.sort_by_key(|o| o.to_str());
+    Ok(Object::new_list(names))
+}
+
+/// A deleted working directory must surface as `FileNotFoundError`, not a
+/// bare `OSError` — `_bootstrap_external._path_importer_cache` catches
+/// exactly `(FileNotFoundError, PermissionError)` around `_os.getcwd()`
+/// (import_.test_path test_deleted_cwd).
+fn getcwd_error(e: std::io::Error) -> RuntimeError {
+    let errno = e.raw_os_error().unwrap_or(0);
+    let class = match e.kind() {
+        std::io::ErrorKind::NotFound => "FileNotFoundError",
+        std::io::ErrorKind::PermissionDenied => "PermissionError",
+        _ => "OSError",
+    };
+    crate::error::oserror_subclass_with_errno(class, errno, format!("getcwd: {e}"))
 }
 
 /// `os.getcwdb()` — the working directory as `bytes` (the OS-encoded path).
 /// `posixpath.abspath`/`realpath` call this for bytes-typed inputs.
 fn os_getcwdb(args: &[Object]) -> Result<Object, RuntimeError> {
     require_no_args(args, "getcwdb")?;
-    let cwd = std::env::current_dir().map_err(|e| os_error(format!("getcwd: {e}")))?;
+    let cwd = std::env::current_dir().map_err(getcwd_error)?;
     let bytes = {
         #[cfg(unix)]
         {
@@ -2398,6 +2467,14 @@ fn os_fstat(args: &[Object]) -> Result<Object, RuntimeError> {
             i64::from(*b)
         }
         Some(Object::Int(n)) => *n,
+        // CPython's int converter overflows before it type-errors:
+        // `os.fstat(2**1000)` must raise OverflowError, not TypeError
+        // (`test_socket.test__sendfile_use_sendfile` asserts the pair).
+        Some(Object::Long(_)) => {
+            return Err(crate::error::overflow_error(
+                "Python int too large to convert to C int",
+            ))
+        }
         _ => return Err(type_error("fstat() argument must be an int")),
     };
     #[cfg(unix)]
@@ -2932,6 +3009,9 @@ fn resolve_fspath_obj(obj: &Object, func: &str) -> Result<Object, RuntimeError> 
             };
             match interp.call_object(fspath, &[], &[])? {
                 r @ (Object::Str(_) | Object::Bytes(_)) => Ok(r),
+                // Surrogate-bearing str result: apply the same PEP 383
+                // fsencode-for-validation as a directly-passed WStr path.
+                w @ Object::WStr(_) => resolve_fspath_obj(&w, func),
                 Object::ByteArray(b) => Ok(Object::new_bytes(b.borrow().clone())),
                 other => Err(type_error(format!(
                     "expected {}.__fspath__() to return str or bytes, not {}",
@@ -2997,7 +3077,10 @@ pub(crate) fn os_fspath(args: &[Object]) -> Result<Object, RuntimeError> {
                 Ok(f) => f,
             };
             match interp.call_object(fspath, &[], &[])? {
-                r @ (Object::Str(_) | Object::Bytes(_)) => Ok(r),
+                // `os.fspath` hands the PathLike's result back untouched;
+                // a surrogate-bearing WStr *is* a str (PEP 383), matching
+                // the direct-argument arm above.
+                r @ (Object::Str(_) | Object::WStr(_) | Object::Bytes(_)) => Ok(r),
                 other => Err(type_error(format!(
                     "expected {}.__fspath__() to return str or bytes, not {}",
                     obj.type_name_owned(),
@@ -4982,6 +5065,191 @@ fn os_write(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
+/// `os.sendfile(out_fd, in_fd, offset, count, [headers, trailers, flags])` —
+/// zero-copy file-to-socket transfer via `sendfile(2)` (RFC 0068 WS8). Backs
+/// `socket.socket.sendfile`'s `_sendfile_use_sendfile` path and asyncio's
+/// `_sock_sendfile_native`, both of which activate on `hasattr(os,
+/// 'sendfile')`.
+///
+/// The platform shapes follow CPython's `os_sendfile_impl` exactly:
+///
+/// - **macOS**: `sendfile(in_fd, out_fd, offset, &len, &sf_hdtr, flags)`.
+///   `len` is in-out — on entry the byte budget (`count` *plus* every
+///   header's length, matching CPython's Apple-only adjustment; `0` means
+///   send to EOF), on exit the total actually sent, headers/trailers
+///   included, which is the return value. `headers`/`trailers` are
+///   sequences of buffers gathered through `struct sf_hdtr`. An
+///   `EAGAIN`/`EBUSY` after a partial transfer returns the partial count;
+///   with nothing sent it raises (`EAGAIN` maps to `BlockingIOError`, which
+///   `socket.py`'s selector retry loop catches).
+/// - **Linux**: `sendfile(out_fd, in_fd, &offset|NULL, count)` — no
+///   header/trailer support; `offset=None` uses (and advances) `in_fd`'s
+///   own file position; returns the syscall's byte count.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn os_sendfile(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let get = |idx: usize, name: &str| -> Option<&Object> {
+        args.get(idx)
+            .or_else(|| kwargs.iter().find(|(k, _)| k == name).map(|(_, v)| v))
+    };
+    let int_arg = |o: Option<&Object>, name: &str| -> Result<i64, RuntimeError> {
+        match o {
+            Some(Object::Int(i)) => Ok(*i),
+            Some(Object::Bool(b)) => Ok(i64::from(*b)),
+            _ => Err(type_error(format!(
+                "sendfile() argument '{name}' must be an int"
+            ))),
+        }
+    };
+    #[cfg(target_os = "macos")]
+    {
+        for (k, _) in kwargs {
+            if !matches!(
+                k.as_str(),
+                "out_fd" | "in_fd" | "offset" | "count" | "headers" | "trailers" | "flags"
+            ) {
+                return Err(type_error(format!(
+                    "'{k}' is an invalid keyword argument for sendfile()"
+                )));
+            }
+        }
+        let out_fd = int_arg(get(0, "out_fd"), "out_fd")? as i32;
+        let in_fd = int_arg(get(1, "in_fd"), "in_fd")? as i32;
+        let offset = int_arg(get(2, "offset"), "offset")?;
+        let count = int_arg(get(3, "count"), "count")?;
+        let flags = match get(6, "flags") {
+            None => 0,
+            some => int_arg(some, "flags")? as i32,
+        };
+        // Materialise each header/trailer buffer up front; the Vecs must
+        // outlive the syscall so the iovec base pointers stay valid.
+        let gather = |o: Option<&Object>, which: &str| -> Result<Vec<Vec<u8>>, RuntimeError> {
+            let Some(o) = o else { return Ok(Vec::new()) };
+            let items = match o {
+                Object::Tuple(t) => t.to_vec(),
+                Object::List(l) => l.borrow().clone(),
+                _ => return Err(type_error(format!("sendfile() {which} must be a sequence"))),
+            };
+            items
+                .iter()
+                .map(|it| match it {
+                    Object::Bytes(b) => Ok(b.to_vec()),
+                    Object::ByteArray(b) => Ok(b.borrow().clone()),
+                    Object::MemoryView(mv) => Ok(mv.to_bytes()),
+                    other => crate::builtins::bytes_argview(other),
+                })
+                .collect()
+        };
+        let headers = gather(get(4, "headers"), "headers")?;
+        let trailers = gather(get(5, "trailers"), "trailers")?;
+        // Apple's `len` budget covers the headers too: CPython adds each
+        // header's length to `sbytes` so `count` file bytes still go out.
+        let mut sbytes: libc::off_t = count;
+        for h in &headers {
+            let blen = h.len() as i64;
+            if sbytes >= i64::MAX - blen {
+                return Err(crate::error::overflow_error(
+                    "sendfile() header is too large",
+                ));
+            }
+            sbytes += blen;
+        }
+        let hdr_iov: Vec<libc::iovec> = headers
+            .iter()
+            .map(|b| libc::iovec {
+                iov_base: b.as_ptr() as *mut _,
+                iov_len: b.len(),
+            })
+            .collect();
+        let trl_iov: Vec<libc::iovec> = trailers
+            .iter()
+            .map(|b| libc::iovec {
+                iov_base: b.as_ptr() as *mut _,
+                iov_len: b.len(),
+            })
+            .collect();
+        // SAFETY: zeroed `sf_hdtr` is the "no headers/trailers" shape; the
+        // iovec arrays outlive the syscall loop below.
+        let mut sf: libc::sf_hdtr = unsafe { std::mem::zeroed() };
+        if !hdr_iov.is_empty() {
+            sf.headers = hdr_iov.as_ptr().cast_mut();
+            sf.hdr_cnt = hdr_iov.len() as i32;
+        }
+        if !trl_iov.is_empty() {
+            sf.trailers = trl_iov.as_ptr().cast_mut();
+            sf.trl_cnt = trl_iov.len() as i32;
+        }
+        loop {
+            let sb = &mut sbytes;
+            let sfp = &mut sf;
+            let r = crate::gil::allow_threads_then(|| unsafe {
+                libc::sendfile(in_fd, out_fd, offset as libc::off_t, sb, sfp, flags)
+            });
+            if r < 0 {
+                let err = std::io::Error::last_os_error();
+                let errno = err.raw_os_error();
+                if errno == Some(libc::EINTR) {
+                    // PEP 475: run tripped handlers, then retry. The kernel
+                    // rewrote `sbytes` to the bytes already sent, and CPython
+                    // reuses that as the next call's budget — so do we.
+                    service_pending_signals()?;
+                    continue;
+                }
+                if matches!(errno, Some(libc::EAGAIN) | Some(libc::EBUSY)) && sbytes != 0 {
+                    // Partial transfer before the socket buffer filled:
+                    // CPython reports the partial count as success.
+                    return Ok(Object::Int(sbytes));
+                }
+                return Err(crate::error::io_error_to_py(&err));
+            }
+            return Ok(Object::Int(sbytes));
+        }
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        for (k, _) in kwargs {
+            if !matches!(k.as_str(), "out_fd" | "in_fd" | "offset" | "count") {
+                return Err(type_error(format!(
+                    "'{k}' is an invalid keyword argument for sendfile()"
+                )));
+            }
+        }
+        let out_fd = int_arg(get(0, "out_fd"), "out_fd")? as i32;
+        let in_fd = int_arg(get(1, "in_fd"), "in_fd")? as i32;
+        let offset_obj = get(2, "offset");
+        if offset_obj.is_none() {
+            return Err(type_error("sendfile() missing required argument 'offset'"));
+        }
+        let count = int_arg(get(3, "count"), "count")?;
+        // `offset=None` → NULL pointer: use and advance the fd's own file
+        // position, exactly CPython's Linux branch.
+        let use_off = !matches!(offset_obj, Some(Object::None));
+        let mut off: libc::off_t = if use_off {
+            int_arg(offset_obj, "offset")?
+        } else {
+            0
+        };
+        loop {
+            let offp = if use_off {
+                &mut off as *mut libc::off_t
+            } else {
+                std::ptr::null_mut()
+            };
+            let r = crate::gil::allow_threads_then(|| unsafe {
+                libc::sendfile(out_fd, in_fd, offp, count as usize)
+            });
+            if r < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    service_pending_signals()?;
+                    continue;
+                }
+                return Err(crate::error::io_error_to_py(&err));
+            }
+            return Ok(Object::Int(r as i64));
+        }
+    }
+}
+
 /// `os.uname()` — host identification via `uname(2)`, returned as an
 /// `os.uname_result` struct sequence. `platform.uname()`/`platform.mac_ver()`
 /// (and thus `@support.requires_mac_ver`, `test_shutil.test_tarfile_vs_tar`)
@@ -6586,6 +6854,54 @@ pub(crate) fn struct_seq_type_layout(
             },
         )
         .expect("struct sequence type");
+        // Named fields as member descriptors on the *type* — CPython
+        // materializes every `PyMemberDef` in `tp_dict`, so
+        // `type(sys.flags).debug` resolves and pydoc documents it as
+        // "debug" (test_pydoc.test_structseq_member_descriptor). Reads
+        // route to the instance dict where the builders store values.
+        for slot in layout.slots.iter().flatten() {
+            let field: &'static str = slot;
+            let key = DictKey(Object::from_static(field));
+            if cls.dict.borrow().contains_key(&key) {
+                continue;
+            }
+            let type_name: &'static str = layout.name;
+            let fget = Object::Builtin(Rc::new(crate::object::BuiltinFn {
+                name: field,
+                binds_instance: true,
+                call: Box::new(move |args| {
+                    let Some(Object::Instance(inst)) = args.first() else {
+                        return Err(type_error(format!(
+                            "descriptor '{field}' for '{type_name}' objects doesn't apply to another object"
+                        )));
+                    };
+                    inst.dict
+                        .borrow()
+                        .get(&crate::object::StrKey(field))
+                        .cloned()
+                        .ok_or_else(|| {
+                            crate::error::attribute_error(format!(
+                                "'{type_name}' object has no attribute '{field}'"
+                            ))
+                        })
+                }),
+                call_kw: None,
+            }));
+            let prop = Object::Property(Rc::new(crate::object::PyProperty::new(
+                fget,
+                Object::None,
+                Object::None,
+                Object::None,
+            )));
+            crate::descr_registry::register(
+                &prop,
+                crate::descr_registry::DescrKind::Member,
+                cls.clone(),
+                field,
+                None,
+            );
+            cls.dict.borrow_mut().insert(key, prop);
+        }
         reg.borrow_mut().insert(name, (cls.clone(), layout));
         cls
     })
@@ -7604,6 +7920,11 @@ pub(crate) fn path_to_string(obj: &Object, func: &str) -> Result<String, Runtime
             match interp.call_object(fspath, &[], &[])? {
                 Object::Str(s) => s.to_string(),
                 Object::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+                // A surrogate-bearing str (pathlib's surrogateescape'd
+                // names) is still a str result: recurse into the WStr
+                // arm's PEP 383 encoding (test_pathlib's
+                // `P(base + '\udfff').exists()` probes).
+                w @ Object::WStr(_) => path_to_string(&w, func)?,
                 other => {
                     return Err(type_error(format!(
                         "expected {}.__fspath__() to return str or bytes, not {}",

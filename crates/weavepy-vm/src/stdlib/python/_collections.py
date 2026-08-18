@@ -6,11 +6,14 @@ imports each inside `try/except ImportError` and falls back to its
 pure-Python definitions when absent.
 
 WeavePy supplies the two containers that have *no* pure-Python fallback
-in the real module — `deque` and `defaultdict` — plus `_count_elements`
-and an `OrderedDict` with the C implementation's observable semantics
+in the real module — `deque` and `defaultdict` — plus `_count_elements`,
+an `OrderedDict` with the C implementation's observable semantics
 (state-guarded iterators that pickle, gh-119004 mutation checks in
-`__eq__`). `_tuplegetter` is intentionally omitted so the reference
-pure-Python implementation runs instead.
+`__eq__`), and `_tuplegetter`. The collections fallback for the latter —
+`property(_itemgetter(index))` — is observably different: a 3.13
+property picks up `__name__` via `__set_name__`, so `pydoc` prints a
+title line for namedtuple fields that CPython's C descriptor never has
+(test_pydoc test_namedtuple_field_descriptor).
 """
 
 __all__ = ["deque", "defaultdict", "OrderedDict", "_count_elements"]
@@ -33,16 +36,62 @@ def _count_elements(mapping, iterable):
         mapping[elem] = mapping_get(elem, 0) + 1
 
 
+# Descriptor for a named tuple field: `obj[index]` carrying the field's
+# docstring (CPython's C `_collections._tuplegetter`). No class
+# docstring — `__doc__` must stay a slot so each instance carries its
+# field's doc.
+class _tuplegetter:
+    __slots__ = ('index', '__doc__')
+
+    def __init__(self, index, doc):
+        self.index = index
+        self.__doc__ = doc
+
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self
+        try:
+            return obj[self.index]
+        except IndexError:
+            raise AttributeError('tuple index out of range') from None
+
+    def __set__(self, obj, value):
+        raise AttributeError("can't set attribute")
+
+    def __delete__(self, obj):
+        raise AttributeError("can't delete attribute")
+
+    def __reduce__(self):
+        return (self.__class__, (self.index, self.__doc__))
+
+
+class _defaultdict_factory_slot:
+    # The C type's `default_factory` is a `tp_members` slot: a *data*
+    # descriptor (`inspect.isdatadescriptor(defaultdict.default_factory)`
+    # — test_inspect test_excluding_predicates), so it must own both
+    # `__get__` and `__set__`. Instance storage lives under a private
+    # instance-dict key (the C struct field's stand-in). Code like
+    # `dataclasses._asdict_inner` probes `hasattr(type(obj),
+    # 'default_factory')`, which this satisfies too.
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self
+        return obj.__dict__.get('_weavepy_default_factory')
+
+    def __set__(self, obj, value):
+        obj.__dict__['_weavepy_default_factory'] = value
+
+    def __delete__(self, obj):
+        obj.__dict__['_weavepy_default_factory'] = None
+
+
 class defaultdict(dict):
     """dict subclass that calls a factory function to supply missing values."""
 
     # The C type reports `collections`, not `_collections`.
     __module__ = "collections"
 
-    # Class-level default mirrors the C type's member descriptor; code like
-    # `dataclasses._asdict_inner` probes `hasattr(type(obj),
-    # 'default_factory')` to recognize defaultdict-shaped mappings.
-    default_factory = None
+    default_factory = _defaultdict_factory_slot()
 
     def __init__(self, default_factory=None, /, *args, **kwds):
         if default_factory is not None and not callable(default_factory):

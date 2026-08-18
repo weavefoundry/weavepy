@@ -30,6 +30,7 @@ use crate::instancemethod;
 use crate::lifecycle;
 use crate::memory;
 use crate::memoryview;
+use crate::modsupport_ext;
 use crate::module;
 use crate::monitoring;
 use crate::mypyc_tail;
@@ -114,6 +115,10 @@ extern "C" {
         va: *mut core::ffi::c_void,
     ) -> *mut crate::object::PyObject;
     fn PyErr_FormatUnraisable(fmt: *const core::ffi::c_char, ...);
+    fn PySys_WriteStdout(fmt: *const core::ffi::c_char, ...);
+    fn PySys_WriteStderr(fmt: *const core::ffi::c_char, ...);
+    fn PySys_FormatStdout(fmt: *const core::ffi::c_char, ...);
+    fn PySys_FormatStderr(fmt: *const core::ffi::c_char, ...);
     fn PyObject_CallFunction(
         callable: *mut crate::object::PyObject,
         fmt: *const core::ffi::c_char,
@@ -583,6 +588,11 @@ static FORCE_LINK: &[FnPtr] = &[
     addr!(PyErr_Format),
     addr!(PyErr_FormatV),
     addr!(PyErr_FormatUnraisable),
+    // RFC 0068 WS3 — ctypes.pythonapi stream writers (test_capi.test_sys).
+    addr!(PySys_WriteStdout),
+    addr!(PySys_WriteStderr),
+    addr!(PySys_FormatStdout),
+    addr!(PySys_FormatStderr),
     // abi313.rs — the wave-2 binary-wheel symbol burn (RFC 0056 WS5).
     addr!(crate::abi313::_Py_IncRef),
     addr!(crate::abi313::_Py_DecRef),
@@ -957,6 +967,22 @@ static FORCE_LINK: &[FnPtr] = &[
     addr!(pystate::PyThread_tss_is_created),
     addr!(pystate::PyThread_tss_alloc),
     addr!(pystate::PyThread_tss_free),
+    addr!(pystate::PyThread_get_thread_native_id),
+    // RFC 0068 WS4 — surface for the compiled `_testsinglephase` /
+    // `_testmultiphase` fixtures (PEP 489 state, clinic helpers, PyTime).
+    addr!(modsupport_ext::PyModule_GetDef),
+    addr!(modsupport_ext::PyModule_New),
+    addr!(modsupport_ext::PyState_AddModule),
+    addr!(modsupport_ext::PyState_RemoveModule),
+    addr!(modsupport_ext::PyUnstable_Module_SetGIL),
+    addr!(modsupport_ext::PyType_GetModule),
+    addr!(modsupport_ext::PyType_GetModuleState),
+    addr!(modsupport_ext::_PyNamespace_New),
+    addr!(modsupport_ext::PyTime_Monotonic),
+    addr!(modsupport_ext::PyTime_AsSecondsDouble),
+    addr!(modsupport_ext::_PyArg_CheckPositional),
+    addr!(modsupport_ext::_PyArg_UnpackKeywords),
+    addr!(pystate::Py_FrozenMain),
     addr!(pystate::PyInterpreterState_GetID),
     addr!(pystate::PyGC_Enable),
     addr!(pystate::PyGC_Disable),

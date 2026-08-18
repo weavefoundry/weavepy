@@ -32,7 +32,38 @@ SPLITTESTDIRS: set[TestName] = {
 
 
 def findtestdir(path: StrPath | None = None) -> StrPath:
-    return path or os.path.dirname(os.path.dirname(__file__)) or os.curdir
+    if path:
+        return path
+    # WeavePy deviation: on CPython, `test.libregrtest` lives inside the
+    # suite itself, so `dirname(dirname(__file__))` *is* `Lib/test`. Here
+    # the package is frozen and materialized into a thin runtime-stdlib
+    # shim carrying only a handful of test files — the real suite is the
+    # on-disk `test/` grafted onto `test.__path__` (a vendored CPython
+    # `Lib/test`, put on `sys.path` by the harness). Pick the `__path__`
+    # entry that carries the most `test_*` entries, which on CPython is
+    # trivially the package directory (test_regrtest's
+    # test_finds_expected_number_of_tests lists ~the whole suite).
+    try:
+        import test as _test_pkg
+
+        def _weight(entry: str) -> int:
+            try:
+                return sum(1 for n in os.listdir(entry) if n.startswith("test_"))
+            except OSError:
+                return 0
+
+        candidates = [
+            entry
+            for entry in getattr(_test_pkg, "__path__", [])
+            if os.path.isdir(entry)
+        ]
+        if candidates:
+            best = max(candidates, key=_weight)
+            if _weight(best) > 0:
+                return best
+    except ImportError:
+        pass
+    return os.path.dirname(os.path.dirname(__file__)) or os.curdir
 
 
 def findtests(*, testdir: StrPath | None = None, exclude: Container[str] = (),

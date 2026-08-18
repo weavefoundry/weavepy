@@ -128,9 +128,35 @@ The `regrtest` subcommand runs individual `Lib/test/test_*.py` files
 end-to-end through WeavePy and grades each against
 `tests/regrtest/expectations.toml`. It is **live** (RFC 0026/0034 built
 the runner + `test.support`; RFC 0036 wired a real CPython checkout into
-the CLI). A test is graded `pass`/`fail`/`error`/`skip`/`timeout`, and
-the baseline gates CI in both directions: a previously-passing test must
-not regress, and a file that starts passing must be promoted.
+the CLI). A test is graded `pass`/`fail`/`error`/`skip`/`timeout` (plus
+the `divergence` expectation below), and the baseline gates CI in both
+directions: a previously-passing test must not regress, and a file that
+starts passing must be promoted.
+
+### The `divergence` status (RFC 0068 WS7)
+
+`status = "divergence"` is reserved for rows where a test asserts
+behavior **provably unsatisfiable under WeavePy's documented object
+model** — not a gap to burn down, but a deliberate design choice the
+suite happens to observe. The bar is strict:
+
+- The row must enumerate the exact unittest ids it is allowed to fail
+  in a mandatory `divergence_tests` list, plus a `reason` explaining
+  why the behavior is unsatisfiable (both are hard load errors when
+  missing).
+- The runner grades the row `divergence` only when the observed
+  failure set **equals** the enumerated list — every listed id fails
+  and nothing else does. A row that starts passing, or failing a
+  different set, is `unexpected` and blocks CI exactly like a `pass`
+  row regressing.
+- `divergence` is counted separately from `fail` in the sweep summary.
+
+The budget is deliberately tiny — **one row**: `test_marshal`, whose
+`InstancingTestCase.testInt`/`testFloat` assert that version-2 marshal
+loads create `id()`-distinct instances. WeavePy's unboxed int/float
+representation (the RFC 0058+ performance arc) derives `id()` from the
+value, so two equal unboxed ints *are* the same object identity-wise;
+abandoning unboxing to satisfy two identity asserts is rejected.
 
 ```bash
 # Run the curated allowlist against a vendored CPython 3.13 Lib/test/,
@@ -161,10 +187,18 @@ subprocess sweep reports `unexpected 0`. Each `cpython/Lib/test/*` row
 carries a `reason` that, where the file fails, quotes the measured first
 failure so the gap is concrete.
 
-As of RFC 0060 the baseline stands at **515 of 548 files passing**
-(fail 27, skip 6, zero timeout rows) with the ecosystem lane at 29/29
-offline (pandas and FastAPI capstones included); every red row carries
-an enumerated, measured residual.
+As of RFC 0068 the burn is complete: the whole-suite sweep grades
+**fail 0, error 0, timeout 0, unexpected 0** across all 550 labels —
+**546 pass**, three principled skips (`test_embed` and `test_getpath`
+exercise CPython build artifacts that don't exist for a Rust
+interpreter; `test_multiprocessing_fork` is skipped on macOS exactly
+as CPython does), and one `divergence` row (`test_marshal`: two
+enumerated `InstancingTestCase` ids assert that version-2 loads mint
+*new* int/float objects by `id()`, unsatisfiable under WeavePy's
+unboxed numeric model — see the status description above). The
+ecosystem lane stands at **36/36 passing rows** offline (pandas and
+FastAPI capstones included, self-tests green); the `gevent` stretch
+row stays a measured fail per RFC 0066.
 
 ## CI integration
 

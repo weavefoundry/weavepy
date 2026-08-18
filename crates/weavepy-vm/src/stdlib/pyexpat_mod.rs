@@ -1555,6 +1555,16 @@ fn parser_create(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object,
 }
 
 fn external_entity_parser_create(args: &[Object]) -> Result<Object, RuntimeError> {
+    // Honour `_testcapi.set_nomemory`: CPython's ExternalEntityParserCreate
+    // allocates through PyMem, so the injected counting allocator makes it
+    // raise MemoryError without touching the parent parser (gh-144984,
+    // test_pyexpat ExternalEntityParserCreateErrorTest).
+    if crate::stdlib::testinternalcapi_mod::nomem_alloc_fails() {
+        return Err(RuntimeError::PyException(PyException::from_builtin(
+            "MemoryError",
+            "",
+        )));
+    }
     let st = state_of_args(args)?;
     let context = opt_str_arg("ExternalEntityParserCreate", "context", args.get(1))?;
     let encoding = opt_str_arg("ExternalEntityParserCreate", "encoding", args.get(2))?;

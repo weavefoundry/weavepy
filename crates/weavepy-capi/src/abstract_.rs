@@ -254,7 +254,44 @@ unsafe fn inherited_repr_str_slot(
 
 #[no_mangle]
 pub unsafe extern "C" fn PyObject_ASCII(o: *mut PyObject) -> *mut PyObject {
-    unsafe { PyObject_Repr(o) }
+    // CPython's `ascii()`: repr, then escape every non-ASCII code point
+    // (`\xhh` / `\uxxxx` / `\Uxxxxxxxx`) — PyUnicode_FromFormat's %A
+    // relies on the escaping (test_capi.test_unicode.test_from_format).
+    let r = unsafe { PyObject_Repr(o) };
+    if r.is_null() {
+        return r;
+    }
+    let cs = unsafe { crate::strings::PyUnicode_AsUTF8(r) };
+    if cs.is_null() {
+        // Not a UTF-8-representable repr (lone surrogates): keep the
+        // repr as-is rather than failing outright.
+        crate::errors::clear_thread_local();
+        return r;
+    }
+    let s = unsafe { core::ffi::CStr::from_ptr(cs) }.to_string_lossy();
+    if s.is_ascii() {
+        return r;
+    }
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(s.len() + 8);
+    for ch in s.chars() {
+        let cp = ch as u32;
+        if cp < 0x80 {
+            out.push(ch);
+        } else if cp <= 0xFF {
+            let _ = write!(out, "\\x{cp:02x}");
+        } else if cp <= 0xFFFF {
+            let _ = write!(out, "\\u{cp:04x}");
+        } else {
+            let _ = write!(out, "\\U{cp:08x}");
+        }
+    }
+    unsafe { crate::object::Py_DecRef(r) };
+    let c = match std::ffi::CString::new(out) {
+        Ok(c) => c,
+        Err(_) => return ptr::null_mut(),
+    };
+    unsafe { crate::strings::PyUnicode_FromString(c.as_ptr()) }
 }
 
 fn repr_for(o: &Object) -> String {

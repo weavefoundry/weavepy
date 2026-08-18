@@ -38,6 +38,102 @@ use crate::object::PyObject;
 /// Type of the entry-point a CPython extension exports.
 type PyInitFn = unsafe extern "C" fn() -> *mut PyObject;
 
+/// RFC 3492 punycode encoding (encode-only), matching Python's
+/// `"punycode"` codec — CPython's `get_encoded_name` runs a module's
+/// non-ASCII leaf name through it to derive the `PyInitU_` symbol.
+fn punycode_encode(input: &str) -> String {
+    const BASE: u32 = 36;
+    const TMIN: u32 = 1;
+    const TMAX: u32 = 26;
+    const SKEW: u32 = 38;
+    const DAMP: u32 = 700;
+    const INITIAL_BIAS: u32 = 72;
+    const INITIAL_N: u32 = 128;
+
+    fn adapt(mut delta: u32, num_points: u32, first_time: bool) -> u32 {
+        delta /= if first_time { DAMP } else { 2 };
+        delta += delta / num_points;
+        let mut k = 0;
+        while delta > ((BASE - TMIN) * TMAX) / 2 {
+            delta /= BASE - TMIN;
+            k += BASE;
+        }
+        k + (((BASE - TMIN + 1) * delta) / (delta + SKEW))
+    }
+
+    fn digit_char(d: u32) -> char {
+        if d < 26 {
+            (b'a' + d as u8) as char
+        } else {
+            (b'0' + (d - 26) as u8) as char
+        }
+    }
+
+    let code_points: Vec<u32> = input.chars().map(|c| c as u32).collect();
+    let mut out: String = input.chars().filter(|c| c.is_ascii()).collect();
+    let basic_len = out.chars().count() as u32;
+    if basic_len > 0 {
+        out.push('-');
+    }
+
+    let mut n = INITIAL_N;
+    let mut delta: u32 = 0;
+    let mut bias = INITIAL_BIAS;
+    let mut handled = basic_len;
+    let total = code_points.len() as u32;
+
+    while handled < total {
+        let m = code_points
+            .iter()
+            .copied()
+            .filter(|&c| c >= n)
+            .min()
+            .unwrap();
+        delta += (m - n) * (handled + 1);
+        n = m;
+        for &c in &code_points {
+            if c < n {
+                delta += 1;
+            }
+            if c == n {
+                let mut q = delta;
+                let mut k = BASE;
+                loop {
+                    let t = if k <= bias {
+                        TMIN
+                    } else if k >= bias + TMAX {
+                        TMAX
+                    } else {
+                        k - bias
+                    };
+                    if q < t {
+                        break;
+                    }
+                    out.push(digit_char(t + ((q - t) % (BASE - t))));
+                    q = (q - t) / (BASE - t);
+                    k += BASE;
+                }
+                out.push(digit_char(q));
+                bias = adapt(delta, handled + 1, handled == basic_len);
+                delta = 0;
+                handled += 1;
+            }
+        }
+        delta += 1;
+        n += 1;
+    }
+    out
+}
+
+/// A `SystemError` RuntimeError for loader-detected init protocol
+/// violations (CPython's `_PyImport_LoadDynamicModuleWithSpec` shapes).
+fn system_error_runtime(message: String) -> weavepy_vm::error::RuntimeError {
+    weavepy_vm::error::RuntimeError::PyException(weavepy_vm::error::PyException::from_builtin(
+        "SystemError",
+        message,
+    ))
+}
+
 /// Loaded library handle. Kept alive for the lifetime of the
 /// running interpreter so the symbols stay resolved.
 pub struct LoadedLibrary {
@@ -59,8 +155,37 @@ pub enum LoadError {
     MissingInit(String),
     #[error("init function returned NULL{}", .pending.as_deref().map(|s| format!(": {s}")).unwrap_or_default())]
     NullInit { pending: Option<String> },
+    /// The init function (or the PEP 489 slot machinery) raised: the
+    /// original exception must propagate as-is — extension.test_loader
+    /// asserts the type (`assertRaises(SystemError)` for bad slots),
+    /// not an ImportError wrapper.
+    #[error("{0}")]
+    Raised(weavepy_vm::error::RuntimeError),
     #[error("init function returned non-module value")]
     NotAModule,
+}
+
+/// CPython's process-wide single-phase extensions cache
+/// (`_PyRuntime.imports.extensions`, keyed by `(filename, name)`).
+/// Stores a snapshot of the module dict taken right after init —
+/// CPython's `def->m_base.m_copy` — so a re-import (same interpreter
+/// or, under the legacy setting, a sub-interpreter) gets a fresh
+/// module object whose dict *values* are the very same objects
+/// (test_capi test_misc's test_module_state_shared_in_global asserts
+/// `id(module.Error)` matches across interpreters, bpo-44050).
+/// `Object` is Send + Sync under the GIL, like the other
+/// mutex-guarded VM singletons.
+static SINGLEPHASE_EXTENSIONS: std::sync::Mutex<Vec<((String, String), DictData)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn singlephase_cached(path: &Path, module_name: &str) -> Option<DictData> {
+    let key = (path.display().to_string(), module_name.to_owned());
+    SINGLEPHASE_EXTENSIONS
+        .lock()
+        .ok()?
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, d)| d.clone())
 }
 
 /// Load `path` as a CPython-style extension module named
@@ -73,6 +198,28 @@ pub fn load_extension_module(
 ) -> Result<Object, LoadError> {
     crate::interp::ensure_initialised();
 
+    // CPython `import_find_extension`: a single-phase module already in
+    // the process-wide cache is *not* re-initialised — a fresh module
+    // object is built around the stored dict snapshot (m_copy). The
+    // sub-interpreter incompatibility gate still applies first, exactly
+    // like `_PyImport_CheckSubinterpIncompatibleExtensionAllowed`.
+    if let Some(snapshot) = singlephase_cached(path, module_name) {
+        let gate = weavepy_vm::vm_singletons::current_interpreter_ptr()
+            // SAFETY: published by an enclosing VM frame live on this
+            // thread; the GIL keeps the access exclusive.
+            .and_then(|p| unsafe { (*p).subinterp_extension_gate() });
+        if gate.is_some() {
+            return Err(LoadError::Raised(weavepy_vm::error::import_error(format!(
+                "module {module_name} does not support loading in subinterpreters"
+            ))));
+        }
+        return Ok(Object::Module(Rc::new(PyModule {
+            name: module_name.to_owned(),
+            filename: Some(path.display().to_string()),
+            dict: Rc::new(weavepy_vm::sync::RefCell::new(snapshot)),
+        })));
+    }
+
     let trace_loader = std::env::var_os("WEAVEPY_TRACE_LOADER").is_some();
     if trace_loader {
         eprintln!("[LOADER] dlopen path={path:?} module={module_name}");
@@ -80,7 +227,14 @@ pub fn load_extension_module(
     let leaf = module_name.rsplit('.').next().unwrap_or(module_name);
     let lib = open_extension_library(path, leaf)?;
 
-    let init_name = format!("PyInit_{leaf}");
+    // CPython's `importdl.c` hook naming: ASCII names use `PyInit_<leaf>`;
+    // non-ASCII names use `PyInitU_<punycode(leaf) with '-' → '_'>`
+    // (extension.test_loader's test_nonascii).
+    let init_name = if leaf.is_ascii() {
+        format!("PyInit_{leaf}")
+    } else {
+        format!("PyInitU_{}", punycode_encode(leaf).replace('-', "_"))
+    };
     let init: Symbol<PyInitFn> = unsafe {
         lib.get(init_name.as_bytes())
             .map_err(|_| LoadError::MissingInit(init_name.clone()))?
@@ -103,10 +257,27 @@ pub fn load_extension_module(
         current_module: Some(placeholder.clone()),
     };
 
+    let single_phase = std::cell::Cell::new(false);
     let raw = crate::interp::enter_extension_call(ctx, || {
         let r = unsafe { init_fn() };
         if r.is_null() {
             return r;
+        }
+        // A def the extension forgot to pass through `PyModuleDef_Init`
+        // has a zeroed object header (extension.test_loader's
+        // `export_uninitialized` variant asserts SystemError).
+        if unsafe { (*r).ob_type.is_null() } {
+            crate::errors::set_pending(
+                Some(
+                    weavepy_vm::builtin_types::builtin_types()
+                        .system_error
+                        .clone(),
+                ),
+                Object::from_str(format!(
+                    "init function of {module_name} returned uninitialized object"
+                )),
+            );
+            return std::ptr::null_mut();
         }
         // PEP 489: a tagged `PyModuleDef` means multi-phase init — run
         // the create/exec slots ourselves to get the populated module.
@@ -119,12 +290,45 @@ pub fn load_extension_module(
             } {
                 Ok(m) => m,
                 Err(e) => {
-                    crate::errors::set_runtime_error(format!("multi-phase init failed: {e}"));
+                    // Preserve a pending exception the slot machinery set
+                    // (SystemError for bad slot IDs, the original error from
+                    // a raising create/exec slot — extension.test_loader
+                    // asserts the exception *type*); only synthesize a
+                    // RuntimeError when nothing is pending.
+                    if !crate::errors::has_pending() {
+                        crate::errors::set_runtime_error(format!("multi-phase init failed: {e}"));
+                    }
                     std::ptr::null_mut()
                 }
             }
         } else {
-            r
+            // Single-phase init. CPython's
+            // `_PyImport_CheckSubinterpIncompatibleExtensionAllowed`:
+            // in a sub-interpreter with the multi-interp extension check
+            // in effect, single-phase modules refuse to load regardless
+            // of GIL configuration (test_util's
+            // IncompatibleExtensionModuleRestrictionsTests).
+            let gate = weavepy_vm::vm_singletons::current_interpreter_ptr()
+                // SAFETY: published by the enclosing extension-call
+                // context; the GIL keeps access exclusive.
+                .and_then(|p| unsafe { (*p).subinterp_extension_gate() });
+            if gate.is_some() {
+                unsafe { crate::object::Py_DecRef(r) };
+                crate::errors::set_pending(
+                    Some(
+                        weavepy_vm::builtin_types::builtin_types()
+                            .import_error
+                            .clone(),
+                    ),
+                    Object::from_str(format!(
+                        "module {module_name} does not support loading in subinterpreters"
+                    )),
+                );
+                std::ptr::null_mut()
+            } else {
+                single_phase.set(true);
+                r
+            }
         }
     });
 
@@ -142,19 +346,26 @@ pub fn load_extension_module(
             });
             eprintln!("[LOADER] FAILED (null init) module={module_name} pending={peek:?}");
         }
-        let pending = crate::errors::take_pending().map(|p| {
-            let ty =
-                p.ty.as_ref()
-                    .map(|t| t.name.clone())
-                    .unwrap_or_else(|| "Exception".to_owned());
-            let msg = crate::errors::message_for(&p.value);
-            if msg.is_empty() {
-                ty
-            } else {
-                format!("{ty}: {msg}")
-            }
-        });
-        return Err(LoadError::NullInit { pending });
+        if let Some(p) = crate::errors::take_pending() {
+            return Err(LoadError::Raised(crate::errors::to_runtime_error(p)));
+        }
+        // export_null: NULL without an exception → SystemError (CPython's
+        // `_PyImport_LoadDynamicModuleWithSpec` wording).
+        return Err(LoadError::Raised(system_error_runtime(format!(
+            "initialization of {leaf} failed without raising an exception"
+        ))));
+    }
+
+    // export_unreported_exception: init returned a module but left an
+    // exception pending — CPython converts this to SystemError chained
+    // via `__cause__` (`_PyErr_FormatFromCause`).
+    if crate::errors::has_pending() {
+        unsafe { crate::object::Py_DecRef(raw) };
+        crate::errors::set_pending_system_error_from_cause(format!(
+            "initialization of {leaf} raised unreported exception"
+        ));
+        let p = crate::errors::take_pending().expect("just set");
+        return Err(LoadError::Raised(crate::errors::to_runtime_error(p)));
     }
 
     let module_obj = unsafe { crate::object::clone_object(raw) };
@@ -162,7 +373,14 @@ pub fn load_extension_module(
 
     let module = match module_obj {
         Object::Module(m) => m,
-        _ => return Err(LoadError::NotAModule),
+        // PEP 489: a `Py_mod_create` slot may return any object
+        // (extension.test_loader's `nonmodule` variants); hand it back
+        // as-is — `sys.modules` accepts arbitrary objects.
+        other => {
+            // Keep the library resident (same leak the module path does).
+            let _: &'static Library = Box::leak(Box::new(lib));
+            return Ok(other);
+        }
     };
 
     // Copy in __file__ / __loader__ stubs.
@@ -172,6 +390,49 @@ pub fn load_extension_module(
             .or_insert_with(|| Object::from_str(path.display().to_string()));
         d.entry(DictKey(Object::from_static("__name__")))
             .or_insert_with(|| Object::from_str(module_name.to_owned()));
+        // `PyModule_Create2` seeds the `__spec__`/`__loader__` = None
+        // placeholders CPython's `module_init_dict` puts in every fresh
+        // module; `_bootstrap._load` normally replaces them. The native
+        // importer synthesizes the pair lazily on first read instead
+        // (`_weave_spec`), which only fires for *missing* keys — drop
+        // the `__spec__` placeholder so the module gets a real
+        // ExtensionFileLoader spec (`importlib.util.find_spec` raises
+        // "__spec__ is None" otherwise — test_capi test_misc's
+        // test_module_state_shared_in_global find_spec's the fixture).
+        // `__loader__` must STAY None: `_init_module_attrs` only
+        // installs the loading spec's loader over a None/missing
+        // `__loader__`, and a Python-level load must win over the lazy
+        // synthesis (test_importlib's Source_LoaderTests.test_module
+        // loads with the *source-variant* ExtensionFileLoader and
+        // asserts `module.__loader__` is that class). The synthesis
+        // pass overwrites the None alongside `__spec__` when it fires.
+        if let Some(Object::None) = d.get(&DictKey(Object::from_static("__spec__"))) {
+            d.shift_remove(&DictKey(Object::from_static("__spec__")));
+        }
+    }
+    // The lazy spec taxonomy classifies by the module's native filename
+    // (`.so` → ExtensionFileLoader); the extension-created module has
+    // none. SAFETY: plain field replacement through the shared handle
+    // under the GIL, before the module is published — same pattern as
+    // `_imp._fix_co_filename`.
+    if module.filename.is_none() {
+        unsafe {
+            let f = std::ptr::addr_of!(module.filename).cast_mut();
+            *f = Some(path.display().to_string());
+        }
+    }
+
+    // Single-phase init: record the post-init dict snapshot in the
+    // process-wide extensions cache (CPython's `update_global_state` /
+    // `def->m_base.m_copy`) so re-imports reuse it without re-running
+    // the init function.
+    if single_phase.get() {
+        if let Ok(mut cache) = SINGLEPHASE_EXTENSIONS.lock() {
+            let key = (path.display().to_string(), module_name.to_owned());
+            if !cache.iter().any(|(k, _)| *k == key) {
+                cache.push((key, module.dict.borrow().clone()));
+            }
+        }
     }
 
     let result = Object::Module(module);

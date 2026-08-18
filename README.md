@@ -202,6 +202,36 @@ work.
 > (retiring wave 4's JIT call regression) and the loop kernels
 > (`sumvm`/`nested_loops`/`jitloop`) at 0.05× — 20× faster than
 > CPython.
+>
+> `RFC 0068` is **conformance zero — the final red-row burn**: the
+> whole-suite sweep now grades **fail 0, error 0, timeout 0,
+> unexpected 0** across all 550 labels (546 pass, the three principled
+> skips — `test_embed`, `test_getpath`,
+> `test_multiprocessing_fork`-on-macOS — and one `divergence` row:
+> `test_marshal`'s two enumerated subtests assert marshal-loaded
+> ints/floats are *new* objects by `id()`, unsatisfiable under the
+> unboxed numeric model). The wave lands the codegen-stage surface —
+> `_testinternalcapi.compiler_codegen` + `optimize_cfg` over the same
+> flowgraph IR the production compiler emits through
+> (`test_compiler_codegen`, `test_peepholer`, `test_compile`,
+> `test_code`, `test_dis` flip) — tracing exactness
+> (`test_sys_settrace`, `test_monitoring`, `test_trace`), the
+> importlib machinery burn (CPython's real `_bootstrap`/
+> `_bootstrap_external` frozen verbatim over the native `_imp`),
+> real multi-process `weavepy -m test -j2` workers over the
+> libregrtest JSON protocol (`test_regrtest` flips), the
+> `test_socket` long tail (`sendmsg`/`recvmsg`/`SCM_RIGHTS`), and
+> PEP 734 sub-interpreters end-to-end (`test_interpreters` and the
+> `test__interpreters`/`test__interpchannels`/`test__interpqueues`
+> trio, C-API-created interpreters included), while the skip-row
+> audit graduates `test_locale`/`test_pdb`/`test_socket` to measured
+> rows. The re-baseline caught real engine bugs, notably exhausted
+> `FOR_ITER` temporaries skipping finalizers — CPython frees a
+> temporary list's elements by refcount the instant the loop ends,
+> and WeavePy's plain drop left `ChannelID.__del__` (and any
+> `__del__` on a loop-consumed temporary) waiting for the next cyclic
+> collection — and the sub-interpreter extension-compatibility
+> ImportError being swallowed by the PyInit blanket retype.
 
 ## Repository layout
 

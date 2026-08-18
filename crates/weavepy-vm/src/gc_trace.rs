@@ -1991,6 +1991,7 @@ pub fn strong_count_for(obj: &Object) -> usize {
         Object::Traceback(t) => Rc::strong_count(t),
         Object::MemoryView(m) => Rc::strong_count(m),
         Object::MappingProxy(d) => Rc::strong_count(d),
+        Object::MappingProxyObj(o) => Rc::strong_count(o),
         Object::DictView(v) => Rc::strong_count(v),
         Object::SimpleNamespace(d) => Rc::strong_count(d),
         Object::Cell(c) => Rc::strong_count(c),
@@ -2034,6 +2035,7 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
                 visit(v);
             }
         }
+        Object::MappingProxyObj(inner) => visit(inner),
         Object::Set(s) => {
             let Ok(m) = s.try_borrow() else { return };
             for k in m.iter() {

@@ -1,157 +1,176 @@
-"""High-level import machinery surface.
+"""A pure Python implementation of import."""
+__all__ = ['__import__', 'import_module', 'invalidate_caches', 'reload']
 
-This module re-exports the canonical pieces of the import system —
-``import_module``, ``reload``, the ``__import__`` hook, and the
-``invalidate_caches`` knob — that user code (especially the packaging
-ecosystem) reaches for. Internal bootstrap submodules
-(``importlib._bootstrap`` and friends) are intentionally omitted: the
-real bootstrap happens in the VM, not in this Python source.
-"""
+# Bootstrap help #####################################################
 
+# Until bootstrapping is complete, DO NOT import any modules that attempt
+# to import importlib._bootstrap (directly or indirectly). Since this
+# partially initialised package would be present in sys.modules, those
+# modules would get an uninitialised copy of the source version, instead
+# of a fully initialised version (either the frozen one or the one
+# initialised below if the frozen one is not available).
+import _imp  # Just the builtin component, NOT the full Python module
 import sys
 
+try:
+    import _frozen_importlib as _bootstrap
+except ImportError:
+    from . import _bootstrap
+    _bootstrap._setup(sys, _imp)
+else:
+    # importlib._bootstrap is the built-in import, ensure we don't create
+    # a second copy of the module.
+    _bootstrap.__name__ = 'importlib._bootstrap'
+    _bootstrap.__package__ = 'importlib'
+    try:
+        _bootstrap.__file__ = __file__.replace('__init__.py', '_bootstrap.py')
+    except NameError:
+        # __file__ is not guaranteed to be defined, e.g. if this code gets
+        # frozen by a tool like cx_Freeze.
+        pass
+    sys.modules['importlib._bootstrap'] = _bootstrap
 
-# Capture the interpreter's import hook *before* this module defines its
-# own ``__import__`` below (after which the bare name resolves to the
-# module-level function instead of the builtin).
-_builtin_import = __import__
+try:
+    import _frozen_importlib_external as _bootstrap_external
+except ImportError:
+    from . import _bootstrap_external
+    _bootstrap_external._set_bootstrap_module(_bootstrap)
+    _bootstrap._bootstrap_external = _bootstrap_external
+else:
+    _bootstrap_external.__name__ = 'importlib._bootstrap_external'
+    _bootstrap_external.__package__ = 'importlib'
+    try:
+        _bootstrap_external.__file__ = __file__.replace('__init__.py', '_bootstrap_external.py')
+    except NameError:
+        # __file__ is not guaranteed to be defined, e.g. if this code gets
+        # frozen by a tool like cx_Freeze.
+        pass
+    sys.modules['importlib._bootstrap_external'] = _bootstrap_external
 
+# To simplify imports in test code
+_pack_uint32 = _bootstrap_external._pack_uint32
+_unpack_uint32 = _bootstrap_external._unpack_uint32
 
-def _import(name, globals_=None, locals_=None, fromlist=(), level=0):
-    # ``builtins`` module isn't yet importable; reach for the
-    # ``__import__`` already wired into the interpreter's builtins
-    # dict by name.
-    return _builtin_import(name, globals_, locals_, fromlist, level)
-
-
-def __import__(name, globals=None, locals=None, fromlist=(), level=0):
-    """Public programmatic mirror of the builtin ``__import__`` (CPython
-    exposes it on importlib for code that wants the import machinery
-    without touching builtins — test.test_importlib.util builds its
-    Frozen/Source variant table from it)."""
-    # CPython `_bootstrap._sanity_check`: reject these *before* the
-    # machinery runs (test_importlib.import_.test_api).
-    if not isinstance(name, str):
-        raise TypeError('module name must be str, not {}'.format(
-            type(name).__name__))
-    if level < 0:
-        raise ValueError('level must be >= 0')
-    return _builtin_import(name, globals, locals, fromlist, level)
-
-__all__ = [
-    'import_module',
-    'reload',
-    'invalidate_caches',
-    'find_loader',
-    'machinery',
-    'util',
-    'abc',
-]
-
-
-def _resolve_name(name, package, level):
-    """Resolve a relative module name. Mirrors CPython's
-    ``importlib._bootstrap._resolve_name``.
-    """
-    if level == 0:
-        return name
-    if not package:
-        raise ImportError(
-            "attempted relative import with no known parent package")
-    bits = package.rsplit('.', level - 1)
-    if len(bits) < level:
-        raise ImportError("attempted relative import beyond top-level package")
-    base = bits[0]
-    return '{}.{}'.format(base, name) if name else base
+# Fully bootstrapped at this point, import whatever you like, circular
+# dependencies and startup overhead minimisation permitting :)
 
 
-def import_module(name, package=None):
-    """``importlib.import_module('pkg.mod')``."""
-    level = 0
-    if name.startswith('.'):
-        if not package:
-            raise TypeError(
-                "the 'package' argument is required to perform a relative "
-                "import for {!r}".format(name))
-        for ch in name:
-            if ch != '.':
-                break
-            level += 1
-        name = name[level:]
-    abs_name = _resolve_name(name, package, level)
-    return _import(abs_name, globals(), locals(), ['__name__'], 0)
+# Public API #########################################################
 
-
-def reload(module):
-    """Re-execute a previously imported module."""
-    if not hasattr(module, '__name__'):
-        raise TypeError("reload() argument must be a module")
-    name = module.__name__
-    if name not in sys.modules:
-        raise ImportError(
-            "module {!r} not in sys.modules".format(name), name=name)
-    spec = getattr(module, '__spec__', None)
-    if spec is None:
-        # Try to discover a spec via the loader chain.
-        from . import util
-        spec = util.find_spec(name)
-    if spec is None:
-        raise ImportError(
-            "no loader available for {!r}".format(name), name=name)
-    loader = spec.loader
-    if loader is None or not hasattr(loader, 'exec_module'):
-        # Fall back to a fresh __import__.
-        del sys.modules[name]
-        return _import(name, globals(), locals(), ['__name__'], 0)
-    loader.exec_module(module)
-    return module
+from ._bootstrap import __import__
 
 
 def invalidate_caches():
-    """Clear any cached finder state. We don't yet maintain caches
-    beyond ``sys.modules`` (which we do not clear here); CPython's
-    sibling ``PathFinder`` would walk every entry on ``sys.meta_path``.
-    """
+    """Call the invalidate_caches() method on all meta path finders stored in
+    sys.meta_path (where implemented)."""
     for finder in sys.meta_path:
         if hasattr(finder, 'invalidate_caches'):
-            try:
-                finder.invalidate_caches()
-            except Exception:
-                pass
+            finder.invalidate_caches()
 
 
-def find_loader(name, path=None):
-    """Compat shim: deprecated upstream but still called by some
-    packaging code. Falls back to ``find_spec``.
+def import_module(name, package=None):
+    """Import a module.
+
+    The 'package' argument is required when performing a relative import. It
+    specifies the package to use as the anchor point from which to resolve the
+    relative import to an absolute import.
+
     """
-    from . import util
-    spec = util.find_spec(name, path)
-    return spec.loader if spec else None
+    level = 0
+    if name.startswith('.'):
+        if not package:
+            raise TypeError("the 'package' argument is required to perform a "
+                            f"relative import for {name!r}")
+        for character in name:
+            if character != '.':
+                break
+            level += 1
+    return _bootstrap._gcd_import(name[level:], package, level)
 
 
-# Submodule re-exports are PEP 562 lazy: CPython's importlib/__init__
-# binds *no* submodules at import time, and eagerly importing `abc`
-# here would drag in `importlib.resources` → `inspect` → `ast` on any
-# startup spec synthesis. `test_traceback.test_print_traceback_at_exit`
-# depends on `ast` NOT being in sys.modules at finalization (so the
-# caret-anchor helper's `import ast` fails and full-range carets are
-# printed). A successful `import importlib.abc` still binds the
-# attribute directly on this package, bypassing this hook thereafter.
-# (`_bootstrap`/`_bootstrap_external` are reachable the same way —
-# `test_zipimport` and packaging tools import them directly.)
-def __getattr__(name):
-    if name in ('machinery', 'util', 'abc', '_bootstrap',
-                '_bootstrap_external'):
-        module = import_module('importlib.' + name)
-        globals()[name] = module
-        return module
-    if name in ('_pack_uint32', '_unpack_uint32'):
-        # CPython's importlib/__init__ re-exports these from
-        # `_bootstrap_external` at import time; keep them lazy here for
-        # the same startup-weight reason as the submodules above.
-        module = import_module('importlib._bootstrap_external')
-        value = getattr(module, name)
-        globals()[name] = value
-        return value
-    raise AttributeError(
-        "module 'importlib' has no attribute {!r}".format(name))
+_RELOADING = {}
+
+
+def reload(module):
+    """Reload the module and return it.
+
+    The module must have been successfully imported before.
+
+    """
+    try:
+        name = module.__spec__.name
+    except AttributeError:
+        try:
+            name = module.__name__
+        except AttributeError:
+            raise TypeError("reload() argument must be a module") from None
+
+    if sys.modules.get(name) is not module:
+        raise ImportError(f"module {name} not in sys.modules", name=name)
+    if name in _RELOADING:
+        return _RELOADING[name]
+    _RELOADING[name] = module
+    try:
+        parent_name = name.rpartition('.')[0]
+        if parent_name:
+            try:
+                parent = sys.modules[parent_name]
+            except KeyError:
+                raise ImportError(f"parent {parent_name!r} not in sys.modules",
+                                  name=parent_name) from None
+            else:
+                pkgpath = parent.__path__
+        else:
+            pkgpath = None
+        target = module
+        spec = module.__spec__ = _bootstrap._find_spec(name, pkgpath, target)
+        if spec is None:
+            raise ModuleNotFoundError(f"spec not found for the module {name!r}", name=name)
+        _bootstrap._exec(spec, module)
+        # The module may have replaced itself in sys.modules!
+        return sys.modules[name]
+    finally:
+        try:
+            del _RELOADING[name]
+        except KeyError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# WeavePy adaptation (RFC 0068 WS4). CPython's interpreter startup installs
+# the default finders (`_bootstrap._install` + `_bootstrap_external._install`)
+# before this module ever runs; WeavePy's live import system is native, so we
+# install them on first `importlib` import — the native importer resolves
+# first and consults `sys.meta_path` as a fallback, while introspection
+# (importlib.util.find_spec, pkgutil, test_importlib) sees CPython's shape.
+def _weave_install_default_finders():
+    meta = sys.meta_path
+    # Match by class *name*, not identity: test_importlib's
+    # `import_importlib` re-executes this module with fresh
+    # `importlib._bootstrap*` copies whose finder classes are distinct
+    # objects — appending them would leave duplicate finders on
+    # `sys.meta_path` (every `importlib.metadata.distributions()` hit
+    # would then be yielded once per copy; metadata's test_zip asserts
+    # exactly one). CPython never installs finders here at all — only
+    # `_bootstrap._install()` at interpreter boot does — so re-imports
+    # must be no-ops.
+    present = {getattr(f, '__name__', None) for f in meta}
+    for finder in (_bootstrap.BuiltinImporter, _bootstrap.FrozenImporter,
+                   _bootstrap_external.PathFinder):
+        if finder.__name__ not in present:
+            meta.append(finder)
+    hooks = sys.path_hooks
+    if not any(getattr(h, '__qualname__', '').startswith('FileFinder.')
+               for h in hooks):
+        import zipimport
+        hooks.append(zipimport.zipimporter)
+        hooks.extend(
+            _bootstrap_external._get_supported_file_loaders()
+            and [_bootstrap_external.FileFinder.path_hook(
+                *_bootstrap_external._get_supported_file_loaders())]
+        )
+        sys.path_importer_cache.clear()
+
+
+_weave_install_default_finders()
+del _weave_install_default_finders

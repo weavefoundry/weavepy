@@ -235,6 +235,73 @@ def test_sys_audit_fires_hook():
     assert_true(found_exec, 'exec audit event fired')
 
 
+def test_trace_none_result_keeps_local_trace():
+    """CPython's `trace_trampoline`: only a non-None hook result
+    replaces `f_trace` — returning None from a *local* trace
+    function (or from the global hook on a resumed generator's
+    'call' event) leaves the installed local trace in place. pdb's
+    `until` in a generator frame depends on this (RFC 0068 WS8)."""
+    events = []
+
+    def local(frame, event, arg):
+        events.append(event)
+        return None  # must NOT stop line tracing
+
+    def global_hook(frame, event, arg):
+        if event == 'call' and frame.f_code.co_name == 'gen':
+            # First entry installs the local trace; the resume's
+            # 'call' returns None and must not clobber it.
+            if not getattr(global_hook, 'installed', False):
+                global_hook.installed = True
+                return local
+            return None
+        return None
+
+    def gen():
+        yield 1
+        yield 2
+
+    global_hook.installed = False
+    sys.settrace(global_hook)
+    try:
+        list(gen())
+    finally:
+        sys.settrace(None)
+    # Lines of both `yield 1` and `yield 2` must have been seen:
+    # the local trace survived both its own None returns and the
+    # None-returning 'call' event on resume.
+    assert_true(events.count('line') >= 2,
+                'local trace survived None results ({!r})'.format(events))
+    assert_true(events.count('return') >= 2,
+                'both yields fired return events ({!r})'.format(events))
+
+
+def test_trace_yield_return_carries_value():
+    """A generator's yield fires the `'return'` trace event with the
+    *yielded value* as arg (CPython's sys_trace_return subscribes to
+    PY_YIELD) — pdb prints `->2` after stepping over `yield 2`."""
+    returns = []
+
+    def global_hook(frame, event, arg):
+        if frame.f_code.co_name != 'gen':
+            return None
+        if event == 'return':
+            returns.append(arg)
+        return global_hook
+
+    def gen():
+        yield 'a'
+        yield 'b'
+
+    sys.settrace(global_hook)
+    try:
+        list(gen())
+    finally:
+        sys.settrace(None)
+    # Two yields plus the final exhaustion return (arg None).
+    assert_eq(returns, ['a', 'b', None], 'yield return args')
+
+
 def main():
     tests = [v for k, v in globals().items()
              if k.startswith('test_') and callable(v)]

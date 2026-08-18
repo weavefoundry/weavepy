@@ -68,9 +68,16 @@ fn is_comp(args: &[Object]) -> Result<Object, RuntimeError> {
 /// "optimized" scopes; their `f_locals` is the namespace itself.
 fn is_module_scope(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = frame_arg(args, "is_module_scope")?;
-    Ok(Object::Bool(
-        f.is_module_scope || f.class_namespace.is_some() || f.class_namespace_obj.is_some(),
-    ))
+    Ok(Object::Bool(f.is_unoptimized_scope()))
+}
+
+/// `namespace(frame)` — the live namespace mapping of a non-optimized
+/// frame (module globals, class body dict, or an exec locals mapping).
+/// The proxy built for such a frame (only when hidden comprehension
+/// locals are live, PEP 709) delegates its visible surface here.
+fn namespace(args: &[Object]) -> Result<Object, RuntimeError> {
+    let f = frame_arg(args, "namespace")?;
+    Ok(f.locals())
 }
 
 /// `fast_names(frame)` — every user-visible fast-local name, in
@@ -229,6 +236,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<crate::object::PyModule> {
             ),
             ("is_comp", is_comp),
             ("is_module_scope", is_module_scope),
+            ("namespace", namespace),
             ("fast_names", fast_names),
             ("bound_names", bound_names),
             ("getvar", getvar),

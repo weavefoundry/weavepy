@@ -567,12 +567,20 @@ class Doc:
         docloc = os.environ.get("PYTHONDOCS", self.PYTHONDOCS)
 
         basedir = os.path.normcase(basedir)
+        # A module materialized in the *running* stdlib is a stdlib
+        # module even when the caller passes a different `Lib/` checkout
+        # as `basedir` (the conformance suite runs vendored CPython tests
+        # against the staged runtime stdlib). On CPython the two prefixes
+        # coincide, so accepting either is behaviorally identical.
+        def _under(prefix):
+            return (file.startswith(prefix) and
+                    not file.startswith(os.path.join(prefix, 'site-packages')))
+        stdlibdir = os.path.normcase(sysconfig.get_path('stdlib'))
         if (isinstance(object, type(os)) and
             (object.__name__ in ('errno', 'exceptions', 'gc',
                                  'marshal', 'posix', 'signal', 'sys',
                                  '_thread', 'zipimport') or
-             (file.startswith(basedir) and
-              not file.startswith(os.path.join(basedir, 'site-packages')))) and
+             _under(basedir) or _under(stdlibdir)) and
             object.__name__ not in ('xml.etree', 'test.test_pydoc.pydoc_mod')):
 
             try:

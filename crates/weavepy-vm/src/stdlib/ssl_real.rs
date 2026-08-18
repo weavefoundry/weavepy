@@ -653,7 +653,14 @@ impl ServerCertVerifier for FlagChecksVerifier {
                     .extensions()
                     .iter()
                     .any(|e| e.oid.to_id_string() == "2.5.29.35");
-                if !has_aki {
+                // RFC 5280 §4.2.1.1 exempts self-signed certificates from
+                // the AKI requirement, and OpenSSL's X509_V_FLAG_X509_STRICT
+                // accepts them too — CPython's own test fixtures
+                // (keycert.pem) are AKI-less self-signed leaves loaded as
+                // their own trust anchor (test_urllib2_localnet.test_https
+                // under create_default_context's VERIFY_X509_STRICT).
+                let self_signed = cert.subject() == cert.issuer();
+                if !has_aki && !self_signed {
                     return Err(rustls::Error::General(
                         "certificate verify failed: RFC 5280 strict check: \
                          missing authorityKeyIdentifier"
@@ -1488,18 +1495,21 @@ fn tls_process_error(e: &rustls::Error) -> RuntimeError {
     ssl_error_rt(format!("tls: {e}"))
 }
 
-/// Is the (dup'd) session socket in non-blocking mode? `socket.settimeout(0)` /
-/// `setblocking(False)` arm `O_NONBLOCK` on the shared open-file description,
-/// which the `dup(2)` inherits; a *positive* timeout instead arms
-/// `SO_RCVTIMEO`/`SO_SNDTIMEO` (no `O_NONBLOCK`). So `O_NONBLOCK` distinguishes
-/// "raise WANT_READ/WANT_WRITE immediately" (non-blocking) from "block up to the
-/// deadline, then `socket.timeout`" (timeout mode) and "block forever"
-/// (blocking).
+/// Is the (dup'd) session socket in non-blocking mode? Under the CPython
+/// timeout model (RFC 0068 WS8) *any* non-None timeout — zero or positive
+/// — arms `O_NONBLOCK` on the shared open-file description, which the
+/// `dup(2)` inherits; `socket_mod` additionally mirrors a positive timeout
+/// into `SO_RCVTIMEO`/`SO_SNDTIMEO` (inert under `O_NONBLOCK`, but visible
+/// through the dup) precisely so this layer can tell the modes apart. So:
+/// `O_NONBLOCK` with a zero `SO_RCVTIMEO` is "raise WANT_READ/WANT_WRITE
+/// immediately" (non-blocking); `O_NONBLOCK` with a positive `SO_RCVTIMEO`
+/// is "poll up to the deadline, then `socket.timeout`" (timeout mode); no
+/// `O_NONBLOCK` is "block forever".
 #[cfg(unix)]
 fn sock_is_nonblocking(sock: &TcpStream) -> bool {
     use std::os::unix::io::AsRawFd;
     let flags = unsafe { libc::fcntl(sock.as_raw_fd(), libc::F_GETFL) };
-    flags >= 0 && (flags & libc::O_NONBLOCK) != 0
+    flags >= 0 && (flags & libc::O_NONBLOCK) != 0 && recv_timeout(sock.as_raw_fd()).is_none()
 }
 
 #[cfg(not(unix))]
@@ -1515,13 +1525,31 @@ fn wait_fd_readable(
     fd: std::os::unix::io::RawFd,
     timeout: Option<std::time::Duration>,
 ) -> std::io::Result<bool> {
+    wait_fd_events(fd, libc::POLLIN, timeout)
+}
+
+/// As [`wait_fd_readable`], for writability.
+#[cfg(unix)]
+fn wait_fd_writable(
+    fd: std::os::unix::io::RawFd,
+    timeout: Option<std::time::Duration>,
+) -> std::io::Result<bool> {
+    wait_fd_events(fd, libc::POLLOUT, timeout)
+}
+
+#[cfg(unix)]
+fn wait_fd_events(
+    fd: std::os::unix::io::RawFd,
+    events: libc::c_short,
+    timeout: Option<std::time::Duration>,
+) -> std::io::Result<bool> {
     let ms: libc::c_int = match timeout {
         Some(d) => d.as_millis().min(libc::c_int::MAX as u128) as libc::c_int,
         None => -1,
     };
     let mut pfd = libc::pollfd {
         fd,
-        events: libc::POLLIN,
+        events,
         revents: 0,
     };
     loop {
@@ -1722,10 +1750,35 @@ fn write_all(id: i64, data: &[u8]) -> Result<usize, RuntimeError> {
         let res = {
             let TlsSession { conn, sock, .. } = &mut *s;
             crate::gil::allow_threads_then(|| -> std::io::Result<()> {
+                // A timeout-mode fd is O_NONBLOCK at the OS level (CPython
+                // model): a full socket buffer surfaces WouldBlock here
+                // rather than blocking in the kernel. Poll for writability
+                // up to the mirrored SO_SNDTIMEO deadline and resume; only
+                // a poll timeout propagates as WouldBlock (→ socket.timeout
+                // below).
+                #[cfg(unix)]
+                let fd = {
+                    use std::os::unix::io::AsRawFd;
+                    sock.as_raw_fd()
+                };
                 while conn.wants_write() {
-                    conn.write_tls(sock)?;
+                    match conn.write_tls(sock) {
+                        Ok(_) => {}
+                        #[cfg(unix)]
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if !wait_fd_writable(fd, recv_timeout(fd))? {
+                                return Err(std::io::ErrorKind::WouldBlock.into());
+                            }
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
-                sock.flush()
+                match sock.flush() {
+                    Ok(()) => Ok(()),
+                    #[cfg(unix)]
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+                    Err(e) => Err(e),
+                }
             })
         };
         res.map_err(|e| {
@@ -1856,16 +1909,19 @@ fn read_n(id: i64, n: usize, ragged_eof_error: bool) -> Result<Vec<u8>, RuntimeE
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // No TLS bytes available yet: a non-blocking socket reports this
-                // as `SSL_ERROR_WANT_READ`; a timeout-mode socket (an expired
-                // `SO_RCVTIMEO`) reports `socket.timeout`.
+                // No TLS bytes available yet: a non-blocking socket reports
+                // this as `SSL_ERROR_WANT_READ`. A blocking/timeout-mode
+                // socket loops back — the readiness poll at the top of the
+                // loop does the waiting (and reports `socket.timeout` on an
+                // expired deadline); reaching here just means the poll's
+                // readability signal was consumed elsewhere.
                 if dbg {
                     eprintln!("[read_n id={id} nb={nonblocking}] read_tls WouldBlock");
                 }
                 if nonblocking {
                     return Err(want_read_error());
                 }
-                return Err(timeout_error("The read operation timed out"));
+                continue;
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 // Same as a transport EOF above: no close_notify was seen.
@@ -2748,6 +2804,20 @@ fn ns_server_read_client_hello(args: &[Object]) -> Result<Object, RuntimeError> 
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock && nonblocking => {
                 return Err(want_read_error());
             }
+            #[cfg(unix)]
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Blocking or timeout-mode socket (O_NONBLOCK + mirrored
+                // SO_RCVTIMEO): wait for the ClientHello bytes up to the
+                // deadline, then retry the acceptor.
+                use std::os::unix::io::AsRawFd;
+                let fd = p.sock.as_raw_fd();
+                let timeout = recv_timeout(fd);
+                let ready = crate::gil::allow_threads_then(|| wait_fd_readable(fd, timeout))
+                    .map_err(|e2| handshake_io_error(&e2))?;
+                if !ready {
+                    return Err(timeout_error("_ssl.c: The handshake operation timed out"));
+                }
+            }
             Err(e) => return Err(handshake_io_error(&e)),
         }
     }
@@ -2945,7 +3015,13 @@ fn ns_do_handshake(args: &[Object]) -> Result<Object, RuntimeError> {
             let TlsSession { conn, sock, .. } = &mut *s;
             crate::gil::allow_threads_then(|| -> std::io::Result<()> {
                 while conn.wants_write() {
-                    conn.write_tls(sock)?;
+                    match conn.write_tls(sock) {
+                        Ok(_) => {}
+                        // Queued records flush on the next write; a repeat
+                        // SSL_do_handshake is a no-op in OpenSSL either way.
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(e) => return Err(e),
+                    }
                 }
                 Ok(())
             })
@@ -2956,18 +3032,47 @@ fn ns_do_handshake(args: &[Object]) -> Result<Object, RuntimeError> {
     // The handshake blocks on the socket; release the GIL so the peer thread
     // (loopback server/client) can make progress instead of deadlocking.
     // The tap records the raw byte streams for `_msg_callback` replay.
-    let res = {
-        let TlsSession {
-            conn,
-            sock,
-            hs_rx,
-            hs_tx,
-            ..
-        } = &mut *s;
-        let mut tap = TapStream { sock, hs_rx, hs_tx };
-        crate::gil::allow_threads_then(|| conn.complete_io(&mut tap))
-    };
-    res.map_err(|e| handshake_io_error(&e))?;
+    // A timeout-mode socket (CPython model: `O_NONBLOCK` + a mirrored
+    // `SO_RCVTIMEO`, see `sock_is_nonblocking`) surfaces WouldBlock from
+    // inside `complete_io`; poll for readiness up to the deadline and
+    // resume — rustls keeps the in-progress handshake on `conn`. A poll
+    // timeout falls through to `handshake_io_error`, which maps it to
+    // `socket.timeout` like CPython's `_ssl.c`.
+    loop {
+        let res = {
+            let TlsSession {
+                conn,
+                sock,
+                hs_rx,
+                hs_tx,
+                ..
+            } = &mut *s;
+            let mut tap = TapStream { sock, hs_rx, hs_tx };
+            crate::gil::allow_threads_then(|| conn.complete_io(&mut tap))
+        };
+        match res {
+            Ok(_) => break,
+            #[cfg(unix)]
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                use std::os::unix::io::AsRawFd;
+                let fd = s.sock.as_raw_fd();
+                let timeout = recv_timeout(fd);
+                let want_write = s.conn.wants_write();
+                let ready = crate::gil::allow_threads_then(|| {
+                    if want_write {
+                        wait_fd_writable(fd, timeout)
+                    } else {
+                        wait_fd_readable(fd, timeout)
+                    }
+                })
+                .map_err(|e2| handshake_io_error(&e2))?;
+                if !ready {
+                    return Err(timeout_error("_ssl.c: The handshake operation timed out"));
+                }
+            }
+            Err(e) => return Err(handshake_io_error(&e)),
+        }
+    }
     note_capath_used(s.ctx, &s.conn);
     if !s.hs_counted {
         s.hs_counted = true;
@@ -3474,6 +3579,12 @@ fn ns_shutdown(args: &[Object]) -> Result<Object, RuntimeError> {
         let mut s = cell.borrow_mut();
         let nonblocking = sock_is_nonblocking(&s.sock);
         s.conn.send_close_notify();
+        #[cfg(unix)]
+        let (fd, drain_timeout) = {
+            use std::os::unix::io::AsRawFd;
+            let fd = s.sock.as_raw_fd();
+            (fd, recv_timeout(fd))
+        };
         let TlsSession {
             conn, sock, rec, ..
         } = &mut *s;
@@ -3519,7 +3630,24 @@ fn ns_shutdown(args: &[Object]) -> Result<Object, RuntimeError> {
                             eprintln!("[shutdown drain] read_tls Ok({k})");
                         }
                     }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // Non-blocking sockets only sweep what is buffered.
+                        // A timeout-mode socket (O_NONBLOCK at the OS level
+                        // under the CPython model) waits for the peer's
+                        // close_notify up to the mirrored SO_RCVTIMEO —
+                        // matching what the kernel did when the fd was
+                        // blocking with a receive timeout.
+                        if nonblocking {
+                            break;
+                        }
+                        #[cfg(unix)]
+                        match wait_fd_readable(fd, drain_timeout) {
+                            Ok(true) => continue,
+                            _ => break,
+                        }
+                        #[cfg(not(unix))]
+                        break;
+                    }
                     Err(e) => {
                         if dbg {
                             eprintln!("[shutdown drain] read_tls err {e}");

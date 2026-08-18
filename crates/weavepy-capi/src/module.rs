@@ -92,8 +92,16 @@ impl MethodEntry {
     /// argument. The wrapper extracts the receiver from `args[0]`
     /// and routes it to the C function's `self` parameter, leaving
     /// only the trailing user-supplied args in the tuple.
-    pub fn bind_unbound(&self) -> Object {
-        wrap_c_method_function(self.name.clone(), self.func, self.flags)
+    ///
+    /// `defining_class` is the late-bound C type pointer for
+    /// `METH_METHOD` (`PyCMethod`) entries — the heap type's pointer is
+    /// stored into the shared cell once the type box exists (see
+    /// `assemble_type_dict`'s callers).
+    pub fn bind_unbound(
+        &self,
+        defining_class: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Object {
+        wrap_c_method_function(self.name.clone(), self.func, self.flags, defining_class)
     }
 }
 
@@ -395,19 +403,22 @@ fn wrap_c_method_function(
     name: String,
     func: Option<unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject>,
     flags: c_int,
+    defining_class: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> Object {
     let qualified = format!("_capi:{name}");
     let static_name: &'static str = Box::leak(qualified.into_boxed_str());
     let display_name: &'static str = Box::leak(name.into_boxed_str());
+    let cell = defining_class.clone();
     let call = move |args: &[Object]| -> Result<Object, RuntimeError> {
-        bridge_invoke_method(func, display_name, flags, args, &[])
+        bridge_invoke_method(func, display_name, flags, args, &[], &cell)
     };
     let call_kw: Option<
         Box<dyn Fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError> + Send + Sync>,
     > = if (flags & METH_KEYWORDS) != 0 {
+        let cell_kw = defining_class;
         Some(Box::new(
             move |args: &[Object], kwargs: &[(String, Object)]| {
-                bridge_invoke_method(func, display_name, flags, args, kwargs)
+                bridge_invoke_method(func, display_name, flags, args, kwargs, &cell_kw)
             },
         ))
     } else {
@@ -431,6 +442,7 @@ fn bridge_invoke_method(
     flags: c_int,
     args: &[Object],
     kwargs: &[(String, Object)],
+    defining_class: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> Result<Object, RuntimeError> {
     let Some(func) = func else {
         return Err(type_error(format!("'{display_name}' is null")));
@@ -470,6 +482,26 @@ fn bridge_invoke_method(
         let r = crate::interp::ensure_active(|| unsafe { func(self_ptr, arg) });
         unsafe { crate::object::Py_DecRef(arg) };
         r
+    } else if (flags & METH_METHOD) != 0 {
+        // `PyCMethod`: `(self, defining_class, args, nargs, kwnames)`.
+        // The class pointer was stamped into the shared cell when the
+        // heap type box was built.
+        let cls = defining_class.load(std::sync::atomic::Ordering::Relaxed);
+        if cls == 0 {
+            unsafe { crate::object::Py_DecRef(self_ptr) };
+            return Err(type_error(format!(
+                "{display_name}(): defining class is not available"
+            )));
+        }
+        unsafe {
+            crate::modsupport_ext::call_meth_method(
+                func,
+                self_ptr,
+                cls as *mut crate::types::PyTypeObject,
+                rest,
+                kwargs,
+            )
+        }
     } else if (flags & METH_FASTCALL) != 0 {
         unsafe { call_fastcall(func, self_ptr, rest, kwargs, flags) }
     } else {
@@ -572,11 +604,19 @@ pub unsafe extern "C" fn PyModule_Create2(def: *mut PyModuleDef, _api: c_int) ->
         let key = Rc::as_ptr(&module) as usize;
         crate::wave5_pandas::ensure_module_state(key, def_ref.m_size as usize);
     }
+    // Remember the def for `PyModule_GetDef` (PEP 3121 / PEP 489;
+    // `_testsinglephase` asserts def identity across re-imports).
+    crate::modsupport_ext::register_module_def(
+        Rc::as_ptr(&module) as usize,
+        def as *mut core::ffi::c_void,
+    );
     // CPython adds a single-phase module with per-interpreter state
     // (`m_size >= 0`) to `interp->modules_by_index`, so the extension can later
     // re-fetch it via `PyState_FindModule(def)`. pandas' vendored ujson relies
     // on this to reach its cached `Series`/`DataFrame`/`Index` types.
-    if def_ref.m_size >= 0 {
+    // Multi-phase defs (m_slots set) are never put in modules_by_index —
+    // `PyState_FindModule` must answer NULL for them (test_try_registration).
+    if def_ref.m_size >= 0 && def_ref.m_slots.is_null() {
         crate::wave5_pandas::register_find_module(
             def as *mut core::ffi::c_void,
             Object::Module(module.clone()),
@@ -588,6 +628,9 @@ pub unsafe extern "C" fn PyModule_Create2(def: *mut PyModuleDef, _api: c_int) ->
 /// PEP 489 module slot ids (mirror the header).
 pub const PY_MOD_CREATE: c_int = 1;
 pub const PY_MOD_EXEC: c_int = 2;
+pub const PY_MOD_MULTIPLE_INTERPRETERS: c_int = 3;
+/// `_Py_mod_LAST_SLOT` — 3.13 defines create/exec/multiple_interpreters/gil.
+pub const PY_MOD_LAST_SLOT: c_int = 4;
 
 /// `PyModuleDef_Init(def)` — entry point for a multi-phase (PEP 489)
 /// extension. Unlike single-phase `PyModule_Create2`, the def is *not*
@@ -657,6 +700,82 @@ pub unsafe fn run_multiphase_init(
         );
     }
 
+    // Slot-table validation, mirroring CPython's `PyModule_FromDefAndSpec2`
+    // (extension.test_loader's bad_slot_large / bad_slot_negative /
+    // multiple_create_slots variants assert SystemError with this wording).
+    let set_system_error = |msg: String| {
+        crate::errors::set_pending(
+            Some(
+                weavepy_vm::builtin_types::builtin_types()
+                    .system_error
+                    .clone(),
+            ),
+            Object::from_str(msg.clone()),
+        );
+        msg
+    };
+    if unsafe { (*def).m_size } < 0 {
+        return Err(set_system_error(format!(
+            "module {full_name}: m_size may not be negative for multi-phase initialization"
+        )));
+    }
+    for slot in &slots {
+        if slot.slot < 1 || slot.slot > PY_MOD_LAST_SLOT {
+            return Err(set_system_error(format!(
+                "module {full_name} uses unknown slot ID {}",
+                slot.slot
+            )));
+        }
+    }
+    if slots.iter().filter(|s| s.slot == PY_MOD_CREATE).count() > 1 {
+        return Err(set_system_error(format!(
+            "module {full_name} has multiple create slots"
+        )));
+    }
+    if slots
+        .iter()
+        .filter(|s| s.slot == PY_MOD_MULTIPLE_INTERPRETERS)
+        .count()
+        > 1
+    {
+        return Err(set_system_error(format!(
+            "module {full_name} has more than one 'multiple interpreters' slots"
+        )));
+    }
+
+    // PEP 684 gate (CPython `module_from_def`'s multiple-interpreters
+    // check): in a sub-interpreter with the extension check in effect,
+    // `NOT_SUPPORTED` never loads and the default `SUPPORTED`
+    // (shared-GIL-only) refuses when the interpreter owns its GIL
+    // (test_util's IncompatibleExtensionModuleRestrictionsTests).
+    let multi_support = slots
+        .iter()
+        .find(|s| s.slot == PY_MOD_MULTIPLE_INTERPRETERS)
+        .map_or(1usize, |s| s.value as usize);
+    let gate = weavepy_vm::vm_singletons::current_interpreter_ptr()
+        // SAFETY: published by the enclosing extension-call context; the
+        // GIL keeps access exclusive.
+        .and_then(|p| unsafe { (*p).subinterp_extension_gate() });
+    if let Some(own_gil) = gate {
+        let incompatible = match multi_support {
+            0 => true,    // Py_MOD_MULTIPLE_INTERPRETERS_NOT_SUPPORTED
+            1 => own_gil, // Py_MOD_MULTIPLE_INTERPRETERS_SUPPORTED
+            _ => false,   // Py_MOD_PER_INTERPRETER_GIL_SUPPORTED
+        };
+        if incompatible {
+            let msg = format!("module {full_name} does not support loading in subinterpreters");
+            crate::errors::set_pending(
+                Some(
+                    weavepy_vm::builtin_types::builtin_types()
+                        .import_error
+                        .clone(),
+                ),
+                Object::from_str(msg.clone()),
+            );
+            return Err(msg);
+        }
+    }
+
     // Phase 1: create the module object.
     let create_slot = slots.iter().find(|s| s.slot == PY_MOD_CREATE);
     let module: *mut PyObject = if let Some(slot) = create_slot {
@@ -688,21 +807,74 @@ pub unsafe fn run_multiphase_init(
         unsafe { PyModule_Create2(def, 1013) }
     };
     if module.is_null() {
-        let pending = crate::errors::take_pending()
-            .map(|p| {
-                let ty =
-                    p.ty.as_ref()
-                        .map(|t| t.name.clone())
-                        .unwrap_or_else(|| "Exception".to_owned());
-                let msg = crate::errors::message_for(&p.value);
-                if msg.is_empty() {
-                    format!("module create slot raised {ty}")
-                } else {
-                    format!("module create slot raised {ty}: {msg}")
+        // Leave a pending exception exactly as the slot raised it —
+        // extension.test_loader's create_raise asserts the original
+        // type; only synthesize when the slot forgot to raise.
+        if !crate::errors::has_pending() {
+            set_system_error(format!(
+                "creation of module {full_name} failed without setting an exception"
+            ));
+        }
+        return Err(format!("creation of module {full_name} failed"));
+    }
+    if crate::errors::has_pending() {
+        // create_unreported_exception: succeeded but left an exception
+        // behind — CPython converts this to SystemError chained via
+        // `__cause__` (`_PyErr_FormatFromCause`).
+        unsafe { crate::object::Py_DecRef(module) };
+        let msg = format!("creation of module {full_name} raised unreported exception");
+        crate::errors::set_pending_system_error_from_cause(msg.clone());
+        return Err(msg);
+    }
+
+    // A `Py_mod_create` slot may legitimately return a non-module object
+    // (extension.test_loader's `nonmodule` variants) — but then the def
+    // must not carry exec slots (CPython's `PyModule_FromDefAndSpec2`).
+    let is_module = matches!(
+        unsafe { crate::object::clone_object(module) },
+        Object::Module(_)
+    );
+    if !is_module {
+        if slots.iter().any(|s| s.slot == PY_MOD_EXEC) {
+            unsafe { crate::object::Py_DecRef(module) };
+            return Err(set_system_error(format!(
+                "module {full_name} specifies execution slots, but did not create a module"
+            )));
+        }
+        // CPython's `PyModule_FromDefAndSpec2` still attaches
+        // `def->m_methods` to the returned object, whatever it is
+        // (`_add_methods_to_object`; issue 27782's
+        // `nonmodule_with_methods` fixture calls `ns.bar(10, 1)`).
+        let m_methods = unsafe { (*def).m_methods };
+        if !m_methods.is_null() {
+            let target = unsafe { crate::object::clone_object(module) };
+            for e in unsafe { collect_methods(m_methods) } {
+                let name = e.name.clone();
+                let bound = e.bind(target.clone());
+                let value = crate::object::into_owned(bound);
+                let cname = std::ffi::CString::new(name).unwrap_or_default();
+                unsafe {
+                    crate::abstract_::PyObject_SetAttrString(module, cname.as_ptr(), value);
+                    crate::object::Py_DecRef(value);
                 }
-            })
-            .unwrap_or_else(|| "module creation slot returned NULL".to_owned());
-        return Err(pending);
+            }
+        }
+        return Ok(module);
+    }
+
+    // PEP 3121/489 bookkeeping for the real-module case: allocate the
+    // `m_size` state block and remember the def for `PyModule_GetDef` /
+    // `PyState_FindModule` round-trips (a custom create slot bypasses
+    // `PyModule_Create2`, which normally does this).
+    unsafe {
+        if let Object::Module(m) = crate::object::clone_object(module) {
+            let key = Rc::as_ptr(&m) as usize;
+            let size = (*def).m_size;
+            if size > 0 {
+                crate::wave5_pandas::ensure_module_state(key, size as usize);
+            }
+            crate::modsupport_ext::register_module_def(key, def as *mut core::ffi::c_void);
+        }
     }
 
     // Make the module discoverable under its full dotted name while the
@@ -743,8 +915,11 @@ pub unsafe fn run_multiphase_init(
             eprintln!("[mpi] {full_name}: exec slot {i} -> rc={rc}");
         }
         if rc != 0 {
-            let pending = crate::errors::take_pending()
-                .map(|p| {
+            // Describe the failure for the Err string (peek, don't
+            // consume: the loader propagates the pending exception
+            // verbatim — exec_raise asserts the original type).
+            let description = match crate::errors::take_pending() {
+                Some(p) => {
                     let ty =
                         p.ty.as_ref()
                             .map(|t| t.name.clone())
@@ -753,27 +928,29 @@ pub unsafe fn run_multiphase_init(
                     // failure behind ImportError("initialization failed")
                     // chained via `raise_from` — surface the cause chain,
                     // it's the only diagnostic the extension left behind.
-                    format!("{ty}: {}{}", p.value.to_str(), cause_chain_suffix(&p.value))
-                })
-                .unwrap_or_else(|| format!("Py_mod_exec slot returned {rc}"));
+                    let s = format!("{ty}: {}{}", p.value.to_str(), cause_chain_suffix(&p.value));
+                    crate::errors::set_pending(p.ty, p.value);
+                    s
+                }
+                // exec_err: rc != 0 with nothing raised → SystemError.
+                None => set_system_error(format!(
+                    "execution of module {full_name} failed without setting an exception"
+                )),
+            };
             if trace {
-                eprintln!("[mpi] {full_name}: exec slot {i} FAILED -> {pending}");
+                eprintln!("[mpi] {full_name}: exec slot {i} FAILED -> {description}");
             }
             unsafe { crate::object::Py_DecRef(module) };
-            return Err(pending);
+            return Err(description);
         }
-        if let Some(p) = crate::errors::take_pending() {
-            let ty =
-                p.ty.as_ref()
-                    .map(|t| t.name.clone())
-                    .unwrap_or_else(|| "Exception".to_owned());
-            let msg = crate::errors::message_for(&p.value);
+        if crate::errors::has_pending() {
+            // exec_unreported_exception: rc == 0 with an exception left
+            // behind — CPython converts this to SystemError chained via
+            // `__cause__` (`_PyErr_FormatFromCause`).
             unsafe { crate::object::Py_DecRef(module) };
-            return Err(if msg.is_empty() {
-                format!("exec slot {i} left pending {ty}")
-            } else {
-                format!("exec slot {i} left pending {ty}: {msg}")
-            });
+            let msg = format!("execution of module {full_name} raised unreported exception");
+            crate::errors::set_pending_system_error_from_cause(msg.clone());
+            return Err(msg);
         }
     }
     Ok(module)

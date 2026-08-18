@@ -1659,6 +1659,12 @@ fn exit_with_system_exit(code: weavepy::vm::object::Object) -> ! {
         Object::None => 0,
         Object::Bool(b) => i32::from(b),
         Object::Int(n) => (n & 0xFF) as i32,
+        // A bignum payload: CPython's `PyLong_AsLong` overflows and
+        // `_Py_HandleSystemExit` exits -1 (observed as 255/0xffffffff —
+        // gh-125842; test_sys.test_exit runs `sys.exit(2**128)`).
+        Object::Long(ref b) => i64::try_from(b.as_ref().clone())
+            .map(|n| (n & 0xFF) as i32)
+            .unwrap_or(255),
         // A bare `raise SystemExit` (and `sys.exit()`) carries no
         // message; WeavePy models the empty payload as an empty string,
         // which means "no error" → exit 0, not a printed message.
@@ -1688,26 +1694,67 @@ fn exit_with_system_exit(code: weavepy::vm::object::Object) -> ! {
                     .get(&weavepy::vm::object::DictKey(Object::from_static("args")))
                     .cloned()
             });
-            let text = match args {
+            let text_obj = match args {
                 Some(Object::Tuple(args)) => match args.len() {
-                    0 => String::new(),
-                    1 => args[0].to_str(),
-                    _ => Object::Tuple(args).to_str(),
+                    0 => Object::from_static(""),
+                    1 => args[0].clone(),
+                    _ => Object::Tuple(args),
                 },
-                _ => Object::Instance(inst).to_str(),
+                _ => Object::Instance(inst),
             };
             let mut stderr = io::stderr().lock();
-            let _ = writeln!(stderr, "{text}");
+            let _ = stderr.write_all(&exit_message_bytes(&text_obj));
+            let _ = writeln!(stderr);
             1
         }
         other => {
             let mut stderr = io::stderr().lock();
-            let _ = writeln!(stderr, "{}", other.to_str());
+            let _ = stderr.write_all(&exit_message_bytes(&other));
+            let _ = writeln!(stderr);
             1
         }
     };
     let _ = io::stderr().flush();
     std::process::exit(status);
+}
+
+/// Encode a `SystemExit` message the way CPython writes it to stderr:
+/// the stream's encoding (`PYTHONIOENCODING` name, default UTF-8) with
+/// the `backslashreplace` error handler — a lone surrogate prints as
+/// `\udcff`, and un-encodable characters under a narrow encoding print
+/// escaped rather than mangled (test_sys test_exit).
+fn exit_message_bytes(obj: &weavepy::vm::object::Object) -> Vec<u8> {
+    use weavepy::vm::object::Object;
+    let encoding = std::env::var("PYTHONIOENCODING")
+        .ok()
+        .and_then(|v| v.split(':').next().map(str::to_ascii_lowercase))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "utf-8".to_owned());
+    let latin1 = matches!(
+        encoding.as_str(),
+        "latin-1" | "latin1" | "latin" | "iso-8859-1" | "iso8859-1" | "8859" | "cp819"
+    );
+    let cps: Vec<u32> = match obj {
+        Object::WStr(w) => w.to_vec(),
+        other => other.to_str().chars().map(|c| c as u32).collect(),
+    };
+    let mut out = Vec::new();
+    for cp in cps {
+        if latin1 {
+            if cp <= 0xFF {
+                out.push(cp as u8);
+            } else {
+                let _ = write!(out, "\\u{cp:04x}");
+            }
+        } else if let Some(c) = char::from_u32(cp) {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        } else {
+            // A lone surrogate survives only in the WStr representation.
+            let _ = write!(out, "\\u{cp:04x}");
+        }
+    }
+    out
 }
 
 /// Terminate via `SIGINT` under the default disposition, the way

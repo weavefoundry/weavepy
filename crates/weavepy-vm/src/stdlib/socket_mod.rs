@@ -37,6 +37,7 @@
 use crate::sync::Rc;
 use crate::sync::RefCell;
 use std::collections::HashMap;
+use std::ffi::CStr;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
@@ -82,7 +83,9 @@ impl Drop for SocketState {
     fn drop(&mut self) {
         if let Some(sock) = self.inner.take() {
             if self.owns_fd {
-                close_owned_socket(sock);
+                // Errors are meaningless during finalization; only an
+                // explicit .close() reports them.
+                let _ = close_owned_socket(sock);
             } else {
                 release_socket(sock);
             }
@@ -101,16 +104,25 @@ impl Drop for SocketState {
 /// (`into_raw_fd`, which does *not* close) and issue the syscall ourselves,
 /// swallowing the error.
 #[cfg(unix)]
-fn close_owned_socket(sock: Socket) {
+fn close_owned_socket(sock: Socket) -> Result<(), RuntimeError> {
     let fd = into_raw_fd_of(sock);
     if fd >= 0 {
-        unsafe { libc::close(fd as libc::c_int) };
+        let r = unsafe { libc::close(fd as libc::c_int) };
+        if r < 0 {
+            let err = std::io::Error::last_os_error();
+            // CPython's sock_close swallows only ECONNRESET.
+            if err.raw_os_error() != Some(libc::ECONNRESET) {
+                return Err(io_error_to_py(&err));
+            }
+        }
     }
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn close_owned_socket(sock: Socket) {
+fn close_owned_socket(sock: Socket) -> Result<(), RuntimeError> {
     drop(sock);
+    Ok(())
 }
 
 /// Drop a non-owning alias `Socket` *without* closing its descriptor — the
@@ -283,6 +295,13 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             Object::Int(libc_sock_dgram()),
         );
         d.insert(DictKey(Object::from_static("SOCK_RAW")), Object::Int(3));
+        // SOCK_RDM/SOCK_SEQPACKET share their numbering across unix
+        // platforms (test_socket's testCrucialConstants touches both).
+        d.insert(DictKey(Object::from_static("SOCK_RDM")), Object::Int(4));
+        d.insert(
+            DictKey(Object::from_static("SOCK_SEQPACKET")),
+            Object::Int(5),
+        );
         // SOCK_NONBLOCK/SOCK_CLOEXEC are Linux-only `socket(2)` type flags;
         // CPython gates them on the platform headers. Exporting them on
         // macOS makes `socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK)` reach
@@ -322,6 +341,71 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 26
             }),
         );
+        // RFC 3542 advanced-API options (test_socket's test3542SocketOptions
+        // asserts every one of these exists). The numbering below is the
+        // Darwin <netinet6/in6.h> set; Linux uses different values for most.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        for (name, val) in [
+            ("IPV6_CHECKSUM", 26),
+            ("IPV6_DONTFRAG", 62),
+            ("IPV6_DSTOPTS", 50),
+            ("IPV6_HOPLIMIT", 47),
+            ("IPV6_HOPOPTS", 49),
+            ("IPV6_NEXTHOP", 48),
+            ("IPV6_PATHMTU", 44),
+            ("IPV6_PKTINFO", 46),
+            ("IPV6_RECVDSTOPTS", 40),
+            ("IPV6_RECVHOPLIMIT", 37),
+            ("IPV6_RECVHOPOPTS", 39),
+            ("IPV6_RECVPATHMTU", 43),
+            ("IPV6_RECVPKTINFO", 61),
+            ("IPV6_RECVRTHDR", 38),
+            ("IPV6_RECVTCLASS", 35),
+            ("IPV6_RTHDR", 51),
+            ("IPV6_RTHDRDSTOPTS", 57),
+            ("IPV6_RTHDR_TYPE_0", 0),
+            ("IPV6_TCLASS", 36),
+            ("IPV6_USE_MIN_MTU", 42),
+            ("IPV6_JOIN_GROUP", 12),
+            ("IPV6_LEAVE_GROUP", 13),
+            ("IPV6_MULTICAST_HOPS", 10),
+            ("IPV6_MULTICAST_IF", 9),
+            ("IPV6_MULTICAST_LOOP", 11),
+            ("IPV6_UNICAST_HOPS", 4),
+        ] {
+            d.insert(DictKey(Object::from_static(name)), Object::Int(val));
+        }
+        #[cfg(target_os = "linux")]
+        for (name, val) in [
+            ("IPV6_CHECKSUM", 7),
+            ("IPV6_DONTFRAG", 62),
+            ("IPV6_DSTOPTS", 59),
+            ("IPV6_HOPLIMIT", 52),
+            ("IPV6_HOPOPTS", 54),
+            ("IPV6_NEXTHOP", 9),
+            ("IPV6_PATHMTU", 61),
+            ("IPV6_PKTINFO", 50),
+            ("IPV6_RECVDSTOPTS", 58),
+            ("IPV6_RECVHOPLIMIT", 51),
+            ("IPV6_RECVHOPOPTS", 53),
+            ("IPV6_RECVPATHMTU", 60),
+            ("IPV6_RECVPKTINFO", 49),
+            ("IPV6_RECVRTHDR", 56),
+            ("IPV6_RECVTCLASS", 66),
+            ("IPV6_RTHDR", 57),
+            ("IPV6_RTHDRDSTOPTS", 55),
+            ("IPV6_RTHDR_TYPE_0", 0),
+            ("IPV6_TCLASS", 67),
+            ("IPV6_USE_MIN_MTU", 63),
+            ("IPV6_JOIN_GROUP", 20),
+            ("IPV6_LEAVE_GROUP", 21),
+            ("IPV6_MULTICAST_HOPS", 18),
+            ("IPV6_MULTICAST_IF", 17),
+            ("IPV6_MULTICAST_LOOP", 19),
+            ("IPV6_UNICAST_HOPS", 16),
+        ] {
+            d.insert(DictKey(Object::from_static(name)), Object::Int(val));
+        }
 
         // Option levels.
         d.insert(
@@ -352,10 +436,45 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("SO_LINGER")),
             Object::Int(libc_so_linger()),
         );
-        d.insert(
-            DictKey(Object::from_static("SO_OOBINLINE")),
-            Object::Int(10),
-        );
+        // These five must be the platform's *real* numbering: the old
+        // Linux-shaped virtualization collided on macOS, where SO_REUSEADDR
+        // is 4 — the same number the fake SO_ERROR used — so
+        // `getsockopt(SOL_SOCKET, SO_REUSEADDR)` read the wrong option
+        // (testSetSockOpt's set/get round-trip caught it).
+        #[cfg(unix)]
+        {
+            d.insert(
+                DictKey(Object::from_static("SO_OOBINLINE")),
+                Object::Int(i64::from(libc::SO_OOBINLINE)),
+            );
+            d.insert(
+                DictKey(Object::from_static("SO_SNDTIMEO")),
+                Object::Int(i64::from(libc::SO_SNDTIMEO)),
+            );
+            d.insert(
+                DictKey(Object::from_static("SO_RCVTIMEO")),
+                Object::Int(i64::from(libc::SO_RCVTIMEO)),
+            );
+            d.insert(
+                DictKey(Object::from_static("SO_ERROR")),
+                Object::Int(i64::from(libc::SO_ERROR)),
+            );
+            d.insert(
+                DictKey(Object::from_static("SO_TYPE")),
+                Object::Int(i64::from(libc::SO_TYPE)),
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            d.insert(
+                DictKey(Object::from_static("SO_OOBINLINE")),
+                Object::Int(10),
+            );
+            d.insert(DictKey(Object::from_static("SO_SNDTIMEO")), Object::Int(21));
+            d.insert(DictKey(Object::from_static("SO_RCVTIMEO")), Object::Int(20));
+            d.insert(DictKey(Object::from_static("SO_ERROR")), Object::Int(4));
+            d.insert(DictKey(Object::from_static("SO_TYPE")), Object::Int(3));
+        }
         d.insert(
             DictKey(Object::from_static("SO_SNDBUF")),
             Object::Int(libc_so_sndbuf()),
@@ -364,10 +483,6 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("SO_RCVBUF")),
             Object::Int(libc_so_rcvbuf()),
         );
-        d.insert(DictKey(Object::from_static("SO_SNDTIMEO")), Object::Int(21));
-        d.insert(DictKey(Object::from_static("SO_RCVTIMEO")), Object::Int(20));
-        d.insert(DictKey(Object::from_static("SO_ERROR")), Object::Int(4));
-        d.insert(DictKey(Object::from_static("SO_TYPE")), Object::Int(3));
 
         // TCP_*
         d.insert(DictKey(Object::from_static("TCP_NODELAY")), Object::Int(1));
@@ -378,6 +493,13 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             Object::Int(5),
         );
         d.insert(DictKey(Object::from_static("TCP_KEEPCNT")), Object::Int(6));
+        // Darwin's spelling of the keepalive-idle option (<netinet/tcp.h>
+        // TCP_KEEPALIVE = 0x10) — TestMacOSTCPFlags asserts it exists.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        d.insert(
+            DictKey(Object::from_static("TCP_KEEPALIVE")),
+            Object::Int(0x10),
+        );
 
         // IP_*
         d.insert(DictKey(Object::from_static("IP_TOS")), Object::Int(1));
@@ -391,14 +513,31 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             Object::Int(11),
         );
 
-        // Recv flags.
-        d.insert(DictKey(Object::from_static("MSG_OOB")), Object::Int(1));
-        d.insert(DictKey(Object::from_static("MSG_PEEK")), Object::Int(2));
-        d.insert(DictKey(Object::from_static("MSG_WAITALL")), Object::Int(64));
-        d.insert(
-            DictKey(Object::from_static("MSG_DONTWAIT")),
-            Object::Int(128),
-        );
+        // Send/recv flags — real libc values (test_socket's
+        // testCrucialConstants and the RecvmsgTests assert on
+        // MSG_CTRUNC/MSG_TRUNC/MSG_EOR presence, RFC 0068 WS8).
+        #[cfg(unix)]
+        for (name, val) in [
+            ("MSG_OOB", libc::MSG_OOB),
+            ("MSG_PEEK", libc::MSG_PEEK),
+            ("MSG_DONTROUTE", libc::MSG_DONTROUTE),
+            ("MSG_TRUNC", libc::MSG_TRUNC),
+            ("MSG_CTRUNC", libc::MSG_CTRUNC),
+            ("MSG_WAITALL", libc::MSG_WAITALL),
+            ("MSG_DONTWAIT", libc::MSG_DONTWAIT),
+            ("MSG_EOR", libc::MSG_EOR),
+        ] {
+            d.insert(
+                DictKey(Object::from_str(name.to_owned())),
+                Object::Int(i64::from(val)),
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            d.insert(DictKey(Object::from_static("MSG_OOB")), Object::Int(1));
+            d.insert(DictKey(Object::from_static("MSG_PEEK")), Object::Int(2));
+            d.insert(DictKey(Object::from_static("MSG_WAITALL")), Object::Int(8));
+        }
         // Ancillary-data control-message types. `SCM_RIGHTS` carries file
         // descriptors over an AF_UNIX socket via `sendmsg`/`recvmsg`; it is
         // what `multiprocessing.reduction.send_handle`/`recv_handle` (and so
@@ -478,7 +617,26 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         ] {
             d.insert(DictKey(Object::from_static(name)), Object::Int(val));
         }
-        #[cfg(not(windows))]
+        // POSIX doesn't fix the NI_* numbering: Linux uses 1/2/4/8/16 for
+        // NOFQDN..DGRAM but macOS/BSD use 1/2/4/8/16 in a *different order*
+        // (NUMERICHOST=2, NAMEREQD=4, NUMERICSERV=8). Take libc's values so
+        // the flags reach getnameinfo(3) meaning what the caller asked
+        // (test_getnameinfo_ipv6_scopeid_symbolic passes NI_NUMERICSERV and
+        // asserts the port comes back numeric).
+        #[cfg(unix)]
+        for (name, val) in [
+            ("NI_NOFQDN", libc::NI_NOFQDN),
+            ("NI_NUMERICHOST", libc::NI_NUMERICHOST),
+            ("NI_NAMEREQD", libc::NI_NAMEREQD),
+            ("NI_NUMERICSERV", libc::NI_NUMERICSERV),
+            ("NI_DGRAM", libc::NI_DGRAM),
+        ] {
+            d.insert(
+                DictKey(Object::from_static(name)),
+                Object::Int(i64::from(val)),
+            );
+        }
+        #[cfg(not(any(windows, unix)))]
         {
             d.insert(
                 DictKey(Object::from_static("NI_NUMERICHOST")),
@@ -629,6 +787,10 @@ fn socket_class() -> Rc<TypeObject> {
             // parity); this is what `unittest.mock`'s `spec=` allow-list and
             // a number of `test_asyncio` transport tests depend on.
             install_socket_getset(&cls);
+            // `_socket.socket` is an immutable type in CPython (no
+            // Py_TPFLAGS_BASETYPE mutation; test_socket_type asserts the
+            // TypeError). Subclassing stays allowed, like `int`.
+            cls.immutable.set(true);
             // The constructor lives on the class as `__init__`, and the
             // module-level `socket.socket(...)` callable goes through
             // `Vm::instantiate` which dispatches it.
@@ -667,9 +829,11 @@ fn socket_methods() -> Vec<(&'static str, Object)> {
         m!("__enter__", sock_enter),
         m!("__exit__", sock_exit),
         m!("__repr__", sock_repr),
+        m!("__del__", sock_del),
         m!("bind", sock_bind),
         m!("listen", sock_listen),
         m!("accept", sock_accept),
+        m!("_accept", sock_accept_fd),
         m!("connect", sock_connect),
         m!("connect_ex", sock_connect_ex),
         m!("send", sock_send),
@@ -704,8 +868,44 @@ fn socket_methods() -> Vec<(&'static str, Object)> {
     // Windows the names are simply *absent* — `hasattr` gates like
     // `multiprocessing.reduction.HAVE_SEND_HANDLE` rely on that signal.
     #[cfg(unix)]
-    methods.extend([m!("sendmsg", sock_sendmsg), m!("recvmsg", sock_recvmsg)]);
+    methods.extend([
+        m!("sendmsg", sock_sendmsg),
+        m!("recvmsg", sock_recvmsg),
+        m!("recvmsg_into", sock_recvmsg_into),
+    ]);
     methods
+}
+
+/// CPython's `sock_finalize`: deallocating a socket whose descriptor is
+/// still open emits `ResourceWarning("unclosed %R")` *before* the fd is
+/// torn down, using the (possibly subclass) live repr — test_dealloc_warn
+/// asserts the rich socket.py repr appears in the message.
+fn sock_del(args: &[Object]) -> Result<Object, RuntimeError> {
+    let Ok(inst) = extract_self(args) else {
+        return Ok(Object::None);
+    };
+    let Ok(handle) = extract_handle(&inst) else {
+        return Ok(Object::None);
+    };
+    if handle == -1 {
+        return Ok(Object::None);
+    }
+    let Some(state) = get_state(handle) else {
+        return Ok(Object::None);
+    };
+    if state.borrow().inner.is_none() {
+        return Ok(Object::None);
+    }
+    if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+        // SAFETY: published by the interpreter driving this finalizer on
+        // this thread; it outlives the call.
+        let interp = unsafe { &mut *ptr };
+        let repr = interp
+            .repr_object(&args[0])
+            .unwrap_or_else(|_| "<socket object>".to_owned());
+        let _ = interp.warn_resource_from_builtin(format!("unclosed {repr}"));
+    }
+    Ok(Object::None)
 }
 
 fn extract_self(args: &[Object]) -> Result<Rc<PyInstance>, RuntimeError> {
@@ -907,15 +1107,81 @@ fn wait_readable_win(
 /// [`socket_call_once`] directly (a signal-interrupted blocking connect
 /// completes asynchronously, so re-issuing `connect(2)` would return
 /// `EISCONN`/`EALREADY`).
+/// One bounded readiness wait against an absolute deadline (the poll leg of
+/// CPython's `sock_call_ex`). `events` is `POLLIN`/`POLLOUT`.
+#[cfg(unix)]
+fn wait_fd_until(
+    fd: libc::c_int,
+    events: libc::c_short,
+    deadline: std::time::Instant,
+) -> Result<(), RuntimeError> {
+    loop {
+        let remain = deadline.saturating_duration_since(std::time::Instant::now());
+        if remain.is_zero() {
+            return Err(timeout_error("timed out"));
+        }
+        let ms = remain.as_millis().min(i32::MAX as u128) as i32;
+        let mut pfd = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        let r = crate::gil::allow_threads_then(|| unsafe {
+            libc::poll(std::ptr::addr_of_mut!(pfd), 1, ms)
+        });
+        match r {
+            0 => return Err(timeout_error("timed out")),
+            n if n > 0 => return Ok(()),
+            _ => {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    run_pending_signals_after_eintr()?;
+                    continue;
+                }
+                return Err(io_error_to_py(&err));
+            }
+        }
+    }
+}
+
+/// CPython's `sock_call_ex` shape (RFC 0068 WS8): a socket in timeout mode
+/// keeps its fd non-blocking — the deadline is enforced with a poll-based
+/// readiness wait *around* the syscall, never with `SO_RCVTIMEO`. `events`
+/// says which readiness the op needs (`POLLIN` for the recv family and
+/// accept, `POLLOUT` for the send family).
 #[cfg(any(unix, windows))]
 fn blocking_socket_io<R>(
     state: &Rc<RefCell<SocketState>>,
+    events: libc::c_short,
     mut f: impl FnMut(&Socket) -> std::io::Result<R>,
 ) -> Result<R, RuntimeError> {
-    // The only retry arm is the unix EINTR case (Winsock waits are already
-    // signal-aware), so on Windows every pass through the body returns.
+    // Timeout mode computes one absolute deadline for the whole operation;
+    // an EAGAIN after a wakeup (readiness stolen by a peer thread) loops
+    // back into the wait with the *remaining* budget, exactly like CPython.
+    #[cfg(unix)]
+    let deadline = {
+        let timeout = state.borrow().timeout;
+        timeout
+            .filter(|t| !t.is_zero())
+            .map(|t| std::time::Instant::now() + t)
+    };
+    #[cfg(windows)]
+    let win_timeout = state.borrow().timeout.filter(|t| !t.is_zero());
+    // The only retry arms are unix-only (EINTR, timeout-mode EAGAIN), so on
+    // Windows every pass through the body returns.
     #[cfg_attr(windows, allow(clippy::never_loop))]
     loop {
+        #[cfg(unix)]
+        if let Some(dl) = deadline {
+            let fd = snapshot_raw_fd(state)? as libc::c_int;
+            wait_fd_until(fd, events, dl)?;
+        }
+        #[cfg(windows)]
+        if let Some(t) = win_timeout {
+            let sock = snapshot_raw_fd(state)?;
+            let _ = events;
+            wait_readable_win(sock as windows_sys::Win32::Networking::WinSock::SOCKET, t)?;
+        }
         match socket_call_once(state, &mut f)? {
             Ok(v) => return Ok(v),
             #[cfg(unix)]
@@ -924,18 +1190,12 @@ fn blocking_socket_io<R>(
                 continue;
             }
             Err(e) => {
-                // A socket in *timeout mode* (`settimeout(d>0)`, which we arm via
-                // `set_read_timeout`/`set_write_timeout`) surfaces an expired
-                // deadline as EAGAIN/EWOULDBLOCK at the fd level. CPython reports
-                // this as `socket.timeout` (`TimeoutError`), not
-                // `BlockingIOError` — imaplib/httplib and `test_socket`'s timeout
-                // tests catch `TimeoutError` specifically. A genuinely
-                // non-blocking socket (`settimeout(0)`) keeps the EAGAIN ->
-                // `BlockingIOError` mapping that asyncio relies on.
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    && matches!(state.borrow().timeout, Some(d) if !d.is_zero())
-                {
-                    return Err(timeout_error("timed out"));
+                #[cfg(unix)]
+                if e.kind() == std::io::ErrorKind::WouldBlock && deadline.is_some() {
+                    // Readiness came and went before our syscall (another
+                    // thread drained the socket): wait again on the same
+                    // deadline rather than failing.
+                    continue;
                 }
                 return Err(io_error_to_py(&e));
             }
@@ -957,10 +1217,6 @@ fn blocking_socket_io<R>(
     _f: impl FnMut(&Socket) -> std::io::Result<R>,
 ) -> Result<R, RuntimeError> {
     Err(os_error("sockets are not supported on this platform"))
-}
-
-fn sock_init(args: &[Object]) -> Result<Object, RuntimeError> {
-    sock_init_kw(args, &[])
 }
 
 fn sock_init_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
@@ -1010,9 +1266,13 @@ fn sock_init_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
             },
         }
     };
-    let family = as_i32(&slots[0], libc_af_inet() as i32, "family")?;
-    let kind = as_i32(&slots[1], libc_sock_stream() as i32, "type")?;
-    let proto = as_i32(&slots[2], 0, "proto")?;
+    // Keep the -1 "unspecified" sentinel through the fileno branch: CPython
+    // infers a missing family/type from the descriptor itself (getsockname /
+    // SO_TYPE), so `socket(fileno=unix_fd).family == AF_UNIX` — only sockets
+    // created from scratch default to AF_INET/SOCK_STREAM.
+    let mut family = as_i32(&slots[0], -1, "family")?;
+    let mut kind = as_i32(&slots[1], -1, "type")?;
+    let mut proto = as_i32(&slots[2], -1, "proto")?;
     let fileno = match &slots[3] {
         None | Some(Object::None) => None,
         Some(Object::Int(fd)) => Some(*fd),
@@ -1031,36 +1291,151 @@ fn sock_init_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
     )?;
     let (inner, owns_fd) = match fileno {
         Some(fd) => {
-            // `socket(fileno=other.fileno())` aliases a descriptor. If another
-            // live WeavePy socket already owns this fd, the new object must be
-            // a non-owning view: it can read/write/`detach()` the fd, but the
-            // original keeps sole responsibility for closing it.
-            let aliased = fd >= 0 && get_state(fd).is_some_and(|s| s.borrow().inner.is_some());
-            (wrap_fd_socket(fd)?, !aliased)
+            // CPython's sock_initobj: a negative fd is a *ValueError*, and a
+            // fd that isn't a live socket raises the getsockname errno
+            // (EBADF / ENOTSOCK — test_socket_fileno_requires_valid_fd and
+            // _requires_socket_fd probe both).
+            if fd < 0 {
+                return Err(value_error("negative file descriptor"));
+            }
+            #[cfg(unix)]
+            {
+                let mut addrbuf = [0u8; 128];
+                let mut addrlen = addrbuf.len() as libc::socklen_t;
+                let r = unsafe {
+                    libc::getsockname(
+                        fd as libc::c_int,
+                        addrbuf.as_mut_ptr().cast::<libc::sockaddr>(),
+                        &raw mut addrlen,
+                    )
+                };
+                if r == 0 {
+                    if family == -1 {
+                        // sa_family sits at the head of every sockaddr.
+                        let sa = unsafe { &*addrbuf.as_ptr().cast::<libc::sockaddr>() };
+                        family = i32::from(sa.sa_family);
+                    }
+                } else {
+                    let err = std::io::Error::last_os_error();
+                    // Mirror CPython: EBADF/ENOTSOCK always raise; other
+                    // getsockname failures only matter when the family
+                    // would have to be inferred from the address.
+                    let fatal =
+                        matches!(err.raw_os_error(), Some(libc::EBADF) | Some(libc::ENOTSOCK))
+                            || family == -1;
+                    if fatal {
+                        return Err(io_error_to_py(&err));
+                    }
+                }
+                if kind == -1 {
+                    let mut stype: libc::c_int = 0;
+                    let mut slen = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+                    let r = unsafe {
+                        libc::getsockopt(
+                            fd as libc::c_int,
+                            libc::SOL_SOCKET,
+                            libc::SO_TYPE,
+                            (&raw mut stype).cast(),
+                            &raw mut slen,
+                        )
+                    };
+                    if r != 0 {
+                        return Err(io_error_to_py(&std::io::Error::last_os_error()));
+                    }
+                    kind = stype;
+                }
+                if proto == -1 {
+                    // SO_PROTOCOL exists on Linux; elsewhere CPython falls
+                    // back to 0 just the same.
+                    #[cfg(target_os = "linux")]
+                    {
+                        let mut p: libc::c_int = 0;
+                        let mut slen = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+                        let r = unsafe {
+                            libc::getsockopt(
+                                fd as libc::c_int,
+                                libc::SOL_SOCKET,
+                                libc::SO_PROTOCOL,
+                                (&raw mut p).cast(),
+                                &raw mut slen,
+                            )
+                        };
+                        proto = if r == 0 { p } else { 0 };
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        proto = 0;
+                    }
+                }
+            }
+            // `socket(fileno=other.fileno())` co-owns the descriptor, exactly
+            // like CPython (which is why `ssl.py` detaches the original after
+            // wrapping): closing either object closes the fd, and the other's
+            // close then reports EBADF (testCloseException). When another live
+            // WeavePy socket is registered under this fd number we register
+            // the new state under a synthetic handle so both objects keep
+            // their own state.
+            (wrap_fd_socket(fd)?, true)
         }
-        None => (
-            Socket::new(
-                Domain::from(family),
-                Type::from(kind),
-                Some(Protocol::from(proto)),
+        None => {
+            if family == -1 {
+                family = libc_af_inet() as i32;
+            }
+            if kind == -1 {
+                kind = libc_sock_stream() as i32;
+            }
+            if proto == -1 {
+                proto = 0;
+            }
+            (
+                Socket::new(
+                    Domain::from(family),
+                    Type::from(kind),
+                    Some(Protocol::from(proto)),
+                )
+                .map_err(|e| io_error_to_py(&e))?,
+                true,
             )
-            .map_err(|e| io_error_to_py(&e))?,
-            true,
-        ),
+        }
     };
+    // Any leftover sentinel (fileno path on non-unix platforms) falls back
+    // to the defaults so the recorded attributes stay well-formed.
+    if family == -1 {
+        family = libc_af_inet() as i32;
+    }
+    if kind == -1 {
+        kind = libc_sock_stream() as i32;
+    }
+    if proto == -1 {
+        proto = 0;
+    }
+    // CPython's init_sockobject: every new socket object starts with the
+    // module-wide default timeout, and a non-None default puts the fd in
+    // non-blocking mode right away (testDefaultTimeout / the accept
+    // inheritance dance in socket.py's accept()).
+    let timeout = (*default_timeout().lock()).map(Duration::from_secs_f64);
+    if timeout.is_some() {
+        let _ = inner.set_nonblocking(true);
+        mirror_timeout_sockopts(&inner, timeout);
+    }
     let state = Rc::new(RefCell::new(SocketState {
         inner: Some(inner),
         family,
         kind,
         proto,
-        timeout: None,
-        blocking: true,
+        timeout,
+        blocking: timeout.is_none(),
         owns_fd,
     }));
-    let handle = if owns_fd {
-        next_handle(state)
-    } else {
+    // A fileno= socket whose fd number is already registered to another live
+    // socket keeps its own state under a synthetic handle (both objects own
+    // the shared descriptor, per CPython).
+    let already_registered =
+        fileno.is_some_and(|fd| get_state(fd).is_some_and(|s| s.borrow().inner.is_some()));
+    let handle = if already_registered {
         insert_alias_handle(state)
+    } else {
+        next_handle(state)
     };
     let mut dict = inst.dict.borrow_mut();
     dict.insert(DictKey(Object::from_static("_handle")), Object::Int(handle));
@@ -1099,6 +1474,12 @@ fn sock_exit(args: &[Object]) -> Result<Object, RuntimeError> {
         // connection this way, surfacing as EBADF in `create_connection` or a
         // dead command channel).
         let state = registry().lock().remove(&handle);
+        // Mark the object closed *before* issuing close(2), like CPython's
+        // sock_close (fd invalidated first, so a double .close() on the same
+        // object is a no-op even when the close itself errors).
+        inst.dict
+            .borrow_mut()
+            .insert(DictKey(Object::from_static("_handle")), Object::Int(-1));
         if let Some(state) = state {
             let (sock, owns) = {
                 let mut b = state.borrow_mut();
@@ -1106,12 +1487,17 @@ fn sock_exit(args: &[Object]) -> Result<Object, RuntimeError> {
             };
             if let Some(sock) = sock {
                 if owns {
-                    close_owned_socket(sock);
+                    // CPython raises close(2) failures (swallowing only
+                    // ECONNRESET): after another socket object sharing the
+                    // descriptor closed it, this close reports EBADF
+                    // (testCloseException).
+                    close_owned_socket(sock)?;
                 } else {
                     release_socket(sock);
                 }
             }
         }
+        return Ok(Object::Bool(false));
     }
     inst.dict
         .borrow_mut()
@@ -1120,25 +1506,27 @@ fn sock_exit(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn sock_repr(args: &[Object]) -> Result<Object, RuntimeError> {
+    // CPython `sock_repr` (socketmodule.c): "<socket object, fd=%ld,
+    // family=%d, type=%d, proto=%d>" with fd=-1 once closed
+    // (test_csocket_repr asserts the exact string; `socket.socket`'s richer
+    // repr lives in socket.py on top of this).
     let inst = extract_self(args)?;
-    let dict = inst.dict.borrow();
-    let family = dict
-        .get(&DictKey(Object::from_static("family")))
-        .cloned()
-        .unwrap_or(Object::Int(0));
-    let kind = dict
-        .get(&DictKey(Object::from_static("type")))
-        .cloned()
-        .unwrap_or(Object::Int(0));
-    let proto = dict
-        .get(&DictKey(Object::from_static("proto")))
-        .cloned()
-        .unwrap_or(Object::Int(0));
+    let attr_int = |name: &'static str| {
+        inst.dict
+            .borrow()
+            .get(&DictKey(Object::from_static(name)))
+            .and_then(Object::as_i64)
+            .unwrap_or(0)
+    };
+    let fd = match sock_fileno(args)? {
+        Object::Int(n) => n,
+        _ => -1,
+    };
     Ok(Object::from_str(format!(
-        "<socket.socket family={} type={} proto={}>",
-        family.repr(),
-        kind.repr(),
-        proto.repr()
+        "<socket object, fd={fd}, family={}, type={}, proto={}>",
+        attr_int("family"),
+        attr_int("type"),
+        attr_int("proto")
     )))
 }
 
@@ -1174,100 +1562,7 @@ fn sock_listen(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn sock_accept(args: &[Object]) -> Result<Object, RuntimeError> {
-    let state = state_of(args)?;
-    // Timeout mode must be enforced with a bounded readiness wait *before*
-    // the syscall: `SO_RCVTIMEO` (what `settimeout` arms) bounds `recv`-family
-    // calls but does **not** bound `accept(2)` on macOS/BSD, so a
-    // `settimeout(20)` listener whose client never arrives blocked forever.
-    // CPython always waits with poll/select first (`sock_call_ex` internal
-    // loop), which is why its `accept` honors timeouts on every platform.
-    // test_ftplib's `TestTimeouts.server` thread relies on this: its
-    // `accept()` must raise `TimeoutError` so the thread exits and
-    // `tearDown`'s `join()` returns (the suite intermittently hung here when
-    // an earlier failure left a test without its client connection).
-    #[cfg(unix)]
-    {
-        let timeout = state.borrow().timeout;
-        if let Some(t) = timeout {
-            if !t.is_zero() {
-                let fd = {
-                    let b = state.borrow();
-                    let sock = b.inner.as_ref().ok_or_else(closed_socket_error)?;
-                    raw_fd_of(sock).ok_or_else(|| os_error("socket has no file descriptor"))?
-                        as libc::c_int
-                };
-                let deadline = std::time::Instant::now() + t;
-                loop {
-                    let remain = deadline.saturating_duration_since(std::time::Instant::now());
-                    if remain.is_zero() {
-                        return Err(timeout_error("timed out"));
-                    }
-                    let ms = remain.as_millis().min(i32::MAX as u128) as i32;
-                    let mut pfd = libc::pollfd {
-                        fd,
-                        events: libc::POLLIN,
-                        revents: 0,
-                    };
-                    let r = crate::gil::allow_threads_then(|| unsafe {
-                        libc::poll(std::ptr::addr_of_mut!(pfd), 1, ms)
-                    });
-                    match r {
-                        0 => return Err(timeout_error("timed out")),
-                        n if n > 0 => break,
-                        _ => {
-                            let err = std::io::Error::last_os_error();
-                            if err.raw_os_error() == Some(libc::EINTR) {
-                                run_pending_signals_after_eintr()?;
-                                continue;
-                            }
-                            return Err(io_error_to_py(&err));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    // Winsock twin of the readiness wait above: `select()` on the single
-    // listening SOCKET (CPython's `internal_select`, socketmodule.c, which
-    // uses select on Windows where there is no poll).
-    #[cfg(windows)]
-    {
-        let timeout = state.borrow().timeout;
-        if let Some(t) = timeout {
-            if !t.is_zero() {
-                let sock = {
-                    let b = state.borrow();
-                    let s = b.inner.as_ref().ok_or_else(closed_socket_error)?;
-                    raw_fd_of(s).ok_or_else(|| os_error("socket has no file descriptor"))?
-                };
-                wait_readable_win(sock as windows_sys::Win32::Networking::WinSock::SOCKET, t)?;
-            }
-        }
-    }
-    // Use `accept_raw` (a bare `accept(2)`) rather than socket2's `accept`,
-    // which on Apple platforms *also* runs `setsockopt(SO_NOSIGPIPE)` on the
-    // freshly accepted fd. When the peer connected and then *closed* (and its
-    // process exited) before we accept, the new connection's protocol control
-    // block is already torn down and that post-accept setsockopt fails with
-    // EINVAL — turning a perfectly valid accept (the bytes the peer sent are
-    // still queued and readable) into an error. CPython issues a plain
-    // `accept(2)`, never setting NOSIGPIPE at accept time (SIGPIPE is ignored
-    // process-wide; see the `signal` init), so it returns the connection and a
-    // subsequent `recv()` drains the buffered data then sees EOF.
-    // `_test_multiprocessing`'s `WithProcessesTestListenerClient.test_issue14725`
-    // exercises exactly this race (child writes, closes, exits; parent accepts).
-    let (new_sock, addr) = blocking_socket_io(&state, |sock| sock.accept_raw())?;
-    // PEP 446: accepted descriptors are non-inheritable. `F_SETFD` acts on the
-    // descriptor-table entry (not the connection), so it succeeds even for a
-    // peer-closed connection; ignore any error to stay non-fatal regardless.
-    // `set_cloexec` is a POSIX (`FD_CLOEXEC`) helper; non-inheritability is
-    // handled differently on Windows, so the call is Unix-only.
-    #[cfg(unix)]
-    let _ = new_sock.set_cloexec(true);
-    let (family, kind, proto) = {
-        let s = state.borrow();
-        (s.family, s.kind, s.proto)
-    };
+    let (new_sock, addr, family, kind, proto) = accept_parts(args)?;
     let new_state = Rc::new(RefCell::new(SocketState {
         inner: Some(new_sock),
         family,
@@ -1300,6 +1595,64 @@ fn sock_accept(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::new_tuple(vec![Object::Instance(inst), addr_tuple]))
 }
 
+/// `_socket.socket._accept()` — the C-level accept: returns `(fd, addr)`
+/// with ownership of the raw descriptor transferred to the caller.
+/// CPython's `socket.py` wraps it via `socket(fileno=fd)` (RFC 0068 WS8:
+/// the verbatim socket.py replaces the WeavePy-shaped shim).
+fn sock_accept_fd(args: &[Object]) -> Result<Object, RuntimeError> {
+    let (new_sock, addr, family, _, _) = accept_parts(args)?;
+    #[cfg(unix)]
+    let fd = {
+        use std::os::unix::io::IntoRawFd;
+        i64::from(new_sock.into_raw_fd())
+    };
+    #[cfg(windows)]
+    let fd = {
+        use std::os::windows::io::IntoRawSocket;
+        new_sock.into_raw_socket() as i64
+    };
+    let addr_tuple = sockaddr_to_tuple(&addr, family);
+    Ok(Object::new_tuple(vec![Object::Int(fd), addr_tuple]))
+}
+
+fn accept_parts(
+    args: &[Object],
+) -> Result<(Socket, socket2::SockAddr, i32, i32, i32), RuntimeError> {
+    let state = state_of(args)?;
+    // The timeout-mode readiness wait (CPython's `sock_call_ex` poll loop)
+    // lives inside `blocking_socket_io` — `SO_RCVTIMEO` never bounded
+    // `accept(2)` on macOS/BSD anyway, which is why CPython always waits
+    // with poll/select first. test_ftplib's `TestTimeouts.server` thread
+    // relies on this: its `accept()` must raise `TimeoutError` so the
+    // thread exits and `tearDown`'s `join()` returns.
+    //
+    // Use `accept_raw` (a bare `accept(2)`) rather than socket2's `accept`,
+    // which on Apple platforms *also* runs `setsockopt(SO_NOSIGPIPE)` on the
+    // freshly accepted fd. When the peer connected and then *closed* (and its
+    // process exited) before we accept, the new connection's protocol control
+    // block is already torn down and that post-accept setsockopt fails with
+    // EINVAL — turning a perfectly valid accept (the bytes the peer sent are
+    // still queued and readable) into an error. CPython issues a plain
+    // `accept(2)`, never setting NOSIGPIPE at accept time (SIGPIPE is ignored
+    // process-wide; see the `signal` init), so it returns the connection and a
+    // subsequent `recv()` drains the buffered data then sees EOF.
+    // `_test_multiprocessing`'s `WithProcessesTestListenerClient.test_issue14725`
+    // exercises exactly this race (child writes, closes, exits; parent accepts).
+    let (new_sock, addr) = blocking_socket_io(&state, libc::POLLIN, |sock| sock.accept_raw())?;
+    // PEP 446: accepted descriptors are non-inheritable. `F_SETFD` acts on the
+    // descriptor-table entry (not the connection), so it succeeds even for a
+    // peer-closed connection; ignore any error to stay non-fatal regardless.
+    // `set_cloexec` is a POSIX (`FD_CLOEXEC`) helper; non-inheritability is
+    // handled differently on Windows, so the call is Unix-only.
+    #[cfg(unix)]
+    let _ = new_sock.set_cloexec(true);
+    let (family, kind, proto) = {
+        let s = state.borrow();
+        (s.family, s.kind, s.proto)
+    };
+    Ok((new_sock, addr, family, kind, proto))
+}
+
 fn sock_connect(args: &[Object]) -> Result<Object, RuntimeError> {
     let state = state_of(args)?;
     let (family, timeout) = {
@@ -1307,24 +1660,49 @@ fn sock_connect(args: &[Object]) -> Result<Object, RuntimeError> {
         (b.family, b.timeout)
     };
     let sockaddr = parse_sockaddr2(args.get(1), family)?;
-    let mut connect_fn = move |sock: &Socket| match timeout {
-        // A strictly-positive timeout means "timeout mode": bound the
-        // connect with `connect_timeout`.
-        Some(t) if !t.is_zero() => sock.connect_timeout(&sockaddr, t),
-        // `Some(0)` is non-blocking mode (CPython couples
-        // `setblocking(False)`/`settimeout(0)` to a zero timeout) and
-        // `None` is blocking. In both cases issue a plain `connect`: on a
-        // non-blocking fd it surfaces `EINPROGRESS`/`EWOULDBLOCK`, exactly
-        // like CPython, instead of being mis-read as a 0-second deadline.
-        _ => sock.connect(&sockaddr),
-    };
+    let mut connect_fn = |sock: &Socket| sock.connect(&sockaddr);
     // Single attempt — *no* EINTR retry: a signal-interrupted blocking
     // connect continues asynchronously, so a second `connect(2)` would return
     // `EISCONN`/`EALREADY` rather than completing it. Surface the syscall
     // result directly (a handled signal still ran via the eval breaker).
     match socket_call_once(&state, &mut connect_fn)? {
         Ok(()) => Ok(Object::None),
-        Err(e) => Err(io_error_to_py(&e)),
+        Err(e) => {
+            // Timeout mode (fd non-blocking, positive deadline): connect
+            // reports EINPROGRESS immediately; CPython's internal_connect
+            // then waits for writability up to the deadline and reads the
+            // final status from SO_ERROR. Plain non-blocking (`settimeout(0)`)
+            // surfaces EINPROGRESS to the caller as BlockingIOError.
+            #[cfg(unix)]
+            if matches!(
+                e.raw_os_error(),
+                Some(libc::EINPROGRESS) | Some(libc::EWOULDBLOCK)
+            ) {
+                if let Some(t) = timeout.filter(|t| !t.is_zero()) {
+                    let fd = snapshot_raw_fd(&state)?;
+                    wait_fd_until(fd, libc::POLLOUT, std::time::Instant::now() + t)?;
+                    let mut err: libc::c_int = 0;
+                    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+                    let r = unsafe {
+                        libc::getsockopt(
+                            fd,
+                            libc::SOL_SOCKET,
+                            libc::SO_ERROR,
+                            (&raw mut err).cast(),
+                            &raw mut len,
+                        )
+                    };
+                    if r != 0 {
+                        return Err(io_error_to_py(&std::io::Error::last_os_error()));
+                    }
+                    if err != 0 {
+                        return Err(io_error_to_py(&std::io::Error::from_raw_os_error(err)));
+                    }
+                    return Ok(Object::None);
+                }
+            }
+            Err(io_error_to_py(&e))
+        }
     }
 }
 
@@ -1364,23 +1742,46 @@ fn errno_of_exception(p: &crate::error::PyException) -> Option<i64> {
     None
 }
 
+/// Strict bytes-like conversion for the send family: CPython's `y*`
+/// converter — `str` is *not* bytes-like ("a bytes-like object is required,
+/// not 'str'", testSendtoErrors), and arbitrary buffer exporters work via
+/// `tobytes()`.
+fn send_data_arg(arg: Option<&Object>) -> Result<Vec<u8>, RuntimeError> {
+    match arg {
+        Some(Object::Str(_)) | Some(Object::WStr(_)) => Err(type_error(
+            "a bytes-like object is required, not 'str'".to_string(),
+        )),
+        Some(o) => extract_bytes(Some(o))
+            .ok()
+            .filter(|_| !matches!(o, Object::Str(_)))
+            .or_else(|| buffer_protocol_bytes(o))
+            .ok_or_else(|| {
+                type_error(format!(
+                    "a bytes-like object is required, not '{}'",
+                    o.type_name()
+                ))
+            }),
+        None => Err(type_error("a bytes-like object is required")),
+    }
+}
+
 fn sock_send(args: &[Object]) -> Result<Object, RuntimeError> {
     let state = state_of(args)?;
-    let data = extract_bytes(args.get(1))?;
-    let n = blocking_socket_io(&state, |sock| sock.send(&data))?;
+    let data = send_data_arg(args.get(1))?;
+    let n = blocking_socket_io(&state, libc::POLLOUT, |sock| sock.send(&data))?;
     Ok(Object::Int(n as i64))
 }
 
 fn sock_sendall(args: &[Object]) -> Result<Object, RuntimeError> {
     let state = state_of(args)?;
-    let data = extract_bytes(args.get(1))?;
+    let data = send_data_arg(args.get(1))?;
     // Loop per chunk in the caller (not inside one `blocking_socket_io`
     // closure) so a PEP 475 `EINTR` retry resumes from the current `offset`
     // instead of re-running the whole send and duplicating already-committed
     // bytes. Each individual `send` is the single retryable syscall.
     let mut offset = 0;
     while offset < data.len() {
-        let n = blocking_socket_io(&state, |sock| sock.send(&data[offset..]))?;
+        let n = blocking_socket_io(&state, libc::POLLOUT, |sock| sock.send(&data[offset..]))?;
         if n == 0 {
             return Err(io_error_to_py(&std::io::Error::from(
                 std::io::ErrorKind::BrokenPipe,
@@ -1403,22 +1804,63 @@ fn sock_sendall(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn sock_sendto(args: &[Object]) -> Result<Object, RuntimeError> {
     let state = state_of(args)?;
-    let data = extract_bytes(args.get(1))?;
-    let family = state.borrow().family;
-    // CPython accepts both `sendto(data, address)` and `sendto(data, flags,
-    // address)`; the address is always the final argument. The `flags` form is
-    // ignored on the loopback paths WeavePy serves.
-    let addr_arg = if args.len() >= 4 {
+    // CPython accepts `sendto(data, address)` and `sendto(data, flags,
+    // address)` only; other arities are a TypeError with the given count
+    // (testSendtoErrors asserts the exact messages).
+    let n_given = args.len().saturating_sub(1);
+    if !(2..=3).contains(&n_given) {
+        return Err(type_error(format!(
+            "sendto() takes 2 or 3 arguments ({n_given} given)"
+        )));
+    }
+    let data = send_data_arg(args.get(1))?;
+    let addr_arg = if n_given == 3 {
+        // The 3-arg form's middle argument is flags; it must be an int.
+        if args.get(2).and_then(Object::as_i64).is_none() {
+            return Err(type_error(format!(
+                "'{}' object cannot be interpreted as an integer",
+                args.get(2).map_or("NoneType", |o| o.type_name())
+            )));
+        }
         args.get(3)
     } else {
         args.get(2)
     };
+    let family = state.borrow().family;
+    // A non-tuple destination on the inet families is CPython's
+    // "sendto(): AF_INET address must be tuple, not NoneType".
+    if family != libc_af_unix_i32()
+        && !matches!(addr_arg, Some(Object::Tuple(_)) | Some(Object::List(_)))
+    {
+        let fam_name = if family == libc_af_inet6() as i32 {
+            "AF_INET6"
+        } else {
+            "AF_INET"
+        };
+        return Err(type_error(format!(
+            "sendto(): {fam_name} address must be tuple, not {}",
+            addr_arg.map_or("NoneType", |o| o.type_name())
+        )));
+    }
     // The destination for an `AF_UNIX` datagram socket is a bare path
     // (`str`/`bytes`), not an `(host, port)` tuple — use the family-aware
     // resolver (test_socketserver's Unix datagram servers).
     let sockaddr = parse_sockaddr2(addr_arg, family)?;
-    let n = blocking_socket_io(&state, |sock| sock.send_to(&data, &sockaddr))?;
+    let n = blocking_socket_io(&state, libc::POLLOUT, |sock| sock.send_to(&data, &sockaddr))?;
     Ok(Object::Int(n as i64))
+}
+
+/// AF_UNIX's numeric value where it exists (1 on every unix), or a sentinel
+/// that never matches on platforms without it.
+fn libc_af_unix_i32() -> i32 {
+    #[cfg(unix)]
+    {
+        1
+    }
+    #[cfg(not(unix))]
+    {
+        -2
+    }
 }
 
 fn sock_recv(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1429,7 +1871,7 @@ fn sock_recv(args: &[Object]) -> Result<Object, RuntimeError> {
         _ => return Err(type_error("recv: bufsize must be int")),
     };
     let mut buf: Vec<std::mem::MaybeUninit<u8>> = vec![std::mem::MaybeUninit::uninit(); bufsize];
-    let n = blocking_socket_io(&state, |sock| sock.recv(&mut buf))?;
+    let n = blocking_socket_io(&state, libc::POLLIN, |sock| sock.recv(&mut buf))?;
     let initialised: Vec<u8> = buf[..n]
         .iter()
         .map(|m| unsafe { m.assume_init() })
@@ -1458,7 +1900,7 @@ fn sock_recv_into(args: &[Object]) -> Result<Object, RuntimeError> {
         nbytes
     };
     let mut buf = vec![std::mem::MaybeUninit::<u8>::uninit(); cap];
-    let n = blocking_socket_io(&state, |sock| sock.recv(&mut buf))?;
+    let n = blocking_socket_io(&state, libc::POLLIN, |sock| sock.recv(&mut buf))?;
     {
         let mut bytes = dst.borrow_mut();
         for i in 0..n {
@@ -1476,7 +1918,7 @@ fn sock_recvfrom(args: &[Object]) -> Result<Object, RuntimeError> {
         _ => return Err(type_error("recvfrom: bufsize must be int")),
     };
     let mut buf = vec![std::mem::MaybeUninit::<u8>::uninit(); bufsize];
-    let (n, addr) = blocking_socket_io(&state, |sock| sock.recv_from(&mut buf))?;
+    let (n, addr) = blocking_socket_io(&state, libc::POLLIN, |sock| sock.recv_from(&mut buf))?;
     let initialised: Vec<u8> = buf[..n]
         .iter()
         .map(|m| unsafe { m.assume_init() })
@@ -1509,7 +1951,7 @@ fn sock_recvfrom_into(args: &[Object]) -> Result<Object, RuntimeError> {
         nbytes
     };
     let mut buf = vec![std::mem::MaybeUninit::<u8>::uninit(); cap];
-    let (n, addr) = blocking_socket_io(&state, |sock| sock.recv_from(&mut buf))?;
+    let (n, addr) = blocking_socket_io(&state, libc::POLLIN, |sock| sock.recv_from(&mut buf))?;
     {
         let mut bytes = dst.borrow_mut();
         for i in 0..n {
@@ -1523,28 +1965,82 @@ fn sock_recvfrom_into(args: &[Object]) -> Result<Object, RuntimeError> {
     ]))
 }
 
+/// Bound a raw-`msghdr` syscall with the socket's timeout, CPython's
+/// `sock_call_ex` readiness wait: poll the fd for `events` up to the
+/// configured timeout, raising `TimeoutError` on expiry. No-op in
+/// blocking (`None`) and non-blocking (`0`) modes.
+#[cfg(unix)]
+fn wait_ready_for_timeout(
+    state: &Rc<RefCell<SocketState>>,
+    events: libc::c_short,
+) -> Result<(), RuntimeError> {
+    let timeout = state.borrow().timeout;
+    let Some(t) = timeout else { return Ok(()) };
+    if t.is_zero() {
+        return Ok(());
+    }
+    let fd = snapshot_raw_fd(state)?;
+    let deadline = std::time::Instant::now() + t;
+    loop {
+        let remain = deadline.saturating_duration_since(std::time::Instant::now());
+        if remain.is_zero() {
+            return Err(timeout_error("timed out"));
+        }
+        let ms = remain.as_millis().min(i32::MAX as u128) as i32;
+        let mut pfd = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        let r = crate::gil::allow_threads_then(|| unsafe {
+            libc::poll(std::ptr::addr_of_mut!(pfd), 1, ms)
+        });
+        match r {
+            0 => return Err(timeout_error("timed out")),
+            n if n > 0 => return Ok(()),
+            _ => {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    run_pending_signals_after_eintr()?;
+                    continue;
+                }
+                return Err(io_error_to_py(&err));
+            }
+        }
+    }
+}
+
 /// `socket.sendmsg(buffers[, ancdata[, flags[, address]]])` — send normal
-/// data plus ancillary data (control messages) on a connected socket.
+/// data plus ancillary data (control messages), optionally to an explicit
+/// destination address (unconnected UDP — test_socket's SendmsgUDPTest
+/// sends via `sendmsgToServer`, RFC 0068 WS8).
 ///
-/// WeavePy uses this for `multiprocessing`'s `SCM_RIGHTS` file-descriptor
-/// hand-off (`reduction.sendfds`): the `forkserver` start method, the
+/// `multiprocessing` uses this for `SCM_RIGHTS` file-descriptor hand-off
+/// (`reduction.sendfds`): the `forkserver` start method, the
 /// `resource_sharer`, and `Connection` fd transfer all push fds through an
-/// AF_UNIX socket this way. The `address` argument (unconnected send) is not
-/// supported — every WeavePy caller uses a connected pair.
+/// AF_UNIX socket this way.
 #[cfg(unix)]
 fn sock_sendmsg(args: &[Object]) -> Result<Object, RuntimeError> {
     use std::os::raw::c_void;
     let state = state_of(args)?;
     let buffers = extract_iov_buffers(args.get(1))?;
     let ancdata = extract_ancdata(args.get(2))?;
+    // `Object::as_i64` also accepts int subclasses (`socket.MsgFlag`
+    // IntFlag members — the suite passes `socket.MSG_DONTROUTE`).
     let flags: libc::c_int = match args.get(3) {
         None | Some(Object::None) => 0,
-        Some(Object::Int(n)) => *n as libc::c_int,
-        _ => return Err(type_error("sendmsg: flags must be an integer")),
+        Some(o) => match o.as_i64() {
+            Some(n) => n as libc::c_int,
+            None => return Err(type_error("sendmsg: flags must be an integer")),
+        },
     };
-    if matches!(args.get(4), Some(o) if !matches!(o, Object::None)) {
-        return Err(os_error("sendmsg: address argument is not supported"));
-    }
+    let dest: Option<SockAddr> = match args.get(4) {
+        None | Some(Object::None) => None,
+        some => {
+            let family = state.borrow().family;
+            Some(parse_sockaddr2(some, family)?)
+        }
+    };
 
     let mut iovecs: Vec<libc::iovec> = buffers
         .iter()
@@ -1569,13 +2065,20 @@ fn sock_sendmsg(args: &[Object]) -> Result<Object, RuntimeError> {
         std::ptr::null_mut()
     };
 
+    // Timeout mode: bounded readiness wait first (CPython `sock_call_ex`).
+    wait_ready_for_timeout(&state, libc::POLLOUT)?;
     // PEP 475: retry after EINTR (running any tripped Python signal
     // handlers first). EINTR means nothing was committed, so a plain
     // re-issue is safe.
     let sent = loop {
         let ancdata_ref = &ancdata;
+        let dest_ref = &dest;
         let sent = crate::gil::allow_threads_then(move || unsafe {
             let mut msg: libc::msghdr = std::mem::zeroed();
+            if let Some(d) = dest_ref {
+                msg.msg_name = d.as_ptr() as *mut c_void;
+                msg.msg_namelen = d.len();
+            }
             msg.msg_iov = iov_ptr;
             msg.msg_iovlen = iov_len as _;
             if controllen > 0 {
@@ -1612,36 +2115,23 @@ fn sock_sendmsg(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Int(sent as i64))
 }
 
-/// `socket.recvmsg(bufsize[, ancbufsize[, flags]])` — receive normal data
-/// plus ancillary data, returning `(data, ancdata, msg_flags, address)`.
-/// `ancdata` is a list of `(cmsg_level, cmsg_type, cmsg_data)` triples (the
-/// shape `multiprocessing.reduction.recvfds` decodes). `address` is `None`
-/// (the WeavePy callers all use connected sockets).
+/// Shared engine for `recvmsg`/`recvmsg_into`: one bounded `recvmsg(2)`
+/// into `databuf` (whole buffer as a single iovec — the kernel fills
+/// scatter buffers in order, so distributing afterwards is equivalent),
+/// returning `(nbytes, ancdata, msg_flags, address)` parts.
 #[cfg(unix)]
-fn sock_recvmsg(args: &[Object]) -> Result<Object, RuntimeError> {
+#[allow(clippy::type_complexity)]
+fn recvmsg_engine(
+    state: &Rc<RefCell<SocketState>>,
+    databuf: &mut [u8],
+    ancbufsize: usize,
+    flags: libc::c_int,
+) -> Result<(usize, Vec<Object>, i64, Object), RuntimeError> {
     use std::os::raw::c_void;
-    let state = state_of(args)?;
-    let bufsize = match args.get(1) {
-        Some(Object::Int(n)) if *n >= 0 => *n as usize,
-        Some(Object::Int(_)) => return Err(value_error("negative buffersize in recvmsg")),
-        _ => return Err(type_error("recvmsg: bufsize must be an integer")),
-    };
-    let ancbufsize = match args.get(2) {
-        None | Some(Object::None) => 0usize,
-        Some(Object::Int(n)) if *n >= 0 => *n as usize,
-        Some(Object::Int(_)) => return Err(value_error("negative ancillary data buffer size")),
-        _ => return Err(type_error("recvmsg: ancbufsize must be an integer")),
-    };
-    let flags: libc::c_int = match args.get(3) {
-        None | Some(Object::None) => 0,
-        Some(Object::Int(n)) => *n as libc::c_int,
-        _ => return Err(type_error("recvmsg: flags must be an integer")),
-    };
-
-    let mut databuf = vec![0u8; bufsize];
     let mut control = vec![0u8; ancbufsize];
-    let fd = snapshot_raw_fd(&state)?;
+    let fd = snapshot_raw_fd(state)?;
 
+    let bufsize = databuf.len();
     let mut iov = [libc::iovec {
         iov_base: databuf.as_mut_ptr().cast::<c_void>(),
         iov_len: bufsize,
@@ -1653,6 +2143,10 @@ fn sock_recvmsg(args: &[Object]) -> Result<Object, RuntimeError> {
         std::ptr::null_mut()
     };
 
+    // Timeout mode: bounded readiness wait first (CPython `sock_call_ex`
+    // — testRecvmsgTimeout asserts the TimeoutError).
+    wait_ready_for_timeout(state, libc::POLLIN)?;
+
     // PEP 475: a signal-interrupted recvmsg (EINTR) must run pending Python
     // signal handlers and retry rather than raising InterruptedError. The
     // forkserver's listener loop (`multiprocessing.forkserver.main`) sits in
@@ -1660,9 +2154,13 @@ fn sock_recvmsg(args: &[Object]) -> Result<Object, RuntimeError> {
     // surfacing EINTR there killed the whole forkserver, and every later
     // `Pool._repopulate_pool` in the parent then died with BrokenPipeError /
     // "did not receive acknowledgement of fd" and the pool hung.
-    let (n, msg_flags, used_controllen) = loop {
+    let mut name_storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let name_ptr = std::ptr::addr_of_mut!(name_storage);
+    let (n, msg_flags, used_controllen, namelen) = loop {
         let res = crate::gil::allow_threads_then(move || unsafe {
             let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_name = name_ptr.cast::<c_void>();
+            msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as _;
             msg.msg_iov = iov_ptr;
             msg.msg_iovlen = 1 as _;
             if ancbufsize > 0 {
@@ -1670,7 +2168,12 @@ fn sock_recvmsg(args: &[Object]) -> Result<Object, RuntimeError> {
                 msg.msg_controllen = ancbufsize as _;
             }
             let n = libc::recvmsg(fd, &raw mut msg, flags);
-            (n, i64::from(msg.msg_flags), msg.msg_controllen as usize)
+            (
+                n,
+                i64::from(msg.msg_flags),
+                msg.msg_controllen as usize,
+                msg.msg_namelen,
+            )
         });
         if res.0 < 0 {
             let err = std::io::Error::last_os_error();
@@ -1682,7 +2185,6 @@ fn sock_recvmsg(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         break res;
     };
-    databuf.truncate(n as usize);
 
     let mut ancdata_items: Vec<Object> = Vec::new();
     if ancbufsize > 0 && used_controllen > 0 {
@@ -1690,6 +2192,7 @@ fn sock_recvmsg(args: &[Object]) -> Result<Object, RuntimeError> {
             let mut msg: libc::msghdr = std::mem::zeroed();
             msg.msg_control = control.as_mut_ptr().cast::<c_void>();
             msg.msg_controllen = used_controllen as _;
+            let control_base = control.as_ptr() as usize;
             let mut cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
             while !cmsg.is_null() {
                 let level = (*cmsg).cmsg_level;
@@ -1699,23 +2202,158 @@ fn sock_recvmsg(args: &[Object]) -> Result<Object, RuntimeError> {
                 // Payload length = cmsg_len minus the (aligned) header up to
                 // CMSG_DATA — never `CMSG_LEN(0)`, which omits the alignment.
                 let data_offset = (data_ptr as usize).saturating_sub(cmsg as usize);
-                let data_len = cmsg_len.saturating_sub(data_offset);
+                let mut data_len = cmsg_len.saturating_sub(data_offset);
+                // On MSG_CTRUNC the kernel reports the *untruncated* cmsg_len
+                // but only `msg_controllen` bytes of buffer are valid —
+                // CPython's `get_cmsg_data_len` clamps the payload to what
+                // fits and stops the walk (the CmsgTrunc* family asserts the
+                // partial byte counts; reading past the window returned
+                // garbage that the SCM_RIGHTS tests then close()d as fds).
+                let data_start = (data_ptr as usize).saturating_sub(control_base);
+                let avail = used_controllen.saturating_sub(data_start);
+                let truncated = data_len > avail;
+                if truncated {
+                    data_len = avail;
+                }
                 let data = std::slice::from_raw_parts(data_ptr.cast::<u8>(), data_len).to_vec();
                 ancdata_items.push(Object::new_tuple(vec![
                     Object::Int(i64::from(level)),
                     Object::Int(i64::from(ctype)),
                     Object::new_bytes(data),
                 ]));
+                if truncated {
+                    break;
+                }
                 cmsg = libc::CMSG_NXTHDR(&raw const msg, cmsg);
             }
         }
     }
 
+    // The source address (CPython `makesockaddr`): a datagram's sender,
+    // or `None` when the kernel reported no name (connected stream).
+    let address = if namelen > 0 {
+        let family = state.borrow().family;
+        let addr = unsafe { SockAddr::new(name_storage, namelen) };
+        sockaddr_to_tuple(&addr, family)
+    } else {
+        Object::None
+    };
+
+    Ok((n as usize, ancdata_items, msg_flags, address))
+}
+
+/// `socket.recvmsg(bufsize[, ancbufsize[, flags]])` — receive normal data
+/// plus ancillary data, returning `(data, ancdata, msg_flags, address)`.
+/// `ancdata` is a list of `(cmsg_level, cmsg_type, cmsg_data)` triples (the
+/// shape `multiprocessing.reduction.recvfds` decodes).
+#[cfg(unix)]
+fn sock_recvmsg(args: &[Object]) -> Result<Object, RuntimeError> {
+    let state = state_of(args)?;
+    let bufsize = match args.get(1).and_then(Object::as_i64) {
+        Some(n) if n >= 0 => n as usize,
+        Some(_) => return Err(value_error("negative buffersize in recvmsg")),
+        None => return Err(type_error("recvmsg: bufsize must be an integer")),
+    };
+    let ancbufsize = match args.get(2) {
+        None | Some(Object::None) => 0usize,
+        Some(o) => match o.as_i64() {
+            Some(n) if n >= 0 => n as usize,
+            Some(_) => return Err(value_error("negative ancillary data buffer size")),
+            None => return Err(type_error("recvmsg: ancbufsize must be an integer")),
+        },
+    };
+    let flags: libc::c_int = match args.get(3) {
+        None | Some(Object::None) => 0,
+        Some(o) => match o.as_i64() {
+            Some(n) => n as libc::c_int,
+            None => return Err(type_error("recvmsg: flags must be an integer")),
+        },
+    };
+
+    let mut databuf = vec![0u8; bufsize];
+    let (n, ancdata_items, msg_flags, address) =
+        recvmsg_engine(&state, &mut databuf, ancbufsize, flags)?;
+    databuf.truncate(n);
+
     Ok(Object::new_tuple(vec![
         Object::new_bytes(databuf),
         Object::new_list(ancdata_items),
         Object::Int(msg_flags),
-        Object::None,
+        address,
+    ]))
+}
+
+/// `socket.recvmsg_into(buffers[, ancbufsize[, flags]])` — scatter the
+/// normal data across the caller's writable buffers (in order), returning
+/// `(nbytes, ancdata, msg_flags, address)` (RFC 0068 WS8:
+/// test_socket's RecvmsgIntoMixin suites).
+#[cfg(unix)]
+fn sock_recvmsg_into(args: &[Object]) -> Result<Object, RuntimeError> {
+    let state = state_of(args)?;
+    // An iterable of writable bytes-like objects.
+    let buf_objs: Vec<Object> = match args.get(1) {
+        Some(Object::List(l)) => l.borrow().clone(),
+        Some(Object::Tuple(t)) => t.to_vec(),
+        Some(other) => {
+            let ptr = crate::vm_singletons::current_interpreter_ptr()
+                .ok_or_else(|| type_error("recvmsg_into() argument 1 must be an iterable"))?;
+            // SAFETY: published by the active builtin call on this thread.
+            let interp = unsafe { &mut *ptr };
+            let it = interp
+                .iter_object(other.clone())
+                .map_err(|_| type_error("recvmsg_into() argument 1 must be an iterable"))?;
+            let mut out = Vec::new();
+            while let Some(item) = interp.iter_next_object(it.clone())? {
+                out.push(item);
+            }
+            out
+        }
+        None => return Err(type_error("recvmsg_into() argument 1 must be an iterable")),
+    };
+    let mut dests = Vec::with_capacity(buf_objs.len());
+    let mut total = 0usize;
+    for obj in &buf_objs {
+        let (dst, start, len) = super::io::writable_buffer_dst(Some(obj), "recvmsg_into")?;
+        total += len;
+        dests.push((dst, start, len));
+    }
+    let ancbufsize = match args.get(2) {
+        None | Some(Object::None) => 0usize,
+        Some(o) => match o.as_i64() {
+            Some(n) if n >= 0 => n as usize,
+            Some(_) => return Err(value_error("negative ancillary data buffer size")),
+            None => return Err(type_error("recvmsg_into: ancbufsize must be an integer")),
+        },
+    };
+    let flags: libc::c_int = match args.get(3) {
+        None | Some(Object::None) => 0,
+        Some(o) => match o.as_i64() {
+            Some(n) => n as libc::c_int,
+            None => return Err(type_error("recvmsg_into: flags must be an integer")),
+        },
+    };
+
+    let mut databuf = vec![0u8; total];
+    let (n, ancdata_items, msg_flags, address) =
+        recvmsg_engine(&state, &mut databuf, ancbufsize, flags)?;
+
+    // Distribute the received bytes across the buffers in order.
+    let mut off = 0usize;
+    for (dst, start, len) in &dests {
+        if off >= n {
+            break;
+        }
+        let take = (*len).min(n - off);
+        let mut bytes = dst.borrow_mut();
+        bytes[*start..*start + take].copy_from_slice(&databuf[off..off + take]);
+        off += take;
+    }
+
+    Ok(Object::new_tuple(vec![
+        Object::Int(n as i64),
+        Object::new_list(ancdata_items),
+        Object::Int(msg_flags),
+        address,
     ]))
 }
 
@@ -1763,11 +2401,47 @@ fn extract_iov_buffers(arg: Option<&Object>) -> Result<Vec<Vec<u8>>, RuntimeErro
     items
         .iter()
         .map(|o| {
-            extract_bytes(Some(o)).map_err(|_| {
-                type_error("sendmsg(): argument 1 must be an iterable of bytes-like objects")
-            })
+            // Buffer-protocol fallback covers `array.array("B", ...)`
+            // (test_socket's testSendmsgArray) and other exporters that
+            // aren't native bytes/bytearray/memoryview.
+            extract_bytes(Some(o))
+                .ok()
+                .or_else(|| buffer_protocol_bytes(o))
+                .ok_or_else(|| {
+                    type_error("sendmsg(): argument 1 must be an iterable of bytes-like objects")
+                })
         })
         .collect()
+}
+
+/// Integer conversion through `__index__`, like the C "i" arg converter:
+/// native ints (and IntEnum members) short-circuit, anything else gets its
+/// `__index__` called through the interpreter.
+fn index_arg(obj: &Object) -> Option<i64> {
+    if let Some(n) = obj.as_i64() {
+        return Some(n);
+    }
+    let ptr = crate::vm_singletons::current_interpreter_ptr()?;
+    // SAFETY: published by the active builtin call on this thread; the
+    // interpreter outlives this call.
+    let interp = unsafe { &mut *ptr };
+    let method = interp.load_attr_public(obj, "__index__").ok()?;
+    interp.call_object(method, &[], &[]).ok()?.as_i64()
+}
+
+/// Bytes of an arbitrary buffer-protocol exporter, via its `tobytes()`
+/// method (the escape hatch for objects the native `extract_bytes` doesn't
+/// know, e.g. `array.array`).
+fn buffer_protocol_bytes(obj: &Object) -> Option<Vec<u8>> {
+    let ptr = crate::vm_singletons::current_interpreter_ptr()?;
+    // SAFETY: published by the active builtin call on this thread; the
+    // interpreter outlives this call.
+    let interp = unsafe { &mut *ptr };
+    let method = interp.load_attr_public(obj, "tobytes").ok()?;
+    match interp.call_object(method, &[], &[]).ok()? {
+        Object::Bytes(b) => Some(b.to_vec()),
+        _ => None,
+    }
 }
 
 /// Extract `sendmsg` ancillary data: an iterable of `(cmsg_level, cmsg_type,
@@ -1781,10 +2455,24 @@ fn extract_ancdata(
         None | Some(Object::None) => return Ok(Vec::new()),
         Some(Object::List(l)) => l.borrow().clone(),
         Some(Object::Tuple(t)) => t.to_vec(),
-        _ => {
-            return Err(type_error(
-                "sendmsg(): ancillary data must be an iterable of zero or more triples",
-            ))
+        // Any other iterable is drained through the interpreter — the suite
+        // passes a generator expression (testSendmsgAncillaryGenerator).
+        Some(other) => {
+            let bad_iterable = || {
+                type_error("sendmsg(): ancillary data must be an iterable of zero or more triples")
+            };
+            let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(bad_iterable)?;
+            // SAFETY: published by the active builtin call on this thread;
+            // the GIL keeps the access exclusive.
+            let interp = unsafe { &mut *ptr };
+            let it = interp
+                .iter_object(other.clone())
+                .map_err(|_| bad_iterable())?;
+            let mut out = Vec::new();
+            while let Some(item) = interp.iter_next_object(it.clone())? {
+                out.push(item);
+            }
+            out
         }
     };
     let mut out = Vec::with_capacity(items.len());
@@ -1798,13 +2486,18 @@ fn extract_ancdata(
                 ))
             }
         };
-        let level = match &triple[0] {
-            Object::Int(n) => *n as libc::c_int,
-            _ => return Err(type_error("sendmsg(): an integer is required (cmsg_level)")),
+        // cmsg_level/cmsg_type go through the C "i" converter, which calls
+        // `__index__` on arbitrary objects — the reentrant-mutation test
+        // passes an object whose `__index__` clears the ancillary list
+        // mid-parse (the list was already snapshotted above, like CPython's
+        // PySequence_Fast).
+        let level = match index_arg(&triple[0]) {
+            Some(n) => n as libc::c_int,
+            None => return Err(type_error("sendmsg(): an integer is required (cmsg_level)")),
         };
-        let ctype = match &triple[1] {
-            Object::Int(n) => *n as libc::c_int,
-            _ => return Err(type_error("sendmsg(): an integer is required (cmsg_type)")),
+        let ctype = match index_arg(&triple[1]) {
+            Some(n) => n as libc::c_int,
+            None => return Err(type_error("sendmsg(): an integer is required (cmsg_type)")),
         };
         let data = cmsg_data_bytes(&triple[2])?;
         out.push((level, ctype, data));
@@ -1835,6 +2528,25 @@ fn cmsg_data_bytes(obj: &Object) -> Result<Vec<u8>, RuntimeError> {
     ))
 }
 
+/// Best-effort mirror of the Python-level timeout into
+/// `SO_RCVTIMEO`/`SO_SNDTIMEO`. CPython never programs these (the fd is
+/// `O_NONBLOCK` and waits happen in poll), but WeavePy's native `_ssl`
+/// works on a `dup(2)` of the fd and cannot see the Python-level timeout
+/// — the sockopt is the one channel both sides of the dup share, letting
+/// the TLS layer distinguish "timeout mode" (poll up to the deadline)
+/// from genuine non-blocking (raise `SSLWantRead/WriteError`). Under
+/// `O_NONBLOCK` the kernel never consults `SO_*TIMEO`, so this is
+/// invisible to socket semantics. Failures (macOS EINVAL on a
+/// peer-closed AF_UNIX socket) are ignored.
+fn mirror_timeout_sockopts(sock: &Socket, timeout: Option<Duration>) {
+    let d = match timeout {
+        Some(d) if !d.is_zero() => Some(d),
+        _ => None,
+    };
+    let _ = sock.set_read_timeout(d);
+    let _ = sock.set_write_timeout(d);
+}
+
 fn sock_setblocking(args: &[Object]) -> Result<Object, RuntimeError> {
     let state = state_of(args)?;
     let flag = match args.get(1) {
@@ -1847,6 +2559,7 @@ fn sock_setblocking(args: &[Object]) -> Result<Object, RuntimeError> {
         let sock = s_borrow.inner.as_ref().ok_or_else(closed_socket_error)?;
         sock.set_nonblocking(!flag)
             .map_err(|e| io_error_to_py(&e))?;
+        mirror_timeout_sockopts(sock, None);
     }
     {
         let mut s = state.borrow_mut();
@@ -1866,7 +2579,10 @@ fn sock_setblocking(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn sock_getblocking(args: &[Object]) -> Result<Object, RuntimeError> {
     let state = state_of(args)?;
-    let blocking = state.borrow().blocking;
+    // CPython: `getblocking() == (gettimeout() != 0)` — a socket in timeout
+    // mode still reports blocking; only `settimeout(0)`/`setblocking(False)`
+    // is non-blocking.
+    let blocking = !matches!(state.borrow().timeout, Some(d) if d.is_zero());
     Ok(Object::Bool(blocking))
 }
 
@@ -1888,41 +2604,20 @@ fn sock_settimeout(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         _ => return Err(type_error("settimeout: arg must be number or None")),
     };
-    // CPython: a zero timeout puts the socket in non-blocking mode; a
-    // positive timeout is "timeout mode" (also non-blocking at the fd
-    // level, with the wait bounded by the runtime); `None` is blocking.
+    // CPython's model (socketmodule.c `internal_setblocking`): *any*
+    // timeout — zero or positive — puts the fd in O_NONBLOCK; only `None`
+    // is a genuinely blocking fd. Positive timeouts are enforced by the
+    // poll-based readiness waits in `blocking_socket_io`, never by
+    // `SO_RCVTIMEO`/`SO_SNDTIMEO` (which CPython never programs — and which
+    // macOS rejects with EINVAL on a peer-closed AF_UNIX socket anyway).
+    // NonBlockingTCPTests.testSetBlocking asserts the fd-level flag for
+    // every mode via fcntl(F_GETFL).
     {
         let s_borrow = state.borrow();
         let sock = s_borrow.inner.as_ref().ok_or_else(closed_socket_error)?;
-        match timeout {
-            // Zero ⇒ pure non-blocking; don't program a 0-duration SO_*TIMEO
-            // (some platforms read that as "block forever").
-            Some(d) if d.is_zero() => {
-                sock.set_nonblocking(true).map_err(|e| io_error_to_py(&e))?;
-            }
-            Some(d) => {
-                // Clear O_NONBLOCK too: the fd may be non-blocking from an
-                // earlier `setblocking(False)` — or *inherited* that flag
-                // via BSD `accept(2)` from a non-blocking listener (macOS).
-                // Without this, `SO_RCVTIMEO` never gets to bound the wait:
-                // recv fails EAGAIN instantly and timeout mode reports
-                // "timed out" immediately (test_sslproto's threaded server).
-                sock.set_nonblocking(false)
-                    .map_err(|e| io_error_to_py(&e))?;
-                sock.set_read_timeout(Some(d))
-                    .map_err(|e| io_error_to_py(&e))?;
-                sock.set_write_timeout(Some(d))
-                    .map_err(|e| io_error_to_py(&e))?;
-            }
-            None => {
-                sock.set_nonblocking(false)
-                    .map_err(|e| io_error_to_py(&e))?;
-                sock.set_read_timeout(None)
-                    .map_err(|e| io_error_to_py(&e))?;
-                sock.set_write_timeout(None)
-                    .map_err(|e| io_error_to_py(&e))?;
-            }
-        }
+        sock.set_nonblocking(timeout.is_some())
+            .map_err(|e| io_error_to_py(&e))?;
+        mirror_timeout_sockopts(sock, timeout);
     }
     {
         let mut s = state.borrow_mut();
@@ -1988,12 +2683,10 @@ fn sock_setsockopt(args: &[Object]) -> Result<Object, RuntimeError> {
     } else if level == sol_socket && optname == libc_so_rcvbuf() as i32 {
         sock.set_recv_buffer_size(want as usize)
             .map_err(|e| io_error_to_py(&e))?;
-    } else if level != sol_socket {
-        // Raw passthrough only off the SOL_SOCKET level: the module
-        // virtualizes a few SO_* numbers (SO_ERROR/SO_TYPE/SO_*TIMEO are
-        // Linux-shaped on every platform), so those must not reach libc
-        // verbatim. IP/IPv6/TCP-level options are exported with real
-        // platform values and pass straight through. POSIX-only: the
+    } else {
+        // Raw passthrough — every exported constant now carries the real
+        // platform numbering (including the SOL_SOCKET level), so unknown
+        // (level, optname) pairs reach libc verbatim. POSIX-only: the
         // Windows libc crate exposes no setsockopt surface, so unknown
         // options stay a no-op there (the pre-RFC-0054 behavior).
         #[cfg(unix)]
@@ -2055,57 +2748,76 @@ fn sock_getsockopt(args: &[Object]) -> Result<Object, RuntimeError> {
     let s_borrow = state.borrow();
     let sock = s_borrow.inner.as_ref().ok_or_else(closed_socket_error)?;
     let as_int = |b: bool| Object::Int(i64::from(b));
+    let sol_socket = libc_sol_socket() as i32;
     // TCP_NODELAY lives at the IPPROTO_TCP/SOL_TCP level (6); disambiguate
     // it from SOL_SOCKET options that share the numeric optname 1.
     if level == 6 && optname == 1 {
         return Ok(as_int(sock.nodelay().map_err(|e| io_error_to_py(&e))?));
     }
-    if optname == 4 {
+    #[cfg(unix)]
+    if level == sol_socket && optname == libc::SO_ERROR {
         // SO_ERROR — return last error number, or 0.
         let err = sock.take_error().ok().flatten();
         return Ok(Object::Int(
             err.map_or(0, |e| i64::from(e.raw_os_error().unwrap_or(0))),
         ));
     }
-    if optname == 3 {
+    #[cfg(unix)]
+    if level == sol_socket && optname == libc::SO_TYPE {
         // SO_TYPE — return our recorded kind.
         return Ok(Object::Int(i64::from(s_borrow.kind)));
     }
     // Read back the SO_* options we know how to set, so a
     // setsockopt/getsockopt round-trip reflects reality (CPython parity;
     // asyncio's `_set_nodelay` and several transport tests rely on this).
-    if optname == libc_so_reuseaddr() as i32 {
+    if level == sol_socket && optname == libc_so_reuseaddr() as i32 {
         return Ok(as_int(
             sock.reuse_address().map_err(|e| io_error_to_py(&e))?,
         ));
     }
     #[cfg(unix)]
-    if optname == libc_so_reuseport() as i32 {
+    if level == sol_socket && optname == libc_so_reuseport() as i32 {
         return Ok(as_int(sock.reuse_port().map_err(|e| io_error_to_py(&e))?));
     }
-    if optname == libc_so_keepalive() as i32 {
+    if level == sol_socket && optname == libc_so_keepalive() as i32 {
         return Ok(as_int(sock.keepalive().map_err(|e| io_error_to_py(&e))?));
     }
-    if optname == libc_so_broadcast() as i32 {
+    if level == sol_socket && optname == libc_so_broadcast() as i32 {
         return Ok(as_int(sock.broadcast().map_err(|e| io_error_to_py(&e))?));
     }
-    if optname == libc_so_sndbuf() as i32 {
+    if level == sol_socket && optname == libc_so_sndbuf() as i32 {
         return Ok(Object::Int(
             sock.send_buffer_size().map_err(|e| io_error_to_py(&e))? as i64,
         ));
     }
-    if optname == libc_so_rcvbuf() as i32 {
+    if level == sol_socket && optname == libc_so_rcvbuf() as i32 {
         return Ok(Object::Int(
             sock.recv_buffer_size().map_err(|e| io_error_to_py(&e))? as i64,
         ));
     }
-    // Off-SOL_SOCKET levels (IP/IPv6/TCP options) read back through a raw
-    // `getsockopt(2)` so a set/get round-trip reflects reality — asyncio's
-    // dual-stack `create_server` verifies `IPV6_V6ONLY` this way.
-    // POSIX-only, like the matching setsockopt passthrough above.
+    // Everything else reads back through a raw `getsockopt(2)` — the module
+    // now exports real platform numbering for every level including
+    // SOL_SOCKET, so the passthrough is safe (asyncio's dual-stack
+    // `create_server` verifies `IPV6_V6ONLY` this way).
     #[cfg(unix)]
-    if level != libc_sol_socket() as i32 {
+    {
         let fd = raw_fd_of(sock).ok_or_else(closed_socket_error)? as i32;
+        // An explicit buflen argument requests the raw bytes form.
+        if let Some(buflen) = args.get(3).and_then(Object::as_i64) {
+            if !(0..=1024).contains(&buflen) {
+                return Err(value_error("getsockopt buflen out of range"));
+            }
+            let mut buf = vec![0u8; buflen as usize];
+            let mut len = buflen as libc::socklen_t;
+            let rc = unsafe {
+                libc::getsockopt(fd, level, optname, buf.as_mut_ptr().cast(), &raw mut len)
+            };
+            if rc != 0 {
+                return Err(io_error_to_py(&std::io::Error::last_os_error()));
+            }
+            buf.truncate(len as usize);
+            return Ok(Object::new_bytes(buf));
+        }
         let mut v: libc::c_int = 0;
         let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
         let rc = unsafe {
@@ -2120,9 +2832,10 @@ fn sock_getsockopt(args: &[Object]) -> Result<Object, RuntimeError> {
         if rc == 0 {
             return Ok(Object::Int(i64::from(v)));
         }
-        return Err(io_error_to_py(&std::io::Error::last_os_error()));
+        Err(io_error_to_py(&std::io::Error::last_os_error()))
     }
     // For anything else, return 0 as a safe default.
+    #[cfg(not(unix))]
     Ok(Object::Int(0))
 }
 
@@ -2150,7 +2863,10 @@ fn sock_fileno(args: &[Object]) -> Result<Object, RuntimeError> {
     // reach the socket by id.
     let inst = extract_self(args)?;
     let handle = extract_handle(&inst).unwrap_or(-1);
-    if handle < 0 {
+    // -1 is the closed marker. Other negative handles are synthetic
+    // registry keys (fd shared with another socket object) whose real fd
+    // still comes from the state's inner socket below.
+    if handle == -1 {
         return Ok(Object::Int(-1));
     }
     let state = match get_state(handle) {
@@ -2619,6 +3335,29 @@ fn parse_socket_address(arg: Option<&Object>, family: i32) -> Result<SocketAddr,
     }
     .or_else(|| candidates.first().copied())
     .ok_or_else(|| os_error("could not resolve address"))?;
+    // The optional IPv6 4-tuple members. CPython's getsockaddrarg bounds
+    // flowinfo to the 20-bit field and raises OverflowError otherwise
+    // (test_flowinfo binds with flowinfo=-10 expecting exactly that).
+    if tup.len() > 2 {
+        let Some(flowinfo) = tup.get(2).and_then(Object::as_i64) else {
+            return Err(type_error("address flowinfo must be int"));
+        };
+        if !(0..=0xfffff).contains(&flowinfo) {
+            return Err(overflow_error(
+                "getsockaddrarg: flowinfo must be 0-1048575.",
+            ));
+        }
+        let flowinfo = flowinfo as u32;
+        let scope_id = tup.get(3).and_then(Object::as_i64).unwrap_or(0) as u32;
+        if let SocketAddr::V6(v6) = parsed {
+            let mut v6 = v6;
+            v6.set_flowinfo(flowinfo);
+            if tup.len() > 3 {
+                v6.set_scope_id(scope_id);
+            }
+            return Ok(SocketAddr::V6(v6));
+        }
+    }
     Ok(parsed)
 }
 
@@ -2704,6 +3443,12 @@ fn parse_sockaddr2(arg: Option<&Object>, family: i32) -> Result<SockAddr, Runtim
     if family == libc::AF_UNIX as i32 {
         let path: Vec<u8> = match arg {
             Some(Object::Str(s)) => s.as_bytes().to_vec(),
+            // Lone surrogates carry raw filesystem bytes (PEP 383):
+            // `b.decode('ascii', 'surrogateescape')` round-trips through
+            // the fs codec back to the original bytes (testSurrogateescapeBind).
+            Some(w @ Object::WStr(_)) => {
+                crate::stdlib::codecs_mod::encode_obj(w, "utf-8", "surrogateescape")?
+            }
             Some(Object::Bytes(b)) => b.to_vec(),
             Some(Object::ByteArray(b)) => b.borrow().clone(),
             _ => return Err(type_error("AF_UNIX address must be a str or bytes path")),
@@ -2771,9 +3516,6 @@ fn module_functions() -> Vec<(&'static str, fn(&[Object]) -> Result<Object, Runt
         ("getservbyport", mod_getservbyport),
         ("getaddrinfo", mod_getaddrinfo),
         ("getnameinfo", mod_getnameinfo),
-        ("getfqdn", mod_getfqdn),
-        ("create_connection", mod_create_connection),
-        ("create_server", mod_create_server),
         ("socketpair", mod_socketpair),
         ("inet_aton", mod_inet_aton),
         ("inet_ntoa", mod_inet_ntoa),
@@ -2785,7 +3527,21 @@ fn module_functions() -> Vec<(&'static str, fn(&[Object]) -> Result<Object, Runt
         ("ntohl", mod_htonl),
         ("getdefaulttimeout", mod_getdefaulttimeout),
         ("setdefaulttimeout", mod_setdefaulttimeout),
+        // The verbatim `socket.py` (RFC 0068 WS8) builds `sock.dup()` and
+        // fd-taking `socket.close(fd)` from these module-level primitives.
+        ("dup", mod_dup),
+        ("close", mod_close_fd),
+        ("getprotobyname", mod_getprotobyname),
     ];
+    #[cfg(unix)]
+    fns.extend([
+        (
+            "if_nameindex",
+            mod_if_nameindex as fn(&[Object]) -> Result<Object, RuntimeError>,
+        ),
+        ("if_nametoindex", mod_if_nametoindex),
+        ("if_indextoname", mod_if_indextoname),
+    ]);
     // Ancillary-data sizing helpers (functions, not constants, exactly
     // like CPython's `socket` module). Needed by `reduction.recvfds`.
     // Absent on Windows, matching CPython's `#ifdef CMSG_LEN` gating.
@@ -2800,11 +3556,161 @@ fn module_functions() -> Vec<(&'static str, fn(&[Object]) -> Result<Object, Runt
     fns
 }
 
+/// `_socket.dup(fd)` — duplicate a socket descriptor (non-inheritable,
+/// like CPython's `_socket.dup`, which uses `F_DUPFD_CLOEXEC`).
+fn mod_dup(args: &[Object]) -> Result<Object, RuntimeError> {
+    let Some(fd) = args.first().and_then(Object::as_i64) else {
+        return Err(type_error("an integer is required"));
+    };
+    #[cfg(unix)]
+    {
+        let new = unsafe { libc::fcntl(fd as libc::c_int, libc::F_DUPFD_CLOEXEC, 0) };
+        if new < 0 {
+            return Err(io_error_to_py(&std::io::Error::last_os_error()));
+        }
+        Ok(Object::Int(i64::from(new)))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fd;
+        Err(os_error("dup is not supported on this platform"))
+    }
+}
+
+/// `_socket.close(fd)` — close a socket descriptor, swallowing `ECONNRESET`
+/// (CPython's `sock_close`; `EBADF` and friends still raise).
+fn mod_close_fd(args: &[Object]) -> Result<Object, RuntimeError> {
+    let Some(fd) = args.first().and_then(Object::as_i64) else {
+        return Err(type_error("an integer is required"));
+    };
+    #[cfg(unix)]
+    {
+        let r = unsafe { libc::close(fd as libc::c_int) };
+        if r < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ECONNRESET) {
+                return Err(io_error_to_py(&err));
+            }
+        }
+        Ok(Object::None)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fd;
+        Err(os_error("close is not supported on this platform"))
+    }
+}
+
+/// `socket.getprotobyname(name)` — protocol number from `/etc/protocols`.
+fn mod_getprotobyname(args: &[Object]) -> Result<Object, RuntimeError> {
+    let Some(Object::Str(name)) = args.first() else {
+        return Err(type_error("getprotobyname() argument must be str"));
+    };
+    #[cfg(unix)]
+    {
+        let c = std::ffi::CString::new(name.as_bytes())
+            .map_err(|_| value_error("embedded null character"))?;
+        let ent = unsafe { libc::getprotobyname(c.as_ptr()) };
+        if ent.is_null() {
+            return Err(os_error("protocol not found"));
+        }
+        Ok(Object::Int(i64::from(unsafe { (*ent).p_proto })))
+    }
+    #[cfg(not(unix))]
+    {
+        match name.as_ref() {
+            "tcp" => Ok(Object::Int(6)),
+            "udp" => Ok(Object::Int(17)),
+            "icmp" => Ok(Object::Int(1)),
+            _ => Err(os_error("protocol not found")),
+        }
+    }
+}
+
+/// `socket.if_nameindex()` — list of `(index, name)` for the interfaces.
+#[cfg(unix)]
+fn mod_if_nameindex(_args: &[Object]) -> Result<Object, RuntimeError> {
+    let head = unsafe { libc::if_nameindex() };
+    if head.is_null() {
+        return Err(io_error_to_py(&std::io::Error::last_os_error()));
+    }
+    let mut out = Vec::new();
+    let mut cur = head;
+    unsafe {
+        while (*cur).if_index != 0 && !(*cur).if_name.is_null() {
+            let name = CStr::from_ptr((*cur).if_name)
+                .to_string_lossy()
+                .into_owned();
+            out.push(Object::new_tuple(vec![
+                Object::Int(i64::from((*cur).if_index)),
+                Object::from_str(name),
+            ]));
+            cur = cur.add(1);
+        }
+        libc::if_freenameindex(head);
+    }
+    Ok(Object::new_list(out))
+}
+
+/// `socket.if_nametoindex(name)`.
+#[cfg(unix)]
+fn mod_if_nametoindex(args: &[Object]) -> Result<Object, RuntimeError> {
+    let Some(Object::Str(name)) = args.first() else {
+        return Err(type_error("if_nametoindex() argument must be str"));
+    };
+    let c = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| value_error("embedded null character"))?;
+    let idx = unsafe { libc::if_nametoindex(c.as_ptr()) };
+    if idx == 0 {
+        // The failure OSError must carry an errno
+        // (testInvalidInterfaceNameToIndex asserts `.errno is not None`);
+        // if_nametoindex(3) leaves ENXIO/ENODEV in errno on BSDs and Linux.
+        return Err(io_error_to_py(&std::io::Error::last_os_error()));
+    }
+    Ok(Object::Int(i64::from(idx)))
+}
+
+/// `socket.if_indextoname(index)`.
+#[cfg(unix)]
+fn mod_if_indextoname(args: &[Object]) -> Result<Object, RuntimeError> {
+    // The index converts as a C unsigned int: a negative value or one that
+    // doesn't fit 32 bits is an OverflowError, while a non-int is a
+    // TypeError (testInvalidInterfaceIndexToName probes -1, 2**1000, and
+    // '_DEADBEEF' separately).
+    let arg = args.first();
+    let idx = match arg.and_then(Object::as_i64) {
+        Some(n) if (0..=i64::from(u32::MAX)).contains(&n) => n,
+        Some(_) => {
+            return Err(crate::error::overflow_error(
+                "if_indextoname() argument out of range",
+            ))
+        }
+        None if matches!(arg, Some(Object::Long(_))) => {
+            return Err(crate::error::overflow_error(
+                "if_indextoname() argument out of range",
+            ))
+        }
+        None => return Err(type_error("if_indextoname() argument must be int")),
+    };
+    let mut buf = [0u8; libc::IF_NAMESIZE];
+    let r = unsafe { libc::if_indextoname(idx as libc::c_uint, buf.as_mut_ptr().cast()) };
+    if r.is_null() {
+        return Err(io_error_to_py(&std::io::Error::last_os_error()));
+    }
+    let name = unsafe { CStr::from_ptr(buf.as_ptr().cast()) }
+        .to_string_lossy()
+        .into_owned();
+    Ok(Object::from_str(name))
+}
+
 /// `socket.CMSG_LEN(length)` — bytes an ancillary-data item of `length`
 /// payload occupies, including the `cmsghdr` (but not the trailing pad).
 #[cfg(unix)]
 fn mod_cmsg_len(args: &[Object]) -> Result<Object, RuntimeError> {
-    let length = cmsg_size_arg(args.first())?;
+    // CPython's get_CMSG_LEN: the result must fit SOCKLEN_T_LIMIT
+    // (INT_MAX), so the payload cap is INT_MAX - CMSG_LEN(0).
+    let limit = i64::from(libc::c_int::MAX) - i64::from(unsafe { libc::CMSG_LEN(0) });
+    let length = cmsg_size_arg(args.first(), limit)?;
     Ok(Object::Int(i64::from(unsafe { libc::CMSG_LEN(length) })))
 }
 
@@ -2812,17 +3718,29 @@ fn mod_cmsg_len(args: &[Object]) -> Result<Object, RuntimeError> {
 /// one ancillary-data item of `length` payload, including alignment pad.
 #[cfg(unix)]
 fn mod_cmsg_space(args: &[Object]) -> Result<Object, RuntimeError> {
-    let length = cmsg_size_arg(args.first())?;
+    // CPython's get_CMSG_SPACE caps at INT_MAX - CMSG_SPACE(1) — SPACE(1)
+    // rather than SPACE(0) accounts for padding before *and* after the
+    // payload (CmsgMacroTests.testCMSG_SPACE probes the exact boundary).
+    let limit = i64::from(libc::c_int::MAX) - i64::from(unsafe { libc::CMSG_SPACE(1) });
+    let length = cmsg_size_arg(args.first(), limit)?;
     Ok(Object::Int(i64::from(unsafe { libc::CMSG_SPACE(length) })))
 }
 
 #[cfg(unix)]
-fn cmsg_size_arg(arg: Option<&Object>) -> Result<u32, RuntimeError> {
-    match arg {
-        Some(Object::Int(n)) if *n >= 0 => Ok(*n as u32),
-        Some(Object::Int(_)) => Err(value_error("CMSG_LEN() argument out of range")),
-        _ => Err(type_error("an integer is required")),
+fn cmsg_size_arg(arg: Option<&Object>, limit: i64) -> Result<u32, RuntimeError> {
+    // Out-of-range values — negatives, huge ints, anything whose result
+    // would overflow a socklen_t — are an *OverflowError* (CmsgMacroTests
+    // probes -1, the exact limit + 1, and sys.maxsize).
+    let out_of_range = || crate::error::overflow_error("CMSG_LEN() argument out of range");
+    let n = match arg.and_then(Object::as_i64) {
+        Some(n) => n,
+        None if matches!(arg, Some(Object::Long(_))) => return Err(out_of_range()),
+        None => return Err(type_error("an integer is required")),
+    };
+    if n < 0 || n > limit {
+        return Err(out_of_range());
     }
+    Ok(n as u32)
 }
 
 /// `gethostname()` over the real libc call. urllib's `file://` handler
@@ -3070,6 +3988,94 @@ fn mod_gethostbyname_ex(args: &[Object]) -> Result<Object, RuntimeError> {
     ]))
 }
 
+#[cfg(unix)]
+fn mod_gethostbyaddr(args: &[Object]) -> Result<Object, RuntimeError> {
+    use std::ffi::{CStr, CString};
+    let addr = match args.first() {
+        Some(Object::Str(s)) => s.to_string(),
+        _ => return Err(type_error("gethostbyaddr: arg must be str")),
+    };
+    // CPython's setipaddr leg: the argument (a numeric address *or* a name)
+    // must forward-resolve — junk like '0.1.1.~1' raises gaierror here
+    // (test_host_resolution_bad_address).
+    let c_addr =
+        CString::new(addr).map_err(|_| value_error("gethostbyaddr: embedded null character"))?;
+    let mut hints: libc::addrinfo = unsafe { std::mem::zeroed() };
+    hints.ai_family = libc::AF_UNSPEC;
+    hints.ai_socktype = libc::SOCK_DGRAM;
+    let mut res: *mut libc::addrinfo = std::ptr::null_mut();
+    let res_ptr = std::ptr::addr_of_mut!(res);
+    let addr_ptr = c_addr.as_ptr();
+    let rc = crate::gil::allow_threads_then(|| unsafe {
+        libc::getaddrinfo(addr_ptr, std::ptr::null(), &raw const hints, res_ptr)
+    });
+    if rc != 0 {
+        let msg = unsafe {
+            let p = libc::gai_strerror(rc);
+            if p.is_null() {
+                "getaddrinfo failed".to_owned()
+            } else {
+                CStr::from_ptr(p).to_string_lossy().into_owned()
+            }
+        };
+        return Err(gaierror(rc, msg));
+    }
+    // SAFETY: rc == 0 guarantees a valid chain until `freeaddrinfo`.
+    let ai = unsafe { &*res };
+    let sa = ai.ai_addr;
+    let salen = ai.ai_addrlen;
+    let mut namebuf = [0i8; 1025];
+    let mut numbuf = [0i8; 1025];
+    let name_out = namebuf.as_mut_ptr();
+    let num_out = numbuf.as_mut_ptr();
+    // Reverse (PTR) lookup for the canonical hostname; hosts without a PTR
+    // record fall back to the numeric form rather than erroring, keeping
+    // loopback/CI environments working.
+    let rev = crate::gil::allow_threads_then(|| unsafe {
+        libc::getnameinfo(
+            sa,
+            salen,
+            name_out.cast(),
+            1025,
+            std::ptr::null_mut(),
+            0,
+            libc::NI_NAMEREQD,
+        )
+    });
+    let num_rc = unsafe {
+        libc::getnameinfo(
+            sa,
+            salen,
+            num_out.cast(),
+            1025,
+            std::ptr::null_mut(),
+            0,
+            libc::NI_NUMERICHOST,
+        )
+    };
+    unsafe { libc::freeaddrinfo(res) };
+    let numeric = if num_rc == 0 {
+        unsafe { CStr::from_ptr(numbuf.as_ptr().cast()) }
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        c_addr.to_string_lossy().into_owned()
+    };
+    let name = if rev == 0 {
+        unsafe { CStr::from_ptr(namebuf.as_ptr().cast()) }
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        numeric.clone()
+    };
+    Ok(Object::new_tuple(vec![
+        Object::from_str(name),
+        Object::new_list(Vec::new()),
+        Object::new_list(vec![Object::from_str(numeric)]),
+    ]))
+}
+
+#[cfg(not(unix))]
 fn mod_gethostbyaddr(args: &[Object]) -> Result<Object, RuntimeError> {
     let addr = match args.first() {
         Some(Object::Str(s)) => s.to_string(),
@@ -3080,15 +4086,6 @@ fn mod_gethostbyaddr(args: &[Object]) -> Result<Object, RuntimeError> {
         Object::new_list(Vec::new()),
         Object::new_list(vec![Object::from_str(addr)]),
     ]))
-}
-
-fn mod_getfqdn(args: &[Object]) -> Result<Object, RuntimeError> {
-    if let Some(Object::Str(s)) = args.first() {
-        if !s.is_empty() {
-            return Ok(Object::from_str(s.to_string()));
-        }
-    }
-    mod_gethostname(args)
 }
 
 /// `getaddrinfo(host, port, family=0, type=0, proto=0, flags=0)` over the
@@ -3103,13 +4100,30 @@ fn mod_getaddrinfo(args: &[Object]) -> Result<Object, RuntimeError> {
     let nul_err = || value_error("getaddrinfo: embedded null character in argument");
     let host: Option<CString> = match args.first() {
         Some(Object::Str(s)) => Some(CString::new(s.as_bytes()).map_err(|_| nul_err())?),
+        // A surrogate-bearing host can't reach the C resolver: encoding it
+        // (idna/utf-8) raises UnicodeEncodeError, matching CPython.
+        Some(w @ Object::WStr(_)) => {
+            let b = crate::stdlib::codecs_mod::encode_obj(w, "utf-8", "strict")?;
+            Some(CString::new(b).map_err(|_| nul_err())?)
+        }
         Some(Object::Bytes(b)) => Some(CString::new(&b[..]).map_err(|_| nul_err())?),
         Some(Object::None) | None => None,
         _ => return Err(type_error("getaddrinfo: host must be str, bytes, or None")),
     };
     let service: Option<CString> = match args.get(1) {
+        // gh-74895: an int port of *any* magnitude is formatted as its
+        // decimal string and left to the platform resolver — CPython no
+        // longer raises OverflowError for values outside C long
+        // (test_getaddrinfo_int_port_overflow feeds ULONG_MAX + 1).
         Some(Object::Int(n)) => Some(CString::new(n.to_string()).expect("digits have no NUL")),
+        Some(Object::Long(b)) => Some(CString::new(b.to_string()).expect("digits have no NUL")),
         Some(Object::Str(s)) => Some(CString::new(s.as_bytes()).map_err(|_| nul_err())?),
+        // A lone surrogate in the service string surfaces as the codec's
+        // UnicodeEncodeError (testGetaddrinfo probes '\uD800').
+        Some(w @ Object::WStr(_)) => {
+            let b = crate::stdlib::codecs_mod::encode_obj(w, "utf-8", "strict")?;
+            Some(CString::new(b).map_err(|_| nul_err())?)
+        }
         Some(Object::Bytes(b)) => Some(CString::new(&b[..]).map_err(|_| nul_err())?),
         Some(Object::None) | None => None,
         _ => {
@@ -3400,25 +4414,108 @@ fn mod_getaddrinfo_kw(
 
 #[cfg(not(windows))]
 fn mod_getnameinfo(args: &[Object]) -> Result<Object, RuntimeError> {
-    let addr_obj = match args.first() {
-        Some(o) => o,
+    // CPython's socket_getnameinfo (socketmodule.c): the host must already
+    // be a *numeric* address — it is re-parsed through
+    // `getaddrinfo(AI_NUMERICHOST)` to build the binary sockaddr (raising
+    // gaierror for names like 'mail.python.org' — test_getnameinfo), the
+    // 4-tuple's flowinfo/scope-id are patched in (they aren't expressible
+    // in the numeric string), and the C `getnameinfo` renders the result —
+    // lowercased hex with a `%ifname` scope suffix (the scopeid_symbolic
+    // tests assert both).
+    use std::ffi::{CStr, CString};
+    let tup = match args.first() {
+        Some(Object::Tuple(t)) => t,
+        Some(_) => return Err(type_error("getnameinfo() argument 1 must be a tuple")),
         None => return Err(type_error("getnameinfo: missing argument")),
-    };
-    let tup = match addr_obj {
-        Object::Tuple(t) => t,
-        _ => return Err(type_error("getnameinfo: address must be tuple")),
     };
     let host = match tup.first() {
         Some(Object::Str(s)) => s.to_string(),
         _ => return Err(type_error("getnameinfo: address[0] must be str")),
     };
-    let port = match tup.get(1) {
-        Some(Object::Int(n)) => *n as u16,
-        _ => return Err(type_error("getnameinfo: address[1] must be int")),
+    let port = match tup.get(1).and_then(Object::as_i64) {
+        Some(n) => n,
+        None => return Err(type_error("getnameinfo: address[1] must be int")),
     };
+    let flowinfo = tup.get(2).and_then(Object::as_i64).unwrap_or(0);
+    if !(0..=0xfffff).contains(&flowinfo) {
+        return Err(crate::error::overflow_error(
+            "getnameinfo(): flowinfo must be 0-1048575.",
+        ));
+    }
+    let scope_id = tup.get(3).and_then(Object::as_i64).unwrap_or(0) as u32;
+    let flags = args.get(1).and_then(Object::as_i64).unwrap_or(0) as libc::c_int;
+
+    let c_host = CString::new(host)
+        .map_err(|_| value_error("getnameinfo: embedded null character in argument"))?;
+    let c_serv = CString::new(port.to_string()).expect("digits have no NUL");
+    let mut hints: libc::addrinfo = unsafe { std::mem::zeroed() };
+    hints.ai_family = libc::AF_UNSPEC;
+    // SOCK_DGRAM keeps the resolver from returning one row per socktype.
+    hints.ai_socktype = libc::SOCK_DGRAM;
+    hints.ai_flags = libc::AI_NUMERICHOST;
+    let mut res: *mut libc::addrinfo = std::ptr::null_mut();
+    let res_ptr = std::ptr::addr_of_mut!(res);
+    let host_ptr = c_host.as_ptr();
+    let serv_ptr = c_serv.as_ptr();
+    let rc = crate::gil::allow_threads_then(|| unsafe {
+        libc::getaddrinfo(host_ptr, serv_ptr, &raw const hints, res_ptr)
+    });
+    if rc != 0 {
+        let msg = unsafe {
+            let p = libc::gai_strerror(rc);
+            if p.is_null() {
+                "getaddrinfo failed".to_owned()
+            } else {
+                CStr::from_ptr(p).to_string_lossy().into_owned()
+            }
+        };
+        return Err(gaierror(rc, msg));
+    }
+    // SAFETY: rc == 0 guarantees a valid chain until `freeaddrinfo`.
+    let ai = unsafe { &*res };
+    if ai.ai_family == libc::AF_INET6 {
+        let sin6 = unsafe { &mut *ai.ai_addr.cast::<libc::sockaddr_in6>() };
+        sin6.sin6_flowinfo = (flowinfo as u32).to_be();
+        sin6.sin6_scope_id = scope_id;
+    }
+    let mut hostbuf = [0i8; 1025]; // NI_MAXHOST
+    let mut servbuf = [0i8; 32]; // NI_MAXSERV
+    let addr = ai.ai_addr;
+    let addrlen = ai.ai_addrlen;
+    let host_out = hostbuf.as_mut_ptr();
+    let serv_out = servbuf.as_mut_ptr();
+    let rc = crate::gil::allow_threads_then(|| unsafe {
+        libc::getnameinfo(
+            addr,
+            addrlen,
+            host_out.cast(),
+            1025,
+            serv_out.cast(),
+            32,
+            flags,
+        )
+    });
+    unsafe { libc::freeaddrinfo(res) };
+    if rc != 0 {
+        let msg = unsafe {
+            let p = libc::gai_strerror(rc);
+            if p.is_null() {
+                "getnameinfo failed".to_owned()
+            } else {
+                CStr::from_ptr(p).to_string_lossy().into_owned()
+            }
+        };
+        return Err(gaierror(rc, msg));
+    }
+    let host_s = unsafe { CStr::from_ptr(hostbuf.as_ptr().cast()) }
+        .to_string_lossy()
+        .into_owned();
+    let serv_s = unsafe { CStr::from_ptr(servbuf.as_ptr().cast()) }
+        .to_string_lossy()
+        .into_owned();
     Ok(Object::new_tuple(vec![
-        Object::from_str(host),
-        Object::from_str(port.to_string()),
+        Object::from_str(host_s),
+        Object::from_str(serv_s),
     ]))
 }
 
@@ -3514,75 +4611,6 @@ fn mod_getnameinfo(args: &[Object]) -> Result<Object, RuntimeError> {
     ]))
 }
 
-fn mod_create_connection(args: &[Object]) -> Result<Object, RuntimeError> {
-    // create_connection(address, timeout=...) returns a connected
-    // socket.socket. We build one via socket_class().
-    let addr_obj = args
-        .first()
-        .ok_or_else(|| type_error("create_connection: missing address"))?
-        .clone();
-    let cls = socket_class();
-    let inst = Rc::new(PyInstance::new(cls));
-    let inst_obj = Object::Instance(inst.clone());
-    sock_init(&[
-        inst_obj.clone(),
-        Object::Int(libc_af_inet()),
-        Object::Int(libc_sock_stream()),
-        Object::Int(0),
-    ])?;
-    if let Some(timeout) = args.get(1).cloned() {
-        sock_settimeout(&[inst_obj.clone(), timeout])?;
-    }
-    sock_connect(&[inst_obj.clone(), addr_obj])?;
-    Ok(inst_obj)
-}
-
-fn mod_create_server(args: &[Object]) -> Result<Object, RuntimeError> {
-    let addr_obj = args
-        .first()
-        .ok_or_else(|| type_error("create_server: missing address"))?
-        .clone();
-    // `as_i64` unwraps the `AddressFamily` IntEnum member `socket.py`
-    // promotes the constant to (a plain `Object::Int` match would silently
-    // fall back to AF_INET and an IPv6 bind would fail with EAFNOSUPPORT —
-    // `test_ftplib.TestIPv6Environment`).
-    let family = match args.get(1).and_then(Object::as_i64) {
-        Some(n) => n as i32,
-        None => libc_af_inet() as i32,
-    };
-    let backlog = args.get(2).and_then(Object::as_i64).unwrap_or(100);
-    let reuse_port = match args.get(3) {
-        Some(Object::Bool(b)) => *b,
-        _ => false,
-    };
-    let cls = socket_class();
-    let inst = Rc::new(PyInstance::new(cls));
-    let inst_obj = Object::Instance(inst);
-    sock_init(&[
-        inst_obj.clone(),
-        Object::Int(i64::from(family)),
-        Object::Int(libc_sock_stream()),
-        Object::Int(0),
-    ])?;
-    sock_setsockopt(&[
-        inst_obj.clone(),
-        Object::Int(libc_sol_socket()),
-        Object::Int(libc_so_reuseaddr()),
-        Object::Int(1),
-    ])?;
-    if reuse_port {
-        sock_setsockopt(&[
-            inst_obj.clone(),
-            Object::Int(libc_sol_socket()),
-            Object::Int(libc_so_reuseport()),
-            Object::Int(1),
-        ])?;
-    }
-    sock_bind(&[inst_obj.clone(), addr_obj])?;
-    sock_listen(&[inst_obj.clone(), Object::Int(backlog)])?;
-    Ok(inst_obj)
-}
-
 fn mod_socketpair(args: &[Object]) -> Result<Object, RuntimeError> {
     // CPython signature: socketpair(family=AF_UNIX, type=SOCK_STREAM, proto=0).
     // The AF_UNIX default is load-bearing: `multiprocessing`'s `Connection`
@@ -3652,6 +4680,9 @@ fn unix_socketpair(family: i32, sock_type: i32, proto: i32) -> Result<Object, Ru
     let make = |fd: libc::c_int| -> Object {
         // SAFETY: `fd` is a fresh, owned descriptor from `socketpair(2)`.
         let sock = unsafe { Socket::from_raw_fd(fd) };
+        // PEP 446: like every descriptor Python creates, the pair is
+        // non-inheritable (InheritanceTest.test_socketpair).
+        let _ = sock.set_cloexec(true);
         let state = Rc::new(RefCell::new(SocketState {
             inner: Some(sock),
             family,
@@ -3791,18 +4822,35 @@ fn mod_inet_ntop(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
-fn mod_htons(args: &[Object]) -> Result<Object, RuntimeError> {
-    match args.first() {
-        Some(Object::Int(n)) => Ok(Object::Int(i64::from((*n as u16).to_be()))),
-        _ => Err(type_error("htons: arg must be int")),
+/// Shared 16/32-bit unsigned conversion for the byte-order helpers: the
+/// value must fit the C type exactly — negatives and larger ints raise
+/// OverflowError (testNtoH feeds `1<<34` to every one of the four).
+fn byteswap_arg(arg: Option<&Object>, bits: u32, name: &str) -> Result<u64, RuntimeError> {
+    let n = match arg.and_then(Object::as_i64) {
+        Some(n) => n,
+        None if matches!(arg, Some(Object::Long(_))) => {
+            return Err(crate::error::overflow_error(format!(
+                "{name}: Python int too large to convert to C unsigned"
+            )))
+        }
+        None => return Err(type_error(format!("{name}: arg must be int"))),
+    };
+    if n < 0 || n >= 1i64 << bits {
+        return Err(crate::error::overflow_error(format!(
+            "{name}: Python int too large to convert to C unsigned"
+        )));
     }
+    Ok(n as u64)
+}
+
+fn mod_htons(args: &[Object]) -> Result<Object, RuntimeError> {
+    let n = byteswap_arg(args.first(), 16, "htons")?;
+    Ok(Object::Int(i64::from((n as u16).to_be())))
 }
 
 fn mod_htonl(args: &[Object]) -> Result<Object, RuntimeError> {
-    match args.first() {
-        Some(Object::Int(n)) => Ok(Object::Int(i64::from((*n as u32).to_be()))),
-        _ => Err(type_error("htonl: arg must be int")),
-    }
+    let n = byteswap_arg(args.first(), 32, "htonl")?;
+    Ok(Object::Int(i64::from((n as u32).to_be())))
 }
 
 // Process-global, matching CPython: `socket.setdefaulttimeout()` affects

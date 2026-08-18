@@ -158,6 +158,49 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             d.insert(DictKey(Object::from_static(export)), obj);
         }
 
+        // Post-splice registration hook: `operator_mod.py` assigns the
+        // natives above into the class dicts (`attrgetter.__call__ = …`)
+        // and then calls this with the three classes. Tagging each
+        // class's `__call__` as a Method descriptor makes it present as
+        // CPython's `method_descriptor` — crucially giving it the
+        // type-level `__get__` that `inspect._descriptor_get` uses to
+        // bind it, so `inspect.signature(attrgetter('a'))` strips the
+        // clinic `$self` and reports `(obj, /)`
+        // (test_operator.test_attrgetter_signature and friends).
+        let register_calls = Object::Builtin(Rc::new(BuiltinFn {
+            name: "_register_call_descriptors",
+            binds_instance: false,
+            call: Box::new(|args: &[Object]| {
+                for arg in args {
+                    let Object::Type(cls) = arg else {
+                        return Err(type_error(
+                            "_register_call_descriptors: arguments must be classes",
+                        ));
+                    };
+                    let call_obj = cls
+                        .dict
+                        .borrow()
+                        .get(&DictKey(Object::from_static("__call__")))
+                        .cloned();
+                    if let Some(obj) = call_obj {
+                        crate::descr_registry::register(
+                            &obj,
+                            crate::descr_registry::DescrKind::Method,
+                            cls.clone(),
+                            "__call__",
+                            None,
+                        );
+                    }
+                }
+                Ok(Object::None)
+            }),
+            call_kw: None,
+        }));
+        d.insert(
+            DictKey(Object::from_static("_register_call_descriptors")),
+            register_calls,
+        );
+
         let compare_digest_fn = Object::Builtin(Rc::new(BuiltinFn {
             name: "_compare_digest",
             binds_instance: false,

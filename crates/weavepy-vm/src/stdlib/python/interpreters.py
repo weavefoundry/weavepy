@@ -189,7 +189,9 @@ class _ChannelBase:
         if self._closed:
             return
         try:
-            _ssi.channel_close(self.id)
+            # Close the *send* end only: pending values keep draining
+            # on the receive side (an empty channel closes outright).
+            _ssi.channel_close(self.id, True, False, False)
         finally:
             self._closed = True
 
@@ -226,7 +228,9 @@ class SendChannel(_ChannelBase):
 class RecvChannel(_ChannelBase):
     def recv(self):
         try:
-            return _ssi.channel_recv(self.id)
+            # The 3.13 backend returns `(obj, unboundop)`.
+            obj, _ = _ssi.channel_recv(self.id)
+            return obj
         except RuntimeError as exc:
             text = str(exc)
             if 'empty' in text:

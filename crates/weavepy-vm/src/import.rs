@@ -72,6 +72,14 @@ pub struct ModuleCache {
     /// CPython's per-module import lock (bpo-34572,
     /// test_pickle test_unpickle_module_race).
     pub initializing: Rc<RefCell<std::collections::HashMap<String, u64>>>,
+    /// Names currently inside `load_one`'s find+create+exec sequence,
+    /// mapped to the loading thread — CPython's per-module
+    /// `_ModuleLockManager` window, which is *wider* than
+    /// `spec._initializing`: it opens before the finders run. Without
+    /// it, two threads that both miss `sys.modules` race into loading
+    /// the same source and the body executes twice (bpo-34572;
+    /// test_pickle test_unpickle_module_race).
+    pub loading: Rc<RefCell<std::collections::HashMap<String, u64>>>,
     /// Which module each blocked thread is currently waiting to import
     /// — CPython `_bootstrap._blocking_on`, used for import-lock
     /// deadlock detection (`_ModuleLock.has_deadlock`).
@@ -82,6 +90,16 @@ pub struct ModuleCache {
     /// mutations don't defeat the hint (test_import's
     /// test_script_shadowing_stdlib_sys_path_modification).
     pub startup_path0: Rc<RefCell<Option<String>>>,
+    /// Whether the *startup* `os` import (the native fast path — the
+    /// analogue of CPython's frozen `os`) has already run. CPython 3.13
+    /// imports `os` frozen during startup but a later fresh import
+    /// resolves the real `Lib/os.py` source (`os.__spec__.loader` is
+    /// `SourceFileLoader`, `cached` a real pyc —
+    /// test.support.import_helper.import_fresh_module('os') +
+    /// test_pydoc test_synopsis_sourceless observe exactly this). Once
+    /// set, a fresh `import os` skips the builtin factory and executes
+    /// the projected source like any frozen module.
+    pub os_native_done: Rc<crate::sync::Cell<bool>>,
 }
 
 impl Default for ModuleCache {
@@ -94,8 +112,10 @@ impl Default for ModuleCache {
             frozen: Rc::new(RefCell::new(HashMap::new())),
             frozen_tests_override: Rc::new(crate::sync::Cell::new(0)),
             initializing: Rc::new(RefCell::new(std::collections::HashMap::new())),
+            loading: Rc::new(RefCell::new(std::collections::HashMap::new())),
             import_waiting: Rc::new(RefCell::new(std::collections::HashMap::new())),
             startup_path0: Rc::new(RefCell::new(None)),
+            os_native_done: Rc::new(crate::sync::Cell::new(false)),
         }
     }
 }
@@ -164,6 +184,28 @@ impl ModuleCache {
     pub fn initializing_holder(&self, full_name: &str) -> Option<u64> {
         self.initializing.borrow().get(full_name).copied()
     }
+    /// Atomically claim the find+load window for `full_name`. Returns
+    /// `true` when this call took the claim (the caller must release it
+    /// via [`Self::end_loading`]); `false` when `me` already holds it
+    /// (nested re-entry — the outer frame owns the release).
+    pub fn try_begin_loading(&self, full_name: &str, me: u64) -> Option<bool> {
+        let mut map = self.loading.borrow_mut();
+        match map.get(full_name) {
+            Some(&h) if h != me => None,
+            Some(_) => Some(false),
+            None => {
+                map.insert(full_name.to_owned(), me);
+                Some(true)
+            }
+        }
+    }
+    pub fn end_loading(&self, full_name: &str) {
+        self.loading.borrow_mut().remove(full_name);
+    }
+    /// The thread currently inside `load_one` for `full_name`, if any.
+    pub fn loading_holder(&self, full_name: &str) -> Option<u64> {
+        self.loading.borrow().get(full_name).copied()
+    }
     /// Record / clear which module `thread` is blocked importing —
     /// CPython's `_blocking_on` table, consulted by
     /// [`Self::import_wait_would_deadlock`].
@@ -184,11 +226,15 @@ impl ModuleCache {
     /// reaches `me`.
     pub fn import_wait_would_deadlock(&self, me: u64, full_name: &str) -> bool {
         let initializing = self.initializing.borrow();
+        let loading = self.loading.borrow();
         let waiting = self.import_waiting.borrow();
         let mut name = full_name.to_owned();
         // Bounded walk: chains are at most one hop per live thread.
         for _ in 0..128 {
-            let Some(&holder) = initializing.get(&name) else {
+            // A name can be held at either lock level: the body-executing
+            // window (`initializing`) or the wider find+load window.
+            let holder = initializing.get(&name).or_else(|| loading.get(&name));
+            let Some(&holder) = holder else {
                 return false;
             };
             if holder == me {
@@ -248,7 +294,7 @@ impl ModuleCache {
     /// can't locate on-disk submodules. CPython's import system always
     /// consults `sys.modules['sys'].path`; mirror that, falling back to
     /// the aliased Rc when the `sys` module isn't built yet (early init).
-    fn live_sys_path(&self) -> Vec<Object> {
+    pub(crate) fn live_sys_path(&self) -> Vec<Object> {
         if let Some(Object::Module(sys_mod)) = self.get("sys") {
             if let Some(Object::List(l)) = sys_mod
                 .dict
@@ -259,6 +305,28 @@ impl ModuleCache {
             }
         }
         self.path.borrow().clone()
+    }
+
+    /// Whether any *live* `sys.path` entry is a zip/archive candidate:
+    /// the entry itself is a file, or — a directory *inside* an archive
+    /// (`pkgs.zip/subdir`) — some ancestor is. Namespace-package
+    /// assembly hands off to the Python `PathFinder` in that case so
+    /// `zipimport` portions merge in.
+    pub fn has_archive_path_entry(&self) -> bool {
+        fn is_archive_entry(p: &Path) -> bool {
+            for anc in p.ancestors() {
+                if anc.is_file() {
+                    return true;
+                }
+                if anc.exists() {
+                    return false;
+                }
+            }
+            false
+        }
+        self.live_sys_path()
+            .iter()
+            .any(|entry| matches!(entry, Object::Str(s) if is_archive_entry(Path::new(s.as_ref()))))
     }
 
     /// Snapshot the current `sys.path` as a list of `PathBuf`s,
@@ -279,7 +347,7 @@ impl ModuleCache {
     /// name byte-for-byte, even on case-insensitive filesystems —
     /// `import RAnDoM` must not resolve `random.py`
     /// (test_import.test_case_sensitivity). `PYTHONCASEOK` relaxes it.
-    fn entry_case_ok(path: &Path) -> bool {
+    pub(crate) fn entry_case_ok(path: &Path) -> bool {
         if std::env::var_os("PYTHONCASEOK").is_some() {
             return true;
         }

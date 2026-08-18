@@ -145,7 +145,51 @@ pub const MAGIC: &[u8; 4] = b"\xf3\x0d\x0d\x0a";
 ///   matplotlib `_mathtext.Parser.subsuper`); previously the method's
 ///   claimed freevar dangled and the class assembled with a bad cell
 ///   index.
-pub const CACHE_TAG: &str = "weavepy-313-24";
+/// - rev `25`: RFC 0068 WS1: production-compiler optimizations — AST
+///   constant folding (ast_opt), `not`-inversion in branch positions,
+///   the comprehension assignment idiom, unconditional-jump-to-return
+///   inlining, and unreachable-code elimination all change emitted
+///   bytecode shapes.
+/// - rev `26`: RFC 0068 WS1: the internal call convention adopts
+///   CPython's self-or-null slot (`PUSH_NULL`, method-flagged
+///   `LOAD_ATTR`, self-riding `CALL`); every call-family instruction
+///   changed its stack shape and `Call`/`CallSelf` arg meanings, so
+///   rev-25 artifacts decode into miscounted calls.
+/// - rev `27`: RFC 0068 WS1 (test_dis parity): loops end with CPython's
+///   dead `END_FOR`/`POP_TOP` pair (the exhausted `FOR_ITER` skips it),
+///   f-string conversions are a separate `CONVERT_VALUE` instruction
+///   (`FORMAT_SIMPLE`/`FORMAT_WITH_SPEC` carry no conversion bits — a
+///   rev-26 `FORMAT_*` with baked conversion bits decodes conversion-
+///   less), and `COMPARE_OP` opargs carry the specialization mask +
+///   branch-fused bool bit.
+/// - rev `43`: RFC 0068 WS5 (test_inspect source retrieval): lambda code
+///   objects report the lambda *expression's* line as `co_firstlineno`
+///   (was the enclosing statement's line — `getsource` on a lambda in a
+///   multiline display returned the whole statement), and a class body's
+///   implicit `__firstlineno__` store honours a `nonlocal
+///   __firstlineno__` declaration (STORE_DEREF, keeping it out of the
+///   class namespace).
+/// - rev `44`: RFC 0068 WS6 (test_source_encoding): source decoding
+///   normalizes `\r\n`/`\r` line endings to `\n` before tokenizing
+///   (CPython's `translate_newlines`), changing compiled string-literal
+///   constants in CR/CRLF sources.
+/// - rev `45`: RFC 0068 WS6 (test_pathlib): docstrings are cleaned at
+///   compile time (CPython 3.13's `_PyCompile_CleanDoc`, gh-81283) —
+///   tabs expanded, common leading whitespace stripped — changing the
+///   `__doc__` constants baked into every cached module.
+/// - rev `46`: RFC 0068 WS7 (test_bool): the AST constant folder keeps
+///   `bool op bool` results bool for `&`/`|`/`^` and no longer folds
+///   `~bool` (the runtime DeprecationWarning must fire, gh-103487),
+///   changing folded constants.
+/// - rev `47`: RFC 0068 WS8 (test_pdb): the return-path unwind now pops
+///   `for`-loop iterators sitting above a `with`'s `__exit__` slot
+///   (CPython's FOR_LOOP fblock unwind) — `return` inside `for` inside
+///   `with` previously called the iterator as the exit function.
+/// - rev `48`: RFC 0068 WS8 (test_pdb): an expression statement's POP_TOP
+///   is emitted with NO_LOCATION like CPython's codegen_expr_stmt
+///   (gh-127321) — at a boolop merge target it stays location-less,
+///   changing line tables.
+pub const CACHE_TAG: &str = "weavepy-313-48";
 
 const HEADER_LEN: usize = 16;
 
@@ -232,7 +276,11 @@ pub(crate) fn rewrite_filenames(code: &mut CodeObject, filename: &str) {
     code.filename = filename.to_owned();
     fn walk(c: &mut weavepy_compiler::Constant, filename: &str) {
         match c {
-            weavepy_compiler::Constant::Code(inner) => rewrite_filenames(inner, filename),
+            // Freshly decoded pools own their code Arcs uniquely, so
+            // `make_mut` rewrites in place (no clone).
+            weavepy_compiler::Constant::Code(inner) => {
+                rewrite_filenames(std::sync::Arc::make_mut(inner), filename)
+            }
             weavepy_compiler::Constant::Tuple(items) => {
                 for it in items {
                     walk(it, filename);

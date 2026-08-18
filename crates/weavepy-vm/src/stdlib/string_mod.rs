@@ -94,7 +94,7 @@ fn formatter_parser(args: &[Object]) -> Result<Object, RuntimeError> {
             }
             i += 1; // consume the `}`
                     // Split field into name + format_spec + conversion.
-            let (field_name, format_spec, conversion) = split_field(&field);
+            let (field_name, format_spec, conversion) = split_field(&field)?;
             out.push(Object::new_tuple(vec![
                 Object::from_str(std::mem::take(&mut literal)),
                 Object::from_str(field_name),
@@ -110,7 +110,9 @@ fn formatter_parser(args: &[Object]) -> Result<Object, RuntimeError> {
                 i += 2;
                 continue;
             }
-            return Err(value_error("single '}' encountered in format string"));
+            // Capital 'S' — CPython's unicode_format message verbatim
+            // (test_logging test_format_validate matches it exactly).
+            return Err(value_error("Single '}' encountered in format string"));
         } else {
             literal.push(c as char);
             i += 1;
@@ -127,7 +129,7 @@ fn formatter_parser(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::new_list(out))
 }
 
-fn split_field(field: &str) -> (String, String, Option<char>) {
+fn split_field(field: &str) -> Result<(String, String, Option<char>), RuntimeError> {
     // Format: name[!conversion][:format_spec]
     // Conversion comes before format_spec.
     let mut name = String::new();
@@ -155,13 +157,24 @@ fn split_field(field: &str) -> (String, String, Option<char>) {
                     conv = Some(ch);
                 } else if ch == ':' {
                     state = 2;
+                } else {
+                    // CPython: exactly one conversion char, then ':' or
+                    // the field's end — `{asctime!aa:15}` is rejected
+                    // (logging's StrFormatStyle.validate, test_logging
+                    // test_format_validate).
+                    return Err(value_error("expected ':' after conversion specifier"));
                 }
             }
             2 => spec.push(ch),
             _ => {}
         }
     }
-    (name, spec, conv)
+    if state == 1 && conv.is_none() {
+        return Err(value_error(
+            "end of string while looking for conversion specifier",
+        ));
+    }
+    Ok((name, spec, conv))
 }
 
 /// Parse `obj.attr[idx][2]` into the leading name + an iterator of

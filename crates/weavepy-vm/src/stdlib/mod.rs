@@ -117,6 +117,7 @@ pub mod warnings_mod;
 
 pub mod gc_real;
 pub mod multiprocessing_mod;
+pub mod queue_native;
 pub mod thread_real;
 pub mod weakref_real;
 
@@ -132,6 +133,12 @@ pub fn register_all(cache: &ModuleCache) {
     // tables demand exact signed-zero fidelity a Python port can't give.
     cache.register_builtin("cmath", cmath_mod::build);
     cache.register_builtin("os", os::build);
+    // The same native surface under an internal alias: the `posix`/`nt`
+    // shims re-export through it. They used to `import os`, but a
+    // *fresh* source import of `os` (see the frozen `os` registration)
+    // executes `os.py` → `from posix import *` → the shim — importing
+    // `os` there would see the half-initialized source module.
+    cache.register_builtin("_weave_posix", os::build);
     cache.register_builtin("os.path", os::build_path);
     // RFC 0040 WS7 — the public `io` module is a thin frozen wrapper
     // (`python/io.py`) that re-exports the native `_io` accelerator, exactly
@@ -239,6 +246,10 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("_sqlite3", sqlite3_native::build);
     cache.register_builtin("_csv", csv_mod::build);
     cache.register_builtin("_weakref", weakref_real::build);
+    // Native `SimpleQueue.put` behind the `_queue` Python shim (the
+    // bound form must be a `builtin_function_or_method` —
+    // test_types.test_method_descriptor_crash).
+    cache.register_builtin("_weave_queue", queue_native::build);
     cache.register_builtin("gc", gc_real::build);
     cache.register_builtin("_multiprocessing", multiprocessing_mod::build);
     // RFC 0040 WS5 — native XML parser behind `xml.parsers.expat`; drives the
@@ -437,6 +448,22 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/_weave_iseq.py"),
             is_package: false,
         },
+        // RFC 0068 WS1 — the compiler flowgraph stage (a Python port of
+        // `Python/flowgraph.c`), backing `_testinternalcapi.optimize_cfg`
+        // (test_peepholer's DirectCfgOptimizerTests).
+        FrozenSource {
+            name: "_weave_flowgraph",
+            source: include_str!("python/_weave_flowgraph.py"),
+            is_package: false,
+        },
+        // RFC 0068 WS1 — the compiler codegen stage (a Python port of
+        // `Python/compile.c`'s AST lowering), backing
+        // `_testinternalcapi.compiler_codegen` (test_compiler_codegen).
+        FrozenSource {
+            name: "_weave_codegen",
+            source: include_str!("python/_weave_codegen.py"),
+            is_package: false,
+        },
         // RFC 0040 WS7 — CPython's pure-Python `io` reference implementation.
         // `test_io`/`test_fileio` import `_pyio` and exercise *both* the native
         // `io` and `_pyio` side-by-side; without it the whole suite fails to
@@ -534,6 +561,14 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "_seqtools",
             source: include_str!("python/_seqtools.py"),
+            is_package: false,
+        },
+        // `_queue` — the C accelerator surface (`Empty`, `SimpleQueue`)
+        // as a Python stand-in; `queue.py` imports it eagerly and
+        // test_types.test_method_descriptor_crash imports it directly.
+        FrozenSource {
+            name: "_queue",
+            source: include_str!("python/_queue.py"),
             is_package: false,
         },
         // `collections` is the verbatim CPython package init; the
@@ -2681,6 +2716,13 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
         // the old custom single-module shim. Bundled verbatim and frozen as
         // a package so `zipfile.Path`, `PyZipFile`, ZIP64, per-file
         // compression, `mkdir`, `testzip`, etc. all work.
+        // RFC 0068 WS8 — `zipapp` is CPython 3.13's Lib/zipapp.py verbatim
+        // (test_pdb imports it to build .pyz targets for `pdb -m`).
+        FrozenSource {
+            name: "zipapp",
+            source: include_str!("python/zipapp.py"),
+            is_package: false,
+        },
         FrozenSource {
             name: "zipfile",
             source: include_str!("python/zipfile.py"),
@@ -2873,13 +2915,56 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             is_package: false,
         },
         FrozenSource {
+            name: "importlib._abc",
+            source: include_str!("python/importlib__abc.py"),
+            is_package: false,
+        },
+        FrozenSource {
             name: "importlib.abc",
             source: include_str!("python/importlib_abc.py"),
             is_package: false,
         },
+        // CPython's `importlib/metadata/` package, frozen verbatim
+        // (RFC 0068 WS4 — test_importlib.metadata exercises internals
+        // like `_unique` that the old single-file digest lacked).
         FrozenSource {
             name: "importlib.metadata",
-            source: include_str!("python/importlib_metadata.py"),
+            source: include_str!("python/importlib_metadata_pkg/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "importlib.metadata._adapters",
+            source: include_str!("python/importlib_metadata_pkg/_adapters.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "importlib.metadata._collections",
+            source: include_str!("python/importlib_metadata_pkg/_collections.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "importlib.metadata._functools",
+            source: include_str!("python/importlib_metadata_pkg/_functools.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "importlib.metadata._itertools",
+            source: include_str!("python/importlib_metadata_pkg/_itertools.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "importlib.metadata._meta",
+            source: include_str!("python/importlib_metadata_pkg/_meta.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "importlib.metadata._text",
+            source: include_str!("python/importlib_metadata_pkg/_text.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "importlib.metadata.diagnose",
+            source: include_str!("python/importlib_metadata_pkg/diagnose.py"),
             is_package: false,
         },
         // CPython's `importlib/resources/` package, frozen verbatim
@@ -2934,15 +3019,16 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/importlib_readers.py"),
             is_package: false,
         },
-        // CPython's frozen import-core modules; stdlib code (pydoc,
-        // pkgutil-adjacent paths) imports these by name.
-        FrozenSource {
-            name: "importlib._bootstrap",
-            source: include_str!("python/importlib_bootstrap.py"),
-            is_package: false,
-        },
         // The `_frozen_importlib*` builtin names CPython freezes; the
         // verbatim `zipimport` (RFC 0055 WS3) imports them directly.
+        // (The dotted-name source files are staged on disk via
+        // stdlib_tree's DATA_FILES.)
+        // `importlib._bootstrap` / `importlib._bootstrap_external` are
+        // deliberately *not* registered under their dotted names:
+        // `importlib/__init__.py` aliases them in `sys.modules`, and a
+        // second frozen execution would mint duplicate classes whose
+        // `__module__` says 'importlib._bootstrap' — builtin.test_loader
+        // asserts `BuiltinImporter.__module__ == '_frozen_importlib'`.
         FrozenSource {
             name: "_frozen_importlib",
             source: include_str!("python/importlib_bootstrap.py"),
@@ -2950,11 +3036,6 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
         },
         FrozenSource {
             name: "_frozen_importlib_external",
-            source: include_str!("python/importlib_bootstrap_external.py"),
-            is_package: false,
-        },
-        FrozenSource {
-            name: "importlib._bootstrap_external",
             source: include_str!("python/importlib_bootstrap_external.py"),
             is_package: false,
         },
@@ -3310,6 +3391,17 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/posix_mod.py"),
             is_package: false,
         },
+        // Verbatim CPython `os.py`. The *startup* import of `os` stays
+        // on the Rust-native fast path (the builtin factory — CPython's
+        // frozen-`os` analogue); this registration serves later *fresh*
+        // imports, which CPython resolves from `Lib/os.py` source
+        // (import_fresh_module('os') → SourceFileLoader spec with a
+        // real `cached` pyc; test_pydoc test_synopsis_sourceless).
+        FrozenSource {
+            name: "os",
+            source: include_str!("python/os_source.py"),
+            is_package: false,
+        },
         FrozenSource {
             name: "nt",
             source: include_str!("python/nt_mod.py"),
@@ -3521,6 +3613,43 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/_testlimitedcapi.py"),
             is_package: false,
         },
+        // RFC 0068 WS3 — the PyArg_ParseTuple/ParseTupleAndKeywords
+        // emulation (a Python port of `Python/getargs.c`), backing the
+        // `getargs_*` fixture family in `_testcapi` (test_getargs).
+        FrozenSource {
+            name: "_weave_getargs",
+            source: include_str!("python/_weave_getargs.py"),
+            is_package: false,
+        },
+        // RFC 0068 WS3 — per-family C-API fixture shims backing the
+        // `test_capi` per-leg suites. Each defines `__all__`; the
+        // `_testcapi` and `_testlimitedcapi` frozen shims star-import
+        // them so tests find fixtures under either module name.
+        FrozenSource {
+            name: "_weave_capi_bin",
+            source: include_str!("python/_weave_capi_bin.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_weave_capi_cont",
+            source: include_str!("python/_weave_capi_cont.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_weave_capi_num",
+            source: include_str!("python/_weave_capi_num.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_weave_capi_text",
+            source: include_str!("python/_weave_capi_text.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_weave_capi_misc",
+            source: include_str!("python/_weave_capi_misc.py"),
+            is_package: false,
+        },
         // Pure-Python stand-in for `_testcapi`, covering the traceback
         // hooks (`exception_print` -> PyErr_Display via the traceback
         // module, `traceback_print` -> PyTraceBack_Print).
@@ -3529,13 +3658,38 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/_testcapi.py"),
             is_package: false,
         },
-        // Pure-Python stand-in for `_testmultiphase` (RFC 0056 WS4):
-        // `test.test_importlib.util` imports it at module scope as a skip
-        // guard, which otherwise wipes out testmock's entire testpatch.py
-        // (`from test.test_importlib.util import uncache`).
+        // `_testmultiphase` is intentionally *not* frozen: RFC 0068 WS4
+        // compiles CPython's real `Modules/_testmultiphase.c` into the
+        // conformance fixture dir (staged onto `sys.path` by the regrtest
+        // bootstrap), and a frozen shim here would shadow it in
+        // `importlib.util.find_spec` (FrozenImporter outranks PathFinder).
+        // The pure-Python stand-in in `python/_testmultiphase.py` still
+        // backs `_imp._load_dynamic` when no real `.so` exists.
+        // RFC 0068 WS3 — CPython 3.13's low-level `_interpreters` module
+        // (PEP 734), a frozen shim over the `_xxsubinterpreters` native
+        // core. test_capi.test_misc's SubinterpreterTest references
+        // `_interpreters.InterpreterError` directly.
         FrozenSource {
-            name: "_testmultiphase",
-            source: include_str!("python/_testmultiphase.py"),
+            name: "_interpreters",
+            source: include_str!("python/_interpreters.py"),
+            is_package: false,
+        },
+        // RFC 0068 WS5 — CPython 3.13's `_interpchannels` (cross-
+        // interpreter channels), adapted onto the same native core.
+        // `test.support.interpreters.channels` imports it at module
+        // scope (test_types SubinterpreterTests.setUpClass).
+        FrozenSource {
+            name: "_interpchannels",
+            source: include_str!("python/_interpchannels.py"),
+            is_package: false,
+        },
+        // RFC 0068 WS9 — CPython 3.13's `_interpqueues` (cross-
+        // interpreter queues), adapted onto the same native core.
+        // `test.support.interpreters.queues` imports it at module scope
+        // (test___all__ star-imports test.support.interpreters).
+        FrozenSource {
+            name: "_interpqueues",
+            source: include_str!("python/_interpqueues.py"),
             is_package: false,
         },
         // RFC 0057 WS3 — CPython's frozen *test* modules (Python/frozen.c's

@@ -145,6 +145,19 @@ except (KeyError, NameError):
 STDLIB_DIR = os.path.dirname(TEST_HOME_DIR)
 REPO_ROOT = os.path.dirname(STDLIB_DIR)
 
+# Submodules this frozen copy doesn't ship (`test.support.venv`, …)
+# resolve from the checked-out suite's own `support/` directory. The
+# frozen directory stays first on `__path__`, so the faithful ports
+# above keep winning for everything we do ship.
+try:
+    __path__
+except NameError:
+    __path__ = [TEST_SUPPORT_DIR]
+_vendor_support = os.path.join(TEST_HOME_DIR, "support")
+if os.path.isdir(_vendor_support) and _vendor_support not in __path__:
+    __path__.append(_vendor_support)
+del _vendor_support
+
 
 class Error(Exception):
     """Base class for regression test exceptions."""

@@ -35,6 +35,7 @@ enum Kind {
     Except = 2,
     Object = 3,
     Null = 4,
+    Lasti = 5,
 }
 
 const BITS_PER_BLOCK: i64 = 3;
@@ -237,7 +238,12 @@ fn mark_bound_exits(code: &CodeObject) -> Option<Vec<u64>> {
                     let v = cur & !slot_bits.get(arg).copied().unwrap_or(0);
                     todo |= meet(&mut bound, next_i, v);
                 }
-                O::PopJumpIfFalse | O::PopJumpIfTrue | O::ForIter | O::Send => {
+                O::PopJumpIfFalse
+                | O::PopJumpIfTrue
+                | O::PopJumpIfNone
+                | O::PopJumpIfNotNone
+                | O::ForIter
+                | O::Send => {
                     todo |= meet(&mut bound, next_i + arg, cur);
                     todo |= meet(&mut bound, next_i, cur);
                 }
@@ -335,18 +341,26 @@ fn plain_effect(code: &CodeObject, i: usize, ins: Instruction) -> Option<(u32, u
     use OpCode as O;
     let arg = ins.arg;
     Some(match ins.op {
-        O::Nop | O::Resume | O::MakeCell | O::SetupAnnotations | O::EndFor => (0, 0),
-        // WeavePy's generator bootstrap suspends and *resumes at the
-        // next instruction* with an unchanged stack (the generator
-        // object lands on the caller's stack, not this frame's) —
-        // unlike CPython, where RETURN_GENERATOR pushes the generator
-        // and is followed by POP_TOP.
-        O::ReturnGenerator => (0, 0),
+        O::Nop | O::Resume | O::MakeCell | O::CopyFreeVars | O::SetupAnnotations => (0, 0),
+        // Dead at runtime (the exhausted FOR_ITER skips it) but the static
+        // walk enters at [.., iter, value]; popping the modeled value keeps
+        // the pair's effects telescoping to [..] after the loop.
+        O::EndFor => (1, 0),
+        // Pops the function + attribute value, pushes the function back.
+        O::SetFunctionAttribute => (2, 1),
+        // The bootstrap suspends here; every resume pushes the sent
+        // value, which the following POP_TOP discards (CPython 3.13
+        // prologue shape — the static walk sees the net push).
+        O::ReturnGenerator => (0, 1),
+        // Pops [sub_iter, last_sent, exc], pushes [None, value].
+        O::CleanupThrow => (3, 2),
+        O::StopIterationError | O::AsyncGenWrap => (1, 1),
         O::DeleteFast | O::DeleteGlobal | O::DeleteName | O::DeleteDeref => (0, 0),
         O::LoadConst
         | O::LoadName
         | O::LoadGlobal
         | O::LoadFast
+        | O::LoadFastAndClear
         | O::LoadDeref
         | O::LoadClosure
         | O::LoadClassderef
@@ -360,13 +374,18 @@ fn plain_effect(code: &CodeObject, i: usize, ins: Instruction) -> Option<(u32, u
         O::BinarySubscr | O::BinaryOp | O::CompareOp | O::IsOp | O::ContainsOp => (2, 1),
         O::StoreSubscr => (3, 0),
         O::DeleteSubscr => (2, 0),
-        O::PopTop | O::PrintExpr | O::ImportStar | O::DictUpdate => (1, 0),
-        O::Call => (arg + 1, 1),
+        O::PopTop | O::PrintExpr | O::DictUpdate => (1, 0),
+        // Pops the module, pushes the intrinsic's None result.
+        O::ImportStar => (1, 1),
+        // RFC 0068 WS1 — the call family pops CPython's self-or-null
+        // slot in addition to the callable and arguments.
+        O::Call => (arg + 2, 1),
+        O::CallSelf => (arg + 1, 1),
         O::CallKw => {
             let kwc = u32::try_from(callkw_names_len(code, i)?).ok()?;
-            (arg + kwc + 2, 1)
+            (arg + kwc + 3, 1)
         }
-        O::CallEx => (2 + arg, 1),
+        O::CallEx => (3 + arg, 1),
         O::BuildList | O::BuildTuple | O::BuildSet | O::BuildString => (arg, 1),
         O::BuildMap => (2 * arg, 1),
         O::ListAppend | O::ListExtend | O::SetAdd => (1, 0),
@@ -379,12 +398,14 @@ fn plain_effect(code: &CodeObject, i: usize, ins: Instruction) -> Option<(u32, u
         // Consumes both the `CopyTop`ed exc and the type, pushes the
         // match bool (see the VM opcode; CPython's version peeks the exc
         // instead, so its effect differs).
-        O::CheckExcMatch => (2, 1),
+        O::CheckExcMatch => (1, 1),
         O::CheckEGMatch => (2, 2),
         O::PrepReraiseStar => (2, 1),
         O::ImportName => (2, 1),
         O::ImportFrom => (0, 1),
         O::FormatValue => (if arg & 0x4 != 0 { 2 } else { 1 }, 1),
+        O::ConvertValue => (1, 1),
+        O::ToBool => (1, 1),
         O::YieldValue => (1, 1),
         O::EndSend => (2, 1),
         O::GetAnext => (0, 1),
@@ -396,6 +417,8 @@ fn plain_effect(code: &CodeObject, i: usize, ins: Instruction) -> Option<(u32, u
         // Handled specially in `mark_stacks`; unreachable here.
         O::PopJumpIfFalse
         | O::PopJumpIfTrue
+        | O::PopJumpIfNone
+        | O::PopJumpIfNotNone
         | O::JumpForward
         | O::JumpBackward
         | O::GetIter
@@ -406,6 +429,9 @@ fn plain_effect(code: &CodeObject, i: usize, ins: Instruction) -> Option<(u32, u
         | O::Send
         | O::CopyTop
         | O::Swap
+        | O::PushNull
+        | O::LoadMethodAttr
+        | O::LoadSuperAttr
         | O::PushExcInfo
         | O::PopExcept
         | O::WithExceptStart
@@ -424,10 +450,20 @@ fn merge(stacks: &mut [i64], exc_depths: &mut [i32], idx: usize, stack: i64, exc
             stacks[idx] = stack;
             changed = true;
         } else if stacks[idx] != stack && stacks[idx] != OVERFLOWED {
-            // Conflicting flows (shouldn't happen with compiler-emitted
-            // code) — poison rather than mis-analyze.
-            stacks[idx] = OVERFLOWED;
-            changed = true;
+            // Conflicting flows. The send-dance rejoin is the legitimate
+            // case: END_SEND merges the SEND jump edge ([.., receiver:
+            // Iterator, retval]) with the CLEANUP_THROW tail ([.., None:
+            // Object, value]) — same depth, one slot differing in
+            // Iterator-vs-Object only. Join those slots to Object
+            // (CPython's in-order last-write scan effectively does the
+            // same); anything else — depth mismatch or a kind conflict
+            // involving Except/Null/Lasti — is poisoned rather than
+            // mis-analyzed.
+            let joined = join_stacks(stacks[idx], stack);
+            if joined != stacks[idx] {
+                stacks[idx] = joined;
+                changed = true;
+            }
         }
         if exc_depths[idx] == -1 {
             exc_depths[idx] = exc;
@@ -435,6 +471,39 @@ fn merge(stacks: &mut [i64], exc_depths: &mut [i32], idx: usize, stack: i64, exc
         }
     }
     changed
+}
+
+/// Per-slot join of two same-depth kind-stacks; `OVERFLOWED` when the
+/// depths differ or a slot conflicts in anything other than
+/// Iterator-vs-Object (which joins to Object).
+fn join_stacks(a: i64, b: i64) -> i64 {
+    if a < 0 || b < 0 || stack_depth(a) != stack_depth(b) {
+        return OVERFLOWED;
+    }
+    let (mut a, mut b) = (a, b);
+    let mut slots: Vec<i64> = Vec::new();
+    while a != 0 {
+        let (ka, kb) = (top_kind(a), top_kind(b));
+        let j = if ka == kb {
+            ka
+        } else if matches!(
+            (ka, kb),
+            (k1, k2) if (k1 == Kind::Iterator as i64 || k1 == Kind::Object as i64)
+                && (k2 == Kind::Iterator as i64 || k2 == Kind::Object as i64)
+        ) {
+            Kind::Object as i64
+        } else {
+            return OVERFLOWED;
+        };
+        slots.push(j);
+        a = pop_kind(a);
+        b = pop_kind(b);
+    }
+    let mut out = EMPTY_STACK;
+    for &k in slots.iter().rev() {
+        out = push_kind(out, kind_of(k));
+    }
+    out
 }
 
 /// Compute the abstract kind-stack and exception-handler depth at every
@@ -460,7 +529,7 @@ fn mark_stacks(code: &CodeObject) -> Marked {
             let next_i = i + 1;
             let arg = ins.arg;
             match ins.op {
-                O::PopJumpIfFalse | O::PopJumpIfTrue => {
+                O::PopJumpIfFalse | O::PopJumpIfTrue | O::PopJumpIfNone | O::PopJumpIfNotNone => {
                     let after = pop_kind(cur);
                     let target = next_i + arg as usize;
                     todo |= merge(&mut stacks, &mut exc_depths, target, after, exc);
@@ -482,10 +551,19 @@ fn mark_stacks(code: &CodeObject) -> Marked {
                     // Fallthrough: loop body sees [.., iter, value].
                     let body = push_kind(cur, Kind::Object);
                     todo |= merge(&mut stacks, &mut exc_depths, next_i, body, exc);
-                    // Exhaustion: WeavePy pops the iterator *before*
-                    // jumping (END_FOR is a no-op).
+                    // Exhaustion: the static edge lands on the dead
+                    // END_FOR/POP_TOP pair at [.., iter, value] (CPython's
+                    // declared effect); the pair's pops telescope back to
+                    // [..] for the code after the loop. At runtime the
+                    // exhausted FOR_ITER pops the iterator and skips both.
                     let target = next_i + arg as usize;
-                    todo |= merge(&mut stacks, &mut exc_depths, target, pop_kind(cur), exc);
+                    todo |= merge(
+                        &mut stacks,
+                        &mut exc_depths,
+                        target,
+                        push_kind(cur, Kind::Object),
+                        exc,
+                    );
                 }
                 O::Send => {
                     // [.., iter, v] on both paths ([.., iter, yielded]
@@ -502,11 +580,48 @@ fn mark_stacks(code: &CodeObject) -> Marked {
                     let after = swap_kinds(cur, arg.max(2));
                     todo |= merge(&mut stacks, &mut exc_depths, next_i, after, exc);
                 }
+                O::PushNull => {
+                    // The self-or-null call slot: CPython marks it `Null`
+                    // so jumps *from* mid-call-setup into a value context
+                    // are rejected (`compatible_kind`: an Object target
+                    // never accepts a Null source —
+                    // test_jump_with_null_on_stack_*).
+                    let after = push_kind(cur, Kind::Null);
+                    todo |= merge(&mut stacks, &mut exc_depths, next_i, after, exc);
+                }
+                O::LoadMethodAttr => {
+                    // LOAD_ATTR with the method flag: [obj] → [attr,
+                    // self-or-null]; CPython marks the extra slot Null.
+                    let after = push_kind(push_kind(pop_kind(cur), Kind::Object), Kind::Null);
+                    todo |= merge(&mut stacks, &mut exc_depths, next_i, after, exc);
+                }
+                O::LoadSuperAttr => {
+                    // [global_super, class, self] → [attr] plus a Null
+                    // self slot when the method flag (arg bit 0) is set.
+                    let mut after = pop_kind(pop_kind(pop_kind(cur)));
+                    after = push_kind(after, Kind::Object);
+                    if arg & 1 != 0 {
+                        after = push_kind(after, Kind::Null);
+                    }
+                    todo |= merge(&mut stacks, &mut exc_depths, next_i, after, exc);
+                }
                 O::PushExcInfo => {
-                    todo |= merge(&mut stacks, &mut exc_depths, next_i, cur, exc + 1);
+                    // CPython 3.13 discipline: inserts the previous
+                    // exception under TOS: [.., exc] -> [.., prev, exc].
+                    let topk = kind_of(top_kind(cur));
+                    let after = push_kind(push_kind(pop_kind(cur), Kind::Except), topk);
+                    todo |= merge(&mut stacks, &mut exc_depths, next_i, after, exc + 1);
                 }
                 O::PopExcept => {
-                    todo |= merge(&mut stacks, &mut exc_depths, next_i, cur, (exc - 1).max(0));
+                    // Pops the saved previous exception.
+                    let after = pop_kind(cur);
+                    todo |= merge(
+                        &mut stacks,
+                        &mut exc_depths,
+                        next_i,
+                        after,
+                        (exc - 1).max(0),
+                    );
                 }
                 O::WithExceptStart => {
                     // Push-only, like the VM opcode: reads `exc` (TOS) and
@@ -546,7 +661,15 @@ fn mark_stacks(code: &CodeObject) -> Marked {
             let handler = h.handler as usize;
             if start < stacks.len() && stacks[start] != UNINITIALIZED {
                 if handler < stacks.len() && stacks[handler] == UNINITIALIZED {
-                    let target = push_kind(pop_to_level(stacks[start], h.depth), Kind::Except);
+                    let mut target = pop_to_level(stacks[start], h.depth);
+                    // lasti-flagged handlers receive the raising offset
+                    // as a real slot under the exception (CPython 3.13,
+                    // marked with its own kind: only another Lasti slot
+                    // is jump-compatible).
+                    if h.push_lasti {
+                        target = push_kind(target, Kind::Lasti);
+                    }
+                    let target = push_kind(target, Kind::Except);
                     stacks[handler] = target;
                     exc_depths[handler] = exc_depths[start].max(0);
                     todo = true;
@@ -562,6 +685,7 @@ fn kind_of(raw: i64) -> Kind {
         k if k == Kind::Iterator as i64 => Kind::Iterator,
         k if k == Kind::Except as i64 => Kind::Except,
         k if k == Kind::Null as i64 => Kind::Null,
+        k if k == Kind::Lasti as i64 => Kind::Lasti,
         _ => Kind::Object,
     }
 }
@@ -614,9 +738,13 @@ pub(crate) fn line_event_starts(code: &CodeObject) -> Vec<bool> {
         let ins = code.instructions[i];
         let arg = ins.arg as usize;
         let target = match ins.op {
-            O::PopJumpIfFalse | O::PopJumpIfTrue | O::JumpForward | O::ForIter | O::Send => {
-                i + 1 + arg
-            }
+            O::PopJumpIfFalse
+            | O::PopJumpIfTrue
+            | O::PopJumpIfNone
+            | O::PopJumpIfNotNone
+            | O::JumpForward
+            | O::ForIter
+            | O::Send => i + 1 + arg,
             O::JumpBackward => (i + 1).saturating_sub(arg),
             _ => continue,
         };
@@ -640,6 +768,24 @@ pub(crate) fn line_event_starts(code: &CodeObject) -> Vec<bool> {
         let t = h.handler as usize;
         if t < n && line_at(t) != 0 && !matches!(code.instructions[t].op, O::EndAsyncFor) {
             out[t] = true;
+        }
+    }
+    // A code object with *no* located instruction at all — an empty (or
+    // comments-only) module, whose whole body is the implicit `return
+    // None` — is CPython's one genuine "line 0": tracing reports a
+    // single line event at line 0 (pdb shows `main.py(0)` and stops
+    // there — test_pdb's test_empty_file must not spin in the restart
+    // loop). Mark the first real instruction so the dispatch loop can
+    // fire it.
+    if !out.iter().any(|&b| b) && (0..n).all(|i| line_at(i) == 0) {
+        for (i, slot) in out.iter_mut().enumerate() {
+            if !matches!(
+                code.instructions[i].op,
+                O::Resume | O::EndFor | O::EndSend | O::EndAsyncFor
+            ) {
+                *slot = true;
+                break;
+            }
         }
     }
     out

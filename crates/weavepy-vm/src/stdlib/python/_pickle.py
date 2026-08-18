@@ -73,11 +73,17 @@ class Pickler(_Pickler):
 
     _weavepy_active = False
 
-    def __init__(self, *args, **kwargs):
+    # The C accelerator's Argument Clinic signature — all four are
+    # positional-or-keyword there (the pure engine makes fix_imports/
+    # buffer_callback keyword-only); inspect.signature(_pickle.Pickler)
+    # must render it exactly (test_inspect test_signature_on_builtin_class).
+    def __init__(self, file, protocol=None, fix_imports=True,
+                 buffer_callback=None):
         if self._weavepy_active:
             raise RuntimeError(
                 "Pickler.__init__() called while a dump is in progress")
-        _Pickler.__init__(self, *args, **kwargs)
+        _Pickler.__init__(self, file, protocol, fix_imports=fix_imports,
+                          buffer_callback=buffer_callback)
 
     def dump(self, obj):
         if self._weavepy_active:
@@ -115,6 +121,93 @@ class Pickler(_Pickler):
                 "must be a function, not %s" % type(state_setter).__name__)
         return _Pickler.save_reduce(self, func, args, state, listitems,
                                     dictitems, state_setter, obj=obj)
+
+
+class _BoundBuiltinMethod:
+    """A bound `_MethodDescriptor`: the shim analogue of a bound C
+    method. The `__class__` lie makes `inspect.isbuiltin` hold, which
+    is what pydoc's `_is_bound_method` checks before rendering
+    "method of _pickle.Pickler instance" (test_pydoc
+    test_bound_builtin_method)."""
+
+    __slots__ = ("_descr", "__self__")
+
+    def __init__(self, descr, obj):
+        self._descr = descr
+        self.__self__ = obj
+
+    @property
+    def __class__(self):
+        import types
+        return types.BuiltinFunctionType
+
+    @property
+    def __name__(self):
+        return self._descr.__name__
+
+    @property
+    def __qualname__(self):
+        return self._descr.__qualname__
+
+    @property
+    def __doc__(self):
+        return self._descr.__doc__
+
+    @property
+    def __text_signature__(self):
+        return self._descr.__text_signature__
+
+    @property
+    def __func__(self):
+        return self._descr
+
+    def __call__(self, *args, **kwargs):
+        return self._descr._func(self.__self__, *args, **kwargs)
+
+    def __repr__(self):
+        return "<built-in method %s of %s object at %#x>" % (
+            self.__name__, type(self.__self__).__name__, id(self.__self__))
+
+
+# The C accelerator's `method_descriptor` face for a shim method:
+# `inspect.ismethoddescriptor` is true (a `__get__` with no `__set__`
+# on the type), and `__objclass__`/`__text_signature__` feed pydoc's
+# "dump(self, obj, /) unbound _pickle.Pickler method" summary
+# (test_pydoc test_unbound_builtin_method). No class docstring —
+# `__doc__` must stay a slot carrying the wrapped function's doc.
+class _MethodDescriptor:
+    __slots__ = ("_func", "__objclass__", "__text_signature__",
+                 "__name__", "__qualname__", "__doc__")
+
+    def __init__(self, func, objclass, text_signature):
+        self._func = func
+        self.__objclass__ = objclass
+        self.__text_signature__ = text_signature
+        self.__name__ = func.__name__
+        self.__qualname__ = "%s.%s" % (objclass.__name__, func.__name__)
+        self.__doc__ = func.__doc__
+
+    @property
+    def __module__(self):
+        return "_pickle"
+
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self
+        return _BoundBuiltinMethod(self, obj)
+
+    def __call__(self, *args, **kwargs):
+        return self._func(*args, **kwargs)
+
+    def __repr__(self):
+        return "<method '%s' of '_pickle.%s' objects>" % (
+            self.__name__, self.__objclass__.__name__)
+
+
+# `Pickler.dump` is a `method_descriptor` in the C module; rebind the
+# plain function through the shim descriptor so introspection matches.
+Pickler.dump = _MethodDescriptor(
+    Pickler.__dict__["dump"], Pickler, "($self, obj, /)")
 
 
 class _StrictStack(list):

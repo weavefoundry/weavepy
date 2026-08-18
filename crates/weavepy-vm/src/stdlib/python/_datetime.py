@@ -33,3 +33,13 @@ datetime_CAPI = object.__new__(PyCapsule)
 # Reachable as type(datetime_CAPI); keeping the name out of the module dict
 # mirrors the C module's surface (only the capsule itself is exposed).
 del PyCapsule
+
+# The C module's classmethods are Argument Clinic `classmethod_descriptor`s
+# publishing `__text_signature__`/`__objclass__` — pydoc's summary line for
+# the *raw* `datetime.__dict__['utcnow']` reads both (test_pydoc
+# test_unbound_builtin_classmethod_noargs). The pure-Python classmethod
+# forwards these to its wrapped function, so pin them there.
+_utcnow_func = datetime.__dict__['utcnow'].__func__
+_utcnow_func.__text_signature__ = '($type, /)'
+_utcnow_func.__objclass__ = datetime
+del _utcnow_func

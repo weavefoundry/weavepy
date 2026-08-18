@@ -2548,6 +2548,7 @@ fn assemble_type_dict(
     getset_pairs: Vec<(String, Object)>,
     member_pairs: Vec<(String, Object)>,
     doc: Option<&str>,
+    defining_class: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> DictData {
     let mut dict = DictData::default();
     if let Some(d) = doc {
@@ -2571,7 +2572,7 @@ fn assemble_type_dict(
     for entry in methods {
         dict.insert(
             DictKey(Object::from_str(entry.name.clone())),
-            entry.bind_unbound(),
+            entry.bind_unbound(defining_class.clone()),
         );
     }
     for (name, obj) in getset_pairs {
@@ -3070,6 +3071,9 @@ pub unsafe extern "C" fn PyType_FromMetaclass(
     // descriptors + synthesised dunder shims. Shared with the
     // `PyType_Ready` path (RFC 0044, WS2) via [`assemble_type_dict`].
     // ----------------------------------------------------------------
+    // Late-bound defining-class cell for METH_METHOD entries; stamped
+    // with the heap type's pointer once the box exists (below).
+    let defining_class = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let dict = assemble_type_dict(
         &qualified,
         &bare,
@@ -3078,6 +3082,7 @@ pub unsafe extern "C" fn PyType_FromMetaclass(
         getset_pairs,
         member_pairs,
         doc.as_deref(),
+        &defining_class,
     );
 
     let ty = match TypeObject::new_user(&bare, bases_resolved, dict) {
@@ -3135,6 +3140,7 @@ pub unsafe extern "C" fn PyType_FromMetaclass(
     });
     let leaked = Box::leak(bx);
     let ty_ptr = &mut leaked.head as *mut PyTypeObject;
+    defining_class.store(ty_ptr as usize, std::sync::atomic::Ordering::Relaxed);
     register_heap_type(ty_ptr);
     // RFC 0045 (wave 3): a heap type that declares inline fields beyond
     // the object head gets faithful `tp_basicsize` instance storage.
@@ -3778,6 +3784,9 @@ pub unsafe extern "C" fn PyType_Ready(t: *mut PyTypeObject) -> c_int {
         .clone()
         .unwrap_or_else(|| weavepy_vm::builtin_types::builtin_types().object_.clone());
 
+    // `PyType_Ready` path: the caller's static struct *is* the type
+    // pointer, so METH_METHOD's defining class is known up front.
+    let defining_class = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(t as usize));
     let dict = assemble_type_dict(
         &qualified,
         &bare,
@@ -3786,6 +3795,7 @@ pub unsafe extern "C" fn PyType_Ready(t: *mut PyTypeObject) -> c_int {
         h.getset_pairs,
         h.member_pairs,
         h.doc.as_deref(),
+        &defining_class,
     );
 
     let ty = if multi_bases.len() >= 2 {

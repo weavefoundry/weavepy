@@ -103,4 +103,46 @@ assert renamed.co_name == "renamed"
 assert renamed.co_argcount == co.co_argcount
 assert co.co_name == "sample", "replace() must not mutate the original"
 
+
+# ---------- compile-time docstring cleaning (RFC 0068 WS6) ----------
+# CPython 3.13 cleans docstrings at compile time (`_PyCompile_CleanDoc`,
+# gh-81283): tabs expanded, the first line's leading spaces stripped, and
+# the minimum space-indent of non-blank continuation lines removed.
+# Blank lines are kept (unlike `inspect.cleandoc`), preserving linenos.
+
+def deep_doc():
+    """
+            Deeply indented summary.
+
+            Second paragraph.
+            """
+
+def shallow_doc():
+    """
+        Deeply indented summary.
+
+        Second paragraph.
+        """
+
+# Different source indentation, identical cleaned docstring — the
+# comparison pathlib's test_matches_pathbase_api relies on.
+assert deep_doc.__doc__ == shallow_doc.__doc__, (
+    deep_doc.__doc__, shallow_doc.__doc__)
+assert deep_doc.__doc__ == "\nDeeply indented summary.\n\nSecond paragraph.\n"
+
+def one_line():
+    """   leading spaces stripped from the first line"""
+assert one_line.__doc__ == "leading spaces stripped from the first line"
+
+def already_clean():
+    """clean
+kept as-is"""
+assert already_clean.__doc__ == "clean\nkept as-is"
+
+class DocCls:
+    """
+        Class docstring.
+        """
+assert DocCls.__doc__ == "\nClass docstring.\n"
+
 print("test_code_object_surface: OK")

@@ -1206,6 +1206,20 @@ fn spawn_python_worker(
     let synth_id = NEXT_IDENT.fetch_add(1, Ordering::AcqRel);
     let thread_name = format!("Thread-{}", synth_id);
 
+    // PEP 684 attribution: a thread belongs to the interpreter that
+    // spawned it, so fork the *spawning thread's* live interpreter for
+    // the worker — not the global seed. The seed is "most recent
+    // `Interpreter::new()` wins", which a real sub-interpreter
+    // (`_interpreters.create`, `run_in_subinterp`) silently replaces;
+    // forking the seed then hands main-interpreter workers the sub's
+    // module cache (test_threading.test_foreign_thread regression) and
+    // mis-attributes `pending_identify` probes (test_capi.test_misc
+    // TestPendingCalls.test_isolated_subinterpreter).
+    let parent_fork = crate::vm_singletons::current_interpreter_ptr()
+        // SAFETY: the pointer is published by a VM frame live on this
+        // thread, and the GIL (held here) keeps the fork exclusive.
+        .map(|p| unsafe { (*p).fork_for_thread() });
+
     let registry = thread_registry();
     // The handle (if any) shares the join lock the worker releases on
     // exit, so `_ThreadHandle.join()` blocks until the target returns.
@@ -1266,9 +1280,19 @@ fn spawn_python_worker(
                 std::thread::yield_now();
             };
             entry.mark_started();
-            let mut worker_interp = match crate::vm_singletons::snapshot_interpreter() {
-                Some(snap) => snap,
-                None => crate::Interpreter::new(),
+            let mut worker_interp = match parent_fork {
+                Some(fork) => {
+                    // Forked on the spawning thread; still install the
+                    // shared built-in type registry on *this* thread so
+                    // class statements the worker executes see the same
+                    // `TypeObject`s as the parent.
+                    crate::vm_singletons::install_seed_builtin_types();
+                    fork
+                }
+                None => match crate::vm_singletons::snapshot_interpreter() {
+                    Some(snap) => snap,
+                    None => crate::Interpreter::new(),
+                },
             };
             // Acquire the process-wide GIL before touching any
             // Python state. Push onto the shared
@@ -1462,11 +1486,20 @@ fn count(_args: &[Object]) -> Result<Object, RuntimeError> {
 // CPython 3.13 `threading.py` port.
 // ---------------------------------------------------------------------------
 
-/// `_thread.daemon_threads_allowed()` — the main interpreter always
-/// permits daemon threads (sub-interpreters that forbid them aren't
-/// modelled).
+/// `_thread.daemon_threads_allowed()` — consults the current
+/// interpreter's PEP 684 feature flags (`Py_RTFLAGS_DAEMON_THREADS`):
+/// isolated sub-interpreters created without `allow_daemon_threads`
+/// forbid them (test__interpreters RunStringTests
+/// test_create_daemon_thread), while the main interpreter's defaults
+/// always allow.
 fn daemon_threads_allowed(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::Bool(true))
+    let allowed = match crate::vm_singletons::current_interpreter_ptr() {
+        // SAFETY: published by the enclosing VM dispatch frame on this
+        // thread; the GIL keeps the access exclusive.
+        Some(p) => (unsafe { (*p).interp_settings().0 } & (1 << 11)) != 0,
+        None => true,
+    };
+    Ok(Object::Bool(allowed))
 }
 
 /// `_thread._is_main_interpreter()` — WeavePy runs a single

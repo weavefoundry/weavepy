@@ -26,9 +26,16 @@ _ALWAYS_STR = {
 }
 
 _INSTALL_SCHEMES = {
+    # WeavePy stages the standard library under `lib/weavepy3.13` while
+    # keeping site-packages at CPython's `lib/python3.13/site-packages`
+    # (pip and site.py agree on the latter). Only the stdlib/platstdlib
+    # entries use the `{stdlib_impl_lower}` var ('weavepy'), so
+    # `sysconfig.get_path('stdlib')` matches `os.path.dirname(os.__file__)`
+    # — pydoc.getdocloc keys module-docs links off that prefix
+    # (test_pydoc test_mixed_case_module_names_are_lower_cased).
     'posix_prefix': {
-        'stdlib': '{installed_base}/{platlibdir}/{implementation_lower}{py_version_short}{abi_thread}',
-        'platstdlib': '{platbase}/{platlibdir}/{implementation_lower}{py_version_short}{abi_thread}',
+        'stdlib': '{installed_base}/{platlibdir}/{stdlib_impl_lower}{py_version_short}{abi_thread}',
+        'platstdlib': '{platbase}/{platlibdir}/{stdlib_impl_lower}{py_version_short}{abi_thread}',
         'purelib': '{base}/lib/{implementation_lower}{py_version_short}{abi_thread}/site-packages',
         'platlib': '{platbase}/{platlibdir}/{implementation_lower}{py_version_short}{abi_thread}/site-packages',
         'include':
@@ -77,8 +84,10 @@ _INSTALL_SCHEMES = {
     # Downstream distributors who patch posix_prefix/nt scheme are encouraged to
     # leave the following schemes unchanged
     'posix_venv': {
-        'stdlib': '{installed_base}/{platlibdir}/{implementation_lower}{py_version_short}{abi_thread}',
-        'platstdlib': '{platbase}/{platlibdir}/{implementation_lower}{py_version_short}{abi_thread}',
+        # stdlib mirrors posix_prefix: a venv shares the base install's
+        # staged `lib/weavepy3.13` tree.
+        'stdlib': '{installed_base}/{platlibdir}/{stdlib_impl_lower}{py_version_short}{abi_thread}',
+        'platstdlib': '{platbase}/{platlibdir}/{stdlib_impl_lower}{py_version_short}{abi_thread}',
         'purelib': '{base}/lib/{implementation_lower}{py_version_short}{abi_thread}/site-packages',
         'platlib': '{platbase}/{platlibdir}/{implementation_lower}{py_version_short}{abi_thread}/site-packages',
         'include':
@@ -148,8 +157,11 @@ if _HAS_USER_BASE:
             'data': '{userbase}',
             },
         'posix_user': {
-            'stdlib': '{userbase}/{platlibdir}/{implementation_lower}{py_version_short}{abi_thread}',
-            'platstdlib': '{userbase}/{platlibdir}/{implementation_lower}{py_version_short}{abi_thread}',
+            # stdlib naming mirrors posix_prefix (see the note on
+            # _INSTALL_SCHEMES): test_sysconfig's test_user_similar derives
+            # the expected user path from the global one.
+            'stdlib': '{userbase}/{platlibdir}/{stdlib_impl_lower}{py_version_short}{abi_thread}',
+            'platstdlib': '{userbase}/{platlibdir}/{stdlib_impl_lower}{py_version_short}{abi_thread}',
             'purelib': '{userbase}/lib/{implementation_lower}{py_version_short}{abi_thread}/site-packages',
             'platlib': '{userbase}/lib/{implementation_lower}{py_version_short}{abi_thread}/site-packages',
             'include': '{userbase}/include/{implementation_lower}{py_version_short}{abi_thread}',
@@ -491,6 +503,9 @@ def _init_config_vars():
     _CONFIG_VARS['platlibdir'] = sys.platlibdir
     _CONFIG_VARS['implementation'] = _get_implementation()
     _CONFIG_VARS['implementation_lower'] = _get_implementation().lower()
+    # The staged stdlib directory name ('weavepy3.13'), distinct from the
+    # site-packages implementation name ('python') — see _INSTALL_SCHEMES.
+    _CONFIG_VARS['stdlib_impl_lower'] = 'weavepy'
     try:
         _CONFIG_VARS['abiflags'] = sys.abiflags
     except AttributeError:

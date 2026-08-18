@@ -224,11 +224,26 @@ pub(crate) fn on_greenlet_stack() -> bool {
 fn stack_size() -> usize {
     static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
+        // The stack is mmap'd and lazily committed: the figure below is
+        // *virtual* reservation, and pages are only faulted in as the
+        // greenlet actually recurses. Debug builds need a much bigger
+        // reservation than release: the interpreter's dispatch functions
+        // have enormous unoptimized frames (rustc gives every match arm's
+        // locals distinct stack slots), on the order of 100+ KiB per
+        // Python-to-Python call, and `stacker` growth is disabled on
+        // greenlet stacks — sys.getrecursionlimit() worth of frames has
+        // to fit in the flat reservation (the bundled
+        // test_greenlet_native runs deep(500) on a greenlet stack).
+        let default = if cfg!(debug_assertions) {
+            512 * 1024 * 1024
+        } else {
+            16 * 1024 * 1024
+        };
         std::env::var("WEAVEPY_GREENLET_STACK_SIZE")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&n| n >= 64 * 1024)
-            .unwrap_or(16 * 1024 * 1024)
+            .unwrap_or(default)
     })
 }
 

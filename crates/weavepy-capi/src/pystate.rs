@@ -355,6 +355,43 @@ pub unsafe extern "C" fn PyThread_tss_free(key: *mut PyTssT) {
     }
 }
 
+/// `PyThread_get_thread_native_id()` — the OS-assigned id of the calling
+/// thread (bpo-36084). Exported so `ctypes.pythonapi` finds it, mirroring
+/// CPython builds where `PY_HAVE_THREAD_NATIVE_ID` is defined.
+#[no_mangle]
+pub unsafe extern "C" fn PyThread_get_thread_native_id() -> libc::c_ulong {
+    #[cfg(target_os = "macos")]
+    {
+        let mut tid: u64 = 0;
+        unsafe {
+            libc::pthread_threadid_np(0, &raw mut tid);
+        }
+        tid as libc::c_ulong
+    }
+    #[cfg(target_os = "linux")]
+    {
+        (unsafe { libc::syscall(libc::SYS_gettid) }) as libc::c_ulong
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        0
+    }
+}
+
+/// `Py_FrozenMain(argc, argv)` — CPython's entry point for frozen
+/// binaries (bpo-44133 requires the symbol to be exported). WeavePy
+/// hosts no frozen `__main__` table, which is exactly the state of a
+/// CPython binary with an empty `PyImport_FrozenModules`: report the
+/// import failure and exit non-zero.
+#[no_mangle]
+pub unsafe extern "C" fn Py_FrozenMain(_argc: c_int, _argv: *mut *mut libc::c_char) -> c_int {
+    let msg = b"Unable to import __main__: no frozen modules are registered\n";
+    unsafe {
+        libc::write(2, msg.as_ptr().cast::<c_void>(), msg.len());
+    }
+    1
+}
+
 /// `PyInterpreterState_GetID(interp)` — WeavePy is single-interpreter, so
 /// the id is always 0. The argument (which Cython derives from
 /// `tstate->interp`, currently a zeroed/NULL slot) is intentionally ignored.
