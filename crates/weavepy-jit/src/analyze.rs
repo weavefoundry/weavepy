@@ -374,7 +374,7 @@ fn plan_rewrite(
         }
         let var_slot = ins[i + 1].arg;
         // Walk the prefix backwards: GET_ITER, CALL k, k simple args,
-        // LOAD_GLOBAL <range>.
+        // PUSH_NULL, LOAD_GLOBAL <range>.
         if i < 2
             || !matches!(ins[i - 1].op, OpCode::GetIter)
             || !matches!(ins[i - 2].op, OpCode::Call)
@@ -382,7 +382,7 @@ fn plan_rewrite(
             return Err(bail());
         }
         let k = ins[i - 2].arg as usize;
-        if !(1..=3).contains(&k) || i < 3 + k {
+        if !(1..=3).contains(&k) || i < 4 + k {
             return Err(bail());
         }
         let args_start = i - 2 - k;
@@ -413,7 +413,11 @@ fn plan_rewrite(
             plan.nop.insert(step_pc);
             pops = 2;
         }
-        let callee = args_start - 1;
+        let push_null = args_start - 1;
+        if !matches!(ins[push_null].op, OpCode::PushNull) {
+            return Err(bail());
+        }
+        let callee = args_start - 2;
         if !matches!(ins[callee].op, OpCode::LoadGlobal) {
             return Err(bail());
         }
@@ -438,8 +442,14 @@ fn plan_rewrite(
         let stop_slot = cur_slot + 1;
         plan.n_synth += 2;
         plan.nop.insert(callee);
+        plan.nop.insert(push_null);
         plan.nop.insert(i - 1);
         plan.nop.insert(exit);
+        // The POP_TOP paired with END_FOR (CPython 3.13 loop-exit shape)
+        // is equally dead in the compiled trace.
+        if exit + 1 < n && matches!(ins[exit + 1].op, OpCode::PopTop) {
+            plan.nop.insert(exit + 1);
+        }
         plan.calls.insert(i - 2, (pops, cur_slot, stop_slot));
         plan.headers.insert(i, (cur_slot, stop_slot, var_slot));
         plan.fused_store.insert(i + 1, var_slot);
@@ -756,6 +766,9 @@ struct SE {
     /// `LOAD_ATTR`'s pc, for the method-span deopt metadata).
     recv: Option<u32>,
     poison: bool,
+    /// RFC 0068 — a `PUSH_NULL` self-or-null marker (`Unbound` on the
+    /// interpreter stack, never native), consumed by its `CALL`.
+    null: bool,
 }
 
 impl SE {
@@ -766,12 +779,13 @@ impl SE {
             callee: None,
             recv: None,
             poison: false,
+            null: false,
         }
     }
 
     /// `true` when a plain value operation may consume this entry.
     fn is_plain(&self) -> bool {
-        self.callee.is_none() && self.recv.is_none() && !self.poison
+        self.callee.is_none() && self.recv.is_none() && !self.poison && !self.null
     }
 }
 
@@ -1063,6 +1077,32 @@ fn step_abstract(
             }
             infer_load_attr(name, recv, i, stack, local_types, changed, probes)?;
         }
+        // RFC 0068 — the self-or-null slot of the CPython calling
+        // convention: `Unbound` on the interpreter stack, never native.
+        OpCode::PushNull => {
+            stack.push(SE {
+                null: true,
+                ..SE::known(JitType::Unknown)
+            });
+        }
+        // RFC 0068 — method-form attribute load: same load as
+        // `LOAD_ATTR`, plus the implicit self-or-null marker on top.
+        OpCode::LoadMethodAttr => {
+            let name = code
+                .names
+                .get(ins.arg as usize)
+                .ok_or(JitVerdict::UnsupportedOpcode("LOAD_ATTR bad name"))?
+                .as_str();
+            let recv = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            if !recv.is_plain() {
+                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+            }
+            infer_load_attr(name, recv, i, stack, local_types, changed, probes)?;
+            stack.push(SE {
+                null: true,
+                ..SE::known(JitType::Unknown)
+            });
+        }
         // RFC 0065 WS5 — scalar attribute write on a pinned instance
         // receiver. Stack is `[.., value, receiver]`.
         OpCode::StoreAttr => {
@@ -1100,7 +1140,7 @@ fn step_abstract(
         // RFC 0065 WS5 adds the `len(list)` and `list.append(v)` shapes.
         OpCode::Call => {
             let argc = ins.arg as usize;
-            if stack.len() < argc + 1 {
+            if stack.len() < argc + 2 {
                 return Err(JitVerdict::StackUnderflow);
             }
             let mut args: Vec<SE> = Vec::with_capacity(argc);
@@ -1110,6 +1150,13 @@ fn step_abstract(
                     return Err(JitVerdict::UnsupportedOpcode("CALL (callee as argument)"));
                 }
                 args.push(v);
+            }
+            // RFC 0068 — the self-or-null slot below the arguments: only
+            // the NULL form is supported (a bound self would mean a
+            // method call shape the JIT doesn't model).
+            let slot = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            if !slot.null {
+                return Err(JitVerdict::UnsupportedOpcode("CALL (self slot)"));
             }
             let f = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             if f.recv.is_some() {
@@ -1583,6 +1630,9 @@ struct ESlot {
     src: Option<u32>,
     recv: Option<u32>,
     poison: bool,
+    /// RFC 0068 — a `PUSH_NULL` self-or-null marker (`Unbound` on the
+    /// interpreter stack, never native), consumed by its `CALL`.
+    null: bool,
 }
 
 impl ESlot {
@@ -1593,11 +1643,12 @@ impl ESlot {
             src: None,
             recv: None,
             poison: false,
+            null: false,
         }
     }
 
     fn is_plain(&self) -> bool {
-        self.callee.is_none() && self.recv.is_none() && !self.poison
+        self.callee.is_none() && self.recv.is_none() && !self.poison && !self.null
     }
 }
 
@@ -1999,6 +2050,59 @@ fn emit_instr(
             });
             push(TOp::AttrGet { site, out: lane }, Some(lane), stack, stmts);
         }
+        // RFC 0068 — the self-or-null slot: interpreter-stack only,
+        // never a native value.
+        OpCode::PushNull => {
+            stack.push(ESlot {
+                null: true,
+                ..ESlot::val(JitType::Unknown)
+            });
+        }
+        // RFC 0068 — method-form attribute load: the erased `.append`
+        // load (re-mark the receiver, no native op), with the implicit
+        // self-or-null marker on top. Any other method shape falls
+        // through to the `CALL` arm and bails there, matching inference.
+        OpCode::LoadMethodAttr => {
+            let name = code
+                .names
+                .get(ins.arg as usize)
+                .ok_or(JitVerdict::UnsupportedOpcode("LOAD_ATTR bad name"))?
+                .as_str();
+            let top = stack.last().copied().ok_or(JitVerdict::StackUnderflow)?;
+            if !top.is_plain() {
+                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+            }
+            if name == "append" && top.ty.is_list() {
+                let last = stack.len() - 1;
+                stack[last].recv = Some(pc);
+                stack.push(ESlot {
+                    null: true,
+                    ..ESlot::val(JitType::Unknown)
+                });
+                return Ok(());
+            }
+            if top.ty != JitType::Obj {
+                return Err(JitVerdict::UnsupportedOpcode("LOAD_ATTR receiver"));
+            }
+            let slot = top.src.ok_or(JitVerdict::UnsupportedOpcode(
+                "LOAD_ATTR (receiver provenance)",
+            ))?;
+            let lane = (probes.attr)(slot, name, false)
+                .ok_or(JitVerdict::UnsupportedOpcode("LOAD_ATTR shape"))?;
+            stack.pop();
+            let site = attr_sites.len() as u32;
+            attr_sites.push(AttrSiteMeta {
+                slot,
+                name: name.to_owned(),
+                lane,
+                store: false,
+            });
+            push(TOp::AttrGet { site, out: lane }, Some(lane), stack, stmts);
+            stack.push(ESlot {
+                null: true,
+                ..ESlot::val(JitType::Unknown)
+            });
+        }
         // RFC 0065 WS5 — pinned-instance scalar attribute write (an
         // `AttrSet` site). Stack is `[.., value, receiver]`.
         OpCode::StoreAttr => {
@@ -2038,12 +2142,17 @@ fn emit_instr(
         // RFC 0065 WS5 adds the `len(list)` and `list.append(v)` shapes.
         OpCode::Call => {
             let argc = ins.arg as usize;
-            if stack.len() < argc + 1 {
+            if stack.len() < argc + 2 {
                 return Err(JitVerdict::StackUnderflow);
             }
             let mut arg_tys: Vec<JitType> = Vec::with_capacity(argc);
             for _ in 0..argc {
                 arg_tys.push(pop_val(stack)?);
+            }
+            // RFC 0068 — the self-or-null slot below the arguments.
+            let slot = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            if !slot.null {
+                return Err(JitVerdict::UnsupportedOpcode("CALL (self slot)"));
             }
             let f = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             // `x.append(v)` — the pin stayed on the native stack under
@@ -2060,8 +2169,11 @@ fn emit_instr(
                 }
                 // The receiver's bottom-based native-stack index equals
                 // its spill index: everything below it that carries a
-                // native value (markers don't).
-                let native_index = stack.iter().filter(|s| s.callee.is_none()).count() as u32;
+                // native value (markers and null slots don't).
+                let native_index = stack
+                    .iter()
+                    .filter(|s| s.callee.is_none() && !s.null)
+                    .count() as u32;
                 method_spans.push(MethodSpanMeta {
                     native_index,
                     live_from: load_pc,

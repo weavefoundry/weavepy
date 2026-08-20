@@ -604,10 +604,11 @@ fn instance_buffer_bytes(value: &Object) -> Option<Vec<u8>> {
 /// CPython `co_flags` for a WeavePy code object. Module/class bodies are
 /// not "optimized" (they use name-based locals); functions are.
 fn code_flags(co: &CodeObject) -> u32 {
+    // Only function scopes: CPython's compute_code_flags sets
+    // CO_OPTIMIZED|CO_NEWLOCALS for FunctionBlock alone — module *and*
+    // class bodies report 0 (plus feature bits below).
     let mut f = 0u32;
-    if co.is_class_body {
-        f |= CO_NEWLOCALS;
-    } else if co.name != "<module>" {
+    if !co.is_class_body && co.name != "<module>" {
         f |= CO_OPTIMIZED | CO_NEWLOCALS;
     }
     if co.has_varargs {
@@ -1107,6 +1108,7 @@ impl<'a> MarshalReader<'a> {
         let lpn = tuple_of_strings(&localsplusnames, "co_localsplusnames")?;
         let lpk = bytes_of(&localspluskinds, "co_localspluskinds")?;
 
+        let constants = tuple_to_constants(&consts)?;
         let decoded = cpython_code::decode_full(
             &code_bytes,
             &line_bytes,
@@ -1114,6 +1116,7 @@ impl<'a> MarshalReader<'a> {
             &lpn,
             &lpk,
             firstlineno,
+            &constants,
         )
         .ok_or_else(|| value_error("marshal: code object uses an unsupported opcode"))?;
 
@@ -1121,6 +1124,12 @@ impl<'a> MarshalReader<'a> {
         // Fall back to the bare name when the producer didn't record a
         // qualname (e.g. older marshal payloads); CPython always writes one.
         let co_qualname = string_of(&qualname, "co_qualname").unwrap_or_else(|_| co_name.clone());
+        // Invert `code_flags`: only function scopes carry CO_OPTIMIZED,
+        // so an unoptimized non-module body is a class body. Without
+        // this a `.pyc` round-trip promoted class-body code to
+        // CO_OPTIMIZED|CO_NEWLOCALS on `co_flags`
+        // (test_capi.test_eval_code_ex test_custom_locals).
+        let is_class_body = flags & CO_OPTIMIZED == 0 && co_name != "<module>";
         let co = CodeObject {
             name: co_name,
             qualname: co_qualname,
@@ -1129,7 +1138,7 @@ impl<'a> MarshalReader<'a> {
             vm_ext: weavepy_compiler::VmExt::default(),
             jit_hint: weavepy_compiler::JitHint::default(),
             instructions: decoded.instructions,
-            constants: tuple_to_constants(&consts)?,
+            constants,
             names: tuple_of_strings(&names, "co_names")?,
             varnames: decoded.varnames,
             freevars: decoded.freevars,
@@ -1145,7 +1154,7 @@ impl<'a> MarshalReader<'a> {
             kwonly_count,
             has_varargs: flags & CO_VARARGS != 0,
             has_varkeywords: flags & CO_VARKEYWORDS != 0,
-            is_class_body: false,
+            is_class_body,
             is_generator: flags & CO_GENERATOR != 0,
             is_coroutine: flags & CO_COROUTINE != 0,
             is_async_generator: flags & CO_ASYNC_GENERATOR != 0,
@@ -1153,6 +1162,7 @@ impl<'a> MarshalReader<'a> {
             future_flags: flags & weavepy_compiler::flags::PYCF_MASK,
             cp_cache: cpython_code::CpCache::default(),
             wire: None,
+            no_interrupt_jumps: decoded.no_interrupt_jumps,
         };
         Ok(Object::Code(Rc::new(co)))
     }

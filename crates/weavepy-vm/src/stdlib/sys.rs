@@ -136,25 +136,50 @@ pub fn build_with_state(
             })),
         );
         let uh = unraisable_hook.clone();
+        let default_unraisablehook = Object::Builtin(Rc::new(BuiltinFn {
+            name: "unraisablehook",
+            binds_instance: false,
+            call: Box::new(move |args| {
+                let _ = uh.borrow().clone();
+                // Called explicitly (a wrapper hook chaining into the
+                // saved original — test.libregrtest's
+                // regrtest_unraisable_hook): perform the default
+                // report from the UnraisableHookArgs object. The VM's
+                // own unraisable path never routes here — it prints
+                // directly — so this is exactly the "call the builtin
+                // as a function" surface.
+                let Some(arg) = args.first() else {
+                    return Err(crate::error::type_error(
+                        "unraisablehook() takes exactly one argument",
+                    ));
+                };
+                if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                    // SAFETY: published by the enclosing VM frame on
+                    // this thread; the GIL keeps the pointer exclusive.
+                    let interp = unsafe { &mut *ptr };
+                    interp.default_unraisablehook_call(arg)?;
+                }
+                Ok(Object::None)
+            }),
+            call_kw: None,
+        }));
         d.insert(
             DictKey(Object::from_static("unraisablehook")),
-            Object::Builtin(Rc::new(BuiltinFn {
-                name: "unraisablehook",
-                binds_instance: false,
-                call: Box::new(move |_args| {
-                    let _ = uh.borrow().clone();
-                    Ok(Object::None)
-                }),
-                call_kw: None,
-            })),
+            default_unraisablehook.clone(),
         );
+        // Like `__excepthook__`: the pristine default, kept reachable so
+        // a wrapper hook can restore or chain into it.
         d.insert(
             DictKey(Object::from_static("__unraisablehook__")),
-            unraisable_hook.borrow().clone(),
+            default_unraisablehook,
         );
         d.insert(
             DictKey(Object::from_static("settrace")),
             builtin("settrace", sys_settrace),
+        );
+        d.insert(
+            DictKey(Object::from_static("call_tracing")),
+            builtin("call_tracing", sys_call_tracing),
         );
         d.insert(
             DictKey(Object::from_static("monitoring")),
@@ -295,9 +320,10 @@ pub fn build_with_state(
         d.insert(DictKey(Object::from_static("last_traceback")), Object::None);
         d.insert(DictKey(Object::from_static("last_exc")), Object::None);
 
-        // `_current_frames` — returns a dict mapping thread-id
-        // to the current frame for that thread. Single-threaded
-        // execution sees a one-entry dict.
+        // `_current_frames` / `_current_exceptions` — dicts keyed by
+        // `threading.get_ident()` covering *every* live thread (the
+        // faulthandler registry is WeavePy's tstate-list analogue; the
+        // caller holds the GIL, so peer stacks are quiescent).
         {
             let fs_cf = frame_stack.clone();
             d.insert(
@@ -306,18 +332,45 @@ pub fn build_with_state(
                     name: "_current_frames",
                     binds_instance: false,
                     call: Box::new(move |_args| {
-                        let frame = if let Some(h) = crate::vm_singletons::current_thread_handles()
-                        {
-                            crate::object::materialize_stack_top(&h.frame_stack)
-                        } else {
-                            crate::object::materialize_stack_top(&fs_cf)
-                        };
                         let mut d = DictData::default();
-                        if let Some(f) = frame {
-                            // Best-effort: every thread has the
-                            // same logical id 0 in the single-
-                            // GIL model.
-                            d.insert(DictKey(Object::Int(0)), Object::Frame(f));
+                        for (ident, stack, _exc) in
+                            crate::stdlib::faulthandler_mod::thread_snapshots()
+                        {
+                            if let Some(f) = crate::object::materialize_stack_top(&stack) {
+                                d.insert(DictKey(Object::Int(ident as i64)), Object::Frame(f));
+                            }
+                        }
+                        if d.is_empty() {
+                            // Pre-threading fallback: the registering
+                            // interpreter's own stack.
+                            if let Some(f) = crate::object::materialize_stack_top(&fs_cf) {
+                                let ident = crate::vm_singletons::current_worker_thread_id();
+                                d.insert(DictKey(Object::Int(ident as i64)), Object::Frame(f));
+                            }
+                        }
+                        Ok(Object::Dict(Rc::new(RefCell::new(d))))
+                    }),
+                    call_kw: None,
+                })),
+            );
+            d.insert(
+                DictKey(Object::from_static("_current_exceptions")),
+                Object::Builtin(Rc::new(BuiltinFn {
+                    name: "_current_exceptions",
+                    binds_instance: false,
+                    call: Box::new(move |_args| {
+                        let mut d = DictData::default();
+                        for (ident, _stack, exc) in
+                            crate::stdlib::faulthandler_mod::thread_snapshots()
+                        {
+                            // 3.12+: the value is the handled exception
+                            // *instance* (None outside any `except`).
+                            let value = exc
+                                .borrow()
+                                .last()
+                                .map(|top| top.instance.clone())
+                                .unwrap_or(Object::None);
+                            d.insert(DictKey(Object::Int(ident as i64)), value);
                         }
                         Ok(Object::Dict(Rc::new(RefCell::new(d))))
                     }),
@@ -326,13 +379,21 @@ pub fn build_with_state(
             );
         }
 
+        // PEP 703 introspection (3.13): this is a GIL build, and the GIL
+        // cannot be disabled.
+        d.insert(
+            DictKey(Object::from_static("_is_gil_enabled")),
+            builtin("_is_gil_enabled", |_| Ok(Object::Bool(true))),
+        );
         d.insert(
             DictKey(Object::from_static("getswitchinterval")),
-            builtin("getswitchinterval", |_| Ok(Object::Float(0.005))),
+            builtin("getswitchinterval", |_| {
+                Ok(Object::Float(SWITCH_INTERVAL.with(|c| c.get())))
+            }),
         );
         d.insert(
             DictKey(Object::from_static("setswitchinterval")),
-            builtin("setswitchinterval", |_args| Ok(Object::None)),
+            builtin("setswitchinterval", sys_setswitchinterval),
         );
         d.insert(
             DictKey(Object::from_static("getrefcount")),
@@ -1021,7 +1082,9 @@ fn builtin_module_names_value() -> Object {
         "marshal",
         "math",
         "mmap",
-        "os",
+        // (`os` is deliberately absent: CPython's `os` is Python source
+        // — its startup-only native fast path here is the analogue of
+        // CPython's *frozen* `os`, which is not a builtin either.)
         "pyexpat",
         "select",
         "sys",
@@ -1065,22 +1128,83 @@ fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeErro
 /// (see `Interpreter`/`Error::system_exit_code` and the CLI's
 /// `exit_with_system_exit`).
 fn sys_exit(args: &[Object]) -> Result<Object, RuntimeError> {
-    let code = args.first().cloned().unwrap_or(Object::None);
+    if args.len() > 1 {
+        return Err(type_error(format!(
+            "exit expected at most 1 argument, got {}",
+            args.len()
+        )));
+    }
+    // A tuple payload spreads into the exception's `args` (CPython's
+    // `PyErr_SetObject` uses a tuple value as the args tuple), so
+    // `sys.exit((42,))` reports `code == 42` while `sys.exit((17, 23))`
+    // keeps the whole tuple as the code (test_sys test_exit).
+    let exc_args: Vec<Object> = match args.first() {
+        Some(Object::Tuple(items)) => items.to_vec(),
+        Some(other) => vec![other.clone()],
+        None => vec![],
+    };
+    let code = match exc_args.len() {
+        0 => Object::None,
+        1 => exc_args[0].clone(),
+        _ => Object::new_tuple(exc_args.clone()),
+    };
     let inst = crate::builtin_types::make_exception_with_class(
         crate::builtin_types::builtin_types().system_exit.clone(),
         "",
     );
     if let Object::Instance(inst_rc) = &inst {
         inst_rc.slot_set("code", code.clone());
-        inst_rc.slot_set("args", Object::new_tuple(vec![code]));
+        inst_rc.slot_set("args", Object::new_tuple(exc_args));
     }
     Err(RuntimeError::PyException(crate::error::PyException::new(
         inst,
     )))
 }
 
-fn sys_getrecursionlimit(_args: &[Object]) -> Result<Object, RuntimeError> {
+/// `sys.call_tracing(func, args)` — call `func(*args)` with tracing
+/// re-enabled. CPython's `_PyEval_CallTracing` saves `tstate->tracing`
+/// and resets it to zero so trace events fire inside the call even when
+/// invoked from within a trace callback — pdb's `debug` command depends
+/// on this to stop inside the recursive debugger (test_pdb's
+/// test_errors_in_command sees `> <string>(1)<module>()`).
+fn sys_call_tracing(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [func, tuple] = args else {
+        return Err(type_error(format!(
+            "call_tracing expected 2 arguments, got {}",
+            args.len()
+        )));
+    };
+    let call_args: Vec<Object> = match tuple {
+        Object::Tuple(items) => items.to_vec(),
+        other => {
+            return Err(type_error(format!(
+                "call_tracing() argument 2 must be tuple, not {}",
+                other.type_name()
+            )))
+        }
+    };
+    let interp = crate::builtins::reentrant_interp()?;
+    let g = interp.builtins_dict();
+    let _reenabled = crate::trace::TracingReenabled::new();
+    interp.call(func, &call_args, &[], &g)
+}
+
+fn sys_getrecursionlimit(args: &[Object]) -> Result<Object, RuntimeError> {
+    reject_args("getrecursionlimit", args)?;
     Ok(Object::Int(crate::recursion::recursion_limit() as i64))
+}
+
+/// Zero-argument clinic check (`sys.getrecursionlimit(42)` →
+/// "takes no arguments" — test_sys pins several of these).
+fn reject_args(name: &str, args: &[Object]) -> Result<(), RuntimeError> {
+    if args.is_empty() {
+        Ok(())
+    } else {
+        Err(type_error(format!(
+            "{name}() takes no arguments ({} given)",
+            args.len()
+        )))
+    }
 }
 
 thread_local! {
@@ -1088,6 +1212,37 @@ thread_local! {
     // limit on conversion, but `sys.get/set_int_max_str_digits` must round-trip
     // (test_int reads/sets it; many modules query it at import).
     static INT_MAX_STR_DIGITS: std::cell::Cell<i64> = const { std::cell::Cell::new(4300) };
+    // `sys.setswitchinterval` value: advisory for WeavePy's GIL (the
+    // holder yields on bytecode-count boundaries, not a timer), but the
+    // set/get pair must round-trip (test_sys test_switchinterval).
+    static SWITCH_INTERVAL: std::cell::Cell<f64> = const { std::cell::Cell::new(0.005) };
+}
+
+fn sys_setswitchinterval(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [arg] = args else {
+        return Err(type_error(format!(
+            "setswitchinterval() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    };
+    let interval = match arg {
+        Object::Float(f) => *f,
+        Object::Int(i) => *i as f64,
+        Object::Bool(b) => f64::from(*b),
+        other => {
+            return Err(type_error(format!(
+                "must be real number, not {}",
+                other.type_name()
+            )))
+        }
+    };
+    if interval <= 0.0 {
+        return Err(crate::error::value_error(
+            "switch interval must be strictly positive",
+        ));
+    }
+    SWITCH_INTERVAL.with(|c| c.set(interval));
+    Ok(Object::None)
 }
 
 /// The current per-thread int↔str conversion digit cap (0 = unlimited).
@@ -1211,11 +1366,19 @@ fn sys_intern(args: &[Object]) -> Result<Object, RuntimeError> {
                 Ok(s.clone())
             }
         }),
+        // A lone-surrogate-bearing str is still a str to CPython's intern —
+        // pathlib interns every path part, and surrogateescape'd filenames
+        // carry surrogates (test_pathlib's `P(base + '\udfff')` probes).
+        // The WStr identity passes through unpooled: interning is an
+        // optimization, and equal-value pooling only matters for the plain
+        // Str fast path (test_parts_interning uses ASCII parts).
+        Some(s @ Object::WStr(_)) => Ok(s.clone()),
         _ => Err(type_error("sys.intern() argument must be str")),
     }
 }
 
-fn sys_getdefaultencoding(_args: &[Object]) -> Result<Object, RuntimeError> {
+fn sys_getdefaultencoding(args: &[Object]) -> Result<Object, RuntimeError> {
+    reject_args("getdefaultencoding", args)?;
     // CPython 3 always returns "utf-8" here.
     Ok(Object::from_static("utf-8"))
 }
@@ -1236,6 +1399,12 @@ fn sys_getframe(
     args: &[Object],
     frame_stack: &crate::object::FrameStack,
 ) -> Result<Object, RuntimeError> {
+    if args.len() > 1 {
+        return Err(type_error(format!(
+            "_getframe expected at most 1 argument, got {}",
+            args.len()
+        )));
+    }
     let depth = match args.first() {
         Some(Object::Int(d)) => *d as usize,
         None => 0,
@@ -1340,7 +1509,37 @@ fn sys_default_excepthook(args: &[Object]) -> Result<Object, RuntimeError> {
     // causes/contexts) to `sys.stderr`. Route through the Python
     // `traceback` module when an interpreter is on the stack; fall
     // back to a bare "Type: msg" line otherwise.
+    if args.len() != 3 {
+        return Err(type_error(format!(
+            "excepthook expected 3 arguments, got {}",
+            args.len()
+        )));
+    }
     let value = args.get(1).cloned().unwrap_or(Object::None);
+    // A non-exception `value` doesn't raise out of the hook — CPython's
+    // `PyErr_Display` reports the internal TypeError on stderr instead
+    // (test_sys.ExceptHookTest.test_excepthook feeds `('1', 1, 1)`).
+    let value_is_exception = matches!(
+        &value,
+        Object::Instance(i) if i.cls().mro.borrow().iter().any(|t| t.name == "BaseException")
+    );
+    if !value_is_exception {
+        let msg = format!(
+            "TypeError: print_exception(): Exception expected for value, {} found\n",
+            value.type_name()
+        );
+        if let Ok(interp) = crate::builtins::reentrant_interp() {
+            let g = interp.builtins_dict();
+            if let Some(target) = interp.current_sys_attr("stderr") {
+                if let Ok(write) = interp.load_attr_public(&target, "write") {
+                    let _ = interp.call(&write, &[Object::from_str(msg.clone())], &[], &g);
+                    return Ok(Object::None);
+                }
+            }
+        }
+        eprint!("{msg}");
+        return Ok(Object::None);
+    }
     if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
         // SAFETY: published by `publish_interpreter_ptr` from a
         // `&mut Interpreter` still on the call stack above us; the
@@ -1594,7 +1793,6 @@ pub(crate) const SYS_FLAGS_FIELDS: &[&str] = &[
     "warn_default_encoding",
     "safe_path",
     "int_max_str_digits",
-    "gil",
 ];
 
 /// `sys.version_info` (and `sys.implementation.version`) — CPython's
@@ -1723,8 +1921,33 @@ fn sys_getwindowsversion(_args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(obj)
 }
 
+/// Mark a sys struct-sequence type as non-instantiable — CPython
+/// creates `sys.version_info` / `sys.flags` with
+/// `Py_TPFLAGS_DISALLOW_INSTANTIATION` (test_sys
+/// test_sys_version_info_no_instantiation / test_sys_flags_no_…).
+fn disallow_instantiation(ty: &Rc<crate::types::TypeObject>, qualname: &'static str) {
+    use crate::object::BuiltinFn;
+    let mut d = ty.dict.borrow_mut();
+    let key = DictKey(Object::from_static("__new__"));
+    if d.get(&key).is_some() {
+        return;
+    }
+    d.insert(
+        key,
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__new__",
+            binds_instance: false,
+            call: Box::new(move |_args| {
+                Err(type_error(format!("cannot create '{qualname}' instances")))
+            }),
+            call_kw: None,
+        })),
+    );
+}
+
 fn version_info_value() -> Object {
     let ty = crate::stdlib::os::struct_seq_type("version_info", "sys", VERSION_INFO_FIELDS);
+    disallow_instantiation(&ty, "sys.version_info");
     let values = vec![
         Object::Int(PY_VERSION.0),
         Object::Int(PY_VERSION.1),
@@ -1741,16 +1964,24 @@ fn sys_flags_value() -> Object {
     // index, with `len()`/iteration over the field values. `tuple(sys.flags)`
     // is used by `test_multiprocessing` to round-trip flags through a spawned
     // child, so a plain namespace (not iterable) is insufficient.
-    let ty = crate::stdlib::os::struct_seq_type("flags", "sys", SYS_FLAGS_FIELDS);
+    // 3.13's `flags` carries `gil` as a *hidden* named field: reachable
+    // as `sys.flags.gil` but excluded from `len()`/indexing/iteration
+    // (`len(sys.flags) == 18` in test_sys.test_sys_flags while
+    // test_cmd_line.test_python_gil reads `sys.flags.gil`).
+    let slots: Vec<Option<&'static str>> = SYS_FLAGS_FIELDS
+        .iter()
+        .map(|f| Some(*f))
+        .chain(std::iter::once(Some("gil")))
+        .collect();
+    let ty =
+        crate::stdlib::os::struct_seq_type_layout("flags", "sys", slots, SYS_FLAGS_FIELDS.len());
+    disallow_instantiation(&ty, "sys.flags");
     let values: Vec<Object> = SYS_FLAGS_FIELDS
         .iter()
         .map(|f| match *f {
             // CPython's default cap on int<->str conversion size (PEP 0467 /
             // `-X int_max_str_digits`). test_int reads this off `sys.flags`.
             "int_max_str_digits" => Object::Int(4300),
-            // 3.13's `-X gil` / `PYTHON_GIL`: on a build where the GIL
-            // can't be disabled the flag is always 1.
-            "gil" => Object::Int(1),
             // WeavePy stores `str` as UTF-8, so UTF-8 mode is on unless the
             // CLI explicitly passes `-X utf8=0` (applied in apply_run_options).
             "utf8_mode" => Object::Int(1),
@@ -1759,77 +1990,101 @@ fn sys_flags_value() -> Object {
             _ => Object::Int(0),
         })
         .collect();
-    crate::stdlib::os::struct_seq_instance(ty, SYS_FLAGS_FIELDS, values)
+    let flags = crate::stdlib::os::struct_seq_instance(ty, SYS_FLAGS_FIELDS, values);
+    if let Object::Instance(inst) = &flags {
+        // This build always runs with the GIL (no free-threading).
+        inst.dict
+            .borrow_mut()
+            .insert(DictKey(Object::from_static("gil")), Object::Int(1));
+    }
+    flags
 }
+
+/// `sys.float_info` field order (CPython `floatinfo_fields`).
+const FLOAT_INFO_FIELDS: &[&str] = &[
+    "max",
+    "max_exp",
+    "max_10_exp",
+    "min",
+    "min_exp",
+    "min_10_exp",
+    "dig",
+    "mant_dig",
+    "epsilon",
+    "radix",
+    "rounds",
+];
 
 fn sys_float_info() -> Object {
-    let mut d = DictData::default();
-    d.insert(DictKey(Object::from_static("max")), Object::Float(f64::MAX));
-    d.insert(
-        DictKey(Object::from_static("min")),
+    // A real struct sequence (`len(sys.float_info) == 11`, indexable,
+    // attribute access) — test_sys test_attributes counts it.
+    let ty = crate::stdlib::os::struct_seq_type("float_info", "sys", FLOAT_INFO_FIELDS);
+    let values = vec![
+        Object::Float(f64::MAX),
+        Object::Int(1024),
+        Object::Int(308),
         Object::Float(f64::MIN_POSITIVE),
-    );
-    d.insert(
-        DictKey(Object::from_static("epsilon")),
-        Object::Float(f64::EPSILON),
-    );
-    d.insert(DictKey(Object::from_static("dig")), Object::Int(15));
-    d.insert(DictKey(Object::from_static("mant_dig")), Object::Int(53));
-    d.insert(DictKey(Object::from_static("max_10_exp")), Object::Int(308));
-    d.insert(
-        DictKey(Object::from_static("min_10_exp")),
+        Object::Int(-1021),
         Object::Int(-307),
-    );
-    d.insert(DictKey(Object::from_static("max_exp")), Object::Int(1024));
-    d.insert(DictKey(Object::from_static("min_exp")), Object::Int(-1021));
-    d.insert(DictKey(Object::from_static("radix")), Object::Int(2));
-    d.insert(DictKey(Object::from_static("rounds")), Object::Int(1));
-    // CPython exposes `sys.float_info` as a struct-sequence, so it must
-    // answer attribute access (`sys.float_info.max`) — used pervasively
-    // by test_math / test_complex. A SimpleNamespace gives us that.
-    Object::SimpleNamespace(Rc::new(RefCell::new(d)))
+        Object::Int(15),
+        Object::Int(53),
+        Object::Float(f64::EPSILON),
+        Object::Int(2),
+        Object::Int(1),
+    ];
+    crate::stdlib::os::struct_seq_instance(ty, FLOAT_INFO_FIELDS, values)
 }
+
+/// `sys.int_info` field order (CPython `int_info_fields`).
+const INT_INFO_FIELDS: &[&str] = &[
+    "bits_per_digit",
+    "sizeof_digit",
+    "default_max_str_digits",
+    "str_digits_check_threshold",
+];
 
 fn sys_int_info() -> Object {
-    let mut d = DictData::default();
-    d.insert(
-        DictKey(Object::from_static("bits_per_digit")),
+    let ty = crate::stdlib::os::struct_seq_type("int_info", "sys", INT_INFO_FIELDS);
+    let values = vec![
         Object::Int(30),
-    );
-    d.insert(DictKey(Object::from_static("sizeof_digit")), Object::Int(4));
-    d.insert(
-        DictKey(Object::from_static("default_max_str_digits")),
+        Object::Int(4),
         Object::Int(4300),
-    );
-    d.insert(
-        DictKey(Object::from_static("str_digits_check_threshold")),
         Object::Int(640),
-    );
-    Object::SimpleNamespace(Rc::new(RefCell::new(d)))
+    ];
+    crate::stdlib::os::struct_seq_instance(ty, INT_INFO_FIELDS, values)
 }
 
+/// `sys.hash_info` field order (CPython `hash_info_fields`).
+const HASH_INFO_FIELDS: &[&str] = &[
+    "width",
+    "modulus",
+    "inf",
+    "nan",
+    "imag",
+    "algorithm",
+    "hash_bits",
+    "seed_bits",
+    "cutoff",
+];
+
 fn sys_hash_info() -> Object {
-    let mut d = DictData::default();
-    d.insert(DictKey(Object::from_static("width")), Object::Int(64));
+    let ty = crate::stdlib::os::struct_seq_type("hash_info", "sys", HASH_INFO_FIELDS);
     // `_PyHASH_MODULUS` on a 64-bit build is the Mersenne prime 2**61-1,
     // which is also the modulus `python_int_hash`/`py_hash_double` reduce
     // through. test_numeric_tower derives `_PyHASH_MODULUS` from this field
     // and checks exact Fraction hashes against it, so it must match.
-    d.insert(
-        DictKey(Object::from_static("modulus")),
+    let values = vec![
+        Object::Int(64),
         Object::Int((1i64 << 61) - 1),
-    );
-    d.insert(DictKey(Object::from_static("inf")), Object::Int(314_159));
-    d.insert(DictKey(Object::from_static("nan")), Object::Int(0));
-    d.insert(DictKey(Object::from_static("imag")), Object::Int(1_000_003));
-    d.insert(
-        DictKey(Object::from_static("algorithm")),
+        Object::Int(314_159),
+        Object::Int(0),
+        Object::Int(1_000_003),
         Object::from_static("siphash13"),
-    );
-    d.insert(DictKey(Object::from_static("hash_bits")), Object::Int(64));
-    d.insert(DictKey(Object::from_static("seed_bits")), Object::Int(128));
-    d.insert(DictKey(Object::from_static("cutoff")), Object::Int(0));
-    Object::SimpleNamespace(Rc::new(RefCell::new(d)))
+        Object::Int(64),
+        Object::Int(128),
+        Object::Int(0),
+    ];
+    crate::stdlib::os::struct_seq_instance(ty, HASH_INFO_FIELDS, values)
 }
 
 /// Whether `name` is a documented stdlib module name. The module
@@ -2328,29 +2583,46 @@ fn sys_breakpointhook_kw(
 }
 
 fn sys_displayhook(args: &[Object]) -> Result<Object, RuntimeError> {
-    let value = args.first().cloned().unwrap_or(Object::None);
-    if matches!(value, Object::None) {
-        return Ok(Object::None);
+    let [value] = args else {
+        return Err(type_error(format!(
+            "displayhook() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    };
+    // Route through the interpreter's shared default-hook body so the
+    // repr lands on the *current* `sys.stdout` (captured_stdout swaps a
+    // StringIO in) and `builtins._` updates — test_sys
+    // DisplayHookTest.test_original_displayhook.
+    match crate::builtins::reentrant_interp() {
+        Ok(interp) => {
+            let g = interp.builtins_dict();
+            interp.displayhook_default(value.clone(), &g)
+        }
+        Err(_) => {
+            // No interpreter on the stack (embedder call): plain echo.
+            if matches!(value, Object::None) {
+                return Ok(Object::None);
+            }
+            println!("{}", value.repr());
+            Ok(Object::None)
+        }
     }
-    let rendered = value.repr();
-    println!("{rendered}");
-    Ok(Object::None)
 }
 
+/// `sys.thread_info` field order (CPython `threadinfo_fields`).
+const THREAD_INFO_FIELDS: &[&str] = &["name", "lock", "version"];
+
 fn sys_thread_info() -> Object {
-    // CPython exposes `sys.thread_info` as a struct-sequence with
-    // attribute access (`.name`, `.lock`, `.version`); `test_os` reads
-    // `sys.thread_info.version` at import. A SimpleNamespace gives us the
-    // same attribute surface.
-    let mut d = DictData::default();
-    d.insert(
-        DictKey(Object::from_static("name")),
-        Object::from_static("weavepy"),
-    );
-    d.insert(
-        DictKey(Object::from_static("lock")),
-        Object::from_static("cooperative"),
-    );
-    d.insert(DictKey(Object::from_static("version")), Object::None);
-    Object::SimpleNamespace(Rc::new(RefCell::new(d)))
+    // A real struct sequence (`len(sys.thread_info) == 3` —
+    // test_sys test_thread_info). WeavePy's `_thread` runs on OS
+    // threads: pthreads everywhere but Windows (`nt` there), guarded by
+    // the CPython-style mutex+cond GIL dance.
+    let name = if cfg!(windows) { "nt" } else { "pthread" };
+    let ty = crate::stdlib::os::struct_seq_type("thread_info", "sys", THREAD_INFO_FIELDS);
+    let values = vec![
+        Object::from_static(name),
+        Object::from_static("mutex+cond"),
+        Object::None,
+    ];
+    crate::stdlib::os::struct_seq_instance(ty, THREAD_INFO_FIELDS, values)
 }

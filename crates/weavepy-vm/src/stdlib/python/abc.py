@@ -268,6 +268,16 @@ class ABCMeta(type):
         return False
 
 
+# CPython's pure-Python path does `from _py_abc import ABCMeta` and then
+# `ABCMeta.__module__ = 'abc'` — and *that assignment* drops the class's
+# `__firstlineno__` (type_set_module invalidates stale source info), so
+# `inspect.getsource(abc.ABCMeta)` reports "source code not available"
+# whenever the C accelerator is absent (test_inspect
+# test_getsource_stdlib_abc). Mirror the assignment — a no-op for the
+# module name itself, but with the same firstlineno-dropping effect.
+ABCMeta.__module__ = 'abc'
+
+
 def update_abstractmethods(cls):
     """Recalculate the set of abstract methods of an abstract class.
 

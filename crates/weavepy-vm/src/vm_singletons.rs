@@ -284,11 +284,18 @@ pub fn publish_interpreter_seed(interp: &crate::Interpreter) {
 /// thread (no-op if this thread already built one) — class statements
 /// executed by the worker must see the same `TypeObject`s as the seed.
 pub fn snapshot_interpreter() -> Option<crate::Interpreter> {
+    install_seed_builtin_types();
+    let slot = seed_slot().lock();
+    slot.as_ref().map(|i| i.fork_for_thread())
+}
+
+/// Install the seed's built-in type registry on the calling thread
+/// (no-op if this thread already built one) without forking the seed —
+/// for workers that fork the *spawning thread's* interpreter instead.
+pub fn install_seed_builtin_types() {
     if let Some(bt) = seed_types_slot().lock().clone() {
         crate::builtin_types::install_shared(bt);
     }
-    let slot = seed_slot().lock();
-    slot.as_ref().map(|i| i.fork_for_thread())
 }
 
 /// Install the synthetic thread id (`_thread.get_ident()` value) for
@@ -451,7 +458,11 @@ pub fn activate_thread_handles(handles: ThreadHandles) -> ThreadHandlesGuard {
     let _ = FAULTHANDLER_REG.try_with(|slot| {
         if slot.borrow().is_none() {
             let ident = current_worker_thread_id();
-            crate::stdlib::faulthandler_mod::note_thread_start(ident, handles.frame_stack.clone());
+            crate::stdlib::faulthandler_mod::note_thread_start(
+                ident,
+                handles.frame_stack.clone(),
+                handles.exc_info_stack.clone(),
+            );
             *slot.borrow_mut() = Some(FaulthandlerThreadGuard { ident });
         }
     });
@@ -589,6 +600,102 @@ pub fn take_pending_resource_warnings() -> Vec<(String, Option<usize>)> {
     crate::hot_gates::clear(crate::hot_gates::RESOURCE_WARNINGS);
     PENDING_RW_FLAG.store(false, std::sync::atomic::Ordering::Release);
     PENDING_RESOURCE_WARNINGS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+}
+
+/// RFC 0068 WS3 — Python-level pending calls, CPython's
+/// `Py_AddPendingCall` / `_PyEval_AddPendingCall` split, driven by the
+/// `_testcapi._pending_threadfunc` / `_testinternalcapi.pending_threadfunc`
+/// fixtures (test_capi.test_misc `TestPendingCalls`). Two process-global
+/// queues mirroring CPython's: the *main-only* queue (capacity 32,
+/// `Py_AddPendingCall`) whose callbacks run exclusively on the main
+/// thread, and the *per-interpreter* queue (capacity 300,
+/// `_PyEval_AddPendingCall`) drained by whichever thread reaches an
+/// eval-breaker safe point first. `Object` is `Send + Sync` and every
+/// producer/consumer runs under the GIL, so plain mutex-guarded vecs
+/// suffice.
+static PENDING_PY_CALLS_MAIN: Mutex<Vec<Object>> = Mutex::new(Vec::new());
+static PENDING_PY_CALLS_ANY: Mutex<Vec<Object>> = Mutex::new(Vec::new());
+
+/// CPython's `MAXPENDINGCALLS_MAIN` (pycore_ceval_state.h).
+const MAX_PENDING_PY_CALLS_MAIN: usize = 32;
+/// CPython's `MAXPENDINGCALLS` (per-interpreter queue).
+const MAX_PENDING_PY_CALLS_ANY: usize = 300;
+
+/// CPython's `pending->busy` re-entrancy latch: while a thread is
+/// running pending calls, no safe point (on any thread, including safe
+/// points reached *inside* a running callback) starts another drain —
+/// otherwise a callback that re-queues itself (`ensure_added=True` on
+/// the wrong thread, test_misc `PendingTask`) nests drains until
+/// RecursionError.
+static PENDING_PY_CALLS_BUSY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Claim the pending-call drain latch. Returns `false` when another
+/// drain is already running (the caller must skip).
+pub fn begin_pending_py_calls() -> bool {
+    PENDING_PY_CALLS_BUSY
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+/// Release the drain latch and re-arm the hot gate if work remains.
+pub fn end_pending_py_calls() {
+    PENDING_PY_CALLS_BUSY.store(false, std::sync::atomic::Ordering::Release);
+    if !PENDING_PY_CALLS_ANY.lock().is_empty() || !PENDING_PY_CALLS_MAIN.lock().is_empty() {
+        crate::hot_gates::set(crate::hot_gates::PENDING_PYCALLS);
+    }
+}
+
+/// Queue `callback` (a zero-argument Python callable) to run at the next
+/// eval-breaker safe point. `main_only` selects CPython's main-thread
+/// queue (capacity 32) over the per-interpreter one (capacity 300).
+/// Returns `false` when the queue is full and `force` is not set
+/// (CPython's `ensure_added=True` retries until the add succeeds; we
+/// model that as an over-capacity push, which never deadlocks).
+pub fn push_pending_py_call(callback: Object, main_only: bool, force: bool) -> bool {
+    let (queue, cap) = if main_only {
+        (&PENDING_PY_CALLS_MAIN, MAX_PENDING_PY_CALLS_MAIN)
+    } else {
+        (&PENDING_PY_CALLS_ANY, MAX_PENDING_PY_CALLS_ANY)
+    };
+    {
+        let mut q = queue.lock();
+        if !force && q.len() >= cap {
+            return false;
+        }
+        q.push(callback);
+    }
+    crate::hot_gates::set(crate::hot_gates::PENDING_PYCALLS);
+    true
+}
+
+/// Cheap probe for the eval-loop safe point: is any Python-level
+/// pending call queued that *this* thread may run?
+pub fn has_pending_py_calls(is_main_thread: bool) -> bool {
+    !PENDING_PY_CALLS_ANY.lock().is_empty()
+        || (is_main_thread && !PENDING_PY_CALLS_MAIN.lock().is_empty())
+}
+
+/// Drain every pending Python call this thread may run: the shared
+/// per-interpreter queue always, plus the main-only queue when called
+/// from the main thread. Clear-drain-recheck on the hot-gate bit —
+/// main-only work left behind by a worker keeps the gate hot so the
+/// main thread's next safe point picks it up.
+pub fn take_pending_py_calls(is_main_thread: bool) -> Vec<Object> {
+    crate::hot_gates::clear(crate::hot_gates::PENDING_PYCALLS);
+    let mut out = std::mem::take(&mut *PENDING_PY_CALLS_ANY.lock());
+    if is_main_thread {
+        out.append(&mut PENDING_PY_CALLS_MAIN.lock());
+    }
+    if !PENDING_PY_CALLS_ANY.lock().is_empty() || !PENDING_PY_CALLS_MAIN.lock().is_empty() {
+        crate::hot_gates::set(crate::hot_gates::PENDING_PYCALLS);
+    }
+    out
 }
 
 thread_local! {
@@ -872,6 +979,22 @@ pub fn cext_call_active() -> bool {
 /// set (already-imported modules keep working), and
 /// `sys.is_finalizing()` reads it.
 static FINALIZING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// CPython clears the `sys` module dict *after* the std streams are
+/// finalized, so a `__del__` raising during that final sweep has nowhere
+/// to report (`test_sys.test_sys_ignores_cleaning_up_user_data`). The
+/// shutdown pass sets this while finalizing sys-held objects and
+/// `write_unraisable_msg` drops the report entirely.
+static UNRAISABLE_SILENCED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_unraisable_silenced(value: bool) {
+    UNRAISABLE_SILENCED.store(value, std::sync::atomic::Ordering::Release);
+}
+
+pub fn unraisable_silenced() -> bool {
+    UNRAISABLE_SILENCED.load(std::sync::atomic::Ordering::Acquire)
+}
 
 pub fn set_finalizing(value: bool) {
     FINALIZING.store(value, std::sync::atomic::Ordering::Release);

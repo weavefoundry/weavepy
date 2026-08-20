@@ -209,6 +209,20 @@ pub(crate) fn register_find_module(def: *mut c_void, module: Object) {
     }
 }
 
+/// Drop the `PyState_FindModule` registration for `def`
+/// (`PyState_RemoveModule`). The immortal box is intentionally leaked —
+/// callers may still hold the borrowed pointer.
+pub(crate) fn unregister_find_module(def: *mut c_void) {
+    if def.is_null() {
+        return;
+    }
+    if let Ok(mut g) = FIND_MODULE.lock() {
+        if let Some(m) = g.as_mut() {
+            m.remove(&(def as usize));
+        }
+    }
+}
+
 /// `PyState_FindModule(def)` — the module previously created from `def`
 /// (borrowed ref), or NULL if none was registered (see
 /// [`register_find_module`]). NULL is the correct answer for a module that

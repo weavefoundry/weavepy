@@ -296,4 +296,36 @@ assert list(itertools.batched("abcdef", 2)) == [
 ]
 
 
+# ---------- unbound io-class methods on native streams (RFC 0068 WS7) ----------
+# `contextlib.ExitStack.enter_context(file)` binds `type(cm).__exit__`
+# unbound and calls it as `__exit__(cm, *exc)`. The object `open()`
+# returns is the native collapsed stream, so the class-dict methods
+# must accept it as `self` (test_regrtest's worker stdout-file cleanup).
+import contextlib
+import types
+
+with tempfile.TemporaryDirectory() as td:
+    p = os.path.join(td, "es.txt")
+
+    # Text stream through ExitStack.
+    with contextlib.ExitStack() as stack:
+        tf = stack.enter_context(open(p, "w"))
+        tf.write("exitstack")
+    assert tf.closed
+    with open(p) as check:
+        assert check.read() == "exitstack"
+
+    # Explicit unbound-call shapes on text and binary streams.
+    tf = open(p)
+    assert type(tf).readable(tf) is True
+    assert type(tf).read(tf) == "exitstack"
+    assert type(tf).__exit__(tf, None, None, None) is None
+    assert tf.closed
+
+    bf = open(p, "rb")
+    m = types.MethodType(type(bf).__exit__, bf)
+    assert m(None, None, None) is None
+    assert bf.closed
+
+
 print("test_io_os_argparse_inspect: OK")

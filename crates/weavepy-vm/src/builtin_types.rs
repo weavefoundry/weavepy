@@ -80,6 +80,12 @@ pub struct BuiltinTypes {
     /// `getset_descriptor` — a computed attribute descriptor reached
     /// through a type (`type(float.real)`, `types.GetSetDescriptorType`).
     pub getset_descriptor_: Rc<TypeObject>,
+    /// `classmethod_descriptor` — a *C-level* classmethod reached through
+    /// a type dict (`type(dict.__dict__['fromkeys'])`,
+    /// `types.ClassMethodDescriptorType`). Distinct from user
+    /// `classmethod` objects, which inspect treats as user-defined
+    /// callables (test_inspect test_signature_on_class [classmethod]).
+    pub classmethod_descriptor_: Rc<TypeObject>,
     /// `super` — the type of `super(...)` proxies (`type(super(C, x))`).
     /// Real (subclassable) so `class mysuper(super)` works.
     pub super_: Rc<TypeObject>,
@@ -249,6 +255,59 @@ impl BuiltinTypes {
         let slice_ = mk("slice", vec![object_.clone()]);
         let memoryview_ = mk("memoryview", vec![object_.clone()]);
         let mappingproxy_ = mk("mappingproxy", vec![object_.clone()]);
+        // `types.MappingProxyType(mapping)` is a live read-only *view*:
+        // wrapping a dict shares the underlying storage (CPython's
+        // `mappingproxy_new`; enum's `__members__` builds one per access).
+        {
+            use crate::object::BuiltinFn;
+            fn proxy_new(args: &[Object]) -> Result<Object, RuntimeError> {
+                // args[0] is the class object. CPython's
+                // `mappingproxy_check_mapping`: any `PyMapping_Check`
+                // object except list/tuple qualifies — a dict subclass,
+                // a ChainMap, any class with `__getitem__`.
+                match args.get(1) {
+                    Some(Object::Dict(d)) => Ok(Object::MappingProxy(d.clone())),
+                    Some(p @ Object::MappingProxy(_)) | Some(p @ Object::MappingProxyObj(_)) => {
+                        Ok(Object::MappingProxyObj(Rc::new(p.clone())))
+                    }
+                    Some(inst @ Object::Instance(i)) => {
+                        // A list/tuple subclass is excluded like the base
+                        // type (CPython uses PyList_Check / PyTuple_Check,
+                        // which include subclasses).
+                        let seq_backed = matches!(
+                            i.native.get(),
+                            Some(Object::List(_)) | Some(Object::Tuple(_))
+                        );
+                        let has_getitem = i.cls().lookup("__getitem__").is_some();
+                        if !seq_backed && has_getitem {
+                            Ok(Object::MappingProxyObj(Rc::new(inst.clone())))
+                        } else {
+                            Err(crate::error::type_error(format!(
+                                "mappingproxy() argument must be a mapping, not {}",
+                                inst.type_name()
+                            )))
+                        }
+                    }
+                    Some(other) => Err(crate::error::type_error(format!(
+                        "mappingproxy() argument must be a mapping, not {}",
+                        other.type_name()
+                    ))),
+                    None => Err(crate::error::type_error(
+                        "mappingproxy() missing required argument 'mapping' (pos 1)",
+                    )),
+                }
+            }
+            mappingproxy_.dict.borrow_mut().insert(
+                DictKey(Object::from_static("__new__")),
+                Object::Builtin(Rc::new(BuiltinFn {
+                    name: "__new__",
+                    binds_instance: false,
+                    call: Box::new(proxy_new),
+                    call_kw: None,
+                })),
+            );
+            crate::builtins::install_mappingproxy_methods(&mappingproxy_);
+        }
         let dict_keys_ = mk("dict_keys", vec![object_.clone()]);
         let dict_values_ = mk("dict_values", vec![object_.clone()]);
         let dict_items_ = mk("dict_items", vec![object_.clone()]);
@@ -333,6 +392,157 @@ impl BuiltinTypes {
             );
         }
         let simple_namespace_ = mk("SimpleNamespace", vec![object_.clone()]);
+        // CPython's `SimpleNamespace(**kwargs)` constructor: attributes
+        // straight from the keywords (plus an optional mapping/iterable
+        // positional in 3.13). `type(sys.implementation)(**kwargs)` is a
+        // live pattern (test_import.SubinterpImportTests builds interp
+        // configs that way).
+        {
+            use crate::object::BuiltinFn;
+            let build_ns =
+                |args: &[Object], kwargs: &[(String, Object)]| -> Result<Object, RuntimeError> {
+                    // args[0] is the class object.
+                    //
+                    // CPython splits construction: `namespace_new` ignores
+                    // the arguments entirely and `namespace_init` consumes
+                    // them. A subclass overriding only `__init__` (e.g.
+                    // test_capi's `PendingTask(payload)`) therefore never
+                    // routes its constructor args through the mapping
+                    // merge — its own `__init__` gets them. Mirror that:
+                    // when the (user) class carries a Python `__init__`,
+                    // allocate an empty namespace and stand aside.
+                    let init_overridden = match args.first() {
+                        Some(Object::Type(cls)) if !cls.flags.is_builtin => {
+                            matches!(cls.lookup("__init__"), Some(Object::Function(_)))
+                        }
+                        _ => false,
+                    };
+                    if init_overridden {
+                        let dict = Rc::new(RefCell::new(crate::object::DictData::default()));
+                        if let Some(Object::Type(cls)) = args.first() {
+                            let mut pi = crate::types::PyInstance::with_native(
+                                cls.clone(),
+                                Object::SimpleNamespace(dict.clone()),
+                            );
+                            pi.dict = dict;
+                            let inst = Object::Instance(Rc::new(pi));
+                            crate::gc_trace::track(inst.clone());
+                            return Ok(inst);
+                        }
+                    }
+                    if args.len() > 2 {
+                        return Err(crate::error::type_error(
+                            "SimpleNamespace() takes at most 1 positional argument",
+                        ));
+                    }
+                    let dict = Rc::new(RefCell::new(crate::object::DictData::default()));
+                    if let Some(mapping) = args.get(1) {
+                        match mapping {
+                            Object::Dict(m) => {
+                                let entries: Vec<_> = m
+                                    .borrow()
+                                    .iter()
+                                    .map(|(k, v)| (k.clone(), v.clone()))
+                                    .collect();
+                                let mut d = dict.borrow_mut();
+                                for (k, v) in entries {
+                                    d.insert(k, v);
+                                }
+                            }
+                            other => {
+                                // CPython's `namespace_init` runs `PyDict_Update`
+                                // on the positional: any mapping (`keys()` +
+                                // `__getitem__`) or iterable of key/value pairs
+                                // qualifies (test_types test_constructor feeds a
+                                // list of lists and a UserDict).
+                                let interp = crate::builtins::reentrant_interp()?;
+                                let g = interp.builtins_dict();
+                                let tmp = Object::Dict(dict.clone());
+                                interp.dict_merge_from(&tmp, other, &g)?;
+                            }
+                        }
+                    }
+                    {
+                        let mut d = dict.borrow_mut();
+                        for (k, v) in kwargs {
+                            d.insert(DictKey(Object::from_str(k.clone())), v.clone());
+                        }
+                    }
+                    // CPython's `namespace_init` re-checks the merged dict:
+                    // every attribute name must be a string
+                    // (`SimpleNamespace({1: 2})` → TypeError, test_constructor).
+                    for (k, _) in dict.borrow().iter() {
+                        if !matches!(k.0, Object::Str(_) | Object::WStr(_)) {
+                            return Err(crate::error::type_error(format!(
+                                "attribute name must be string, not '{}'",
+                                k.0.type_name()
+                            )));
+                        }
+                    }
+                    let ns = Object::SimpleNamespace(dict.clone());
+                    // Subclass constructor: the instance's `__dict__` *is* the
+                    // namespace dict (CPython allocates `ns_dict` in the
+                    // object struct; `vars(spam)` and plain setattr see the
+                    // same storage — test_subclass / test_replace_subclass).
+                    if let Some(Object::Type(cls)) = args.first() {
+                        if !cls.flags.is_builtin {
+                            let mut pi = crate::types::PyInstance::with_native(cls.clone(), ns);
+                            pi.dict = dict;
+                            let inst = Object::Instance(Rc::new(pi));
+                            crate::gc_trace::track(inst.clone());
+                            return Ok(inst);
+                        }
+                    }
+                    Ok(ns)
+                };
+            let mut ns_dict = simple_namespace_.dict.borrow_mut();
+            ns_dict.insert(
+                DictKey(Object::from_static("__new__")),
+                Object::Builtin(Rc::new(BuiltinFn {
+                    name: "__new__",
+                    binds_instance: false,
+                    call: Box::new(move |args| build_ns(args, &[])),
+                    call_kw: Some(Box::new(build_ns)),
+                })),
+            );
+            // CPython tp_name is "types.SimpleNamespace"; pickle's
+            // save-by-reference needs the module to resolve.
+            ns_dict.insert(
+                DictKey(Object::from_static("__module__")),
+                Object::from_static("types"),
+            );
+            // `__reduce__` (all pickle protocols route here) and
+            // `__replace__` (copy.replace, 3.13) — installed on the type
+            // so subclass instances inherit them through the MRO and
+            // `getattr(cls, '__replace__')` (copy.replace's probe) hits.
+            ns_dict.insert(
+                DictKey(Object::from_static("__reduce__")),
+                Object::Builtin(Rc::new(BuiltinFn {
+                    name: "__reduce__",
+                    binds_instance: true,
+                    call: Box::new(crate::builtins::namespace_reduce),
+                    call_kw: None,
+                })),
+            );
+            ns_dict.insert(
+                DictKey(Object::from_static("__reduce_ex__")),
+                Object::Builtin(Rc::new(BuiltinFn {
+                    name: "__reduce_ex__",
+                    binds_instance: true,
+                    call: Box::new(crate::builtins::namespace_reduce),
+                    call_kw: None,
+                })),
+            );
+            ns_dict.insert(
+                DictKey(Object::from_static("__replace__")),
+                Object::Builtin(Rc::new(BuiltinFn {
+                    name: "__replace__",
+                    binds_instance: true,
+                    call: Box::new(|args| crate::builtins::namespace_replace(args, &[])),
+                    call_kw: Some(Box::new(crate::builtins::namespace_replace)),
+                })),
+            );
+        }
         // PEP 585 / PEP 604 runtime types. The *instances* are
         // namespace-shaped (`Object::SimpleNamespace` carrying
         // `__origin__` / `__args__`), but their reported class must be
@@ -352,6 +562,8 @@ impl BuiltinTypes {
                 Object::from_static("types"),
             );
         }
+        // (Their C tp_doc strings live in `builtin_type_doc` — the
+        // `type.__doc__` getset path; test_pydoc test_union_type.)
         // CPython's `ga_new`: `GenericAlias(origin, args)` — also reached
         // through subclasses (`class SubClass(GenericAlias)`) and
         // `super().__new__(cls, ...)`, and rejects keyword arguments
@@ -480,6 +692,7 @@ impl BuiltinTypes {
         let method_descriptor_ = mk("method_descriptor", vec![object_.clone()]);
         let wrapper_descriptor_ = mk("wrapper_descriptor", vec![object_.clone()]);
         let getset_descriptor_ = mk("getset_descriptor", vec![object_.clone()]);
+        let classmethod_descriptor_ = mk("classmethod_descriptor", vec![object_.clone()]);
         // `super` is a real, subclassable type (`class mysuper(super)`,
         // test_supers). Its instances are ordinary `PyInstance`s carrying
         // `__thisclass__`/`__self__`/`__self_class__`; attribute access is
@@ -498,6 +711,7 @@ impl BuiltinTypes {
         install_gen_name_getsets(&coroutine_, "coroutine");
         install_gen_name_getsets(&async_generator_, "async generator");
         let frame_ = mk("frame", vec![object_.clone()]);
+        install_frame_getsets(&frame_);
         let code_ = mk("code", vec![object_.clone()]);
         // `copy.replace(code, …)` resolves `type(code).__replace__` and
         // calls it unbound with the code object first (RFC 0060 /
@@ -752,6 +966,7 @@ impl BuiltinTypes {
             member_descriptor_,
             method_descriptor_,
             wrapper_descriptor_,
+            classmethod_descriptor_,
             getset_descriptor_,
             super_,
             generator_,
@@ -864,7 +1079,11 @@ impl BuiltinTypes {
         // the final, fully-populated descriptor type dicts.
         install_builtin_descriptor_get(&bt.method_descriptor_);
         install_builtin_descriptor_get(&bt.wrapper_descriptor_);
-        install_builtin_descriptor_get(&bt.builtin_function_);
+        install_classmethod_descriptor_get(&bt.classmethod_descriptor_);
+        // NOT on `builtin_function_or_method`: CPython's PyCFunction type
+        // has no `tp_descr_get` — a bound builtin stored as a class attr
+        // (`__call__ = ''.join`) is used as-is, never re-bound (test_inspect
+        // test_signature_on_callable_objects [BuiltinMethodType]).
         bt
     }
 
@@ -1219,6 +1438,8 @@ fn exc_slot(name: &str, class_name: &str, default: Object) -> Object {
         class_name: class_name.to_owned(),
         default: Some(default),
         readonly: false,
+        doc: None,
+        objclass: crate::sync::RefCell::new(None),
     }))
 }
 
@@ -1231,6 +1452,8 @@ fn exc_slot_readonly(name: &str, class_name: &str, default: Object) -> Object {
         class_name: class_name.to_owned(),
         default: Some(default),
         readonly: true,
+        doc: None,
+        objclass: crate::sync::RefCell::new(None),
     }))
 }
 
@@ -1723,15 +1946,22 @@ pub(crate) fn overrides_dunder_init(cls: &Rc<TypeObject>) -> bool {
     false
 }
 
-/// A fresh `Object::StaticMethod(Builtin "__new__")` wrapping [`object_new`].
-/// Each call returns a *distinct* object so `int.__new__ is object.__new__`
+/// A fresh `Object::Builtin("__new__")` wrapping [`object_new`]. Each
+/// call returns a *distinct* object so `int.__new__ is object.__new__`
 /// is `False` (matching CPython) while the instantiation path still treats it
 /// as the default allocator (it keys on the builtin's `"__new__"` name).
+/// Stored *raw*, not `StaticMethod`-wrapped: CPython's type dicts hold
+/// the bare `PyCFunction` (`vars(object)['__new__']` is
+/// `<built-in method __new__ …>`, and pydoc's allmethods diffs it
+/// against `getattr(cls, '__new__')` by equality — test_pydoc
+/// test_allmethods). `binds_instance: false` keeps instance reads
+/// unbound, which is the staticmethod-like half CPython gets from
+/// `PyCFunction` simply not being a descriptor.
 fn make_default_new() -> Object {
     use crate::object::BuiltinFn;
-    Object::StaticMethod(MethodWrapper::new(Object::Builtin(Rc::new(BuiltinFn {
+    let obj = Object::Builtin(Rc::new(BuiltinFn {
         name: "__new__",
-        binds_instance: true,
+        binds_instance: false,
         call: Box::new(object_new),
         // CPython's `object.__new__(cls, *args, **kwargs)` ignores excess
         // arguments when `cls` overrides `__init__` but not `__new__`
@@ -1764,7 +1994,14 @@ fn make_default_new() -> Object {
             }
             object_new(&args[..args.len().min(1)])
         })),
-    }))))
+    }));
+    crate::descr_registry::mark_default_new(&obj);
+    // CPython `object.__new__`'s clinic string — `inspect.signature(
+    // C.__new__, follow_wrapped=False)` on a plain class parses it to
+    // `(*args, **kwargs)` (test_inspect test_signature_on_class_with_
+    // wrapped_init [descriptor]).
+    crate::descr_registry::register_text_signature(&obj, "($type, *args, **kwargs)");
+    obj
 }
 
 /// `module.__init__(self, name, doc=None)` — CPython's `module_init`.
@@ -1790,10 +2027,10 @@ fn install_gen_name_getsets(ty: &Rc<TypeObject>, kind: &'static str) {
         }
     }
     fn get_name(args: &[Object]) -> Result<Object, RuntimeError> {
-        Ok(Object::from_str(gen_of(args)?.name.borrow().clone()))
+        Ok(gen_of(args)?.name.borrow().clone())
     }
     fn get_qualname(args: &[Object]) -> Result<Object, RuntimeError> {
-        Ok(Object::from_str(gen_of(args)?.qualname.borrow().clone()))
+        Ok(gen_of(args)?.qualname.borrow().clone())
     }
     let docs = [
         (
@@ -1838,6 +2075,51 @@ fn install_gen_name_getsets(ty: &Rc<TypeObject>, kind: &'static str) {
 /// `self` is dropped from a constructor signature). Without the
 /// type-level slot that lookup misses and every class signature keeps a
 /// spurious `self`.
+/// CPython's frame type exposes `f_locals` as a `tp_getset` entry —
+/// `type(frame).f_locals` is a `getset_descriptor`
+/// (`inspect.isgetsetdescriptor` in test_inspect
+/// test_excluding_predicates). Instance reads are served by the native
+/// `Object::Frame` attribute fast path; the descriptor's own getter
+/// routes back through the current interpreter for parity.
+fn install_frame_getsets(frame_: &Rc<TypeObject>) {
+    use crate::object::{BuiltinFn, PyProperty};
+    fn get_f_locals(args: &[Object]) -> Result<Object, RuntimeError> {
+        if let Some(Object::Frame(f)) = args.first() {
+            if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                // SAFETY: builtin getters only run on the interpreter
+                // thread that owns the pointer, under the GIL.
+                let vm = unsafe { &mut *ptr };
+                return vm.frame_locals_view(f.clone());
+            }
+        }
+        Err(crate::error::type_error(
+            "descriptor 'f_locals' for 'frame' objects doesn't apply",
+        ))
+    }
+    let prop = Object::Property(Rc::new(PyProperty::new(
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "f_locals",
+            binds_instance: true,
+            call: Box::new(get_f_locals),
+            call_kw: None,
+        })),
+        Object::None,
+        Object::None,
+        Object::None,
+    )));
+    crate::descr_registry::register(
+        &prop,
+        crate::descr_registry::DescrKind::GetSet,
+        frame_.clone(),
+        "f_locals",
+        None,
+    );
+    frame_
+        .dict
+        .borrow_mut()
+        .insert(DictKey(Object::from_static("f_locals")), prop);
+}
+
 fn install_function_methods(function_: &Rc<TypeObject>) {
     let get = crate::builtins::function_get_builtin();
     crate::descr_registry::register(
@@ -1851,6 +2133,61 @@ fn install_function_methods(function_: &Rc<TypeObject>) {
         .dict
         .borrow_mut()
         .insert(DictKey(Object::from_static("__get__")), get);
+    // CPython's function type also exposes its attributes as *type-dict
+    // descriptors*: `__code__` is a `tp_getset` entry (getset_descriptor)
+    // and `__globals__` a `tp_members` one (member_descriptor). Class-level
+    // access must resolve — `Lib/types.py` literally derives the
+    // descriptor types from them (`GetSetDescriptorType =
+    // type(FunctionType.__code__)`), and `importlib.reload(types)`
+    // re-executes that file verbatim (test_api's ReloadTests). Instance
+    // reads never reach these: the native `Object::Function` attribute
+    // fast path serves `f.__code__` first.
+    fn get_code(args: &[Object]) -> Result<Object, RuntimeError> {
+        match args.first() {
+            Some(Object::Function(f)) => Ok(Object::Code(f.code())),
+            _ => Err(crate::error::type_error(
+                "descriptor '__code__' for 'function' objects doesn't apply",
+            )),
+        }
+    }
+    fn get_globals(args: &[Object]) -> Result<Object, RuntimeError> {
+        match args.first() {
+            Some(Object::Function(f)) => Ok(Object::Dict(f.globals.clone())),
+            _ => Err(crate::error::type_error(
+                "descriptor '__globals__' for 'function' objects doesn't apply",
+            )),
+        }
+    }
+    use crate::object::{BuiltinFn, PyProperty};
+    for (attr, f, kind) in [
+        (
+            "__code__",
+            get_code as fn(&[Object]) -> Result<Object, RuntimeError>,
+            crate::descr_registry::DescrKind::GetSet,
+        ),
+        (
+            "__globals__",
+            get_globals,
+            crate::descr_registry::DescrKind::Member,
+        ),
+    ] {
+        let prop = Object::Property(Rc::new(PyProperty::new(
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: attr,
+                binds_instance: true,
+                call: Box::new(f),
+                call_kw: None,
+            })),
+            Object::None,
+            Object::None,
+            Object::None,
+        )));
+        crate::descr_registry::register(&prop, kind, function_.clone(), attr, None);
+        function_
+            .dict
+            .borrow_mut()
+            .insert(DictKey(Object::from_static(attr)), prop);
+    }
 }
 
 /// Expose `__get__` on a native-callable *type* dict (see
@@ -1862,6 +2199,53 @@ fn install_builtin_descriptor_get(ty: &Rc<TypeObject>) {
         name: "__get__",
         binds_instance: true,
         call: Box::new(crate::builtins::builtin_descriptor_get),
+        call_kw: None,
+    }));
+    crate::descr_registry::register(
+        &get,
+        crate::descr_registry::DescrKind::Method,
+        ty.clone(),
+        "__get__",
+        None,
+    );
+    ty.dict
+        .borrow_mut()
+        .insert(DictKey(Object::from_static("__get__")), get);
+}
+
+/// `classmethod_descriptor.__get__(obj, owner)` — CPython's
+/// `classmethod_get`: binds the wrapped C function to the *owner class*
+/// (or `type(obj)` when only an instance is given), never to the
+/// instance itself (`dict.__dict__['fromkeys'].__get__(None, dict)` is
+/// the bound `dict.fromkeys`).
+fn install_classmethod_descriptor_get(ty: &Rc<TypeObject>) {
+    use crate::object::BuiltinFn;
+    fn cmd_get(args: &[Object]) -> Result<Object, RuntimeError> {
+        let descr = args
+            .first()
+            .cloned()
+            .ok_or_else(|| crate::error::type_error("__get__() missing descriptor"))?;
+        let inner = match &descr {
+            Object::ClassMethod(w) => w.func(),
+            other => other.clone(),
+        };
+        let obj = args.get(1).cloned().unwrap_or(Object::None);
+        let owner = args.get(2).cloned().unwrap_or(Object::None);
+        let target = match (&obj, &owner) {
+            (Object::None, Object::None) => {
+                return Err(crate::error::type_error("__get__(None, None) is invalid"))
+            }
+            (_, o @ Object::Type(_)) => o.clone(),
+            _ => Object::Type(crate::builtins::class_of(&obj)),
+        };
+        Ok(Object::BoundMethod(Rc::new(
+            crate::object::BoundMethod::new(target, inner),
+        )))
+    }
+    let get = Object::Builtin(Rc::new(BuiltinFn {
+        name: "__get__",
+        binds_instance: true,
+        call: Box::new(cmd_get),
         call_kw: None,
     }));
     crate::descr_registry::register(
@@ -2136,7 +2520,10 @@ fn install_module_methods(module_: &Rc<TypeObject>) {
             // this thread; the GIL keeps access exclusive.
             let interp = unsafe { &mut *ptr };
             let repr = (|| {
-                let m = interp.import_path_internal("importlib._bootstrap")?;
+                // The frozen name: `importlib._bootstrap` is only a
+                // sys.modules alias minted by `importlib/__init__` and may
+                // not exist yet.
+                let m = interp.import_path_internal("_frozen_importlib")?;
                 let f = interp.load_attr_public(&m, "_module_repr")?;
                 interp.call_object(f, &[this.clone()], &[])
             })();
@@ -2449,7 +2836,9 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
             call_kw: None,
         })),
     );
-    dict.insert(DictKey(Object::from_static("__new__")), make_default_new());
+    let object_new_obj = make_default_new();
+    register_new_metadata(&object_new_obj, object_);
+    dict.insert(DictKey(Object::from_static("__new__")), object_new_obj);
     dict.insert(
         DictKey(Object::from_static("__init__")),
         Object::Builtin(Rc::new(BuiltinFn {
@@ -2899,6 +3288,16 @@ pub fn install_type_dunders(type_: &Rc<TypeObject>) {
                 "descriptor '__bases__' for 'type' objects doesn't apply to other objects",
             ));
         };
+        // gh-132176: `type()` called with a tuple-*subclass* bases object
+        // keeps that object in `tp_bases` unchanged, so
+        // `type(typ.__bases__)` reports the subclass.
+        if let Some(orig) = ty
+            .dict
+            .borrow()
+            .get(&DictKey(Object::from_static("__weavepy_bases_obj__")))
+        {
+            return Ok(orig.clone());
+        }
         Ok(Object::new_tuple(
             ty.bases
                 .borrow()
@@ -3312,6 +3711,8 @@ fn install_os_error_init(os_error: &Rc<TypeObject>) {
             class_name: "OSError".to_owned(),
             default: None,
             readonly: false,
+            doc: None,
+            objclass: crate::sync::RefCell::new(None),
         })),
     );
 }
@@ -3775,6 +4176,12 @@ fn exc_str(args: &[Object]) -> Result<Object, RuntimeError> {
                     [single] => {
                         if is_key_error {
                             Object::from_str(single.repr())
+                        } else if matches!(single, Object::Str(_) | Object::WStr(_)) {
+                            // `str(args[0])` of a str IS args[0] — round-
+                            // tripping through a Rust String would mangle
+                            // lone surrogates (test_getargs's surrogate
+                            // keyword message).
+                            single.clone()
                         } else if matches!(single, Object::Instance(_) | Object::Foreign(_)) {
                             // A nested exception, other instance, or a
                             // *foreign* extension object (e.g. a numpy
@@ -4955,11 +5362,29 @@ fn install_value_type_new(bt: &BuiltinTypes) {
         } else {
             make_default_new()
         };
+        register_new_metadata(&wrapper, ty);
         ty.dict
             .borrow_mut()
             .insert(DictKey(Object::from_static("__new__")), wrapper);
     }
     install_mutable_container_init(bt);
+}
+
+/// Descriptor metadata for a per-type default allocator:
+/// `complex.__new__.__qualname__ == 'complex.__new__'` and
+/// `__module__ is None`, as on CPython's tp_new wrappers — pickling a
+/// `partial(cls.__new__, cls, …)` (protocol 2/3 `__getnewargs_ex__`
+/// route) resolves the callable through `builtins.<type>.__new__` by
+/// qualname (pickletester test_complex_newobj_ex).
+fn register_new_metadata(wrapper: &Object, ty: &Rc<TypeObject>) {
+    crate::descr_registry::register(
+        wrapper,
+        crate::descr_registry::DescrKind::StaticBuiltin,
+        ty.clone(),
+        "__new__",
+        None,
+    );
+    crate::descr_registry::set_builtin_module(wrapper, Object::None);
 }
 
 /// Like [`make_default_new`], but the wrapper knows which built-in type it
@@ -4983,9 +5408,11 @@ fn make_owned_new(owner: &'static str) -> Object {
         Ok(())
     }
     let owner2 = owner;
-    Object::StaticMethod(MethodWrapper::new(Object::Builtin(Rc::new(BuiltinFn {
+    // Raw builtin, like `make_default_new` — CPython type dicts hold the
+    // bare `PyCFunction`, never a staticmethod wrapper.
+    let obj = Object::Builtin(Rc::new(BuiltinFn {
         name: "__new__",
-        binds_instance: true,
+        binds_instance: false,
         call: Box::new(move |args| {
             reject_bool(owner, args)?;
             object_new(args)
@@ -5005,7 +5432,14 @@ fn make_owned_new(owner: &'static str) -> Object {
                 "__new__() takes no keyword arguments".to_owned(),
             ))
         })),
-    }))))
+    }));
+    crate::descr_registry::mark_default_new(&obj);
+    // CPython `object.__new__`'s clinic string — `inspect.signature(
+    // C.__new__, follow_wrapped=False)` on a plain class parses it to
+    // `(*args, **kwargs)` (test_inspect test_signature_on_class_with_
+    // wrapped_init [descriptor]).
+    crate::descr_registry::register_text_signature(&obj, "($type, *args, **kwargs)");
+    obj
 }
 
 /// `int.__new__(cls, …, base=…)`: forward the keyword form to the real int

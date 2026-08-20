@@ -650,5 +650,26 @@ pub unsafe extern "C" fn _WeavePy_Format_Set(ty: *mut PyObject, msg: *const c_ch
             _ => None,
         }
     };
+    // CPython's `_PyErr_SetObject` rejects a non-exception class with
+    // SystemError (test_capi.test_exceptions test_format:
+    // `PyErr_Format(list, ...)`); passing it through would raise a
+    // bare `list` "exception" and corrupt the pending-error channel.
+    if let Some(t) = &cls {
+        if !t.mro.borrow().iter().any(|c| c.name == "BaseException") {
+            let msg = format!(
+                "_PyErr_SetObject: exception {} is not a BaseException subclass",
+                t.name
+            );
+            crate::errors::set_pending(
+                Some(
+                    weavepy_vm::builtin_types::builtin_types()
+                        .system_error
+                        .clone(),
+                ),
+                Object::from_str(msg),
+            );
+            return;
+        }
+    }
     crate::errors::set_pending(cls, Object::from_str(s));
 }

@@ -134,6 +134,32 @@ static NATIVE_DESCR_ACCESSOR: LazyLock<parking_lot::RwLock<HashSet<usize>>> =
 static SURFACE_ONLY: LazyLock<parking_lot::RwLock<HashSet<usize>>> =
     LazyLock::new(|| parking_lot::RwLock::new(HashSet::new()));
 
+/// The default-allocator `__new__` builtins (`make_default_new` /
+/// `make_owned_new`), by identity. Several *real* constructing builtins
+/// are also named `__new__` (`mappingproxy`, exception groups, struct
+/// sequences…), so the instantiation path cannot key on the name alone
+/// now that the allocators are stored as raw builtins.
+static DEFAULT_NEW: LazyLock<parking_lot::RwLock<HashSet<usize>>> =
+    LazyLock::new(|| parking_lot::RwLock::new(HashSet::new()));
+
+/// Tag `obj` as a default-allocator `__new__` (see [`is_default_new`]).
+pub fn mark_default_new(obj: &Object) {
+    if let Object::Builtin(b) = obj {
+        let k = Rc::as_ptr(b).cast::<()>() as usize;
+        DEFAULT_NEW.write().insert(k);
+    }
+}
+
+/// True when `obj` is one of the default-allocator `__new__` builtins
+/// tagged via [`mark_default_new`].
+pub fn is_default_new(obj: &Object) -> bool {
+    let Object::Builtin(b) = obj else {
+        return false;
+    };
+    let k = Rc::as_ptr(b).cast::<()>() as usize;
+    DEFAULT_NEW.read().contains(&k)
+}
+
 /// Tag `obj` (a builtin placed in a type dict) as introspection-only:
 /// [`TypeObject::lookup`] will skip it during dispatch.
 pub fn mark_surface_only(obj: &Object) {
@@ -237,6 +263,29 @@ pub fn register(
 pub fn lookup(obj: &Object) -> Option<DescrMeta> {
     let k = key(obj)?;
     DESCR_META.with(|m| m.borrow().get(&k).cloned())
+}
+
+thread_local! {
+    /// Per-object `__text_signature__` overrides — Argument-Clinic
+    /// strings attached to descriptors minted at runtime (the
+    /// `_weave_descr.method_descriptor` shim helper), where the static
+    /// name-keyed table in `builtin_text_signature` can't reach.
+    static TEXT_SIGNATURE: RefCell<HashMap<usize, &'static str>> = RefCell::new(HashMap::new());
+}
+
+/// Attach an Argument-Clinic `__text_signature__` string to `obj`.
+pub fn register_text_signature(obj: &Object, sig: &'static str) {
+    if let Some(k) = key(obj) {
+        TEXT_SIGNATURE.with(|m| {
+            m.borrow_mut().insert(k, sig);
+        });
+    }
+}
+
+/// The `__text_signature__` recorded for `obj`, if any.
+pub fn text_signature_of(obj: &Object) -> Option<&'static str> {
+    let k = key(obj)?;
+    TEXT_SIGNATURE.with(|m| m.borrow().get(&k).copied())
 }
 
 /// The CPython descriptor *type* for `obj`, if tagged — used by `class_of`.

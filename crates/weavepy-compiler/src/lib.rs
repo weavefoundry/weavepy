@@ -20,7 +20,7 @@
 //!   peephole optimizer and adaptive specialization produce different
 //!   shapes that we deliberately don't reproduce.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use indexmap::IndexMap;
@@ -31,6 +31,7 @@ use weavepy_parser::ast::{
     Pattern, Stmt, StmtKind, TypeParamKind, UnaryOp, WithItem,
 };
 
+mod ast_opt;
 pub mod bytecode;
 pub mod cpython_code;
 mod mangle;
@@ -41,6 +42,31 @@ pub use bytecode::{
     BINARY_OP_INPLACE_FLAG, COOLDOWN,
 };
 pub use cpython_code::{CpythonCode, Position};
+
+/// CPython compile.c `STACK_USE_GUIDELINE`: literal displays and call
+/// sites with more operands than this compile through accumulator
+/// shapes (append/add/update loops) instead of pushing every operand,
+/// keeping `co_stacksize` O(1) in the source length.
+const STACK_USE_GUIDELINE: usize = 30;
+
+/// Placeholder for an exception-table `depth` that can only be known
+/// after the stream is final: handlers emitted inside an *inlined*
+/// comprehension protect a region whose base stack depth depends on
+/// the surrounding expression. `Compiler::finish` resolves these with
+/// a static stack simulation (`cpython_code::compute_startdepths`),
+/// reading the depth at the region's *start*.
+pub(crate) const HANDLER_DEPTH_SENTINEL: u32 = u32::MAX;
+
+/// Anchored variant: `HANDLER_DEPTH_ANCHOR_FLAG | insn_index` resolves
+/// to the static depth at `insn_index` instead of the region start.
+/// Needed when a covered range begins above its own baseline — a
+/// `with`'s coverage starts at the `__enter__`-result bind (one slot
+/// above the kept `__exit__`), so its depth anchors at the first body
+/// instruction. Instruction indices stay below 2^31; the plain
+/// sentinel (`u32::MAX`) is disjoint because no anchor uses index
+/// `0x7fff_ffff`. Stream-rewriting passes (`compact_stream`) remap the
+/// packed index alongside `start`/`end`/`handler`.
+pub(crate) const HANDLER_DEPTH_ANCHOR_FLAG: u32 = 0x8000_0000;
 
 // ---------- error type ----------
 
@@ -277,6 +303,15 @@ pub struct CodeObject {
     /// surface reports these bytes verbatim instead of re-encoding the
     /// instruction stream, so constructor/replace round-trips are exact.
     pub wire: Option<Box<WireOverrides>>,
+    /// Sorted indices of `JumpBackward` instructions that encode as
+    /// `JUMP_BACKWARD_NO_INTERRUPT` on the CPython wire (RFC 0068).
+    /// CPython emits JUMP_NO_INTERRUPT for every synthetic scope-exit
+    /// jump (exception-handler exits, `with`-suppress exits, cold-block
+    /// rejoins); the distinction only becomes visible when the edge
+    /// ends up backward. The VM executes both identically (the
+    /// eval-breaker poll is not observable here), so this is pure
+    /// wire/dis metadata.
+    pub no_interrupt_jumps: Vec<u32>,
 }
 
 /// Raw CPython-3.13 wire fields pinned on a [`CodeObject`] by the
@@ -498,7 +533,12 @@ pub enum Constant {
     /// `compile()` of a caller-built `ast.Constant` (or the `in (…)`
     /// peephole, matching CPython's frozenset conversion).
     FrozenSet(Vec<Constant>),
-    Code(Box<CodeObject>),
+    /// Shared (`Arc`, matching the VM's `Object::Code` handle) so
+    /// materialising `co_consts` hands out the *same* code object on
+    /// every access — dis/inspect compare nested code objects by
+    /// identity (test_dis builds its expected Instruction lists from
+    /// `outer.__code__.co_consts[1]`).
+    Code(std::sync::Arc<CodeObject>),
     Ellipsis,
     /// A `co_consts` slot holding a value the constant pool cannot
     /// represent (a live type, a set of types, …), produced only by
@@ -644,7 +684,7 @@ pub struct CompileOptions {
 
 /// The per-compilation parameters shared by a top-level compiler and
 /// every nested scope it spawns.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct CompileParams {
     future_annotations: bool,
     optimize: u8,
@@ -652,6 +692,20 @@ struct CompileParams {
     /// stamped onto every produced code object.
     future_flags: u32,
     allow_top_level_await: bool,
+    /// Names bound by an `import`/`from-import` in the *module* scope
+    /// (CPython symtable `DEF_IMPORT` on `st_top`). The method-call
+    /// optimization refuses an attribute base that is import-originated
+    /// (`maybe_optimize_method_call` → `is_import_originated`), so
+    /// `os.getcwd()` compiles as `LOAD_GLOBAL os; PUSH_NULL; …`, not as
+    /// a flagged method load.
+    module_imports: Rc<HashSet<String>>,
+    /// `True` when the name `super` appears *directly* in the module
+    /// scope (CPython `can_optimize_super_call`'s shadowing check:
+    /// `_PyST_GetScope(c->c_st->st_top, "super") != 0`). Any
+    /// module-level mention — read or store, including in decorators,
+    /// defaults and class bases, which evaluate in module scope —
+    /// disables the `LOAD_SUPER_ATTR` lowering module-wide.
+    module_mentions_super: bool,
 }
 
 // ---------- public entry point ----------
@@ -733,7 +787,274 @@ fn make_params(module: &Module, opts: CompileOptions) -> CompileParams {
         optimize: opts.optimize,
         future_flags,
         allow_top_level_await: opts.flags & flags::PYCF_ALLOW_TOP_LEVEL_AWAIT != 0,
+        module_imports: Rc::new(collect_module_imports(&module.body)),
+        module_mentions_super: module_mentions_super(&module.body),
     }
+}
+
+/// Names bound by `import` / `from-import` statements in the module
+/// scope, including those nested in `if`/`try`/`for`/`while`/`with`
+/// blocks (same symtable scope) but not inside `def`/`class` bodies
+/// (their own scopes). Mirrors CPython symtable's `DEF_IMPORT` flags
+/// on the top-level scope, as consulted by `is_import_originated`.
+fn collect_module_imports(body: &[Stmt]) -> HashSet<String> {
+    fn walk(body: &[Stmt], out: &mut HashSet<String>) {
+        for stmt in body {
+            match &stmt.kind {
+                StmtKind::Import(aliases) => {
+                    for a in aliases {
+                        match &a.asname {
+                            Some(n) => {
+                                out.insert(n.clone());
+                            }
+                            // `import a.b.c` binds the first segment.
+                            None => {
+                                let first = a.name.split('.').next().unwrap_or(&a.name);
+                                out.insert(first.to_owned());
+                            }
+                        }
+                    }
+                }
+                StmtKind::ImportFrom { names, .. } => {
+                    for a in names {
+                        if a.name == "*" {
+                            continue;
+                        }
+                        out.insert(a.asname.clone().unwrap_or_else(|| a.name.clone()));
+                    }
+                }
+                StmtKind::If { body, orelse, .. }
+                | StmtKind::While { body, orelse, .. }
+                | StmtKind::For { body, orelse, .. }
+                | StmtKind::AsyncFor { body, orelse, .. } => {
+                    walk(body, out);
+                    walk(orelse, out);
+                }
+                StmtKind::Try {
+                    body,
+                    handlers,
+                    orelse,
+                    finalbody,
+                } => {
+                    walk(body, out);
+                    for h in handlers {
+                        walk(&h.body, out);
+                    }
+                    walk(orelse, out);
+                    walk(finalbody, out);
+                }
+                StmtKind::With { body, .. } | StmtKind::AsyncWith { body, .. } => walk(body, out),
+                StmtKind::Match { cases, .. } => {
+                    for case in cases {
+                        walk(&case.body, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = HashSet::new();
+    walk(body, &mut out);
+    out
+}
+
+/// `True` when the name `super` appears *directly* in the module scope
+/// (any read, store or import binding). Mirrors the module-level half
+/// of CPython's `can_optimize_super_call` shadowing check: the module
+/// symtable owns names used in module-level statements — including
+/// decorators, argument defaults/annotations and class bases, which
+/// evaluate in module scope — but *not* names inside nested function,
+/// class or lambda bodies (their own symtable scopes).
+fn module_mentions_super(body: &[Stmt]) -> bool {
+    fn in_expr(e: &Expr) -> bool {
+        match &e.kind {
+            ExprKind::Name(n) => n == "super",
+            ExprKind::Constant(_) => false,
+            ExprKind::Attribute { value, .. } | ExprKind::Starred(value) => in_expr(value),
+            ExprKind::Subscript { value, slice } => in_expr(value) || in_expr(slice),
+            ExprKind::Slice { lower, upper, step } => [lower, upper, step]
+                .into_iter()
+                .flatten()
+                .any(|x| in_expr(x)),
+            ExprKind::BinOp { left, right, .. } => in_expr(left) || in_expr(right),
+            ExprKind::BoolOp { values, .. } => values.iter().any(in_expr),
+            ExprKind::UnaryOp { operand, .. } => in_expr(operand),
+            ExprKind::Compare {
+                left, comparators, ..
+            } => in_expr(left) || comparators.iter().any(in_expr),
+            ExprKind::IfExp { test, body, orelse } => {
+                in_expr(test) || in_expr(body) || in_expr(orelse)
+            }
+            ExprKind::NamedExpr { target, value } => in_expr(target) || in_expr(value),
+            // Lambda bodies are their own symtable scope; only the
+            // defaults evaluate (and are recorded) in this scope.
+            ExprKind::Lambda { args, .. } | ExprKind::TypeParamFn { args, .. } => {
+                args.defaults.iter().any(in_expr) || args.kw_defaults.iter().flatten().any(in_expr)
+            }
+            ExprKind::Call {
+                func,
+                args,
+                keywords,
+            } => {
+                in_expr(func)
+                    || args.iter().any(in_expr)
+                    || keywords.iter().any(|k| in_expr(&k.value))
+            }
+            ExprKind::Tuple(items) | ExprKind::List(items) | ExprKind::Set(items) => {
+                items.iter().any(in_expr)
+            }
+            ExprKind::Dict { keys, values } => {
+                keys.iter().flatten().any(in_expr) || values.iter().any(in_expr)
+            }
+            // PEP 709: list/set/dict comprehensions are inlined into
+            // the enclosing scope in 3.13, so all their names count.
+            ExprKind::ListComp { elt, generators } | ExprKind::SetComp { elt, generators } => {
+                in_expr(elt) || generators.iter().any(in_comp)
+            }
+            ExprKind::DictComp {
+                key,
+                value,
+                generators,
+            } => in_expr(key) || in_expr(value) || generators.iter().any(in_comp),
+            // Generator expressions stay a separate scope; only the
+            // first (eagerly evaluated) iterable belongs here.
+            ExprKind::GeneratorExp { generators, .. } => {
+                generators.first().is_some_and(|g| in_expr(&g.iter))
+            }
+            ExprKind::Yield(v) => v.as_deref().is_some_and(in_expr),
+            ExprKind::YieldFrom(v) | ExprKind::Await(v) => in_expr(v),
+            ExprKind::JoinedStr(parts) => parts.iter().any(in_expr),
+            ExprKind::FormattedValue {
+                value, format_spec, ..
+            } => in_expr(value) || format_spec.as_deref().is_some_and(in_expr),
+        }
+    }
+    fn in_comp(g: &Comprehension) -> bool {
+        in_expr(&g.target) || in_expr(&g.iter) || g.ifs.iter().any(in_expr)
+    }
+    fn in_args_outer(args: &AstArguments) -> bool {
+        // Defaults and annotations evaluate in the enclosing scope.
+        args.defaults.iter().any(in_expr)
+            || args.kw_defaults.iter().flatten().any(in_expr)
+            || args
+                .posonlyargs
+                .iter()
+                .chain(&args.args)
+                .chain(&args.kwonlyargs)
+                .chain(&args.vararg)
+                .chain(&args.kwarg)
+                .any(|a| a.annotation.as_deref().is_some_and(in_expr))
+    }
+    fn in_stmt(s: &Stmt) -> bool {
+        match &s.kind {
+            // Nested function/class bodies are separate scopes; their
+            // decorators, defaults, annotations and bases are ours.
+            StmtKind::FunctionDef {
+                args,
+                decorator_list,
+                returns,
+                ..
+            }
+            | StmtKind::AsyncFunctionDef {
+                args,
+                decorator_list,
+                returns,
+                ..
+            } => {
+                decorator_list.iter().any(in_expr)
+                    || in_args_outer(args)
+                    || returns.as_deref().is_some_and(in_expr)
+            }
+            StmtKind::ClassDef {
+                bases,
+                keywords,
+                decorator_list,
+                ..
+            } => {
+                decorator_list.iter().any(in_expr)
+                    || bases.iter().any(in_expr)
+                    || keywords.iter().any(|k| in_expr(&k.value))
+            }
+            // The alias value is a lazy PEP 695 annotation scope.
+            StmtKind::TypeAlias { .. } => false,
+            StmtKind::Return(v) => v.as_ref().is_some_and(in_expr),
+            StmtKind::Assign { targets, value } => targets.iter().any(in_expr) || in_expr(value),
+            StmtKind::AugAssign { target, value, .. } => in_expr(target) || in_expr(value),
+            StmtKind::AnnAssign {
+                target,
+                annotation,
+                value,
+                ..
+            } => in_expr(target) || in_expr(annotation) || value.as_ref().is_some_and(in_expr),
+            StmtKind::If { test, body, orelse } | StmtKind::While { test, body, orelse } => {
+                in_expr(test) || body.iter().any(in_stmt) || orelse.iter().any(in_stmt)
+            }
+            StmtKind::For {
+                target,
+                iter,
+                body,
+                orelse,
+            }
+            | StmtKind::AsyncFor {
+                target,
+                iter,
+                body,
+                orelse,
+            } => {
+                in_expr(target)
+                    || in_expr(iter)
+                    || body.iter().any(in_stmt)
+                    || orelse.iter().any(in_stmt)
+            }
+            StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            } => {
+                body.iter().any(in_stmt)
+                    || handlers.iter().any(|h| {
+                        h.type_.as_ref().is_some_and(in_expr)
+                            || h.name.as_deref() == Some("super")
+                            || h.body.iter().any(in_stmt)
+                    })
+                    || orelse.iter().any(in_stmt)
+                    || finalbody.iter().any(in_stmt)
+            }
+            StmtKind::Raise { exc, cause } => {
+                exc.as_ref().is_some_and(in_expr) || cause.as_ref().is_some_and(in_expr)
+            }
+            StmtKind::With { items, body } | StmtKind::AsyncWith { items, body } => {
+                items.iter().any(|it| {
+                    in_expr(&it.context_expr) || it.optional_vars.as_ref().is_some_and(in_expr)
+                }) || body.iter().any(in_stmt)
+            }
+            StmtKind::Import(aliases) => aliases.iter().any(|a| {
+                a.asname.as_deref() == Some("super")
+                    || (a.asname.is_none() && a.name.split('.').next() == Some("super"))
+            }),
+            StmtKind::ImportFrom { names, .. } => aliases_bind_super(names),
+            StmtKind::Global(names) | StmtKind::Nonlocal(names) => {
+                names.iter().any(|n| n == "super")
+            }
+            StmtKind::Match { subject, cases } => {
+                in_expr(subject)
+                    || cases.iter().any(|c| {
+                        c.guard.as_ref().is_some_and(in_expr) || c.body.iter().any(in_stmt)
+                    })
+            }
+            StmtKind::Expr(e) => in_expr(e),
+            StmtKind::Delete(targets) => targets.iter().any(in_expr),
+            StmtKind::Assert { test, msg } => in_expr(test) || msg.as_ref().is_some_and(in_expr),
+            StmtKind::Pass | StmtKind::Break | StmtKind::Continue => false,
+        }
+    }
+    fn aliases_bind_super(names: &[weavepy_parser::ast::Alias]) -> bool {
+        names
+            .iter()
+            .any(|a| a.asname.as_deref().unwrap_or(&a.name) == "super")
+    }
+    body.iter().any(in_stmt)
 }
 
 /// PEP 695 `type` statements arrive first-class from the parser (so
@@ -875,6 +1196,9 @@ pub fn compile_module_with_options(
     let params = make_params(module, opts);
     let _pep563 = Pep563Guard::install(params.future_annotations);
     validate::validate_module(module, source, params.future_annotations)?;
+    let mut folded = module.clone();
+    ast_opt::fold_module(&mut folded, params.future_annotations);
+    let module = &folded;
     let line_index = LineIndex::new(source);
     let mut top = Compiler::new(
         "<module>".to_owned(),
@@ -913,6 +1237,9 @@ pub fn compile_interactive_with_options(
     let params = make_params(module, opts);
     let _pep563 = Pep563Guard::install(params.future_annotations);
     validate::validate_module(module, source, params.future_annotations)?;
+    let mut folded = module.clone();
+    ast_opt::fold_module(&mut folded, params.future_annotations);
+    let module = &folded;
     let line_index = LineIndex::new(source);
     let mut top = Compiler::new(
         "<module>".to_owned(),
@@ -982,6 +1309,9 @@ pub fn compile_eval_with_options(
     let params = make_params(module, opts);
     let _pep563 = Pep563Guard::install(params.future_annotations);
     validate::validate_module(module, source, params.future_annotations)?;
+    let mut folded = module.clone();
+    ast_opt::fold_module(&mut folded, params.future_annotations);
+    let module = &folded;
     let line_index = LineIndex::new(source);
     let mut top = Compiler::new(
         "<module>".to_owned(),
@@ -1121,16 +1451,6 @@ struct Compiler {
     /// Monotonic counter for synthetic locals used by chained
     /// comparisons (`.chain0`, `.chain1`, …).
     chain_counter: u32,
-    /// Monotonic counter for synthetic `with`-statement locals.
-    with_counter: u32,
-    /// Current `with`/`async with` nesting depth — keys the synthetic
-    /// `.with_cm`/`.with_exit`/`.aexit` fast-local slots so sibling
-    /// blocks share a slot (CPython value-stack parity; see
-    /// `compile_with`).
-    with_depth: u32,
-    /// Monotonic counter for synthetic locals used by `return` inside
-    /// `try/finally` to preserve the value across the finally body.
-    finally_counter: u32,
     /// Monotonic id stamped on every [`FinallyFrame`] when it is pushed.
     /// Used to associate a return/break/continue-path *inline copy* of a
     /// finally body with the specific `try`/`with` it belongs to.
@@ -1176,6 +1496,25 @@ struct Compiler {
     /// preceding instruction's line (CPython's `propagate_line_numbers`
     /// result), so threading eligibility needs this side channel.
     synthetic_jumps: HashSet<u32>,
+    /// Rejoin jumps synthesized by [`Self::push_cold_blocks_to_end`]
+    /// (a moved cold block's fallthrough edge made explicit). CPython
+    /// creates these *after* `label_exception_targets`, so they carry
+    /// no exception coverage — the PEP 479 epilogue's complement
+    /// coverage must skip them.
+    cold_rejoins: HashSet<u32>,
+    /// Jumps CPython emits as `JUMP_NO_INTERRUPT` (synthetic scope
+    /// exits: handler exits, `with`-suppress exits). When such a jump
+    /// ends up backward on the wire it encodes as
+    /// `JUMP_BACKWARD_NO_INTERRUPT`; forward it's indistinguishable
+    /// from `JUMP_FORWARD`. Copied into
+    /// [`CodeObject::no_interrupt_jumps`] by [`Self::finish`].
+    no_interrupt_jumps: HashSet<u32>,
+    /// Nesting depth of PEP 709 *inlined* comprehension emission.
+    /// While > 0, `compile_comp_body` skips the `.0`-argument dance at
+    /// generator depth 0 (the caller pushed the ready iterator) and
+    /// registers its exception handlers with
+    /// [`HANDLER_DEPTH_SENTINEL`] depths for `finish` to resolve.
+    inline_comp: u32,
     /// Number of *live exception values* sitting on the operand stack at
     /// the current compile point: a `finally` body (or the unmatched
     /// re-raise path of a `try/except`) runs with the propagating
@@ -1190,6 +1529,13 @@ struct Compiler {
     /// `break`/`continue` jumping out of a handler must POP_EXCEPT
     /// the levels they exit.
     handler_depth: u32,
+    /// Number of pending return values on the operand stack at the
+    /// current compile point: while `return` inlines its `finally`
+    /// bodies, the value being returned stays on the stack under them.
+    /// A `break`/`continue` inside such an inline abandons the return
+    /// and must POP_TOP the pending value(s)
+    /// (test_grammar.test_break_in_finally_after_return).
+    pending_retvals: u32,
     /// `True` for methods compiled inside a class body. Such methods
     /// implicitly capture the class's `__class__` cell so `super()`
     /// works without arguments.
@@ -1303,6 +1649,12 @@ struct LoopFrame {
     /// EXCEPTION_HANDLER fblock (`for … try: 1/0 finally: continue`,
     /// test_grammar.test_continue_in_finally).
     exc_on_stack_at_entry: u32,
+    /// `pending_retvals` when the loop was entered. `break`/`continue`
+    /// from inside a `finally` body inlined on a *return path* must
+    /// discard the pending return value(s) sitting on the operand
+    /// stack under the loop's frame (the return is abandoned —
+    /// test_grammar.test_break_in_finally_after_return).
+    pending_retvals_at_entry: u32,
 }
 
 /// One pending `finally` clause. We hold the AST so `return`,
@@ -1312,32 +1664,24 @@ enum FinallyKind {
     /// Body of a `finally:` clause; emitted by re-compiling the
     /// statements at the non-normal exit site.
     Stmts(Vec<Stmt>),
-    /// Synthetic frame for a `with` block: emit
-    /// `<exit_local>(None, None, None)` directly using the stored
-    /// fast-local index that holds the *bound* `__exit__` captured by
-    /// `BEFORE_WITH`. CPython looks `__exit__` up once (special lookup,
-    /// bypassing instance `__getattribute__`) and reuses the bound
-    /// method on every exit path; re-deriving it via `LoadAttr` would
-    /// route through `__getattribute__` (test_descr
+    /// Synthetic frame for a `with` block. The *bound* `__exit__`
+    /// captured by `BEFORE_WITH` lives on the operand stack for the
+    /// whole body (CPython 3.13's SETUP_WITH discipline): the inline
+    /// emits `TOS(None, None, None)` — swapping a preserved return
+    /// value out of the way first. CPython looks `__exit__` up once
+    /// (special lookup, bypassing instance `__getattribute__`) and
+    /// reuses the bound method on every exit path (test_descr
     /// test_special_method_lookup).
     /// `line`/`span` carry the `with` statement's own location: the
     /// inlined `__exit__` call is stamped with it (CPython's L3 exit
     /// block re-reports the `with` line when e.g. a `break` leaves the
     /// body — test_sys_settrace test_early_exit_with).
-    WithExit {
-        exit_idx: u32,
-        line: u32,
-        span: (u32, u32),
-    },
+    WithExit { line: u32, span: (u32, u32) },
     /// Synthetic frame for an `async with` block: emit
-    /// `await <aexit_local>(None, None, None)`. Mirrors `WithExit`
-    /// but awaits the `__aexit__` coroutine, so a `return`/`break`/
-    /// `continue` out of an `async with` body still runs the exit.
-    AsyncWithExit {
-        aexit_idx: u32,
-        line: u32,
-        span: (u32, u32),
-    },
+    /// `await TOS(None, None, None)`. Mirrors `WithExit` but awaits
+    /// the `__aexit__` coroutine, so a `return`/`break`/`continue`
+    /// out of an `async with` body still runs the exit.
+    AsyncWithExit { line: u32, span: (u32, u32) },
 }
 
 struct FinallyFrame {
@@ -1360,6 +1704,18 @@ struct FinallyFrame {
     /// `pickle.load`'s `except _Stop: return stopinst.value` relies on
     /// this to release the unpickled graph immediately).
     pop_except_after: bool,
+    /// `exc_on_stack` when this frame was pushed. `break`/`continue`
+    /// unwinding interleaves exception-region pops with frame inlines
+    /// in recency order: regions *newer* than a frame sit above its
+    /// stack state (notably a with's on-stack `__exit__`) and must be
+    /// drained before the frame's inline runs.
+    exc_at_push: u32,
+    /// `handler_depth` when this frame was pushed (same interleaving,
+    /// for enclosing `except`-handler bodies' saved-prev slots).
+    handler_at_push: u32,
+    /// `pending_retvals` when this frame was pushed (same
+    /// interleaving, for pending return values).
+    rv_at_push: u32,
 }
 
 impl Compiler {
@@ -1391,9 +1747,6 @@ impl Compiler {
             loop_stack: Vec::new(),
             finally_stack: Vec::new(),
             chain_counter: 0,
-            with_counter: 0,
-            with_depth: 0,
-            finally_counter: 0,
             next_finally_id: 0,
             finally_holes: Vec::new(),
             line_index,
@@ -1402,7 +1755,11 @@ impl Compiler {
             pinned_colspan: ColSpan::default(),
             current_span: (0, 0),
             synthetic_jumps: HashSet::new(),
+            cold_rejoins: HashSet::new(),
+            no_interrupt_jumps: HashSet::new(),
+            inline_comp: 0,
             exc_on_stack: 0,
+            pending_retvals: 0,
             handler_depth: 0,
             inside_class_body: false,
             annotations_initialized: false,
@@ -1485,6 +1842,13 @@ impl Compiler {
     }
 
     fn finish(mut self) -> CodeObject {
+        // CPython's `optimize_basic_block` folds branches on constant
+        // conditions and constant tuple builds before any jump surgery
+        // (`if 0:` bodies then die as unreachable code below; function
+        // default tuples become a single constant).
+        self.fold_const_branches();
+        self.fold_const_pops();
+        self.fold_const_tuples();
         // Always terminate the code object with an implicit `return None`,
         // matching CPython's "fall off the end of the function" shape.
         //
@@ -1519,7 +1883,10 @@ impl Compiler {
             let ins = self.co.instructions[i as usize];
             let (is_cond, target) = match ins.op {
                 OpCode::JumpForward => (false, i + 1 + ins.arg),
-                OpCode::PopJumpIfFalse | OpCode::PopJumpIfTrue => (true, i + 1 + ins.arg),
+                OpCode::PopJumpIfFalse
+                | OpCode::PopJumpIfTrue
+                | OpCode::PopJumpIfNone
+                | OpCode::PopJumpIfNotNone => (true, i + 1 + ins.arg),
                 _ => continue,
             };
             let site_line = self.co.linetable[i as usize];
@@ -1560,7 +1927,11 @@ impl Compiler {
         // ends on its *last target's* line, not the statement head
         // (test_trace_unpack_long_sequence).
         self.emit_no_line(OpCode::LoadConst, none_idx);
-        self.emit_no_line(OpCode::ReturnValue, 0);
+        // arg 1: the implicit `return None` is CPython's RETURN_CONST
+        // (the wire encoder fuses only codegen-origin constant returns;
+        // an optimizer-produced LOAD_CONST + RETURN_VALUE pair stays
+        // split, as in 3.13 — test_compile test_consts_in_conditionals).
+        self.emit_no_line(OpCode::ReturnValue, 1);
         // A synthetic no-location run directly before the epilogue
         // (the class-body tail: `__static_attributes__` /
         // `__classcell__` stores, emitted with `line_pinned = 0`)
@@ -1594,9 +1965,11 @@ impl Compiler {
             for i in 0..tail_start {
                 let ins = self.co.instructions[i as usize];
                 let target = match ins.op {
-                    OpCode::JumpForward | OpCode::PopJumpIfFalse | OpCode::PopJumpIfTrue => {
-                        i + 1 + ins.arg
-                    }
+                    OpCode::JumpForward
+                    | OpCode::PopJumpIfFalse
+                    | OpCode::PopJumpIfTrue
+                    | OpCode::PopJumpIfNone
+                    | OpCode::PopJumpIfNotNone => i + 1 + ins.arg,
                     OpCode::JumpBackward => (i + 1).saturating_sub(ins.arg),
                     _ => continue,
                 };
@@ -1653,7 +2026,11 @@ impl Compiler {
                 let ins = self.co.instructions[i as usize];
                 matches!(
                     ins.op,
-                    OpCode::JumpForward | OpCode::PopJumpIfFalse | OpCode::PopJumpIfTrue
+                    OpCode::JumpForward
+                        | OpCode::PopJumpIfFalse
+                        | OpCode::PopJumpIfTrue
+                        | OpCode::PopJumpIfNone
+                        | OpCode::PopJumpIfNotNone
                 ) && resolve(&self.co, self.co.linetable[i as usize], i + 1 + ins.arg) == tail_start
             })
             .collect();
@@ -1669,6 +2046,40 @@ impl Compiler {
                 );
             }
         }
+        // Jump targets and handler entries: block heads the location
+        // walk-back below must not cross (multi-predecessor joins —
+        // CPython's `propagate_line_numbers` only flows a location into
+        // a single-predecessor successor, so a NO_LOCATION join like
+        // the except* PREP_RERAISE_STAR epilogue stays location-free
+        // rather than borrowing whatever path was emitted last).
+        let mut block_head = vec![false; self.co.instructions.len() + 1];
+        for (i, ins) in self.co.instructions.iter().enumerate() {
+            let from = i as u32 + 1;
+            match ins.op {
+                OpCode::JumpForward
+                | OpCode::PopJumpIfFalse
+                | OpCode::PopJumpIfTrue
+                | OpCode::PopJumpIfNone
+                | OpCode::PopJumpIfNotNone
+                | OpCode::ForIter
+                | OpCode::Send => {
+                    if let Some(b) = block_head.get_mut((from + ins.arg) as usize) {
+                        *b = true;
+                    }
+                }
+                OpCode::JumpBackward => {
+                    if let Some(b) = block_head.get_mut(from.saturating_sub(ins.arg) as usize) {
+                        *b = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        for h in &self.co.exception_table {
+            if let Some(b) = block_head.get_mut(h.handler as usize) {
+                *b = true;
+            }
+        }
         for site in jump_sites {
             let mut line = self.co.linetable[site as usize];
             let mut col = self.co.coltable[site as usize];
@@ -1677,12 +2088,28 @@ impl Compiler {
             // block's last located instruction, as CPython's
             // `propagate_line_numbers` + exit-line guarantee would —
             // the `'return'` event reports the handler body's line,
-            // never `None`.
+            // never `None`. The walk stays within the fallthrough
+            // chain: it stops at multi-predecessor block heads and at
+            // instructions that end the fallthrough (returns, raises,
+            // unconditional jumps), where CPython would not propagate.
             if line == 0 {
                 for k in (0..site).rev() {
+                    if matches!(
+                        self.co.instructions[k as usize].op,
+                        OpCode::JumpForward
+                            | OpCode::JumpBackward
+                            | OpCode::ReturnValue
+                            | OpCode::RaiseVarargs
+                            | OpCode::Reraise
+                    ) {
+                        break;
+                    }
                     if self.co.linetable[k as usize] != 0 {
                         line = self.co.linetable[k as usize];
                         col = self.co.coltable[k as usize];
+                        break;
+                    }
+                    if block_head[k as usize] {
                         break;
                     }
                 }
@@ -1704,6 +2131,125 @@ impl Compiler {
             if self.co.linetable[j] == 0 && j > 0 {
                 self.co.linetable[j] = self.co.linetable[j - 1];
                 self.co.coltable[j] = self.co.coltable[j - 1];
+            }
+        }
+        // CPython's `basicblock_inline_small_or_no_lineno_blocks`
+        // copies a small scope-exiting target block into each
+        // unconditional-jump predecessor. The flat-stream equivalent
+        // handled here is the single-instruction case: an unconditional
+        // jump straight at a RETURN_VALUE becomes that return, keeping
+        // the *return's* location (the inlined copy carries its own
+        // loc, as CPython's copy does) — test_peepholer's
+        // test_elim_jump_to_return.
+        {
+            let n = self.co.instructions.len() as u32;
+            for i in 0..n as usize {
+                let ins = self.co.instructions[i];
+                let target = match ins.op {
+                    OpCode::JumpForward => i as u32 + 1 + ins.arg,
+                    OpCode::JumpBackward => (i as u32 + 1).saturating_sub(ins.arg),
+                    _ => continue,
+                };
+                if target < n && self.co.instructions[target as usize].op == OpCode::ReturnValue {
+                    self.co.instructions[i] = Instruction {
+                        op: OpCode::ReturnValue,
+                        // Keep the RETURN_CONST-fusability tag of the
+                        // duplicated return (arg 1 = codegen-origin
+                        // constant return; see `StmtKind::Return`).
+                        arg: self.co.instructions[target as usize].arg,
+                    };
+                    self.co.linetable[i] = self.co.linetable[target as usize];
+                    self.co.coltable[i] = self.co.coltable[target as usize];
+                }
+            }
+        }
+        // Literal pack-then-unpack becomes direct stack shuffling.
+        self.optimize_pack_unpack();
+        // …and remaining SWAPs over plain stores/pops are applied
+        // statically by reordering the consumers.
+        self.apply_static_swaps();
+        // CPython flowgraph `inline_small_or_no_lineno_blocks` (the
+        // small-exit-block half): an unconditional jump to a block of
+        // ≤ MAX_COPY_SIZE instructions that exits the scope is replaced
+        // by a copy of the block — a `with`'s normal-exit and swallow
+        // paths each fall into their own copy of the statement tail
+        // (test_dis test_disassemble_with).
+        self.inline_small_exit_blocks();
+        // CPython's flowgraph removes unreachable basic blocks
+        // entirely (`remove_unreachable` + `eliminate_empty_basic_blocks`),
+        // so dead code after a return/raise or an unconditional jump
+        // never survives into co_code (test_peepholer's
+        // test_elim_jump_after_return1 asserts the absence of the dead
+        // loop back-edge). Compact the flat stream accordingly.
+        self.eliminate_unreachable();
+        // Conditional jumps must not land on unconditional back edges.
+        self.normalize_backward_conditionals();
+        // Normalisation retargets the conditional through a fresh
+        // trampoline; if that conditional was the *only* way into the
+        // original back edge (`if …: break` as the loop body's last
+        // statement), the old edge is now dead — CPython re-runs
+        // `remove_unreachable` after jump normalisation for the same
+        // reason (test_dis's jumpy has no stray JUMP_BACKWARD after
+        // the break's JUMP_FORWARD).
+        self.eliminate_unreachable();
+        // CPython `push_cold_blocks_to_end`: exception-only-reachable
+        // blocks (handlers, send-dance CLEANUP_THROW tails) move to
+        // the stream tail in original order, with explicit rejoin
+        // jumps for severed fallthrough edges.
+        self.push_cold_blocks_to_end();
+        // Drop NOPs whose line a same-block neighbour covers, then NOP
+        // out jumps whose target is the next instruction and repeat —
+        // CPython's `remove_redundant_nops_and_jumps` fixpoint
+        // (test_compile's test_false_while_loop: `while False: pass`
+        // must compile to just RESUME; RETURN_CONST).
+        loop {
+            self.remove_redundant_nops();
+            if !self.remove_jumps_to_next() {
+                break;
+            }
+        }
+        // Finally, prune constants nothing loads any more (CPython's
+        // `remove_unused_consts` — folded branches and inlined returns
+        // leave orphans behind, and test_dis indexes co_consts).
+        self.remove_unused_consts();
+        // Canonicalize `co_cellvars` to CPython's localsplus-slot order:
+        // cells aliasing a local (escaping parameters) come first, in
+        // varname order (they share the parameter's slot), then the
+        // rest alphabetically (symtable `dictbytype` sorts cell names;
+        // non-aliased cells take slots after the plain locals in that
+        // order). Emission used promotion order — remap every emitted
+        // cell index. Keeping the internal order equal to slot order
+        // makes the RFC 0068 wire codec's deref mapping invertible.
+        if self.co.cellvars.len() > 1 {
+            let mut sorted: Vec<String> = self.co.cellvars.clone();
+            sorted.sort_unstable_by_key(|c| match self.co.varnames.iter().position(|v| v == c) {
+                Some(p) => (0usize, p, String::new()),
+                None => (1usize, 0, c.clone()),
+            });
+            if sorted != self.co.cellvars {
+                let remap: Vec<u32> = self
+                    .co
+                    .cellvars
+                    .iter()
+                    .map(|n| sorted.iter().position(|s| s == n).unwrap() as u32)
+                    .collect();
+                let ncells = self.co.cellvars.len() as u32;
+                for ins in self.co.instructions.iter_mut() {
+                    if matches!(
+                        ins.op,
+                        OpCode::LoadDeref
+                            | OpCode::StoreDeref
+                            | OpCode::DeleteDeref
+                            | OpCode::LoadClosure
+                            | OpCode::MakeCell
+                            | OpCode::LoadClassderef
+                            | OpCode::LoadClassdictOrDeref
+                    ) && ins.arg < ncells
+                    {
+                        ins.arg = remap[ins.arg as usize];
+                    }
+                }
+                self.co.cellvars = sorted;
             }
         }
         // Place freevars at the end of the cells/freevars combined
@@ -1740,11 +2286,1864 @@ impl Compiler {
             }
         }
         self.co.freevars = self.free_order.clone();
+        // CPython flowgraph `duplicate_exits_without_lineno`: a shared
+        // location-free exit/eval-break block (e.g. the POP_EXCEPT +
+        // JUMP_BACKWARD continue tail two handlers converge on) is
+        // duplicated per jump predecessor so each copy can take that
+        // path's line in the propagation below.
+        self.duplicate_exits_without_lineno();
+        // CPython flowgraph `propagate_line_numbers`: fill remaining
+        // NO_LOCATION instructions from their basic block's previous
+        // located instruction, seeding single-predecessor successors —
+        // a synthetic loop-continue jump after POP_EXCEPT reports the
+        // handler body's line, never None (test_compile
+        // test_line_number_synthetic_jump_multiple_predecessors*).
+        self.propagate_line_numbers();
+        // CPython's table is a disjoint innermost-wins partition (built
+        // from per-instruction `i_except` pointers); flatten nested
+        // entries the same way — a with-cleanup range wrapping a
+        // send-dance's CLEANUP_THROW entry splits around it.
+        self.partition_exception_table();
+        // PEP 479: the generator-family epilogue handler and its
+        // whole-body complement coverage, plus RESUME depth-1 flags.
+        // Emitted after line propagation — the block is NO_LOCATION
+        // (dis shows `--`), matching CPython's
+        // `wrap_in_stopiteration_handler`.
+        self.emit_stopiteration_epilogue();
+        // Resolve sentinel exception depths (inlined-comprehension
+        // handlers) now that offsets are final: the handler's depth is
+        // the static stack depth at its protected region's start.
+        if self
+            .co
+            .exception_table
+            .iter()
+            .any(|h| h.depth & HANDLER_DEPTH_ANCHOR_FLAG != 0)
+        {
+            let depths = crate::cpython_code::compute_startdepths(&self.co);
+            for h in self.co.exception_table.iter_mut() {
+                if h.depth & HANDLER_DEPTH_ANCHOR_FLAG != 0 {
+                    let at = if h.depth == HANDLER_DEPTH_SENTINEL {
+                        h.start
+                    } else {
+                        h.depth & !HANDLER_DEPTH_ANCHOR_FLAG
+                    };
+                    let d = depths.get(at as usize).copied().unwrap_or(-1);
+                    h.depth = u32::try_from(d).unwrap_or(0);
+                }
+            }
+        }
+        // Drop entries whose covered range contains only NOPs — they can
+        // never fire, and CPython's table omits them (a `return <const>`
+        // try-body reduces to a lone located NOP: test_dis
+        // test_disassemble_try_finally, _tryfinallyconst). Runs *after*
+        // sentinel resolution: the dropped entry may have been the seed
+        // that gave its (now-dead) handler block a static depth.
+        {
+            let instrs = &self.co.instructions;
+            self.co.exception_table.retain(|h| {
+                instrs
+                    .get(h.start as usize..(h.end as usize).min(instrs.len()))
+                    .is_none_or(|r| r.iter().any(|i| i.op != OpCode::Nop))
+            });
+        }
+        // CPython emits the table in instruction order (it scans the
+        // assembled stream); dis prints it verbatim.
+        self.co.exception_table.sort_by_key(|h| (h.start, h.end));
+        // Wire metadata: which backward jumps encode as
+        // JUMP_BACKWARD_NO_INTERRUPT (see field docs).
+        let mut noint: Vec<u32> = self
+            .no_interrupt_jumps
+            .iter()
+            .copied()
+            .filter(|&s| {
+                self.co
+                    .instructions
+                    .get(s as usize)
+                    .is_some_and(|i| i.op == OpCode::JumpBackward)
+            })
+            .collect();
+        noint.sort_unstable();
+        self.co.no_interrupt_jumps = noint;
         // RFC 0021: size the inline-cache side-table to match the
         // emitted instruction stream so the VM can index into it
         // without bounds checks on the hot path.
         self.co.caches.resize(self.co.instructions.len());
         self.co
+    }
+
+    /// Flatten the exception table into a disjoint innermost-wins
+    /// partition. Emission pushes *nested* ranges (a with/finally
+    /// cleanup covering a whole handler region that itself contains a
+    /// send-dance CLEANUP_THROW entry); CPython's assembled table has
+    /// one owner per instruction, with outer ranges split around inner
+    /// ones. Plain depth sentinels are converted to anchored form
+    /// first so a split half doesn't re-resolve at its own (shifted)
+    /// start.
+    fn partition_exception_table(&mut self) {
+        let n = self.co.instructions.len();
+        if self.co.exception_table.len() < 2 || n == 0 {
+            return;
+        }
+        for h in self.co.exception_table.iter_mut() {
+            if h.depth == HANDLER_DEPTH_SENTINEL {
+                h.depth = HANDLER_DEPTH_ANCHOR_FLAG | h.start;
+            }
+        }
+        // owner[i] = index of the innermost (smallest-span) entry
+        // covering instruction i.
+        let mut owner: Vec<Option<usize>> = vec![None; n];
+        for (idx, h) in self.co.exception_table.iter().enumerate() {
+            let span = h.end.saturating_sub(h.start);
+            for k in h.start..h.end.min(n as u32) {
+                let slot = &mut owner[k as usize];
+                let replace = match slot {
+                    None => true,
+                    Some(prev) => {
+                        let p = &self.co.exception_table[*prev];
+                        span < p.end.saturating_sub(p.start)
+                    }
+                };
+                if replace {
+                    *slot = Some(idx);
+                }
+            }
+        }
+        let old = std::mem::take(&mut self.co.exception_table);
+        let mut i = 0usize;
+        while i < n {
+            let Some(o) = owner[i] else {
+                i += 1;
+                continue;
+            };
+            let s = i;
+            while i < n && owner[i] == Some(o) {
+                i += 1;
+            }
+            let h = &old[o];
+            self.co.exception_table.push(ExcHandler {
+                start: s as u32,
+                end: i as u32,
+                handler: h.handler,
+                depth: h.depth,
+                push_lasti: h.push_lasti,
+            });
+        }
+    }
+
+    /// Port of CPython flowgraph.c `duplicate_exits_without_lineno`,
+    /// over the flat stream. A basic block whose instructions are all
+    /// NO_LOCATION and which exits the scope (return/raise/reraise) or
+    /// ends in an eval-break back edge (JUMP_BACKWARD) cannot take a
+    /// single meaningful line when several branches converge on it —
+    /// CPython clones it per jump predecessor and lets
+    /// `propagate_line_numbers` give each copy its path's line
+    /// (test_compile test_line_number_synthetic_jump_* nested shapes).
+    /// Copies are appended to the stream tail with their exception
+    /// coverage replicated.
+    fn duplicate_exits_without_lineno(&mut self) {
+        // WeavePy's handler-exit codegen shares unwind tails between
+        // paths (CPython's codegen inlines the POP_EXCEPT chain per
+        // path), so one duplication round can expose another shared
+        // tail — iterate to a fixpoint (bounded: each round strictly
+        // reduces multi-predecessor location-free exits).
+        for _ in 0..20 {
+            if !self.duplicate_exits_without_lineno_once() {
+                break;
+            }
+        }
+    }
+
+    fn duplicate_exits_without_lineno_once(&mut self) -> bool {
+        let n = self.co.instructions.len();
+        if n == 0 {
+            return false;
+        }
+        let insns = &self.co.instructions;
+        let jump_target = |i: usize| -> Option<usize> {
+            let ins = insns[i];
+            let from = i + 1;
+            match ins.op {
+                OpCode::JumpForward
+                | OpCode::PopJumpIfFalse
+                | OpCode::PopJumpIfTrue
+                | OpCode::PopJumpIfNone
+                | OpCode::PopJumpIfNotNone
+                | OpCode::ForIter
+                | OpCode::Send => Some(from + ins.arg as usize),
+                OpCode::JumpBackward => Some(from.saturating_sub(ins.arg as usize)),
+                _ => None,
+            }
+        };
+        let no_fallthrough = |i: usize| {
+            matches!(
+                insns[i].op,
+                OpCode::JumpForward
+                    | OpCode::JumpBackward
+                    | OpCode::ReturnValue
+                    | OpCode::RaiseVarargs
+                    | OpCode::Reraise
+            )
+        };
+        let mut leader = vec![false; n];
+        leader[0] = true;
+        for h in &self.co.exception_table {
+            if (h.handler as usize) < n {
+                leader[h.handler as usize] = true;
+            }
+        }
+        for i in 0..n {
+            if let Some(t) = jump_target(i) {
+                if t < n {
+                    leader[t] = true;
+                }
+            }
+            if (jump_target(i).is_some() || no_fallthrough(i)) && i + 1 < n {
+                leader[i + 1] = true;
+            }
+        }
+        // Block extent and candidacy per leader.
+        let block_end = |start: usize| -> usize {
+            let mut e = start;
+            while e + 1 < n && !leader[e + 1] {
+                e += 1;
+            }
+            e
+        };
+        // Jump predecessor sites and whether a fallthrough edge exists,
+        // per target leader.
+        let mut jump_preds: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut has_fallthrough_pred = vec![false; n];
+        for i in 0..n {
+            if let Some(t) = jump_target(i) {
+                if t < n && leader[t] {
+                    jump_preds.entry(t).or_default().push(i);
+                }
+            }
+            if i + 1 < n && leader[i + 1] && !no_fallthrough(i) {
+                has_fallthrough_pred[i + 1] = true;
+            }
+        }
+        let candidates: Vec<usize> = (0..n)
+            .filter(|&t| {
+                if !leader[t] {
+                    return false;
+                }
+                let e = block_end(t);
+                // All instructions location-free…
+                (t..=e).all(|k| self.co.linetable[k] == 0)
+                    // …and the block exits scope, polls the eval
+                    // breaker, or is a bare connector hopping to one
+                    // (a shared POP_EXCEPT unwind tail).
+                    && matches!(
+                        self.co.instructions[e].op,
+                        OpCode::ReturnValue
+                            | OpCode::RaiseVarargs
+                            | OpCode::Reraise
+                            | OpCode::JumpBackward
+                            | OpCode::JumpForward
+                    )
+            })
+            .collect();
+        let mut changed = false;
+        for t in candidates {
+            let e = block_end(t);
+            let Some(preds) = jump_preds.get(&t) else {
+                continue;
+            };
+            // Only unconditional and conditional *jump* predecessors can
+            // be retargeted; keep one edge on the original (the
+            // fallthrough when present, else the last jump).
+            let total_edges = preds.len() + usize::from(has_fallthrough_pred[t]);
+            if total_edges < 2 {
+                continue;
+            }
+            let mut may_duplicate = total_edges - 1;
+            for &p in preds {
+                if may_duplicate == 0 {
+                    break;
+                }
+                may_duplicate -= 1;
+                changed = true;
+                let copy_start = self.co.instructions.len();
+                for k in t..=e {
+                    let mut ins = self.co.instructions[k];
+                    if matches!(ins.op, OpCode::JumpBackward | OpCode::JumpForward) {
+                        // Re-anchor the copied jump from its new offset
+                        // (the copy sits at the stream tail, so a
+                        // forward hop to an earlier block flips to a
+                        // backward jump).
+                        let orig_target = if ins.op == OpCode::JumpBackward {
+                            (k + 1) - ins.arg as usize
+                        } else {
+                            k + 1 + ins.arg as usize
+                        };
+                        let new_pos = copy_start + (k - t);
+                        if orig_target > new_pos {
+                            ins.op = OpCode::JumpForward;
+                            ins.arg = (orig_target - (new_pos + 1)) as u32;
+                        } else {
+                            ins.op = OpCode::JumpBackward;
+                            ins.arg = (new_pos + 1 - orig_target) as u32;
+                        }
+                    }
+                    self.co.instructions.push(ins);
+                    self.co.linetable.push(0);
+                    self.co.coltable.push(ColSpan::default());
+                }
+                let copy_end = self.co.instructions.len() as u32;
+                // Replicate exception coverage (innermost-first order is
+                // preserved: appended ranges are disjoint from all
+                // existing ones).
+                let covering: Vec<ExcHandler> = self
+                    .co
+                    .exception_table
+                    .iter()
+                    .filter(|h| (h.start as usize) <= t && e < h.end as usize)
+                    .copied()
+                    .collect();
+                for h in covering {
+                    self.co.exception_table.push(ExcHandler {
+                        start: copy_start as u32,
+                        end: copy_end,
+                        ..h
+                    });
+                }
+                self.retarget_jump(p, copy_start);
+            }
+        }
+        changed
+    }
+
+    /// Point the jump at `site` to `target`, switching between
+    /// JUMP_FORWARD and JUMP_BACKWARD when the direction flips
+    /// (conditional jumps are forward-only and keep their op).
+    fn retarget_jump(&mut self, site: usize, target: usize) {
+        let from = site + 1;
+        let ins = &mut self.co.instructions[site];
+        match ins.op {
+            OpCode::JumpForward | OpCode::JumpBackward => {
+                if target >= from {
+                    ins.op = OpCode::JumpForward;
+                    ins.arg = (target - from) as u32;
+                } else {
+                    ins.op = OpCode::JumpBackward;
+                    ins.arg = (from - target) as u32;
+                }
+            }
+            _ => {
+                debug_assert!(target >= from);
+                ins.arg = (target - from) as u32;
+            }
+        }
+    }
+
+    /// Port of CPython flowgraph.c `propagate_line_numbers`, over the
+    /// flat stream. Within each basic block a NO_LOCATION instruction
+    /// (linetable slot 0) inherits the previous located instruction's
+    /// location. At block end, the running location seeds the successor
+    /// block's first instruction when that block has exactly one
+    /// incoming normal edge (exception-handler entries have none, so
+    /// CPython's cleanup runs — PUSH_EXC_INFO / COPY / POP_EXCEPT /
+    /// RERAISE tails — stay location-free, exactly as 3.13's do).
+    fn propagate_line_numbers(&mut self) {
+        // A seed can flow backwards in stream order (a duplicated tail
+        // at the end of the stream seeding an earlier block), so run
+        // the block walk to a fixpoint.
+        for _ in 0..10 {
+            if !self.propagate_line_numbers_once() {
+                break;
+            }
+        }
+    }
+
+    fn propagate_line_numbers_once(&mut self) -> bool {
+        let n = self.co.instructions.len();
+        if n == 0 {
+            return false;
+        }
+        let mut changed = false;
+        let jump_target = |i: usize| -> Option<usize> {
+            let ins = self.co.instructions[i];
+            let from = i + 1;
+            match ins.op {
+                OpCode::JumpForward
+                | OpCode::PopJumpIfFalse
+                | OpCode::PopJumpIfTrue
+                | OpCode::PopJumpIfNone
+                | OpCode::PopJumpIfNotNone
+                | OpCode::ForIter
+                | OpCode::Send => Some(from + ins.arg as usize),
+                OpCode::JumpBackward => Some(from.saturating_sub(ins.arg as usize)),
+                _ => None,
+            }
+        };
+        let no_fallthrough = |i: usize| {
+            matches!(
+                self.co.instructions[i].op,
+                OpCode::JumpForward
+                    | OpCode::JumpBackward
+                    | OpCode::ReturnValue
+                    | OpCode::RaiseVarargs
+                    | OpCode::Reraise
+            )
+        };
+        // Block leaders: entry, jump targets, exception-handler entries,
+        // and every instruction after a jump or scope exit.
+        let mut leader = vec![false; n];
+        leader[0] = true;
+        for h in &self.co.exception_table {
+            if (h.handler as usize) < n {
+                leader[h.handler as usize] = true;
+            }
+        }
+        for i in 0..n {
+            if let Some(t) = jump_target(i) {
+                if t < n {
+                    leader[t] = true;
+                }
+            }
+            if (jump_target(i).is_some() || no_fallthrough(i)) && i + 1 < n {
+                leader[i + 1] = true;
+            }
+        }
+        // Incoming normal-edge counts per leader (CPython's
+        // b_predecessors: fallthrough + jump edges; exception edges
+        // don't count).
+        let mut preds = vec![0u32; n];
+        for i in 0..n {
+            if let Some(t) = jump_target(i) {
+                if t < n {
+                    preds[t] += 1;
+                }
+            }
+            if i + 1 < n && leader[i + 1] && !no_fallthrough(i) {
+                preds[i + 1] += 1;
+            }
+        }
+        // Walk blocks in stream order, filling and seeding as CPython
+        // does (seeds cascade into later blocks).
+        let mut i = 0usize;
+        while i < n {
+            debug_assert!(leader[i]);
+            let mut prev_line = 0u32;
+            let mut prev_col = ColSpan::default();
+            let mut end = i;
+            loop {
+                if self.co.linetable[end] == 0 {
+                    if prev_line != 0 {
+                        self.co.linetable[end] = prev_line;
+                        self.co.coltable[end] = prev_col;
+                        changed = true;
+                    }
+                } else {
+                    prev_line = self.co.linetable[end];
+                    prev_col = self.co.coltable[end];
+                }
+                if end + 1 >= n || leader[end + 1] {
+                    break;
+                }
+                end += 1;
+            }
+            if prev_line != 0 {
+                // Seed the fallthrough successor.
+                if !no_fallthrough(end)
+                    && end + 1 < n
+                    && preds[end + 1] == 1
+                    && self.co.linetable[end + 1] == 0
+                {
+                    self.co.linetable[end + 1] = prev_line;
+                    self.co.coltable[end + 1] = prev_col;
+                    changed = true;
+                }
+                // Seed the jump target.
+                if let Some(t) = jump_target(end) {
+                    if t < n && preds[t] == 1 && self.co.linetable[t] == 0 {
+                        self.co.linetable[t] = prev_line;
+                        self.co.coltable[t] = prev_col;
+                        changed = true;
+                    }
+                }
+            }
+            i = end + 1;
+        }
+        changed
+    }
+
+    /// Drop instructions no execution path can reach, remapping every
+    /// relative jump displacement, the exception table, and the
+    /// line/column tables. Successors are the fallthrough (except
+    /// after returns/raises/unconditional jumps), jump targets, and —
+    /// once any instruction in a protected range is reachable — that
+    /// range's exception handler (iterated to a fixpoint, since a
+    /// handler body can itself be protected by another handler).
+    fn eliminate_unreachable(&mut self) {
+        let n = self.co.instructions.len();
+        if n == 0 {
+            return;
+        }
+        let mut reachable = vec![false; n];
+        let mut stack: Vec<u32> = vec![0];
+        let mut handler_seen = vec![false; self.co.exception_table.len()];
+        loop {
+            while let Some(i) = stack.pop() {
+                let i = i as usize;
+                if i >= n || reachable[i] {
+                    continue;
+                }
+                reachable[i] = true;
+                let ins = self.co.instructions[i];
+                let from = i as u32 + 1;
+                match ins.op {
+                    OpCode::ReturnValue | OpCode::RaiseVarargs | OpCode::Reraise => {}
+                    OpCode::JumpForward => stack.push(from + ins.arg),
+                    OpCode::JumpBackward => stack.push(from.saturating_sub(ins.arg)),
+                    OpCode::PopJumpIfFalse
+                    | OpCode::PopJumpIfTrue
+                    | OpCode::PopJumpIfNone
+                    | OpCode::PopJumpIfNotNone
+                    | OpCode::ForIter
+                    | OpCode::Send => {
+                        stack.push(from + ins.arg);
+                        stack.push(from);
+                    }
+                    _ => stack.push(from),
+                }
+            }
+            let mut changed = false;
+            for (hi, h) in self.co.exception_table.iter().enumerate() {
+                if handler_seen[hi] {
+                    continue;
+                }
+                let lo = h.start as usize;
+                let end = (h.end as usize).min(n);
+                if (lo..end).any(|k| reachable[k]) {
+                    handler_seen[hi] = true;
+                    stack.push(h.handler);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        self.compact_stream(&reachable);
+    }
+
+    /// Drop every instruction whose `keep` slot is false, remapping
+    /// relative jump displacements, `PUSH_EXC_INFO`'s absolute
+    /// body-end tag, the exception table, the line/column tables, and
+    /// the synthetic-jump set. A jump *to* a dropped instruction lands
+    /// on the next kept one.
+    // Index-driven on purpose: one instruction offset indexes the
+    // parallel `keep`/`instructions`/`linetable`/`coltable` arrays.
+    #[allow(clippy::needless_range_loop)]
+    fn compact_stream(&mut self, keep: &[bool]) {
+        let n = self.co.instructions.len();
+        debug_assert_eq!(keep.len(), n);
+        if keep.iter().all(|&r| r) {
+            return;
+        }
+        // new_off[x] = number of kept instructions before x;
+        // n + 1 entries so exclusive range ends map too.
+        let mut new_off = vec![0u32; n + 1];
+        let mut cnt = 0u32;
+        for i in 0..n {
+            new_off[i] = cnt;
+            if keep[i] {
+                cnt += 1;
+            }
+        }
+        new_off[n] = cnt;
+        let mut k = 0usize;
+        for i in 0..n {
+            if keep[i] {
+                self.co.instructions[k] = self.co.instructions[i];
+                self.co.linetable[k] = self.co.linetable[i];
+                self.co.coltable[k] = self.co.coltable[i];
+                k += 1;
+            }
+        }
+        self.co.instructions.truncate(k);
+        self.co.linetable.truncate(k);
+        self.co.coltable.truncate(k);
+        for i in 0..n {
+            if !keep[i] {
+                continue;
+            }
+            let ins = self.co.instructions[new_off[i] as usize];
+            let from_old = i as u32 + 1;
+            // PUSH_EXC_INFO carries an *absolute* offset (the pc just
+            // past its handler body, used to tag the unwinder entry).
+            if ins.op == OpCode::PushExcInfo {
+                self.co.instructions[new_off[i] as usize].arg = new_off[(ins.arg as usize).min(n)];
+                continue;
+            }
+            let (t_old, backward) = match ins.op {
+                OpCode::JumpForward
+                | OpCode::PopJumpIfFalse
+                | OpCode::PopJumpIfTrue
+                | OpCode::PopJumpIfNone
+                | OpCode::PopJumpIfNotNone
+                | OpCode::ForIter
+                | OpCode::Send => (from_old + ins.arg, false),
+                OpCode::JumpBackward => (from_old.saturating_sub(ins.arg), true),
+                _ => continue,
+            };
+            let from_new = new_off[i] + 1;
+            let t_new = new_off[(t_old as usize).min(n)];
+            self.co.instructions[new_off[i] as usize].arg = if backward {
+                from_new - t_new
+            } else {
+                t_new - from_new
+            };
+        }
+        self.co.exception_table.retain_mut(|h| {
+            let lo = h.start as usize;
+            let end = (h.end as usize).min(n);
+            if lo >= end {
+                return false;
+            }
+            let s = new_off[lo];
+            let e = new_off[end];
+            if s == e {
+                return false;
+            }
+            h.start = s;
+            h.end = e;
+            h.handler = new_off[h.handler as usize];
+            if h.depth & HANDLER_DEPTH_ANCHOR_FLAG != 0 && h.depth != HANDLER_DEPTH_SENTINEL {
+                let anchor = (h.depth & !HANDLER_DEPTH_ANCHOR_FLAG) as usize;
+                h.depth = HANDLER_DEPTH_ANCHOR_FLAG | new_off[anchor.min(n)];
+            }
+            true
+        });
+        self.synthetic_jumps = self
+            .synthetic_jumps
+            .iter()
+            .filter(|&&s| (s as usize) < n && keep[s as usize])
+            .map(|&s| new_off[s as usize])
+            .collect();
+        self.cold_rejoins = self
+            .cold_rejoins
+            .iter()
+            .filter(|&&s| (s as usize) < n && keep[s as usize])
+            .map(|&s| new_off[s as usize])
+            .collect();
+        self.no_interrupt_jumps = self
+            .no_interrupt_jumps
+            .iter()
+            .filter(|&&s| (s as usize) < n && keep[s as usize])
+            .map(|&s| new_off[s as usize])
+            .collect();
+    }
+
+    /// Jump targets and exception-handler entries: positions a
+    /// same-block peephole scan must not cross.
+    fn block_leaders(&self) -> Vec<bool> {
+        let n = self.co.instructions.len();
+        let mut leader = vec![false; n + 1];
+        for i in 0..n {
+            let ins = self.co.instructions[i];
+            let from = i as u32 + 1;
+            match ins.op {
+                OpCode::JumpForward
+                | OpCode::PopJumpIfFalse
+                | OpCode::PopJumpIfTrue
+                | OpCode::PopJumpIfNone
+                | OpCode::PopJumpIfNotNone
+                | OpCode::ForIter
+                | OpCode::Send => leader[((from + ins.arg) as usize).min(n)] = true,
+                OpCode::JumpBackward => {
+                    leader[(from.saturating_sub(ins.arg) as usize).min(n)] = true;
+                }
+                _ => {}
+            }
+        }
+        for h in &self.co.exception_table {
+            leader[(h.handler as usize).min(n)] = true;
+        }
+        leader
+    }
+
+    /// CPython's `optimize_basic_block`: a conditional jump on a
+    /// constant becomes either a plain jump (branch always taken) or
+    /// nothing (never taken); `if 0:` / `while False:` bodies then die
+    /// as unreachable code (test_compile's test_false_while_loop and
+    /// test_consts_in_conditionals).
+    fn fold_const_branches(&mut self) {
+        let n = self.co.instructions.len();
+        if n == 0 {
+            return;
+        }
+        let leader = self.block_leaders();
+        for i in 1..n {
+            let is_true_jump = match self.co.instructions[i].op {
+                OpCode::PopJumpIfTrue => true,
+                OpCode::PopJumpIfFalse => false,
+                _ => continue,
+            };
+            // A branch that is itself a jump target has predecessors
+            // pushing runtime values; the pop must stay.
+            if leader[i] {
+                continue;
+            }
+            // CPython's `optimize_load_const` also sees through a
+            // `COPY 1` between the constant load and the branch — the
+            // value-position `and`/`or` shape (`LOAD_CONST; COPY 1;
+            // POP_JUMP_IF_x`). The COPY dies; the LOAD_CONST survives
+            // as the expression's value (test_consts_in_conditionals).
+            let prev_idx = if self.co.instructions[i - 1].op == OpCode::CopyTop
+                && self.co.instructions[i - 1].arg <= 1
+                && !leader[i - 1]
+                && i >= 2
+            {
+                i - 2
+            } else {
+                i - 1
+            };
+            let prev = self.co.instructions[prev_idx];
+            if prev.op != OpCode::LoadConst {
+                continue;
+            }
+            // `Unmarshallable` never occurs here (only via
+            // `code.replace`, after compilation).
+            let truthy = match &self.co.constants[prev.arg as usize] {
+                Constant::None => false,
+                Constant::Bool(b) => *b,
+                Constant::Int(v) => *v != 0,
+                Constant::BigInt(v) => !num_traits::Zero::is_zero(v),
+                Constant::Float(f) => *f != 0.0,
+                Constant::Complex(r, i) => *r != 0.0 || *i != 0.0,
+                Constant::Str(s) => !s.is_empty(),
+                Constant::WStr(p) => !p.is_empty(),
+                Constant::Bytes(b) => !b.is_empty(),
+                Constant::Tuple(t) | Constant::FrozenSet(t) => !t.is_empty(),
+                Constant::Code(_) | Constant::Ellipsis | Constant::Unmarshallable => true,
+            };
+            // Non-copy form: the LOAD_CONST at i-1 dies (the branch
+            // consumed it). Copy form: the COPY at i-1 dies and the
+            // LOAD_CONST at i-2 stays — its value is the expression
+            // result on the taken path, or feed for the fallthrough's
+            // POP_TOP (which the const/pop pair pass then removes).
+            self.co.instructions[i - 1] = Instruction {
+                op: OpCode::Nop,
+                arg: 0,
+            };
+            if truthy == is_true_jump {
+                self.co.instructions[i].op = OpCode::JumpForward;
+            } else {
+                self.co.instructions[i] = Instruction {
+                    op: OpCode::Nop,
+                    arg: 0,
+                };
+            }
+        }
+    }
+
+    /// CPython's `remove_redundant_nops_and_pairs`: a `LOAD_CONST`
+    /// whose value is immediately discarded by a same-block `POP_TOP`
+    /// (only NOPs between) — both die. This is what reduces the
+    /// fallthrough leg of a constant `and`/`or` operand after
+    /// [`Self::fold_const_branches`] neutralised the branch.
+    // Index-driven on purpose: `i` addresses both `leader` and the
+    // mutated `instructions`, and is stored into `prev_load`.
+    #[allow(clippy::needless_range_loop)]
+    fn fold_const_pops(&mut self) {
+        let n = self.co.instructions.len();
+        let leader = self.block_leaders();
+        let mut prev_load: Option<usize> = None;
+        for i in 0..n {
+            if leader[i] {
+                prev_load = None;
+            }
+            match self.co.instructions[i].op {
+                OpCode::LoadConst => prev_load = Some(i),
+                OpCode::Nop => {}
+                OpCode::PopTop => {
+                    if let Some(p) = prev_load.take() {
+                        self.co.instructions[p] = Instruction {
+                            op: OpCode::Nop,
+                            arg: 0,
+                        };
+                        self.co.instructions[i] = Instruction {
+                            op: OpCode::Nop,
+                            arg: 0,
+                        };
+                    }
+                }
+                _ => prev_load = None,
+            }
+        }
+    }
+
+    /// CPython's `fold_tuple_of_constants`: `BUILD_TUPLE n` over `n`
+    /// constant loads collapses to a single tuple constant. Function
+    /// default tuples are the load-bearing case — test_dis indexes
+    /// `outer.__code__.co_consts[1]` expecting the folded shape.
+    fn fold_const_tuples(&mut self) {
+        let n = self.co.instructions.len();
+        let leader = self.block_leaders();
+        for i in 0..n {
+            if self.co.instructions[i].op != OpCode::BuildTuple {
+                continue;
+            }
+            let count = self.co.instructions[i].arg as usize;
+            if count > i {
+                continue;
+            }
+            let start = i - count;
+            if (start..i).any(|k| self.co.instructions[k].op != OpCode::LoadConst)
+                || ((start + 1)..=i).any(|k| leader[k])
+            {
+                continue;
+            }
+            let items: Vec<Constant> = (start..i)
+                .map(|k| self.co.constants[self.co.instructions[k].arg as usize].clone())
+                .collect();
+            let idx = self.co.intern_constant(Constant::Tuple(items));
+            for k in start..i {
+                self.co.instructions[k] = Instruction {
+                    op: OpCode::Nop,
+                    arg: 0,
+                };
+            }
+            self.co.instructions[i] = Instruction {
+                op: OpCode::LoadConst,
+                arg: idx,
+            };
+        }
+    }
+
+    /// CPython's `remove_unused_consts`: drop pool entries nothing
+    /// references, keeping slot 0 (the docstring slot) and renumbering
+    /// every LOAD_CONST.
+    fn remove_unused_consts(&mut self) {
+        let nconsts = self.co.constants.len();
+        if nconsts == 0 {
+            return;
+        }
+        let mut used = vec![false; nconsts];
+        used[0] = true;
+        for ins in &self.co.instructions {
+            if ins.op == OpCode::LoadConst {
+                if let Some(u) = used.get_mut(ins.arg as usize) {
+                    *u = true;
+                }
+            }
+        }
+        if used.iter().all(|&u| u) {
+            return;
+        }
+        let mut remap = vec![0u32; nconsts];
+        let mut kept = Vec::with_capacity(nconsts);
+        for (i, &keep) in used.iter().enumerate() {
+            if keep {
+                remap[i] = kept.len() as u32;
+                kept.push(self.co.constants[i].clone());
+            }
+        }
+        self.co.constants = kept;
+        for ins in self.co.instructions.iter_mut() {
+            if ins.op == OpCode::LoadConst {
+                ins.arg = remap[ins.arg as usize];
+            }
+        }
+    }
+
+    /// CPython's `optimize_basic_block` rewrites a literal pack
+    /// immediately unpacked — `a, b = b, a` — into direct stack
+    /// shuffling: `BUILD_TUPLE 1; UNPACK_SEQUENCE 1` becomes nothing,
+    /// and for 2 or 3 elements the pair becomes a single `SWAP`
+    /// (test_peepholer's test_pack_unpack).
+    fn optimize_pack_unpack(&mut self) {
+        let n = self.co.instructions.len();
+        // CPython's pass runs per basic block: the pair must not be
+        // fused when the UNPACK_SEQUENCE is a jump target or handler
+        // entry — another path reaches it *without* the BUILD_TUPLE
+        // (`a, b = f() if c else (x, y)` merges a one-value branch
+        // into the unpack; fusing corrupted that branch's stack).
+        let mut leader = vec![false; n + 1];
+        for i in 0..n {
+            let ins = self.co.instructions[i];
+            let from = i as u32 + 1;
+            match ins.op {
+                OpCode::JumpForward
+                | OpCode::PopJumpIfFalse
+                | OpCode::PopJumpIfTrue
+                | OpCode::PopJumpIfNone
+                | OpCode::PopJumpIfNotNone
+                | OpCode::ForIter
+                | OpCode::Send => leader[((from + ins.arg) as usize).min(n)] = true,
+                OpCode::JumpBackward => {
+                    leader[(from.saturating_sub(ins.arg) as usize).min(n)] = true;
+                }
+                _ => {}
+            }
+        }
+        for h in &self.co.exception_table {
+            leader[(h.handler as usize).min(n)] = true;
+        }
+        for i in 0..n.saturating_sub(1) {
+            let a = self.co.instructions[i];
+            let b = self.co.instructions[i + 1];
+            if a.op != OpCode::BuildTuple || b.op != OpCode::UnpackSequence || a.arg != b.arg {
+                continue;
+            }
+            if leader[i + 1] {
+                continue;
+            }
+            match a.arg {
+                1 => {
+                    self.co.instructions[i] = Instruction {
+                        op: OpCode::Nop,
+                        arg: 0,
+                    };
+                    self.co.instructions[i + 1] = Instruction {
+                        op: OpCode::Nop,
+                        arg: 0,
+                    };
+                }
+                2 | 3 => {
+                    self.co.instructions[i] = Instruction {
+                        op: OpCode::Nop,
+                        arg: 0,
+                    };
+                    self.co.instructions[i + 1] = Instruction {
+                        op: OpCode::Swap,
+                        arg: a.arg,
+                    };
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// CPython's `apply_static_swaps`: a `SWAP k` whose next `k`
+    /// same-line consumers are plain stores/pops is applied
+    /// *statically* by exchanging the first and k-th consumer
+    /// instructions instead — match statements and unpacking
+    /// assignments compile without any runtime SWAP (test_peepholer's
+    /// test_static_swaps family).
+    fn apply_static_swaps(&mut self) {
+        let n = self.co.instructions.len();
+        // Same-block scans must not cross a jump target or handler entry.
+        let mut leader = vec![false; n + 1];
+        for i in 0..n {
+            let ins = self.co.instructions[i];
+            let from = i as u32 + 1;
+            match ins.op {
+                OpCode::JumpForward
+                | OpCode::PopJumpIfFalse
+                | OpCode::PopJumpIfTrue
+                | OpCode::PopJumpIfNone
+                | OpCode::PopJumpIfNotNone
+                | OpCode::ForIter
+                | OpCode::Send => leader[((from + ins.arg) as usize).min(n)] = true,
+                OpCode::JumpBackward => {
+                    leader[(from.saturating_sub(ins.arg) as usize).min(n)] = true;
+                }
+                _ => {}
+            }
+        }
+        for h in &self.co.exception_table {
+            leader[(h.handler as usize).min(n)] = true;
+        }
+        let swappable = |op: OpCode| matches!(op, OpCode::StoreFast | OpCode::PopTop);
+        let stores_to =
+            |ins: Instruction| -> Option<u32> { (ins.op == OpCode::StoreFast).then_some(ins.arg) };
+        // Next swappable instruction after `i`, skipping NOPs, staying
+        // in-block, and (when `lineno` is a real line) on that line.
+        let next_swappable = |co: &CodeObject, leader: &[bool], mut i: usize, lineno: u32| loop {
+            i += 1;
+            if i >= n || leader[i] {
+                return None;
+            }
+            if lineno != 0 && co.linetable[i] != lineno {
+                return None;
+            }
+            match co.instructions[i].op {
+                OpCode::Nop => {}
+                op if swappable(op) => return Some(i),
+                _ => return None,
+            }
+        };
+        // Right-to-left, as CPython's downward scan: a SWAP chain
+        // (`SWAP 3; SWAP 2; stores…`) resolves the rightmost SWAP
+        // first so the earlier one can see through the fresh NOP.
+        for i in (0..n).rev() {
+            let swap = self.co.instructions[i];
+            if swap.op != OpCode::Swap {
+                continue;
+            }
+            if swap.arg <= 1 {
+                self.co.instructions[i] = Instruction {
+                    op: OpCode::Nop,
+                    arg: 0,
+                };
+                continue;
+            }
+            let Some(j) = next_swappable(&self.co, &leader, i, 0) else {
+                continue;
+            };
+            let lineno = self.co.linetable[j];
+            let mut k = j;
+            let mut ok = true;
+            for _ in 1..swap.arg {
+                match next_swappable(&self.co, &leader, k, lineno) {
+                    Some(nk) => k = nk,
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+            // Reordering two stores to the same local — or hopping a
+            // store over another to the same slot — changes results.
+            let store_j = stores_to(self.co.instructions[j]);
+            let store_k = stores_to(self.co.instructions[k]);
+            if store_j.is_some() || store_k.is_some() {
+                if store_j == store_k {
+                    continue;
+                }
+                if ((j + 1)..k).any(|idx| {
+                    let s = stores_to(self.co.instructions[idx]);
+                    s.is_some() && (s == store_j || s == store_k)
+                }) {
+                    continue;
+                }
+            }
+            self.co.instructions[i] = Instruction {
+                op: OpCode::Nop,
+                arg: 0,
+            };
+            self.co.instructions.swap(j, k);
+            self.co.linetable.swap(j, k);
+            self.co.coltable.swap(j, k);
+        }
+    }
+
+    /// CPython's `normalize_jumps`: a conditional jump that (after
+    /// threading) would land on an eligible unconditional back edge is
+    /// inverted to fall into a fresh `JUMP_BACKWARD` trampoline
+    /// carrying the conditional's own location — runtime conditional
+    /// jumps only encode forward displacements (test_peepholer's
+    /// test_elim_jump_to_uncond_jump4).
+    fn normalize_backward_conditionals(&mut self) {
+        let n = self.co.instructions.len();
+        // (site, final backward target) pairs, in stream order.
+        let mut sites: Vec<(usize, u32)> = Vec::new();
+        for i in 0..n {
+            let ins = self.co.instructions[i];
+            if !matches!(ins.op, OpCode::PopJumpIfFalse | OpCode::PopJumpIfTrue) {
+                continue;
+            }
+            let t = i as u32 + 1 + ins.arg;
+            if (t as usize) >= n {
+                continue;
+            }
+            let tin = self.co.instructions[t as usize];
+            // Same eligibility as jump threading: hop only through a
+            // synthetic (NO_LOCATION) jump or one on the site's line.
+            if tin.op == OpCode::JumpBackward
+                && (self.synthetic_jumps.contains(&t)
+                    || self.co.linetable[t as usize] == self.co.linetable[i])
+            {
+                sites.push((i, (t + 1).saturating_sub(tin.arg)));
+            }
+        }
+        if sites.is_empty() {
+            return;
+        }
+        // new(x) = x + number of trampolines inserted before x.
+        let shift = |x: u32| -> u32 {
+            x + sites.iter().take_while(|&&(s, _)| (s as u32) < x).count() as u32
+        };
+        let mut instructions = Vec::with_capacity(n + sites.len());
+        let mut linetable = Vec::with_capacity(n + sites.len());
+        let mut coltable = Vec::with_capacity(n + sites.len());
+        let mut site_iter = sites.iter().peekable();
+        for i in 0..n {
+            let mut ins = self.co.instructions[i];
+            let from_old = i as u32 + 1;
+            let from_new = shift(i as u32) + 1;
+            if let Some(&&(s, back_target)) = site_iter.peek() {
+                if s == i {
+                    site_iter.next();
+                    // Inverted condition falls past the trampoline
+                    // into the old fallthrough (always displacement 1).
+                    ins.op = if ins.op == OpCode::PopJumpIfFalse {
+                        OpCode::PopJumpIfTrue
+                    } else {
+                        OpCode::PopJumpIfFalse
+                    };
+                    ins.arg = 1;
+                    instructions.push(ins);
+                    linetable.push(self.co.linetable[i]);
+                    coltable.push(self.co.coltable[i]);
+                    // The trampoline takes the conditional's location
+                    // (CPython normalize_jumps_in_block uses last->i_loc).
+                    let p = from_new; // trampoline's new position
+                    let t_new = shift(back_target);
+                    if t_new <= p + 1 {
+                        instructions.push(Instruction {
+                            op: OpCode::JumpBackward,
+                            arg: (p + 1) - t_new,
+                        });
+                    } else {
+                        instructions.push(Instruction {
+                            op: OpCode::JumpForward,
+                            arg: t_new - (p + 1),
+                        });
+                    }
+                    linetable.push(self.co.linetable[i]);
+                    coltable.push(self.co.coltable[i]);
+                    continue;
+                }
+            }
+            match ins.op {
+                OpCode::PushExcInfo => {
+                    ins.arg = shift(ins.arg);
+                }
+                OpCode::JumpForward
+                | OpCode::PopJumpIfFalse
+                | OpCode::PopJumpIfTrue
+                | OpCode::PopJumpIfNone
+                | OpCode::PopJumpIfNotNone
+                | OpCode::ForIter
+                | OpCode::Send => {
+                    ins.arg = shift(from_old + ins.arg) - from_new;
+                }
+                OpCode::JumpBackward => {
+                    ins.arg = from_new - shift(from_old - ins.arg);
+                }
+                _ => {}
+            }
+            instructions.push(ins);
+            linetable.push(self.co.linetable[i]);
+            coltable.push(self.co.coltable[i]);
+        }
+        self.co.instructions = instructions;
+        self.co.linetable = linetable;
+        self.co.coltable = coltable;
+        for h in self.co.exception_table.iter_mut() {
+            h.start = shift(h.start);
+            h.end = shift(h.end);
+            h.handler = shift(h.handler);
+            if h.depth & HANDLER_DEPTH_ANCHOR_FLAG != 0 && h.depth != HANDLER_DEPTH_SENTINEL {
+                h.depth = HANDLER_DEPTH_ANCHOR_FLAG | shift(h.depth & !HANDLER_DEPTH_ANCHOR_FLAG);
+            }
+        }
+        self.synthetic_jumps = self.synthetic_jumps.iter().map(|&s| shift(s)).collect();
+        self.cold_rejoins = self.cold_rejoins.iter().map(|&s| shift(s)).collect();
+        self.no_interrupt_jumps = self.no_interrupt_jumps.iter().map(|&s| shift(s)).collect();
+    }
+
+    /// Port of CPython flowgraph.c `push_cold_blocks_to_end` over the
+    /// flat stream. Blocks unreachable through normal control flow
+    /// (fallthrough + jumps from the entry) are *cold* — they can only
+    /// be entered through the exception table. CPython moves every
+    /// cold block to the end of the function, preserving their
+    /// relative order, and materialises any cold→warm fallthrough
+    /// edge as an explicit `JUMP_NO_INTERRUPT` (a send-dance's
+    /// CLEANUP_THROW rejoining its END_SEND). The synthesized jumps
+    /// are recorded in [`Self::cold_rejoins`]: CPython creates them
+    /// after `label_exception_targets`, so they carry no exception
+    /// coverage.
+    fn push_cold_blocks_to_end(&mut self) {
+        let n = self.co.instructions.len();
+        if n == 0 {
+            return;
+        }
+        let insns = &self.co.instructions;
+        let jump_target = |i: usize| -> Option<usize> {
+            let ins = insns[i];
+            let from = i + 1;
+            match ins.op {
+                OpCode::JumpForward
+                | OpCode::PopJumpIfFalse
+                | OpCode::PopJumpIfTrue
+                | OpCode::PopJumpIfNone
+                | OpCode::PopJumpIfNotNone
+                | OpCode::ForIter
+                | OpCode::Send => Some(from + ins.arg as usize),
+                OpCode::JumpBackward => Some(from.saturating_sub(ins.arg as usize)),
+                _ => None,
+            }
+        };
+        let no_fallthrough = |i: usize| {
+            matches!(
+                insns[i].op,
+                OpCode::JumpForward
+                    | OpCode::JumpBackward
+                    | OpCode::ReturnValue
+                    | OpCode::RaiseVarargs
+                    | OpCode::Reraise
+            )
+        };
+        // Basic-block leaders.
+        let mut leader = vec![false; n];
+        leader[0] = true;
+        for i in 0..n {
+            if let Some(t) = jump_target(i) {
+                if t < n {
+                    leader[t] = true;
+                }
+            }
+            if (jump_target(i).is_some() || no_fallthrough(i)) && i + 1 < n {
+                leader[i + 1] = true;
+            }
+        }
+        for h in &self.co.exception_table {
+            if (h.handler as usize) < n {
+                leader[h.handler as usize] = true;
+            }
+        }
+        let mut block_starts: Vec<usize> = (0..n).filter(|&i| leader[i]).collect();
+        block_starts.push(n);
+        let nb = block_starts.len() - 1;
+        let mut block_of = vec![0usize; n];
+        for b in 0..nb {
+            block_of[block_starts[b]..block_starts[b + 1]].fill(b);
+        }
+        // Warm = reachable from block 0 via normal control flow only.
+        let mut warm = vec![false; nb];
+        let mut stack = vec![0usize];
+        while let Some(b) = stack.pop() {
+            if warm[b] {
+                continue;
+            }
+            warm[b] = true;
+            let last = block_starts[b + 1] - 1;
+            if let Some(t) = jump_target(last) {
+                if t < n {
+                    stack.push(block_of[t]);
+                }
+            }
+            if !no_fallthrough(last) && b + 1 < nb {
+                stack.push(b + 1);
+            }
+        }
+        if warm.iter().all(|&w| w) {
+            return;
+        }
+        // Already laid out warm-then-cold? Nothing to do — this keeps
+        // the pass a no-op for the shapes codegen already emits in
+        // CPython's canonical order.
+        let first_cold = warm.iter().position(|&w| !w).unwrap();
+        if warm[first_cold..].iter().all(|&w| !w) {
+            return;
+        }
+        // A conditional jump crossing the warm/cold boundary would
+        // need direction normalisation this pass doesn't do — bail
+        // out (CPython can't produce such an edge either: a cold
+        // block's conditional targets are cold, a warm one's warm).
+        for i in 0..n {
+            if matches!(
+                insns[i].op,
+                OpCode::PopJumpIfFalse
+                    | OpCode::PopJumpIfTrue
+                    | OpCode::PopJumpIfNone
+                    | OpCode::PopJumpIfNotNone
+                    | OpCode::ForIter
+                    | OpCode::Send
+            ) {
+                if let Some(t) = jump_target(i) {
+                    if t < n && warm[block_of[i]] != warm[block_of[t]] {
+                        return;
+                    }
+                }
+            }
+        }
+        // New layout: warm blocks in order, then cold blocks in order.
+        // `Rejoin(target)` marks a synthesized explicit jump for a
+        // moved cold block whose fallthrough successor is warm.
+        enum Slot {
+            Old(usize),
+            Rejoin(usize),
+        }
+        let mut layout: Vec<Slot> = Vec::with_capacity(n + 4);
+        for &want_warm in &[true, false] {
+            for b in 0..nb {
+                if warm[b] != want_warm {
+                    continue;
+                }
+                for k in block_starts[b]..block_starts[b + 1] {
+                    layout.push(Slot::Old(k));
+                }
+                let last = block_starts[b + 1] - 1;
+                if !want_warm && !no_fallthrough(last) && b + 1 < nb && warm[b + 1] {
+                    layout.push(Slot::Rejoin(block_starts[b + 1]));
+                }
+            }
+        }
+        // Map old index -> new index.
+        let mut new_index = vec![0u32; n + 1];
+        for (pos, slot) in layout.iter().enumerate() {
+            if let Slot::Old(k) = slot {
+                new_index[*k] = pos as u32;
+            }
+        }
+        new_index[n] = layout.len() as u32;
+        // Convert plain depth sentinels to anchored form *before* the
+        // reorder: a plain sentinel resolves at the entry's start, and
+        // splitting/remapping the range must not change which
+        // instruction that is.
+        for h in self.co.exception_table.iter_mut() {
+            if h.depth == HANDLER_DEPTH_SENTINEL {
+                h.depth = HANDLER_DEPTH_ANCHOR_FLAG | h.start;
+            }
+        }
+        // Rebuild the stream.
+        let old_insns = std::mem::take(&mut self.co.instructions);
+        let old_lines = std::mem::take(&mut self.co.linetable);
+        let old_cols = std::mem::take(&mut self.co.coltable);
+        let mut rejoin_sites: Vec<u32> = Vec::new();
+        for slot in &layout {
+            match slot {
+                Slot::Old(k) => {
+                    let mut ins = old_insns[*k];
+                    let from_new = new_index[*k] + 1;
+                    match ins.op {
+                        OpCode::PushExcInfo => {
+                            ins.arg = new_index[(ins.arg as usize).min(n)];
+                        }
+                        OpCode::JumpForward | OpCode::JumpBackward => {
+                            let t_old = if ins.op == OpCode::JumpBackward {
+                                (*k as u32 + 1).saturating_sub(ins.arg)
+                            } else {
+                                *k as u32 + 1 + ins.arg
+                            };
+                            let t_new = new_index[(t_old as usize).min(n)];
+                            if t_new >= from_new {
+                                ins.op = OpCode::JumpForward;
+                                ins.arg = t_new - from_new;
+                            } else {
+                                ins.op = OpCode::JumpBackward;
+                                ins.arg = from_new - t_new;
+                            }
+                        }
+                        OpCode::PopJumpIfFalse
+                        | OpCode::PopJumpIfTrue
+                        | OpCode::PopJumpIfNone
+                        | OpCode::PopJumpIfNotNone
+                        | OpCode::ForIter
+                        | OpCode::Send => {
+                            let t_old = *k as u32 + 1 + ins.arg;
+                            let t_new = new_index[(t_old as usize).min(n)];
+                            debug_assert!(t_new >= from_new);
+                            ins.arg = t_new - from_new;
+                        }
+                        _ => {}
+                    }
+                    self.co.instructions.push(ins);
+                    self.co.linetable.push(old_lines[*k]);
+                    self.co.coltable.push(old_cols[*k]);
+                }
+                Slot::Rejoin(target_old) => {
+                    let pos = self.co.instructions.len() as u32;
+                    let t_new = new_index[*target_old];
+                    debug_assert!(t_new < pos, "rejoin target must be warm (already placed)");
+                    self.co.instructions.push(Instruction {
+                        op: OpCode::JumpBackward,
+                        arg: (pos + 1) - t_new,
+                    });
+                    // NO_LOCATION, like CPython's explicit_jump;
+                    // `propagate_line_numbers` fills it later.
+                    self.co.linetable.push(0);
+                    self.co.coltable.push(ColSpan::default());
+                    rejoin_sites.push(pos);
+                }
+            }
+        }
+        // Remap the exception table. A range whose instructions end up
+        // non-contiguous is split into one entry per contiguous run.
+        let old_table = std::mem::take(&mut self.co.exception_table);
+        for h in old_table {
+            let mut positions: Vec<u32> = (h.start..h.end.min(n as u32))
+                .map(|k| new_index[k as usize])
+                .collect();
+            positions.sort_unstable();
+            let handler = new_index[(h.handler as usize).min(n)];
+            let depth =
+                if h.depth & HANDLER_DEPTH_ANCHOR_FLAG != 0 && h.depth != HANDLER_DEPTH_SENTINEL {
+                    let anchor = (h.depth & !HANDLER_DEPTH_ANCHOR_FLAG) as usize;
+                    HANDLER_DEPTH_ANCHOR_FLAG | new_index[anchor.min(n)]
+                } else {
+                    h.depth
+                };
+            let mut run_start = 0usize;
+            while run_start < positions.len() {
+                let mut run_end = run_start + 1;
+                while run_end < positions.len() && positions[run_end] == positions[run_end - 1] + 1
+                {
+                    run_end += 1;
+                }
+                self.co.exception_table.push(ExcHandler {
+                    start: positions[run_start],
+                    end: positions[run_end - 1] + 1,
+                    handler,
+                    depth,
+                    push_lasti: h.push_lasti,
+                });
+                run_start = run_end;
+            }
+        }
+        self.synthetic_jumps = self
+            .synthetic_jumps
+            .iter()
+            .map(|&s| new_index[(s as usize).min(n)])
+            .collect();
+        self.no_interrupt_jumps = self
+            .no_interrupt_jumps
+            .iter()
+            .map(|&s| new_index[(s as usize).min(n)])
+            .collect();
+        // This pass runs once, before any rejoins exist; the set holds
+        // exactly the jumps synthesized above (in new coordinates).
+        debug_assert!(self.cold_rejoins.is_empty());
+        for &s in &rejoin_sites {
+            self.cold_rejoins.insert(s);
+            self.synthetic_jumps.insert(s);
+            // flowgraph.c synthesizes rejoins as JUMP_NO_INTERRUPT.
+            self.no_interrupt_jumps.insert(s);
+        }
+    }
+
+    /// CPython's `wrap_in_stopiteration_handler` (PEP 479): every
+    /// generator-family code object gets an outermost virtual handler
+    /// covering the whole body — an escaping `StopIteration` (or, for
+    /// async generators, `StopAsyncIteration`) is converted to a
+    /// RuntimeError by the STOPITERATION_ERROR intrinsic and
+    /// re-raised with the original raise offset (`RERAISE 1`).
+    ///
+    /// The flat table holds only the innermost entry per instruction,
+    /// so the epilogue's coverage is the *complement*: every
+    /// instruction from the entry RESUME up to the epilogue block
+    /// that no other entry covers — except the cold-rejoin jumps,
+    /// which CPython synthesizes after `label_exception_targets` and
+    /// which therefore carry no coverage at all.
+    ///
+    /// Also stamps CPython's `RESUME_OPARG_DEPTH1_MASK` (bit 2): a
+    /// post-yield RESUME whose preceding YIELD_VALUE is covered
+    /// directly by the epilogue sits at exception-handler depth 1,
+    /// which `gen.close()` uses as its no-finally fast path.
+    fn emit_stopiteration_epilogue(&mut self) {
+        if !(self.co.is_generator || self.co.is_coroutine || self.co.is_async_generator) {
+            return;
+        }
+        let n = self.co.instructions.len() as u32;
+        let Some(resume_at) = self
+            .co
+            .instructions
+            .iter()
+            .position(|i| i.op == OpCode::Resume)
+        else {
+            return;
+        };
+        let handler = n;
+        self.emit_no_line(OpCode::StopIterationError, 0);
+        self.emit_no_line(OpCode::Reraise, 1);
+        let mut covered = vec![false; n as usize];
+        for h in &self.co.exception_table {
+            for k in h.start..h.end.min(n) {
+                covered[k as usize] = true;
+            }
+        }
+        // RESUME depth-1 flags: decided *before* the epilogue entries
+        // are added — an own-yield at depth 1 is exactly one not yet
+        // covered by anything.
+        for i in 1..n as usize {
+            let ins = self.co.instructions[i];
+            if ins.op != OpCode::Resume || ins.arg == 0 {
+                continue;
+            }
+            if self.co.instructions[i - 1].op == OpCode::YieldValue && !covered[i - 1] {
+                self.co.instructions[i].arg |= 4;
+            }
+        }
+        for &j in &self.cold_rejoins {
+            if j < n {
+                covered[j as usize] = true;
+            }
+        }
+        let mut i = resume_at as u32;
+        while i < n {
+            if covered[i as usize] {
+                i += 1;
+                continue;
+            }
+            let s = i;
+            while i < n && !covered[i as usize] {
+                i += 1;
+            }
+            self.co.exception_table.push(ExcHandler {
+                start: s,
+                end: i,
+                handler,
+                depth: 0,
+                push_lasti: true,
+            });
+        }
+    }
+
+    /// CPython flowgraph `basicblock_inline_small_or_no_lineno_blocks`,
+    /// small-exit-block half: replace an unconditional forward jump
+    /// whose target block exits the scope (return / raise / reraise)
+    /// in at most `MAX_COPY_SIZE` wire instructions with an inline copy
+    /// of that block. The location-free half of CPython's pass is
+    /// handled by `duplicate_exits_without_lineno`. Restricted to
+    /// sites and targets outside all exception coverage: CPython's
+    /// copies keep their per-instruction `i_except`, which a flat
+    /// range-based table cannot express for a mid-range insertion.
+    fn inline_small_exit_blocks(&mut self) {
+        const MAX_COPY_SIZE: usize = 4;
+        let n = self.co.instructions.len();
+        if n == 0 {
+            return;
+        }
+        let covered = |i: u32| {
+            self.co
+                .exception_table
+                .iter()
+                .any(|h| h.start <= i && i < h.end)
+        };
+        // Block leaders, as in `duplicate_exits_without_lineno`.
+        let mut leader = vec![false; n + 1];
+        leader[0] = true;
+        for h in &self.co.exception_table {
+            if (h.handler as usize) < n {
+                leader[h.handler as usize] = true;
+            }
+        }
+        for i in 0..n {
+            let ins = self.co.instructions[i];
+            let from = i + 1;
+            let target = match ins.op {
+                OpCode::JumpForward
+                | OpCode::PopJumpIfFalse
+                | OpCode::PopJumpIfTrue
+                | OpCode::PopJumpIfNone
+                | OpCode::PopJumpIfNotNone
+                | OpCode::ForIter
+                | OpCode::Send => Some(from + ins.arg as usize),
+                OpCode::JumpBackward => Some(from.saturating_sub(ins.arg as usize)),
+                _ => None,
+            };
+            if let Some(t) = target {
+                if t <= n {
+                    leader[t] = true;
+                }
+                leader[(i + 1).min(n)] = true;
+            }
+            if matches!(
+                ins.op,
+                OpCode::ReturnValue | OpCode::RaiseVarargs | OpCode::Reraise
+            ) {
+                leader[(i + 1).min(n)] = true;
+            }
+        }
+        // (jump site, target block range) pairs, in stream order.
+        let mut sites: Vec<(usize, usize, usize)> = Vec::new();
+        // Sites inside an exception-covered range whose inlined copy
+        // must be punched out of the covering entries (see below).
+        let mut covered_sites: Vec<usize> = Vec::new();
+        for i in 0..n {
+            let ins = self.co.instructions[i];
+            if ins.op != OpCode::JumpForward {
+                continue;
+            }
+            let t = i + 1 + ins.arg as usize;
+            if t >= n {
+                continue;
+            }
+            let mut e = t;
+            while e + 1 < n && !leader[e + 1] {
+                e += 1;
+            }
+            if !matches!(
+                self.co.instructions[e].op,
+                OpCode::ReturnValue | OpCode::RaiseVarargs | OpCode::Reraise
+            ) {
+                continue;
+            }
+            // A jump site inside an exception-covered range: CPython
+            // still inlines (its per-instruction handler annotation
+            // keeps the copied return *uncovered*, splitting the wire
+            // table around it — the except* epilogue's POP_EXCEPT;
+            // RETURN_CONST exit shows exactly that shape). Range-based
+            // coverage can only mirror this for copies that cannot
+            // raise: restrict to pure constant returns and punch the
+            // copy out of every covering entry afterwards. Raising
+            // exits (RAISE/RERAISE) keep the shared block — inlining
+            // them under coverage would change which handler wins.
+            let site_covered = covered(i as u32);
+            if site_covered {
+                let pure_return = self.co.instructions[e].op == OpCode::ReturnValue
+                    && (e == t || (e == t + 1 && self.co.instructions[t].op == OpCode::LoadConst));
+                if !pure_return {
+                    continue;
+                }
+            }
+            // Wire size: a fusable LOAD_CONST; RETURN_VALUE pair encodes
+            // as one RETURN_CONST (CPython counts post-fold blocks).
+            let mut size = e - t + 1;
+            if self.co.instructions[e].op == OpCode::ReturnValue
+                && self.co.instructions[e].arg != 0
+                && e > t
+                && self.co.instructions[e - 1].op == OpCode::LoadConst
+            {
+                size -= 1;
+            }
+            if size > MAX_COPY_SIZE {
+                continue;
+            }
+            // PUSH_EXC_INFO carries an absolute offset and marks handler
+            // context; never part of a copyable exit tail.
+            if (t..=e)
+                .any(|k| self.co.instructions[k].op == OpCode::PushExcInfo || covered(k as u32))
+            {
+                continue;
+            }
+            if site_covered {
+                covered_sites.push(i);
+            }
+            sites.push((i, t, e));
+        }
+        if sites.is_empty() {
+            return;
+        }
+        // new(x) = x + growth from copies inserted before x. Each site
+        // replaces 1 jump with (e - t + 1) instructions.
+        let shift = |x: u32| -> u32 {
+            x + sites
+                .iter()
+                .take_while(|&&(s, _, _)| (s as u32) < x)
+                .map(|&(_, t, e)| (e - t) as u32)
+                .sum::<u32>()
+        };
+        let grown: usize = sites.iter().map(|&(_, t, e)| e - t).sum();
+        let mut instructions = Vec::with_capacity(n + grown);
+        let mut linetable = Vec::with_capacity(n + grown);
+        let mut coltable = Vec::with_capacity(n + grown);
+        let mut site_iter = sites.iter().peekable();
+        for i in 0..n {
+            if let Some(&&(s, t, e)) = site_iter.peek() {
+                if s == i {
+                    site_iter.next();
+                    for k in t..=e {
+                        instructions.push(self.co.instructions[k]);
+                        linetable.push(self.co.linetable[k]);
+                        coltable.push(self.co.coltable[k]);
+                    }
+                    continue;
+                }
+            }
+            let mut ins = self.co.instructions[i];
+            let from_old = i as u32 + 1;
+            let from_new = shift(i as u32) + 1;
+            match ins.op {
+                OpCode::PushExcInfo => {
+                    ins.arg = shift(ins.arg);
+                }
+                OpCode::JumpForward
+                | OpCode::PopJumpIfFalse
+                | OpCode::PopJumpIfTrue
+                | OpCode::PopJumpIfNone
+                | OpCode::PopJumpIfNotNone
+                | OpCode::ForIter
+                | OpCode::Send => {
+                    ins.arg = shift(from_old + ins.arg) - from_new;
+                }
+                OpCode::JumpBackward => {
+                    ins.arg = from_new - shift(from_old - ins.arg);
+                }
+                _ => {}
+            }
+            instructions.push(ins);
+            linetable.push(self.co.linetable[i]);
+            coltable.push(self.co.coltable[i]);
+        }
+        self.co.instructions = instructions;
+        self.co.linetable = linetable;
+        self.co.coltable = coltable;
+        for h in self.co.exception_table.iter_mut() {
+            h.start = shift(h.start);
+            h.end = shift(h.end);
+            h.handler = shift(h.handler);
+            if h.depth & HANDLER_DEPTH_ANCHOR_FLAG != 0 && h.depth != HANDLER_DEPTH_SENTINEL {
+                let anchor = h.depth & !HANDLER_DEPTH_ANCHOR_FLAG;
+                h.depth = HANDLER_DEPTH_ANCHOR_FLAG | shift(anchor);
+            }
+        }
+        let inlined: HashSet<u32> = sites.iter().map(|&(s, _, _)| s as u32).collect();
+        self.synthetic_jumps = self
+            .synthetic_jumps
+            .iter()
+            .filter(|s| !inlined.contains(s))
+            .map(|&s| shift(s))
+            .collect();
+        self.no_interrupt_jumps = self
+            .no_interrupt_jumps
+            .iter()
+            .filter(|s| !inlined.contains(s))
+            .map(|&s| shift(s))
+            .collect();
+        // Punch every covered site's inlined return out of the entries
+        // that covered the original jump: the copy stands in for the
+        // (uncovered) shared exit block, so the wire table must split
+        // around it exactly as CPython's per-instruction handler info
+        // does.
+        for &s in &covered_sites {
+            let (_, t, e) = *sites.iter().find(|&&(si, _, _)| si == s).unwrap();
+            let copy_start = shift(s as u32);
+            let copy_end = copy_start + (e - t + 1) as u32;
+            let mut split: Vec<ExcHandler> = Vec::new();
+            for h in self.co.exception_table.iter_mut() {
+                if h.start < copy_end && h.end > copy_start {
+                    // Pin a plain-sentinel depth to the *original* range
+                    // start first: a split half must keep resolving at
+                    // the covering region's entry depth (CPython's SETUP
+                    // point), not re-anchor at its own shifted start.
+                    if h.depth == HANDLER_DEPTH_SENTINEL {
+                        h.depth = HANDLER_DEPTH_ANCHOR_FLAG | h.start;
+                    }
+                    if h.end > copy_end {
+                        split.push(ExcHandler {
+                            start: copy_end,
+                            end: h.end,
+                            handler: h.handler,
+                            depth: h.depth,
+                            push_lasti: h.push_lasti,
+                        });
+                    }
+                    h.end = h.start.max(copy_start);
+                }
+            }
+            self.co.exception_table.extend(split);
+            self.co.exception_table.retain(|h| h.end > h.start);
+        }
+    }
+
+    /// CPython's `remove_redundant_nops`: drop a NOP when its line is
+    /// already covered by a neighbour in the same basic block (or when
+    /// it has no location at all), so `pass` on its own line keeps its
+    /// trace event while pack/unpack leftovers vanish.
+    fn remove_redundant_nops(&mut self) {
+        let n = self.co.instructions.len();
+        if n == 0 {
+            return;
+        }
+        // Block leaders: jump targets and exception-handler entries. A
+        // NOP that starts a block must not borrow its predecessor's
+        // line (that predecessor belongs to another path), and a
+        // neighbour that starts a block is no in-block neighbour.
+        let mut leader = vec![false; n + 1];
+        for i in 0..n {
+            let ins = self.co.instructions[i];
+            let from = i as u32 + 1;
+            match ins.op {
+                OpCode::JumpForward
+                | OpCode::PopJumpIfFalse
+                | OpCode::PopJumpIfTrue
+                | OpCode::PopJumpIfNone
+                | OpCode::PopJumpIfNotNone
+                | OpCode::ForIter
+                | OpCode::Send => leader[((from + ins.arg) as usize).min(n)] = true,
+                OpCode::JumpBackward => {
+                    leader[(from.saturating_sub(ins.arg) as usize).min(n)] = true;
+                }
+                _ => {}
+            }
+        }
+        for h in &self.co.exception_table {
+            leader[(h.handler as usize).min(n)] = true;
+        }
+        let ends_block = |op: OpCode| {
+            matches!(
+                op,
+                OpCode::JumpForward
+                    | OpCode::JumpBackward
+                    | OpCode::PopJumpIfFalse
+                    | OpCode::PopJumpIfTrue
+                    | OpCode::PopJumpIfNone
+                    | OpCode::PopJumpIfNotNone
+                    | OpCode::ForIter
+                    | OpCode::Send
+                    | OpCode::ReturnValue
+                    | OpCode::RaiseVarargs
+                    | OpCode::Reraise
+            )
+        };
+        // Sequential like CPython's per-block dest/src walk: the
+        // "previous" check reads the last *kept* instruction, so a run
+        // of same-line NOPs collapses to one survivor rather than each
+        // covering the other into mutual annihilation (`if 1:` must
+        // keep its located NOP — test_sys_settrace test_02_arigo2).
+        let mut keep = vec![true; n];
+        let mut prev_kept: Option<usize> = None;
+        for i in 0..n {
+            if leader[i] {
+                prev_kept = None;
+            }
+            if self.co.instructions[i].op != OpCode::Nop {
+                prev_kept = Some(i);
+                continue;
+            }
+            let line = self.co.linetable[i];
+            if line == 0 {
+                keep[i] = false;
+                continue;
+            }
+            let prev_covers = prev_kept.is_some_and(|p| {
+                !ends_block(self.co.instructions[p].op) && self.co.linetable[p] == line
+            });
+            let mut next_covers = i + 1 < n && !leader[i + 1] && self.co.linetable[i + 1] == line;
+            // CPython's `propagate_line_numbers` runs before NOP
+            // removal: a located NOP flows its location onto following
+            // NO_LOCATION instructions in the same block, after which
+            // the NOP is redundant (a `pass`-only except clause puts
+            // its line on the handler-exit POP_EXCEPT/RETURN run —
+            // the except* burn's outer `except KeyError: pass` shape).
+            if !next_covers && i + 1 < n && !leader[i + 1] && self.co.linetable[i + 1] == 0 {
+                let mut k = i + 1;
+                while k < n && !leader[k] && self.co.linetable[k] == 0 {
+                    self.co.linetable[k] = line;
+                    self.co.coltable[k] = self.co.coltable[i];
+                    if ends_block(self.co.instructions[k].op) {
+                        break;
+                    }
+                    k += 1;
+                }
+                next_covers = true;
+            }
+            if prev_covers || next_covers {
+                keep[i] = false;
+            } else {
+                prev_kept = Some(i);
+            }
+        }
+        self.compact_stream(&keep);
+    }
+
+    /// CPython's `remove_redundant_jumps`: an unconditional jump whose
+    /// target is the very next instruction is a NOP. Returns whether
+    /// anything changed (the caller loops with NOP removal to a
+    /// fixpoint, as `remove_redundant_nops_and_jumps` does).
+    fn remove_jumps_to_next(&mut self) -> bool {
+        let mut changed = false;
+        for ins in self.co.instructions.iter_mut() {
+            if matches!(ins.op, OpCode::JumpForward | OpCode::JumpBackward) && ins.arg == 0 {
+                *ins = Instruction {
+                    op: OpCode::Nop,
+                    arg: 0,
+                };
+                changed = true;
+            }
+        }
+        changed
     }
 
     fn emit(&mut self, op: OpCode, arg: u32) -> u32 {
@@ -1853,6 +4252,20 @@ impl Compiler {
         Ok(())
     }
 
+    /// Emit CPython 3.13's function-construction shape: a bare
+    /// `MAKE_FUNCTION` followed by one `SET_FUNCTION_ATTRIBUTE` per
+    /// present attribute, consumed top-down (closure 0x08 sits nearest
+    /// the top of the stack, defaults 0x01 deepest — the reverse of the
+    /// push order).
+    fn emit_make_function(&mut self, flags: u32) {
+        self.emit(OpCode::MakeFunction, 0);
+        for bit in [0x08u32, 0x04, 0x02, 0x01] {
+            if flags & bit != 0 {
+                self.emit(OpCode::SetFunctionAttribute, bit);
+            }
+        }
+    }
+
     /// Emit the entry `Resume` for a function/class/comprehension body.
     /// CPython 3.11+ places `RESUME` at the header line with a zero-width
     /// `0..0` column span (GH-93249), so synthesized tracebacks pointing
@@ -1914,6 +4327,92 @@ impl Compiler {
         self.current_line = saved_line;
     }
 
+    /// CPython 3.13 `can_optimize_super_call`: `True` when a Load of
+    /// `attr_expr` (an `Attribute` whose base is a `super(...)` call)
+    /// may lower to the fused `LOAD_SUPER_ATTR`. Requires: the call is
+    /// `super()` or `super(a, b)` (no keywords/stars), the attribute is
+    /// not `__class__`, `super` is an implicit global both here and at
+    /// module level, and — for the zero-argument form — the enclosing
+    /// function has a positional parameter and a `__class__` freevar.
+    fn super_attr_optimizable(&self, attr_expr: &Expr) -> bool {
+        let ExprKind::Attribute { value, attr } = &attr_expr.kind else {
+            return false;
+        };
+        let ExprKind::Call {
+            func,
+            args,
+            keywords,
+        } = &value.kind
+        else {
+            return false;
+        };
+        if !matches!(&func.kind, ExprKind::Name(n) if n == "super")
+            || attr == "__class__"
+            || !keywords.is_empty()
+        {
+            return false;
+        }
+        // Statically visible shadowing of `super`: a binding in the
+        // current scope (local, cell/free capture, `global`/`nonlocal`
+        // declaration) or any module-level mention disables the fusion.
+        if self.bindings.get("super").is_some() || self.params.module_mentions_super {
+            return false;
+        }
+        match args.len() {
+            2 => !args.iter().any(|a| matches!(a.kind, ExprKind::Starred(_))),
+            0 => {
+                self.co.arg_count >= 1
+                    && matches!(self.bindings.get("__class__"), Some(Binding::Free))
+            }
+            _ => false,
+        }
+    }
+
+    /// CPython `load_args_for_super` + the fused super-attribute load:
+    /// `LOAD_GLOBAL super`, then either the two explicit arguments or
+    /// the `__class__` cell + first parameter, then `LOAD_SUPER_ATTR`
+    /// (arg = `namei << 2 | method | two_arg << 1`) at the attribute
+    /// expression's full location and a trailing `NOP` at the
+    /// attr-name-adjusted location. The caller must have validated via
+    /// [`Self::super_attr_optimizable`] and set `current_span` to the
+    /// attribute expression's span.
+    fn emit_super_attr(&mut self, attr_expr: &Expr, method: bool) -> Result<(), CompileError> {
+        let ExprKind::Attribute { value, attr } = &attr_expr.kind else {
+            unreachable!("emit_super_attr requires an attribute expression");
+        };
+        let ExprKind::Call { func, args, .. } = &value.kind else {
+            unreachable!("emit_super_attr requires a super() call base");
+        };
+        let saved = self.current_span;
+        self.set_span(func.span);
+        self.emit_load_name("super");
+        self.current_span = saved;
+        let two_arg = args.len() == 2;
+        if two_arg {
+            self.compile_expr(&args[0])?;
+            self.compile_expr(&args[1])?;
+        } else {
+            let saved = self.current_span;
+            self.set_span(value.span);
+            self.emit_load_name("__class__");
+            let first_param = self
+                .co
+                .varnames
+                .first()
+                .cloned()
+                .expect("super_attr_optimizable checked arg_count >= 1");
+            self.emit_load_name(&first_param);
+            self.current_span = saved;
+        }
+        let namei = self.co.intern_name(attr);
+        let arg = (namei << 2) | u32::from(method) | (u32::from(two_arg) << 1);
+        self.emit(OpCode::LoadSuperAttr, arg);
+        self.with_attr_location(attr_expr.span.end.0, attr.len() as u32, |c| {
+            c.emit(OpCode::Nop, 0);
+        });
+        Ok(())
+    }
+
     fn next_offset(&self) -> u32 {
         self.co.instructions.len() as u32
     }
@@ -1925,6 +4424,8 @@ impl Compiler {
             OpCode::JumpForward
             | OpCode::PopJumpIfFalse
             | OpCode::PopJumpIfTrue
+            | OpCode::PopJumpIfNone
+            | OpCode::PopJumpIfNotNone
             | OpCode::ForIter
             | OpCode::Send => {
                 ins.arg = target.saturating_sub(from);
@@ -1947,6 +4448,9 @@ impl Compiler {
         if self.allows_top_level_await() && body_has_top_level_await(&module.body) {
             self.co.is_coroutine = true;
             self.emit(OpCode::ReturnGenerator, 0);
+            // CPython 3.13 prologue: every resume pushes the sent value
+            // (None on the first), discarded here.
+            self.emit(OpCode::PopTop, 0);
         }
         self.emit(OpCode::Resume, 0);
         // CPython's symtable marks a module block containing any annotated
@@ -1955,6 +4459,13 @@ impl Compiler {
         // the first annotation can already read `__annotations__`
         // (ann_module.py does `__annotations__[1] = 2` at module top).
         if block_has_annotations(&module.body) {
+            // CPython locates SETUP_ANNOTATIONS on the module's first
+            // statement (compiler_body seeds `loc` from stmt 0 before
+            // emitting it — dis_annot_stmt_str asserts the line).
+            if let Some(first) = module.body.first() {
+                self.set_line_from(first.span.start.0);
+                self.set_span(first.span);
+            }
             self.emit(OpCode::SetupAnnotations, 0);
             self.annotations_initialized = true;
         }
@@ -1967,7 +4478,7 @@ impl Compiler {
         if !self.interactive && !self.eval_mode {
             if let Some(doc) = first_stmt_docstring(&module.body) {
                 if self.params.optimize < 2 {
-                    let doc_const = self.co.intern_constant(Constant::Str(doc.to_owned()));
+                    let doc_const = self.co.intern_constant(Constant::Str(clean_docstring(doc)));
                     let doc_name = self.co.intern_name("__doc__");
                     self.set_line_from(module.body[0].span.start.0);
                     self.set_span(module.body[0].span);
@@ -2131,13 +4642,31 @@ impl Compiler {
                 // instead of being discarded. Only the top-level compiler
                 // sets these flags; nested scopes get fresh `Compiler`
                 // instances, so this never fires inside functions/classes.
+                // CPython stamps the consuming op with the *value
+                // expression's* location, not the statement head — a
+                // parenthesized call statement must not surface the
+                // paren line in co_lines (test_lineno_procedure_call).
+                let saved_line = self.current_line;
+                let saved_span = self.current_span;
+                self.set_line_from(e.span.start.0);
+                self.set_span(e.span);
                 if self.eval_mode {
                     self.emit(OpCode::ReturnValue, 0);
                 } else if self.interactive {
                     self.emit(OpCode::PrintExpr, 0);
                 } else {
-                    self.emit(OpCode::PopTop, 0);
+                    // CPython emits the statement's POP_TOP with NO_LOCATION
+                    // and lets flowgraph line propagation fill it in when it
+                    // follows the value in the same basic block. At a
+                    // multi-predecessor join (a boolop merge target) it stays
+                    // location-less, so a debugger stepping by opcode sees
+                    // `f_lineno is None` there and moves on to the next real
+                    // line (gh-127321; test_pdb_issue_gh_127321 stops at the
+                    // line *after* a mid-expression `set_trace()`).
+                    self.emit_no_line(OpCode::PopTop, 0);
                 }
+                self.current_line = saved_line;
+                self.current_span = saved_span;
             }
             StmtKind::TypeAlias { .. } => {
                 // Normally rewritten at the compiler entry
@@ -2171,24 +4700,41 @@ impl Compiler {
                 if self.params.optimize >= 1 {
                     return Ok(());
                 }
-                self.compile_expr(test)?;
-                // The raise sequence carries the *test expression's*
-                // location (CPython compiler_assert): the traceback's
-                // PEP-657 carets underline the failed condition, not
-                // the whole `assert …, msg` statement.
-                let saved = self.current_span;
+                let stmt_span = stmt.span;
+                let (cond, invert) = strip_not_chain(test);
+                self.compile_expr(cond)?;
+                if !expr_is_bool(cond) {
+                    self.set_span(test.span);
+                    self.emit(OpCode::ToBool, 0);
+                }
+                // Location split mirrors CPython compiler_assert: the
+                // branch carries the test's span, LOAD_ASSERTION_ERROR
+                // and the msg CALL carry the whole statement's, and
+                // RAISE_VARARGS carries the test's again so PEP-657
+                // carets underline the failed condition.
                 self.set_span(test.span);
-                let skip = self.emit(OpCode::PopJumpIfTrue, 0);
+                let skip = self.emit(
+                    if invert {
+                        OpCode::PopJumpIfFalse
+                    } else {
+                        OpCode::PopJumpIfTrue
+                    },
+                    0,
+                );
                 // The *builtin* AssertionError, immune to shadowing
                 // (CPython LOAD_ASSERTION_ERROR, bpo-34880).
+                self.set_span(stmt_span);
                 self.emit(OpCode::LoadAssertionError, 0);
                 if let Some(m) = msg {
                     self.compile_expr(m)?;
-                    self.set_span(test.span);
-                    self.emit(OpCode::Call, 1);
+                    self.set_span(stmt_span);
+                    // The message rides the wire view's self slot
+                    // (CPython compiler_assert: `CALL 0`).
+                    self.emit(OpCode::CallSelf, 1);
                 }
+                self.set_span(test.span);
                 self.emit(OpCode::RaiseVarargs, 1);
-                self.current_span = saved;
+                self.set_span(stmt_span);
                 let end = self.next_offset();
                 self.patch_jump(skip, end);
             }
@@ -2225,13 +4771,68 @@ impl Compiler {
                         target.span,
                     ));
                 }
-                self.compile_load_target(target)?;
-                self.compile_expr(value)?;
-                self.emit(
-                    OpCode::BinaryOp,
-                    bin_op_kind(*op) as u32 | crate::bytecode::BINARY_OP_INPLACE_FLAG,
-                );
-                self.compile_assign(target)?;
+                let bin_arg = bin_op_kind(*op) as u32 | crate::bytecode::BINARY_OP_INPLACE_FLAG;
+                // CPython's codegen_augassign evaluates the target primary
+                // *once* and shuffles with COPY/SWAP (an attribute or
+                // subscript receiver with side effects must not run twice);
+                // it also keeps the line sequence exact — re-evaluating
+                // `o` would fire the receiver's line again before the
+                // store (test_compile test_lineno_attribute).
+                match &target.kind {
+                    ExprKind::Attribute { value: obj, attr } => {
+                        if attr == "__debug__" {
+                            return Err(CompileError::spanned(
+                                "cannot assign to __debug__",
+                                target.span,
+                            ));
+                        }
+                        self.compile_expr(obj)?;
+                        let saved = self.current_span;
+                        self.set_span(target.span);
+                        self.emit(OpCode::CopyTop, 1);
+                        let idx = self.co.intern_name(attr);
+                        self.with_attr_location(target.span.end.0, attr.len() as u32, |c| {
+                            c.emit(OpCode::LoadAttr, idx);
+                        });
+                        self.current_span = saved;
+                        self.compile_expr(value)?;
+                        self.emit(OpCode::BinaryOp, bin_arg);
+                        let saved = self.current_span;
+                        self.set_span(target.span);
+                        // Both the SWAP and the STORE_ATTR carry the
+                        // attr-adjusted location (CPython applies
+                        // update_start_location_to_match_attr to both).
+                        self.with_attr_location(target.span.end.0, attr.len() as u32, |c| {
+                            c.emit(OpCode::Swap, 2);
+                            c.emit(OpCode::StoreAttr, idx);
+                        });
+                        self.current_span = saved;
+                    }
+                    ExprKind::Subscript { value: obj, slice } => {
+                        self.compile_expr(obj)?;
+                        self.compile_expr(slice)?;
+                        let saved = self.current_span;
+                        self.set_span(target.span);
+                        self.emit(OpCode::CopyTop, 2);
+                        self.emit(OpCode::CopyTop, 2);
+                        self.emit(OpCode::BinarySubscr, 0);
+                        self.current_span = saved;
+                        self.compile_expr(value)?;
+                        self.emit(OpCode::BinaryOp, bin_arg);
+                        let saved = self.current_span;
+                        self.set_span(target.span);
+                        self.emit(OpCode::Swap, 3);
+                        self.emit(OpCode::Swap, 2);
+                        self.emit(OpCode::StoreSubscr, 0);
+                        self.current_span = saved;
+                    }
+                    _ => {
+                        self.compile_load_target(target)?;
+                        self.compile_expr(value)?;
+                        self.emit(OpCode::BinaryOp, bin_arg);
+                        self.compile_assign(target)?;
+                    }
+                }
             }
             StmtKind::AnnAssign {
                 target,
@@ -2256,10 +4857,51 @@ impl Compiler {
                         self.compile_annotation_record(name, annotation)?;
                     }
                 }
+                // CPython's compiler_annassign side-effect evaluation for
+                // targets that don't record an annotation: an unassigned
+                // attribute/subscript target evaluates its subexpressions
+                // (check_ann_expr / check_ann_subscr), and — outside PEP
+                // 563 mode, at module/class scope only — a non-simple
+                // statement evaluates the annotation itself and discards
+                // it (check_annotation; dis_annot_stmt_str grades the
+                // LOAD_NAME/POP_TOP tail).
+                if value.is_none() {
+                    match &target.kind {
+                        ExprKind::Attribute { value: obj, .. } => {
+                            self.compile_expr(obj)?;
+                            self.emit(OpCode::PopTop, 0);
+                        }
+                        ExprKind::Subscript { value: obj, slice } => {
+                            self.compile_expr(obj)?;
+                            self.emit(OpCode::PopTop, 0);
+                            self.compile_expr(slice)?;
+                            self.emit(OpCode::PopTop, 0);
+                        }
+                        _ => {}
+                    }
+                }
+                if !*simple
+                    && !self.future_annotations
+                    && matches!(self.code_kind, CodeKind::Class | CodeKind::Module)
+                {
+                    self.compile_expr(annotation)?;
+                    self.emit(OpCode::PopTop, 0);
+                }
             }
             StmtKind::If { test, body, orelse } => {
-                self.compile_expr(test)?;
-                let jump_else = self.emit(OpCode::PopJumpIfFalse, 0);
+                let (cond, invert) = strip_not_chain(test);
+                self.compile_expr(cond)?;
+                if !expr_is_bool(cond) {
+                    self.emit(OpCode::ToBool, 0);
+                }
+                let jump_else = self.emit(
+                    if invert {
+                        OpCode::PopJumpIfTrue
+                    } else {
+                        OpCode::PopJumpIfFalse
+                    },
+                    0,
+                );
                 for s in body {
                     self.compile_stmt(s)?;
                 }
@@ -2307,9 +4949,20 @@ impl Compiler {
                     self.set_span(test.span);
                     self.emit(OpCode::Nop, 0);
                 } else {
-                    self.compile_expr(test)?;
+                    let (cond, invert) = strip_not_chain(test);
+                    self.compile_expr(cond)?;
                     self.set_span(test.span);
-                    jump_exit_top = Some(self.emit(OpCode::PopJumpIfFalse, 0));
+                    if !expr_is_bool(cond) {
+                        self.emit(OpCode::ToBool, 0);
+                    }
+                    jump_exit_top = Some(self.emit(
+                        if invert {
+                            OpCode::PopJumpIfTrue
+                        } else {
+                            OpCode::PopJumpIfFalse
+                        },
+                        0,
+                    ));
                 }
                 let body_start = self.next_offset();
                 self.loop_stack.push(LoopFrame {
@@ -2321,6 +4974,7 @@ impl Compiler {
                     is_for_loop: false,
                     handler_depth_at_entry: self.handler_depth,
                     exc_on_stack_at_entry: self.exc_on_stack,
+                    pending_retvals_at_entry: self.pending_retvals,
                 });
                 for s in body {
                     self.compile_stmt(s)?;
@@ -2333,9 +4987,20 @@ impl Compiler {
                     self.current_span = while_span;
                     self.set_span(test.span);
                 } else {
-                    self.compile_expr(test)?;
+                    let (cond, invert) = strip_not_chain(test);
+                    self.compile_expr(cond)?;
                     self.set_span(test.span);
-                    jump_exit_bottom = Some(self.emit(OpCode::PopJumpIfFalse, 0));
+                    if !expr_is_bool(cond) {
+                        self.emit(OpCode::ToBool, 0);
+                    }
+                    jump_exit_bottom = Some(self.emit(
+                        if invert {
+                            OpCode::PopJumpIfTrue
+                        } else {
+                            OpCode::PopJumpIfFalse
+                        },
+                        0,
+                    ));
                 }
                 let back = self.emit(OpCode::JumpBackward, 0);
                 self.synthetic_jumps.insert(back);
@@ -2387,6 +5052,7 @@ impl Compiler {
                     is_for_loop: true,
                     handler_depth_at_entry: self.handler_depth,
                     exc_on_stack_at_entry: self.exc_on_stack,
+                    pending_retvals_at_entry: self.pending_retvals,
                 });
                 for s in body {
                     self.compile_stmt(s)?;
@@ -2403,7 +5069,13 @@ impl Compiler {
                 // spurious `line` event for the loop body after exhaustion.
                 self.set_span(iter.span);
                 self.current_line = for_line;
+                // CPython 3.13's loop-exit pair: END_FOR then POP_TOP
+                // (the exhausted FOR_ITER pops the iterator and jumps
+                // *past* both at runtime — they exist as the jump
+                // target and for instrumentation; test_dis asserts the
+                // shape). The VM skips them the same way.
                 self.emit(OpCode::EndFor, 0);
+                self.emit(OpCode::PopTop, 0);
                 for s in orelse {
                     self.compile_stmt(s)?;
                 }
@@ -2537,27 +5209,106 @@ impl Compiler {
                         stmt.span,
                     ));
                 }
-                match value {
-                    Some(v) => self.compile_expr(v)?,
-                    None => {
-                        let idx = self.co.intern_constant(Constant::None);
-                        self.emit(OpCode::LoadConst, idx);
+                // CPython's `preserve_tos`: a constant return value is
+                // *not* pushed before the inlined finally bodies run —
+                // codegen emits a located NOP at the `return` (the
+                // traced line), the unwind, then LOAD_CONST +
+                // RETURN_VALUE (fused to RETURN_CONST on the wire) at
+                // the end (test_dis test_disassemble_try_finally,
+                // _tryfinallyconst).
+                let const_ret = match value {
+                    None => true,
+                    Some(v) => matches!(v.kind, ExprKind::Constant(_)),
+                };
+                if !const_ret {
+                    match value {
+                        Some(v) => self.compile_expr(v)?,
+                        None => unreachable!("const_ret covers None"),
                     }
+                } else if !self.finally_stack.is_empty() {
+                    self.emit(OpCode::Nop, 0);
                 }
                 // Inline every pending finally clause from innermost
                 // outward so each runs before we leave the function.
-                // We stash the return value in a synthetic local across
-                // each finally body to keep it alive even if the body
-                // mutates the stack.
+                // A non-constant return value stays *on the operand
+                // stack* while the inlined bodies run (they are
+                // stack-neutral), exactly as CPython's duplicated
+                // finally shape does — a synthetic `.retvalN` local
+                // would leak into co_varnames, which test_dis grades
+                // verbatim. If a body raises, the unwinder's depth
+                // truncation discards the pending value, matching
+                // CPython.
                 if !self.finally_stack.is_empty() {
-                    let tmp = format!(".retval{}", self.finally_counter);
-                    self.finally_counter += 1;
-                    let tmp_idx = self.var_index_or_add(&tmp);
-                    self.emit(OpCode::StoreFast, tmp_idx);
                     let frames = std::mem::take(&mut self.finally_stack);
                     let mut compiled: Result<(), CompileError> = Ok(());
                     let mut hole_starts: Vec<(u32, u32)> = Vec::new();
+                    // The value being returned rides the operand stack
+                    // under the inlined finally bodies; a `break`/
+                    // `continue` inside one of them abandons the return
+                    // and must pop it (see `pending_retvals`).
+                    if !const_ret {
+                        self.pending_retvals += 1;
+                    }
+                    let mut cur_exc = self.exc_on_stack;
+                    let mut cur_loops = self.loop_stack.len();
                     for (i, frame) in frames.iter().enumerate().rev() {
+                        // Exception regions ([prev, exc] of an
+                        // exception-path finally copy) entered *after*
+                        // this frame was pushed sit above its stack
+                        // state. Frames that consume specific slots — a
+                        // with's on-stack `__exit__`, a handler-exit's
+                        // POP_EXCEPT — need them drained first
+                        // (CPython's FINALLY_END unwind), preserving the
+                        // pending return value on top.
+                        let positional = frame.pop_except_after
+                            || matches!(
+                                frame.kind,
+                                FinallyKind::WithExit { .. } | FinallyKind::AsyncWithExit { .. }
+                            );
+                        if positional {
+                            // Everything pushed *after* this frame sits above
+                            // the slot its inline consumes and must be
+                            // drained first, in recency order: exception
+                            // regions ([prev, exc]) *and* `for`-loop
+                            // iterators (CPython's FOR_LOOP fblock unwind
+                            // pops the iterator — without it a `return` from
+                            // a `for` inside a `with` called the *iterator*
+                            // as if it were `__exit__`; pdb.find_function's
+                            // `with fp: for … return` shape hit this).
+                            // Recency between the two kinds is recovered
+                            // from each loop's `exc_on_stack_at_entry`.
+                            while cur_exc > frame.exc_at_push
+                                || cur_loops > frame.loop_depth_at_push
+                            {
+                                let loop_is_newer = cur_loops > frame.loop_depth_at_push
+                                    && (cur_exc == frame.exc_at_push
+                                        || self.loop_stack[cur_loops - 1].exc_on_stack_at_entry
+                                            >= cur_exc);
+                                if loop_is_newer {
+                                    cur_loops -= 1;
+                                    if self.loop_stack[cur_loops].is_for_loop {
+                                        if const_ret {
+                                            self.emit(OpCode::PopTop, 0);
+                                        } else {
+                                            // [iter, rv] → [rv]
+                                            self.emit(OpCode::Swap, 2);
+                                            self.emit(OpCode::PopTop, 0);
+                                        }
+                                    }
+                                } else if const_ret {
+                                    self.emit(OpCode::PopTop, 0);
+                                    self.emit(OpCode::PopExcept, 0);
+                                    cur_exc -= 1;
+                                } else {
+                                    // [prev, exc, rv] → [rv]
+                                    self.emit(OpCode::Swap, 2);
+                                    self.emit(OpCode::PopTop, 0);
+                                    self.emit(OpCode::Swap, 2);
+                                    self.emit(OpCode::PopExcept, 0);
+                                    cur_exc -= 1;
+                                }
+                            }
+                        }
                         // While compiling this finally body, hide it
                         // from the stack so nested `return`s inside the
                         // body don't recurse infinitely.
@@ -2565,7 +5316,7 @@ impl Compiler {
                             frames.iter().take(i).map(clone_finally_frame).collect();
                         self.finally_stack = saved_finally;
                         let inline_start = self.next_offset();
-                        if let Err(e) = self.emit_finally_frame(frame) {
+                        if let Err(e) = self.emit_finally_frame(frame, !const_ret) {
                             compiled = Err(e);
                         }
                         // Returning out of an `except` handler body:
@@ -2574,7 +5325,15 @@ impl Compiler {
                         // `e = None; del e; POP_EXCEPT` order), so the
                         // pop's prompt-reap cascade can free the handled
                         // exception — and everything its traceback pins.
+                        // The saved previous exception (PUSH_EXC_INFO's
+                        // stack slot) sits *under* a pending return
+                        // value; CPython swaps them (only when a value is
+                        // preserved) so POP_EXCEPT consumes the right
+                        // slot.
                         if compiled.is_ok() && frame.pop_except_after {
+                            if !const_ret {
+                                self.emit(OpCode::Swap, 2);
+                            }
                             self.emit(OpCode::PopExcept, 0);
                         }
                         hole_starts.push((frame.id, inline_start));
@@ -2583,22 +5342,59 @@ impl Compiler {
                             break;
                         }
                     }
+                    if !const_ret {
+                        self.pending_retvals -= 1;
+                    }
                     self.finally_stack = frames;
                     compiled?;
-                    // The inlined finally bodies ran here for the return;
-                    // the `LoadFast`/`ReturnValue` below cannot raise.
-                    // Exclude each frame's inline (extended through the end
-                    // of the whole run, so an outer frame's `raise` is also
-                    // excluded from inner tries) from its owning try's
-                    // exception coverage, so a `raise` inside a return-path
-                    // finally propagates outward instead of re-running it.
+                    // The constant value materialises *after* the
+                    // unwind, adjacent to RETURN_VALUE and at the
+                    // current (finally-end) location, so the encoder's
+                    // RETURN_CONST fusion applies — same-line check
+                    // included (arg 1 marks a codegen-origin constant
+                    // return as fusable).
+                    if const_ret {
+                        let c = match value {
+                            Some(Expr {
+                                kind: ExprKind::Constant(c),
+                                ..
+                            }) => c.clone().into(),
+                            None => Constant::None,
+                            Some(_) => unreachable!("const_ret guards the kind"),
+                        };
+                        let idx = self.co.intern_constant(c);
+                        self.emit(OpCode::LoadConst, idx);
+                    }
+                    self.emit(OpCode::ReturnValue, u32::from(const_ret));
+                    // The inlined finally bodies ran here for the return.
+                    // Exclude each frame's inline — through the
+                    // RETURN_VALUE itself, which CPython leaves uncovered
+                    // (test_dis's try/finally exception table) — from its
+                    // owning try's exception coverage, so a `raise` inside
+                    // a return-path finally propagates outward instead of
+                    // re-running it.
                     let inline_end = self.next_offset();
                     for (id, start) in hole_starts {
                         self.finally_holes.push((id, start, inline_end));
                     }
-                    self.emit(OpCode::LoadFast, tmp_idx);
+                    return Ok(());
                 }
-                self.emit(OpCode::ReturnValue, 0);
+                // No finally clauses: materialise a constant value here
+                // (the non-constant case compiled it above). arg 1 marks
+                // a codegen-origin constant return as RETURN_CONST-
+                // fusable on the wire (CPython emits RETURN_CONST from
+                // codegen only; the flowgraph never re-fuses an
+                // optimizer-produced LOAD_CONST + RETURN_VALUE pair).
+                if const_ret {
+                    match value {
+                        Some(v) => self.compile_expr(v)?,
+                        None => {
+                            let idx = self.co.intern_constant(Constant::None);
+                            self.emit(OpCode::LoadConst, idx);
+                        }
+                    }
+                }
+                self.emit(OpCode::ReturnValue, u32::from(const_ret));
             }
             StmtKind::Break => {
                 // CPython's codegen_break emits a located NOP so tracing
@@ -2610,28 +5406,14 @@ impl Compiler {
                     .last()
                     .ok_or_else(|| CompileError::spanned("'break' outside loop", stmt.span))?;
                 let is_for = frame_top.is_for_loop;
-                let exc_to_pop = self
-                    .handler_depth
-                    .saturating_sub(frame_top.handler_depth_at_entry);
-                let exc_vals = self
-                    .exc_on_stack
-                    .saturating_sub(frame_top.exc_on_stack_at_entry);
-                // Leaving `except` handler bodies on the way out: discard
-                // their handled-exception state (CPython POP_EXCEPT
-                // during block unwind).
-                for _ in 0..exc_to_pop {
-                    self.emit(OpCode::PopExcept, 0);
-                }
-                // Leaving a `finally` running on the exception path:
-                // drop the propagating exception (value stack) and its
-                // handler state — the RERAISE it awaited is skipped.
-                for _ in 0..exc_vals {
-                    self.emit(OpCode::PopExcept, 0);
-                    self.emit(OpCode::PopTop, 0);
-                }
-                // Run any `finally` clauses that lie between us and
-                // the enclosing loop, in innermost-out order.
-                self.inline_finally_for_loop_exit()?;
+                let tgt_exc = frame_top.exc_on_stack_at_entry;
+                let tgt_handler = frame_top.handler_depth_at_entry;
+                let tgt_rv = frame_top.pending_retvals_at_entry;
+                // Inline the `finally` clauses between us and the loop
+                // (innermost-out), interleaved with pops for exception
+                // regions / handler bodies / pending return values in
+                // recency order.
+                self.unwind_for_loop_exit(tgt_exc, tgt_handler, tgt_rv)?;
                 if is_for {
                     self.emit(OpCode::PopTop, 0);
                 }
@@ -2651,21 +5433,11 @@ impl Compiler {
                     CompileError::spanned("'continue' not properly in loop", stmt.span)
                 })?;
                 let target = frame_top.continue_target;
-                let exc_to_pop = self
-                    .handler_depth
-                    .saturating_sub(frame_top.handler_depth_at_entry);
-                let exc_vals = self
-                    .exc_on_stack
-                    .saturating_sub(frame_top.exc_on_stack_at_entry);
-                for _ in 0..exc_to_pop {
-                    self.emit(OpCode::PopExcept, 0);
-                }
-                // See Break: unwind exception-path `finally` state.
-                for _ in 0..exc_vals {
-                    self.emit(OpCode::PopExcept, 0);
-                    self.emit(OpCode::PopTop, 0);
-                }
-                self.inline_finally_for_loop_exit()?;
+                let tgt_exc = frame_top.exc_on_stack_at_entry;
+                let tgt_handler = frame_top.handler_depth_at_entry;
+                let tgt_rv = frame_top.pending_retvals_at_entry;
+                // See Break: recency-ordered unwind.
+                self.unwind_for_loop_exit(tgt_exc, tgt_handler, tgt_rv)?;
                 let site = self.emit(OpCode::JumpBackward, 0);
                 self.patch_jump(site, target);
             }
@@ -2770,8 +5542,12 @@ impl Compiler {
         self.emit(OpCode::ImportName, name_idx);
 
         // `from m import *` is its own opcode and binds every public name.
+        // CPython lowers it to CALL_INTRINSIC_1(IMPORT_STAR) which returns
+        // None, popped by an explicit POP_TOP — the VM's ImportStar pushes
+        // None to match (test_dis test_intrinsic_1 grades the pair).
         if names.len() == 1 && names[0].name == "*" {
             self.emit(OpCode::ImportStar, 0);
+            self.emit(OpCode::PopTop, 0);
             return Ok(());
         }
 
@@ -3700,6 +6476,9 @@ impl Compiler {
         // `__classdict__` (CPython `ste_can_see_class_scope`).
         self.pending_lazy_class_ctx = self.make_lazy_ctx();
         self.build_function_object_inner(&hidden_name, &hidden_args, &hidden_body, None, false)?;
+        // The hidden function is a NULL-style callable (CPython:
+        // `MAKE_FUNCTION; PUSH_NULL; CALL 0`).
+        self.emit(OpCode::PushNull, 0);
         for e in &hoisted {
             self.compile_expr(e)?;
         }
@@ -3707,7 +6486,9 @@ impl Compiler {
         for d in decorator_list.iter().rev() {
             let saved = self.current_span;
             self.set_span(d.span);
-            self.emit(OpCode::Call, 1);
+            // The decorated value rides the self slot (CPython
+            // compiler_apply_decorators: `CALL 0`, no PUSH_NULL).
+            self.emit(OpCode::CallSelf, 1);
             self.current_span = saved;
         }
         self.compile_assign(&name_expr(name))
@@ -3771,7 +6552,8 @@ impl Compiler {
         for d in decorator_list.iter().rev() {
             let saved = self.current_span;
             self.set_span(d.span);
-            self.emit(OpCode::Call, 1);
+            // Decorated function rides the self slot (wire `CALL 0`).
+            self.emit(OpCode::CallSelf, 1);
             self.current_span = saved;
         }
         let name_expr = Expr {
@@ -3850,7 +6632,7 @@ impl Compiler {
             CodeKind::Function,
             self.line_index.clone(),
             self.source.clone(),
-            self.params,
+            self.params.clone(),
         );
         inner.private = self.private.clone();
         // PEP 695: a hidden `<generic parameters of X>` scope being
@@ -3961,10 +6743,12 @@ impl Compiler {
             inner.co.is_async_generator = has_yield;
             inner.co.is_coroutine = !has_yield;
             inner.emit(OpCode::ReturnGenerator, 0);
+            inner.emit(OpCode::PopTop, 0);
         } else {
             inner.co.is_generator = has_yield;
             if has_yield {
                 inner.emit(OpCode::ReturnGenerator, 0);
+                inner.emit(OpCode::PopTop, 0);
             }
         }
         inner.emit_entry_resume();
@@ -3979,7 +6763,7 @@ impl Compiler {
         let doc_slot = match first_stmt_docstring(body) {
             // `-OO` (optimize >= 2) strips docstrings; the slot decays
             // to the shared `None` constant like CPython's.
-            Some(doc) if self.params.optimize < 2 => Constant::Str(doc.to_owned()),
+            Some(doc) if self.params.optimize < 2 => Constant::Str(clean_docstring(doc)),
             _ => Constant::None,
         };
         inner.co.intern_constant(doc_slot);
@@ -4070,9 +6854,9 @@ impl Compiler {
         }
         let code_idx = self
             .co
-            .intern_constant(Constant::Code(Box::new(inner_code)));
+            .intern_constant(Constant::Code(std::sync::Arc::new(inner_code)));
         self.emit(OpCode::LoadConst, code_idx);
-        self.emit(OpCode::MakeFunction, flags);
+        self.emit_make_function(flags);
         Ok(())
     }
 
@@ -4106,6 +6890,9 @@ impl Compiler {
         self.current_line = class_line;
         self.current_span = class_span;
         self.emit(OpCode::LoadBuildClass, 0);
+        // `__build_class__` is a NULL-style callable (CPython:
+        // `LOAD_BUILD_CLASS; PUSH_NULL; …`).
+        self.emit(OpCode::PushNull, 0);
 
         // A `**kwds` in the class header (or a `*bases` splat) can't be
         // expressed with the fixed-arity `Call`/`CallKw` shapes, so fall
@@ -4158,7 +6945,8 @@ impl Compiler {
         for d in decorator_list.iter().rev() {
             let saved = self.current_span;
             self.set_span(d.span);
-            self.emit(OpCode::Call, 1);
+            // Decorated class rides the self slot (wire `CALL 0`).
+            self.emit(OpCode::CallSelf, 1);
             self.current_span = saved;
         }
         let name_expr = Expr {
@@ -4200,7 +6988,7 @@ impl Compiler {
             CodeKind::Class,
             self.line_index.clone(),
             self.source.clone(),
-            self.params,
+            self.params.clone(),
         );
         inner.private = Some(Rc::from(name));
         inner.co.qualname = self.compute_child_qualname(name);
@@ -4402,7 +7190,20 @@ impl Compiler {
             )));
             let line_name = inner.co.intern_name("__firstlineno__");
             inner.emit(OpCode::LoadConst, line_const);
-            inner.emit(OpCode::StoreName, line_name);
+            // A `nonlocal __firstlineno__` declaration in the class body
+            // redirects this store to the enclosing function's cell — the
+            // class dict then carries no `__firstlineno__` and
+            // `inspect.getsource` reports "source code not available"
+            // (test_inspect test_getsource_on_class_without_firstlineno).
+            match inner.classify_for_store("__firstlineno__") {
+                Binding::Free | Binding::Nonlocal | Binding::Cell => {
+                    let idx = inner.cell_or_free_index("__firstlineno__");
+                    inner.emit(OpCode::StoreDeref, idx);
+                }
+                _ => {
+                    inner.emit(OpCode::StoreName, line_name);
+                }
+            }
         }
 
         // CPython stores a class body's leading string literal as
@@ -4416,7 +7217,9 @@ impl Compiler {
         if let Some(doc) = first_stmt_docstring(body) {
             // `-OO` (optimize >= 2) strips class docstrings too.
             if self.params.optimize < 2 {
-                let doc_const = inner.co.intern_constant(Constant::Str(doc.to_owned()));
+                let doc_const = inner
+                    .co
+                    .intern_constant(Constant::Str(clean_docstring(doc)));
                 let doc_name = inner.co.intern_name("__doc__");
                 // CPython locates the `__doc__` store at the docstring
                 // statement, so tracing a class body fires a `'line'`
@@ -4434,6 +7237,11 @@ impl Compiler {
         // symtable `ste_annotations_used`), so a read of `__annotations__`
         // preceding the first annotation sees the dict.
         if block_has_annotations(body) {
+            // Located on the body's first statement, as in compiler_body.
+            if let Some(first) = body.first() {
+                inner.set_line_from(first.span.start.0);
+                inner.set_span(first.span);
+            }
             inner.emit(OpCode::SetupAnnotations, 0);
             inner.annotations_initialized = true;
         }
@@ -4459,28 +7267,15 @@ impl Compiler {
         inner.line_pinned = Some(0);
 
         // `__static_attributes__` (sorted names assigned through
-        // `self.X` in any method body) — stored after the body runs,
-        // exactly where CPython 3.13's compiler emits it.
+        // `self.X` lexically inside the class) — stored after the body
+        // runs, exactly where CPython 3.13's compiler emits it.
+        // CPython's `compiler_maybe_add_static_attribute_to_class`
+        // matches the literal name `self` in *any* unit nested under
+        // the class scope (nested functions included; nested classes
+        // collect their own), regardless of parameter names.
         {
             let mut attrs: HashSet<String> = HashSet::new();
-            for s in body {
-                if let StmtKind::FunctionDef {
-                    args, body: fbody, ..
-                }
-                | StmtKind::AsyncFunctionDef {
-                    args, body: fbody, ..
-                } = &s.kind
-                {
-                    let self_name = args
-                        .posonlyargs
-                        .first()
-                        .or_else(|| args.args.first())
-                        .map(|a| a.name.clone());
-                    if let Some(self_name) = self_name {
-                        collect_self_attr_stores(fbody, &self_name, &mut attrs);
-                    }
-                }
-            }
+            collect_self_attr_stores(body, "self", &mut attrs);
             let mut attrs: Vec<String> = attrs.into_iter().collect();
             attrs.sort();
             let tup = Constant::Tuple(attrs.into_iter().map(Constant::Str).collect());
@@ -4523,9 +7318,9 @@ impl Compiler {
         }
         let code_idx = self
             .co
-            .intern_constant(Constant::Code(Box::new(inner_code)));
+            .intern_constant(Constant::Code(std::sync::Arc::new(inner_code)));
         self.emit(OpCode::LoadConst, code_idx);
-        self.emit(OpCode::MakeFunction, flags);
+        self.emit_make_function(flags);
         Ok(())
     }
 
@@ -4557,18 +7352,45 @@ impl Compiler {
         push_lasti: bool,
         frame_id: Option<u32>,
     ) {
+        let ids: Vec<u32> = frame_id.into_iter().collect();
+        self.push_body_exc_entries_ids(start, end, handler, depth, push_lasti, &ids);
+    }
+
+    /// [`Self::push_body_exc_entries`] with holes punched for *several*
+    /// frames' inline copies (an except-region's segments must exclude
+    /// every clause's return-path unwind run).
+    fn push_body_exc_entries_ids(
+        &mut self,
+        start: u32,
+        end: u32,
+        handler: u32,
+        depth: u32,
+        push_lasti: bool,
+        frame_ids: &[u32],
+    ) {
         if end <= start {
             return;
         }
-        let mut holes: Vec<(u32, u32)> = match frame_id {
-            Some(fid) => self
-                .finally_holes
-                .iter()
-                .filter(|(id, hs, he)| *id == fid && *hs < end && *he > start)
-                .map(|(_, hs, he)| ((*hs).max(start), (*he).min(end)))
-                .collect(),
-            None => Vec::new(),
+        // RFC 0068 WS1: with CPython's on-stack exception discipline
+        // (PUSH_EXC_INFO's saved previous exception and lasti offsets
+        // occupy real stack slots) hand-maintained depth counts no
+        // longer track the true entry depth in nested handler contexts.
+        // Record the sentinel instead; `finish` resolves each entry to
+        // the static stack depth at its protected range's start — which
+        // is exactly CPython's handler depth. Callers whose range starts
+        // above its own baseline pass an *anchored* depth
+        // (`HANDLER_DEPTH_ANCHOR_FLAG | insn`), kept as-is.
+        let depth = if depth & HANDLER_DEPTH_ANCHOR_FLAG != 0 && depth != HANDLER_DEPTH_SENTINEL {
+            depth
+        } else {
+            HANDLER_DEPTH_SENTINEL
         };
+        let mut holes: Vec<(u32, u32)> = self
+            .finally_holes
+            .iter()
+            .filter(|(id, hs, he)| frame_ids.contains(id) && *hs < end && *he > start)
+            .map(|(_, hs, he)| ((*hs).max(start), (*he).min(end)))
+            .collect();
         holes.sort_by_key(|(hs, _)| *hs);
         let mut cur = start;
         for (hs, he) in holes {
@@ -4594,11 +7416,23 @@ impl Compiler {
         }
     }
 
-    /// Inline every `finally` clause that lives *inside* the
-    /// enclosing loop (i.e. was pushed after the current loop frame),
-    /// in innermost-out order. Used by `break` / `continue` so the
-    /// cleanup runs before we transfer control out of the loop.
-    fn inline_finally_for_loop_exit(&mut self) -> Result<(), CompileError> {
+    /// Unwind the operand stack for a `break`/`continue`: inline every
+    /// `finally` clause that lives *inside* the enclosing loop (i.e.
+    /// was pushed after the current loop frame) in innermost-out
+    /// order, interleaved — in recency order — with pops for
+    /// exception regions ([prev, exc] of an exception-path finally
+    /// copy), handler bodies ([prev] of an `except` clause), and
+    /// pending return values that sit *above* each frame's stack
+    /// state. Ordering matters now that a `with`'s bound `__exit__`
+    /// is a real stack slot: its inline consumes TOS, so everything
+    /// newer must be drained first. `tgt_*` are the loop-entry
+    /// snapshots; everything above them is drained by the end.
+    fn unwind_for_loop_exit(
+        &mut self,
+        tgt_exc: u32,
+        tgt_handler: u32,
+        tgt_rv: u32,
+    ) -> Result<(), CompileError> {
         let loop_depth = self.loop_stack.len();
         let mut to_inline: Vec<FinallyFrame> = Vec::new();
         for frame in self.finally_stack.iter().rev() {
@@ -4608,15 +7442,51 @@ impl Compiler {
                 break;
             }
         }
-        if to_inline.is_empty() {
-            return Ok(());
-        }
+        let mut cur_exc = self.exc_on_stack;
+        let mut cur_handler = self.handler_depth;
+        let mut cur_rv = self.pending_retvals;
+        let drain = |c: &mut Self,
+                     cur_exc: &mut u32,
+                     cur_handler: &mut u32,
+                     cur_rv: &mut u32,
+                     exc_floor: u32,
+                     handler_floor: u32,
+                     rv_floor: u32| {
+            // Exception regions: [prev, exc] — pop the value, then
+            // restore the handled-exception state (CPython order).
+            while *cur_exc > exc_floor {
+                c.emit(OpCode::PopTop, 0);
+                c.emit(OpCode::PopExcept, 0);
+                *cur_exc -= 1;
+            }
+            // Handler bodies: [prev] — POP_EXCEPT during block unwind.
+            while *cur_handler > handler_floor {
+                c.emit(OpCode::PopExcept, 0);
+                *cur_handler -= 1;
+            }
+            // Abandoned pending return values
+            // (test_grammar.test_break_in_finally_after_return).
+            while *cur_rv > rv_floor {
+                c.emit(OpCode::PopTop, 0);
+                *cur_rv -= 1;
+            }
+        };
         let saved = std::mem::take(&mut self.finally_stack);
         // Walk innermost out; on each iteration further trim the
         // finally stack so a `return` nested inside a finally body
         // can't re-inline its own ancestors infinitely.
         let mut hole_starts: Vec<(u32, u32)> = Vec::new();
+        let mut result: Result<(), CompileError> = Ok(());
         for (offset, frame) in to_inline.iter().enumerate() {
+            drain(
+                self,
+                &mut cur_exc,
+                &mut cur_handler,
+                &mut cur_rv,
+                frame.exc_at_push.max(tgt_exc),
+                frame.handler_at_push.max(tgt_handler),
+                frame.rv_at_push.max(tgt_rv),
+            );
             let outer_count = saved.len().saturating_sub(offset + 1);
             self.finally_stack = saved
                 .iter()
@@ -4624,10 +7494,23 @@ impl Compiler {
                 .map(clone_finally_frame)
                 .collect();
             let inline_start = self.next_offset();
-            self.emit_finally_frame(frame)?;
+            if let Err(e) = self.emit_finally_frame(frame, false) {
+                result = Err(e);
+                break;
+            }
             hole_starts.push((frame.id, inline_start));
         }
         self.finally_stack = saved;
+        result?;
+        drain(
+            self,
+            &mut cur_exc,
+            &mut cur_handler,
+            &mut cur_rv,
+            tgt_exc,
+            tgt_handler,
+            tgt_rv,
+        );
         // Each inlined finally runs once, here, for the loop exit; a
         // `raise` from it must skip this try's own coverage (and that of
         // any inner try) and propagate to an enclosing one. Extend every
@@ -4642,9 +7525,16 @@ impl Compiler {
     }
 
     /// Emit cleanup code for one `FinallyFrame`. `Stmts` frames
-    /// re-compile the AST body; `WithExit` frames emit
-    /// `<cm_local>.__exit__(None, None, None)` directly.
-    fn emit_finally_frame(&mut self, frame: &FinallyFrame) -> Result<(), CompileError> {
+    /// re-compile the AST body; `WithExit` frames call the on-stack
+    /// bound `__exit__` with three `None`s. `preserve_tos` marks a
+    /// pending return value riding on top of the frame's stack state
+    /// (CPython's `preserve_tos` in `codegen_unwind_fblock`): the
+    /// with-exits SWAP it out of the way before consuming their slot.
+    fn emit_finally_frame(
+        &mut self,
+        frame: &FinallyFrame,
+        preserve_tos: bool,
+    ) -> Result<(), CompileError> {
         match &frame.kind {
             FinallyKind::Stmts(body) => {
                 for s in body {
@@ -4652,55 +7542,43 @@ impl Compiler {
                 }
                 Ok(())
             }
-            FinallyKind::WithExit {
-                exit_idx,
-                line,
-                span,
-            } => {
-                // The bound `__exit__` was stashed at `exit_idx` by
-                // `compile_with`; call it directly (no `LoadAttr`).
+            FinallyKind::WithExit { line, span } => {
+                // The bound `__exit__` (pushed by BEFORE_WITH) is on
+                // the operand stack; call it in place (no `LoadAttr`).
                 // Located on the `with` statement itself (CPython).
                 self.current_line = *line;
                 self.current_span = *span;
-                self.emit(OpCode::LoadFast, *exit_idx);
+                if preserve_tos {
+                    self.emit(OpCode::Swap, 2);
+                }
                 let none_idx = self.co.intern_constant(Constant::None);
                 self.emit(OpCode::LoadConst, none_idx);
                 self.emit(OpCode::LoadConst, none_idx);
                 self.emit(OpCode::LoadConst, none_idx);
-                self.emit(OpCode::Call, 3);
+                // First None rides the self slot (CPython's with-exit
+                // shape is `CALL 2`).
+                self.emit(OpCode::CallSelf, 3);
                 self.emit(OpCode::PopTop, 0);
-                // A `return`/`break`/`continue` out of the `with` leaves the
-                // block for good; drop the synthetic `.with_exit` local (the
-                // `.with_cm` was already dropped right after `__enter__`) so a
-                // generator that yields afterwards — e.g. `break` out of a
-                // `with` inside a loop — doesn't keep the manager alive. The
-                // local is always bound here (set before the body ran).
-                self.emit(OpCode::DeleteFast, *exit_idx);
                 Ok(())
             }
-            FinallyKind::AsyncWithExit {
-                aexit_idx,
-                line,
-                span,
-            } => {
-                // `await <aexit>(None, None, None)`. The bound coroutine
-                // method was stashed at `aexit_idx` by `compile_async_with`.
-                // Located on the `async with` statement itself (CPython).
+            FinallyKind::AsyncWithExit { line, span } => {
+                // `await TOS(None, None, None)`. The bound coroutine
+                // method was pushed by BEFORE_ASYNC_WITH. Located on
+                // the `async with` statement itself (CPython).
                 self.current_line = *line;
                 self.current_span = *span;
-                self.emit(OpCode::LoadFast, *aexit_idx);
+                if preserve_tos {
+                    self.emit(OpCode::Swap, 2);
+                }
                 let none_idx = self.co.intern_constant(Constant::None);
                 self.emit(OpCode::LoadConst, none_idx);
                 self.emit(OpCode::LoadConst, none_idx);
                 self.emit(OpCode::LoadConst, none_idx);
-                self.emit(OpCode::Call, 3);
-                self.compile_await_dance(3);
+                // First None rides the self slot (wire `CALL 2`).
+                self.emit(OpCode::CallSelf, 3);
+                self.compile_await_dance(2);
                 self.emit(OpCode::PopTop, 0);
                 // `return`/`break`/`continue` leaves the `async with` for
-                // good; drop the synthetic `.aexit` local so an async
-                // generator that yields afterwards doesn't pin the manager.
-                // Always bound here (set before the body ran).
-                self.emit(OpCode::DeleteFast, *aexit_idx);
                 Ok(())
             }
         }
@@ -4771,20 +7649,27 @@ impl Compiler {
         // `finally` keeps on the stack for its trailing RERAISE.
         let body_depth =
             self.loop_stack.iter().filter(|fr| fr.is_for_loop).count() as u32 + self.exc_on_stack;
-        // Make the finally body visible to any `return`/`break`/
-        // `continue` nested inside `body`/`orelse`/handlers. We pop it
-        // before emitting the *direct* normal-/exception-exit copies
-        // below — those copies must not see themselves on the stack.
-        let pushed_finally = has_finally;
-        if pushed_finally {
+        // CPython nests `try/except/else/finally` as a try/finally
+        // whose body is the whole try/except part (compiler_try_finally
+        // → compiler_try_except): one shared normal finally copy after
+        // the try/except region, one exceptional copy at the end. The
+        // frame makes the finally body visible to `return`/`break`/
+        // `continue` nested anywhere inside body/orelse/handlers.
+        let wrap_frame_id = if has_finally {
             let id = self.fresh_finally_id();
             self.finally_stack.push(FinallyFrame {
                 kind: FinallyKind::Stmts(finalbody.to_vec()),
                 loop_depth_at_push: self.loop_stack.len(),
                 id,
                 pop_except_after: false,
+                exc_at_push: self.exc_on_stack,
+                handler_at_push: self.handler_depth,
+                rv_at_push: self.pending_retvals,
             });
-        }
+            Some(id)
+        } else {
+            None
+        };
         // The finally frame whose return/break/continue-path inlines must
         // be punched out of this statement's body coverage. With a
         // `finally` it is this try's own frame (just pushed, now on top);
@@ -4793,49 +7678,34 @@ impl Compiler {
         // here. Captured before the body compiles so nested frames pushed
         // by inner `try`s don't shadow it.
         let body_frame_id = self.finally_stack.last().map(|f| f.id);
+        let wrap_start = self.next_offset();
         let body_start = self.next_offset();
         for s in body {
             self.compile_stmt(s)?;
         }
         let body_end = self.next_offset();
-        // Else clause runs only on normal body completion. It sits
-        // *outside* the handled range: an exception raised in `else`
-        // does not reach this statement's own `except` clauses (it
-        // still passes through `finally` via the cleanup entries
-        // registered below).
-        let orelse_start = self.next_offset();
-        for s in orelse {
-            self.compile_stmt(s)?;
-        }
-        let orelse_end = self.next_offset();
-
-        // Normal-exit finally + jump to end. Falls through to the
-        // finally body, then skips past the exception handlers.
-        // We temporarily pop the finally frame so the inline copy here
-        // doesn't see itself as still-pending (which would double-run
-        // it on a nested `return`).
-        let saved_frame = if pushed_finally {
-            self.finally_stack.pop()
-        } else {
-            None
-        };
-        let normal_skip = if has_handlers || has_finally {
-            for s in finalbody {
+        let mut normal_skip = None;
+        if has_handlers {
+            // Else clause runs only on normal body completion, inline
+            // right after the body and *outside* the handled range
+            // (CPython compiles it before the handlers): an exception
+            // raised in `else` does not reach this statement's own
+            // `except` clauses — only an enclosing `finally`.
+            for s in orelse {
                 self.compile_stmt(s)?;
             }
-            // Structural skip over the handler region: NO_LOCATION in
-            // CPython, so jump threading may hop through it.
-            let j = self.emit(OpCode::JumpForward, 0);
+            // Normal-exit hop over the handler region: CPython's
+            // NO_LOCATION JUMP_NO_INTERRUPT to `end` (backward — and
+            // thus visible as JUMP_BACKWARD_NO_INTERRUPT — once the
+            // cold-block pass moves the handlers to the stream end).
+            let j = self.emit_no_line(OpCode::JumpForward, 0);
             self.synthetic_jumps.insert(j);
-            j
-        } else {
-            self.next_offset()
-        };
-        if let Some(frame) = saved_frame {
-            self.finally_stack.push(frame);
+            self.no_interrupt_jumps.insert(j);
+            normal_skip = Some(j);
         }
 
-        // Handlers begin here.
+        // Handlers begin here (reachable only via exception edges; the
+        // cold-block pass relocates them, as CPython's flowgraph does).
         let handlers_start = self.next_offset();
         let is_star_try = handlers.iter().any(|h| h.is_star);
         if has_handlers && is_star_try {
@@ -4862,65 +7732,57 @@ impl Compiler {
             // non-`except*` branch for the rationale). No location, as
             // in the non-star branch.
             let push_exc_site = self.emit_no_line(OpCode::PushExcInfo, 0);
-            // CPython locates the whole match prologue on the first
-            // `except*` clause (BUILD_LIST/COPY carry its line), so the
-            // handler entry's first traced line is the clause — not
-            // whatever the normal-exit `finally` copy above left in
-            // `current_line` (test_sys_settrace
-            // test_try_except_star_exception_caught).
-            if let Some(h0) = handlers.first() {
-                self.set_span(h0.span);
-                self.set_line_from(h0.span.start.0);
-            }
-            // Stack on entry: [exc]. Stash the original (for
-            // PREP_RERAISE_STAR), the running remainder, and the
-            // raised-collection list in synthetic locals.
-            let uid = self.with_counter;
-            self.with_counter += 1;
-            let orig_idx = self.var_index_or_add(&format!(".eg_orig{uid}"));
-            let rem_idx = self.var_index_or_add(&format!(".eg_remaining{uid}"));
-            let raised_idx = self.var_index_or_add(&format!(".eg_raised{uid}"));
-            self.emit(OpCode::CopyTop, 0);
-            self.emit(OpCode::StoreFast, orig_idx);
-            self.emit(OpCode::StoreFast, rem_idx);
-            self.emit(OpCode::BuildList, 0);
-            self.emit(OpCode::StoreFast, raised_idx);
-
-            let none_idx = self.co.intern_constant(Constant::None);
-            for h in handlers {
-                // Each clause's match sequence carries the clause's own
-                // location, starting from the remainder load.
+            // CPython `compiler_try_star_except` keeps the whole group
+            // state on the operand stack — during clause bodies it is
+            // `[prev, orig, res, rest]` (saved previous exc_info, the
+            // original group, the raised/reraised list, the running
+            // remainder). No synthetic locals: consuming the values in
+            // PREP_RERAISE_STAR releases the group by refcount the
+            // moment the statement ends (RFC 0054 taskgroups refcycle
+            // timing) and the wire shape matches CPython's exactly
+            // (test_dis, test_monitoring branch/jump offsets).
+            let n_handlers = handlers.len();
+            // Jumps into the PREP_RERAISE_STAR epilogue (each exit path
+            // of the *last* clause inlines its own `LIST_APPEND 1` +
+            // jump, as CPython's flowgraph small-block inlining does).
+            let mut reraise_star_jumps: Vec<u32> = Vec::new();
+            // Jumps to the next clause's match sequence.
+            let mut next_clause_jumps: Vec<u32> = Vec::new();
+            for (i, h) in handlers.iter().enumerate() {
+                let clause_start = self.next_offset();
+                for site in next_clause_jumps.drain(..) {
+                    self.patch_jump(site, clause_start);
+                }
+                // The whole match sequence carries the clause's own
+                // location (CPython locates BUILD_LIST/COPY/CHECK_EG_MATCH
+                // on the `except*` clause), so entering the handler fires
+                // exactly one `'line'` event there
+                // (test_sys_settrace test_try_except_star_exception_caught).
                 self.set_span(h.span);
                 self.set_line_from(h.span.start.0);
-                // [.remaining]
-                self.emit(OpCode::LoadFast, rem_idx);
+                if i == 0 {
+                    // [prev, exc] → [prev, orig, res, rest]
+                    self.emit(OpCode::BuildList, 0);
+                    self.emit(OpCode::CopyTop, 2);
+                }
                 let ty = h
                     .type_
                     .as_ref()
                     .expect("except* requires a type expression — parser must reject bare except*");
                 self.compile_expr(ty)?;
-                // [.remaining, type]. CPython locates CHECK_EG_MATCH on
-                // the whole clause; the implicit wrapper around a naked
-                // exception gets its traceback entry here (gh-128799).
+                // [prev, orig, res, rest, type]. CPython locates
+                // CHECK_EG_MATCH on the whole clause; the implicit
+                // wrapper around a naked exception gets its traceback
+                // entry here (gh-128799).
                 self.set_span(h.span);
                 self.set_line_from(h.span.start.0);
                 self.emit(OpCode::CheckEGMatch, 0);
-                // [rest, matched]
-                self.emit(OpCode::Swap, 2);
-                // [matched, rest]
-                self.emit(OpCode::StoreFast, rem_idx);
-                // [matched]
-                self.emit(OpCode::CopyTop, 0);
-                // [matched, matched]
-                self.emit(OpCode::LoadConst, none_idx);
-                // [matched, matched, None]
-                self.emit(OpCode::IsOp, 0);
-                // [matched, is_none]
-                let skip_body = self.emit(OpCode::PopJumpIfTrue, 0);
-                // matched is on stack and is not None. It becomes the
-                // active exception while the clause body runs —
-                // back-patched below to tag the body's extent.
-                let push_match_site = self.emit(OpCode::PushExcInfo, 0);
+                // [prev, orig, res, rest, match?]
+                self.emit(OpCode::CopyTop, 1);
+                let no_match = self.emit(OpCode::PopJumpIfNone, 0);
+                // Matched (not None): bind or discard. CHECK_EG_MATCH
+                // already made it the active exception for the clause
+                // body (`sys.exc_info()`, bare `raise` context).
                 if let Some(n) = &h.name {
                     let name_expr = Expr {
                         kind: ExprKind::Name(n.clone()),
@@ -4930,11 +7792,12 @@ impl Compiler {
                 } else {
                     self.emit(OpCode::PopTop, 0);
                 }
+                // [prev, orig, res, rest]
                 let clause_body_start = self.next_offset();
                 // `e` is unbound on every exit from the block (CPython
                 // behaviour); `break`/`continue`/`return` cannot leave
-                // an `except*` block at all (PEP 654), enforced via the
-                // loop-mark pushed here.
+                // an `except*` block at all (PEP 654), enforced by
+                // `validate_star_clause_jumps`.
                 let unbind_stmts = h
                     .name
                     .as_deref()
@@ -4946,61 +7809,121 @@ impl Compiler {
                         loop_depth_at_push: self.loop_stack.len(),
                         id,
                         pop_except_after: false,
+                        exc_at_push: self.exc_on_stack,
+                        handler_at_push: self.handler_depth,
+                        rv_at_push: self.pending_retvals,
                     });
                 }
                 for s in &h.body {
                     self.compile_stmt(s)?;
                 }
-                if let Some(stmts) = &unbind_stmts {
+                if unbind_stmts.is_some() {
                     self.finally_stack.pop();
-                    // Fallthrough unbind carries the clause body's last
-                    // line (CPython), so no fresh `'line'` event fires on
-                    // normal clause exit.
+                }
+                let clause_body_end = self.next_offset();
+                // Fallthrough exit: the unbind (`e = None; del e`) and
+                // the inlined `LIST_APPEND 1` + hop carry the clause
+                // body's last line — CPython emits them NO_LOCATION and
+                // its flowgraph's `propagate_line_numbers` copies the
+                // preceding location, so no fresh `'line'` event fires
+                // on normal clause exit (and the JUMP event reports the
+                // body line: test_monitoring test_except_star). The
+                // propagated location must be computed the way CPython
+                // does: nothing flows into a jump target (a clause body
+                // ending in a nested `try` exits by *jumping* here, so
+                // the tail stays location-free — the nested
+                // test_sys_settrace test_try_except_star_nested shape),
+                // and the walk back stops at block boundaries.
+                let (pin_line, pin_col) = {
+                    let tgt = clause_body_end;
+                    let is_jump_target = |k: u32| -> bool {
+                        self.co.instructions.iter().enumerate().any(|(j, ins)| {
+                            let from = j as u32 + 1;
+                            match ins.op {
+                                OpCode::JumpForward
+                                | OpCode::PopJumpIfFalse
+                                | OpCode::PopJumpIfTrue
+                                | OpCode::PopJumpIfNone
+                                | OpCode::PopJumpIfNotNone
+                                | OpCode::ForIter
+                                | OpCode::Send => from + ins.arg == k,
+                                OpCode::JumpBackward => from.saturating_sub(ins.arg) == k,
+                                _ => false,
+                            }
+                        })
+                    };
+                    let mut line = 0u32;
+                    let mut col = ColSpan::default();
+                    if !is_jump_target(tgt) {
+                        let mut k = clause_body_end;
+                        while k > clause_body_start {
+                            let k1 = (k - 1) as usize;
+                            if matches!(
+                                self.co.instructions[k1].op,
+                                OpCode::JumpForward
+                                    | OpCode::JumpBackward
+                                    | OpCode::ReturnValue
+                                    | OpCode::RaiseVarargs
+                                    | OpCode::Reraise
+                            ) {
+                                break;
+                            }
+                            if self.co.linetable[k1] != 0 {
+                                line = self.co.linetable[k1];
+                                col = self.co.coltable[k1];
+                                break;
+                            }
+                            if is_jump_target(k1 as u32) {
+                                break;
+                            }
+                            k -= 1;
+                        }
+                    }
+                    (line, col)
+                };
+                {
                     let saved_line = self.current_line;
                     let saved_span = self.current_span;
                     let saved_pin = self.line_pinned;
                     let saved_col = self.pinned_colspan;
-                    self.line_pinned = Some(saved_line);
-                    self.pinned_colspan = self.resolve_colspan();
-                    for s in stmts {
-                        self.compile_stmt(s)?;
+                    self.line_pinned = Some(pin_line);
+                    self.pinned_colspan = pin_col;
+                    if let Some(stmts) = &unbind_stmts {
+                        for s in stmts {
+                            self.compile_stmt(s)?;
+                        }
+                    }
+                    if i == n_handlers - 1 {
+                        // [prev, orig, res, rest] → [prev, orig, res]
+                        self.emit(OpCode::ListAppend, 1);
+                        let j = self.emit(OpCode::JumpForward, 0);
+                        self.no_interrupt_jumps.insert(j);
+                        reraise_star_jumps.push(j);
+                    } else {
+                        let j = self.emit(OpCode::JumpForward, 0);
+                        self.no_interrupt_jumps.insert(j);
+                        next_clause_jumps.push(j);
                     }
                     self.line_pinned = saved_pin;
                     self.pinned_colspan = saved_col;
                     self.current_line = saved_line;
                     self.current_span = saved_span;
                 }
-                let clause_body_end = self.next_offset();
-                self.co.instructions[push_match_site as usize].arg = clause_body_end;
-                // Clause-exit hop: NO_LOCATION, like every other piece
-                // of the except* bookkeeping — a multi-line clause body
-                // must not re-trace the clause header on exit.
-                self.emit_no_line(OpCode::PopExcept, 0);
-                let after_body = self.emit_no_line(OpCode::JumpForward, 0);
-                self.synthetic_jumps.insert(after_body);
-
                 // Collector: an exception raised by the clause body
-                // lands here with `[raised_exc]` on the stack (its
-                // `__context__` already chained to the matched group by
-                // the raise itself). Stash it and run the next clause.
+                // lands here with `[prev, orig, res, rest, lasti, exc]`
+                // (lasti-flagged entry; the raise chained `__context__`
+                // to the matched group already). Unbind, add it to the
+                // res list, drop the lasti, and run the next clause —
+                // all NO_LOCATION (CPython's cleanup_end block).
                 let collector = self.next_offset();
                 self.co.exception_table.push(ExcHandler {
                     start: clause_body_start,
                     end: clause_body_end,
                     handler: collector,
-                    depth: body_depth,
-                    push_lasti: false,
+                    depth: HANDLER_DEPTH_SENTINEL,
+                    push_lasti: true,
                 });
-                self.emit(OpCode::LoadFast, raised_idx);
-                // [exc, list]
-                self.emit(OpCode::Swap, 2);
-                // [list, exc]
-                self.emit(OpCode::ListAppend, 1);
-                // [list]
-                self.emit(OpCode::PopTop, 0);
                 if let Some(stmts) = &unbind_stmts {
-                    // Escape-path unbind is NO_LOCATION in CPython —
-                    // tracing must not see it.
                     let saved_pin = self.line_pinned;
                     self.line_pinned = Some(0);
                     for s in stmts {
@@ -5008,117 +7931,90 @@ impl Compiler {
                     }
                     self.line_pinned = saved_pin;
                 }
-                let after_collect = self.emit_no_line(OpCode::JumpForward, 0);
-                self.synthetic_jumps.insert(after_collect);
-
-                let skip_target = self.next_offset();
-                self.patch_jump(skip_body, skip_target);
-                // No-match path carries the clause's location (CPython's
-                // L3 POP_TOP/LIST_APPEND block) — already traced when the
+                self.emit_no_line(OpCode::ListAppend, 3);
+                // [prev, orig, res, rest, lasti]
+                self.emit_no_line(OpCode::PopTop, 0);
+                // [prev, orig, res, rest]
+                if i == n_handlers - 1 {
+                    self.emit_no_line(OpCode::ListAppend, 1);
+                    let j = self.emit_no_line(OpCode::JumpForward, 0);
+                    self.synthetic_jumps.insert(j);
+                    self.no_interrupt_jumps.insert(j);
+                    reraise_star_jumps.push(j);
+                } else {
+                    let j = self.emit_no_line(OpCode::JumpForward, 0);
+                    self.synthetic_jumps.insert(j);
+                    self.no_interrupt_jumps.insert(j);
+                    next_clause_jumps.push(j);
+                }
+                // No-match path: discard the copied None. Carries the
+                // clause's location (CPython) — already traced when the
                 // match check ran, so no fresh `'line'` event fires.
+                let no_match_target = self.next_offset();
+                self.patch_jump(no_match, no_match_target);
                 self.set_span(h.span);
                 self.set_line_from(h.span.start.0);
-                // matched is on stack still (was a None) — discard.
                 self.emit(OpCode::PopTop, 0);
-                let after_skip = self.next_offset();
-                self.patch_jump(after_body, after_skip);
-                self.patch_jump(after_collect, after_skip);
+                // [prev, orig, res, rest]; the last clause appends the
+                // unhandled remainder and falls into the epilogue, the
+                // others fall into the next clause's match sequence.
+                if i == n_handlers - 1 {
+                    self.emit(OpCode::ListAppend, 1);
+                }
             }
-            // After all clauses: excs = raised + [remainder]; compute
-            // the exception to propagate (None when fully handled).
-            // The whole PREP_RERAISE_STAR epilogue is NO_LOCATION in
-            // CPython (dis shows `--` for the L4..L7 blocks) — reaching
-            // it must not fire a `'line'` event, whatever line the last
-            // clause body left behind.
-            let star_epilogue_pin = self.line_pinned;
-            self.line_pinned = Some(0);
-            self.emit(OpCode::LoadFast, raised_idx);
-            self.emit(OpCode::LoadFast, rem_idx);
-            // [list, rem]
-            self.emit(OpCode::ListAppend, 1);
-            // [list]
-            self.emit(OpCode::LoadFast, orig_idx);
-            // [list, orig]
-            self.emit(OpCode::PrepReraiseStar, 0);
-            // [result]. The synthetic locals are dead now — clear them.
-            // CPython keeps these values on the *stack* and consumes them
-            // here; leaving them in fastlocals would pin the original group
-            // (and its `[excs]` ctor payload) for the rest of the frame's
-            // life, defeating the refcount-timed release the taskgroups
-            // refcycle tests observe (`gc.get_referrers(exc) == []` right
-            // after the `except*` block — RFC 0054).
-            for idx in [orig_idx, rem_idx, raised_idx] {
-                self.emit(OpCode::LoadConst, none_idx);
-                self.emit(OpCode::StoreFast, idx);
+            // PREP_RERAISE_STAR epilogue — entirely NO_LOCATION in
+            // CPython (dis shows `--`): reaching it must not fire a
+            // `'line'` event, whatever line the last clause body left
+            // behind (test_try_except_star_nested).
+            let reraise_star = self.next_offset();
+            for site in reraise_star_jumps {
+                self.patch_jump(site, reraise_star);
             }
-            self.emit(OpCode::CopyTop, 0);
-            self.emit(OpCode::LoadConst, none_idx);
-            self.emit(OpCode::IsOp, 0);
-            let all_handled = self.emit(OpCode::PopJumpIfTrue, 0);
-            // Re-raise without recording the re-raise site and without
-            // re-chaining `__context__` (CPython RERAISE).
-            self.emit(OpCode::Reraise, 0);
-            let after_raise = self.next_offset();
-            self.patch_jump(all_handled, after_raise);
-            // [None] — discard, drop the original from exc_info.
-            self.emit(OpCode::PopTop, 0);
-            self.emit(OpCode::PopExcept, 0);
-            self.line_pinned = star_epilogue_pin;
-            let saved = if pushed_finally {
-                self.finally_stack.pop()
-            } else {
-                None
-            };
-            for s in finalbody {
-                self.compile_stmt(s)?;
-            }
-            if let Some(f) = saved {
-                self.finally_stack.push(f);
-            }
-            // NO_LOCATION (CPython's `--` POP_EXCEPT/JUMP epilogue) —
-            // leaving the except* machinery must not re-fire the clause
-            // line left in `current_line` (test_try_except_star_nested).
+            // [prev, orig, res] → [prev, result] (None when everything
+            // was handled).
+            self.emit_no_line(OpCode::PrepReraiseStar, 0);
+            self.emit_no_line(OpCode::CopyTop, 1);
+            let rer = self.emit_no_line(OpCode::PopJumpIfNotNone, 0);
+            // Nothing to re-raise: [prev, None] → drop both, restore
+            // the previous exc_info.
+            self.emit_no_line(OpCode::PopTop, 0);
+            // The machinery's own cleanup coverage (CPython's
+            // SETUP_CLEANUP around the whole except* region) ends here:
+            // both exit runs below pop the exc_info explicitly, so a
+            // RERAISE from them must propagate to the *enclosing*
+            // handler, not bounce back into this region's cleanup.
+            let coverage_end = self.next_offset();
+            self.emit_no_line(OpCode::PopExcept, 0);
             let exit = self.emit_no_line(OpCode::JumpForward, 0);
             self.synthetic_jumps.insert(exit);
-            // Shared finally-cleanup for exceptions escaping the
-            // `except*` machinery — clause-internal raises are collected
-            // (above), so this covers match evaluation and the final
-            // re-raise. Reached only via the exception-table entry;
-            // normal flow jumps past.
-            if has_finally {
-                let cleanup_start = self.next_offset();
-                let cleanup_push = self.emit_no_line(OpCode::PushExcInfo, 0);
-                let saved = self.finally_stack.pop();
-                self.exc_on_stack += 1;
-                for s in finalbody {
-                    self.compile_stmt(s)?;
-                }
-                self.exc_on_stack -= 1;
-                if let Some(f) = saved {
-                    self.finally_stack.push(f);
-                }
-                self.emit(OpCode::Reraise, 0);
-                let cleanup_end = self.next_offset();
-                self.co.instructions[cleanup_push as usize].arg = cleanup_end;
-                // Registered after the per-clause collector entries so
-                // the forward innermost-first scan prefers those.
-                self.co.exception_table.push(ExcHandler {
-                    start: handlers_start,
-                    end: after_raise,
-                    handler: cleanup_start,
-                    depth: body_depth,
-                    push_lasti: false,
-                });
-                if orelse_end > orelse_start {
-                    self.co.exception_table.push(ExcHandler {
-                        start: orelse_start,
-                        end: orelse_end,
-                        handler: cleanup_start,
-                        depth: body_depth,
-                        push_lasti: false,
-                    });
-                }
-            }
+            self.no_interrupt_jumps.insert(exit);
+            // Re-raise path (CPython: POP_BLOCK; SWAP 2; POP_EXCEPT;
+            // RERAISE 0): restore the previous exc_info first, then
+            // re-raise without recording the re-raise site and without
+            // re-chaining `__context__`.
+            let reraise = self.next_offset();
+            self.patch_jump(rer, reraise);
+            self.emit_no_line(OpCode::Swap, 2);
+            self.emit_no_line(OpCode::PopExcept, 0);
+            self.emit_no_line(OpCode::Reraise, 0);
+            // Cleanup tail for exceptions escaping the machinery itself
+            // (match evaluation, PREP_RERAISE_STAR, …): restore the
+            // previous exc_info and re-raise at the original site —
+            // CPython's POP_EXCEPT_AND_RERAISE behind the region-wide
+            // SETUP_CLEANUP. Clause bodies keep their own (narrower)
+            // collector coverage; the innermost-wins partition in
+            // `finish()` resolves the overlap.
+            let cleanup_start = self.next_offset();
+            self.emit_no_line(OpCode::CopyTop, 3);
+            self.emit_no_line(OpCode::PopExcept, 0);
+            self.emit_no_line(OpCode::Reraise, 1);
+            self.co.exception_table.push(ExcHandler {
+                start: handlers_start,
+                end: coverage_end,
+                handler: cleanup_start,
+                depth: HANDLER_DEPTH_ANCHOR_FLAG | handlers_start,
+                push_lasti: true,
+            });
             let end = self.next_offset();
             self.patch_jump(exit, end);
             // Record the handler-body end on PUSH_EXC_INFO (see below).
@@ -5140,21 +8036,21 @@ impl Compiler {
             // entering the handler must not fire a `'line'` event of
             // its own; the first clause-check instruction does.
             let push_exc_site = self.emit_no_line(OpCode::PushExcInfo, 0);
-            // Stack on entry: [exc] (pushed by dispatch loop).
+            // Stack on entry: [prev, exc] (dispatch pushed exc,
+            // PUSH_EXC_INFO slid prev underneath).
             let mut next_handler_sites: Vec<u32> = Vec::new();
             let mut handler_exit_jumps: Vec<u32> = Vec::new();
-            // With a `finally`, an exception raised *inside* an except
-            // clause (match check, bind, or body — e.g. a bare
-            // `raise`) must still run the finally before propagating.
-            // We record each clause's covered range (excluding the
-            // inline finally copies) and point them at a shared
-            // cleanup block emitted after the re-raise path.
-            let mut cleanup_ranges: Vec<(u32, u32)> = Vec::new();
-            // Each except clause's body lives between the body and the
-            // catch-all `RERAISE` at the bottom. If a clause's `type_`
-            // doesn't match we fall through to the next clause via the
-            // patched `next_handler_sites`. After running a clause we
-            // POP_EXCEPT and jump to `handler_exit_jumps`.
+            // Except-region coverage → the COPY 3 cleanup tail, in
+            // *segments*: CPython's SETUP_CLEANUP coverage is off
+            // during each clause's exit sequence (POP_EXCEPT/unbind/
+            // JUMP), so those slices stay uncovered (or fall to an
+            // enclosing finally via the wrapper's whole-range entry
+            // and the innermost-wins partition).
+            let mut segments: Vec<(u32, u32)> = Vec::new();
+            // Every clause's own finally frame id: their return-path
+            // inline runs must be punched out of the segments.
+            let mut clause_frame_ids: Vec<u32> = Vec::new();
+            let mut seg_start = handlers_start;
             for (i, h) in handlers.iter().enumerate() {
                 // Patch the previous handler's "no-match" branch.
                 if i > 0 {
@@ -5164,20 +8060,19 @@ impl Compiler {
                         self.patch_jump(site, cur);
                     }
                 }
-                let clause_start = self.next_offset();
                 // The whole clause-check sequence is located on the
                 // `except E:` clause (CPython puts CHECK_EXC_MATCH and
-                // friends at the handler-type location), so entering
-                // the handler fires exactly one `'line'` event there.
+                // friends at the handler location), so entering the
+                // handler fires exactly one `'line'` event there.
                 self.set_line_from(h.span.start.0);
                 self.set_span(h.span);
                 match &h.type_ {
                     Some(t) => {
                         // Stack: [exc] → [exc, type] → [exc, bool]
-                        self.emit(OpCode::CopyTop, 0);
+                        // (CHECK_EXC_MATCH peeks the exception).
                         self.compile_expr(t)?;
-                        self.set_line_from(t.span.start.0);
-                        self.set_span(t.span);
+                        self.set_line_from(h.span.start.0);
+                        self.set_span(h.span);
                         self.emit(OpCode::CheckExcMatch, 0);
                         let no_match = self.emit(OpCode::PopJumpIfFalse, 0);
                         next_handler_sites.push(no_match);
@@ -5217,11 +8112,15 @@ impl Compiler {
                 {
                     let id = self.fresh_finally_id();
                     unbind_frame_id = Some(id);
+                    clause_frame_ids.push(id);
                     self.finally_stack.push(FinallyFrame {
                         kind: FinallyKind::Stmts(unbind_stmts.clone().unwrap_or_default()),
                         loop_depth_at_push: self.loop_stack.len(),
                         id,
                         pop_except_after: true,
+                        exc_at_push: self.exc_on_stack,
+                        handler_at_push: self.handler_depth,
+                        rv_at_push: self.pending_retvals,
                     });
                 }
                 let hbody_start = self.next_offset();
@@ -5232,16 +8131,20 @@ impl Compiler {
                 self.handler_depth -= 1;
                 let hbody_end = self.next_offset();
                 self.finally_stack.pop();
+                // Coverage segment ends right before the exit
+                // POP_EXCEPT: CPython's SETUP_CLEANUP is popped there,
+                // so the exit run is uncovered by this region's own
+                // cleanup.
+                segments.push((seg_start, self.next_offset()));
+                // Handler-exit: POP_EXCEPT, then the fallthrough unbind
+                // (`e = None; del e`), then the hop to `end` — all
+                // NO_LOCATION in CPython (its flowgraph copies the
+                // single jump predecessor's location; emitting
+                // location-free gives the same event stream —
+                // test_no_tracing_of_named_except_cleanup,
+                // test_nested_try_if).
+                self.emit_no_line(OpCode::PopExcept, 0);
                 if let Some(stmts) = &unbind_stmts {
-                    // CPython emits the fallthrough unbind (`e = None;
-                    // del e`) NO_LOCATION; its flowgraph pass then copies
-                    // the location of the block's single jump predecessor
-                    // (e.g. the `if` that skipped a trailing `raise`), so
-                    // tracing never fires a fresh `'line'` event here —
-                    // notably not the handler body's *last* line when the
-                    // exit is reached by jumping over it
-                    // (test_no_tracing_of_named_except_cleanup). Emitting
-                    // with no location gives the same event stream.
                     let saved_line = self.current_line;
                     let saved_span = self.current_span;
                     let saved_pin = self.line_pinned;
@@ -5253,43 +8156,37 @@ impl Compiler {
                     self.current_line = saved_line;
                     self.current_span = saved_span;
                 }
-                // Handler-exit POP_EXCEPT: NO_LOCATION in CPython (same
-                // propagation story as the unbind above — test_nested_try_if).
-                self.emit_no_line(OpCode::PopExcept, 0);
+                // CPython's NO_LOCATION JUMP_NO_INTERRUPT to `end`.
+                let exit = self.emit_no_line(OpCode::JumpForward, 0);
+                self.synthetic_jumps.insert(exit);
+                self.no_interrupt_jumps.insert(exit);
+                handler_exit_jumps.push(exit);
+                seg_start = self.next_offset();
                 if let Some(stmts) = &unbind_stmts {
                     if hbody_end > hbody_start {
                         // Exception escaping the clause body: unbind the
-                        // name, then keep propagating. Normal flow jumps
-                        // over this block. The whole cleanup is
-                        // location-free (CPython NO_LOCATION): tracing
-                        // must not see `'line'` events for it
-                        // (test_no_tracing_of_named_except_cleanup).
-                        let over = self.emit_no_line(OpCode::JumpForward, 0);
-                        self.synthetic_jumps.insert(over);
+                        // name, then re-raise at the original site
+                        // (`RERAISE 1` — the entry is lasti-flagged).
+                        // Reached only via the exception table; the
+                        // whole block is location-free (CPython
+                        // NO_LOCATION). No PUSH_EXC_INFO: the handler
+                        // context is still the clause's own.
+                        let cleanup_start = self.next_offset();
                         let saved_line = self.current_line;
                         let saved_span = self.current_span;
                         let saved_pin = self.line_pinned;
                         self.line_pinned = Some(0);
-                        let cleanup_start = self.next_offset();
-                        let cleanup_push = self.emit(OpCode::PushExcInfo, 0);
-                        self.exc_on_stack += 1;
                         for s in stmts {
                             self.compile_stmt(s)?;
                         }
-                        self.exc_on_stack -= 1;
-                        self.emit(OpCode::Reraise, 0);
                         self.line_pinned = saved_pin;
                         self.current_line = saved_line;
                         self.current_span = saved_span;
-                        let cleanup_end = self.next_offset();
-                        self.co.instructions[cleanup_push as usize].arg = cleanup_end;
-                        self.patch_jump(over, cleanup_end);
-                        // CPython marks the unbind-cleanup with the lasti
-                        // flag: its RERAISE restores f_lasti to the raise
-                        // site inside the except body. Punch out this
-                        // clause's own `return`-path `del e` inline so a
-                        // `raise` from it (or a following inlined finally)
-                        // doesn't re-enter the unbind cleanup.
+                        self.emit_no_line(OpCode::Reraise, 1);
+                        // Punch out this clause's own `return`-path
+                        // `del e` inline so a `raise` from it (or a
+                        // following inlined finally) doesn't re-enter
+                        // the unbind cleanup.
                         self.push_body_exc_entries(
                             hbody_start,
                             hbody_end,
@@ -5300,97 +8197,45 @@ impl Compiler {
                         );
                     }
                 }
-                if has_finally {
-                    // Includes the unbind-cleanup RERAISE so the escaping
-                    // exception still runs this statement's finally.
-                    cleanup_ranges.push((clause_start, self.next_offset()));
-                }
-                // Run finally on the matched path.
-                let saved = if pushed_finally {
-                    self.finally_stack.pop()
-                } else {
-                    None
-                };
-                for s in finalbody {
-                    self.compile_stmt(s)?;
-                }
-                if let Some(f) = saved {
-                    self.finally_stack.push(f);
-                }
-                // NO_LOCATION: the handler-exit hop must not fire a
-                // `'line'` event for whatever line the body ended on
-                // (CPython duplicates the after-try tail instead of
-                // jumping — test_nested_try_if).
-                let exit = self.emit_no_line(OpCode::JumpForward, 0);
-                self.synthetic_jumps.insert(exit);
-                handler_exit_jumps.push(exit);
             }
             // Unmatched: re-raise. Patch the last failed-match jump.
             while let Some(site) = next_handler_sites.pop() {
                 let cur = self.next_offset();
                 self.patch_jump(site, cur);
             }
-            // Run finally on the re-raise path before propagating. The
-            // unmatched exception stays on the stack until RERAISE.
-            let saved = if pushed_finally {
-                self.finally_stack.pop()
-            } else {
-                None
-            };
-            self.exc_on_stack += 1;
-            for s in finalbody {
-                self.compile_stmt(s)?;
-            }
-            self.exc_on_stack -= 1;
-            if let Some(f) = saved {
-                self.finally_stack.push(f);
-            }
             // CPython locates the unmatched-exception RERAISE on the
-            // *last* `except` clause.
+            // *last* `except` clause. Stack: [prev, exc] — RERAISE 0
+            // pops exc and propagates it (through the cleanup tail
+            // below, which restores the previous exc_info).
             if let Some(h) = handlers.last() {
                 self.set_line_from(h.span.start.0);
                 self.set_span(h.span);
             }
             self.emit(OpCode::Reraise, 0);
-            // Shared finally-cleanup block for exceptions escaping an
-            // except clause or the `else` body. Reached only through
-            // the exception-table entries registered below; normal
-            // flow jumps past it (handler exits patch to `end`).
-            if has_finally {
-                let cleanup_start = self.next_offset();
-                let cleanup_push = self.emit_no_line(OpCode::PushExcInfo, 0);
-                let saved = self.finally_stack.pop();
-                // The escaping exception is on the stack until RERAISE.
-                self.exc_on_stack += 1;
-                for s in finalbody {
-                    self.compile_stmt(s)?;
-                }
-                self.exc_on_stack -= 1;
-                if let Some(f) = saved {
-                    self.finally_stack.push(f);
-                }
-                self.emit(OpCode::Reraise, 0);
-                let cleanup_end = self.next_offset();
-                self.co.instructions[cleanup_push as usize].arg = cleanup_end;
-                if orelse_end > orelse_start {
-                    cleanup_ranges.push((orelse_start, orelse_end));
-                }
-                // Appended after any entries pushed while compiling
-                // nested statements, so the forward "innermost-first"
-                // scan in the VM still prefers those. Each range is
-                // punched for this try's own finally so a `return` from a
-                // clause body (which inlines the finally here) doesn't
-                // re-run it via the cleanup path if it raises.
-                for (s, e) in cleanup_ranges {
-                    self.push_body_exc_entries(
-                        s,
-                        e,
-                        cleanup_start,
-                        body_depth,
-                        false,
-                        body_frame_id,
-                    );
-                }
+            segments.push((seg_start, self.next_offset()));
+            // CPython's except-region cleanup tail: an exception raised
+            // inside the region (match check, a clause's bare `raise`,
+            // the RERAISE above) lands here (lasti-flagged): restore
+            // the previous exc_info, then re-raise with the original
+            // raise offset (`COPY 3; POP_EXCEPT; RERAISE 1`).
+            let cleanup_start = self.next_offset();
+            self.emit_no_line(OpCode::CopyTop, 3);
+            self.emit_no_line(OpCode::PopExcept, 0);
+            self.emit_no_line(OpCode::Reraise, 1);
+            // Segment depths anchor at the PUSH_EXC_INFO: CPython's
+            // declared depth is the stack depth at the SETUP point
+            // ([prev] above the base), not the depth a given covered
+            // slice happens to run at (the RERAISE-0 block, entered
+            // with [prev, exc], still declares the SETUP depth).
+            for (s, e) in segments {
+                self.push_body_exc_entries_ids(
+                    s,
+                    e,
+                    cleanup_start,
+                    HANDLER_DEPTH_ANCHOR_FLAG | handlers_start,
+                    true,
+                    &clause_frame_ids,
+                );
             }
             // Patch handler-exit jumps to end.
             let end = self.next_offset();
@@ -5399,59 +8244,81 @@ impl Compiler {
             }
             // Record the handler-body end on PUSH_EXC_INFO (see above).
             self.co.instructions[push_exc_site as usize].arg = end;
-        } else if has_finally {
-            // `try/finally` without except. The dispatch loop has
-            // pushed the exception onto the value stack. We leave it
-            // there across `finalbody` — every statement compiles to
-            // stack-balanced bytecode — then RERAISE 0 pops it and
-            // re-raises. Popping the exception eagerly (as we did
-            // historically) left RERAISE with nothing to pop and
-            // produced a `stack underflow` once the finally ran.
-            self.push_body_exc_entries(
-                body_start,
-                body_end,
-                handlers_start,
-                body_depth,
-                false,
-                body_frame_id,
-            );
-            // Record the propagating exception as the active handled
-            // exception for the duration of the finally body. Without
-            // this a `raise` inside `finally` (e.g. a `@contextmanager`
-            // generator's `finally: raise`) gets no implicit
-            // `__context__`, breaking PEP 3134 chaining. `PUSH_EXC_INFO`
-            // only peeks the value-stack top in this VM, so the
-            // exception stays put for the trailing `RERAISE 0`.
+        }
+        // Patch the normal-exit hop past the handler region.
+        if let Some(j) = normal_skip {
+            let end = self.next_offset();
+            self.patch_jump(j, end);
+        }
+        let wrap_end = self.next_offset();
+
+        // The try/finally wrapper tail (CPython compiler_try_finally):
+        // one shared normal copy (all normal completions of the
+        // try/except part fall through or jump here), then the
+        // exceptional copy behind the whole-range coverage.
+        if has_finally {
+            self.finally_stack.pop();
+            for s in finalbody {
+                self.compile_stmt(s)?;
+            }
+            // CPython's NO_LOCATION JUMP_NO_INTERRUPT over the
+            // exceptional copy.
+            let exit_j = self.emit_no_line(OpCode::JumpForward, 0);
+            self.synthetic_jumps.insert(exit_j);
+            self.no_interrupt_jumps.insert(exit_j);
+            // Exceptional copy. The dispatch loop pushed the
+            // propagating exception; PUSH_EXC_INFO slides the previous
+            // one underneath. The exception stays on the stack across
+            // `finalbody` — every statement compiles to stack-balanced
+            // bytecode — then RERAISE 0 pops and re-raises it.
             // No location (CPython): the first finally-body line fires
             // the handler-entry `'line'` event.
+            let fexc_start = self.next_offset();
             let push_exc_site = self.emit_no_line(OpCode::PushExcInfo, 0);
-            let saved = self.finally_stack.pop();
-            // The propagating exception is on the stack until RERAISE;
-            // nested handlers registered inside the finally body must
-            // preserve that slot.
             self.exc_on_stack += 1;
             for s in finalbody {
                 self.compile_stmt(s)?;
             }
             self.exc_on_stack -= 1;
-            if let Some(f) = saved {
-                self.finally_stack.push(f);
-            }
             self.emit(OpCode::Reraise, 0);
+            // CPython's finally-cleanup tail: a `raise` from inside the
+            // exceptional copy itself lands here (lasti-flagged,
+            // keeping the saved previous exception at the bottom):
+            // restore the handled-exception state, then re-raise the
+            // new exception with the original raise offset (`COPY 3;
+            // POP_EXCEPT; RERAISE 1` — test_dis
+            // test_disassemble_try_finally).
+            let fcleanup_start = self.next_offset();
+            self.emit_no_line(OpCode::CopyTop, 3);
+            self.emit_no_line(OpCode::PopExcept, 0);
+            self.emit_no_line(OpCode::Reraise, 1);
+            // Whole-range coverage of the try/except part (body,
+            // orelse, handler region and its cleanup blocks alike —
+            // the innermost-wins partition carves out the slices owned
+            // by inner entries), punched for this frame's own
+            // return-path inlines.
+            self.push_body_exc_entries(
+                wrap_start,
+                wrap_end,
+                fexc_start,
+                body_depth,
+                false,
+                wrap_frame_id,
+            );
+            self.co.exception_table.push(ExcHandler {
+                start: fexc_start,
+                end: fcleanup_start,
+                handler: fcleanup_start,
+                depth: HANDLER_DEPTH_SENTINEL,
+                push_lasti: true,
+            });
             // Tag the active-handler entry with the pc just past the
-            // RERAISE so the unwinder drops it when a `raise` inside the
-            // finally escapes to an enclosing `try` (mirrors the
-            // except-handler path above).
+            // cleanup tail so the unwinder keeps it live while the
+            // cleanup runs (its POP_EXCEPT pops it) and drops it when a
+            // `raise` inside the finally escapes to an enclosing `try`.
             let end = self.next_offset();
+            self.patch_jump(exit_j, end);
             self.co.instructions[push_exc_site as usize].arg = end;
-        }
-        // Patch normal exit jump to land after handlers/finally.
-        if has_handlers || has_finally {
-            let end = self.next_offset();
-            self.patch_jump(normal_skip, end);
-        }
-        if pushed_finally {
-            self.finally_stack.pop();
         }
         Ok(())
     }
@@ -5478,79 +8345,53 @@ impl Compiler {
         self.set_span(item.context_expr.span);
         let with_line = self.current_line;
         let with_span = self.current_span;
-        // Synthetic slots are keyed by *with-nesting depth*, not a unique
-        // counter: two sequential `with` blocks at the same depth share a
-        // slot, exactly like CPython keeps the bound `__exit__` at the
-        // same value-stack depth. Observable via `frame.f_lineno` jumps
-        // *between* sibling with-bodies (test_sys_settrace
-        // test_jump_between_with_blocks): the landing block's exit path
-        // reads the slot and finds the *first* block's `__exit__`,
-        // reproducing CPython's stack reuse.
-        let cm_name = format!(".with_cm{}", self.with_depth);
-        let exit_name_local = format!(".with_exit{}", self.with_depth);
-        let cm_idx = self.var_index_or_add(&cm_name);
-        let exit_idx = self.var_index_or_add(&exit_name_local);
-
-        // Evaluate cm and stash it for later __enter__ access.
+        // Evaluate cm; BEFORE_WITH does the special-method lookup once
+        // and pushes the *bound* `__exit__` under the `__enter__`
+        // result. The `__exit__` stays on the operand stack for the
+        // whole body — CPython 3.13's SETUP_WITH discipline (test_dis
+        // grades the exact shape, and co_varnames must not contain
+        // synthetic slots).
         self.compile_expr(&item.context_expr)?;
         self.current_line = with_line;
         self.current_span = with_span;
-        self.emit(OpCode::StoreFast, cm_idx);
-
-        // Call __enter__ and bind (or discard).
-        self.emit(OpCode::LoadFast, cm_idx);
         self.emit(OpCode::BeforeWith, 0);
+        // CPython's exception coverage starts right after BEFORE_WITH:
+        // the bind (or POP_TOP) of the `__enter__` result is inside it.
+        let cover_start = self.next_offset();
         if let Some(target) = &item.optional_vars {
             self.compile_assign(target)?;
         } else {
             self.emit(OpCode::PopTop, 0);
         }
-        // After BEFORE_WITH the *bound* `__exit__` remains at TOS. Stash
-        // it in a synthetic local and reuse it on every exit path —
-        // CPython looks `__exit__` up exactly once (special lookup,
-        // bypassing instance `__getattribute__`); re-deriving it via
-        // `LoadAttr` would route through `__getattribute__` (test_descr
-        // test_special_method_lookup).
-        self.emit(OpCode::StoreFast, exit_idx);
-        // The context-manager object is dead once `__enter__` has run and
-        // the bound `__exit__` is captured; drop the synthetic `.with_cm`
-        // local now. CPython keeps these transient values on the operand
-        // stack, which is unwound at scope exit; we stash them in fast
-        // locals instead, so without this an unfinished generator (or any
-        // frame that yields after the `with`) keeps the manager — and
-        // everything it references — alive. `test_as_completed`'s
-        // `_yield_finished_futures` is yielded out of `as_completed` while
-        // `with _AcquireFutures(fs):` is still on a suspended frame, and
-        // `_AcquireFutures` holds every future (`test_free_reference_*`).
-        // `DeleteFast` also prompt-reaps the manager.
-        self.emit(OpCode::DeleteFast, cm_idx);
+        // Coverage starts at the bind, one slot *above* the body's
+        // baseline (the `__enter__` result rides over `__exit__`), so
+        // the handler depth anchors at the first body instruction.
+        let depth_anchor = self.next_offset();
 
         // Push a synthetic finally frame so `return`, `break`, and
-        // `continue` from inside the body run `cm.__exit__(None, None, None)`
-        // before transferring control. CPython does this via
-        // CLEANUP_THROW / SETUP_WITH; we encode it as a `WithExit`
-        // frame that emits the call from the cm's fast-local index.
+        // `continue` from inside the body call the on-stack
+        // `__exit__(None, None, None)` before transferring control.
         let with_loop_depth = self.loop_stack.len();
         let with_frame_id = self.fresh_finally_id();
         self.finally_stack.push(FinallyFrame {
             kind: FinallyKind::WithExit {
-                exit_idx,
                 line: with_line,
                 span: with_span,
             },
             loop_depth_at_push: with_loop_depth,
             id: with_frame_id,
             pop_except_after: false,
+            exc_at_push: self.exc_on_stack,
+            handler_at_push: self.handler_depth,
+            rv_at_push: self.pending_retvals,
         });
 
-        let body_start = self.next_offset();
-        self.with_depth += 1;
+        let body_start = cover_start;
         let body_result = if rest.is_empty() {
             body.iter().try_for_each(|s| self.compile_stmt(s))
         } else {
             self.compile_with(rest, body)
         };
-        self.with_depth -= 1;
         body_result?;
         let body_end = self.next_offset();
 
@@ -5562,87 +8403,93 @@ impl Compiler {
         self.current_line = with_line;
         self.current_span = with_span;
 
-        // Normal exit: <bound __exit__>(None, None, None). The bound
-        // method was captured by BEFORE_WITH and stashed at `exit_idx`.
-        self.emit(OpCode::LoadFast, exit_idx);
+        // Normal exit: TOS is the bound `__exit__`; call it with three
+        // `None`s. First None rides the self slot (CPython's with-exit
+        // `CALL 2`).
         let none_idx = self.co.intern_constant(Constant::None);
         self.emit(OpCode::LoadConst, none_idx);
         self.emit(OpCode::LoadConst, none_idx);
         self.emit(OpCode::LoadConst, none_idx);
-        self.emit(OpCode::Call, 3);
+        self.emit(OpCode::CallSelf, 3);
         self.emit(OpCode::PopTop, 0);
         let end_jump = self.emit(OpCode::JumpForward, 0);
 
-        // Exception handler: __exit__(type(exc), exc, None); if truthy, swallow.
+        // Exception handler (CPython 3.13 shape):
+        //   L3: PUSH_EXC_INFO; WITH_EXCEPT_START; TO_BOOL;
+        //       POP_JUMP_IF_TRUE L4; RERAISE 2
+        //   L4: POP_TOP
+        //   L5: POP_EXCEPT; POP_TOP; POP_TOP
+        //   --  COPY 3; POP_EXCEPT; RERAISE 1   (cleanup, covers L3..L5)
         let handler_start = self.next_offset();
-        // RFC 0037 (WS2): the operand-stack depth to restore before
-        // entering the handler must preserve every enclosing for-loop's
-        // iterator (each lives on the stack for the loop's duration).
-        // Hardcoding `0` truncated the stack to empty, so a `with` that
-        // *suppressed* an exception inside a `for` lost the iterator and
-        // the next `FOR_ITER` found an empty stack. This matches the
-        // `body_depth` convention used by `try`/`except` handlers above.
-        let body_depth =
-            self.loop_stack.iter().filter(|fr| fr.is_for_loop).count() as u32 + self.exc_on_stack;
         // CPython's SETUP_WITH cleanup carries the lasti flag: when
         // __exit__ doesn't suppress, RERAISE restores f_lasti to the
         // raising instruction inside the body (PEP 626). A `return`/
         // `break`/`continue` from the body inlines `__exit__(None,None,
         // None)` here; punch that inline out so a `raise` from it isn't
         // re-caught and `__exit__` re-invoked with the exception triple.
+        // Depth resolves statically at the body baseline (anchored
+        // sentinel): keep the on-stack `__exit__` and everything below.
         self.push_body_exc_entries(
             body_start,
             body_end,
             handler_start,
-            body_depth,
+            HANDLER_DEPTH_ANCHOR_FLAG | depth_anchor,
             true,
             Some(with_frame_id),
         );
-        // Stack: [exc]. Record the propagating exception as the active
-        // handled exception for the duration of the `__exit__` call so a
-        // `raise` inside `__exit__` chains it as the new exception's
-        // implicit `__context__` (PEP 3134). This is what makes
-        // `contextlib.ExitStack`'s `_fix_exception_context` work — it
-        // walks each callback exception's context back to
-        // `sys.exc_info()[1]`. `PUSH_EXC_INFO` only peeks the value-stack
-        // top in this VM, so `[exc]` is preserved for `WITH_EXCEPT_START`.
+        // Entry stack: [__exit__, lasti, exc]. Record the propagating
+        // exception as the active handled exception for the duration of
+        // the `__exit__` call so a `raise` inside `__exit__` chains it
+        // as the new exception's implicit `__context__` (PEP 3134) —
+        // `contextlib.ExitStack`'s `_fix_exception_context` walks each
+        // callback exception's context back to `sys.exc_info()[1]`.
+        // After PUSH_EXC_INFO: [__exit__, lasti, prev, exc].
         let push_exc_site = self.emit(OpCode::PushExcInfo, 0);
-        // The bound `__exit__` stashed by BEFORE_WITH (no `LoadAttr`).
-        self.emit(OpCode::LoadFast, exit_idx);
-        // Stack: [exc, __exit__]
-        self.emit(OpCode::Swap, 2);
-        // Stack: [__exit__, exc]
+        // Calls `__exit__(type(exc), exc, exc.__traceback__)` peeking
+        // the exit at depth 4; pushes the result.
         self.emit(OpCode::WithExceptStart, 0);
-        // Stack: [__exit__, exc, result]
+        self.emit(OpCode::ToBool, 0);
         let swallow = self.emit(OpCode::PopJumpIfTrue, 0);
-        // Falsy: re-raise. Stack: [__exit__, exc]. CPython uses RERAISE
-        // here: the original traceback is preserved and no entry is
-        // recorded for the re-raise site.
-        self.emit(OpCode::Swap, 2);
-        self.emit(OpCode::PopTop, 0);
-        // Drop the synthetic `.with_exit` local before propagating, so a
-        // generator that survives this exception (caught by an enclosing
-        // handler in the same frame) doesn't keep the bound `__exit__`
-        // and its context manager alive across a later `yield`.
-        self.emit(OpCode::DeleteFast, exit_idx);
-        self.emit(OpCode::Reraise, 0);
+        // Falsy: re-raise `exc` (TOS), restoring f_lasti from the slot
+        // two below it (CPython RERAISE 2) — no entry is recorded for
+        // the re-raise site and the original traceback is preserved.
+        self.emit(OpCode::Reraise, 2);
         let swallow_target = self.next_offset();
         self.patch_jump(swallow, swallow_target);
-        // Swallowed: Stack: [__exit__, exc]. Drop the active handled-exc
-        // entry now that the suppressing `__exit__` returned cleanly.
+        // Swallowed: [__exit__, lasti, prev, exc] — drain.
+        self.emit(OpCode::PopTop, 0);
+        // The cleanup entry's coverage ends here (CPython's L5): the
+        // drains below cannot raise.
+        let cleanup_cover_end = self.next_offset();
         self.emit(OpCode::PopExcept, 0);
         self.emit(OpCode::PopTop, 0);
         self.emit(OpCode::PopTop, 0);
+        let swallow_exit = self.emit_no_line(OpCode::JumpForward, 0);
+        self.synthetic_jumps.insert(swallow_exit);
+        // CPython's suppress exit is a JUMP_NO_INTERRUPT.
+        self.no_interrupt_jumps.insert(swallow_exit);
+        // Cleanup tail: a `raise` out of `__exit__` itself (or the
+        // RERAISE) lands here with [__exit__, lasti, prev] preserved
+        // plus the new lasti/exception: restore the handled-exception
+        // state and re-raise (CPython `COPY 3; POP_EXCEPT; RERAISE 1`).
+        let cleanup_start = self.next_offset();
+        self.emit_no_line(OpCode::CopyTop, 3);
+        self.emit_no_line(OpCode::PopExcept, 0);
+        self.emit_no_line(OpCode::Reraise, 1);
+        self.co.exception_table.push(ExcHandler {
+            start: handler_start,
+            end: cleanup_cover_end,
+            handler: cleanup_start,
+            depth: HANDLER_DEPTH_SENTINEL,
+            push_lasti: true,
+        });
         let end = self.next_offset();
-        // Normal exit (`end_jump`) and a suppressed exception both converge
-        // here; drop the synthetic `.with_exit` local (the bound `__exit__`,
-        // which also pins its context manager) so a `yield` later in the
-        // same frame can't keep them alive. See `DeleteFast cm_idx` above.
-        self.emit(OpCode::DeleteFast, exit_idx);
         self.patch_jump(end_jump, end);
-        // Tag the active-handler entry with the pc just past the handler
-        // so the unwinder drops it if `__exit__` raises and the new
-        // exception escapes to an enclosing `try`.
+        self.patch_jump(swallow_exit, end);
+        // Tag the active-handler entry with the pc just past the whole
+        // handler region: the swallow path's POP_EXCEPT (or the cleanup
+        // tail's) pops it; an escape beyond `end` drops it in the
+        // unwinder.
         self.co.instructions[push_exc_site as usize].arg = end;
         Ok(())
     }
@@ -5952,12 +8799,12 @@ impl Compiler {
             match &item.kind {
                 ExprKind::Starred(inner) => {
                     let m = self.co.intern_name(spread);
-                    self.emit(OpCode::LoadAttr, m);
+                    self.emit(OpCode::LoadMethodAttr, m);
                     self.compile_expr(inner)?;
                 }
                 _ => {
                     let m = self.co.intern_name(single);
-                    self.emit(OpCode::LoadAttr, m);
+                    self.emit(OpCode::LoadMethodAttr, m);
                     self.compile_expr(item)?;
                 }
             }
@@ -6343,8 +9190,19 @@ impl Compiler {
                 self.compile_compare(left, ops, comparators)?;
             }
             ExprKind::IfExp { test, body, orelse } => {
-                self.compile_expr(test)?;
-                let jump_else = self.emit(OpCode::PopJumpIfFalse, 0);
+                let (cond, invert) = strip_not_chain(test);
+                self.compile_expr(cond)?;
+                if !expr_is_bool(cond) {
+                    self.emit(OpCode::ToBool, 0);
+                }
+                let jump_else = self.emit(
+                    if invert {
+                        OpCode::PopJumpIfTrue
+                    } else {
+                        OpCode::PopJumpIfFalse
+                    },
+                    0,
+                );
                 self.compile_expr(body)?;
                 let jump_end = self.emit(OpCode::JumpForward, 0);
                 let else_target = self.next_offset();
@@ -6359,11 +9217,28 @@ impl Compiler {
                 self.compile_assign(target)?;
             }
             ExprKind::Lambda { args, body } => {
+                // The implicit RETURN_VALUE carries the lambda *body*'s
+                // location, not the whole lambda expression's
+                // (test_compile's test_lambda_return_position).
                 let synthetic = Stmt {
                     kind: StmtKind::Return(Some((**body).clone())),
-                    span: e.span,
+                    span: body.span,
                 };
-                self.build_function_object("<lambda>", args, &[synthetic])?;
+                // `co_firstlineno` is the *lambda expression's* own line,
+                // not the enclosing statement's — `inspect.getsource` of a
+                // lambda buried in a multiline initializer must start at
+                // the `lambda` token (test_inspect TestOneliners
+                // test_lambda_in_list / test_parenthesized_multiline_lambda).
+                let lambda_line =
+                    Some(self.line_index.line_for(e.span.start.0)).filter(|l| *l != 0);
+                self.build_function_object_full(
+                    "<lambda>",
+                    args,
+                    &[synthetic],
+                    None,
+                    false,
+                    lambda_line,
+                )?;
             }
             ExprKind::TypeParamFn { args, body } => {
                 // A PEP 695 annotation-scope thunk (type-param bound /
@@ -6403,7 +9278,59 @@ impl Compiler {
                         c.emit(op, arg);
                     }
                 };
-                self.compile_expr(func)?;
+                // CPython `maybe_optimize_method_call`: an attribute
+                // callable whose base is not import-originated, with no
+                // splats and a small operand count, loads via the
+                // method-flagged LOAD_ATTR — the receiver rides the wire
+                // view's self slot instead of a PUSH_NULL.
+                let method_form = !has_starred
+                    && !has_kw_splat
+                    && args.len() + keywords.len() + usize::from(!keywords.is_empty())
+                        < STACK_USE_GUIDELINE
+                    && match &func.kind {
+                        ExprKind::Attribute { value, .. } => match &value.kind {
+                            ExprKind::Name(n) => !self.params.module_imports.contains(n),
+                            _ => true,
+                        },
+                        _ => false,
+                    };
+                if method_form {
+                    let ExprKind::Attribute { value, attr } = &func.kind else {
+                        unreachable!("method_form implies an attribute callable");
+                    };
+                    if self.super_attr_optimizable(func) {
+                        // `super().meth(...)` — the fused method-flagged
+                        // LOAD_SUPER_ATTR (CPython LOAD_[ZERO_]SUPER_METHOD).
+                        let saved_span = self.current_span;
+                        self.set_span(func.span);
+                        self.emit_super_attr(func, true)?;
+                        self.current_span = saved_span;
+                    } else {
+                        self.compile_expr(value)?;
+                        let idx = self.co.intern_name(attr);
+                        // The method load carries the *attribute expression's*
+                        // span (not the whole call's), exactly like a plain
+                        // `ExprKind::Attribute` visit.
+                        let saved_span = self.current_span;
+                        self.set_span(func.span);
+                        self.with_attr_location(func.span.end.0, attr.len() as u32, |c| {
+                            c.emit(OpCode::LoadMethodAttr, idx);
+                        });
+                        self.current_span = saved_span;
+                    }
+                } else {
+                    self.compile_expr(func)?;
+                    // The callable's NULL mate, at the callable's own
+                    // location (CPython codegen_call: `ADDOP(c,
+                    // LOC(func), PUSH_NULL)`).
+                    let saved_span = self.current_span;
+                    let saved_line = self.current_line;
+                    self.set_line_from(func.span.start.0);
+                    self.set_span(func.span);
+                    self.emit(OpCode::PushNull, 0);
+                    self.current_span = saved_span;
+                    self.current_line = saved_line;
+                }
                 if has_starred || has_kw_splat {
                     // `f(*x)` with a lone splat passes `x` through raw —
                     // the VM's `CallEx` converts it, branding a
@@ -6426,6 +9353,38 @@ impl Compiler {
                     } else {
                         emit_call(self, OpCode::CallEx, 0);
                     }
+                } else if args.len() + keywords.len() * 2 > STACK_USE_GUIDELINE {
+                    // CPython's big-call path (codegen_call_helper): when
+                    // the operand count exceeds the stack-use guideline
+                    // (each keyword weighs double: name + value),
+                    // positionals accumulate through a list into a tuple
+                    // and keywords into a dict, called via
+                    // CALL_FUNCTION_EX — `co_stacksize` stays O(1)
+                    // (test_compile TestExpressionStackSize).
+                    if args.is_empty() {
+                        let idx = self.co.intern_constant(Constant::Tuple(Vec::new()));
+                        self.emit(OpCode::LoadConst, idx);
+                    } else {
+                        self.emit(OpCode::BuildList, 0);
+                        for a in args {
+                            self.compile_expr(a)?;
+                            self.emit(OpCode::ListAppend, 1);
+                        }
+                        self.emit(OpCode::ListToTuple, 0);
+                    }
+                    if keywords.is_empty() {
+                        emit_call(self, OpCode::CallEx, 0);
+                    } else {
+                        self.emit(OpCode::BuildMap, 0);
+                        for k in keywords {
+                            let n = k.arg.clone().expect("checked above");
+                            let idx = self.co.intern_constant(Constant::Str(n));
+                            self.emit(OpCode::LoadConst, idx);
+                            self.compile_expr(&k.value)?;
+                            self.emit(OpCode::MapAdd, 1);
+                        }
+                        emit_call(self, OpCode::CallEx, 1);
+                    }
                 } else if keywords.is_empty() {
                     for a in args {
                         self.compile_expr(a)?;
@@ -6447,11 +9406,15 @@ impl Compiler {
                 }
             }
             ExprKind::Attribute { value, attr } => {
-                self.compile_expr(value)?;
-                let idx = self.co.intern_name(attr);
-                self.with_attr_location(e.span.end.0, attr.len() as u32, |c| {
-                    c.emit(OpCode::LoadAttr, idx);
-                });
+                if self.super_attr_optimizable(e) {
+                    self.emit_super_attr(e, false)?;
+                } else {
+                    self.compile_expr(value)?;
+                    let idx = self.co.intern_name(attr);
+                    self.with_attr_location(e.span.end.0, attr.len() as u32, |c| {
+                        c.emit(OpCode::LoadAttr, idx);
+                    });
+                }
             }
             ExprKind::Subscript { value, slice } => {
                 self.compile_expr(value)?;
@@ -6490,6 +9453,16 @@ impl Compiler {
                     // multi-line `return (1,\n2,\n3)`).
                     let idx = self.co.intern_constant(folded);
                     self.emit(OpCode::LoadConst, idx);
+                } else if items.len() > STACK_USE_GUIDELINE {
+                    // CPython's starunpack_helper "big" path: accumulate
+                    // through a list so `co_stacksize` stays O(1)
+                    // (test_compile TestExpressionStackSize).
+                    self.emit(OpCode::BuildList, 0);
+                    for x in items {
+                        self.compile_expr(x)?;
+                        self.emit(OpCode::ListAppend, 1);
+                    }
+                    self.emit(OpCode::ListToTuple, 0);
                 } else {
                     for x in items {
                         self.compile_expr(x)?;
@@ -6500,6 +9473,12 @@ impl Compiler {
             ExprKind::List(items) => {
                 if items.iter().any(|x| matches!(x.kind, ExprKind::Starred(_))) {
                     self.compile_splat_list(items)?;
+                } else if items.len() > STACK_USE_GUIDELINE {
+                    self.emit(OpCode::BuildList, 0);
+                    for x in items {
+                        self.compile_expr(x)?;
+                        self.emit(OpCode::ListAppend, 1);
+                    }
                 } else {
                     for x in items {
                         self.compile_expr(x)?;
@@ -6510,6 +9489,12 @@ impl Compiler {
             ExprKind::Set(items) => {
                 if items.iter().any(|x| matches!(x.kind, ExprKind::Starred(_))) {
                     self.compile_unpacking_sequence(items, OpCode::BuildSet, "add", "update")?;
+                } else if items.len() > STACK_USE_GUIDELINE {
+                    self.emit(OpCode::BuildSet, 0);
+                    for x in items {
+                        self.compile_expr(x)?;
+                        self.emit(OpCode::SetAdd, 1);
+                    }
                 } else {
                     for x in items {
                         self.compile_expr(x)?;
@@ -6524,7 +9509,18 @@ impl Compiler {
                 // `BuildMap` for explicit `{k: v}` chunks separated
                 // by `DictUpdate` for each `**other` segment.
                 let has_spread = keys.iter().any(|k| k.is_none());
-                if !has_spread {
+                if !has_spread && keys.len() * 2 > STACK_USE_GUIDELINE {
+                    // CPython codegen_dict "big" path: an empty map plus
+                    // MAP_ADD per pair keeps the stack O(1).
+                    self.emit(OpCode::BuildMap, 0);
+                    for (k, v) in keys.iter().zip(values.iter()) {
+                        if let Some(ke) = k {
+                            self.compile_expr(ke)?;
+                            self.compile_expr(v)?;
+                            self.emit(OpCode::MapAdd, 1);
+                        }
+                    }
+                } else if !has_spread {
                     for (k, v) in keys.iter().zip(values.iter()) {
                         if let Some(ke) = k {
                             self.compile_expr(ke)?;
@@ -6609,15 +9605,18 @@ impl Compiler {
                     let idx = self.co.intern_constant(Constant::None);
                     self.emit(OpCode::LoadConst, idx);
                 }
-                // An async generator's *own* `yield` produces a value for the
-                // consumer (`__anext__`), distinct from the `YIELD_VALUE` the
-                // `await`/`yield from` dance emits to pass an inner
-                // suspension's value through (oparg 0). The runtime uses this
-                // marker (CPython's `PyAsyncGenWrappedValue`) to tell "the
-                // agen yielded X" from "the agen is suspended on an inner
-                // await that yielded X".
-                let yield_arg = u32::from(self.co.is_async_generator);
-                self.emit(OpCode::YieldValue, yield_arg);
+                // CPython 3.13 own-yield shape. An async generator's *own*
+                // `yield` produces a value for the consumer (`__anext__`),
+                // distinct from the `YIELD_VALUE 1` the `await`/`yield from`
+                // dance emits to pass an inner suspension's value through;
+                // the ASYNC_GEN_WRAP intrinsic marks it (CPython's
+                // `PyAsyncGenWrappedValue`). The RESUME lands the sent
+                // value on the stack — it is this expression's result.
+                if self.co.is_async_generator {
+                    self.emit(OpCode::AsyncGenWrap, 0);
+                }
+                self.emit(OpCode::YieldValue, 0);
+                self.emit(OpCode::Resume, 1);
             }
             ExprKind::YieldFrom(iter) => {
                 if self.kind != CodeKind::Function {
@@ -6631,28 +9630,11 @@ impl Compiler {
                         e.span,
                     ));
                 }
-                // CPython 3.13 pattern:
-                //   <iter>
-                //   GET_YIELD_FROM_ITER
-                //   LOAD_CONST None
-                // loop:
-                //   SEND end          ; pushes value or jumps with [iter, value]
-                //   YIELD_VALUE       ; suspend; on resume sent_value at TOS
-                //   JUMP_BACKWARD loop
-                // end:
-                //   END_SEND          ; stack: [iter, value] -> [value]
                 self.compile_expr(iter)?;
                 self.emit(OpCode::GetYieldFromIter, 0);
-                let idx = self.co.intern_constant(Constant::None);
-                self.emit(OpCode::LoadConst, idx);
-                let loop_start = self.next_offset();
-                let send = self.emit(OpCode::Send, 0);
-                self.emit(OpCode::YieldValue, 0);
-                let back = self.emit(OpCode::JumpBackward, 0);
-                self.patch_jump(back, loop_start);
-                let end = self.next_offset();
-                self.patch_jump(send, end);
-                self.emit(OpCode::EndSend, 0);
+                // RESUME 2 = after `yield from` (CPython
+                // RESUME_AFTER_YIELD_FROM).
+                self.emit_send_dance(2);
             }
             ExprKind::Await(value) => {
                 if !self.in_async_context() {
@@ -6699,22 +9681,56 @@ impl Compiler {
     /// Emit the "drive awaitable to completion" instruction sequence
     /// CPython 3.13 uses for `await`. Stack on entry: `[awaitable]`;
     /// stack on exit: `[result]`. `awaitable_arg` is passed to
-    /// `GET_AWAITABLE` and selects the error message: 0 = plain
-    /// `await`, 1 = `async for`'s `__anext__` result, 2 = `async
-    /// with`'s `__aenter__` result, 3 = its `__aexit__` result.
+    /// `GET_AWAITABLE` and selects the error message (CPython's
+    /// numbering): 0 = plain `await`, 1 = `async with`'s `__aenter__`
+    /// result, 2 = its `__aexit__` result. `async for` uses no
+    /// GET_AWAITABLE — GET_ANEXT coerces its own result.
     fn compile_await_dance(&mut self, awaitable_arg: u32) {
         self.emit(OpCode::GetAwaitable, awaitable_arg);
+        // RESUME 3 = after `await` (CPython RESUME_AFTER_AWAIT).
+        self.emit_send_dance(3);
+    }
+
+    /// CPython 3.13 `codegen_add_yield_from`: drive the iterator at TOS
+    /// to completion. Stack on entry: `[iter]`; on exit: `[result]`.
+    ///
+    ///   LOAD_CONST None
+    /// send: SEND -> exit        ; pushes yielded value, or jumps with
+    ///                           ; [iter, retval] on StopIteration
+    ///   YIELD_VALUE 1           ; passthrough suspension
+    ///   RESUME resume_arg       ; sent value lands at TOS
+    ///   JUMP_BACKWARD_NO_INTERRUPT -> send
+    /// fail: CLEANUP_THROW       ; StopIteration from a throw()/close()
+    ///                           ; injected at the YIELD -> [None, value]
+    /// exit: END_SEND            ; [iter, value] -> [value]
+    ///
+    /// The virtual try around the YIELD_VALUE targets `fail`
+    /// (CLEANUP_THROW); the cold-block pass in `finish` moves that
+    /// block to the stream tail with an explicit rejoin jump, exactly
+    /// like CPython's `push_cold_blocks_to_end`.
+    fn emit_send_dance(&mut self, resume_arg: u32) {
         let none_idx = self.co.intern_constant(Constant::None);
         self.emit(OpCode::LoadConst, none_idx);
         let loop_start = self.next_offset();
         let send = self.emit(OpCode::Send, 0);
-        self.emit(OpCode::YieldValue, 0);
+        let yield_at = self.emit(OpCode::YieldValue, 1);
+        self.emit(OpCode::Resume, resume_arg);
         let back = self.emit(OpCode::JumpBackward, 0);
         self.patch_jump(back, loop_start);
+        let fail = self.emit(OpCode::CleanupThrow, 0);
         let end = self.next_offset();
         self.patch_jump(send, end);
         // Stack: [iter, value]. Drop the iterator, keep the value.
         self.emit(OpCode::EndSend, 0);
+        // Covered range is exactly the YIELD_VALUE; the depth resolves
+        // statically at that instruction ([.., iter, value] kept).
+        self.co.exception_table.push(ExcHandler {
+            start: yield_at,
+            end: yield_at + 1,
+            handler: fail,
+            depth: HANDLER_DEPTH_SENTINEL,
+            push_lasti: false,
+        });
     }
 
     /// `True` if the current code object is the body of an `async def`
@@ -6746,13 +9762,14 @@ impl Compiler {
         self.compile_expr(iter)?;
         self.emit(OpCode::GetAiter, 0);
         let loop_top = self.next_offset();
-        // GetAnext peeks the aiter and pushes an awaitable. The
-        // await-dance drives it; on success we land at the
-        // STORE_FAST target. On StopAsyncIteration, control flows
-        // to the cleanup block.
-        let anext_site = self.emit(OpCode::GetAnext, 0);
-        let _ = anext_site;
-        self.compile_await_dance(1);
+        // GetAnext peeks the aiter and pushes a *coerced* awaitable
+        // (CPython's GET_ANEXT applies `_PyCoro_GetAwaitableIter`
+        // itself — no GET_AWAITABLE in the async-for dance). The
+        // send-dance drives it; on success we land at the STORE_FAST
+        // target. On StopAsyncIteration, control flows to the cleanup
+        // block.
+        self.emit(OpCode::GetAnext, 0);
+        self.emit_send_dance(3);
         // The StopAsyncIteration window closes here: only the
         // `__anext__` await may end the loop. An exception raised by
         // the assignment target or the body — even a
@@ -6766,6 +9783,7 @@ impl Compiler {
             is_for_loop: true,
             handler_depth_at_entry: self.handler_depth,
             exc_on_stack_at_entry: self.exc_on_stack,
+            pending_retvals_at_entry: self.pending_retvals,
         });
         for s in body {
             self.compile_stmt(s)?;
@@ -6782,19 +9800,14 @@ impl Compiler {
         // aiter stays at stack depth 1 across the whole loop body —
         // every per-iteration push lives above it.
         let cleanup_target = self.next_offset();
-        // The unwind depth must preserve every *enclosing* for-loop's
-        // iterator (each lives on the stack for its loop's duration) —
-        // the async-for's own frame was popped above, so `loop_stack`
-        // holds exactly the enclosing loops. Counting only the aiter
-        // dropped an outer `for`'s iterator on exhaustion (`for …:
-        // async for …:` hit "FOR_ITER no iter", test_sys_settrace
-        // test_jump_out_of_async_for_block_forwards).
-        let enclosing_iters = self.loop_stack.iter().filter(|fr| fr.is_for_loop).count() as u32;
+        // Sentinel depth: resolved by `finish` to the static stack
+        // depth at `loop_top`, which preserves every enclosing loop's
+        // iterator, the aiter itself, and any pinned exception slots.
         self.co.exception_table.push(ExcHandler {
             start: loop_top,
             end: dance_end,
             handler: cleanup_target,
-            depth: enclosing_iters + 1 + self.exc_on_stack,
+            depth: HANDLER_DEPTH_SENTINEL,
             push_lasti: false,
         });
         // Cleanup: pop aiter + exception, then run the `else` clause.
@@ -6832,23 +9845,22 @@ impl Compiler {
         self.compile_expr(&head.context_expr)?;
         self.current_line = with_line;
         self.current_span = with_span;
-        // BEFORE_ASYNC_WITH leaves [aexit, awaitable(aenter)].
+        // BEFORE_ASYNC_WITH leaves [aexit, awaitable(aenter)]. The bound
+        // `__aexit__` stays on the operand stack for the whole body —
+        // the async counterpart of `compile_with`'s SETUP_WITH shape.
         self.emit(OpCode::BeforeAsyncWith, 0);
-        self.compile_await_dance(2);
-        // Stack: [aexit, value].
+        self.compile_await_dance(1);
+        // Stack: [aexit, value]. Exception coverage starts at the bind.
+        let cover_start = self.next_offset();
         if let Some(target) = &head.optional_vars {
             self.compile_assign(target)?;
         } else {
             self.emit(OpCode::PopTop, 0);
         }
-        // Stash aexit in a synthetic local so we can recover it on
-        // both the normal-exit and the exception-cleanup paths.
-        // Depth-keyed like `.with_exit` (see `compile_with`): sibling
-        // `async with` blocks share the slot, mirroring CPython's
-        // value-stack reuse (test_jump_between_async_with_blocks).
-        let slot = format!(".aexit{}", self.with_depth);
-        let slot_idx = self.var_index_or_add(&slot);
-        self.emit(OpCode::StoreFast, slot_idx);
+        // Coverage starts one slot above the body baseline (the
+        // `__aenter__` result rides over `__aexit__`): anchor the
+        // handler depth at the first body instruction.
+        let depth_anchor = self.next_offset();
 
         // Synthetic finally frame so `return`/`break`/`continue` out of
         // the body still `await __aexit__(None, None, None)`. Mirrors the
@@ -6860,23 +9872,23 @@ impl Compiler {
         let awith_frame_id = self.fresh_finally_id();
         self.finally_stack.push(FinallyFrame {
             kind: FinallyKind::AsyncWithExit {
-                aexit_idx: slot_idx,
                 line: with_line,
                 span: with_span,
             },
             loop_depth_at_push: awith_loop_depth,
             id: awith_frame_id,
             pop_except_after: false,
+            exc_at_push: self.exc_on_stack,
+            handler_at_push: self.handler_depth,
+            rv_at_push: self.pending_retvals,
         });
 
-        let body_start = self.next_offset();
-        self.with_depth += 1;
+        let body_start = cover_start;
         let body_result = if rest.is_empty() {
             body.iter().try_for_each(|s| self.compile_stmt(s))
         } else {
             self.compile_async_with(rest, body)
         };
-        self.with_depth -= 1;
         body_result?;
         let body_end = self.next_offset();
 
@@ -6888,84 +9900,91 @@ impl Compiler {
         self.current_line = with_line;
         self.current_span = with_span;
 
-        // Normal exit: `await aexit(None, None, None)`.
-        self.emit(OpCode::LoadFast, slot_idx);
+        // Normal exit: TOS is the bound `__aexit__`; `await
+        // aexit(None, None, None)`. First None rides the self slot
+        // (wire `CALL 2`).
         let none_idx = self.co.intern_constant(Constant::None);
         self.emit(OpCode::LoadConst, none_idx);
         self.emit(OpCode::LoadConst, none_idx);
         self.emit(OpCode::LoadConst, none_idx);
-        self.emit(OpCode::Call, 3);
-        self.compile_await_dance(3);
+        self.emit(OpCode::CallSelf, 3);
+        self.compile_await_dance(2);
         self.emit(OpCode::PopTop, 0);
         let end_jump = self.emit(OpCode::JumpForward, 0);
 
-        // Exception-cleanup path — the async counterpart of the handler
-        // emitted by `compile_with`: `result = await aexit(type(exc), exc,
-        // None)`; if `result` is truthy the exception is swallowed,
-        // otherwise it is re-raised. The previous codegen omitted this
-        // entirely, so an exception escaping an `async with` body never
-        // reached `__aexit__` and could not be suppressed (the `with`
-        // statement's `__exit__` already had this).
+        // Exception handler — the async counterpart of `compile_with`'s:
+        //   PUSH_EXC_INFO; WITH_EXCEPT_START; <await>; TO_BOOL;
+        //   POP_JUMP_IF_TRUE swallow; RERAISE 2
+        //   swallow: POP_TOP; POP_EXCEPT; POP_TOP; POP_TOP
+        //   cleanup: COPY 3; POP_EXCEPT; RERAISE 1
         let handler_start = self.next_offset();
-        // Preserve enclosing for-loop iterators on the operand stack, the
-        // same depth convention used by `try`/`except` and `compile_with`.
-        let body_depth =
-            self.loop_stack.iter().filter(|fr| fr.is_for_loop).count() as u32 + self.exc_on_stack;
         // Same lasti semantics as the sync `with` cleanup. Punch out the
         // body's `return`/`break`/`continue`-path `await __aexit__(None,
         // None, None)` inline so a `raise` from it isn't re-caught and
-        // `__aexit__` re-awaited with the exception triple.
+        // `__aexit__` re-awaited with the exception triple. Depth is
+        // anchored at the body baseline (keeps the on-stack `__aexit__`).
         self.push_body_exc_entries(
             body_start,
             body_end,
             handler_start,
-            body_depth,
+            HANDLER_DEPTH_ANCHOR_FLAG | depth_anchor,
             true,
             Some(awith_frame_id),
         );
-        // Stack: [exc]. Record the propagating exception as the active
-        // handled exception for the duration of the awaited `__aexit__`,
-        // exactly as the sync `with` handler does. Without it the body's
-        // exception isn't visible via `sys.exc_info()` inside `__aexit__`
-        // (a coroutine driven by the await dance below), so a `raise`
-        // there gets no implicit `__context__` and
-        // `contextlib.AsyncExitStack`'s `_fix_exception_context` (which
-        // walks each callback exception back to `sys.exc_info()[1]`)
-        // cannot reconstruct the chain.
+        // Entry stack: [aexit, lasti, exc]. Record the propagating
+        // exception as the active handled exception for the duration of
+        // the awaited `__aexit__` so a `raise` inside it chains as the
+        // new exception's implicit `__context__` (PEP 3134) —
+        // `contextlib.AsyncExitStack`'s `_fix_exception_context` walks
+        // each callback exception's context back to `sys.exc_info()[1]`.
+        // After PUSH_EXC_INFO: [aexit, lasti, prev, exc].
         let push_exc_site = self.emit(OpCode::PushExcInfo, 0);
-        self.emit(OpCode::LoadFast, slot_idx);
-        // Stack: [exc, aexit]
-        self.emit(OpCode::Swap, 2);
-        // Stack: [aexit, exc]
+        // Calls `__aexit__(type(exc), exc, exc.__traceback__)` peeking
+        // the exit at depth 4; pushes the coroutine, which the dance
+        // awaits into the suppress flag.
         self.emit(OpCode::WithExceptStart, 0);
-        // Stack: [aexit, exc, awaitable] — await the `__aexit__` coroutine.
-        self.compile_await_dance(3);
-        // Stack: [aexit, exc, result]
+        self.compile_await_dance(2);
+        self.emit(OpCode::ToBool, 0);
         let swallow = self.emit(OpCode::PopJumpIfTrue, 0);
-        // Falsy: re-raise. Stack: [aexit, exc]. RERAISE preserves the
-        // original traceback (no entry for the re-raise site).
-        self.emit(OpCode::Swap, 2);
-        self.emit(OpCode::PopTop, 0);
-        // Drop the synthetic `.aexit` local before propagating, so an async
-        // generator surviving this exception doesn't pin the manager.
-        self.emit(OpCode::DeleteFast, slot_idx);
-        self.emit(OpCode::Reraise, 0);
+        // Falsy: re-raise `exc` (TOS), restoring f_lasti from the slot
+        // two below (CPython RERAISE 2); the original traceback is
+        // preserved (no entry recorded for the re-raise site).
+        self.emit(OpCode::Reraise, 2);
         let swallow_target = self.next_offset();
         self.patch_jump(swallow, swallow_target);
-        // Swallowed: Stack: [aexit, exc]. Drop the active handled-exc
-        // entry now that the suppressing `__aexit__` returned cleanly.
+        // Swallowed: [aexit, lasti, prev, exc] — drain.
+        self.emit(OpCode::PopTop, 0);
+        // Cleanup coverage ends here: the drains below cannot raise.
+        let cleanup_cover_end = self.next_offset();
         self.emit(OpCode::PopExcept, 0);
         self.emit(OpCode::PopTop, 0);
         self.emit(OpCode::PopTop, 0);
+        let swallow_exit = self.emit_no_line(OpCode::JumpForward, 0);
+        self.synthetic_jumps.insert(swallow_exit);
+        // CPython's suppress exit is a JUMP_NO_INTERRUPT.
+        self.no_interrupt_jumps.insert(swallow_exit);
+        // Cleanup tail: a `raise` out of the awaited `__aexit__` (or the
+        // RERAISE) lands here with [aexit, lasti, prev] preserved plus
+        // the new lasti/exception: restore the handled-exception state
+        // and re-raise (CPython `COPY 3; POP_EXCEPT; RERAISE 1`).
+        let cleanup_start = self.next_offset();
+        self.emit_no_line(OpCode::CopyTop, 3);
+        self.emit_no_line(OpCode::PopExcept, 0);
+        self.emit_no_line(OpCode::Reraise, 1);
+        self.co.exception_table.push(ExcHandler {
+            start: handler_start,
+            end: cleanup_cover_end,
+            handler: cleanup_start,
+            depth: HANDLER_DEPTH_SENTINEL,
+            push_lasti: true,
+        });
         let end = self.next_offset();
-        // Drop the synthetic `.aexit` local on the normal/suppressed exit
-        // paths (which converge here) so a later `yield`/`await` in the same
-        // async generator frame can't keep the bound `__aexit__` and its
-        // context manager alive. Mirrors the sync `with` fix.
-        self.emit(OpCode::DeleteFast, slot_idx);
         self.patch_jump(end_jump, end);
-        // Tag the active-handler entry with the pc just past the handler
-        // so the unwinder drops it if `__aexit__` raises a new exception.
+        self.patch_jump(swallow_exit, end);
+        // Tag the active-handler entry with the pc just past the whole
+        // handler region: the swallow path's POP_EXCEPT (or the cleanup
+        // tail's) pops it; an escape beyond `end` drops it in the
+        // unwinder.
         self.co.instructions[push_exc_site as usize].arg = end;
         Ok(())
     }
@@ -7000,7 +10019,7 @@ impl Compiler {
         spec: Option<&Expr>,
     ) -> Result<(), CompileError> {
         self.compile_expr(value)?;
-        let mut arg: u32 = match conversion {
+        let conv: u32 = match conversion {
             -1 => 0,
             115 => 1, // 's'
             114 => 2, // 'r'
@@ -7011,6 +10030,14 @@ impl Compiler {
                 )));
             }
         };
+        // CPython 3.13 shape: the conversion is its own CONVERT_VALUE
+        // instruction, then the spec (if any), then FORMAT_SIMPLE /
+        // FORMAT_WITH_SPEC (the internal FormatValue keeps only the
+        // spec-on-stack bit).
+        if conv != 0 {
+            self.emit(OpCode::ConvertValue, conv);
+        }
+        let mut arg: u32 = 0;
         if let Some(spec_expr) = spec {
             self.compile_expr(spec_expr)?;
             arg |= 0x04;
@@ -7073,6 +10100,212 @@ impl Compiler {
 
     // ---------- comprehensions ----------
 
+    /// Whether this comprehension takes the PEP 709 inlined lowering.
+    /// Phase-1 conservative gates — anything rejected here keeps the
+    /// classic nested-function lowering (still correct, just a
+    /// different frame shape):
+    /// - generator expressions never inline (per the PEP);
+    /// - class bodies keep the fallback (hidden fast locals in a class
+    ///   frame need bespoke handling);
+    /// - async comprehensions inline only inside an async context;
+    /// - no walrus targets in the comp scope;
+    /// - no comp-local may be closed over by a nested scope (would
+    ///   need a parent cell);
+    /// - comp-locals must not collide with enclosing
+    ///   cell/free/nonlocal names.
+    fn comp_inline_eligible(
+        &self,
+        kind: CompKind,
+        elt: &Expr,
+        value: Option<&Expr>,
+        generators: &[Comprehension],
+        is_async_comp: bool,
+    ) -> bool {
+        if matches!(kind, CompKind::Generator) {
+            return false;
+        }
+        if matches!(self.kind, CodeKind::Class) {
+            return false;
+        }
+        // A PEP 695 annotation scope that can see a class namespace
+        // resolves name loads through `__classdict__` — but a
+        // comprehension is a real nested scope whose reads must *skip*
+        // the class namespace (`type Alias = [T for _ in (1,)]` in a
+        // class body reads the global `T`, test_type_params
+        // test_nested_scope_in_generic_alias). Inlining would leak the
+        // classdict resolution into the comp body; keep the
+        // nested-function lowering, whose free-variable analysis
+        // already skips class scopes.
+        if self.lazy_class_ctx.is_some() {
+            return false;
+        }
+        if is_async_comp && !self.in_async_context() {
+            return false;
+        }
+        let mut has_walrus = false;
+        collect_comp_scope_walruses(elt, value, generators, &mut |_| has_walrus = true);
+        if has_walrus {
+            return false;
+        }
+        // A comprehension-scope `yield`/`yield from` is a SyntaxError
+        // regardless of inlining; take the nested-function path whose
+        // Comprehension-kind compiler reports it ("'yield' inside list
+        // comprehension", test_grammar test_yield_in_comprehensions).
+        // Inlining instead would compile the yield into the enclosing
+        // function, where it is legal.
+        if comp_scope_contains_yield(elt, value, generators) {
+            return false;
+        }
+        let mut locals_map: IndexMap<String, Binding> = IndexMap::new();
+        for g in generators {
+            let mut names = HashSet::new();
+            collect_target_names(&g.target, &mut names);
+            for n in names {
+                locals_map.insert(n, Binding::Local);
+            }
+        }
+        let mut needed = HashSet::new();
+        collect_inner_free_expr(elt, &locals_map, &mut needed);
+        if let Some(v) = value {
+            collect_inner_free_expr(v, &locals_map, &mut needed);
+        }
+        for (gi, g) in generators.iter().enumerate() {
+            if gi > 0 {
+                collect_inner_free_expr(&g.iter, &locals_map, &mut needed);
+            }
+            collect_inner_free_expr(&g.target, &locals_map, &mut needed);
+            for cond in &g.ifs {
+                collect_inner_free_expr(cond, &locals_map, &mut needed);
+            }
+        }
+        if !needed.is_empty() {
+            return false;
+        }
+        for name in locals_map.keys() {
+            if matches!(
+                self.bindings.get(name),
+                Some(Binding::Cell | Binding::Free | Binding::Nonlocal | Binding::ClassPassthrough)
+            ) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// PEP 709 inlined lowering (CPython codegen_comprehension with
+    /// an inlined symtable entry): the loop compiles into the current
+    /// stream. The comp's for-targets become hidden fast locals of the
+    /// enclosing scope, saved with LOAD_FAST_AND_CLEAR before the loop
+    /// and restored after — including on the exception path, via a
+    /// cleanup handler that re-raises.
+    fn compile_inlined_comprehension(
+        &mut self,
+        kind: CompKind,
+        elt: &Expr,
+        value: Option<&Expr>,
+        generators: &[Comprehension],
+    ) -> Result<(), CompileError> {
+        let collector_op = match kind {
+            CompKind::List => OpCode::BuildList,
+            CompKind::Set => OpCode::BuildSet,
+            CompKind::Dict => OpCode::BuildMap,
+            CompKind::Generator => unreachable!("genexps never inline"),
+        };
+        let append_op = match kind {
+            CompKind::List => OpCode::ListAppend,
+            CompKind::Set => OpCode::SetAdd,
+            CompKind::Dict => OpCode::MapAdd,
+            CompKind::Generator => unreachable!("genexps never inline"),
+        };
+        let comp_line = self.current_line;
+        let comp_span = self.current_span;
+        // Comp-locals in first-seen order (deterministic co_varnames).
+        let mut names: Vec<String> = Vec::new();
+        for g in generators {
+            collect_target_names_ordered(&g.target, &mut names);
+        }
+        // The outermost iterable evaluates in the *enclosing* scope —
+        // before the comp-local overrides shadow anything
+        // (`[x for x in x]` iterates the outer `x`).
+        self.compile_expr(&generators[0].iter)?;
+        let iter_span = generators[0].iter.span;
+        self.set_line_from(iter_span.start.0);
+        self.set_span(iter_span);
+        if generators[0].is_async {
+            self.emit(OpCode::GetAiter, 0);
+        } else {
+            self.emit(OpCode::GetIter, 0);
+        }
+        self.current_line = comp_line;
+        self.current_span = comp_span;
+        // Shadow the comp-locals for the duration of the body.
+        let mut overrides: Vec<(String, Option<Binding>)> = Vec::new();
+        for n in &names {
+            let prev = self.bindings.insert(n.clone(), Binding::Local);
+            overrides.push((n.clone(), prev));
+        }
+        let slots: Vec<u32> = names.iter().map(|n| self.var_index_or_add(n)).collect();
+        // Save and clear each hidden local, keeping the iterator on top.
+        for &s in &slots {
+            self.emit(OpCode::LoadFastAndClear, s);
+            self.emit(OpCode::Swap, 2);
+        }
+        // Accumulator goes *under* the iterator; this is where the
+        // protected region begins (CPython's L1).
+        let protect_start = self.next_offset();
+        self.emit(collector_op, 0);
+        self.emit(OpCode::Swap, 2);
+        self.inline_comp += 1;
+        let body = compile_comp_body(self, generators, 0, 1, elt, value, append_op);
+        self.inline_comp -= 1;
+        body?;
+        // Loop done: stack is [saved.., accumulator].
+        let protect_end = self.next_offset();
+        self.current_line = comp_line;
+        self.current_span = comp_span;
+        if !slots.is_empty() {
+            // Normal-path restore.
+            for &s in slots.iter().rev() {
+                self.emit(OpCode::Swap, 2);
+                self.emit(OpCode::StoreFast, s);
+            }
+            let over = self.emit_no_line(OpCode::JumpForward, 0);
+            self.synthetic_jumps.insert(over);
+            // Exception-path restore: [saved.., acc, exc] → drop the
+            // partial accumulator, restore, re-raise. Depth is
+            // resolved in `finish` (base depth of the surrounding
+            // expression isn't known here).
+            let handler = self.next_offset();
+            self.co.exception_table.push(ExcHandler {
+                start: protect_start,
+                end: protect_end,
+                handler,
+                depth: HANDLER_DEPTH_SENTINEL,
+                push_lasti: false,
+            });
+            self.emit_no_line(OpCode::Swap, 2);
+            self.emit_no_line(OpCode::PopTop, 0);
+            for &s in slots.iter().rev() {
+                self.emit(OpCode::Swap, 2);
+                self.emit(OpCode::StoreFast, s);
+            }
+            self.emit(OpCode::Reraise, 0);
+            let after = self.next_offset();
+            self.patch_jump(over, after);
+        }
+        for (n, prev) in overrides {
+            match prev {
+                Some(b) => {
+                    self.bindings.insert(n, b);
+                }
+                None => {
+                    self.bindings.shift_remove(&n);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn compile_comprehension(
         &mut self,
         kind: CompKind,
@@ -7096,6 +10329,35 @@ impl Compiler {
         // at nested comprehension scopes, so we detect the nested-async
         // case separately with `expr_contains_async_comp`.
         let is_async_comp = comp_clause_is_async(generators, elt, value);
+        // PEP 572: enforce the symtable-stage named-expression rules
+        // once per comprehension nest, *before* choosing a lowering —
+        // an inlined comp must reject a walrus in its iterable exactly
+        // like the nested-function form (test_named_expressions). The
+        // outermost comprehension of a nest sees the whole nest; nested
+        // ones (classic `CodeKind::Comprehension` scopes or inlined
+        // bodies) were already covered by that outermost walk.
+        if !matches!(self.kind, CodeKind::Comprehension) && self.inline_comp == 0 {
+            let mut stack = Vec::new();
+            check_comp_walrus_nest(
+                matches!(self.kind, CodeKind::Class),
+                elt,
+                value,
+                generators,
+                &mut stack,
+            )?;
+        }
+        // PEP 709: list/set/dict comprehensions inline into the
+        // enclosing scope — no nested code object, no call, the loop
+        // ops (LIST_APPEND & co.) land in the enclosing stream
+        // (test_compile TestSourcePositions multiline comprehensions).
+        // `comp_inline_eligible` keeps the classic nested-function
+        // lowering for the shapes phase 1 doesn't cover.
+        if self.comp_inline_eligible(kind, elt, value, generators, is_async_comp) {
+            return self.compile_inlined_comprehension(kind, elt, value, generators);
+        }
+        // `compile_expr` set the current span to the whole comprehension
+        // expression before dispatching here.
+        let whole_span = self.current_span;
         let name = match kind {
             CompKind::List => "<listcomp>",
             CompKind::Set => "<setcomp>",
@@ -7108,7 +10370,7 @@ impl Compiler {
             CodeKind::Comprehension,
             self.line_index.clone(),
             self.source.clone(),
-            self.params,
+            self.params.clone(),
         );
         inner.current_line = self.current_line;
         inner.comp_kind = Some(kind);
@@ -7180,20 +10442,8 @@ impl Compiler {
                 inner.bindings.insert(n, Binding::Local);
             }
         }
-        // PEP 572: enforce the symtable-stage named-expression rules once
-        // per comprehension nest (the outermost comprehension sees the
-        // whole nest; nested ones were already covered by that walk).
-        if !matches!(self.kind, CodeKind::Comprehension) {
-            let mut stack = Vec::new();
-            check_comp_walrus_nest(
-                matches!(self.kind, CodeKind::Class),
-                elt,
-                value,
-                generators,
-                &mut stack,
-            )?;
-        }
-        // …then bind each walrus target in the nearest enclosing
+        // The PEP 572 named-expression rules were enforced above,
+        // before the lowering choice. Bind each walrus target in the nearest enclosing
         // non-comprehension scope: a comprehension in a *function* stores
         // it through a cell (implicit `nonlocal`), a comprehension at
         // module scope stores a global, and an intermediate comprehension
@@ -7321,25 +10571,42 @@ impl Compiler {
         if matches!(kind, CompKind::Generator) && !is_async_comp {
             inner.co.is_generator = true;
             inner.emit(OpCode::ReturnGenerator, 0);
+            inner.emit(OpCode::PopTop, 0);
         } else if is_async_comp {
             // Both async-generator comps and async list/set/dict
             // comps use the suspended-frame infrastructure.
             inner.emit(OpCode::ReturnGenerator, 0);
+            inner.emit(OpCode::PopTop, 0);
         }
         inner.emit_entry_resume();
         if let Some(op) = collector_op {
             inner.emit(op, 0);
         }
-        // Outermost iterator comes in as `.0`.
+        // Outermost iterator comes in as `.0`. CPython 3.13 re-iters it
+        // defensively (`LOAD_FAST .0; GET_ITER` — the argument is any
+        // iterable as far as the frame surface is concerned); the async
+        // depth-0 arm converts with GET_AITER inside the body instead.
         inner.emit(OpCode::LoadFast, 0);
-        compile_comp_body(&mut inner, generators, 0, elt, value, append_op)?;
+        if !generators[0].is_async {
+            inner.emit(OpCode::GetIter, 0);
+        }
+        compile_comp_body(&mut inner, generators, 0, 1, elt, value, append_op)?;
         if matches!(kind, CompKind::Generator) {
             // ForIter pops the iterator on exhaustion. Return None
             // so the generator finishes cleanly (the VM converts
-            // this to `StopIteration`).
+            // this to `StopIteration`). arg 1: codegen-origin constant
+            // return, fused to RETURN_CONST on the wire
+            // (test_multiline_generator_expression). An *async* genexp
+            // stamps that return with the whole expression's span
+            // (test_multiline_async_generator_expression); a sync one
+            // inherits the loop-exit location.
+            if is_async_comp {
+                inner.current_span = whole_span;
+                inner.set_line_from(whole_span.0);
+            }
             let none_idx = inner.co.intern_constant(Constant::None);
             inner.emit(OpCode::LoadConst, none_idx);
-            inner.emit(OpCode::ReturnValue, 0);
+            inner.emit(OpCode::ReturnValue, 1);
         } else {
             inner.emit(OpCode::ReturnValue, 0);
         }
@@ -7368,9 +10635,9 @@ impl Compiler {
         }
         let code_idx = self
             .co
-            .intern_constant(Constant::Code(Box::new(inner_code)));
+            .intern_constant(Constant::Code(std::sync::Arc::new(inner_code)));
         self.emit(OpCode::LoadConst, code_idx);
-        self.emit(OpCode::MakeFunction, flags);
+        self.emit_make_function(flags);
         // Push iterator of outermost generator as `.0`. For an async
         // comprehension we still pass the raw source — the inner
         // body fetches `aiter()` when it sees `is_async`.
@@ -7387,7 +10654,9 @@ impl Compiler {
         if !(is_async_comp && generators[0].is_async) {
             self.emit(OpCode::GetIter, 0);
         }
-        self.emit(OpCode::Call, 1);
+        // The iterator rides the self slot (CPython's comprehension
+        // invocation is `CALL 0`).
+        self.emit(OpCode::CallSelf, 1);
         // For an async list/set/dict comprehension the call returned
         // a coroutine; the enclosing async function awaits it so the
         // final value (list/set/dict) ends up on the stack.
@@ -7936,10 +11205,28 @@ fn check_comp_walrus_nest(
     Ok(())
 }
 
+/// Stamp the compiler's current location with the comprehension
+/// element's span (for dict comps, the combined `key: value` span).
+/// CPython gives this location to the loop's back edge and — via jump
+/// threading — to the comp-`if` conditional jumps that land on it
+/// (test_compile's TestSourcePositions multiline comprehension family).
+fn stamp_comp_elt_span(inner: &mut Compiler, elt: &Expr, value: Option<&Expr>, append_op: OpCode) {
+    let end = match (append_op, value) {
+        (OpCode::MapAdd, Some(v)) => v.span.end.0,
+        _ => elt.span.end.0,
+    };
+    inner.current_span = (elt.span.start.0, end);
+    inner.set_line_from(elt.span.start.0);
+}
+
 fn compile_comp_body(
     inner: &mut Compiler,
     generators: &[Comprehension],
     depth: usize,
+    // Iterators live on the stack while the body runs; CPython threads
+    // this count separately from `depth` because the assignment-idiom
+    // fast path below creates no iterator for its generator.
+    iters_on_stack: usize,
     elt: &Expr,
     value: Option<&Expr>,
     append_op: OpCode,
@@ -7949,24 +11236,42 @@ fn compile_comp_body(
         // generator expressions, yield the element instead.
         match append_op {
             OpCode::MapAdd => {
+                let val = value.expect("dict comp needs value");
                 inner.compile_expr(elt)?;
-                inner.compile_expr(value.expect("dict comp needs value"))?;
-                let i = generators.len() + 1; // stack depth to accumulator
+                inner.compile_expr(val)?;
+                let i = iters_on_stack + 1; // stack depth to accumulator
+                                            // CPython stamps MAP_ADD with the `key: value` span
+                                            // (test_compile test_multiline_dict_comprehension).
+                inner.current_span = (elt.span.start.0, val.span.end.0);
+                inner.set_line_from(elt.span.start.0);
                 inner.emit(OpCode::MapAdd, i as u32);
             }
             OpCode::YieldValue => {
                 inner.compile_expr(elt)?;
-                // An async-generator comprehension `(x async for x in xs)`
-                // yields a consumer value here; mark it (arg 1) like a plain
-                // async-gen `yield` so the runtime's passthrough machinery
-                // doesn't mistake it for an inner-await suspension. Sync
-                // genexps stay arg 0.
-                inner.emit(OpCode::YieldValue, u32::from(inner.co.is_async_generator));
+                // CPython stamps the yield (and the discarding POP_TOP)
+                // with the element's span
+                // (test_multiline_generator_expression).
+                stamp_comp_elt_span(inner, elt, value, append_op);
+                // CPython 3.13 own-yield shape: an async-generator
+                // comprehension wraps the value (ASYNC_GEN_WRAP intrinsic)
+                // so the runtime can tell a consumer value from an
+                // inner-await passthrough; every own yield is `YIELD_VALUE
+                // 0` + `RESUME 1`, and the sent value pushed on resume is
+                // discarded.
+                if inner.co.is_async_generator {
+                    inner.emit(OpCode::AsyncGenWrap, 0);
+                }
+                inner.emit(OpCode::YieldValue, 0);
+                inner.emit(OpCode::Resume, 1);
                 inner.emit(OpCode::PopTop, 0);
             }
             _ => {
                 inner.compile_expr(elt)?;
-                let i = generators.len() + 1;
+                let i = iters_on_stack + 1;
+                // CPython stamps LIST_APPEND/SET_ADD with the element's
+                // span (test_compile test_multiline_list_comprehension).
+                inner.set_span(elt.span);
+                inner.set_line_from(elt.span.start.0);
                 inner.emit(append_op, i as u32);
             }
         }
@@ -7976,14 +11281,16 @@ fn compile_comp_body(
     if gen.is_async {
         // depth==0: caller pushed the source expr (not yet GetAiter'd)
         // because compile_comprehension uses GetIter for the .0 arg.
-        // We need to convert to async-iter here for the body.
-        if depth == 0 {
+        // We need to convert to async-iter here for the body. An
+        // *inlined* comprehension pushed the ready aiter instead —
+        // nothing to convert.
+        if depth == 0 && inner.inline_comp == 0 {
             inner.emit(OpCode::PopTop, 0);
             inner.emit(OpCode::LoadFast, 0);
             inner.emit(OpCode::GetAiter, 0);
             inner.emit(OpCode::CopyTop, 0);
             inner.emit(OpCode::StoreFast, 0);
-        } else {
+        } else if depth > 0 {
             inner.compile_expr(&gen.iter)?;
             inner.emit(OpCode::GetAiter, 0);
         }
@@ -7994,26 +11301,63 @@ fn compile_comp_body(
             OpCode::YieldValue => 0,
             _ => 1,
         };
-        let outer_iters: u32 = generators.iter().take(depth).map(|_| 1u32).sum();
-        let cleanup_depth = accumulator_depth + outer_iters + 1;
+        // At depth 0 the `.0` slot was converted in place (still one
+        // iterator on the stack); deeper levels push a fresh aiter.
+        let iters_here = if depth == 0 {
+            iters_on_stack
+        } else {
+            iters_on_stack + 1
+        };
+        // Inlined comps sit on an unknown base stack depth — resolved
+        // by `finish`'s static simulation via the sentinel.
+        let cleanup_depth = if inner.inline_comp > 0 {
+            HANDLER_DEPTH_SENTINEL
+        } else {
+            accumulator_depth + iters_here as u32
+        };
         let loop_top = inner.next_offset();
         inner.emit(OpCode::GetAnext, 0);
-        inner.compile_await_dance(1);
+        inner.emit_send_dance(3);
         // As in `compile_async_for`: only the `__anext__` await may end
         // the loop via StopAsyncIteration (bpo-44895).
         let dance_end = inner.next_offset();
         inner.compile_assign(&gen.target)?;
         let mut filter_jumps = Vec::new();
         for cond in &gen.ifs {
-            inner.compile_expr(cond)?;
-            let jf = inner.emit(OpCode::PopJumpIfFalse, 0);
+            let (c, invert) = strip_not_chain(cond);
+            inner.compile_expr(c)?;
+            if !expr_is_bool(c) {
+                inner.emit(OpCode::ToBool, 0);
+            }
+            // The comp-`if` jump lands on the elt-located back edge; in
+            // CPython, jump threading gives it that same location.
+            stamp_comp_elt_span(inner, elt, value, append_op);
+            let jf = inner.emit(
+                if invert {
+                    OpCode::PopJumpIfTrue
+                } else {
+                    OpCode::PopJumpIfFalse
+                },
+                0,
+            );
             filter_jumps.push(jf);
         }
-        compile_comp_body(inner, generators, depth + 1, elt, value, append_op)?;
+        compile_comp_body(
+            inner,
+            generators,
+            depth + 1,
+            iters_here,
+            elt,
+            value,
+            append_op,
+        )?;
         for jf in filter_jumps {
             let cur = inner.next_offset();
             inner.patch_jump(jf, cur);
         }
+        // The loop's back edge carries the element span, as CPython
+        // does (test_multiline_async_*_comprehension).
+        stamp_comp_elt_span(inner, elt, value, append_op);
         let back = inner.emit(OpCode::JumpBackward, 0);
         inner.patch_jump(back, loop_top);
         let cleanup_target = inner.next_offset();
@@ -8030,24 +11374,111 @@ fn compile_comp_body(
     // For depth 0, the iterator is already on the stack (`.0` was
     // pushed). For deeper levels, push and iter the source.
     if depth > 0 {
+        // CPython's temporary-variable "assignment idiom" fast path
+        // (compiler_comprehension_generator): a sub-iterable that is a
+        // one-element list/tuple display — `for y in [f(x)]` — compiles
+        // to a plain assignment with no iterator and no FOR_ITER loop
+        // (test_peepholer's test_assignment_idiom_in_comprehensions).
+        let single = match &gen.iter.kind {
+            ExprKind::List(elts) | ExprKind::Tuple(elts) if elts.len() == 1 => {
+                let e0 = &elts[0];
+                (!matches!(e0.kind, ExprKind::Starred(_))).then_some(e0)
+            }
+            _ => None,
+        };
+        if let Some(e0) = single {
+            inner.compile_expr(e0)?;
+            inner.compile_assign(&gen.target)?;
+            let mut filter_jumps = Vec::new();
+            for cond in &gen.ifs {
+                let (c, invert) = strip_not_chain(cond);
+                inner.compile_expr(c)?;
+                if !expr_is_bool(c) {
+                    inner.emit(OpCode::ToBool, 0);
+                }
+                stamp_comp_elt_span(inner, elt, value, append_op);
+                let jf = inner.emit(
+                    if invert {
+                        OpCode::PopJumpIfTrue
+                    } else {
+                        OpCode::PopJumpIfFalse
+                    },
+                    0,
+                );
+                filter_jumps.push(jf);
+            }
+            // No new iterator on the stack: the body runs exactly once.
+            compile_comp_body(
+                inner,
+                generators,
+                depth + 1,
+                iters_on_stack,
+                elt,
+                value,
+                append_op,
+            )?;
+            for jf in filter_jumps {
+                let cur = inner.next_offset();
+                inner.patch_jump(jf, cur);
+            }
+            return Ok(());
+        }
         inner.compile_expr(&gen.iter)?;
+        inner.set_span(gen.iter.span);
+        inner.set_line_from(gen.iter.span.start.0);
         inner.emit(OpCode::GetIter, 0);
     }
+    // FOR_ITER carries the *iterable expression's* location (CPython
+    // compiler_comprehension_generator uses LOC(gen->iter)):
+    // test_compile's test_line_number_genexp grades the loop head on
+    // the iterable's line, distinct from the prologue's.
     let loop_top = inner.next_offset();
+    inner.set_span(gen.iter.span);
+    inner.set_line_from(gen.iter.span.start.0);
     let for_site = inner.emit(OpCode::ForIter, 0);
     let for_line = inner.current_line;
     inner.compile_assign(&gen.target)?;
     let mut filter_jumps = Vec::new();
     for cond in &gen.ifs {
-        inner.compile_expr(cond)?;
-        let jf = inner.emit(OpCode::PopJumpIfFalse, 0);
+        let (c, invert) = strip_not_chain(cond);
+        inner.compile_expr(c)?;
+        if !expr_is_bool(c) {
+            inner.emit(OpCode::ToBool, 0);
+        }
+        // As in the async arm: the comp-`if` jump takes the element
+        // span its back-edge target carries (CPython jump threading).
+        stamp_comp_elt_span(inner, elt, value, append_op);
+        let jf = inner.emit(
+            if invert {
+                OpCode::PopJumpIfTrue
+            } else {
+                OpCode::PopJumpIfFalse
+            },
+            0,
+        );
         filter_jumps.push(jf);
     }
-    compile_comp_body(inner, generators, depth + 1, elt, value, append_op)?;
+    let iters_here = if depth == 0 {
+        iters_on_stack
+    } else {
+        iters_on_stack + 1
+    };
+    compile_comp_body(
+        inner,
+        generators,
+        depth + 1,
+        iters_here,
+        elt,
+        value,
+        append_op,
+    )?;
     for jf in filter_jumps {
         let cur = inner.next_offset();
         inner.patch_jump(jf, cur);
     }
+    // The loop's back edge carries the element span, as CPython does
+    // (test_multiline_*_comprehension).
+    stamp_comp_elt_span(inner, elt, value, append_op);
     let back = inner.emit(OpCode::JumpBackward, 0);
     inner.patch_jump(back, loop_top);
     let after = inner.next_offset();
@@ -8056,8 +11487,53 @@ fn compile_comp_body(
     // comprehension's loop exhaustion does not emit a spurious `line` event.
     inner.set_span(gen.iter.span);
     inner.current_line = for_line;
+    // END_FOR + POP_TOP, as in the statement-level loop above.
     inner.emit(OpCode::EndFor, 0);
+    inner.emit(OpCode::PopTop, 0);
     Ok(())
+}
+
+/// Strip a chain of `not`s off a branch condition, returning the
+/// innermost operand and whether the branch sense is inverted.
+/// CPython's `compiler_jump_if` (Not_kind case) compiles `if not x:`
+/// as a test of `x` with the opposite jump instead of emitting
+/// UNARY_NOT + POP_JUMP_IF_FALSE; test_peepholer's `test_unot`
+/// grades this shape.
+/// `true` if the expression statically produces an exact `bool`, so a
+/// conditional jump on it needs no `TO_BOOL`. Mirrors CPython's
+/// post-optimization shape: codegen emits `TO_BOOL` before every
+/// `POP_JUMP_IF_*`, then `optimize_basic_block` folds it into
+/// `COMPARE_OP`'s bool bit / drops it after `IS_OP`, `CONTAINS_OP`,
+/// `UNARY_NOT`, and bool constants.
+fn expr_is_bool(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Compare { .. } => true,
+        ExprKind::UnaryOp {
+            op: UnaryOp::Not, ..
+        } => true,
+        // Any constant: truthiness is static — CPython's optimizer
+        // folds `TO_BOOL` after `LOAD_CONST` into the bool constant,
+        // and `fold_const_branches` here resolves the branch entirely.
+        ExprKind::Constant(_) => true,
+        // The value-shape short circuit leaves whichever operand was
+        // selected: bool only if every operand is.
+        ExprKind::BoolOp { values, .. } => values.iter().all(expr_is_bool),
+        ExprKind::NamedExpr { value, .. } => expr_is_bool(value),
+        _ => false,
+    }
+}
+
+fn strip_not_chain(mut test: &Expr) -> (&Expr, bool) {
+    let mut invert = false;
+    while let ExprKind::UnaryOp {
+        op: UnaryOp::Not,
+        operand,
+    } = &test.kind
+    {
+        invert = !invert;
+        test = operand;
+    }
+    (test, invert)
 }
 
 fn emit_cmp_op(compiler: &mut Compiler, op: CmpOp) {
@@ -8100,21 +11576,11 @@ fn emit_cmp_op(compiler: &mut Compiler, op: CmpOp) {
 fn clone_finally_frame(f: &FinallyFrame) -> FinallyFrame {
     let kind = match &f.kind {
         FinallyKind::Stmts(body) => FinallyKind::Stmts(body.clone()),
-        FinallyKind::WithExit {
-            exit_idx,
-            line,
-            span,
-        } => FinallyKind::WithExit {
-            exit_idx: *exit_idx,
+        FinallyKind::WithExit { line, span } => FinallyKind::WithExit {
             line: *line,
             span: *span,
         },
-        FinallyKind::AsyncWithExit {
-            aexit_idx,
-            line,
-            span,
-        } => FinallyKind::AsyncWithExit {
-            aexit_idx: *aexit_idx,
+        FinallyKind::AsyncWithExit { line, span } => FinallyKind::AsyncWithExit {
             line: *line,
             span: *span,
         },
@@ -8124,6 +11590,9 @@ fn clone_finally_frame(f: &FinallyFrame) -> FinallyFrame {
         loop_depth_at_push: f.loop_depth_at_push,
         id: f.id,
         pop_except_after: f.pop_except_after,
+        exc_at_push: f.exc_at_push,
+        handler_at_push: f.handler_at_push,
+        rv_at_push: f.rv_at_push,
     }
 }
 
@@ -8747,6 +12216,72 @@ fn first_stmt_docstring(body: &[Stmt]) -> Option<&str> {
     }
 }
 
+/// CPython 3.13's `_PyCompile_CleanDoc` (compile.c, gh-81283): docstrings
+/// are cleaned at compile time like `inspect.cleandoc` — tabs expanded
+/// (tab stops of 8), the first line's leading spaces stripped, and the
+/// minimum space-indent of the non-blank continuation lines removed from
+/// every continuation line. Unlike `inspect.cleandoc`, leading/trailing
+/// blank lines are *kept* (preserves line numbers). Only ASCII spaces
+/// count as margin, exactly as upstream.
+fn clean_docstring(doc: &str) -> String {
+    // str.expandtabs() with the default tabsize of 8: each code point
+    // advances the column by one; '\n'/'\r' reset it.
+    let doc: std::borrow::Cow<'_, str> = if doc.contains('\t') {
+        let mut out = String::with_capacity(doc.len());
+        let mut col = 0usize;
+        for ch in doc.chars() {
+            match ch {
+                '\t' => {
+                    let pad = 8 - col % 8;
+                    out.extend(std::iter::repeat_n(' ', pad));
+                    col += pad;
+                }
+                '\n' | '\r' => {
+                    out.push(ch);
+                    col = 0;
+                }
+                _ => {
+                    out.push(ch);
+                    col += 1;
+                }
+            }
+        }
+        out.into()
+    } else {
+        doc.into()
+    };
+
+    let lines: Vec<&str> = doc.split('\n').collect();
+    let leading_spaces = |line: &str| line.len() - line.trim_start_matches(' ').len();
+
+    // Minimum indentation of non-blank lines after the first (a line of
+    // only spaces is blank and contributes nothing).
+    let mut margin = usize::MAX;
+    for line in &lines[1..] {
+        let n = leading_spaces(line);
+        if n < line.len() {
+            margin = margin.min(n);
+        }
+    }
+    if margin == usize::MAX {
+        margin = 0;
+    }
+
+    let first_indent = leading_spaces(lines[0]);
+    if first_indent == 0 && margin == 0 {
+        return doc.into_owned();
+    }
+
+    let mut out = String::with_capacity(doc.len());
+    out.push_str(&lines[0][first_indent..]);
+    for line in &lines[1..] {
+        out.push('\n');
+        // Blank (all-space) lines may hold fewer spaces than the margin.
+        out.push_str(&line[margin.min(leading_spaces(line))..]);
+    }
+    out
+}
+
 /// `True` if any statement in `body` contains a `yield` or `yield from`
 /// in the immediate scope. Does NOT recurse into nested `def` / `lambda`
 /// / comprehension bodies — those have their own scopes.
@@ -9066,6 +12601,88 @@ fn expr_contains_yield(expr: &Expr) -> bool {
 /// `true` if `expr` contains an `await` at the surface scope (does
 /// not descend into nested lambdas or comprehensions). Used to mark
 /// comprehensions as coroutines.
+/// `yield`/`yield from` anywhere in a comprehension's *own* scope: the
+/// element/value, filters, targets and non-outermost iterables, plus
+/// the outermost iterable of any comprehension nested in those
+/// positions (it evaluates in this scope). Stops at scope boundaries
+/// (lambda bodies and the rest of a nested comprehension) — those
+/// scopes run their own placement checks when they compile.
+fn comp_scope_contains_yield(
+    elt: &Expr,
+    value: Option<&Expr>,
+    generators: &[Comprehension],
+) -> bool {
+    expr_yields_in_scope(elt)
+        || value.is_some_and(expr_yields_in_scope)
+        || generators.iter().enumerate().any(|(gi, g)| {
+            (gi > 0 && expr_yields_in_scope(&g.iter))
+                || expr_yields_in_scope(&g.target)
+                || g.ifs.iter().any(expr_yields_in_scope)
+        })
+}
+
+fn expr_yields_in_scope(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Yield(_) | ExprKind::YieldFrom(_) => true,
+        ExprKind::Lambda { .. } | ExprKind::TypeParamFn { .. } => false,
+        ExprKind::GeneratorExp { generators, .. }
+        | ExprKind::ListComp { generators, .. }
+        | ExprKind::SetComp { generators, .. }
+        | ExprKind::DictComp { generators, .. } => generators
+            .first()
+            .is_some_and(|g| expr_yields_in_scope(&g.iter)),
+        ExprKind::Await(v) => expr_yields_in_scope(v),
+        ExprKind::JoinedStr(parts) => parts.iter().any(expr_yields_in_scope),
+        ExprKind::FormattedValue {
+            value, format_spec, ..
+        } => {
+            expr_yields_in_scope(value) || format_spec.as_deref().is_some_and(expr_yields_in_scope)
+        }
+        ExprKind::BinOp { left, right, .. } => {
+            expr_yields_in_scope(left) || expr_yields_in_scope(right)
+        }
+        ExprKind::BoolOp { values, .. } => values.iter().any(expr_yields_in_scope),
+        ExprKind::UnaryOp { operand, .. } => expr_yields_in_scope(operand),
+        ExprKind::Compare {
+            left, comparators, ..
+        } => expr_yields_in_scope(left) || comparators.iter().any(expr_yields_in_scope),
+        ExprKind::IfExp { test, body, orelse } => {
+            expr_yields_in_scope(test) || expr_yields_in_scope(body) || expr_yields_in_scope(orelse)
+        }
+        ExprKind::NamedExpr { target, value } => {
+            expr_yields_in_scope(target) || expr_yields_in_scope(value)
+        }
+        ExprKind::Call {
+            func,
+            args,
+            keywords,
+        } => {
+            expr_yields_in_scope(func)
+                || args.iter().any(expr_yields_in_scope)
+                || keywords.iter().any(|k| expr_yields_in_scope(&k.value))
+        }
+        ExprKind::Attribute { value, .. } => expr_yields_in_scope(value),
+        ExprKind::Subscript { value, slice } => {
+            expr_yields_in_scope(value) || expr_yields_in_scope(slice)
+        }
+        ExprKind::Slice { lower, upper, step } => {
+            lower.as_deref().is_some_and(expr_yields_in_scope)
+                || upper.as_deref().is_some_and(expr_yields_in_scope)
+                || step.as_deref().is_some_and(expr_yields_in_scope)
+        }
+        ExprKind::Tuple(items) | ExprKind::List(items) | ExprKind::Set(items) => {
+            items.iter().any(expr_yields_in_scope)
+        }
+        ExprKind::Dict { keys, values } => {
+            keys.iter()
+                .any(|k| k.as_ref().is_some_and(expr_yields_in_scope))
+                || values.iter().any(expr_yields_in_scope)
+        }
+        ExprKind::Starred(inner) => expr_yields_in_scope(inner),
+        ExprKind::Constant(_) | ExprKind::Name(_) => false,
+    }
+}
+
 fn expr_contains_await(expr: &Expr) -> bool {
     match &expr.kind {
         ExprKind::Await(_) => true,
@@ -9484,6 +13101,20 @@ fn collect_self_attr_stores(stmts: &[Stmt], self_name: &str, out: &mut HashSet<S
                 collect_self_attr_stores(orelse, self_name, out);
                 collect_self_attr_stores(finalbody, self_name, out);
             }
+            StmtKind::Match { cases, .. } => {
+                for c in cases {
+                    collect_self_attr_stores(&c.body, self_name, out);
+                }
+            }
+            // Nested functions at any depth contribute to the nearest
+            // enclosing class; nested classes collect their own
+            // (CPython walks the compiler stack to the first
+            // COMPILER_SCOPE_CLASS — test_compile's
+            // test_nested_function / test_nested_class).
+            StmtKind::FunctionDef { body, .. } | StmtKind::AsyncFunctionDef { body, .. } => {
+                collect_self_attr_stores(body, self_name, out);
+            }
+            StmtKind::ClassDef { .. } => {}
             _ => {}
         }
     }
@@ -10318,6 +13949,28 @@ fn find_nonlocal_decl_span(body: &[Stmt], name: &str) -> Option<weavepy_lexer::S
     None
 }
 
+/// Like [`collect_target_names`] but preserving first-seen source
+/// order (deterministic hidden-local slot assignment for inlined
+/// comprehensions — `co_varnames` must not vary between builds).
+fn collect_target_names_ordered(expr: &Expr, out: &mut Vec<String>) {
+    match &expr.kind {
+        ExprKind::Name(n) => {
+            if !out.iter().any(|x| x == n) {
+                out.push(n.clone());
+            }
+        }
+        ExprKind::Starred(inner) => collect_target_names_ordered(inner, out),
+        ExprKind::Tuple(items) | ExprKind::List(items) => {
+            for item in items {
+                collect_target_names_ordered(item, out);
+            }
+        }
+        // Attribute/subscript targets store into existing objects and
+        // bind no comp-local name.
+        _ => {}
+    }
+}
+
 fn collect_target_names(expr: &Expr, out: &mut HashSet<String>) {
     match &expr.kind {
         ExprKind::Name(n) => {
@@ -10758,10 +14411,8 @@ fn collect_reads_stmt(stmt: &Stmt, out: &mut HashSet<String>) {
             returns,
             ..
         } => {
-            // Reads inside an inner function are not "reads" in the
-            // current scope from the perspective of scope analysis,
-            // but defaults / annotations and decorators evaluate in
-            // the OUTER scope.
+            // Defaults / annotations and decorators evaluate in the
+            // OUTER scope.
             for d in decorator_list {
                 collect_reads_expr(d, out);
             }
@@ -10788,8 +14439,48 @@ fn collect_reads_stmt(stmt: &Stmt, out: &mut HashSet<String>) {
                     collect_reads_expr(r, out);
                 }
             }
+            // Only names *free* in the nested function surface as reads
+            // here: its aggregate body reads minus its own params and
+            // assigned locals (recursion applies the same subtraction to
+            // deeper nestings). Descending raw leaked e.g. an inner
+            // parameter named `f` as a read of this scope, spuriously
+            // cell-promoting an enclosing `def f` (test_dis's `outer`
+            // fodder). `global` names read the module (never a promotion
+            // source); `nonlocal` names reach up even when only written.
+            let mut nested_reads = HashSet::new();
             for s in body {
-                collect_reads_stmt(s, out);
+                collect_reads_stmt(s, &mut nested_reads);
+            }
+            let mut nested_locals: HashSet<String> = HashSet::new();
+            for a in args
+                .posonlyargs
+                .iter()
+                .chain(&args.args)
+                .chain(&args.kwonlyargs)
+                .chain(&args.vararg)
+                .chain(&args.kwarg)
+            {
+                nested_locals.insert(a.name.clone());
+            }
+            let mut nested_globals = HashSet::new();
+            let mut nested_nonlocals = HashSet::new();
+            let mut nested_assigned = HashSet::new();
+            for s in body {
+                collect_decls(
+                    s,
+                    &mut nested_globals,
+                    &mut nested_nonlocals,
+                    &mut nested_assigned,
+                );
+            }
+            nested_locals.extend(nested_assigned);
+            for n in &nested_nonlocals {
+                out.insert(n.clone());
+            }
+            for r in nested_reads {
+                if !nested_locals.contains(&r) && !nested_globals.contains(&r) {
+                    out.insert(r);
+                }
             }
         }
         StmtKind::ClassDef {
@@ -11261,7 +14952,9 @@ mod tests {
 
     #[test]
     fn simple_expression_emits_load_and_pop() {
-        let co = compile("1 + 2\n");
+        // Named operands: `1 + 2` is now constant-folded away
+        // (ast_opt), leaving no BINARY_OP behind.
+        let co = compile("a + b\n");
         let ops: Vec<_> = co.instructions.iter().map(|i| i.op).collect();
         assert!(ops.contains(&OpCode::BinaryOp));
         assert!(ops.contains(&OpCode::PopTop));

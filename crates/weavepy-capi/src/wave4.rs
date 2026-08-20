@@ -816,7 +816,7 @@ pub unsafe extern "C" fn PySys_GetObject(name: *const c_char) -> *mut PyObject {
             .unwrap_or("")
     };
     let name_owned = nm.to_string();
-    pinned_borrowed(format!("sys.{nm}"), move || {
+    let fetch = move || {
         let sys =
             unsafe { crate::module::PyImport_ImportModule(b"sys\0".as_ptr() as *const c_char) };
         if sys.is_null() {
@@ -837,7 +837,22 @@ pub unsafe extern "C" fn PySys_GetObject(name: *const c_char) -> *mut PyObject {
             return ptr::null_mut();
         }
         v
-    })
+    };
+    // The std streams must be fetched *live*: test code swaps
+    // `sys.stdout`/`sys.stderr` (`support.captured_output`) and expects
+    // `PySys_WriteStdout` & co. to hit the replacement, so a first-fetch
+    // pin would write to a stale stream. Each fetched box is still pinned
+    // (leaked) to honour the borrowed-reference contract; the leak is
+    // bounded by the number of C-level stream fetches.
+    if matches!(nm, "stdout" | "stderr" | "stdin") {
+        let p = fetch();
+        if !p.is_null() {
+            static STREAM_PINS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+            STREAM_PINS.lock().unwrap().push(p as usize);
+        }
+        return p;
+    }
+    pinned_borrowed(format!("sys.{nm}"), move || fetch())
 }
 
 #[no_mangle]

@@ -218,6 +218,11 @@ const WCONTINUED: libc::c_int = 0x10;
 fn obj_to_cstring(o: &Object, what: &str) -> Result<CString, RuntimeError> {
     let bytes: Vec<u8> = match o {
         Object::Str(s) => s.as_bytes().to_vec(),
+        // PEP 383: lone-surrogate `str` arguments fs-encode with
+        // `surrogateescape` (CPython's `PyUnicode_FSConverter`).
+        Object::WStr(cps) => {
+            crate::stdlib::codecs_mod::encode_codepoints(cps, "utf-8", "surrogateescape")?
+        }
         Object::Bytes(b) => b.to_vec(),
         Object::ByteArray(b) => b.borrow().clone(),
         // `os.PathLike` — CPython's exec/spawn path arguments go through
@@ -405,6 +410,14 @@ fn env_mapping_dict(env: &Object) -> Option<Rc<RefCell<DictData>>> {
 fn bytes_of(o: &Object) -> Option<Vec<u8>> {
     match o {
         Object::Str(s) => Some(s.as_bytes().to_vec()),
+        // PEP 383: a lone-surrogate `str` (the regrtest harness plants one
+        // in `os.environ` via PYTHONREGRTEST_UNICODE_GUARD) fs-encodes with
+        // `surrogateescape`, like CPython's `PyUnicode_FSConverter`
+        // (test_posix TestPosixSpawn.test_specify_environment spawns with
+        // `{**os.environ, ...}`).
+        Object::WStr(cps) => {
+            crate::stdlib::codecs_mod::encode_codepoints(cps, "utf-8", "surrogateescape").ok()
+        }
         Object::Bytes(b) => Some(b.to_vec()),
         Object::ByteArray(b) => Some(b.borrow().clone()),
         _ => None,
@@ -420,6 +433,20 @@ fn last_os_err() -> RuntimeError {
 // fork / exec / _exit
 // ---------------------------------------------------------------------------
 
+/// Whether the *currently executing* interpreter's PEP 684 feature
+/// flags include `bit` (`Py_RTFLAGS_*`). Outside any published
+/// interpreter frame everything is allowed (the main interpreter's
+/// defaults carry all the process-control bits).
+#[cfg_attr(not(unix), allow(dead_code))]
+fn current_interp_allows(bit: u32) -> bool {
+    match crate::vm_singletons::current_interpreter_ptr() {
+        // SAFETY: published by the enclosing VM dispatch frame on this
+        // thread; the GIL keeps the access exclusive.
+        Some(p) => (unsafe { (*p).interp_settings().0 } & bit) != 0,
+        None => true,
+    }
+}
+
 #[cfg(unix)]
 fn os_fork(_args: &[Object]) -> Result<Object, RuntimeError> {
     // CPython refuses to fork once the interpreter is tearing down (a
@@ -429,6 +456,15 @@ fn os_fork(_args: &[Object]) -> Result<Object, RuntimeError> {
     if crate::vm_singletons::is_finalizing() {
         return Err(crate::error::runtime_error(
             "can't fork at interpreter shutdown",
+        ));
+    }
+    // PEP 684 `Py_RTFLAGS_FORK`: an isolated sub-interpreter created
+    // without `allow_fork` refuses (CPython `os_fork_impl`'s
+    // `interp->feature_flags` check — test__interpreters
+    // RunStringTests.test_fork expects RuntimeError).
+    if !current_interp_allows(1 << 15) {
+        return Err(crate::error::runtime_error(
+            "fork not supported for isolated subinterpreters",
         ));
     }
     // CPython 3.12+ (`Modules/posixmodule.c: warn_about_fork_with_threads`):
@@ -442,10 +478,18 @@ fn os_fork(_args: &[Object]) -> Result<Object, RuntimeError> {
     // which is what `test_fork_warns_when_non_python_thread_exists` asserts.
     let multithreaded = process_is_multithreaded();
     run_atfork(AtForkPhase::Before);
+    // `PyOS_BeforeFork` (after the Python before-handlers): take the
+    // global import lock, so a subthread mid-import — which published a
+    // partial module to `sys.modules` under this lock — finishes before
+    // the address space is snapshotted. The child then never observes
+    // partially initialized modules (test_fork1
+    // test_threaded_import_lock_fork).
+    crate::stdlib::imp_mod::import_lock_acquire();
     // SAFETY: `fork(2)`. In the child only this thread survives; we run the
     // registered after-in-child handlers (CPython's `PyOS_AfterFork_Child`).
     let pid = unsafe { libc::fork() };
     if pid < 0 {
+        let _ = crate::stdlib::imp_mod::import_lock_release();
         run_atfork(AtForkPhase::Parent);
         return Err(last_os_err());
     }
@@ -493,8 +537,18 @@ fn os_fork(_args: &[Object]) -> Result<Object, RuntimeError> {
         // / `threading._after_fork` see them dead. Runs before the Python
         // `after_in_child` handlers (`threading._after_fork`) below.
         crate::stdlib::thread_real::after_fork_in_child();
+        // `_PyThreadState_DeleteExcept`: purge the vanished peers'
+        // thread-state entries so `sys._current_frames()` reports exactly
+        // one frame in the child (test_threading
+        // test_clear_threads_states_after_fork).
+        crate::stdlib::faulthandler_mod::reinit_threads_after_fork_in_child(cur);
+        // `_PyImport_ReInitLock`: drop the fork-time acquisition and hand
+        // any remaining user-held levels to this (sole surviving) thread.
+        crate::stdlib::imp_mod::import_lock_reinit_in_child();
         run_atfork(AtForkPhase::Child);
     } else {
+        // `PyOS_AfterFork_Parent`: release the fork-time import-lock level.
+        let _ = crate::stdlib::imp_mod::import_lock_release();
         run_atfork(AtForkPhase::Parent);
         if multithreaded {
             if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
@@ -670,6 +724,15 @@ fn do_exec(
     envp: Option<&Object>,
     what: &str,
 ) -> Result<Object, RuntimeError> {
+    // PEP 684 `Py_RTFLAGS_EXEC`: isolated sub-interpreters created
+    // without `allow_exec` refuse (CPython `os.exec*`'s
+    // `interp->feature_flags` check — test__interpreters
+    // RunStringTests.test_os_exec expects RuntimeError).
+    if !current_interp_allows(1 << 16) {
+        return Err(crate::error::runtime_error(
+            "exec not supported for isolated subinterpreters",
+        ));
+    }
     let cpath = obj_to_cstring(path, what)?;
     let (argv_owned, argv_ptrs) = build_argv(argv, what)?;
     // CPython's `os.execv`/`execve` reject an empty first argument

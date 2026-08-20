@@ -162,6 +162,24 @@ pub(crate) fn connection_class() -> Rc<TypeObject> {
         }
         let cls = TypeObject::new_user("Connection", vec![bt.object_.clone()], dict)
             .expect("Connection class must linearise");
+        // Tag `__call__` as a method descriptor: gives it the type-level
+        // `__get__` that `inspect._descriptor_get` binds through, so
+        // `signature(cx)` strips the clinic `$self` and reports `(sql, /)`
+        // (test_sqlite3 test_connection_signature).
+        if let Some(call_obj) = cls
+            .dict
+            .borrow()
+            .get(&DictKey(Object::from_static("__call__")))
+            .cloned()
+        {
+            crate::descr_registry::register(
+                &call_obj,
+                crate::descr_registry::DescrKind::Method,
+                cls.clone(),
+                "__call__",
+                None,
+            );
+        }
         install_getset(
             &cls,
             "isolation_level",

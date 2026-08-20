@@ -2362,6 +2362,7 @@ fn fingerprint(o: &Object) -> u64 {
         LazyIter(rc) => mix(42, rc_id(rc)),
         Capsule(rc) => mix(43, rc_id(rc)),
         Foreign(rc) => mix(44, rc_id(rc)),
+        MappingProxyObj(rc) => mix(45, rc_id(rc)),
     }
 }
 

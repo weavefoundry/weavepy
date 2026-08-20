@@ -122,6 +122,7 @@ pub mod loader;
 pub mod memory;
 pub mod memoryview;
 pub mod mirror;
+pub mod modsupport_ext;
 pub mod module;
 pub mod monitoring;
 pub mod mypyc_tail;

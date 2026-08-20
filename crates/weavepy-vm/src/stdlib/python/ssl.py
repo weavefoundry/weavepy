@@ -1243,10 +1243,6 @@ class SSLSocket(_socket_type):
                                  "client mode")
         if context.check_hostname and not server_hostname:
             raise ValueError("check_hostname requires server_hostname")
-        server_hostname = _encode_hostname(server_hostname)
-        if server_hostname is not None and "\x00" in server_hostname:
-            raise TypeError("argument must be encoded string without null "
-                            "bytes")
         self = cls.__new__(cls)
         # Adopt the underlying fd from the original socket. WeavePy keys its
         # socket registry by fd, so we must `detach()` the original *first*
@@ -1254,41 +1250,91 @@ class SSLSocket(_socket_type):
         # exactly the pattern `socket.accept()` uses. Read all metadata before
         # detaching, since the original becomes unusable afterwards.
         fam, typ, prot = sock.family, sock.type, sock.proto
-        timeout = sock.gettimeout()
+        sock_timeout = sock.gettimeout()
         fd = sock.detach()
         _socket_type.__init__(self, family=fam, type=typ, proto=prot, fileno=fd)
-        self.settimeout(timeout)
 
-        self._context = context
-        self.server_side = server_side
-        self.server_hostname = server_hostname
-        self.do_handshake_on_connect = do_handshake_on_connect
-        self.suppress_ragged_eofs = suppress_ragged_eofs
-        self._sslobj_id = None
-        if session is not None:
-            # Routes through the session setter: type/context validation and
-            # the reused-session bookkeeping (pre-handshake only).
-            self.session = session
-
-        # Detect whether the underlying socket is already connected. The
-        # ubiquitous client pattern ``wrap_socket(socket.socket())`` then
-        # ``.connect(addr)`` hands us an *unconnected* fd: the TLS session and
-        # handshake must be deferred to ``connect()`` (CPython does the same,
-        # keyed on ``getpeername()`` raising ``ENOTCONN``). An accepted/already
-        # connected fd (server side, or ``create_connection`` result) wraps and
-        # handshakes right here.
+        # From here on this SSLSocket owns the fd: *any* failure — including
+        # the getpeername() probe raising a non-ENOTCONN error on a
+        # RST-closed connection (macOS EINVAL) — must close it, or the
+        # abandoned socket surfaces as a ResourceWarning at GC
+        # (test_ssl.TestPreHandshakeClose runs under
+        # check_no_resource_warning). Mirrors CPython _create's outer
+        # try/except around everything after ``sock.detach()``.
         try:
-            self.getpeername()
-        except OSError as e:
-            if e.errno != _errno.ENOTCONN:
-                raise
-            connected = False
-        else:
-            connected = True
-        self._connected = connected
+            # First: the except below tears this down, so it must exist
+            # before anything in here can raise.
+            self._sslobj_id = None
+            self._context = context
+            self.server_side = server_side
+            # IDNA-encode *after* the fd handover: a bad hostname
+            # (UnicodeError for '.pythontest.net') must still close the
+            # adopted fd through the except below, or the caller's inline
+            # `socket.socket()` leaks as a ResourceWarning
+            # (test_check_hostname_idn's no-resource-warning legs).
+            server_hostname = _encode_hostname(server_hostname)
+            if server_hostname is not None and "\x00" in server_hostname:
+                raise TypeError("argument must be encoded string without null "
+                                "bytes")
+            self.server_hostname = server_hostname
+            self.do_handshake_on_connect = do_handshake_on_connect
+            self.suppress_ragged_eofs = suppress_ragged_eofs
+            if session is not None:
+                # Routes through the session setter: type/context validation
+                # and the reused-session bookkeeping (pre-handshake only).
+                self.session = session
 
-        if connected:
+            # Detect whether the underlying socket is already connected. The
+            # ubiquitous client pattern ``wrap_socket(socket.socket())`` then
+            # ``.connect(addr)`` hands us an *unconnected* fd: the TLS session
+            # and handshake must be deferred to ``connect()`` (CPython does
+            # the same, keyed on ``getpeername()`` raising ``ENOTCONN``). An
+            # accepted/already connected fd (server side, or
+            # ``create_connection`` result) wraps and handshakes right here.
             try:
+                self.getpeername()
+            except OSError as e:
+                if e.errno != _errno.ENOTCONN:
+                    raise
+                connected = False
+                # gh-97001: a peer that sent plaintext and slammed the
+                # connection shut (RST) can leave its bytes in our receive
+                # buffer while getpeername() already reports ENOTCONN. Those
+                # bytes must never escape to the caller as if they had
+                # arrived over a completed TLS connection — probe
+                # non-blockingly and raise if anything is pending
+                # (test_https_client_non_tls_response_ignored).
+                blocking = self.getblocking()
+                self.setblocking(False)
+                try:
+                    # Not supposed to block on an unconnected socket, but
+                    # macOS/Windows proved otherwise — do the non-blocking
+                    # dance regardless.
+                    notconn_pre_handshake_data = self.recv(1)
+                except OSError as e2:
+                    # EINVAL occurs for recv(1) on non-connected unix sockets.
+                    if e2.errno not in (_errno.ENOTCONN, _errno.EINVAL):
+                        raise
+                    notconn_pre_handshake_data = b''
+                self.setblocking(blocking)
+                if notconn_pre_handshake_data:
+                    reason = "Closed before TLS handshake with data in recv buffer."
+                    notconn_pre_handshake_data_error = SSLError(e.errno, reason)
+                    # Add the SSLError attributes that _ssl.c always adds.
+                    notconn_pre_handshake_data_error.reason = reason
+                    notconn_pre_handshake_data_error.library = None
+                    try:
+                        raise notconn_pre_handshake_data_error
+                    finally:
+                        # Explicitly break the reference cycle.
+                        notconn_pre_handshake_data_error = None
+            else:
+                connected = True
+
+            self.settimeout(sock_timeout)  # Must come after setblocking() calls.
+            self._connected = connected
+
+            if connected:
                 try:
                     self._sslobj_id = _ssl.wrap_socket(
                         context._id, self.fileno(), bool(server_side),
@@ -1301,16 +1347,16 @@ class SSLSocket(_socket_type):
                         raise ValueError("do_handshake_on_connect should not be "
                                          "specified for non-blocking sockets")
                     self.do_handshake()
-            except (OSError, ValueError):
-                # Free the native session first — it dup(2)'d our fd, so
-                # closing only the Python-level socket would leave the TCP
-                # connection alive (see _teardown_sslobj_id).
-                self._teardown_sslobj_id()
-                try:
-                    _socket_type.close(self)
-                except Exception:
-                    pass
-                raise
+        except:
+            # Free the native session first — it dup(2)'d our fd, so closing
+            # only the Python-level socket would leave the TCP connection
+            # alive (see _teardown_sslobj_id).
+            self._teardown_sslobj_id()
+            try:
+                _socket_type.close(self)
+            except OSError:
+                pass
+            raise
         return self
 
     @property
@@ -1575,6 +1621,19 @@ class SSLSocket(_socket_type):
             while sent < total:
                 sent += self.send(view[sent:])
         return None
+
+    def sendfile(self, file, offset=0, count=None):
+        """Send a file, possibly by using os.sendfile() if this is a
+        clear-text socket.  Return the total number of bytes sent.
+        """
+        if self._sslobj_id is not None:
+            # TLS framing means the kernel can't splice file bytes into the
+            # stream — route through the send()-based fallback (CPython's
+            # SSLSocket.sendfile does exactly this).
+            return self._sendfile_use_send(file, offset, count)
+        else:
+            # os.sendfile() works with plain sockets only
+            return _socket_type.sendfile(self, file, offset, count)
 
     def sendto(self, data, flags_or_addr, addr=None):
         # Datagram ops have no meaning over a live TLS stream, but an *unwrapped*

@@ -614,7 +614,13 @@ class timedelta:
     # arbitrarily; the exact rationale originally specified in the docstring
     # was "Because I felt like it."
 
-    __slots__ = '_days', '_seconds', '_microseconds', '_hashcode'
+    # WEAVEPY: the public field names are *slots* (member descriptors), not
+    # properties — this module doubles as the `_datetime` accelerator, whose
+    # C type publishes them as `tp_members`
+    # (`inspect.ismemberdescriptor(datetime.timedelta.days)` —
+    # test_inspect test_excluding_predicates).
+    __slots__ = ('_days', '_seconds', '_microseconds', '_hashcode',
+                 'days', 'seconds', 'microseconds')
 
     def __new__(cls, days=0, seconds=0, microseconds=0,
                 milliseconds=0, minutes=0, hours=0, weeks=0):
@@ -715,6 +721,11 @@ class timedelta:
         self._seconds = s
         self._microseconds = us
         self._hashcode = -1
+        # Mirror into the public member-descriptor slots (the C struct
+        # fields); the value is immutable after construction.
+        self.days = d
+        self.seconds = s
+        self.microseconds = us
         return self
 
     def __repr__(self):
@@ -748,21 +759,8 @@ class timedelta:
         return ((self.days * 86400 + self.seconds) * 10**6 +
                 self.microseconds) / 10**6
 
-    # Read-only field accessors
-    @property
-    def days(self):
-        """days"""
-        return self._days
-
-    @property
-    def seconds(self):
-        """seconds"""
-        return self._seconds
-
-    @property
-    def microseconds(self):
-        """microseconds"""
-        return self._microseconds
+    # WEAVEPY: field accessors are __slots__ members above, not properties
+    # (the C accelerator's tp_members surface).
 
     def __add__(self, other):
         if isinstance(other, timedelta):

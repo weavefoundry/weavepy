@@ -8,7 +8,10 @@ frozen Python shim so that ``import posix`` works for code (notably
 classical layout.
 """
 
-import os as _os
+# The native surface under its internal alias, *not* `import os`: a
+# fresh source import of `os.py` runs `from posix import *` while the
+# `os` entry in sys.modules is still half-initialized.
+import _weave_posix as _os
 import sys as _sys
 
 # Re-export every name the underlying ``os`` module advertises so that
@@ -25,6 +28,10 @@ for _name in dir(_os):
 # the ``dir(_os)`` loop above skips them — re-export explicitly so the bundled
 # ``shutil`` (and ``test_shutil.TestZeroCopyMACOS``) find ``posix._fcopyfile``
 # and the ``_COPYFILE_*`` flag bits exactly where CPython's ``posix`` puts them.
+# `os.py` re-imports `_exit` explicitly (`from posix import _exit`);
+# the underscore loop above skipped it.
+_exit = _os._exit
+
 if hasattr(_os, "_fcopyfile"):
     _fcopyfile = _os._fcopyfile
     _COPYFILE_ACL = _os._COPYFILE_ACL

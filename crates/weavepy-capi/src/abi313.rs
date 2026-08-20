@@ -308,19 +308,38 @@ pub(crate) fn register_type_module(ty: *mut PyObject, module: *mut PyObject) {
         .push((ty as usize, module as usize));
 }
 
-/// `PyType_GetModuleByDef(type, def)` — the module a heap type (or one
-/// of its bases) was created under. multidict's methods resolve their
-/// per-module state through this. Borrowed reference. WeavePy keys the
-/// registry by type identity rather than matching `def`, which is
-/// equivalent for single-module extensions.
-#[no_mangle]
-pub unsafe extern "C" fn PyType_GetModuleByDef(
-    ty: *mut PyObject,
-    _def: *mut c_void,
-) -> *mut PyObject {
+/// The module registered for heap type `ty` (or NULL) — shared lookup
+/// for `PyType_GetModuleByDef` and `PyType_GetModule` (borrowed ref).
+pub(crate) fn lookup_type_module(ty: *mut PyObject) -> *mut PyObject {
     let reg = TYPE_MODULES.lock().unwrap();
     for (t, m) in reg.iter() {
         if *t == ty as usize {
+            return *m as *mut PyObject;
+        }
+    }
+    core::ptr::null_mut()
+}
+
+/// `PyType_GetModuleByDef(type, def)` — the module a heap type (or one
+/// of its bases) was created under, *provided its `PyModuleDef` is
+/// `def`*. multidict's methods resolve their per-module state through
+/// this. Borrowed reference. A registered module whose def is unknown
+/// (created before the def registry existed) matches leniently, but a
+/// module carrying a *different* def is rejected like CPython's MRO
+/// walk (the `_testmultiphase` fixture's `getmodulebydef_bad_def`
+/// asserts a TypeError is pending on mismatch).
+#[no_mangle]
+pub unsafe extern "C" fn PyType_GetModuleByDef(
+    ty: *mut PyObject,
+    def: *mut c_void,
+) -> *mut PyObject {
+    fn module_matches_def(m: usize, def: *mut c_void) -> bool {
+        let mod_def = unsafe { crate::modsupport_ext::PyModule_GetDef(m as *mut PyObject) };
+        mod_def.is_null() || def.is_null() || mod_def == def
+    }
+    let reg = TYPE_MODULES.lock().unwrap();
+    for (t, m) in reg.iter() {
+        if *t == ty as usize && module_matches_def(*m, def) {
             return *m as *mut PyObject;
         }
     }
@@ -330,13 +349,15 @@ pub unsafe extern "C" fn PyType_GetModuleByDef(
         for base in mro.iter() {
             let base_ptr = crate::types::install_user_type(base) as usize;
             for (t, m) in reg.iter() {
-                if *t == base_ptr {
+                if *t == base_ptr && module_matches_def(*m, def) {
                     return *m as *mut PyObject;
                 }
             }
         }
     }
-    crate::errors::set_type_error("PyType_GetModuleByDef: no module registered for type");
+    crate::errors::set_type_error(
+        "PyType_GetModuleByDef: No superclass of the type has the given module",
+    );
     ptr::null_mut()
 }
 

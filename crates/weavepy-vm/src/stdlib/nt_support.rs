@@ -66,6 +66,25 @@ pub(crate) mod crt {
         ) -> i32;
         pub(crate) fn _errno() -> *mut i32;
         pub(crate) fn strerror(errnum: i32) -> *const i8;
+        pub(crate) fn _set_invalid_parameter_handler(
+            handler: Option<
+                unsafe extern "C" fn(
+                    expression: *const u16,
+                    function: *const u16,
+                    file: *const u16,
+                    line: u32,
+                    reserved: usize,
+                ),
+            >,
+        ) -> Option<
+            unsafe extern "C" fn(
+                expression: *const u16,
+                function: *const u16,
+                file: *const u16,
+                line: u32,
+                reserved: usize,
+            ),
+        >;
         pub(crate) fn raise(sig: i32) -> i32;
         pub(crate) fn _heapmin() -> i32;
         // conio (msvcrt's console family).
@@ -280,6 +299,31 @@ pub(crate) fn crt_error_to_py(errnum: i32, filename: Option<&str>) -> RuntimeErr
 /// `crt_error_to_py` from the CRT's current `errno`.
 pub(crate) fn last_crt_error_to_py(filename: Option<&str>) -> RuntimeError {
     crt_error_to_py(crt_errno(), filename)
+}
+
+/// Install a process-wide no-op CRT invalid-parameter handler, once.
+///
+/// Without one, the release UCRT *fast-fails the process* (exit
+/// `0xc0000409`, no message) whenever a CRT function is handed an
+/// invalid argument — most relevantly `_get_osfhandle`/`_close`/`_read`
+/// on a stale fd — instead of returning `-1` with `errno` set the way
+/// every caller in this module expects. CPython guards against exactly
+/// this with `_Py_BEGIN_SUPPRESS_IPH` (a thread-local silent handler
+/// around every CRT fd call); a single process-wide handler gives the
+/// same soft-failure semantics at one audit point.
+pub fn install_silent_invalid_parameter_handler() {
+    unsafe extern "C" fn silent(
+        _expression: *const u16,
+        _function: *const u16,
+        _file: *const u16,
+        _line: u32,
+        _reserved: usize,
+    ) {
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        let _ = crt::_set_invalid_parameter_handler(Some(silent));
+    });
 }
 
 // ---------------------------------------------------------------------------

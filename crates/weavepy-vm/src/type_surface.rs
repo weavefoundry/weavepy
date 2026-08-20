@@ -49,6 +49,7 @@ pub fn install(bt: &BuiltinTypes) {
     install_object_compare(bt);
     install_value_richcmp(bt);
     install_numeric_getsets(bt);
+    install_introspection_getsets(bt);
     install_value_reprs(bt);
     install_numeric_dunders(bt);
     install_immutable_getnewargs(bt);
@@ -220,6 +221,16 @@ fn mirror_builtin(orig: &Object) -> Option<Object> {
 /// real implementations here — marked surface-only, since anything in
 /// `type`'s dict is on every metaclass lookup path.
 fn install_type_dict_extras(bt: &BuiltinTypes) {
+    // `object.__dict__['__doc__']` is the plain doc *string* in CPython
+    // (subclass `__doc__` reads never see it — the metaclass `__doc__`
+    // getset wins first). pydoc's allmethods test diffs `vars(object)`
+    // and deletes the key (test_pydoc test_allmethods).
+    if let Some(doc) = crate::builtin_type_doc("object") {
+        bt.object_.dict.borrow_mut().insert(
+            crate::object::DictKey(Object::from_static("__doc__")),
+            Object::from_static(doc),
+        );
+    }
     fn type_or(args: &[Object]) -> Result<Object, RuntimeError> {
         let [a, b] = args else {
             return Err(type_error(format!(
@@ -227,7 +238,7 @@ fn install_type_dict_extras(bt: &BuiltinTypes) {
                 args.len().saturating_sub(1)
             )));
         };
-        Ok(crate::make_pep604_union(a, b))
+        crate::make_pep604_union(a, b)
     }
     fn type_ror(args: &[Object]) -> Result<Object, RuntimeError> {
         let [a, b] = args else {
@@ -236,7 +247,7 @@ fn install_type_dict_extras(bt: &BuiltinTypes) {
                 args.len().saturating_sub(1)
             )));
         };
-        Ok(crate::make_pep604_union(b, a))
+        crate::make_pep604_union(b, a)
     }
     fn type_prepare(_args: &[Object]) -> Result<Object, RuntimeError> {
         Ok(Object::Dict(Rc::new(RefCell::new(
@@ -256,12 +267,18 @@ fn install_type_dict_extras(bt: &BuiltinTypes) {
             mro.into_iter().map(Object::Type).collect(),
         ))
     }
-    // Explicit unbound calls of `__subclasses__` go through the same
-    // sentinel name that `load_attr_type`'s bound form uses — the live
-    // subclass registry is only reachable from `Interpreter::call`.
-    fn type_subclasses_sentinel(_args: &[Object]) -> Result<Object, RuntimeError> {
-        Err(crate::error::runtime_error(
-            "type.__subclasses__ must be dispatched via Interpreter::call",
+    // Explicit unbound calls (`type.__subclasses__(cls)` — pydoc's
+    // docclass builds its "Built-in subclasses" section exactly this
+    // way) take the type as the leading argument; no capture needed,
+    // the live registry hangs off the argument itself.
+    fn type_subclasses_sentinel(args: &[Object]) -> Result<Object, RuntimeError> {
+        let Some(Object::Type(ty)) = args.first() else {
+            return Err(type_error(
+                "unbound method type.__subclasses__() needs an argument",
+            ));
+        };
+        Ok(Object::new_list(
+            ty.subclasses().into_iter().map(Object::Type).collect(),
         ))
     }
     for (key, name, call) in [
@@ -702,6 +719,143 @@ fn install_numeric_getsets(bt: &BuiltinTypes) {
     );
 }
 
+/// Type-dict descriptors for the read-only data attributes that pydoc /
+/// `inspect` reach through the *type* (`range.start`, `slice.stop`,
+/// `property.fget`, `memoryview.obj` — test_pydoc test_member_descriptor
+/// / test_getset_descriptor). Instance reads keep their existing
+/// fast-paths; these entries make the unbound descriptor objects
+/// themselves resolvable, with `__objclass__`/`__name__`/`__doc__`.
+fn install_introspection_getsets(bt: &BuiltinTypes) {
+    use crate::descr_registry::DescrKind::{GetSet, Member};
+    fn getset(
+        ty: &Rc<TypeObject>,
+        name: &'static str,
+        kind: crate::descr_registry::DescrKind,
+        doc: Option<&'static str>,
+        f: fn(&[Object]) -> Result<Object, RuntimeError>,
+    ) {
+        let fget = Object::Builtin(Rc::new(BuiltinFn {
+            name,
+            binds_instance: true,
+            call: Box::new(f),
+            call_kw: None,
+        }));
+        let prop = Object::Property(Rc::new(crate::object::PyProperty::new(
+            fget,
+            Object::None,
+            Object::None,
+            Object::None,
+        )));
+        let key = DictKey(Object::from_static(name));
+        let mut d = ty.dict.borrow_mut();
+        if !d.contains_key(&key) {
+            crate::descr_registry::register(&prop, kind, ty.clone(), name, doc);
+            d.insert(key, prop);
+        }
+    }
+    fn range_of(args: &[Object]) -> Result<Rc<crate::object::Range>, RuntimeError> {
+        match args.first() {
+            Some(Object::Range(r)) => Ok(r.clone()),
+            _ => Err(type_error("descriptor requires a 'range' object")),
+        }
+    }
+    fn slice_of(args: &[Object]) -> Result<Rc<crate::object::PySlice>, RuntimeError> {
+        match args.first() {
+            Some(Object::Slice(s)) => Ok(s.clone()),
+            _ => Err(type_error("descriptor requires a 'slice' object")),
+        }
+    }
+    fn property_of(args: &[Object]) -> Result<Rc<crate::object::PyProperty>, RuntimeError> {
+        match args.first() {
+            Some(Object::Property(p)) => Ok(p.clone()),
+            // A `property` *subclass* instance carries the native property
+            // as its native value — `MyProperty(...).fget` must resolve
+            // like on the base type (test_unittest testmock
+            // test_autospec_data_descriptor's `MyProperty` spec walk).
+            Some(o @ Object::Instance(_)) => match o.native_value() {
+                Some(Object::Property(p)) => Ok(p),
+                _ => Err(type_error("descriptor requires a 'property' object")),
+            },
+            _ => Err(type_error("descriptor requires a 'property' object")),
+        }
+    }
+    getset(&bt.range_, "start", Member, None, |a| {
+        range_of(a).map(|r| r.start_obj())
+    });
+    getset(&bt.range_, "stop", Member, None, |a| {
+        range_of(a).map(|r| r.stop_obj())
+    });
+    getset(&bt.range_, "step", Member, None, |a| {
+        range_of(a).map(|r| r.step_obj())
+    });
+    getset(&bt.slice_, "start", Member, None, |a| {
+        slice_of(a).map(|s| s.start.clone())
+    });
+    getset(&bt.slice_, "stop", Member, None, |a| {
+        slice_of(a).map(|s| s.stop.clone())
+    });
+    getset(&bt.slice_, "step", Member, None, |a| {
+        slice_of(a).map(|s| s.step.clone())
+    });
+    getset(&bt.property_, "fget", Member, None, |a| {
+        property_of(a).map(|p| p.fget())
+    });
+    getset(&bt.property_, "fset", Member, None, |a| {
+        property_of(a).map(|p| p.fset())
+    });
+    getset(&bt.property_, "fdel", Member, None, |a| {
+        property_of(a).map(|p| p.fdel())
+    });
+    getset(&bt.memoryview_, "obj", GetSet, None, |a| match a.first() {
+        Some(Object::MemoryView(mv)) => Ok(match mv.exporter.borrow().clone() {
+            Some(o) => o,
+            None => match &mv.buffer {
+                crate::object::MemoryViewBuffer::Bytes(b) => Object::Bytes(b.clone()),
+                crate::object::MemoryViewBuffer::ByteArray(b) => Object::ByteArray(b.clone()),
+                crate::object::MemoryViewBuffer::Shared(_) => Object::None,
+            },
+        }),
+        _ => Err(type_error("descriptor requires a 'memoryview' object")),
+    });
+    // `inspect.isdatadescriptor` keys on the descriptor *type* carrying
+    // `__set__`/`__delete__`; CPython's getset/member descriptor types
+    // both do (writes route to the setter — always absent for the
+    // read-only descriptors registered here, so they raise).
+    for dty in [&bt.getset_descriptor_, &bt.member_descriptor_] {
+        let set_key = DictKey(Object::from_static("__set__"));
+        let del_key = DictKey(Object::from_static("__delete__"));
+        let mut d = dty.dict.borrow_mut();
+        for (key, opname) in [(set_key, "__set__"), (del_key, "__delete__")] {
+            if d.contains_key(&key) {
+                continue;
+            }
+            d.insert(
+                key,
+                Object::Builtin(Rc::new(BuiltinFn {
+                    name: opname,
+                    binds_instance: true,
+                    call: Box::new(descr_set_readonly),
+                    call_kw: None,
+                })),
+            );
+        }
+    }
+}
+
+/// `__set__`/`__delete__` body for the read-only getset/member
+/// descriptors: CPython's `descr_setcheck` raises AttributeError when
+/// the underlying getset has no setter.
+fn descr_set_readonly(args: &[Object]) -> Result<Object, RuntimeError> {
+    let descr = args.first().cloned().unwrap_or(Object::None);
+    let (name, cls) = match crate::descr_registry::lookup(&descr) {
+        Some(m) => (m.name.clone(), m.objclass.name.clone()),
+        None => ("?".to_owned(), "?".to_owned()),
+    };
+    Err(crate::error::attribute_error(format!(
+        "attribute '{name}' of '{cls}' objects is not writable"
+    )))
+}
+
 // ---------------------------------------------------------------------------
 // Value-type rich comparisons
 // ---------------------------------------------------------------------------
@@ -1005,6 +1159,12 @@ fn unwrap_shim(inner: Rc<BuiltinFn>, owner: &Rc<TypeObject>) -> Object {
         }
         Ok(())
     }
+    // The dict view methods must see the *instance* receiver: their impl
+    // (`dict_self`) unwraps it itself, and the returned view pins the
+    // subclass instance so its `__del__` can't fire while a view or view
+    // iterator is live (test_dict test_free_after_iterating). Only dict
+    // carries these names in the `install_named_methods` tables.
+    let keep_instance = matches!(inner.name, "keys" | "values" | "items");
     let mut shim = BuiltinFn {
         name: inner.name,
         // `maketrans`/`fromkeys`/`fromhex` are CPython class/static methods:
@@ -1021,11 +1181,13 @@ fn unwrap_shim(inner: Rc<BuiltinFn>, owner: &Rc<TypeObject>) -> Object {
                 if !no_receiver {
                     check_receiver(inner_pos.name, &owner_pos, first)?;
                 }
-                let unwrapped = as_native(first);
-                if !unwrapped.is_same(first) {
-                    let mut v = args.to_vec();
-                    v[0] = unwrapped;
-                    return (inner_pos.call)(&v);
+                if !keep_instance {
+                    let unwrapped = as_native(first);
+                    if !unwrapped.is_same(first) {
+                        let mut v = args.to_vec();
+                        v[0] = unwrapped;
+                        return (inner_pos.call)(&v);
+                    }
                 }
             }
             (inner_pos.call)(args)
@@ -1146,11 +1308,36 @@ fn check_slot_arity(args: &[Object], expected: usize) -> Result<(), RuntimeError
 
 fn obj_iter_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
     check_slot_arity(args, 0)?;
-    let recv = as_native(
-        args.first()
-            .ok_or_else(|| type_error("__iter__() missing self"))?,
-    );
-    Ok(Object::Iter(Rc::new(RefCell::new(recv.make_iter()?))))
+    let self_obj = args
+        .first()
+        .ok_or_else(|| type_error("__iter__() missing self"))?;
+    let recv = as_native(self_obj);
+    let mut it = recv.make_iter()?;
+    // A builtin-container *subclass* receiver: the iterator holds only
+    // the native payload, so pin the instance (and its `__del__`) for
+    // the iterator's lifetime — CPython's dictiter holds the dict object
+    // itself (test_dict test_free_after_iterating).
+    if matches!(self_obj, Object::Instance(_)) {
+        match &mut it {
+            crate::object::PyIterator::DictKeys { owner, .. } => {
+                *owner = Some(self_obj.clone());
+            }
+            crate::object::PyIterator::List { owner, .. } => {
+                *owner = Some(Box::new(self_obj.clone()));
+            }
+            // Everything else (tuple/str/bytes/set/... payloads) takes
+            // the generic KeepAlive wrapper.
+            _ => {
+                return Ok(Object::Iter(Rc::new(RefCell::new(
+                    crate::object::PyIterator::KeepAlive {
+                        inner: Rc::new(RefCell::new(it)),
+                        owner: Some(self_obj.clone()),
+                    },
+                ))));
+            }
+        }
+    }
+    Ok(Object::Iter(Rc::new(RefCell::new(it))))
 }
 
 fn obj_len_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1175,15 +1362,26 @@ fn obj_contains_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn list_reversed_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
-    let recv = as_native(
-        args.first()
-            .ok_or_else(|| type_error("__reversed__() missing self"))?,
-    );
+    let self_obj = args
+        .first()
+        .ok_or_else(|| type_error("__reversed__() missing self"))?;
+    let recv = as_native(self_obj);
     let Object::List(items) = &recv else {
         return Err(type_error(
             "descriptor '__reversed__' requires a 'list' object",
         ));
     };
+    // A list-*subclass* receiver: iterate the live payload and pin the
+    // instance so its `__del__` doesn't fire while the iterator is live
+    // (test_list test_free_after_iterating via seq_tests).
+    if matches!(self_obj, Object::Instance(_)) {
+        let index = items.borrow().len() as i64 - 1;
+        return Ok(Object::Iter(Rc::new(RefCell::new(PyIterator::Reversed {
+            items: items.clone(),
+            index,
+            owner: Some(Box::new(self_obj.clone())),
+        }))));
+    }
     let reversed: Vec<Object> = items.borrow().iter().rev().cloned().collect();
     Ok(Object::Iter(Rc::new(RefCell::new(PyIterator::Tuple {
         items: Rc::from(reversed.as_slice()),

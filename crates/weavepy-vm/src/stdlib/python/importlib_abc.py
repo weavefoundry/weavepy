@@ -1,21 +1,21 @@
-"""Abstract base classes related to import (CPython 3.13 surface).
-
-These are the canonical ABCs ``pip``, ``setuptools``, and
-``importlib.metadata`` subclass / `isinstance`-check. Following
-CPython's ``importlib/abc.py``, the concrete machinery classes are
-*registered* against the ABCs (so
-``isinstance(SourceFileLoader(...), importlib.abc.SourceLoader)``
-holds), the finder ABCs deliberately do *not* define ``find_spec``
-(back-compat ``hasattr`` probes depend on its absence), and the
-``importlib.resources.abc`` names resolve lazily with a deprecation
-warning, exactly like CPython until the 3.14 removal.
-"""
-
-from importlib import machinery
+"""Abstract base classes related to import."""
+from . import _bootstrap_external
+from . import machinery
+try:
+    import _frozen_importlib
+except ImportError as exc:
+    if exc.name != '_frozen_importlib':
+        raise
+    _frozen_importlib = None
+try:
+    import _frozen_importlib_external
+except ImportError:
+    _frozen_importlib_external = _bootstrap_external
+from ._abc import Loader
 import abc
 import warnings
 
-from importlib.resources import abc as _resources_abc
+from .resources import abc as _resources_abc
 
 
 __all__ = [
@@ -41,35 +41,12 @@ def __getattr__(name):
 def _register(abstract_cls, *classes):
     for cls in classes:
         abstract_cls.register(cls)
-
-
-class Loader(metaclass=abc.ABCMeta):
-
-    """Abstract base class for import loaders."""
-
-    def create_module(self, spec):
-        """Return a module to initialize and into which to load.
-
-        This method should raise ImportError if anything prevents it
-        from creating a new module.  It may return None to indicate
-        that the spec should create the new module.
-        """
-        return None
-
-    # We don't define exec_module() here since that would break
-    # hasattr checks we do to support backward compatibility.
-
-    def load_module(self, fullname):
-        """Return the loaded module.
-
-        This method is deprecated in favor of loader.exec_module(). If
-        exec_module() exists then it is used to provide a
-        backwards-compatible functionality for this method.
-        """
-        if not hasattr(self, 'exec_module'):
-            raise ImportError
-        import importlib._bootstrap
-        return importlib._bootstrap._load_module_shim(self, fullname)
+        if _frozen_importlib is not None:
+            try:
+                frozen_cls = getattr(_frozen_importlib, cls.__name__)
+            except AttributeError:
+                frozen_cls = getattr(_frozen_importlib_external, cls.__name__)
+            abstract_cls.register(frozen_cls)
 
 
 class MetaPathFinder(metaclass=abc.ABCMeta):
@@ -84,8 +61,8 @@ class MetaPathFinder(metaclass=abc.ABCMeta):
         This method is used by importlib.invalidate_caches().
         """
 
-_register(MetaPathFinder, machinery.BuiltinImporter,
-          machinery.FrozenImporter, machinery.PathFinder)
+_register(MetaPathFinder, machinery.BuiltinImporter, machinery.FrozenImporter,
+          machinery.PathFinder, machinery.WindowsRegistryFinder)
 
 
 class PathEntryFinder(metaclass=abc.ABCMeta):
@@ -103,7 +80,11 @@ _register(PathEntryFinder, machinery.FileFinder)
 class ResourceLoader(Loader):
 
     """Abstract base class for loaders which can return data from their
-    back-end storage."""
+    back-end storage.
+
+    This ABC represents one of the optional protocols specified by PEP 302.
+
+    """
 
     @abc.abstractmethod
     def get_data(self, path):
@@ -115,7 +96,11 @@ class ResourceLoader(Loader):
 class InspectLoader(Loader):
 
     """Abstract base class for loaders which support inspection about the
-    modules they can load."""
+    modules they can load.
+
+    This ABC represents one of the optional protocols specified by PEP 302.
+
+    """
 
     def is_package(self, fullname):
         """Optional method which when implemented should return whether the
@@ -151,36 +136,29 @@ class InspectLoader(Loader):
     def source_to_code(data, path='<string>'):
         """Compile 'data' into a code object.
 
-        The 'data' argument can be anything that compile() can handle. The
-        'path' argument should be where the data was retrieved (when
-        applicable)."""
+        The 'data' argument can be anything that compile() can handle. The'path'
+        argument should be where the data was retrieved (when applicable)."""
         return compile(data, path, 'exec', dont_inherit=True)
 
-    def exec_module(self, module):
-        code = self.get_code(module.__name__)
-        if code is None:
-            raise ImportError(
-                f'cannot load module {module.__name__!r} when '
-                'get_code() returns None')
-        exec(code, module.__dict__)
+    exec_module = _bootstrap_external._LoaderBasics.exec_module
+    load_module = _bootstrap_external._LoaderBasics.load_module
 
-    def load_module(self, fullname):
-        import importlib._bootstrap
-        return importlib._bootstrap._load_module_shim(self, fullname)
-
-_register(InspectLoader, machinery.BuiltinImporter,
-          machinery.FrozenImporter, machinery.NamespaceLoader)
+_register(InspectLoader, machinery.BuiltinImporter, machinery.FrozenImporter, machinery.NamespaceLoader)
 
 
 class ExecutionLoader(InspectLoader):
 
     """Abstract base class for loaders that wish to support the execution of
-    modules as scripts."""
+    modules as scripts.
+
+    This ABC represents one of the optional protocols specified in PEP 302.
+
+    """
 
     @abc.abstractmethod
     def get_filename(self, fullname):
-        """Abstract method which should return the value that __file__ is to
-        be set to.
+        """Abstract method which should return the value that __file__ is to be
+        set to.
 
         Raises ImportError if the module cannot be found.
         """
@@ -202,31 +180,23 @@ class ExecutionLoader(InspectLoader):
         else:
             return self.source_to_code(source, path)
 
-_register(ExecutionLoader, machinery.ExtensionFileLoader,
-          machinery.AppleFrameworkLoader)
+_register(
+    ExecutionLoader,
+    machinery.ExtensionFileLoader,
+    machinery.AppleFrameworkLoader,
+)
 
 
-class FileLoader(ResourceLoader, ExecutionLoader):
+class FileLoader(_bootstrap_external.FileLoader, ResourceLoader, ExecutionLoader):
 
     """Abstract base class partially implementing the ResourceLoader and
     ExecutionLoader ABCs."""
 
-    def __init__(self, fullname, path):
-        self.name = fullname
-        self.path = path
-
-    def get_filename(self, fullname=None):
-        return self.path
-
-    def get_data(self, path):
-        with open(path, 'rb') as f:
-            return f.read()
-
 _register(FileLoader, machinery.SourceFileLoader,
-          machinery.SourcelessFileLoader)
+            machinery.SourcelessFileLoader)
 
 
-class SourceLoader(FileLoader):
+class SourceLoader(_bootstrap_external.SourceLoader, ResourceLoader, ExecutionLoader):
 
     """Abstract base class for loading source code (and optionally any
     corresponding bytecode).
@@ -240,6 +210,7 @@ class SourceLoader(FileLoader):
 
         * ResourceLoader.get_data
         * ExecutionLoader.get_filename
+
     """
 
     def path_mtime(self, path):
@@ -252,7 +223,7 @@ class SourceLoader(FileLoader):
         """Return a metadata dict for the source pointed to by the path (str).
         Possible keys:
         - 'mtime' (mandatory) is the numeric timestamp of last source
-          file modification;
+          code modification;
         - 'size' (optional) is the size in bytes of the source code.
         """
         if self.path_mtime.__func__ is SourceLoader.path_mtime:
@@ -262,19 +233,11 @@ class SourceLoader(FileLoader):
     def set_data(self, path, data):
         """Write the bytes to the path (if possible).
 
+        Accepts a str path and data as bytes.
+
         Any needed intermediary directories are to be created. If for some
         reason the file cannot be written because of permissions, fail
         silently.
         """
-
-    def get_source(self, fullname=None):
-        from importlib.util import decode_source
-        path = self.get_filename(fullname)
-        try:
-            source_bytes = self.get_data(path)
-        except OSError as exc:
-            raise ImportError('source not available through get_data()',
-                              name=fullname) from exc
-        return decode_source(source_bytes)
 
 _register(SourceLoader, machinery.SourceFileLoader)

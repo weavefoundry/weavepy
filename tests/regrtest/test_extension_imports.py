@@ -39,9 +39,11 @@ assert any(s in candidates or s.endswith('.so') for s in exts), exts
 loader = machinery.ExtensionFileLoader('demo', '/tmp/_demo.so')
 assert loader.name == 'demo'
 assert loader.path == '/tmp/_demo.so'
-assert loader.get_source() is None
-assert loader.get_code() is None
-assert loader.is_package() is False
+# CPython's ExtensionFileLoader methods take the module name (RFC 0068
+# swapped the facade for the verbatim _bootstrap_external sources).
+assert loader.get_source('demo') is None
+assert loader.get_code('demo') is None
+assert loader.is_package('demo') is False
 
 # ---------------------------------------------------------------------
 # _imp surface

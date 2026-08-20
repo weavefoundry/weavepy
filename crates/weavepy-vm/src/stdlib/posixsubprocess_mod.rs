@@ -81,6 +81,45 @@ fn obj_cstring(o: &Object, what: &str) -> Result<CString, RuntimeError> {
     CString::new(b).map_err(|_| crate::error::value_error("embedded null byte"))
 }
 
+/// CPython's `_PySequence_BytesToCharpArray` motion for objects that are
+/// not native list/tuple sequences (test_capi.test_seq_bytes_to_charp_array):
+/// `PySequence_Size` (→ `__len__`), an overflow check on the
+/// `(argc + 1) * sizeof(char *)` allocation that surfaces as `MemoryError`,
+/// then per-index `PySequence_GetItem` — which for a type without
+/// `__getitem__` raises CPython's "does not support indexing" `TypeError`.
+#[cfg(unix)]
+fn bytes_to_charp_items(obj: &Object) -> Result<Vec<Object>, RuntimeError> {
+    let ptr = crate::vm_singletons::current_interpreter_ptr()
+        .ok_or_else(|| type_error("fork_exec: no active interpreter"))?;
+    // SAFETY: published by the enclosing VM frame on this thread.
+    let interp = unsafe { &mut *ptr };
+    let globals = interp.builtins_dict();
+    let len_meth = interp
+        .load_attr_public(obj, "__len__")
+        .map_err(|_| type_error("fork_exec: executable_list must be a sequence"))?;
+    let argc = match interp.call(&len_meth, &[], &[], &globals)? {
+        Object::Int(n) if n >= 0 => n as u64,
+        _ => return Err(type_error("fork_exec: executable_list must be a sequence")),
+    };
+    // `argc > (PY_SSIZE_T_MAX - sizeof(char *)) / sizeof(char *)` — the
+    // array allocation would overflow; CPython returns PyErr_NoMemory().
+    let word = std::mem::size_of::<*const libc::c_char>() as u64;
+    if argc > (isize::MAX as u64 - word) / word {
+        return Err(crate::error::memory_error(""));
+    }
+    let getitem = interp.load_attr_public(obj, "__getitem__").map_err(|_| {
+        type_error(format!(
+            "'{}' object does not support indexing",
+            obj.type_name_owned()
+        ))
+    })?;
+    let mut items = Vec::with_capacity(usize::try_from(argc).unwrap_or(0));
+    for i in 0..argc {
+        items.push(interp.call(&getitem, &[Object::Int(i as i64)], &[], &globals)?);
+    }
+    Ok(items)
+}
+
 #[cfg(unix)]
 fn opt_int(o: Option<&Object>) -> Option<i64> {
     match o {
@@ -200,8 +239,10 @@ fn fork_exec(args: &[Object]) -> Result<Object, RuntimeError> {
     let preexec_fn = &args[21];
 
     // ---- Parent: build all C data BEFORE forking (no alloc in child). ----
-    let exec_items = crate::stdlib::os::sequence_items(exec_list)
-        .ok_or_else(|| type_error("fork_exec: executable_list must be a sequence"))?;
+    let exec_items = match crate::stdlib::os::sequence_items(exec_list) {
+        Some(items) => items,
+        None => bytes_to_charp_items(exec_list)?,
+    };
     let exec_paths: Vec<CString> = exec_items
         .iter()
         .map(|o| obj_cstring(o, "executable"))

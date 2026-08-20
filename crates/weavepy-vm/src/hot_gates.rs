@@ -44,6 +44,14 @@ pub const ASYNC_EXC: u32 = 1 << 3;
 pub const SIGNALS: u32 = 1 << 4;
 /// `Py_Finalize` has begun: spawned daemon workers must unwind.
 pub const FINALIZING: u32 = 1 << 5;
+/// Python-level pending calls (`Py_AddPendingCall` /
+/// `_PyEval_AddPendingCall`) are queued — RFC 0068 WS3
+/// (`vm_singletons::push_pending_py_call`).
+pub const PENDING_PYCALLS: u32 = 1 << 6;
+/// RFC 0068 WS3 — cross-interpreter `pending_identify` probes
+/// (test_capi.test_misc TestPendingCalls.test_isolated_subinterpreter):
+/// armed while a `_testinternalcapi.pending_identify` waiter is queued.
+pub const PENDING_IDENTIFY: u32 = 1 << 7;
 
 /// The word itself. Process-global, like the granular gates it fuses
 /// (all of them were process-wide statics; per-thread queues keep

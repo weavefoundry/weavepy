@@ -61,6 +61,14 @@ pub enum TestStatus {
     Error,
     Skip,
     Timeout,
+    /// RFC 0068 WS7: the row fails *exactly* the test ids enumerated in
+    /// its `divergence_tests` — behavior provably unsatisfiable under
+    /// WeavePy's documented object model (e.g. `test_marshal`'s
+    /// `id()`-distinct instancing asserts, unsatisfiable with unboxed
+    /// ints/floats). Counted separately from `fail` and gated exactly
+    /// like `pass`: a divergence row that starts passing, or failing a
+    /// different set of tests, is `unexpected`.
+    Divergence,
 }
 
 impl TestStatus {
@@ -71,6 +79,7 @@ impl TestStatus {
             TestStatus::Error => "error",
             TestStatus::Skip => "skip",
             TestStatus::Timeout => "timeout",
+            TestStatus::Divergence => "divergence",
         }
     }
 
@@ -117,6 +126,10 @@ pub struct RegrtestSummary {
     pub error: usize,
     pub skip: usize,
     pub timeout: usize,
+    /// RFC 0068 WS7: rows failing exactly their enumerated
+    /// `divergence_tests` — documented object-model divergences,
+    /// counted separately from `fail`.
+    pub divergence: usize,
     /// Tests whose observed status differed from the expectations file —
     /// the regressions that should block CI.
     pub unexpected: usize,
@@ -133,6 +146,7 @@ impl RegrtestSummary {
                 TestStatus::Error => s.error += 1,
                 TestStatus::Skip => s.skip += 1,
                 TestStatus::Timeout => s.timeout += 1,
+                TestStatus::Divergence => s.divergence += 1,
             }
             if !r.matches_expectation() {
                 s.unexpected += 1;
@@ -181,6 +195,13 @@ pub struct ExpectedEntry {
     /// (larger) budget.
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
+    /// RFC 0068 WS7: mandatory (non-empty) on `status = "divergence"`
+    /// rows — the exact unittest ids the row is allowed to fail. The
+    /// runner grades the row `divergence` only when the observed
+    /// failure set equals this list; any other outcome keeps its
+    /// observed status and trips the gate as `unexpected`.
+    #[serde(default)]
+    pub divergence_tests: Vec<String>,
 }
 
 impl Expectations {
@@ -791,17 +812,25 @@ pub fn run_one_with(
         .map(Duration::from_secs)
         .unwrap_or(opts.timeout);
 
+    // The enumerated ids a `divergence` row is allowed to fail (empty
+    // for every other status).
+    let divergence_ids: &[String] = expectations
+        .tests
+        .get(&file.label)
+        .map(|e| e.divergence_tests.as_slice())
+        .unwrap_or(&[]);
+
     match opts.mode {
-        ExecutionMode::InProcess => run_inprocess(file, expected, eff_timeout),
+        ExecutionMode::InProcess => run_inprocess(file, expected, eff_timeout, divergence_ids),
         ExecutionMode::Subprocess => {
             if eff_timeout == opts.timeout {
-                run_subprocess(file, expected, opts)
+                run_subprocess(file, expected, opts, divergence_ids)
             } else {
                 let scoped = RunnerOptions {
                     timeout: eff_timeout,
                     ..opts.clone()
                 };
-                run_subprocess(file, expected, &scoped)
+                run_subprocess(file, expected, &scoped, divergence_ids)
             }
         }
     }
@@ -828,31 +857,41 @@ fn cpython_lib_dir(file: &RegrtestFile) -> Option<String> {
     Some(sanitized_lib_dir(lib_dir.parent()?))
 }
 
-/// Guard against site hooks living next to the vendored `test` package.
+/// Mirror the vendored `Lib` through a shim directory of per-entry
+/// symlinks, omitting the entries the harness must not expose:
 ///
-/// A dev machine often points `vendor/cpython/Lib` at a *live* install
-/// (a Homebrew stdlib symlink). Homebrew ships `sitecustomize.py`
-/// there, and since the lib dir lands on every child interpreter's
-/// `sys.path` (via `WEAVEPY_CPYTHON_LIB`), `site` would import it at
-/// each startup — dragging `re` + Homebrew site-packages into pristine
-/// `-I` children and failing test_site's `test_startup_imports`. When
-/// hooks are present, mirror the lib dir through a shim directory of
-/// per-entry symlinks that omits only the hook files, so module
-/// resolution (`sched`, `tabnanny`, … resolve from the vendored Lib)
-/// matches a clean checkout. Clean checkouts (CI) are returned
-/// unchanged.
+/// - `sitecustomize.py` / `usercustomize.py`: a dev machine often
+///   points `vendor/cpython/Lib` at a *live* install (a Homebrew stdlib
+///   symlink) shipping site hooks. Since the lib dir lands on every
+///   child interpreter's `sys.path` (via `WEAVEPY_CPYTHON_LIB`), `site`
+///   would import them at each startup — dragging `re` + Homebrew
+///   site-packages into pristine `-I` children and failing test_site's
+///   `test_startup_imports`.
+/// - `os.py`: the staged runtime stdlib carries the real one; a second
+///   landmark-bearing Lib breaks test_venv (see the shim-version note
+///   inside).
+///
+/// Module resolution (`sched`, `tabnanny`, … resolve from the vendored
+/// Lib) is otherwise unchanged.
 fn sanitized_lib_dir(lib_dir: &Path) -> String {
     let raw = lib_dir.display().to_string();
-    if !lib_dir.join("sitecustomize.py").is_file() && !lib_dir.join("usercustomize.py").is_file() {
-        return raw;
-    }
     #[cfg(unix)]
     {
         use std::hash::{Hash, Hasher};
         let mut h = std::hash::DefaultHasher::new();
         raw.hash(&mut h);
-        // "v2": the mirror shim (a stale v1 shim held only `test`).
-        let shim = std::env::temp_dir().join(format!("weavepy-cpython-lib-v2-{:016x}", h.finish()));
+        // "v3": the mirror shim is now unconditional and omits `os.py`
+        // (a stale v2 shim was hook-triggered and kept it). The staged
+        // runtime stdlib materializes a real `os.py` (RFC 0068 WS5 — a
+        // fresh `import os` executes source, like CPython), so with the
+        // vendored `os.py` visible *two* sys.path entries would carry
+        // the stdlib landmark: test_venv's non-installed-python builder
+        // (test_zippath_from_non_installed_posix) copytree-merges every
+        // landmark-bearing entry into one directory and collides on the
+        // second. CPython never runs with two Libs on sys.path; hiding
+        // the vendored copy (module resolution never reaches it — the
+        // staged tree wins) keeps the single-landmark invariant.
+        let shim = std::env::temp_dir().join(format!("weavepy-cpython-lib-v3-{:016x}", h.finish()));
         let done = shim.join(".weavepy-shim-complete");
         if !done.is_file() {
             // Populate a staging dir, then rename into place so parallel
@@ -864,7 +903,10 @@ fn sanitized_lib_dir(lib_dir: &Path) -> String {
                 if let Ok(entries) = std::fs::read_dir(lib_dir) {
                     for entry in entries.flatten() {
                         let name = entry.file_name();
-                        if name == "sitecustomize.py" || name == "usercustomize.py" {
+                        if name == "sitecustomize.py"
+                            || name == "usercustomize.py"
+                            || name == "os.py"
+                        {
                             continue;
                         }
                         let _ = std::os::unix::fs::symlink(entry.path(), stage.join(&name));
@@ -907,28 +949,40 @@ fn sanitized_lib_dir(lib_dir: &Path) -> String {
 /// headers / no cc) — `test_buffer` then keeps skipping its
 /// `TestBufferProtocol` class exactly as before.
 fn capi_fixtures_dir() -> Option<String> {
-    let built = option_env!("WEAVEPY_REGRTEST_TESTBUFFER_EXTENSION")?;
-    let built = Path::new(built);
-    if !built.is_file() {
+    // Semicolon-separated list of built fixture dylibs (`_testbuffer`,
+    // `_testsinglephase`, `_testmultiphase` — RFC 0068 WS4).
+    let built_list = option_env!("WEAVEPY_REGRTEST_TESTBUFFER_EXTENSION")?;
+    let built: Vec<&Path> = built_list
+        .split(';')
+        .map(Path::new)
+        .filter(|p| p.is_file())
+        .collect();
+    if built.is_empty() {
         return None;
     }
-    let file_name = built.file_name()?;
     use std::hash::{Hash, Hasher};
     let mut h = std::hash::DefaultHasher::new();
-    built.display().to_string().hash(&mut h);
+    built_list.hash(&mut h);
     let shim = std::env::temp_dir().join(format!("weavepy-capi-fixtures-{:016x}", h.finish()));
-    let staged = shim.join(file_name);
-    if !staged.is_file() {
+    if !built
+        .iter()
+        .all(|p| p.file_name().is_some_and(|n| shim.join(n).is_file()))
+    {
         let stage = shim.with_extension(format!("stage-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&stage);
         std::fs::create_dir_all(&stage).ok()?;
-        std::fs::copy(built, stage.join(file_name)).ok()?;
+        for p in &built {
+            std::fs::copy(p, stage.join(p.file_name()?)).ok()?;
+        }
         if std::fs::rename(&stage, &shim).is_err() {
             // Lost the race to a parallel worker — its copy is as good.
             let _ = std::fs::remove_dir_all(&stage);
         }
     }
-    staged.is_file().then(|| shim.display().to_string())
+    built
+        .iter()
+        .all(|p| p.file_name().is_some_and(|n| shim.join(n).is_file()))
+        .then(|| shim.display().to_string())
 }
 
 fn libregrtest_bootstrap(file: &RegrtestFile) -> Option<String> {
@@ -943,22 +997,40 @@ fn libregrtest_bootstrap(file: &RegrtestFile) -> Option<String> {
     let path = file.path.display().to_string();
     // Compiled C-API fixtures (`_testbuffer`, RFC 0066 WS1): appended to
     // the tail of `sys.path` so they can never shadow the stdlib.
+    // (Also on the default path via WEAVEPY_CPYTHON_LIB — the guard keeps
+    // sys.path duplicate-free for stdlib-walking tests like test_venv.)
     let fixtures = match capi_fixtures_dir() {
-        Some(dir) => format!("sys.path.append({dir:?})\n"),
+        Some(dir) => {
+            format!("(lambda d: None if d in sys.path else sys.path.append(d))({dir:?})\n")
+        }
         None => String::new(),
     };
     Some(format!(
         r#"
 import sys, os
 # The runner also exports WEAVEPY_CPYTHON_LIB, which lands the same
-# directory on the default path — keep exactly one copy, at the front
-# (a duplicate breaks test_venv's stdlib-copying walk of sys.path).
+# directory on the default path — keep exactly one copy (a duplicate
+# breaks test_venv's stdlib-copying walk of sys.path), at its *default*
+# position: after the staged runtime stdlib, like a site dir. Fronting
+# it would make PathFinder re-finds (importlib.reload's `_find_spec`)
+# resolve running-stdlib modules to the vendored tree while their
+# `__file__`/`__loader__.path` point at the staged tree — test_api's
+# ReloadTests assert the two agree.
 _lib = {lib_dir:?}
-try:
-    sys.path.remove(_lib)
-except ValueError:
-    pass
-sys.path.insert(0, _lib)
+if _lib not in sys.path:
+    sys.path.append(_lib)
+# The suite computes `test.support.STDLIB_DIR` from the `test` package's
+# location — the vendored Lib. `FrozenImporter._resolve_filename` builds
+# frozen-module filenames from `sys._stdlib_dir`; for test_importlib's
+# frozen tests, point it at the same tree so the two agree
+# (frozen.test_finder's check_loader_state), which also matches CPython,
+# where the running stdlib *is* the Lib the tests live in. The vendored
+# tree really contains `__hello__.py` &co. Scoped to test_importlib only:
+# everywhere else `sys._stdlib_dir` must keep naming the *running* staged
+# stdlib — test_sys's test_stdlib_dir asserts it equals the directory a
+# fresh `os` import loads from.
+if {name:?}.split(".")[0] == "test_importlib":
+    sys._stdlib_dir = _lib
 del _lib
 {fixtures}
 sys.argv = [{path:?}]
@@ -997,6 +1069,19 @@ try:
     _support.use_resources = _reslist
 except Exception:
     pass
+# libregrtest's `setup_process()` guarantees a non-ASCII env var is present
+# for every test (BPO-44647); this harness replaces libregrtest as the
+# runner, so it makes the same guarantee (test_regrtest's
+# test_unicode_guard_env asserts the variable is set and non-ASCII).
+try:
+    from test.support.os_helper import FS_NONASCII as _fsna
+    from test.support.os_helper import TESTFN_UNDECODABLE as _tfu
+    if _tfu and os.supports_bytes_environ:
+        os.environb.setdefault(b"PYTHONREGRTEST_UNICODE_GUARD", _tfu)
+    elif _fsna:
+        os.environ.setdefault("PYTHONREGRTEST_UNICODE_GUARD", _fsna)
+except Exception:
+    pass
 try:
     mod = __import__("test.{name}", fromlist=["__spec__"])
 except unittest.SkipTest as e:
@@ -1013,6 +1098,10 @@ fn run_inprocess(
     file: &RegrtestFile,
     expected: Option<TestStatus>,
     timeout: Duration,
+    // Unused: in-process runs have no captured unittest output to grade
+    // a divergence row against (see the SystemExit arm below); graded
+    // sweeps run in subprocess mode.
+    _divergence_ids: &[String],
 ) -> TestReport {
     let source = match libregrtest_bootstrap(file) {
         Some(bootstrap) => bootstrap,
@@ -1060,6 +1149,11 @@ fn run_inprocess(
                         (TestStatus::Pass, None)
                     } else {
                         let msg = err.format(&source, &opts.filename);
+                        // The in-process path has no captured unittest
+                        // output to grade a divergence row against; a
+                        // SystemExit payload doesn't carry the failing
+                        // ids, so the row stays `Fail` here (the graded
+                        // sweeps run in subprocess mode).
                         (TestStatus::Fail, Some(truncate_detail(&msg)))
                     }
                 } else {
@@ -1091,6 +1185,7 @@ fn run_subprocess(
     file: &RegrtestFile,
     expected: Option<TestStatus>,
     runner: &RunnerOptions,
+    divergence_ids: &[String],
 ) -> TestReport {
     let weavepy_bin = runner
         .weavepy_binary
@@ -1133,9 +1228,19 @@ fn run_subprocess(
     // Export the external CPython `Lib` dir so child interpreters spawned
     // by the test (`assert_python_ok`, `multiprocessing` spawn,
     // `subprocess` re-execs) inherit it on their default `sys.path` even
-    // under `-I`/`-E` (which strip `PYTHON*` but not this).
+    // under `-I`/`-E` (which strip `PYTHON*` but not this). The compiled
+    // C-API fixture dir rides the same variable (pathsep-joined) so
+    // grandchildren can import `_testmultiphase` &co too —
+    // extension.test_loader's test_nonmodule_cases re-execs
+    // `sys.executable` on a script that loads them (RFC 0068 WS4).
     if let Some(lib_dir) = cpython_lib_dir(file) {
-        cmd.env("WEAVEPY_CPYTHON_LIB", lib_dir);
+        let mut parts = vec![std::path::PathBuf::from(lib_dir)];
+        if let Some(fix) = capi_fixtures_dir() {
+            parts.push(std::path::PathBuf::from(fix));
+        }
+        if let Ok(joined) = std::env::join_paths(parts) {
+            cmd.env("WEAVEPY_CPYTHON_LIB", joined);
+        }
     }
     let child = match cmd.spawn() {
         Ok(c) => c,
@@ -1162,7 +1267,7 @@ fn run_subprocess(
             } else {
                 None
             };
-            let test_status = if status.success() {
+            let mut test_status = if status.success() {
                 TestStatus::Pass
             } else if matches!(status.code(), Some(0)) {
                 TestStatus::Pass
@@ -1175,6 +1280,17 @@ fn run_subprocess(
             } else {
                 TestStatus::Fail
             };
+            // RFC 0068 WS7: a `divergence` row grades `Divergence` only
+            // when the run failed *exactly* its enumerated ids. A clean
+            // pass, an error exit, or a different failure set keeps the
+            // observed status — and trips the gate as `unexpected`.
+            if expected == Some(TestStatus::Divergence)
+                && test_status == TestStatus::Fail
+                && (divergence_matches(&stdout, divergence_ids)
+                    || divergence_matches(&stderr, divergence_ids))
+            {
+                test_status = TestStatus::Divergence;
+            }
             TestReport {
                 label,
                 status: test_status,
@@ -1291,6 +1407,38 @@ fn system_exit_is_success(code: &weavepy::vm::object::Object) -> bool {
     }
 }
 
+/// RFC 0068 WS7 — grade a failing run against a `divergence` row's
+/// enumerated ids. `true` iff the set of unittest ids reported in
+/// `FAIL:` / `ERROR:` result blocks equals `ids` exactly: every
+/// enumerated id failed, and nothing else did. The runner's unittest
+/// bootstrap prints these header lines for each failure regardless of
+/// verbosity (`FAIL: testInt (test.test_marshal.InstancingTestCase.testInt)`),
+/// so the observed set is recoverable from the captured output.
+fn divergence_matches(output: &str, ids: &[String]) -> bool {
+    if ids.is_empty() {
+        return false;
+    }
+    let mut observed: BTreeSet<String> = BTreeSet::new();
+    for line in output.lines() {
+        let Some(rest) = line
+            .strip_prefix("FAIL: ")
+            .or_else(|| line.strip_prefix("ERROR: "))
+        else {
+            continue;
+        };
+        // "testInt (test.test_marshal.InstancingTestCase.testInt)" —
+        // prefer the parenthesized full id; fall back to the bare name
+        // (module-level errors print without parentheses).
+        let id = match (rest.rfind('('), rest.rfind(')')) {
+            (Some(open), Some(close)) if open < close => &rest[open + 1..close],
+            _ => rest.trim(),
+        };
+        observed.insert(id.to_owned());
+    }
+    let expected: BTreeSet<String> = ids.iter().cloned().collect();
+    observed == expected
+}
+
 fn truncate_detail(msg: &str) -> String {
     const LIMIT: usize = 1024;
     if msg.len() <= LIMIT {
@@ -1314,15 +1462,21 @@ pub fn report_to_markdown(reports: &[TestReport]) -> String {
     let summary = RegrtestSummary::from_reports(reports);
     let mut out = String::new();
     let _ = writeln!(out, "# WeavePy regrtest");
+    let divergence_part = if summary.divergence > 0 {
+        format!(" / divergence {}", summary.divergence)
+    } else {
+        String::new()
+    };
     let _ = writeln!(
         out,
-        "{} total — pass {} / fail {} / error {} / skip {} / timeout {} — unexpected {}",
+        "{} total — pass {} / fail {} / error {} / skip {} / timeout {}{} — unexpected {}",
         summary.total,
         summary.pass,
         summary.fail,
         summary.error,
         summary.skip,
         summary.timeout,
+        divergence_part,
         summary.unexpected,
     );
     let _ = writeln!(out);
@@ -1479,6 +1633,7 @@ mod simple_toml {
             "error" => TestStatus::Error,
             "skip" => TestStatus::Skip,
             "timeout" => TestStatus::Timeout,
+            "divergence" => TestStatus::Divergence,
             other => return Err(format!("[tests.{label}] bad status {other:?}")),
         };
         let reason = resolve("reason").cloned();
@@ -1489,16 +1644,65 @@ mod simple_toml {
             ),
             None => None,
         };
+        // RFC 0068 WS7: a `divergence` row must enumerate the exact
+        // unittest ids it is allowed to fail — an anonymous divergence
+        // is just a fail row wearing a nicer name.
+        let divergence_tests = match table.get("divergence_tests") {
+            Some(v) => parse_string_array(v, &format!("[tests.{label}] divergence_tests"))?,
+            None => Vec::new(),
+        };
+        if status == TestStatus::Divergence {
+            if divergence_tests.is_empty() {
+                return Err(format!(
+                    "[tests.{label}] status \"divergence\" requires a non-empty \
+                     divergence_tests list of unittest ids"
+                ));
+            }
+            if reason.is_none() {
+                return Err(format!(
+                    "[tests.{label}] status \"divergence\" requires a reason"
+                ));
+            }
+        } else if !divergence_tests.is_empty() {
+            return Err(format!(
+                "[tests.{label}] divergence_tests is only valid with \
+                 status \"divergence\""
+            ));
+        }
         top.tests.insert(
             label,
             ExpectedEntry {
                 status,
                 reason,
                 timeout_seconds,
+                divergence_tests,
             },
         );
         table.clear();
         Ok(())
+    }
+
+    /// Parse a single-line TOML array of quoted strings (the
+    /// `divergence_tests` value shape).
+    fn parse_string_array(v: &str, ctx: &str) -> Result<Vec<String>, String> {
+        let inner = v
+            .trim()
+            .strip_prefix('[')
+            .and_then(|t| t.strip_suffix(']'))
+            .ok_or_else(|| format!("{ctx} must be a single-line array of strings"))?;
+        let mut out = Vec::new();
+        for item in inner.split(',') {
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            let name = strip_quotes(item);
+            if name.len() == item.len() {
+                return Err(format!("{ctx} entry {item:?} must be a quoted string"));
+            }
+            out.push(name.to_owned());
+        }
+        Ok(out)
     }
 
     /// Parse the top-level `measured_os = ["macos", "linux"]` stamp
@@ -1611,6 +1815,51 @@ mod simple_toml {
                 exp.tests["cpython/Lib/test/test_grammar.py"].timeout_seconds,
                 None
             );
+        }
+
+        #[test]
+        fn parses_divergence_row() {
+            let body = "\
+                [tests.\"cpython/Lib/test/test_marshal.py\"]\n\
+                status = \"divergence\"\n\
+                divergence_tests = [\"test.test_marshal.InstancingTestCase.testInt\", \"test.test_marshal.InstancingTestCase.testFloat\"]\n\
+                reason = \"unboxed int/float id() semantics\"\n\
+            ";
+            let exp = parse(body).unwrap();
+            let entry = &exp.tests["cpython/Lib/test/test_marshal.py"];
+            assert_eq!(entry.status, TestStatus::Divergence);
+            assert_eq!(
+                entry.divergence_tests,
+                vec![
+                    "test.test_marshal.InstancingTestCase.testInt".to_owned(),
+                    "test.test_marshal.InstancingTestCase.testFloat".to_owned(),
+                ]
+            );
+        }
+
+        #[test]
+        fn divergence_requires_ids_and_reason() {
+            // No divergence_tests → hard load error.
+            let missing_ids = "\
+                [tests.\"cpython/Lib/test/test_x.py\"]\n\
+                status = \"divergence\"\n\
+                reason = \"r\"\n\
+            ";
+            assert!(parse(missing_ids).is_err());
+            // No reason → hard load error.
+            let missing_reason = "\
+                [tests.\"cpython/Lib/test/test_x.py\"]\n\
+                status = \"divergence\"\n\
+                divergence_tests = [\"a.b.C.d\"]\n\
+            ";
+            assert!(parse(missing_reason).is_err());
+            // divergence_tests on a non-divergence row → hard load error.
+            let stray_ids = "\
+                [tests.\"cpython/Lib/test/test_x.py\"]\n\
+                status = \"fail\"\n\
+                divergence_tests = [\"a.b.C.d\"]\n\
+            ";
+            assert!(parse(stray_ids).is_err());
         }
 
         // Shared fixture for the per-OS override tests (RFC 0062 WS3).
@@ -1837,6 +2086,39 @@ mod tests {
             expected: None,
         };
         assert!(!r.matches_expectation());
+    }
+
+    // -- divergence grading (RFC 0068 WS7) -------------------------------
+
+    #[test]
+    fn divergence_matches_exact_failure_set() {
+        let ids = vec![
+            "test.test_marshal.InstancingTestCase.testInt".to_owned(),
+            "test.test_marshal.InstancingTestCase.testFloat".to_owned(),
+        ];
+        let output = "\
+............F.F...\n\
+======================================================================\n\
+FAIL: testFloat (test.test_marshal.InstancingTestCase.testFloat)\n\
+----------------------------------------------------------------------\n\
+Traceback (most recent call last):\n\
+AssertionError: 2 not greater than 2\n\
+======================================================================\n\
+FAIL: testInt (test.test_marshal.InstancingTestCase.testInt)\n\
+----------------------------------------------------------------------\n\
+FAILED (failures=2, skipped=14)\n";
+        assert!(divergence_matches(output, &ids));
+        // A clean pass (no FAIL blocks) never grades divergence.
+        assert!(!divergence_matches("OK (skipped=14)\n", &ids));
+        // An extra failure beyond the enumerated set doesn't either.
+        let extra = format!("{output}FAIL: testStr (test.test_marshal.StrTestCase.testStr)\n");
+        assert!(!divergence_matches(&extra, &ids));
+        // A subset (one of two enumerated ids) is also a mismatch.
+        let only_one = "\
+FAIL: testInt (test.test_marshal.InstancingTestCase.testInt)\n";
+        assert!(!divergence_matches(only_one, &ids));
+        // Empty id list can never match.
+        assert!(!divergence_matches(output, &[]));
     }
 
     // -- measured_os advisory gate (RFC 0063 WS7) -----------------------

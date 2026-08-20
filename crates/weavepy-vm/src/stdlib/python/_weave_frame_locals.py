@@ -26,7 +26,7 @@ _repr_running = set()
 
 
 class FrameLocalsProxy:
-    __slots__ = ("_frame", "_hidden", "_visible")
+    __slots__ = ("_frame", "_hidden", "_visible", "_ns_scope")
 
     # Py_TPFLAGS_MAPPING for MATCH_MAPPING (`case {...}` patterns).
     _abc_collection_flags = 1 << 6
@@ -42,12 +42,26 @@ class FrameLocalsProxy:
         _wf.check(frame)
         self = object.__new__(cls)
         object.__setattr__(self, "_frame", frame)
+        object.__setattr__(self, "_ns_scope", False)
         if _wf.is_comp(frame):
             back = frame.f_back
             if back is not None:
                 object.__setattr__(self, "_hidden", frame)
                 object.__setattr__(self, "_visible", back.f_locals)
                 return self
+        if _wf.is_module_scope(frame):
+            # PEP 709 at module/exec scope: the frame's fast slots are
+            # an inlined comprehension's *hidden* locals; the visible
+            # namespace mapping stays the module/exec dict. Reads see
+            # bound hidden names first, writes/dels go to the mapping,
+            # and enumeration includes bound hidden names (CPython's
+            # proxy walks co_localsplusnames, so locals() snapshots
+            # them; they vanish once LOAD_FAST_AND_CLEAR unbinds the
+            # slots at loop exit — test_listcomps test_frame_locals).
+            object.__setattr__(self, "_hidden", frame)
+            object.__setattr__(self, "_visible", _wf.namespace(frame))
+            object.__setattr__(self, "_ns_scope", True)
+            return self
         object.__setattr__(self, "_hidden", None)
         object.__setattr__(self, "_visible", None)
         return self
@@ -126,8 +140,19 @@ class FrameLocalsProxy:
         raise KeyError(key)
 
     def __contains__(self, key):
-        # Hidden variables are invisible to `in` (PEP 667 asymmetry).
+        # Hidden variables of a *legacy comp frame* are invisible to
+        # `in` (PEP 667 asymmetry); truly-inlined hidden locals of a
+        # module/exec frame are visible while bound, like CPython's
+        # proxy walking co_localsplusnames.
         if self._hidden is not None:
+            if self._ns_scope:
+                name = self._resolve(key, self._hidden)
+                if name is not None:
+                    try:
+                        _wf.getvar(self._hidden, name)
+                        return True
+                    except KeyError:
+                        pass
             return key in self._visible
         frame = self._frame
         name = self._resolve(key, frame)
@@ -144,8 +169,14 @@ class FrameLocalsProxy:
         if self._hidden is not None:
             visible = self._visible
             if isinstance(visible, FrameLocalsProxy):
-                return visible.keys()
-            return list(visible.keys())
+                out = visible.keys()
+            else:
+                out = list(visible.keys())
+            if self._ns_scope:
+                for name in _wf.bound_names(self._hidden):
+                    if name not in out:
+                        out.append(name)
+            return out
         frame = self._frame
         out = _wf.bound_names(frame)
         extra = _wf.extra(frame, False)

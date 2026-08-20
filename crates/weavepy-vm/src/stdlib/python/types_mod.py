@@ -1,258 +1,176 @@
-"""Lightweight stand-in for CPython's `types` module.
-
-This file ships frozen with WeavePy. The exposed surface mirrors the
-public API of CPython's ``Lib/types.py`` closely enough that the
-standard library can ``import types`` without conditional imports; full
-fidelity is not yet a goal (some helpers are simplified — see
-:class:`SimpleNamespace`, :func:`new_class`).
+"""
+Define names for built-in types that aren't directly accessible as a builtin.
 """
 
-import sys as _sys
+import sys
 
-__all__ = [
-    "FunctionType",
-    "LambdaType",
-    "CodeType",
-    "MappingProxyType",
-    "SimpleNamespace",
-    "GeneratorType",
-    "CoroutineType",
-    "AsyncGeneratorType",
-    "MethodType",
-    "BuiltinFunctionType",
-    "BuiltinMethodType",
-    "WrapperDescriptorType",
-    "MethodWrapperType",
-    "MethodDescriptorType",
-    "ClassMethodDescriptorType",
-    "ModuleType",
-    "TracebackType",
-    "FrameType",
-    "GetSetDescriptorType",
-    "MemberDescriptorType",
-    "CellType",
-    "NoneType",
-    "NotImplementedType",
-    "EllipsisType",
-    "UnionType",
-    "GenericAlias",
-    "coroutine",
-    "new_class",
-    "prepare_class",
-    "resolve_bases",
-    "get_original_bases",
-    "DynamicClassAttribute",
-]
+# Iterators in Python aren't a matter of type but of protocol.  A large
+# and changing number of builtin types implement *some* flavor of
+# iterator.  Don't check the type!  Use hasattr to check for both
+# "__iter__" and "__next__" attributes instead.
 
-
-# --- type aliases sourced from the running interpreter ------------------
-def _f():
-    pass
-
-
+def _f(): pass
 FunctionType = type(_f)
-LambdaType = type(lambda: None)
+LambdaType = type(lambda: None)         # Same as FunctionType
 CodeType = type(_f.__code__)
+MappingProxyType = type(type.__dict__)
+SimpleNamespace = type(sys.implementation)
 
+def _cell_factory():
+    a = 1
+    def f():
+        nonlocal a
+    return f.__closure__[0]
+CellType = type(_cell_factory())
 
 def _g():
     yield 1
-
-
 GeneratorType = type(_g())
 
-
-async def _c():
-    pass
-
-
-_coro = _c()
-try:
-    CoroutineType = type(_coro)
-finally:
-    try:
-        _coro.close()
-    except Exception:
-        pass
-
+async def _c(): pass
+_c = _c()
+CoroutineType = type(_c)
+_c.close()  # Prevent ResourceWarning
 
 async def _ag():
-    yield 1
-
-
-_a = _ag()
-AsyncGeneratorType = type(_a)
-# The never-started bootstrap agen needs no aclose() — calling it would
-# create (and discard) an aclose awaitable, tripping the gh-113753
-# "was never awaited" RuntimeWarning during interpreter startup.
-del _a, _ag
-
+    yield
+_ag = _ag()
+AsyncGeneratorType = type(_ag)
 
 class _C:
-    def _m(self):
-        pass
-
-
+    def _m(self): pass
 MethodType = type(_C()._m)
+
 BuiltinFunctionType = type(len)
-BuiltinMethodType = BuiltinFunctionType
+BuiltinMethodType = type([].append)     # Same as BuiltinFunctionType
 
-# Several CPython-specific descriptor types don't have direct
-# equivalents in WeavePy yet. We resolve them to ``type(None)`` rather
-# than raising at import time so that ``import types`` succeeds and
-# ``isinstance(x, types.WrapperDescriptorType)`` is a (correctly) False
-# check.
-def _safe_type(expr_lambda, fallback=type(None)):
-    try:
-        return type(expr_lambda())
-    except BaseException:
-        # Catch BaseException so SystemExit / KeyboardInterrupt fired
-        # while WeavePy boots a frozen module don't bubble out of
-        # ``import types`` at startup. The traceback printer further
-        # down the line was emitting noise on every interpreter
-        # session because the `str.join` lookup failed silently in
-        # the original ``except Exception`` form.
-        return fallback
+WrapperDescriptorType = type(object.__init__)
+MethodWrapperType = type(object().__str__)
+MethodDescriptorType = type(str.join)
+ClassMethodDescriptorType = type(dict.__dict__['fromkeys'])
 
+ModuleType = type(sys)
 
-WrapperDescriptorType = _safe_type(lambda: object.__init__)
-MethodWrapperType = _safe_type(lambda: object().__str__)
-MethodDescriptorType = _safe_type(lambda: str.join)
-ClassMethodDescriptorType = _safe_type(lambda: dict.__dict__.get("fromkeys", classmethod(lambda *a: None)))
-ModuleType = type(_sys)
-# CPython's own idiom (Lib/types.py): raise and catch to obtain a live
-# traceback object whose class is the real `traceback` type.
 try:
     raise TypeError
-except TypeError as _exc:
-    _tb = _exc.__traceback__
-    TracebackType = type(_tb) if _tb is not None else type(None)
-    del _tb
-FrameType = _safe_type(lambda: _sys._getframe()) if hasattr(_sys, "_getframe") else type(None)
-GetSetDescriptorType = _safe_type(lambda: type.__dict__.get("__dict__", object))
+except TypeError as exc:
+    TracebackType = type(exc.__traceback__)
+    FrameType = type(exc.__traceback__.tb_frame)
+
+GetSetDescriptorType = type(FunctionType.__code__)
+MemberDescriptorType = type(FunctionType.__globals__)
+
+del sys, _f, _g, _C, _c, _ag, _cell_factory  # Not for export
 
 
-class _SlotSample:
-    __slots__ = ("_member",)
+# Provide a PEP 3115 compliant mechanism for class creation
+def new_class(name, bases=(), kwds=None, exec_body=None):
+    """Create a class object dynamically using the appropriate metaclass."""
+    resolved_bases = resolve_bases(bases)
+    meta, ns, kwds = prepare_class(name, resolved_bases, kwds)
+    if exec_body is not None:
+        exec_body(ns)
+    if resolved_bases is not bases:
+        ns['__orig_bases__'] = bases
+    return meta(name, resolved_bases, ns, **kwds)
+
+def resolve_bases(bases):
+    """Resolve MRO entries dynamically as specified by PEP 560."""
+    new_bases = list(bases)
+    updated = False
+    shift = 0
+    for i, base in enumerate(bases):
+        if isinstance(base, type):
+            continue
+        if not hasattr(base, "__mro_entries__"):
+            continue
+        new_base = base.__mro_entries__(bases)
+        updated = True
+        if not isinstance(new_base, tuple):
+            raise TypeError("__mro_entries__ must return a tuple")
+        else:
+            new_bases[i+shift:i+shift+1] = new_base
+            shift += len(new_base) - 1
+    if not updated:
+        return bases
+    return tuple(new_bases)
+
+def prepare_class(name, bases=(), kwds=None):
+    """Call the __prepare__ method of the appropriate metaclass.
+
+    Returns (metaclass, namespace, kwds) as a 3-tuple
+
+    *metaclass* is the appropriate metaclass
+    *namespace* is the prepared class namespace
+    *kwds* is an updated copy of the passed in kwds argument with any
+    'metaclass' entry removed. If no kwds argument is passed in, this will
+    be an empty dict.
+    """
+    if kwds is None:
+        kwds = {}
+    else:
+        kwds = dict(kwds) # Don't alter the provided mapping
+    if 'metaclass' in kwds:
+        meta = kwds.pop('metaclass')
+    else:
+        if bases:
+            meta = type(bases[0])
+        else:
+            meta = type
+    if isinstance(meta, type):
+        # when meta is a type, we first determine the most-derived metaclass
+        # instead of invoking the initial candidate directly
+        meta = _calculate_meta(meta, bases)
+    if hasattr(meta, '__prepare__'):
+        ns = meta.__prepare__(name, bases, **kwds)
+    else:
+        ns = {}
+    return meta, ns, kwds
+
+def _calculate_meta(meta, bases):
+    """Calculate the most derived metaclass."""
+    winner = meta
+    for base in bases:
+        base_meta = type(base)
+        if issubclass(winner, base_meta):
+            continue
+        if issubclass(base_meta, winner):
+            winner = base_meta
+            continue
+        # else:
+        raise TypeError("metaclass conflict: "
+                        "the metaclass of a derived class "
+                        "must be a (non-strict) subclass "
+                        "of the metaclasses of all its bases")
+    return winner
 
 
-# The type of a `__slots__` storage descriptor (CPython samples
-# `FunctionType.__globals__`; a slots class is equivalent and simpler here).
-MemberDescriptorType = type(_SlotSample.__dict__["_member"])
-del _SlotSample
-CellType = _safe_type(lambda: (lambda x: (lambda: x))(1).__closure__[0])
+def get_original_bases(cls, /):
+    """Return the class's "original" bases prior to modification by `__mro_entries__`.
 
-NoneType = type(None)
-NotImplementedType = type(NotImplemented)
-EllipsisType = type(Ellipsis)
+    Examples::
 
-UnionType = _safe_type(lambda: int | str)
-GenericAlias = _safe_type(lambda: list[int])
+        from typing import TypeVar, Generic, NamedTuple, TypedDict
 
+        T = TypeVar("T")
+        class Foo(Generic[T]): ...
+        class Bar(Foo[int], float): ...
+        class Baz(list[str]): ...
+        Eggs = NamedTuple("Eggs", [("a", int), ("b", str)])
+        Spam = TypedDict("Spam", {"a": int, "b": str})
 
-class MappingProxyType:
-    """Read-only view over a mapping. Mirrors :class:`types.MappingProxyType`."""
-
-    __slots__ = ("_mapping",)
-
-    def __class_getitem__(cls, item):
-        # CPython's C mappingproxy exposes `__class_getitem__ =
-        # Py_GenericAlias` (test_genericalias generic_types sweep).
-        return GenericAlias(cls, item)
-
-    def __init__(self, mapping):
-        # CPython's check is `PyMapping_Check`: the *type* must supply
-        # `__getitem__` (no `keys` requirement — a custom mapping with
-        # just `__getitem__`/`__len__` is accepted).
-        if isinstance(mapping, dict):
-            self._mapping = mapping
-            return
-        if not hasattr(type(mapping), "__getitem__"):
-            raise TypeError(
-                "mappingproxy() argument must support the mapping protocol"
-            )
-        self._mapping = mapping
-
-    def __getitem__(self, key):
-        return self._mapping[key]
-
-    def __contains__(self, key):
-        return key in self._mapping
-
-    def __iter__(self):
-        return iter(self._mapping)
-
-    def __len__(self):
-        return len(self._mapping)
-
-    def __eq__(self, other):
-        if isinstance(other, MappingProxyType):
-            return self._mapping == other._mapping
-        return self._mapping == other
-
-    def __ne__(self, other):
-        return not self == other
-
-    def __repr__(self):
-        return f"mappingproxy({self._mapping!r})"
-
-    def __or__(self, other):
-        # CPython's mappingproxy.__or__ is PyNumber_Or(mapping, other):
-        # delegating to `|` keeps the full binary protocol, so e.g.
-        # `proxy | UserDict(...)` reaches UserDict.__ror__ and returns a
-        # UserDict (test_userdict test_mixed_or).
-        if isinstance(other, MappingProxyType):
-            other = other._mapping
-        return self._mapping | other
-
-    def __ror__(self, other):
-        if isinstance(other, MappingProxyType):
-            other = other._mapping
-        return other | self._mapping
-
-    def get(self, key, default=None):
-        return self._mapping.get(key, default)
-
-    def keys(self):
-        return self._mapping.keys()
-
-    def values(self):
-        return self._mapping.values()
-
-    def items(self):
-        return self._mapping.items()
-
-    def copy(self):
-        if hasattr(self._mapping, "copy"):
-            return self._mapping.copy()
-        return dict(self._mapping)
-
-
-class SimpleNamespace:
-    """A simple attribute-bag type. Mirrors :class:`types.SimpleNamespace`."""
-
-    def __init__(self, **kwargs):
-        for k, v in kwargs.items():
-            setattr(self, k, v)
-
-    def __repr__(self):
-        try:
-            keys = sorted(vars(self))
-            items = ", ".join(f"{k}={getattr(self, k)!r}" for k in keys)
-            return f"namespace({items})"
-        except Exception:
-            return "namespace(...)"
-
-    def __eq__(self, other):
-        if isinstance(self, SimpleNamespace) and isinstance(other, SimpleNamespace):
-            return vars(self) == vars(other)
-        return NotImplemented
-
-    def __ne__(self, other):
-        result = self.__eq__(other)
-        if result is NotImplemented:
-            return result
-        return not result
+        assert get_original_bases(Bar) == (Foo[int], float)
+        assert get_original_bases(Baz) == (list[str],)
+        assert get_original_bases(Eggs) == (NamedTuple,)
+        assert get_original_bases(Spam) == (TypedDict,)
+        assert get_original_bases(int) == (object,)
+    """
+    try:
+        return cls.__dict__.get("__orig_bases__", cls.__bases__)
+    except AttributeError:
+        raise TypeError(
+            f"Expected an instance of type, not {type(cls).__name__!r}"
+        ) from None
 
 
 class DynamicClassAttribute:
@@ -318,211 +236,112 @@ class DynamicClassAttribute:
         return result
 
 
-def coroutine(func):
-    """Mark a generator function so it can be used with `await`.
-
-    Mirrors CPython's implementation: a generator function gets
-    `CO_ITERABLE_COROUTINE` set on its code (done natively); other
-    callables are wrapped so generator results are awaitable.
-    """
-    if not callable(func):
-        raise TypeError('types.coroutine() expects a callable')
-
-    co = getattr(func, '__code__', None)
-    flags = getattr(co, 'co_flags', None)
-    if flags is not None:
-        # Already a coroutine function or already marked: no-op.
-        if flags & 0x180:  # CO_COROUTINE | CO_ITERABLE_COROUTINE
-            return func
-        if flags & 0x20:  # CO_GENERATOR
-            return _weavepy_mark_iterable_coroutine(func)
-
-    import functools as _functools
-
-    @_functools.wraps(func)
-    def wrapped(*args, **kwargs):
-        coro = func(*args, **kwargs)
-        cls_name = type(coro).__name__
-        if cls_name == 'coroutine' or (
-            getattr(coro, 'gi_code', None) is not None
-            and coro.gi_code.co_flags & 0x180
-        ):
-            return coro
-        if cls_name == 'generator':
-            return _GeneratorWrapper(coro)
-        return coro
-
-    return wrapped
-
-
 class _GeneratorWrapper:
-    """Adapt a plain generator into an awaitable (CPython types.py)."""
-
+    # TODO: Implement this in C.
     def __init__(self, gen):
         self.__wrapped = gen
-        self.__isgen = type(gen).__name__ == 'generator'
+        self.__isgen = gen.__class__ is GeneratorType
         self.__name__ = getattr(gen, '__name__', None)
         self.__qualname__ = getattr(gen, '__qualname__', None)
-
     def send(self, val):
         return self.__wrapped.send(val)
-
     def throw(self, tp, *rest):
         return self.__wrapped.throw(tp, *rest)
-
     def close(self):
         return self.__wrapped.close()
-
     @property
     def gi_code(self):
         return self.__wrapped.gi_code
-
     @property
     def gi_frame(self):
         return self.__wrapped.gi_frame
-
     @property
     def gi_running(self):
         return self.__wrapped.gi_running
-
     @property
     def gi_yieldfrom(self):
         return self.__wrapped.gi_yieldfrom
-
+    @property
+    def gi_suspended(self):
+        return self.__wrapped.gi_suspended
     cr_code = gi_code
     cr_frame = gi_frame
     cr_running = gi_running
     cr_await = gi_yieldfrom
-
+    cr_suspended = gi_suspended
     def __next__(self):
         return next(self.__wrapped)
-
     def __iter__(self):
         if self.__isgen:
             return self.__wrapped
         return self
-
     __await__ = __iter__
 
+def coroutine(func):
+    """Convert regular generator function to a coroutine."""
 
-def resolve_bases(bases):
-    """PEP 560 helper — replace `__mro_entries__` results in *bases*."""
-    new_bases = list(bases)
-    updated = False
-    shift = 0
-    for i, base in enumerate(bases):
-        if isinstance(base, type):
-            continue
-        if not hasattr(base, "__mro_entries__"):
-            continue
-        new = base.__mro_entries__(bases)
-        if not isinstance(new, tuple):
-            raise TypeError("__mro_entries__ must return a tuple")
-        new_bases[i + shift : i + shift + 1] = new
-        shift += len(new) - 1
-        updated = True
-    return tuple(new_bases) if updated else bases
+    if not callable(func):
+        raise TypeError('types.coroutine() expects a callable')
 
+    if (func.__class__ is FunctionType and
+        getattr(func, '__code__', None).__class__ is CodeType):
 
-def prepare_class(name, bases=(), kwds=None):
-    """PEP 3115 helper — compute metaclass + namespace before class body runs."""
-    if kwds is None:
-        kwds = {}
-    else:
-        kwds = dict(kwds)
-    if "metaclass" in kwds:
-        meta = kwds.pop("metaclass")
-    else:
-        meta = type(bases[0]) if bases else type
-    if isinstance(meta, type):
-        meta = _calculate_meta(meta, bases)
-    if hasattr(meta, "__prepare__"):
-        ns = meta.__prepare__(name, bases, **kwds)
-    else:
-        ns = {}
-    return meta, ns, kwds
+        co_flags = func.__code__.co_flags
 
+        # Check if 'func' is a coroutine function.
+        # (0x180 == CO_COROUTINE | CO_ITERABLE_COROUTINE)
+        if co_flags & 0x180:
+            return func
 
-def _calculate_meta(meta, bases):
-    """Return the most-derived metaclass implied by *meta* and *bases*."""
-    winner = meta
-    for base in bases:
-        base_meta = type(base)
-        if issubclass(winner, base_meta):
-            continue
-        if issubclass(base_meta, winner):
-            winner = base_meta
-            continue
-        raise TypeError(
-            "metaclass conflict: the metaclass of a derived class must be "
-            "a (non-strict) subclass of the metaclasses of all its bases"
-        )
-    return winner
+        # Check if 'func' is a generator function.
+        # (0x20 == CO_GENERATOR)
+        if co_flags & 0x20:
+            # TODO: Implement this in C.
+            co = func.__code__
+            # 0x100 == CO_ITERABLE_COROUTINE
+            func.__code__ = co.replace(co_flags=co.co_flags | 0x100)
+            return func
 
+    # The following code is primarily to support functions that
+    # return generator-like objects (for instance generators
+    # compiled with Cython).
 
-def new_class(name, bases=(), kwds=None, exec_body=None):
-    """PEP 3115 dynamic class construction helper."""
-    resolved = resolve_bases(bases)
-    meta, ns, kwds = prepare_class(name, resolved, kwds)
-    if exec_body is not None:
-        exec_body(ns)
-    if resolved is not bases:
-        ns["__orig_bases__"] = bases
-    return meta(name, resolved, ns, **kwds)
+    # Delay functools and _collections_abc import for speeding up types import.
+    import functools
+    import _collections_abc
+    @functools.wraps(func)
+    def wrapped(*args, **kwargs):
+        coro = func(*args, **kwargs)
+        if (coro.__class__ is CoroutineType or
+            coro.__class__ is GeneratorType and coro.gi_code.co_flags & 0x100):
+            # 'coro' is a native coroutine object or an iterable coroutine
+            return coro
+        if (isinstance(coro, _collections_abc.Generator) and
+            not isinstance(coro, _collections_abc.Coroutine)):
+            # 'coro' is either a pure Python generator iterator, or it
+            # implements collections.abc.Generator (and does not implement
+            # collections.abc.Coroutine).
+            return _GeneratorWrapper(coro)
+        # 'coro' is either an instance of collections.abc.Coroutine or
+        # some other object -- pass it through.
+        return coro
 
+    return wrapped
 
-def get_original_bases(cls, /):
-    """Return the class's "original" bases prior to modification by `__mro_entries__`.
+GenericAlias = type(list[int])
+UnionType = type(int | str)
 
-    Examples::
-
-        from typing import TypeVar, Generic, NamedTuple, TypedDict
-
-        T = TypeVar("T")
-        class Foo(Generic[T]): ...
-        class Bar(Foo[int], float): ...
-        class Baz(list[str]): ...
-        Eggs = NamedTuple("Eggs", [("a", int), ("b", str)])
-        Spam = TypedDict("Spam", {"a": int, "b": str})
-
-        assert get_original_bases(Bar) == (Foo[int], float)
-        assert get_original_bases(Baz) == (list[str],)
-        assert get_original_bases(Eggs) == (NamedTuple,)
-        assert get_original_bases(Spam) == (TypedDict,)
-        assert get_original_bases(int) == (object,)
-    """
-    try:
-        return cls.__dict__.get("__orig_bases__", cls.__bases__)
-    except AttributeError:
-        raise TypeError(
-            f"Expected an instance of type, not {type(cls).__name__!r}"
-        ) from None
-
-
-def _cell_factory():
-    """Internal helper used by tests to build a freshly-empty ``cell``."""
-    a = 1
-
-    def f():
-        nonlocal a
-        a = 2
-        return a
-
-    return f.__closure__[0]
-
+EllipsisType = type(Ellipsis)
+NoneType = type(None)
+NotImplementedType = type(NotImplemented)
 
 def __getattr__(name):
-    # CPython 3.13 exposes CapsuleType lazily (its types.py pulls the type
-    # from `_socket.CAPI`); WeavePy sources it from `_datetime.datetime_CAPI`.
     if name == 'CapsuleType':
+        # WeavePy adaptation: no `_socket.CAPI` capsule exists yet, but the
+        # `_datetime` stand-in exposes a capsule of the same (unique) type.
         import _datetime
-
         return type(_datetime.datetime_CAPI)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
-
+__all__ = [n for n in globals() if n[:1] != '_']
 __all__ += ['CapsuleType']
-
-
-# Cleanup helper names so the module's public surface stays clean.
-del _f, _g, _c, _ag, _a, _C, _coro, _safe_type, _sys

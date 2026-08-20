@@ -8,7 +8,10 @@ Python shim so that ``import nt`` works for code (notably ``shutil`` and
 ``posix`` shim used on POSIX hosts.
 """
 
-import os as _os
+# The native surface under its internal alias, *not* `import os`: a
+# fresh source import of `os.py` runs `from nt import *` while the
+# `os` entry in sys.modules is still half-initialized.
+import _weave_posix as _os
 import sys as _sys
 
 # CPython only builds the ``nt`` module on Windows; on POSIX hosts
@@ -25,6 +28,26 @@ for _name in dir(_os):
         continue
     globals()[_name] = getattr(_os, _name)
     _names.append(_name)
+
+# `os.py` re-imports `_exit` explicitly (`from nt import _exit`); the
+# underscore loop above skipped it.
+_exit = _os._exit
+
+# The importlib bootstrap (`import nt as _os` → `_os._path_splitroot(...)`
+# in `_path_join`/`_path_isabs`), `ntpath`'s fast paths, and
+# `shutil.disk_usage` call CPython's private NT helpers directly on this
+# module; the underscore loop above skipped them, so re-export whichever
+# ones the native module provides.
+for _name in (
+    "_path_splitroot",
+    "_path_splitroot_ex",
+    "_getfullpathname",
+    "_getfinalpathname",
+    "_getvolumepathname",
+    "_getdiskusage",
+):
+    if hasattr(_os, _name):
+        globals()[_name] = getattr(_os, _name)
 
 
 # Access-mode constants (also exposed by ``os``; kept here so ``from nt import
@@ -58,8 +81,11 @@ def _supports_virtual_terminal():
     return False
 
 
-def _getdiskusage(path):
-    raise OSError("nt._getdiskusage is not implemented on this build of WeavePy")
+if "_getdiskusage" not in globals():
+    def _getdiskusage(path):
+        raise OSError(
+            "nt._getdiskusage is not implemented on this build of WeavePy"
+        )
 
 
 def getenv(key, default=None):

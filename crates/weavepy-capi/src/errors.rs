@@ -183,6 +183,13 @@ pub fn pending() -> Option<PendingError> {
     Some(PendingError { ty, value })
 }
 
+/// Is an exception currently pending on this thread? (Non-consuming;
+/// the C `PyErr_Occurred()` truth test.)
+pub fn has_pending() -> bool {
+    let slot = crate::pystate::current_exception_slot();
+    !unsafe { *slot }.is_null()
+}
+
 /// Take the pending exception out of the cell, transferring the slot's
 /// owned reference out.
 pub fn take_pending() -> Option<PendingError> {
@@ -205,6 +212,22 @@ pub fn take_pending() -> Option<PendingError> {
 /// [`RuntimeError`] suitable for returning from VM-facing trampolines.
 pub fn take_pending_error_runtime() -> Option<RuntimeError> {
     take_pending().map(to_runtime_error)
+}
+
+/// Replace the pending exception with a `SystemError` chained to it via
+/// `__cause__` — CPython's `_PyErr_FormatFromCause` shape, used when an
+/// extension init/create/exec hook "raised unreported exception"
+/// (extension.test_loader asserts `exception.__cause__` is set).
+pub fn set_pending_system_error_from_cause(message: String) {
+    let cause = take_pending().and_then(|p| match to_runtime_error(p) {
+        RuntimeError::PyException(pe) => Some(pe.instance),
+        _ => None,
+    });
+    let value = weavepy_vm::builtin_types::make_exception("SystemError", message);
+    if let (Some(c), Object::Instance(inst)) = (&cause, &value) {
+        inst.slot_set("__cause__", c.clone());
+    }
+    set_pending(Some(builtin_types().system_error.clone()), value);
 }
 
 /// Convert a [`PendingError`] to a [`RuntimeError`] suitable for

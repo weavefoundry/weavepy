@@ -139,8 +139,10 @@ struct CacheEntry {
     /// bumping [`JitState::compile_gen`].
     native: Option<(u64, StdRc<NativeTable>)>,
     /// Keeps the code object alive so its address can't be reused while
-    /// this entry (and any compiled pointer keyed by it) is live.
-    _code: Rc<CodeObject>,
+    /// this entry (and any compiled pointer keyed by it) is live. Also
+    /// read by [`evict_dead_entries`]: strong_count == 1 means the JIT
+    /// is the sole owner and the entry is evictable.
+    code: Rc<CodeObject>,
 }
 
 /// Give up on OSR for a code object after this many failed validations.
@@ -262,7 +264,7 @@ impl JitState {
                 osr_failures: 0,
                 deopts: 0,
                 native: None,
-                _code: code.clone(),
+                code: code.clone(),
             });
             match &entry.tier {
                 Tier::Compiled(cf, snap, callees, attrs) => {
@@ -472,7 +474,7 @@ impl JitState {
             osr_failures: 0,
             deopts: 0,
             native: None,
-            _code: code.clone(),
+            code: code.clone(),
         });
         match entry.tier {
             Tier::Cold => {
@@ -795,6 +797,49 @@ fn attr_fingerprint(
     let (_, v) = dict.get_index(key_idx as usize)?;
     let lane = scalar_lane(v)?;
     Some((lane, type_id, ver, key_idx, inst.cls()))
+}
+
+/// RFC 0068 — drop tier-cache and ret-lane entries whose code object
+/// the JIT is the *sole* owner of (`Rc::strong_count == 1`). The cache
+/// pins code objects so pointer keys stay valid, which would otherwise
+/// make every executed code object immortal (observable through
+/// `weakref` on `__code__`). Called from `gc.collect()`. Eviction is
+/// always safe: a live code object re-enters the cache through the
+/// normal hot path. Runs to a fixpoint because an evicted entry can
+/// release the last strong reference to another cached code object
+/// (e.g. a nested function's code held via `co_consts`).
+pub(crate) fn gc_sweep() {
+    loop {
+        let mut removed = false;
+        JIT.with(|cell| {
+            let mut st = cell.borrow_mut();
+            let dead: Vec<*const CodeObject> = st
+                .cache
+                .iter()
+                .filter(|(_, e)| Rc::strong_count(&e.code) == 1)
+                .map(|(k, _)| *k)
+                .collect();
+            for k in dead {
+                st.cache.remove(&k);
+                removed = true;
+            }
+        });
+        RET_LANE_CACHE.with(|c| {
+            let mut m = c.borrow_mut();
+            let dead: Vec<*const CodeObject> = m
+                .iter()
+                .filter(|(_, (_, code))| Rc::strong_count(code) == 1)
+                .map(|(k, _)| *k)
+                .collect();
+            for k in dead {
+                m.remove(&k);
+                removed = true;
+            }
+        });
+        if !removed {
+            break;
+        }
+    }
 }
 
 /// Bump the back-edge hot counter for a code object. Returns `true`
@@ -1349,6 +1394,7 @@ fn finish_deopted_callee(
         py_frame: None,
         gen_owner: None,
         cleanup_lasti: None,
+        pending_lasti: None,
         suppress_call_event: true,
         gen_first_resume: false,
         shell_cache: None,
@@ -2072,12 +2118,18 @@ fn rebuild_stack(
     // callee spans open at the deopt pc (strictly between the erased
     // LOAD_GLOBAL and its CALL) and `len` spans likewise (their
     // `live_to` is already past the CALL).
-    let mut inserts: Vec<(u32, Object)> = cf
+    // RFC 0068 — every erased callee load is immediately followed by a
+    // PUSH_NULL in the self-or-null calling convention, so each open
+    // span reinserts the callee *and* the `Unbound` marker above it.
+    let mut inserts: Vec<(u32, Object)> = Vec::new();
+    for s in cf
         .callee_spans
         .iter()
         .filter(|s| s.live_from < jf.deopt_pc && jf.deopt_pc < s.live_to)
-        .map(|s| (s.interp_depth, entry.callees[s.token as usize].0.clone()))
-        .collect();
+    {
+        inserts.push((s.interp_depth, entry.callees[s.token as usize].0.clone()));
+        inserts.push((s.interp_depth + 1, Object::Unbound));
+    }
     if !cf.len_spans.is_empty() {
         let len_obj = entry
             .guard_snapshot
@@ -2090,6 +2142,7 @@ fn rebuild_stack(
             .filter(|s| s.live_from < jf.deopt_pc && jf.deopt_pc < s.live_to)
         {
             inserts.push((s.interp_depth, len_obj.clone().unwrap_or(Object::None)));
+            inserts.push((s.interp_depth + 1, Object::Unbound));
         }
     }
     inserts.sort_unstable_by_key(|(depth, _)| *depth);
@@ -2108,7 +2161,8 @@ fn rebuild_stack(
             next += 1;
         }
         let mut v = unpack_pins(spill[i], tags[i], pins);
-        if bound_recv.contains(&(i as u32)) {
+        let rebound = bound_recv.contains(&(i as u32));
+        if rebound {
             // The receiver of an open `.append` span: what the
             // interpreter holds here is the *bound method*. `list`
             // always has `append`, so the load cannot fail; `None` is
@@ -2118,6 +2172,11 @@ fn rebuild_stack(
                 .unwrap_or(Object::None);
         }
         frame.stack.push(v);
+        if rebound {
+            // RFC 0068 — LOAD_ATTR in method form leaves the
+            // self-or-null `Unbound` marker above the bound method.
+            frame.stack.push(Object::Unbound);
+        }
     }
     while next < inserts.len() {
         frame.stack.push(inserts[next].1.clone());

@@ -459,6 +459,15 @@ try:
     itemgetter.__call__ = _itemgetter_call
     methodcaller.__call__ = _methodcaller_call
     del _attrgetter_call, _itemgetter_call, _methodcaller_call
+
+    # Tag the spliced natives as method descriptors (CPython's
+    # `attrgetter.__call__` is a `method_descriptor`): gives them the
+    # type-level `__get__` that `inspect.signature` binds through, so
+    # `signature(attrgetter('a'))` reports `(obj, /)`.
+    from _operator import _register_call_descriptors
+
+    _register_call_descriptors(attrgetter, itemgetter, methodcaller)
+    del _register_call_descriptors
 except ImportError:
     pass
 

@@ -254,8 +254,12 @@ fn l_setlocale(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
-/// CPython's `copy_grouping`: the lconv grouping byte string becomes a list
-/// of ints, keeping a trailing `CHAR_MAX` terminator and stopping there.
+/// CPython's `copy_grouping` (`_localemodule.c`): the lconv grouping byte
+/// string becomes a list of ints *including* the terminator element — a
+/// trailing `CHAR_MAX` stays, and a string ending at NUL contributes a
+/// final `0` (locale.py's "repeat the last group ad infinitum" marker;
+/// dropping it makes `format_string("%i", 10**6, grouping=True)` stop
+/// after one group — test_locale's test_complex_formatting).
 #[cfg(unix)]
 fn copy_grouping(ptr: *const libc::c_char) -> Object {
     if ptr.is_null() {
@@ -263,13 +267,18 @@ fn copy_grouping(ptr: *const libc::c_char) -> Object {
     }
     // SAFETY: lconv grouping fields are NUL-terminated byte strings.
     let bytes = unsafe { CStr::from_ptr(ptr) }.to_bytes();
+    if bytes.is_empty() {
+        // Empty string: no grouping at all.
+        return Object::new_list(vec![]);
+    }
     let mut out = Vec::new();
     for &b in bytes {
         out.push(Object::Int(i64::from(b)));
         if i64::from(b) == CHAR_MAX {
-            break;
+            return Object::new_list(out);
         }
     }
+    out.push(Object::Int(0));
     Object::new_list(out)
 }
 
@@ -331,10 +340,25 @@ fn arg_str(args: &[Object], idx: usize, fname: &str) -> Result<String, RuntimeEr
     }
 }
 
+/// `PyUnicode_AsWideCharString(s, NULL)` rejects embedded NULs — the
+/// wide-char collation entry points take NUL-terminated strings, so a
+/// `'\0'` inside the text would silently truncate (test_locale's
+/// test_strcoll/test_strxfrm assert the ValueError).
+fn reject_embedded_nul(s: &str) -> Result<(), RuntimeError> {
+    if s.contains('\0') {
+        return Err(value_error("embedded null character"));
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn l_strcoll(args: &[Object]) -> Result<Object, RuntimeError> {
-    let a = to_wide(&arg_str(args, 0, "strcoll")?);
-    let b = to_wide(&arg_str(args, 1, "strcoll")?);
+    let sa = arg_str(args, 0, "strcoll")?;
+    let sb = arg_str(args, 1, "strcoll")?;
+    reject_embedded_nul(&sa)?;
+    reject_embedded_nul(&sb)?;
+    let a = to_wide(&sa);
+    let b = to_wide(&sb);
     // SAFETY: both buffers are NUL-terminated wide strings.
     let r = unsafe { wcscoll(a.as_ptr(), b.as_ptr()) };
     Ok(Object::Int(i64::from(r)))
@@ -343,6 +367,7 @@ fn l_strcoll(args: &[Object]) -> Result<Object, RuntimeError> {
 #[cfg(unix)]
 fn l_strxfrm(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = arg_str(args, 0, "strxfrm")?;
+    reject_embedded_nul(&s)?;
     let src = to_wide(&s);
     // SAFETY: sizing call with a NULL destination, then a copy into a
     // buffer of the reported length (+1 for the terminator).
@@ -538,6 +563,8 @@ fn l_localeconv(_args: &[Object]) -> Result<Object, RuntimeError> {
 fn l_strcoll(args: &[Object]) -> Result<Object, RuntimeError> {
     let a = arg_str(args, 0, "strcoll")?;
     let b = arg_str(args, 1, "strcoll")?;
+    reject_embedded_nul(&a)?;
+    reject_embedded_nul(&b)?;
     use std::cmp::Ordering;
     Ok(Object::Int(match a.cmp(&b) {
         Ordering::Less => -1,
@@ -548,5 +575,7 @@ fn l_strcoll(args: &[Object]) -> Result<Object, RuntimeError> {
 
 #[cfg(not(unix))]
 fn l_strxfrm(args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::from_str(arg_str(args, 0, "strxfrm")?))
+    let s = arg_str(args, 0, "strxfrm")?;
+    reject_embedded_nul(&s)?;
+    Ok(Object::from_str(s))
 }

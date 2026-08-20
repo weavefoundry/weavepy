@@ -187,6 +187,13 @@ extern int _WeavePy_Kwargs_Len(PyObject *kwargs);
 extern const char *_WeavePy_Kwargs_KeyAt(PyObject *kwargs, int i);
 extern void _WeavePy_Arg_Tether(PyObject *owner, PyObject *arg);
 
+/* Defined in wave4.rs / strings.rs; the local single-header Python.h
+ * doesn't declare these. */
+extern PyObject *PySys_GetObject(const char *name);
+extern PyObject *PyUnicode_DecodeUTF8(const char *s, Py_ssize_t size,
+                                      const char *errors);
+extern PyTypeObject PyType_Type;
+
 extern PyObject *_WeavePy_Build_None(void);
 extern PyObject *_WeavePy_Build_FromI64(long long v);
 extern PyObject *_WeavePy_Build_FromU64(unsigned long long v);
@@ -1394,10 +1401,13 @@ static int weavepy_format_into(char *buf, size_t bufsize, const char *fmt, va_li
             p++;
             continue;
         }
-        /* flags */
+        /* flags — CPython accepts '-' (left-justify), '0' (zero-pad) and
+         * '#' (the %#T / %#N separator); anything else ('+', ' ') lands
+         * on the conversion switch and raises SystemError below
+         * (test_from_format "%+i"). */
         char flags[8];
         int nf = 0;
-        while (*p && strchr("-+ 0#", *p)) {
+        while (*p && strchr("-0#", *p)) {
             if (nf < 7) flags[nf++] = *p;
             p++;
         }
@@ -1445,9 +1455,12 @@ static int weavepy_format_into(char *buf, size_t bufsize, const char *fmt, va_li
         length[nl] = '\0';
         char conv = *p;
         if (conv == '\0') {
-            /* dangling '%': emit verbatim. */
-            wpy_append(buf, bufsize, &pos, start, (size_t)(p - start));
-            break;
+            /* Dangling '%' (or trailing width/precision/length):
+             * CPython raises SystemError (test_from_format "%", "%0",
+             * "%.", "%l", ...). */
+            PyErr_Format(PyExc_SystemError, "invalid format string: %s",
+                         start);
+            return -2;
         }
         p++;
 
@@ -1455,30 +1468,105 @@ static int weavepy_format_into(char *buf, size_t bufsize, const char *fmt, va_li
          * width/precision by reformatting the resulting C string with a
          * synthesised `%[flags][width][.prec]s` directive. */
         if (conv == 'S' || conv == 'R' || conv == 'A' || conv == 'U' ||
-            conv == 'V' || conv == 'T') {
+            conv == 'V' || conv == 'T' || conv == 'N') {
             int wv = 0, pv = 0;
             if (width_star) wv = va_arg(ap, int);
             if (prec_star) pv = va_arg(ap, int);
             PyObject *owned = NULL;
             const char *cs = NULL;
+            /* A %V that fell back to its C string behaves like %s:
+             * precision counts *bytes* of the raw UTF-8 (decoded with
+             * "replace" at the end), not code points. */
+            int cs_is_cstr = 0;
+            char wtmp[8192];
             if (conv == 'V') {
                 PyObject *o = va_arg(ap, PyObject *);
-                const char *fb = va_arg(ap, const char *);
-                if (o) {
-                    owned = PyObject_Str(o);
-                    cs = owned ? PyUnicode_AsUTF8(owned) : fb;
+                if (nl >= 1 && length[0] == 'l') {
+                    /* %lV — the fallback is a wchar_t* (CPython's
+                     * longflag → PyUnicode_FromWideChar); precision
+                     * counts code points like %ls. */
+                    const wchar_t *wfb = va_arg(ap, const wchar_t *);
+                    if (o) {
+                        owned = PyObject_Str(o);
+                        cs = owned ? PyUnicode_AsUTF8(owned) : NULL;
+                    } else if (wfb != NULL) {
+                        size_t tn = 0;
+                        for (const wchar_t *w = wfb;
+                             *w && tn + 4 < sizeof(wtmp); w++) {
+                            unsigned int cp = (unsigned int)*w;
+                            if (cp < 0x80) {
+                                wtmp[tn++] = (char)cp;
+                            } else if (cp < 0x800) {
+                                wtmp[tn++] = (char)(0xC0 | (cp >> 6));
+                                wtmp[tn++] = (char)(0x80 | (cp & 0x3F));
+                            } else if (cp < 0x10000) {
+                                wtmp[tn++] = (char)(0xE0 | (cp >> 12));
+                                wtmp[tn++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                                wtmp[tn++] = (char)(0x80 | (cp & 0x3F));
+                            } else {
+                                wtmp[tn++] = (char)(0xF0 | (cp >> 18));
+                                wtmp[tn++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+                                wtmp[tn++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                                wtmp[tn++] = (char)(0x80 | (cp & 0x3F));
+                            }
+                        }
+                        wtmp[tn] = '\0';
+                        cs = wtmp;
+                    }
                 } else {
-                    cs = fb;
+                    const char *fb = va_arg(ap, const char *);
+                    if (o) {
+                        owned = PyObject_Str(o);
+                        cs = owned ? PyUnicode_AsUTF8(owned) : fb;
+                    } else {
+                        cs = fb;
+                        cs_is_cstr = 1;
+                    }
                 }
-            } else if (conv == 'T') {
-                /* PyType_GetName returns a str *object* (3.11+); keep it
-                 * alive in `owned` while we borrow its UTF-8 buffer. */
+            } else if (conv == 'T' || conv == 'N') {
+                /* %T — the fully-qualified name of the argument's type;
+                 * %N — same, but the argument *is* the type. The name is
+                 * module.qualname with a "builtins" module omitted, and
+                 * ':' instead of '.' under the '#' flag (CPython 3.13's
+                 * _PyType_GetFullyQualifiedName). */
                 PyObject *o = va_arg(ap, PyObject *);
-                if (o) {
-                    owned = PyType_GetName(Py_TYPE(o));
-                    cs = owned ? PyUnicode_AsUTF8(owned) : "NULL";
+                PyObject *t = NULL;
+                if (conv == 'N') {
+                    int is_type =
+                        o ? PyObject_IsInstance(o, (PyObject *)&PyType_Type)
+                          : 0;
+                    if (is_type <= 0) {
+                        PyErr_Clear();
+                        PyErr_SetString(PyExc_TypeError,
+                                        "%N argument must be a type");
+                        return -2;
+                    }
+                    t = o;
                 } else {
+                    t = o ? (PyObject *)Py_TYPE(o) : NULL;
+                }
+                if (t == NULL) {
                     cs = "NULL";
+                } else {
+                    PyObject *mod = PyObject_GetAttrString(t, "__module__");
+                    PyObject *qual = PyObject_GetAttrString(t, "__qualname__");
+                    const char *mods = mod ? PyUnicode_AsUTF8(mod) : NULL;
+                    const char *quals = qual ? PyUnicode_AsUTF8(qual) : NULL;
+                    if (mods == NULL || quals == NULL) PyErr_Clear();
+                    if (quals == NULL) {
+                        owned = PyType_GetName((PyTypeObject *)t);
+                        cs = owned ? PyUnicode_AsUTF8(owned) : "NULL";
+                    } else if (mods == NULL || strcmp(mods, "builtins") == 0) {
+                        snprintf(wtmp, sizeof(wtmp), "%s", quals);
+                        cs = wtmp;
+                    } else {
+                        char sep = (strchr(flags, '#') != NULL) ? ':' : '.';
+                        snprintf(wtmp, sizeof(wtmp), "%s%c%s", mods, sep,
+                                 quals);
+                        cs = wtmp;
+                    }
+                    Py_XDECREF(mod);
+                    Py_XDECREF(qual);
                 }
             } else {
                 PyObject *o = va_arg(ap, PyObject *);
@@ -1498,24 +1586,47 @@ static int weavepy_format_into(char *buf, size_t bufsize, const char *fmt, va_li
                 }
             }
             if (cs == NULL) cs = "<error>";
-            /* Reformat with width/precision if either was requested. */
-            if (nf || nw || width_star || has_prec) {
-                char sspec[48];
-                if (width_star && prec_star) {
-                    snprintf(sspec, sizeof(sspec), "%%%s%d.%ds", flags, wv, pv);
-                } else if (width_star) {
-                    snprintf(sspec, sizeof(sspec), "%%%s%d%s%ss", flags, wv,
-                             has_prec ? "." : "", has_prec ? prec : "");
-                } else if (prec_star) {
-                    snprintf(sspec, sizeof(sspec), "%%%s%s.%ds", flags, width, pv);
-                } else {
-                    snprintf(sspec, sizeof(sspec), "%%%s%s%s%ss", flags, width,
-                             has_prec ? "." : "", has_prec ? prec : "");
+            /* Width and precision count *code points*, not bytes (CPython
+             * measures the unicode result — "%.3R" of '\u20acABCDEF' is
+             * "'\u20acA", test_from_format), so truncate and pad along
+             * UTF-8 character boundaries. */
+            {
+                size_t cs_len = strlen(cs);
+                if (has_prec) {
+                    int limit = prec_star ? pv : atoi(prec);
+                    if (limit < 0) limit = 0;
+                    if (cs_is_cstr) {
+                        if ((size_t)limit < cs_len) cs_len = (size_t)limit;
+                    } else {
+                        size_t i = 0;
+                        int count = 0;
+                        while (i < cs_len && count < limit) {
+                            i++;
+                            while (i < cs_len &&
+                                   ((unsigned char)cs[i] & 0xC0) == 0x80) {
+                                i++;
+                            }
+                            count++;
+                        }
+                        cs_len = i;
+                    }
                 }
-                int n = snprintf(tmp, sizeof(tmp), sspec, cs);
-                if (n > 0) wpy_append(buf, bufsize, &pos, tmp, (size_t)n);
-            } else {
-                wpy_append(buf, bufsize, &pos, cs, strlen(cs));
+                int nchars = 0;
+                for (size_t i = 0; i < cs_len; i++) {
+                    if (((unsigned char)cs[i] & 0xC0) != 0x80) nchars++;
+                }
+                int want = width_star ? wv : (nw ? atoi(width) : 0);
+                int padn = want > nchars ? want - nchars : 0;
+                int left_align = (strchr(flags, '-') != NULL);
+                if (!left_align) {
+                    for (int k = 0; k < padn; k++)
+                        wpy_append(buf, bufsize, &pos, " ", 1);
+                }
+                wpy_append(buf, bufsize, &pos, cs, cs_len);
+                if (left_align) {
+                    for (int k = 0; k < padn; k++)
+                        wpy_append(buf, bufsize, &pos, " ", 1);
+                }
             }
             Py_XDECREF(owned);
             continue;
@@ -1587,7 +1698,33 @@ static int weavepy_format_into(char *buf, size_t bufsize, const char *fmt, va_li
                 break;
             }
             case 'c': {
-                WPY_SNPRINTF(va_arg(ap, int));
+                /* CPython's %c takes a Unicode ordinal, not a C char:
+                 * range-check against MAX_UNICODE and splice the UTF-8
+                 * encoding in (test_from_format checks U+ABCD and
+                 * U+10FFFF, and OverflowError past the range). */
+                int ordinal = va_arg(ap, int);
+                if (ordinal < 0 || ordinal > 0x10FFFF) {
+                    PyErr_SetString(PyExc_OverflowError,
+                                    "character argument not in range(0x110000)");
+                    return -2;
+                }
+                unsigned int cp = (unsigned int)ordinal;
+                n = 0;
+                if (cp < 0x80) {
+                    tmp[n++] = (char)cp;
+                } else if (cp < 0x800) {
+                    tmp[n++] = (char)(0xC0 | (cp >> 6));
+                    tmp[n++] = (char)(0x80 | (cp & 0x3F));
+                } else if (cp < 0x10000) {
+                    tmp[n++] = (char)(0xE0 | (cp >> 12));
+                    tmp[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                    tmp[n++] = (char)(0x80 | (cp & 0x3F));
+                } else {
+                    tmp[n++] = (char)(0xF0 | (cp >> 18));
+                    tmp[n++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+                    tmp[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                    tmp[n++] = (char)(0x80 | (cp & 0x3F));
+                }
                 break;
             }
             case 'e':
@@ -1600,7 +1737,61 @@ static int weavepy_format_into(char *buf, size_t bufsize, const char *fmt, va_li
                 break;
             }
             case 's': {
-                WPY_SNPRINTF(va_arg(ap, const char *));
+                if (is_ll || is_z || is_j || is_t) {
+                    /* Only the wide 'l' modifier is valid on %s
+                     * (test_from_format "%lls", "%zs"). */
+                    PyErr_Format(PyExc_SystemError,
+                                 "invalid format string: %s", start);
+                    return -2;
+                }
+                if (is_l) {
+                    /* %ls — a wchar_t* argument (CPython's longflag):
+                     * precision counts wide chars, width pads by code
+                     * points (test_from_format "%5ls"). wchar_t is
+                     * UTF-32 on unix. */
+                    const wchar_t *ws = va_arg(ap, const wchar_t *);
+                    if (ws == NULL) ws = L"";
+                    int limit = -1;
+                    if (has_prec) limit = prec_star ? pv : atoi(prec);
+                    size_t tn = 0;
+                    int nchars = 0;
+                    for (const wchar_t *w = ws;
+                         *w && (limit < 0 || nchars < limit) &&
+                         tn + 4 < sizeof(tmp);
+                         w++, nchars++) {
+                        unsigned int cp = (unsigned int)*w;
+                        if (cp < 0x80) {
+                            tmp[tn++] = (char)cp;
+                        } else if (cp < 0x800) {
+                            tmp[tn++] = (char)(0xC0 | (cp >> 6));
+                            tmp[tn++] = (char)(0x80 | (cp & 0x3F));
+                        } else if (cp < 0x10000) {
+                            tmp[tn++] = (char)(0xE0 | (cp >> 12));
+                            tmp[tn++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                            tmp[tn++] = (char)(0x80 | (cp & 0x3F));
+                        } else {
+                            tmp[tn++] = (char)(0xF0 | (cp >> 18));
+                            tmp[tn++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+                            tmp[tn++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                            tmp[tn++] = (char)(0x80 | (cp & 0x3F));
+                        }
+                    }
+                    int want = width_star ? wv : (nw ? atoi(width) : 0);
+                    int padn = want > nchars ? want - nchars : 0;
+                    int left_align = (strchr(flags, '-') != NULL);
+                    if (!left_align) {
+                        for (int k = 0; k < padn; k++)
+                            wpy_append(buf, bufsize, &pos, " ", 1);
+                    }
+                    wpy_append(buf, bufsize, &pos, tmp, tn);
+                    if (left_align) {
+                        for (int k = 0; k < padn; k++)
+                            wpy_append(buf, bufsize, &pos, " ", 1);
+                    }
+                    n = 0; /* already appended */
+                } else {
+                    WPY_SNPRINTF(va_arg(ap, const char *));
+                }
                 break;
             }
             case 'p': {
@@ -1608,13 +1799,37 @@ static int weavepy_format_into(char *buf, size_t bufsize, const char *fmt, va_li
                 break;
             }
             default: {
-                /* Unknown spec: emit verbatim, consume nothing. */
-                wpy_append(buf, bufsize, &pos, start, (size_t)(p - start));
-                n = -1;
-                break;
+                /* Unknown conversion (including '%' after flags/width,
+                 * "%+i", "%1abc"): SystemError, like CPython. */
+                PyErr_Format(PyExc_SystemError, "invalid format string: %s",
+                             start);
+                return -2;
             }
         }
 #undef WPY_SNPRINTF
+        /* CPython zero-pads a numeric conversion to *width* even when a
+         * precision is present ("%010.7i" of 123 is "0000000123"); C's
+         * printf switches to space padding there, so re-pad by hand. */
+        if (n > 0 && has_prec && strchr(flags, '0') != NULL &&
+            (conv == 'd' || conv == 'i' || conv == 'u' || conv == 'o' ||
+             conv == 'x' || conv == 'X')) {
+            int want = width_star ? wv : (nw ? atoi(width) : 0);
+            int lead = 0;
+            while (lead < n && tmp[lead] == ' ') lead++;
+            int body = n - lead;
+            if (want > body && lead > 0) {
+                int sign = (tmp[lead] == '-' || tmp[lead] == '+') ? 1 : 0;
+                if (sign) {
+                    wpy_append(buf, bufsize, &pos, tmp + lead, 1);
+                    lead++;
+                    body--;
+                }
+                for (int k = body; k < want - sign; k++)
+                    wpy_append(buf, bufsize, &pos, "0", 1);
+                wpy_append(buf, bufsize, &pos, tmp + lead, (size_t)body);
+                n = 0; /* consumed */
+            }
+        }
         if (n > 0) {
             wpy_append(buf, bufsize, &pos, tmp, (size_t)n);
         }
@@ -1623,12 +1838,31 @@ static int weavepy_format_into(char *buf, size_t bufsize, const char *fmt, va_li
 }
 
 PyObject *PyUnicode_FromFormatV(const char *fmt, va_list ap) {
+    /* CPython validates the format string up front: it must be pure
+     * ASCII (unicode_fromformat_arg rejects the first byte >= 0x80 with
+     * this exact ValueError — test_capi.test_unicode.test_from_format). */
+    for (const unsigned char *q = (const unsigned char *)fmt; *q; q++) {
+        if (*q >= 0x80) {
+            PyErr_Format(PyExc_ValueError,
+                         "PyUnicode_FromFormatV() expects an ASCII-encoded "
+                         "format string, got a non-ASCII byte: 0x%02x",
+                         (int)*q);
+            return NULL;
+        }
+    }
     char buf[8192];
     int n = weavepy_format_into(buf, sizeof(buf), fmt, ap);
+    if (n == -2) {
+        /* A directive raised (e.g. %c ordinal out of range). */
+        return NULL;
+    }
     if (n < 0) {
         return _WeavePy_Build_None();
     }
-    return _WeavePy_Build_FromStringAndSize(buf, (Py_ssize_t)n);
+    /* CPython decodes %s splices with errors="replace"
+     * (unicode_fromformat_arg), so a precision-truncated UTF-8 sequence
+     * becomes U+FFFD instead of raising (test_from_format "%.5s"). */
+    return PyUnicode_DecodeUTF8(buf, (Py_ssize_t)n, "replace");
 }
 
 PyObject *PyUnicode_FromFormat(const char *fmt, ...) {
@@ -1640,8 +1874,25 @@ PyObject *PyUnicode_FromFormat(const char *fmt, ...) {
 }
 
 PyObject *PyErr_FormatV(PyObject *ty, const char *fmt, va_list ap) {
+    /* CPython routes through PyUnicode_FromFormatV: a non-ASCII format
+     * string raises ValueError, and a directive that raises (e.g. %c
+     * ordinal out of range -> OverflowError) leaves *that* exception
+     * set instead of `ty` (test_capi.test_exceptions test_format). */
+    for (const unsigned char *q = (const unsigned char *)fmt; *q; q++) {
+        if (*q >= 0x80) {
+            PyErr_Format(PyExc_ValueError,
+                         "PyUnicode_FromFormatV() expects an ASCII-encoded "
+                         "format string, got a non-ASCII byte: 0x%02x",
+                         (int)*q);
+            return NULL;
+        }
+    }
     char buf[4096];
     int n = weavepy_format_into(buf, sizeof(buf), fmt, ap);
+    if (n == -2) {
+        /* A directive raised; keep its exception. */
+        return NULL;
+    }
     if (n < 0) {
         _WeavePy_Format_Set(ty, "<format error>", 14);
     } else {
@@ -1656,6 +1907,89 @@ PyObject *PyErr_Format(PyObject *ty, const char *fmt, ...) {
     PyObject *r = PyErr_FormatV(ty, fmt, ap);
     va_end(ap);
     return r;
+}
+
+/* PySys_WriteStdout / PySys_WriteStderr / PySys_FormatStdout /
+ * PySys_FormatStderr — printf-formatted writes to the *Python-level*
+ * sys.stdout / sys.stderr (so `support.captured_output` sees them),
+ * falling back to the C stream when the attribute is missing or the
+ * write fails (test_capi.test_sys). The Write* pair mirrors CPython's
+ * `sys_write`: C vsnprintf into a 1001-byte buffer, with a literal
+ * "... truncated" tail on overflow. The Format* pair mirrors
+ * `sys_format`: the PyUnicode_FromFormatV grammar, unlimited length. */
+static void weavepy_sys_write_str(const char *name, FILE *fp, const char *text) {
+    PyObject *file = PySys_GetObject(name); /* borrowed */
+    if (file != NULL && file != Py_None) {
+        PyObject *res = PyObject_CallMethod(file, "write", "s", text);
+        if (res != NULL) {
+            Py_DECREF(res);
+            return;
+        }
+        PyErr_Clear();
+    }
+    fputs(text, fp);
+}
+
+static void weavepy_sys_write(const char *name, FILE *fp, const char *format, va_list va) {
+    char buffer[1001];
+    int written = vsnprintf(buffer, sizeof(buffer), format, va);
+    weavepy_sys_write_str(name, fp, buffer);
+    if (written < 0 || (size_t)written >= sizeof(buffer)) {
+        weavepy_sys_write_str(name, fp, "... truncated");
+    }
+}
+
+void PySys_WriteStdout(const char *format, ...) {
+    va_list va;
+    va_start(va, format);
+    weavepy_sys_write("stdout", stdout, format, va);
+    va_end(va);
+}
+
+void PySys_WriteStderr(const char *format, ...) {
+    va_list va;
+    va_start(va, format);
+    weavepy_sys_write("stderr", stderr, format, va);
+    va_end(va);
+}
+
+static void weavepy_sys_format(const char *name, FILE *fp, const char *format, va_list va) {
+    PyObject *text = PyUnicode_FromFormatV(format, va);
+    if (text == NULL) {
+        PyErr_Clear();
+        return;
+    }
+    PyObject *file = PySys_GetObject(name); /* borrowed */
+    if (file != NULL && file != Py_None) {
+        PyObject *res = PyObject_CallMethod(file, "write", "O", text);
+        if (res != NULL) {
+            Py_DECREF(res);
+            Py_DECREF(text);
+            return;
+        }
+        PyErr_Clear();
+    }
+    const char *cs = PyUnicode_AsUTF8(text);
+    if (cs != NULL) {
+        fputs(cs, fp);
+    } else {
+        PyErr_Clear();
+    }
+    Py_DECREF(text);
+}
+
+void PySys_FormatStdout(const char *format, ...) {
+    va_list va;
+    va_start(va, format);
+    weavepy_sys_format("stdout", stdout, format, va);
+    va_end(va);
+}
+
+void PySys_FormatStderr(const char *format, ...) {
+    va_list va;
+    va_start(va, format);
+    weavepy_sys_format("stderr", stderr, format, va);
+    va_end(va);
 }
 
 /* PyErr_FormatUnraisable (3.13) — report-and-swallow: CPython routes the

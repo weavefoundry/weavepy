@@ -67,6 +67,7 @@ static WATCHDOG_GEN: AtomicU64 = AtomicU64::new(0);
 struct RegisteredThread {
     ident: u64,
     frame_stack: crate::object::FrameStack,
+    exc_info_stack: Rc<RefCell<Vec<crate::error::PyException>>>,
 }
 
 /// Registration order == thread creation order; CPython's
@@ -75,12 +76,56 @@ struct RegisteredThread {
 static THREADS: Mutex<Vec<RegisteredThread>> = Mutex::new(Vec::new());
 
 /// Called (once per OS thread) by `vm_singletons::activate_thread_handles`.
-pub fn note_thread_start(ident: u64, frame_stack: crate::object::FrameStack) {
+pub fn note_thread_start(
+    ident: u64,
+    frame_stack: crate::object::FrameStack,
+    exc_info_stack: Rc<RefCell<Vec<crate::error::PyException>>>,
+) {
     let mut g = THREADS.lock().unwrap();
     if g.iter().any(|t| t.ident == ident) {
         return;
     }
-    g.push(RegisteredThread { ident, frame_stack });
+    g.push(RegisteredThread {
+        ident,
+        frame_stack,
+        exc_info_stack,
+    });
+}
+
+/// Snapshot of every registered thread's ident, frame stack, and
+/// exception stack — the walk behind `sys._current_frames()` /
+/// `sys._current_exceptions()`. Safe to materialize under the GIL:
+/// peer threads are parked, exactly as during a faulthandler dump.
+#[allow(clippy::type_complexity)]
+pub fn thread_snapshots() -> Vec<(
+    u64,
+    crate::object::FrameStack,
+    Rc<RefCell<Vec<crate::error::PyException>>>,
+)> {
+    THREADS
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|t| (t.ident, t.frame_stack.clone(), t.exc_info_stack.clone()))
+        .collect()
+}
+
+/// Fork child: only the forking thread survives (CPython's
+/// `PyOS_AfterFork_Child` runs `_PyThreadState_DeleteExcept`) — drop the
+/// vanished peers' entries so `sys._current_frames()` reports exactly
+/// one frame in the child (test_threading
+/// test_clear_threads_states_after_fork). `try_lock`: a peer that died
+/// mid-registration would leave the (copied) mutex held forever; peers
+/// only hold it for brief non-blocking spans, so a contended fork-time
+/// lock is vanishingly rare — skipping the purge then only leaves stale
+/// introspection entries, never a wedge.
+pub fn reinit_threads_after_fork_in_child(current: u64) {
+    let mut g = match THREADS.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return,
+    };
+    g.retain(|t| t.ident == current);
 }
 
 /// Called from the thread-local guard's `Drop` at OS-thread exit.
@@ -256,7 +301,11 @@ fn dump_ext_modules(out: &mut String) {
             continue;
         }
         let name = name.as_ref();
-        if !ctx.native_names.contains(&name) {
+        // The `_testcapi` family are C extensions in CPython (frozen
+        // Python shims here): the fatal banner must list them like
+        // extensions (test_capi.test_exceptions test_fatal_error).
+        let is_ext_shim = matches!(name, "_testcapi" | "_testlimitedcapi");
+        if !ctx.native_names.contains(&name) && !is_ext_shim {
             continue;
         }
         if stdlib_names.iter().any(|s| s == name) {

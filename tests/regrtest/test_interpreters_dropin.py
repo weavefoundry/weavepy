@@ -118,10 +118,12 @@ def test_concurrent_send_recv_across_interps():
     interp = create()
     try:
         # The sub imports _xxsubinterpreters and pulls from the
-        # channel using its integer id.
+        # channel using its integer id. Like CPython 3.13's
+        # `_interpchannels.recv`, the native call returns
+        # (obj, unboundop).
         interp.exec(
             'import _xxsubinterpreters as ssi; '
-            'v = ssi.channel_recv({})'.format(recv.id) +
+            'v, _ = ssi.channel_recv({})'.format(recv.id) +
             '; assert v == "from-main", v'
         )
         # Same channel id, opposite direction:
@@ -138,8 +140,13 @@ def test_concurrent_send_recv_across_interps():
 def test_with_statement_lifecycle():
     with create() as interp:
         interp.exec('x = 1')
-        assert_true(interp.is_running())
-    assert_true(not interp.is_running(), 'context manager destroyed the interp')
+        # CPython semantics: `is_running` reports an in-progress exec
+        # (an interpreter running its __main__), not liveness — an
+        # idle interpreter is not "running".
+        assert_true(not interp.is_running())
+        assert_true(interp.id in [x.id for x in list_all()])
+    assert_true(interp.id not in [x.id for x in list_all()],
+                'context manager destroyed the interp')
 
 
 def main():

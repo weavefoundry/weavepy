@@ -11,6 +11,12 @@ context"; a freshly started thread begins with an empty context (it
 does NOT inherit the spawning thread's values). We keep the per-thread
 state in a dict keyed by `_thread.get_ident()` — all mutations happen
 under the GIL, so plain dict operations are safe.
+
+Contexts map ContextVar objects (identity-hashed) to values, so
+iteration/keys/items yield the real variables like CPython's
+HAMT-backed Context. Tokens record the Context they were minted in;
+`reset` enforces CPython's full error taxonomy (RuntimeError for a
+reused token, ValueError for a foreign variable or Context).
 """
 
 __all__ = ["ContextVar", "Context", "Token", "copy_context"]
@@ -24,20 +30,38 @@ from types import GenericAlias as _GenericAlias
 
 _MISSING = object()
 
+# Py_ReprEnter stand-in for ContextVar.__repr__: a var whose *default*
+# reprs back to the var (e.g. a list containing it) renders as `...`
+# instead of recursing (test_context test_context_var_repr_1).
+_repr_running = set()
+
+
+def _no_subclassing(cls):
+    # The C types are final (no Py_TPFLAGS_BASETYPE); class statements
+    # deriving from them fail at creation (test_context
+    # test_context_subclassing_1).
+    raise TypeError(
+        f"type 'contextvars.{cls.__mro__[1].__name__}' "
+        "is not an acceptable base type")
+
 
 class Token:
     """Returned by `ContextVar.set`; used to restore the previous value."""
 
     MISSING = _MISSING
 
-    __slots__ = ("_var", "_old", "_used")
+    __slots__ = ("_var", "_old", "_used", "_ctx", "__weakref__")
 
     __class_getitem__ = classmethod(_GenericAlias)
 
-    def __init__(self, var, old):
+    def __init_subclass__(cls, **kwargs):
+        _no_subclassing(cls)
+
+    def __init__(self, var, old, ctx):
         self._var = var
         self._old = old
         self._used = False
+        self._ctx = ctx
 
     @property
     def var(self):
@@ -48,34 +72,45 @@ class Token:
         return self._old
 
     def __repr__(self):
-        return f"<Token var={self._var!r}>"
+        used = " used" if self._used else ""
+        return f"<Token{used} var={self._var!r} at {id(self):#x}>"
 
 
 class ContextVar:
     """A variable whose value depends on the active `Context`."""
 
-    __slots__ = ("_name", "_default", "_id")
+    __slots__ = ("_name", "_default", "__weakref__")
 
     __class_getitem__ = classmethod(_GenericAlias)
 
-    _counter = 0
+    def __init_subclass__(cls, **kwargs):
+        _no_subclassing(cls)
 
-    def __init__(self, name, *, default=_MISSING):
+    def __init__(self, *args, default=_MISSING):
+        if len(args) != 1:
+            raise TypeError(
+                "ContextVar() takes exactly 1 positional argument "
+                f"({len(args)} given)")
+        name = args[0]
         if not isinstance(name, str):
-            raise TypeError("ContextVar name must be a str")
+            raise TypeError("context variable name must be a str")
+        # The C type interns the name in a hash-keyed cache slot; an
+        # unhashable str subclass fails *here*, not later (gh-132002).
+        hash(name)
         self._name = name
         self._default = default
-        ContextVar._counter += 1
-        self._id = ContextVar._counter
 
     @property
     def name(self):
         return self._name
 
     def get(self, *args):
-        ctx = _current_context()
-        if self._id in ctx._data:
-            return ctx._data[self._id]
+        if len(args) > 1:
+            raise TypeError(
+                f"get() takes at most 1 argument ({len(args)} given)")
+        data = _current_context()._data
+        if self in data:
+            return data[self]
         if args:
             return args[0]
         if self._default is not _MISSING:
@@ -84,28 +119,38 @@ class ContextVar:
 
     def set(self, value):
         ctx = _current_context()
-        old = ctx._data.get(self._id, _MISSING)
-        ctx._data[self._id] = value
-        return Token(self, old)
+        old = ctx._data.get(self, _MISSING)
+        ctx._data[self] = value
+        return Token(self, old, ctx)
 
     def reset(self, token):
         if not isinstance(token, Token):
-            raise TypeError("not a Token")
+            raise TypeError("expected an instance of Token")
         if token._used:
-            raise ValueError("Token already used")
+            raise RuntimeError(f"{token!r} has already been used once")
         if token._var is not self:
-            raise ValueError("Token belongs to a different ContextVar")
+            raise ValueError(f"{token!r} was created by a different ContextVar")
         ctx = _current_context()
+        if token._ctx is not ctx:
+            raise ValueError(f"{token!r} was created in a different Context")
         token._used = True
         if token._old is _MISSING:
-            ctx._data.pop(self._id, None)
+            ctx._data.pop(self, None)
         else:
-            ctx._data[self._id] = token._old
+            ctx._data[self] = token._old
 
     def __repr__(self):
-        if self._default is _MISSING:
-            return f"<ContextVar name={self._name!r}>"
-        return f"<ContextVar name={self._name!r} default={self._default!r}>"
+        key = id(self)
+        if key in _repr_running:
+            return "..."
+        r = f"<ContextVar name={self._name!r}"
+        if self._default is not _MISSING:
+            _repr_running.add(key)
+            try:
+                r += f" default={self._default!r}"
+            finally:
+                _repr_running.discard(key)
+        return r + f" at {id(self):#x}>"
 
 
 class Context:
@@ -113,11 +158,16 @@ class Context:
 
     __slots__ = ("_data", "_entered")
 
-    def __init__(self):
+    def __init_subclass__(cls, **kwargs):
+        _no_subclassing(cls)
+
+    def __init__(self, *args, **kwargs):
+        if args or kwargs:
+            raise TypeError("Context() does not accept any arguments")
         self._data = {}
         self._entered = False
 
-    def run(self, callable_, *args, **kwargs):
+    def run(self, callable_, /, *args, **kwargs):
         if self._entered:
             raise RuntimeError(
                 f"cannot enter context: {self!r} is already entered")
@@ -139,55 +189,53 @@ class Context:
         new._data = dict(self._data)
         return new
 
-    def __contains__(self, var):
+    @staticmethod
+    def _check_key(var):
         if not isinstance(var, ContextVar):
-            return False
-        return var._id in self._data
+            raise TypeError(f"a ContextVar key was expected, got {var!r}")
+
+    def __contains__(self, var):
+        self._check_key(var)
+        return var in self._data
 
     def __getitem__(self, var):
-        if not isinstance(var, ContextVar):
-            raise TypeError("expected ContextVar")
-        if var._id not in self._data:
-            raise KeyError(var)
-        return self._data[var._id]
+        self._check_key(var)
+        return self._data[var]
 
     def get(self, var, default=None):
-        if not isinstance(var, ContextVar):
-            raise TypeError("expected ContextVar")
-        return self._data.get(var._id, default)
+        self._check_key(var)
+        return self._data.get(var, default)
+
+    def __eq__(self, other):
+        if not isinstance(other, Context):
+            return NotImplemented
+        return self._data == other._data
+
+    # Unhashable, like the C type (it defines tp_richcompare without
+    # tp_hash inheritance).
+    __hash__ = None
 
     def __iter__(self):
-        # The Context API yields ContextVar objects, but we only keep
-        # them by id. The cooperative use case (`for k, v in ctx:`) is
-        # rare, so we yield (id, value) — close enough for typical
-        # introspection. Pull names from a registry if needed.
-        return iter(_resolve_keys(self._data))
+        # Snapshot: iteration stays valid if a nested `run` mutates
+        # the live mapping (CPython iterates an immutable HAMT).
+        return iter(list(self._data))
 
     def __len__(self):
         return len(self._data)
 
     def keys(self):
-        return list(iter(self))
+        return list(self._data)
 
     def values(self):
         return list(self._data.values())
 
     def items(self):
-        return [(k, self._data[k._id]) for k in iter(self)]
+        return list(self._data.items())
 
 
 # Per-thread current context: thread ident -> Context. A thread with
 # no entry yet lazily gets a fresh empty Context on first access.
 _STATES = {}
-_REGISTRY = {}
-
-
-def _resolve_keys(data):
-    # We cannot dereference variables by id reliably without a
-    # registry; we approximate by returning Tokens-less keys. For
-    # the typical PEP 567 use case (asyncio reads its tasks' context)
-    # this iteration is rarely needed.
-    return iter(data.keys())
 
 
 def _current_context():

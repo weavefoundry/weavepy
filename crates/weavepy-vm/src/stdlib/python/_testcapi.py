@@ -22,6 +22,12 @@ from _testinternalcapi import (  # noqa: F401
     _end_spawned_pthread,
 )
 
+# `Py_AddPendingCall` fixture (test_capi.test_misc TestPendingCalls):
+# queues a Python callback to run at the eval-breaker safe point on the
+# *main* thread only. The per-interpreter (any-thread) variant lives on
+# `_testinternalcapi.pending_threadfunc`.
+from _testinternalcapi import _main_pending_threadfunc as _pending_threadfunc  # noqa: F401
+
 # PEP 509 dict version tag probe (`test_dict_version`): CPython's
 # `_testcapi.dict_get_version` wraps `PyDict_GetVersion`; ours reads the
 # native side-registry that stamps and advances the tags.
@@ -137,18 +143,64 @@ def bad_get(self, obj, cls):
 
 
 def set_nomemory(start, stop=None):
-    # CPython's hook swaps in an allocator that fails the start..stop-th
-    # allocations (PyMem_SetAllocator). WeavePy's allocator is Rust's
-    # global allocator with no failure-injection seam, so tests that
-    # need real allocation failures (test_pyexpat's
-    # test_error_path_no_crash) skip rather than error.
-    import unittest
+    # PyMem_SetAllocator failure injection: the native hook counts
+    # instance allocations and fails the start..stop-th ones with
+    # MemoryError (test_capi.test_mem test_set_nomemory).
+    import _testinternalcapi
 
-    raise unittest.SkipTest("WeavePy cannot inject allocation failures")
+    if stop is None:
+        _testinternalcapi.set_nomemory(start)
+    else:
+        _testinternalcapi.set_nomemory(start, stop)
 
 
 def remove_mem_hooks():
-    pass
+    import _testinternalcapi
+
+    _testinternalcapi.remove_mem_hooks()
+
+
+def crash_no_current_thread():
+    # PyThreadState_Get() with the GIL released: dies with the fatal
+    # banner (test_capi.test_misc test_no_FatalError_infinite_loop).
+    import _testinternalcapi
+
+    _testinternalcapi.crash_no_current_thread()
+
+
+def toggle_reftrace_printer(enabled):
+    # PyRefTracer_SetTracer printer: while enabled, the VM prints
+    # "CREATE <type>" / "DESTROY <type>" lines for object lifecycle
+    # events (test_capi.test_misc TestCEval.test_ceval_decref).
+    import _testinternalcapi
+
+    _testinternalcapi.toggle_reftrace_printer(enabled)
+
+
+def pymem_buffer_overflow():
+    # Writes past the end of a PyMem_Malloc'd block; the PYTHONMALLOC
+    # debug hooks catch the clobbered pad byte and die fatally.
+    import _testinternalcapi
+
+    return _testinternalcapi.pymem_buffer_overflow()
+
+
+def pymem_api_misuse():
+    import _testinternalcapi
+
+    return _testinternalcapi.pymem_api_misuse()
+
+
+def pymem_malloc_without_gil():
+    import _testinternalcapi
+
+    return _testinternalcapi.pymem_malloc_without_gil()
+
+
+def pyobject_malloc_without_gil():
+    import _testinternalcapi
+
+    return _testinternalcapi.pyobject_malloc_without_gil()
 
 
 def test_pymem_alloc0():
@@ -189,38 +241,29 @@ def tracemalloc_track_race():
 
 
 def run_in_subinterp(code):
-    # Py_NewInterpreter + PyRun_SimpleString: execute `code` in a fresh
-    # interpreter namespace; uncaught exceptions are printed to stderr
-    # (PyErr_Print) and the call reports -1, matching the C helper.
+    # Py_NewInterpreter + PyRun_SimpleString: execute `code` in a real
+    # fresh sub-interpreter (own module cache, own `sys.modules`, own
+    # `builtins` — test_capi.test_misc test_subinterps asserts distinct
+    # ids); uncaught exceptions are printed to stderr (PyErr_Print) and
+    # the call reports -1, matching the C helper. Non-daemon threads the
+    # code started are joined before returning (Py_EndInterpreter,
+    # issue #18808).
     #
-    # A real sub-interpreter starts from the default interpreter config, so
-    # config knobs the child flips must not leak back into this interpreter
-    # (test_int.test_int_max_str_digits_is_per_interpreter). WeavePy's
-    # runtime keeps these process-global; snapshot + restore around the
-    # exec gives the caller CPython's isolation semantics.
-    import threading
+    # A real sub-interpreter starts from the default interpreter config,
+    # so config knobs the child flips must not leak back into this
+    # interpreter (test_int.test_int_max_str_digits_is_per_interpreter).
+    # WeavePy keeps a few of those knobs process-global; snapshot +
+    # restore around the exec gives the caller CPython's isolation
+    # semantics.
+    import _testinternalcapi
 
     saved_digits = sys.get_int_max_str_digits()
     saved_recursion = sys.getrecursionlimit()
-    before = set(threading.enumerate())
     try:
-        exec(code, {"__name__": "__main__"})
-    except SystemExit:
-        raise
-    except BaseException:
-        _traceback.print_exc()
-        return -1
+        return _testinternalcapi.run_in_subinterp(code)
     finally:
-        # Py_EndInterpreter joins the interpreter's non-daemon threads
-        # before tearing it down (issue #18808); threads the exec'd code
-        # started must have finished by the time this call returns
-        # (test_threading.SubinterpThreadingTests.test_threads_join).
-        for t in threading.enumerate():
-            if t not in before and not t.daemon:
-                t.join()
         sys.set_int_max_str_digits(saved_digits)
         sys.setrecursionlimit(saved_recursion)
-    return 0
 
 
 # `call_in_temporary_c_thread()` (Modules/_testcapi/run.c): run *callback*
@@ -682,20 +725,77 @@ class _UnraisableHookArgs:
         self.object = obj
 
 
+def _fromformat_msg(fmt, args):
+    """The PyUnicode_FromFormat subset PyErr_FormatUnraisable feeds it:
+    literal text, %%, and the object conversions (%R repr, %S str,
+    %A ascii, %d/%i/%s/%U stringified)."""
+    out = []
+    it = iter(args)
+    i = 0
+    n = len(fmt)
+    while i < n:
+        c = fmt[i]
+        if c != "%":
+            out.append(c)
+            i += 1
+            continue
+        i += 1
+        if i >= n:
+            break
+        conv = fmt[i]
+        i += 1
+        if conv == "%":
+            out.append("%")
+            continue
+        try:
+            a = next(it)
+        except StopIteration:
+            break
+        if conv == "R":
+            out.append(repr(a))
+        elif conv == "A":
+            out.append(ascii(a))
+        else:
+            out.append(str(a))
+    return "".join(out)
+
+
 def err_formatunraisable(exc, fmt=None, *args):
-    """`_PyErr_FormatUnraisable`: route `exc` through
-    `sys.unraisablehook` with a formatted message. Fires the PEP 578
-    `sys.unraisablehook` audit event with the resolved hook first
+    """`PyErr_FormatUnraisable`: route `exc` through
+    `sys.unraisablehook` with a message formatted by the
+    PyUnicode_FromFormat grammar — the format arrives as *bytes* (a C
+    `char*`); an undecodable one leaves err_msg NULL, like FromFormatV
+    failing (test_exceptions test_err_formatunraisable). Fires the PEP
+    578 `sys.unraisablehook` audit event with the resolved hook first
     (test_audit test_unraisablehook)."""
     import sys
+    import types
 
     err_msg = None
     if fmt is not None:
-        err_msg = (fmt % args) if args else fmt
+        f = fmt
+        if isinstance(f, (bytes, bytearray)):
+            try:
+                f = bytes(f).decode("utf-8")
+            except UnicodeDecodeError:
+                f = None
+        if f is not None:
+            err_msg = _fromformat_msg(f, args)
+    # The C API reports the *caller's* line: a fresh exception carries
+    # no traceback, so synthesize one from the calling frame (CPython's
+    # unraisable machinery does the equivalent via PyTraceBack_Here).
+    tb = getattr(exc, "__traceback__", None) if exc is not None else None
+    if exc is not None and tb is None:
+        try:
+            frame = sys._getframe(1)
+            tb = types.TracebackType(None, frame, frame.f_lasti, frame.f_lineno)
+            exc.__traceback__ = tb
+        except BaseException:
+            tb = None
     hookargs = _UnraisableHookArgs(
         type(exc) if exc is not None else None,
         exc,
-        getattr(exc, "__traceback__", None),
+        tb,
         err_msg,
         None,
     )
@@ -704,7 +804,11 @@ def err_formatunraisable(exc, fmt=None, *args):
         sys.audit("sys.unraisablehook", hook, hookargs)
         hook(hookargs)
         return None
-    sys.__unraisablehook__(hookargs)
+    # A None hook (swap_attr in the test) falls back to the default
+    # stderr writer, like CPython's _PyErr_WriteUnraisableDefaultHook.
+    from _weave_capi_misc import _default_unraisable_write
+
+    _default_unraisable_write(hookargs)
     return None
 
 
@@ -751,3 +855,560 @@ class CodeLike:
 
     def __repr__(self):
         return f"CodeLike(num_events={self._num_events})"
+
+
+# ---------------------------------------------------------------------------
+# PyArg_ParseTuple / PyArg_ParseTupleAndKeywords fixture family
+# (Modules/_testcapi/getargs.c, exercised by test_capi.test_getargs).
+# The conversion engine — a Python port of Python/getargs.c — lives in
+# the `_weave_getargs` frozen helper.
+
+import _weave_getargs as _ga
+
+
+class _CFunc:
+    """Builtin-function stand-in: callable but *not* a descriptor, so
+    stashing a fixture on a test class does not bind `self` (the tests
+    do `class C: getargs = _testcapi.getargs_...`)."""
+
+    def __init__(self, func, name=None):
+        self._func = func
+        self.__name__ = name or getattr(func, "__name__", "fixture")
+
+    def __call__(self, *args, **kwargs):
+        return self._func(*args, **kwargs)
+
+    def __repr__(self):
+        return "<built-in function %s>" % self.__name__
+
+
+def get_args(*args):
+    return args
+
+
+def get_kwargs(*args, **kwargs):
+    return kwargs
+
+
+def _pt1(fmt):
+    # ParseTuple fixture: one converted unit out, e.g. getargs_b.
+    def fixture(*args):
+        return _ga.parse_tuple(args, fmt)[0]
+
+    return _CFunc(fixture, "getargs_" + fmt.replace("*", "_star").replace(
+        "#", "_hash"))
+
+
+getargs_b = _pt1("b")
+getargs_B = _pt1("B")
+getargs_h = _pt1("h")
+getargs_H = _pt1("H")
+getargs_i = _pt1("i")
+getargs_I = _pt1("I")
+getargs_k = _pt1("k")
+getargs_l = _pt1("l")
+getargs_n = _pt1("n")
+getargs_L = _pt1("L")
+getargs_K = _pt1("K")
+getargs_f = _pt1("f")
+getargs_d = _pt1("d")
+getargs_D = _pt1("D")
+getargs_p = _pt1("p")
+getargs_c = _pt1("c")
+getargs_C = _pt1("C")
+getargs_s = _pt1("s")
+getargs_s_star = _pt1("s*")
+getargs_s_hash = _pt1("s#")
+getargs_z = _pt1("z")
+getargs_z_star = _pt1("z*")
+getargs_z_hash = _pt1("z#")
+getargs_y = _pt1("y")
+getargs_y_star = _pt1("y*")
+getargs_y_hash = _pt1("y#")
+getargs_S = _pt1("S")
+getargs_Y = _pt1("Y")
+getargs_U = _pt1("U")
+
+
+def getargs_tuple(*args):
+    a, group = _ga.parse_tuple(args, "i(ii)")
+    return (a,) + group
+
+
+def getargs_keywords(*args, **kwargs):
+    res = _ga.vgetargskeywords(
+        args,
+        kwargs,
+        "(ii)i|(i(ii))(iii)i",
+        ["arg1", "arg2", "arg3", "arg4", "arg5"],
+    )
+    # The C fixture's ten int slots default to -1; an unfilled unit
+    # leaves every one of its leaves untouched.
+    leaf_counts = [2, 1, 3, 3, 1]
+    out = []
+    for val, n in zip(res, leaf_counts):
+        if val is _ga.NULL:
+            out.extend([-1] * n)
+        else:
+            flat = _ga._flatten(val)
+            out.extend(flat)
+    return tuple(out)
+
+
+def getargs_keyword_only(*args, **kwargs):
+    res = _ga.vgetargskeywords(
+        args, kwargs, "i|i$i", ["required", "optional", "keyword_only"]
+    )
+    return tuple(-1 if v is _ga.NULL else v for v in res)
+
+
+def getargs_positional_only_and_keywords(*args, **kwargs):
+    res = _ga.vgetargskeywords(args, kwargs, "i|ii", ["", "", "keyword"])
+    return tuple(-1 if v is _ga.NULL else v for v in res)
+
+
+# The tests stash these on test classes; builtins never bind.
+getargs_keywords = _CFunc(getargs_keywords)
+getargs_keyword_only = _CFunc(getargs_keyword_only)
+getargs_positional_only_and_keywords = _CFunc(
+    getargs_positional_only_and_keywords
+)
+
+
+def getargs_empty(*args, **kwargs):
+    if kwargs:
+        _ga.vgetargskeywords(args, kwargs, "|:getargs_empty", [])
+    else:
+        _ga.parse_tuple(args, "|:getargs_empty")
+    return 1
+
+
+def getargs_es(*args):
+    res = _ga.parse_tuple(args, "O|s")
+    arg = res[0]
+    enc = res[1].decode("utf-8") if len(res) > 1 else None
+    return _ga.parse_one(arg, "es", _ga._Va([enc]))
+
+
+def getargs_et(*args):
+    res = _ga.parse_tuple(args, "O|s")
+    arg = res[0]
+    enc = res[1].decode("utf-8") if len(res) > 1 else None
+    return _ga.parse_one(arg, "et", _ga._Va([enc]))
+
+
+def getargs_es_hash(*args):
+    res = _ga.parse_tuple(args, "O|sY")
+    arg = res[0]
+    enc = res[1].decode("utf-8") if len(res) > 1 else None
+    buf = res[2] if len(res) > 2 else None
+    return _ga.parse_one(arg, "es#", _ga._Va([enc, buf]))
+
+
+def getargs_et_hash(*args):
+    res = _ga.parse_tuple(args, "O|sY")
+    arg = res[0]
+    enc = res[1].decode("utf-8") if len(res) > 1 else None
+    buf = res[2] if len(res) > 2 else None
+    return _ga.parse_one(arg, "et#", _ga._Va([enc, buf]))
+
+
+def getargs_w_star(*args):
+    buf = _ga.parse_tuple(args, "w*")[0]
+    buf[0] = ord("[")
+    buf[len(buf) - 1] = ord("]")
+    return bytes(buf)
+
+
+def getargs_w_star_opt(*args):
+    buf = _ga.parse_tuple(args, "w*|w*i")[0]
+    buf[0] = ord("[")
+    buf[len(buf) - 1] = ord("]")
+    return bytes(buf)
+
+
+def gh_99240_clear_args(*args):
+    _ga.parse_tuple(args, "eses", _ga._Va(["idna", "idna"]))
+    return None
+
+
+def argparsing(*args):
+    # Bug #6012 fixture: "O|Oi" round-trip reporting success as 1.
+    _ga.parse_tuple(args, "O|Oi:argparsing")
+    return 1
+
+
+def parse_tuple_and_keywords(sub_args, sub_kwargs, sub_format, sub_keywords):
+    """The test wrapper around PyArg_ParseTupleAndKeywords itself."""
+    if not isinstance(sub_format, str):
+        raise TypeError(
+            "parse_tuple_and_keywords() argument 3 must be str, not %s"
+            % type(sub_format).__name__
+        )
+    if type(sub_keywords) not in (list, tuple):
+        raise ValueError(
+            "parse_tuple_and_keywords: "
+            "sub_keywords must be either list or tuple"
+        )
+    if len(sub_keywords) > 8:
+        raise ValueError(
+            "parse_tuple_and_keywords: too many keywords in sub_keywords"
+        )
+    kwlist = []
+    for o in sub_keywords:
+        if isinstance(o, str):
+            o.encode("utf-8")  # PyUnicode_AsUTF8 up front
+            kwlist.append(o)
+        elif isinstance(o, bytes):
+            kwlist.append(o)
+        else:
+            raise ValueError(
+                "parse_tuple_and_keywords: keywords must be str or bytes"
+            )
+
+    results = _ga.vgetargskeywords(
+        tuple(sub_args), sub_kwargs, sub_format, kwlist,
+        _ga._Va(zeroed=True),
+    )
+
+    # C wrapper: all-object formats echo the filled buffers back.
+    objects_only = True
+    count = 0
+    for ch in sub_format:
+        if ch.isalnum():
+            if ch not in "OSUY":
+                objects_only = False
+                break
+            count += 1
+    if not objects_only:
+        return None
+    flat = []
+    for v in results:
+        flat.extend(_ga._flatten(v))
+    while len(flat) < count:
+        flat.append(_ga.NULL)
+    return tuple(None if v is _ga.NULL else v for v in flat[:count])
+
+
+def test_w_code_invalid():
+    # Modules/_testcapi/getargs.c: every 'w'-code format lacking the
+    # '*' suffix must be rejected with SystemError.
+    keywords = ["a", "b", "c", "d"]
+    formats_3 = ["O|w#$O", "O|w$O", "O|w#O", "O|wO"]
+    formats_4 = ["O|w#O$O", "O|wO$O", "O|Ow#O", "O|OwO", "O|Ow#$O", "O|Ow$O"]
+    for fmt, kw in [(f, {"c": None}) for f in formats_3] + [
+        (f, {"d": None}) for f in formats_4
+    ]:
+        try:
+            _ga.vgetargskeywords((None,), kw, fmt, keywords)
+        except SystemError:
+            continue
+        raise AssertionError("test_w_code_invalid_suffix: %s" % fmt)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Assorted C-API surface constants (test_capi legs gate on these at
+# import time).
+
+SIZEOF_VOID_P = 8
+SIZEOF_WCHAR_T = 4
+SIZEOF_PID_T = 4
+# Grammar start tokens (Include/compile.h).
+Py_single_input = 256
+Py_file_input = 257
+Py_eval_input = 258
+# PyTime_t is int64_t (Include/cpython/pytime.h).
+PyTime_MIN = -(2**63)
+PyTime_MAX = 2**63 - 1
+
+
+def PyTime_Time():
+    import time as _time
+
+    return _time.time()
+
+
+PyTime_TimeRaw = PyTime_Time
+
+
+def PyTime_Monotonic():
+    import time as _time
+
+    return _time.monotonic()
+
+
+PyTime_MonotonicRaw = PyTime_Monotonic
+
+
+def PyTime_PerfCounter():
+    import time as _time
+
+    return _time.perf_counter()
+
+
+PyTime_PerfCounterRaw = PyTime_PerfCounter
+
+
+class instancemethod:
+    """`PyInstanceMethod_Type` (Objects/classobject.c): wraps any
+    callable as an unbound instance method.  Class access hands back
+    the bare callable; instance access binds it."""
+
+    def __init__(self, func):
+        self.__func__ = func
+
+    def __get__(self, obj, owner=None):
+        if obj is None:
+            return self.__func__
+        import types as _types
+
+        return _types.MethodType(self.__func__, obj)
+
+    def __call__(self, *args, **kwargs):
+        return self.__func__(*args, **kwargs)
+
+    @property
+    def __doc__(self):
+        return self.__func__.__doc__
+
+
+# ---------------------------------------------------------------------------
+# PyRun_StringFlags / PyRun_FileExFlags fixtures (test_capi.test_run).
+
+
+def _run_checked(source, start, globals, locals):
+    # PyEval_EvalCode: globals must be a real dict (subclass ok) —
+    # SystemError otherwise; locals may be any mapping — TypeError
+    # otherwise.
+    if not isinstance(globals, dict):
+        raise SystemError("PyEval_EvalCodeEx: globals must be a dict")
+    if locals is None:
+        locals = globals
+    if not hasattr(type(locals), "__getitem__") or isinstance(
+        locals, (list, tuple)
+    ):
+        raise TypeError("locals must be a mapping")
+    mode = {256: "single", 257: "exec", 258: "eval"}.get(start, "exec")
+    if isinstance(source, bytes):
+        # The C parser reports bad UTF-8 as a SyntaxError.
+        try:
+            source = source.decode("utf-8")
+        except UnicodeDecodeError as e:
+            raise SyntaxError("(unicode error) %s" % e) from None
+    code = compile(source, "<string>", mode)
+    result = eval(code, globals, locals)
+    return result if mode == "eval" else None
+
+
+def run_stringflags(source, start, globals=None, locals=None, flags=None):
+    return _run_checked(source, start, globals, locals)
+
+
+def run_fileexflags(filename, start, globals=None, locals=None, closeit=0,
+                    flags=None):
+    import os as _os
+
+    with open(_os.fsdecode(filename), "rb") as fp:
+        source = fp.read()
+    return _run_checked(source, start, globals, locals)
+
+
+# ---------------------------------------------------------------------------
+# structmember.h typed-member fixture (test_capi.test_structmembers):
+# `PyMember_SetOne`'s conversion, truncation-warning and overflow
+# semantics, one property per member code.
+
+
+def _sm_int_member(name, c_min, c_max, hard_min, hard_max, warn_msg,
+                   use_index=True):
+    slot = "_" + name
+
+    def conv(value):
+        import warnings as _warnings
+
+        if use_index:
+            if not isinstance(value, int):
+                f = getattr(type(value), "__index__", None)
+                if f is None:
+                    raise TypeError(
+                        "an integer is required (got type %s)"
+                        % type(value).__name__
+                    )
+                value = f(value)
+                if not isinstance(value, int):
+                    raise TypeError(
+                        "__index__ returned non-int (type %s)"
+                        % type(value).__name__
+                    )
+        elif not isinstance(value, int):
+            raise TypeError(
+                "an integer is required (got type %s)"
+                % type(value).__name__
+            )
+        if isinstance(value, bool):
+            value = int(value)
+        value = int(value)
+        if value < hard_min or value > hard_max:
+            raise OverflowError(
+                "Python int too large to convert to C %s" % name
+            )
+        if value < c_min or value > c_max:
+            _warnings.warn(warn_msg, RuntimeWarning, stacklevel=3)
+            span = c_max - c_min + 1
+            value = (value - c_min) % span + c_min
+        return value
+
+    def getter(self):
+        return getattr(self, slot)
+
+    def setter(self, value):
+        object.__setattr__(self, slot, conv(value))
+
+    return property(getter, setter), conv
+
+
+_LLONG_MIN, _LLONG_MAX = -(2**63), 2**63 - 1
+_ULLONG_MAX = 2**64 - 1
+
+
+class _StructMembers:
+    """`test_structmembersType`: one attribute per structmember code."""
+
+    _members = {}
+
+    def __init__(self, *args):
+        defaults = [
+            ("T_BOOL", False),
+            ("T_BYTE", 0),
+            ("T_UBYTE", 0),
+            ("T_SHORT", 0),
+            ("T_USHORT", 0),
+            ("T_INT", 0),
+            ("T_UINT", 0),
+            ("T_LONG", 0),
+            ("T_ULONG", 0),
+            ("T_PYSSIZET", 0),
+            ("T_FLOAT", 0.0),
+            ("T_DOUBLE", 0.0),
+            ("T_STRING_INPLACE", ""),
+        ]
+        if len(args) > len(defaults):
+            raise TypeError("too many arguments")
+        object.__setattr__(self, "_T_LONGLONG", 0)
+        object.__setattr__(self, "_T_ULONGLONG", 0)
+        for (name, default), value in zip(
+            defaults, list(args) + [d for _, d in defaults[len(args) :]]
+        ):
+            if name == "T_BOOL":
+                object.__setattr__(self, "_T_BOOL", bool(value))
+            elif name in ("T_FLOAT", "T_DOUBLE"):
+                object.__setattr__(self, "_" + name, float(value))
+            elif name == "T_STRING_INPLACE":
+                object.__setattr__(self, "_" + name, str(value))
+            else:
+                object.__setattr__(self, "_" + name, int(value))
+
+    @property
+    def T_BOOL(self):
+        return self._T_BOOL
+
+    @T_BOOL.setter
+    def T_BOOL(self, value):
+        if not isinstance(value, bool):
+            raise TypeError("attribute value type must be bool")
+        object.__setattr__(self, "_T_BOOL", value)
+
+    @property
+    def T_STRING_INPLACE(self):
+        return self._T_STRING_INPLACE
+
+    @T_STRING_INPLACE.setter
+    def T_STRING_INPLACE(self, value):
+        raise TypeError("readonly attribute")
+
+    @T_STRING_INPLACE.deleter
+    def T_STRING_INPLACE(self):
+        raise TypeError("readonly attribute")
+
+    @property
+    def T_FLOAT(self):
+        return self._T_FLOAT
+
+    @T_FLOAT.setter
+    def T_FLOAT(self, value):
+        object.__setattr__(self, "_T_FLOAT", float(value))
+
+    @property
+    def T_DOUBLE(self):
+        return self._T_DOUBLE
+
+    @T_DOUBLE.setter
+    def T_DOUBLE(self, value):
+        object.__setattr__(self, "_T_DOUBLE", float(value))
+
+
+for _name, _lo, _hi, _hlo, _hhi, _msg, _idx in [
+    ("T_BYTE", -128, 127, LONG_MIN, LONG_MAX,
+     "Truncation of value to char", True),
+    ("T_UBYTE", 0, 255, LONG_MIN, LONG_MAX,
+     "Truncation of value to unsigned char", True),
+    ("T_SHORT", SHRT_MIN, SHRT_MAX, LONG_MIN, LONG_MAX,
+     "Truncation of value to short", True),
+    ("T_USHORT", 0, 2**16 - 1, LONG_MIN, LONG_MAX,
+     "Truncation of value to unsigned short", True),
+    ("T_INT", INT_MIN, INT_MAX, LONG_MIN, LONG_MAX,
+     "Truncation of value to int", True),
+    ("T_UINT", 0, UINT_MAX, LONG_MIN, ULONG_MAX,
+     "Writing negative value into unsigned field", True),
+    ("T_LONG", LONG_MIN, LONG_MAX, LONG_MIN, LONG_MAX,
+     "", True),
+    ("T_ULONG", 0, ULONG_MAX, LONG_MIN, ULONG_MAX,
+     "Writing negative value into unsigned field", True),
+    ("T_LONGLONG", _LLONG_MIN, _LLONG_MAX, _LLONG_MIN, _LLONG_MAX,
+     "", True),
+    ("T_ULONGLONG", 0, _ULLONG_MAX, LONG_MIN, _ULLONG_MAX,
+     "Writing negative value into unsigned field", True),
+    ("T_PYSSIZET", -(2**63), 2**63 - 1, -(2**63), 2**63 - 1,
+     "", False),
+]:
+    _prop, _ = _sm_int_member(_name, _lo, _hi, _hlo, _hhi, _msg, _idx)
+    setattr(_StructMembers, _name, _prop)
+del _name, _lo, _hi, _hlo, _hhi, _msg, _idx, _prop
+
+
+_test_structmembersType_OldAPI = _StructMembers
+
+
+class _StructMembersNew(_StructMembers):
+    pass
+
+
+_test_structmembersType_NewAPI = _StructMembersNew
+
+
+# RFC 0068 WS3 — per-family C-API fixture shims (test_capi per-leg
+# suites). Each module defines `__all__`; the star imports splice its
+# fixtures into this namespace. Kept last so nothing above is shadowed.
+# test_misc splices every `test_*` fixture into a TestCase namespace
+# (`locals().update(get_test_funcs(_testcapi))`), where a plain function
+# would wrongly bind `self` like a method; a C builtin doesn't. Wrap the
+# zero-argument self-test fixtures so they behave like builtins there.
+test_pymem_alloc0 = _CFunc(test_pymem_alloc0)
+test_w_code_invalid = _CFunc(test_w_code_invalid)
+
+from _weave_capi_bin import *  # noqa: E402,F401,F403
+from _weave_capi_cont import *  # noqa: E402,F401,F403
+from _weave_capi_num import *  # noqa: E402,F401,F403
+from _weave_capi_text import *  # noqa: E402,F401,F403
+from _weave_capi_misc import *  # noqa: E402,F401,F403
+
+# Native PyErr_Restore (kept *after* the star imports so it wins over
+# the Python-level port in _weave_capi_misc): raising from a Python
+# fixture would land the fixture's own frame in the traceback, but the
+# test asserts `caught.__traceback__.tb_next is tb` by identity
+# (test_exceptions test_err_restore).
+import _testinternalcapi as _tic_native  # noqa: E402
+
+err_restore = _tic_native._err_restore
+del _tic_native

@@ -204,6 +204,11 @@ pub enum OpCode {
     LoadGlobal,
     /// Push `co_varnames[arg]` from the current frame's locals.
     LoadFast,
+    /// PEP 709 (CPython `LOAD_FAST_AND_CLEAR`): push the slot's current
+    /// value — `Unbound` included, without raising — and clear the
+    /// slot. Pairs with a later `StoreFast` to save/restore a hidden
+    /// local around an inlined comprehension.
+    LoadFastAndClear,
     /// Pop and store TOS into `co_varnames[arg]`.
     StoreFast,
     /// Pop and store TOS into globals[co_names[arg]].
@@ -225,10 +230,36 @@ pub enum OpCode {
     MakeCell,
     /// Push the cell object itself (not its content) — for building closures.
     LoadClosure,
+    /// Runtime no-op in the WeavePy VM (frame setup already copies the
+    /// closure cells); encodes as CPython's `COPY_FREE_VARS n` prologue
+    /// unit so `co_code`/`dis` match (RFC 0068 WS1). Appears only in
+    /// code decoded from the CPython wire form — WeavePy's own encoder
+    /// synthesizes the prologue.
+    CopyFreeVars,
+
+    /// Stack no-op in the WeavePy VM (its `Call` convention carries no
+    /// self-or-null slot); encodes as CPython's `PUSH_NULL` on the wire
+    /// so `co_code`/`dis`/`co_stacksize` match CPython's call shapes
+    /// exactly (RFC 0068 WS1). The compiler emits it after every
+    /// callable load that CPython pairs with a NULL push.
+    PushNull,
 
     // Attributes / subscripts
     /// `value = stack[-1]; push value.<co_names[arg]>`
     LoadAttr,
+    /// Same runtime behaviour as [`OpCode::LoadAttr`] (one bound value
+    /// is pushed), but marks CPython's method-call optimization site:
+    /// encodes as `LOAD_ATTR` with oparg bit 0 set (the wire view
+    /// pushes `attr, self_or_null` there, so no `PUSH_NULL` precedes
+    /// the call).
+    LoadMethodAttr,
+    /// CPython 3.13 `LOAD_SUPER_ATTR`: pops `self, class, global_super`
+    /// (top-down), calls `global_super` — with `(class, self)` when arg
+    /// bit 1 is set (explicit two-argument `super(a, b)`), zero-arg
+    /// otherwise — then loads `co_names[arg >> 2]` from the resulting
+    /// super object. Pushes the attribute, plus a null self slot when
+    /// arg bit 0 is set (method-call form, mirrors [`OpCode::LoadMethodAttr`]).
+    LoadSuperAttr,
     /// `value = stack[-1]; tos = stack[-2]; tos.<co_names[arg]> = value`
     StoreAttr,
     /// Delete attribute.
@@ -264,6 +295,12 @@ pub enum OpCode {
     /// Call a callable with `arg` positional arguments.
     /// Stack layout (top-down): `arg_n, arg_(n-1), ..., arg_1, callable`.
     Call,
+    /// Same runtime behaviour as [`OpCode::Call`], but encodes as
+    /// CPython's self-slot shape: `CALL arg-1` with the first argument
+    /// sitting in the wire view's self-or-null slot (no `PUSH_NULL`).
+    /// CPython uses this for decorator application and comprehension
+    /// invocation.
+    CallSelf,
     /// Call with keyword arguments. `arg` = positional arg count;
     /// stack also carries kw arg names (tuple) and values.
     CallKw,
@@ -280,6 +317,13 @@ pub enum OpCode {
     PopJumpIfFalse,
     /// Pop TOS; if truthy, jump by `arg` instructions (signed).
     PopJumpIfTrue,
+    /// Pop TOS; if it is `None`, jump by `arg` instructions (CPython
+    /// 3.13 `POP_JUMP_IF_NONE`, the `except*` match-check branch).
+    PopJumpIfNone,
+    /// Pop TOS; if it is not `None`, jump by `arg` instructions
+    /// (CPython 3.13 `POP_JUMP_IF_NOT_NONE`, the `except*` reraise
+    /// branch).
+    PopJumpIfNotNone,
     /// Unconditional forward jump.
     JumpForward,
     /// Unconditional backward jump (`arg` is a positive distance to subtract).
@@ -337,8 +381,16 @@ pub enum OpCode {
     // Functions / closures
     /// Build a function object from the code object on TOS.
     /// `arg` is a bitmask: 0x01 = defaults tuple, 0x02 = kw_defaults
-    /// dict, 0x04 = annotations dict, 0x08 = closure tuple.
+    /// dict, 0x04 = annotations dict, 0x08 = closure tuple. The
+    /// compiler emits `arg == 0` and attaches attributes with
+    /// [`OpCode::SetFunctionAttribute`] (CPython 3.13's shape); the
+    /// flag form remains for decoded legacy streams.
     MakeFunction,
+    /// `func = pop; value = pop; set func attribute per the flag bits
+    /// of `arg` (same 0x01/0x02/0x04/0x08 meanings as
+    /// [`OpCode::MakeFunction`]); push func` — CPython 3.13's
+    /// `SET_FUNCTION_ATTRIBUTE`.
+    SetFunctionAttribute,
     /// Slice — build a Slice(low, high, step) and push it.
     BuildSlice,
 
@@ -426,6 +478,18 @@ pub enum OpCode {
     /// 1 = `!s`, 2 = `!r`, 3 = `!a`); `arg & 0x04` indicates a
     /// spec is on top (popped before the value).
     FormatValue,
+    /// CPython 3.13's CONVERT_VALUE: apply an f-string conversion to
+    /// TOS in place (`arg`: 1 = `!s`, 2 = `!r`, 3 = `!a`). Emitted as a
+    /// separate instruction before FORMAT_SIMPLE/FORMAT_WITH_SPEC, as
+    /// CPython's codegen does (test_dis grades the shape).
+    ConvertValue,
+    /// CPython 3.13's TO_BOOL: replace TOS with its truthiness as an
+    /// exact `bool` (calls `__bool__`/`__len__`, may raise). Emitted
+    /// before `POP_JUMP_IF_*` whenever the condition isn't statically
+    /// boolean (comparisons, `not`, `is`, `in` fuse instead), and in
+    /// the `with`-cleanup after `WITH_EXCEPT_START` — test_dis grades
+    /// the shape.
+    ToBool,
 
     // Generators (RFC 0006)
     /// Pop the value at TOS; suspend this frame, returning the
@@ -505,6 +569,26 @@ pub enum OpCode {
     /// Appended at the end of the enum so existing `#[repr(u8)]`
     /// discriminants stay stable for any cached bytecode.
     DeleteDeref,
+
+    /// CPython 3.13 `CLEANUP_THROW`: handler for an exception delivered
+    /// by `throw()`/`close()` while suspended at a send-dance
+    /// `YIELD_VALUE`. Stack on entry: `[sub_iter, last_sent, exc]`. If
+    /// `exc` is a `StopIteration`, pops all three and pushes
+    /// `[None, exc.value]` (the following `END_SEND` keeps the value);
+    /// otherwise re-raises `exc` without recording a new traceback
+    /// entry.
+    CleanupThrow,
+    /// CPython's `CALL_INTRINSIC_1(STOPITERATION_ERROR)`: TOS is an
+    /// exception instance escaping a generator-family frame. Replace a
+    /// `StopIteration` (or an async generator's `StopAsyncIteration`)
+    /// with the PEP 479 `RuntimeError`, chaining the original as cause
+    /// and context; any other exception passes through unchanged.
+    StopIterationError,
+    /// CPython's `CALL_INTRINSIC_1(ASYNC_GEN_WRAP)`: mark TOS as an
+    /// async generator's *own* yielded value (CPython wraps it in
+    /// `PyAsyncGenWrappedValue`) so `__anext__` can tell it apart from
+    /// a value passed through by an inner await's send dance.
+    AsyncGenWrap,
 }
 
 impl OpCode {
@@ -516,6 +600,7 @@ impl OpCode {
             OpCode::LoadName => "LOAD_NAME",
             OpCode::LoadGlobal => "LOAD_GLOBAL",
             OpCode::LoadFast => "LOAD_FAST",
+            OpCode::LoadFastAndClear => "LOAD_FAST_AND_CLEAR",
             OpCode::StoreFast => "STORE_FAST",
             OpCode::StoreGlobal => "STORE_GLOBAL",
             OpCode::StoreName => "STORE_NAME",
@@ -526,6 +611,7 @@ impl OpCode {
             OpCode::StoreDeref => "STORE_DEREF",
             OpCode::MakeCell => "MAKE_CELL",
             OpCode::LoadClosure => "LOAD_CLOSURE",
+            OpCode::CopyFreeVars => "COPY_FREE_VARS",
             OpCode::LoadAttr => "LOAD_ATTR",
             OpCode::StoreAttr => "STORE_ATTR",
             OpCode::DeleteAttr => "DELETE_ATTR",
@@ -541,11 +627,17 @@ impl OpCode {
             OpCode::CopyTop => "COPY",
             OpCode::Swap => "SWAP",
             OpCode::Call => "CALL",
+            OpCode::CallSelf => "CALL",
+            OpCode::PushNull => "PUSH_NULL",
+            OpCode::LoadMethodAttr => "LOAD_ATTR",
+            OpCode::LoadSuperAttr => "LOAD_SUPER_ATTR",
             OpCode::CallKw => "CALL_KW",
             OpCode::CallEx => "CALL_FUNCTION_EX",
             OpCode::ReturnValue => "RETURN_VALUE",
             OpCode::PopJumpIfFalse => "POP_JUMP_IF_FALSE",
             OpCode::PopJumpIfTrue => "POP_JUMP_IF_TRUE",
+            OpCode::PopJumpIfNone => "POP_JUMP_IF_NONE",
+            OpCode::PopJumpIfNotNone => "POP_JUMP_IF_NOT_NONE",
             OpCode::JumpForward => "JUMP_FORWARD",
             OpCode::JumpBackward => "JUMP_BACKWARD",
             OpCode::GetIter => "GET_ITER",
@@ -566,6 +658,7 @@ impl OpCode {
             OpCode::DictUpdate => "DICT_UPDATE",
             OpCode::SetupAnnotations => "SETUP_ANNOTATIONS",
             OpCode::MakeFunction => "MAKE_FUNCTION",
+            OpCode::SetFunctionAttribute => "SET_FUNCTION_ATTRIBUTE",
             OpCode::BuildSlice => "BUILD_SLICE",
             OpCode::LoadBuildClass => "LOAD_BUILD_CLASS",
             OpCode::LoadClassderef => "LOAD_CLASSDEREF",
@@ -585,6 +678,8 @@ impl OpCode {
             OpCode::ImportFrom => "IMPORT_FROM",
             OpCode::ImportStar => "IMPORT_STAR",
             OpCode::FormatValue => "FORMAT_VALUE",
+            OpCode::ConvertValue => "CONVERT_VALUE",
+            OpCode::ToBool => "TO_BOOL",
             OpCode::YieldValue => "YIELD_VALUE",
             OpCode::GetYieldFromIter => "GET_YIELD_FROM_ITER",
             OpCode::ReturnGenerator => "RETURN_GENERATOR",
@@ -602,6 +697,9 @@ impl OpCode {
             OpCode::GetLen => "GET_LEN",
             OpCode::PrintExpr => "PRINT_EXPR",
             OpCode::DeleteDeref => "DELETE_DEREF",
+            OpCode::CleanupThrow => "CLEANUP_THROW",
+            OpCode::StopIterationError => "CALL_INTRINSIC_1",
+            OpCode::AsyncGenWrap => "CALL_INTRINSIC_1",
         }
     }
 }

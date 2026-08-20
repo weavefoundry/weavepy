@@ -170,14 +170,20 @@ pub(crate) fn run(argv: Vec<String>) -> Result<i32> {
     let summary = RegrtestSummary::from_reports(&reports);
 
     if cli.quiet {
+        let divergence_part = if summary.divergence > 0 {
+            format!(" / divergence {}", summary.divergence)
+        } else {
+            String::new()
+        };
         println!(
-            "{} total — pass {} / fail {} / error {} / skip {} / timeout {} — unexpected {}",
+            "{} total — pass {} / fail {} / error {} / skip {} / timeout {}{} — unexpected {}",
             summary.total,
             summary.pass,
             summary.fail,
             summary.error,
             summary.skip,
             summary.timeout,
+            divergence_part,
             summary.unexpected
         );
     } else {

@@ -522,6 +522,36 @@ impl std::fmt::Debug for ReentryGuard {
     }
 }
 
+/// CPython's `_PyEval_CallTracing` (`sys.call_tracing`): save the hook
+/// re-entry depth and reset it to zero so trace events fire again inside
+/// the call — that's how pdb's `debug` command re-enters a fully traced
+/// recursive debugger from inside a trace callback. The saved depth is
+/// restored on drop.
+#[derive(Debug)]
+pub struct TracingReenabled {
+    saved: u32,
+}
+
+impl Default for TracingReenabled {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TracingReenabled {
+    pub fn new() -> Self {
+        let saved = HOOK_REENTRY.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+        Self { saved }
+    }
+}
+
+impl Drop for TracingReenabled {
+    fn drop(&mut self) {
+        let saved = self.saved;
+        HOOK_REENTRY.with(|cell| *cell.borrow_mut() = saved);
+    }
+}
+
 // ---------- PEP 669 event indices ----------
 //
 // These match the bit positions used in `crate::stdlib::sys_monitoring::build_events_namespace`.

@@ -777,6 +777,17 @@ pub(crate) fn io_open(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = opts
         .open(&path)
         .map_err(|e| crate::error::io_error_to_py_named(&e, Some(&path)))?;
+    // CPython raises `IsADirectoryError` when `open()` targets a directory
+    // (the kernel happily hands out a read-only dir fd; CPython's `FileIO`
+    // fstat-checks S_ISDIR). Same eager check as the builtin `open` —
+    // importlib.resources' functional API opens an anchor directory and
+    // asserts `OSError` (test_functional.test_open_text).
+    if f.metadata().map(|m| m.is_dir()).unwrap_or(false) {
+        return Err(crate::error::io_error_to_py_named(
+            &std::io::Error::from_raw_os_error(21),
+            Some(&path),
+        ));
+    }
     let backend = FileBackend::Disk(f);
     let file = Object::File(Rc::new(PyFile::new(path, mode, backend)));
     // CPython's `FileIO` explicitly seeks an append-mode stream to the end at

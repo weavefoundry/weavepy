@@ -197,6 +197,15 @@ pub enum Object {
     /// `__match_args__` exposure. Backed by a shared `DictData`
     /// reference; mutations through this view raise `TypeError`.
     MappingProxy(Rc<RefCell<DictData>>),
+    /// An *object-backed* `mappingproxy` (RFC 0068 WS5). CPython's
+    /// `types.MappingProxyType(mapping)` accepts any mapping object and
+    /// delegates every operation to it — overridden methods on a dict
+    /// subclass (`__missing__`, custom `keys`, …) show through the view
+    /// (test_types.MappingProxyTests). Plain-`dict` proxies stay on the
+    /// [`Object::MappingProxy`] fast path; this variant carries the
+    /// wrapped mapping for everything else, and all protocol dispatch
+    /// routes through the interpreter.
+    MappingProxyObj(Rc<Object>),
     /// A view over `dict.keys() / .values() / .items()` (RFC 0023).
     /// Keeps a reference to the source dict so the view stays live
     /// across mutations, matching CPython's dict view semantics.
@@ -310,10 +319,10 @@ impl fmt::Debug for Object {
             Object::Type(t) => write!(f, "<class '{}'>", t.name),
             Object::Instance(i) => write!(f, "<{} object>", i.cls().name),
             Object::Module(m) => write!(f, "<module {:?}>", m.name),
-            Object::Generator(g) => write!(f, "<generator object {}>", g.name.borrow()),
-            Object::Coroutine(g) => write!(f, "<coroutine object {}>", g.name.borrow()),
+            Object::Generator(g) => write!(f, "<generator object {}>", g.name.borrow().to_str()),
+            Object::Coroutine(g) => write!(f, "<coroutine object {}>", g.name.borrow().to_str()),
             Object::AsyncGenerator(g) => {
-                write!(f, "<async_generator object {}>", g.name.borrow())
+                write!(f, "<async_generator object {}>", g.name.borrow().to_str())
             }
             Object::AsyncGenAwait(a) => write!(f, "<{} object>", a.kind.type_name()),
             Object::Bytes(b) => write!(f, "Bytes({})", b.len()),
@@ -326,7 +335,9 @@ impl fmt::Debug for Object {
             Object::ClassMethod(inner) => write!(f, "<classmethod {:?}>", inner.func()),
             Object::SlotDescriptor(sd) => write!(f, "<slot {:?} of {:?}>", sd.name, sd.class_name),
             Object::Frame(fr) => write!(f, "<frame at 0x{:x}>", Rc::as_ptr(fr) as usize),
-            Object::Traceback(tb) => write!(f, "<traceback at 0x{:x}>", Rc::as_ptr(tb) as usize),
+            Object::Traceback(tb) => {
+                write!(f, "<traceback object at 0x{:x}>", Rc::as_ptr(tb) as usize)
+            }
             Object::MemoryView(mv) => {
                 let state = if mv.released.get() {
                     "released memory"
@@ -342,6 +353,9 @@ impl fmt::Debug for Object {
                     m.entry(&k.0, v);
                 }
                 m.finish()
+            }
+            Object::MappingProxyObj(inner) => {
+                write!(f, "mappingproxy({:?})", inner.as_ref())
             }
             Object::DictView(v) => write!(f, "<{} {:?}>", v.kind.type_name(), v),
             Object::SimpleNamespace(d) => {
@@ -732,14 +746,75 @@ impl PyFrame {
         dict
     }
 
+    /// Is this a non-optimized (module / class / exec) scope, i.e. one
+    /// whose names live in a namespace mapping instead of fast slots?
+    pub fn is_unoptimized_scope(&self) -> bool {
+        self.is_module_scope || self.class_namespace.is_some() || self.class_namespace_obj.is_some()
+    }
+
+    /// PEP 709: a *non-optimized* frame currently holding a bound fast
+    /// local. Only inlined comprehensions give module/exec frames fast
+    /// slots (their iteration variables — CPython's "hidden" fast
+    /// locals), and only while the loop runs (LOAD_FAST_AND_CLEAR
+    /// unbinds them on exit). While true, `locals()` / `f_locals` must
+    /// expose the hidden names (test_listcomps scope='module').
+    pub fn has_live_hidden_locals(&self) -> bool {
+        if !self.is_unoptimized_scope() || self.cleared.get() {
+            return false;
+        }
+        let mirror = self.locals_mirror.borrow().clone();
+        let Some(mirror) = mirror else {
+            return false;
+        };
+        let m = mirror.borrow();
+        self.code
+            .varnames
+            .iter()
+            .zip(m.iter())
+            .any(|(n, v)| !n.starts_with('.') && !matches!(v, Object::Unbound))
+    }
+
+    /// The dict backing this non-optimized frame's namespace (module
+    /// globals or a plain-dict class/exec namespace); `None` for
+    /// optimized frames and custom mapping namespaces.
+    fn namespace_dict(&self) -> Option<Rc<RefCell<DictData>>> {
+        if self.class_namespace_obj.is_some() {
+            return None;
+        }
+        if let Some(ns) = self.class_namespace.as_ref() {
+            return Some(ns.clone());
+        }
+        if self.is_module_scope {
+            return Some(self.globals.clone());
+        }
+        None
+    }
+
     /// The `locals()` builtin, PEP 667 split: function (optimized)
     /// scopes return an *independent snapshot* per call — mutating it
     /// never affects the frame, and later calls return new dicts
     /// (test_patma_204: `out = locals(); del out["w"]`). Module, class,
-    /// and exec scopes return the live namespace itself. The
-    /// identity-stable [`Self::locals`] cache stays reserved for
-    /// `frame.f_locals`.
+    /// and exec scopes return the live namespace itself — except while
+    /// an inlined comprehension's hidden fast locals are live, when
+    /// CPython's `_PyEval_GetFrameLocals` dict-ifies the frame's
+    /// `FrameLocalsProxy`: a fresh snapshot of the namespace with the
+    /// bound hidden names merged over it (test_listcomps
+    /// `locals()["x"]` at module scope). The identity-stable
+    /// [`Self::locals`] cache stays reserved for `frame.f_locals`.
     pub fn locals_snapshot(&self) -> Object {
+        if self.has_live_hidden_locals() {
+            if let Some(ns) = self.namespace_dict() {
+                let mut d = ns.borrow().clone();
+                if let Some(mirror) = self.locals_mirror.borrow().as_ref() {
+                    for (name, value) in self.code.varnames.iter().zip(mirror.borrow().iter()) {
+                        if !name.starts_with('.') && !matches!(value, Object::Unbound) {
+                            d.insert(DictKey(Object::from_str(name.clone())), value.clone());
+                        }
+                    }
+                }
+                return Object::Dict(Rc::new(RefCell::new(d)));
+            }
+        }
         match self.compute_locals() {
             Some(dict) => dict,
             None => self.locals(),
@@ -1841,6 +1916,11 @@ impl DictViewKind {
 pub struct PyDictView {
     pub dict: Rc<RefCell<DictData>>,
     pub kind: DictViewKind,
+    /// Keepalive for a dict-*subclass* receiver: the view holds only the
+    /// native `DictData` payload, so without this the subclass instance
+    /// (and its `__del__`) would fire as soon as `A(dict)().keys()`
+    /// returns (test_dict test_free_after_iterating).
+    pub owner: Option<Object>,
 }
 
 /// Set-like equality for `dict_keys` / `dict_items` views (CPython
@@ -2085,6 +2165,16 @@ pub struct SlotDescriptor {
     /// `AttributeError("readonly attribute")`; only internal
     /// `slot_set` writes land.
     pub readonly: bool,
+    /// Docstring surfaced as `__doc__` — the `__dict__`/`__weakref__`
+    /// getsets carry CPython's fixed text ("dictionary for instance
+    /// variables", …); plain `__slots__` members have none. pydoc
+    /// renders it under the descriptor's summary line.
+    pub doc: Option<&'static str>,
+    /// The declaring type, for `__objclass__`. Weak: the type's dict
+    /// owns the descriptor, so a strong ref would be a guaranteed
+    /// cycle. `None` for descriptors built before their type exists
+    /// (exception pseudo-slots), which resolve by `class_name` instead.
+    pub objclass: RefCell<Option<crate::sync::Weak<crate::types::TypeObject>>>,
 }
 
 /// Ordered set backing for [`Object::Set`] and [`Object::FrozenSet`].
@@ -3734,11 +3824,16 @@ pub struct PySlice {
 /// `state` and only legal to inspect via interpreter methods.
 pub struct PyGenerator {
     /// `gi_name`. Seeded from the function's `__name__` at call time;
-    /// user code may reassign it (`gen.__name__ = ...`).
-    pub name: RefCell<String>,
+    /// user code may reassign it (`gen.__name__ = ...`). Held as the
+    /// *string object* so repeated reads return the identical object —
+    /// CPython stores `gi_name` as a `PyObject*` and
+    /// `gen.__name__ is gen.__name__` holds (test_types
+    /// CoroutineTests.test_gen reads it through two paths and
+    /// asserts `is`).
+    pub name: RefCell<Object>,
     /// `gi_qualname` (PEP 3155). Seeded from the function's
     /// `__qualname__` at call time; reassignable like `name`.
-    pub qualname: RefCell<String>,
+    pub qualname: RefCell<Object>,
     /// Whether this is a plain generator, a coroutine, or an async
     /// generator. Needed so the shared send/throw machinery can apply
     /// PEP 479 (a `StopIteration` escaping the *body* becomes a
@@ -3777,8 +3872,8 @@ impl PyGenerator {
         frame: Box<dyn std::any::Any + Send + Sync>,
     ) -> Self {
         Self {
-            name: RefCell::new(name.into()),
-            qualname: RefCell::new(qualname.into()),
+            name: RefCell::new(Object::from_str(name.into())),
+            qualname: RefCell::new(Object::from_str(qualname.into())),
             kind,
             code,
             state: RefCell::new(GeneratorState::Created(frame)),
@@ -3796,7 +3891,7 @@ impl PyGenerator {
 
 impl fmt::Debug for PyGenerator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<generator {}>", self.name.borrow())
+        write!(f, "<generator {}>", self.name.borrow().to_str())
     }
 }
 
@@ -4239,6 +4334,13 @@ pub struct PyFile {
     /// The stream has no filesystem name (`io.BytesIO`/`io.StringIO`): reading
     /// `f.name` raises `AttributeError`, like CPython's in-memory streams.
     pub no_name: crate::sync::Cell<bool>,
+    /// An in-memory text buffer (`io.StringIO`) received *bridged* lone
+    /// surrogates (PUA window, see `builtins::BRIDGE_BASE`) via `write()`
+    /// or its initial value. Read paths un-bridge only when set, so a
+    /// genuine plane-16 PUA character (U+10F800..U+10FFFF) written to a
+    /// surrogate-free buffer round-trips verbatim
+    /// (test_capi.test_file `test_pyfile_writestring`).
+    pub mem_bridged: crate::sync::Cell<bool>,
     /// CPython `FileIO(fd, closefd=...)`: when `false`, closing the stream
     /// must *not* close the wrapped OS descriptor (the caller still owns it —
     /// e.g. wrapping `sys.stdin`'s fd). Defaults to `true`.
@@ -4319,6 +4421,15 @@ pub struct PyFile {
     /// sibling — which shares the OS file description and offset — shares the
     /// lock too.
     pub fd_syscall_lock: std::sync::Arc<std::sync::Mutex<()>>,
+    /// Bytes read ahead of the logical stream position, served back before the
+    /// backend on the next read. Universal-newline `readline` on a
+    /// *non-seekable* stream must read one byte past a `\r` to distinguish a
+    /// lone `\r` from the front half of `\r\n` (CPython's incremental newline
+    /// decoder holds the `\r` back); when that byte starts the next line it
+    /// cannot be `lseek`-ed back, so it parks here
+    /// (test_file_eintr.test_readlines: SIGINT splits the pipe read between
+    /// `\r` and `\n`).
+    pub read_pushback: RefCell<Vec<u8>>,
 }
 
 impl PyFile {
@@ -4341,6 +4452,7 @@ impl PyFile {
             name_is_bytes: crate::sync::Cell::new(false),
             name_is_fd: crate::sync::Cell::new(false),
             no_name: crate::sync::Cell::new(false),
+            mem_bridged: crate::sync::Cell::new(false),
             closefd: crate::sync::Cell::new(true),
             extra_attrs: RefCell::new(Vec::new()),
             binary_buffer_cache: RefCell::new(None),
@@ -4354,6 +4466,7 @@ impl PyFile {
             blksize: crate::sync::Cell::new(DEFAULT_BUFFER_SIZE as i64),
             repr_class: RefCell::new(None),
             fd_syscall_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            read_pushback: RefCell::new(Vec::new()),
         }
     }
 
@@ -5808,6 +5921,9 @@ impl PyFile {
             use std::os::unix::io::AsRawFd;
             self.check_open()?;
             self.flush_write_buf()?;
+            if let Some(parked) = self.take_pushback(n) {
+                return Ok(Some(parked));
+            }
             let raw_fd = match &*self.backend.borrow() {
                 FileBackend::Disk(f) => Some(f.as_raw_fd()),
                 _ => None,
@@ -5821,12 +5937,39 @@ impl PyFile {
         self.read_bytes(n).map(Some)
     }
 
+    /// Serve read-ahead bytes parked by [`PyFile::read_line_bytes`]'s
+    /// non-seekable `\r`-lookahead. `Some(bytes)` is a complete short read
+    /// (never mixed with a backend read — a pipe read returning fewer bytes
+    /// than asked is always legal); `None` means nothing is parked. A `None`
+    /// size request drains the whole pushback, then the caller's read-to-EOF
+    /// logic would miss it, so that case appends the backend's remainder here.
+    fn take_pushback(&self, n: Option<usize>) -> Option<Vec<u8>> {
+        let mut pb = self.read_pushback.borrow_mut();
+        if pb.is_empty() {
+            return None;
+        }
+        match n {
+            Some(k) => {
+                let take = k.min(pb.len());
+                Some(pb.drain(..take).collect())
+            }
+            None => Some(std::mem::take(&mut *pb)),
+        }
+    }
+
     pub fn read_bytes(&self, n: Option<usize>) -> Result<Vec<u8>, RuntimeError> {
         self.check_open()?;
         // Any staged writes must reach the descriptor before a read observes
         // the stream position (defensive; a pure `BufferedWriter` is not
         // readable, but keeps read-after-write coherent).
         self.flush_write_buf()?;
+        if let Some(mut parked) = self.take_pushback(n) {
+            // A read-to-EOF must not stop at the parked byte.
+            if n.is_none() {
+                parked.extend(self.read_bytes(None)?);
+            }
+            return Ok(parked);
+        }
         // Unix disk/pipe descriptors go through the PEP 475-aware raw read:
         // snapshot the fd under a short borrow, then read with the backend
         // released so a signal handler can run (and even touch this stream)
@@ -6038,21 +6181,24 @@ impl PyFile {
                     }
                     if ch == b'\r' {
                         // A lone `\r` ends the line, but `\r\n` is a single
-                        // terminator — peek one byte to tell them apart, and
-                        // un-read it (seek back) when it belongs to the next
-                        // line. A non-seekable stream can't un-read, so a lone
-                        // `\r` simply ends the line there.
-                        if !self.seekable() {
-                            break;
-                        }
+                        // terminator — read one byte to tell them apart
+                        // (CPython's incremental newline decoder holds the
+                        // `\r` back until the next byte settles it, even
+                        // across an EINTR-split pipe read —
+                        // test_file_eintr.test_readlines). When the byte
+                        // belongs to the next line, un-read it: seek back on
+                        // a seekable stream, park it in `read_pushback`
+                        // otherwise.
                         let nb = self.read_bytes(Some(1))?;
                         if nb.is_empty() {
                             break;
                         }
                         if nb[0] == b'\n' {
                             out.push(b'\n');
-                        } else {
+                        } else if self.seekable() {
                             self.seek(-1, 1)?;
+                        } else {
+                            self.read_pushback.borrow_mut().insert(0, nb[0]);
                         }
                         break;
                     }
@@ -6083,11 +6229,31 @@ impl PyFile {
             Ok(Some(Object::new_bytes(out)))
         } else {
             // Un-bridge PUA-window code points back to lone surrogates
-            // (StringIO buffers and surrogate-producing error handlers).
-            Ok(Some(crate::builtins::bridge_to_object(
-                &self.decode_text(out)?,
-            )))
+            // (StringIO buffers that received surrogates, and
+            // surrogate-producing error handlers). Gated so a genuine
+            // plane-16 PUA character in a surrogate-free stream is not
+            // misread as a bridged surrogate.
+            let text = self.decode_text(out)?;
+            if self.unbridge_on_read() {
+                Ok(Some(crate::builtins::bridge_to_object(&text)))
+            } else {
+                Ok(Some(Object::from_str(text)))
+            }
         }
+    }
+
+    /// Whether read paths must un-bridge PUA-window code points back to
+    /// lone surrogates: an in-memory buffer that actually *received*
+    /// bridged surrogates, or a decode error handler that can produce
+    /// them. See [`Self::mem_bridged`].
+    pub fn unbridge_on_read(&self) -> bool {
+        if matches!(&*self.backend.borrow(), FileBackend::MemText { .. }) {
+            return self.mem_bridged.get();
+        }
+        matches!(
+            self.errors_name().as_str(),
+            "surrogateescape" | "surrogatepass"
+        )
     }
 
     /// Write **all** of `data`, blocking as needed — the text-layer commit
@@ -6560,8 +6726,14 @@ impl PyFile {
             }
             // The buffer stores lone surrogates as bridged PUA code points
             // (so a Rust `String` can hold them); map them back to a `str`/
-            // `WStr` here. A surrogate-free buffer canonicalises to `Str`.
-            FileBackend::MemText { data, .. } => Some(crate::builtins::bridge_to_object(data)),
+            // `WStr` here — but only when surrogates were actually written
+            // (`mem_bridged`), so a genuine plane-16 PUA character
+            // round-trips verbatim.
+            FileBackend::MemText { data, .. } => Some(if self.mem_bridged.get() {
+                crate::builtins::bridge_to_object(data)
+            } else {
+                Object::from_str(data.as_str())
+            }),
             _ => None,
         }
     }
@@ -6911,6 +7083,11 @@ pub enum PyIterator {
     List {
         items: Rc<RefCell<Vec<Object>>>,
         index: usize,
+        /// Keepalive for a list-*subclass* source: `items` is only the
+        /// native payload, so the subclass instance (and its `__del__`)
+        /// is pinned here while the iterator lives (test_list
+        /// test_free_after_iterating). Boxed to keep the variant small.
+        owner: Option<Box<Object>>,
     },
     Tuple {
         items: Rc<[Object]>,
@@ -6971,6 +7148,11 @@ pub enum PyIterator {
         /// `RuntimeError: dictionary keys changed during iteration`,
         /// matching CPython's tombstone-based detection.
         watch: Option<DictWatch>,
+        /// Keepalive for a dict-*subclass* source: `dict` above is only
+        /// the native payload, so the subclass instance (and its
+        /// `__del__`) must be pinned here for the iterator's lifetime
+        /// (test_dict test_free_after_iterating).
+        owner: Option<Object>,
     },
     Bytes {
         data: Rc<[u8]>,
@@ -7003,6 +7185,8 @@ pub enum PyIterator {
     Reversed {
         items: Rc<RefCell<Vec<Object>>>,
         index: i64,
+        /// Keepalive for a list-*subclass* source (see [`Self::List`]).
+        owner: Option<Box<Object>>,
     },
     /// Shared handle onto an existing `Object::Iter`'s cursor: `iter(it)
     /// is it` in Python, so any consumer draining the handle must advance
@@ -7010,6 +7194,17 @@ pub enum PyIterator {
     /// and then scans the tail with `for elem in it`). Cloning the cursor
     /// instead would silently fork the position.
     Shared(Rc<RefCell<PyIterator>>),
+    /// Generic subclass keepalive: `inner` iterates a builtin-container
+    /// *subclass*'s native payload, and `owner` pins the subclass
+    /// instance so its `__del__` can't fire while the iterator is live;
+    /// the pin drops on exhaustion, running the finalizer at CPython's
+    /// timing (support.check_free_after_iterating — tuple / str / bytes
+    /// / bytearray / set subclasses; `List`/`Reversed`/`DictKeys` carry
+    /// dedicated `owner` slots instead).
+    KeepAlive {
+        inner: Rc<RefCell<PyIterator>>,
+        owner: Option<Object>,
+    },
     /// Live iterator over a mutable `set` (CPython's `setiterobject`).
     /// Unlike the snapshot iterators above it keeps the *set object*
     /// alive and walks it by slot index, so (a) the cycle GC can trace
@@ -7042,7 +7237,11 @@ impl PyIterator {
     /// Pull the next value out of the iterator, or `None` if exhausted.
     pub fn next_value(&mut self) -> Option<Object> {
         match self {
-            PyIterator::List { items, index } => {
+            PyIterator::List {
+                items,
+                index,
+                owner,
+            } => {
                 let next = items.borrow().get(*index).cloned();
                 match next {
                     Some(v) => {
@@ -7053,8 +7252,12 @@ impl PyIterator {
                         // Exhausted. Detach from the backing list so a
                         // later `append`/`extend` can't resurrect the
                         // iterator — CPython clears `it_seq` on the first
-                        // StopIteration and the iterator stays empty.
+                        // StopIteration and the iterator stays empty. The
+                        // subclass keepalive drops with it, running its
+                        // `__del__` here like CPython freeing the list
+                        // (test_free_after_iterating).
                         *items = Rc::new(RefCell::new(Vec::new()));
+                        *owner = None;
                         None
                     }
                 }
@@ -7135,7 +7338,11 @@ impl PyIterator {
                 Some(Object::int_from_bigint(v))
             }
             PyIterator::DictKeys {
-                kind, index, dict, ..
+                kind,
+                index,
+                dict,
+                owner,
+                ..
             } => {
                 let d = dict.as_ref()?;
                 let entry = d
@@ -7155,8 +7362,12 @@ impl PyIterator {
                         // Exhausted: detach from the dict (CPython clears
                         // `di_dict` on the first StopIteration) so a later
                         // mutation can't resurrect the cursor or trip the
-                        // mutation guards.
+                        // mutation guards. The subclass keepalive drops
+                        // with it — CPython frees the dict object here,
+                        // running its `__del__` (test_free_after_iterating
+                        // expects that ordering).
                         *dict = None;
+                        *owner = None;
                         None
                     }
                 }
@@ -7206,6 +7417,16 @@ impl PyIterator {
                 Some(Object::new_tuple(vec![idx, v]))
             }
             PyIterator::Shared(inner) => inner.borrow_mut().next_value(),
+            PyIterator::KeepAlive { inner, owner } => {
+                let v = inner.borrow_mut().next_value();
+                if v.is_none() {
+                    // Exhausted: drop the subclass pin so its `__del__`
+                    // runs now, like CPython freeing the container on
+                    // the iterator's first StopIteration.
+                    *owner = None;
+                }
+                v
+            }
             // Lazy file line. The error channel is `next_value_checked`
             // (used by FOR_ITER / `next()`); the rare internal drain that
             // calls `next_value` treats a read error as end-of-stream.
@@ -7230,9 +7451,14 @@ impl PyIterator {
                     None => None,
                 }
             }
-            PyIterator::Reversed { items, index } => {
+            PyIterator::Reversed {
+                items,
+                index,
+                owner,
+            } => {
                 if *index < 0 {
                     *items = Rc::new(RefCell::new(Vec::new()));
+                    *owner = None;
                     return None;
                 }
                 let v = items.borrow().get(*index as usize).cloned();
@@ -7245,6 +7471,7 @@ impl PyIterator {
                         // Index out of range (list shrank): exhaust + detach.
                         *items = Rc::new(RefCell::new(Vec::new()));
                         *index = -1;
+                        *owner = None;
                         None
                     }
                 }
@@ -7268,6 +7495,7 @@ impl PyIterator {
                 | PyIterator::Reversed { .. }
                 | PyIterator::Enumerate { .. }
                 | PyIterator::Shared(_)
+                | PyIterator::KeepAlive { .. }
         )
     }
 
@@ -7279,7 +7507,13 @@ impl PyIterator {
     /// `Set` iterator exposes the set's current elements.
     pub fn gc_referents(&self, visit: &mut dyn FnMut(&Object)) {
         match self {
-            PyIterator::List { items, .. } | PyIterator::Reversed { items, .. } => {
+            PyIterator::List { items, owner, .. } | PyIterator::Reversed { items, owner, .. } => {
+                // A list-subclass keepalive is a real edge — the
+                // free-after-iterating cycle (`iter -> instance -> class
+                // -> __del__ cell -> iter`) must be traceable.
+                if let Some(o) = owner {
+                    visit(o);
+                }
                 // `iter(list)` shares the *live* list's backing buffer (the
                 // same `Rc<RefCell<Vec>>`), so the referent edge to subtract is
                 // `iter -> list`, not `iter -> elements`: the list object is a
@@ -7298,13 +7532,19 @@ impl PyIterator {
                     visit(v);
                 }
             }
-            PyIterator::DictKeys { dict, .. } => {
+            PyIterator::DictKeys { dict, owner, .. } => {
                 // A live cursor: the iterator holds only the *dict* (a
                 // shared `Rc`), so the cycle edge to subtract is
                 // `iter -> dict`; the dict's own `tp_traverse` accounts
                 // `dict -> items` (bug #3680's dict-iterator analogue).
                 if let Some(d) = dict {
                     visit(&Object::Dict(d.clone()));
+                }
+                // A dict-subclass keepalive is a real edge too — the
+                // free-after-iterating cycle (`iter -> instance -> class
+                // -> __del__ cell -> iter`) must be traceable.
+                if let Some(o) = owner {
+                    visit(o);
                 }
             }
             PyIterator::Set { set, .. } => {
@@ -7317,6 +7557,17 @@ impl PyIterator {
                 visit(&Object::Set(set.clone()));
             }
             PyIterator::Enumerate { inner, .. } | PyIterator::Shared(inner) => {
+                if let Ok(inner) = inner.try_borrow() {
+                    inner.gc_referents(visit);
+                }
+            }
+            PyIterator::KeepAlive { inner, owner } => {
+                // The subclass pin is a real edge — the
+                // free-after-iterating cycle (`iter -> instance -> class
+                // -> __del__ cell -> iter`) must be traceable.
+                if let Some(o) = owner {
+                    visit(o);
+                }
                 if let Ok(inner) = inner.try_borrow() {
                     inner.gc_referents(visit);
                 }
@@ -7399,6 +7650,16 @@ impl PyIterator {
             }
             return Ok(line);
         }
+        if let PyIterator::KeepAlive { inner, owner } = self {
+            // Delegate so the inner cursor's mutation guards (set/dict
+            // size checks above) still fire through the wrapper.
+            let r = inner.borrow_mut().next_value_checked();
+            if matches!(r, Ok(None)) {
+                // Exhausted: drop the subclass pin (see `next_value`).
+                *owner = None;
+            }
+            return r;
+        }
         Ok(self.next_value())
     }
 
@@ -7408,7 +7669,9 @@ impl PyIterator {
     /// for sources whose remaining length isn't known in O(1).
     pub fn remaining(&self) -> Option<usize> {
         match self {
-            PyIterator::List { items, index } => Some(items.borrow().len().saturating_sub(*index)),
+            PyIterator::List { items, index, .. } => {
+                Some(items.borrow().len().saturating_sub(*index))
+            }
             PyIterator::Tuple { items, index } => Some(items.len().saturating_sub(*index)),
             PyIterator::Str { s, index } => Some(s[(*index).min(s.len())..].chars().count()),
             PyIterator::DictKeys { dict, index, .. } => Some(
@@ -7421,11 +7684,12 @@ impl PyIterator {
             }
             PyIterator::Enumerate { inner, .. } => inner.borrow().remaining(),
             PyIterator::Shared(inner) => inner.borrow().remaining(),
+            PyIterator::KeepAlive { inner, .. } => inner.borrow().remaining(),
             PyIterator::Set { set, index, .. } => Some(set.borrow().len().saturating_sub(*index)),
             // CPython `listreviter_len`: `index + 1`, but 0 when the live
             // list shrank below the cursor (test_iterlen
             // TestListReversed.test_mutation).
-            PyIterator::Reversed { items, index } => {
+            PyIterator::Reversed { items, index, .. } => {
                 let len = (*index + 1).max(0) as usize;
                 if items.borrow().len() < len {
                     Some(0)
@@ -7495,7 +7759,7 @@ impl PyIterator {
     /// advanced.
     pub fn remaining_items(&self) -> Vec<Object> {
         match self {
-            PyIterator::List { items, index } => items
+            PyIterator::List { items, index, .. } => items
                 .borrow()
                 .get(*index..)
                 .map(<[_]>::to_vec)
@@ -7626,13 +7890,14 @@ impl PyIterator {
                 out
             }
             PyIterator::Shared(inner) => inner.borrow().remaining_items(),
+            PyIterator::KeepAlive { inner, .. } => inner.borrow().remaining_items(),
             PyIterator::Set { set, index, .. } => set
                 .borrow()
                 .iter()
                 .skip(*index)
                 .map(|k| k.0.clone())
                 .collect(),
-            PyIterator::Reversed { items, index } => {
+            PyIterator::Reversed { items, index, .. } => {
                 // Not-yet-yielded values, in yield order: items[index]..items[0].
                 let items = items.borrow();
                 let mut out = Vec::new();
@@ -7657,7 +7922,7 @@ impl PyIterator {
     /// Empty when exhausted, giving CPython's `(reversed, ([],))`.
     pub fn reversed_reduce_arg(&self) -> Option<Object> {
         match self {
-            PyIterator::Reversed { items, index } => {
+            PyIterator::Reversed { items, index, .. } => {
                 let items = items.borrow();
                 let end = ((*index).max(-1) + 1) as usize;
                 let slice = items.get(..end.min(items.len())).unwrap_or(&[]);
@@ -7757,6 +8022,9 @@ impl Object {
             Object::Foreign(s) => crate::foreign::is_true(s),
             Object::MemoryView(mv) => mv.len.get() > 0,
             Object::MappingProxy(d) => !d.borrow().is_empty(),
+            // Static fallback; the VM's truthiness path delegates to the
+            // wrapped mapping's `__len__` before reaching here.
+            Object::MappingProxyObj(inner) => inner.is_truthy(),
             Object::DictView(v) => !v.dict.borrow().is_empty(),
             Object::SimpleNamespace(_) => true,
             Object::LazyIter(_) => true,
@@ -7850,6 +8118,7 @@ impl Object {
             (Object::Traceback(a), Object::Traceback(b)) => Rc::ptr_eq(a, b),
             (Object::MemoryView(a), Object::MemoryView(b)) => Rc::ptr_eq(a, b),
             (Object::MappingProxy(a), Object::MappingProxy(b)) => Rc::ptr_eq(a, b),
+            (Object::MappingProxyObj(a), Object::MappingProxyObj(b)) => Rc::ptr_eq(a, b),
             (Object::DictView(a), Object::DictView(b)) => Rc::ptr_eq(a, b),
             (Object::SimpleNamespace(a), Object::SimpleNamespace(b)) => Rc::ptr_eq(a, b),
             (Object::LazyIter(a), Object::LazyIter(b)) => Rc::ptr_eq(a, b),
@@ -8369,6 +8638,9 @@ impl Object {
                 }
             }
             Object::MappingProxy(d) => Ok(d.borrow().contains_key(&DictKey(item.clone()))),
+            // Static fallback; the VM's `in` dispatch delegates to the
+            // wrapped mapping's own `__contains__` first.
+            Object::MappingProxyObj(inner) => inner.contains(item),
             // View membership matches the dict's own: user `__hash__`/
             // `__eq__` dispatch through Python and their exceptions
             // propagate (test_dictviews.test_compare_error).
@@ -8438,6 +8710,7 @@ impl Object {
             Object::List(items) => Ok(PyIterator::List {
                 items: items.clone(),
                 index: 0,
+                owner: None,
             }),
             Object::Tuple(items) => Ok(PyIterator::Tuple {
                 items: items.clone(),
@@ -8456,6 +8729,7 @@ impl Object {
                         .collect(),
                 )),
                 index: 0,
+                owner: None,
             }),
             Object::Range(r) => Ok({
                 if let Some(b) = &r.big {
@@ -8498,6 +8772,7 @@ impl Object {
                     dict: Some(d.clone()),
                     len,
                     watch: None,
+                    owner: None,
                 })
             }
             Object::Set(s) => {
@@ -8514,6 +8789,7 @@ impl Object {
                 Ok(PyIterator::List {
                     items: Rc::new(RefCell::new(items)),
                     index: 0,
+                    owner: None,
                 })
             }
             Object::Bytes(b) => Ok(PyIterator::Bytes {
@@ -8544,6 +8820,7 @@ impl Object {
                 Ok(PyIterator::List {
                     items: Rc::new(RefCell::new(items)),
                     index: 0,
+                    owner: None,
                 })
             }
             Object::DictView(v) => {
@@ -8559,6 +8836,7 @@ impl Object {
                     dict: Some(v.dict.clone()),
                     len,
                     watch: None,
+                    owner: v.owner.clone(),
                 })
             }
             Object::MappingProxy(d) => {
@@ -8569,8 +8847,12 @@ impl Object {
                     dict: Some(d.clone()),
                     len,
                     watch: None,
+                    owner: None,
                 })
             }
+            // Static fallback; the VM's iteration dispatch delegates to
+            // the wrapped mapping's own `__iter__` first.
+            Object::MappingProxyObj(inner) => inner.make_iter(),
             Object::File(file) => {
                 // CPython's file object is its own iterator: each step calls
                 // ``readline`` and yields the line, raising StopIteration at
@@ -8626,6 +8908,7 @@ impl Object {
                 Ok(PyIterator::List {
                     items: Rc::new(RefCell::new(items)),
                     index: 0,
+                    owner: None,
                 })
             }
             _ => Err(type_error(format!(
@@ -8687,7 +8970,7 @@ impl Object {
             Object::Frame(_) => "frame",
             Object::Traceback(_) => "traceback",
             Object::MemoryView(_) => "memoryview",
-            Object::MappingProxy(_) => "mappingproxy",
+            Object::MappingProxy(_) | Object::MappingProxyObj(_) => "mappingproxy",
             Object::DictView(v) => v.kind.type_name(),
             Object::SimpleNamespace(_) => "SimpleNamespace",
             Object::LazyIter(l) => l.type_name(),
@@ -8991,7 +9274,23 @@ impl Object {
                 };
                 format!("<bound method {} of {}>", qual, bm.receiver.repr())
             }
-            Object::Code(c) => format!("<code object {}>", c.name),
+            // CPython `code_repr`: name, heap address, filename, and the
+            // first line (test_dis normalizes the address but asserts the
+            // file/line tail verbatim).
+            Object::Code(c) => {
+                let firstlineno = if c.name == "<module>" {
+                    1
+                } else {
+                    c.linetable.iter().copied().find(|l| *l > 0).unwrap_or(1)
+                };
+                format!(
+                    "<code object {} at 0x{:012x}, file \"{}\", line {}>",
+                    c.name,
+                    Rc::as_ptr(c) as usize,
+                    c.filename,
+                    firstlineno
+                )
+            }
             Object::Iter(_) => "<iterator>".to_owned(),
             Object::Slice(s) => format!(
                 "slice({}, {}, {})",
@@ -9030,17 +9329,17 @@ impl Object {
             // CPython's repr shows the qualified name (PEP 3155).
             Object::Generator(g) => format!(
                 "<generator object {} at 0x{:x}>",
-                g.qualname.borrow(),
+                g.qualname.borrow().to_str(),
                 Rc::as_ptr(g) as usize
             ),
             Object::Coroutine(g) => format!(
                 "<coroutine object {} at 0x{:x}>",
-                g.qualname.borrow(),
+                g.qualname.borrow().to_str(),
                 Rc::as_ptr(g) as usize
             ),
             Object::AsyncGenerator(g) => format!(
                 "<async_generator object {} at 0x{:x}>",
-                g.qualname.borrow(),
+                g.qualname.borrow().to_str(),
                 Rc::as_ptr(g) as usize
             ),
             Object::AsyncGenAwait(a) => format!(
@@ -9193,7 +9492,9 @@ impl Object {
                 fr.current_lineno(),
                 fr.code.name
             ),
-            Object::Traceback(tb) => format!("<traceback at 0x{:x}>", Rc::as_ptr(tb) as usize),
+            Object::Traceback(tb) => {
+                format!("<traceback object at 0x{:x}>", Rc::as_ptr(tb) as usize)
+            }
             Object::MemoryView(mv) => {
                 // A released view reprs distinctly (CPython `memory_repr`);
                 // str()/repr() must keep working after release.
@@ -9207,6 +9508,11 @@ impl Object {
             Object::MappingProxy(d) => {
                 let body = Object::Dict(d.clone()).repr();
                 format!("mappingproxy({body})")
+            }
+            // Static fallback; the VM's `repr_of` delegates to the wrapped
+            // mapping's own `__repr__` first.
+            Object::MappingProxyObj(inner) => {
+                format!("mappingproxy({})", inner.repr())
             }
             Object::DictView(v) => {
                 // CPython `dictview_repr` guards with `Py_ReprEnter`: a view
@@ -9359,10 +9665,24 @@ impl Object {
                     let parts: Vec<String> = items.iter().map(type_param_repr).collect();
                     return format!("{}{}[{}]", star, type_param_repr(origin), parts.join(", "));
                 }
+                // CPython's `namespace_repr` is `Py_ReprEnter`-guarded:
+                // a self-referencing namespace renders as `namespace(...)`
+                // (test_types.test_recursive_repr).
+                thread_local! {
+                    static IN_REPR: RefCell<std::collections::HashSet<usize>> =
+                        RefCell::new(std::collections::HashSet::new());
+                }
+                let key = Rc::as_ptr(d) as usize;
+                if !IN_REPR.with(|s| s.borrow_mut().insert(key)) {
+                    return "namespace(...)".to_owned();
+                }
                 let parts: Vec<String> = dict
                     .iter()
                     .map(|(k, v)| format!("{}={}", k.0.to_str(), v.repr()))
                     .collect();
+                IN_REPR.with(|s| {
+                    s.borrow_mut().remove(&key);
+                });
                 format!("namespace({})", parts.join(", "))
             }
         }
@@ -9448,6 +9768,9 @@ impl Object {
                 Ok(mv.shape_dims().first().copied().unwrap_or(0))
             }
             Object::MappingProxy(d) => Ok(d.borrow().len()),
+            // Static fallback; the VM's `len()` delegates to the wrapped
+            // mapping's own `__len__` first.
+            Object::MappingProxyObj(inner) => inner.len(),
             Object::DictView(v) => Ok(v.dict.borrow().len()),
             // A subclass of a built-in container (`class C(list)`, …)
             // measures the length of the native payload it wraps.

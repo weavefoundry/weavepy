@@ -41,11 +41,16 @@ def make_spec_and_loader(name, filename, is_package, search_locations):
             # package the native importer assembled. CPython 3.12+
             # gives these a NamespaceLoader (importlib.resources
             # depends on its get_resource_reader — NamespaceDiskTests).
+            # Build it the way `_bootstrap._init_module_attrs` does —
+            # `__new__` plus a `_path` alias onto the module's own
+            # search locations — so `spec.submodule_search_locations`
+            # *is* `module.__path__` (the dynamic `_NamespacePath`
+            # object included; bpo-32303 asserts loader consistency).
             from importlib.machinery import NamespaceLoader
-            locations = list(search_locations)
-            loader = NamespaceLoader(name, locations)
+            loader = NamespaceLoader.__new__(NamespaceLoader)
+            loader._path = search_locations
             spec = ModuleSpec(name, loader, origin=None, is_package=True)
-            spec.submodule_search_locations = locations
+            spec.submodule_search_locations = search_locations
             return spec, loader
         spec = ModuleSpec(name, BuiltinImporter, origin="built-in")
         return spec, BuiltinImporter
@@ -60,6 +65,23 @@ def make_spec_and_loader(name, filename, is_package, search_locations):
                                   is_package=is_package)
             return spec, FrozenImporter
         return None, None
+    try:
+        import _imp
+        is_frozen_stdlib = _imp.is_frozen(name)
+    except Exception:
+        is_frozen_stdlib = False
+    if is_frozen_stdlib:
+        # CPython 3.13 deep-freezes the startup stdlib (os, io, abc,
+        # codecs, site, …): those modules' specs carry
+        # `FrozenImporter` + `origin='frozen'` + a populated
+        # `loader_state` even though `__file__` points at the real
+        # source. `FrozenImporter.find_spec` builds exactly that shape
+        # (and `_bootstrap._setup` re-runs — e.g. test_importlib's
+        # source-variant importlib re-imports — assert `loader_state`
+        # is complete).
+        spec = FrozenImporter.find_spec(name)
+        if spec is not None:
+            return spec, FrozenImporter
     if filename.endswith((".so", ".pyd", ".dylib")):
         loader = ExtensionFileLoader(name, filename)
         spec = ModuleSpec(name, loader, origin=filename,
@@ -77,3 +99,14 @@ def make_spec_and_loader(name, filename, is_package, search_locations):
     except Exception:
         pass
     return spec, loader
+
+
+def make_namespace_path(name, portions):
+    """A live ``_NamespacePath`` for a native namespace package.
+
+    Recomputes when the parent path changes or ``invalidate_caches()``
+    bumps the epoch — test_namespace_pkgs' DynamicPathCalculation and
+    SeparatedNamespacePackagesCreatedWhileRunning assert both flavours.
+    """
+    from importlib import _bootstrap_external as ext
+    return ext._NamespacePath(name, portions, ext.PathFinder._get_spec)

@@ -19,6 +19,11 @@ silently faked into passing.
 int_const = 1969
 str_const = 'something different'
 
+# `_test_module_state_shared` (single-phase variant, bpo-44050): its
+# PyInit_ adds `Error = PyExc_RuntimeError`. The exception type is the
+# runtime singleton, so its identity is shared across interpreters.
+Error = RuntimeError
+
 
 class error(Exception):
     pass
@@ -45,3 +50,53 @@ def foo(a, b):
 
 def call_state_registration_func(n):
     raise error("WeavePy _testmultiphase stub has no per-module state")
+
+
+class StateAccessType:
+    """Type accessing per-module state (the `PyInit__testmultiphase_meth_state_access`
+    variant's `StateAccessType`, graded by test_capi.test_misc
+    Test_ModuleStateAccess). Each `_load_dynamic` of the
+    `_testmultiphase_meth_state_access` name executes this body afresh,
+    so the class-level `_count` is genuinely per-module state and
+    `_defining_module` is the module PyType_GetModuleByDef would find.
+    """
+
+    _defining_module = None
+    _count = 0
+
+    def get_defining_module(self):
+        return StateAccessType._defining_module
+
+    def getmodulebydef_bad_def(self):
+        # PyType_GetModuleByDef with a module def no superclass was
+        # created from (bpo-46433).
+        raise TypeError(
+            "PyType_GetModuleByDef: No superclass of 'StateAccessType' "
+            "has the given module"
+        )
+
+    def increment_count_clinic(self, n=1, /, *, twice=False):
+        StateAccessType._count += n * (2 if twice else 1)
+
+    def increment_count_noclinic(self, n=1, /, *, twice=False):
+        StateAccessType._count += n * (2 if twice else 1)
+
+    def get_count(self):
+        return StateAccessType._count
+
+
+def _weave_rebind_module(mod):
+    # Called by ExtensionFileLoader.exec_module after it copies this
+    # body's dict into the spec-allocated module object: rebind the
+    # "defining module" so `get_defining_module()` preserves identity
+    # with the caller's module (assertIs in Test_ModuleStateAccess).
+    StateAccessType._defining_module = mod
+
+
+try:
+    import sys as _sys
+
+    StateAccessType._defining_module = _sys.modules.get(__name__)
+    del _sys
+except Exception:
+    pass

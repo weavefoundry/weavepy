@@ -266,6 +266,32 @@ pub(crate) fn io_text_encoding(args: &[Object]) -> Result<Object, RuntimeError> 
 // recover them from `self`.
 // ---------------------------------------------------------------------------
 
+/// Wrap an io-class unbound-method body so a *native* stream receiver
+/// (`Object::File` — the collapsed stream `open()` returns, whose
+/// `type(f)` still reports this class) delegates to the equivalent
+/// native file method. CPython code calls these unbound —
+/// `contextlib.ExitStack.enter_context(file)` binds `type(cm).__exit__`
+/// and later invokes it as `__exit__(cm, *exc)` (test_regrtest's worker
+/// stdout-file cleanup) — so the class-dict methods must accept the
+/// native stream, not only Python-level wrapper instances. Sentinel
+/// dispatch names (leading `.`, e.g. `.file_writelines`) need the
+/// interpreter loop and fall through to the class body instead.
+fn file_delegating(
+    name: &'static str,
+    body: fn(&[Object]) -> Result<Object, RuntimeError>,
+) -> impl Fn(&[Object]) -> Result<Object, RuntimeError> + Send + Sync {
+    move |args: &[Object]| {
+        if let Some(recv @ Object::File(_)) = args.first() {
+            if let Some(Object::Builtin(native)) = crate::builtins::lookup_method(recv, name) {
+                if !native.name.starts_with('.') {
+                    return (native.call)(args);
+                }
+            }
+        }
+        body(args)
+    }
+}
+
 pub(crate) fn make_text_io_wrapper(
     base: Rc<crate::types::TypeObject>,
 ) -> Rc<crate::types::TypeObject> {
@@ -277,7 +303,7 @@ pub(crate) fn make_text_io_wrapper(
             Object::Builtin(Rc::new(BuiltinFn {
                 name,
                 binds_instance: true,
-                call: Box::new(body),
+                call: Box::new(file_delegating(name, body)),
                 call_kw: None,
             })),
         );
@@ -511,11 +537,15 @@ fn stringio_file(args: &[Object], kwargs: &[(String, Object)]) -> Result<Rc<PyFi
         .get(1)
         .cloned()
         .or_else(|| kw_get(kwargs, "initial_value"));
+    let mut has_surrogates = false;
     let data = match initial {
         Some(Object::Str(s)) => s.to_string(),
         // A surrogate-bearing initial value is stored bridged (lone surrogates
         // → PUA window) so it round-trips through `getvalue`/`read`.
-        Some(Object::WStr(cps)) => crate::builtins::bridge_encode_cps(&cps),
+        Some(Object::WStr(cps)) => {
+            has_surrogates = true;
+            crate::builtins::bridge_encode_cps(&cps)
+        }
         Some(Object::None) | None => String::new(),
         Some(_) => return Err(type_error("initial_value must be str or None, not int")),
     };
@@ -525,6 +555,7 @@ fn stringio_file(args: &[Object], kwargs: &[(String, Object)]) -> Result<Rc<PyFi
     let f = PyFile::new("<string>", "r+", FileBackend::MemText { data, pos: 0 });
     f.set_newline(newline.as_deref());
     f.no_name.set(true);
+    f.mem_bridged.set(has_surrogates);
     Ok(Rc::new(f))
 }
 
@@ -1887,7 +1918,20 @@ fn build_iobase_family_inner() -> IoFamily {
         TypeObject::new_with_flags("BufferedIOBase", vec![iobase.clone()], bd, flags())
             .expect("io child type must linearise")
     };
-    let text = child("TextIOBase", &iobase);
+    // `TextIOBase` carries the abstract `read`/`readline`/`write`/`detach`
+    // stubs (CPython `_io._TextIOBase`): default bodies raise
+    // `io.UnsupportedOperation` and every concrete text stream overrides
+    // them. They must exist on the ABC so `_io._TextIOBase.read.__get__`
+    // works (test_types test_method_descriptor_crash).
+    let text = {
+        let mut td = DictData::default();
+        iobase_method(&mut td, "read", textiobase_read_unsup);
+        iobase_method(&mut td, "readline", textiobase_readline_unsup);
+        iobase_method(&mut td, "write", textiobase_write_unsup);
+        iobase_method(&mut td, "detach", textiobase_detach_unsup);
+        TypeObject::new_with_flags("TextIOBase", vec![iobase.clone()], td, flags())
+            .expect("io child type must linearise")
+    };
     // CPython `_io._TextIOBase` carries default `encoding`/`errors`/
     // `newlines` getsets that report `None`; concrete wrappers shadow them
     // with real values (TextIOWrapper via its instance state). Plain class
@@ -2356,6 +2400,22 @@ fn bufferediobase_read1_unsup(_args: &[Object]) -> Result<Object, RuntimeError> 
 
 fn bufferediobase_write_unsup(_args: &[Object]) -> Result<Object, RuntimeError> {
     Err(unsupported_op("write"))
+}
+
+fn textiobase_read_unsup(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Err(unsupported_op("read"))
+}
+
+fn textiobase_readline_unsup(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Err(unsupported_op("readline"))
+}
+
+fn textiobase_write_unsup(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Err(unsupported_op("write"))
+}
+
+fn textiobase_detach_unsup(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Err(unsupported_op("detach"))
 }
 
 fn bufferediobase_detach_unsup(_args: &[Object]) -> Result<Object, RuntimeError> {
@@ -4363,13 +4423,15 @@ pub(crate) fn make_buffered(
 ) -> Rc<crate::types::TypeObject> {
     use crate::types::{TypeFlags, TypeObject};
     let mut dict = DictData::default();
+    // `file_delegating`: unbound `type(f).meth(f, …)` calls must accept
+    // the native `Object::File` receiver `open()` returns.
     let mut method = |n: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>| {
         dict.insert(
             DictKey(Object::from_static(n)),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: n,
                 binds_instance: true,
-                call: Box::new(body),
+                call: Box::new(file_delegating(n, body)),
                 call_kw: None,
             })),
         );

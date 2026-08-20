@@ -225,6 +225,10 @@ fn collect(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Int(n)) => (*n).max(0) as usize,
         _ => N_GENERATIONS - 1,
     };
+    // RFC 0068 — release JIT-pinned code objects this thread's tier
+    // cache is the sole owner of, so `weakref`s on dead `__code__`
+    // objects die like they do under CPython's collector.
+    crate::tier2::gc_sweep();
     let collected = gc_trace::collect_upto(upto);
     Ok(Object::Int(collected as i64))
 }
