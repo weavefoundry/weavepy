@@ -802,6 +802,12 @@ pub struct Interpreter {
 impl Default for Interpreter {
     fn default() -> Self {
         install_parser_unicode_hook();
+        // The UCRT's default response to an invalid parameter (e.g. a CRT
+        // call on a stale fd) is a *silent* process fast-fail (exit
+        // 0xc0000409); make it the errno-return contract the fd layer is
+        // written against, like CPython's `_Py_BEGIN_SUPPRESS_IPH`.
+        #[cfg(windows)]
+        crate::stdlib::nt_support::install_silent_invalid_parameter_handler();
         // Adopt the environment's `LC_CTYPE` locale (CPython pre-init's
         // `_Py_SetLocaleFromEnv`) so `_locale.getencoding()` and
         // `locale.setlocale(..., None)` observe the user's locale.
