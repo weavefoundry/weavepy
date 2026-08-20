@@ -1144,6 +1144,19 @@ fn wait_fd_until(
     }
 }
 
+/// Readiness masks for [`blocking_socket_io`]. On unix these are the real
+/// `poll(2)` bits; on Windows the wait leg (`wait_readable_win`) ignores
+/// the mask (Winsock `select` is used instead), so only the type has to
+/// line up — `libc` does not export `POLLIN`/`POLLOUT` there.
+#[cfg(unix)]
+const POLL_IN: libc::c_short = libc::POLLIN;
+#[cfg(unix)]
+const POLL_OUT: libc::c_short = libc::POLLOUT;
+#[cfg(not(unix))]
+const POLL_IN: libc::c_short = 0x0001;
+#[cfg(not(unix))]
+const POLL_OUT: libc::c_short = 0x0004;
+
 /// CPython's `sock_call_ex` shape (RFC 0068 WS8): a socket in timeout mode
 /// keeps its fd non-blocking — the deadline is enforced with a poll-based
 /// readiness wait *around* the syscall, never with `SO_RCVTIMEO`. `events`
@@ -1638,7 +1651,7 @@ fn accept_parts(
     // subsequent `recv()` drains the buffered data then sees EOF.
     // `_test_multiprocessing`'s `WithProcessesTestListenerClient.test_issue14725`
     // exercises exactly this race (child writes, closes, exits; parent accepts).
-    let (new_sock, addr) = blocking_socket_io(&state, libc::POLLIN, |sock| sock.accept_raw())?;
+    let (new_sock, addr) = blocking_socket_io(&state, POLL_IN, |sock| sock.accept_raw())?;
     // PEP 446: accepted descriptors are non-inheritable. `F_SETFD` acts on the
     // descriptor-table entry (not the connection), so it succeeds even for a
     // peer-closed connection; ignore any error to stay non-fatal regardless.
@@ -1659,6 +1672,10 @@ fn sock_connect(args: &[Object]) -> Result<Object, RuntimeError> {
         let b = state.borrow();
         (b.family, b.timeout)
     };
+    // The connect-timeout poll leg below is unix-only; keep the binding
+    // from tripping `-D unused_variables` on Windows.
+    #[cfg(windows)]
+    let _ = timeout;
     let sockaddr = parse_sockaddr2(args.get(1), family)?;
     let mut connect_fn = |sock: &Socket| sock.connect(&sockaddr);
     // Single attempt — *no* EINTR retry: a signal-interrupted blocking
@@ -1768,7 +1785,7 @@ fn send_data_arg(arg: Option<&Object>) -> Result<Vec<u8>, RuntimeError> {
 fn sock_send(args: &[Object]) -> Result<Object, RuntimeError> {
     let state = state_of(args)?;
     let data = send_data_arg(args.get(1))?;
-    let n = blocking_socket_io(&state, libc::POLLOUT, |sock| sock.send(&data))?;
+    let n = blocking_socket_io(&state, POLL_OUT, |sock| sock.send(&data))?;
     Ok(Object::Int(n as i64))
 }
 
@@ -1781,7 +1798,7 @@ fn sock_sendall(args: &[Object]) -> Result<Object, RuntimeError> {
     // bytes. Each individual `send` is the single retryable syscall.
     let mut offset = 0;
     while offset < data.len() {
-        let n = blocking_socket_io(&state, libc::POLLOUT, |sock| sock.send(&data[offset..]))?;
+        let n = blocking_socket_io(&state, POLL_OUT, |sock| sock.send(&data[offset..]))?;
         if n == 0 {
             return Err(io_error_to_py(&std::io::Error::from(
                 std::io::ErrorKind::BrokenPipe,
@@ -1846,7 +1863,7 @@ fn sock_sendto(args: &[Object]) -> Result<Object, RuntimeError> {
     // (`str`/`bytes`), not an `(host, port)` tuple — use the family-aware
     // resolver (test_socketserver's Unix datagram servers).
     let sockaddr = parse_sockaddr2(addr_arg, family)?;
-    let n = blocking_socket_io(&state, libc::POLLOUT, |sock| sock.send_to(&data, &sockaddr))?;
+    let n = blocking_socket_io(&state, POLL_OUT, |sock| sock.send_to(&data, &sockaddr))?;
     Ok(Object::Int(n as i64))
 }
 
@@ -1871,7 +1888,7 @@ fn sock_recv(args: &[Object]) -> Result<Object, RuntimeError> {
         _ => return Err(type_error("recv: bufsize must be int")),
     };
     let mut buf: Vec<std::mem::MaybeUninit<u8>> = vec![std::mem::MaybeUninit::uninit(); bufsize];
-    let n = blocking_socket_io(&state, libc::POLLIN, |sock| sock.recv(&mut buf))?;
+    let n = blocking_socket_io(&state, POLL_IN, |sock| sock.recv(&mut buf))?;
     let initialised: Vec<u8> = buf[..n]
         .iter()
         .map(|m| unsafe { m.assume_init() })
@@ -1900,7 +1917,7 @@ fn sock_recv_into(args: &[Object]) -> Result<Object, RuntimeError> {
         nbytes
     };
     let mut buf = vec![std::mem::MaybeUninit::<u8>::uninit(); cap];
-    let n = blocking_socket_io(&state, libc::POLLIN, |sock| sock.recv(&mut buf))?;
+    let n = blocking_socket_io(&state, POLL_IN, |sock| sock.recv(&mut buf))?;
     {
         let mut bytes = dst.borrow_mut();
         for i in 0..n {
@@ -1918,7 +1935,7 @@ fn sock_recvfrom(args: &[Object]) -> Result<Object, RuntimeError> {
         _ => return Err(type_error("recvfrom: bufsize must be int")),
     };
     let mut buf = vec![std::mem::MaybeUninit::<u8>::uninit(); bufsize];
-    let (n, addr) = blocking_socket_io(&state, libc::POLLIN, |sock| sock.recv_from(&mut buf))?;
+    let (n, addr) = blocking_socket_io(&state, POLL_IN, |sock| sock.recv_from(&mut buf))?;
     let initialised: Vec<u8> = buf[..n]
         .iter()
         .map(|m| unsafe { m.assume_init() })
@@ -1951,7 +1968,7 @@ fn sock_recvfrom_into(args: &[Object]) -> Result<Object, RuntimeError> {
         nbytes
     };
     let mut buf = vec![std::mem::MaybeUninit::<u8>::uninit(); cap];
-    let (n, addr) = blocking_socket_io(&state, libc::POLLIN, |sock| sock.recv_from(&mut buf))?;
+    let (n, addr) = blocking_socket_io(&state, POLL_IN, |sock| sock.recv_from(&mut buf))?;
     {
         let mut bytes = dst.borrow_mut();
         for i in 0..n {
@@ -2365,6 +2382,15 @@ fn snapshot_raw_fd(state: &Rc<RefCell<SocketState>>) -> Result<libc::c_int, Runt
     let sock = b.inner.as_ref().ok_or_else(closed_socket_error)?;
     let fd = raw_fd_of(sock).ok_or_else(|| os_error("socket has no file descriptor"))?;
     Ok(fd as libc::c_int)
+}
+
+/// Windows twin of [`snapshot_raw_fd`]: the raw SOCKET handle as `i64`
+/// (callers cast to `winsock::SOCKET` at the wait site).
+#[cfg(windows)]
+fn snapshot_raw_fd(state: &Rc<RefCell<SocketState>>) -> Result<i64, RuntimeError> {
+    let b = state.borrow();
+    let sock = b.inner.as_ref().ok_or_else(closed_socket_error)?;
+    raw_fd_of(sock).ok_or_else(|| os_error("socket has no file descriptor"))
 }
 
 /// Extract the `sendmsg` iovec list — an iterable of bytes-like objects.

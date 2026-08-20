@@ -5230,7 +5230,7 @@ fn os_sendfile(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, R
         };
         loop {
             let offp = if use_off {
-                &mut off as *mut libc::off_t
+                &raw mut off
             } else {
                 std::ptr::null_mut()
             };
