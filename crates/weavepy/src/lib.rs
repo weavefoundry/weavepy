@@ -726,26 +726,47 @@ impl<'a> SourceLocation<'a> {
 mod tests {
     use super::*;
 
+    /// Every interpreter entry point runs on a main-thread-sized stack
+    /// (the CLI and conformance runner reserve 1 GiB; the fixture harness
+    /// spawns 16 MiB threads) — Rust's 2 MiB test threads are not enough
+    /// for full `site` initialization in unoptimized builds. Windows hit
+    /// this first (STATUS_STACK_OVERFLOW) once the `nt` shim let startup
+    /// run to completion; mirror the fixture harness here.
+    fn on_big_stack(f: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(f)
+            .expect("spawn test thread")
+            .join()
+            .expect("test thread panicked");
+    }
+
     #[test]
     fn run_empty_source_succeeds() {
-        run_source("").expect("empty source should run");
+        on_big_stack(|| {
+            run_source("").expect("empty source should run");
+        });
     }
 
     #[test]
     fn syntax_error_carries_caret() {
-        let err = run_source("def 3():\n    pass").unwrap_err();
-        let msg = err.format("def 3():\n    pass", "/tmp/x.py");
-        assert!(msg.contains("/tmp/x.py"), "{msg}");
-        assert!(msg.contains("line 1"), "{msg}");
-        assert!(msg.contains('^'), "{msg}");
-        assert!(msg.contains("SyntaxError"), "{msg}");
+        on_big_stack(|| {
+            let err = run_source("def 3():\n    pass").unwrap_err();
+            let msg = err.format("def 3():\n    pass", "/tmp/x.py");
+            assert!(msg.contains("/tmp/x.py"), "{msg}");
+            assert!(msg.contains("line 1"), "{msg}");
+            assert!(msg.contains('^'), "{msg}");
+            assert!(msg.contains("SyntaxError"), "{msg}");
+        });
     }
 
     #[test]
     fn runtime_error_includes_filename() {
-        let err = run_source_with_filename("undefined_name", "/tmp/y.py").unwrap_err();
-        let msg = err.format("undefined_name", "/tmp/y.py");
-        assert!(msg.starts_with("Traceback"), "{msg}");
-        assert!(msg.contains("/tmp/y.py"), "{msg}");
+        on_big_stack(|| {
+            let err = run_source_with_filename("undefined_name", "/tmp/y.py").unwrap_err();
+            let msg = err.format("undefined_name", "/tmp/y.py");
+            assert!(msg.starts_with("Traceback"), "{msg}");
+            assert!(msg.contains("/tmp/y.py"), "{msg}");
+        });
     }
 }

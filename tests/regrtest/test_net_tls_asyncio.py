@@ -17,7 +17,9 @@ import asyncio
 import os
 import socket
 import ssl
+import sys
 import threading
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CERT = os.path.join(HERE, "certs", "localhost.cert")
@@ -110,14 +112,29 @@ def sni_dispatch():
     listener.listen(1)
     host, port = listener.getsockname()[:2]
     server_error = []
+    # Post-mortem for an intermittent CI-only stall (client recv timing
+    # out after 15s): timestamped server-thread progress, dumped on any
+    # client-side failure to show where the server stopped.
+    t0 = time.monotonic()
+    progress = []
+
+    def step(what):
+        progress.append("%.3fs %s" % (time.monotonic() - t0, what))
 
     def serve():
         try:
+            step("accepting")
             raw, _ = listener.accept()
+            step("accepted")
             raw.settimeout(15)
             tls = sctx.wrap_socket(raw, server_side=True)
-            tls.sendall(tls.recv(64))
+            step("handshake done")
+            data = tls.recv(64)
+            step("received %r" % (data,))
+            tls.sendall(data)
+            step("echoed")
             tls.close()
+            step("closed")
         except Exception as e:
             server_error.append(repr(e))
 
@@ -126,10 +143,21 @@ def sni_dispatch():
     try:
         raw = socket.create_connection((host, port), timeout=15)
         raw.settimeout(15)
+        step("client connected")
         tls = cctx.wrap_socket(raw, server_hostname="localhost")
+        step("client handshake done")
         tls.sendall(b"sni")
+        step("client sent")
         assert tls.recv(64) == b"sni"
         tls.close()
+    except Exception:
+        # Let the server thread hit its own 15s timeout so server_error
+        # is populated before the report is printed.
+        t.join(timeout=20)
+        print("sni_dispatch progress:", progress, file=sys.stderr)
+        print("sni_dispatch server error:", server_error, file=sys.stderr)
+        print("sni_dispatch sni_seen:", sni_seen, file=sys.stderr)
+        raise
     finally:
         t.join(timeout=15)
         listener.close()
@@ -137,6 +165,13 @@ def sni_dispatch():
     assert sni_seen == ["localhost"], sni_seen
 
 
-sni_dispatch()
+# Native `_ssl` read/write traces on stderr for the section that stalls
+# intermittently on CI; harmless on success, decisive in a failure's
+# captured stderr.
+os.environ["WEAVE_SSL_DEBUG"] = "1"
+try:
+    sni_dispatch()
+finally:
+    del os.environ["WEAVE_SSL_DEBUG"]
 
 print("RFC 0054 asyncio TLS echo fixture ok")

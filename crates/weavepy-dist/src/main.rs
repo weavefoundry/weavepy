@@ -955,7 +955,13 @@ fn leg_venv(
     env: &[(OsString, OsString)],
 ) -> Leg {
     let venv_arg = venv_dir.display().to_string();
-    let created = run_captured(python3, &["-m", "venv", &venv_arg], env, None);
+    // Import-trace the creation run (`PYTHONVERBOSE=1`): a native crash —
+    // Windows fast-fail is *silent* (no traceback, empty stderr) — leaves
+    // the trace's last `import ...` line as the only pointer to where
+    // startup died. Verbose output is discarded on success.
+    let mut create_env = env.to_vec();
+    create_env.push((OsString::from("PYTHONVERBOSE"), OsString::from("1")));
+    let created = run_captured(python3, &["-m", "venv", &venv_arg], &create_env, None);
     match created {
         Err(err) => {
             return Leg {
@@ -965,6 +971,16 @@ fn leg_venv(
             }
         }
         Ok(out) if !out.status.success() => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            // The import trace can run to thousands of lines; only the
+            // tail (the crash neighbourhood) is diagnostic.
+            let tail_start = stderr
+                .lines()
+                .rev()
+                .take(60)
+                .last()
+                .map(|l| l.as_ptr() as usize - stderr.as_ptr() as usize)
+                .unwrap_or(0);
             return Leg {
                 name: "venv",
                 status: LegStatus::Fail,
@@ -972,10 +988,10 @@ fn leg_venv(
                     "`python3 -m venv` exited {}\n{}\n{}{}",
                     out.status,
                     String::from_utf8_lossy(&out.stdout),
-                    String::from_utf8_lossy(&out.stderr),
+                    &stderr[tail_start..],
                     venv_failure_diagnostics(venv_python, env),
                 ),
-            }
+            };
         }
         Ok(_) => {}
     }
