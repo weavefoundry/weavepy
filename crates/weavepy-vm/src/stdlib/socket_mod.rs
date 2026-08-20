@@ -37,6 +37,8 @@
 use crate::sync::Rc;
 use crate::sync::RefCell;
 use std::collections::HashMap;
+// Only the unix-gated interface/name lookups use `CStr` directly.
+#[cfg(unix)]
 use std::ffi::CStr;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, ToSocketAddrs};
@@ -2443,6 +2445,7 @@ fn extract_iov_buffers(arg: Option<&Object>) -> Result<Vec<Vec<u8>>, RuntimeErro
 /// Integer conversion through `__index__`, like the C "i" arg converter:
 /// native ints (and IntEnum members) short-circuit, anything else gets its
 /// `__index__` called through the interpreter.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn index_arg(obj: &Object) -> Option<i64> {
     if let Some(n) = obj.as_i64() {
         return Some(n);

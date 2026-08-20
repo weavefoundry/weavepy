@@ -387,7 +387,9 @@ pub unsafe extern "C" fn PyThread_get_thread_native_id() -> libc::c_ulong {
 pub unsafe extern "C" fn Py_FrozenMain(_argc: c_int, _argv: *mut *mut libc::c_char) -> c_int {
     let msg = b"Unable to import __main__: no frozen modules are registered\n";
     unsafe {
-        libc::write(2, msg.as_ptr().cast::<c_void>(), msg.len());
+        // `write(2)`'s count is `usize` on unix but `c_uint` on Windows;
+        // the message is a fixed 61-byte literal, so `as _` is lossless.
+        libc::write(2, msg.as_ptr().cast::<c_void>(), msg.len() as _);
     }
     1
 }

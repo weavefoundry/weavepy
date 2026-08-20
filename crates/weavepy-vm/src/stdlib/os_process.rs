@@ -437,6 +437,7 @@ fn last_os_err() -> RuntimeError {
 /// flags include `bit` (`Py_RTFLAGS_*`). Outside any published
 /// interpreter frame everything is allowed (the main interpreter's
 /// defaults carry all the process-control bits).
+#[cfg_attr(not(unix), allow(dead_code))]
 fn current_interp_allows(bit: u32) -> bool {
     match crate::vm_singletons::current_interpreter_ptr() {
         // SAFETY: published by the enclosing VM dispatch frame on this
