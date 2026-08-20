@@ -3050,27 +3050,47 @@ fn ns_do_handshake(args: &[Object]) -> Result<Object, RuntimeError> {
             let mut tap = TapStream { sock, hs_rx, hs_tx };
             crate::gil::allow_threads_then(|| conn.complete_io(&mut tap))
         };
+        if std::env::var("WEAVE_SSL_DEBUG").is_ok() {
+            eprintln!(
+                "[hs id={id}] complete_io -> {res:?} handshaking={} wants_write={}",
+                s.conn.is_handshaking(),
+                s.conn.wants_write()
+            );
+        }
         match res {
-            Ok(_) => break,
+            Ok(_) if !s.conn.is_handshaking() => break,
+            // `complete_io` reports *partial* progress as success: a
+            // mid-handshake read that WouldBlocks after some bytes landed
+            // returns `Ok((rdlen, wrlen))` instead of the error (its
+            // `blocked_read` arm short-circuits on `rdlen > 0`). That happens
+            // whenever the peer's flight straddles two TCP reads — e.g. a
+            // loaded scheduler descheduling the peer between its `write_tls`
+            // calls. Breaking here hands back a socket whose handshake never
+            // finishes: our Finished stays queued while `recv` polls for
+            // application data the peer won't send before it. Poll and resume
+            // until `is_handshaking()` actually clears.
+            Ok(_) => {}
             #[cfg(unix)]
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                use std::os::unix::io::AsRawFd;
-                let fd = s.sock.as_raw_fd();
-                let timeout = recv_timeout(fd);
-                let want_write = s.conn.wants_write();
-                let ready = crate::gil::allow_threads_then(|| {
-                    if want_write {
-                        wait_fd_writable(fd, timeout)
-                    } else {
-                        wait_fd_readable(fd, timeout)
-                    }
-                })
-                .map_err(|e2| handshake_io_error(&e2))?;
-                if !ready {
-                    return Err(timeout_error("_ssl.c: The handshake operation timed out"));
-                }
-            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => return Err(handshake_io_error(&e)),
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = s.sock.as_raw_fd();
+            let timeout = recv_timeout(fd);
+            let want_write = s.conn.wants_write();
+            let ready = crate::gil::allow_threads_then(|| {
+                if want_write {
+                    wait_fd_writable(fd, timeout)
+                } else {
+                    wait_fd_readable(fd, timeout)
+                }
+            })
+            .map_err(|e2| handshake_io_error(&e2))?;
+            if !ready {
+                return Err(timeout_error("_ssl.c: The handshake operation timed out"));
+            }
         }
     }
     note_capath_used(s.ctx, &s.conn);
