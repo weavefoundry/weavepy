@@ -791,6 +791,10 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
                 DictKey(Object::from_static("_path_splitroot_ex")),
                 builtin("_path_splitroot_ex", nt_path_splitroot_ex),
             );
+            d.insert(
+                DictKey(Object::from_static("_path_splitroot")),
+                builtin("_path_splitroot", nt_path_splitroot),
+            );
             // RFC 0064 WS2 — `os.add_dll_directory` (PEP 578-audited
             // `AddDllDirectory`). Binary wheels' `__init__` shims call it
             // to make vendored dependent DLLs resolvable by the loader
@@ -6472,6 +6476,41 @@ fn nt_path_splitroot_ex(args: &[Object]) -> Result<Object, RuntimeError> {
                 Object::new_bytes(b[..d].to_vec()),
                 Object::new_bytes(b[d..r].to_vec()),
                 Object::new_bytes(b[r..].to_vec()),
+            ]))
+        }
+        _ => unreachable!("resolve_fspath_obj returns str/bytes"),
+    }
+}
+
+/// `nt._path_splitroot(path)` → `(root, tail)`: the drive+root prefix and
+/// the remainder, with `/` normalised to `\` throughout — the shape of
+/// posixmodule.c's `PathCchSkipRoot`-based `os__path_splitroot_impl`. The
+/// frozen importlib bootstrap (`_path_join`/`_path_isabs`) and `site` call
+/// this two-tuple variant, not `_path_splitroot_ex`.
+#[cfg(windows)]
+fn nt_path_splitroot(args: &[Object]) -> Result<Object, RuntimeError> {
+    let obj = args
+        .first()
+        .ok_or_else(|| type_error("_path_splitroot() requires a path argument"))?;
+    let resolved = resolve_fspath_obj(obj, "_path_splitroot")?;
+    match &resolved {
+        Object::Str(s) => {
+            let full = s.to_string().replace('/', "\\");
+            let (_, r) = nt_splitroot_indices(full.as_bytes());
+            Ok(Object::new_tuple(vec![
+                Object::from_str(full[..r].to_owned()),
+                Object::from_str(full[r..].to_owned()),
+            ]))
+        }
+        Object::Bytes(b) => {
+            let full: Vec<u8> = b
+                .iter()
+                .map(|&c| if c == b'/' { b'\\' } else { c })
+                .collect();
+            let (_, r) = nt_splitroot_indices(&full);
+            Ok(Object::new_tuple(vec![
+                Object::new_bytes(full[..r].to_vec()),
+                Object::new_bytes(full[r..].to_vec()),
             ]))
         }
         _ => unreachable!("resolve_fspath_obj returns str/bytes"),
