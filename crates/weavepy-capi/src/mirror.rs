@@ -476,9 +476,12 @@ pub fn mirror_out_with_type(obj: Object, ty: *mut PyTypeObject) -> *mut PyObject
                 unsafe { sync_list_ob_item(p) };
                 return p;
             }
-            let p = mirror_out_fresh(obj, ty);
-            register_list_box(key, p);
-            return p;
+            // RFC 0069 WS5: the mint registers itself in the canonical
+            // cache *before* filling `ob_item`, so a self-referential list
+            // (`l.append(l)`, numpy's pathological-self-containing test)
+            // resolves its inner crossing to the box being built instead
+            // of recursing the mint until the C stack faults.
+            return mirror_out_fresh_inner(obj, ty, Some(key));
         }
     }
     // A bytearray likewise crosses as a single canonical box per VM buffer
@@ -577,6 +580,22 @@ pub fn mirror_out_unpinned(obj: Object) -> *mut PyObject {
 /// consultation). Every mirror is born here; [`mirror_out_with_type`]
 /// layers the set cache on top.
 fn mirror_out_fresh(obj: Object, ty: *mut PyTypeObject) -> *mut PyObject {
+    mirror_out_fresh_inner(obj, ty, None)
+}
+
+/// The mint body. `list_precache_key` is `Some` only from the canonical
+/// list lane of [`mirror_out_with_type`]: the box is published to
+/// [`LIST_BOX_CACHE`] *before* its elements are materialised, so a list
+/// that (transitively) contains itself terminates — the inner crossing
+/// hits the cache and stores this very box's pointer, giving the C side
+/// the same self-referential `ob_item` CPython would (RFC 0069 WS5;
+/// numpy's `test_pathological_self_containing` used to ride this mint
+/// recursion into a stack fault).
+fn mirror_out_fresh_inner(
+    obj: Object,
+    ty: *mut PyTypeObject,
+    list_precache_key: Option<usize>,
+) -> *mut PyObject {
     if listsync_trace_enabled() {
         if let Object::List(rc) = &obj {
             eprintln!(
@@ -595,18 +614,24 @@ fn mirror_out_fresh(obj: Object, ty: *mut PyTypeObject) -> *mut PyObject {
 
     let body = unsafe { raw.add(PREFIX_SIZE) } as *mut PyObject;
 
+    // Head — written *before* the body fill so a re-entrant crossing of a
+    // self-referential list (which hands back a fresh reference to this
+    // box mid-fill) increments a live refcount instead of being clobbered.
+    // No `fill_body` lane touches `ob_refcnt`/`ob_type`.
+    unsafe {
+        (*body).ob_refcnt = 1;
+        (*body).ob_type = ty;
+    }
+    if let Some(key) = list_precache_key {
+        register_list_box(key, body);
+    }
+
     // Allocate any out-of-line buffer (list `ob_item`) before we move
     // `obj` into the prefix, so we can still read it.
     let mut aux_ptr: *mut u8 = ptr::null_mut();
     let mut aux_size: usize = 0;
     unsafe {
         fill_body(body, ty, &obj, &plan, &mut aux_ptr, &mut aux_size);
-    }
-
-    // Head.
-    unsafe {
-        (*body).ob_refcnt = 1;
-        (*body).ob_type = ty;
     }
 
     // Prefix (owns the native object).
@@ -1012,6 +1037,18 @@ pub unsafe fn native_of(p: *mut PyObject) -> Object {
             // position vanished). For a C-built list (`PyList_New` + macro
             // fills) the mint `Rc` is unshared and the refill is the same
             // seeding as before.
+            // RFC 0069 WS5: flip `list_synced` *before* reading the buffer.
+            // `read_list_vec` clones every slot back to a VM object, and a
+            // self-referential list (`l.append(l)` — numpy's pathological-
+            // self-containing test) holds this very box in slot 0: with the
+            // flag still clear the nested clone re-entered this seed until
+            // the C stack faulted. Synced-early, the nested crossing takes
+            // the reconcile branch (a no-op — the box is not yet in
+            // `SEEDED_LISTS`) and resolves to the shared prefix `Rc`, which
+            // is exactly the identity `l[0] is l` requires.
+            unsafe {
+                (*pre).list_synced = true;
+            }
             if let Object::List(rc) = unsafe { &(*pre).obj } {
                 let cur = unsafe { read_list_vec(p) };
                 *rc.borrow_mut() = cur;
@@ -1020,9 +1057,6 @@ pub unsafe fn native_of(p: *mut PyObject) -> Object {
                 unsafe {
                     (*pre).obj = seeded;
                 }
-            }
-            unsafe {
-                (*pre).list_synced = true;
             }
             // Now VM-shared: a Python-side mutation of this list must be
             // re-published to `ob_item` before C reads it back through the
@@ -1762,6 +1796,9 @@ fn cached_list_box(key: usize) -> Option<*mut PyObject> {
 
 /// Record `p` as the canonical box for native-list identity `key`.
 fn register_list_box(key: usize, p: *mut PyObject) {
+    if listsync_trace_enabled() {
+        eprintln!("[LISTSYNC] register key=0x{key:x} p={p:p}");
+    }
     if let Ok(mut g) = LIST_BOX_CACHE.lock() {
         if g.get_or_insert_with(FxHashMap::default)
             .insert(key, p as usize)
@@ -1972,7 +2009,7 @@ pub fn enter_arg_pin() -> ArgPinGuard {
     ArgPinGuard(())
 }
 
-fn arg_pin_active() -> bool {
+pub(crate) fn arg_pin_active() -> bool {
     ARG_PIN_DEPTH.try_with(|c| c.get() > 0).unwrap_or(false)
 }
 
@@ -2372,6 +2409,10 @@ thread_local! {
     /// thus `ensure_active` → `flush_seeded_lists`); the guard makes that
     /// nested call a no-op so the outer flush keeps a consistent snapshot.
     static FLUSHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Boxes currently mid-[`sync_list_ob_item`] on this thread — the
+    /// re-entrancy fence for self-referential lists (RFC 0069 WS5).
+    static LIST_SYNCING: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 struct FlushGuard;
@@ -2476,6 +2517,32 @@ pub unsafe fn sync_list_ob_item(p: *mut PyObject) {
     if !unsafe { (*pre).list_synced } {
         return;
     }
+    // RFC 0069 WS5: publishing the elements below crosses each of them
+    // back out (`into_owned`), and a list that (transitively) contains
+    // itself re-enters this very sync through the canonical-cache hit —
+    // its fingerprint is only recorded on the way *out*, so the nested
+    // call would republish forever. The box being synced already holds
+    // its own live pointer in the slot; skip the nested pass.
+    let key = p as usize;
+    let reentered = LIST_SYNCING.with(|s| {
+        let mut v = s.borrow_mut();
+        if v.contains(&key) {
+            true
+        } else {
+            v.push(key);
+            false
+        }
+    });
+    if reentered {
+        return;
+    }
+    struct SyncGuard(usize);
+    impl Drop for SyncGuard {
+        fn drop(&mut self) {
+            LIST_SYNCING.with(|s| s.borrow_mut().retain(|&k| k != self.0));
+        }
+    }
+    let _guard = SyncGuard(key);
     // Adopt any *direct* C-side write first (RFC 0047, wave 5). Cython's
     // `__Pyx_ListComp_Append` fast path grows a seeded list straight through
     // the `PyList_SET_ITEM` + `__Pyx_SET_SIZE` macros (e.g. `[np.dtype(x)

@@ -73,9 +73,13 @@ fn add_two_ints() {
         len_spans: vec![],
         method_spans: vec![],
         attr_sites: vec![],
+        method_sites: vec![],
+        math_guards: vec![],
+        math_spans: vec![],
         osr_entries: vec![],
         max_call_args: 0,
         ret_lane: None,
+        ret_none: false,
         blocks: vec![TBlock {
             entry_stack: vec![],
             stmts: vec![
@@ -108,9 +112,13 @@ fn add_overflow_deopts_with_operands_spilled() {
         len_spans: vec![],
         method_spans: vec![],
         attr_sites: vec![],
+        method_sites: vec![],
+        math_guards: vec![],
+        math_spans: vec![],
         osr_entries: vec![],
         max_call_args: 0,
         ret_lane: None,
+        ret_none: false,
         blocks: vec![TBlock {
             entry_stack: vec![],
             stmts: vec![
@@ -144,9 +152,13 @@ fn sum_loop() -> TFunc {
         len_spans: vec![],
         method_spans: vec![],
         attr_sites: vec![],
+        method_sites: vec![],
+        math_guards: vec![],
+        math_spans: vec![],
         osr_entries: vec![],
         max_call_args: 0,
         ret_lane: None,
+        ret_none: false,
         blocks: vec![
             // B0: s=0; i=0; -> B1
             TBlock {
@@ -229,9 +241,13 @@ fn binop_fn(op: ArithKind) -> TFunc {
         len_spans: vec![],
         method_spans: vec![],
         attr_sites: vec![],
+        method_sites: vec![],
+        math_guards: vec![],
+        math_spans: vec![],
         osr_entries: vec![],
         max_call_args: 0,
         ret_lane: None,
+        ret_none: false,
         blocks: vec![TBlock {
             entry_stack: vec![],
             stmts: vec![
@@ -297,9 +313,13 @@ fn int_truediv_returns_float() {
         len_spans: vec![],
         method_spans: vec![],
         attr_sites: vec![],
+        method_sites: vec![],
+        math_guards: vec![],
+        math_spans: vec![],
         osr_entries: vec![],
         max_call_args: 0,
         ret_lane: None,
+        ret_none: false,
         blocks: vec![TBlock {
             entry_stack: vec![],
             stmts: vec![

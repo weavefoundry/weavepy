@@ -45,6 +45,49 @@ pub enum CmpKind {
     Ge,
 }
 
+/// RFC 0069 WS2 — the math-module intrinsics the JIT burns in as
+/// native instructions. `Sqrt` lowers to Cranelift's `sqrt`; `Sin`/
+/// `Cos` call the registered libm-backed helpers (bit-identical to
+/// what the interpreter's `math` module computes); `Fabs` lowers to
+/// `fabs`. Domain surprises (negative `sqrt` operand, non-finite
+/// `sin`/`cos` input) deopt *before* the operation so the interpreter
+/// re-executes the call and raises the exact `ValueError`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MathFunc {
+    Sqrt,
+    Sin,
+    Cos,
+    Fabs,
+}
+
+impl MathFunc {
+    /// Map a `math` attribute name to its intrinsic, or `None` for
+    /// anything outside the burned-in set.
+    #[must_use]
+    pub fn from_attr(name: &str) -> Option<MathFunc> {
+        match name {
+            "sqrt" => Some(MathFunc::Sqrt),
+            "sin" => Some(MathFunc::Sin),
+            "cos" => Some(MathFunc::Cos),
+            "fabs" => Some(MathFunc::Fabs),
+            _ => None,
+        }
+    }
+}
+
+/// RFC 0069 WS1 — how a burned-in method call's result is typed. A
+/// provably-`None` return (every return site is the `None` constant)
+/// exists only on the interpreter stack — the analyzer requires the
+/// following instruction to consume it (`POP_TOP`) — while a scalar
+/// return rides the native stack like a `CallPy` result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MethodRet {
+    /// The callee provably returns `None` (procedure shape).
+    None,
+    /// The callee returns one stable scalar lane.
+    Scalar(JitType),
+}
+
 /// A single stack-machine operation. Operands are implicit (the top of
 /// the abstract value stack); results are pushed.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -64,8 +107,10 @@ pub enum TOp {
     /// `FloorDiv`/`Mod` deopt on zero divisor or `MIN / -1`. Never
     /// carries `TrueDiv` (see [`TOp::IntTrueDiv`]).
     IntArith(ArithKind),
-    /// `float (op) float → float`. Only `Add`/`Sub`/`Mul`/`TrueDiv`
-    /// (float floor-div / mod are non-JITable in v1).
+    /// `float (op) float → float`. `Add`/`Sub`/`Mul`/`TrueDiv`, plus
+    /// (RFC 0069 WS2) `FloorDiv`/`Mod` with Python's sign-follows-
+    /// divisor semantics; `TrueDiv`/`FloorDiv`/`Mod` deopt on a zero
+    /// divisor (the interpreter raises `ZeroDivisionError`).
     FloatArith(ArithKind),
     /// `int / int → float` (Python true division). Deopts on a zero
     /// divisor (the interpreter raises `ZeroDivisionError`).
@@ -153,6 +198,29 @@ pub enum TOp {
     /// object belongs to the interpreter's store path); any surprise
     /// deopts at this pc and the interpreter re-executes the store.
     AttrSet { site: u32 },
+    /// RFC 0069 WS2 — a burned-in `math` intrinsic: pops one `float`
+    /// operand (already promoted) and pushes the `float` result.
+    /// Domain surprises deopt at this pc *before* the operation with
+    /// the operand spilled, so the interpreter re-executes the call
+    /// (the enclosing math span rebuilds the `[func, null]` pair the
+    /// interpreter holds below the argument) and raises exactly.
+    MathIntrinsic(MathFunc),
+    /// RFC 0069 WS1 — a guarded method call on a pinned receiver: pops
+    /// `argc` scalar arguments and the receiver pin, and calls the
+    /// registered `wpjit_call_method` helper with `token` (an index
+    /// into the compiled frame's method table). The helper
+    /// re-validates the burned-in class fingerprint + `__code__`
+    /// identity per call; a mismatch deopts *at* this pc with the
+    /// receiver + arguments spilled (the call never ran — the
+    /// interpreter re-executes it generically). A raised callee takes
+    /// the `Raised` exit; an unrepresentable result (or invalidated
+    /// caller guard) deopts *after* the call, exactly the `CallPy`
+    /// protocol.
+    CallMethod {
+        token: u32,
+        argc: u8,
+        ret: MethodRet,
+    },
 }
 
 /// One IR statement: a [`TOp`] tagged with its originating bytecode pc
@@ -168,6 +236,10 @@ pub struct TStmt {
 pub enum TTerm {
     /// Pop TOS and return it from the frame.
     Return,
+    /// RFC 0069 WS1 — `return None` (including the implicit
+    /// function-tail return): no native value is popped; the frame
+    /// exits `Returned` with the `None` slot tag.
+    ReturnNone,
     /// Unconditional branch; the current abstract stack is passed as
     /// block args.
     Jump(BlockId),
@@ -230,16 +302,24 @@ pub enum ResolvedGlobal {
     /// RFC 0059 WS3 — a plain Python function, callable natively through
     /// the `wpjit_call_py` helper. `token` indexes the embedder's callee
     /// table (parallel to resolution order); `arg_count` is the callee's
-    /// positional arity; `ret` is the callee's inferred scalar return
-    /// lane (`None` when the callee is the function being compiled —
-    /// the analyzer resolves self-recursion through its own return-lane
-    /// fixpoint).
+    /// positional arity; `min_args` is the arity minus its trailing
+    /// defaults (RFC 0069 WS3 — a call site passing `min_args..=
+    /// arg_count` positionals is admitted, and the embedder binds the
+    /// snapshotted defaults for the tail); `ret` is the callee's
+    /// inferred scalar return lane (`None` when the callee is the
+    /// function being compiled — the analyzer resolves self-recursion
+    /// through its own return-lane fixpoint).
     PyFunc {
         token: u32,
         arg_count: u32,
+        min_args: u32,
         is_self: bool,
         ret: Option<JitType>,
     },
+    /// RFC 0069 WS2 — the canonical `math` module. Only consumable by
+    /// an immediately following method-form attribute load of a
+    /// burned-in intrinsic name; any other use disqualifies the frame.
+    MathModule,
     /// Anything else — not representable; the load disqualifies the frame.
     Opaque,
 }
@@ -276,24 +356,30 @@ pub struct CalleeSpanMeta {
 }
 
 /// Deopt-reconstruction metadata for one erased *method receiver*
-/// (RFC 0065 WS5): between a `LOAD_ATTR append` on a pinned list and
-/// its `CALL`, the *interpreter's* operand stack holds the bound
-/// `list.append` method where the native stack holds the raw list pin.
-/// A side exit at a pc in `(live_from, live_to)` must rebuild the
-/// spilled entry at native-stack index `native_index` as the bound
-/// method (via a fresh attribute load on the pinned list) instead of
-/// the bare list. `live_to` is the pc *after* the `CALL`, so a
-/// (defensive) deopt at the `CALL` itself is still inside the span.
+/// (RFC 0065 WS5 / RFC 0069 WS1): between a `LOAD_ATTR` method load
+/// on a pinned receiver and its `CALL`, the *interpreter's* operand
+/// stack holds the bound method (plus the self-or-null `Unbound`
+/// marker above it) where the native stack holds the raw pin. A side
+/// exit at a pc in `(live_from, live_to)` must rebuild the spilled
+/// entry at native-stack index `native_index` as the bound method +
+/// marker instead of the bare pin. `live_to` is the pc *after* the
+/// `CALL`, so a deopt at the `CALL` itself (a rejected method guard,
+/// or `append`'s defensive exit) is still inside the span.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MethodSpanMeta {
     /// Bottom-based index of the receiver in the native operand stack
     /// (equal to its index in the deopt spill).
     pub native_index: u32,
-    /// The `LOAD_ATTR` pc (exclusive — the receiver is a plain list
+    /// The `LOAD_ATTR` pc (exclusive — the receiver is a plain value
     /// before it executes).
     pub live_from: u32,
     /// The pc after the `CALL` (exclusive).
     pub live_to: u32,
+    /// RFC 0069 WS1 — `Some(token)` for a burned-in method site (the
+    /// bound method rebuilds from the embedder's method table);
+    /// `None` for the RFC 0065 `list.append` shape (rebuilds via a
+    /// fresh `append` load on the pinned list).
+    pub token: Option<u32>,
 }
 
 /// One burned-in attribute-access site (RFC 0065 WS5). The embedder
@@ -310,6 +396,40 @@ pub struct AttrSiteMeta {
     pub lane: JitType,
     /// `true` for a `STORE_ATTR` site.
     pub store: bool,
+}
+
+/// RFC 0069 WS1 — one burned-in method-call site, indexed by
+/// [`TOp::CallMethod`]'s `token`. The embedder resolved `(slot, name)`
+/// through the receiver's class at analysis time and snapshots the
+/// resolved function + class fingerprint per token; the call helper
+/// re-validates both per call.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MethodSiteMeta {
+    /// The local slot the receiver was loaded from (probe key).
+    pub slot: u32,
+    /// The method name.
+    pub name: String,
+    /// The callee's positional arity, `self` included.
+    pub arg_count: u32,
+    /// Arity minus trailing defaults (`self` included).
+    pub min_args: u32,
+    /// The call result's typing.
+    pub ret: MethodRet,
+}
+
+/// RFC 0069 WS2 — one burned-in `math` intrinsic guard: the global
+/// `name` must resolve to the canonical math module *and* its `attr`
+/// must still be the function object the embedder snapshotted at
+/// compile time (module dicts are mutable, so the entry guard and the
+/// per-stride poll both re-validate the pair).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MathGuardMeta {
+    /// The `LOAD_GLOBAL` name (`math`, or an alias bound to the module).
+    pub name: String,
+    /// The attribute name (`sqrt`, `sin`, `cos`, `fabs`).
+    pub attr: String,
+    /// The intrinsic burned in for this site.
+    pub kind: MathFunc,
 }
 
 /// One OSR entry point (RFC 0059 WS3b): a backward-jump target block
@@ -372,21 +492,40 @@ pub struct TFunc {
     /// re-inserted object is the guard snapshot's `len` (the `token`
     /// field is unused) and `live_to` is the pc *after* the `CALL`.
     pub len_spans: Vec<CalleeSpanMeta>,
-    /// RFC 0065 WS5 — erased bound-method receivers (`list.append`),
-    /// for rewriting the spilled receiver on a mid-span deopt.
+    /// RFC 0065 WS5 / RFC 0069 WS1 — erased bound-method receivers
+    /// (`list.append` and burned-in method sites), for rewriting the
+    /// spilled receiver on a mid-span deopt.
     pub method_spans: Vec<MethodSpanMeta>,
     /// RFC 0065 WS5 — burned-in attribute-access sites, indexed by
     /// [`TOp::AttrGet`]/[`TOp::AttrSet`]'s `site`.
     pub attr_sites: Vec<AttrSiteMeta>,
+    /// RFC 0069 WS1 — burned-in method-call sites, indexed by
+    /// [`TOp::CallMethod`]'s `token`. The embedder's method table is
+    /// parallel to this.
+    pub method_sites: Vec<MethodSiteMeta>,
+    /// RFC 0069 WS2 — burned-in math-intrinsic guards, one per
+    /// distinct `(name, attr)` pair, in first-use order.
+    pub math_guards: Vec<MathGuardMeta>,
+    /// RFC 0069 WS2 — erased `math` intrinsic callables riding the
+    /// interpreter stack between their method load and `CALL`. Same
+    /// reconstruction contract as [`Self::len_spans`] (`token` indexes
+    /// [`Self::math_guards`], `live_to` is the pc after the `CALL`).
+    pub math_spans: Vec<CalleeSpanMeta>,
     /// OSR entry points (RFC 0059 WS3b): backward-jump target blocks
     /// enterable via `entry_pc`.
     pub osr_entries: Vec<OsrEntry>,
-    /// Widest `CallPy` argument count, for sizing the marshal buffer.
+    /// Widest `CallPy`/`CallMethod` argument count, for sizing the
+    /// marshal buffer.
     pub max_call_args: u32,
     /// The function's own scalar return lane, when every `return` site
     /// agrees on one representable lane (RFC 0059 WS3). This is what a
     /// *caller's* analysis burns in as `PyFunc::ret`.
     pub ret_lane: Option<JitType>,
+    /// RFC 0069 WS1 — `true` when every return site is provably the
+    /// `None` constant (the procedure shape). Mutually exclusive with
+    /// a concrete [`Self::ret_lane`]: mixed None/scalar returns poison
+    /// the lane to `Unknown`.
+    pub ret_none: bool,
 }
 
 impl TOp {
@@ -408,6 +547,9 @@ impl TOp {
                 | TOp::IntToFloatTos { guarded: true }
                 | TOp::IntToFloatSecond { guarded: true }
                 | TOp::CallPy { .. }
+                | TOp::CallMethod { .. }
+                | TOp::MathIntrinsic(_)
+                | TOp::FloatArith(ArithKind::FloorDiv | ArithKind::Mod)
                 | TOp::ListGet { .. }
                 | TOp::ListSet
                 | TOp::ListLen

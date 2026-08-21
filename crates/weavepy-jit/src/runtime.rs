@@ -71,6 +71,12 @@ pub enum CallStatus {
     /// *after* the call with the result spilled — the call must never
     /// re-execute.
     Boxed = 2,
+    /// RFC 0069 WS1 — the call was *rejected before running* (a method
+    /// guard mismatch: different class, mutated class version, rebound
+    /// `__code__`). The caller must deopt **at** the call's pc with the
+    /// receiver and arguments spilled, so the interpreter re-executes
+    /// the call generically. Never returned once the callee has run.
+    Reject = 3,
 }
 
 /// How to interpret a `u64` slot in [`JitFrame::locals`] /
@@ -96,6 +102,10 @@ pub enum SlotTag {
     /// per-entry pinned-object table (a pinned *instance* receiver).
     /// Same reconstruction contract as [`SlotTag::ListPin`].
     ObjPin = 5,
+    /// RFC 0069 WS1 — the Python `None` singleton (a `ReturnNone`
+    /// exit, or a provably-`None` method-call result). The bits are
+    /// ignored; the embedder rebuilds `Object::None`.
+    None = 6,
 }
 
 impl SlotTag {
@@ -109,6 +119,7 @@ impl SlotTag {
             3 => SlotTag::Boxed,
             4 => SlotTag::ListPin,
             5 => SlotTag::ObjPin,
+            6 => SlotTag::None,
             _ => SlotTag::Int,
         }
     }
@@ -364,4 +375,93 @@ pub(crate) fn attr_get_helper_addr() -> usize {
 #[must_use]
 pub(crate) fn attr_set_helper_addr() -> usize {
     ATTR_SET_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// RFC 0069 WS1 — the embedder's guarded method-call helper. Compiled
+/// code marshals `argc` scalar arguments into [`JitFrame::call_args`] /
+/// [`JitFrame::call_tags`] (bottom-to-top, receiver *not* included),
+/// then calls this with the method-table `token`, the receiver's pin
+/// index, the argument count, and the expected result [`SlotTag`].
+/// The helper re-validates the burned-in class fingerprint and
+/// `__code__` identity against the live receiver, performs the call
+/// (natively when the callee is compiled and shape-eligible, through
+/// the interpreter otherwise), and returns a [`CallStatus`] — with
+/// [`CallStatus::Reject`] when the guard failed and the call must be
+/// re-executed by the interpreter at the call's pc.
+///
+/// # Safety contract (for implementors)
+///
+/// Same as [`CallPyHelper`].
+pub type CallMethodHelper = unsafe extern "C" fn(
+    frame: *mut JitFrame,
+    token: u32,
+    recv_pin: i64,
+    argc: u32,
+    expect_tag: u32,
+) -> i64;
+
+static CALL_METHOD_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide method-call helper (RFC 0069 WS1). Must
+/// precede the first compile of a frame containing `CallMethod` ops.
+pub fn register_call_method_helper(helper: CallMethodHelper) {
+    CALL_METHOD_HELPER.store(helper as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn call_method_helper_addr() -> usize {
+    CALL_METHOD_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// RFC 0069 WS2 — a unary libm-backed math helper (`sin`/`cos`),
+/// bit-identical to what the interpreter's `math` module computes.
+/// Never runs Python code, never unwinds across the FFI boundary.
+pub type MathUnaryHelper = extern "C" fn(f64) -> f64;
+
+/// RFC 0069 WS2 — a binary float helper carrying Python's floor-div /
+/// mod semantics (result sign follows the divisor). The zero-divisor
+/// case deopts *before* the helper is called, so implementations may
+/// assume a non-zero divisor.
+pub type MathBinaryHelper = extern "C" fn(f64, f64) -> f64;
+
+static MATH_SIN_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static MATH_COS_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static FLOAT_FLOORDIV_HELPER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static FLOAT_MOD_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide math helpers (RFC 0069 WS2): the libm
+/// `sin`/`cos` intrinsics and the Python-semantics float floor-div /
+/// mod. Must precede the first compile of a frame containing
+/// `MathIntrinsic` or float floor-div/mod ops.
+pub fn register_math_helpers(
+    sin: MathUnaryHelper,
+    cos: MathUnaryHelper,
+    floordiv: MathBinaryHelper,
+    fmod: MathBinaryHelper,
+) {
+    MATH_SIN_HELPER.store(sin as usize, std::sync::atomic::Ordering::Release);
+    MATH_COS_HELPER.store(cos as usize, std::sync::atomic::Ordering::Release);
+    FLOAT_FLOORDIV_HELPER.store(floordiv as usize, std::sync::atomic::Ordering::Release);
+    FLOAT_MOD_HELPER.store(fmod as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn math_sin_helper_addr() -> usize {
+    MATH_SIN_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
+pub(crate) fn math_cos_helper_addr() -> usize {
+    MATH_COS_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
+pub(crate) fn float_floordiv_helper_addr() -> usize {
+    FLOAT_FLOORDIV_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
+pub(crate) fn float_mod_helper_addr() -> usize {
+    FLOAT_MOD_HELPER.load(std::sync::atomic::Ordering::Acquire)
 }

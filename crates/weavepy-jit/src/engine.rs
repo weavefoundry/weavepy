@@ -16,10 +16,10 @@ use cranelift_frontend::FunctionBuilderContext;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
 
-use crate::analyze::JitVerdict;
+use crate::analyze::{JitVerdict, Probes};
 use crate::ir::{
-    AttrSiteMeta, CalleeSpanMeta, GlobalGuard, MethodSpanMeta, OsrEntry, RangeLoopMeta,
-    ResolvedGlobal, TFunc, TOp,
+    ArithKind, AttrSiteMeta, CalleeSpanMeta, GlobalGuard, MathFunc, MathGuardMeta, MethodSiteMeta,
+    MethodSpanMeta, OsrEntry, RangeLoopMeta, ResolvedGlobal, TFunc, TOp,
 };
 use crate::lower::build_function;
 use crate::runtime::{self, JitFrame, JitStatus};
@@ -59,6 +59,20 @@ pub struct CompiledFrame {
     /// RFC 0065 WS5 — burned-in attribute-access sites; the embedder
     /// snapshots one guard fingerprint per site before first entry.
     pub attr_sites: Vec<AttrSiteMeta>,
+    /// RFC 0069 WS1 — burned-in method-call sites, indexed by the
+    /// `wpjit_call_method` token; the embedder keeps its method table
+    /// parallel to this.
+    pub method_sites: Vec<MethodSiteMeta>,
+    /// RFC 0069 WS2 — burned-in math-intrinsic guards; the embedder
+    /// snapshots the resolved `(module, function)` pair per guard and
+    /// re-validates it at entry and per poll stride.
+    pub math_guards: Vec<MathGuardMeta>,
+    /// RFC 0069 WS2 — erased `math` intrinsic callables riding the
+    /// interpreter stack (`token` indexes [`Self::math_guards`]).
+    pub math_spans: Vec<CalleeSpanMeta>,
+    /// RFC 0069 WS1 — every return site is provably `None` (the
+    /// procedure shape; feeds callers' [`crate::ir::MethodRet::None`]).
+    pub ret_none: bool,
     /// Loop-header pcs enterable mid-frame via `entry_pc` (OSR).
     pub osr_entries: Vec<OsrEntry>,
     /// Widest `CallPy` argument count, for sizing the marshal buffers.
@@ -176,6 +190,19 @@ impl JitEngine {
         self.compile_tfunc(&tfunc)
     }
 
+    /// [`Self::compile_with_probes`] with the full probe bundle
+    /// (RFC 0069 WS1/WS2 adds the method-resolution and math-module
+    /// probes).
+    pub fn compile_frame(
+        &mut self,
+        code: &CodeObject,
+        resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
+        probes: &mut Probes<'_>,
+    ) -> Result<CompiledFrame, JitVerdict> {
+        let tfunc = crate::analyze::analyze_frame(code, resolve, probes)?;
+        self.compile_tfunc(&tfunc)
+    }
+
     /// Compile an already-analyzed [`TFunc`] (also the unit-test entry).
     pub fn compile_tfunc(&mut self, tfunc: &TFunc) -> Result<CompiledFrame, JitVerdict> {
         // A frame with native Python-to-Python calls needs the embedder's
@@ -218,6 +245,38 @@ impl JitEngine {
             && (runtime::attr_get_helper_addr() == 0 || runtime::attr_set_helper_addr() == 0)
         {
             return Err(JitVerdict::UnsupportedOpcode("ATTR (no helper registered)"));
+        }
+        // RFC 0069 WS1 — the method-call helper.
+        if !tfunc.method_sites.is_empty() && runtime::call_method_helper_addr() == 0 {
+            return Err(JitVerdict::UnsupportedOpcode(
+                "CALL method (no helper registered)",
+            ));
+        }
+        // RFC 0069 WS2 — the libm-backed sin/cos and the Python-
+        // semantics float floor-div / mod helpers.
+        let needs_math_unary = tfunc.blocks.iter().any(|b| {
+            b.stmts
+                .iter()
+                .any(|s| matches!(s.op, TOp::MathIntrinsic(MathFunc::Sin | MathFunc::Cos)))
+        });
+        if needs_math_unary
+            && (runtime::math_sin_helper_addr() == 0 || runtime::math_cos_helper_addr() == 0)
+        {
+            return Err(JitVerdict::UnsupportedOpcode(
+                "math sin/cos (no helper registered)",
+            ));
+        }
+        let needs_float_divmod = tfunc.blocks.iter().any(|b| {
+            b.stmts
+                .iter()
+                .any(|s| matches!(s.op, TOp::FloatArith(ArithKind::FloorDiv | ArithKind::Mod)))
+        });
+        if needs_float_divmod
+            && (runtime::float_floordiv_helper_addr() == 0 || runtime::float_mod_helper_addr() == 0)
+        {
+            return Err(JitVerdict::UnsupportedOpcode(
+                "float floordiv/mod (no helper registered)",
+            ));
         }
         self.module.clear_context(&mut self.ctx);
 
@@ -267,9 +326,13 @@ impl JitEngine {
             len_spans: tfunc.len_spans.clone(),
             method_spans: tfunc.method_spans.clone(),
             attr_sites: tfunc.attr_sites.clone(),
+            method_sites: tfunc.method_sites.clone(),
+            math_guards: tfunc.math_guards.clone(),
+            math_spans: tfunc.math_spans.clone(),
             osr_entries: tfunc.osr_entries.clone(),
             max_call_args: tfunc.max_call_args,
             ret_lane: tfunc.ret_lane,
+            ret_none: tfunc.ret_none,
         })
     }
 }

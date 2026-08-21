@@ -5113,7 +5113,17 @@ impl Interpreter {
                     let jump_fire = matches!(
                         (prev_pc, prev_op),
                         (Some(p), Some(OpCode::JumpBackward)) if p > cur_pc
-                    ) && prev_line == Some(line);
+                    ) && prev_line == Some(line)
+                        // …except the send dance's loop-back to SEND: that
+                        // jump is CPython's JUMP_BACKWARD_NO_INTERRUPT,
+                        // which is never instrumented, so an `await` /
+                        // `yield from` resume hop must not re-report its
+                        // line (pdb's `next` over an await chain counts
+                        // stops — test_pdb's coroutine doctests).
+                        && !matches!(
+                            frame.code.instructions.get(cur_pc).map(|i| i.op),
+                            Some(OpCode::Send)
+                        );
                     // `line == 0` is NO_LOCATION — transparent — except
                     // when the instruction is *marked*: the only marked
                     // line-0 instruction is the implicit return of an
@@ -5673,6 +5683,15 @@ impl Interpreter {
         // refreshed. `gen_owner` is re-derived because the very first
         // push happens *before* `RETURN_GENERATOR` creates the owner.
         if let Some(cached) = &frame.shell_cache {
+            // RFC 0069 (WS4 follow-up): a `PyFrame` materialised
+            // *mid-activation* (`sys._getframe`, a tracer installed by
+            // `pdb.set_trace`) lives only on the parked shell. Adopt it, so
+            // one Python-visible frame object spans the generator's whole
+            // life — CPython identity that bdb's `frame is self.stopframe`
+            // (and the frame's `f_trace`) depend on across suspensions.
+            if frame.py_frame.is_none() {
+                frame.py_frame = cached.materialized.borrow().clone();
+            }
             let materialized = frame.py_frame.clone();
             if let Some(existing) = &materialized {
                 existing.lasti.set(frame.pc);
@@ -8238,19 +8257,138 @@ impl Interpreter {
                 }
             }
             OpCode::CallKw => {
+                use weavepy_compiler::InlineCache as IC;
+                let kw_op = OpCode::CallKw as u8;
                 let argc = ins.arg as usize;
                 // Stack (top-down): kw_names_tuple, kw_values...,
                 // positional_values..., self_or_null, callable.
                 let names_obj = frame.pop()?;
-                let names: Vec<String> = match names_obj {
-                    Object::Tuple(items) => items.iter().map(|x| x.to_str()).collect(),
-                    _ => {
-                        return Err(RuntimeError::Internal(
-                            "CallKw expects a tuple of names".to_owned(),
-                        ))
-                    }
+                let Object::Tuple(name_items) = &names_obj else {
+                    return Err(RuntimeError::Internal(
+                        "CallKw expects a tuple of names".to_owned(),
+                    ));
                 };
-                let kwc = names.len();
+                let kwc = name_items.len();
+                let mon_call = crate::trace::any_observers_active()
+                    && crate::trace::monitoring_union_mask_cached()
+                        & crate::trace::event_mask(crate::trace::EVENT_CALL)
+                        != 0;
+                // RFC 0069 WS3 — the CallPyKwNames fast path: the cached
+                // permutation turns the whole keyword bind into slot
+                // moves, skipping the name conversion, the pair zip, and
+                // the generic binder's per-name matching.
+                if !mon_call {
+                    if let IC::CallPyKwNames {
+                        func_id,
+                        perm,
+                        argc: ca,
+                        kwc: ck,
+                    } = frame.code.caches.get(cache_pc)
+                    {
+                        let len = frame.stack.len();
+                        let mut fast: Option<(Rc<PyFunction>, u32, usize)> = None;
+                        if ca as usize == argc && ck as usize == kwc && len >= kwc + argc + 2 {
+                            let callable_at = len - kwc - argc - 2;
+                            if let (Object::Function(f), Object::Unbound) =
+                                (&frame.stack[callable_at], &frame.stack[callable_at + 1])
+                            {
+                                // `func_id` is a raw pointer fingerprint
+                                // and can alias a recycled allocation
+                                // (ABA) — re-verify everything the bind
+                                // below assumes, exactly like the plain
+                                // CALL shapes.
+                                let code = f.code();
+                                let total = code.arg_count as usize;
+                                let mut ok = specialize::rc_id(f) == func_id
+                                    && total <= 16
+                                    && argc <= total
+                                    && !code.is_generator
+                                    && !code.is_coroutine
+                                    && !code.is_async_generator
+                                    && !code.has_varargs
+                                    && !code.has_varkeywords
+                                    && code.kwonly_count == 0
+                                    && code.cellvars.is_empty()
+                                    && code.freevars.is_empty()
+                                    && f.closure.is_empty()
+                                    && f.slot("__defaults__").is_none();
+                                let mut covered: u32 = (1u32 << argc) - 1;
+                                if ok {
+                                    for (j, name) in name_items.iter().enumerate() {
+                                        let slot = ((perm >> (4 * j)) & 0xF) as usize;
+                                        // The permutation self-validates
+                                        // against the *live* code: each
+                                        // keyword must still name its
+                                        // cached slot, so a rebound
+                                        // `__code__` with renamed
+                                        // parameters (or an ABA'd
+                                        // function) can never mis-bind.
+                                        let name_ok = matches!(
+                                            name, Object::Str(s) if code
+                                                .varnames
+                                                .get(slot)
+                                                .is_some_and(|v| v.as_str() == &**s)
+                                        );
+                                        if !name_ok
+                                            || slot >= total
+                                            || slot < code.posonly_count as usize
+                                            || covered & (1 << slot) != 0
+                                        {
+                                            ok = false;
+                                            break;
+                                        }
+                                        covered |= 1 << slot;
+                                    }
+                                }
+                                if ok {
+                                    let d_start = total - f.defaults.len().min(total);
+                                    let uncovered = !covered & ((1u32 << total) - 1);
+                                    ok = uncovered.trailing_zeros() as usize >= d_start;
+                                }
+                                if ok {
+                                    fast = Some((f.clone(), covered, total));
+                                }
+                            }
+                        }
+                        match fast {
+                            Some((f, covered, total)) => {
+                                specialize::record_hit(kw_op);
+                                let mut locals: Vec<Object> = self.pooled_scratch();
+                                locals.resize(total, Object::Unbound);
+                                // Keyword values ride the top of the
+                                // stack; each moves straight to its
+                                // permuted parameter slot.
+                                for (j, v) in frame.stack.drain(len - kwc..).enumerate() {
+                                    locals[((perm >> (4 * j)) & 0xF) as usize] = v;
+                                }
+                                let plen = frame.stack.len();
+                                for (slot, v) in frame.stack.drain(plen - argc..).enumerate() {
+                                    locals[slot] = v;
+                                }
+                                frame.pop()?; // the Unbound self slot
+                                let callable = frame.pop()?;
+                                // Right-aligned defaults fill for the
+                                // uncovered tail (validated above).
+                                #[allow(clippy::needless_range_loop)]
+                                for slot in argc..total {
+                                    if covered & (1 << slot) == 0 {
+                                        locals[slot] =
+                                            f.defaults[f.defaults.len() - (total - slot)].clone();
+                                    }
+                                }
+                                let r = self.run_py_exact_nofree(&f, locals)?;
+                                frame.push(r);
+                                self.reap_call_receiver(callable);
+                                return Ok(StepOutcome::Continue);
+                            }
+                            None => {
+                                specialize::record_miss(kw_op);
+                                frame.code.caches.set(cache_pc, IC::Cooldown(COOLDOWN));
+                            }
+                        }
+                    }
+                }
+                let names: Vec<String> = name_items.iter().map(|x| x.to_str()).collect();
                 let split_kw_at = frame.stack.len().saturating_sub(kwc);
                 let kw_values: Vec<Object> = frame.stack.split_off(split_kw_at);
                 let split_pos_at = frame.stack.len().saturating_sub(argc);
@@ -8258,17 +8396,16 @@ impl Interpreter {
                 // Self-or-null slot (RFC 0068 WS1): a real value (a
                 // method-flagged LOAD_ATTR pair in foreign bytecode)
                 // rides as the first positional argument.
-                match frame.pop()? {
-                    Object::Unbound => {}
-                    v => pos_args.insert(0, v),
-                }
+                let had_self = match frame.pop()? {
+                    Object::Unbound => false,
+                    v => {
+                        pos_args.insert(0, v);
+                        true
+                    }
+                };
                 let callable = frame.pop()?;
                 let kw_pairs: Vec<(String, Object)> = names.into_iter().zip(kw_values).collect();
                 // PEP 669 CALL for the keyword-call instruction.
-                let mon_call = crate::trace::any_observers_active()
-                    && crate::trace::monitoring_union_mask_cached()
-                        & crate::trace::event_mask(crate::trace::EVENT_CALL)
-                        != 0;
                 if mon_call {
                     self.fire_monitoring_call_family(
                         crate::trace::EVENT_CALL,
@@ -8299,6 +8436,38 @@ impl Interpreter {
                     }
                 }
                 if let Object::Function(f) = &callable {
+                    // RFC 0069 WS3 — decide a `CallPyKwNames`
+                    // specialization for the next execution (a real
+                    // self-slot value shifts the positional count away
+                    // from the opcode arity, so those sites stay
+                    // generic).
+                    if !mon_call {
+                        match frame.code.caches.get(cache_pc) {
+                            IC::Empty => {
+                                specialize::record_specialize_attempt(kw_op);
+                                let decision = if had_self {
+                                    IC::Cooldown(COOLDOWN)
+                                } else {
+                                    specialize::attempt_specialize_call_kw(f, argc, &kw_pairs)
+                                };
+                                frame.code.caches.set(cache_pc, decision);
+                                if matches!(decision, IC::Cooldown(_)) {
+                                    specialize::record_specialize_skip(kw_op);
+                                } else {
+                                    specialize::record_specialize_success(kw_op);
+                                }
+                            }
+                            IC::Cooldown(n) => {
+                                let next = if n > 0 {
+                                    IC::Cooldown(n - 1)
+                                } else {
+                                    IC::Empty
+                                };
+                                frame.code.caches.set(cache_pc, next);
+                            }
+                            _ => {}
+                        }
+                    }
                     let f = f.clone();
                     let r = self.call_python_owned(&f, std::mem::take(&mut pos_args), kw_pairs)?;
                     frame.push(r);
@@ -16631,6 +16800,25 @@ impl Interpreter {
         // operands fire: `sum([Fraction(3,5), Fraction(4,5)])` starts at the
         // int `0`, and `int.__add__(0, Fraction)` returns NotImplemented —
         // only `Fraction.__radd__` (an interpreter reentry) yields the sum.
+        //
+        // RFC 0069 WS4 — generators (and generator expressions, the
+        // dominant `sum(x for x in …)` shape) stream item-by-item
+        // instead of materializing the whole sequence first; CPython's
+        // `builtin_sum_impl` is exactly this drive loop.
+        if let Object::Generator(g) = &args[0] {
+            loop {
+                let x = match self.generator_send(g, Object::None) {
+                    Ok(v) => v,
+                    Err(RuntimeError::PyException(exc)) if exc.type_name() == "StopIteration" => {
+                        self.fire_caught_stop_iteration(&exc)?;
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                };
+                acc = self.op_binary(&acc, &x, BinOpKind::Add)?;
+            }
+            return Ok(acc);
+        }
         let items = self.collect_iterable(&args[0], globals)?;
         for x in items {
             acc = self.op_binary(&acc, &x, BinOpKind::Add)?;
@@ -21269,12 +21457,21 @@ impl Interpreter {
     /// an internal "bad local index"
     /// (`test_tarfile.TestExtractionFilters`).
     fn park_suspended(gen: &Rc<PyGenerator>, frame: Frame) {
-        if let Some(py) = &frame.py_frame {
-            if py.gen_owner.borrow().is_none() {
-                *py.gen_owner.borrow_mut() = Some(Rc::downgrade(gen));
+        Self::park_suspended_boxed(gen, Box::new(frame));
+    }
+
+    /// [`Self::park_suspended`] for a frame that never left its box:
+    /// the yield/resume round-trip re-parks the *same* allocation
+    /// (RFC 0069 WS4 — zero allocations on the hot resume path).
+    fn park_suspended_boxed(gen: &Rc<PyGenerator>, boxed: Box<dyn std::any::Any + Send + Sync>) {
+        if let Some(frame) = boxed.downcast_ref::<Frame>() {
+            if let Some(py) = &frame.py_frame {
+                if py.gen_owner.borrow().is_none() {
+                    *py.gen_owner.borrow_mut() = Some(Rc::downgrade(gen));
+                }
             }
         }
-        *gen.state.borrow_mut() = GeneratorState::Suspended(Box::new(frame));
+        *gen.state.borrow_mut() = GeneratorState::Suspended(boxed);
     }
 
     fn generator_send(
@@ -21282,21 +21479,13 @@ impl Interpreter {
         gen: &Rc<PyGenerator>,
         sent: Object,
     ) -> Result<Object, RuntimeError> {
-        // Take ownership of the frame so we can mutate it.
+        // Take the boxed frame; it is run *in place* (RFC 0069 WS4) so
+        // the yield round-trip neither reallocates the box nor moves
+        // the frame through the stack.
         let prev_state = std::mem::replace(&mut *gen.state.borrow_mut(), GeneratorState::Running);
-        let (mut frame, first_resume) = match prev_state {
-            GeneratorState::Created(boxed) => (
-                *boxed
-                    .downcast::<Frame>()
-                    .map_err(|_| RuntimeError::Internal("generator frame downcast".to_owned()))?,
-                true,
-            ),
-            GeneratorState::Suspended(boxed) => (
-                *boxed
-                    .downcast::<Frame>()
-                    .map_err(|_| RuntimeError::Internal("generator frame downcast".to_owned()))?,
-                false,
-            ),
+        let (mut boxed, first_resume) = match prev_state {
+            GeneratorState::Created(boxed) => (boxed, true),
+            GeneratorState::Suspended(boxed) => (boxed, false),
             GeneratorState::Finished => {
                 *gen.state.borrow_mut() = GeneratorState::Finished;
                 // bpo-25887: re-awaiting a completed coroutine is an
@@ -21315,40 +21504,63 @@ impl Interpreter {
                 )));
             }
         };
+        if boxed.downcast_ref::<Frame>().is_none() {
+            return Err(RuntimeError::Internal(
+                "generator frame downcast".to_owned(),
+            ));
+        }
         // On the first call, `sent` must be None (or omitted).
         if first_resume && !matches!(sent, Object::None) {
-            Self::park_suspended(gen, frame);
+            Self::park_suspended_boxed(gen, boxed);
             return Err(type_error(format!(
                 "can't send non-None value to a just-started {}",
                 gen.kind.word()
             )));
         }
-        // PEP 667: writes made through the suspended frame's `f_locals`
-        // take effect when the generator resumes.
-        Self::apply_py_frame_locals_writes(&mut frame);
-        // PEP 669: the first activation runs the body from the top and
-        // reports PY_START; only later resumptions report PY_RESUME.
-        frame.gen_first_resume = first_resume;
-        // Tag the Python-visible frame with its owning generator *before*
-        // entering: while Running, `gi_frame`/`cr_frame` locates the live
-        // frame on the interpreter stack through this backlink (CPython
-        // returns the executing frame; `Task.get_stack()` reads it from
-        // inside the running coroutine).
-        if frame.py_frame.is_none() {
-            frame.py_frame = Some(self.build_py_frame(&frame, None));
-        }
-        if let Some(py) = &frame.py_frame {
-            if py.gen_owner.borrow().is_none() {
-                *py.gen_owner.borrow_mut() = Some(Rc::downgrade(gen));
+        let outcome = {
+            let frame = boxed
+                .downcast_mut::<Frame>()
+                .expect("checked by the downcast_ref above");
+            // PEP 667: writes made through the suspended frame's `f_locals`
+            // take effect when the generator resumes.
+            Self::apply_py_frame_locals_writes(frame);
+            // PEP 669: the first activation runs the body from the top and
+            // reports PY_START; only later resumptions report PY_RESUME.
+            frame.gen_first_resume = first_resume;
+            // Tag the Python-visible frame with its owning generator
+            // *before* entering, when one exists. While Running,
+            // `gi_frame`/`cr_frame` locates the live frame on the
+            // interpreter stack through the *shell's* backlink (derived
+            // from `frame.gen_owner`, stamped at creation), so the
+            // unobserved path never materializes a `PyFrame` here —
+            // `gen_py_frame` builds one on demand for a suspended
+            // generator, and observers get theirs below (RFC 0069 WS4).
+            if frame.py_frame.is_none() {
+                // Adopt a frame materialised during a previous activation
+                // (parked on the cached shell) before building a fresh one:
+                // the generator must present a single frame object for its
+                // whole life (see `push_frame_shell`).
+                if let Some(cached) = &frame.shell_cache {
+                    frame.py_frame = cached.materialized.borrow().clone();
+                }
             }
-        }
-        // CPython 3.13 prologue: RETURN_GENERATOR / POP_TOP / RESUME —
-        // *every* resume pushes the sent value; the first activation's
-        // None lands in the prologue's POP_TOP.
-        let sent_for_frame = Some(if first_resume { Object::None } else { sent });
-        match self.run_until_yield_or_return(&mut frame, sent_for_frame) {
+            if frame.py_frame.is_none() && crate::trace::any_observers_active() {
+                frame.py_frame = Some(self.build_py_frame(frame, None));
+            }
+            if let Some(py) = &frame.py_frame {
+                if py.gen_owner.borrow().is_none() {
+                    *py.gen_owner.borrow_mut() = Some(Rc::downgrade(gen));
+                }
+            }
+            // CPython 3.13 prologue: RETURN_GENERATOR / POP_TOP / RESUME —
+            // *every* resume pushes the sent value; the first activation's
+            // None lands in the prologue's POP_TOP.
+            let sent_for_frame = Some(if first_resume { Object::None } else { sent });
+            self.run_until_yield_or_return(frame, sent_for_frame)
+        };
+        match outcome {
             Ok(FrameOutcome::Yielded(v)) => {
-                Self::park_suspended(gen, frame);
+                Self::park_suspended_boxed(gen, boxed);
                 Ok(v)
             }
             Ok(FrameOutcome::Returned(v)) => {
@@ -21360,10 +21572,13 @@ impl Interpreter {
                 // string we get from `from_builtin("StopIteration",
                 // "")`.
                 *gen.state.borrow_mut() = GeneratorState::Finished;
-                self.reap_dead_frame(&mut frame);
+                let frame = boxed
+                    .downcast_mut::<Frame>()
+                    .expect("checked by the downcast_ref above");
+                self.reap_dead_frame(frame);
                 // RFC 0059 WS4: the exhausted frame's storage is dead —
                 // donate it back to the frame pools.
-                self.recycle_frame_allocs(&mut frame);
+                self.recycle_frame_allocs(frame);
                 Err(stop_iteration_with(v))
             }
             Ok(FrameOutcome::StartGenerator) => {
@@ -21375,8 +21590,11 @@ impl Interpreter {
             Err(err) => {
                 *gen.state.borrow_mut() = GeneratorState::Finished;
                 let escaped = self.pep479_escape(gen, err);
-                self.reap_dead_frame(&mut frame);
-                self.recycle_frame_allocs(&mut frame);
+                let frame = boxed
+                    .downcast_mut::<Frame>()
+                    .expect("checked by the downcast_ref above");
+                self.reap_dead_frame(frame);
+                self.recycle_frame_allocs(frame);
                 Err(escaped)
             }
         }
@@ -33236,6 +33454,14 @@ impl Interpreter {
         mut args: Vec<Object>,
     ) -> Result<Object, RuntimeError> {
         let code = f.code();
+        // RFC 0069 WS3b — a callee that is already tier-2 compiled and
+        // native-enterable runs frameless, straight from the argument
+        // objects (falls through on any ineligibility).
+        #[cfg(feature = "jit")]
+        if let Some(r) = crate::tier2::try_call_native_direct(self, f, &code, &args) {
+            self.recycle_scratch(args);
+            return r;
+        }
         // RFC 0061 (WS3b): move the arguments straight into the leading
         // locals slots and recycle the drained staging vector.
         let locals_rc = self.pooled_locals_from_args(&mut args, code.varnames.len());
@@ -45337,6 +45563,51 @@ mod tests {
                    while i < 20:\n    total = total + f(i)\n    i = i + 1\n\
                    print(total)\n";
         assert_eq!(run(src), "390\n");
+    }
+
+    #[test]
+    fn call_spec_kwnames_hit() {
+        // RFC 0069 WS3 — `CallPyKwNames`: a hot keyword call site binds
+        // through the cached permutation (positionals, one permuted
+        // keyword, one defaults fill).
+        let src = "def f(a, b, c=10, d=20):\n    return a * 1000 + b * 100 + c * 10 + d\n\
+                   total = 0\ni = 0\n\
+                   while i < 300:\n    total = total + f(1, 2, d=3)\n    i = i + 1\n\
+                   print(total)\n";
+        assert_eq!(run(src), "390900\n");
+    }
+
+    #[test]
+    fn call_spec_kwnames_defaults_rebind_deopts() {
+        // `f.__defaults__ = …` lands in the slot store; the warm
+        // kwnames site must miss (the hit guard checks the override)
+        // and honour the new defaults through the generic binder.
+        let src = "def f(a, b=1, c=2):\n    return a * 100 + b * 10 + c\n\
+                   total = 0\ni = 0\n\
+                   while i < 200:\n    total = total + f(3, b=4)\n    i = i + 1\n\
+                   f.__defaults__ = (8, 9)\n\
+                   j = 0\n\
+                   while j < 200:\n    total = total + f(3, b=4)\n    j = j + 1\n\
+                   print(total)\n";
+        // 200 * 342 + 200 * 349
+        assert_eq!(run(src), "138200\n");
+    }
+
+    #[test]
+    fn call_spec_kwnames_code_rename_deopts() {
+        // Rebinding `__code__` to a body with *renamed* parameters
+        // through the same warm site must deopt (the permutation
+        // self-validates against the live `varnames`) — never bind the
+        // stale slot. CPython raises the unexpected-keyword TypeError.
+        let src = "def f(a, b=2):\n    return a + b\n\
+                   def g(x, q=3):\n    return x * q\n\
+                   total = 0\ni = 0\n\
+                   while i < 200:\n    total = total + f(1, b=5)\n    i = i + 1\n\
+                   f.__code__ = g.__code__\n\
+                   msg = ''\n\
+                   try:\n    f(1, b=5)\nexcept TypeError as e:\n    msg = 'TypeError'\n\
+                   print(total, msg)\n";
+        assert_eq!(run(src), "1200 TypeError\n");
     }
 
     // RFC 0032 — tier-2 JIT integration. Each test forces the JIT on,

@@ -18,7 +18,7 @@ use std::rc::Rc as StdRc;
 use weavepy_compiler::CodeObject;
 use weavepy_jit::{
     AttrSiteMeta, CallStatus, CompiledFrame, JitEngine, JitFrame, JitStatus, JitType,
-    ResolvedGlobal, SlotTag,
+    MethodResolution, MethodRet, Probes, ResolvedGlobal, SlotTag,
 };
 
 use crate::error::RuntimeError;
@@ -70,6 +70,42 @@ struct AttrGuard {
     _class: Rc<TypeObject>,
 }
 
+/// RFC 0069 WS1 — one burned-in method-site resolution: the class-
+/// resolved plain Python function the `(slot, name)` probe found, plus
+/// the guard fingerprint (class identity + attr-version) and its
+/// `__code__` at compile time. `wpjit_call_method` re-validates all of
+/// it per call and rejects (deopts) on any mismatch, so class mutation,
+/// instance-dict shadowing, and `__code__` rebinding introduced after
+/// compilation stay exact.
+struct MethodEntry {
+    func: Rc<PyFunction>,
+    /// The function's `__code__` at compile time (rebindable).
+    code: Rc<CodeObject>,
+    /// The method name (for the shadow check and the span rebuild).
+    name: String,
+    /// Positional arity, `self` included.
+    arg_count: u32,
+    /// Arity minus trailing defaults, `self` included.
+    min_args: u32,
+    /// The burned-in result typing.
+    ret: MethodRet,
+    /// `rc_id` of the receiver's class at compile time.
+    type_id: u64,
+    /// The class's `attr_version` at compile time.
+    ver: u32,
+    /// Pins the class object so `type_id` (an address) can't be reused.
+    _class: Rc<TypeObject>,
+}
+
+/// One slot per method token (parallel to `cf.method_sites`).
+type MethodTable = Vec<MethodEntry>;
+
+/// RFC 0069 WS2 — the snapshot of one burned-in math intrinsic:
+/// `(global name, attr, function object)`. The entry check and the
+/// per-stride poll re-resolve `name.attr` and require identity with
+/// the snapshotted function (module dicts are mutable).
+type MathTable = Vec<(String, String, Object)>;
+
 /// A compiled frame plus the globals it burned in: `snapshot[i]` is the
 /// object `guards[i].name` resolved to at compile time. Every entry
 /// re-resolves each name against the entering frame's namespaces and
@@ -81,10 +117,20 @@ struct CompiledEntry {
     /// RFC 0065 WS5 — one guard per burned-in attribute site, in
     /// `site`-token order (parallel to `cf.attr_sites`).
     attr_guards: StdRc<Vec<AttrGuard>>,
+    /// RFC 0069 WS1 — per-token method resolutions (parallel to
+    /// `cf.method_sites`; may carry trailing entries whose probe
+    /// tokens no surviving site uses).
+    methods: StdRc<MethodTable>,
+    /// RFC 0069 WS2 — per-guard math-intrinsic snapshots (parallel to
+    /// `cf.math_guards`).
+    math: StdRc<MathTable>,
     /// RFC 0067 WS1 — the per-token native-callee resolution (`None`
     /// per token whose callee isn't natively enterable), snapshotted
     /// at the current compile generation.
     native: Option<StdRc<NativeTable>>,
+    /// RFC 0069 WS1 — the per-method-token native resolution (parallel
+    /// to [`Self::methods`]), same generation discipline.
+    method_native: Option<StdRc<NativeTable>>,
 }
 
 /// RFC 0067 WS1 — one *natively enterable* burned-in callee: its
@@ -98,6 +144,8 @@ struct NativeCallee {
     snap: StdRc<Vec<(String, Object)>>,
     callees: StdRc<CalleeTable>,
     attr_guards: StdRc<Vec<AttrGuard>>,
+    methods: StdRc<MethodTable>,
+    math: StdRc<MathTable>,
     func: Rc<PyFunction>,
     code: Rc<CodeObject>,
 }
@@ -105,16 +153,37 @@ struct NativeCallee {
 /// One slot per callee-table token (parallel to [`CalleeTable`]).
 type NativeTable = Vec<Option<NativeCallee>>;
 
+/// RFC 0069 WS3b — everything a frameless interpreter→native call
+/// needs, resolved once per compile generation and handed out as a
+/// single `Rc` clone per call (the per-call lookup cost is what makes
+/// or breaks a ~100ns call).
+struct DirectEntry {
+    art: Artifacts,
+    native: Option<StdRc<NativeTable>>,
+    method_native: Option<StdRc<NativeTable>>,
+    /// `true` = receiver-in-slot-0 shape ([`native_method_callable`]);
+    /// `false` = all-scalar parameters ([`native_callable`]).
+    method_shape: bool,
+}
+
+/// Everything one successful compile produced (RFC 0069 — the pieces
+/// outgrew a tuple): the native frame plus the guard snapshots and
+/// resolution tables its entries validate against.
+#[derive(Clone)]
+struct Artifacts {
+    cf: StdRc<CompiledFrame>,
+    snap: StdRc<Vec<(String, Object)>>,
+    callees: StdRc<CalleeTable>,
+    attr_guards: StdRc<Vec<AttrGuard>>,
+    methods: StdRc<MethodTable>,
+    math: StdRc<MathTable>,
+}
+
 /// Per-`CodeObject` compilation state.
 enum Tier {
     Cold,
     NotJitable,
-    Compiled(
-        StdRc<CompiledFrame>,
-        StdRc<Vec<(String, Object)>>,
-        StdRc<CalleeTable>,
-        StdRc<Vec<AttrGuard>>,
-    ),
+    Compiled(Artifacts),
 }
 
 struct CacheEntry {
@@ -138,6 +207,14 @@ struct CacheEntry {
     /// (which may flip a `None` slot to `Some`) invalidates it by
     /// bumping [`JitState::compile_gen`].
     native: Option<(u64, StdRc<NativeTable>)>,
+    /// RFC 0069 WS1 — the resolved native *method* table (parallel to
+    /// the compiled entry's method table), same generation stamp.
+    method_native: Option<(u64, StdRc<NativeTable>)>,
+    /// RFC 0069 WS3b — the memoized frameless-direct-call bundle
+    /// (artifacts + resolved tables + entry shape), same generation
+    /// stamp; `Some((g, None))` memoizes *ineligibility* so a hot
+    /// never-eligible callee costs one lookup, not a shape re-check.
+    direct: Option<(u64, Option<StdRc<DirectEntry>>)>,
     /// Keeps the code object alive so its address can't be reused while
     /// this entry (and any compiled pointer keyed by it) is live. Also
     /// read by [`evict_dead_entries`]: strong_count == 1 means the JIT
@@ -178,9 +255,22 @@ pub(crate) struct JitStats {
 struct NativeCallStats {
     /// Fast-path native-to-native call entries.
     calls: std::cell::Cell<u64>,
+    /// RFC 0069 WS3b — frameless interpreter→native calls (the tier-1
+    /// call fast path entered compiled code directly from the argument
+    /// objects, skipping `Frame` construction). Counted separately
+    /// from `JitStats::native_entries` (framed entries).
+    direct_calls: std::cell::Cell<u64>,
     /// Eligible token, fast path refused (pending work, observers,
     /// argument-lane mismatch, callee guard failure, recursion limit).
     fallbacks: std::cell::Cell<u64>,
+    /// RFC 0069 WS1 — `wpjit_call_method` invocations (any path).
+    method_calls: std::cell::Cell<u64>,
+    /// Method calls completed through the interpreter (callee not
+    /// compiled / not enterable) with the caller's loop surviving.
+    method_call_fallbacks: std::cell::Cell<u64>,
+    /// Method guard misses (class version, instance-dict shadow, or
+    /// `__code__` rebind) — each one is a Reject deopt at the call pc.
+    method_guard_misses: std::cell::Cell<u64>,
     /// Nested native callee deopted or raised mid-call and was
     /// materialized into an interpreter frame.
     deopts: std::cell::Cell<u64>,
@@ -227,6 +317,16 @@ impl JitState {
         weavepy_jit::register_attr_helpers(wpjit_attr_get, wpjit_attr_set);
         // RFC 0067 WS2 — the eval-breaker poll for native loop headers.
         weavepy_jit::register_poll_helper(wpjit_poll);
+        // RFC 0069 WS1 — the guarded method-call lane.
+        weavepy_jit::register_call_method_helper(wpjit_call_method);
+        // RFC 0069 WS2 — the libm sin/cos intrinsics and the Python-
+        // semantics float floor-div / mod.
+        weavepy_jit::register_math_helpers(
+            wpjit_math_sin,
+            wpjit_math_cos,
+            wpjit_float_floordiv,
+            wpjit_float_mod,
+        );
         JitState {
             enabled,
             threshold,
@@ -238,23 +338,13 @@ impl JitState {
     }
 
     /// Bump the hot counter for `code` and, once it crosses the
-    /// threshold, attempt compilation. `resolve_obj` maps a
-    /// `LOAD_GLOBAL` name to its current resolution in the requesting
-    /// frame's namespaces (used both to classify globals for analysis
-    /// and to snapshot the guard expectations); `ret_lane_of` reports a
-    /// candidate Python callee's stable scalar return lane (RFC 0059
-    /// WS3); `probe_list` reports a subscripted local's observed element
-    /// lane in the requesting activation (RFC 0061 WS5). Returns the
-    /// compiled frame + guard snapshot + callee table when one is
-    /// available.
+    /// threshold, attempt compilation with the embedder probes in
+    /// `probes` (see [`VmProbes`]). Returns the compiled frame + guard
+    /// snapshots + resolution tables when one is available.
     fn get_compiled(
         &mut self,
         code: &Rc<CodeObject>,
-        resolve_obj: &mut dyn FnMut(&str) -> Option<Object>,
-        ret_lane_of: &mut dyn FnMut(&Rc<PyFunction>, &Rc<CodeObject>) -> Option<JitType>,
-        probe_list: &mut dyn FnMut(u32) -> Option<JitType>,
-        probe_attr: &mut dyn FnMut(u32, &str, bool) -> Option<JitType>,
-        attr_guard_of: &mut dyn FnMut(&AttrSiteMeta) -> Option<AttrGuard>,
+        probes: &mut VmProbes<'_>,
     ) -> Option<CompiledEntry> {
         let key = Rc::as_ptr(code).cast::<CodeObject>();
         {
@@ -264,19 +354,29 @@ impl JitState {
                 osr_failures: 0,
                 deopts: 0,
                 native: None,
+                method_native: None,
+                direct: None,
                 code: code.clone(),
             });
             match &entry.tier {
-                Tier::Compiled(cf, snap, callees, attrs) => {
+                Tier::Compiled(a) => {
                     let out = CompiledEntry {
-                        cf: cf.clone(),
-                        guard_snapshot: snap.clone(),
-                        callees: callees.clone(),
-                        attr_guards: attrs.clone(),
+                        cf: a.cf.clone(),
+                        guard_snapshot: a.snap.clone(),
+                        callees: a.callees.clone(),
+                        attr_guards: a.attr_guards.clone(),
+                        methods: a.methods.clone(),
+                        math: a.math.clone(),
                         native: None,
+                        method_native: None,
                     };
                     let native = self.native_table_for(key);
-                    return Some(CompiledEntry { native, ..out });
+                    let method_native = self.method_native_table_for(key);
+                    return Some(CompiledEntry {
+                        native,
+                        method_native,
+                        ..out
+                    });
                 }
                 Tier::NotJitable => return None,
                 Tier::Cold => {
@@ -297,100 +397,204 @@ impl JitState {
             }
         }
         let engine = self.engine.as_mut()?;
-        // RFC 0059 WS3 — classify each LOAD_GLOBAL. A plain Python
-        // function becomes a `PyFunc` callee: it gets a token in the
-        // callee table, and (for non-self callees) must have an
-        // analyzable scalar return lane so the caller can type the call
-        // result. The analyzer resolves each name exactly once, so the
-        // token sequence here matches the compiled code's.
-        let mut callees: CalleeTable = Vec::new();
-        let mut classify = |name: &str| {
-            let obj = resolve_obj(name);
-            if let Some(Object::Function(f)) = obj.as_ref() {
-                let fcode = f.code.borrow().clone();
-                if !py_callee_ok(&fcode) {
-                    return ResolvedGlobal::Opaque;
-                }
-                let is_self = Rc::ptr_eq(&fcode, code);
-                let ret = if is_self {
-                    None
-                } else {
-                    ret_lane_of(f, &fcode)
-                };
-                if !is_self && ret.is_none() {
-                    return ResolvedGlobal::Opaque;
-                }
-                let token = callees.len() as u32;
-                callees.push((obj.clone().expect("checked Some above"), fcode.clone()));
-                return ResolvedGlobal::PyFunc {
-                    token,
-                    arg_count: fcode.arg_count,
-                    is_self,
-                    ret,
-                };
-            }
-            classify_global(obj.as_ref())
-        };
-        let (tier, out) =
-            match engine.compile_with_probes(code, &mut classify, probe_list, probe_attr) {
-                Ok(cf) => {
-                    self.stats.frames_compiled += 1;
-                    // Snapshot the exact objects the guards must keep
-                    // resolving to. Every guarded name resolved during
-                    // analysis, so it resolves here too (nothing ran since
-                    // — same thread, GIL held).
-                    let snap: Vec<(String, Object)> = cf
-                        .global_guards
-                        .iter()
-                        .filter_map(|g| resolve_obj(&g.name).map(|o| (g.name.clone(), o)))
-                        .collect();
-                    // RFC 0065 WS5 — snapshot one guard fingerprint per
-                    // burned-in attribute site. Every site probed during
-                    // analysis, so it probes here too.
-                    let mut attr_guards: Vec<AttrGuard> = Vec::with_capacity(cf.attr_sites.len());
-                    for site in &cf.attr_sites {
-                        match attr_guard_of(site) {
-                            Some(g) => attr_guards.push(g),
-                            None => break,
-                        }
+        let VmProbes {
+            resolve_obj,
+            ret_lane_of,
+            list,
+            attr,
+            attr_guard_of,
+            method,
+            math_attr,
+            param,
+        } = probes;
+        // RFC 0069 WS3 — one analysis attempt. The token tables
+        // (callees, methods) are built fresh per attempt because the
+        // analyzer's token sequence restarts with it. `seed_params`
+        // gates the parameter-lane probe: the first attempt runs
+        // unseeded (identical to the pre-seeding behavior); only a
+        // `TypeUnknown` failure triggers a seeded retry, so shapes the
+        // fixpoint can type on its own never pick up extra entry
+        // guards or seed-vs-assignment conflicts.
+        let mut run = |seed_params: bool| -> (
+            Result<weavepy_jit::CompiledFrame, weavepy_jit::JitVerdict>,
+            CalleeTable,
+            MethodTable,
+        ) {
+            // RFC 0059 WS3 — classify each LOAD_GLOBAL. A plain Python
+            // function becomes a `PyFunc` callee: it gets a token in the
+            // callee table, and (for non-self callees) must have an
+            // analyzable scalar return lane so the caller can type the call
+            // result. The analyzer resolves each name exactly once, so the
+            // token sequence here matches the compiled code's.
+            let mut callees: CalleeTable = Vec::new();
+            let mut classify = |name: &str| {
+                let obj = resolve_obj(name);
+                if let Some(Object::Function(f)) = obj.as_ref() {
+                    let fcode = f.code.borrow().clone();
+                    if !py_callee_ok(&fcode) {
+                        return ResolvedGlobal::Opaque;
                     }
-                    if snap.len() != cf.global_guards.len()
-                        || attr_guards.len() != cf.attr_sites.len()
-                    {
-                        self.stats.frames_notjitable += 1;
-                        (Tier::NotJitable, None)
+                    let is_self = Rc::ptr_eq(&fcode, code);
+                    let ret = if is_self {
+                        None
                     } else {
-                        let rc = StdRc::new(cf);
-                        let snap = StdRc::new(snap);
-                        let callees = StdRc::new(callees);
-                        let attr_guards = StdRc::new(attr_guards);
-                        // RFC 0067 WS1 — a fresh compile can flip a
-                        // `None` native-callee slot in *other* frames'
-                        // tables to `Some`; the generation bump makes
-                        // every stale table re-resolve on next entry.
-                        self.compile_gen += 1;
-                        (
-                            Tier::Compiled(
-                                rc.clone(),
-                                snap.clone(),
-                                callees.clone(),
-                                attr_guards.clone(),
-                            ),
-                            Some(CompiledEntry {
-                                cf: rc,
-                                guard_snapshot: snap,
-                                callees,
-                                attr_guards,
-                                native: None,
-                            }),
-                        )
+                        ret_lane_of(f, &fcode)
+                    };
+                    if !is_self && ret.is_none() {
+                        return ResolvedGlobal::Opaque;
+                    }
+                    let token = callees.len() as u32;
+                    callees.push((obj.clone().expect("checked Some above"), fcode.clone()));
+                    // RFC 0069 WS3 — trailing defaults widen the admitted
+                    // call-site arity range; the interpreter call binds
+                    // them (the native fast path requires full arity).
+                    let min_args = fcode
+                        .arg_count
+                        .saturating_sub(u32::try_from(f.defaults.len()).unwrap_or(u32::MAX));
+                    return ResolvedGlobal::PyFunc {
+                        token,
+                        arg_count: fcode.arg_count,
+                        min_args,
+                        is_self,
+                        ret,
+                    };
+                }
+                // RFC 0069 WS2 — a module named `math`: the intrinsic
+                // probe decides per attribute whether the pair is
+                // burnable; a mis-shaped module simply fails every probe.
+                if let Some(Object::Module(m)) = obj.as_ref() {
+                    if m.name == "math" {
+                        return ResolvedGlobal::MathModule;
                     }
                 }
-                Err(_) => {
+                classify_global(obj.as_ref())
+            };
+            // RFC 0069 WS1 — the method probe with token assignment: the
+            // first resolution of a `(slot, name)` pair appends to the
+            // table; repeated probes (the analyzer probes during both
+            // inference and emission) reuse the token, keeping the table
+            // parallel to the compiled `method_sites`.
+            let mut methods: MethodTable = Vec::new();
+            let mut method_tokens: HashMap<(u32, String), u32> = HashMap::new();
+            let mut probe_method = |slot: u32, name: &str| -> Option<MethodResolution> {
+                if let Some(&token) = method_tokens.get(&(slot, name.to_owned())) {
+                    let e = &methods[token as usize];
+                    return Some(MethodResolution {
+                        token,
+                        arg_count: e.arg_count,
+                        min_args: e.min_args,
+                        ret: e.ret,
+                    });
+                }
+                let e = method(slot, name)?;
+                let token = methods.len() as u32;
+                method_tokens.insert((slot, name.to_owned()), token);
+                let res = MethodResolution {
+                    token,
+                    arg_count: e.arg_count,
+                    min_args: e.min_args,
+                    ret: e.ret,
+                };
+                methods.push(e);
+                Some(res)
+            };
+            // RFC 0069 WS2 — the math probe reports eligibility only; the
+            // guard snapshot below re-resolves each burned pair.
+            let mut probe_math = |name: &str, attr_name: &str| math_attr(name, attr_name).is_some();
+            // RFC 0069 WS3 — parameter-lane seeding, active on retry only.
+            let mut probe_param = |slot: u32| if seed_params { param(slot) } else { None };
+            let mut jit_probes = Probes {
+                list: &mut **list,
+                attr: &mut **attr,
+                method: &mut probe_method,
+                math: &mut probe_math,
+                param: &mut probe_param,
+            };
+            let r = engine.compile_frame(code, &mut classify, &mut jit_probes);
+            (r, callees, methods)
+        };
+        let (res, callees, methods) = {
+            let first = run(false);
+            if matches!(first.0, Err(weavepy_jit::JitVerdict::TypeUnknown)) {
+                run(true)
+            } else {
+                first
+            }
+        };
+        let (tier, out) = match res {
+            Ok(cf) => {
+                self.stats.frames_compiled += 1;
+                // Snapshot the exact objects the guards must keep
+                // resolving to. Every guarded name resolved during
+                // analysis, so it resolves here too (nothing ran since
+                // — same thread, GIL held).
+                let snap: Vec<(String, Object)> = cf
+                    .global_guards
+                    .iter()
+                    .filter_map(|g| resolve_obj(&g.name).map(|o| (g.name.clone(), o)))
+                    .collect();
+                // RFC 0065 WS5 — snapshot one guard fingerprint per
+                // burned-in attribute site. Every site probed during
+                // analysis, so it probes here too.
+                let mut attr_guards: Vec<AttrGuard> = Vec::with_capacity(cf.attr_sites.len());
+                for site in &cf.attr_sites {
+                    match attr_guard_of(site) {
+                        Some(g) => attr_guards.push(g),
+                        None => break,
+                    }
+                }
+                // RFC 0069 WS2 — snapshot the resolved function per
+                // math guard. Every pair probed during analysis, so it
+                // resolves here too.
+                let mut math_tbl: MathTable = Vec::with_capacity(cf.math_guards.len());
+                for g in &cf.math_guards {
+                    match math_attr(&g.name, &g.attr) {
+                        Some(f) => math_tbl.push((g.name.clone(), g.attr.clone(), f)),
+                        None => break,
+                    }
+                }
+                if snap.len() != cf.global_guards.len()
+                    || attr_guards.len() != cf.attr_sites.len()
+                    || math_tbl.len() != cf.math_guards.len()
+                    || methods.len() < cf.method_sites.len()
+                {
                     self.stats.frames_notjitable += 1;
                     (Tier::NotJitable, None)
+                } else {
+                    let artifacts = Artifacts {
+                        cf: StdRc::new(cf),
+                        snap: StdRc::new(snap),
+                        callees: StdRc::new(callees),
+                        attr_guards: StdRc::new(attr_guards),
+                        methods: StdRc::new(methods),
+                        math: StdRc::new(math_tbl),
+                    };
+                    // RFC 0067 WS1 — a fresh compile can flip a
+                    // `None` native-callee slot in *other* frames'
+                    // tables to `Some`; the generation bump makes
+                    // every stale table re-resolve on next entry.
+                    self.compile_gen += 1;
+                    let entry = CompiledEntry {
+                        cf: artifacts.cf.clone(),
+                        guard_snapshot: artifacts.snap.clone(),
+                        callees: artifacts.callees.clone(),
+                        attr_guards: artifacts.attr_guards.clone(),
+                        methods: artifacts.methods.clone(),
+                        math: artifacts.math.clone(),
+                        native: None,
+                        method_native: None,
+                    };
+                    (Tier::Compiled(artifacts), Some(entry))
                 }
-            };
+            }
+            Err(v) => {
+                if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
+                    eprintln!("jit reject {:?}: {v:?}", code.name);
+                }
+                self.stats.frames_notjitable += 1;
+                (Tier::NotJitable, None)
+            }
+        };
         if matches!(tier, Tier::NotJitable) {
             // RFC 0067 — denormalize the rejection onto the code
             // object so every later activation skips tier-up on one
@@ -402,7 +606,12 @@ impl JitState {
         }
         out.map(|entry| {
             let native = self.native_table_for(key);
-            CompiledEntry { native, ..entry }
+            let method_native = self.method_native_table_for(key);
+            CompiledEntry {
+                native,
+                method_native,
+                ..entry
+            }
         })
     }
 
@@ -420,10 +629,10 @@ impl JitState {
                     return Some(tbl.clone());
                 }
             }
-            let Tier::Compiled(_, _, callees, _) = &entry.tier else {
+            let Tier::Compiled(a) = &entry.tier else {
                 return None;
             };
-            callees.clone()
+            a.callees.clone()
         };
         let table: NativeTable = callees
             .iter()
@@ -436,25 +645,113 @@ impl JitState {
         Some(tbl)
     }
 
+    /// RFC 0069 WS1 — like [`Self::native_table_for`] but for the
+    /// method table: one slot per method token, `Some` when the
+    /// resolved method's own body is compiled and shape-eligible for
+    /// a direct native entry (receiver passed as slot 0).
+    fn method_native_table_for(&mut self, key: *const CodeObject) -> Option<StdRc<NativeTable>> {
+        let gen = self.compile_gen;
+        let methods = {
+            let entry = self.cache.get(&key)?;
+            if let Some((g, tbl)) = &entry.method_native {
+                if *g == gen {
+                    return Some(tbl.clone());
+                }
+            }
+            let Tier::Compiled(a) = &entry.tier else {
+                return None;
+            };
+            a.methods.clone()
+        };
+        let table: NativeTable = methods
+            .iter()
+            .map(|m| self.resolve_native_func(&m.func, &m.code, true))
+            .collect();
+        let tbl = StdRc::new(table);
+        if let Some(entry) = self.cache.get_mut(&key) {
+            entry.method_native = Some((gen, tbl.clone()));
+        }
+        Some(tbl)
+    }
+
+    /// RFC 0069 WS3b — the memoized frameless-direct-call bundle for a
+    /// code object: artifacts, resolved native tables, and the entry
+    /// shape, re-resolved when the compile generation moved. `None`
+    /// when the code isn't compiled or neither entry shape is
+    /// eligible (also memoized).
+    fn direct_entry_for(&mut self, key: *const CodeObject) -> Option<StdRc<DirectEntry>> {
+        let gen = self.compile_gen;
+        let (art, code) = {
+            let ce = self.cache.get(&key)?;
+            if let Some((g, d)) = &ce.direct {
+                if *g == gen {
+                    return d.clone();
+                }
+            }
+            let Tier::Compiled(a) = &ce.tier else {
+                return None;
+            };
+            (a.clone(), ce.code.clone())
+        };
+        let method_shape = if native_callable(&art.cf, &code) {
+            Some(false)
+        } else if native_method_callable(&art.cf, &code) {
+            Some(true)
+        } else {
+            None
+        };
+        let out = method_shape.map(|method_shape| {
+            StdRc::new(DirectEntry {
+                native: self.native_table_for(key),
+                method_native: self.method_native_table_for(key),
+                art,
+                method_shape,
+            })
+        });
+        if let Some(ce) = self.cache.get_mut(&key) {
+            ce.direct = Some((gen, out.clone()));
+        }
+        out
+    }
+
     /// Resolve one burned-in callee to its native entry, when its code
     /// is compiled and shape-eligible for a direct native call.
     fn resolve_native_callee(&self, obj: &Object, fcode: &Rc<CodeObject>) -> Option<NativeCallee> {
         let Object::Function(pf) = obj else {
             return None;
         };
+        self.resolve_native_func(pf, fcode, false)
+    }
+
+    /// The function-object form of [`Self::resolve_native_callee`]
+    /// (method entries store the resolved `Rc<PyFunction>` directly).
+    /// `method` selects the receiver-in-slot-0 eligibility shape.
+    fn resolve_native_func(
+        &self,
+        pf: &Rc<PyFunction>,
+        fcode: &Rc<CodeObject>,
+        method: bool,
+    ) -> Option<NativeCallee> {
         let ckey = Rc::as_ptr(fcode).cast::<CodeObject>();
         let entry = self.cache.get(&ckey)?;
-        let Tier::Compiled(cf, snap, callees, attrs) = &entry.tier else {
+        let Tier::Compiled(a) = &entry.tier else {
             return None;
         };
-        if !native_callable(cf, fcode) {
+        let eligible = if method {
+            native_method_callable(&a.cf, fcode)
+        } else {
+            native_callable(&a.cf, fcode)
+        };
+        if !eligible {
             return None;
         }
         Some(NativeCallee {
-            cf: cf.clone(),
-            snap: snap.clone(),
-            callees: callees.clone(),
-            attr_guards: attrs.clone(),
+            cf: a.cf.clone(),
+            snap: a.snap.clone(),
+            callees: a.callees.clone(),
+            attr_guards: a.attr_guards.clone(),
+            methods: a.methods.clone(),
+            math: a.math.clone(),
             func: pf.clone(),
             code: fcode.clone(),
         })
@@ -474,6 +771,8 @@ impl JitState {
             osr_failures: 0,
             deopts: 0,
             native: None,
+            method_native: None,
+            direct: None,
             code: code.clone(),
         });
         match entry.tier {
@@ -508,6 +807,35 @@ fn py_callee_ok(code: &CodeObject) -> bool {
         && !code.has_varargs
         && !code.has_varkeywords
         && code.kwonly_count == 0
+}
+
+/// The embedder probes one compile consults (RFC 0059/0061/0065/0069),
+/// bundled because the list outgrew a parameter row. Each borrows the
+/// requesting frame and interpreter for the duration of one
+/// [`JitState::get_compiled`] call.
+struct VmProbes<'a> {
+    /// A `LOAD_GLOBAL` name → its current resolution in the requesting
+    /// frame's namespaces (classification and guard snapshots).
+    resolve_obj: &'a mut dyn FnMut(&str) -> Option<Object>,
+    /// A candidate Python callee's stable scalar return lane (RFC 0059
+    /// WS3).
+    ret_lane_of: &'a mut dyn FnMut(&Rc<PyFunction>, &Rc<CodeObject>) -> Option<JitType>,
+    /// A subscripted local's observed element lane (RFC 0061 WS5).
+    list: &'a mut dyn FnMut(u32) -> Option<JitType>,
+    /// An instance-dict attribute's observed scalar lane (RFC 0065 WS5).
+    attr: &'a mut dyn FnMut(u32, &str, bool) -> Option<JitType>,
+    /// The post-compile guard fingerprint of one attribute site.
+    attr_guard_of: &'a mut dyn FnMut(&AttrSiteMeta) -> Option<AttrGuard>,
+    /// RFC 0069 WS1 — the class-resolved method on the instance
+    /// currently in a local slot, when the shape is eligible.
+    method: &'a mut dyn FnMut(u32, &str) -> Option<MethodEntry>,
+    /// RFC 0069 WS2 — the canonical intrinsic function `name.attr`
+    /// currently resolves to, when the pair is burnable.
+    math_attr: &'a mut dyn FnMut(&str, &str) -> Option<Object>,
+    /// RFC 0069 WS3 — the observed scalar lane of a parameter slot in
+    /// the requesting activation (used only on the seeded retry after
+    /// an unseeded analysis fails with `TypeUnknown`).
+    param: &'a mut dyn FnMut(u32) -> Option<JitType>,
 }
 
 /// `true` for the three lanes a native call can marshal by value.
@@ -545,32 +873,74 @@ fn native_callable(cf: &CompiledFrame, code: &CodeObject) -> bool {
     code.cellvars.is_empty() && code.freevars.is_empty()
 }
 
+/// RFC 0069 WS1 — the method-body variant of [`native_callable`]: the
+/// receiver occupies slot 0 as an object-pin lane (the caller seeds it
+/// as pin 0 of the callee's pin table), every *other* parameter is a
+/// marshalable scalar, and no other slot is a pin lane (pins are
+/// created only at entry, so a non-receiver pin lane could never be
+/// seeded from a native call).
+fn native_method_callable(cf: &CompiledFrame, code: &CodeObject) -> bool {
+    let argc = code.arg_count as usize;
+    if argc == 0 {
+        return false;
+    }
+    if cf.local_types.first().copied().flatten() != Some(JitType::Obj) {
+        return false;
+    }
+    for j in 1..argc {
+        match cf.local_types.get(j).copied().flatten() {
+            Some(t) if scalar_lane_ty(t) => {}
+            _ => return false,
+        }
+    }
+    if !cf.livein.iter().all(|&s| (s as usize) < argc) {
+        return false;
+    }
+    let extra_pin = cf
+        .local_types
+        .iter()
+        .enumerate()
+        .any(|(j, t)| j != 0 && t.is_some_and(|t| !scalar_lane_ty(t)));
+    if extra_pin {
+        return false;
+    }
+    code.cellvars.is_empty() && code.freevars.is_empty()
+}
+
 thread_local! {
     static JIT: RefCell<JitState> = RefCell::new(JitState::new());
 
-    /// Memoized callee return lanes (RFC 0059 WS3), keyed by code
-    /// object identity. The `Rc<CodeObject>` pins the address against
-    /// reuse. The lane is a *prediction* — the call helper re-checks
-    /// the actual result's tag at runtime — so staleness (e.g. the
-    /// callee's own globals changing what its analysis would say) costs
-    /// a deopt, never correctness.
-    static RET_LANE_CACHE: RefCell<HashMap<*const CodeObject, (Option<JitType>, Rc<CodeObject>)>> =
-        RefCell::new(HashMap::new());
+    /// Memoized callee return typing (RFC 0059 WS3 / RFC 0069 WS1):
+    /// `(scalar lane, provably-returns-None)`, keyed by code object
+    /// identity. The `Rc<CodeObject>` pins the address against reuse.
+    /// Both are *predictions* — the call helpers re-check the actual
+    /// result at runtime — so staleness (e.g. the callee's own globals
+    /// changing what its analysis would say) costs a deopt, never
+    /// correctness.
+    static RET_LANE_CACHE: RefCell<
+        HashMap<*const CodeObject, (Option<JitType>, bool, Rc<CodeObject>)>,
+    > = RefCell::new(HashMap::new());
 }
 
-/// Infer a candidate callee's stable scalar return lane by running the
-/// tier-2 analyzer over its body, resolving names in the *callee's* own
-/// namespaces. Nested Python callees are only recognized when they are
-/// the callee itself (self-recursion, e.g. `fib`); anything deeper stays
-/// opaque, bounding the recursion at depth one.
-fn callee_ret_lane(
+/// Infer a candidate callee's return typing — its stable scalar return
+/// lane, plus whether it provably returns `None` from every site — by
+/// running the tier-2 analyzer over its body, resolving names in the
+/// *callee's* own namespaces. Nested Python callees are only recognized
+/// when they are the callee itself (self-recursion, e.g. `fib`);
+/// anything deeper stays opaque, bounding the recursion at depth one.
+/// A body the analyzer rejects can still be recognized as a procedure
+/// by the syntactic `return None` scan (RFC 0069 WS1) — that shape is
+/// what method-heavy programs (deltablue) are made of.
+fn callee_ret_info(
     interp: &super::Interpreter,
     f: &Rc<PyFunction>,
     fcode: &Rc<CodeObject>,
-) -> Option<JitType> {
+) -> (Option<JitType>, bool) {
     let key = Rc::as_ptr(fcode).cast::<CodeObject>();
-    if let Some(lane) = RET_LANE_CACHE.with(|c| c.borrow().get(&key).map(|(lane, _)| *lane)) {
-        return lane;
+    if let Some(hit) =
+        RET_LANE_CACHE.with(|c| c.borrow().get(&key).map(|(lane, none, _)| (*lane, *none)))
+    {
+        return hit;
     }
     let resolve = |name: &str| resolve_plain_dicts(interp, &f.globals, &f.builtins, name);
     let mut classify = |name: &str| {
@@ -578,9 +948,13 @@ fn callee_ret_lane(
         if let Some(Object::Function(g)) = obj.as_ref() {
             let gcode = g.code.borrow().clone();
             if Rc::ptr_eq(&gcode, fcode) && py_callee_ok(&gcode) {
+                let min_args = gcode
+                    .arg_count
+                    .saturating_sub(u32::try_from(g.defaults.len()).unwrap_or(u32::MAX));
                 return ResolvedGlobal::PyFunc {
                     token: 0,
                     arg_count: gcode.arg_count,
+                    min_args,
                     is_self: true,
                     ret: None,
                 };
@@ -589,11 +963,82 @@ fn callee_ret_lane(
         }
         classify_global(obj.as_ref())
     };
-    let lane = weavepy_jit::analyze(fcode, &mut classify)
-        .ok()
-        .and_then(|tf| tf.ret_lane);
-    RET_LANE_CACHE.with(|c| c.borrow_mut().insert(key, (lane, fcode.clone())));
-    lane
+    let (lane, ret_none) = match weavepy_jit::analyze(fcode, &mut classify) {
+        Ok(tf) => (tf.ret_lane, tf.ret_none),
+        Err(_) => (None, weavepy_jit::returns_none_syntactically(fcode)),
+    };
+    RET_LANE_CACHE.with(|c| c.borrow_mut().insert(key, (lane, ret_none, fcode.clone())));
+    (lane, ret_none)
+}
+
+/// The RFC 0059 WS3 lane-only view of [`callee_ret_info`] (feeds the
+/// `PyFunc` classification, which has no `None` lane).
+fn callee_ret_lane(
+    interp: &super::Interpreter,
+    f: &Rc<PyFunction>,
+    fcode: &Rc<CodeObject>,
+) -> Option<JitType> {
+    callee_ret_info(interp, f, fcode).0
+}
+
+/// RFC 0069 WS1 — [`callee_ret_info`] for a *method* body, with the
+/// caller's live receiver standing in for `self` (local slot 0): the
+/// analyzer's attribute probes resolve against it, which is what makes
+/// `return self.x * self.y`-shaped bodies typable. Uncached — the
+/// shared ret cache has no receiver in its key, and a method body is
+/// analyzed at most once per `(slot, name)` site per compile.
+fn method_ret_info(
+    interp: &super::Interpreter,
+    f: &Rc<PyFunction>,
+    fcode: &Rc<CodeObject>,
+    recv: &Object,
+) -> (Option<JitType>, bool) {
+    let resolve = |name: &str| resolve_plain_dicts(interp, &f.globals, &f.builtins, name);
+    let mut classify = |name: &str| {
+        let obj = resolve(name);
+        if let Some(Object::Function(g)) = obj.as_ref() {
+            let gcode = g.code.borrow().clone();
+            if Rc::ptr_eq(&gcode, fcode) && py_callee_ok(&gcode) {
+                let min_args = gcode
+                    .arg_count
+                    .saturating_sub(u32::try_from(g.defaults.len()).unwrap_or(u32::MAX));
+                return ResolvedGlobal::PyFunc {
+                    token: 0,
+                    arg_count: gcode.arg_count,
+                    min_args,
+                    is_self: true,
+                    ret: None,
+                };
+            }
+            return ResolvedGlobal::Opaque;
+        }
+        classify_global(obj.as_ref())
+    };
+    let mut list = |_: u32| None;
+    let mut attr = |slot: u32, name: &str, store: bool| -> Option<JitType> {
+        if slot != 0 {
+            return None;
+        }
+        attr_fingerprint_obj(recv, name, store).map(|(lane, ..)| lane)
+    };
+    // Depth bound: nested method resolution stays opaque, like nested
+    // callees in `callee_ret_info`.
+    let mut method = |_: u32, _: &str| None;
+    let mut math = |_: &str, _: &str| false;
+    // No live callee activation to observe parameter values from —
+    // seeding stays off (RFC 0069 WS3).
+    let mut param = |_: u32| None;
+    let mut probes = Probes {
+        list: &mut list,
+        attr: &mut attr,
+        method: &mut method,
+        math: &mut math,
+        param: &mut param,
+    };
+    match weavepy_jit::analyze_frame(fcode, &mut classify, &mut probes) {
+        Ok(tf) => (tf.ret_lane, tf.ret_none),
+        Err(_) => (None, weavepy_jit::returns_none_syntactically(fcode)),
+    }
 }
 
 /// One pinned object in an activation's pin table (RFC 0061/0065 WS5):
@@ -629,6 +1074,8 @@ fn unpack(bits: u64, tag: u32) -> Object {
         SlotTag::Int => Object::Int(bits as i64),
         SlotTag::Float => Object::Float(f64::from_bits(bits)),
         SlotTag::Bool => Object::Bool(bits != 0),
+        // RFC 0069 WS1 — the `None` singleton (a `ReturnNone` exit).
+        SlotTag::None => Object::None,
         SlotTag::Boxed | SlotTag::ListPin | SlotTag::ObjPin => Object::None,
     }
 }
@@ -721,6 +1168,16 @@ fn probe_list_lane(frame: &super::Frame, slot: u32) -> Option<JitType> {
     lane
 }
 
+/// RFC 0069 WS3 — the parameter-lane probe: the observed scalar lane
+/// of the argument currently bound in local `slot` of the requesting
+/// activation. Only a prediction — every seeded slot is entry-guarded,
+/// so a later call with a differently-typed argument falls back to
+/// the interpreter.
+fn probe_param_lane(frame: &super::Frame, slot: u32) -> Option<JitType> {
+    let locals = frame.locals.borrow();
+    locals.get(slot as usize).and_then(scalar_lane)
+}
+
 /// The scalar lane of an [`Object`], or `None` for anything else.
 fn scalar_lane(obj: &Object) -> Option<JitType> {
     match obj {
@@ -760,6 +1217,110 @@ fn attr_site_guard(frame: &super::Frame, site: &AttrSiteMeta) -> Option<AttrGuar
     })
 }
 
+/// RFC 0069 WS1 — the compile-time method probe: resolve `name` on the
+/// class of the instance currently in local `slot`, when the shape is
+/// eligible for a burned-in method call:
+///
+/// - the receiver is an instance whose class has no attribute-lookup
+///   override (`__getattr__` / non-default `__getattribute__`), so the
+///   class-version guard captures the full lookup semantics;
+/// - `name` is not shadowed by an instance attribute (instance dict
+///   beats a non-data descriptor) — re-checked per call;
+/// - the MRO hit is a plain Python function with a burnable signature
+///   (positional-only, no cells) taking at least `self`;
+/// - its return typing is known: a stable scalar lane, or the provable
+///   `return None` procedure shape.
+///
+/// The resolution is a prediction pinned by the returned fingerprint;
+/// `wpjit_call_method` re-validates it per call.
+fn probe_method_entry(
+    interp: &super::Interpreter,
+    frame: &super::Frame,
+    slot: u32,
+    name: &str,
+) -> Option<MethodEntry> {
+    let locals = frame.locals.borrow();
+    let Some(Object::Instance(inst)) = locals.get(slot as usize) else {
+        return None;
+    };
+    let cls = inst.cls();
+    if crate::specialize::type_has_attr_override(&cls) {
+        return None;
+    }
+    if inst.dict.borrow().get(&StrKey(name)).is_some() {
+        return None;
+    }
+    let Some(Object::Function(f)) = cls.lookup(name) else {
+        return None;
+    };
+    let fcode = f.code.borrow().clone();
+    if !py_callee_ok(&fcode) || fcode.arg_count == 0 {
+        return None;
+    }
+    let n_defaults = u32::try_from(f.defaults.len()).ok()?;
+    let min_args = fcode.arg_count.checked_sub(n_defaults)?;
+    if min_args == 0 {
+        // A default for `self` is nonsense the interpreter would
+        // still bind; keep such shapes on the generic path.
+        return None;
+    }
+    let recv = Object::Instance(inst.clone());
+    let (lane, ret_none) = method_ret_info(interp, &f, &fcode, &recv);
+    let ret = if ret_none {
+        MethodRet::None
+    } else {
+        MethodRet::Scalar(lane.filter(|t| scalar_lane_ty(*t))?)
+    };
+    let type_id = crate::specialize::rc_id(&cls);
+    let ver = cls.attr_version.get();
+    let arg_count = fcode.arg_count;
+    Some(MethodEntry {
+        func: f,
+        code: fcode,
+        name: name.to_owned(),
+        arg_count,
+        min_args,
+        ret,
+        type_id,
+        ver,
+        _class: cls,
+    })
+}
+
+/// RFC 0069 WS2 — the compile-time math-intrinsic probe: the function
+/// object `name.attr` currently resolves to, when the pair is burnable
+/// — `name` resolves to a module, its `attr` entry is a Rust builtin
+/// wearing the same name, and a smoke call on `0.0` returns a plain
+/// `float` (which tells `math.sin` apart from `cmath.sin`: the only
+/// other builtins wearing these names are complex-valued). Builtins
+/// are pure Rust — the smoke call can't run Python or observe state.
+/// The returned object is snapshotted per guard; the entry check and
+/// per-stride poll re-require identity.
+fn math_attr_object(
+    interp: &super::Interpreter,
+    frame: &super::Frame,
+    name: &str,
+    attr: &str,
+) -> Option<Object> {
+    let Some(Object::Module(m)) = resolve_plain_global(interp, frame, name) else {
+        return None;
+    };
+    let obj = m.dict.borrow().get(&StrKey(attr)).cloned()?;
+    math_builtin_ok(&obj, attr).then_some(obj)
+}
+
+/// [`math_attr_object`]'s intrinsic-shape check: a builtin named
+/// `attr` whose smoke call on `0.0` yields a plain `float`.
+fn math_builtin_ok(obj: &Object, attr: &str) -> bool {
+    let Object::Builtin(b) = obj else {
+        return false;
+    };
+    if b.name != attr {
+        return false;
+    }
+    matches!((b.call)(&[Object::Float(0.0)]), Ok(Object::Float(_)))
+}
+
 /// Shared probe body: classify the receiver with the tier-1
 /// specialization predicate and read the current value's lane.
 fn attr_fingerprint(
@@ -768,9 +1329,19 @@ fn attr_fingerprint(
     name: &str,
     store: bool,
 ) -> Option<(JitType, u64, u32, u32, Rc<TypeObject>)> {
-    use weavepy_compiler::InlineCache as IC;
     let locals = frame.locals.borrow();
-    let obj = locals.get(slot as usize)?;
+    attr_fingerprint_obj(locals.get(slot as usize)?, name, store)
+}
+
+/// As [`attr_fingerprint`] against an explicit receiver (the method
+/// return-typing analysis probes the caller's live receiver, which has
+/// no frame slot of its own — RFC 0069 WS1).
+fn attr_fingerprint_obj(
+    obj: &Object,
+    name: &str,
+    store: bool,
+) -> Option<(JitType, u64, u32, u32, Rc<TypeObject>)> {
+    use weavepy_compiler::InlineCache as IC;
     let Object::Instance(inst) = obj else {
         return None;
     };
@@ -828,7 +1399,7 @@ pub(crate) fn gc_sweep() {
             let mut m = c.borrow_mut();
             let dead: Vec<*const CodeObject> = m
                 .iter()
-                .filter(|(_, (_, code))| Rc::strong_count(code) == 1)
+                .filter(|(_, (_, _, code))| Rc::strong_count(code) == 1)
                 .map(|(k, _)| *k)
                 .collect();
             for k in dead {
@@ -936,6 +1507,12 @@ struct CallCtx {
     /// RFC 0065 WS5 — per-site attribute guards, indexed by the `site`
     /// operand of `wpjit_attr_get`/`_set`.
     attr_guards: StdRc<Vec<AttrGuard>>,
+    /// RFC 0069 WS1 — per-token method resolutions, indexed by the
+    /// `token` operand of `wpjit_call_method`.
+    methods: StdRc<MethodTable>,
+    /// RFC 0069 WS2 — per-guard math-intrinsic snapshots, re-validated
+    /// alongside the global guards.
+    math: StdRc<MathTable>,
     /// RFC 0067 WS1 — `true` once arbitrary Python ran on behalf of
     /// this activation (an interpreter-path call, or a materialized
     /// deopt inside a nested native call). Burned-in resolutions are
@@ -950,18 +1527,24 @@ struct CallCtx {
     /// RFC 0067 WS1 — the per-token native-callee table (parallel to
     /// [`Self::callees`]).
     native: Option<StdRc<NativeTable>>,
+    /// RFC 0069 WS1 — the per-token native *method* table (parallel to
+    /// [`Self::methods`]).
+    method_native: Option<StdRc<NativeTable>>,
 }
 
 /// `true` while every burned-in resolution still holds: each guarded
-/// global resolves to the identical object, and each burned-in callee
+/// global resolves to the identical object, each burned-in callee
 /// still wears the `__code__` it was compiled against (functions are
-/// code-rebindable; a swap invalidates arity/lane assumptions).
+/// code-rebindable; a swap invalidates arity/lane assumptions), and
+/// each burned-in math intrinsic's `name.attr` still resolves to the
+/// snapshotted function (RFC 0069 WS2 — module dicts are mutable).
 fn guards_hold(
     interp: &super::Interpreter,
     globals: &Rc<GilRefCell<DictData>>,
     builtins: &Rc<GilRefCell<DictData>>,
     guard_snapshot: &[(String, Object)],
     callees: &CalleeTable,
+    math: &MathTable,
 ) -> bool {
     for (name, expected) in guard_snapshot {
         let ok = resolve_plain_dicts(interp, globals, builtins, name)
@@ -975,6 +1558,19 @@ fn guards_hold(
             return false;
         };
         if !Rc::ptr_eq(&pf.code.borrow(), code_snap) {
+            return false;
+        }
+    }
+    for (name, attr, expected) in math {
+        let ok = match resolve_plain_dicts(interp, globals, builtins, name) {
+            Some(Object::Module(m)) => m
+                .dict
+                .borrow()
+                .get(&StrKey(attr))
+                .is_some_and(|cur| cur.is_same(expected)),
+            _ => false,
+        };
+        if !ok {
             return false;
         }
     }
@@ -1076,6 +1672,7 @@ unsafe extern "C" fn wpjit_poll(frame: *mut JitFrame) -> i64 {
             &ctx.builtins,
             &ctx.guard_snapshot,
             &ctx.callees,
+            &ctx.math,
         ) {
             return 1;
         }
@@ -1100,10 +1697,21 @@ fn resolved_native_table(key: *const CodeObject) -> Option<StdRc<NativeTable>> {
     JIT.with(|cell| cell.borrow_mut().native_table_for(key))
 }
 
+/// RFC 0069 WS1 — the resolved native *method* table for a compiled
+/// code object (thread-local tier cache lookup, generation-checked).
+fn resolved_method_native_table(key: *const CodeObject) -> Option<StdRc<NativeTable>> {
+    JIT.with(|cell| cell.borrow_mut().method_native_table_for(key))
+}
+
 /// RFC 0067 WS1 — attempt a native-to-native call for one marshaled
 /// `CallPy` site. Returns `Some(CallStatus as i64)` when the call
 /// completed through the native path (including via a materialized
 /// deopt), or `None` when the caller should use the interpreter path.
+///
+/// RFC 0069 WS1 — a method call passes its guarded receiver as `recv`:
+/// it is seeded as pin 0 of the callee's pin table (the receiver slot
+/// carries the pin index), and the marshaled scalars fill parameter
+/// slots `1..`.
 ///
 /// # Safety
 ///
@@ -1112,6 +1720,7 @@ fn resolved_native_table(key: *const CodeObject) -> Option<StdRc<NativeTable>> {
 /// entries of the marshal buffers are initialized. `nc` must have been
 /// resolved from this thread's tier cache (its `CompiledFrame` is
 /// backed by the thread's engine).
+#[allow(clippy::too_many_lines)]
 unsafe fn try_native_call(
     jf: &mut JitFrame,
     ctx: &mut CallCtx,
@@ -1119,6 +1728,7 @@ unsafe fn try_native_call(
     nc: &NativeCallee,
     argc: u32,
     expect_tag: u32,
+    recv: Option<&Object>,
 ) -> Option<i64> {
     // Deep native call trees have no back edges, so this is their poll
     // point (RFC 0067 WS2): hand the GIL off inline; route pending
@@ -1128,12 +1738,26 @@ unsafe fn try_native_call(
     if crate::hot_gates::load() != 0 || crate::trace::any_observers_active() {
         return None;
     }
+    // RFC 0069 WS3 — an under-arity call site (trailing defaults bind
+    // the rest) must go through the interpreter: the native prologue
+    // reads all `arg_count` parameter slots, and defaults are
+    // `Object`s the marshal buffer can't carry.
+    let offset = usize::from(recv.is_some());
+    let argc_usize = argc as usize;
+    if argc_usize + offset != nc.code.arg_count as usize {
+        return None;
+    }
+    // The receiver slot must be the object-pin lane the eligibility
+    // check admitted (defensive — `native_method_callable` verified
+    // this at resolution).
+    if recv.is_some() && nc.cf.local_types.first().copied().flatten() != Some(JitType::Obj) {
+        return None;
+    }
     // Argument lanes must match the callee's compiled parameter lanes
     // exactly (`bool` is not `int` here, for the same reason the entry
     // type-guard separates them).
-    let argc_usize = argc as usize;
     for j in 0..argc_usize {
-        let lane = nc.cf.local_types.get(j).copied().flatten()?;
+        let lane = nc.cf.local_types.get(j + offset).copied().flatten()?;
         // SAFETY: per the function contract, `argc` marshaled entries
         // are live.
         let tag = unsafe { *jf.call_tags.add(j) };
@@ -1154,6 +1778,7 @@ unsafe fn try_native_call(
             &nc.func.builtins,
             &nc.snap,
             &nc.callees,
+            &nc.math,
         )
     {
         return None;
@@ -1169,9 +1794,14 @@ unsafe fn try_native_call(
 
     let n_locals = nc.cf.n_locals as usize;
     let mut locals_buf = take_u64(n_locals);
-    for (j, dst) in locals_buf.iter_mut().enumerate().take(argc_usize) {
+    let mut pins: PinTable = Vec::new();
+    if let Some(r) = recv {
+        // The receiver slot carries pin index 0 (`take_u64` zeroed it).
+        pins.push(Pin::Obj(r.clone()));
+    }
+    for j in 0..argc_usize {
         // SAFETY: as above — `argc` marshaled entries are live.
-        *dst = unsafe { *jf.call_args.add(j) };
+        locals_buf[j + offset] = unsafe { *jf.call_args.add(j) };
     }
     let cap = nc.cf.max_stack as usize + 1;
     let mut spill = take_u64(cap);
@@ -1182,10 +1812,13 @@ unsafe fn try_native_call(
     let callee_key = Rc::as_ptr(&nc.code).cast::<CodeObject>();
     // Self-recursion reuses this activation's own table; anything else
     // resolves (generation-cached) from the tier cache.
-    let native = if callee_key == ctx.code_ptr {
-        ctx.native.clone()
+    let (native, method_native) = if callee_key == ctx.code_ptr {
+        (ctx.native.clone(), ctx.method_native.clone())
     } else {
-        resolved_native_table(callee_key)
+        (
+            resolved_native_table(callee_key),
+            resolved_method_native_table(callee_key),
+        )
     };
     let mut nctx = CallCtx {
         interp: ctx.interp,
@@ -1195,11 +1828,14 @@ unsafe fn try_native_call(
         builtins: nc.func.builtins.clone(),
         parked: None,
         raised: None,
-        pins: Vec::new(),
+        pins,
         attr_guards: nc.attr_guards.clone(),
+        methods: nc.methods.clone(),
+        math: nc.math.clone(),
         dirty: false,
         code_ptr: callee_key,
         native,
+        method_native,
     };
     let mut njf = JitFrame {
         locals: locals_buf.as_mut_ptr(),
@@ -1292,6 +1928,7 @@ unsafe fn try_native_call(
                     &ctx.builtins,
                     &ctx.guard_snapshot,
                     &ctx.callees,
+                    &ctx.math,
                 )
             {
                 ctx.parked = Some(unpack(bits, tag));
@@ -1299,9 +1936,11 @@ unsafe fn try_native_call(
             } else if tag == expect_tag
                 && matches!(
                     SlotTag::from_raw(tag),
-                    SlotTag::Int | SlotTag::Float | SlotTag::Bool
+                    SlotTag::Int | SlotTag::Float | SlotTag::Bool | SlotTag::None
                 )
             {
+                // The `None` lane is the method procedure shape: the
+                // caller pushes nothing, so the ret slot is ignored.
                 jf.ret_bits = bits;
                 jf.ret_tag = tag;
                 CallStatus::Ok as i64
@@ -1318,12 +1957,24 @@ unsafe fn try_native_call(
                 &ctx.builtins,
                 &ctx.guard_snapshot,
                 &ctx.callees,
+                &ctx.math,
             );
+            if guards_ok
+                && matches!(SlotTag::from_raw(expect_tag), SlotTag::None)
+                && matches!(v, Object::None)
+            {
+                // The procedure shape: nothing to write back.
+                jf.ret_bits = 0;
+                jf.ret_tag = expect_tag;
+                return Some(CallStatus::Ok as i64);
+            }
             let expect = match SlotTag::from_raw(expect_tag) {
                 SlotTag::Int => JitType::Int,
                 SlotTag::Float => JitType::Float,
                 SlotTag::Bool => JitType::Bool,
-                SlotTag::Boxed | SlotTag::ListPin | SlotTag::ObjPin => JitType::Unknown,
+                SlotTag::None | SlotTag::Boxed | SlotTag::ListPin | SlotTag::ObjPin => {
+                    JitType::Unknown
+                }
             };
             match pack(&v, expect) {
                 Some(bits) if guards_ok => {
@@ -1375,7 +2026,10 @@ fn finish_deopted_callee(
         guard_snapshot: nc.snap.clone(),
         callees: nc.callees.clone(),
         attr_guards: nc.attr_guards.clone(),
+        methods: nc.methods.clone(),
+        math: nc.math.clone(),
         native: None,
+        method_native: None,
     };
     let mut frame = super::Frame {
         code: code.clone(),
@@ -1457,7 +2111,7 @@ unsafe extern "C" fn wpjit_call_py(
         // SAFETY: `jf`/`ctx` are this activation's live buffers (see
         // the function contract) and `nc` came from this thread's
         // tier cache via the activation's resolved table.
-        match unsafe { try_native_call(jf, ctx, interp, nc, argc, expect_tag) } {
+        match unsafe { try_native_call(jf, ctx, interp, nc, argc, expect_tag, None) } {
             Some(status) => return status,
             None => NATIVE_CALL_STATS.with(|s| s.fallbacks.set(s.fallbacks.get() + 1)),
         }
@@ -1493,6 +2147,7 @@ unsafe extern "C" fn wpjit_call_py(
                 &ctx.builtins,
                 &ctx.guard_snapshot,
                 &ctx.callees,
+                &ctx.math,
             );
             if still_valid {
                 let expect = match SlotTag::from_raw(expect_tag) {
@@ -1501,7 +2156,9 @@ unsafe extern "C" fn wpjit_call_py(
                     SlotTag::Bool => JitType::Bool,
                     // A pin-lane call result is rejected at emission;
                     // `Unknown` never packs, forcing the boxed path.
-                    SlotTag::Boxed | SlotTag::ListPin | SlotTag::ObjPin => JitType::Unknown,
+                    SlotTag::None | SlotTag::Boxed | SlotTag::ListPin | SlotTag::ObjPin => {
+                        JitType::Unknown
+                    }
                 };
                 if let Some(bits) = pack(&v, expect) {
                     jf.ret_bits = bits;
@@ -1513,6 +2170,180 @@ unsafe extern "C" fn wpjit_call_py(
             CallStatus::Boxed as i64
         }
     }
+}
+
+/// The `wpjit_call_method` helper (RFC 0069 WS1): native code calls
+/// this with a burned-in method token, the receiver's pin, and the
+/// marshaled scalar arguments (receiver excluded). The guard is
+/// re-validated *before* the call runs — receiver class identity +
+/// attr-version (which pins the MRO hit), no instance-dict shadowing,
+/// and the resolved function still wearing its compile-time
+/// `__code__` — and any mismatch returns [`CallStatus::Reject`], a
+/// deopt at the call's pc where the interpreter re-executes the call
+/// generically. A validated call runs through the interpreter and
+/// reports like [`wpjit_call_py`], with one more lane:
+/// [`SlotTag::None`] as `expect_tag` accepts exactly the `None`
+/// result (the procedure shape) and parks anything else.
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`].
+unsafe extern "C" fn wpjit_call_method(
+    frame: *mut JitFrame,
+    token: u32,
+    recv_pin: i64,
+    argc: u32,
+    expect_tag: u32,
+) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    // SAFETY: the `&mut Interpreter` that entered native code is dormant
+    // while the helper runs; this is the only live path to it.
+    let interp = unsafe { &mut *ctx.interp };
+    NATIVE_CALL_STATS.with(|s| s.method_calls.set(s.method_calls.get() + 1));
+    let guard_miss = || {
+        NATIVE_CALL_STATS.with(|s| s.method_guard_misses.set(s.method_guard_misses.get() + 1));
+        CallStatus::Reject as i64
+    };
+
+    // The method table is snapshotted per activation (an `StdRc`), so
+    // cloning the handle ends the `ctx` borrow before the native path
+    // below needs `ctx` mutably.
+    let methods = ctx.methods.clone();
+    let Some(entry) = methods.get(token as usize) else {
+        return guard_miss();
+    };
+    let recv = match ctx.pins.get(recv_pin as usize) {
+        Some(Pin::Obj(o)) => o.clone(),
+        _ => return guard_miss(),
+    };
+    let Object::Instance(inst) = &recv else {
+        return guard_miss();
+    };
+    let guard_ok = {
+        let cls = inst.class.borrow();
+        crate::specialize::rc_id(&cls) == entry.type_id && cls.attr_version.get() == entry.ver
+    };
+    if !guard_ok
+        || inst.dict.borrow().get(&StrKey(&entry.name)).is_some()
+        || !Rc::ptr_eq(&entry.func.code.borrow(), &entry.code)
+    {
+        return guard_miss();
+    }
+
+    // RFC 0069 WS1 — the native fast path: the guarded method's own
+    // body is compiled and shape-eligible, so enter it directly with
+    // the receiver seeded as its pin 0. The table is parallel to
+    // `ctx.methods` (same compile artifacts), and the guard above
+    // already pinned func/`__code__` identity.
+    let method_native = ctx.method_native.clone();
+    if let Some(nc) = method_native
+        .as_deref()
+        .and_then(|t| t.get(token as usize))
+        .and_then(Option::as_ref)
+    {
+        if Rc::ptr_eq(&nc.func, &entry.func) && Rc::ptr_eq(&nc.code, &entry.code) {
+            // SAFETY: `jf`/`ctx` are this activation's live buffers
+            // (see the function contract) and `nc` came from this
+            // thread's tier cache via the activation's resolved table.
+            match unsafe { try_native_call(jf, ctx, interp, nc, argc, expect_tag, Some(&recv)) } {
+                Some(status) => return status,
+                None => NATIVE_CALL_STATS.with(|s| s.fallbacks.set(s.fallbacks.get() + 1)),
+            }
+        }
+    }
+
+    // Interpreter path: arbitrary Python runs on behalf of this
+    // activation, so burned-in resolutions must be revalidated after
+    // the call (RFC 0067 WS1's dirtiness discipline).
+    NATIVE_CALL_STATS.with(|s| {
+        s.method_call_fallbacks
+            .set(s.method_call_fallbacks.get() + 1);
+    });
+    ctx.dirty = true;
+    let callee = Object::Function(entry.func.clone());
+    let mut args: Vec<Object> = Vec::with_capacity(argc as usize + 1);
+    args.push(recv.clone());
+    for j in 0..argc as usize {
+        // SAFETY: native code wrote `argc` entries, and the buffers are
+        // `max_call_args` wide.
+        let (bits, tag) = unsafe { (*jf.call_args.add(j), *jf.call_tags.add(j)) };
+        args.push(unpack(bits, tag));
+    }
+
+    match interp.call(&callee, &args, &[], &ctx.globals) {
+        Err(err) => {
+            ctx.raised = Some(err);
+            CallStatus::Raised as i64
+        }
+        Ok(v) => {
+            let still_valid = guards_hold(
+                interp,
+                &ctx.globals,
+                &ctx.builtins,
+                &ctx.guard_snapshot,
+                &ctx.callees,
+                &ctx.math,
+            );
+            if still_valid {
+                match SlotTag::from_raw(expect_tag) {
+                    // The procedure lane: nothing to write back, the
+                    // compiled code pushes no result.
+                    SlotTag::None => {
+                        if matches!(v, Object::None) {
+                            return CallStatus::Ok as i64;
+                        }
+                    }
+                    SlotTag::Int | SlotTag::Float | SlotTag::Bool => {
+                        let expect = match SlotTag::from_raw(expect_tag) {
+                            SlotTag::Int => JitType::Int,
+                            SlotTag::Float => JitType::Float,
+                            _ => JitType::Bool,
+                        };
+                        if let Some(bits) = pack(&v, expect) {
+                            jf.ret_bits = bits;
+                            jf.ret_tag = expect_tag;
+                            return CallStatus::Ok as i64;
+                        }
+                    }
+                    SlotTag::Boxed | SlotTag::ListPin | SlotTag::ObjPin => {}
+                }
+            }
+            ctx.parked = Some(v);
+            CallStatus::Boxed as i64
+        }
+    }
+}
+
+/// The `sin` intrinsic helper (RFC 0069 WS2) — the same `f64::sin`
+/// the interpreter's `math.sin` computes; the compiled guard already
+/// excluded the infinite inputs whose `NaN` result the interpreter
+/// turns into `ValueError`.
+extern "C" fn wpjit_math_sin(x: f64) -> f64 {
+    x.sin()
+}
+
+/// The `cos` intrinsic helper (RFC 0069 WS2); see [`wpjit_math_sin`].
+extern "C" fn wpjit_math_cos(x: f64) -> f64 {
+    x.cos()
+}
+
+/// Python-semantics `float` floor division (RFC 0069 WS2): CPython's
+/// `float_divmod` quotient, sign discipline included. The compiled
+/// guard deopts the zero-divisor case *before* the call (the
+/// interpreter re-executes and raises the exact `ZeroDivisionError`),
+/// so the error arm is unreachable-defensive.
+extern "C" fn wpjit_float_floordiv(a: f64, b: f64) -> f64 {
+    crate::py_float_divmod(a, b, "float floor division").map_or(f64::NAN, |(div, _)| div)
+}
+
+/// Python-semantics `float` modulo (RFC 0069 WS2): the remainder takes
+/// the divisor's sign. Zero divisors deopt before the call, as with
+/// [`wpjit_float_floordiv`].
+extern "C" fn wpjit_float_mod(a: f64, b: f64) -> f64 {
+    crate::py_float_divmod(a, b, "float modulo").map_or(f64::NAN, |(_, m)| m)
 }
 
 /// The `wpjit_list_get` helper (RFC 0061 WS5): read one element of a
@@ -1738,6 +2569,203 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
     0
 }
 
+/// RFC 0069 WS3b — a frameless interpreter→native call. When the
+/// tier-1 exact-arity call fast path targets a function whose code is
+/// already tier-2 compiled and native-enterable, enter the compiled
+/// body directly from the argument objects — no interpreter `Frame`,
+/// no locals vector, no `run_frame` dispatch. Two shapes qualify,
+/// mirroring the native-to-native call lanes (RFC 0067 WS1 / 0069
+/// WS1):
+///
+/// - **plain**: every parameter is a managed scalar lane
+///   ([`native_callable`]);
+/// - **method**: the receiver in slot 0 rides as pin 0 of the pin
+///   table and the remaining parameters are scalars
+///   ([`native_method_callable`]). Any instance receiver is safe: the
+///   body's attribute helpers re-validate their guard fingerprints
+///   per access and deopt on mismatch.
+///
+/// Returns `None` when the interpreter path must run instead (not
+/// compiled, lane mismatch, observers active, guard failure, recursion
+/// limit, …). On a native side exit the continuation materializes an
+/// interpreter frame exactly like a deopted native-to-native callee
+/// ([`finish_deopted_callee`]), so semantics match the framed path.
+pub(crate) fn try_call_native_direct(
+    interp: &mut super::Interpreter,
+    f: &Rc<PyFunction>,
+    code: &Rc<CodeObject>,
+    args: &[Object],
+) -> Option<Result<Object, RuntimeError>> {
+    // One relaxed load gates every never-compilable callee.
+    if code.jit_hint.is_not_jitable() {
+        return None;
+    }
+    // Pending interpreter work and active observers (which need the
+    // callee's trace events fired) route through the framed path.
+    if crate::hot_gates::load() != 0 || crate::trace::any_observers_active() {
+        return None;
+    }
+    if args.len() != code.arg_count as usize {
+        return None;
+    }
+    let key = Rc::as_ptr(code).cast::<CodeObject>();
+    let entry = JIT.with(|cell| {
+        let mut st = cell.borrow_mut();
+        if !st.enabled {
+            return None;
+        }
+        st.direct_entry_for(key)
+    })?;
+    let cf = &entry.art.cf;
+    let method_shape = entry.method_shape;
+    if method_shape && !matches!(args[0], Object::Instance(_)) {
+        return None;
+    }
+    // Argument lanes must match the compiled parameter lanes exactly
+    // (the framed path's entry type-guard, applied to the call
+    // arguments directly).
+    let offset = usize::from(method_shape);
+    for (j, a) in args.iter().enumerate().skip(offset) {
+        let ty = cf.local_types.get(j).copied().flatten()?;
+        pack(a, ty)?;
+    }
+    // Deep call chains have no back edges below this point — poll
+    // *before* guard validation (the handoff can run Python that
+    // rebinds a guarded global).
+    crate::gil::yield_checkpoint();
+    // The callee's burned-in resolutions must hold before entry.
+    if !guards_hold(
+        interp,
+        &f.globals,
+        &f.builtins,
+        &entry.art.snap,
+        &entry.art.callees,
+        &entry.art.math,
+    ) {
+        JIT.with(|cell| cell.borrow_mut().stats.entry_guard_failures += 1);
+        return None;
+    }
+    // The same recursion tick the framed path would charge (on
+    // overflow the interpreter path raises with full fidelity).
+    let recursion_guard = match crate::recursion::enter() {
+        crate::recursion::Enter::Ok(g) => g,
+        crate::recursion::Enter::Overflow => return None,
+    };
+
+    // One pooled buffer per element width: locals + stack spill +
+    // call-arg marshal share a single allocation (the take/put round
+    // trips are per-call costs).
+    let n = cf.n_locals as usize;
+    let cap = cf.max_stack as usize + 1;
+    let call_cap = (cf.max_call_args as usize).max(1);
+    let mut u64_buf = take_u64(n + cap + call_cap);
+    let (locals_buf, rest) = u64_buf.split_at_mut(n);
+    let (spill, call_args) = rest.split_at_mut(cap);
+    let mut u32_buf = take_u32(cap + call_cap);
+    let (tags, call_tags) = u32_buf.split_at_mut(cap);
+    let mut pins: PinTable = Vec::new();
+    if method_shape {
+        // The receiver slot carries pin index 0 (`take_u64` zeroed it).
+        pins.push(Pin::Obj(args[0].clone()));
+    }
+    for (j, a) in args.iter().enumerate().skip(offset) {
+        let ty = cf.local_types[j].expect("checked above");
+        locals_buf[j] = pack(a, ty).expect("checked above");
+    }
+    let mut ctx = CallCtx {
+        interp: std::ptr::from_mut(interp),
+        callees: entry.art.callees.clone(),
+        guard_snapshot: entry.art.snap.clone(),
+        globals: f.globals.clone(),
+        builtins: f.builtins.clone(),
+        parked: None,
+        raised: None,
+        pins,
+        attr_guards: entry.art.attr_guards.clone(),
+        methods: entry.art.methods.clone(),
+        math: entry.art.math.clone(),
+        dirty: false,
+        code_ptr: key,
+        native: entry.native.clone(),
+        method_native: entry.method_native.clone(),
+    };
+    let mut jf = JitFrame {
+        locals: locals_buf.as_mut_ptr(),
+        n_locals: cf.n_locals,
+        entry_pc: 0,
+        ret_bits: 0,
+        ret_tag: 0,
+        deopt_pc: 0,
+        stack_spill: spill.as_mut_ptr(),
+        stack_tags: tags.as_mut_ptr(),
+        stack_len: 0,
+        stack_cap: cap as u32,
+        ctx: std::ptr::from_mut(&mut ctx).cast::<u8>(),
+        call_args: call_args.as_mut_ptr(),
+        call_tags: call_tags.as_mut_ptr(),
+    };
+    // SAFETY: the buffers are sized per the compiled frame's analysis
+    // (the invariants `enter_compiled` documents); the engine backing
+    // `cf` lives in this thread's `JIT` state for the process
+    // lifetime; `ctx` outlives the call. Stack growth mirrors
+    // `try_native_call`.
+    let status = if crate::stdlib::greenlet_native::on_greenlet_stack() {
+        unsafe { cf.enter(&raw mut jf) }
+    } else {
+        stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || unsafe {
+            cf.enter(&raw mut jf)
+        })
+    };
+
+    NATIVE_CALL_STATS.with(|s| s.direct_calls.set(s.direct_calls.get() + 1));
+
+    let out = match status {
+        JitStatus::Returned => Ok(unpack_pins(jf.ret_bits, jf.ret_tag, &ctx.pins)),
+        JitStatus::Deopt | JitStatus::Raised => {
+            // Deopt accounting + budget, exactly like the framed entry
+            // path (off the happy path, so the state borrow is fine).
+            JIT.with(|cell| {
+                let mut st = cell.borrow_mut();
+                if matches!(status, JitStatus::Deopt) {
+                    st.stats.deopts += 1;
+                    if let Some(ce) = st.cache.get_mut(&key) {
+                        ce.deopts += 1;
+                        if ce.deopts >= DEOPT_BUDGET {
+                            ce.tier = Tier::NotJitable;
+                            code.jit_hint.mark_not_jitable();
+                        }
+                    }
+                }
+            });
+            // The materialized continuation is a full interpreter
+            // activation that charges its own recursion tick — release
+            // this level's first so the logical frame is counted once.
+            drop(recursion_guard);
+            let pending = if matches!(status, JitStatus::Raised) {
+                Some(ctx.raised.take().unwrap_or_else(|| {
+                    RuntimeError::Internal("JIT Raised exit without a parked exception".to_owned())
+                }))
+            } else {
+                None
+            };
+            let nc = NativeCallee {
+                cf: entry.art.cf.clone(),
+                snap: entry.art.snap.clone(),
+                callees: entry.art.callees.clone(),
+                attr_guards: entry.art.attr_guards.clone(),
+                methods: entry.art.methods.clone(),
+                math: entry.art.math.clone(),
+                func: f.clone(),
+                code: code.clone(),
+            };
+            finish_deopted_callee(interp, &nc, &mut ctx, locals_buf, spill, tags, &jf, pending)
+        }
+    };
+    put_u64(u64_buf);
+    put_u32(u32_buf);
+    Some(out)
+}
+
 /// Offer a fresh frame (pc 0, empty stack) to the JIT. See [`JitEntry`].
 pub(crate) fn try_enter(interp: &mut super::Interpreter, frame: &mut super::Frame) -> JitEntry {
     // RFC 0067 — code the JIT already rejected skips tier-up on one
@@ -1762,13 +2790,23 @@ pub(crate) fn try_enter(interp: &mut super::Interpreter, frame: &mut super::Fram
         let mut probe_attr =
             |slot: u32, name: &str, store: bool| probe_attr_lane(frame_ref, slot, name, store);
         let mut attr_guard = |site: &AttrSiteMeta| attr_site_guard(frame_ref, site);
+        let mut probe_method =
+            |slot: u32, name: &str| probe_method_entry(interp_ref, frame_ref, slot, name);
+        let mut math_attr =
+            |name: &str, attr: &str| math_attr_object(interp_ref, frame_ref, name, attr);
+        let mut probe_param = |slot: u32| probe_param_lane(frame_ref, slot);
         st.get_compiled(
             &frame.code,
-            &mut resolve,
-            &mut ret_of,
-            &mut probe,
-            &mut probe_attr,
-            &mut attr_guard,
+            &mut VmProbes {
+                resolve_obj: &mut resolve,
+                ret_lane_of: &mut ret_of,
+                list: &mut probe,
+                attr: &mut probe_attr,
+                attr_guard_of: &mut attr_guard,
+                method: &mut probe_method,
+                math_attr: &mut math_attr,
+                param: &mut probe_param,
+            },
         )
     });
     let Some(entry) = entry else {
@@ -1782,6 +2820,7 @@ pub(crate) fn try_enter(interp: &mut super::Interpreter, frame: &mut super::Fram
         &frame.builtins,
         &entry.guard_snapshot,
         &entry.callees,
+        &entry.math,
     ) {
         JIT.with(|cell| cell.borrow_mut().stats.entry_guard_failures += 1);
         return JitEntry::Skip;
@@ -1828,13 +2867,23 @@ pub(crate) fn try_enter_osr(interp: &mut super::Interpreter, frame: &mut super::
         let mut probe_attr =
             |slot: u32, name: &str, store: bool| probe_attr_lane(frame_ref, slot, name, store);
         let mut attr_guard = |site: &AttrSiteMeta| attr_site_guard(frame_ref, site);
+        let mut probe_method =
+            |slot: u32, name: &str| probe_method_entry(interp_ref, frame_ref, slot, name);
+        let mut math_attr =
+            |name: &str, attr: &str| math_attr_object(interp_ref, frame_ref, name, attr);
+        let mut probe_param = |slot: u32| probe_param_lane(frame_ref, slot);
         st.get_compiled(
             &frame.code,
-            &mut resolve,
-            &mut ret_of,
-            &mut probe,
-            &mut probe_attr,
-            &mut attr_guard,
+            &mut VmProbes {
+                resolve_obj: &mut resolve,
+                ret_lane_of: &mut ret_of,
+                list: &mut probe,
+                attr: &mut probe_attr,
+                attr_guard_of: &mut attr_guard,
+                method: &mut probe_method,
+                math_attr: &mut math_attr,
+                param: &mut probe_param,
+            },
         )
     });
     let Some(entry) = entry else {
@@ -1855,6 +2904,7 @@ pub(crate) fn try_enter_osr(interp: &mut super::Interpreter, frame: &mut super::
         &frame.builtins,
         &entry.guard_snapshot,
         &entry.callees,
+        &entry.math,
     ) {
         return fail(&frame.code);
     }
@@ -1971,9 +3021,12 @@ fn enter_compiled(
         raised: None,
         pins,
         attr_guards: entry.attr_guards.clone(),
+        methods: entry.methods.clone(),
+        math: entry.math.clone(),
         dirty: false,
         code_ptr: Rc::as_ptr(&frame.code).cast::<CodeObject>(),
         native: entry.native.clone(),
+        method_native: entry.method_native.clone(),
     };
     let mut jf = JitFrame {
         locals: locals_buf.as_mut_ptr(),
@@ -2145,14 +3198,31 @@ fn rebuild_stack(
             inserts.push((s.interp_depth + 1, Object::Unbound));
         }
     }
+    // RFC 0069 WS2 — open math-intrinsic spans: the interpreter holds
+    // the bound intrinsic function (from the per-guard snapshot) and
+    // the self-or-null marker above it.
+    for s in cf
+        .math_spans
+        .iter()
+        .filter(|s| s.live_from < jf.deopt_pc && jf.deopt_pc < s.live_to)
+    {
+        let f = entry
+            .math
+            .get(s.token as usize)
+            .map_or(Object::None, |(_, _, f)| f.clone());
+        inserts.push((s.interp_depth, f));
+        inserts.push((s.interp_depth + 1, Object::Unbound));
+    }
     inserts.sort_unstable_by_key(|(depth, _)| *depth);
     // Open method spans: the spilled entry at `native_index` must
-    // rebuild as the bound method, not the bare pinned list.
-    let bound_recv: Vec<u32> = cf
+    // rebuild as the bound method, not the bare pin — via a fresh
+    // `append` load for the RFC 0065 list shape (`token: None`), or
+    // the burned-in site's method name for an RFC 0069 WS1 site.
+    let bound_recv: Vec<(u32, Option<u32>)> = cf
         .method_spans
         .iter()
         .filter(|s| s.live_from < jf.deopt_pc && jf.deopt_pc < s.live_to)
-        .map(|s| s.native_index)
+        .map(|s| (s.native_index, s.token))
         .collect();
     let mut next = 0usize;
     for i in 0..jf.stack_len as usize {
@@ -2161,18 +3231,20 @@ fn rebuild_stack(
             next += 1;
         }
         let mut v = unpack_pins(spill[i], tags[i], pins);
-        let rebound = bound_recv.contains(&(i as u32));
-        if rebound {
-            // The receiver of an open `.append` span: what the
-            // interpreter holds here is the *bound method*. `list`
-            // always has `append`, so the load cannot fail; `None` is
-            // an unreachable defensive fallback.
-            v = interp
-                .load_attr_public(&v, "append")
-                .unwrap_or(Object::None);
+        let rebound = bound_recv.iter().find(|(ni, _)| *ni == i as u32);
+        if let Some((_, token)) = rebound {
+            // The receiver of an open method span: what the
+            // interpreter holds here is the *bound method*. The load
+            // cannot fail (`list` always has `append`; a burned-in
+            // site's guard held when the span opened); `None` is an
+            // unreachable defensive fallback.
+            let name = token
+                .and_then(|t| cf.method_sites.get(t as usize))
+                .map_or("append", |site| site.name.as_str());
+            v = interp.load_attr_public(&v, name).unwrap_or(Object::None);
         }
         frame.stack.push(v);
-        if rebound {
+        if rebound.is_some() {
             // RFC 0068 — LOAD_ATTR in method form leaves the
             // self-or-null `Unbound` marker above the bound method.
             frame.stack.push(Object::Unbound);
@@ -2228,8 +3300,18 @@ pub(crate) fn format_stats_markdown() -> Option<String> {
         if s.frames_seen == 0 {
             return None;
         }
-        let (ncalls, nfallbacks, ndeopts) =
-            NATIVE_CALL_STATS.with(|n| (n.calls.get(), n.fallbacks.get(), n.deopts.get()));
+        let (ncalls, nfallbacks, ndeopts, mcalls, mfallbacks, mmisses, direct) = NATIVE_CALL_STATS
+            .with(|n| {
+                (
+                    n.calls.get(),
+                    n.fallbacks.get(),
+                    n.deopts.get(),
+                    n.method_calls.get(),
+                    n.method_call_fallbacks.get(),
+                    n.method_guard_misses.get(),
+                    n.direct_calls.get(),
+                )
+            });
         Some(format!(
             "\n## Tier-2 JIT stats\n\n\
              - frames seen: **{}**\n\
@@ -2237,21 +3319,29 @@ pub(crate) fn format_stats_markdown() -> Option<String> {
              - frames not JITable: **{}**\n\
              - native entries: **{}**\n\
              - OSR entries: **{}**\n\
+             - direct native calls: **{}**\n\
              - deopts: **{}**\n\
              - entry-guard failures: **{}**\n\
              - native-to-native calls: **{}**\n\
              - native-call fallbacks: **{}**\n\
-             - native-call deopts: **{}**\n",
+             - native-call deopts: **{}**\n\
+             - method calls: **{}**\n\
+             - method-call fallbacks: **{}**\n\
+             - method guard misses: **{}**\n",
             s.frames_seen,
             s.frames_compiled,
             s.frames_notjitable,
             s.native_entries,
             s.osr_entries,
+            direct,
             s.deopts,
             s.entry_guard_failures,
             ncalls,
             nfallbacks,
             ndeopts,
+            mcalls,
+            mfallbacks,
+            mmisses,
         ))
     })
 }

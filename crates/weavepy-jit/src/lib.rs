@@ -29,17 +29,22 @@ mod lower;
 mod runtime;
 mod value;
 
-pub use analyze::{analyze, analyze_with_probe, analyze_with_probes, JitVerdict};
+pub use analyze::{
+    analyze, analyze_frame, analyze_with_probe, analyze_with_probes, returns_none_syntactically,
+    JitVerdict, MethodResolution, Probes,
+};
 pub use engine::{CompiledFrame, JitEngine};
 pub use ir::{
-    ArithKind, AttrSiteMeta, BlockId, CalleeSpanMeta, CmpKind, GlobalGuard, MethodSpanMeta,
-    OsrEntry, RangeLoopMeta, ResolvedGlobal, TBlock, TFunc, TOp, TStmt, TTerm,
+    ArithKind, AttrSiteMeta, BlockId, CalleeSpanMeta, CmpKind, GlobalGuard, MathFunc,
+    MathGuardMeta, MethodRet, MethodSiteMeta, MethodSpanMeta, OsrEntry, RangeLoopMeta,
+    ResolvedGlobal, TBlock, TFunc, TOp, TStmt, TTerm,
 };
 pub use runtime::{
-    register_attr_helpers, register_call_py_helper, register_list_extra_helpers,
-    register_list_helpers, register_poll_helper, AttrGetHelper, AttrSetHelper, CallPyHelper,
-    CallStatus, JitFrame, JitStatus, ListAppendHelper, ListGetHelper, ListLenHelper, ListSetHelper,
-    PollHelper, SlotTag, JIT_POLL_STRIDE,
+    register_attr_helpers, register_call_method_helper, register_call_py_helper,
+    register_list_extra_helpers, register_list_helpers, register_math_helpers,
+    register_poll_helper, AttrGetHelper, AttrSetHelper, CallMethodHelper, CallPyHelper, CallStatus,
+    JitFrame, JitStatus, ListAppendHelper, ListGetHelper, ListLenHelper, ListSetHelper,
+    MathBinaryHelper, MathUnaryHelper, PollHelper, SlotTag, JIT_POLL_STRIDE,
 };
 pub use value::JitType;
 

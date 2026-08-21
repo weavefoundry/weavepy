@@ -2086,6 +2086,21 @@ pub(crate) fn synth_type_for_class(cls: &Rc<TypeObject>) -> Option<*mut PyTypeOb
     let leaked = Box::leak(bx);
     let p = &mut leaked.head as *mut PyTypeObject;
     register_heap_type(p);
+    // RFC 0069 WS5: publish faithful `tp_bases` / `tp_mro` post-
+    // registration (see the matching note in [`install_user_type`] —
+    // numpy's `PyArray_DescrFromTypeObject` walks `tp_mro` directly).
+    unsafe {
+        let bases_for_c: Vec<Rc<TypeObject>> = cls.bases.borrow().clone();
+        let mro_for_c: Vec<Rc<TypeObject>> = cls.mro.borrow().clone();
+        let tp_bases_box = build_type_ptr_tuple(&bases_for_c);
+        if !tp_bases_box.is_null() {
+            (*p).tp_bases = tp_bases_box;
+        }
+        let tp_mro_box = build_type_ptr_tuple(&mro_for_c);
+        if !tp_mro_box.is_null() {
+            (*p).tp_mro = tp_mro_box;
+        }
+    }
     // Mirror the inline base: instances need the same faithful inline body
     // (RFC 0045) so fixed-offset field reads/writes land on real
     // CPython-shaped memory rather than the Rust `obj` payload.
@@ -2324,6 +2339,15 @@ fn inherit_inline_base_layout(
     let mut solid_size: PySsizeT = 0;
     for b in bases.iter() {
         if let Some(bp) = resolve(b) {
+            if std::env::var_os("WEAVEPY_TRACE_CTOR").is_some() {
+                eprintln!(
+                    "[CTOR] layout-probe class={} base={} bp={bp:p} inline={} basicsize={}",
+                    t.name,
+                    b.name,
+                    is_inline_instance_type(bp),
+                    unsafe { (*bp).tp_basicsize },
+                );
+            }
             if is_inline_instance_type(bp) {
                 let sz = unsafe { (*bp).tp_basicsize };
                 if solid.is_none() || sz > solid_size {
@@ -2504,6 +2528,26 @@ pub fn install_user_type(t: &Rc<TypeObject>) -> *mut PyTypeObject {
     // (`PyExc_*` aliases — e.g. `SystemError` → `runtime_error` —
     // would otherwise install distinct slots for the same type).
     register_heap_type(ty_ptr);
+    // RFC 0069 WS5: publish faithful C-level `tp_bases` / `tp_mro` (built
+    // *after* registration so the type's own pointer resolves for the
+    // `tp_mro[0]` self entry), exactly as the spec-built and
+    // `PyType_Ready` paths do. numpy's `PyArray_DescrFromTypeObject`
+    // walks `tp_mro` directly to map a scalar *subclass* back to its
+    // dtype — a VM `class my_int16(np.int16)` crossed here with
+    // `tp_mro == NULL`, so `np.int16(x)` / `x.item()` / `str(x)`
+    // faulted (the `test_scalarinherit` census row).
+    unsafe {
+        let bases_for_c: Vec<Rc<TypeObject>> = t.bases.borrow().clone();
+        let mro_for_c: Vec<Rc<TypeObject>> = t.mro.borrow().clone();
+        let tp_bases_box = build_type_ptr_tuple(&bases_for_c);
+        if !tp_bases_box.is_null() {
+            (*ty_ptr).tp_bases = tp_bases_box;
+        }
+        let tp_mro_box = build_type_ptr_tuple(&mro_for_c);
+        if !tp_mro_box.is_null() {
+            (*ty_ptr).tp_mro = tp_mro_box;
+        }
+    }
     // Mirror the inline base: instances of this subclass need the same
     // faithful inline body (RFC 0045) so fixed-offset field reads/writes
     // land on real CPython-shaped memory.

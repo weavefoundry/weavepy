@@ -61,7 +61,13 @@ timeout_seconds = 60
 # deviations from that bar.
 # ---------------------------------------------------------------------
 
-# (none currently — all bundled tests are expected to pass)
+# (all bundled tests are expected to pass; rows below only raise
+# per-test budget headroom)
+
+[tests."bundled/test_capi_recursion.py"]
+status = "pass"
+timeout_seconds = 180
+reason = "RFC 0069 WS5: compiles a C extension at test time and walks the full 1 GiB interpreter stack twice to prove the uncharged-recursion headroom guard raises RecursionError; ~35 s unloaded, needs headroom under parallel-sweep load."
 
 # ---------------------------------------------------------------------
 # CPython `Lib/test/` measured baseline. Rows are sorted by label.

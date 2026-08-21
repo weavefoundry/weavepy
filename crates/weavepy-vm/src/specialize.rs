@@ -520,6 +520,68 @@ pub fn attempt_specialize_call(callable: &Object, argc: usize) -> InlineCache {
     }
 }
 
+/// Decide on a `CALL_KW` specialization (RFC 0069 WS3): a plain Python
+/// function (no `*args`/`**kwargs`/kw-only, cell-free, no
+/// `__defaults__` override) where every keyword name resolves to a
+/// distinct keyword-bindable positional slot at or above the
+/// positional count, and every slot left uncovered is filled by a
+/// trailing default. The kw→slot permutation packs 4 bits per keyword
+/// into `perm`; anything that doesn't fit (more than 8 keywords, more
+/// than 16 parameter slots) stays generic. Binder *errors* (multiple
+/// values, unexpected keyword, posonly-as-keyword, missing arguments)
+/// all fail these checks, so the generic binder keeps owning the
+/// error messages.
+pub fn attempt_specialize_call_kw(
+    f: &Rc<crate::object::PyFunction>,
+    argc: usize,
+    kw_names: &[(String, crate::object::Object)],
+) -> InlineCache {
+    let code = f.code();
+    let total = code.arg_count as usize;
+    let kwc = kw_names.len();
+    if code.is_generator
+        || code.is_coroutine
+        || code.is_async_generator
+        || code.has_varargs
+        || code.has_varkeywords
+        || code.kwonly_count != 0
+        || !(code.cellvars.is_empty() && code.freevars.is_empty() && f.closure.is_empty())
+        || f.slot("__defaults__").is_some()
+        || total > 16
+        || kwc == 0
+        || kwc > 8
+        || argc > total
+    {
+        return InlineCache::Cooldown(COOLDOWN);
+    }
+    let mut perm: u32 = 0;
+    let mut covered: u32 = (1u32 << argc) - 1;
+    for (j, (name, _)) in kw_names.iter().enumerate() {
+        let Some(slot) = code.varnames[..total].iter().position(|v| v == name) else {
+            return InlineCache::Cooldown(COOLDOWN);
+        };
+        if slot < code.posonly_count as usize || covered & (1 << slot) != 0 {
+            return InlineCache::Cooldown(COOLDOWN);
+        }
+        perm |= (slot as u32) << (4 * j);
+        covered |= 1 << slot;
+    }
+    // Every slot not covered by a positional or keyword must carry a
+    // trailing default (right-aligned, like the generic fill).
+    let d_start = total - f.defaults.len().min(total);
+    let full = (1u32 << total) - 1;
+    let uncovered = !covered & full;
+    if (uncovered.trailing_zeros() as usize) < d_start {
+        return InlineCache::Cooldown(COOLDOWN);
+    }
+    InlineCache::CallPyKwNames {
+        func_id: rc_id(f),
+        perm,
+        argc: argc as u8,
+        kwc: kwc as u8,
+    }
+}
+
 /// Decide on a `CALL` specialization for a bound method whose target is
 /// a plain Python function (RFC 0058 WS3). Mirrors the exact-arity
 /// no-free shape with the receiver counted as the leading argument.
@@ -560,7 +622,7 @@ pub fn rc_id<T>(rc: &Rc<T>) -> u64 {
 /// Whether a type's MRO defines an attribute-access override that
 /// would invalidate the simple "dict slot" fast path. We bail out
 /// of LOAD_ATTR / STORE_ATTR specialization for these.
-fn type_has_attr_override(ty: &Rc<TypeObject>) -> bool {
+pub(crate) fn type_has_attr_override(ty: &Rc<TypeObject>) -> bool {
     if ty.lookup("__getattr__").is_some() {
         return true;
     }

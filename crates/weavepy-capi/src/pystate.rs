@@ -156,6 +156,17 @@ pub fn delete_later_slot() -> *mut *mut PyObject {
     unsafe { (*store).body.as_mut_ptr().add(OFF_DELETE_LATER) as *mut *mut PyObject }
 }
 
+/// RFC 0069 WS5 — pointer to this thread's `c_recursion_remaining`
+/// field. `Py_EnterRecursiveCall`/`Py_LeaveRecursiveCall` charge *this*
+/// slot (not a separate counter) because mypyc's `Py_TRASHCAN_*`
+/// expansions and Cython's inlined recursion checks read and write the
+/// field directly at its struct offset — one budget, shared by both
+/// access styles, exactly like CPython's `tstate`.
+pub fn c_recursion_remaining_slot() -> *mut i32 {
+    let store = store_ptr();
+    unsafe { (*store).body.as_mut_ptr().add(OFF_C_RECURSION_REMAINING) as *mut i32 }
+}
+
 // ---------------------------------------------------------------------------
 // FFI
 // ---------------------------------------------------------------------------
