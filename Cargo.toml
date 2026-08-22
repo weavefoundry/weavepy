@@ -64,7 +64,7 @@ chrono      = { version = "0.4", default-features = false, features = ["clock"] 
 clap        = { version = "4.5", features = ["derive", "wrap_help"] }
 indexmap    = "2.5"
 regex       = "1.10"
-fancy-regex = "0.13"
+fancy-regex = "0.18"
 serde       = { version = "1.0", features = ["derive"] }
 serde_json  = "1.0"
 thiserror   = "2.0"
@@ -75,16 +75,16 @@ walkdir     = "2.5"
 
 # RFC 0017 — OS interface, networking, subprocess.
 mio         = { version = "1.0", features = ["os-poll", "os-ext", "net"] }
-socket2     = { version = "0.5", features = ["all"] }
-sha2        = "0.10"
-sha1        = "0.10"
-sha3        = "0.10"
-md-5        = "0.10"
-digest      = "0.10"
-hmac        = "0.12"
+socket2     = { version = "0.6", features = ["all"] }
+sha2        = "0.11"
+sha1        = "0.11"
+sha3        = "0.12"
+md-5        = "0.11"
+digest      = "0.11"
+hmac        = "0.13"
 blake2b_simd = "1.0"
 blake2s_simd = "1.0"
-base64      = "0.22"
+base64      = "0.23"
 crc32fast   = "1.4"
 # `zlib-rs` is a pure-Rust zlib reimplementation (no C dependency) that, via
 # flate2's `any_zlib` cfg, unlocks the full low-level API we need for faithful
@@ -93,16 +93,16 @@ crc32fast   = "1.4"
 flate2      = { version = "1.0", default-features = false, features = ["zlib-rs"] }
 
 # RFC 0019 — numerics and serialization.
-num-bigint  = "0.4"
+num-bigint  = "0.5"
 num-integer = "0.1"
 num-traits  = "0.2"
 num-rational = "0.4"
 byteorder   = "1.5"
 encoding_rs = "0.8"
-bzip2       = { version = "0.4", features = ["static"] }
+bzip2       = { version = "0.6", features = ["static"] }
 xz2         = "0.1"
 lzma-sys    = "0.1"
-rusqlite    = { version = "0.31", features = ["bundled", "column_decltype"] }
+rusqlite    = { version = "0.40", features = ["bundled", "column_decltype"] }
 rust_decimal = "1.36"
 
 # RFC 0056 WS3 — real expat: vendored 2.6.4 C sources + raw FFI bindings
@@ -110,17 +110,17 @@ rust_decimal = "1.36"
 expat-sys   = { path = "vendor/expat-sys" }
 
 # RFC 0020 — interactive REPL + CLI surface.
-rustyline   = { version = "14.0", default-features = false, features = ["with-file-history"] }
-dirs        = "5.0"
+rustyline   = { version = "18.0", default-features = false, features = ["with-file-history"] }
+dirs        = "6.0"
 
 # RFC 0022 — C-API foundation (dlopen + cc-driven extension build harness).
-libloading  = "0.8"
+libloading  = "0.9"
 cc          = "1.0"
 
 # RFC 0023 — drop-in stdlib parity + HTTPS.
 unicode-normalization = "0.1"
 unicode-properties    = "0.1"
-unicode_names2        = "2.0"
+unicode_names2        = "3.1"
 memmap2               = "0.9"
 memchr                = "2.8"
 libc                  = "0.2"
@@ -128,14 +128,14 @@ rustls                = { version = "0.23", default-features = false, features =
 rustls-pki-types      = "1.7"
 # PKCS#8 "ENCRYPTED PRIVATE KEY" (PBES2) decryption for password-protected
 # keys in SSLContext.load_cert_chain.
-pkcs8                 = { version = "0.10", features = ["encryption", "pem"] }
+pkcs8                 = { version = "0.11", features = ["encryption", "pem"] }
 rustls-pemfile        = "2.1"
-rustls-native-certs   = "0.7"
-webpki-roots          = "0.26"
+rustls-native-certs   = "0.8"
+webpki-roots          = "1.0"
 # `SSLSocket.getpeercert()` returns CPython's decoded-certificate dict
 # (subject/issuer RDNs, validity, SAN, AIA, CRL points); rustls treats certs
 # as opaque DER, so the decode needs a real X.509/ASN.1 parser.
-x509-parser           = "0.16"
+x509-parser           = "0.18"
 
 # RFC 0024 — real OS threads, GIL, cycle GC, weakrefs.
 parking_lot           = "0.12"
@@ -173,11 +173,11 @@ windows-sys = { version = "0.61", features = [
 # RFC 0032 — tier-2 JIT backend (Cranelift). Only compiled when the
 # `jit` feature is enabled (on by default since RFC 0067); CI exercises it via
 # `--all-features`. MSRV floor for these is Rust 1.93.
-cranelift-codegen     = "0.132"
-cranelift-frontend    = "0.132"
-cranelift-jit         = "0.132"
-cranelift-module      = "0.132"
-cranelift-native      = "0.132"
+cranelift-codegen     = "0.134"
+cranelift-frontend    = "0.134"
+cranelift-jit         = "0.133"
+cranelift-module      = "0.133"
+cranelift-native      = "0.133"
 
 # Test/bench-only.
 insta       = { version = "1.40", features = ["yaml"] }
