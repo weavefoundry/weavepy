@@ -503,7 +503,12 @@ fixtures moved substantially but unevenly:
   2.23× host measurement, and CI's fastest macOS runner class
   (CPython starting in ~15 ms against weavepy's disk-bound ~44 ms
   binary load) measures 3.0×, outside a dev-host envelope, per the
-  bench README's refresh rule.
+  bench README's refresh rule. `deltablue` (also untouched — it
+  *is* the wave-7 carry) gets the same treatment: the re-record
+  tightened its envelope from wave 5's CI-derived 25.46× to the
+  21.3× host measurement, and CI runners measure 24.9–30.1× on it
+  (it is the fixture the gate's noise-rejection retry was built
+  for), so the committed row re-widens to the CI-observed 27.29×.
 
 **WS5 (numpy crash burn): complete.** All 12 previously-crashing
 `numpy._core` selftest modules now run to completion or time out —
@@ -574,10 +579,10 @@ handler entry still fires on `close()`
 **Gates**: `cargo test --workspace` green; the bundled regrtest
 sweep grades **fail 0, error 0, timeout 0, unexpected 0** (433
 pass / 3 skip / 1 enumerated divergence); the committed
-macOS-aarch64 baseline is re-recorded at 3.12× (the dev host
-measured 3.05×, but `fib`'s row keeps the wave-5 2.26× and
-`startup`'s envelope is re-widened to the CI-observed 3.04× — see
-above) and the bench gate passes against it. Acceptance criteria 2–6 are met in full;
+macOS-aarch64 baseline is re-recorded at 3.16× (the dev host
+measured 3.05×, but `fib`'s row keeps the wave-5 2.26× and the
+`startup`/`deltablue` envelopes are re-widened to the CI-observed
+3.04×/27.29× — see above) and the bench gate passes against it. Acceptance criteria 2–6 are met in full;
 criterion 1's geomean gate is missed (3.05× against ≤ 2.33×) with
 the shortfall isolated to the object-lane fixtures named above —
 the wave-7 opening move.

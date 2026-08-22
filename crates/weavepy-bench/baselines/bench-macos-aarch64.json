@@ -3,7 +3,7 @@
   "host": "unknown",
   "created_at": "ts=1787297828",
   "platform": "macos-aarch64",
-  "geomean_ratio": 3.1215441338911907,
+  "geomean_ratio": 3.1583429477411,
   "rows": [
     {
       "name": "fannkuch",
@@ -400,7 +400,7 @@
         "max_rss_bytes": 16760832
       },
       "interp": null,
-      "ratio": 21.33622592386386,
+      "ratio": 27.29,
       "memory_ratio": 2.555229716520039
     },
     {

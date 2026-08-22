@@ -243,7 +243,7 @@ work.
 > (exact-positional, defaults, kwnames, bound-method) plus a
 > **zero-allocation generator park/unpark** that holds the frame in
 > the generator box across yields. Committed baseline: suite
-> geomean **3.12× CPython** (3.05× measured on the dev host; from
+> geomean **3.16× CPython** (3.05× measured on the dev host; from
 > wave 5's 3.33×, 3.60× re-measured pre-wave on the same host), with
 > `spectral_norm` 2.3× faster, `richards` 1.7×, `generators` 1.6×,
 > and `call_overhead` 1.5× — the boxed-object fixtures
