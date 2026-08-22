@@ -200,8 +200,8 @@ fn load_mt(inst: &Rc<PyInstance>) -> Result<Mt, RuntimeError> {
     };
     let buf = bytes.borrow();
     let mut key = [0u32; N];
-    for (i, chunk) in buf.chunks_exact(4).enumerate().take(N) {
-        key[i] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    for (i, chunk) in buf.as_chunks::<4>().0.iter().enumerate().take(N) {
+        key[i] = u32::from_le_bytes(*chunk);
     }
     Ok(Mt { key, pos })
 }

@@ -798,12 +798,14 @@ fn decode_utf16_surrogatepass_codepoints(
         ));
     }
     let units: Vec<u16> = body
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| {
             if big {
-                u16::from_be_bytes([c[0], c[1]])
+                u16::from_be_bytes(*c)
             } else {
-                u16::from_le_bytes([c[0], c[1]])
+                u16::from_le_bytes(*c)
             }
         })
         .collect();
@@ -844,11 +846,11 @@ fn decode_utf32_surrogatepass_codepoints(
         ));
     }
     let mut out = Vec::with_capacity(body.len() / 4);
-    for c in body.chunks_exact(4) {
+    for c in body.as_chunks::<4>().0 {
         let v = if big {
-            u32::from_be_bytes([c[0], c[1], c[2], c[3]])
+            u32::from_be_bytes(*c)
         } else {
-            u32::from_le_bytes([c[0], c[1], c[2], c[3]])
+            u32::from_le_bytes(*c)
         };
         if v > 0x10_FFFF {
             return Err(crate::error::unicode_decode_error(

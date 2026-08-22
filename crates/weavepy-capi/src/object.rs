@@ -616,7 +616,10 @@ unsafe fn pinned_box_is_dead(bp: *mut PyObject) -> bool {
 /// without freeing). When the instance is no longer reachable outside the
 /// box, the entry is evicted and `false` is returned so the ordinary free
 /// path reclaims it.
-fn instance_pin_parks(p: *mut PyObject, inst: &weavepy_vm::sync::Rc<weavepy_vm::types::PyInstance>) -> bool {
+fn instance_pin_parks(
+    p: *mut PyObject,
+    inst: &weavepy_vm::sync::Rc<weavepy_vm::types::PyInstance>,
+) -> bool {
     let mut g = match INSTANCE_ARG_PINS.lock() {
         Ok(g) => g,
         Err(_) => return false,

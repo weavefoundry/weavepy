@@ -242,9 +242,9 @@ work.
 > ternaries), and tier-1 gains **call-shape inline caches**
 > (exact-positional, defaults, kwnames, bound-method) plus a
 > **zero-allocation generator park/unpark** that holds the frame in
-> the generator box across yields. Measured on the committed
-> baseline: suite geomean **3.05× CPython** (from wave 5's 3.33×;
-> 3.60× re-measured pre-wave on the same host), with
+> the generator box across yields. Committed baseline: suite
+> geomean **3.08× CPython** (3.05× measured on the dev host; from
+> wave 5's 3.33×, 3.60× re-measured pre-wave on the same host), with
 > `spectral_norm` 2.3× faster, `richards` 1.7×, `generators` 1.6×,
 > and `call_overhead` 1.5× — the boxed-object fixtures
 > (`float_math`, `deltablue`) carry to wave 7. The crash burn fixes

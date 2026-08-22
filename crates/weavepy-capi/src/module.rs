@@ -1183,10 +1183,22 @@ pub unsafe extern "C" fn PyModule_AddObject(
         .to_string_lossy()
         .into_owned();
     let v = unsafe { crate::object::clone_object(value) };
+    let key_obj = Object::from_str(key);
     module
         .dict
         .borrow_mut()
-        .insert(DictKey(Object::from_str(key)), v);
+        .insert(DictKey(key_obj.clone()), v.clone());
+    // RFC 0069 WS5 follow-up: on CPython the stolen reference lives on in
+    // the module dict, so the extension's *borrowed* pointer stays valid —
+    // numpy's `PyInit__simd` does `PyModule_AddObject(m, "targets", d)` and
+    // keeps filling `d` through the borrowed pointer afterwards. Our module
+    // dict stores a VM clone, so without a retain the steal-decref below
+    // frees the box and the extension writes into freed memory (the
+    // heap-layout-dependent `_simd` import SIGSEGV). Retain the value box
+    // for the module's lifetime, exactly like `PyDict_SetItemString` does
+    // for plain dicts; the retain is released when the slot is overwritten
+    // or the module box is freed (`invalidate_borrowed_cache`).
+    crate::containers::dict_retain_value(m, crate::containers::dict_key_id(&key_obj), value, v);
     unsafe { crate::object::Py_DecRef(value) };
     0
 }

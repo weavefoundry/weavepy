@@ -10385,14 +10385,13 @@ fn siphash13(k0: u64, k1: u64, data: &[u8]) -> u64 {
     let mut v1 = k1 ^ 0x646f_7261_6e64_6f6d;
     let mut v2 = k0 ^ 0x6c79_6765_6e65_7261;
     let mut v3 = k1 ^ 0x7465_6462_7974_6573;
-    let mut chunks = data.chunks_exact(8);
-    for chunk in &mut chunks {
-        let mi = u64::from_le_bytes(chunk.try_into().unwrap());
+    let (chunks, rem) = data.as_chunks::<8>();
+    for chunk in chunks {
+        let mi = u64::from_le_bytes(*chunk);
         v3 ^= mi;
         round(&mut v0, &mut v1, &mut v2, &mut v3);
         v0 ^= mi;
     }
-    let rem = chunks.remainder();
     let mut tail = [0u8; 8];
     tail[..rem.len()].copy_from_slice(rem);
     let b = ((data.len() as u64) << 56) | u64::from_le_bytes(tail);

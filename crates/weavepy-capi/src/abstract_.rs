@@ -2243,10 +2243,7 @@ pub unsafe extern "C" fn PyObject_Length(o: *mut PyObject) -> PySsizeT {
         // the C stack faults (RFC 0069 WS5 — numpy's sequence discovery
         // under `np.asarray(wrapper)` calls `len()` on a foreign numpy
         // scalar; test_protocols' census row rode that cycle to a SIGBUS).
-        crate::errors::set_type_error(format!(
-            "object of type '{}' has no len()",
-            type_name(&obj)
-        ));
+        crate::errors::set_type_error(format!("object of type '{}' has no len()", type_name(&obj)));
         return -1;
     }
     // Any other VM object — a `list`/`dict`/… *subclass* instance, a
@@ -3502,16 +3499,16 @@ pub unsafe extern "C" fn PySequence_GetItem(o: *mut PyObject, i: PySsizeT) -> *m
         Object::Tuple(items) => {
             let n = items.len() as PySsizeT;
             let idx = if i < 0 { i + n } else { i };
-            (0..n).contains(&idx).then(|| {
-                unsafe { crate::containers::PyTuple_GetItem(o, idx) }
-            })
+            (0..n)
+                .contains(&idx)
+                .then(|| unsafe { crate::containers::PyTuple_GetItem(o, idx) })
         }
         Object::List(rc) => {
             let n = rc.borrow().len() as PySsizeT;
             let idx = if i < 0 { i + n } else { i };
-            (0..n).contains(&idx).then(|| {
-                unsafe { crate::containers::PyList_GetItem(o, idx) }
-            })
+            (0..n)
+                .contains(&idx)
+                .then(|| unsafe { crate::containers::PyList_GetItem(o, idx) })
         }
         _ => None,
     };
@@ -4085,10 +4082,18 @@ const C_STACK_HEADROOM: usize = 512 * 1024;
 
 /// `true` when the calling thread's native stack still has headroom.
 /// Threads whose stack bounds are unknown to the probe report `true`
-/// (the counted budget still applies).
+/// (the counted budget still applies). While a greenlet is current the
+/// probe is skipped outright: execution runs on the greenlet's own
+/// mmap'd stack, so `stacker`'s figure (measured against the OS
+/// thread's stack bounds) is garbage — sqlalchemy's `greenlet_spawn`
+/// legs raised spurious `RecursionError`s from exactly this misread.
+/// Greenlet stacks are sized for a full recursion limit's worth of
+/// frames (see `greenlet_native::stack_size`), and the counted budget
+/// still applies.
 #[inline]
 fn c_stack_headroom_ok() -> bool {
-    stacker::remaining_stack().is_none_or(|r| r >= C_STACK_HEADROOM)
+    weavepy_vm::stdlib::greenlet_native::on_greenlet_stack()
+        || stacker::remaining_stack().is_none_or(|r| r >= C_STACK_HEADROOM)
 }
 
 /// RFC 0069 WS5 — the shared overflow check for structurally recursive

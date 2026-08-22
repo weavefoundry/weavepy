@@ -72,7 +72,7 @@ static DICT_BOX_CACHE: Mutex<Option<FxHashMap<usize, FxHashMap<String, (usize, O
 
 /// A stable cache key for a dict key object (matches `==`-equal keys, the
 /// dict contract numpy relies on for string / int / DType-class keys).
-fn dict_key_id(key: &Object) -> String {
+pub(crate) fn dict_key_id(key: &Object) -> String {
     match key {
         Object::Str(s) => format!("s\0{s}"),
         // Python dict keys unify across the numeric tower (`d[2]`,
@@ -113,7 +113,12 @@ fn dict_key_id(key: &Object) -> String {
 /// so it survives the caller's matching `Py_DECREF`. `value_obj` is the
 /// native [`Object`] `value` boxes; it is stashed so a later read can tell
 /// whether the slot still holds the same value (see [`dict_borrowed_box`]).
-fn dict_retain_value(dict: *mut PyObject, key: String, value: *mut PyObject, value_obj: Object) {
+pub(crate) fn dict_retain_value(
+    dict: *mut PyObject,
+    key: String,
+    value: *mut PyObject,
+    value_obj: Object,
+) {
     if value.is_null() {
         return;
     }
