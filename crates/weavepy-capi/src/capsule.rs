@@ -55,7 +55,7 @@ fn refcnt_of(p: *mut PyObject) -> i64 {
 /// (used by `free_box` to detect a use-after-free).
 pub fn soul_alive(p: *mut PyObject) -> bool {
     let key = p as usize;
-    CAPSULE_SOULS.lock().ok().is_some_and(|g| {
+    CAPSULE_SOULS.lock().is_ok_and(|g| {
         g.as_ref().is_some_and(|m| {
             m.get(&key)
                 .and_then(weavepy_vm::sync::Weak::upgrade)
