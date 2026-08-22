@@ -496,7 +496,14 @@ fixtures moved substantially but unevenly:
   `pidigits`/`jitkernels` stay ≤ 1.0×; `fib` measured 2.26× → 1.90×
   on the tier-1 call caches on the dev host, but the gain proved
   host-sensitive (CI's macOS runners measure ~2.4×), so the
-  committed row keeps the wave-5 2.26×.
+  committed row keeps the wave-5 2.26×. `startup` (untouched by the
+  wave: the branch binary starts marginally *faster* than main on
+  the same host) gets its envelope re-widened to the CI-observed
+  3.04× — the wave's dev-host re-record had tightened it to a
+  2.23× host measurement, and CI's fastest macOS runner class
+  (CPython starting in ~15 ms against weavepy's disk-bound ~44 ms
+  binary load) measures 3.0×, outside a dev-host envelope, per the
+  bench README's refresh rule.
 
 **WS5 (numpy crash burn): complete.** All 12 previously-crashing
 `numpy._core` selftest modules now run to completion or time out —
@@ -567,9 +574,10 @@ handler entry still fires on `close()`
 **Gates**: `cargo test --workspace` green; the bundled regrtest
 sweep grades **fail 0, error 0, timeout 0, unexpected 0** (433
 pass / 3 skip / 1 enumerated divergence); the committed
-macOS-aarch64 baseline is re-recorded at 3.08× (the dev host
-measured 3.05×, but `fib`'s row keeps the wave-5 2.26× — see above)
-and the bench gate passes against it. Acceptance criteria 2–6 are met in full;
+macOS-aarch64 baseline is re-recorded at 3.12× (the dev host
+measured 3.05×, but `fib`'s row keeps the wave-5 2.26× and
+`startup`'s envelope is re-widened to the CI-observed 3.04× — see
+above) and the bench gate passes against it. Acceptance criteria 2–6 are met in full;
 criterion 1's geomean gate is missed (3.05× against ≤ 2.33×) with
 the shortfall isolated to the object-lane fixtures named above —
 the wave-7 opening move.
