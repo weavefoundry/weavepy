@@ -20,17 +20,40 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
-use weavepy_compiler::{BinOpKind, CodeObject, CompareKind, Constant, OpCode, UnaryKind};
+use weavepy_compiler::{
+    BinOpKind, CodeObject, CompareKind, Constant, OpCode, UnaryKind, BINARY_OP_INPLACE_FLAG,
+};
 
 use crate::ir::{
-    ArithKind, AttrSiteMeta, BlockId, CalleeSpanMeta, CmpKind, GlobalGuard, MethodSpanMeta,
-    OsrEntry, RangeLoopMeta, ResolvedGlobal, TBlock, TFunc, TOp, TStmt, TTerm,
+    ArithKind, AttrSiteMeta, BlockId, CalleeSpanMeta, CmpKind, GlobalGuard, MathFunc,
+    MathGuardMeta, MethodRet, MethodSiteMeta, MethodSpanMeta, OsrEntry, RangeLoopMeta,
+    ResolvedGlobal, TBlock, TFunc, TOp, TStmt, TTerm,
 };
 use crate::value::JitType;
 
-/// The embedder's shape probes (RFC 0061/0065 WS5), bundled so the
-/// inference and emission passes share one source of truth.
-pub(crate) struct Probes<'a> {
+/// RFC 0069 WS1 — the embedder's resolution of one `(slot, name)`
+/// method probe: the class-resolved plain Python function's token in
+/// the embedder's method table (which the embedder must keep parallel
+/// to [`TFunc::method_sites`]), its positional arity (`self`
+/// included), the arity minus trailing defaults, and its result
+/// typing. The resolution is a prediction — the call helper
+/// re-validates the class fingerprint and `__code__` identity per
+/// call — but the *token assignment* must be stable across repeated
+/// probes of the same `(slot, name)` pair (the analyzer probes during
+/// both inference and emission).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MethodResolution {
+    pub token: u32,
+    pub arg_count: u32,
+    pub min_args: u32,
+    pub ret: MethodRet,
+}
+
+/// The embedder's shape probes (RFC 0061/0065 WS5, 0069 WS1/WS2),
+/// bundled so the inference and emission passes share one source of
+/// truth.
+#[allow(missing_debug_implementations)]
+pub struct Probes<'a> {
     /// Element lane of a local currently holding a homogeneous `int`/
     /// `float` list (`Some(Unknown)` = an *empty* list: definitely a
     /// list, but with no lane evidence — only `append` can pin it).
@@ -41,6 +64,25 @@ pub(crate) struct Probes<'a> {
     /// predicate: no `__getattr__`/`__getattribute__`, no shadowing
     /// data descriptor, name present in the instance dict.
     pub attr: &'a mut dyn FnMut(u32, &str, bool) -> Option<JitType>,
+    /// RFC 0069 WS1 — `(slot, name)` → the class-resolved method on
+    /// the instance currently in `slot`, when the shape is eligible
+    /// (plain function on the class, not shadowed by an instance
+    /// attribute, receiver an instance with a pinnable class).
+    pub method: &'a mut dyn FnMut(u32, &str) -> Option<MethodResolution>,
+    /// RFC 0069 WS2 — `(global_name, attr)` → `true` when the global
+    /// currently resolves to the canonical `math` module *and* its
+    /// `attr` is the canonical intrinsic function (the embedder
+    /// snapshots both as entry guards).
+    pub math: &'a mut dyn FnMut(&str, &str) -> bool,
+    /// RFC 0069 WS3 — the *observed* scalar lane of a parameter slot in
+    /// the requesting activation (`None` = not a managed scalar, or no
+    /// live activation to observe). Purely a prediction: every typed
+    /// parameter slot is entry-guarded, so a call with a differently-
+    /// typed argument falls back to the interpreter. The embedder
+    /// supplies this only on a *retry* after an unseeded analysis
+    /// failed with [`JitVerdict::TypeUnknown`], so shapes the fixpoint
+    /// can type on its own never pick up extra guards or conflicts.
+    pub param: &'a mut dyn FnMut(u32) -> Option<JitType>,
 }
 
 /// Why a code object could not be compiled by the v1 JIT. Carried back
@@ -167,8 +209,21 @@ pub fn analyze_with_probes(
     let mut probes = Probes {
         list: probe_list,
         attr: probe_attr,
+        method: &mut |_, _| None,
+        math: &mut |_, _| false,
+        param: &mut |_| None,
     };
     analyze_impl(code, resolve, &mut probes)
+}
+
+/// [`analyze_with_probes`] with the full probe bundle (RFC 0069 WS1/
+/// WS2 adds the method-resolution and math-module probes).
+pub fn analyze_frame(
+    code: &CodeObject,
+    resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
+    probes: &mut Probes<'_>,
+) -> Result<TFunc, JitVerdict> {
+    analyze_impl(code, resolve, probes)
 }
 
 fn analyze_impl(
@@ -198,24 +253,57 @@ fn analyze_impl(
     let n_locals = code.varnames.len() as u32 + plan.n_synth;
     let livein = compute_livein(code, &raw, &reachable, code.varnames.len() as u32);
 
-    // Type inference fixpoint. `ret_lane` is the function's own scalar
-    // return lane, fed back into self-recursive `CallPy` results
-    // (RFC 0059 WS3) — fib-shaped recursion converges in two passes.
+    // Type inference fixpoint. `ret` tracks the function's own return
+    // typing, fed back into self-recursive `CallPy` results (RFC 0059
+    // WS3) — fib-shaped recursion converges in two passes. RFC 0069
+    // WS2 adds per-block *entry stacks*: a block seeded `None` has not
+    // been reached yet and is skipped until a predecessor seeds it
+    // (the entry block starts empty); boundary stacks merge
+    // elementwise, refining `Unknown` lanes and requiring marker
+    // identity.
     let mut local_types: Vec<Option<JitType>> = vec![None; n_locals as usize];
-    let mut ret_lane: Option<JitType> = None;
+    // RFC 0069 WS3 — seed parameter lanes from the requesting
+    // activation's live argument values (scalar lanes only; the probe
+    // is a no-op unless the embedder opted into seeding, see
+    // [`Probes::param`]). A seeded slot behaves exactly like one typed
+    // by an assignment: conflicting evidence still rejects, and the
+    // final `TFunc` entry-guards it.
+    for slot in 0..code.arg_count {
+        if local_types[slot as usize].is_none() {
+            if let Some(t) = (probes.param)(slot) {
+                if matches!(t, JitType::Int | JitType::Float | JitType::Bool) {
+                    local_types[slot as usize] = Some(t);
+                }
+            }
+        }
+    }
+    let mut ret = RetInfo::default();
+    let mut entry_stacks: Vec<Option<Vec<SE>>> = vec![None; raw.len()];
+    let entry_raw = block_index_at(&raw, 0);
+    entry_stacks[entry_raw] = Some(Vec::new());
     let mut iters = 0;
     loop {
         let mut changed = false;
         for &bi in &reachable {
-            infer_block(
+            let Some(entry) = entry_stacks[bi].clone() else {
+                continue;
+            };
+            let outs = infer_block(
                 code,
                 &raw[bi],
                 &plan,
+                entry,
                 &mut local_types,
-                &mut ret_lane,
+                &mut ret,
                 &mut changed,
                 probes,
             )?;
+            for (succ, stack) in outs {
+                if succ == entry_raw && !stack.is_empty() {
+                    return Err(JitVerdict::NonEmptyBoundaryStack);
+                }
+                merge_entry(&mut entry_stacks[succ], stack, &mut changed)?;
+            }
         }
         if !changed {
             break;
@@ -225,6 +313,13 @@ fn analyze_impl(
             return Err(JitVerdict::NotConverged);
         }
     }
+    // A reachable block never seeded means its only in-edges carry a
+    // stack shape inference refused; treat as non-analyzable.
+    if reachable.iter().any(|&bi| entry_stacks[bi].is_none()) {
+        return Err(JitVerdict::NonEmptyBoundaryStack);
+    }
+    let ret_lane = ret.final_lane();
+    let ret_none = ret.saw_none && !ret.saw_scalar;
 
     // Compact block ids over reachable blocks (entry first is convenient
     // but not required — we record the entry id explicitly).
@@ -236,17 +331,40 @@ fn analyze_impl(
         .get(&block_index_at(&raw, 0))
         .ok_or(JitVerdict::Trivial)?;
 
-    // Emission pass.
-    let mut blocks: Vec<TBlock> = Vec::with_capacity(reachable.len());
+    // Emission pass. Entry ESlot stacks propagate forward along the
+    // same edges inference walked: a block is emittable once any
+    // predecessor has seeded its entry (all predecessors agree — the
+    // fixpoint proved it), so a worklist over seeded blocks visits
+    // every reachable block exactly once regardless of index order.
     let mut out = EmitOut {
         max_stack: 0,
         callee_spans: Vec::new(),
         len_spans: Vec::new(),
         method_spans: Vec::new(),
         attr_sites: Vec::new(),
+        method_sites: Vec::new(),
+        math_guards: Vec::new(),
+        math_spans: Vec::new(),
         max_call_args: 0,
     };
-    for &bi in &reachable {
+    let mut emit_entries: Vec<Option<Vec<ESlot>>> = vec![None; raw.len()];
+    emit_entries[entry_raw] = Some(Vec::new());
+    let mut blocks_opt: Vec<Option<TBlock>> = vec![None; reachable.len()];
+    let mut queue: VecDeque<usize> = reachable.iter().copied().collect();
+    let mut stalled = 0usize;
+    while let Some(bi) = queue.pop_front() {
+        let Some(entry) = emit_entries[bi].clone() else {
+            // Not seeded yet — requeue. A full lap without progress
+            // means an unreachable-by-seeding block, which inference
+            // would already have rejected (defensive).
+            stalled += 1;
+            if stalled > queue.len() {
+                return Err(JitVerdict::NonEmptyBoundaryStack);
+            }
+            queue.push_back(bi);
+            continue;
+        };
+        stalled = 0;
         let tb = emit_block(
             code,
             &raw[bi],
@@ -254,23 +372,44 @@ fn analyze_impl(
             &local_types,
             ret_lane,
             &compact,
+            entry,
+            &mut emit_entries,
             &mut out,
             probes,
         )?;
-        blocks.push(tb);
+        blocks_opt[compact[&bi]] = Some(tb);
     }
+    let mut blocks: Vec<TBlock> = Vec::with_capacity(reachable.len());
+    for tb in blocks_opt {
+        blocks.push(tb.ok_or(JitVerdict::NonEmptyBoundaryStack)?);
+    }
+    let method_sites: Vec<MethodSiteMeta> = {
+        let mut sites = Vec::with_capacity(out.method_sites.len());
+        for s in out.method_sites {
+            sites.push(s.ok_or(JitVerdict::UnsupportedOpcode("method site (token gap)"))?);
+        }
+        sites
+    };
 
-    // OSR entry points (RFC 0059 WS3b): every backward-jump target is a
-    // block leader with an empty boundary stack in this subset, so it is
-    // enterable mid-frame once the VM packs the locals (and decomposes
-    // any live range iterators into their synthetic slots).
+    // OSR entry points (RFC 0059 WS3b): every backward-jump target
+    // with an *empty* boundary stack is enterable mid-frame once the
+    // VM packs the locals (and decomposes any live range iterators
+    // into their synthetic slots). RFC 0069 WS2 — a target carrying
+    // boundary values is simply not OSR-enterable.
     let mut osr_entries: Vec<OsrEntry> = Vec::new();
     let mut osr_seen: HashSet<usize> = HashSet::new();
     for (i, ins) in code.instructions.iter().enumerate() {
         if matches!(ins.op, OpCode::JumpBackward) {
             let t = backward_target(i, ins.arg).ok_or(JitVerdict::BadJumpTarget)?;
             if osr_seen.insert(t) {
-                if let Some(&bid) = compact.get(&block_index_at(&raw, t)) {
+                let raw_idx = block_index_at(&raw, t);
+                let empty_entry = entry_stacks[raw_idx]
+                    .as_ref()
+                    .is_some_and(std::vec::Vec::is_empty);
+                if !empty_entry {
+                    continue;
+                }
+                if let Some(&bid) = compact.get(&raw_idx) {
                     osr_entries.push(OsrEntry {
                         pc: t as u32,
                         block: bid,
@@ -308,10 +447,82 @@ fn analyze_impl(
         len_spans: out.len_spans,
         method_spans: out.method_spans,
         attr_sites: out.attr_sites,
+        method_sites,
+        math_guards: out.math_guards,
+        math_spans: out.math_spans,
         osr_entries,
         max_call_args: out.max_call_args,
         ret_lane: ret_lane.filter(|t| t.is_representable()),
+        ret_none,
     })
+}
+
+/// RFC 0069 WS1 — the function's return typing accumulated across
+/// return sites: the scalar lane fixpoint (RFC 0059 WS3), plus
+/// whether any site returned the `None` constant or a value.
+#[derive(Default)]
+struct RetInfo {
+    lane: Option<JitType>,
+    saw_none: bool,
+    saw_scalar: bool,
+}
+
+impl RetInfo {
+    /// The function-wide scalar return lane: only meaningful when no
+    /// return site was the `None` constant (mixed None/scalar returns
+    /// cannot be typed for callers).
+    fn final_lane(&self) -> Option<JitType> {
+        if self.saw_none {
+            None
+        } else {
+            self.lane
+        }
+    }
+}
+
+/// Merge one block's computed boundary stack into a successor's entry
+/// (RFC 0069 WS2). A `None` destination is seeded outright; otherwise
+/// the stacks must agree elementwise — identical markers, joinable
+/// lanes (`Unknown` refines to a concrete lane; two distinct concrete
+/// lanes disqualify), and provenance kept only when both sides agree.
+fn merge_entry(
+    dst: &mut Option<Vec<SE>>,
+    new: Vec<SE>,
+    changed: &mut bool,
+) -> Result<(), JitVerdict> {
+    let Some(cur) = dst else {
+        *changed = true;
+        *dst = Some(new);
+        return Ok(());
+    };
+    if cur.len() != new.len() {
+        return Err(JitVerdict::NonEmptyBoundaryStack);
+    }
+    for (c, n) in cur.iter_mut().zip(new) {
+        if c.callee != n.callee
+            || c.recv != n.recv
+            || c.method != n.method
+            || c.math_mod != n.math_mod
+            || c.poison != n.poison
+            || c.null != n.null
+            || c.none_const != n.none_const
+        {
+            return Err(JitVerdict::NonEmptyBoundaryStack);
+        }
+        if c.ty != n.ty {
+            if c.ty == JitType::Unknown {
+                c.ty = n.ty;
+                *changed = true;
+            } else if n.ty != JitType::Unknown {
+                return Err(JitVerdict::NonEmptyBoundaryStack);
+            }
+        }
+        if c.src != n.src && c.src.is_some() {
+            c.src = None;
+            *changed = true;
+        }
+    }
+    Ok(())
 }
 
 /// Recognize every `FOR_ITER` as the canonical counted `range` loop and
@@ -474,7 +685,8 @@ fn plan_rewrite(
             | ResolvedGlobal::ConstFloat(_)
             | ResolvedGlobal::ConstBool(_)
             | ResolvedGlobal::LenBuiltin
-            | ResolvedGlobal::PyFunc { .. } => {
+            | ResolvedGlobal::PyFunc { .. }
+            | ResolvedGlobal::MathModule => {
                 let name = &code.names[item.arg as usize];
                 if !plan.guards.iter().any(|g| g.name == *name) {
                     plan.guards.push(GlobalGuard {
@@ -500,6 +712,58 @@ fn forward_target(i: usize, arg: u32) -> usize {
 #[inline]
 fn backward_target(i: usize, arg: u32) -> Option<usize> {
     (i + 1).checked_sub(arg as usize)
+}
+
+/// RFC 0069 WS1 — a cheap syntactic scan for the procedure shape:
+/// `true` when every `RETURN_VALUE` in `code` returns the `None`
+/// constant loaded by the immediately preceding instruction and no
+/// recognized jump lands on a `RETURN_VALUE` directly (something
+/// other than the `None` load could flow in). Lets the embedder
+/// *predict* [`crate::ir::MethodRet::None`] for callees whose bodies
+/// the analyzer cannot type. The prediction is validated per call
+/// (the call helper checks the actual result), so a misprediction —
+/// e.g. an exception-handler edge this scan cannot see — costs a
+/// deopt, never correctness.
+#[must_use]
+pub fn returns_none_syntactically(code: &CodeObject) -> bool {
+    let n = code.instructions.len();
+    let mut saw_return = false;
+    for (i, ins) in code.instructions.iter().enumerate() {
+        if !matches!(ins.op, OpCode::ReturnValue) {
+            continue;
+        }
+        saw_return = true;
+        let none_load = i > 0
+            && matches!(code.instructions[i - 1].op, OpCode::LoadConst)
+            && matches!(
+                code.constants.get(code.instructions[i - 1].arg as usize),
+                Some(Constant::None)
+            );
+        if !none_load {
+            return false;
+        }
+    }
+    if !saw_return {
+        return false;
+    }
+    for (i, ins) in code.instructions.iter().enumerate() {
+        let target = match ins.op {
+            OpCode::PopJumpIfFalse
+            | OpCode::PopJumpIfTrue
+            | OpCode::PopJumpIfNone
+            | OpCode::PopJumpIfNotNone
+            | OpCode::JumpForward
+            | OpCode::ForIter => Some(forward_target(i, ins.arg)),
+            OpCode::JumpBackward => backward_target(i, ins.arg),
+            _ => None,
+        };
+        if let Some(t) = target {
+            if t < n && matches!(code.instructions[t].op, OpCode::ReturnValue) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Build the basic blocks, resolving relative jumps to absolute indices.
@@ -721,23 +985,28 @@ fn assigned_out(code: &CodeObject, b: &RawBlock, assigned_in: &HashSet<u32>) -> 
 }
 
 /// What a callee marker stands for (RFC 0065 WS5): a burned-in Python
-/// function, or the erased `len` builtin (lowered to `ListLen`, never
-/// a real call).
+/// function, the erased `len` builtin (lowered to `ListLen`, never a
+/// real call), or an erased `math` intrinsic (RFC 0069 WS2, lowered
+/// to [`TOp::MathIntrinsic`]).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MarkKind {
     Py,
     Len,
+    Math(MathFunc),
 }
 
 /// A `LOAD_GLOBAL`-resolved Python callee riding the *abstract* stack
 /// between its load and its `CALL` (RFC 0059 WS3). The object itself
 /// never reaches the native stack — the marker only carries what the
 /// `CALL` site and the deopt metadata need.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct CalleeMark {
     kind: MarkKind,
     token: u32,
     arg_count: u32,
+    /// RFC 0069 WS3 — arity minus trailing defaults; call sites
+    /// passing `min_args..=arg_count` positionals are admitted.
+    min_args: u32,
     is_self: bool,
     ret: Option<JitType>,
     /// The erased `LOAD_GLOBAL` pc.
@@ -745,6 +1014,22 @@ struct CalleeMark {
     /// Interpreter-stack index of the callee object at load time
     /// (emission only; 0 during inference).
     interp_depth: u32,
+}
+
+/// RFC 0069 WS1 — a resolved method riding on its *receiver's* stack
+/// entry between the method-form `LOAD_ATTR` and the `CALL`: the
+/// receiver's pin stays the native value while the interpreter holds
+/// the bound method (plus the self-or-null marker above it).
+#[derive(Clone, Copy, PartialEq)]
+struct MethodMark {
+    token: u32,
+    /// Callee arity, `self` included.
+    arg_count: u32,
+    /// Arity minus trailing defaults, `self` included.
+    min_args: u32,
+    ret: MethodRet,
+    /// The method-form `LOAD_ATTR` pc.
+    load_pc: u32,
 }
 
 /// One operand-stack entry during analysis, with provenance for the
@@ -765,10 +1050,21 @@ struct SE {
     /// `Some(load_pc)` when this is a `.append` receiver (the
     /// `LOAD_ATTR`'s pc, for the method-span deopt metadata).
     recv: Option<u32>,
+    /// RFC 0069 WS1 — a pinned receiver carrying a resolved method
+    /// (the native value stays the pin; the interpreter holds the
+    /// bound method + self-or-null marker).
+    method: Option<MethodMark>,
+    /// RFC 0069 WS2 — the `math` module (`(name_idx, load_pc)`),
+    /// interpreter-stack only, consumable solely by an immediately
+    /// following method-form intrinsic load.
+    math_mod: Option<(u32, u32)>,
     poison: bool,
     /// RFC 0068 — a `PUSH_NULL` self-or-null marker (`Unbound` on the
     /// interpreter stack, never native), consumed by its `CALL`.
     null: bool,
+    /// RFC 0069 WS1 — the `None` constant (interpreter-stack only),
+    /// consumable solely by `RETURN_VALUE` (the `return None` shape).
+    none_const: bool,
 }
 
 impl SE {
@@ -778,14 +1074,32 @@ impl SE {
             src: None,
             callee: None,
             recv: None,
+            method: None,
+            math_mod: None,
             poison: false,
             null: false,
+            none_const: false,
         }
     }
 
     /// `true` when a plain value operation may consume this entry.
     fn is_plain(&self) -> bool {
-        self.callee.is_none() && self.recv.is_none() && !self.poison && !self.null
+        self.callee.is_none()
+            && self.recv.is_none()
+            && self.method.is_none()
+            && self.math_mod.is_none()
+            && !self.poison
+            && !self.null
+            && !self.none_const
+    }
+
+    /// `true` when this entry may cross a basic-block boundary
+    /// (RFC 0069 WS2): plain values and the marker kinds whose
+    /// reconstruction metadata is position-independent. `poison`,
+    /// `none_const`, and the math-module marker never cross (their
+    /// consumers are required to be adjacent).
+    fn boundary_ok(&self) -> bool {
+        !self.poison && !self.none_const && self.math_mod.is_none()
     }
 }
 
@@ -799,19 +1113,40 @@ fn const_type(c: &Constant) -> Option<JitType> {
     }
 }
 
-/// Infer/validate one block during the fixpoint. Mutates `local_types`
-/// (setting `changed` when it grows) and bails on hard errors. Transient
-/// `Unknown` operands are tolerated — a later iteration may resolve them.
+/// The widest boundary stack the analyzer carries across a block edge
+/// (RFC 0069 WS2). Deopt spill buffers grow with it; no real
+/// predicate/ternary shape comes close to the cap.
+const MAX_BOUNDARY_STACK: usize = 8;
+
+/// Validate a stack about to cross a block boundary and hand it to
+/// the caller for the successor merge.
+fn boundary_stack(stack: Vec<SE>) -> Result<Vec<SE>, JitVerdict> {
+    if stack.len() > MAX_BOUNDARY_STACK {
+        return Err(JitVerdict::NonEmptyBoundaryStack);
+    }
+    if !stack.iter().all(SE::boundary_ok) {
+        return Err(JitVerdict::NonEmptyBoundaryStack);
+    }
+    Ok(stack)
+}
+
+/// Infer/validate one block during the fixpoint, starting from its
+/// merged entry stack. Mutates `local_types` (setting `changed` when
+/// it grows), bails on hard errors, and returns the per-successor
+/// boundary stacks. Transient `Unknown` operands are tolerated — a
+/// later iteration may resolve them.
+#[allow(clippy::too_many_arguments)]
 fn infer_block(
     code: &CodeObject,
     b: &RawBlock,
     plan: &Plan,
+    entry: Vec<SE>,
     local_types: &mut [Option<JitType>],
-    ret_lane: &mut Option<JitType>,
+    ret: &mut RetInfo,
     changed: &mut bool,
     probes: &mut Probes<'_>,
-) -> Result<(), JitVerdict> {
-    let mut stack: Vec<SE> = Vec::new();
+) -> Result<Vec<(usize, Vec<SE>)>, JitVerdict> {
+    let mut stack: Vec<SE> = entry;
     for i in b.start..(b.end - 1) {
         step_abstract(
             code,
@@ -819,39 +1154,50 @@ fn infer_block(
             &mut stack,
             plan,
             local_types,
-            *ret_lane,
+            ret.final_lane(),
             changed,
             probes,
         )?;
     }
-    // Terminator stack-shape validation.
+    // Terminator stack-shape validation + successor boundary stacks.
     let last = b.end - 1;
     let ins = code.instructions[last];
-    match ins.op {
+    let outs = match ins.op {
         OpCode::ReturnValue => {
             let v = *stack.last().ok_or(JitVerdict::StackUnderflow)?;
-            if !v.is_plain() {
-                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+            if v.none_const {
+                // RFC 0069 WS1 — `return None` (incl. the implicit
+                // function-tail return).
+                if !ret.saw_none {
+                    ret.saw_none = true;
+                    *changed = true;
+                }
+            } else {
+                if !v.is_plain() {
+                    return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+                }
+                if !ret.saw_scalar {
+                    ret.saw_scalar = true;
+                    *changed = true;
+                }
+                merge_ret_lane(&mut ret.lane, v.ty, changed);
             }
-            merge_ret_lane(ret_lane, v.ty, changed);
+            Vec::new()
         }
         OpCode::JumpForward | OpCode::JumpBackward => {
-            if !stack.is_empty() {
-                return Err(JitVerdict::NonEmptyBoundaryStack);
-            }
+            vec![(b.succs[0], boundary_stack(stack)?)]
         }
         // A rewritten range header operates purely on its synthetic
-        // slots; the operand stack must be empty like any other jump.
+        // slots; the operand stack must be empty (the interpreter
+        // holds only the erased iterator there).
         OpCode::ForIter => {
             if !stack.is_empty() {
                 return Err(JitVerdict::NonEmptyBoundaryStack);
             }
+            vec![(b.succs[0], Vec::new()), (b.succs[1], Vec::new())]
         }
         OpCode::PopJumpIfFalse | OpCode::PopJumpIfTrue => {
-            if stack.len() != 1 {
-                return Err(JitVerdict::NonEmptyBoundaryStack);
-            }
-            let c = stack[0];
+            let c = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             if !c.is_plain() {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
             }
@@ -864,8 +1210,11 @@ fn infer_block(
             if !c.ty.is_representable() && c.src.is_none() {
                 return Err(JitVerdict::TypeUnknown);
             }
+            let out = boundary_stack(stack)?;
+            vec![(b.succs[0], out.clone()), (b.succs[1], out)]
         }
-        // Fall-through terminator: must leave an empty stack.
+        // Fall-through terminator: the remaining stack flows to the
+        // lone successor.
         _ => {
             step_abstract(
                 code,
@@ -873,16 +1222,14 @@ fn infer_block(
                 &mut stack,
                 plan,
                 local_types,
-                *ret_lane,
+                ret.final_lane(),
                 changed,
                 probes,
             )?;
-            if !stack.is_empty() {
-                return Err(JitVerdict::NonEmptyBoundaryStack);
-            }
+            vec![(b.succs[0], boundary_stack(stack)?)]
         }
-    }
-    Ok(())
+    };
+    Ok(outs)
 }
 
 /// Merge one `return` site's lane into the function-wide return lane
@@ -957,6 +1304,7 @@ fn step_abstract(
                 Some(&ResolvedGlobal::PyFunc {
                     token,
                     arg_count,
+                    min_args,
                     is_self,
                     ret,
                 }) => {
@@ -967,6 +1315,7 @@ fn step_abstract(
                             kind: MarkKind::Py,
                             token,
                             arg_count,
+                            min_args,
                             is_self,
                             ret,
                             load_pc: i as u32,
@@ -984,11 +1333,22 @@ fn step_abstract(
                             kind: MarkKind::Len,
                             token: 0,
                             arg_count: 1,
+                            min_args: 1,
                             is_self: false,
                             ret: Some(JitType::Int),
                             load_pc: i as u32,
                             interp_depth: 0,
                         }),
+                        ..SE::known(JitType::Unknown)
+                    });
+                    return Ok(());
+                }
+                // RFC 0069 WS2: the math module rides the abstract
+                // stack until the immediately following method-form
+                // intrinsic load consumes it.
+                Some(ResolvedGlobal::MathModule) => {
+                    stack.push(SE {
+                        math_mod: Some((ins.arg, i as u32)),
                         ..SE::known(JitType::Unknown)
                     });
                     return Ok(());
@@ -1002,6 +1362,15 @@ fn step_abstract(
                 .constants
                 .get(ins.arg as usize)
                 .ok_or(JitVerdict::UnsupportedConst)?;
+            // RFC 0069 WS1 — the `None` constant is admitted as a
+            // marker whose only legal consumer is `RETURN_VALUE`.
+            if matches!(c, Constant::None) {
+                stack.push(SE {
+                    none_const: true,
+                    ..SE::known(JitType::Unknown)
+                });
+                return Ok(());
+            }
             let ty = const_type(c).ok_or(JitVerdict::UnsupportedConst)?;
             stack.push(SE::known(ty));
         }
@@ -1064,7 +1433,10 @@ fn step_abstract(
         // RFC 0065 WS5 — attribute load: either the erased `.append`
         // method load on a pinned list (the receiver stays on the
         // abstract stack, re-marked), or a scalar attribute read on a
-        // pinned instance receiver.
+        // pinned instance receiver. RFC 0069 WS2 — a `math.<intrinsic>`
+        // load consumes the module marker (the compiler pairs the
+        // plain form with an explicit `PUSH_NULL`, so no implicit null
+        // is pushed here).
         OpCode::LoadAttr => {
             let name = code
                 .names
@@ -1072,6 +1444,10 @@ fn step_abstract(
                 .ok_or(JitVerdict::UnsupportedOpcode("LOAD_ATTR bad name"))?
                 .as_str();
             let recv = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            if let Some((name_idx, load_pc)) = recv.math_mod {
+                infer_math_load(code, name, name_idx, load_pc, stack, probes)?;
+                return Ok(());
+            }
             if !recv.is_plain() {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
             }
@@ -1087,6 +1463,8 @@ fn step_abstract(
         }
         // RFC 0068 — method-form attribute load: same load as
         // `LOAD_ATTR`, plus the implicit self-or-null marker on top.
+        // RFC 0069 adds the `math.<intrinsic>` (WS2) and resolved
+        // instance-method (WS1) forms.
         OpCode::LoadMethodAttr => {
             let name = code
                 .names
@@ -1094,8 +1472,46 @@ fn step_abstract(
                 .ok_or(JitVerdict::UnsupportedOpcode("LOAD_ATTR bad name"))?
                 .as_str();
             let recv = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            // RFC 0069 WS2 — the math-module marker's only legal
+            // consumer: an intrinsic load, riding on as a callee mark
+            // (with the method form's implicit self-or-null on top).
+            if let Some((name_idx, load_pc)) = recv.math_mod {
+                infer_math_load(code, name, name_idx, load_pc, stack, probes)?;
+                stack.push(SE {
+                    null: true,
+                    ..SE::known(JitType::Unknown)
+                });
+                return Ok(());
+            }
             if !recv.is_plain() {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+            }
+            // RFC 0069 WS1 — a class-resolved method on a pinned
+            // instance receiver: the receiver stays on the abstract
+            // stack (its pin is the native value), re-marked with the
+            // resolution. `.append` keeps its dedicated list path.
+            if name != "append" {
+                if let Some(slot) = obj_recv_slot(&recv) {
+                    if let Some(res) = (probes.method)(slot, name) {
+                        set_local(local_types, slot, JitType::Obj, changed)?;
+                        stack.push(SE {
+                            ty: JitType::Obj,
+                            method: Some(MethodMark {
+                                token: res.token,
+                                arg_count: res.arg_count,
+                                min_args: res.min_args,
+                                ret: res.ret,
+                                load_pc: i as u32,
+                            }),
+                            ..recv
+                        });
+                        stack.push(SE {
+                            null: true,
+                            ..SE::known(JitType::Unknown)
+                        });
+                        return Ok(());
+                    }
+                }
             }
             infer_load_attr(name, recv, i, stack, local_types, changed, probes)?;
             stack.push(SE {
@@ -1171,12 +1587,51 @@ fn step_abstract(
                 });
                 return Ok(());
             }
+            // RFC 0069 WS1 — a resolved method call: `self` rides as
+            // the receiver's pin, so the effective arity is `argc + 1`.
+            if let Some(m) = f.method {
+                let total = argc + 1;
+                if total < m.min_args as usize || total > m.arg_count as usize {
+                    return Err(JitVerdict::UnsupportedOpcode("CALL (method arity)"));
+                }
+                match m.ret {
+                    // Procedure shape: the `None` result exists only on
+                    // the interpreter stack (consumed by `POP_TOP`).
+                    MethodRet::None => stack.push(SE {
+                        poison: true,
+                        ..SE::known(JitType::Unknown)
+                    }),
+                    MethodRet::Scalar(ty) => stack.push(SE::known(ty)),
+                }
+                return Ok(());
+            }
             let Some(mark) = f.callee else {
                 return Err(JitVerdict::UnsupportedOpcode("CALL"));
             };
-            // Exact positional arity only: default-filled or mis-arity
-            // calls would chronically deopt, so they disqualify instead.
-            if mark.arg_count as usize != argc {
+            // RFC 0069 WS2 — a burned-in math intrinsic: one operand,
+            // `float` (an integral operand promotes with the guarded
+            // exact-range conversion, like mixed arithmetic).
+            if let MarkKind::Math(_) = mark.kind {
+                if argc != 1 {
+                    return Err(JitVerdict::UnsupportedOpcode("math (arity)"));
+                }
+                let a = &args[0];
+                if a.ty.is_representable() {
+                    if !(a.ty == JitType::Float || a.ty.is_integral()) {
+                        return Err(JitVerdict::UnsupportedOpcode("math (operand lane)"));
+                    }
+                }
+                // Untyped-with-src stays transient: the operand could
+                // legitimately be int or float, so nothing is pinned
+                // here; emission bails if it never resolves.
+                stack.push(SE::known(JitType::Float));
+                return Ok(());
+            }
+            // Positional arity within the defaults window (RFC 0069
+            // WS3): `min_args..=arg_count` positionals are admitted —
+            // the call helper binds the snapshotted defaults for the
+            // tail. Anything else disqualifies.
+            if argc < mark.min_args as usize || argc > mark.arg_count as usize {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (arity)"));
             }
             if mark.kind == MarkKind::Len {
@@ -1345,6 +1800,97 @@ fn obj_recv_slot(recv: &SE) -> Option<u32> {
         JitType::Unknown => recv.src,
         _ => None,
     }
+}
+
+/// RFC 0069 WS2 — infer a `math.<intrinsic>` load: the module marker
+/// was popped by the caller; validate the attribute against
+/// [`MathFunc`] and the embedder's probe, and push the callee mark
+/// (the caller adds the self-or-null marker in the method form; the
+/// plain form's explicit `PUSH_NULL` follows in the bytecode).
+fn infer_math_load(
+    code: &CodeObject,
+    name: &str,
+    name_idx: u32,
+    load_pc: u32,
+    stack: &mut Vec<SE>,
+    probes: &mut Probes<'_>,
+) -> Result<(), JitVerdict> {
+    let global_name = code
+        .names
+        .get(name_idx as usize)
+        .ok_or(JitVerdict::UnsupportedOpcode("LOAD_GLOBAL bad name"))?
+        .as_str();
+    let func = MathFunc::from_attr(name).ok_or(JitVerdict::UnsupportedOpcode("math (attr)"))?;
+    if !(probes.math)(global_name, name) {
+        return Err(JitVerdict::UnsupportedOpcode("math (shape)"));
+    }
+    stack.push(SE {
+        callee: Some(CalleeMark {
+            kind: MarkKind::Math(func),
+            token: name_idx,
+            arg_count: 1,
+            min_args: 1,
+            is_self: false,
+            ret: Some(JitType::Float),
+            load_pc,
+            interp_depth: 0,
+        }),
+        ..SE::known(JitType::Unknown)
+    });
+    Ok(())
+}
+
+/// RFC 0069 WS2 — [`infer_math_load`]'s emission twin: validate the
+/// pair again (the probe must agree with inference — nothing ran in
+/// between), intern the guard token, and push the callee mark.
+#[allow(clippy::too_many_arguments)]
+fn emit_math_load(
+    code: &CodeObject,
+    name: &str,
+    name_idx: u32,
+    load_pc: u32,
+    interp_depth: u32,
+    stack: &mut Vec<ESlot>,
+    math_guards: &mut Vec<MathGuardMeta>,
+    probes: &mut Probes<'_>,
+) -> Result<(), JitVerdict> {
+    let global_name = code
+        .names
+        .get(name_idx as usize)
+        .ok_or(JitVerdict::UnsupportedOpcode("LOAD_GLOBAL bad name"))?
+        .as_str();
+    let func = MathFunc::from_attr(name).ok_or(JitVerdict::UnsupportedOpcode("math (attr)"))?;
+    if !(probes.math)(global_name, name) {
+        return Err(JitVerdict::UnsupportedOpcode("math (shape)"));
+    }
+    let token = match math_guards
+        .iter()
+        .position(|g| g.name == global_name && g.attr == name)
+    {
+        Some(idx) => idx as u32,
+        None => {
+            math_guards.push(MathGuardMeta {
+                name: global_name.to_owned(),
+                attr: name.to_owned(),
+                kind: func,
+            });
+            (math_guards.len() - 1) as u32
+        }
+    };
+    stack.push(ESlot {
+        callee: Some(CalleeMark {
+            kind: MarkKind::Math(func),
+            token,
+            arg_count: 1,
+            min_args: 1,
+            is_self: false,
+            ret: Some(JitType::Float),
+            load_pc,
+            interp_depth,
+        }),
+        ..ESlot::val(JitType::Unknown)
+    });
+    Ok(())
 }
 
 /// RFC 0065 WS5 — infer one `LOAD_ATTR`. Order of resolution:
@@ -1519,15 +2065,28 @@ fn bin_result_type(kind: ArithKind, a: JitType, b: JitType) -> Result<JitType, J
             }
             _ => Ok(JitType::Int),
         }
+    } else if a == JitType::Float && b == JitType::Float {
+        // Float∘float: RFC 0069 WS2 adds floor-div / mod (lowered
+        // through the Python-semantics helpers with a zero-divisor
+        // deopt); bit ops stay illegal on floats.
+        match kind {
+            ArithKind::Add
+            | ArithKind::Sub
+            | ArithKind::Mul
+            | ArithKind::TrueDiv
+            | ArithKind::FloorDiv
+            | ArithKind::Mod => Ok(JitType::Float),
+            _ => Err(JitVerdict::UnsupportedOpcode("float bitop")),
+        }
     } else if a == JitType::Float || b == JitType::Float {
-        // Float∘float, or mixed integral/float (RFC 0058 WS4): the
-        // integral operand is promoted with the same `as f64` cast the
-        // interpreter applies, so only the float-lane op set is legal.
+        // Mixed integral/float (RFC 0058 WS4): the integral operand is
+        // promoted with the same `as f64` cast the interpreter
+        // applies, so only the unguarded-promotion op set is legal.
         match kind {
             ArithKind::Add | ArithKind::Sub | ArithKind::Mul | ArithKind::TrueDiv => {
                 Ok(JitType::Float)
             }
-            _ => Err(JitVerdict::UnsupportedOpcode("float floordiv/mod/bitop")),
+            _ => Err(JitVerdict::UnsupportedOpcode("mixed floordiv/mod/bitop")),
         }
     } else {
         Err(JitVerdict::MixedArithTypes)
@@ -1577,7 +2136,13 @@ fn unary_result_type(kind: UnaryKind, a: JitType) -> Result<JitType, JitVerdict>
 }
 
 fn bin_kind(arg: u32) -> Result<ArithKind, JitVerdict> {
-    let k = match arg {
+    // RFC 0069: augmented assignments (`x += y`) set BINARY_OP_INPLACE_FLAG
+    // on the same operator byte. Every lane the JIT actually lowers
+    // arithmetic for is an immutable scalar (int / float / bool — anything
+    // else is rejected by `bin_result_type` / `lower_bin`), and immutable
+    // scalars have no `__iadd__`: the interpreter's in-place dispatch falls
+    // back to the plain operator. Stripping the flag is therefore exact.
+    let k = match arg & !BINARY_OP_INPLACE_FLAG {
         x if x == BinOpKind::Add as u32 => ArithKind::Add,
         x if x == BinOpKind::Sub as u32 => ArithKind::Sub,
         x if x == BinOpKind::Mult as u32 => ArithKind::Mul,
@@ -1622,17 +2187,30 @@ fn unary_kind(arg: u32) -> Result<UnaryKind, JitVerdict> {
 /// sites), `recv` (an erased `.append` receiver: native holds the pin,
 /// the interpreter holds the bound method), and `poison` (`append`'s
 /// `None` result: on the interpreter stack only, consumed by
-/// `POP_TOP`).
+/// `POP_TOP`). RFC 0069 adds `method` (WS1 — a receiver pin carrying
+/// its resolved method), `math_mod` (WS2 — the erased `math` module),
+/// and `none_const` (WS1 — the `None` constant feeding a
+/// `RETURN_VALUE`).
 #[derive(Clone, Copy)]
 struct ESlot {
     ty: JitType,
     callee: Option<CalleeMark>,
     src: Option<u32>,
     recv: Option<u32>,
+    /// RFC 0069 WS1 — a pinned receiver re-marked with its resolved
+    /// method between the method-form load and the `CALL`.
+    method: Option<MethodMark>,
+    /// RFC 0069 WS2 — the erased `math` module:
+    /// `(name_idx, load_pc, interp_depth)`. Interpreter-stack only,
+    /// consumed by the immediately following intrinsic load.
+    math_mod: Option<(u32, u32, u32)>,
     poison: bool,
     /// RFC 0068 — a `PUSH_NULL` self-or-null marker (`Unbound` on the
     /// interpreter stack, never native), consumed by its `CALL`.
     null: bool,
+    /// RFC 0069 WS1 — the `None` constant, consumable solely by
+    /// `RETURN_VALUE`.
+    none_const: bool,
 }
 
 impl ESlot {
@@ -1642,13 +2220,29 @@ impl ESlot {
             callee: None,
             src: None,
             recv: None,
+            method: None,
+            math_mod: None,
             poison: false,
             null: false,
+            none_const: false,
         }
     }
 
     fn is_plain(&self) -> bool {
-        self.callee.is_none() && self.recv.is_none() && !self.poison && !self.null
+        self.callee.is_none()
+            && self.recv.is_none()
+            && self.method.is_none()
+            && self.math_mod.is_none()
+            && !self.poison
+            && !self.null
+            && !self.none_const
+    }
+
+    /// `true` when this entry occupies a *native* stack position
+    /// (plain values, plus the `.append`/method receiver pins). The
+    /// other marker kinds live only on the interpreter's stack.
+    fn has_native(&self) -> bool {
+        self.is_plain() || self.recv.is_some() || self.method.is_some()
     }
 }
 
@@ -1669,15 +2263,39 @@ struct EmitOut {
     /// RFC 0065 WS5 — erased `len` builtins (guard-snapshot object,
     /// `live_to` = pc after the `CALL`).
     len_spans: Vec<CalleeSpanMeta>,
-    /// RFC 0065 WS5 — erased `.append` bound-method receivers.
+    /// RFC 0065 WS5 / RFC 0069 WS1 — erased bound-method receivers
+    /// (`.append` and burned-in method sites).
     method_spans: Vec<MethodSpanMeta>,
     /// RFC 0065 WS5 — burned-in attribute-access sites, in `site`
     /// token order.
     attr_sites: Vec<AttrSiteMeta>,
+    /// RFC 0069 WS1 — burned-in method-call sites, indexed by the
+    /// embedder's probe token (a gap means a token the probe issued
+    /// but no surviving site uses — rejected after emission).
+    method_sites: Vec<Option<MethodSiteMeta>>,
+    /// RFC 0069 WS2 — math-intrinsic guards, deduplicated by
+    /// `(name, attr)`, in first-use order ([`TOp::MathIntrinsic`]
+    /// spans index this).
+    math_guards: Vec<MathGuardMeta>,
+    /// RFC 0069 WS2 — erased math-intrinsic callables (`token`
+    /// indexes [`Self::math_guards`], `live_to` = pc after the
+    /// `CALL`).
+    math_spans: Vec<CalleeSpanMeta>,
     max_call_args: u32,
 }
 
-/// Emit the typed IR for one block, with all local types now known.
+/// Seed a successor's emission entry stack (first predecessor wins —
+/// the inference fixpoint already proved every in-edge agrees on the
+/// boundary shape, so later predecessors are redundant).
+fn seed_entry(emit_entries: &mut [Option<Vec<ESlot>>], succ: usize, stack: &[ESlot]) {
+    if emit_entries[succ].is_none() {
+        emit_entries[succ] = Some(stack.to_vec());
+    }
+}
+
+/// Emit the typed IR for one block, starting from its (propagated)
+/// entry stack, with all local types now known. Seeds each successor's
+/// entry stack in `emit_entries` (RFC 0069 WS2 — boundary values).
 #[allow(clippy::too_many_arguments)]
 fn emit_block(
     code: &CodeObject,
@@ -1686,11 +2304,25 @@ fn emit_block(
     local_types: &[Option<JitType>],
     ret_lane: Option<JitType>,
     compact: &HashMap<usize, BlockId>,
+    entry: Vec<ESlot>,
+    emit_entries: &mut [Option<Vec<ESlot>>],
     out: &mut EmitOut,
     probes: &mut Probes<'_>,
 ) -> Result<TBlock, JitVerdict> {
-    let mut stack: Vec<ESlot> = Vec::new();
+    // The lowered block parameters: one per *native* entry value
+    // (interpreter-only markers occupy no machine slot).
+    let mut entry_stack: Vec<JitType> = Vec::with_capacity(entry.len());
+    for s in &entry {
+        if s.has_native() {
+            if !s.ty.is_representable() {
+                return Err(JitVerdict::TypeUnknown);
+            }
+            entry_stack.push(s.ty);
+        }
+    }
+    let mut stack: Vec<ESlot> = entry;
     let mut stmts: Vec<TStmt> = Vec::new();
+    out.max_stack = out.max_stack.max(stack.len() as u32);
 
     for i in b.start..(b.end - 1) {
         emit_instr(
@@ -1713,28 +2345,50 @@ fn emit_block(
             // Lowering pops the return value off its own type stack at
             // the `Return` terminator; no statement is emitted here.
             let top = stack.last().ok_or(JitVerdict::StackUnderflow)?;
-            if !top.is_plain() {
-                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+            if top.none_const {
+                // RFC 0069 WS1 — `return None` (incl. the implicit
+                // tail return): nothing native to pop.
+                TTerm::ReturnNone
+            } else {
+                if !top.is_plain() {
+                    return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+                }
+                TTerm::Return
             }
-            TTerm::Return
         }
         OpCode::JumpForward | OpCode::JumpBackward => {
-            let t = compact[&block_succ(b, 0)];
-            TTerm::Jump(t)
+            seed_entry(emit_entries, block_succ(b, 0), &stack);
+            TTerm::Jump(compact[&block_succ(b, 0)])
         }
-        OpCode::PopJumpIfFalse => TTerm::BranchFalse {
-            fallthrough: compact[&block_succ(b, 0)],
-            target: compact[&block_succ(b, 1)],
-        },
-        OpCode::PopJumpIfTrue => TTerm::BranchTrue {
-            fallthrough: compact[&block_succ(b, 0)],
-            target: compact[&block_succ(b, 1)],
-        },
+        OpCode::PopJumpIfFalse | OpCode::PopJumpIfTrue => {
+            let c = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            if !c.is_plain() {
+                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+            }
+            seed_entry(emit_entries, block_succ(b, 0), &stack);
+            seed_entry(emit_entries, block_succ(b, 1), &stack);
+            if matches!(ins.op, OpCode::PopJumpIfFalse) {
+                TTerm::BranchFalse {
+                    fallthrough: compact[&block_succ(b, 0)],
+                    target: compact[&block_succ(b, 1)],
+                }
+            } else {
+                TTerm::BranchTrue {
+                    fallthrough: compact[&block_succ(b, 0)],
+                    target: compact[&block_succ(b, 1)],
+                }
+            }
+        }
         OpCode::ForIter => {
             let &(cur_slot, stop_slot, var_slot) = plan
                 .headers
                 .get(&last)
                 .ok_or(JitVerdict::UnsupportedOpcode("FOR_ITER (unplanned)"))?;
+            if !stack.is_empty() {
+                return Err(JitVerdict::NonEmptyBoundaryStack);
+            }
+            seed_entry(emit_entries, block_succ(b, 0), &stack);
+            seed_entry(emit_entries, block_succ(b, 1), &stack);
             TTerm::ForRange {
                 cur_slot,
                 stop_slot,
@@ -1755,13 +2409,13 @@ fn emit_block(
                 out,
                 probes,
             )?;
+            seed_entry(emit_entries, block_succ(b, 0), &stack);
             TTerm::Jump(compact[&block_succ(b, 0)])
         }
     };
 
-    // Entry stack is always empty in the v1 subset.
     Ok(TBlock {
-        entry_stack: Vec::new(),
+        entry_stack,
         stmts,
         term,
     })
@@ -1794,6 +2448,9 @@ fn emit_instr(
         len_spans,
         method_spans,
         attr_sites,
+        method_sites,
+        math_guards,
+        math_spans,
         max_call_args,
     } = out;
     // Note: `max_stack` counts markers too — a harmless overestimate of
@@ -1840,6 +2497,7 @@ fn emit_instr(
                 Some(&ResolvedGlobal::PyFunc {
                     token,
                     arg_count,
+                    min_args,
                     is_self,
                     ret,
                 }) => {
@@ -1858,6 +2516,7 @@ fn emit_instr(
                             kind: MarkKind::Py,
                             token,
                             arg_count,
+                            min_args,
                             is_self,
                             ret,
                             load_pc: pc,
@@ -1880,11 +2539,26 @@ fn emit_instr(
                             kind: MarkKind::Len,
                             token: 0,
                             arg_count: 1,
+                            min_args: 1,
                             is_self: false,
                             ret: Some(JitType::Int),
                             load_pc: pc,
                             interp_depth: n_iters + stack.len() as u32,
                         }),
+                        ..ESlot::val(JitType::Unknown)
+                    });
+                    return Ok(());
+                }
+                // RFC 0069 WS2 — the math module: interpreter-stack
+                // only, consumed by the following intrinsic load.
+                Some(ResolvedGlobal::MathModule) => {
+                    let n_iters = plan
+                        .loops
+                        .iter()
+                        .filter(|l| (l.live_from as usize) <= i && i < l.live_to as usize)
+                        .count() as u32;
+                    stack.push(ESlot {
+                        math_mod: Some((ins.arg, pc, n_iters + stack.len() as u32)),
                         ..ESlot::val(JitType::Unknown)
                     });
                     return Ok(());
@@ -1895,6 +2569,15 @@ fn emit_instr(
         }
         OpCode::LoadConst => {
             let c = &code.constants[ins.arg as usize];
+            // RFC 0069 WS1 — the `None` constant: interpreter-stack
+            // only, consumed by `RETURN_VALUE`.
+            if matches!(c, Constant::None) {
+                stack.push(ESlot {
+                    none_const: true,
+                    ..ESlot::val(JitType::Unknown)
+                });
+                return Ok(());
+            }
             let (op, ty) = match c {
                 Constant::Int(v) => (TOp::PushConstInt(*v), JitType::Int),
                 Constant::Bool(v) => (TOp::PushConstBool(*v), JitType::Bool),
@@ -2024,6 +2707,23 @@ fn emit_instr(
                 .ok_or(JitVerdict::UnsupportedOpcode("LOAD_ATTR bad name"))?
                 .as_str();
             let top = stack.last().copied().ok_or(JitVerdict::StackUnderflow)?;
+            // RFC 0069 WS2 — plain-form `math.<intrinsic>` (the
+            // explicit `PUSH_NULL` follows in the bytecode).
+            if let Some((name_idx, load_pc, interp_depth)) = top.math_mod {
+                stack.pop();
+                emit_math_load(
+                    code,
+                    name,
+                    name_idx,
+                    load_pc,
+                    interp_depth,
+                    stack,
+                    math_guards,
+                    probes,
+                )?;
+                *max_stack = (*max_stack).max(stack.len() as u32);
+                return Ok(());
+            }
             if !top.is_plain() {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
             }
@@ -2060,8 +2760,8 @@ fn emit_instr(
         }
         // RFC 0068 — method-form attribute load: the erased `.append`
         // load (re-mark the receiver, no native op), with the implicit
-        // self-or-null marker on top. Any other method shape falls
-        // through to the `CALL` arm and bails there, matching inference.
+        // self-or-null marker on top. RFC 0069 adds the math-intrinsic
+        // (WS2) and resolved instance-method (WS1) forms.
         OpCode::LoadMethodAttr => {
             let name = code
                 .names
@@ -2069,6 +2769,28 @@ fn emit_instr(
                 .ok_or(JitVerdict::UnsupportedOpcode("LOAD_ATTR bad name"))?
                 .as_str();
             let top = stack.last().copied().ok_or(JitVerdict::StackUnderflow)?;
+            // RFC 0069 WS2 — `math.<intrinsic>`: replace the module
+            // marker with a callee mark carrying the guard token (plus
+            // the method form's implicit self-or-null on top).
+            if let Some((name_idx, load_pc, interp_depth)) = top.math_mod {
+                stack.pop();
+                emit_math_load(
+                    code,
+                    name,
+                    name_idx,
+                    load_pc,
+                    interp_depth,
+                    stack,
+                    math_guards,
+                    probes,
+                )?;
+                stack.push(ESlot {
+                    null: true,
+                    ..ESlot::val(JitType::Unknown)
+                });
+                *max_stack = (*max_stack).max(stack.len() as u32);
+                return Ok(());
+            }
             if !top.is_plain() {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
             }
@@ -2087,6 +2809,39 @@ fn emit_instr(
             let slot = top.src.ok_or(JitVerdict::UnsupportedOpcode(
                 "LOAD_ATTR (receiver provenance)",
             ))?;
+            // RFC 0069 WS1 — a class-resolved method: re-mark the
+            // receiver in place (its pin stays the native value) and
+            // record the site under the probe's token.
+            if name != "append" {
+                if let Some(res) = (probes.method)(slot, name) {
+                    let meta = MethodSiteMeta {
+                        slot,
+                        name: name.to_owned(),
+                        arg_count: res.arg_count,
+                        min_args: res.min_args,
+                        ret: res.ret,
+                    };
+                    let idx = res.token as usize;
+                    if method_sites.len() <= idx {
+                        method_sites.resize(idx + 1, None);
+                    }
+                    method_sites[idx] = Some(meta);
+                    let last = stack.len() - 1;
+                    stack[last].method = Some(MethodMark {
+                        token: res.token,
+                        arg_count: res.arg_count,
+                        min_args: res.min_args,
+                        ret: res.ret,
+                        load_pc: pc,
+                    });
+                    stack.push(ESlot {
+                        null: true,
+                        ..ESlot::val(JitType::Unknown)
+                    });
+                    *max_stack = (*max_stack).max(stack.len() as u32);
+                    return Ok(());
+                }
+            }
             let lane = (probes.attr)(slot, name, false)
                 .ok_or(JitVerdict::UnsupportedOpcode("LOAD_ATTR shape"))?;
             stack.pop();
@@ -2169,15 +2924,13 @@ fn emit_instr(
                 }
                 // The receiver's bottom-based native-stack index equals
                 // its spill index: everything below it that carries a
-                // native value (markers and null slots don't).
-                let native_index = stack
-                    .iter()
-                    .filter(|s| s.callee.is_none() && !s.null)
-                    .count() as u32;
+                // native value (interpreter-only markers don't).
+                let native_index = stack.iter().filter(|s| s.has_native()).count() as u32;
                 method_spans.push(MethodSpanMeta {
                     native_index,
                     live_from: load_pc,
                     live_to: pc + 1,
+                    token: None,
                 });
                 // Re-model the operands for the statement, then emit:
                 // `ListAppend` pops the value and the pin natively.
@@ -2194,10 +2947,96 @@ fn emit_instr(
                 *max_stack = (*max_stack).max(stack.len() as u32);
                 return Ok(());
             }
+            // RFC 0069 WS1 — a burned-in method call: the receiver pin
+            // is the callee's `self`, popped natively by `CallMethod`.
+            if let Some(m) = f.method {
+                let total = argc + 1;
+                if total < m.min_args as usize || total > m.arg_count as usize {
+                    return Err(JitVerdict::UnsupportedOpcode("CALL (method arity)"));
+                }
+                for &ty in &arg_tys {
+                    if !ty.is_representable() {
+                        return Err(JitVerdict::TypeUnknown);
+                    }
+                    if ty.is_pinned() {
+                        return Err(JitVerdict::UnsupportedOpcode("CALL (pinned argument)"));
+                    }
+                }
+                let native_index = stack.iter().filter(|s| s.has_native()).count() as u32;
+                method_spans.push(MethodSpanMeta {
+                    native_index,
+                    live_from: m.load_pc,
+                    live_to: pc + 1,
+                    token: Some(m.token),
+                });
+                *max_call_args = (*max_call_args).max(argc as u32);
+                // Re-model the receiver + args for the statement
+                // (`CallMethod` pops `argc` scalars and the pin).
+                stack.push(ESlot::val(f.ty));
+                for &ty in arg_tys.iter().rev() {
+                    stack.push(ESlot::val(ty));
+                }
+                push(
+                    TOp::CallMethod {
+                        token: m.token,
+                        argc: argc as u8,
+                        ret: m.ret,
+                    },
+                    None,
+                    stack,
+                    stmts,
+                );
+                for _ in 0..=argc {
+                    stack.pop();
+                }
+                match m.ret {
+                    // Procedure shape: `None` exists only on the
+                    // interpreter stack (consumed by `POP_TOP`).
+                    MethodRet::None => stack.push(ESlot {
+                        poison: true,
+                        ..ESlot::val(JitType::Unknown)
+                    }),
+                    MethodRet::Scalar(ty) => {
+                        if !ty.is_representable() || ty.is_pinned() {
+                            return Err(JitVerdict::TypeUnknown);
+                        }
+                        stack.push(ESlot::val(ty));
+                    }
+                }
+                *max_stack = (*max_stack).max(stack.len() as u32);
+                return Ok(());
+            }
             let Some(mark) = f.callee else {
                 return Err(JitVerdict::UnsupportedOpcode("CALL"));
             };
-            if mark.arg_count as usize != argc {
+            // RFC 0069 WS2 — a burned-in math intrinsic: one float
+            // operand (an integral operand converts exactly — i64 →
+            // f64 is correctly rounded for the whole lane, matching
+            // the interpreter's conversion).
+            if let MarkKind::Math(func) = mark.kind {
+                if argc != 1 {
+                    return Err(JitVerdict::UnsupportedOpcode("math (arity)"));
+                }
+                if arg_tys[0].is_integral() {
+                    stack.push(ESlot::val(arg_tys[0]));
+                    push(TOp::IntToFloatTos { guarded: false }, None, stack, stmts);
+                    stack.pop();
+                } else if arg_tys[0] != JitType::Float {
+                    return Err(JitVerdict::UnsupportedOpcode("math (operand lane)"));
+                }
+                math_spans.push(CalleeSpanMeta {
+                    token: mark.token,
+                    live_from: mark.load_pc,
+                    live_to: pc + 1,
+                    interp_depth: mark.interp_depth,
+                });
+                push(TOp::MathIntrinsic(func), Some(JitType::Float), stack, stmts);
+                return Ok(());
+            }
+            // Positional arity within the defaults window (RFC 0069
+            // WS3): the call helper binds the snapshotted defaults for
+            // the `argc..arg_count` tail.
+            if argc < mark.min_args as usize || argc > mark.arg_count as usize {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (arity)"));
             }
             // `len(x)` on a pinned list — no real call, no deopt-able
@@ -2346,10 +3185,13 @@ fn lower_bin(kind: ArithKind, a: JitType, b: JitType) -> Result<(TOp, JitType), 
         }
     } else if a == JitType::Float && b == JitType::Float {
         match kind {
-            ArithKind::Add | ArithKind::Sub | ArithKind::Mul | ArithKind::TrueDiv => {
-                Ok((TOp::FloatArith(kind), JitType::Float))
-            }
-            _ => Err(JitVerdict::UnsupportedOpcode("float floordiv/mod/bitop")),
+            ArithKind::Add
+            | ArithKind::Sub
+            | ArithKind::Mul
+            | ArithKind::TrueDiv
+            | ArithKind::FloorDiv
+            | ArithKind::Mod => Ok((TOp::FloatArith(kind), JitType::Float)),
+            _ => Err(JitVerdict::UnsupportedOpcode("float bitop")),
         }
     } else {
         Err(JitVerdict::MixedArithTypes)

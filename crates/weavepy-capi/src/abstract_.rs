@@ -342,6 +342,11 @@ pub unsafe extern "C" fn PyObject_GetAttr(o: *mut PyObject, attr: *mut PyObject)
     if o.is_null() || attr.is_null() {
         return ptr::null_mut();
     }
+    // RFC 0069 WS5 — attribute dispatch can recurse through extension
+    // `tp_getattro` chains that never charge `Py_EnterRecursiveCall`.
+    if c_stack_exhausted(" while getting an attribute") {
+        return ptr::null_mut();
+    }
     let key = match unsafe { crate::object::clone_object(attr) } {
         Object::Str(s) => s.to_string(),
         _ => {
@@ -2230,6 +2235,16 @@ pub unsafe extern "C" fn PyObject_Length(o: *mut PyObject) -> PySsizeT {
         if let Some(n) = unsafe { foreign_len(o) } {
             return n;
         }
+        // A genuinely foreign object with *no* length slot fails here with
+        // `TypeError`, exactly like CPython's `PyObject_Size`. It must NOT
+        // fall through to the interpreter route below: the VM's Foreign
+        // lane resolves `len()` by forwarding straight back through
+        // `fwd_length` → `PyObject_Length`, so the two sides bounce until
+        // the C stack faults (RFC 0069 WS5 — numpy's sequence discovery
+        // under `np.asarray(wrapper)` calls `len()` on a foreign numpy
+        // scalar; test_protocols' census row rode that cycle to a SIGBUS).
+        crate::errors::set_type_error(format!("object of type '{}' has no len()", type_name(&obj)));
+        return -1;
     }
     // Any other VM object — a `list`/`dict`/… *subclass* instance, a
     // generator, … — resolves `__len__` through the interpreter. Routing an
@@ -2311,6 +2326,12 @@ fn sequence_len(o: &Object) -> Option<PySsizeT> {
 pub unsafe extern "C" fn PyObject_GetItem(o: *mut PyObject, key: *mut PyObject) -> *mut PyObject {
     if o.is_null() || key.is_null() {
         crate::errors::set_type_error("bad argument to internal function");
+        return ptr::null_mut();
+    }
+    // RFC 0069 WS5 — subscript dispatch recurses through extension
+    // `mp_subscript`/`sq_item` chains (numpy's sequence discovery)
+    // that never charge `Py_EnterRecursiveCall`.
+    if c_stack_exhausted(" while subscripting an object") {
         return ptr::null_mut();
     }
     let obj = unsafe { crate::object::clone_object(o) };
@@ -3456,6 +3477,50 @@ pub unsafe extern "C" fn PySequence_GetItem(o: *mut PyObject, i: PySsizeT) -> *m
     if o.is_null() {
         return ptr::null_mut();
     }
+    // RFC 0069 WS5: structurally recursive abstract entry — extension code
+    // (numpy's dimension discovery) recurses through here without
+    // `Py_EnterRecursiveCall`, and the stable-slot lane below bypasses
+    // `PyObject_GetItem`'s guard, so this entry needs its own.
+    if c_stack_exhausted(" while getting an item") {
+        return ptr::null_mut();
+    }
+    // RFC 0069 WS5: on CPython, the new reference returned for a tuple/list
+    // element is a pointer the *container itself* also owns, so the common
+    // extension idiom `stash[i] = PySequence_GetItem(seq, i); Py_DECREF(item)`
+    // leaves a valid pointer for as long as the container lives. numpy's
+    // `_vec_string_with_args` builds its broadcast list exactly that way —
+    // a fresh per-call box died on that DECREF and `PyArray_FromAny` then
+    // discovered a dtype from freed memory (the test_defchararray census
+    // SIGSEGV). Serve elements from the same stable-slot lanes the
+    // borrowed-reference getters use (faithful `ob_item` / borrowed-item
+    // cache), upgraded to a new reference.
+    let obj = unsafe { crate::object::clone_object(o) };
+    let stable = match &obj {
+        Object::Tuple(items) => {
+            let n = items.len() as PySsizeT;
+            let idx = if i < 0 { i + n } else { i };
+            (0..n)
+                .contains(&idx)
+                .then(|| unsafe { crate::containers::PyTuple_GetItem(o, idx) })
+        }
+        Object::List(rc) => {
+            let n = rc.borrow().len() as PySsizeT;
+            let idx = if i < 0 { i + n } else { i };
+            (0..n)
+                .contains(&idx)
+                .then(|| unsafe { crate::containers::PyList_GetItem(o, idx) })
+        }
+        _ => None,
+    };
+    if let Some(p) = stable {
+        if !p.is_null() {
+            unsafe { crate::object::Py_IncRef(p) };
+            return p;
+        }
+        // Slot read failed (e.g. staged container): fall through to the
+        // generic path, clearing whatever the borrowed getter set.
+        crate::errors::clear_thread_local();
+    }
     let key = crate::object::into_owned(Object::Int(i as i64));
     let result = unsafe { PyObject_GetItem(o, key) };
     unsafe { crate::object::Py_DecRef(key) };
@@ -3993,21 +4058,89 @@ pub unsafe extern "C" fn PyObject_Format(o: *mut PyObject, spec: *mut PyObject) 
 }
 
 // ----------------------------------------------------------------
-// RFC 0029 — recursion guards.
+// RFC 0029 / RFC 0069 WS5 — recursion guards.
 // ----------------------------------------------------------------
 //
-// CPython's `Py_EnterRecursiveCall` increments a thread-local
-// counter and checks it against the recursion limit; we cheat
-// and always return success, since the host Rust stack is the
-// real bound. `_Py_CheckRecursionLimit` is the limit accessor.
+// CPython charges every `Py_EnterRecursiveCall` against
+// `tstate->c_recursion_remaining` (initialized to its
+// `Py_C_RECURSION_LIMIT` analogue) so unbounded *C-level* recursion —
+// numpy's recursive sequence discovery, extension↔bridge dunder
+// ping-pong — raises `RecursionError` long before the native stack
+// faults. The previous stub always succeeded, so such recursion rode
+// the real C stack into SIGBUS (RFC 0066's crash census). The counter
+// lives in the byte-faithful thread-state body (mypyc/Cython touch the
+// field directly; one budget serves both access styles), and a
+// native-stack headroom probe backstops paths whose per-frame C
+// footprint is too large for a counted limit to catch in time.
 
-#[no_mangle]
-pub unsafe extern "C" fn Py_EnterRecursiveCall(_where: *const c_char) -> c_int {
-    0
+/// Native-stack headroom floor: a guarded C-API entry below this
+/// remaining-stack figure raises `RecursionError` instead of letting
+/// the next C frame chain fault. Sized like the interpreter's own
+/// `stacker::maybe_grow` red zone (512 KiB) — comfortably more than
+/// any single extension frame chain observed in the census.
+const C_STACK_HEADROOM: usize = 512 * 1024;
+
+/// `true` when the calling thread's native stack still has headroom.
+/// Threads whose stack bounds are unknown to the probe report `true`
+/// (the counted budget still applies). While a greenlet is current the
+/// probe is skipped outright: execution runs on the greenlet's own
+/// mmap'd stack, so `stacker`'s figure (measured against the OS
+/// thread's stack bounds) is garbage — sqlalchemy's `greenlet_spawn`
+/// legs raised spurious `RecursionError`s from exactly this misread.
+/// Greenlet stacks are sized for a full recursion limit's worth of
+/// frames (see `greenlet_native::stack_size`), and the counted budget
+/// still applies.
+#[inline]
+fn c_stack_headroom_ok() -> bool {
+    weavepy_vm::stdlib::greenlet_native::on_greenlet_stack()
+        || stacker::remaining_stack().is_none_or(|r| r >= C_STACK_HEADROOM)
+}
+
+/// RFC 0069 WS5 — the shared overflow check for structurally recursive
+/// abstract entries (`PyObject_GetItem` / `PySequence_GetItem` /
+/// `PyObject_GetAttr`): these recurse through extension code without
+/// necessarily passing `Py_EnterRecursiveCall`, so the headroom probe
+/// is the boundary's own guard. Returns `true` (with a pending
+/// `RecursionError`) when the caller must fail the call.
+#[inline]
+fn c_stack_exhausted(where_: &str) -> bool {
+    if c_stack_headroom_ok() {
+        return false;
+    }
+    crate::errors::set_recursion_error(format!("maximum recursion depth exceeded{where_}"));
+    true
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn Py_LeaveRecursiveCall() {}
+pub unsafe extern "C" fn Py_EnterRecursiveCall(where_: *const c_char) -> c_int {
+    let slot = crate::pystate::c_recursion_remaining_slot();
+    // SAFETY: the slot is a live, thread-local `i32` for the calling
+    // thread (see `pystate::store_ptr`).
+    let remaining = unsafe { *slot } - 1;
+    unsafe { *slot = remaining };
+    if remaining > 0 && c_stack_headroom_ok() {
+        return 0;
+    }
+    // Roll the failed activation back (the caller does not pair a
+    // failing enter with `Py_LeaveRecursiveCall`).
+    unsafe { *slot = remaining + 1 };
+    let suffix = if where_.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(where_) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    crate::errors::set_recursion_error(format!("maximum recursion depth exceeded{suffix}"));
+    -1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn Py_LeaveRecursiveCall() {
+    let slot = crate::pystate::c_recursion_remaining_slot();
+    // SAFETY: as in `Py_EnterRecursiveCall`.
+    unsafe { *slot += 1 };
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn _Py_CheckRecursionLimit() -> c_int {

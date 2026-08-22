@@ -744,12 +744,14 @@ pub unsafe extern "C" fn PyObject_GetOptionalAttr(
         }
         return 1;
     }
-    // Missing attribute is reported as 0 with the error suppressed.
-    crate::errors::clear_thread_local();
     if !result.is_null() {
         unsafe { *result = ptr::null_mut() };
     }
-    0
+    // Suppress only `AttributeError`; anything else propagates as -1 with
+    // the error pending (see `errors::optional_probe_failure`).
+    crate::errors::optional_probe_failure(
+        &weavepy_vm::builtin_types::builtin_types().attribute_error,
+    )
 }
 
 #[no_mangle]

@@ -491,6 +491,9 @@ fn cached_instance_box(
     }
     let p = cached as *mut PyObject;
     unsafe { Py_IncRef(p) };
+    if crate::mirror::arg_pin_active() {
+        pin_instance_arg_box(p);
+    }
     Some(p)
 }
 
@@ -512,11 +515,15 @@ fn mint_instance_box(
     let raw = Box::into_raw(boxed) as *mut PyObject;
     register_minted(raw);
     inst.c_body.set(raw as usize);
+    if crate::mirror::arg_pin_active() {
+        pin_instance_arg_box(raw);
+    }
     if ibox_trace_enabled() {
         eprintln!(
-            "[IBOX-MINT] p=0x{:x} cls={} rc=1",
+            "[IBOX-MINT] p=0x{:x} cls={} rc=1 argpin={}",
             raw as usize,
-            inst.cls().name
+            inst.cls().name,
+            crate::mirror::arg_pin_active(),
         );
         if let Some(filter) = std::env::var_os("WEAVEPY_IBOX_BT") {
             if filter.to_string_lossy() == inst.cls().name.as_str() {
@@ -525,6 +532,112 @@ fn mint_instance_box(
         }
     }
     raw
+}
+
+// ---------------------------------------------------------------------------
+// Argument-pinned instance identity boxes (RFC 0069 WS5).
+//
+// numpy's `PyArrayIdentityHash` stores raw `PyObject*` keys and values
+// **borrowed** — no incref, the caller guarantees the lifetime through its
+// own references (CPython: the test's `keys_vals` list keeps the objects,
+// and therefore the pointers, alive). On WeavePy the VM object and its
+// identity box have separate lifetimes: the box died with C's refcount when
+// the args tuple was released at call end, so the table dangled — the next
+// `identity_hash_get_item` incref'd freed memory (SIGSEGV, the
+// `test_hashtable` census row).
+//
+// Fix, mirroring the scalar pin cache (`mirror::ScalarPinKey`): an instance
+// identity box that crosses while marshaling VM arguments into a C call is
+// recorded here. At C refcount zero, `free_box` *parks* it instead of
+// freeing — the box (and `inst.c_body`, so pointer identity stays stable
+// for the next crossing) survives while the VM instance is reachable
+// elsewhere. Once only the box's own payload clone keeps the instance
+// alive, the entry is reclaimed (at the next refcount-zero event or by the
+// high-water-mark sweep).
+// ---------------------------------------------------------------------------
+
+static INSTANCE_ARG_PINS: std::sync::Mutex<Option<weavepy_vm::fasthash::FxHashSet<usize>>> =
+    std::sync::Mutex::new(None);
+/// Eviction sweep threshold (entries), matching the scalar pin cache.
+const INSTANCE_PIN_HWM: usize = 1 << 16;
+
+/// Record `p` (a live instance identity box) as argument-pinned, sweeping
+/// parked-and-dead entries first when past the high-water mark.
+fn pin_instance_arg_box(p: *mut PyObject) {
+    let victims: Vec<usize> = {
+        let mut g = match INSTANCE_ARG_PINS.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let set = g.get_or_insert_with(weavepy_vm::fasthash::FxHashSet::default);
+        let victims = if set.len() >= INSTANCE_PIN_HWM {
+            let dead: Vec<usize> = set
+                .iter()
+                .copied()
+                .filter(|&bp| unsafe { pinned_box_is_dead(bp as *mut PyObject) })
+                .collect();
+            for bp in &dead {
+                set.remove(bp);
+            }
+            dead
+        } else {
+            Vec::new()
+        };
+        set.insert(p as usize);
+        victims
+    };
+    // Free outside the lock: `free_box` re-consults the registry (the
+    // victim is already evicted, so it takes the ordinary free path).
+    for bp in victims {
+        unsafe { free_box(bp as *mut PyObject) };
+    }
+}
+
+/// True iff a parked pinned box is reclaimable: C holds no reference and
+/// the box's own payload clone is the *only* strong reference left to the
+/// instance (the program can never cross it again).
+///
+/// # Safety
+/// `bp` must be a live [`PyObjectBox`] whose payload is `Object::Instance`.
+unsafe fn pinned_box_is_dead(bp: *mut PyObject) -> bool {
+    if unsafe { (*bp).ob_refcnt } > 0 {
+        return false;
+    }
+    let bx = unsafe { &*(bp as *mut PyObjectBox) };
+    match &bx.payload.obj {
+        Object::Instance(inst) => weavepy_vm::sync::Rc::strong_count(inst) <= 1,
+        _ => true,
+    }
+}
+
+/// Park decision for `free_box`: keep an argument-pinned identity box
+/// alive past C refcount zero while the VM instance is still reachable
+/// elsewhere. Returns `true` when the box must survive (caller returns
+/// without freeing). When the instance is no longer reachable outside the
+/// box, the entry is evicted and `false` is returned so the ordinary free
+/// path reclaims it.
+fn instance_pin_parks(
+    p: *mut PyObject,
+    inst: &weavepy_vm::sync::Rc<weavepy_vm::types::PyInstance>,
+) -> bool {
+    let mut g = match INSTANCE_ARG_PINS.lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    let Some(set) = g.as_mut() else {
+        return false;
+    };
+    if !set.contains(&(p as usize)) {
+        return false;
+    }
+    // The payload's own clone is one strong count; anything above it means
+    // the program (or another C reference chain) can still reach the
+    // instance and re-cross it — keep the pointer valid and stable.
+    if weavepy_vm::sync::Rc::strong_count(inst) > 1 {
+        return true;
+    }
+    set.remove(&(p as usize));
+    false
 }
 
 /// Cached `WEAVEPY_IBOX_TRACE` gate: trace identity-box mint/incref/free
@@ -1051,6 +1164,32 @@ pub(crate) unsafe fn free_box(p: *mut PyObject) {
                 "[CAP] *** UAF: freeing capsule box with live soul ***\n{}",
                 std::backtrace::Backtrace::force_capture()
             );
+        }
+    }
+
+    // RFC 0069 WS5: an argument-pinned instance identity box outlives a
+    // zero C refcount while its VM instance is reachable — an extension may
+    // have stored the pointer borrowed with no incref (numpy's
+    // `PyArrayIdentityHash` keys/values). Parking it here keeps that
+    // borrowed pointer valid and, because `inst.c_body` still holds it,
+    // pointer-stable for the next crossing, so C-side identity lookups hit
+    // exactly as they do on CPython. See [`INSTANCE_ARG_PINS`].
+    {
+        let bx = unsafe { &*(p as *mut PyObjectBox) };
+        if let Object::Instance(inst) = &bx.payload.obj {
+            let parks = inst.c_body.get() == p as usize && instance_pin_parks(p, inst);
+            if ibox_trace_enabled() {
+                eprintln!(
+                    "[IBOX-FREE] p=0x{:x} cls={} c_body=0x{:x} parks={}",
+                    p as usize,
+                    inst.cls().name,
+                    inst.c_body.get(),
+                    parks,
+                );
+            }
+            if parks {
+                return;
+            }
         }
     }
 

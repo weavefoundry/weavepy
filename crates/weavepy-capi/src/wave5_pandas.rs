@@ -190,8 +190,7 @@ pub(crate) fn register_find_module(def: *mut c_void, module: Object) {
     let key = def as usize;
     if FIND_MODULE
         .lock()
-        .ok()
-        .is_some_and(|g| g.as_ref().is_some_and(|m| m.contains_key(&key)))
+        .is_ok_and(|g| g.as_ref().is_some_and(|m| m.contains_key(&key)))
     {
         return;
     }

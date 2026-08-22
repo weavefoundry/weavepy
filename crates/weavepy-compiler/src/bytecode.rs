@@ -900,6 +900,23 @@ pub enum InlineCache {
         func_id: u64,
         argc: u32,
     },
+    /// Keyword call (`CALL_KW`) on a plain Python function whose name
+    /// tuple resolves to a fixed name→slot permutation: bind is the
+    /// positional moves, the permuted keyword writes, and a defaults
+    /// fill — no per-call name *search* (RFC 0069 WS3). The hit guard
+    /// re-verifies each keyword against `varnames[slot]` directly
+    /// (one short string compare per keyword), so a rebound
+    /// `__code__` with renamed parameters can never mis-bind — the
+    /// permutation is self-validating against the live code. `perm`
+    /// packs the keyword→slot map 4 bits per keyword; sites with more
+    /// than 8 keywords, or callees with more than 16 parameter slots,
+    /// stay generic.
+    CallPyKwNames {
+        func_id: u64,
+        perm: u32,
+        argc: u8,
+        kwc: u8,
+    },
     /// Module-level native callable (`math.sqrt`, `ord`, …) with no
     /// interpreter-aware dispatch chain: straight to the Rust `fn`
     /// (RFC 0058 WS3). Deopts whenever observers (profile/trace

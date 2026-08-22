@@ -1,8 +1,11 @@
 //! Lower the typed IR ([`TFunc`]) to a Cranelift function.
 //!
 //! Locals become Cranelift *variables* (the SSA builder inserts phis at
-//! merges); the operand stack is an explicit `Vec` of SSA values, which
-//! the v1 subset guarantees is empty at every block boundary. Integer
+//! merges); the operand stack is an explicit `Vec` of SSA values.
+//! Cross-block operand values (RFC 0069 WS2 — ternaries, short-circuit
+//! chains) are carried as Cranelift *block parameters*: each block
+//! declares one param per [`crate::ir::TBlock::entry_stack`] lane and
+//! every jump/branch passes the live stack as block arguments. Integer
 //! arithmetic is emitted with explicit overflow / divide-by-zero checks
 //! that branch to per-op *side-exit* blocks; a side exit writes the live
 //! locals + spilled stack back into the [`JitFrame`] and returns
@@ -10,11 +13,12 @@
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
-    types, AbiParam, Block, Function, InstBuilder, MemFlags, SigRef, Signature, Type, Value,
+    types, AbiParam, Block, BlockArg, Function, InstBuilder, MemFlags, SigRef, Signature, Type,
+    Value,
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 
-use crate::ir::{ArithKind, CmpKind, TFunc, TOp, TStmt, TTerm};
+use crate::ir::{ArithKind, CmpKind, MathFunc, MethodRet, TFunc, TOp, TStmt, TTerm};
 use crate::runtime::{self, JitFrame, JitStatus, SlotTag};
 use crate::value::JitType;
 
@@ -61,6 +65,15 @@ struct Lowerer<'a, 'b> {
     call_tags_base: Value,
     /// Imported signature of the `wpjit_call_py` helper (lazy).
     call_sig: Option<SigRef>,
+    /// RFC 0069 WS1 — imported signature of the `wpjit_call_method`
+    /// helper (lazy).
+    call_method_sig: Option<SigRef>,
+    /// RFC 0069 WS2 — imported `f64 -> f64` signature of the libm
+    /// `sin`/`cos` helpers (lazy).
+    math_unary_sig: Option<SigRef>,
+    /// RFC 0069 WS2 — imported `(f64, f64) -> f64` signature of the
+    /// float floor-div / mod helpers (lazy).
+    math_binary_sig: Option<SigRef>,
     /// Imported signature shared by the `wpjit_list_get`/`_set` and
     /// `wpjit_attr_get`/`_set` helpers — all `(frame, i64, i64) -> i64`
     /// (RFC 0061/0065 WS5, lazy).
@@ -96,6 +109,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             call_args_base: dummy,
             call_tags_base: dummy,
             call_sig: None,
+            call_method_sig: None,
+            math_unary_sig: None,
+            math_binary_sig: None,
             list_sig: None,
             pin_sig: None,
             poll_sig: None,
@@ -142,7 +158,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .b
             .ins()
             .load(self.ptr_ty, trusted, self.frame_ptr, OFF_STACK_TAGS);
-        if !self.tfunc.callee_spans.is_empty() {
+        if !self.tfunc.callee_spans.is_empty() || !self.tfunc.method_sites.is_empty() {
             self.call_args_base =
                 self.b
                     .ins()
@@ -153,10 +169,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .load(self.ptr_ty, trusted, self.frame_ptr, OFF_CALL_TAGS);
         }
 
-        // One Cranelift block per TBlock.
-        self.cl_blocks = (0..self.tfunc.blocks.len())
-            .map(|_| self.b.create_block())
-            .collect();
+        // One Cranelift block per TBlock, with one block parameter per
+        // entry-stack lane (RFC 0069 WS2).
+        self.cl_blocks = Vec::with_capacity(self.tfunc.blocks.len());
+        for tb in &self.tfunc.blocks {
+            let cl = self.b.create_block();
+            for &ty in &tb.entry_stack {
+                self.b.append_block_param(cl, Self::cl_ty(ty));
+            }
+            self.cl_blocks.push(cl);
+        }
 
         // RFC 0067 WS2 — the poll countdown. Seeded once per
         // activation; every loop-header visit decrements it and calls
@@ -210,13 +232,26 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             self.b.ins().jump(entry_target, &[]);
         }
 
-        // Emit each block body.
+        // Emit each block body, seeding the abstract stack from the
+        // block's parameters.
         for bi in 0..self.tfunc.blocks.len() {
             let cl = self.cl_blocks[bi];
             self.b.switch_to_block(cl);
             self.vstack.clear();
+            let params: Vec<Value> = self.b.block_params(cl).to_vec();
+            for (v, &ty) in params.iter().zip(&self.tfunc.blocks[bi].entry_stack) {
+                self.vstack.push((*v, ty));
+            }
             self.emit_block(bi);
         }
+    }
+
+    /// The current abstract stack as block-call arguments.
+    fn block_args(&self) -> Vec<BlockArg> {
+        self.vstack
+            .iter()
+            .map(|&(v, _)| BlockArg::from(v))
+            .collect()
     }
 
     fn emit_block(&mut self, bi: usize) {
@@ -242,9 +277,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         }
         match block.term {
             TTerm::Return => self.emit_return(),
+            TTerm::ReturnNone => self.emit_return_none(),
             TTerm::Jump(t) => {
+                let args = self.block_args();
                 let target = self.cl_blocks[t];
-                self.b.ins().jump(target, &[]);
+                self.b.ins().jump(target, &args);
             }
             TTerm::BranchFalse {
                 target,
@@ -252,10 +289,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             } => {
                 let (cond, ty) = self.pop();
                 let truthy = self.truth(cond, ty);
+                let args = self.block_args();
                 let tb = self.cl_blocks[target];
                 let fb = self.cl_blocks[fallthrough];
                 // if truthy → fallthrough else → target.
-                self.b.ins().brif(truthy, fb, &[], tb, &[]);
+                self.b.ins().brif(truthy, fb, &args, tb, &args);
             }
             TTerm::BranchTrue {
                 target,
@@ -263,9 +301,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             } => {
                 let (cond, ty) = self.pop();
                 let truthy = self.truth(cond, ty);
+                let args = self.block_args();
                 let tb = self.cl_blocks[target];
                 let fb = self.cl_blocks[fallthrough];
-                self.b.ins().brif(truthy, tb, &[], fb, &[]);
+                self.b.ins().brif(truthy, tb, &args, fb, &args);
             }
             TTerm::ForRange {
                 cur_slot,
@@ -303,6 +342,23 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .ins()
             .store(trusted, val, self.frame_ptr, OFF_RET_BITS);
         let tag = self.b.ins().iconst(types::I32, Self::tag(ty));
+        self.b
+            .ins()
+            .store(trusted, tag, self.frame_ptr, OFF_RET_TAG);
+        let status = self.b.ins().iconst(types::I64, JitStatus::Returned as i64);
+        self.b.ins().return_(&[status]);
+    }
+
+    /// RFC 0069 WS1 — `return None`: nothing native to pop; the
+    /// [`SlotTag::None`] tag alone tells the embedder to rebuild the
+    /// `None` singleton.
+    fn emit_return_none(&mut self) {
+        let trusted = MemFlags::trusted();
+        let zero = self.b.ins().iconst(types::I64, 0);
+        self.b
+            .ins()
+            .store(trusted, zero, self.frame_ptr, OFF_RET_BITS);
+        let tag = self.b.ins().iconst(types::I32, SlotTag::None as i64);
         self.b
             .ins()
             .store(trusted, tag, self.frame_ptr, OFF_RET_TAG);
@@ -391,7 +447,221 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             TOp::ListAppend => self.emit_list_append(stmt.pc),
             TOp::AttrGet { site, out } => self.emit_attr_get(site, out, stmt.pc),
             TOp::AttrSet { site } => self.emit_attr_set(site, stmt.pc),
+            TOp::MathIntrinsic(func) => self.emit_math_intrinsic(func, stmt.pc),
+            TOp::CallMethod { token, argc, ret } => {
+                self.emit_call_method(token, argc, ret, stmt.pc);
+            }
         }
+    }
+
+    /// RFC 0069 WS2 — a burned-in `math` intrinsic. The domain guard
+    /// deopts *before* the operation with the operand still on the
+    /// spilled stack, so the interpreter re-executes the call (the
+    /// enclosing math span rebuilds the `[func, null]` pair below the
+    /// argument) and raises the exact `ValueError`/`OverflowError`:
+    ///
+    /// - `sqrt(x)` requires `x >= 0.0` (`NaN` and `-0.0` pass, exactly
+    ///   like libm);
+    /// - `sin`/`cos` require non-infinite input (`NaN` propagates
+    ///   without error, matching CPython);
+    /// - `fabs` never errors.
+    fn emit_math_intrinsic(&mut self, func: MathFunc, pc: u32) {
+        match func {
+            MathFunc::Sqrt => {
+                let snapshot = self.vstack.clone();
+                let (x, _) = self.pop();
+                let z = self.b.ins().f64const(0.0);
+                let neg = self.b.ins().fcmp(FloatCC::LessThan, x, z);
+                let cont = self.guard(neg, pc, &snapshot);
+                self.b.switch_to_block(cont);
+                let r = self.b.ins().sqrt(x);
+                self.vstack.push((r, JitType::Float));
+            }
+            MathFunc::Fabs => {
+                let (x, _) = self.pop();
+                let r = self.b.ins().fabs(x);
+                self.vstack.push((r, JitType::Float));
+            }
+            MathFunc::Sin | MathFunc::Cos => {
+                let snapshot = self.vstack.clone();
+                let (x, _) = self.pop();
+                let mag = self.b.ins().fabs(x);
+                let inf = self.b.ins().f64const(f64::INFINITY);
+                let is_inf = self.b.ins().fcmp(FloatCC::Equal, mag, inf);
+                let cont = self.guard(is_inf, pc, &snapshot);
+                self.b.switch_to_block(cont);
+                let addr = if matches!(func, MathFunc::Sin) {
+                    runtime::math_sin_helper_addr()
+                } else {
+                    runtime::math_cos_helper_addr()
+                };
+                let sig = self.math_unary_helper_sig();
+                let helper = self.b.ins().iconst(self.ptr_ty, addr as i64);
+                let call = self.b.ins().call_indirect(sig, helper, &[x]);
+                let r = self.b.inst_results(call)[0];
+                self.vstack.push((r, JitType::Float));
+            }
+        }
+    }
+
+    /// RFC 0069 WS2 — float floor-div / mod through the registered
+    /// Python-semantics helpers, with the zero-divisor deopt *before*
+    /// the call (the interpreter re-executes and raises the exact
+    /// `ZeroDivisionError`).
+    fn emit_float_divmod_helper(&mut self, kind: ArithKind, pc: u32) {
+        let snapshot = self.vstack.clone();
+        let (b, _) = self.pop();
+        let (a, _) = self.pop();
+        let z = self.b.ins().f64const(0.0);
+        let is_zero = self.b.ins().fcmp(FloatCC::Equal, b, z);
+        let cont = self.guard(is_zero, pc, &snapshot);
+        self.b.switch_to_block(cont);
+        let addr = if matches!(kind, ArithKind::FloorDiv) {
+            runtime::float_floordiv_helper_addr()
+        } else {
+            runtime::float_mod_helper_addr()
+        };
+        let sig = self.math_binary_helper_sig();
+        let helper = self.b.ins().iconst(self.ptr_ty, addr as i64);
+        let call = self.b.ins().call_indirect(sig, helper, &[a, b]);
+        let r = self.b.inst_results(call)[0];
+        self.vstack.push((r, JitType::Float));
+    }
+
+    /// The imported `f64 -> f64` signature of the libm-backed unary
+    /// math helpers (RFC 0069 WS2, lazy).
+    fn math_unary_helper_sig(&mut self) -> SigRef {
+        if let Some(sig) = self.math_unary_sig {
+            return sig;
+        }
+        let mut sig = Signature::new(self.b.func.signature.call_conv);
+        sig.params.push(AbiParam::new(types::F64));
+        sig.returns.push(AbiParam::new(types::F64));
+        let r = self.b.import_signature(sig);
+        self.math_unary_sig = Some(r);
+        r
+    }
+
+    /// The imported `(f64, f64) -> f64` signature of the float
+    /// floor-div / mod helpers (RFC 0069 WS2, lazy).
+    fn math_binary_helper_sig(&mut self) -> SigRef {
+        if let Some(sig) = self.math_binary_sig {
+            return sig;
+        }
+        let mut sig = Signature::new(self.b.func.signature.call_conv);
+        sig.params.push(AbiParam::new(types::F64));
+        sig.params.push(AbiParam::new(types::F64));
+        sig.returns.push(AbiParam::new(types::F64));
+        let r = self.b.import_signature(sig);
+        self.math_binary_sig = Some(r);
+        r
+    }
+
+    /// RFC 0069 WS1 — a guarded method call via `wpjit_call_method`.
+    /// Marshals the `argc` scalar arguments (receiver excluded — its
+    /// pin travels as a helper parameter), then dispatches on the
+    /// returned [`crate::runtime::CallStatus`]:
+    ///
+    /// - `Ok` — push the lane-checked result (procedure-shaped callees
+    ///   push nothing; their `None` lives only on the interpreter
+    ///   stack).
+    /// - `Raised` — exit `Raised` at the call pc, operands consumed.
+    /// - `Boxed` — the call *completed* with an unrepresentable result
+    ///   (or invalidated caller guard): deopt at `pc + 1`, the parked
+    ///   result is pushed by the embedder. Never re-executes.
+    /// - `Reject` — the guard failed *before* the call ran: deopt at
+    ///   the call pc with the receiver and arguments still on the
+    ///   spilled stack (the open method span rebuilds the receiver as
+    ///   the bound method + `Unbound` pair), so the interpreter
+    ///   re-executes the call generically.
+    fn emit_call_method(&mut self, token: u32, argc: u8, ret: MethodRet, pc: u32) {
+        let trusted = MemFlags::trusted();
+        let n = argc as usize;
+        // Snapshot *including* receiver + args: the Reject exit re-runs
+        // the CALL in the interpreter.
+        let snapshot_full = self.vstack.clone();
+        let base = self.vstack.len() - n;
+        for (j, &(v, ty)) in self.vstack[base..].iter().enumerate() {
+            let voff = (j as i32) * 8;
+            let toff = (j as i32) * 4;
+            self.b.ins().store(trusted, v, self.call_args_base, voff);
+            let tagv = self.b.ins().iconst(types::I32, Self::tag(ty));
+            self.b.ins().store(trusted, tagv, self.call_tags_base, toff);
+        }
+        self.vstack.truncate(base);
+        let (pin, _) = self.pop();
+        let snapshot = self.vstack.clone();
+
+        self.writeback_locals();
+
+        let expect = match ret {
+            MethodRet::None => SlotTag::None as i64,
+            MethodRet::Scalar(t) => Self::tag(t),
+        };
+        let sig = self.call_method_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::call_method_helper_addr() as i64);
+        let tokenv = self.b.ins().iconst(types::I32, i64::from(token));
+        let argcv = self.b.ins().iconst(types::I32, i64::from(argc));
+        let expectv = self.b.ins().iconst(types::I32, expect);
+        let call =
+            self.b
+                .ins()
+                .call_indirect(sig, helper, &[self.frame_ptr, tokenv, pin, argcv, expectv]);
+        let status = self.b.inst_results(call)[0];
+
+        let ok_b = self.b.create_block();
+        let bad_b = self.b.create_block();
+        let is_ok = self.b.ins().icmp_imm(IntCC::Equal, status, 0);
+        self.b.ins().brif(is_ok, ok_b, &[], bad_b, &[]);
+
+        self.b.switch_to_block(bad_b);
+        let raised_b = self.b.create_block();
+        let not_raised_b = self.b.create_block();
+        let is_raised = self.b.ins().icmp_imm(IntCC::Equal, status, 1);
+        self.b
+            .ins()
+            .brif(is_raised, raised_b, &[], not_raised_b, &[]);
+        self.b.switch_to_block(raised_b);
+        self.emit_exit(pc, &snapshot, JitStatus::Raised);
+        self.b.switch_to_block(not_raised_b);
+        let boxed_b = self.b.create_block();
+        let reject_b = self.b.create_block();
+        let is_boxed = self.b.ins().icmp_imm(IntCC::Equal, status, 2);
+        self.b.ins().brif(is_boxed, boxed_b, &[], reject_b, &[]);
+        self.b.switch_to_block(boxed_b);
+        self.emit_exit(pc + 1, &snapshot, JitStatus::Deopt);
+        self.b.switch_to_block(reject_b);
+        self.emit_exit(pc, &snapshot_full, JitStatus::Deopt);
+
+        self.b.switch_to_block(ok_b);
+        if let MethodRet::Scalar(t) = ret {
+            let res = self
+                .b
+                .ins()
+                .load(Self::cl_ty(t), trusted, self.frame_ptr, OFF_RET_BITS);
+            self.vstack.push((res, t));
+        }
+    }
+
+    /// The imported signature of the `wpjit_call_method` helper
+    /// (RFC 0069 WS1, lazy).
+    fn call_method_helper_sig(&mut self) -> SigRef {
+        if let Some(sig) = self.call_method_sig {
+            return sig;
+        }
+        let mut sig = Signature::new(self.b.func.signature.call_conv);
+        sig.params.push(AbiParam::new(self.ptr_ty)); // frame
+        sig.params.push(AbiParam::new(types::I32)); // token
+        sig.params.push(AbiParam::new(types::I64)); // receiver pin
+        sig.params.push(AbiParam::new(types::I32)); // argc
+        sig.params.push(AbiParam::new(types::I32)); // expect_tag
+        sig.returns.push(AbiParam::new(types::I64)); // CallStatus
+        let r = self.b.import_signature(sig);
+        self.call_method_sig = Some(r);
+        r
     }
 
     /// RFC 0065 WS5 — pinned-list length via `wpjit_list_len`. The
@@ -794,6 +1064,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     fn emit_float_arith(&mut self, kind: ArithKind, pc: u32) {
         if matches!(kind, ArithKind::TrueDiv) {
             self.emit_float_truediv(pc);
+            return;
+        }
+        // RFC 0069 WS2 — Python-semantics floor-div / mod ride the
+        // registered helpers.
+        if matches!(kind, ArithKind::FloorDiv | ArithKind::Mod) {
+            self.emit_float_divmod_helper(kind, pc);
             return;
         }
         let (b, _) = self.pop();

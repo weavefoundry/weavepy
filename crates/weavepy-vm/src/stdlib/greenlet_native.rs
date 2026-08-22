@@ -215,8 +215,13 @@ fn chain_contains(id: u64) -> bool {
 }
 
 /// True while a non-main greenlet is current on this thread — the eval
-/// loop's `stacker::maybe_grow` gate (see module docs).
-pub(crate) fn on_greenlet_stack() -> bool {
+/// loop's `stacker::maybe_grow` gate (see module docs). Also consulted
+/// by the C-API's stack-headroom probes (RFC 0069 WS5 follow-up):
+/// `stacker::remaining_stack` measures against the *OS thread's* stack
+/// bounds, which are meaningless while running on a greenlet's own
+/// mmap'd stack, so those probes must fall back to their counted
+/// budgets here.
+pub fn on_greenlet_stack() -> bool {
     let main = MAIN_ID.with(|m| m.get());
     main != 0 && CURRENT.with(|c| c.get()) != main
 }

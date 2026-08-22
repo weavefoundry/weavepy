@@ -3415,7 +3415,9 @@ fn general_name_pair(gn: &x509_parser::extensions::GeneralName<'_>) -> Option<(S
                     // ('0:0:0:0:0:0:0:1', not '::1') — test_parse_all_sans /
                     // CVE_2013_4238 compare exact strings.
                     let groups: Vec<String> = b
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .map(|c| format!("{:X}", (u16::from(c[0]) << 8) | u16::from(c[1])))
                         .collect();
                     groups.join(":")

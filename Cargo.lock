@@ -2717,6 +2717,7 @@ dependencies = [
  "libloading",
  "num-bigint",
  "num-traits",
+ "stacker",
  "tempfile",
  "thiserror 2.0.18",
  "weavepy",

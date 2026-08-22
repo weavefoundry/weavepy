@@ -57,9 +57,15 @@ pub extern "C" fn _PyObject_GetDictPtr(_obj: *mut PyObject) -> *mut *mut PyObjec
 // ---------------------------------------------------------------------------
 
 /// Shared tail for the `*Optional*` probes: a present value is handed back
-/// (1), a missing one clears the error and reports absence (0). Any failure
-/// is treated as "missing", matching `crate::wave4::PyObject_GetOptionalAttr`.
-unsafe fn optional_result(v: *mut PyObject, result: *mut *mut PyObject) -> c_int {
+/// (1); on failure only the probe's designated "absent" exception
+/// (`AttributeError` / `KeyError`) is suppressed and reported as 0 — any
+/// other pending exception propagates as -1 with the error left pending
+/// (RFC 0069 WS5; see `errors::optional_probe_failure`).
+unsafe fn optional_result(
+    v: *mut PyObject,
+    result: *mut *mut PyObject,
+    suppressed: &weavepy_vm::sync::Rc<weavepy_vm::types::TypeObject>,
+) -> c_int {
     if !v.is_null() {
         if !result.is_null() {
             unsafe { *result = v };
@@ -68,11 +74,10 @@ unsafe fn optional_result(v: *mut PyObject, result: *mut *mut PyObject) -> c_int
         }
         return 1;
     }
-    crate::errors::clear_thread_local();
     if !result.is_null() {
         unsafe { *result = ptr::null_mut() };
     }
-    0
+    crate::errors::optional_probe_failure(suppressed)
 }
 
 #[no_mangle]
@@ -82,7 +87,13 @@ pub unsafe extern "C" fn PyObject_GetOptionalAttrString(
     result: *mut *mut PyObject,
 ) -> c_int {
     let v = unsafe { crate::abstract_::PyObject_GetAttrString(obj, name) };
-    unsafe { optional_result(v, result) }
+    unsafe {
+        optional_result(
+            v,
+            result,
+            &weavepy_vm::builtin_types::builtin_types().attribute_error,
+        )
+    }
 }
 
 #[no_mangle]
@@ -92,7 +103,13 @@ pub unsafe extern "C" fn PyMapping_GetOptionalItem(
     result: *mut *mut PyObject,
 ) -> c_int {
     let v = unsafe { crate::abstract_::PyObject_GetItem(obj, key) };
-    unsafe { optional_result(v, result) }
+    unsafe {
+        optional_result(
+            v,
+            result,
+            &weavepy_vm::builtin_types::builtin_types().key_error,
+        )
+    }
 }
 
 #[no_mangle]
@@ -102,7 +119,13 @@ pub unsafe extern "C" fn PyMapping_GetOptionalItemString(
     result: *mut *mut PyObject,
 ) -> c_int {
     let v = unsafe { crate::abstract_::PyMapping_GetItemString(obj, key) };
-    unsafe { optional_result(v, result) }
+    unsafe {
+        optional_result(
+            v,
+            result,
+            &weavepy_vm::builtin_types::builtin_types().key_error,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------

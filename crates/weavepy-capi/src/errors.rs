@@ -208,6 +208,34 @@ pub fn take_pending() -> Option<PendingError> {
     Some(PendingError { ty, value })
 }
 
+/// Shared failure tail for the C-API `*GetOptional*` probes (CPython 3.13
+/// additions). CPython suppresses (only) the probe's designated "absent"
+/// exception — `AttributeError` for the attribute probes, `KeyError` for
+/// the mapping probes — reporting 0 with the error cleared; any *other*
+/// pending exception propagates as -1 with the error left pending. numpy's
+/// `PyArray_LookupSpecial_OnInstance` relies on exactly this split for its
+/// `__array_*` probes (gh-14735): a warnings-as-errors `UserWarning`
+/// raised inside the probed object's `__getattr__` must abort
+/// `np.asarray`, not be swallowed as a missing attribute
+/// (test_protocols `test_getattr_warning`).
+pub fn optional_probe_failure(suppressed: &Rc<TypeObject>) -> i32 {
+    match take_pending() {
+        None => 0,
+        Some(pe) => {
+            let is_absent = pe
+                .ty
+                .as_ref()
+                .is_some_and(|t| t.mro.borrow().iter().any(|c| Rc::ptr_eq(c, suppressed)));
+            if is_absent {
+                0
+            } else {
+                set_pending(pe.ty, pe.value);
+                -1
+            }
+        }
+    }
+}
+
 /// Take the pending exception out of the cell and convert to a
 /// [`RuntimeError`] suitable for returning from VM-facing trampolines.
 pub fn take_pending_error_runtime() -> Option<RuntimeError> {
@@ -349,6 +377,16 @@ pub fn set_type_error(msg: impl Into<String>) {
     set_pending(
         Some(builtin_types().type_error.clone()),
         Object::from_str(msg),
+    );
+}
+
+/// RFC 0069 WS5 — install a `RecursionError` (the C-API recursion
+/// guard's overflow report, message-compatible with CPython's
+/// `Py_EnterRecursiveCall`).
+pub fn set_recursion_error(msg: impl Into<String>) {
+    set_pending(
+        Some(builtin_types().recursion_error.clone()),
+        Object::from_str(msg.into()),
     );
 }
 

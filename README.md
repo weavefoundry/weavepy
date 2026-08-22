@@ -232,6 +232,33 @@ work.
 > `__del__` on a loop-consumed temporary) waiting for the next cyclic
 > collection — and the sub-interpreter extension-compatibility
 > ImportError being swallowed by the PyInit blanket retype.
+>
+> `RFC 0069` (performance wave 6) attacks the call-shaped remainder
+> and burns the numpy crash census. Tier-2 lands **method-call
+> lanes** (class-version-guarded `recv.method(args)` with a pinned
+> receiver and native method entry), **float completion**
+> (`math.sqrt`/`sin`/`cos`/`fabs` intrinsics with CPython's domain
+> errors, float floor-div/mod, cross-block operand values for
+> ternaries), and tier-1 gains **call-shape inline caches**
+> (exact-positional, defaults, kwnames, bound-method) plus a
+> **zero-allocation generator park/unpark** that holds the frame in
+> the generator box across yields. Committed baseline: suite
+> geomean **3.16× CPython** (3.05× measured on the dev host; from
+> wave 5's 3.33×, 3.60× re-measured pre-wave on the same host), with
+> `spectral_norm` 2.3× faster, `richards` 1.7×, `generators` 1.6×,
+> and `call_overhead` 1.5× — the boxed-object fixtures
+> (`float_math`, `deltablue`) carry to wave 7. The crash burn fixes
+> **seven C-API crash classes** (C-recursion accounting with stack
+> headroom guards, self-referential list crossing, `tp_mro`/
+> `tp_basicsize` publication for VM subclasses of C types, borrowed
+> instance-pointer pinning, foreign `len()` grounding,
+> optional-probe error discipline, container-owned
+> `PySequence_GetItem` references): all 12 previously-crashing
+> `numpy._core` selftest modules now run **zero-crash**, with
+> `test_hashtable` and `test_protocols` passing outright. The sweep
+> stays at **unexpected 0**, catching two real WS4 regressions
+> in-wave (generator frame identity across `await` for pdb, and the
+> send dance's line-event discipline for `sys.settrace`).
 
 ## Repository layout
 
