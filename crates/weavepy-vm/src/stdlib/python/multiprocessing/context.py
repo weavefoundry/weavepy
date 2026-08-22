@@ -268,7 +268,9 @@ class DefaultContext(BaseContext):
         if sys.platform == 'win32':
             return ['spawn']
         else:
-            methods = ['spawn', 'fork'] if sys.platform == 'darwin' else ['fork', 'spawn']
+            # WeavePy: spawn is the default on every POSIX platform (see
+            # the _default_context selection below), so it sorts first.
+            methods = ['spawn', 'fork']
             if reduction.HAVE_SEND_HANDLE:
                 methods.append('forkserver')
             return methods
@@ -326,12 +328,22 @@ if sys.platform != 'win32':
         'spawn': SpawnContext(),
         'forkserver': ForkServerContext(),
     }
-    if sys.platform == 'darwin':
-        # bpo-33725: running arbitrary code after fork() is no longer reliable
-        # on macOS since macOS 10.14 (Mojave). Use spawn by default instead.
-        _default_context = DefaultContext(_concrete_contexts['spawn'])
-    else:
-        _default_context = DefaultContext(_concrete_contexts['fork'])
+    # bpo-33725: running arbitrary code after fork() is no longer reliable
+    # on macOS since macOS 10.14 (Mojave), so CPython defaults macOS to
+    # spawn. WeavePy: default *every* POSIX platform to spawn. The WeavePy
+    # runtime is inherently multi-threaded (JIT/infra threads) and its
+    # locks are parking_lot-backed; parking_lot keeps a process-global
+    # bucket table shared by all locks, and a fork() that lands while any
+    # other thread transiently holds a bucket word-lock leaves the child's
+    # copy of that bucket poisoned — even freshly created locks then hash
+    # into it and wedge or spin (reproduced: manager children hanging in
+    # GilState::acquire under CPU contention on Linux). The after-fork
+    # reinit in os.fork() rebuilds WeavePy's own locks but cannot reach
+    # parking_lot's global table, so fork-with-threads stays unsound;
+    # `fork`/`forkserver` remain available explicitly via get_context()/
+    # set_start_method() exactly as on CPython. (CPython itself is moving
+    # off fork-by-default: gh-84559 changed the Linux default in 3.14.)
+    _default_context = DefaultContext(_concrete_contexts['spawn'])
 
 else:
 
