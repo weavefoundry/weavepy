@@ -169,9 +169,15 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // same marshal buffer as call arguments, so a call-free
         // function that builds lists still needs the base loaded.
         let stages_elements = self.tfunc.blocks.iter().any(|tb| {
-            tb.stmts
-                .iter()
-                .any(|s| matches!(s.op, TOp::BuildList { none_fill: false, .. }))
+            tb.stmts.iter().any(|s| {
+                matches!(
+                    s.op,
+                    TOp::BuildList {
+                        none_fill: false,
+                        ..
+                    }
+                )
+            })
         });
         if !self.tfunc.callee_spans.is_empty()
             || !self.tfunc.method_sites.is_empty()
@@ -406,10 +412,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let is_got = self.b.ins().icmp_imm(IntCC::Equal, status, 0);
                 self.b.ins().brif(is_got, got_b, &[], rest_b, &[]);
                 self.b.switch_to_block(got_b);
-                let res = self
-                    .b
-                    .ins()
-                    .load(Self::cl_ty(elem), trusted, self.frame_ptr, OFF_RET_BITS);
+                let res =
+                    self.b
+                        .ins()
+                        .load(Self::cl_ty(elem), trusted, self.frame_ptr, OFF_RET_BITS);
                 self.b.def_var(loop_var, res);
                 let next = self.b.ins().iadd_imm(idx, 1);
                 self.b.def_var(idx_var, next);
@@ -463,10 +469,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let is_got = self.b.ins().icmp_imm(IntCC::Equal, status, 0);
                 self.b.ins().brif(is_got, got_b, &[], rest_b, &[]);
                 self.b.switch_to_block(got_b);
-                let res = self
-                    .b
-                    .ins()
-                    .load(Self::cl_ty(elem), trusted, self.frame_ptr, OFF_RET_BITS);
+                let res =
+                    self.b
+                        .ins()
+                        .load(Self::cl_ty(elem), trusted, self.frame_ptr, OFF_RET_BITS);
                 self.b.def_var(loop_var, res);
                 let bb = self.cl_blocks[body];
                 self.b.ins().jump(bb, &[]);
@@ -481,10 +487,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let is_lane = self.b.ins().icmp_imm(IntCC::Equal, status, 3);
                 self.b.ins().brif(is_lane, lane_b, &[], hdr_b, &[]);
                 self.b.switch_to_block(lane_b);
-                let elem_pin =
-                    self.b
-                        .ins()
-                        .load(types::I64, trusted, self.frame_ptr, OFF_RET_BITS);
+                let elem_pin = self
+                    .b
+                    .ins()
+                    .load(types::I64, trusted, self.frame_ptr, OFF_RET_BITS);
                 self.emit_exit(store_pc, &[(elem_pin, JitType::Obj)], JitStatus::Deopt);
                 self.b.switch_to_block(hdr_b);
                 let raise_b = self.b.create_block();

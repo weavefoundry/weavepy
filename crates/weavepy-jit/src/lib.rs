@@ -45,9 +45,9 @@ pub use runtime::{
     register_list_next_helper, register_math_helpers, register_poll_helper, register_str_helpers,
     AttrGetHelper, AttrSetHelper, BuildListHelper, BytesGetHelper, CallMethodHelper, CallPyHelper,
     CallStatus, GetIterHelper, IterNextHelper, JitFrame, JitStatus, ListAppendHelper,
-    ListGetHelper, ListLenHelper, ListNextHelper, ListRepeatHelper, ListSetHelper,
-    ListSliceHelper, MathBinaryHelper, MathUnaryHelper, PollHelper, SlotTag, StrEqHelper,
-    StrLenHelper, JIT_POLL_STRIDE,
+    ListGetHelper, ListLenHelper, ListNextHelper, ListRepeatHelper, ListSetHelper, ListSliceHelper,
+    MathBinaryHelper, MathUnaryHelper, PollHelper, SlotTag, StrEqHelper, StrLenHelper,
+    JIT_POLL_STRIDE,
 };
 pub use value::JitType;
 

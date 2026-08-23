@@ -452,8 +452,7 @@ pub type BuildListHelper =
 /// repeated list (element `Arc`s shared, CPython's aliasing), pin it
 /// on the same lane, and return the pin index — or a negative value
 /// to deopt. Never runs Python code.
-pub type ListRepeatHelper =
-    unsafe extern "C" fn(frame: *mut JitFrame, pin: i64, count: i64) -> i64;
+pub type ListRepeatHelper = unsafe extern "C" fn(frame: *mut JitFrame, pin: i64, count: i64) -> i64;
 
 /// RFC 0071 WS4 — the embedder's list *slice* helper (`xs[a:b]`,
 /// unit step): bounds are pre-clamped CPython-style; `i64::MIN`

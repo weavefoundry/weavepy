@@ -560,8 +560,7 @@ impl JitState {
             let mut method_tokens: HashMap<(u32, Vec<String>, String), u32> = HashMap::new();
             let mut probe_method =
                 |slot: u32, path: &[String], name: &str| -> Option<MethodResolution> {
-                    if let Some(&token) =
-                        method_tokens.get(&(slot, path.to_vec(), name.to_owned()))
+                    if let Some(&token) = method_tokens.get(&(slot, path.to_vec(), name.to_owned()))
                     {
                         let e = &methods[token as usize];
                         return Some(MethodResolution {
@@ -989,10 +988,7 @@ struct ClassCtorEntry {
 /// The same probe re-runs as the guard predicate (memoised via
 /// [`TypeObject::instance_plan`]'s `attr_version` key, so revalidation
 /// is a version check in the common case).
-fn probe_class_ctor(
-    interp: &super::Interpreter,
-    cls: &Rc<TypeObject>,
-) -> Option<ClassCtorEntry> {
+fn probe_class_ctor(interp: &super::Interpreter, cls: &Rc<TypeObject>) -> Option<ClassCtorEntry> {
     let bt = crate::builtin_types::builtin_types();
     // `type` subclasses (metaclasses) construct *classes* through the
     // three-argument form, never plain instances.
@@ -1020,8 +1016,7 @@ fn probe_class_ctor(
         return None;
     }
     let arg_count = icode.arg_count - 1;
-    let min_args =
-        arg_count.saturating_sub(u32::try_from(init.defaults.len()).unwrap_or(u32::MAX));
+    let min_args = arg_count.saturating_sub(u32::try_from(init.defaults.len()).unwrap_or(u32::MAX));
     Some(ClassCtorEntry {
         init_code: icode,
         arg_count,
@@ -1398,10 +1393,7 @@ fn entry_local_ok(obj: &Object, ty: JitType) -> bool {
         (None, _)
             | (Some(Object::Int(_)), JitType::Int)
             | (Some(Object::Float(_)), JitType::Float)
-            | (
-                Some(Object::Instance(_) | Object::None),
-                JitType::Obj
-            )
+            | (Some(Object::Instance(_) | Object::None), JitType::Obj)
     )
 }
 
@@ -3434,7 +3426,12 @@ unsafe extern "C" fn wpjit_list_repeat(frame: *mut JitFrame, pin: i64, count: i6
 /// # Safety
 ///
 /// Same contract as [`wpjit_call_py`].
-unsafe extern "C" fn wpjit_list_slice(frame: *mut JitFrame, pin: i64, start: i64, stop: i64) -> i64 {
+unsafe extern "C" fn wpjit_list_slice(
+    frame: *mut JitFrame,
+    pin: i64,
+    start: i64,
+    stop: i64,
+) -> i64 {
     // SAFETY: see wpjit_call_py — same live-buffer contract.
     let jf = unsafe { &mut *frame };
     #[allow(clippy::cast_ptr_alignment)]

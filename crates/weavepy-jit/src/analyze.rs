@@ -3327,7 +3327,14 @@ fn emit_instr(
             // the pin lands in the seq slot; the idx slot is unused.
             if local_types.get(seq_slot as usize).copied().flatten() == Some(JitType::Obj) {
                 stack.pop().ok_or(JitVerdict::StackUnderflow)?;
-                push(TOp::IterCapture { iter_slot: seq_slot }, None, stack, stmts);
+                push(
+                    TOp::IterCapture {
+                        iter_slot: seq_slot,
+                    },
+                    None,
+                    stack,
+                    stmts,
+                );
                 return Ok(());
             }
             stack.pop().ok_or(JitVerdict::StackUnderflow)?;

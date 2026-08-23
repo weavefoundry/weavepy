@@ -46849,7 +46849,10 @@ mod tests {
                    while k < 10:\n    r = spin(p, 100)\n    k = k + 1\n\
                    print(r)\n";
         let (out, calls, _fallbacks, deopts) = run_jit_native(src);
-        assert!(calls >= 1, "object argument never took the native call path");
+        assert!(
+            calls >= 1,
+            "object argument never took the native call path"
+        );
         assert_eq!(deopts, 0, "clean object passing should not deopt");
         assert_eq!(out, "700\n");
         assert_eq!(out, run(src));
