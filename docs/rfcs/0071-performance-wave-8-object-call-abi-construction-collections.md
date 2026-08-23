@@ -465,7 +465,9 @@ surface is a regression guard rather than a migration.
 
 Per the "measured, not aspirational" rule, this records the as-landed
 state: all six workstreams shipped, the committed baseline moved from
-geomean **3.107× → 2.928×**, every correctness gate is green, and
+geomean **3.107× → 2.957×** (2.928× as host-measured, before two
+envelope rows kept their looser wave-7 ratios — see the table note),
+every correctness gate is green, and
 several of the red-tail per-fixture speed gates were **not met** — the
 misses are enumerated below with their measured causes, and the
 blocking shapes are named as deferred work rather than silently
@@ -512,19 +514,27 @@ lower is better):
 
 | Fixture | Wave 7 | Wave 8 | Δ | Gate | Met |
 |---|---|---|---|---|---|
-| geomean | 3.107 | 2.928 | 1.06× | improve | ✓ |
+| geomean | 3.107 | 2.957 | 1.05× | improve | ✓ |
 | attr_access | 8.44 | 4.58 | 1.84× | ≥ 1.1× | ✓ |
 | spectral_norm | 4.01 | 2.72 | 1.48× | — | ✓ |
 | startup | 3.04 | 2.28 | 1.33× | — | ✓ |
-| fib | 2.26 | 1.97 | 1.15× | — | ✓ |
+| fib | 2.26 | 2.26 † | 1.15× (host) | — | ✓ |
 | pidigits | 1.01 | 0.89 | 1.13× | — | ✓ (now beats CPython) |
-| deltablue | 22.35 | 20.83 | 1.07× | ≥ 1.3× | ✗ |
+| deltablue | 22.35 | 22.35 † | 1.07× (host) | ≥ 1.3× | ✗ |
 | float_math | 12.75 | 12.44 | 1.02× | ≥ 2.0× | ✗ |
 | pyaes | 12.37 | 12.15 | 1.02× | ≥ 1.2× | ✗ |
 | list_ops | 12.86 | 13.13 | 0.98× | ≥ 1.4× | ✗ |
 | richards | 11.35 | 11.67 | 0.97× | ≥ 1.5× | ✗ |
 | generators | 9.70 | 10.06 | 0.96× | ≥ 1.4× | ✗ |
 | loop kernels | ≤ 0.053 | ≤ 0.056 | — | ≤ 0.06 | ✓ |
+
+† The committed *envelope* keeps its wave-7 value per the bench
+README's cross-machine skew rule: the dev host measured fib 1.97 and
+deltablue 20.83, but CI's shared runners report up to ~25% above a
+quiet host (the macOS runner measured fib at 2.62), so adopting the
+tighter host ratio on rows this wave didn't genuinely move converts
+skew into gate flakes. The Δ column reports the host measurement; the
+Wave 8 column reports the committed gate.
 
 Two caveats on the table. First, the attr_access/spectral_norm/startup
 wins are larger than this wave alone plausibly explains — the wave-7
