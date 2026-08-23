@@ -31,20 +31,23 @@ mod value;
 
 pub use analyze::{
     analyze, analyze_frame, analyze_with_probe, analyze_with_probes, returns_none_syntactically,
-    JitVerdict, MethodResolution, Probes,
+    JitVerdict, MethodResolution, PathArena, Probes,
 };
 pub use engine::{CompiledFrame, JitEngine};
 pub use ir::{
-    ArithKind, AttrSiteMeta, BlockId, CalleeSpanMeta, CmpKind, GlobalGuard, MathFunc,
-    MathGuardMeta, MethodRet, MethodSiteMeta, MethodSpanMeta, OsrEntry, RangeLoopMeta,
-    ResolvedGlobal, TBlock, TFunc, TOp, TStmt, TTerm,
+    ArithKind, AttrSiteMeta, BlockId, CalleeSpanMeta, CmpKind, GlobalGuard, IterLoopMeta,
+    ListLoopMeta, MathFunc, MathGuardMeta, MethodRet, MethodSiteMeta, MethodSpanMeta, OsrEntry,
+    RangeLoopMeta, ResolvedGlobal, TBlock, TFunc, TOp, TStmt, TTerm,
 };
 pub use runtime::{
     register_attr_helpers, register_call_method_helper, register_call_py_helper,
-    register_list_extra_helpers, register_list_helpers, register_math_helpers,
-    register_poll_helper, AttrGetHelper, AttrSetHelper, CallMethodHelper, CallPyHelper, CallStatus,
-    JitFrame, JitStatus, ListAppendHelper, ListGetHelper, ListLenHelper, ListSetHelper,
-    MathBinaryHelper, MathUnaryHelper, PollHelper, SlotTag, JIT_POLL_STRIDE,
+    register_iter_helpers, register_list_extra_helpers, register_list_helpers,
+    register_list_next_helper, register_math_helpers, register_poll_helper, register_str_helpers,
+    AttrGetHelper, AttrSetHelper, BuildListHelper, BytesGetHelper, CallMethodHelper, CallPyHelper,
+    CallStatus, GetIterHelper, IterNextHelper, JitFrame, JitStatus, ListAppendHelper,
+    ListGetHelper, ListLenHelper, ListNextHelper, ListRepeatHelper, ListSetHelper, ListSliceHelper,
+    MathBinaryHelper, MathUnaryHelper, PollHelper, SlotTag, StrEqHelper, StrLenHelper,
+    JIT_POLL_STRIDE,
 };
 pub use value::JitType;
 

@@ -18,8 +18,34 @@ interpreters plus the WeavePy/CPython **ratio** per fixture, the
 suite geometric mean, and the platform it was measured on. `gate`
 compares ratios — host-independent, unlike absolute nanoseconds —
 and fails on regressions beyond a threshold, like the regrtest and
-ecosystem lanes' `--check`. CI runs `gate --pct=25` on ubuntu +
-macos (the `bench` job).
+ecosystem lanes' `--check`.
+
+## The A/B gate (what CI blocks PRs on)
+
+On pull requests CI does **not** gate against the committed baseline.
+It builds the PR's *merge-base* commit in a worktree and passes it as
+`gate --base-weavepy=PATH`: every fixture is timed under both
+binaries **interleaved on the same runner** (PR, base, CPython, PR,
+base, …), and the blocking verdict is the per-fixture and
+suite-geomean **PR/base ratio** at `--pct=15`. Machine skew — the
+difference between a quiet dev host and a loud shared runner, which
+is ~25% on interpreter-bound fixtures and used to consume the entire
+baseline envelope — cancels exactly in that ratio, and the
+interleaving cancels within-job drift (thermal ramp, noisy
+neighbors). The result is a gate that is simultaneously less flaky
+and more sensitive than the baseline comparison it replaces, and it
+works on platforms with no committed baseline at all.
+
+In A/B mode the committed baseline demotes to an **advisory**
+per-fixture table plus one still-blocking check: the suite geomean
+against the baseline at `--baseline-pct=25`. That ratchet is what
+stops a long sequence of small, individually-under-threshold
+regressions from compounding silently across PRs — refresh the
+baseline (below) to re-arm it after intentional perf changes.
+
+On pushes to main there is no merge-base to compare against, so the
+gate falls back to the committed-baseline comparison at `--pct=25`
+(advisory on platforms without a committed baseline).
 
 Two per-platform guardrails:
 
@@ -54,6 +80,11 @@ cargo xbench gate --pct=25
 # Advisory mode: exit 0 with a note when the host platform has no
 # committed baseline (a present-but-foreign baseline still fails).
 cargo xbench gate --allow-missing-baseline
+
+# A/B mode (what CI runs on PRs): gate on the PR/base ratio measured
+# interleaved on this machine; the committed baseline demotes to an
+# advisory table + a blocking suite-geomean drift ratchet.
+cargo xbench gate --base-weavepy=/path/to/merge-base/weavepy --pct=15
 
 # Refresh the host platform's baseline JSON tracked at
 # `baselines/bench-{os}-{arch}.json`.

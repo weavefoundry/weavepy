@@ -102,12 +102,17 @@ fn shadowed_range_stays_interpreted() {
 
 #[test]
 fn non_range_iterable_stays_interpreted() {
+    // RFC 0071 WS4 — with no list- or param-probe evidence the
+    // analyzer asks for the seeded retry (`TypeUnknown`) instead of
+    // rejecting outright: a list or identity-iterable argument would
+    // take the `ForList`/`ForIter` path there. Without evidence the
+    // frame still stays interpreted.
     let err = analyze_fn(
         "def k(xs):\n    s = 0\n    for x in xs:\n        s = s + x\n    return s\n",
         &mut range_only,
     )
     .unwrap_err();
-    assert!(matches!(err, JitVerdict::UnsupportedOpcode(_)), "{err:?}");
+    assert!(matches!(err, JitVerdict::TypeUnknown), "{err:?}");
 }
 
 #[test]

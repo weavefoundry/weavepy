@@ -131,13 +131,29 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-    # RFC 0058 — the benchmark lane. Gates on WeavePy/CPython *ratios*
-    # against the per-platform baselines/bench-{os}-{arch}.json (RFC
-    # 0062 WS3; host-independent, unlike absolute times); the 25%
-    # threshold absorbs shared-runner noise. The markdown report lands
-    # in the job summary so every PR shows its ratio table.
+    # RFC 0058 — the benchmark lane.
+    #
+    # On PRs the blocking verdict is an *A/B comparison*: the
+    # merge-base binary is built in a worktree and timed interleaved
+    # with the PR binary on the same runner, gated on the PR/base
+    # ratio at 15%. Machine skew cancels in that ratio, which is what
+    # the old baseline gate spent its whole 25% envelope absorbing —
+    # so this is both less flaky *and* more sensitive. The committed
+    # per-platform baseline demotes to an advisory table plus a
+    # blocking suite-geomean drift ratchet at 25% (many small
+    # under-threshold regressions can't compound silently). A/B needs
+    # no committed baseline, so Linux/Windows get a real blocking
+    # gate too.
+    #
+    # On pushes (no merge-base to compare against) the gate falls
+    # back to the committed-baseline comparison, advisory where no
+    # baseline exists (RFC 0062 for linux, RFC 0063 for windows).
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The A/B gate builds the merge-base commit; a shallow
+          # clone can't resolve it.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
@@ -147,18 +163,34 @@ jobs:
         # weavepy-pylib: python313.dll, the runtime the Windows shim
         # exe loads (RFC 0064 WS1).
         run: cargo build --release -p weavepy-cli -p weavepy-pylib -p weavepy-bench
-      - name: Run bench gate
-        # Linux and Windows have no committed per-platform baseline
-        # yet, so the gate is advisory there (--allow-missing-baseline
-        # prints a note and exits 0). Each leg graduates to strict once
-        # its measured bench-{os}-x86_64.json is committed — drop the
-        # flag for that OS then (RFC 0062 for linux, RFC 0063 for
-        # windows). macOS gates strictly against bench-macos-aarch64.json.
+      - name: Build merge-base weavepy (A/B reference)
+        if: github.event_name == 'pull_request'
+        # A separate worktree + target dir so the two builds never
+        # thrash each other's incremental state; the shared
+        # rust-cache still primes dependency compilation, and the
+        # merge-base is usually a recent main commit CI has built
+        # before, so this step is mostly cache hits.
         shell: bash
         run: |
-          target/release/weavepy-bench gate --pct=25 \
+          BASE_SHA=$(git merge-base "${{ github.event.pull_request.base.sha }}" HEAD)
+          echo "merge-base: $BASE_SHA"
+          git worktree add ../weavepy-base "$BASE_SHA"
+          cargo build --release -p weavepy-cli -p weavepy-pylib \
+            --manifest-path ../weavepy-base/Cargo.toml \
+            --target-dir ../weavepy-base/target
+          BIN="$PWD/../weavepy-base/target/release/weavepy"
+          [ -f "$BIN.exe" ] && BIN="$BIN.exe"
+          echo "BASE_WEAVEPY=$BIN" >> "$GITHUB_ENV"
+      - name: Run bench gate
+        shell: bash
+        run: |
+          if [ -n "${BASE_WEAVEPY:-}" ]; then
+            FLAGS="--base-weavepy=$BASE_WEAVEPY --pct=15 --baseline-pct=25"
+          else
+            FLAGS="--pct=25 ${{ (matrix.os == 'ubuntu-latest' || matrix.os == 'windows-latest') && '--allow-missing-baseline' || '' }}"
+          fi
+          target/release/weavepy-bench gate $FLAGS \
             --weavepy=target/release/weavepy \
-            ${{ (matrix.os == 'ubuntu-latest' || matrix.os == 'windows-latest') && '--allow-missing-baseline' || '' }} \
             | tee bench-report.md
       - name: Append bench report to job summary
         if: always()

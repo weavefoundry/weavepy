@@ -60,6 +60,18 @@ pub struct Row {
     /// re-recorded them, so old files simply lack this field.)
     #[serde(default)]
     pub interp: Option<RunSet>,
+    /// The merge-base binary's timings, when `gate --base-weavepy`
+    /// ran an A/B comparison (never persisted into baselines — the
+    /// base binary is meaningful only within the run that measured
+    /// it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<RunSet>,
+    /// `weavepy.median_ns / base.median_ns` — the A/B gate's subject.
+    /// Both legs run interleaved on the same machine in the same
+    /// process tree, so machine skew cancels exactly; 1.0 = parity
+    /// with the merge-base binary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_ratio: Option<f64>,
     /// `weavepy.median_ns / cpython.median_ns`.
     #[serde(default)]
     pub ratio: Option<f64>,
@@ -94,9 +106,23 @@ impl Row {
             weavepy,
             cpython,
             interp,
+            base: None,
+            base_ratio: None,
             ratio,
             memory_ratio,
         }
+    }
+
+    /// Attach a merge-base leg (A/B gate mode) and compute
+    /// [`Self::base_ratio`].
+    #[must_use]
+    pub fn with_base(mut self, base: Option<RunSet>) -> Self {
+        self.base_ratio = base
+            .as_ref()
+            .filter(|b| b.median_ns > 0.0 && self.weavepy.median_ns > 0.0)
+            .map(|b| self.weavepy.median_ns / b.median_ns);
+        self.base = base;
+        self
     }
 }
 
@@ -176,6 +202,7 @@ impl Report {
     pub fn to_markdown(&self) -> String {
         use std::fmt::Write;
         let has_interp = self.rows.iter().any(|r| r.interp.is_some());
+        let has_base = self.rows.iter().any(|r| r.base.is_some());
         let mut out = String::new();
         let _ = writeln!(
             out,
@@ -189,18 +216,23 @@ impl Report {
         } else {
             ("", "")
         };
+        let (base_head, base_bars) = if has_base {
+            (" merge-base | ×base (PR/base) |", "---|---|")
+        } else {
+            ("", "")
+        };
         if has_interp {
             let _ = writeln!(
                 out,
-                "| fixture | work | WeavePy | WeavePy (interp) | CPython | ×CPython (lower is better) |{rss_head}"
+                "| fixture | work | WeavePy |{base_head} WeavePy (interp) | CPython | ×CPython (lower is better) |{rss_head}"
             );
-            let _ = writeln!(out, "|---|---|---|---|---|---|{rss_bars}");
+            let _ = writeln!(out, "|---|---|---|{base_bars}---|---|---|{rss_bars}");
         } else {
             let _ = writeln!(
                 out,
-                "| fixture | work | WeavePy | CPython | ×CPython (lower is better) |{rss_head}"
+                "| fixture | work | WeavePy |{base_head} CPython | ×CPython (lower is better) |{rss_head}"
             );
-            let _ = writeln!(out, "|---|---|---|---|---|{rss_bars}");
+            let _ = writeln!(out, "|---|---|---|{base_bars}---|---|{rss_bars}");
         }
         for r in &self.rows {
             let wp = format_ns(r.weavepy.median_ns);
@@ -211,6 +243,19 @@ impl Report {
             let ratio = match r.ratio {
                 Some(x) => format!("{x:.2}×"),
                 None => "-".to_owned(),
+            };
+            let base_cells = if has_base {
+                let b = match &r.base {
+                    Some(b) => format_ns(b.median_ns),
+                    None => "-".to_owned(),
+                };
+                let br = match r.base_ratio {
+                    Some(x) => format!("{x:.3}×"),
+                    None => "-".to_owned(),
+                };
+                format!(" {b} | {br} |")
+            } else {
+                String::new()
             };
             let rss_cells = if has_rss {
                 let rss = match r.weavepy.max_rss_bytes {
@@ -232,13 +277,13 @@ impl Report {
                 };
                 let _ = writeln!(
                     out,
-                    "| {} | {} | {} | {} | {} | {} |{rss_cells}",
+                    "| {} | {} | {} |{base_cells} {} | {} | {} |{rss_cells}",
                     r.name, r.work, wp, interp, cp, ratio
                 );
             } else {
                 let _ = writeln!(
                     out,
-                    "| {} | {} | {} | {} | {} |{rss_cells}",
+                    "| {} | {} | {} |{base_cells} {} | {} |{rss_cells}",
                     r.name, r.work, wp, cp, ratio
                 );
             }
@@ -247,7 +292,64 @@ impl Report {
             let _ = writeln!(out);
             let _ = writeln!(out, "Geometric mean: **{g:.2}× CPython**");
         }
+        if let Some(g) = self.base_geomean() {
+            let _ = writeln!(out);
+            let _ = writeln!(out, "Geometric mean vs merge-base: **{g:.3}×** (PR/base)");
+        }
         out
+    }
+
+    /// Geometric mean of the per-fixture PR/merge-base ratios (A/B
+    /// gate mode); `None` when no row carries a base leg.
+    pub fn base_geomean(&self) -> Option<f64> {
+        let ratios: Vec<f64> = self.rows.iter().filter_map(|r| r.base_ratio).collect();
+        (!ratios.is_empty()).then(|| stats::geometric_mean(&ratios))
+    }
+
+    /// The A/B gate (RFC 0058 addendum): compare the PR binary
+    /// against the merge-base binary measured interleaved on the
+    /// same machine, and return one regression string per problem.
+    /// Machine skew cancels in the PR/base ratio, so the threshold
+    /// can sit well below the cross-machine baseline envelope. The
+    /// suite geomean of PR/base ratios is gated with the same
+    /// threshold — it catches broad regressions that stay under the
+    /// per-fixture bar.
+    pub fn ab_regressions(&self, pct_threshold: f64) -> Vec<String> {
+        let factor = 1.0 + pct_threshold / 100.0;
+        let mut out = Vec::new();
+        for r in &self.rows {
+            if let Some(br) = r.base_ratio {
+                if br > factor {
+                    out.push(format!(
+                        "{}: {:.3}× vs merge-base ({:+.1}%)",
+                        r.name,
+                        br,
+                        100.0 * (br - 1.0),
+                    ));
+                }
+            }
+        }
+        if let Some(g) = self.base_geomean() {
+            if g > factor {
+                out.push(format!(
+                    "geomean: {:.3}× vs merge-base ({:+.1}%)",
+                    g,
+                    100.0 * (g - 1.0),
+                ));
+            }
+        }
+        out
+    }
+
+    /// Names of fixtures whose row fails the A/B per-row test — what
+    /// the gate's noise-rejection retry re-measures in A/B mode.
+    pub fn ab_regressed_fixture_names(&self, pct_threshold: f64) -> Vec<String> {
+        let factor = 1.0 + pct_threshold / 100.0;
+        self.rows
+            .iter()
+            .filter(|r| r.base_ratio.is_some_and(|br| br > factor))
+            .map(|r| r.name.clone())
+            .collect()
     }
 
     /// Compare against a baseline [`Report`] and return one
@@ -453,6 +555,65 @@ mod tests {
         baseline.platform = None;
         let err = baseline.check_platform("linux-x86_64").unwrap_err();
         assert!(err.contains("no recorded platform"), "{err}");
+    }
+
+    fn ab_row(name: &str, pr_ns: f64, base_ns: f64) -> Row {
+        row(name, pr_ns, Some(100.0)).with_base(Some(runset(base_ns)))
+    }
+
+    #[test]
+    fn ab_gate_flags_relative_regression_only() {
+        // 5% slower than merge-base: passes a 15% gate.
+        let ok = Report::new(vec![ab_row("a", 105.0, 100.0)]);
+        assert!(ok.ab_regressions(15.0).is_empty());
+        // 30% slower: per-fixture and geomean both fire.
+        let bad = Report::new(vec![ab_row("a", 130.0, 100.0)]);
+        let regs = bad.ab_regressions(15.0);
+        assert_eq!(regs.len(), 2, "{regs:?}");
+        assert!(regs[0].contains("a:"), "{regs:?}");
+        assert!(regs[1].contains("geomean"), "{regs:?}");
+    }
+
+    #[test]
+    fn ab_geomean_catches_broad_under_threshold_regression() {
+        // Every fixture 12% slower — each under a 15% per-fixture
+        // bar, but the suite geomean (also 1.12×) fires at 10%.
+        let rows: Vec<Row> = (0..5)
+            .map(|i| ab_row(&format!("f{i}"), 112.0, 100.0))
+            .collect();
+        let report = Report::new(rows);
+        let regs = report.ab_regressions(10.0);
+        assert!(
+            regs.iter().any(|r| r.contains("geomean")),
+            "geomean should fire: {regs:?}"
+        );
+    }
+
+    #[test]
+    fn ab_row_without_base_leg_is_skipped() {
+        // A fixture the merge-base binary couldn't run carries no
+        // base leg — it must not fail the A/B gate.
+        let report = Report::new(vec![
+            ab_row("old", 100.0, 100.0),
+            row("brand_new", 100.0, Some(100.0)), // no base leg
+        ]);
+        assert!(report.ab_regressions(15.0).is_empty());
+        assert_eq!(report.ab_regressed_fixture_names(15.0).len(), 0);
+    }
+
+    #[test]
+    fn base_fields_absent_from_non_ab_serialization() {
+        // `--update-baseline` serializes rows from `run_suite`, which
+        // never attaches a base leg — the committed baseline schema
+        // must stay byte-identical to pre-A/B files. And old baseline
+        // files (no base fields at all) must keep deserializing.
+        let report = Report::new(vec![row("a", 100.0, Some(100.0))]);
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains("\"base\""), "{json}");
+        assert!(!json.contains("base_ratio"), "{json}");
+        let back: Report = serde_json::from_str(&json).unwrap();
+        assert!(back.rows[0].base.is_none());
+        assert!(back.rows[0].base_ratio.is_none());
     }
 
     #[test]

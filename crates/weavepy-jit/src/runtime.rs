@@ -317,6 +317,199 @@ pub(crate) fn list_append_helper_addr() -> usize {
     LIST_APPEND_HELPER.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// RFC 0071 WS4 — the embedder's list-loop *step* helper, called by
+/// the [`crate::ir::TTerm::ForList`] terminator each iteration with
+/// the pinned list and the current index. Re-checks the index against
+/// the live length and re-validates the element lane. Returns:
+///
+/// - `0` — an element was yielded; its lane-typed bits are in
+///   [`JitFrame::ret_bits`] (an object element was pinned; `None`
+///   rides as `-1`);
+/// - `1` — the list is exhausted (index ≥ live length);
+/// - any other value — deopt at the header pc (element-shape
+///   surprise, pin miss, or pin-cap pressure).
+///
+/// Never runs Python code; same safety contract as [`ListGetHelper`].
+pub type ListNextHelper = unsafe extern "C" fn(frame: *mut JitFrame, pin: i64, idx: i64) -> i64;
+
+static LIST_NEXT_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide list-loop step helper (RFC 0071 WS4).
+/// Must precede the first compile of a frame containing a `ForList`
+/// terminator.
+pub fn register_list_next_helper(next: ListNextHelper) {
+    LIST_NEXT_HELPER.store(next as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn list_next_helper_addr() -> usize {
+    LIST_NEXT_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// RFC 0071 WS6 — the embedder's pinned-`str` equality helper. Both
+/// operands are pin-table indices; identical pins and pointer-equal
+/// payloads answer before any content compare. Returns `0` (unequal),
+/// `1` (equal), or any other value to deopt (pin miss — defensive).
+/// Never runs Python code; same safety contract as [`ListGetHelper`].
+pub type StrEqHelper = unsafe extern "C" fn(frame: *mut JitFrame, a: i64, b: i64) -> i64;
+
+/// RFC 0071 WS6 — the embedder's pinned-`str`/`bytes` *length* helper
+/// (`str` answers the character count, `bytes` the byte count).
+/// Returns the length (always `>= 0`) or a negative value to deopt
+/// (pin miss). Same safety contract as [`ListGetHelper`].
+pub type StrLenHelper = unsafe extern "C" fn(frame: *mut JitFrame, pin: i64) -> i64;
+
+/// RFC 0071 WS6 — the embedder's pinned-`bytes` subscript helper.
+/// Returns `0` with the byte value in [`JitFrame::ret_bits`], or
+/// non-zero to deopt (out of range, pin miss); negative indices are
+/// normalized against the length first. Same safety contract as
+/// [`ListGetHelper`].
+pub type BytesGetHelper = unsafe extern "C" fn(frame: *mut JitFrame, pin: i64, idx: i64) -> i64;
+
+static STR_EQ_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static STR_LEN_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static BYTES_LEN_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static BYTES_GET_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide string/bytes read helpers (RFC 0071 WS6).
+/// Must precede the first compile of a frame containing `StrEq`,
+/// `StrLen`, `BytesLen`, or `BytesGetItem` ops.
+pub fn register_str_helpers(
+    eq: StrEqHelper,
+    str_len: StrLenHelper,
+    bytes_len: StrLenHelper,
+    bytes_get: BytesGetHelper,
+) {
+    STR_EQ_HELPER.store(eq as usize, std::sync::atomic::Ordering::Release);
+    STR_LEN_HELPER.store(str_len as usize, std::sync::atomic::Ordering::Release);
+    BYTES_LEN_HELPER.store(bytes_len as usize, std::sync::atomic::Ordering::Release);
+    BYTES_GET_HELPER.store(bytes_get as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn str_eq_helper_addr() -> usize {
+    STR_EQ_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
+pub(crate) fn str_len_helper_addr() -> usize {
+    STR_LEN_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
+pub(crate) fn bytes_len_helper_addr() -> usize {
+    BYTES_LEN_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
+pub(crate) fn bytes_get_helper_addr() -> usize {
+    BYTES_GET_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// RFC 0071 WS4 — the embedder's opaque-iterator *capture* helper,
+/// called by [`crate::ir::TOp::IterCapture`] behind an erased
+/// `GET_ITER` whose operand rides the object lane. Admits only
+/// objects where `iter(x) is x` (generators, builtin iterators);
+/// returns `0` (the pin may be stored as the loop's iterator) or
+/// non-zero to deopt (the interpreter executes the `GET_ITER` — and
+/// the loop — generically). Never runs Python code; same safety
+/// contract as [`ListGetHelper`].
+pub type GetIterHelper = unsafe extern "C" fn(frame: *mut JitFrame, pin: i64) -> i64;
+
+/// RFC 0071 WS4 — the embedder's opaque-iterator *step* helper,
+/// called by the [`crate::ir::TTerm::ForIter`] terminator each
+/// iteration with the pinned iterator and the compiled element lane
+/// (a [`SlotTag`] discriminant). **Runs Python code** (the iterator
+/// protocol through the interpreter core — generator bodies,
+/// `__next__`). Returns:
+///
+/// - `0` — an element was yielded in the compiled lane; its bits are
+///   in [`JitFrame::ret_bits`] (an object element was pinned; `None`
+///   rides as `-1`);
+/// - `1` — the iterator is exhausted (the pin stays — it may be
+///   shared with a local slot — and dies with the activation under
+///   RFC 0070's runtime-pin drain);
+/// - `2` — deopt at the header pc, nothing consumed (pin miss);
+/// - `3` — the element was consumed but is outside the compiled
+///   lane: its raw object was pinned (index in `ret_bits`, `None` as
+///   `-1`) and the deopt resumes at the fused store's pc with the
+///   element spilled on top;
+/// - `4` — the iterator raised; the exception is parked for the
+///   ordinary `Raised` exit at the header pc.
+pub type IterNextHelper =
+    unsafe extern "C" fn(frame: *mut JitFrame, pin: i64, elem_tag: i64) -> i64;
+
+/// RFC 0071 WS4 — the embedder's `BUILD_LIST` helper: build a fresh
+/// list from `n` elements staged in the marshal buffer (lane-tagged
+/// per `elem_tag`; `none_fill` passes `n` with an empty buffer), pin
+/// it, and return the pin index — or a negative value to deopt (cap
+/// pressure). Never runs Python code; same safety contract as
+/// [`ListGetHelper`].
+pub type BuildListHelper =
+    unsafe extern "C" fn(frame: *mut JitFrame, n: i64, elem_tag: i64, none_fill: i64) -> i64;
+
+/// RFC 0071 WS4 — the embedder's `list * int` helper: build the
+/// repeated list (element `Arc`s shared, CPython's aliasing), pin it
+/// on the same lane, and return the pin index — or a negative value
+/// to deopt. Never runs Python code.
+pub type ListRepeatHelper = unsafe extern "C" fn(frame: *mut JitFrame, pin: i64, count: i64) -> i64;
+
+/// RFC 0071 WS4 — the embedder's list *slice* helper (`xs[a:b]`,
+/// unit step): bounds are pre-clamped CPython-style; `i64::MIN`
+/// marks an absent bound. Returns the fresh pin index or a negative
+/// value to deopt. Never runs Python code.
+pub type ListSliceHelper =
+    unsafe extern "C" fn(frame: *mut JitFrame, pin: i64, start: i64, stop: i64) -> i64;
+
+static GET_ITER_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ITER_NEXT_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static BUILD_LIST_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static LIST_REPEAT_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static LIST_SLICE_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide opaque-iterator and list-construction
+/// helpers (RFC 0071 WS4). Must precede the first compile of a frame
+/// containing `ForIter`, `IterCapture`, `BuildList`, `ListRepeat`, or
+/// `ListSlice`.
+pub fn register_iter_helpers(
+    get_iter: GetIterHelper,
+    next: IterNextHelper,
+    build: BuildListHelper,
+    repeat: ListRepeatHelper,
+    slice: ListSliceHelper,
+) {
+    GET_ITER_HELPER.store(get_iter as usize, std::sync::atomic::Ordering::Release);
+    ITER_NEXT_HELPER.store(next as usize, std::sync::atomic::Ordering::Release);
+    BUILD_LIST_HELPER.store(build as usize, std::sync::atomic::Ordering::Release);
+    LIST_REPEAT_HELPER.store(repeat as usize, std::sync::atomic::Ordering::Release);
+    LIST_SLICE_HELPER.store(slice as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn get_iter_helper_addr() -> usize {
+    GET_ITER_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
+pub(crate) fn iter_next_helper_addr() -> usize {
+    ITER_NEXT_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
+pub(crate) fn build_list_helper_addr() -> usize {
+    BUILD_LIST_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
+pub(crate) fn list_repeat_helper_addr() -> usize {
+    LIST_REPEAT_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
+pub(crate) fn list_slice_helper_addr() -> usize {
+    LIST_SLICE_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// RFC 0067 WS2 — the embedder's eval-breaker poll. Called from loop
 /// headers every `JIT_POLL_STRIDE` iterations: the embedder performs
 /// its cooperative GIL hand-off inline (no interpreter state needed)
