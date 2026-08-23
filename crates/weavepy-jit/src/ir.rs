@@ -205,6 +205,23 @@ pub enum TOp {
     /// (the enclosing math span rebuilds the `[func, null]` pair the
     /// interpreter holds below the argument) and raises exactly.
     MathIntrinsic(MathFunc),
+    /// RFC 0070 WS1 — `x is None` / `x is not None` on a nullable
+    /// object lane: pops the `Obj` value (machine value: pin index, or
+    /// `-1` for `None`) and pushes the `bool` result. Purely native —
+    /// no helper call, no deopt.
+    IsNone { negate: bool },
+    /// RFC 0070 WS1 — push the `None` singleton in the nullable object
+    /// lane (machine value `-1`). Emitted where a `None` constant must
+    /// occupy a *native* stack slot: a `StoreFast` into an `Obj` local,
+    /// or the value operand of an object-lane `AttrSet`.
+    PushNone,
+    /// RFC 0070 WS1 — deopt at this pc when TOS (an `Obj` lane) is
+    /// `None` (machine value `-1`), *without* popping it. Emitted at an
+    /// erased method-form `LOAD_ATTR` whose burned-in resolution
+    /// assumed an instance receiver: the deopt spills the receiver as
+    /// the real `None` and the interpreter re-executes the attribute
+    /// load, raising the exact `AttributeError`.
+    GuardNotNone,
     /// RFC 0069 WS1 — a guarded method call on a pinned receiver: pops
     /// `argc` scalar arguments and the receiver pin, and calls the
     /// registered `wpjit_call_method` helper with `token` (an index
@@ -267,6 +284,15 @@ pub enum TTerm {
         body: BlockId,
         exit: BlockId,
     },
+    /// RFC 0070 WS2 — `YIELD_VALUE`: an unconditional deopt-shaped
+    /// side exit with [`crate::runtime::JitStatus::Yielded`]. Locals
+    /// are written back and the abstract stack is spilled with the
+    /// yielded value on top; `pc` names the `YIELD_VALUE` instruction
+    /// itself, which the embedder *re-executes* in the interpreter to
+    /// perform the actual suspension. The block has no native
+    /// successors — post-yield code runs interpreted until the next
+    /// loop back edge OSR-enters the compiled body again.
+    Yield { pc: u32 },
 }
 
 /// A basic block: a static entry-stack shape, a straight-line body, and
@@ -556,6 +582,7 @@ impl TOp {
                 | TOp::ListAppend
                 | TOp::AttrGet { .. }
                 | TOp::AttrSet { .. }
+                | TOp::GuardNotNone
         )
     }
 }

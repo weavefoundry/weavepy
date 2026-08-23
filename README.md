@@ -259,6 +259,25 @@ work.
 > stays at **unexpected 0**, catching two real WS4 regressions
 > in-wave (generator frame identity across `await` for pdb, and the
 > send dance's line-event discipline for `sys.settrace`).
+>
+> `RFC 0070` (performance wave 7) generalizes tier-2's single pinned
+> receiver into a **nullable object lane**: any number of
+> object-typed locals and stack values ride pin slots, `-1` encodes
+> the `None` singleton, and `is None` / `is not None` fences lower
+> to one integer compare — with **object-valued attribute loads and
+> stores** (runtime pins, displaced-value prompt-reap discipline)
+> and **`__slots__` attribute lanes** on top. **Native generator
+> activations (v1)** land deopt-shaped: a yield writes the frame
+> back and lets the interpreter execute the suspension
+> (`JitStatus::Yielded`, never charged to the deopt budget), resumes
+> re-enter natively at the next loop back edge's OSR entry, and a
+> profitability gate admits only generator bodies with a yield-free
+> inner loop — real work between suspensions — so yield-dense
+> pipelines never pay the round trip. Committed baseline: suite
+> geomean **3.11× CPython** (3.06× measured on the dev host), with
+> `deltablue` 1.2× faster and `attr_access` 1.16×; the deferred
+> object-lane consumers (class-call construction, object
+> arguments/returns, iterator pipelines) carry to the next wave.
 
 ## Repository layout
 

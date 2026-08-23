@@ -38,6 +38,12 @@ pub enum JitType {
     /// the receiver's shape (type identity + attr-version, instance-
     /// dict hit, expected value lane) per access and deopt on any
     /// surprise.
+    ///
+    /// RFC 0070 WS1 — the lane is *nullable*: the machine value `-1`
+    /// stands for the Python `None` singleton (there is no pin-table
+    /// entry for it). `IsNone` fences test it natively; every helper
+    /// treats a `-1` pin as a table miss and deopts, so the interpreter
+    /// re-executes the access on the real `None` and raises exactly.
     Obj,
     /// Anything the JIT can't represent. Its presence as an operand to a
     /// supported opcode makes the enclosing region non-JITable.
