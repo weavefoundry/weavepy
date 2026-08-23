@@ -156,6 +156,85 @@ fn runset(samples: &[Sample]) -> RunSet {
     RunSet::from_samples_ns(&ns).with_max_rss(max_rss)
 }
 
+/// Time a single fixture under the PR binary *and* a merge-base
+/// binary, interleaving the legs sample by sample (PR, base, CPython,
+/// PR, base, CPython, …) so slow drift on a shared runner — thermal
+/// ramp, a neighbor tenant spinning up — lands on both legs equally
+/// and cancels in the PR/base ratio. This is what makes the A/B gate
+/// immune to the machine skew that a committed-baseline comparison
+/// spends its whole envelope absorbing.
+///
+/// A base-leg failure is not an error: a fixture added by the PR
+/// under test may exercise syntax the merge-base binary cannot run
+/// yet. The row simply carries no base leg (the A/B gate skips it,
+/// with a note from the caller).
+pub fn run_one_ab(
+    fix: &Fixture,
+    opts: &RunOpts,
+    weavepy: &Path,
+    base: &Path,
+    python: Option<&str>,
+) -> io::Result<Row> {
+    let runs = if opts.warmup {
+        opts.samples + 1
+    } else {
+        opts.samples
+    };
+    let mut pr_samples = Vec::with_capacity(opts.samples as usize);
+    let mut base_samples = Vec::with_capacity(opts.samples as usize);
+    let mut py_samples = Vec::with_capacity(opts.samples as usize);
+    let mut base_ok = true;
+    for i in 0..runs {
+        let keep = !opts.warmup || i > 0;
+        let pr = time_subprocess(weavepy.as_os_str(), fix, &[])?;
+        if keep {
+            pr_samples.push(pr);
+        }
+        if base_ok {
+            match time_subprocess(base.as_os_str(), fix, &[]) {
+                Ok(b) => {
+                    if keep {
+                        base_samples.push(b);
+                    }
+                }
+                Err(_) => base_ok = false,
+            }
+        }
+        if let Some(py) = python {
+            let p = time_subprocess(std::ffi::OsStr::new(py), fix, &[])?;
+            if keep {
+                py_samples.push(p);
+            }
+        }
+    }
+    let cpython = (!py_samples.is_empty()).then(|| runset(&py_samples));
+    let base_set = (base_ok && !base_samples.is_empty()).then(|| runset(&base_samples));
+    Ok(Row::new(
+        fix.name.clone(),
+        fix.work,
+        runset(&pr_samples),
+        cpython,
+        None,
+    )
+    .with_base(base_set))
+}
+
+/// Run all known fixtures A/B (see [`run_one_ab`]) and return one
+/// [`Row`] per fixture.
+pub fn run_suite_ab(opts: &RunOpts, base: &Path) -> io::Result<Vec<Row>> {
+    let weavepy = resolve_weavepy(opts)?;
+    let python = if opts.include_cpython {
+        Some(resolve_python(opts)?)
+    } else {
+        None
+    };
+    let mut rows = Vec::new();
+    for fix in discover_fixtures() {
+        rows.push(run_one_ab(&fix, opts, &weavepy, base, python.as_deref())?);
+    }
+    Ok(rows)
+}
+
 /// Run all known fixtures and return one [`Row`] per fixture.
 pub fn run_suite(opts: &RunOpts) -> io::Result<Vec<Row>> {
     let weavepy = resolve_weavepy(opts)?;

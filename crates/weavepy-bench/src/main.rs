@@ -16,6 +16,13 @@
 //!   Missing per-platform baselines are an error unless
 //!   `--allow-missing-baseline` makes the gate advisory (RFC 0062
 //!   WS3).
+//! - `gate --base-weavepy=PATH` — A/B mode: times PATH (the
+//!   merge-base binary) interleaved with the PR binary on the same
+//!   machine and gates on the PR/base ratio instead. Machine skew
+//!   cancels in that ratio, so the threshold can sit well below the
+//!   committed baseline's cross-machine envelope; the committed
+//!   baseline demotes to an advisory report plus a blocking
+//!   suite-geomean drift ratchet (`--baseline-pct`, default 25).
 //!
 //! For maximum portability we hand-roll arg parsing rather than
 //! pull in `clap` — the tool has at most a handful of flags.
@@ -28,7 +35,9 @@ use std::process::ExitCode;
 
 use weavepy_bench::fixtures::{baseline_path, discover_fixtures, platform_key};
 use weavepy_bench::report::Report;
-use weavepy_bench::runner::{resolve_python, resolve_weavepy, run_one, run_suite, RunOpts};
+use weavepy_bench::runner::{
+    resolve_python, resolve_weavepy, run_one, run_one_ab, run_suite, run_suite_ab, RunOpts,
+};
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -92,6 +101,17 @@ fn print_help() {
     eprintln!("    --allow-missing-baseline");
     eprintln!("                          If the host platform has no baseline file, print");
     eprintln!("                          an advisory note and exit 0 instead of failing.");
+    eprintln!("    --base-weavepy=PATH   A/B mode: also time PATH (the merge-base binary),");
+    eprintln!("                          interleaved with the PR binary on this machine, and");
+    eprintln!("                          gate on the PR/base ratio at --pct. Machine skew");
+    eprintln!("                          cancels, so --pct can sit well below the committed");
+    eprintln!("                          baseline's cross-machine envelope. The committed");
+    eprintln!("                          baseline demotes to an advisory report, except the");
+    eprintln!("                          suite geomean, which still blocks at --baseline-pct");
+    eprintln!("                          as the cross-PR drift ratchet.");
+    eprintln!("    --baseline-pct=PCT    A/B mode only: envelope for the (still blocking)");
+    eprintln!("                          suite-geomean check against the committed baseline");
+    eprintln!("                          (default 25).");
 }
 
 fn parse_common(opts: &mut RunOpts, arg: &str) -> bool {
@@ -156,7 +176,9 @@ fn cmd_run(args: &[String]) -> io::Result<()> {
 
 fn cmd_gate(args: &[String]) -> io::Result<bool> {
     let mut pct = 10.0_f64;
+    let mut baseline_pct = 25.0_f64;
     let mut allow_missing = false;
+    let mut base_weavepy: Option<PathBuf> = None;
     let mut opts = RunOpts::default();
     for a in args {
         if parse_common(&mut opts, a) {
@@ -167,10 +189,19 @@ fn cmd_gate(args: &[String]) -> io::Result<bool> {
             x if x.starts_with("--pct=") => {
                 pct = x[6..].parse().unwrap_or(pct);
             }
+            x if x.starts_with("--baseline-pct=") => {
+                baseline_pct = x[15..].parse().unwrap_or(baseline_pct);
+            }
+            x if x.starts_with("--base-weavepy=") => {
+                base_weavepy = Some(PathBuf::from(&x[15..]));
+            }
             other => {
                 return Err(io::Error::other(format!("unknown flag '{other}'")));
             }
         }
+    }
+    if let Some(base) = base_weavepy {
+        return cmd_gate_ab(&opts, &base, pct, baseline_pct);
     }
     let host_platform = platform_key();
     let baseline = load_baseline(&baseline_path(), &host_platform, allow_missing)?;
@@ -254,6 +285,139 @@ fn cmd_gate(args: &[String]) -> io::Result<bool> {
 
     if regs.is_empty() {
         println!("OK: no ratio regressions over {pct:.1}%");
+        Ok(true)
+    } else {
+        println!("REGRESSIONS:");
+        for r in &regs {
+            println!("  {r}");
+        }
+        Ok(false)
+    }
+}
+
+/// The A/B gate: measure the PR binary against the merge-base binary
+/// interleaved on this machine and gate on the PR/base ratio.
+///
+/// Blocking checks, all at `pct`:
+///   1. each fixture's PR/base ratio,
+///   2. the suite geomean of PR/base ratios (catches broad
+///      regressions that stay under the per-fixture bar).
+///
+/// The committed per-platform baseline — when one exists for this
+/// platform — demotes to an *advisory* per-fixture report (its
+/// cross-machine skew is exactly what the A/B design removes from
+/// the blocking path), except the suite geomean vs the baseline,
+/// which still blocks at `baseline_pct`: that ratchet is what stops
+/// many small under-threshold regressions from compounding silently
+/// across PRs. A missing baseline just skips that section — the A/B
+/// comparison needs no committed numbers, which is also what makes
+/// this gate meaningful on platforms that never recorded one.
+fn cmd_gate_ab(opts: &RunOpts, base: &Path, pct: f64, baseline_pct: f64) -> io::Result<bool> {
+    let host_platform = platform_key();
+    // Advisory: tolerate both a missing file and a foreign platform
+    // stamp (the A/B verdict never depends on it).
+    let baseline = load_baseline(&baseline_path(), &host_platform, true).unwrap_or_default();
+    let rows = run_suite_ab(opts, base)?;
+    let mut report = Report::new(rows);
+    println!("{}", report.to_markdown());
+    for r in &report.rows {
+        if r.base.is_none() {
+            println!(
+                "NOTE: {}: merge-base binary could not run this fixture (new fixture?) — \
+                 no A/B verdict for it this PR",
+                r.name
+            );
+        }
+    }
+
+    // The same noise-rejection retry as the baseline gate: an
+    // excursion can only inflate the leg it lands on, so re-measure
+    // regressed fixtures once and keep the lower PR/base ratio; a
+    // genuine regression reproduces and still fails.
+    let retry_names = report.ab_regressed_fixture_names(pct);
+    if !retry_names.is_empty() {
+        println!(
+            "RETRY: re-measuring {} regressed fixture(s) to reject one-off runner noise: {}",
+            retry_names.len(),
+            retry_names.join(", ")
+        );
+        let weavepy = resolve_weavepy(opts)?;
+        let python = if opts.include_cpython {
+            Some(resolve_python(opts)?)
+        } else {
+            None
+        };
+        let mut rows = report.rows;
+        for fix in discover_fixtures() {
+            if !retry_names.contains(&fix.name) {
+                continue;
+            }
+            let retry = run_one_ab(&fix, opts, &weavepy, base, python.as_deref())?;
+            let slot = rows
+                .iter_mut()
+                .find(|r| r.name == fix.name)
+                .expect("regressed fixture has a report row");
+            let better = match (retry.base_ratio, slot.base_ratio) {
+                (Some(nr), Some(or)) => nr < or,
+                _ => false,
+            };
+            if let (Some(or), Some(nr)) = (slot.base_ratio, retry.base_ratio) {
+                println!(
+                    "  {}: {:.3}× -> {:.3}× vs merge-base on retry ({})",
+                    fix.name,
+                    or,
+                    nr,
+                    if better {
+                        "kept retry"
+                    } else {
+                        "kept original"
+                    }
+                );
+            }
+            if better {
+                *slot = retry;
+            }
+        }
+        report = Report::new(rows);
+    }
+
+    let mut regs = report.ab_regressions(pct);
+
+    match &baseline {
+        Some(baseline) => {
+            let advisory = report.regressions(baseline, baseline_pct);
+            if advisory.is_empty() {
+                println!(
+                    "ADVISORY: committed baseline comparison clean at {baseline_pct:.1}% \
+                     (informational; the blocking verdict is the A/B comparison)"
+                );
+            } else {
+                println!("ADVISORY vs committed baseline (per-fixture rows informational):");
+                for a in &advisory {
+                    println!("  {a}");
+                }
+            }
+            // The one baseline check that still blocks: the suite
+            // geomean ratchet against cross-PR drift.
+            if let (Some(ng), Some(og)) = (report.geomean_ratio, baseline.geomean_ratio) {
+                let factor = 1.0 + baseline_pct / 100.0;
+                if og > 0.0 && ng > og * factor {
+                    regs.push(format!(
+                        "geomean vs committed baseline: {og:.2}× -> {ng:.2}× vs CPython \
+                         ({:+.1}%; over the {baseline_pct:.1}% drift ratchet)",
+                        100.0 * (ng - og) / og,
+                    ));
+                }
+            }
+        }
+        None => println!(
+            "NOTE: no committed baseline for this platform ({host_platform}) — \
+             skipping the advisory comparison; the A/B verdict stands alone."
+        ),
+    }
+
+    if regs.is_empty() {
+        println!("OK: no A/B regressions over {pct:.1}% vs the merge-base binary");
         Ok(true)
     } else {
         println!("REGRESSIONS:");
