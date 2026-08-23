@@ -25,9 +25,9 @@ use weavepy_compiler::{
 };
 
 use crate::ir::{
-    ArithKind, AttrSiteMeta, BlockId, CalleeSpanMeta, CmpKind, GlobalGuard, MathFunc,
-    MathGuardMeta, MethodRet, MethodSiteMeta, MethodSpanMeta, OsrEntry, RangeLoopMeta,
-    ResolvedGlobal, TBlock, TFunc, TOp, TStmt, TTerm,
+    ArithKind, AttrSiteMeta, BlockId, CalleeSpanMeta, CmpKind, GlobalGuard, IterLoopMeta,
+    ListLoopMeta, MathFunc, MathGuardMeta, MethodRet, MethodSiteMeta, MethodSpanMeta, OsrEntry,
+    RangeLoopMeta, ResolvedGlobal, TBlock, TFunc, TOp, TStmt, TTerm,
 };
 use crate::value::JitType;
 
@@ -49,6 +49,60 @@ pub struct MethodResolution {
     pub ret: MethodRet,
 }
 
+/// RFC 0071 WS3 — the maximum attribute-chain depth the analyzer
+/// tracks as provenance (`a.b.c.d` from a root local). Deeper chains
+/// disqualify the access rather than growing unbounded metadata.
+const MAX_ATTR_PATH: usize = 4;
+
+/// RFC 0071 WS3 — interned attribute-path provenance. An `Obj`-lane
+/// value produced by an attribute load carries `(root local, chain of
+/// names)` so a later access *through* it can be probed against the
+/// live object the chain currently reaches. Segments form a parent-
+/// linked interning tree; stack entries carry a segment index (they
+/// must stay `Copy`).
+#[derive(Debug, Default)]
+pub struct PathArena {
+    /// `(parent segment, root local slot, attribute name)`.
+    segs: Vec<(Option<u32>, u32, String)>,
+}
+
+impl PathArena {
+    /// Intern one more link on `parent` (rooted at `root`). `None`
+    /// when the chain would exceed [`MAX_ATTR_PATH`].
+    fn seg(&mut self, parent: Option<u32>, root: u32, name: &str) -> Option<u32> {
+        if let Some(idx) = self
+            .segs
+            .iter()
+            .position(|(p, r, n)| *p == parent && *r == root && n == name)
+        {
+            return Some(idx as u32);
+        }
+        if self.names(parent).len() >= MAX_ATTR_PATH {
+            return None;
+        }
+        self.segs.push((parent, root, name.to_owned()));
+        Some((self.segs.len() - 1) as u32)
+    }
+
+    /// The root local slot of a segment chain.
+    fn root(&self, idx: u32) -> u32 {
+        self.segs[idx as usize].1
+    }
+
+    /// The chain's names, root-first.
+    fn names(&self, idx: Option<u32>) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = idx;
+        while let Some(i) = cur {
+            let (parent, _, name) = &self.segs[i as usize];
+            out.push(name.clone());
+            cur = *parent;
+        }
+        out.reverse();
+        out
+    }
+}
+
 /// The embedder's shape probes (RFC 0061/0065 WS5, 0069 WS1/WS2),
 /// bundled so the inference and emission passes share one source of
 /// truth.
@@ -58,17 +112,21 @@ pub struct Probes<'a> {
     /// `float` list (`Some(Unknown)` = an *empty* list: definitely a
     /// list, but with no lane evidence — only `append` can pin it).
     pub list: &'a mut dyn FnMut(u32) -> Option<JitType>,
-    /// `(slot, name, store)` → the scalar value lane of an eligible
-    /// instance-dict attribute on the local currently in `slot`
-    /// (RFC 0065 WS5). Eligibility mirrors the tier-1 inline-cache
+    /// `(slot, path, name, store)` → the value lane of an eligible
+    /// instance attribute on the object reached by walking `path` from
+    /// the local currently in `slot` (RFC 0065 WS5; RFC 0071 WS3 adds
+    /// the chain walk). Eligibility mirrors the tier-1 inline-cache
     /// predicate: no `__getattr__`/`__getattribute__`, no shadowing
-    /// data descriptor, name present in the instance dict.
-    pub attr: &'a mut dyn FnMut(u32, &str, bool) -> Option<JitType>,
-    /// RFC 0069 WS1 — `(slot, name)` → the class-resolved method on
-    /// the instance currently in `slot`, when the shape is eligible
-    /// (plain function on the class, not shadowed by an instance
-    /// attribute, receiver an instance with a pinnable class).
-    pub method: &'a mut dyn FnMut(u32, &str) -> Option<MethodResolution>,
+    /// data descriptor, name present in the instance dict — plus,
+    /// RFC 0071 WS2, the store-only new-key shape reported as
+    /// `Some(Unknown)`.
+    pub attr: &'a mut dyn FnMut(u32, &[String], &str, bool) -> Option<JitType>,
+    /// RFC 0069 WS1 — `(slot, path, name)` → the class-resolved method
+    /// on the instance reached by walking `path` from the local
+    /// currently in `slot`, when the shape is eligible (plain function
+    /// on the class, not shadowed by an instance attribute, receiver
+    /// an instance with a pinnable class).
+    pub method: &'a mut dyn FnMut(u32, &[String], &str) -> Option<MethodResolution>,
     /// RFC 0069 WS2 — `(global_name, attr)` → `true` when the global
     /// currently resolves to the canonical `math` module *and* its
     /// `attr` is the canonical intrinsic function (the embedder
@@ -83,6 +141,10 @@ pub struct Probes<'a> {
     /// failed with [`JitVerdict::TypeUnknown`], so shapes the fixpoint
     /// can type on its own never pick up extra guards or conflicts.
     pub param: &'a mut dyn FnMut(u32) -> Option<JitType>,
+    /// RFC 0071 WS3 — the analysis-local attribute-path interner (the
+    /// analyzer owns the entries; it lives here so both passes and the
+    /// probe adapters share it without threading another parameter).
+    pub paths: &'a mut PathArena,
 }
 
 /// Why a code object could not be compiled by the v1 JIT. Carried back
@@ -151,17 +213,53 @@ struct Plan {
     guards: Vec<GlobalGuard>,
     /// Rewritten loops, outermost-first.
     loops: Vec<RangeLoopMeta>,
+    /// RFC 0071 WS4 — rewritten `GET_ITER` pcs of recognized list
+    /// loops → (seq synthetic slot, index synthetic slot). The op pops
+    /// the pinned list into the seq slot and zeroes the index.
+    get_iter: HashMap<usize, (u32, u32)>,
+    /// RFC 0071 WS4 — list-loop `FOR_ITER` pcs → (seq slot, index
+    /// slot, loop variable slot).
+    iter_headers: HashMap<usize, (u32, u32, u32)>,
+    /// RFC 0071 WS4 — the fused `STORE_FAST` pc after each list-loop
+    /// `FOR_ITER` → its slot (the `ForList` terminator performs this
+    /// store; the variable's lane comes from the header's element
+    /// lane, not a forced `Int`).
+    fused_store_iter: HashMap<usize, u32>,
+    /// RFC 0071 WS4 — rewritten list loops, ascending `live_from`.
+    list_loops: Vec<ListLoopMeta>,
     /// Synthetic slots appended after the code object's real locals.
     n_synth: u32,
 }
 
 impl Plan {
-    /// `true` when the interpreter would have a live range iterator on
-    /// its stack at `pc` — i.e. `pc` is inside some rewritten loop.
+    /// `true` when the interpreter would have a live iterator on its
+    /// stack at `pc` — i.e. `pc` is inside some rewritten loop (range
+    /// or list).
     fn in_loop_span(&self, pc: usize) -> bool {
         self.loops
             .iter()
             .any(|l| (l.live_from as usize) <= pc && pc < l.live_to as usize)
+            || self
+                .list_loops
+                .iter()
+                .any(|l| (l.live_from as usize) <= pc && pc < l.live_to as usize)
+    }
+
+    /// How many rewritten-loop iterators the *interpreter's* stack
+    /// holds at `pc` (range and list loops both park one erased
+    /// iterator there for their whole span).
+    fn live_iters_at(&self, pc: usize) -> u32 {
+        let ranges = self
+            .loops
+            .iter()
+            .filter(|l| (l.live_from as usize) <= pc && pc < l.live_to as usize)
+            .count();
+        let lists = self
+            .list_loops
+            .iter()
+            .filter(|l| (l.live_from as usize) <= pc && pc < l.live_to as usize)
+            .count();
+        (ranges + lists) as u32
     }
 }
 
@@ -206,12 +304,23 @@ pub fn analyze_with_probes(
     probe_list: &mut dyn FnMut(u32) -> Option<JitType>,
     probe_attr: &mut dyn FnMut(u32, &str, bool) -> Option<JitType>,
 ) -> Result<TFunc, JitVerdict> {
+    // Adapt the path-less probe shape: only direct local receivers
+    // resolve (RFC 0071 WS3 chains need the full-bundle entry).
+    let mut attr = |slot: u32, path: &[String], name: &str, store: bool| {
+        if path.is_empty() {
+            probe_attr(slot, name, store)
+        } else {
+            None
+        }
+    };
+    let mut arena = PathArena::default();
     let mut probes = Probes {
         list: probe_list,
-        attr: probe_attr,
-        method: &mut |_, _| None,
+        attr: &mut attr,
+        method: &mut |_, _, _| None,
         math: &mut |_, _| false,
         param: &mut |_| None,
+        paths: &mut arena,
     };
     analyze_impl(code, resolve, &mut probes)
 }
@@ -274,7 +383,20 @@ fn analyze_impl(
     for slot in 0..code.arg_count {
         if local_types[slot as usize].is_none() {
             if let Some(t) = (probes.param)(slot) {
-                if matches!(t, JitType::Int | JitType::Float | JitType::Bool) {
+                // RFC 0071 — `Str`/`Bytes` (WS6) and the nullable
+                // object lane (WS1) join the seedable lanes: entry
+                // packing pins exact-typed values (the guard rejects
+                // subclasses), and an `Obj` seed admits parameters
+                // whose only use is flowing into a call.
+                if matches!(
+                    t,
+                    JitType::Int
+                        | JitType::Float
+                        | JitType::Bool
+                        | JitType::Obj
+                        | JitType::Str
+                        | JitType::Bytes
+                ) {
                     local_types[slot as usize] = Some(t);
                 }
             }
@@ -423,6 +545,35 @@ fn analyze_impl(
     }
     osr_entries.sort_unstable_by_key(|e| e.pc);
 
+    // RFC 0071 WS5 — generator resume entries: for every yield whose
+    // continuation block's boundary stack is exactly `[Obj]` (the sent
+    // value and nothing beneath it), the embedder may enter natively
+    // at the resume pc, passing the sent value through `ret_bits`.
+    // A yield buried in a wider expression stack keeps the interpreted
+    // resume (the dispatch preamble cannot materialize the deeper
+    // spilled values).
+    let mut resume_entries: Vec<OsrEntry> = Vec::new();
+    if code.is_generator {
+        for (i, ins) in code.instructions.iter().enumerate() {
+            if !matches!(ins.op, OpCode::YieldValue) || i + 1 >= code.instructions.len() {
+                continue;
+            }
+            let raw_idx = block_index_at(&raw, i + 1);
+            if raw[raw_idx].start != i + 1 {
+                continue;
+            }
+            if let Some(&bid) = compact.get(&raw_idx) {
+                if blocks[bid].entry_stack == [JitType::Obj] {
+                    resume_entries.push(OsrEntry {
+                        pc: (i + 1) as u32,
+                        block: bid,
+                    });
+                }
+            }
+        }
+    }
+    resume_entries.sort_unstable_by_key(|e| e.pc);
+
     // RFC 0070 WS2 — generator profitability gate. A generator body
     // only ever enters natively at an OSR pc, and every yield pays the
     // full deopt-shaped round trip (entry guards + marshal in, spill +
@@ -438,8 +589,18 @@ fn analyze_impl(
     // not worth compiling. Same verdict when no OSR entry survived:
     // with fresh pc-0 entry gated off for generators, an entry-less
     // body could never run natively at all.
+    // RFC 0071 WS5 — resume entries do *not* relax the cycle
+    // requirement. A trailing-yield loop (`while ...: yield x`) can
+    // enter natively at the yield's continuation, but each resume
+    // then executes a bounded straight-line stretch (loop check,
+    // next element, yield) and pays the full native entry + spill
+    // round trip per element — measured as a clear net loss against
+    // the interpreter's resume path (RFC 0071 measurements). Yield-
+    // dense bodies stay interpreted; resume entries earn their keep
+    // in bodies with a yield-free cycle, where each resume runs a
+    // whole inner reduction natively.
     if code.is_generator {
-        if osr_entries.is_empty() {
+        if osr_entries.is_empty() && resume_entries.is_empty() {
             return Err(JitVerdict::Trivial);
         }
         if !has_native_cycle(&blocks) {
@@ -461,6 +622,33 @@ fn analyze_impl(
     let mut livein_vec: Vec<u32> = livein.into_iter().collect();
     livein_vec.sort_unstable();
 
+    // RFC 0071 WS4 — split the plan-time GET_ITER loops by the seq
+    // slot's final lane: pinned-list loops keep the (list, index)
+    // reconstruction; object-lane loops rebuild the pinned iterator
+    // itself.
+    let list_loops: Vec<ListLoopMeta> = plan
+        .list_loops
+        .iter()
+        .filter(|l| {
+            local_types
+                .get(l.seq_slot as usize)
+                .copied()
+                .flatten()
+                .is_some_and(JitType::is_list)
+        })
+        .copied()
+        .collect();
+    let iter_loops: Vec<IterLoopMeta> = plan
+        .list_loops
+        .iter()
+        .filter(|l| local_types.get(l.seq_slot as usize).copied().flatten() == Some(JitType::Obj))
+        .map(|l| IterLoopMeta {
+            iter_slot: l.seq_slot,
+            live_from: l.live_from,
+            live_to: l.live_to,
+        })
+        .collect();
+
     Ok(TFunc {
         n_locals,
         local_types,
@@ -470,6 +658,8 @@ fn analyze_impl(
         entry_block,
         global_guards: plan.guards,
         range_loops: plan.loops,
+        list_loops,
+        iter_loops,
         callee_spans: out.callee_spans,
         len_spans: out.len_spans,
         method_spans: out.method_spans,
@@ -478,6 +668,7 @@ fn analyze_impl(
         math_guards: out.math_guards,
         math_spans: out.math_spans,
         osr_entries,
+        resume_entries,
         max_call_args: out.max_call_args,
         ret_lane: ret_lane.filter(|t| t.is_representable()),
         ret_none,
@@ -497,9 +688,11 @@ struct RetInfo {
 impl RetInfo {
     /// The function-wide scalar return lane: only meaningful when no
     /// return site was the `None` constant (mixed None/scalar returns
-    /// cannot be typed for callers).
+    /// cannot be typed for callers) — except the *object* lane (RFC
+    /// 0071 WS1), which is nullable: a `return None` site joins
+    /// object-returning sites, crossing the call as the lane's `-1`.
     fn final_lane(&self) -> Option<JitType> {
-        if self.saw_none {
+        if self.saw_none && self.lane != Some(JitType::Obj) {
             None
         } else {
             self.lane
@@ -533,6 +726,7 @@ fn merge_entry(
             || c.poison != n.poison
             || c.null != n.null
             || c.none_const != n.none_const
+            || c.slice != n.slice
         {
             return Err(JitVerdict::NonEmptyBoundaryStack);
         }
@@ -546,6 +740,12 @@ fn merge_entry(
         }
         if c.src != n.src && c.src.is_some() {
             c.src = None;
+            *changed = true;
+        }
+        // RFC 0071 WS3 — attribute-path provenance is kept only when
+        // both sides walked the identical chain.
+        if c.path != n.path && c.path.is_some() {
+            c.path = None;
             *changed = true;
         }
     }
@@ -611,92 +811,77 @@ fn plan_rewrite(
             return Err(bail());
         }
         let var_slot = ins[i + 1].arg;
-        // Walk the prefix backwards: GET_ITER, CALL k, k simple args,
-        // PUSH_NULL, LOAD_GLOBAL <range>.
-        if i < 2
-            || !matches!(ins[i - 1].op, OpCode::GetIter)
-            || !matches!(ins[i - 2].op, OpCode::Call)
-        {
-            return Err(bail());
-        }
-        let k = ins[i - 2].arg as usize;
-        if !(1..=3).contains(&k) || i < 4 + k {
-            return Err(bail());
-        }
-        let args_start = i - 2 - k;
-        for arg_ins in &ins[args_start..(i - 2)] {
-            match arg_ins.op {
-                OpCode::LoadFast => {}
-                OpCode::LoadConst
-                    if matches!(
-                        code.constants.get(arg_ins.arg as usize),
-                        Some(Constant::Int(_))
-                    ) => {}
-                _ => return Err(bail()),
+        // Recognize the counted `range` shape first — walk the prefix
+        // backwards: GET_ITER, CALL k, k simple args, PUSH_NULL,
+        // LOAD_GLOBAL <range>.
+        if let Some((callee, push_null, step_nop, pops)) = range_prefix(code, &plan, &targets, i) {
+            let name = code.names[ins[callee].arg as usize].clone();
+            if !plan.guards.iter().any(|g| g.name == name) {
+                plan.guards.push(GlobalGuard {
+                    name,
+                    expect: ResolvedGlobal::RangeBuiltin,
+                });
             }
+
+            let cur_slot = n_real + plan.n_synth;
+            let stop_slot = cur_slot + 1;
+            plan.n_synth += 2;
+            if let Some(step_pc) = step_nop {
+                plan.nop.insert(step_pc);
+            }
+            plan.nop.insert(callee);
+            plan.nop.insert(push_null);
+            plan.nop.insert(i - 1);
+            plan.nop.insert(exit);
+            // The POP_TOP paired with END_FOR (CPython 3.13 loop-exit
+            // shape) is equally dead in the compiled trace.
+            if exit + 1 < n && matches!(ins[exit + 1].op, OpCode::PopTop) {
+                plan.nop.insert(exit + 1);
+            }
+            plan.calls.insert(i - 2, (pops, cur_slot, stop_slot));
+            plan.headers.insert(i, (cur_slot, stop_slot, var_slot));
+            plan.fused_store.insert(i + 1, var_slot);
+            plan.loops.push(RangeLoopMeta {
+                cur_slot,
+                stop_slot,
+                live_from: i as u32,
+                live_to: exit as u32,
+            });
+            continue;
         }
-        // An explicit step is only allowed as the constant 1; it is
-        // erased so the call effectively becomes `range(start, stop)`.
-        let mut pops = k as u8;
-        if k == 3 {
-            let step_pc = i - 3;
-            if !matches!(ins[step_pc].op, OpCode::LoadConst)
-                || !matches!(
-                    code.constants.get(ins[step_pc].arg as usize),
-                    Some(Constant::Int(1))
-                )
-            {
+        // RFC 0071 WS4 — the list-loop shape: `<iterable expr>,
+        // GET_ITER, FOR_ITER`. The iterable stays an ordinary stack
+        // value (any expression); the rewritten `GET_ITER` captures it
+        // into the seq synthetic slot (so rebinding the source local
+        // mid-loop cannot retarget the iteration) and zeroes the index
+        // slot. Whether the captured value is actually a pinned list
+        // is decided by type inference at the `GET_ITER`; a non-list
+        // disqualifies there.
+        if i >= 1 && matches!(ins[i - 1].op, OpCode::GetIter) {
+            // No jump may land on the `GET_ITER` or the fused store —
+            // the header itself is the only allowed landing point.
+            if targets.iter().any(|&t| i - 1 <= t && t <= i + 1 && t != i) {
                 return Err(bail());
             }
-            plan.nop.insert(step_pc);
-            pops = 2;
-        }
-        let push_null = args_start - 1;
-        if !matches!(ins[push_null].op, OpCode::PushNull) {
-            return Err(bail());
-        }
-        let callee = args_start - 2;
-        if !matches!(ins[callee].op, OpCode::LoadGlobal) {
-            return Err(bail());
-        }
-        if plan.globals.get(&ins[callee].arg) != Some(&ResolvedGlobal::RangeBuiltin) {
-            return Err(bail());
-        }
-        // No jump may land inside the prefix or on the fused store — the
-        // header itself (a JUMP_BACKWARD target) is the only allowed
-        // landing point.
-        if targets.iter().any(|&t| callee < t && t <= i + 1 && t != i) {
-            return Err(bail());
-        }
-        let name = code.names[ins[callee].arg as usize].clone();
-        if !plan.guards.iter().any(|g| g.name == name) {
-            plan.guards.push(GlobalGuard {
-                name,
-                expect: ResolvedGlobal::RangeBuiltin,
+            let seq_slot = n_real + plan.n_synth;
+            let idx_slot = seq_slot + 1;
+            plan.n_synth += 2;
+            plan.get_iter.insert(i - 1, (seq_slot, idx_slot));
+            plan.nop.insert(exit);
+            if exit + 1 < n && matches!(ins[exit + 1].op, OpCode::PopTop) {
+                plan.nop.insert(exit + 1);
+            }
+            plan.iter_headers.insert(i, (seq_slot, idx_slot, var_slot));
+            plan.fused_store_iter.insert(i + 1, var_slot);
+            plan.list_loops.push(ListLoopMeta {
+                seq_slot,
+                idx_slot,
+                live_from: i as u32,
+                live_to: exit as u32,
             });
+            continue;
         }
-
-        let cur_slot = n_real + plan.n_synth;
-        let stop_slot = cur_slot + 1;
-        plan.n_synth += 2;
-        plan.nop.insert(callee);
-        plan.nop.insert(push_null);
-        plan.nop.insert(i - 1);
-        plan.nop.insert(exit);
-        // The POP_TOP paired with END_FOR (CPython 3.13 loop-exit shape)
-        // is equally dead in the compiled trace.
-        if exit + 1 < n && matches!(ins[exit + 1].op, OpCode::PopTop) {
-            plan.nop.insert(exit + 1);
-        }
-        plan.calls.insert(i - 2, (pops, cur_slot, stop_slot));
-        plan.headers.insert(i, (cur_slot, stop_slot, var_slot));
-        plan.fused_store.insert(i + 1, var_slot);
-        plan.loops.push(RangeLoopMeta {
-            cur_slot,
-            stop_slot,
-            live_from: i as u32,
-            live_to: exit as u32,
-        });
+        return Err(bail());
     }
 
     // Burnable globals: every LOAD_GLOBAL that is not a recognized range
@@ -727,6 +912,76 @@ fn plan_rewrite(
     }
 
     Ok(plan)
+}
+
+/// Recognize the counted-`range` prefix of the `FOR_ITER` at `i`
+/// (RFC 0058 WS4): `LOAD_GLOBAL <range>, PUSH_NULL, k simple args,
+/// CALL k, GET_ITER`, with no jump landing inside the prefix or on the
+/// fused store. Returns `(callee pc, push_null pc, erased step pc,
+/// bound pops)` on a match, `None` when the shape doesn't apply (the
+/// caller then tries the list-loop shape).
+fn range_prefix(
+    code: &CodeObject,
+    plan: &Plan,
+    targets: &HashSet<usize>,
+    i: usize,
+) -> Option<(usize, usize, Option<usize>, u8)> {
+    let ins = &code.instructions;
+    if i < 2 || !matches!(ins[i - 1].op, OpCode::GetIter) || !matches!(ins[i - 2].op, OpCode::Call)
+    {
+        return None;
+    }
+    let k = ins[i - 2].arg as usize;
+    if !(1..=3).contains(&k) || i < 4 + k {
+        return None;
+    }
+    let args_start = i - 2 - k;
+    for arg_ins in &ins[args_start..(i - 2)] {
+        match arg_ins.op {
+            OpCode::LoadFast => {}
+            OpCode::LoadConst
+                if matches!(
+                    code.constants.get(arg_ins.arg as usize),
+                    Some(Constant::Int(_))
+                ) => {}
+            _ => return None,
+        }
+    }
+    // An explicit step is only allowed as the constant 1; it is erased
+    // so the call effectively becomes `range(start, stop)`.
+    let mut pops = k as u8;
+    let mut step_nop = None;
+    if k == 3 {
+        let step_pc = i - 3;
+        if !matches!(ins[step_pc].op, OpCode::LoadConst)
+            || !matches!(
+                code.constants.get(ins[step_pc].arg as usize),
+                Some(Constant::Int(1))
+            )
+        {
+            return None;
+        }
+        step_nop = Some(step_pc);
+        pops = 2;
+    }
+    let push_null = args_start - 1;
+    if !matches!(ins[push_null].op, OpCode::PushNull) {
+        return None;
+    }
+    let callee = args_start - 2;
+    if !matches!(ins[callee].op, OpCode::LoadGlobal) {
+        return None;
+    }
+    if plan.globals.get(&ins[callee].arg) != Some(&ResolvedGlobal::RangeBuiltin) {
+        return None;
+    }
+    // No jump may land inside the prefix or on the fused store — the
+    // header itself (a JUMP_BACKWARD target) is the only allowed
+    // landing point.
+    if targets.iter().any(|&t| callee < t && t <= i + 1 && t != i) {
+        return None;
+    }
+    Some((callee, push_null, step_nop, pops))
 }
 
 /// Resolve a forward branch/jump target instruction index.
@@ -866,10 +1121,16 @@ fn build_blocks(code: &CodeObject) -> Result<Vec<RawBlock>, JitVerdict> {
         let ins = code.instructions[last];
         let succs = match ins.op {
             OpCode::ReturnValue => Vec::new(),
-            // RFC 0070 WS2 — control leaves native code at a yield;
-            // the resume path runs interpreted (and re-enters through
-            // a loop back edge's OSR entry, not a CFG edge).
-            OpCode::YieldValue => Vec::new(),
+            // RFC 0070 WS2 — control leaves native code at a yield.
+            // RFC 0071 WS5 — the continuation block is still a
+            // *dataflow* successor (the yielded value replaced by the
+            // sent value on the boundary stack): it compiles so a
+            // resume entry can jump straight to it. `TTerm::Yield`
+            // itself keeps no CFG edge — the suspension always exits.
+            OpCode::YieldValue => match index_of.get(&end) {
+                Some(&fall) => vec![fall],
+                None => Vec::new(),
+            },
             // RFC 0070 WS2 — `RERAISE` never falls through. It closes
             // the generator epilogue's unreachable `StopIterationError`
             // trailer (past the final `RETURN_VALUE`); a *reachable*
@@ -933,7 +1194,9 @@ fn has_native_cycle(blocks: &[TBlock]) -> bool {
                 target,
                 fallthrough,
             } => [Some(*target), Some(*fallthrough)],
-            TTerm::ForRange { body, exit, .. } => [Some(*body), Some(*exit)],
+            TTerm::ForRange { body, exit, .. }
+            | TTerm::ForList { body, exit, .. }
+            | TTerm::ForIter { body, exit, .. } => [Some(*body), Some(*exit)],
             TTerm::Return | TTerm::ReturnNone | TTerm::Yield { .. } => [None, None],
         }
     }
@@ -1142,6 +1405,10 @@ struct MethodMark {
 struct SE {
     ty: JitType,
     src: Option<u32>,
+    /// RFC 0071 WS3 — attribute-path provenance: this `Obj`-lane value
+    /// was produced by walking the interned chain from a root local
+    /// (an index into the analysis's [`PathArena`]).
+    path: Option<u32>,
     callee: Option<CalleeMark>,
     /// `Some(load_pc)` when this is a `.append` receiver (the
     /// `LOAD_ATTR`'s pc, for the method-span deopt metadata).
@@ -1161,6 +1428,11 @@ struct SE {
     /// RFC 0069 WS1 — the `None` constant (interpreter-stack only),
     /// consumable solely by `RETURN_VALUE` (the `return None` shape).
     none_const: bool,
+    /// RFC 0071 WS4 — an erased `BUILD_SLICE` result
+    /// (`(has_start, has_stop)`; unit step), consumable solely by an
+    /// immediately following `BINARY_SUBSCR` on a pinned list. The
+    /// present bounds occupy native stack slots below this marker.
+    slice: Option<(bool, bool)>,
 }
 
 impl SE {
@@ -1168,6 +1440,7 @@ impl SE {
         SE {
             ty,
             src: None,
+            path: None,
             callee: None,
             recv: None,
             method: None,
@@ -1175,6 +1448,7 @@ impl SE {
             poison: false,
             null: false,
             none_const: false,
+            slice: None,
         }
     }
 
@@ -1187,15 +1461,16 @@ impl SE {
             && !self.poison
             && !self.null
             && !self.none_const
+            && self.slice.is_none()
     }
 
     /// `true` when this entry may cross a basic-block boundary
     /// (RFC 0069 WS2): plain values and the marker kinds whose
     /// reconstruction metadata is position-independent. `poison`,
-    /// `none_const`, and the math-module marker never cross (their
-    /// consumers are required to be adjacent).
+    /// `none_const`, the slice marker, and the math-module marker
+    /// never cross (their consumers are required to be adjacent).
     fn boundary_ok(&self) -> bool {
-        !self.poison && !self.none_const && self.math_mod.is_none()
+        !self.poison && !self.none_const && self.math_mod.is_none() && self.slice.is_none()
     }
 }
 
@@ -1283,12 +1558,32 @@ fn infer_block(
         OpCode::JumpForward | OpCode::JumpBackward => {
             vec![(b.succs[0], boundary_stack(stack)?)]
         }
-        // A rewritten range header operates purely on its synthetic
-        // slots; the operand stack must be empty (the interpreter
-        // holds only the erased iterator there).
+        // A rewritten range/list header operates purely on its
+        // synthetic slots; the operand stack must be empty (the
+        // interpreter holds only the erased iterator there).
         OpCode::ForIter => {
             if !stack.is_empty() {
                 return Err(JitVerdict::NonEmptyBoundaryStack);
+            }
+            // RFC 0071 WS4 — a list loop's variable wears the seq
+            // slot's element lane (the seq slot is typed by the
+            // dominating `GET_ITER`; until the fixpoint reaches it,
+            // contribute nothing). An *opaque* iterator (seq slot on
+            // the object lane) yields `Int` elements in v1 — the step
+            // helper re-validates each element and a lane surprise
+            // deopts with the element preserved; a body that needs a
+            // different lane conflicts here and stays interpreted.
+            if let Some(&(seq_slot, _idx, var)) = plan.iter_headers.get(&last) {
+                if let Some(lane) = local_types.get(seq_slot as usize).copied().flatten() {
+                    if lane == JitType::Obj {
+                        set_local(local_types, var, JitType::Int, changed)?;
+                    } else {
+                        let elem = lane.elem_lane().ok_or(JitVerdict::UnsupportedOpcode(
+                            "FOR_ITER (unsupported iterable)",
+                        ))?;
+                        set_local(local_types, var, elem, changed)?;
+                    }
+                }
             }
             vec![(b.succs[0], Vec::new()), (b.succs[1], Vec::new())]
         }
@@ -1313,7 +1608,10 @@ fn infer_block(
         // exit re-executing `YIELD_VALUE` in the interpreter: the
         // yielded value must exist on the *native* stack for the
         // spill (a `None` constant materializes through `PushNone`
-        // at emission). No successors — the resume runs interpreted.
+        // at emission). RFC 0071 WS5 — the continuation block flows
+        // as a dataflow successor: the yielded value replaced by the
+        // sent value on the *object* lane (a resume entry provides
+        // it; `next()`'s `None` rides as `-1`).
         OpCode::YieldValue => {
             if !code.is_generator {
                 return Err(JitVerdict::UnsupportedOpcode(
@@ -1331,7 +1629,14 @@ fn infer_block(
                     return Err(JitVerdict::TypeUnknown);
                 }
             }
-            Vec::new()
+            match b.succs.first() {
+                Some(&succ) => {
+                    stack.pop();
+                    stack.push(SE::known(JitType::Obj));
+                    vec![(succ, boundary_stack(stack)?)]
+                }
+                None => Vec::new(),
+            }
         }
         // Fall-through terminator: the remaining stack flows to the
         // lone successor.
@@ -1414,8 +1719,71 @@ fn step_abstract(
         set_local(local_types, var, JitType::Int, changed)?;
         return Ok(());
     }
+    // RFC 0071 WS4 — performed by the `ForList` terminator; the
+    // variable's lane comes from the header's element lane (typed at
+    // the `FOR_ITER` inference), not here.
+    if plan.fused_store_iter.contains_key(&i) {
+        return Ok(());
+    }
     match ins.op {
         OpCode::Nop | OpCode::Resume => {}
+        // RFC 0071 WS4 — a recognized list-loop `GET_ITER`: pop the
+        // iterable (it must be, or probe as, a pinned list) into the
+        // seq synthetic slot and type the index slot. Anything
+        // non-list disqualifies the frame here.
+        OpCode::GetIter => {
+            let &(seq_slot, idx_slot) = plan
+                .get_iter
+                .get(&i)
+                .ok_or(JitVerdict::UnsupportedOpcode("GET_ITER (unplanned)"))?;
+            let v = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            if !v.is_plain() {
+                return Err(JitVerdict::UnsupportedOpcode("GET_ITER (marker operand)"));
+            }
+            // RFC 0071 WS4 — an object-lane iterable takes the
+            // *opaque-iterator* path: the seq slot wears `Obj` (the
+            // runtime capture verifies `iter(x) is x` and deopts
+            // otherwise) and the idx slot stays unused.
+            if v.ty == JitType::Obj {
+                set_local(local_types, seq_slot, JitType::Obj, changed)?;
+                return Ok(());
+            }
+            let lane = if v.ty.is_list() {
+                v.ty
+            } else if !v.ty.is_representable() {
+                // A list shape wins when the live value probes as one;
+                // a generator/iterator parameter probes onto the
+                // object lane instead.
+                match resolve_list_container(&v, local_types, changed, probes) {
+                    Ok(Some(elem)) => JitType::list_of(elem)
+                        .ok_or(JitVerdict::UnsupportedOpcode("FOR_ITER (iterable lane)"))?,
+                    Ok(None) => return Err(JitVerdict::TypeUnknown),
+                    Err(e) => {
+                        if let Some(slot) = v.src {
+                            if (probes.param)(slot) == Some(JitType::Obj) {
+                                set_local(local_types, slot, JitType::Obj, changed)?;
+                                set_local(local_types, seq_slot, JitType::Obj, changed)?;
+                                return Ok(());
+                            }
+                            // The param probe is a no-op on the
+                            // unseeded pass: surface `TypeUnknown` so
+                            // the seeded retry gets to classify the
+                            // slot (an identity-iterable argument
+                            // takes the opaque path above; anything
+                            // else rejects there for real).
+                            return Err(JitVerdict::TypeUnknown);
+                        }
+                        return Err(e);
+                    }
+                }
+            } else {
+                return Err(JitVerdict::UnsupportedOpcode(
+                    "FOR_ITER (unsupported iterable)",
+                ));
+            };
+            set_local(local_types, seq_slot, lane, changed)?;
+            set_local(local_types, idx_slot, JitType::Int, changed)?;
+        }
         OpCode::LoadGlobal => {
             let ty = match plan.globals.get(&ins.arg) {
                 Some(ResolvedGlobal::ConstInt(_)) => JitType::Int,
@@ -1557,19 +1925,26 @@ fn step_abstract(
             if !a.is_plain() || !b.is_plain() {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
             }
+            // RFC 0071 WS4 — `list * int` repeats a pinned list on the
+            // same lane (`[None] * n`, padding shapes).
+            if matches!(kind, ArithKind::Mul) && a.ty.is_list() {
+                check_subscr_index(&b, local_types, changed)?;
+                stack.push(SE::known(a.ty));
+                return Ok(());
+            }
             let (a, b) = resolve_pair(a, b, local_types, changed);
             let res = bin_result_type(kind, a.ty, b.ty)?;
             stack.push(SE::known(res));
         }
         OpCode::CompareOp => {
-            let _ = cmp_kind(ins.arg)?;
+            let kind = cmp_kind(ins.arg)?;
             let b = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             let a = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             if !a.is_plain() || !b.is_plain() {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
             }
             let (a, b) = resolve_pair(a, b, local_types, changed);
-            cmp_check(a.ty, b.ty)?;
+            cmp_check(kind, a.ty, b.ty)?;
             stack.push(SE::known(JitType::Bool));
         }
         // RFC 0070 WS1 — `x is None` / `x is not None` on a nullable
@@ -1611,6 +1986,22 @@ fn step_abstract(
             }
             let res = unary_result_type(kind, a.ty)?;
             stack.push(SE::known(res));
+        }
+        // CPython 3.13's `TO_BOOL` — the exact-bool coercion inserted
+        // before a branch (or `not`) on a non-bool operand. Scalar
+        // lanes only; a transient `Unknown` is tolerated for a later
+        // iteration.
+        OpCode::ToBool => {
+            let a = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            if !a.is_plain() {
+                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+            }
+            if a.ty.is_representable()
+                && !matches!(a.ty, JitType::Int | JitType::Float | JitType::Bool)
+            {
+                return Err(JitVerdict::UnsupportedOpcode("TO_BOOL lane"));
+            }
+            stack.push(SE::known(JitType::Bool));
         }
         // RFC 0065 WS5 — attribute load: either the erased `.append`
         // method load on a pinned list (the receiver stays on the
@@ -1672,10 +2063,15 @@ fn step_abstract(
             // instance receiver: the receiver stays on the abstract
             // stack (its pin is the native value), re-marked with the
             // resolution. `.append` keeps its dedicated list path.
+            // RFC 0071 WS3 admits attribute-chain receivers.
             if name != "append" {
-                if let Some(slot) = obj_recv_slot(&recv) {
-                    if let Some(res) = (probes.method)(slot, name) {
-                        set_local(local_types, slot, JitType::Obj, changed)?;
+                if let Some((slot, path)) = obj_recv_ref(recv.ty, recv.src, recv.path, probes.paths)
+                {
+                    let names = probes.paths.names(path);
+                    if let Some(res) = (probes.method)(slot, &names, name) {
+                        if path.is_none() {
+                            set_local(local_types, slot, JitType::Obj, changed)?;
+                        }
                         stack.push(SE {
                             ty: JitType::Obj,
                             method: Some(MethodMark {
@@ -1719,17 +2115,38 @@ fn step_abstract(
             if !val.is_plain() && !val.none_const {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
             }
-            let Some(slot) = obj_recv_slot(&recv) else {
+            let Some((slot, path)) = obj_recv_ref(recv.ty, recv.src, recv.path, probes.paths)
+            else {
                 if !recv.ty.is_representable() {
                     // Transient — a later iteration may type it.
                     return Ok(());
                 }
                 return Err(JitVerdict::UnsupportedOpcode("STORE_ATTR receiver"));
             };
-            let lane = (probes.attr)(slot, name, true)
+            let names = probes.paths.names(path);
+            let lane = (probes.attr)(slot, &names, name, true)
                 .ok_or(JitVerdict::UnsupportedOpcode("STORE_ATTR shape"))?;
-            set_local(local_types, slot, JitType::Obj, changed)?;
-            if val.none_const {
+            // RFC 0071 WS6 is read-only: `str`/`bytes`-lane attribute
+            // *stores* stay interpreted.
+            if matches!(lane, JitType::Str | JitType::Bytes) {
+                return Err(JitVerdict::UnsupportedOpcode("STORE_ATTR (value lane)"));
+            }
+            if path.is_none() {
+                set_local(local_types, slot, JitType::Obj, changed)?;
+            }
+            // RFC 0071 WS2 — an `Unknown` store lane is the *new-key*
+            // shape (the constructor pattern): the attribute doesn't
+            // exist yet, so the stored value's own lane defines the
+            // site. Any marshalable lane is admissible.
+            if lane == JitType::Unknown {
+                if !val.none_const
+                    && val.ty.is_representable()
+                    && val.ty.is_pinned()
+                    && val.ty != JitType::Obj
+                {
+                    return Err(JitVerdict::UnsupportedOpcode("STORE_ATTR (value lane)"));
+                }
+            } else if val.none_const {
                 if lane != JitType::Obj {
                     return Err(JitVerdict::UnsupportedOpcode("STORE_ATTR (value lane)"));
                 }
@@ -1826,14 +2243,18 @@ fn step_abstract(
                 return Err(JitVerdict::UnsupportedOpcode("CALL (arity)"));
             }
             if mark.kind == MarkKind::Len {
-                // `len(x)` on a pinned list → an `int`, no real call.
+                // `len(x)` on a pinned list (or — RFC 0071 WS6 — a
+                // pinned `str`/`bytes`) → an `int`, no real call.
                 let arg = &args[0];
-                if arg.ty.is_list() {
+                if arg.ty.is_list() || matches!(arg.ty, JitType::Str | JitType::Bytes) {
                     // fine
                 } else if !arg.ty.is_representable() {
                     if let Some(slot) = arg.src {
-                        let elem = (probes.list)(slot)
-                            .ok_or(JitVerdict::UnsupportedOpcode("len (argument shape)"))?;
+                        // Not a list either — fail as `TypeUnknown` so
+                        // the seeded retry can type a `str`/`bytes`
+                        // *parameter* (RFC 0071 WS6); a genuinely
+                        // unsupported shape fails the retry too.
+                        let elem = (probes.list)(slot).ok_or(JitVerdict::TypeUnknown)?;
                         let lty = JitType::list_of(elem)
                             .ok_or(JitVerdict::UnsupportedOpcode("len (elem lane)"))?;
                         set_local(local_types, slot, lty, changed)?;
@@ -1894,14 +2315,105 @@ fn step_abstract(
         OpCode::BinarySubscr => {
             let idx = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             let cont = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            // RFC 0071 WS4 — `xs[a:b]` through an erased `BUILD_SLICE`
+            // marker: the result is a fresh list on the *same* lane.
+            if idx.slice.is_some() {
+                if !cont.is_plain() {
+                    return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+                }
+                let elem = resolve_list_container(&cont, local_types, changed, probes)?
+                    .ok_or(JitVerdict::TypeUnknown)?;
+                let lane = JitType::list_of(elem)
+                    .ok_or(JitVerdict::UnsupportedOpcode("slice container lane"))?;
+                stack.push(SE::known(lane));
+                return Ok(());
+            }
             if !idx.is_plain() || !cont.is_plain() {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
             }
             check_subscr_index(&idx, local_types, changed)?;
+            // RFC 0071 WS6 — `bytes[i]` reads a byte as an `Int`.
+            if cont.ty == JitType::Bytes {
+                stack.push(SE::known(JitType::Int));
+                return Ok(());
+            }
             let elem = resolve_list_container(&cont, local_types, changed, probes)?;
             stack.push(match elem {
                 Some(l) => SE::known(l),
                 None => SE::known(JitType::Unknown),
+            });
+        }
+        // RFC 0071 WS4 — `BUILD_LIST k` with uniform-lane elements (or
+        // all-`None`, the `[None] * n` seed): a fresh pinned list.
+        // `BUILD_LIST 0` has no lane evidence and stays interpreted.
+        OpCode::BuildList => {
+            let k = ins.arg as usize;
+            if k == 0 || k > 16 {
+                return Err(JitVerdict::UnsupportedOpcode("BUILD_LIST (shape)"));
+            }
+            let base = stack
+                .len()
+                .checked_sub(k)
+                .ok_or(JitVerdict::StackUnderflow)?;
+            let elems: Vec<SE> = stack.drain(base..).collect();
+            if elems.iter().all(|e| e.none_const) {
+                stack.push(SE::known(JitType::ListObj));
+                return Ok(());
+            }
+            let mut lane: Option<JitType> = None;
+            for e in &elems {
+                if !e.is_plain() {
+                    return Err(JitVerdict::UnsupportedOpcode("BUILD_LIST (marker element)"));
+                }
+                if !e.ty.is_representable() {
+                    // Transient — a later iteration may type it.
+                    stack.push(SE::known(JitType::Unknown));
+                    return Ok(());
+                }
+                match lane {
+                    None => lane = Some(e.ty),
+                    Some(l) if l == e.ty => {}
+                    Some(_) => {
+                        return Err(JitVerdict::UnsupportedOpcode("BUILD_LIST (mixed lanes)"))
+                    }
+                }
+            }
+            let elem = lane.ok_or(JitVerdict::TypeUnknown)?;
+            let list = JitType::list_of(elem)
+                .ok_or(JitVerdict::UnsupportedOpcode("BUILD_LIST (element lane)"))?;
+            stack.push(SE::known(list));
+        }
+        // RFC 0071 WS4 — `BUILD_SLICE` with a `None` step: erased into
+        // a marker consumable only by the immediately following
+        // `BINARY_SUBSCR` on a pinned list. Bounds are `int`s or the
+        // `None` constant.
+        OpCode::BuildSlice => {
+            if ins.arg != 3 && ins.arg != 2 {
+                return Err(JitVerdict::UnsupportedOpcode("BUILD_SLICE (shape)"));
+            }
+            if ins.arg == 3 {
+                let step = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+                if !step.none_const {
+                    return Err(JitVerdict::UnsupportedOpcode("BUILD_SLICE (step)"));
+                }
+            }
+            let stop = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            let start = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            let mut bound = |e: &SE| -> Result<bool, JitVerdict> {
+                if e.none_const {
+                    return Ok(false);
+                }
+                if !e.is_plain() {
+                    return Err(JitVerdict::UnsupportedOpcode("BUILD_SLICE (bound)"));
+                }
+                check_subscr_index(e, local_types, changed)?;
+                Ok(true)
+            };
+            let has_start = bound(&start)?;
+            let has_stop = bound(&stop)?;
+            stack.push(SE {
+                slice: Some((has_start, has_stop)),
+                ..SE::known(JitType::Unknown)
             });
         }
         // RFC 0061 WS5 — pinned-list element write. The stored value's
@@ -1982,15 +2494,24 @@ fn resolve_list_container(
     Ok(None)
 }
 
-/// RFC 0065 WS5 — the receiver slot of an attribute access: an
-/// `Obj`-lane (or as-yet-untyped) local load. `None` when the receiver
-/// has no local provenance or wears an incompatible concrete lane.
-fn obj_recv_slot(recv: &SE) -> Option<u32> {
-    match recv.ty {
-        JitType::Obj => recv.src,
-        JitType::Unknown => recv.src,
-        _ => None,
+/// RFC 0065 WS5 / RFC 0071 WS3 — the receiver reference of an
+/// attribute access: `(root slot, interned path)` for an `Obj`-lane
+/// (or as-yet-untyped) receiver with local or attribute-chain
+/// provenance. `None` when the receiver has neither, or wears an
+/// incompatible concrete lane.
+fn obj_recv_ref(
+    ty: JitType,
+    src: Option<u32>,
+    path: Option<u32>,
+    arena: &PathArena,
+) -> Option<(u32, Option<u32>)> {
+    if !matches!(ty, JitType::Obj | JitType::Unknown) {
+        return None;
     }
+    if let Some(p) = path {
+        return Some((arena.root(p), Some(p)));
+    }
+    src.map(|s| (s, None))
 }
 
 /// RFC 0069 WS2 — infer a `math.<intrinsic>` load: the module marker
@@ -2140,7 +2661,7 @@ fn infer_load_attr(
             }
         }
     }
-    let Some(slot) = obj_recv_slot(&recv) else {
+    let Some((slot, path)) = obj_recv_ref(recv.ty, recv.src, recv.path, probes.paths) else {
         if !recv.ty.is_representable() {
             // Transient — tolerate; emission bails if never resolved.
             stack.push(SE::known(JitType::Unknown));
@@ -2148,11 +2669,28 @@ fn infer_load_attr(
         }
         return Err(JitVerdict::UnsupportedOpcode("LOAD_ATTR receiver"));
     };
-    let Some(lane) = (probes.attr)(slot, name, false) else {
+    let names = probes.paths.names(path);
+    let Some(lane) = (probes.attr)(slot, &names, name, false) else {
         return Err(JitVerdict::UnsupportedOpcode("LOAD_ATTR shape"));
     };
-    set_local(local_types, slot, JitType::Obj, changed)?;
-    stack.push(SE::known(lane));
+    if lane == JitType::Unknown {
+        return Err(JitVerdict::UnsupportedOpcode("LOAD_ATTR shape"));
+    }
+    if path.is_none() {
+        set_local(local_types, slot, JitType::Obj, changed)?;
+    }
+    // RFC 0071 WS3 — an object-lane result extends the provenance
+    // chain, so a later access through it can be probed (a chain past
+    // the depth cap simply carries no provenance).
+    let out_path = if lane == JitType::Obj {
+        probes.paths.seg(path, slot, name)
+    } else {
+        None
+    };
+    stack.push(SE {
+        path: out_path,
+        ..SE::known(lane)
+    });
     Ok(())
 }
 
@@ -2287,15 +2825,18 @@ fn bin_result_type(kind: ArithKind, a: JitType, b: JitType) -> Result<JitType, J
 /// Validate comparison operand lanes. Same-lane always works; mixed
 /// integral/float works via a *guarded* promotion (the interpreter
 /// compares exactly, so the JIT deopts when the int exceeds ±2^53).
-fn cmp_check(a: JitType, b: JitType) -> Result<(), JitVerdict> {
+fn cmp_check(kind: CmpKind, a: JitType, b: JitType) -> Result<(), JitVerdict> {
     if !a.is_representable() || !b.is_representable() {
         return Ok(());
     }
     if (a.is_integral() || a == JitType::Float) && (b.is_integral() || b == JitType::Float) {
-        Ok(())
-    } else {
-        Err(JitVerdict::MixedArithTypes)
+        return Ok(());
     }
+    // RFC 0071 WS6 — `str` equality (only) rides the pinned lane.
+    if a == JitType::Str && b == JitType::Str && matches!(kind, CmpKind::Eq | CmpKind::Ne) {
+        return Ok(());
+    }
+    Err(JitVerdict::MixedArithTypes)
 }
 
 /// Result lane of a unary op.
@@ -2387,6 +2928,8 @@ struct ESlot {
     ty: JitType,
     callee: Option<CalleeMark>,
     src: Option<u32>,
+    /// RFC 0071 WS3 — attribute-path provenance (see [`SE::path`]).
+    path: Option<u32>,
     recv: Option<u32>,
     /// RFC 0069 WS1 — a pinned receiver re-marked with its resolved
     /// method between the method-form load and the `CALL`.
@@ -2402,6 +2945,9 @@ struct ESlot {
     /// RFC 0069 WS1 — the `None` constant, consumable solely by
     /// `RETURN_VALUE`.
     none_const: bool,
+    /// RFC 0071 WS4 — an erased `BUILD_SLICE` result (see
+    /// [`SE::slice`]).
+    slice: Option<(bool, bool)>,
 }
 
 impl ESlot {
@@ -2410,12 +2956,14 @@ impl ESlot {
             ty,
             callee: None,
             src: None,
+            path: None,
             recv: None,
             method: None,
             math_mod: None,
             poison: false,
             null: false,
             none_const: false,
+            slice: None,
         }
     }
 
@@ -2427,6 +2975,7 @@ impl ESlot {
             && !self.poison
             && !self.null
             && !self.none_const
+            && self.slice.is_none()
     }
 
     /// `true` when this entry occupies a *native* stack position
@@ -2571,28 +3120,73 @@ fn emit_block(
             }
         }
         OpCode::ForIter => {
-            let &(cur_slot, stop_slot, var_slot) = plan
-                .headers
-                .get(&last)
-                .ok_or(JitVerdict::UnsupportedOpcode("FOR_ITER (unplanned)"))?;
             if !stack.is_empty() {
                 return Err(JitVerdict::NonEmptyBoundaryStack);
             }
-            seed_entry(emit_entries, block_succ(b, 0), &stack);
-            seed_entry(emit_entries, block_succ(b, 1), &stack);
-            TTerm::ForRange {
-                cur_slot,
-                stop_slot,
-                var_slot,
-                body: compact[&block_succ(b, 0)],
-                exit: compact[&block_succ(b, 1)],
+            if let Some(&(cur_slot, stop_slot, var_slot)) = plan.headers.get(&last) {
+                seed_entry(emit_entries, block_succ(b, 0), &stack);
+                seed_entry(emit_entries, block_succ(b, 1), &stack);
+                TTerm::ForRange {
+                    cur_slot,
+                    stop_slot,
+                    var_slot,
+                    body: compact[&block_succ(b, 0)],
+                    exit: compact[&block_succ(b, 1)],
+                }
+            } else if let Some(&(seq_slot, idx_slot, var_slot)) = plan.iter_headers.get(&last) {
+                // RFC 0071 WS4 — the list-loop header steps through
+                // the registered helper; the element lane comes from
+                // the seq slot's inferred list lane. An `Obj` seq slot
+                // is the *opaque-iterator* loop: the step helper
+                // advances the pinned iterator through the interpreter
+                // core, and the element lane is the loop variable's.
+                let lane = local_types
+                    .get(seq_slot as usize)
+                    .copied()
+                    .flatten()
+                    .ok_or(JitVerdict::TypeUnknown)?;
+                seed_entry(emit_entries, block_succ(b, 0), &stack);
+                seed_entry(emit_entries, block_succ(b, 1), &stack);
+                if lane == JitType::Obj {
+                    let elem = local_types
+                        .get(var_slot as usize)
+                        .copied()
+                        .flatten()
+                        .ok_or(JitVerdict::TypeUnknown)?;
+                    TTerm::ForIter {
+                        iter_slot: seq_slot,
+                        var_slot,
+                        elem,
+                        pc: last as u32,
+                        store_pc: (last + 1) as u32,
+                        body: compact[&block_succ(b, 0)],
+                        exit: compact[&block_succ(b, 1)],
+                    }
+                } else {
+                    let elem = lane.elem_lane().ok_or(JitVerdict::UnsupportedOpcode(
+                        "FOR_ITER (unsupported iterable)",
+                    ))?;
+                    TTerm::ForList {
+                        seq_slot,
+                        idx_slot,
+                        var_slot,
+                        elem,
+                        pc: last as u32,
+                        body: compact[&block_succ(b, 0)],
+                        exit: compact[&block_succ(b, 1)],
+                    }
+                }
+            } else {
+                return Err(JitVerdict::UnsupportedOpcode("FOR_ITER (unplanned)"));
             }
         }
         // RFC 0070 WS2 — the yield's unconditional side exit. A
         // `None` yield (`yield`, `yield None`) materializes through
         // `PushNone` so the spilled stack top rebuilds as the real
         // singleton; anything else must already be a plain native
-        // lane. No successors to seed — the resume is interpreted.
+        // lane. RFC 0071 WS5 — the continuation block is seeded with
+        // the yielded value replaced by the sent value (object lane),
+        // so a resume entry can jump straight to it.
         OpCode::YieldValue => {
             if !code.is_generator {
                 return Err(JitVerdict::UnsupportedOpcode(
@@ -2617,6 +3211,12 @@ fn emit_block(
                 if !top.ty.is_representable() {
                     return Err(JitVerdict::TypeUnknown);
                 }
+            }
+            if let Some(&succ) = b.succs.first() {
+                let mut cont = stack.clone();
+                cont.pop();
+                cont.push(ESlot::val(JitType::Obj));
+                seed_entry(emit_entries, succ, &cont);
             }
             TTerm::Yield { pc: last as u32 }
         }
@@ -2686,8 +3286,12 @@ fn emit_instr(
             }
             *max_stack = (*max_stack).max(stack.len() as u32);
         };
-    // RFC 0058 WS4 — rewritten range-loop pcs.
-    if plan.nop.contains(&i) || plan.fused_store.contains_key(&i) {
+    // RFC 0058 WS4 — rewritten range-loop pcs (RFC 0071 WS4 adds the
+    // list-loop fused store, performed by the `ForList` terminator).
+    if plan.nop.contains(&i)
+        || plan.fused_store.contains_key(&i)
+        || plan.fused_store_iter.contains_key(&i)
+    {
         return Ok(());
     }
     if let Some(&(pops, cur_slot, stop_slot)) = plan.calls.get(&i) {
@@ -2710,6 +3314,28 @@ fn emit_instr(
     }
     match ins.op {
         OpCode::Nop | OpCode::Resume => {}
+        // RFC 0071 WS4 — a recognized list-loop `GET_ITER`: capture
+        // the pinned list into the seq synthetic slot and zero the
+        // index slot (inference already typed both).
+        OpCode::GetIter => {
+            let &(seq_slot, idx_slot) = plan
+                .get_iter
+                .get(&i)
+                .ok_or(JitVerdict::UnsupportedOpcode("GET_ITER (unplanned)"))?;
+            // RFC 0071 WS4 — the opaque-iterator capture: the runtime
+            // helper verifies `iter(x) is x` (deopting otherwise) and
+            // the pin lands in the seq slot; the idx slot is unused.
+            if local_types.get(seq_slot as usize).copied().flatten() == Some(JitType::Obj) {
+                stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+                push(TOp::IterCapture { iter_slot: seq_slot }, None, stack, stmts);
+                return Ok(());
+            }
+            stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            push(TOp::StoreLocal(seq_slot), None, stack, stmts);
+            push(TOp::PushConstInt(0), Some(JitType::Int), stack, stmts);
+            stack.pop();
+            push(TOp::StoreLocal(idx_slot), None, stack, stmts);
+        }
         OpCode::LoadGlobal => {
             let (op, ty) = match plan.globals.get(&ins.arg) {
                 Some(&ResolvedGlobal::ConstInt(v)) => (TOp::PushConstInt(v), JitType::Int),
@@ -2727,13 +3353,9 @@ fn emit_instr(
                     // RFC 0059 WS3: the callee never reaches the native
                     // stack — push a marker and record where the
                     // *interpreter's* stack would hold the object (below
-                    // any values already pushed, above the live range
+                    // any values already pushed, above the live
                     // iterators of enclosing rewritten loops).
-                    let n_iters = plan
-                        .loops
-                        .iter()
-                        .filter(|l| (l.live_from as usize) <= i && i < l.live_to as usize)
-                        .count() as u32;
+                    let n_iters = plan.live_iters_at(i);
                     stack.push(ESlot {
                         callee: Some(CalleeMark {
                             kind: MarkKind::Py,
@@ -2752,11 +3374,7 @@ fn emit_instr(
                 // RFC 0065 WS5: `len` rides the interpreter stack the
                 // same way; the `CALL` lowers to `ListLen`.
                 Some(ResolvedGlobal::LenBuiltin) => {
-                    let n_iters = plan
-                        .loops
-                        .iter()
-                        .filter(|l| (l.live_from as usize) <= i && i < l.live_to as usize)
-                        .count() as u32;
+                    let n_iters = plan.live_iters_at(i);
                     stack.push(ESlot {
                         callee: Some(CalleeMark {
                             kind: MarkKind::Len,
@@ -2775,11 +3393,7 @@ fn emit_instr(
                 // RFC 0069 WS2 — the math module: interpreter-stack
                 // only, consumed by the following intrinsic load.
                 Some(ResolvedGlobal::MathModule) => {
-                    let n_iters = plan
-                        .loops
-                        .iter()
-                        .filter(|l| (l.live_from as usize) <= i && i < l.live_to as usize)
-                        .count() as u32;
+                    let n_iters = plan.live_iters_at(i);
                     stack.push(ESlot {
                         math_mod: Some((ins.arg, pc, n_iters + stack.len() as u32)),
                         ..ESlot::val(JitType::Unknown)
@@ -2850,6 +3464,15 @@ fn emit_instr(
             let kind = bin_kind(ins.arg)?;
             let b = pop_val(stack)?;
             let a = pop_val(stack)?;
+            // RFC 0071 WS4 — `list * int` repeats the pinned list on
+            // the same lane through `wpjit_list_repeat`.
+            if matches!(kind, ArithKind::Mul) && a.is_list() {
+                if b != JitType::Int {
+                    return Err(JitVerdict::UnsupportedOpcode("list repeat (count lane)"));
+                }
+                push(TOp::ListRepeat, Some(a), stack, stmts);
+                return Ok(());
+            }
             if (a.is_integral() && b == JitType::Float) || (a == JitType::Float && b.is_integral())
             {
                 // Mixed integral/float (RFC 0058 WS4): promote the
@@ -2905,6 +3528,15 @@ fn emit_instr(
                 stack.pop();
                 stack.pop();
                 push(TOp::FloatCmp(kind), Some(JitType::Bool), stack, stmts);
+            } else if a == JitType::Str && b == JitType::Str {
+                // RFC 0071 WS6 — `str` equality through the registered
+                // helper; ordering compares stay non-JITable.
+                let negate = match kind {
+                    CmpKind::Eq => false,
+                    CmpKind::Ne => true,
+                    _ => return Err(JitVerdict::UnsupportedOpcode("COMPARE_OP (str order)")),
+                };
+                push(TOp::StrEq { negate }, Some(JitType::Bool), stack, stmts);
             } else {
                 return Err(JitVerdict::MixedArithTypes);
             }
@@ -2962,6 +3594,27 @@ fn emit_instr(
                 _ => return Err(JitVerdict::UnsupportedOpcode("UNARY_OP lane")),
             }
         }
+        // CPython 3.13's `TO_BOOL`: `bool` is the identity;
+        // `int`/`float` lower as a double negation (`x != 0`) on the
+        // existing `Not` ops — two cheap native instructions, no new
+        // IR.
+        OpCode::ToBool => {
+            let a = pop_val(stack)?;
+            match a {
+                JitType::Bool => stack.push(ESlot::val(JitType::Bool)),
+                t if t.is_integral() => {
+                    push(TOp::IntNot, Some(JitType::Bool), stack, stmts);
+                    stack.pop();
+                    push(TOp::IntNot, Some(JitType::Bool), stack, stmts);
+                }
+                JitType::Float => {
+                    push(TOp::FloatNot, Some(JitType::Bool), stack, stmts);
+                    stack.pop();
+                    push(TOp::IntNot, Some(JitType::Bool), stack, stmts);
+                }
+                _ => return Err(JitVerdict::UnsupportedOpcode("TO_BOOL lane")),
+            }
+        }
         // RFC 0065 WS5 — attribute load: erased `.append` method load
         // (re-mark the receiver in place; no native op), or a pinned-
         // instance scalar attribute read (an `AttrGet` site).
@@ -3000,20 +3653,32 @@ fn emit_instr(
             if top.ty != JitType::Obj {
                 return Err(JitVerdict::UnsupportedOpcode("LOAD_ATTR receiver"));
             }
-            let slot = top.src.ok_or(JitVerdict::UnsupportedOpcode(
-                "LOAD_ATTR (receiver provenance)",
-            ))?;
-            let lane = (probes.attr)(slot, name, false)
+            let (slot, path) = obj_recv_ref(top.ty, top.src, top.path, probes.paths).ok_or(
+                JitVerdict::UnsupportedOpcode("LOAD_ATTR (receiver provenance)"),
+            )?;
+            let names = probes.paths.names(path);
+            let lane = (probes.attr)(slot, &names, name, false)
                 .ok_or(JitVerdict::UnsupportedOpcode("LOAD_ATTR shape"))?;
+            if lane == JitType::Unknown {
+                return Err(JitVerdict::UnsupportedOpcode("LOAD_ATTR shape"));
+            }
             stack.pop();
             let site = attr_sites.len() as u32;
             attr_sites.push(AttrSiteMeta {
                 slot,
+                path: names,
                 name: name.to_owned(),
                 lane,
                 store: false,
+                new_key: false,
             });
             push(TOp::AttrGet { site, out: lane }, Some(lane), stack, stmts);
+            // RFC 0071 WS3 — extend the provenance chain on the result.
+            if lane == JitType::Obj {
+                if let Some(last) = stack.last_mut() {
+                    last.path = probes.paths.seg(path, slot, name);
+                }
+            }
         }
         // RFC 0068 — the self-or-null slot: interpreter-stack only,
         // never a native value.
@@ -3071,14 +3736,15 @@ fn emit_instr(
             if top.ty != JitType::Obj {
                 return Err(JitVerdict::UnsupportedOpcode("LOAD_ATTR receiver"));
             }
-            let slot = top.src.ok_or(JitVerdict::UnsupportedOpcode(
-                "LOAD_ATTR (receiver provenance)",
-            ))?;
+            let (slot, path) = obj_recv_ref(top.ty, top.src, top.path, probes.paths).ok_or(
+                JitVerdict::UnsupportedOpcode("LOAD_ATTR (receiver provenance)"),
+            )?;
+            let names = probes.paths.names(path);
             // RFC 0069 WS1 — a class-resolved method: re-mark the
             // receiver in place (its pin stays the native value) and
             // record the site under the probe's token.
             if name != "append" {
-                if let Some(res) = (probes.method)(slot, name) {
+                if let Some(res) = (probes.method)(slot, &names, name) {
                     let meta = MethodSiteMeta {
                         slot,
                         name: name.to_owned(),
@@ -3113,17 +3779,28 @@ fn emit_instr(
                     return Ok(());
                 }
             }
-            let lane = (probes.attr)(slot, name, false)
+            let lane = (probes.attr)(slot, &names, name, false)
                 .ok_or(JitVerdict::UnsupportedOpcode("LOAD_ATTR shape"))?;
+            if lane == JitType::Unknown {
+                return Err(JitVerdict::UnsupportedOpcode("LOAD_ATTR shape"));
+            }
             stack.pop();
             let site = attr_sites.len() as u32;
             attr_sites.push(AttrSiteMeta {
                 slot,
+                path: names,
                 name: name.to_owned(),
                 lane,
                 store: false,
+                new_key: false,
             });
             push(TOp::AttrGet { site, out: lane }, Some(lane), stack, stmts);
+            // RFC 0071 WS3 — extend the provenance chain on the result.
+            if lane == JitType::Obj {
+                if let Some(last) = stack.last_mut() {
+                    last.path = probes.paths.seg(path, slot, name);
+                }
+            }
             stack.push(ESlot {
                 null: true,
                 ..ESlot::val(JitType::Unknown)
@@ -3141,12 +3818,26 @@ fn emit_instr(
             if !recv.is_plain() || recv.ty != JitType::Obj {
                 return Err(JitVerdict::UnsupportedOpcode("STORE_ATTR receiver"));
             }
-            let slot = recv.src.ok_or(JitVerdict::UnsupportedOpcode(
-                "STORE_ATTR (receiver provenance)",
-            ))?;
-            let lane = (probes.attr)(slot, name, true)
+            let (slot, path) = obj_recv_ref(recv.ty, recv.src, recv.path, probes.paths).ok_or(
+                JitVerdict::UnsupportedOpcode("STORE_ATTR (receiver provenance)"),
+            )?;
+            let names = probes.paths.names(path);
+            let probe_lane = (probes.attr)(slot, &names, name, true)
                 .ok_or(JitVerdict::UnsupportedOpcode("STORE_ATTR shape"))?;
             let val = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            // RFC 0071 WS2 — the new-key shape: the value's own lane
+            // defines the site (the fingerprint records the insert-or-
+            // replace storage mode).
+            let new_key = probe_lane == JitType::Unknown;
+            let lane = if new_key {
+                if val.none_const {
+                    JitType::Obj
+                } else {
+                    val.ty
+                }
+            } else {
+                probe_lane
+            };
             if val.none_const {
                 // RFC 0070 WS1 — `x.attr = None`: the `None` never had
                 // a native slot, so materialize it above the receiver
@@ -3167,13 +3858,23 @@ fn emit_instr(
                 if val.ty != lane {
                     return Err(JitVerdict::UnsupportedOpcode("STORE_ATTR (value lane)"));
                 }
+                // A storable lane: scalars and the object lane; other
+                // pinned lanes have no cross-store meaning.
+                if lane.is_pinned() && lane != JitType::Obj {
+                    return Err(JitVerdict::UnsupportedOpcode("STORE_ATTR (value lane)"));
+                }
+                if !lane.is_representable() {
+                    return Err(JitVerdict::TypeUnknown);
+                }
             }
             let site = attr_sites.len() as u32;
             attr_sites.push(AttrSiteMeta {
                 slot,
+                path: names,
                 name: name.to_owned(),
                 lane,
                 store: true,
+                new_key,
             });
             // Native stack order matches the interpreter: value below,
             // receiver on top. Lowering pops receiver then value.
@@ -3247,7 +3948,11 @@ fn emit_instr(
                     if !ty.is_representable() {
                         return Err(JitVerdict::TypeUnknown);
                     }
-                    if ty.is_pinned() {
+                    // RFC 0071 WS1 — object-lane values marshal across
+                    // the call as `ObjPin` entries (the helper resolves
+                    // them against this activation's pin table). Other
+                    // pinned lanes still stay put.
+                    if ty.is_pinned() && ty != JitType::Obj {
                         return Err(JitVerdict::UnsupportedOpcode("CALL (pinned argument)"));
                     }
                 }
@@ -3286,7 +3991,9 @@ fn emit_instr(
                         ..ESlot::val(JitType::Unknown)
                     }),
                     MethodRet::Scalar(ty) => {
-                        if !ty.is_representable() || ty.is_pinned() {
+                        // RFC 0071 WS1 — an `Obj`-lane result arrives as
+                        // a fresh pin in this activation's table.
+                        if !ty.is_representable() || (ty.is_pinned() && ty != JitType::Obj) {
                             return Err(JitVerdict::TypeUnknown);
                         }
                         stack.push(ESlot::val(ty));
@@ -3328,21 +4035,28 @@ fn emit_instr(
             if argc < mark.min_args as usize || argc > mark.arg_count as usize {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (arity)"));
             }
-            // `len(x)` on a pinned list — no real call, no deopt-able
-            // argument window (only loads can produce a list value).
+            // `len(x)` on a pinned list / `str` / `bytes` (RFC 0071
+            // WS6) — no real call, no deopt-able argument window
+            // (only loads can produce a pinned value).
             if mark.kind == MarkKind::Len {
-                if !arg_tys[0].is_list() {
+                let op = if arg_tys[0].is_list() {
+                    TOp::ListLen
+                } else if arg_tys[0] == JitType::Str {
+                    TOp::StrLen
+                } else if arg_tys[0] == JitType::Bytes {
+                    TOp::BytesLen
+                } else {
                     return Err(JitVerdict::UnsupportedOpcode("len (argument lane)"));
-                }
+                };
                 len_spans.push(CalleeSpanMeta {
                     token: 0,
                     live_from: mark.load_pc,
                     live_to: pc + 1,
                     interp_depth: mark.interp_depth,
                 });
-                // Re-model the pin for the statement (ListLen pops it).
+                // Re-model the pin for the statement (the len op pops it).
                 stack.push(ESlot::val(arg_tys[0]));
-                push(TOp::ListLen, None, stack, stmts);
+                push(op, None, stack, stmts);
                 stack.pop();
                 stack.push(ESlot::val(JitType::Int));
                 *max_stack = (*max_stack).max(stack.len() as u32);
@@ -3352,10 +4066,11 @@ fn emit_instr(
                 if !ty.is_representable() {
                     return Err(JitVerdict::TypeUnknown);
                 }
-                // RFC 0061/0065 WS5 — a pin index is meaningless outside
-                // this activation; a pinned value cannot be marshaled as
-                // a scalar call argument.
-                if ty.is_pinned() {
+                // RFC 0061/0065 WS5 — a raw pin index is meaningless
+                // outside this activation. RFC 0071 WS1 carves out the
+                // object lane: it marshals as an `ObjPin` entry the call
+                // helper resolves (and re-pins on the callee side).
+                if ty.is_pinned() && ty != JitType::Obj {
                     return Err(JitVerdict::UnsupportedOpcode("CALL (pinned argument)"));
                 }
             }
@@ -3364,9 +4079,9 @@ fn emit_instr(
                 _ => return Err(JitVerdict::TypeUnknown),
             };
             // RFC 0061/0065 WS5 — a pin index is only meaningful within
-            // its own activation's pinned-object table; a callee's
-            // returned value cannot cross the boundary as one.
-            if ret.is_pinned() {
+            // its own activation's pinned-object table; RFC 0071 WS1
+            // lets an object-lane result cross as a fresh caller pin.
+            if ret.is_pinned() && ret != JitType::Obj {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (pinned return)"));
             }
             callee_spans.push(CalleeSpanMeta {
@@ -3435,15 +4150,142 @@ fn emit_instr(
             stack.swap(len - 1, len - 2);
             push(TOp::Swap2, None, stack, stmts);
         }
+        // RFC 0071 WS4 — `BUILD_LIST k` (uniform lane or all-`None`).
+        OpCode::BuildList => {
+            let k = ins.arg as usize;
+            if k == 0 || k > 16 {
+                return Err(JitVerdict::UnsupportedOpcode("BUILD_LIST (shape)"));
+            }
+            let base = stack
+                .len()
+                .checked_sub(k)
+                .ok_or(JitVerdict::StackUnderflow)?;
+            let none_fill = stack[base..].iter().all(|e| e.none_const);
+            let elem = if none_fill {
+                JitType::Obj
+            } else {
+                let mut lane: Option<JitType> = None;
+                for e in &stack[base..] {
+                    if !e.is_plain() {
+                        return Err(JitVerdict::UnsupportedOpcode("BUILD_LIST (marker element)"));
+                    }
+                    match lane {
+                        None => lane = Some(e.ty),
+                        Some(l) if l == e.ty => {}
+                        Some(_) => {
+                            return Err(JitVerdict::UnsupportedOpcode("BUILD_LIST (mixed lanes)"))
+                        }
+                    }
+                }
+                lane.ok_or(JitVerdict::TypeUnknown)?
+            };
+            let list = JitType::list_of(elem)
+                .ok_or(JitVerdict::UnsupportedOpcode("BUILD_LIST (element lane)"))?;
+            stack.truncate(base);
+            // The elements stage through the call-arg marshal buffer,
+            // which must be wide enough for them (`none_fill` stages
+            // nothing).
+            if !none_fill {
+                *max_call_args = (*max_call_args).max(k as u32);
+            }
+            push(
+                TOp::BuildList {
+                    n: k as u32,
+                    elem,
+                    none_fill,
+                },
+                Some(list),
+                stack,
+                stmts,
+            );
+        }
+        // RFC 0071 WS4 — erased `BUILD_SLICE` (unit step): the marker
+        // rides the emission stack; the present bounds keep their
+        // native slots below it.
+        OpCode::BuildSlice => {
+            if ins.arg != 3 && ins.arg != 2 {
+                return Err(JitVerdict::UnsupportedOpcode("BUILD_SLICE (shape)"));
+            }
+            if ins.arg == 3 {
+                let step = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+                if !step.none_const {
+                    return Err(JitVerdict::UnsupportedOpcode("BUILD_SLICE (step)"));
+                }
+            }
+            let stop = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            let start = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            let bound = |e: &ESlot| -> Result<bool, JitVerdict> {
+                if e.none_const {
+                    return Ok(false);
+                }
+                if !e.is_plain() || e.ty != JitType::Int {
+                    return Err(JitVerdict::UnsupportedOpcode("BUILD_SLICE (bound)"));
+                }
+                Ok(true)
+            };
+            let has_start = bound(&start)?;
+            let has_stop = bound(&stop)?;
+            // The native bounds stay on the model stack *below* the
+            // marker, in start-then-stop order (matching what the
+            // `ListSlice` lowering pops).
+            if has_start {
+                stack.push(start);
+            }
+            if has_stop {
+                stack.push(stop);
+            }
+            stack.push(ESlot {
+                slice: Some((has_start, has_stop)),
+                ..ESlot::val(JitType::Unknown)
+            });
+            *max_stack = (*max_stack).max(stack.len() as u32);
+        }
         // RFC 0061 WS5 — pinned-list element read/write. Inference
         // already pinned the container slot's lane; emission just
         // re-validates the operand lanes it sees.
         OpCode::BinarySubscr => {
+            // RFC 0071 WS4 — the slice marker's only consumer: the
+            // fresh sliced list on the container's own lane. The
+            // deopt point is the erased `BUILD_SLICE` (must be the
+            // immediately preceding instruction).
+            if let Some(&marker) = stack.last() {
+                if let Some((has_start, has_stop)) = marker.slice {
+                    if i == 0 || !matches!(code.instructions[i - 1].op, OpCode::BuildSlice) {
+                        return Err(JitVerdict::UnsupportedOpcode("slice (non-adjacent)"));
+                    }
+                    stack.pop();
+                    if has_stop {
+                        pop_val(stack)?;
+                    }
+                    if has_start {
+                        pop_val(stack)?;
+                    }
+                    let cont = pop_val(stack)?;
+                    if cont.elem_lane().is_none() {
+                        return Err(JitVerdict::UnsupportedOpcode("slice container lane"));
+                    }
+                    stmts.push(TStmt {
+                        pc: (i - 1) as u32,
+                        op: TOp::ListSlice {
+                            start: has_start,
+                            stop: has_stop,
+                        },
+                    });
+                    stack.push(ESlot::val(cont));
+                    *max_stack = (*max_stack).max(stack.len() as u32);
+                    return Ok(());
+                }
+            }
             let idx = pop_val(stack)?;
             if idx != JitType::Int {
                 return Err(JitVerdict::UnsupportedOpcode("subscript index lane"));
             }
             let cont = pop_val(stack)?;
+            // RFC 0071 WS6 — `bytes[i]` through the registered helper.
+            if cont == JitType::Bytes {
+                push(TOp::BytesGetItem, Some(JitType::Int), stack, stmts);
+                return Ok(());
+            }
             let elem = cont
                 .elem_lane()
                 .ok_or(JitVerdict::UnsupportedOpcode("subscript container lane"))?;

@@ -31,6 +31,12 @@ pub enum JitType {
     ListInt,
     /// RFC 0061 WS5 — a pinned `list` of `float` elements.
     ListFloat,
+    /// RFC 0071 WS4 — a pinned `list` of *object* elements (instances
+    /// and `None`). Element reads ride the nullable object lane
+    /// (loaded elements pin at runtime, `None` as `-1`); the helpers
+    /// re-validate the element shape per access and deopt on any
+    /// surprise, exactly as the scalar list lanes do.
+    ListObj,
     /// RFC 0065 WS5 — a *pinned* instance receiver. Like the list pins,
     /// the machine value is an `i64` index into the embedder's
     /// per-entry pinned-object table; attribute access goes through the
@@ -45,6 +51,16 @@ pub enum JitType {
     /// treats a `-1` pin as a table miss and deopts, so the interpreter
     /// re-executes the access on the real `None` and raises exactly.
     Obj,
+    /// RFC 0071 WS6 — a *pinned* exact `str` (subclasses stay
+    /// `Unknown`). The machine value is a pin-table index; the read
+    /// helpers (`wpjit_str_eq`, `wpjit_str_len`) re-validate the pin
+    /// per access. Never nullable — `None` in a `Str` slot is a lane
+    /// conflict, not a `-1`.
+    Str,
+    /// RFC 0071 WS6 — a *pinned* exact `bytes` (subclasses stay
+    /// `Unknown`); same discipline as [`JitType::Str`]. `BytesGetItem`
+    /// reads bytes as `Int`s through the registered helper.
+    Bytes,
     /// Anything the JIT can't represent. Its presence as an operand to a
     /// supported opcode makes the enclosing region non-JITable.
     Unknown,
@@ -66,21 +82,34 @@ impl JitType {
         matches!(self, JitType::Int | JitType::Bool)
     }
 
-    /// `true` for a pinned-list lane (RFC 0061 WS5).
+    /// `true` for a pinned-list lane (RFC 0061 WS5 / RFC 0071 WS4).
     #[inline]
     #[must_use]
     pub fn is_list(self) -> bool {
-        matches!(self, JitType::ListInt | JitType::ListFloat)
+        matches!(
+            self,
+            JitType::ListInt | JitType::ListFloat | JitType::ListObj
+        )
     }
 
     /// `true` for any *pinned* lane (RFC 0061/0065 WS5): the machine
     /// value is a pin-table index, meaningless outside its own
     /// activation — it cannot be marshaled as a call argument or
-    /// returned across a frame boundary.
+    /// returned across a frame boundary (RFC 0071 WS1 exempts the
+    /// nullable `Obj` lane, whose marshaling resolves the pin to the
+    /// real object at the boundary).
     #[inline]
     #[must_use]
     pub fn is_pinned(self) -> bool {
-        matches!(self, JitType::ListInt | JitType::ListFloat | JitType::Obj)
+        matches!(
+            self,
+            JitType::ListInt
+                | JitType::ListFloat
+                | JitType::ListObj
+                | JitType::Obj
+                | JitType::Str
+                | JitType::Bytes
+        )
     }
 
     /// A pinned list's element lane, or `None` for non-list lanes.
@@ -90,6 +119,7 @@ impl JitType {
         match self {
             JitType::ListInt => Some(JitType::Int),
             JitType::ListFloat => Some(JitType::Float),
+            JitType::ListObj => Some(JitType::Obj),
             _ => None,
         }
     }
@@ -102,6 +132,7 @@ impl JitType {
         match elem {
             JitType::Int => Some(JitType::ListInt),
             JitType::Float => Some(JitType::ListFloat),
+            JitType::Obj => Some(JitType::ListObj),
             _ => None,
         }
     }

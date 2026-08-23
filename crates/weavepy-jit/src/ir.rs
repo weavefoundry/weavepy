@@ -238,6 +238,64 @@ pub enum TOp {
         argc: u8,
         ret: MethodRet,
     },
+    /// RFC 0071 WS6 — `==`/`!=` on two pinned `str` values: pops both
+    /// pins, calls the registered `wpjit_str_eq` helper (identical-pin
+    /// and pointer equality answer before a content compare), and
+    /// pushes the `bool` result (inverted when `negate`). A pin-table
+    /// surprise (defensive) deopts at this pc with both operands
+    /// spilled.
+    StrEq { negate: bool },
+    /// RFC 0071 WS6 — `len(s)` on a pinned `str`: pops the pin, calls
+    /// the registered `wpjit_str_len` helper, and pushes the `int`
+    /// *character* count (the helper counts scalar values, matching
+    /// `str.__len__`). Negative status (pin miss) deopts at this pc.
+    StrLen,
+    /// RFC 0071 WS6 — `len(b)` on a pinned `bytes`: like [`Self::StrLen`]
+    /// but the byte count.
+    BytesLen,
+    /// RFC 0071 WS6 — `BINARY_SUBSCR` on a pinned `bytes` with an `int`
+    /// index: pops the index and the pin, calls the registered
+    /// `wpjit_bytes_get` helper (bounds-checked, negative index
+    /// normalized), and pushes the byte as an `Int`. Out of range
+    /// deopts at this pc and the interpreter re-executes the subscript
+    /// to raise exactly.
+    BytesGetItem,
+    /// RFC 0071 WS4 — the opaque-iterator capture behind an erased
+    /// `GET_ITER` whose operand rides the object lane: pops the pin
+    /// and calls the registered `wpjit_get_iter` helper, which admits
+    /// only objects where `iter(x) is x` (generators, builtin
+    /// iterators) and stores the pin into `iter_slot`. Anything else
+    /// (an instance with `__iter__`, a non-iterable) deopts at this
+    /// pc with the operand spilled, and the interpreter executes the
+    /// `GET_ITER` — and the whole loop — generically.
+    IterCapture { iter_slot: u32 },
+    /// RFC 0071 WS4 — `BUILD_LIST k`: pops `n` same-lane elements
+    /// (staged through the frame's marshal buffer) and pushes a fresh
+    /// pinned list of the `elem` lane. `none_fill` covers the
+    /// `[None, ...]` literal shape: nothing is popped (the `None`
+    /// constants never reached the native stack) and the helper
+    /// writes `n` `None` elements. Pin-cap pressure deopts at this pc
+    /// and the interpreter re-executes the `BUILD_LIST`.
+    BuildList {
+        n: u32,
+        elem: JitType,
+        none_fill: bool,
+    },
+    /// RFC 0071 WS4 — `list * int` (`BINARY_OP *` with a pinned-list
+    /// lhs): pops the count and the pin, calls the registered
+    /// `wpjit_list_repeat` helper (element `Arc`s are shared, exactly
+    /// CPython's aliasing), and pushes the fresh pinned list on the
+    /// same lane. Cap pressure deopts at this pc.
+    ListRepeat,
+    /// RFC 0071 WS4 — `xs[a:b]` on a pinned list (an erased
+    /// `BUILD_SLICE 3` whose step is the `None` constant followed by
+    /// `BINARY_SUBSCR`): pops the present bounds (`stop` above
+    /// `start`, each only when its flag is set; an absent bound is the
+    /// `None` marker, never a native value) and the pin, calls the
+    /// registered `wpjit_list_slice` helper (CPython index clamping),
+    /// and pushes the fresh pinned list on the same lane. Cap
+    /// pressure deopts at this pc.
+    ListSlice { start: bool, stop: bool },
 }
 
 /// One IR statement: a [`TOp`] tagged with its originating bytecode pc
@@ -281,6 +339,60 @@ pub enum TTerm {
         cur_slot: u32,
         stop_slot: u32,
         var_slot: u32,
+        body: BlockId,
+        exit: BlockId,
+    },
+    /// RFC 0071 WS4 — a recognized `FOR_ITER` over a pinned list,
+    /// rewritten to an index-stepped loop over two synthetic slots:
+    /// `seq_slot` holds the pinned list (captured at the erased
+    /// `GET_ITER`, so rebinding the source local mid-loop cannot
+    /// retarget the iteration) and `idx_slot` the next element index.
+    /// Each step calls the registered `wpjit_list_next` helper, which
+    /// re-checks the index against the *live* length (mutation during
+    /// iteration is defined behavior — CPython's `FOR_ITER_LIST` does
+    /// the same) and re-validates the element lane: a yielded element
+    /// stores into `var_slot` and branches to `body`; exhaustion
+    /// branches to `exit`; an element-shape surprise deopts at the
+    /// header pc, where the interpreter resumes on a freshly rebuilt
+    /// list iterator.
+    ForList {
+        seq_slot: u32,
+        idx_slot: u32,
+        var_slot: u32,
+        /// The element lane (`var_slot`'s lane).
+        elem: JitType,
+        /// The `FOR_ITER` pc — the deopt resume point on an
+        /// element-shape surprise (the interpreter re-executes the
+        /// step on the rebuilt iterator).
+        pc: u32,
+        body: BlockId,
+        exit: BlockId,
+    },
+    /// RFC 0071 WS4 — a recognized `FOR_ITER` over an *opaque*
+    /// iterator (a generator or builtin iterator object riding the
+    /// object lane), stepped through the registered `wpjit_iter_next`
+    /// helper. The iterator object is pinned in `iter_slot` (captured
+    /// at the erased `GET_ITER`, which verified `iter(x) is x`); each
+    /// step advances it through the interpreter core. Statuses:
+    /// element in the compiled `elem` lane → store into `var_slot`,
+    /// branch to `body`; exhaustion → branch to `exit` (the helper
+    /// promptly reaps the iterator — RFC 0068's finalization
+    /// discipline); a lane surprise → the element was already
+    /// *consumed*, so the deopt resumes at `store_pc` (the fused
+    /// `STORE_FAST`) with the raw element spilled on top of the
+    /// rebuilt stack; a raise inside the iterator propagates through
+    /// the ordinary `Raised` exit at the header pc.
+    ForIter {
+        iter_slot: u32,
+        var_slot: u32,
+        /// The element lane (`var_slot`'s lane).
+        elem: JitType,
+        /// The `FOR_ITER` pc (raise site; also the deopt point when
+        /// the pin is not steppable — nothing consumed yet).
+        pc: u32,
+        /// The fused `STORE_FAST` pc — the resume point for a
+        /// consumed-element deopt.
+        store_pc: u32,
         body: BlockId,
         exit: BlockId,
     },
@@ -414,14 +526,25 @@ pub struct MethodSpanMeta {
 /// its `wpjit_attr_get`/`_set` helpers re-validate per access.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AttrSiteMeta {
-    /// The local slot the receiver was loaded from (probe key).
+    /// The local slot the receiver chain is rooted at (probe key).
     pub slot: u32,
+    /// RFC 0071 WS3 — the attribute names walked from the root local
+    /// to reach the receiver (empty for a direct local receiver). The
+    /// embedder's probe and guard snapshot walk the same chain; the
+    /// runtime helper needs only the receiver's *pin*, so the path is
+    /// compile-time metadata.
+    pub path: Vec<String>,
     /// The attribute name.
     pub name: String,
     /// The value lane the site was typed with.
     pub lane: JitType,
     /// `true` for a `STORE_ATTR` site.
     pub store: bool,
+    /// RFC 0071 WS2 — `true` for the constructor-pattern store shape:
+    /// the attribute is not yet present, so the helper performs a
+    /// single-probe insert-or-replace (mirroring tier-1's
+    /// `StoreAttrNewKey`) instead of an indexed overwrite.
+    pub new_key: bool,
 }
 
 /// RFC 0069 WS1 — one burned-in method-call site, indexed by
@@ -485,6 +608,39 @@ pub struct RangeLoopMeta {
     pub live_to: u32,
 }
 
+/// RFC 0071 WS4 — deopt-reconstruction metadata for one rewritten
+/// *list* loop: at any deopt pc in `[live_from, live_to)` the
+/// interpreter's operand stack would hold a live list iterator below
+/// the spilled temporaries, rebuilt from the pinned list in `seq_slot`
+/// and the index in `idx_slot`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ListLoopMeta {
+    /// Synthetic slot holding the pinned list (a pin-table index).
+    pub seq_slot: u32,
+    /// Synthetic slot holding the next element index.
+    pub idx_slot: u32,
+    /// First pc (the `FOR_ITER`) at which the iterator is live.
+    pub live_from: u32,
+    /// The `END_FOR` pc; the iterator is dead from here on.
+    pub live_to: u32,
+}
+
+/// RFC 0071 WS4 — deopt-reconstruction metadata for one rewritten
+/// *opaque-iterator* loop: at any deopt pc in `[live_from, live_to)`
+/// the interpreter's operand stack would hold the iterator *object
+/// itself* (a generator or builtin iterator — `iter(x) is x` was
+/// verified at capture) below the spilled temporaries, rebuilt
+/// directly from the pin in `iter_slot`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IterLoopMeta {
+    /// Synthetic slot holding the pinned iterator (a pin-table index).
+    pub iter_slot: u32,
+    /// First pc (the `FOR_ITER`) at which the iterator is live.
+    pub live_from: u32,
+    /// The `END_FOR` pc; the iterator is dead from here on.
+    pub live_to: u32,
+}
+
 /// A fully analyzed, JITable function body.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TFunc {
@@ -509,6 +665,14 @@ pub struct TFunc {
     /// Rewritten `range` loops, ordered outermost-first (ascending
     /// `live_from`), for deopt stack reconstruction.
     pub range_loops: Vec<RangeLoopMeta>,
+    /// RFC 0071 WS4 — rewritten *list* loops, ascending `live_from`,
+    /// for deopt stack reconstruction (interleaved with
+    /// [`Self::range_loops`] by `live_from` when rebuilding).
+    pub list_loops: Vec<ListLoopMeta>,
+    /// RFC 0071 WS4 — rewritten *opaque-iterator* loops, ascending
+    /// `live_from`, for deopt stack reconstruction (interleaved with
+    /// the other loop kinds by `live_from` when rebuilding).
+    pub iter_loops: Vec<IterLoopMeta>,
     /// Erased Python callees (RFC 0059 WS3), ascending `live_from`, for
     /// deopt stack reconstruction during argument computation.
     pub callee_spans: Vec<CalleeSpanMeta>,
@@ -540,6 +704,13 @@ pub struct TFunc {
     /// OSR entry points (RFC 0059 WS3b): backward-jump target blocks
     /// enterable via `entry_pc`.
     pub osr_entries: Vec<OsrEntry>,
+    /// RFC 0071 WS5 — generator *resume* entry points: the block after
+    /// a `YIELD_VALUE`, enterable via `entry_pc` when the embedder
+    /// resumes a suspended generator. Each target block's boundary
+    /// stack is exactly `[Obj]` — the sent value, passed in
+    /// [`crate::runtime::JitFrame::ret_bits`] on the object lane's
+    /// packing (a pin index, `None` as `-1`).
+    pub resume_entries: Vec<OsrEntry>,
     /// Widest `CallPy`/`CallMethod` argument count, for sizing the
     /// marshal buffer.
     pub max_call_args: u32,
@@ -583,6 +754,14 @@ impl TOp {
                 | TOp::AttrGet { .. }
                 | TOp::AttrSet { .. }
                 | TOp::GuardNotNone
+                | TOp::StrEq { .. }
+                | TOp::StrLen
+                | TOp::BytesLen
+                | TOp::BytesGetItem
+                | TOp::IterCapture { .. }
+                | TOp::BuildList { .. }
+                | TOp::ListRepeat
+                | TOp::ListSlice { .. }
         )
     }
 }

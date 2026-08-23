@@ -18,8 +18,9 @@ use cranelift_module::{Linkage, Module};
 
 use crate::analyze::{JitVerdict, Probes};
 use crate::ir::{
-    ArithKind, AttrSiteMeta, CalleeSpanMeta, GlobalGuard, MathFunc, MathGuardMeta, MethodSiteMeta,
-    MethodSpanMeta, OsrEntry, RangeLoopMeta, ResolvedGlobal, TFunc, TOp,
+    ArithKind, AttrSiteMeta, CalleeSpanMeta, GlobalGuard, IterLoopMeta, ListLoopMeta, MathFunc,
+    MathGuardMeta, MethodSiteMeta, MethodSpanMeta, OsrEntry, RangeLoopMeta, ResolvedGlobal, TFunc,
+    TOp,
 };
 use crate::lower::build_function;
 use crate::runtime::{self, JitFrame, JitStatus};
@@ -49,6 +50,14 @@ pub struct CompiledFrame {
     /// Rewritten range loops, outermost-first, for rebuilding the live
     /// iterators on the interpreter stack after a mid-loop deopt.
     pub range_loops: Vec<RangeLoopMeta>,
+    /// RFC 0071 WS4 — rewritten list loops, ascending `live_from`
+    /// (interleaved with [`Self::range_loops`] by `live_from` when
+    /// rebuilding the interpreter stack).
+    pub list_loops: Vec<ListLoopMeta>,
+    /// RFC 0071 WS4 — rewritten opaque-iterator loops, ascending
+    /// `live_from` (the pinned iterator object rebuilds directly onto
+    /// the interpreter stack).
+    pub iter_loops: Vec<IterLoopMeta>,
     /// Erased Python callees (RFC 0059 WS3), for rebuilding the callee
     /// object on the interpreter stack after a mid-arguments deopt.
     pub callee_spans: Vec<CalleeSpanMeta>,
@@ -75,6 +84,9 @@ pub struct CompiledFrame {
     pub ret_none: bool,
     /// Loop-header pcs enterable mid-frame via `entry_pc` (OSR).
     pub osr_entries: Vec<OsrEntry>,
+    /// RFC 0071 WS5 — generator resume pcs enterable via `entry_pc`
+    /// (the sent value passed in `ret_bits`, object-lane packed).
+    pub resume_entries: Vec<OsrEntry>,
     /// Widest `CallPy` argument count, for sizing the marshal buffers.
     pub max_call_args: u32,
     /// The function's own stable scalar return lane, when every return
@@ -322,6 +334,8 @@ impl JitEngine {
             n_locals: tfunc.n_locals,
             global_guards: tfunc.global_guards.clone(),
             range_loops: tfunc.range_loops.clone(),
+            list_loops: tfunc.list_loops.clone(),
+            iter_loops: tfunc.iter_loops.clone(),
             callee_spans: tfunc.callee_spans.clone(),
             len_spans: tfunc.len_spans.clone(),
             method_spans: tfunc.method_spans.clone(),
@@ -330,6 +344,7 @@ impl JitEngine {
             math_guards: tfunc.math_guards.clone(),
             math_spans: tfunc.math_spans.clone(),
             osr_entries: tfunc.osr_entries.clone(),
+            resume_entries: tfunc.resume_entries.clone(),
             max_call_args: tfunc.max_call_args,
             ret_lane: tfunc.ret_lane,
             ret_none: tfunc.ret_none,
