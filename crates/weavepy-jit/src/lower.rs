@@ -332,6 +332,15 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let bb = self.cl_blocks[body];
                 self.b.ins().jump(bb, &[]);
             }
+            // RFC 0070 WS2 — a yield is an unconditional deopt-shaped
+            // exit parked *at* the `YIELD_VALUE` pc: the full stack
+            // (yielded value on top) spills, and the embedder resumes
+            // interpretation on the yield instruction itself, whose
+            // ordinary execution performs the suspension.
+            TTerm::Yield { pc } => {
+                let snapshot = self.vstack.clone();
+                self.emit_exit(pc, &snapshot, JitStatus::Yielded);
+            }
         }
     }
 
@@ -447,6 +456,30 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             TOp::ListAppend => self.emit_list_append(stmt.pc),
             TOp::AttrGet { site, out } => self.emit_attr_get(site, out, stmt.pc),
             TOp::AttrSet { site } => self.emit_attr_set(site, stmt.pc),
+            // RFC 0070 WS1 — nullable object lanes: `None` is the
+            // machine value `-1` (never a valid pin-table index).
+            TOp::IsNone { negate } => {
+                let (v, _) = self.pop();
+                let cc = if negate {
+                    IntCC::NotEqual
+                } else {
+                    IntCC::Equal
+                };
+                let cmp = self.b.ins().icmp_imm(cc, v, -1);
+                let r = self.b.ins().uextend(types::I64, cmp);
+                self.vstack.push((r, JitType::Bool));
+            }
+            TOp::PushNone => {
+                let v = self.b.ins().iconst(types::I64, -1);
+                self.vstack.push((v, JitType::Obj));
+            }
+            TOp::GuardNotNone => {
+                let snapshot = self.vstack.clone();
+                let &(v, _) = self.vstack.last().expect("guard on empty stack");
+                let is_none = self.b.ins().icmp_imm(IntCC::Equal, v, -1);
+                let cont = self.guard(is_none, stmt.pc, &snapshot);
+                self.b.switch_to_block(cont);
+            }
             TOp::MathIntrinsic(func) => self.emit_math_intrinsic(func, stmt.pc),
             TOp::CallMethod { token, argc, ret } => {
                 self.emit_call_method(token, argc, ret, stmt.pc);

@@ -37,6 +37,17 @@ pub enum JitStatus {
     /// (the `wpjit_call_py` helper parked it before returning its
     /// raised status).
     Raised = 2,
+    /// RFC 0070 WS2 — a generator body reached `YIELD_VALUE`. The
+    /// frame state is written back exactly as for
+    /// [`JitStatus::Deopt`], with [`JitFrame::deopt_pc`] naming the
+    /// `YIELD_VALUE` instruction itself and the yielded value on top
+    /// of the spilled stack: the embedder resumes interpretation *at*
+    /// the yield, whose ordinary execution performs the suspension
+    /// (park, `gi_frame` consistency, exception-state swap-out).
+    /// Distinct from `Deopt` only so the embedder's deopt-backoff
+    /// budget ignores it — yielding is the healthy exit of a
+    /// generator activation, not a sign of shape trouble.
+    Yielded = 3,
 }
 
 impl JitStatus {
@@ -47,6 +58,7 @@ impl JitStatus {
         match v {
             0 => JitStatus::Returned,
             2 => JitStatus::Raised,
+            3 => JitStatus::Yielded,
             _ => JitStatus::Deopt,
         }
     }
@@ -101,6 +113,10 @@ pub enum SlotTag {
     /// RFC 0065 WS5 — the value is an index into the embedder's
     /// per-entry pinned-object table (a pinned *instance* receiver).
     /// Same reconstruction contract as [`SlotTag::ListPin`].
+    ///
+    /// RFC 0070 WS1 — the lane is nullable: the bits `-1` (`u64::MAX`,
+    /// never a valid pin index) stand for the `None` singleton, and
+    /// the embedder rebuilds `None` instead of a table lookup.
     ObjPin = 5,
     /// RFC 0069 WS1 — the Python `None` singleton (a `ReturnNone`
     /// exit, or a provably-`None` method-call result). The bits are

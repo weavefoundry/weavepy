@@ -46260,6 +46260,495 @@ mod tests {
         assert_eq!(out, run(src));
     }
 
+    // RFC 0070 WS1 — nullable object lanes: `is None` / `is not None`
+    // fences, `x = None` stores, and the `None`-receiver deopt paths.
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_is_none_check_compiles_clean() {
+        // `q is None` on an object-lane parameter lowers to the native
+        // `-1` fence — no helper call, no deopt — and both the `None`
+        // and instance shapes run natively (entry packs `None` as -1).
+        let src = "class P:\n    def __init__(self):\n        self.x = 3\n\
+                   def scan(p, q, n):\n    s = 0\n    i = 0\n\
+                   \x20   while i < n:\n\
+                   \x20       if q is None:\n            s = s + 1\n\
+                   \x20       else:\n            s = s + p.x\n\
+                   \x20       i = i + 1\n\
+                   \x20   return s\n\
+                   p = P()\n\
+                   r = 0\nk = 0\n\
+                   while k < 60:\n    r = r + scan(p, None, 5) + scan(p, p, 5)\n    k = k + 1\n\
+                   print(r)\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the is-None kernel");
+        assert_eq!(deopts, 0, "the None fence must not deopt");
+        assert_eq!(out, "1200\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_none_store_flips_object_local() {
+        // A local that alternates between a pinned instance and `None`
+        // (`cur = None` lowers to a `-1` store; `cur is not None`
+        // fences it) stays native through both states.
+        let src = "class P:\n    def __init__(self):\n        self.x = 5\n\
+                   def flip(p, n):\n    cur = p\n    s = 0\n    i = 0\n\
+                   \x20   while i < n:\n\
+                   \x20       if cur is None:\n            cur = p\n\
+                   \x20       else:\n            s = s + p.x\n            cur = None\n\
+                   \x20       i = i + 1\n\
+                   \x20   return s\n\
+                   p = P()\n\
+                   r = 0\nk = 0\n\
+                   while k < 60:\n    r = flip(p, 10)\n    k = k + 1\n\
+                   print(r)\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the None-flip kernel");
+        assert_eq!(deopts, 0, "the None flip should stay native");
+        assert_eq!(out, "25\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_none_receiver_attr_access_raises_exactly() {
+        // A hot attribute kernel entered with `None` for its pinned
+        // receiver: entry now packs the nullable lane (-1), the access
+        // helper misses the pin table and deopts, and the interpreter
+        // re-executes the load to raise the exact AttributeError.
+        let src = "class P:\n    def __init__(self):\n        self.x = 1\n\
+                   def get(p, n):\n    s = 0\n    i = 0\n\
+                   \x20   while i < n:\n        s = s + p.x\n        i = i + 1\n\
+                   \x20   return s\n\
+                   p = P()\n\
+                   k = 0\n\
+                   while k < 60:\n    get(p, 10)\n    k = k + 1\n\
+                   msg = ''\n\
+                   try:\n    get(None, 3)\nexcept AttributeError:\n    msg = 'AttributeError'\n\
+                   print(msg)\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the attr kernel");
+        assert!(deopts >= 1, "the None receiver must deopt, not skip");
+        assert_eq!(out, "AttributeError\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_none_receiver_method_call_raises_exactly() {
+        // A burned-in method site whose receiver arrives as `None`:
+        // the GuardNotNone fence deopts at the (erased) LOAD_ATTR pc
+        // with the receiver spilled as the real `None`, so the
+        // interpreter raises the exact AttributeError.
+        let src = "class C:\n    def __init__(self):\n        self.v = 0\n\
+                   \x20   def bump(self):\n        self.v = self.v + 1\n\
+                   def drive(c, n):\n    i = 0\n\
+                   \x20   while i < n:\n        c.bump()\n        i = i + 1\n\
+                   \x20   return c.v\n\
+                   c = C()\n\
+                   k = 0\n\
+                   while k < 60:\n    drive(c, 5)\n    k = k + 1\n\
+                   msg = ''\n\
+                   try:\n    drive(None, 1)\nexcept AttributeError:\n    msg = 'AttributeError'\n\
+                   print(msg, c.v)\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the method kernel");
+        assert_eq!(out, "AttributeError 300\n");
+        assert_eq!(out, run(src));
+    }
+
+    // RFC 0070 WS1b — object-valued attribute lanes: runtime pins on
+    // loads, pin-resolved stores, and the displaced-temporary deopt.
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_linked_list_traversal_compiles_clean() {
+        // `cur = cur.next` walks: each object-lane load pins the next
+        // node at runtime; the tail's `None` (-1) exits the loop
+        // through the native fence. Compiles via OSR (the probe needs
+        // `cur` live) and never deopts.
+        let src = "class Node:\n    def __init__(self, v):\n        self.v = v\n        self.next = None\n\
+                   def total(head, m):\n    t = 0\n    k = 0\n\
+                   \x20   while k < m:\n\
+                   \x20       cur = head\n        s = 0\n\
+                   \x20       while cur is not None:\n            s = s + cur.v\n            cur = cur.next\n\
+                   \x20       t = t + s\n        k = k + 1\n\
+                   \x20   return t\n\
+                   head = Node(1)\nn2 = Node(2)\nn3 = Node(3)\n\
+                   head.next = n2\nn2.next = n3\n\
+                   print(total(head, 100))\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the traversal kernel");
+        assert_eq!(deopts, 0, "a stable chain walk should not deopt");
+        assert_eq!(out, "600\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_object_attr_store_and_reload() {
+        // Object-valued stores resolve the staged pin back to the real
+        // object; reloading through the same site re-pins it, and the
+        // `None` store flips the lane back.
+        let src = "class Box:\n    def __init__(self, v):\n        self.v = v\n        self.peer = None\n\
+                   def link(a, b, n):\n    i = 0\n    s = 0\n\
+                   \x20   while i < n:\n\
+                   \x20       a.peer = b\n        p = a.peer\n\
+                   \x20       if p is None:\n            s = s + 1000\n\
+                   \x20       else:\n            s = s + b.v\n\
+                   \x20       a.peer = None\n        i = i + 1\n\
+                   \x20   return s\n\
+                   a = Box(1)\nb = Box(7)\n\
+                   r = 0\nk = 0\n\
+                   while k < 60:\n    r = link(a, b, 10)\n    k = k + 1\n\
+                   print(r, a.peer)\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the store kernel");
+        assert_eq!(deopts, 0, "stable object stores should not deopt");
+        assert_eq!(out, "70 None\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_object_attr_store_reapable_displacement_deopts() {
+        // Displacing an attribute value that is a dying temporary must
+        // run its `__del__` promptly: the store helper detects the
+        // reapable displacement, deopts *before* storing, and the
+        // interpreter's store path performs the reap exactly.
+        let src = "class D:\n    def __del__(self):\n        print('gone')\n\
+                   class P:\n    def __init__(self):\n        self.x = None\n\
+                   def clear(p, n):\n    i = 0\n\
+                   \x20   while i < n:\n        p.x = None\n        i = i + 1\n\
+                   p = P()\np.x = D()\n\
+                   k = 0\n\
+                   while k < 60:\n    clear(p, 5)\n    k = k + 1\n\
+                   p.x = D()\n\
+                   print('armed')\n\
+                   clear(p, 3)\n\
+                   print('done')\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the clear kernel");
+        assert_eq!(out, run(src), "reap timing diverged from interpreter");
+        assert!(
+            out.contains("armed\ngone\ndone"),
+            "the displaced temporary's __del__ must run at the store, got: {out}"
+        );
+    }
+
+    // RFC 0070 WS3 — `__slots__` attribute lanes: slot side-table
+    // reads/writes through the burned-in sites.
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_slots_scalar_roundtrip_compiles_clean() {
+        // `p.x = p.x + p.y` on a `__slots__` class: both loads and the
+        // store go through the slot side table under the class-version
+        // guard, and a stable shape never deopts.
+        let src = "class P:\n    __slots__ = ('x', 'y')\n\
+                   \x20   def __init__(self):\n        self.x = 0\n        self.y = 1\n\
+                   def move(p, n):\n    i = 0\n\
+                   \x20   while i < n:\n        p.x = p.x + p.y\n        i = i + 1\n\
+                   \x20   return p.x\n\
+                   p = P()\n\
+                   r = 0\nk = 0\n\
+                   while k < 60:\n    r = move(p, 10)\n    k = k + 1\n\
+                   print(r)\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the slots kernel");
+        assert_eq!(deopts, 0, "stable slot shape should not deopt");
+        assert_eq!(out, "600\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_slots_object_lane_traversal() {
+        // A `__slots__`-backed linked chain: object-lane loads from the
+        // slot side table pin at runtime, and the `None` tail exits
+        // through the native fence.
+        let src = "class Node:\n    __slots__ = ('v', 'next')\n\
+                   \x20   def __init__(self, v):\n        self.v = v\n        self.next = None\n\
+                   def total(head, m):\n    t = 0\n    k = 0\n\
+                   \x20   while k < m:\n\
+                   \x20       cur = head\n        s = 0\n\
+                   \x20       while cur is not None:\n            s = s + cur.v\n            cur = cur.next\n\
+                   \x20       t = t + s\n        k = k + 1\n\
+                   \x20   return t\n\
+                   head = Node(4)\nn2 = Node(5)\n\
+                   head.next = n2\n\
+                   print(total(head, 100))\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the slots traversal");
+        assert_eq!(deopts, 0, "a stable slots chain should not deopt");
+        assert_eq!(out, "900\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_slots_class_mutation_deopts_exactly() {
+        // Rebinding the slot descriptor's class attribute bumps
+        // `attr_version`; the site guard fails and the generic path
+        // takes over with identical results.
+        let src = "class P:\n    __slots__ = ('x',)\n\
+                   \x20   def __init__(self):\n        self.x = 1\n\
+                   def get(p, n):\n    s = 0\n    i = 0\n\
+                   \x20   while i < n:\n        s = s + p.x\n        i = i + 1\n\
+                   \x20   return s\n\
+                   p = P()\n\
+                   k = 0\n\
+                   while k < 60:\n    get(p, 10)\n    k = k + 1\n\
+                   P.z = 99\n\
+                   print(get(p, 10))\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the slots kernel");
+        assert_eq!(out, "10\n");
+        assert_eq!(out, run(src));
+    }
+
+    // RFC 0070 WS2 — native generator activations: yields exit through
+    // the `Yielded` writeback (interpreter executes the suspension),
+    // resumes re-enter natively at the loop back edge's OSR entry.
+    // The profitability gate admits only bodies with a *yield-free
+    // inner loop* (a native CFG cycle), so every test generator does
+    // real work between suspensions.
+
+    /// Like [`run_jit`], but also reports the OSR-entry and
+    /// `Yielded`-exit counters:
+    /// `(stdout, compiled, deopts, osr_entries, yields)`.
+    #[cfg(feature = "jit")]
+    fn run_jit_gen(src: &str) -> (String, u64, u64, u64, u64) {
+        let src = src.to_owned();
+        std::thread::spawn(move || {
+            crate::tier2::force_enable_for_test(2);
+            let out = run(&src);
+            let (compiled, _entries, deopts) = crate::tier2::stats_for_test();
+            let osr = crate::tier2::osr_stats_for_test();
+            let yields = crate::tier2::yield_stats_for_test();
+            (out, compiled, deopts, osr, yields)
+        })
+        .join()
+        .expect("jit worker thread")
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_generator_range_loop_yields_natively() {
+        // Each resume interprets only `POP_TOP` + `JUMP_BACKWARD`
+        // before OSR re-enters the native body, which runs the whole
+        // inner reduction natively and takes the `Yielded` exit.
+        // Yields must not burn the deopt budget (the body stays
+        // compiled for the whole run).
+        let src = "def g(n):\n\
+                   \x20   for i in range(n):\n\
+                   \x20       s = 0\n\
+                   \x20       j = 0\n\
+                   \x20       while j < 25:\n\
+                   \x20           s = s + i + j\n\
+                   \x20           j = j + 1\n\
+                   \x20       yield s\n\
+                   t = 0\nk = 0\n\
+                   while k < 60:\n\
+                   \x20   for v in g(20):\n        t = t + v\n\
+                   \x20   k = k + 1\n\
+                   print(t)\n";
+        let (out, compiled, deopts, osr, yields) = run_jit_gen(src);
+        assert!(compiled >= 1, "JIT never compiled the generator body");
+        assert_eq!(deopts, 0, "yields must not count as deopts");
+        assert!(osr >= 1, "generator resumes never re-entered natively");
+        assert!(yields >= 1, "no native yield exit was taken");
+        assert_eq!(out, "645000\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_generator_trailing_yield_stays_interpreted() {
+        // The profitability gate: a body whose only loop suspends
+        // every iteration (no yield-free native cycle) would pay the
+        // full OSR round trip per element for a couple of native ops —
+        // the analyzer rules it `Trivial` and the interpreter keeps it.
+        let src = "def g(n):\n    for i in range(n):\n        yield i * 2\n\
+                   t = 0\nk = 0\n\
+                   while k < 60:\n\
+                   \x20   for v in g(20):\n        t = t + v\n\
+                   \x20   k = k + 1\n\
+                   print(t)\n";
+        let (out, _compiled, _deopts, osr, yields) = run_jit_gen(src);
+        assert_eq!(yields, 0, "trailing-yield body must not run natively");
+        assert_eq!(osr, 0, "trailing-yield body must not OSR-enter");
+        assert_eq!(out, "22800\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_generator_while_loop_with_return_value() {
+        // `return` inside a generator raises `StopIteration` with the
+        // value; the native `Returned` exit must feed the same
+        // machinery. The `while` shape checks the non-range loop
+        // header OSR path too.
+        let src = "def count(n):\n    i = 0\n\
+                   \x20   while i < n:\n\
+                   \x20       s = 0\n\
+                   \x20       j = 0\n\
+                   \x20       while j < 20:\n            s = s + j\n            j = j + 1\n\
+                   \x20       yield i + s\n\
+                   \x20       i = i + 1\n\
+                   \x20   return 99\n\
+                   t = 0\nk = 0\n\
+                   while k < 60:\n\
+                   \x20   it = count(15)\n\
+                   \x20   try:\n\
+                   \x20       while True:\n            t = t + next(it)\n\
+                   \x20   except StopIteration as e:\n        t = t + e.value\n\
+                   \x20   k = k + 1\n\
+                   print(t)\n";
+        let (out, _compiled, _deopts, _osr, _yields) = run_jit_gen(src);
+        assert_eq!(out, "183240\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_generator_send_and_expression_yield() {
+        // `x = yield v` resumes interpreted (the sent-value store
+        // always runs in the interpreter), so `send` needs no special
+        // casing — and the loop still tiers back in at the back edge.
+        let src = "def echo(n):\n    i = 0\n    t = 0\n\
+                   \x20   while i < n:\n\
+                   \x20       s = 0\n\
+                   \x20       j = 0\n\
+                   \x20       while j < 10:\n            s = s + 1\n            j = j + 1\n\
+                   \x20       x = yield t + s\n\
+                   \x20       t = t + x\n\
+                   \x20       i = i + 1\n\
+                   r = 0\nk = 0\n\
+                   while k < 60:\n\
+                   \x20   it = echo(10)\n    it.send(None)\n    j = 0\n\
+                   \x20   try:\n\
+                   \x20       while True:\n            r = r + it.send(j)\n            j = j + 1\n\
+                   \x20   except StopIteration:\n        pass\n\
+                   \x20   k = k + 1\n\
+                   print(r)\n";
+        let (out, _compiled, _deopts, _osr, _yields) = run_jit_gen(src);
+        assert_eq!(out, "12600\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_generator_close_and_throw_between_resumes() {
+        // `close()` and `throw()` inject at a parked yield boundary —
+        // the writeback left the frame exactly as an interpreted
+        // suspension would, so the injection paths see real state.
+        let src = "def g(n):\n    i = 0\n\
+                   \x20   while i < n:\n\
+                   \x20       s = 0\n\
+                   \x20       j = 0\n\
+                   \x20       while j < 10:\n            s = s + 1\n            j = j + 1\n\
+                   \x20       yield i + s\n\
+                   \x20       i = i + 1\n\
+                   k = 0\nc = 0\n\
+                   while k < 60:\n\
+                   \x20   it = g(50)\n    s = 0\n    j = 0\n\
+                   \x20   while j < 5:\n        s = s + next(it)\n        j = j + 1\n\
+                   \x20   it.close()\n    c = c + s\n    k = k + 1\n\
+                   it2 = g(50)\n\
+                   next(it2)\n\
+                   try:\n    it2.throw(ValueError('boom'))\n\
+                   except ValueError as e:\n    print(e)\n\
+                   print(c)\n";
+        let (out, _compiled, _deopts, _osr, _yields) = run_jit_gen(src);
+        assert_eq!(out, "boom\n3600\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_generator_gi_frame_locals_after_yield() {
+        // PEP 667: a `gi_frame.f_locals` handle captured mid-life must
+        // show assignments made before the latest yield. The `Yielded`
+        // writeback unpacks locals before the interpreter suspends, so
+        // the handle reads real values.
+        let src = "def g(n):\n    acc = 0\n\
+                   \x20   for i in range(n):\n\
+                   \x20       j = 0\n\
+                   \x20       while j < 10:\n            acc = acc + 1\n            j = j + 1\n\
+                   \x20       acc = acc + i\n\
+                   \x20       yield acc\n\
+                   k = 0\nt = 0\n\
+                   while k < 60:\n\
+                   \x20   it = g(30)\n    j = 0\n\
+                   \x20   while j < 10:\n        t = t + next(it)\n        j = j + 1\n\
+                   \x20   k = k + 1\n\
+                   it = g(30)\n\
+                   next(it)\nnext(it)\nnext(it)\n\
+                   f = it.gi_frame\n\
+                   print(f.f_locals['acc'])\n\
+                   print(t)\n";
+        let (out, _compiled, _deopts, _osr, _yields) = run_jit_gen(src);
+        assert_eq!(out, "33\n42900\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_generator_object_lane_traversal() {
+        // WS1 + WS2 composed: a linked-list walking generator keeps
+        // the cursor in a nullable object lane across native
+        // stretches; the `is not None` fence and attr loads run
+        // native between yields.
+        let src = "class Node:\n\
+                   \x20   def __init__(self, v, nxt):\n        self.v = v\n        self.next = nxt\n\
+                   def walk(head, n):\n    cur = head\n    i = 0\n\
+                   \x20   while cur is not None:\n\
+                   \x20       s = 0\n\
+                   \x20       j = 0\n\
+                   \x20       while j < 10:\n            s = s + 1\n            j = j + 1\n\
+                   \x20       yield cur.v + s\n\
+                   \x20       cur = cur.next\n\
+                   \x20       i = i + 1\n\
+                   head = None\n\
+                   j = 30\n\
+                   while j > 0:\n    head = Node(j, head)\n    j = j - 1\n\
+                   t = 0\nk = 0\n\
+                   while k < 60:\n\
+                   \x20   for v in walk(head, 30):\n        t = t + v\n\
+                   \x20   k = k + 1\n\
+                   print(t)\n";
+        let (out, _compiled, _deopts, _osr, _yields) = run_jit_gen(src);
+        assert_eq!(out, "45900\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_bare_yield_and_yield_none() {
+        // `yield` / `yield None` materialize the `None` through the
+        // object-lane `PushNone` so the spilled top rebuilds as the
+        // real singleton.
+        let src = "def pulse(n):\n    i = 0\n\
+                   \x20   while i < n:\n\
+                   \x20       s = 0\n\
+                   \x20       j = 0\n\
+                   \x20       while j < 10:\n            s = s + 1\n            j = j + 1\n\
+                   \x20       yield\n\
+                   \x20       i = i + 1\n\
+                   k = 0\nc = 0\n\
+                   while k < 60:\n\
+                   \x20   for v in pulse(10):\n\
+                   \x20       if v is None:\n            c = c + 1\n\
+                   \x20   k = k + 1\n\
+                   print(c)\n";
+        let (out, _compiled, _deopts, _osr, _yields) = run_jit_gen(src);
+        assert_eq!(out, "600\n");
+        assert_eq!(out, run(src));
+    }
+
     // RFC 0067 WS1/WS2 — native-to-native calls and the eval-breaker
     // poll.
 

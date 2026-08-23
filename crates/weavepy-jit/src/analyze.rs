@@ -231,7 +231,10 @@ fn analyze_impl(
     resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
     probes: &mut Probes<'_>,
 ) -> Result<TFunc, JitVerdict> {
-    if code.is_generator || code.is_coroutine || code.is_async_generator || code.is_class_body {
+    // RFC 0070 WS2 — sync generator bodies are admitted (yields become
+    // `Yielded` side exits; entry is OSR-only). Coroutines and async
+    // generators stay excluded this wave.
+    if code.is_coroutine || code.is_async_generator || code.is_class_body {
         return Err(JitVerdict::UnsupportedSignature);
     }
     if code.has_varargs || code.has_varkeywords || code.kwonly_count > 0 {
@@ -419,6 +422,30 @@ fn analyze_impl(
         }
     }
     osr_entries.sort_unstable_by_key(|e| e.pc);
+
+    // RFC 0070 WS2 — generator profitability gate. A generator body
+    // only ever enters natively at an OSR pc, and every yield pays the
+    // full deopt-shaped round trip (entry guards + marshal in, spill +
+    // interpreted suspension out). That round trip is only worth it
+    // when real work runs natively *between* suspensions — i.e. when
+    // the compiled CFG contains a cycle. Yield blocks have no
+    // successors, so any cycle here is by construction yield-free: an
+    // inner loop that runs to completion per resume. A body with no
+    // native cycle (the classic trailing-yield loop — `while ...:
+    // yield x; ...` — whose back edge is only reachable *through* the
+    // interpreted resume) would execute a bounded straight-line
+    // stretch per entry and lose to the interpreter, so it is ruled
+    // not worth compiling. Same verdict when no OSR entry survived:
+    // with fresh pc-0 entry gated off for generators, an entry-less
+    // body could never run natively at all.
+    if code.is_generator {
+        if osr_entries.is_empty() {
+            return Err(JitVerdict::Trivial);
+        }
+        if !has_native_cycle(&blocks) {
+            return Err(JitVerdict::Trivial);
+        }
+    }
 
     // Parameters flow in from the caller, so every *typed* parameter
     // slot must be entry-guarded even though the definite-assignment
@@ -815,6 +842,12 @@ fn build_blocks(code: &CodeObject) -> Result<Vec<RawBlock>, JitVerdict> {
             OpCode::ReturnValue if i + 1 < n => {
                 leaders.insert(i + 1);
             }
+            // RFC 0070 WS2 — a yield ends its block (the suspension
+            // is a side exit); the continuation is a fresh block the
+            // interpreter resumes into.
+            OpCode::YieldValue if i + 1 < n => {
+                leaders.insert(i + 1);
+            }
             _ => {}
         }
     }
@@ -833,6 +866,16 @@ fn build_blocks(code: &CodeObject) -> Result<Vec<RawBlock>, JitVerdict> {
         let ins = code.instructions[last];
         let succs = match ins.op {
             OpCode::ReturnValue => Vec::new(),
+            // RFC 0070 WS2 — control leaves native code at a yield;
+            // the resume path runs interpreted (and re-enters through
+            // a loop back edge's OSR entry, not a CFG edge).
+            OpCode::YieldValue => Vec::new(),
+            // RFC 0070 WS2 — `RERAISE` never falls through. It closes
+            // the generator epilogue's unreachable `StopIterationError`
+            // trailer (past the final `RETURN_VALUE`); a *reachable*
+            // block ending in it is still rejected by the abstract
+            // pass (unsupported opcode), exactly as before.
+            OpCode::Reraise => Vec::new(),
             OpCode::JumpForward => vec![index_of[&forward_target(last, ins.arg)]],
             OpCode::JumpBackward => {
                 vec![index_of[&backward_target(last, ins.arg).ok_or(JitVerdict::BadJumpTarget)?]]
@@ -871,6 +914,59 @@ fn build_blocks(code: &CodeObject) -> Result<Vec<RawBlock>, JitVerdict> {
 /// Index of the block whose `start == pc` (pc must be a leader).
 fn block_index_at(raw: &[RawBlock], pc: usize) -> usize {
     raw.iter().position(|b| b.start == pc).unwrap_or(0)
+}
+
+/// Whether the compiled CFG contains any cycle (RFC 0070 WS2 —
+/// generator profitability). Yield terminators have no successors, so
+/// a cycle is always a fully native inner loop. Iterative three-color
+/// DFS over the terminator edges of every block (all compiled blocks
+/// are reachable by construction).
+fn has_native_cycle(blocks: &[TBlock]) -> bool {
+    fn succs(term: &TTerm) -> [Option<BlockId>; 2] {
+        match term {
+            TTerm::Jump(b) => [Some(*b), None],
+            TTerm::BranchFalse {
+                target,
+                fallthrough,
+            }
+            | TTerm::BranchTrue {
+                target,
+                fallthrough,
+            } => [Some(*target), Some(*fallthrough)],
+            TTerm::ForRange { body, exit, .. } => [Some(*body), Some(*exit)],
+            TTerm::Return | TTerm::ReturnNone | TTerm::Yield { .. } => [None, None],
+        }
+    }
+    // 0 = unvisited, 1 = on the DFS stack, 2 = done.
+    let mut color = vec![0u8; blocks.len()];
+    for start in 0..blocks.len() {
+        if color[start] != 0 {
+            continue;
+        }
+        // Stack of (block, next successor slot to explore).
+        let mut stack: Vec<(usize, usize)> = vec![(start, 0)];
+        color[start] = 1;
+        while let Some(&(b, next)) = stack.last() {
+            let ss = succs(&blocks[b].term);
+            if next >= ss.len() {
+                color[b] = 2;
+                stack.pop();
+                continue;
+            }
+            stack.last_mut().expect("non-empty DFS stack").1 += 1;
+            if let Some(s) = ss[next] {
+                match color[s] {
+                    1 => return true,
+                    0 => {
+                        color[s] = 1;
+                        stack.push((s, 0));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Blocks reachable from the entry (block 0), in deterministic order.
@@ -1213,6 +1309,30 @@ fn infer_block(
             let out = boundary_stack(stack)?;
             vec![(b.succs[0], out.clone()), (b.succs[1], out)]
         }
+        // RFC 0070 WS2 — a yield is an unconditional deopt-shaped
+        // exit re-executing `YIELD_VALUE` in the interpreter: the
+        // yielded value must exist on the *native* stack for the
+        // spill (a `None` constant materializes through `PushNone`
+        // at emission). No successors — the resume runs interpreted.
+        OpCode::YieldValue => {
+            if !code.is_generator {
+                return Err(JitVerdict::UnsupportedOpcode(
+                    "YIELD_VALUE (non-generator shape)",
+                ));
+            }
+            let v = *stack.last().ok_or(JitVerdict::StackUnderflow)?;
+            if !v.none_const {
+                if !v.is_plain() {
+                    return Err(JitVerdict::UnsupportedOpcode(
+                        "YIELD_VALUE (marker operand)",
+                    ));
+                }
+                if !v.ty.is_representable() && v.src.is_none() {
+                    return Err(JitVerdict::TypeUnknown);
+                }
+            }
+            Vec::new()
+        }
         // Fall-through terminator: the remaining stack flows to the
         // lone successor.
         _ => {
@@ -1390,13 +1510,44 @@ fn step_abstract(
                 ..SE::known(JitType::Unknown)
             });
         }
+        // RFC 0070 WS2 — the generator prologue. The interpreted
+        // bootstrap executes this once (creating the generator and
+        // parking the frame); the *first resume* pushes the sent
+        // `None` that the following `POP_TOP` discards. Modeling it
+        // as an Obj-lane `None` push keeps abstract flow (and thus
+        // loop-header typing for the OSR entries) alive through the
+        // prologue. Native code never actually enters here — the
+        // embedder gates fresh pc-0 entries off generator code.
+        OpCode::ReturnGenerator => {
+            if !code.is_generator {
+                return Err(JitVerdict::UnsupportedOpcode(
+                    "RETURN_GENERATOR (non-generator shape)",
+                ));
+            }
+            stack.push(SE::known(JitType::Obj));
+        }
         OpCode::StoreFast => {
             let v = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            // RFC 0070 WS1 — `x = None` stores the unboxed `None` into
+            // a nullable object-lane local (machine value `-1`).
+            if v.none_const {
+                set_local(local_types, ins.arg, JitType::Obj, changed)?;
+                return Ok(());
+            }
             if !v.is_plain() {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
             }
             if v.ty.is_representable() {
                 set_local(local_types, ins.arg, v.ty, changed)?;
+            } else if let Some(src) = v.src {
+                // RFC 0070 WS1 — back-propagate a known destination
+                // lane to an untyped source local (`cur = head` where
+                // `cur` is typed by later uses): the copy asserts both
+                // slots share one lane, and a conflict rejects the
+                // frame exactly like a forward mismatch.
+                if let Some(dst_ty) = local_types.get(ins.arg as usize).copied().flatten() {
+                    set_local(local_types, src, dst_ty, changed)?;
+                }
             }
         }
         OpCode::BinaryOp => {
@@ -1419,6 +1570,37 @@ fn step_abstract(
             }
             let (a, b) = resolve_pair(a, b, local_types, changed);
             cmp_check(a.ty, b.ty)?;
+            stack.push(SE::known(JitType::Bool));
+        }
+        // RFC 0070 WS1 — `x is None` / `x is not None` on a nullable
+        // object lane. Exactly one operand must be the `None` constant
+        // (interpreter-stack only); the other must be (or infer as) an
+        // `Obj`-lane value. Lowers to the native `IsNone` fence.
+        OpCode::IsOp => {
+            if ins.arg > 1 {
+                return Err(JitVerdict::UnsupportedOpcode("IS_OP kind"));
+            }
+            let b = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            let a = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            let val = match (a.none_const, b.none_const) {
+                (false, true) => a,
+                (true, false) => b,
+                _ => return Err(JitVerdict::UnsupportedOpcode("IS_OP shape")),
+            };
+            if !val.is_plain() {
+                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+            }
+            match val.ty {
+                JitType::Obj => {}
+                JitType::Unknown => {
+                    if let Some(slot) = val.src {
+                        set_local(local_types, slot, JitType::Obj, changed)?;
+                    }
+                    // No provenance: transient — a later iteration may
+                    // type it; emission bails if it never resolves.
+                }
+                _ => return Err(JitVerdict::UnsupportedOpcode("IS_OP operand lane")),
+            }
             stack.push(SE::known(JitType::Bool));
         }
         OpCode::UnaryOp => {
@@ -1529,7 +1711,12 @@ fn step_abstract(
                 .as_str();
             let recv = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             let val = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
-            if !recv.is_plain() || !val.is_plain() {
+            if !recv.is_plain() {
+                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+            }
+            // RFC 0070 WS1 — `x.attr = None` is legal on an object-lane
+            // site (the unboxed `None` is the machine value `-1`).
+            if !val.is_plain() && !val.none_const {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
             }
             let Some(slot) = obj_recv_slot(&recv) else {
@@ -1542,7 +1729,11 @@ fn step_abstract(
             let lane = (probes.attr)(slot, name, true)
                 .ok_or(JitVerdict::UnsupportedOpcode("STORE_ATTR shape"))?;
             set_local(local_types, slot, JitType::Obj, changed)?;
-            if val.ty.is_representable() {
+            if val.none_const {
+                if lane != JitType::Obj {
+                    return Err(JitVerdict::UnsupportedOpcode("STORE_ATTR (value lane)"));
+                }
+            } else if val.ty.is_representable() {
                 if val.ty != lane {
                     return Err(JitVerdict::UnsupportedOpcode("STORE_ATTR (value lane)"));
                 }
@@ -2397,6 +2588,38 @@ fn emit_block(
                 exit: compact[&block_succ(b, 1)],
             }
         }
+        // RFC 0070 WS2 — the yield's unconditional side exit. A
+        // `None` yield (`yield`, `yield None`) materializes through
+        // `PushNone` so the spilled stack top rebuilds as the real
+        // singleton; anything else must already be a plain native
+        // lane. No successors to seed — the resume is interpreted.
+        OpCode::YieldValue => {
+            if !code.is_generator {
+                return Err(JitVerdict::UnsupportedOpcode(
+                    "YIELD_VALUE (non-generator shape)",
+                ));
+            }
+            let top = *stack.last().ok_or(JitVerdict::StackUnderflow)?;
+            if top.none_const {
+                stack.pop();
+                stmts.push(TStmt {
+                    pc: last as u32,
+                    op: TOp::PushNone,
+                });
+                stack.push(ESlot::val(JitType::Obj));
+                out.max_stack = out.max_stack.max(stack.len() as u32);
+            } else {
+                if !top.is_plain() {
+                    return Err(JitVerdict::UnsupportedOpcode(
+                        "YIELD_VALUE (marker operand)",
+                    ));
+                }
+                if !top.ty.is_representable() {
+                    return Err(JitVerdict::TypeUnknown);
+                }
+            }
+            TTerm::Yield { pc: last as u32 }
+        }
         _ => {
             emit_instr(
                 code,
@@ -2605,6 +2828,21 @@ fn emit_instr(
             *max_stack = (*max_stack).max(stack.len() as u32);
         }
         OpCode::StoreFast => {
+            let top = *stack.last().ok_or(JitVerdict::StackUnderflow)?;
+            // RFC 0070 WS1 — `x = None` on an object-lane local: the
+            // `None` constant never had a native slot, so materialize
+            // it (machine value `-1`) and store it like any value.
+            if top.none_const {
+                let lt = local_types.get(ins.arg as usize).copied().flatten();
+                if lt != Some(JitType::Obj) {
+                    return Err(JitVerdict::UnsupportedOpcode("STORE_FAST (None lane)"));
+                }
+                stack.pop();
+                push(TOp::PushNone, Some(JitType::Obj), stack, stmts);
+                stack.pop();
+                push(TOp::StoreLocal(ins.arg), None, stack, stmts);
+                return Ok(());
+            }
             pop_val(stack)?;
             push(TOp::StoreLocal(ins.arg), None, stack, stmts);
         }
@@ -2670,6 +2908,33 @@ fn emit_instr(
             } else {
                 return Err(JitVerdict::MixedArithTypes);
             }
+        }
+        // RFC 0070 WS1 — `x is None` / `x is not None` on a nullable
+        // object lane. The `None` constant rides the interpreter stack
+        // only (no native slot), so the native effect is pop-Obj /
+        // push-Bool regardless of operand order.
+        OpCode::IsOp => {
+            if ins.arg > 1 {
+                return Err(JitVerdict::UnsupportedOpcode("IS_OP kind"));
+            }
+            let b = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            let a = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            let val = match (a.none_const, b.none_const) {
+                (false, true) => a,
+                (true, false) => b,
+                _ => return Err(JitVerdict::UnsupportedOpcode("IS_OP shape")),
+            };
+            if !val.is_plain() || val.ty != JitType::Obj {
+                return Err(JitVerdict::UnsupportedOpcode("IS_OP operand lane"));
+            }
+            push(
+                TOp::IsNone {
+                    negate: ins.arg == 1,
+                },
+                Some(JitType::Bool),
+                stack,
+                stmts,
+            );
         }
         OpCode::UnaryOp => {
             let kind = unary_kind(ins.arg)?;
@@ -2826,6 +3091,12 @@ fn emit_instr(
                         method_sites.resize(idx + 1, None);
                     }
                     method_sites[idx] = Some(meta);
+                    // RFC 0070 WS1 — the burned-in resolution assumed
+                    // an *instance* receiver, but the lane is nullable:
+                    // fence out `None` here (deopt at this pc, receiver
+                    // still on the stack) so the interpreter re-executes
+                    // the load and raises the exact `AttributeError`.
+                    push(TOp::GuardNotNone, None, stack, stmts);
                     let last = stack.len() - 1;
                     stack[last].method = Some(MethodMark {
                         token: res.token,
@@ -2875,9 +3146,27 @@ fn emit_instr(
             ))?;
             let lane = (probes.attr)(slot, name, true)
                 .ok_or(JitVerdict::UnsupportedOpcode("STORE_ATTR shape"))?;
-            let val = pop_val(stack)?;
-            if val != lane {
-                return Err(JitVerdict::UnsupportedOpcode("STORE_ATTR (value lane)"));
+            let val = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            if val.none_const {
+                // RFC 0070 WS1 — `x.attr = None`: the `None` never had
+                // a native slot, so materialize it above the receiver
+                // and swap into the interpreter's `[value, receiver]`
+                // order (`Swap2` is a free lowering-stack rotation).
+                if lane != JitType::Obj {
+                    return Err(JitVerdict::UnsupportedOpcode("STORE_ATTR (value lane)"));
+                }
+                stack.push(recv);
+                push(TOp::PushNone, Some(JitType::Obj), stack, stmts);
+                push(TOp::Swap2, None, stack, stmts);
+                stack.pop();
+                stack.pop();
+            } else {
+                if !val.is_plain() {
+                    return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+                }
+                if val.ty != lane {
+                    return Err(JitVerdict::UnsupportedOpcode("STORE_ATTR (value lane)"));
+                }
             }
             let site = attr_sites.len() as u32;
             attr_sites.push(AttrSiteMeta {
@@ -3107,6 +3396,18 @@ fn emit_instr(
             }
             pop_val(stack)?;
             push(TOp::Pop, None, stack, stmts);
+        }
+        // RFC 0070 WS2 — the generator prologue's bootstrap-sent
+        // `None` (see the abstract pass): a real Obj-lane push so the
+        // following `POP_TOP` pops a native value. Dead code in
+        // practice — native entry only happens at OSR pcs past it.
+        OpCode::ReturnGenerator => {
+            if !code.is_generator {
+                return Err(JitVerdict::UnsupportedOpcode(
+                    "RETURN_GENERATOR (non-generator shape)",
+                ));
+            }
+            push(TOp::PushNone, Some(JitType::Obj), stack, stmts);
         }
         OpCode::CopyTop => {
             let t = *stack.last().ok_or(JitVerdict::StackUnderflow)?;
