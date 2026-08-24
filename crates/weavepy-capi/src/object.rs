@@ -89,7 +89,61 @@ pub fn is_immortal_refcnt(refcnt: PySsizeT) -> bool {
 #[repr(C)]
 pub struct PyObjectBox {
     pub head: PyObject,
+    /// C-visible exception tail (RFC 0072 WS3): the fields of CPython's
+    /// `PyBaseExceptionObject` (+ `PyStopIterationObject.value`) at their
+    /// exact ABI offsets. Compiled Cython reads them *directly* — its
+    /// generator/coroutine return path fetches the result with
+    /// `((PyStopIterationObject *)ev)->value` when `Py_IS_TYPE(ev,
+    /// PyExc_StopIteration)` holds, and `__Pyx_ErrRestore` compares
+    /// `((PyBaseExceptionObject *)value)->traceback` before calling
+    /// `PyException_SetTraceback`. With the payload at offset 16 those
+    /// reads landed inside the Rust `PayloadCell` (or past the
+    /// allocation), so every awaited uvloop coroutine "returned" None.
+    /// The tail costs 64 bytes per box and is all-NULL except for
+    /// exception instances, which [`mint_instance_box`] fills.
+    pub exc: ExcFields,
     pub payload: PayloadCell,
+}
+
+/// See [`PyObjectBox::exc`]. Field order and padding mirror CPython
+/// 3.13's `PyBaseExceptionObject` after `PyObject_HEAD` (offsets 16–64)
+/// plus the single-pointer tail subclasses append at offset 72
+/// (`StopIteration.value` / `SystemExit.code`).
+#[repr(C)]
+pub struct ExcFields {
+    pub dict: *mut PyObject,      // +16
+    pub args: *mut PyObject,      // +24
+    pub notes: *mut PyObject,     // +32
+    pub traceback: *mut PyObject, // +40
+    pub context: *mut PyObject,   // +48
+    pub cause: *mut PyObject,     // +56
+    pub suppress_context: u8,     // +64
+    _pad: [u8; 7],
+    pub value: *mut PyObject, // +72
+}
+
+impl Default for ExcFields {
+    fn default() -> Self {
+        Self {
+            dict: std::ptr::null_mut(),
+            args: std::ptr::null_mut(),
+            notes: std::ptr::null_mut(),
+            traceback: std::ptr::null_mut(),
+            context: std::ptr::null_mut(),
+            cause: std::ptr::null_mut(),
+            suppress_context: 0,
+            _pad: [0; 7],
+            value: std::ptr::null_mut(),
+        }
+    }
+}
+
+impl ExcFields {
+    /// The owned references the tail holds (fill-time `into_owned`
+    /// results); released by [`free_box`].
+    fn owned_fields(&self) -> [*mut PyObject; 2] {
+        [self.args, self.value]
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -253,7 +307,7 @@ impl std::fmt::Debug for PyObjectBox {
             .field("ob_refcnt", &self.head.ob_refcnt)
             .field("ob_type", &self.head.ob_type)
             .field("payload", &self.payload)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -437,6 +491,7 @@ pub fn into_owned(obj: Object) -> *mut PyObject {
             ob_refcnt: 1,
             ob_type: ty,
         },
+        exc: ExcFields::default(),
         payload: PayloadCell::from_object(obj),
     });
     let raw = Box::into_raw(boxed) as *mut PyObject;
@@ -465,6 +520,7 @@ fn stable_module_box(m: &weavepy_vm::sync::Rc<weavepy_vm::object::PyModule>) -> 
             ob_refcnt: IMMORTAL_REFCNT,
             ob_type: crate::types::type_for_object(&module),
         },
+        exc: ExcFields::default(),
         payload: PayloadCell::from_object(module),
     });
     let raw = Box::into_raw(boxed) as *mut PyObject;
@@ -510,11 +566,13 @@ fn mint_instance_box(
             ob_refcnt: 1,
             ob_type: ty,
         },
+        exc: ExcFields::default(),
         payload: PayloadCell::from_object(Object::Instance(inst.clone())),
     });
     let raw = Box::into_raw(boxed) as *mut PyObject;
     register_minted(raw);
     inst.c_body.set(raw as usize);
+    fill_exception_tail(raw, inst);
     if crate::mirror::arg_pin_active() {
         pin_instance_arg_box(raw);
     }
@@ -532,6 +590,51 @@ fn mint_instance_box(
         }
     }
     raw
+}
+
+/// Fill the C-visible exception tail of a freshly minted identity box
+/// (see [`PyObjectBox::exc`]). Only `args` and — for `StopIteration` —
+/// `value` are populated: those are the fields compiled Cython reads
+/// through struct offsets. `traceback`/`context`/`cause` stay NULL,
+/// which is both a valid CPython state and what keeps the fill cheap
+/// and cycle-free (a chained `__context__` would otherwise recurse the
+/// mint down the whole chain); consumers reach those fields through the
+/// `PyException_Get*` functions, which read the live VM attributes.
+///
+/// Runs *after* `inst.c_body` is set, so a self-referential `args`
+/// crossing back through [`into_owned`] reuses this box instead of
+/// recursing.
+fn fill_exception_tail(
+    raw: *mut PyObject,
+    inst: &weavepy_vm::sync::Rc<weavepy_vm::types::PyInstance>,
+) {
+    let bt = weavepy_vm::builtin_types::builtin_types();
+    let cls = inst.cls();
+    if !cls.is_subclass_of(&bt.base_exception) {
+        return;
+    }
+    let bx = raw as *mut PyObjectBox;
+    if let Some(args @ Object::Tuple(_)) = inst.slot_get("args") {
+        unsafe { (*bx).exc.args = into_owned(args) };
+    }
+    if cls.is_subclass_of(&bt.stop_iteration) {
+        // Never NULL for a constructed StopIteration on CPython (`__init__`
+        // stores `args[0]` or `Py_None`), and Cython increfs the read
+        // unconditionally — so fill None as the None singleton, not NULL.
+        let value = inst.slot_get("value").unwrap_or(Object::None);
+        unsafe { (*bx).exc.value = into_owned(value) };
+    }
+    if std::env::var_os("WEAVEPY_TRACE_EXCTAIL").is_some() {
+        unsafe {
+            eprintln!(
+                "[EXCTAIL] mint p=0x{:x} cls={} args=0x{:x} value=0x{:x}",
+                raw as usize,
+                cls.name,
+                (*bx).exc.args as usize,
+                (*bx).exc.value as usize,
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -679,10 +782,12 @@ pub fn into_owned_with_type_uncached(obj: Object, ty: *mut PyTypeObject) -> *mut
                     ob_refcnt: 1,
                     ob_type: ty,
                 },
+                exc: ExcFields::default(),
                 payload: PayloadCell::from_object(Object::Instance(inst.clone())),
             });
             let raw = Box::into_raw(boxed) as *mut PyObject;
             register_minted(raw);
+            fill_exception_tail(raw, inst);
             return raw;
         }
     }
@@ -747,6 +852,7 @@ pub fn into_owned_with_type(obj: Object, ty: *mut PyTypeObject) -> *mut PyObject
             ob_refcnt: 1,
             ob_type: ty,
         },
+        exc: ExcFields::default(),
         payload: PayloadCell::from_object(obj),
     });
     let raw = Box::into_raw(boxed) as *mut PyObject;
@@ -1196,6 +1302,13 @@ pub(crate) unsafe fn free_box(p: *mut PyObject) {
     unregister_minted(p);
 
     let bx = unsafe { Box::from_raw(p as *mut PyObjectBox) };
+    // Release the exception tail's owned references (see
+    // [`PyObjectBox::exc`]); all-NULL for non-exception boxes.
+    for field in bx.exc.owned_fields() {
+        if !field.is_null() {
+            unsafe { Py_DecRef(field) };
+        }
+    }
     // RFC 0046 (wave 4): if this is an instance's cached identity box, drop
     // the `c_body` cache so a subsequent crossing re-mints a fresh box
     // rather than handing C this about-to-be-freed pointer (use-after-free).

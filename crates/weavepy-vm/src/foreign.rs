@@ -166,6 +166,17 @@ pub struct ForeignHooks {
     /// yields the bound method; without this hook such attributes crossed
     /// unbound and calls lost `self`.
     pub descr_get: fn(usize, &Object, &Object) -> Result<Option<Object>, RuntimeError>,
+    /// The C-API layer's *handled* exception (`tstate->exc_info->exc_value`,
+    /// the slot `PyErr_SetHandledException` / Cython's `__Pyx_GetException`
+    /// maintain), or `None` when clear. `sys.exc_info()` consults this when
+    /// the VM's own handled-exception stack is empty: Python code invoked
+    /// from inside a compiled `except` block (gevent's Cython
+    /// `_notify_link_list` does `hub.handle_error((link, self),
+    /// *sys.exc_info())`) has no VM-side handler frame, so without this
+    /// bridge the caught exception is invisible and gevent reports
+    /// `issubclass() arg 1 must be a class` from `handle_error(None, None,
+    /// None)` (RFC 0072 WS2).
+    pub handled_exception: fn() -> Option<Object>,
 }
 
 static HOOKS: OnceLock<ForeignHooks> = OnceLock::new();
@@ -221,6 +232,12 @@ pub fn release_object_ptr(ptr: usize) {
     if let Some(h) = HOOKS.get() {
         (h.release_object_ptr)(ptr);
     }
+}
+
+/// The C-API layer's handled exception, or `None` when the slot is clear
+/// (or the bridge is not installed). See [`ForeignHooks::handled_exception`].
+pub fn capi_handled_exception() -> Option<Object> {
+    HOOKS.get().and_then(|h| (h.handled_exception)())
 }
 
 pub fn repr(s: &PyForeignSoul) -> Result<String, RuntimeError> {

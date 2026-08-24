@@ -1409,6 +1409,12 @@ pub unsafe extern "C" fn PySet_Contains(s: *mut PyObject, item: *mut PyObject) -
     }
 }
 
+/// Returns 1 when the item was found and removed, 0 when it was not
+/// present, -1 on error — CPython's exact contract. Cython's
+/// `set.remove` codegen raises `KeyError` on a 0 return (RFC 0072 WS3:
+/// the old unconditional 0 made uvloop's `TimerHandle.cancel` —
+/// `self._timers.remove(self)` on a `cdef set` — raise for every timer
+/// it successfully removed).
 #[no_mangle]
 pub unsafe extern "C" fn PySet_Discard(s: *mut PyObject, item: *mut PyObject) -> c_int {
     if s.is_null() || item.is_null() {
@@ -1416,12 +1422,16 @@ pub unsafe extern "C" fn PySet_Discard(s: *mut PyObject, item: *mut PyObject) ->
     }
     match as_set_rc(&unsafe { crate::object::clone_object(s) }) {
         Some(rc) => {
-            rc.borrow_mut()
+            let removed = rc
+                .borrow_mut()
                 .shift_remove(&DictKey(unsafe { crate::object::clone_object(item) }));
             unsafe { crate::mirror::sync_set_used(s) };
-            0
+            i32::from(removed)
         }
-        None => -1,
+        None => {
+            crate::errors::set_type_error("PySet_Discard: expected set");
+            -1
+        }
     }
 }
 

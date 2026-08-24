@@ -312,6 +312,46 @@ pub unsafe extern "C" fn PyErr_GetExcInfo(
     }
 }
 
+/// `PyErr_GetHandledException()` — the 3.11+ single-object spelling of
+/// [`PyErr_GetExcInfo`]: a **new reference** to the currently handled
+/// exception (the `tstate->exc_info->exc_value` slot), or NULL. Cython's
+/// `__Pyx_GetException` calls it (via `PyErr_SetHandledException`'s
+/// sibling) around every `except` block it compiles — gevent's
+/// `TrackedRawGreenlet.__init__` (`except ValueError` around
+/// `sys._getframe`) jumped to a NULL stub without this export
+/// (RFC 0072 WS2).
+#[no_mangle]
+pub unsafe extern "C" fn PyErr_GetHandledException() -> *mut PyObject {
+    let value = unsafe { *crate::pystate::exc_info_value_slot() };
+    if value.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe {
+        crate::object::Py_IncRef(value);
+    }
+    value
+}
+
+/// `PyErr_SetHandledException(exc)` — install the handled exception.
+/// Does **not** steal `exc` (CPython holds a new reference); `None` and
+/// NULL both clear the slot.
+#[no_mangle]
+pub unsafe extern "C" fn PyErr_SetHandledException(exc: *mut PyObject) {
+    let slot = crate::pystate::exc_info_value_slot();
+    unsafe {
+        let old = *slot;
+        if exc.is_null() || matches!(clone_object(exc), Object::None) {
+            *slot = ptr::null_mut();
+        } else {
+            crate::object::Py_IncRef(exc);
+            *slot = exc;
+        }
+        if !old.is_null() {
+            Py_DecRef(old);
+        }
+    }
+}
+
 /// `PyErr_SetExcInfo(ty, value, tb)` — install the handled exception.
 /// Steals all three references; only `value` is retained (the 3.12+
 /// single-object model), the type/traceback are derivable from it.

@@ -106,6 +106,7 @@ pub unsafe extern "C" fn PyCapsule_New(
             ob_refcnt: 1,
             ob_type: crate::types::PyCapsule_Type.as_ptr(),
         },
+        exc: crate::object::ExcFields::default(),
         payload: crate::object::PayloadCell {
             obj: Object::None,
             user_data,
@@ -641,6 +642,35 @@ fn try_install_well_known_capsule(
             crate::datetime_api::PyDateTimeAPI =
                 payload as *mut crate::datetime_api::PyDateTimeCAPI;
         }
+        return Some(capsule);
+    }
+    // RFC 0072 WS1: the greenlet C-API table. Upstream mints one capsule
+    // named `"greenlet._C_API"` (attached to `greenlet._greenlet` and
+    // re-exported as `greenlet._C_API`; `PyGreenlet_Import()` in every
+    // shipped `greenlet.h` imports the latter). The modern dotted path is
+    // accepted too — each capsule's stored name must equal the import
+    // string, so a matching capsule is minted per path over the same
+    // table.
+    if dotted == "greenlet._C_API" || dotted == "greenlet._greenlet._C_API" {
+        let name = match CString::new(dotted) {
+            Ok(s) => s,
+            Err(_) => return None,
+        };
+        let payload = crate::greenlet_api::capi_table_ptr();
+        let capsule = unsafe { PyCapsule_New(payload, name.as_ptr(), None) };
+        if capsule.is_null() {
+            return None;
+        }
+        // Overwrite the facade's `_C_API = None` placeholder so
+        // subsequent imports (and Python-level `greenlet._C_API`
+        // reads) see the real capsule.
+        let attr = match CString::new("_C_API") {
+            Ok(s) => s,
+            Err(_) => return Some(capsule),
+        };
+        let _ = unsafe {
+            crate::abstract_::PyObject_SetAttrString(parent_module, attr.as_ptr(), capsule)
+        };
         return Some(capsule);
     }
     None

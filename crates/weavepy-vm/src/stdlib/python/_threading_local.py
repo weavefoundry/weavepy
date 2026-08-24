@@ -39,6 +39,14 @@ Two WeavePy-specific deviations from upstream:
 import _thread
 import weakref as _weakref
 
+# Bind the true ident function at import time. CPython's C ``_local`` keys
+# storage off the thread state itself, so monkey-patching
+# ``_thread.get_ident`` (gevent replaces it with ``id(getcurrent())``) never
+# affects it. Resolving ``get_ident`` through the module at every ``_slot``
+# call would silently flip this class to *greenlet*-local semantics the
+# moment gevent patches — orphaning everything stored before the patch.
+_get_ident = _thread.get_ident
+
 __all__ = ["local"]
 
 
@@ -115,7 +123,7 @@ def _slot(self, impl):
     performs re-enter through the (already-present) slot rather than recursing
     forever.
     """
-    ident = _thread.get_ident()
+    ident = _get_ident()
     dicts = impl.dicts
     dct = dicts.get(ident)
     if dct is None:

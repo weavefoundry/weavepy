@@ -307,6 +307,34 @@ fn main() {
                 name: "_abi3check",
                 env_var: "WEAVEPY_CAPI_ABI3CHECK_EXTENSION",
             });
+            // `_greenletconsumer.c` — RFC 0072 WS1: a gevent-shaped
+            // consumer of the `greenlet._C_API` capsule, compiled
+            // against the stock headers plus the vendored upstream
+            // `greenlet/greenlet.h`. Exercises `PyGreenlet_Import`,
+            // the 12-slot table, `sizeof(PyGreenlet)` type checks, a
+            // static C subclass with a field at offset
+            // `sizeof(PyGreenlet)`, and switching from inside a C
+            // frame.
+            {
+                let mut greenlet_inc = stock_inc.clone();
+                greenlet_inc.push(workspace_root.join("tests/capi_ext"));
+                println!(
+                    "cargo:rerun-if-changed={}",
+                    workspace_root
+                        .join("tests/capi_ext/greenlet/greenlet.h")
+                        .display()
+                );
+                build_extension(ExtensionBuild {
+                    cc: &cc,
+                    include_dirs: &greenlet_inc,
+                    out_dir: &out_dir,
+                    target_os: &target_os,
+                    suffix,
+                    src: &workspace_root.join("tests/capi_ext/_greenletconsumer.c"),
+                    name: "_greenletconsumer",
+                    env_var: "WEAVEPY_CAPI_GREENLETCONSUMER_EXTENSION",
+                });
+            }
             // `_testbuffer.c` — RFC 0066 WS1: CPython's own
             // `Modules/_testbuffer.c`, verbatim — the PEP 3118 spec
             // exporter (`ndarray` with the full PyBUF flag matrix incl.

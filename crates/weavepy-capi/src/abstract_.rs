@@ -2587,6 +2587,70 @@ pub unsafe extern "C" fn PyIter_Next(it: *mut PyObject) -> *mut PyObject {
     }
 }
 
+/// `PyIter_Send(iter, arg, presult)` — the 3.10+ send protocol (RFC 0072
+/// WS3). Cython's coroutine machinery resumes a delegated *exact*
+/// generator/coroutine through this (`__Pyx_PyGen_Send`); the extension
+/// links it with `-undefined dynamic_lookup`, so a missing symbol is a
+/// jump through NULL at the first `await` of a VM awaitable.
+///
+/// Returns `PYGEN_NEXT` (1) with a yielded value, `PYGEN_RETURN` (0)
+/// with the completed iterator's return value (no exception left
+/// pending, per CPython), or `PYGEN_ERROR` (-1) with the exception set.
+#[no_mangle]
+pub unsafe extern "C" fn PyIter_Send(
+    iter: *mut PyObject,
+    arg: *mut PyObject,
+    presult: *mut *mut PyObject,
+) -> c_int {
+    if presult.is_null() {
+        crate::errors::set_runtime_error("PyIter_Send: NULL result pointer");
+        return -1;
+    }
+    unsafe { *presult = ptr::null_mut() };
+    if iter.is_null() {
+        crate::errors::set_runtime_error("PyIter_Send: NULL iterator");
+        return -1;
+    }
+    let obj = unsafe { crate::object::clone_object(iter) };
+    let sent = if arg.is_null() {
+        Object::None
+    } else {
+        unsafe { crate::object::clone_object(arg) }
+    };
+    let r = crate::interp::with_interp_mut(|interp| interp.send_object_capi(obj, sent));
+    match r {
+        Some(Ok(v)) => {
+            unsafe { *presult = crate::object::into_owned(v) };
+            1 // PYGEN_NEXT
+        }
+        Some(Err(weavepy_vm::error::RuntimeError::PyException(pe)))
+            if pe.type_name() == "StopIteration" =>
+        {
+            let value = match &pe.instance {
+                Object::Instance(inst) => inst
+                    .slot_get("value")
+                    .filter(|v| !matches!(v, Object::None))
+                    .or_else(|| match inst.slot_get("args") {
+                        Some(Object::Tuple(t)) => t.first().cloned(),
+                        _ => None,
+                    })
+                    .unwrap_or(Object::None),
+                _ => Object::None,
+            };
+            unsafe { *presult = crate::object::into_owned(value) };
+            0 // PYGEN_RETURN
+        }
+        Some(Err(err)) => {
+            install_runtime_error(err);
+            -1 // PYGEN_ERROR
+        }
+        None => {
+            crate::errors::set_runtime_error("PyIter_Send: no active interpreter");
+            -1
+        }
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn PyIter_NextItem(it: *mut PyObject, finished: *mut c_int) -> *mut PyObject {
     if !finished.is_null() {

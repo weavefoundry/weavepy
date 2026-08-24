@@ -33,6 +33,40 @@ MANIFEST = WORKSPACE / "tests" / "ecosystem" / "manifest.toml"
 # venv seeding needs these even though no manifest row lists them
 BOOTSTRAP = ["pip", "setuptools", "wheel"]
 
+# The expectations spelling of this host (the harness's own mapping).
+HOST_OS = {"win32": "windows", "darwin": "macos"}.get(sys.platform, "linux")
+
+
+def skipped_rows(manifest_path: Path):
+    """Row names whose baseline says `status_<host> = \"skip\"`.
+
+    The harness never installs those rows on this platform (RFC 0063),
+    and some of them are *unfetchable* here by construction — uvloop
+    publishes no Windows wheels at all, so `pip download` for its group
+    would fail the whole cache build on the windows runner.
+    """
+    expectations = manifest_path.parent / "expectations.toml"
+    if not expectations.is_file():
+        return set()
+    text = expectations.read_text()
+    if tomllib is not None:
+        rows = tomllib.loads(text).get("packages", {})
+        return {
+            name
+            for name, row in rows.items()
+            if row.get(f"status_{HOST_OS}") == "skip"
+        }
+    return {
+        m.group(1)
+        for m in re.finditer(
+            r'^\[packages\.([^\]]+)\][^\[]*?^status_'
+            + HOST_OS
+            + r'\s*=\s*"skip"',
+            text,
+            re.MULTILINE | re.DOTALL,
+        )
+    }
+
 
 def _requirement_name(spec):
     """Base project name of a pip requirement string."""
@@ -44,8 +78,11 @@ def _normalize(name):
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
-def load_manifest(manifest_path: Path):
+def load_manifest(manifest_path: Path, skip=frozenset()):
     """Return (wheel_req_groups, sdist_requirements) from the manifest.
+
+    Rows named in `skip` (platform-skipped per the baseline — see
+    `skipped_rows`) contribute nothing to either list.
 
     wheel_req_groups — one requirement list per manifest row (the row's
     `requirements` plus its selftest `requirements`, which install into
@@ -62,7 +99,9 @@ def load_manifest(manifest_path: Path):
     if tomllib is not None:
         with open(manifest_path, "rb") as f:
             manifest = tomllib.load(f)
-        for row in manifest.get("packages", {}).values():
+        for name, row in manifest.get("packages", {}).items():
+            if name in skip:
+                continue
             requirements = row.get("requirements", "").split()
             group = list(requirements)
             for pkg in re.split(r"[,\s]+", row.get("no_binary", "")):
@@ -92,6 +131,17 @@ def load_manifest(manifest_path: Path):
     # come from `source` lines plus any `==`-pinned requirement
     # matching a `no_binary` name.
     text = manifest_path.read_text()
+    # Drop the [packages.<skipped>] sections (and their .selftest
+    # sub-tables) before the line scans below.
+    if skip:
+        text = "".join(
+            chunk
+            for chunk in re.split(r"(?=^\[packages\.)", text, flags=re.MULTILINE)
+            if not any(
+                re.match(rf"\[packages\.{re.escape(name)}[.\]]", chunk)
+                for name in skip
+            )
+        )
     for reqs in re.findall(r'^\s*requirements\s*=\s*"([^"]*)"', text, re.MULTILINE):
         if reqs.split():
             wheel_groups.append(reqs.split())
@@ -118,7 +168,10 @@ def main() -> int:
     ap.add_argument("--manifest", type=Path, default=MANIFEST)
     args = ap.parse_args()
 
-    wheel_groups, sdist_reqs = load_manifest(args.manifest)
+    skip = skipped_rows(args.manifest)
+    if skip:
+        print(f"skipping {HOST_OS}-skipped rows: {', '.join(sorted(skip))}")
+    wheel_groups, sdist_reqs = load_manifest(args.manifest, skip)
     wheel_groups = [BOOTSTRAP] + wheel_groups
 
     args.dest.mkdir(parents=True, exist_ok=True)

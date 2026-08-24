@@ -359,7 +359,7 @@ pub unsafe extern "C" fn PyImport_ImportModuleLevelObject(
             }
         }
     } else {
-        name_str
+        name_str.clone()
     };
 
     let cname = match std::ffi::CString::new(abs_name.clone()) {
@@ -388,17 +388,53 @@ pub unsafe extern "C" fn PyImport_ImportModuleLevelObject(
         return ptr::null_mut();
     }
 
+    // Empty `fromlist` — a plain `import a.b` statement. CPython returns
+    // the *root* package here (the statement binds `a`, not `a.b`);
+    // Cython's `__Pyx_ImportDottedModule` relies on it (uvloop's
+    // `import asyncio.transports` must leave the name `asyncio` bound to
+    // the top package, not the leaf).
+    let fromlist_items = if fromlist.is_null() {
+        Vec::new()
+    } else {
+        match unsafe { crate::object::clone_object(fromlist) } {
+            Object::Tuple(t) => t.iter().cloned().collect::<Vec<_>>(),
+            Object::List(l) => l.borrow().iter().cloned().collect::<Vec<_>>(),
+            _ => Vec::new(),
+        }
+    };
+    if fromlist_items.is_empty() {
+        // Per CPython: cut the trailing components the *written* name
+        // contributed beyond its first dot, keeping any level-derived
+        // package prefix intact (`import .b.c` inside `pkg` returns
+        // `pkg`... for `name = "b.c"` the cut leaves `pkg.b` — CPython
+        // keeps the first written component).
+        let root_name = match name_str.split_once('.') {
+            Some((first, _)) => {
+                let cut = name_str.len() - first.len();
+                &abs_name[..abs_name.len() - cut]
+            }
+            None => abs_name.as_str(),
+        };
+        if root_name != abs_name {
+            if let Ok(rootc) = std::ffi::CString::new(root_name) {
+                let root = unsafe { crate::module::PyImport_ImportModule(rootc.as_ptr()) };
+                if !root.is_null() {
+                    unsafe { crate::object::Py_DecRef(module) };
+                    return root;
+                }
+                crate::errors::clear_thread_local();
+            }
+        }
+        return module;
+    }
+
     // `_handle_fromlist`: ensure any submodule named in `fromlist` that is
     // not already an attribute of the imported package is imported as
     // `abs_name.sub`. A failure here is non-fatal (the name may be a plain
     // attribute the module defines itself, which Cython resolves with its
     // own `GetAttr`), so swallow the error and let the caller decide.
-    if !fromlist.is_null() {
-        let items = match unsafe { crate::object::clone_object(fromlist) } {
-            Object::Tuple(t) => t.iter().cloned().collect::<Vec<_>>(),
-            Object::List(l) => l.borrow().iter().cloned().collect::<Vec<_>>(),
-            _ => Vec::new(),
-        };
+    {
+        let items = fromlist_items;
         for item in items {
             let Object::Str(sub) = item else { continue };
             let sub = sub.to_string();

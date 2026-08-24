@@ -96,6 +96,23 @@ fn exception_instance(ty: Option<Rc<TypeObject>>, value: Object) -> Object {
             return inst;
         }
     }
+    // Any other non-None value is a *single* constructor argument:
+    // CPython's normalization runs `type(value)`, keeping the object in
+    // `args[0]`. Collapsing it to a message string loses it — Cython's
+    // coroutine return path does `PyErr_SetObject(PyExc_StopIteration,
+    // result)`, and `StopIteration.value` must carry the real result
+    // (uvloop's `getaddrinfo` returns a list; the message fallback
+    // yielded `value=None` and every await produced None — RFC 0072
+    // WS3). Strings keep the message path below, which builds the same
+    // `args=(str,)` shape without an interpreter round-trip.
+    if !matches!(&value, Object::Str(_) | Object::None) {
+        let args = Object::new_tuple(vec![value.clone()]);
+        if let Some(Ok(inst @ Object::Instance(_))) = crate::interp::with_interp_mut(|interp| {
+            interp.construct_exception_from_capi(class.clone(), args)
+        }) {
+            return inst;
+        }
+    }
     make_exception_with_class(class, message_for(&value))
 }
 

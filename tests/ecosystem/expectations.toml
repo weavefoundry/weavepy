@@ -35,7 +35,7 @@ status = "pass"
 [packages.attrs]
 status = "pass"
 selftest_status = "skip"
-selftest_reason = "measured 2026-08: the suite exceeds its 2400s budget (killed at 2402.8s well short of completion) — hypothesis @given loops are woven through the core files (test_make, test_funcs, test_dunders), so there is no honest property-lane trim like packaging's; interpreter-speed-bound, not a correctness signal. The RFC 0062 acceptance fail-row allowance lands here; revisit when the interpreter is faster or upstream splits its property lanes."
+selftest_reason = "re-measured 2026-08 on the wave-4 interpreter (RFC 0072 WS5): still exceeds the 2400s budget (graded run killed at 2403.1s). Fresh pacing datapoint: a 300s sample completes ~311 of 1385 collected tests (~1 test/s), and the hypothesis @given loops woven through the core files (test_make, test_funcs, test_dunders) dominate the un-reached tail — interpreter-speed-bound, not a correctness signal; there is no honest property-lane trim like packaging's. Revisit when the interpreter is faster or upstream splits its property lanes."
 
 [packages.click]
 status = "pass"
@@ -98,7 +98,7 @@ status = "pass"
 status = "pass"
 notes = "PyPI binary wheel (not source build), pinned 2.5.2 (RFC 0066 WS5): dtype arithmetic, broadcasting, linalg.norm, memoryview round-trip."
 selftest_status = "fail"
-selftest_reason = "measured 2026-08 (RFC 0066 WS5 capstone census, per-module): 30/66 `numpy._core` test modules pass clean (13575 tests), 23 modules carry 268 failures, 12 crash (SIGBUS/SEGV): test_array_coercion (C-stack exhaustion in recursive sequence discovery — test_pathological_self_containing), test_multiarray, test_datetime, test_dtype, test_ufunc, test_scalarmath, test_scalarinherit, test_stringdtype, test_protocols, test_regression, test_defchararray, test_hashtable. The wave landed the collection unblocker (PyType_Ready inherits the metatype from Py_TYPE(tp_base) per CPython's type_ready_set_type, fixing the sfloat test DType's cast-spec registration); the lane is also interpreter-speed-bound — `--pyargs numpy._core` pytest collection alone measures ~31 min (36240 tests) against the 2400s budget, so the graded run times out before the census is even reachable. Full-suite (`--pyargs numpy`) not attempted separately: it strictly contains the _core lane whose collection alone exceeds the budget. The crash/failure census is the wave-4 worklist."
+selftest_reason = "measured 2026-08 (RFC 0072 WS5 re-census, per-module under a 1200s/module budget): 32/66 `numpy._core` test modules pass clean, 29 modules carry 281 failures, 5 exceed the per-module budget (test_multiarray, test_dtype, test_strings, test_stringdtype, test_mem_overlap), and — the wave-4 headline — **zero crash**: all 12 SIGBUS/SEGV modules from the RFC 0066 census now run to a verdict. Top failure clusters, one root cause each: scalar `__text_signature__` introspection (test_scalar_methods, 96 — inspect.signature over C scalar constructors), ufunc object-loop calls + ufunc pickling (test_ufunc, 32), cast-safety enforcement for numeric→datetime (test_casting_unittests, 28 — DID-NOT-RAISE), mmap objects as buffer sources (test_memmap, 24 — TypeError: bytes-like required). The graded single-invocation lane also stays speed-bound: `--pyargs numpy._core` pytest collection alone re-measured 2170.6s (36998 tests) against the 2400s budget, so the row cannot pass as one pytest run regardless of test health. The cluster burn-down is the wave-5 worklist."
 
 [packages.markupsafe]
 status = "pass"
@@ -177,5 +177,21 @@ status = "pass"
 notes = "measured 2026-08 (RFC 0066 WS6 stretch): Agg figure render + PNG round-trip + savefig buffer. Landed on the way: CPython-faithful abstract-instantiation gate (native allocator bypasses __abstractmethods__), PyType_Type.tp_call for pybind11_meta_call, __class__ cell for methods that locally bind super, foreign tp_call fast path (pybind11 instancemethod repr during m.def default-arg registration), LoadAttrType inline-cache deopt for foreign descriptors (FT2Font.get_sfnt lost self on the second dispatch), math index coercion driving nb_index on foreign numpy scalars (bezier _comb via np.vectorize)."
 
 [packages.gevent]
+status = "pass"
+notes = "measured 2026-08 (RFC 0072 WS2): monkey.patch_all + spawn fan-out/joinall + gevent.sleep cooperative ordering + loopback echo over the patched socket module, riding the native greenlet through the greenlet._C_API capsule. Landed on the way: import-time-bound _thread.get_ident in _threading_local (patch_all swaps _thread.get_ident for a greenlet-id version, which silently flipped every pre-patch threading.local — including gevent's own hub registry — to greenlet-local storage), sys.exc_info() fallback to the C-API handled-exception slot (Cython except blocks park the caught exception where only PyErr_GetHandledException sees it), _socket EAI_* constants (gevent.resolver imports EAI_NONAME/EAI_SERVICE at module scope), cross-thread greenlet start (the registry is process-global and a greenlet binds to a thread at first switch, which gevent's threadpool worker pattern requires), type(lock).acquire unbound-method trampolines, and PyMemoryView_Type bridged to the real VM memoryview (Cython caches _memoryview = memoryview as the static and calls it)."
+
+# --- infrastructure-native tail (RFC 0072 WS3/WS4) -----------------------------
+
+[packages.uvloop]
+status = "pass"
+status_windows = "skip"
+reason_windows = "no upstream Windows support — uvloop publishes no Windows wheels (libuv loop is POSIX-only there by design)."
+notes = "measured 2026-08 (RFC 0072 WS3): policy install, gather fan-out, loopback TCP echo through uvloop transports, UDP datagram endpoint round-trip, loop.getaddrinfo, run_in_executor, subprocess_exec. Landed on the way: PyImport_ImportModuleLevelObject returns the root package for empty-fromlist dotted imports (Cython's __Pyx_ImportDottedModule binds `asyncio`, not the leaf), PyContext_CopyCurrent/Enter/Exit bridged to contextvars (uvloop runs every callback under a copied context), PyOS_setsig/PyThread_get_thread_ident/PyDescr_IsData and the fork hooks, a faithful C-visible exception tail on identity boxes (PyBaseExceptionObject fields at ABI offsets; Cython fetches StopIteration.value with a direct struct read), value-preserving tp_iternext bridges + PyIter_Send (the swallowing PyIter_Next lane made every compiled await of a VM awaitable complete with None), and PySet_Discard's found/not-found return contract (Cython's set.remove raised KeyError for every uvloop timer cancellation)."
+
+[packages.psycopg]
+status = "pass"
+notes = "measured 2026-08 (RFC 0072 WS4): serverless but behavior-asserting — pq.__impl__ == 'binary' (the Cython/libpq wheel is the live implementation), SQL composition, Transformer dumper/loader round-trips, conninfo parse/build, and a real libpq connect driven to OperationalError against a closed loopback port. Landed on the way: PyOS_double_to_string (psycopg's FloatDumper renders every float parameter through it; the missing symbol was a NULL jump). One cosmetic divergence: the failed-connect cleanup prints an ignored finalizer AttributeError to stderr that CPython formats as 'Exception ignored in'."
+
+[packages.grpcio]
 status = "fail"
-reason = "measured 2026-08 (RFC 0066 WS6 stretch): import fails in gevent._gevent_c_greenlet_primitives — its Cython modules PyGreenlet_Import the greenlet._greenlet._C_API capsule (PyGreenlet_New/Switch/Throw/GetCurrent + PyGreenlet_Type), which the WS4 native greenlet does not yet export (PyCapsule_GetPointer: not a capsule). The RFC scopes the capsule surface as stretch; full gevent is the wave-4 headline row."
+reason = "measured 2026-08 (RFC 0072 WS4 stretch): import + channel/server construction + insecure port bind succeed, but the cygrpc server poller thread dies as soon as an RPC arrives (Exception in thread _serve with an empty traceback; the client then reports StatusCode.CANCELLED). The C++ core's completion-queue threading model needs deeper thread-state work than this wave scopes; the row stays measured-fail per the RFC."
