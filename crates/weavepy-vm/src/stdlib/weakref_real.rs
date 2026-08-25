@@ -171,6 +171,37 @@ pub fn c_new_ref(target: Object, callback: Option<Object>) -> Result<Object, Run
     Ok(make_ref_object(target, callback, kind::REF))
 }
 
+/// C-API bridge (RFC 0072 WS2): the live `weakref.ref` class
+/// (`ReferenceType`) for this thread's interpreter — the identity the
+/// faithful `PyWeakReference` shell validates and bridges against.
+pub fn capi_ref_class() -> Rc<TypeObject> {
+    ref_type()
+}
+
+/// C-API bridge (RFC 0072 WS2): the subclass-allocation path
+/// (CPython's `weakref___new__`) for a **C-side** `tp_new` chain — a
+/// Cython `cdef class V(ref)` calls its base's `tp_new` slot directly
+/// with `(ob, callback)`, and the result must be a fully-wired ref
+/// whose class is the (harvested) subclass.
+pub fn capi_subclass_new(
+    cls: Rc<TypeObject>,
+    target: Object,
+    callback: Option<Object>,
+) -> Result<Object, RuntimeError> {
+    if !supports_weakref(&target) {
+        return Err(type_error(format!(
+            "cannot create weak reference to '{}' object",
+            target.type_name_owned()
+        )));
+    }
+    Ok(make_ref_object_with_class(
+        target,
+        callback,
+        kind::REF,
+        Some(cls),
+    ))
+}
+
 /// C-API bridge (`PyWeakref_GetRef`): referent of a weakref wrapper.
 /// `Some(Some(target))` while live, `Some(None)` once dead, `None` when
 /// `obj` isn't a weakref wrapper at all.

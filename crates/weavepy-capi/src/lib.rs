@@ -112,6 +112,7 @@ pub mod frozen_table;
 pub mod gc_bridge;
 pub mod genericalloc;
 pub mod getset;
+pub mod greenlet_api;
 pub mod inherit;
 pub mod instance;
 pub mod instancemethod;
@@ -139,6 +140,7 @@ pub mod vectorcall;
 pub mod wave4;
 pub mod wave5;
 pub mod wave5_pandas;
+pub mod weakref_api;
 
 pub use interp::{enter_extension_call, with_active, ActiveContext};
 pub use loader::{load_extension_module, LoadError};

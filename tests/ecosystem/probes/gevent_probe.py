@@ -69,4 +69,54 @@ gevent.joinall([srv, cli], timeout=30)
 assert cli.value == b"WEAVEPY ECHO", cli.value
 server.close()
 
+# gevent-native legs (RFC 0072 WS2): a Greenlet subclass — the shape a
+# compiled Cython subclass takes over the C-API type — plus queue and
+# Timeout.
+import gevent.queue
+
+
+class Doubler(gevent.Greenlet):
+    def __init__(self, n):
+        super().__init__()
+        self.n = n
+
+    def _run(self):
+        gevent.sleep(0)
+        return self.n * 2
+
+
+doublers = [Doubler(i) for i in range(4)]
+for d in doublers:
+    d.start()
+gevent.joinall(doublers, timeout=30)
+assert [d.value for d in doublers] == [0, 2, 4, 6], [d.value for d in doublers]
+
+# queue producer/consumer: bounded queue forces the producer to block
+# cooperatively until the consumer drains.
+q = gevent.queue.Queue(maxsize=2)
+consumed = []
+
+
+def producer():
+    for i in range(6):
+        q.put(i)
+    q.put(StopIteration)
+
+
+def consumer():
+    for item in q:
+        consumed.append(item)
+
+
+gevent.joinall([gevent.spawn(producer), gevent.spawn(consumer)], timeout=30)
+assert consumed == list(range(6)), consumed
+
+# Timeout: fires inside a blocking sleep as gevent.Timeout.
+try:
+    with gevent.Timeout(0.05):
+        gevent.sleep(5)
+    raise AssertionError("Timeout did not fire")
+except gevent.Timeout:
+    pass
+
 print("gevent ok", gevent.__version__)

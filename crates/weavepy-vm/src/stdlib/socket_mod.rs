@@ -606,6 +606,71 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             );
         }
 
+        // getaddrinfo error codes — `gaierror.errno` values, published with
+        // the platform's own numbering exactly as CPython does (negative on
+        // Linux, positive on Darwin). gevent's resolver package imports
+        // `EAI_NONAME`/`EAI_SERVICE` from `_socket` at module scope
+        // (RFC 0072 WS2).
+        #[cfg(unix)]
+        for (name, val) in [
+            ("EAI_AGAIN", libc::EAI_AGAIN),
+            ("EAI_BADFLAGS", libc::EAI_BADFLAGS),
+            ("EAI_FAIL", libc::EAI_FAIL),
+            ("EAI_FAMILY", libc::EAI_FAMILY),
+            ("EAI_MEMORY", libc::EAI_MEMORY),
+            ("EAI_NONAME", libc::EAI_NONAME),
+            ("EAI_OVERFLOW", libc::EAI_OVERFLOW),
+            ("EAI_SERVICE", libc::EAI_SERVICE),
+            ("EAI_SOCKTYPE", libc::EAI_SOCKTYPE),
+            ("EAI_SYSTEM", libc::EAI_SYSTEM),
+        ] {
+            d.insert(
+                DictKey(Object::from_str(name.to_owned())),
+                Object::Int(i64::from(val)),
+            );
+        }
+        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+        d.insert(
+            DictKey(Object::from_static("EAI_NODATA")),
+            Object::Int(i64::from(libc::EAI_NODATA)),
+        );
+        // glibc netdb.h value; the libc crate doesn't expose the
+        // deprecated EAI_ADDRFAMILY for linux-gnu.
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        d.insert(
+            DictKey(Object::from_static("EAI_ADDRFAMILY")),
+            Object::Int(-9),
+        );
+        // Darwin-only codes CPython also publishes there (netdb.h values;
+        // the libc crate doesn't carry the deprecated EAI_ADDRFAMILY).
+        #[cfg(target_os = "macos")]
+        for (name, val) in [
+            ("EAI_ADDRFAMILY", 1i32),
+            ("EAI_BADHINTS", 12),
+            ("EAI_PROTOCOL", 13),
+            ("EAI_MAX", 15),
+        ] {
+            d.insert(
+                DictKey(Object::from_str(name.to_owned())),
+                Object::Int(i64::from(val)),
+            );
+        }
+        // Winsock spelling (ws2tcpip.h maps EAI_* onto WSA error codes).
+        #[cfg(not(unix))]
+        for (name, val) in [
+            ("EAI_AGAIN", 11002i64),
+            ("EAI_BADFLAGS", 10022),
+            ("EAI_FAIL", 11003),
+            ("EAI_FAMILY", 10047),
+            ("EAI_MEMORY", 8),
+            ("EAI_NODATA", 11004),
+            ("EAI_NONAME", 11001),
+            ("EAI_SERVICE", 10109),
+            ("EAI_SOCKTYPE", 10044),
+        ] {
+            d.insert(DictKey(Object::from_str(name.to_owned())), Object::Int(val));
+        }
+
         // getnameinfo flags — like AI_*, these reach the resolver verbatim,
         // so publish the platform's own numbering (ws2tcpip.h on Windows,
         // where NI_NUMERICHOST is 2 and NI_NUMERICSERV is 8).

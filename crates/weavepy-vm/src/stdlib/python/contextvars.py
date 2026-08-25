@@ -249,3 +249,42 @@ def _current_context():
 
 def copy_context():
     return _current_context().copy()
+
+
+# --- C-API bridge (RFC 0072 WS3) -------------------------------------------
+#
+# `PyContext_Enter`/`PyContext_Exit` (uvloop runs every callback under a
+# copied context this way) are `Context.run` split in half: enter makes
+# `ctx` current and remembers the previous context, exit restores it.
+# CPython stashes the previous context inside the C struct; here it
+# lives in a side table keyed by context identity — safe because a
+# context cannot be entered twice (the `_entered` guard).
+
+_C_PREV = {}
+
+
+def _enter_context(ctx):
+    if not isinstance(ctx, Context):
+        raise TypeError(f"a Context was expected, got {ctx!r}")
+    if ctx._entered:
+        raise RuntimeError(
+            f"cannot enter context: {ctx!r} is already entered")
+    ident = _thread.get_ident()
+    _C_PREV[id(ctx)] = _STATES.get(ident)
+    ctx._entered = True
+    _STATES[ident] = ctx
+
+
+def _exit_context(ctx):
+    if not isinstance(ctx, Context):
+        raise TypeError(f"a Context was expected, got {ctx!r}")
+    if not ctx._entered:
+        raise RuntimeError(
+            f"cannot exit context: {ctx!r} has not been entered")
+    ident = _thread.get_ident()
+    prev = _C_PREV.pop(id(ctx), None)
+    ctx._entered = False
+    if prev is None:
+        _STATES.pop(ident, None)
+    else:
+        _STATES[ident] = prev

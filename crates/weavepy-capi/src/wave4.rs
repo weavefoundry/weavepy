@@ -1083,3 +1083,284 @@ pub unsafe extern "C" fn PyContextVar_Set(
     }
     token
 }
+
+// ---------------------------------------------------------------------------
+// Context objects (RFC 0072 WS3 — uvloop's callback machinery)
+//
+// uvloop's `Handle`/`TimerHandle` copy the current context at creation
+// (`PyContext_CopyCurrent`) and run callbacks under it via
+// `PyContext_Enter`/`PyContext_Exit` — the C spelling of
+// `contextvars.copy_context()` / `Context.run`. The VM keeps contexts
+// as a thread-local stack of `_data` dicts (`contextvars_mod`), so
+// enter/exit push and pop the *live* dict of the given Context
+// instance: `ContextVar.set` inside the entered context mutates that
+// Context, exactly as CPython's ownership model has it.
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub unsafe extern "C" fn PyContext_CopyCurrent() -> *mut PyObject {
+    let module =
+        unsafe { crate::module::PyImport_ImportModule(b"contextvars\0".as_ptr() as *const c_char) };
+    if module.is_null() {
+        return ptr::null_mut();
+    }
+    let f = unsafe {
+        crate::abstract_::PyObject_GetAttrString(
+            module,
+            b"copy_context\0".as_ptr() as *const c_char,
+        )
+    };
+    unsafe { crate::object::Py_DecRef(module) };
+    if f.is_null() {
+        return ptr::null_mut();
+    }
+    let ctx = unsafe { crate::abstract_::PyObject_CallObject(f, ptr::null_mut()) };
+    unsafe { crate::object::Py_DecRef(f) };
+    ctx
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyContext_New() -> *mut PyObject {
+    let module =
+        unsafe { crate::module::PyImport_ImportModule(b"contextvars\0".as_ptr() as *const c_char) };
+    if module.is_null() {
+        return ptr::null_mut();
+    }
+    let cls = unsafe {
+        crate::abstract_::PyObject_GetAttrString(module, b"Context\0".as_ptr() as *const c_char)
+    };
+    unsafe { crate::object::Py_DecRef(module) };
+    if cls.is_null() {
+        return ptr::null_mut();
+    }
+    let ctx = unsafe { crate::abstract_::PyObject_CallObject(cls, ptr::null_mut()) };
+    unsafe { crate::object::Py_DecRef(cls) };
+    ctx
+}
+
+/// Call `contextvars.<helper>(ctx)` — the Python-side halves of
+/// `Context.run` that `_enter_context` / `_exit_context` expose for
+/// this bridge. Returns 0, or -1 with the helper's exception set.
+unsafe fn call_context_helper(helper: &'static [u8], ctx: *mut PyObject) -> c_int {
+    let module =
+        unsafe { crate::module::PyImport_ImportModule(b"contextvars\0".as_ptr() as *const c_char) };
+    if module.is_null() {
+        return -1;
+    }
+    let f = unsafe {
+        crate::abstract_::PyObject_GetAttrString(module, helper.as_ptr() as *const c_char)
+    };
+    unsafe { crate::object::Py_DecRef(module) };
+    if f.is_null() {
+        return -1;
+    }
+    let args = unsafe { pack_tuple(&[ctx]) };
+    let res = unsafe { crate::abstract_::PyObject_CallObject(f, args) };
+    unsafe {
+        crate::object::Py_DecRef(f);
+        crate::object::Py_DecRef(args);
+    }
+    if res.is_null() {
+        return -1;
+    }
+    unsafe { crate::object::Py_DecRef(res) };
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyContext_Enter(ctx: *mut PyObject) -> c_int {
+    unsafe { call_context_helper(b"_enter_context\0", ctx) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyContext_Exit(ctx: *mut PyObject) -> c_int {
+    unsafe { call_context_helper(b"_exit_context\0", ctx) }
+}
+
+// ---------------------------------------------------------------------------
+// Descriptor / OS / thread tail (RFC 0072 WS3 — uvloop links these)
+// ---------------------------------------------------------------------------
+
+/// `PyDescr_IsData(descr)` — CPython tests `tp_descr_set != NULL`;
+/// WeavePy mirrors that as "the type defines `__set__` or `__delete__`".
+#[no_mangle]
+pub unsafe extern "C" fn PyDescr_IsData(descr: *mut PyObject) -> c_int {
+    let ty = unsafe { crate::abstract_::PyObject_Type(descr) };
+    if ty.is_null() {
+        crate::errors::clear_thread_local();
+        return 0;
+    }
+    let has_set = unsafe {
+        crate::abstract_::PyObject_HasAttrString(ty, b"__set__\0".as_ptr() as *const c_char)
+    };
+    let has_delete = if has_set == 1 {
+        1
+    } else {
+        unsafe {
+            crate::abstract_::PyObject_HasAttrString(ty, b"__delete__\0".as_ptr() as *const c_char)
+        }
+    };
+    unsafe { crate::object::Py_DecRef(ty) };
+    c_int::from(has_set == 1 || has_delete == 1)
+}
+
+/// `PyOS_BeforeFork` / `PyOS_AfterFork_Parent` / `PyOS_AfterFork_Child` —
+/// CPython quiesces runtime locks around `fork()`. WeavePy's fork users
+/// (uvloop's libuv `uv_spawn`, `posix.fork`) exec or run on their own
+/// dedicated state; there is no runtime-wide lock set to quiesce, so
+/// these are sound no-ops.
+#[no_mangle]
+pub extern "C" fn PyOS_BeforeFork() {}
+
+#[no_mangle]
+pub extern "C" fn PyOS_AfterFork_Parent() {}
+
+#[no_mangle]
+pub extern "C" fn PyOS_AfterFork_Child() {}
+
+/// `PyOS_setsig(sig, handler)` — install a signal handler via
+/// `sigaction` (empty mask, no flags — CPython's exact recipe) and
+/// return the previous handler, or `SIG_ERR` on failure. On Windows
+/// CPython has no `HAVE_SIGACTION` and falls back to `signal(2)`;
+/// so do we.
+#[cfg(unix)]
+#[no_mangle]
+pub unsafe extern "C" fn PyOS_setsig(
+    sig: c_int,
+    handler: libc::sighandler_t,
+) -> libc::sighandler_t {
+    unsafe {
+        let mut context: libc::sigaction = std::mem::zeroed();
+        let mut ocontext: libc::sigaction = std::mem::zeroed();
+        context.sa_sigaction = handler;
+        libc::sigemptyset(&mut context.sa_mask);
+        context.sa_flags = 0;
+        if libc::sigaction(sig, &context, &mut ocontext) == -1 {
+            return libc::SIG_ERR;
+        }
+        ocontext.sa_sigaction
+    }
+}
+
+#[cfg(windows)]
+#[no_mangle]
+pub unsafe extern "C" fn PyOS_setsig(
+    sig: c_int,
+    handler: libc::sighandler_t,
+) -> libc::sighandler_t {
+    unsafe { libc::signal(sig, handler) }
+}
+
+/// `PyThread_get_thread_ident()` — the same ident `_thread.get_ident()`
+/// reports (the synthetic worker id when set, else the OS thread id),
+/// so C-side thread checks (uvloop's `loop._thread_id`) agree with
+/// Python-side `threading.get_ident()`.
+#[no_mangle]
+pub extern "C" fn PyThread_get_thread_ident() -> c_ulong {
+    weavepy_vm::vm_singletons::current_worker_thread_id() as c_ulong
+}
+
+// ---------------------------------------------------------------------------
+// PyOS_double_to_string (RFC 0072 WS4 — psycopg's FloatDumper)
+//
+// psycopg-binary's `FloatDumper.cdump` renders every float parameter with
+// `PyOS_double_to_string(d, b'r', 0, Py_DTSF_ADD_DOT_0, NULL)` and frees
+// the result with `PyMem_Free`. The wheel links the symbol with
+// `-undefined dynamic_lookup`, so its absence was a jump through NULL at
+// the first float dump.
+// ---------------------------------------------------------------------------
+
+/// `Py_DTSF_*` flags and `Py_DTST_*` result types (CPython pystrtod.h).
+const PY_DTSF_SIGN: c_int = 0x01;
+const PY_DTSF_ADD_DOT_0: c_int = 0x02;
+const PY_DTSF_NO_NEG_0: c_int = 0x08;
+const PY_DTST_FINITE: c_int = 0;
+const PY_DTST_INFINITE: c_int = 1;
+const PY_DTST_NAN: c_int = 2;
+
+/// `PyOS_double_to_string(val, format_code, precision, flags, ptype)` —
+/// render `val` per the format code (`'r'` shortest-repr, `'e'/'f'/'g'`
+/// printf-style with `precision`; uppercase variants upcase the result)
+/// into a `PyMem_Malloc`-compatible NUL-terminated buffer the caller
+/// releases with `PyMem_Free`. The repr lane reuses the VM's
+/// CPython-faithful `float_repr` (shortest round-trip, `e+NN`
+/// exponents); the precision lanes go through C `snprintf`, which is
+/// CPython's own fallback recipe.
+#[no_mangle]
+pub unsafe extern "C" fn PyOS_double_to_string(
+    val: f64,
+    format_code: c_char,
+    precision: c_int,
+    flags: c_int,
+    ptype: *mut c_int,
+) -> *mut c_char {
+    let code = format_code as u8;
+    let upper = code.is_ascii_uppercase();
+    let mut s = if val.is_nan() {
+        if !ptype.is_null() {
+            unsafe { *ptype = PY_DTST_NAN };
+        }
+        "nan".to_string()
+    } else if val.is_infinite() {
+        if !ptype.is_null() {
+            unsafe { *ptype = PY_DTST_INFINITE };
+        }
+        if val < 0.0 { "-inf" } else { "inf" }.to_string()
+    } else {
+        if !ptype.is_null() {
+            unsafe { *ptype = PY_DTST_FINITE };
+        }
+        match code.to_ascii_lowercase() {
+            b'r' => weavepy_vm::object::float_repr(val),
+            c @ (b'e' | b'f' | b'g') => {
+                let fmt = format!("%.{}{}", precision.max(0), c as char);
+                let cfmt = std::ffi::CString::new(fmt).expect("no NUL in float format");
+                let mut buf = [0u8; 128];
+                let n = unsafe {
+                    libc::snprintf(
+                        buf.as_mut_ptr() as *mut c_char,
+                        buf.len(),
+                        cfmt.as_ptr(),
+                        val,
+                    )
+                };
+                if n < 0 {
+                    return ptr::null_mut();
+                }
+                let n = (n as usize).min(buf.len() - 1);
+                String::from_utf8_lossy(&buf[..n]).into_owned()
+            }
+            _ => {
+                crate::errors::set_value_error("PyOS_double_to_string: unknown format code");
+                return ptr::null_mut();
+            }
+        }
+    };
+    if val.is_finite() {
+        if flags & PY_DTSF_NO_NEG_0 != 0
+            && s.starts_with('-')
+            && !s[1..].bytes().any(|b| (b'1'..=b'9').contains(&b))
+        {
+            s.remove(0);
+        }
+        if flags & PY_DTSF_ADD_DOT_0 != 0 && !s.contains(['.', 'e', 'E']) {
+            s.push_str(".0");
+        }
+    }
+    if flags & PY_DTSF_SIGN != 0 && !s.starts_with('-') {
+        s.insert(0, '+');
+    }
+    if upper {
+        s.make_ascii_uppercase();
+    }
+    let bytes = s.as_bytes();
+    let out = unsafe { libc::malloc(bytes.len() + 1) } as *mut c_char;
+    if out.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out as *mut u8, bytes.len());
+        *out.add(bytes.len()) = 0;
+    }
+    out
+}

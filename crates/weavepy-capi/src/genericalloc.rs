@@ -211,6 +211,7 @@ pub unsafe extern "C" fn PyType_GenericAlloc(
                     ob_refcnt: 1,
                     ob_type: ty,
                 },
+                exc: crate::object::ExcFields::default(),
                 payload: PayloadCell::from_object(payload_obj),
             },
         );

@@ -800,9 +800,14 @@ pub unsafe fn free_instance_body(p: *mut PyObject) {
     if unsafe { is_faithful_list(p) } {
         unregister_seeded_list(p);
         if !aux_ptr.is_null() && aux_size > 0 {
-            let n = (aux_size / std::mem::size_of::<*mut PyObject>()) as isize;
+            // Live prefix only (`ob_size`), like CPython's `list_dealloc`:
+            // the allocated tail can hold stale pointers a shrinking
+            // mutation (Cython's inlined `pop()`) left behind — see the
+            // matching sweep in [`free_mirror`].
+            let cap = (aux_size / std::mem::size_of::<*mut PyObject>()) as isize;
+            let live = unsafe { (*(p as *const layout::PyVarObject)).ob_size }.clamp(0, cap);
             let slots = aux_ptr as *mut *mut PyObject;
-            for i in 0..n {
+            for i in 0..live {
                 let elem = unsafe { *slots.offset(i) };
                 if !elem.is_null() {
                     unsafe { crate::object::Py_DecRef(elem) };
@@ -3586,10 +3591,23 @@ pub unsafe fn free_mirror(p: *mut PyObject) {
     // **memoryview** mirror (RFC 0047, wave 5) also carries an aux buffer,
     // but its bytes are packed `shape`/`strides`/data/format — *not*
     // `PyObject*` slots — and must never be decref'd here.
+    //
+    // Only the **live prefix** (`ob_size` slots) owns references, exactly
+    // like CPython's `list_dealloc` (which walks `Py_SIZE(op)` items). The
+    // allocated tail beyond `ob_size` can hold *stale* pointers: Cython's
+    // inlined `list.pop()` fast path takes the item and shrinks `ob_size`
+    // via `__Pyx_SET_SIZE` without nulling the vacated slot (CPython never
+    // reads past `ob_size`, so it doesn't need to). Sweeping the whole
+    // buffer by `aux_size` decref'd those popped elements a second time —
+    // uvloop's `UVProcess._init` pops the errpipe fds off `fds_to_close`
+    // while `self._errpipe_read/_write` still own them, so the double
+    // decref freed live int boxes and the transport's later `tp_traverse`
+    // visited freed memory (SIGSEGV on Linux; masked by macOS's allocator).
     if !aux_ptr.is_null() && aux_size > 0 && unsafe { is_faithful_list(p) } {
-        let n = (aux_size / std::mem::size_of::<*mut PyObject>()) as isize;
+        let cap = (aux_size / std::mem::size_of::<*mut PyObject>()) as isize;
+        let live = unsafe { (*(p as *const layout::PyVarObject)).ob_size }.clamp(0, cap);
         let slots = aux_ptr as *mut *mut PyObject;
-        for i in 0..n {
+        for i in 0..live {
             let elem = unsafe { *slots.offset(i) };
             if !elem.is_null() {
                 unsafe { crate::object::Py_DecRef(elem) };

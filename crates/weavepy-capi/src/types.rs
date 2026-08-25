@@ -480,9 +480,15 @@ pub fn init_static_types() {
         "builtin_function_or_method",
     );
     install_synth(&PyMethod_Type, b"method\0", "method");
+    // `memoryview` bridges to the VM's *real* builtin class: Cython caches
+    // `_memoryview = memoryview` as `&PyMemoryView_Type` and later *calls*
+    // it (gevent's `get_memory`), so `type_tp_call` must instantiate a
+    // working memoryview, not a synthetic shell (RFC 0072 WS2). Pointer
+    // identity for numpy's `Py_TYPE(x) == &PyMemoryView_Type` checks is
+    // unchanged.
+    install(&PyMemoryView_Type, b"memoryview\0", bt.memoryview_.clone());
     // RFC 0046 (wave 4): numpy references these by address. Synthetic
     // minimal types are enough for symbol resolution + pointer identity.
-    install_synth(&PyMemoryView_Type, b"memoryview\0", "memoryview");
     install_synth(&PyDictProxy_Type, b"mappingproxy\0", "mappingproxy");
     install_synth(
         &PyGetSetDescr_Type,
@@ -829,6 +835,12 @@ pub fn type_for_object(o: &Object) -> *mut PyTypeObject {
         // `into_owned`, but report the faithful `PyCapsule_Type` for any
         // direct `Py_TYPE`-style query that reaches here.
         O::Capsule(_) => PyCapsule_Type.as_ptr(),
+        // RFC 0072 WS2: a mappingproxy crosses wearing `PyDictProxy_Type`
+        // (with mapping slots installed), not a bare `object`. gevent's
+        // compiled `_local_find_descriptors` does `base.__dict__[attr]` —
+        // Cython's `__Pyx_PyObject_GetItem` reads `tp_as_mapping` straight
+        // off `ob_type` and reported "'object' object is not subscriptable".
+        O::MappingProxy(_) | O::MappingProxyObj(_) => PyDictProxy_Type.as_ptr(),
         _ => PyBaseObject_Type.as_ptr(),
     }
 }
@@ -933,6 +945,21 @@ fn find_type_ptr_uncached(t: &Rc<TypeObject>) -> Option<*mut PyTypeObject> {
     // and identity-checked, so it runs *before* the generic registry scan
     // and never collides with a coincidentally-named user class.
     if let Some(p) = crate::datetime_api::faithful_type_for_class(t) {
+        return Some(p);
+    }
+    // RFC 0072 WS1: the VM `greenlet` class resolves to the byte-faithful
+    // `PyGreenlet` shell (`tp_basicsize == sizeof(PyGreenlet)`), never the
+    // generic identity-box mirror — gevent's Cython subclasses compute
+    // their field offsets from the upstream struct size.
+    if let Some(p) = crate::greenlet_api::faithful_type_for_class(t) {
+        return Some(p);
+    }
+    // RFC 0072 WS2: the builtin `weakref.ref` (`ReferenceType`) class
+    // resolves to the byte-faithful `PyWeakReference` shell
+    // (`tp_basicsize == 64`) — gevent's `_gevent_c_ident` imports it
+    // with a `sizeof(PyWeakReference)` check and subclasses it with a
+    // cdef field at that offset.
+    if let Some(p) = crate::weakref_api::faithful_type_for_class(t) {
         return Some(p);
     }
     let target = Rc::as_ptr(t);
@@ -1042,7 +1069,9 @@ unsafe extern "C" fn synth_tp_iter(o: *mut PyObject) -> *mut PyObject {
     unsafe { crate::abstract_::PyObject_GetIter(o) }
 }
 unsafe extern "C" fn synth_tp_iternext(o: *mut PyObject) -> *mut PyObject {
-    unsafe { crate::abstract_::PyIter_Next(o) }
+    // Value-preserving: a `StopIteration(value)` stays pending so compiled
+    // yield-from delegation can fetch the result (see `tp_iternext_bridge`).
+    unsafe { crate::builtin_slots::tp_iternext_bridge(o) }
 }
 unsafe extern "C" fn synth_tp_call(
     o: *mut PyObject,
@@ -2160,6 +2189,13 @@ static STATIC_TYPE_TABLE: &[&StaticType] = &[
     // RFC 0066 WS3: membership resolves `type(im)` for the foreign
     // instancemethod proxies pybind11 mints.
     &PyInstanceMethod_Type,
+    // RFC 0072 WS2: gevent's Cython caches `_memoryview = memoryview` as
+    // `&PyMemoryView_Type` and *calls* it (`get_memory`); membership lets
+    // `bridge_type` resolve the static to the real VM `memoryview` class so
+    // `type_tp_call` constructs a working memoryview. `PyDictProxy_Type`
+    // likewise round-trips (`type(cls.__dict__)` through the C surface).
+    &PyMemoryView_Type,
+    &PyDictProxy_Type,
 ];
 
 /// Borrow the bridged native type from a [`PyTypeObject`].

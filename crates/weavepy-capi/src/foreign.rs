@@ -519,5 +519,18 @@ pub fn install() {
         object_to_owned_ptr: fwd_object_to_owned_ptr,
         release_object_ptr: fwd_release_object_ptr,
         descr_get: fwd_descr_get,
+        handled_exception: fwd_handled_exception,
     });
+}
+
+/// [`ForeignHooks::handled_exception`] — the C-API handled-exception slot
+/// (`PyErr_SetHandledException`'s cell, which Cython's `__Pyx_GetException`
+/// fills for every compiled `except` block) as a VM exception instance.
+fn fwd_handled_exception() -> Option<Object> {
+    let value = unsafe { *crate::pystate::exc_info_value_slot() };
+    if value.is_null() {
+        return None;
+    }
+    let obj = unsafe { crate::object::clone_object(value) };
+    matches!(&obj, Object::Instance(_)).then_some(obj)
 }

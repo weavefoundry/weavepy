@@ -334,6 +334,35 @@ requirements = "gevent"
 probe = "probes/gevent_probe.py"
 timeout_seconds = 900
 
+# --- infrastructure-native tail (RFC 0072 WS3/WS4) ----------------------------
+
+# uvloop: Cython over bundled libuv, a drop-in asyncio loop. POSIX-only
+# upstream (no Windows wheels exist) — status_windows = "skip" in
+# expectations by construction.
+[packages.uvloop]
+requirements = "uvloop"
+probe = "probes/uvloop_probe.py"
+timeout_seconds = 900
+
+# psycopg v3: pure-Python frontend + the Cython/libpq binary
+# implementation, named explicitly (the `psycopg[binary]` extra resolves
+# to the same wheel, but the in-tree pip lane installs extras-free
+# requirements more reliably). The probe is serverless but proves the C
+# extension is the one live (`pq.__impl__ == "binary"`) and drives real
+# libpq to a connection-refused OperationalError.
+[packages.psycopg]
+requirements = "psycopg psycopg-binary"
+probe = "probes/psycopg_probe.py"
+timeout_seconds = 900
+
+# grpcio (stretch, measured whatever its color): the C++ core +
+# Cython bindings; generic bytes handlers keep protobuf out of the
+# probe.
+[packages.grpcio]
+requirements = "grpcio"
+probe = "probes/grpcio_probe.py"
+timeout_seconds = 900
+
 # --- source-build proof rows (RFC 0062 WS2) ----------------------------------
 #
 # `no_binary` forces the pinned package through pip's sdist path: the

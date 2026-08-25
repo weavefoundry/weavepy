@@ -385,6 +385,43 @@ fn instance_dunder_trampoline(name: &'static str) -> Object {
     }))
 }
 
+/// Like [`instance_dunder_trampoline`] but for the ordinary method
+/// surface (`acquire`/`release`/…), kwargs included. gevent's
+/// `_threading.acquire_with_timeout` swizzles itself to
+/// `type(lock).acquire` and calls it *unbound* —
+/// `type(lock).acquire(lock, timeout=-1)` — so the methods must be
+/// reachable via the type, not just the instance dict (RFC 0072 WS2).
+fn instance_method_trampoline(name: &'static str) -> Object {
+    let forward =
+        move |args: &[Object], kwargs: &[(String, Object)]| -> Result<Object, RuntimeError> {
+            let Some(Object::Instance(inst)) = args.first() else {
+                return Err(type_error(format!(
+                    "descriptor '{name}' requires a lock instance"
+                )));
+            };
+            let closure = inst
+                .dict
+                .borrow()
+                .get(&DictKey(Object::from_static(name)))
+                .cloned();
+            match closure {
+                Some(Object::Builtin(b)) => match &b.call_kw {
+                    Some(kw) => kw(&args[1..], kwargs),
+                    None if kwargs.is_empty() => (b.call)(&args[1..]),
+                    None => Err(type_error(format!("{name}() takes no keyword arguments"))),
+                },
+                _ => Err(type_error(format!("instance has no {name}"))),
+            }
+        };
+    let forward_pos = forward;
+    Object::Builtin(Rc::new(BuiltinFn {
+        name,
+        binds_instance: true,
+        call: Box::new(move |args| forward_pos(args, &[])),
+        call_kw: Some(Box::new(forward)),
+    }))
+}
+
 /// Returns the user-visible "lock" type. Built lazily so
 /// `type(lock).__name__ == 'lock'` matches CPython.
 fn lock_type() -> Rc<TypeObject> {
@@ -418,6 +455,20 @@ fn lock_type() -> Rc<TypeObject> {
             DictKey(Object::from_static("__exit__")),
             instance_dunder_trampoline("__exit__"),
         );
+        for name in [
+            "acquire",
+            "release",
+            "locked",
+            "acquire_lock",
+            "release_lock",
+            "locked_lock",
+            "_at_fork_reinit",
+        ] {
+            d.insert(
+                DictKey(Object::from_static(name)),
+                instance_method_trampoline(name),
+            );
+        }
         let t = TypeObject::new_with_flags(
             "lock",
             vec![crate::builtin_types::builtin_types().object_.clone()],
@@ -488,6 +539,21 @@ fn rlock_type() -> Rc<TypeObject> {
             DictKey(Object::from_static("__exit__")),
             instance_dunder_trampoline("__exit__"),
         );
+        for name in [
+            "acquire",
+            "release",
+            "locked",
+            "_is_owned",
+            "_release_save",
+            "_acquire_restore",
+            "_recursion_count",
+            "_at_fork_reinit",
+        ] {
+            d.insert(
+                DictKey(Object::from_static(name)),
+                instance_method_trampoline(name),
+            );
+        }
         let t = TypeObject::new_with_flags(
             "RLock",
             vec![crate::builtin_types::builtin_types().object_.clone()],
@@ -1359,6 +1425,14 @@ fn spawn_python_worker(
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 worker_interp.run_pending_finalizers();
             }));
+            // Reap greenlets bound to this thread (the registry is
+            // process-global since RFC 0072 WS2 so unstarted greenlets can
+            // be adopted cross-thread; bodies bound here must be dropped
+            // while the GIL is still held — their frames/contexts pin
+            // Python objects).
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                super::greenlet_native::on_thread_teardown,
+            ));
             // Release this worker's Python references *while the GIL is
             // still held*. The interpreter snapshot pins a large shared
             // object graph; dropping it after the GIL is gone lets its

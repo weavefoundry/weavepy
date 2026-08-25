@@ -1917,6 +1917,66 @@ impl Interpreter {
         self.iter_next(&iter, &globals)
     }
 
+    /// [`iter_next_object`] for the C-API's `tp_iternext` slot bridges
+    /// (RFC 0072 WS3): a `StopIteration` is *not* collapsed to
+    /// `Ok(None)` — it surfaces as `Err` with the exception instance
+    /// intact, so the bridge can leave a value-carrying
+    /// `StopIteration(value)` pending exactly like CPython's
+    /// `gen_iternext`. Routing through `PyIter_Next` instead silently
+    /// discarded a generator's return value: Cython's yield-from resume
+    /// (`__Pyx_Coroutine_FinishDelegation` →
+    /// `__Pyx_PyGen_FetchStopIterationValue`) saw no exception and
+    /// substituted `None` — every `await` of a VM awaitable from a
+    /// compiled coroutine (uvloop's `getaddrinfo` awaiting our
+    /// `_asyncio.Future`) "returned" None.
+    pub fn iter_next_object_preserving(
+        &mut self,
+        iter: Object,
+    ) -> Result<Option<Object>, RuntimeError> {
+        let _interp_guard =
+            crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
+        let _handles = self.activate_thread_handles();
+        let globals = self.builtins.clone();
+        match &iter {
+            Object::Generator(g) | Object::Coroutine(g) => {
+                self.generator_send(g, Object::None).map(Some)
+            }
+            Object::Instance(_) => match instance_method(&iter, "__next__") {
+                Some(m) => self.call(&m, &[], &[], &globals).map(Some),
+                None => self.iter_next(&iter, &globals),
+            },
+            _ => self.iter_next(&iter, &globals),
+        }
+    }
+
+    /// `gen.send(value)` for the C-API's `PyIter_Send` (RFC 0072 WS3).
+    /// Completion surfaces as `Err(StopIteration-with-value)` — the
+    /// caller translates it to `PYGEN_RETURN`.
+    pub fn send_object_capi(
+        &mut self,
+        iter: Object,
+        value: Object,
+    ) -> Result<Object, RuntimeError> {
+        let _interp_guard =
+            crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
+        let _handles = self.activate_thread_handles();
+        let globals = self.builtins.clone();
+        match &iter {
+            Object::Generator(g) | Object::Coroutine(g) => self.generator_send(g, value),
+            _ => {
+                // CPython `PyIter_Send`: prefer `am_send`/`send`, fall back
+                // to `tp_iternext` for a None send.
+                if matches!(value, Object::None) {
+                    if let Some(m) = instance_method(&iter, "__next__") {
+                        return self.call(&m, &[], &[], &globals);
+                    }
+                }
+                let m = self.load_attr(&iter, "send")?;
+                self.call(&m, std::slice::from_ref(&value), &[], &globals)
+            }
+        }
+    }
+
     /// RFC 0025: install this interpreter's per-thread handles as
     /// the active set for the calling OS thread. The returned guard
     /// pops the handles on drop, restoring the previous registration

@@ -153,7 +153,25 @@ struct GreenletBody {
     /// read these) while parked. Guards push/pop on the greenlet's own
     /// native stack, so the vector must travel with it.
     saved_handles: RefCell<Vec<crate::vm_singletons::ThreadHandles>>,
+    /// The worker-thread id this greenlet is bound to, or 0 while
+    /// unstarted. Upstream greenlet binds a greenlet to a thread at its
+    /// *first switch*, not at construction — gevent's threadpool relies
+    /// on this: `_WorkerGreenlet` is constructed on the pool's thread
+    /// and first switched from the freshly-started worker OS thread
+    /// (RFC 0072 WS2). All switch paths reject a bound greenlet from
+    /// any other thread.
+    bound_thread: Cell<u64>,
 }
+
+// Safety: the registry is shared across threads so an *unstarted*
+// greenlet can be adopted by whichever thread first switches to it
+// (upstream semantics). Once bound, only the bound thread resumes the
+// coroutine or touches `yielder` (all switch entry points check
+// `bound_thread` first), and every interior cell is a GIL-guarded
+// `GilCell`. The raw `Yielder` pointer and the coroutine are only ever
+// dereferenced on the bound thread's own stack.
+unsafe impl Send for GreenletBody {}
+unsafe impl Sync for GreenletBody {}
 
 enum InstanceRef {
     None,
@@ -193,9 +211,15 @@ impl Drop for GreenletBody {
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// The process-wide body registry. Global (not thread-local) so a
+/// greenlet constructed on one thread can be *started* from another —
+/// the binding to a thread happens at first switch (`bound_thread`),
+/// exactly as in upstream greenlet. Bodies bound to a dying thread are
+/// reaped by [`on_thread_teardown`].
+static REGISTRY: std::sync::Mutex<Option<HashMap<u64, Rc<GreenletBody>>>> =
+    std::sync::Mutex::new(None);
+
 thread_local! {
-    static REGISTRY: RefCell<HashMap<u64, Rc<GreenletBody>>> =
-        RefCell::new(HashMap::new());
     /// The currently-executing greenlet's id (0 before first use).
     static CURRENT: Cell<u64> = const { Cell::new(0) };
     /// This thread's main greenlet id (0 before first use).
@@ -207,7 +231,42 @@ thread_local! {
 }
 
 fn body(id: u64) -> Option<Rc<GreenletBody>> {
-    REGISTRY.with(|r| r.borrow().get(&id).cloned())
+    REGISTRY.lock().ok()?.as_ref()?.get(&id).cloned()
+}
+
+fn registry_insert(id: u64, b: Rc<GreenletBody>) {
+    if let Ok(mut guard) = REGISTRY.lock() {
+        guard.get_or_insert_with(HashMap::new).insert(id, b);
+    }
+}
+
+fn registry_remove(id: u64) -> Option<Rc<GreenletBody>> {
+    REGISTRY.lock().ok()?.as_mut()?.remove(&id)
+}
+
+/// Reap every body bound to the dying thread (including its main
+/// greenlet). Suspended coroutines are abandoned via `GreenletBody`'s
+/// `Drop` (`force_reset`), matching both upstream greenlet's exit
+/// behaviour and the previous thread-local registry, which dropped its
+/// bodies with the thread.
+pub(crate) fn on_thread_teardown() {
+    let tid = crate::vm_singletons::current_worker_thread_id();
+    let reaped: Vec<Rc<GreenletBody>> = match REGISTRY.lock() {
+        Ok(mut guard) => match guard.as_mut() {
+            Some(map) => {
+                let ids: Vec<u64> = map
+                    .iter()
+                    .filter(|(_, b)| b.bound_thread.get() == tid)
+                    .map(|(id, _)| *id)
+                    .collect();
+                ids.into_iter().filter_map(|id| map.remove(&id)).collect()
+            }
+            None => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    };
+    // Drop outside the lock: `Drop` may run arbitrary force-reset work.
+    drop(reaped);
 }
 
 fn chain_contains(id: u64) -> bool {
@@ -417,6 +476,11 @@ fn fresh_body(is_main: bool) -> Rc<GreenletBody> {
         saved_depth: Cell::new(0),
         context: RefCell::new(Object::None),
         saved_handles: RefCell::new(Vec::new()),
+        bound_thread: Cell::new(if is_main {
+            crate::vm_singletons::current_worker_thread_id()
+        } else {
+            0
+        }),
     })
 }
 
@@ -451,7 +515,7 @@ fn ensure_main() -> Rc<GreenletBody> {
     MAIN_ID.with(|m| m.set(b.id));
     CURRENT.with(|c| c.set(b.id));
     CHAIN.with(|c| c.borrow_mut().push(b.id));
-    REGISTRY.with(|r| r.borrow_mut().insert(b.id, b.clone()));
+    registry_insert(b.id, b.clone());
     b
 }
 
@@ -488,6 +552,11 @@ fn resume_body(target: u64, payload: Payload) -> Directive {
     let b = body(target).expect("resume_body: registered target");
     if b.status.get() == Status::Unstarted {
         b.status.set(Status::Active);
+        // First switch: the greenlet binds to this thread for life
+        // (upstream `g_initialstub` allocates the stack in the switching
+        // thread).
+        b.bound_thread
+            .set(crate::vm_singletons::current_worker_thread_id());
         let id = b.id;
         let stack = DefaultStack::new(stack_size()).expect("greenlet stack allocation");
         let coro: GreenCoroutine = Coroutine::with_stack(stack, move |yielder, first| {
@@ -731,8 +800,19 @@ fn green_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
         DictKey(Object::from_static("_greenlet_id")),
         Object::Int(b.id as i64),
     );
-    REGISTRY.with(|r| r.borrow_mut().insert(b.id, b));
+    registry_insert(b.id, b);
     Ok(Object::None)
+}
+
+/// Upstream affinity rule: once a greenlet has started it belongs to
+/// that thread; switching (or throwing) into it from any other thread
+/// is `greenlet.error`.
+fn check_thread_affinity(target: &GreenletBody) -> Result<(), RuntimeError> {
+    let bound = target.bound_thread.get();
+    if bound != 0 && bound != crate::vm_singletons::current_worker_thread_id() {
+        return Err(green_error("cannot switch to a different thread"));
+    }
+    Ok(())
 }
 
 /// `g.switch(*args, **kwargs)`.
@@ -740,6 +820,7 @@ fn green_switch(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
     let inst = extract_self(args)?;
     ensure_main();
     let target = body_of(&inst)?;
+    check_thread_affinity(&target)?;
     let cur = current_body();
     if target.status.get() == Status::Unstarted && target.run.borrow().is_none() && !target.is_main
     {
@@ -812,6 +893,7 @@ fn green_throw(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = extract_self(args)?;
     ensure_main();
     let target = body_of(&inst)?;
+    check_thread_affinity(&target)?;
     let cur = current_body();
     let exc = throw_exception(args)?;
     if target.status.get() == Status::Unstarted && !target.is_main {
@@ -844,13 +926,19 @@ fn green_del(args: &[Object]) -> Result<Object, RuntimeError> {
         return Ok(Object::None);
     };
     let cur = current_body();
+    // A greenlet bound to *another* thread must not be resumed (or its
+    // stack freed) from here; leave it for that thread's teardown reap.
+    let bound = b.bound_thread.get();
+    if bound != 0 && bound != crate::vm_singletons::current_worker_thread_id() {
+        return Ok(Object::None);
+    }
     let collectable =
         b.status.get() == Status::Active && !b.is_main && b.id != cur.id && !chain_contains(b.id);
     if collectable {
         b.parent.set(cur.id);
         let _ = initiate(&cur, &b, Payload::Throw(greenlet_exit_error()));
     }
-    REGISTRY.with(|r| r.borrow_mut().remove(&id));
+    registry_remove(id);
     Ok(Object::None)
 }
 
@@ -1118,6 +1206,120 @@ fn settrace(_args: &[Object]) -> Result<Object, RuntimeError> {
 }
 fn gettrace(_args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
+}
+
+// ---------------------------------------------------------------------------
+// C-API bridge surface (RFC 0072 WS1).
+//
+// The `greenlet._C_API` capsule (weavepy-capi's `greenlet_api` module)
+// needs callable entry points for the upstream `PyGreenlet_*` table.
+// Everything above is deliberately private module plumbing; this block
+// exposes exactly the verbs the 12-slot table binds, as plain Rust
+// functions over `Object`s — the capi layer does the `PyObject*`
+// marshalling and error-pending conversion.
+// ---------------------------------------------------------------------------
+
+/// The process-global `greenlet.greenlet` class (for the C type shell's
+/// bridge and `PyGreenlet_Type` resolution).
+pub fn capi_class() -> Rc<TypeObject> {
+    greenlet_class()
+}
+
+/// `greenlet.GreenletExit` (capsule slot `PyExc_GreenletExit`).
+pub fn capi_exit_class() -> Rc<TypeObject> {
+    greenlet_exit_class()
+}
+
+/// `greenlet.error` (capsule slot `PyExc_GreenletError`).
+pub fn capi_error_class() -> Rc<TypeObject> {
+    green_error_class()
+}
+
+/// `PyGreenlet_New(run, parent)`: a fresh, initialised greenlet of the
+/// base class — upstream routes through `green_new` + `green_init` with
+/// keyword arguments, and so does this (`run`/`parent` only when given).
+pub fn capi_new(run: Option<Object>, parent: Option<Object>) -> Result<Object, RuntimeError> {
+    let inst = Rc::new(PyInstance::new(greenlet_class()));
+    let self_obj = Object::Instance(inst);
+    let mut kwargs: Vec<(String, Object)> = Vec::new();
+    if let Some(r) = run {
+        kwargs.push(("run".to_owned(), r));
+    }
+    if let Some(p) = parent {
+        kwargs.push(("parent".to_owned(), p));
+    }
+    green_init(std::slice::from_ref(&self_obj), &kwargs)?;
+    Ok(self_obj)
+}
+
+/// `PyGreenlet_GetCurrent()`.
+pub fn capi_getcurrent() -> Result<Object, RuntimeError> {
+    getcurrent(&[])
+}
+
+/// `PyGreenlet_Switch(g, args, kwargs)` — the **base** `switch`
+/// implementation, deliberately bypassing any subclass override
+/// (upstream calls `green_switch` directly; gevent's
+/// `SwitchOutGreenletWithLoop.switch` relies on that to avoid
+/// recursing into itself).
+pub fn capi_switch(
+    target: &Object,
+    args: Vec<Object>,
+    kwargs: Vec<(String, Object)>,
+) -> Result<Object, RuntimeError> {
+    let mut full = Vec::with_capacity(args.len() + 1);
+    full.push(target.clone());
+    full.extend(args);
+    green_switch(&full, &kwargs)
+}
+
+/// `PyGreenlet_Throw(g, typ, val, tb)` — base `throw`, upstream default
+/// semantics (`typ = None` → `GreenletExit`).
+pub fn capi_throw(
+    target: &Object,
+    typ: Object,
+    val: Object,
+    tb: Object,
+) -> Result<Object, RuntimeError> {
+    green_throw(&[target.clone(), typ, val, tb])
+}
+
+/// `PyGreenlet_SetParent(g, nparent)`.
+pub fn capi_set_parent(target: &Object, parent: Object) -> Result<(), RuntimeError> {
+    green_parent_set(&[target.clone(), parent]).map(|_| ())
+}
+
+/// `PyGreenlet_GetParent(g)` — `None` for main (upstream returns NULL
+/// without an exception there).
+pub fn capi_get_parent(target: &Object) -> Result<Object, RuntimeError> {
+    green_parent_get(std::slice::from_ref(target))
+}
+
+fn capi_body(target: &Object) -> Result<Rc<GreenletBody>, RuntimeError> {
+    let inst = extract_self(std::slice::from_ref(target))?;
+    body_of(&inst)
+}
+
+/// `PyGreenlet_MAIN(g)`.
+pub fn capi_is_main(target: &Object) -> Result<bool, RuntimeError> {
+    Ok(capi_body(target)?.is_main)
+}
+
+/// `PyGreenlet_STARTED(g)` — has ever been started (active or dead).
+pub fn capi_is_started(target: &Object) -> Result<bool, RuntimeError> {
+    Ok(capi_body(target)?.status.get() != Status::Unstarted)
+}
+
+/// `PyGreenlet_ACTIVE(g)` — started and not yet dead.
+pub fn capi_is_active(target: &Object) -> Result<bool, RuntimeError> {
+    Ok(capi_body(target)?.status.get() == Status::Active)
+}
+
+/// True when `o` is a greenlet instance (any subclass — decided by the
+/// MRO, exactly like the Python-level methods).
+pub fn capi_is_greenlet(o: &Object) -> bool {
+    matches!(o, Object::Instance(inst)
+        if inst.cls().mro.borrow().iter().any(|t| t.name == "greenlet"))
 }
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {

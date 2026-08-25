@@ -13,6 +13,9 @@ The module is version-stringed to the upstream line it models, and a
 SQLAlchemy's asyncio bridge) see an installed distribution.
 """
 
+import sys as _sys
+
+import _greenlet
 from _greenlet import (
     GREENLET_VERSION,
     GreenletExit,
@@ -25,8 +28,17 @@ from _greenlet import (
 
 __version__ = GREENLET_VERSION
 
-# Upstream API-surface aliases.
-_C_API = None  # The C-API capsule is a WS6 stretch (gevent); see RFC 0066.
+# Upstream layout parity (RFC 0072 WS1): the C extension lives at
+# ``greenlet._greenlet``, and C consumers may import the capsule through
+# either dotted path. Alias the native module under the package so
+# ``PyCapsule_Import("greenlet._greenlet._C_API", 0)`` resolves.
+_sys.modules.setdefault("greenlet._greenlet", _greenlet)
+
+# The C-API capsule (RFC 0072 WS1). The real ``PyGreenlet_*`` table is
+# minted C-side on first import — ``PyCapsule_Import("greenlet._C_API",
+# 0)`` installs it over this placeholder (the RFC 0057 `datetime_CAPI`
+# stand-in discipline).
+_C_API = None
 
 __all__ = [
     "__version__",

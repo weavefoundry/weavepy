@@ -1476,15 +1476,29 @@ fn sys_exception(
     Ok(stack
         .last()
         .map(|top| top.instance.clone())
+        .or_else(capi_handled_exception_instance)
         .unwrap_or(Object::None))
+}
+
+/// The C-API layer's handled exception, when Python code runs with no VM
+/// `except` frame on the stack — i.e. it was called from inside a *compiled*
+/// `except` block (Cython's `__Pyx_GetException` installs the caught
+/// exception via `PyErr_SetHandledException`, which only the C-API layer
+/// sees). CPython keeps one `exc_info` chain for both worlds; WeavePy
+/// bridges the C side in as the outermost entry.
+fn capi_handled_exception_instance() -> Option<Object> {
+    crate::foreign::capi_handled_exception()
 }
 
 fn sys_exc_info(
     exc_info_stack: &Rc<RefCell<Vec<crate::error::PyException>>>,
 ) -> Result<Object, RuntimeError> {
     let stack = exc_info_stack.borrow();
-    if let Some(top) = stack.last() {
-        let inst = top.instance.clone();
+    let inst = stack
+        .last()
+        .map(|top| top.instance.clone())
+        .or_else(capi_handled_exception_instance);
+    if let Some(inst) = inst {
         let type_obj = match &inst {
             Object::Instance(i) => Object::Type(i.cls()),
             _ => Object::None,

@@ -34,6 +34,7 @@ use std::os::raw::c_int;
 use crate::layout::{PyMappingMethods, PyNumberMethods, PySequenceMethods};
 use crate::object::{PyObject, PySsizeT};
 use crate::types::StaticType;
+use weavepy_vm::object::Object;
 
 // ---------------------------------------------------------------------------
 // Sequence-protocol bridges (`tp_as_sequence`).
@@ -285,12 +286,60 @@ unsafe extern "C" fn iter_self(o: *mut PyObject) -> *mut PyObject {
     o
 }
 
-/// `tp_iternext` bridge: forwards to [`crate::abstract_::PyIter_Next`],
-/// which advances the shared `Object::Iter` cursor and returns NULL with
-/// **no** exception set on normal exhaustion — exactly the `tp_iternext`
-/// contract Cython's `__Pyx_PyIter_Next` / `for`-loop codegen expects.
-unsafe extern "C" fn tp_iternext_bridge(o: *mut PyObject) -> *mut PyObject {
-    unsafe { crate::abstract_::PyIter_Next(o) }
+/// `tp_iternext` bridge (RFC 0072 WS3): advances the iterator, returning
+/// NULL with **no** exception set on plain exhaustion (the `tp_iternext`
+/// contract Cython's `__Pyx_PyIter_Next` / `for`-loop codegen expects) —
+/// but leaving a *value-carrying* `StopIteration(value)` **pending**, as
+/// CPython's `gen_iternext` does when a generator `return`s non-None.
+/// Compiled Cython reads the value back with
+/// `__Pyx_PyGen_FetchStopIterationValue` (a direct
+/// `((PyStopIterationObject *)ev)->value` read against the exception
+/// tail); swallowing it here made every compiled `await` of a VM
+/// awaitable complete with None.
+pub(crate) unsafe extern "C" fn tp_iternext_bridge(o: *mut PyObject) -> *mut PyObject {
+    if o.is_null() {
+        return std::ptr::null_mut();
+    }
+    let obj = unsafe { crate::object::clone_object(o) };
+    let r = crate::interp::with_interp_mut(|interp| interp.iter_next_object_preserving(obj));
+    match r {
+        Some(Ok(Some(v))) => crate::object::into_owned(v),
+        Some(Ok(None)) | None => std::ptr::null_mut(),
+        Some(Err(err)) => {
+            // A bare StopIteration (no value) is plain exhaustion: NULL,
+            // nothing pending — CPython's fast path, and what keeps stock
+            // `while ((item = tp_iternext(it)))` loops error-free.
+            if !stop_iteration_carries_value(&err) {
+                if let weavepy_vm::error::RuntimeError::PyException(pe) = &err {
+                    if pe.type_name() == "StopIteration" {
+                        return std::ptr::null_mut();
+                    }
+                }
+            }
+            crate::errors::set_pending_from_runtime(err);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Does this error carry a `StopIteration` whose `value` (or first
+/// constructor argument) is a real payload? See [`tp_iternext_bridge`].
+fn stop_iteration_carries_value(err: &weavepy_vm::error::RuntimeError) -> bool {
+    let weavepy_vm::error::RuntimeError::PyException(pe) = err else {
+        return false;
+    };
+    if pe.type_name() != "StopIteration" {
+        return false;
+    }
+    let Object::Instance(inst) = &pe.instance else {
+        return false;
+    };
+    if let Some(v) = inst.slot_get("value") {
+        if !matches!(v, Object::None) {
+            return true;
+        }
+    }
+    matches!(inst.slot_get("args"), Some(Object::Tuple(t)) if !t.is_empty())
 }
 
 /// Wire a type as a faithful iterator: `tp_iter` returns self and
@@ -466,6 +515,18 @@ pub fn install() {
         dseq.sq_contains = dict_sq_contains as *mut c_void;
         (*PyDict_Type.as_ptr()).tp_as_sequence = Box::into_raw(Box::new(dseq)) as *mut c_void;
         set_iter(&PyDict_Type);
+
+        // mappingproxy — read-only mapping + membership + iteration
+        // (RFC 0072 WS2: `type.__dict__` handed to a Cython consumer;
+        // gevent's `_local_find_descriptors` subscripts it directly).
+        // Membership uses the generic `sq_contains`: `PySequence_Contains`
+        // routes non-dict mappings through the VM's containment (keys).
+        install_mapping(&crate::types::PyDictProxy_Type, immutable_map);
+        let mut mpseq: PySequenceMethods = std::mem::zeroed();
+        mpseq.sq_contains = sq_contains as *mut c_void;
+        (*crate::types::PyDictProxy_Type.as_ptr()).tp_as_sequence =
+            Box::into_raw(Box::new(mpseq)) as *mut c_void;
+        set_iter(&crate::types::PyDictProxy_Type);
 
         // set / frozenset — length + membership + iteration (the numeric
         // set algebra `|`/`&`/`^`/`-` routes through `PyNumber_*` → the VM,
