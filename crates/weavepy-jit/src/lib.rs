@@ -31,23 +31,27 @@ mod value;
 
 pub use analyze::{
     analyze, analyze_frame, analyze_with_probe, analyze_with_probes, returns_none_syntactically,
-    JitVerdict, MethodResolution, PathArena, Probes,
+    returns_self_syntactically, JitVerdict, MethodResolution, PathArena, Probes, ELEM_SENTINEL,
 };
 pub use engine::{CompiledFrame, JitEngine};
 pub use ir::{
-    ArithKind, AttrSiteMeta, BlockId, CalleeSpanMeta, CmpKind, GlobalGuard, IterLoopMeta,
-    ListLoopMeta, MathFunc, MathGuardMeta, MethodRet, MethodSiteMeta, MethodSpanMeta, OsrEntry,
-    RangeLoopMeta, ResolvedGlobal, TBlock, TFunc, TOp, TStmt, TTerm,
+    ArithKind, AttrSiteMeta, BlockId, CalleeSpanMeta, CmpKind, CompSavedMeta, CtorFieldSrc,
+    GlobalGuard, IterLoopMeta, ListLoopMeta, MathFunc, MathGuardMeta, MethodRet, MethodSiteMeta,
+    MethodSpanMeta, OsrEntry, RangeLoopMeta, ResolvedGlobal, StrMethod, TBlock, TFunc, TOp, TStmt,
+    TTerm,
 };
 pub use runtime::{
-    register_attr_helpers, register_call_method_helper, register_call_py_helper,
-    register_iter_helpers, register_list_extra_helpers, register_list_helpers,
-    register_list_next_helper, register_math_helpers, register_poll_helper, register_str_helpers,
-    AttrGetHelper, AttrSetHelper, BuildListHelper, BytesGetHelper, CallMethodHelper, CallPyHelper,
-    CallStatus, GetIterHelper, IterNextHelper, JitFrame, JitStatus, ListAppendHelper,
-    ListGetHelper, ListLenHelper, ListNextHelper, ListRepeatHelper, ListSetHelper, ListSliceHelper,
-    MathBinaryHelper, MathUnaryHelper, PollHelper, SlotTag, StrEqHelper, StrLenHelper,
-    JIT_POLL_STRIDE,
+    register_attr_helpers, register_build_map_helper, register_call_method_helper,
+    register_call_py_helper, register_const_str_helper, register_dict_helpers,
+    register_dict_iter_helper, register_iter_helpers, register_list_extra_helpers,
+    register_list_helpers, register_list_next_helper, register_math_helpers, register_poll_helper,
+    register_str_helpers, register_str_method_helper, register_str_write_helpers, AttrGetHelper,
+    AttrSetHelper, BuildListHelper, BuildTupleHelper, BytesGetHelper, CallMethodHelper,
+    CallPyHelper, CallStatus, DictAccessHelper, GetIterHelper, IterNextHelper, JitFrame, JitStatus,
+    ListAppendHelper, ListGetHelper, ListLenHelper, ListNextHelper, ListRepeatHelper,
+    ListSetHelper, ListSliceHelper, MathBinaryHelper, MathUnaryHelper, PollHelper, SlotTag,
+    StrEqHelper, StrLenHelper, DICT_KEY_INT, DICT_KEY_STR, DICT_VAL_FLOAT, DICT_VAL_INT,
+    DICT_VAL_OBJ, ITER_ELEM_STR, JIT_POLL_STRIDE,
 };
 pub use value::JitType;
 

@@ -406,6 +406,75 @@ pub(crate) fn bytes_get_helper_addr() -> usize {
     BYTES_GET_HELPER.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// RFC 0073 WS2 — key-lane discriminant passed to the dict helpers
+/// (burned per site by the lowering): the key operand's bits are a
+/// signed integer.
+pub const DICT_KEY_INT: i64 = 0;
+/// The key operand's bits are a pin-table index of an exact `str`.
+pub const DICT_KEY_STR: i64 = 1;
+/// RFC 0073 WS2 — value-lane discriminants for the dict helpers.
+pub const DICT_VAL_INT: i64 = 0;
+pub const DICT_VAL_FLOAT: i64 = 1;
+/// The value rides the nullable object lane (pin index, `-1` = `None`).
+pub const DICT_VAL_OBJ: i64 = 2;
+
+/// RFC 0073 WS2 — the shared dict-access helper shape:
+/// `(frame, pin, key_bits, key_tag, val_tag) -> status` with `status`
+/// `0` = ok (result, if any, in `ret_bits`), `1` = deopt at the op's
+/// pc, `2` = raised (the helper parked the exception — the missing-key
+/// `KeyError`). For `set` the value is pre-staged in `ret_bits`; for
+/// `contains` the `bool` result lands in `ret_bits` and `val_tag` is
+/// ignored. Same safety contract as [`ListGetHelper`].
+pub type DictAccessHelper = unsafe extern "C" fn(
+    frame: *mut JitFrame,
+    pin: i64,
+    key_bits: i64,
+    key_tag: i64,
+    val_tag: i64,
+) -> i64;
+
+static DICT_GET_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DICT_SET_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DICT_CONTAINS_HELPER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static DICT_LEN_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide dict-lane helpers (RFC 0073 WS2). Must
+/// precede the first compile of a frame containing `DictGet`,
+/// `DictSet`, `DictContains`, or `DictLen` ops. `len` shares the
+/// [`StrLenHelper`] `(frame, pin) -> status` shape.
+pub fn register_dict_helpers(
+    get: DictAccessHelper,
+    set: DictAccessHelper,
+    contains: DictAccessHelper,
+    len: StrLenHelper,
+) {
+    DICT_GET_HELPER.store(get as usize, std::sync::atomic::Ordering::Release);
+    DICT_SET_HELPER.store(set as usize, std::sync::atomic::Ordering::Release);
+    DICT_CONTAINS_HELPER.store(contains as usize, std::sync::atomic::Ordering::Release);
+    DICT_LEN_HELPER.store(len as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn dict_get_helper_addr() -> usize {
+    DICT_GET_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
+pub(crate) fn dict_set_helper_addr() -> usize {
+    DICT_SET_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
+pub(crate) fn dict_contains_helper_addr() -> usize {
+    DICT_CONTAINS_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
+pub(crate) fn dict_len_helper_addr() -> usize {
+    DICT_LEN_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// RFC 0071 WS4 — the embedder's opaque-iterator *capture* helper,
 /// called by [`crate::ir::TOp::IterCapture`] behind an erased
 /// `GET_ITER` whose operand rides the object lane. Admits only
@@ -443,10 +512,21 @@ pub type IterNextHelper =
 /// list from `n` elements staged in the marshal buffer (lane-tagged
 /// per `elem_tag`; `none_fill` passes `n` with an empty buffer), pin
 /// it, and return the pin index — or a negative value to deopt (cap
-/// pressure). Never runs Python code; same safety contract as
-/// [`ListGetHelper`].
+/// pressure). RFC 0073 WS1 — a *negative* `elem_tag` means the
+/// elements carry per-slot [`SlotTag`]s in [`JitFrame::call_tags`]
+/// (a mixed-lane literal); each element boxes by its own tag and the
+/// result rides the object-element lane. Never runs Python code;
+/// same safety contract as [`ListGetHelper`].
 pub type BuildListHelper =
     unsafe extern "C" fn(frame: *mut JitFrame, n: i64, elem_tag: i64, none_fill: i64) -> i64;
+
+/// RFC 0073 WS1 — the embedder's `BUILD_TUPLE` helper: build a fresh
+/// tuple from `n` elements staged in the marshal buffer with per-slot
+/// [`SlotTag`]s in [`JitFrame::call_tags`], pin it on the object
+/// lane, and return the pin index — or a negative value to deopt
+/// (cap pressure). Never runs Python code; same safety contract as
+/// [`ListGetHelper`].
+pub type BuildTupleHelper = unsafe extern "C" fn(frame: *mut JitFrame, n: i64) -> i64;
 
 /// RFC 0071 WS4 — the embedder's `list * int` helper: build the
 /// repeated list (element `Arc`s shared, CPython's aliasing), pin it
@@ -464,23 +544,26 @@ pub type ListSliceHelper =
 static GET_ITER_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static ITER_NEXT_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static BUILD_LIST_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static BUILD_TUPLE_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static LIST_REPEAT_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static LIST_SLICE_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Register the process-wide opaque-iterator and list-construction
-/// helpers (RFC 0071 WS4). Must precede the first compile of a frame
-/// containing `ForIter`, `IterCapture`, `BuildList`, `ListRepeat`, or
-/// `ListSlice`.
+/// Register the process-wide opaque-iterator and list/tuple
+/// construction helpers (RFC 0071 WS4 / RFC 0073 WS1). Must precede
+/// the first compile of a frame containing `ForIter`, `IterCapture`,
+/// `BuildList`, `BuildTuple`, `ListRepeat`, or `ListSlice`.
 pub fn register_iter_helpers(
     get_iter: GetIterHelper,
     next: IterNextHelper,
     build: BuildListHelper,
+    build_tuple: BuildTupleHelper,
     repeat: ListRepeatHelper,
     slice: ListSliceHelper,
 ) {
     GET_ITER_HELPER.store(get_iter as usize, std::sync::atomic::Ordering::Release);
     ITER_NEXT_HELPER.store(next as usize, std::sync::atomic::Ordering::Release);
     BUILD_LIST_HELPER.store(build as usize, std::sync::atomic::Ordering::Release);
+    BUILD_TUPLE_HELPER.store(build_tuple as usize, std::sync::atomic::Ordering::Release);
     LIST_REPEAT_HELPER.store(repeat as usize, std::sync::atomic::Ordering::Release);
     LIST_SLICE_HELPER.store(slice as usize, std::sync::atomic::Ordering::Release);
 }
@@ -501,6 +584,11 @@ pub(crate) fn build_list_helper_addr() -> usize {
 }
 
 #[must_use]
+pub(crate) fn build_tuple_helper_addr() -> usize {
+    BUILD_TUPLE_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
 pub(crate) fn list_repeat_helper_addr() -> usize {
     LIST_REPEAT_HELPER.load(std::sync::atomic::Ordering::Acquire)
 }
@@ -509,6 +597,104 @@ pub(crate) fn list_repeat_helper_addr() -> usize {
 pub(crate) fn list_slice_helper_addr() -> usize {
     LIST_SLICE_HELPER.load(std::sync::atomic::Ordering::Acquire)
 }
+
+static BUILD_MAP_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide `BUILD_MAP` helper (RFC 0073 WS2): build
+/// a fresh dict from `n` key/value pairs staged in the marshal buffer
+/// (interleaved `k1, v1, …`, per-slot tags), pin it, and return the
+/// pin index — or a negative value to deopt (cap pressure, or a key
+/// outside the `str`/`int` lanes). Shares the [`BuildTupleHelper`]
+/// `(frame, n) -> i64` shape (`n` counts *pairs*). Must precede the
+/// first compile of a frame containing `BuildMap`.
+pub fn register_build_map_helper(f: BuildTupleHelper) {
+    BUILD_MAP_HELPER.store(f as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn build_map_helper_addr() -> usize {
+    BUILD_MAP_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+static CONST_STR_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide `str`-constant helper (RFC 0073 WS2):
+/// materialize the activation's code-object constant `idx` as an
+/// exact `str` pin, memoized per `(activation, idx)` so loops reuse
+/// one pin. Returns the pin index or a negative value to deopt (cap
+/// pressure). Shares the [`StrLenHelper`] `(frame, i64) -> i64`
+/// shape. Must precede the first compile of a frame containing
+/// `PushConstStr`.
+pub fn register_const_str_helper(f: StrLenHelper) {
+    CONST_STR_HELPER.store(f as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn const_str_helper_addr() -> usize {
+    CONST_STR_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+static DICT_ITER_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide dict-iterator capture helper (RFC 0073
+/// WS2): materialize the pinned exact dict's real `DictKeys` iterator
+/// and answer its fresh pin index — or a negative value to deopt
+/// (pin surprise, cap pressure). Shares the [`StrLenHelper`]
+/// `(frame, pin) -> i64` shape. Must precede the first compile of a
+/// frame containing `DictIterNew`.
+pub fn register_dict_iter_helper(f: StrLenHelper) {
+    DICT_ITER_HELPER.store(f as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn dict_iter_helper_addr() -> usize {
+    DICT_ITER_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+static STR_CONCAT_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static STR_GET_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static BUILD_STRING_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide string write-lane helpers (RFC 0073
+/// WS3): `concat` joins two `str` pins (`(frame, a_pin, b_pin) ->
+/// pin-or-negative`, the [`ListGetHelper`] shape), `get` is ASCII-only
+/// `s[i]` (`(frame, pin, idx) -> pin-or-negative`, same shape), and
+/// `build` concatenates `n` staged `str` pins (`(frame, n) ->
+/// pin-or-negative`, the [`BuildTupleHelper`] shape). Must precede the
+/// first compile of a frame containing `StrConcat`, `StrGetItem`, or
+/// `BuildString`.
+pub fn register_str_write_helpers(
+    concat: ListGetHelper,
+    get: ListGetHelper,
+    build: BuildTupleHelper,
+) {
+    STR_CONCAT_HELPER.store(concat as usize, std::sync::atomic::Ordering::Release);
+    STR_GET_HELPER.store(get as usize, std::sync::atomic::Ordering::Release);
+    BUILD_STRING_HELPER.store(build as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn str_concat_helper_addr() -> usize {
+    STR_CONCAT_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
+pub(crate) fn str_get_helper_addr() -> usize {
+    STR_GET_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
+pub(crate) fn build_string_helper_addr() -> usize {
+    BUILD_STRING_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// RFC 0073 WS2 — the `wpjit_iter_next` element discriminant for an
+/// exact-`str` element lane (a dict-keys loop over str keys). The
+/// [`SlotTag`] domain collapses `Str` into `ObjPin`, whose packing
+/// only admits instances; this out-of-band value tells the step
+/// helper to pin exact-`str` elements (anything else surrenders the
+/// consumed element through the store-pc deopt).
+pub const ITER_ELEM_STR: i64 = 100;
 
 /// RFC 0067 WS2 — the embedder's eval-breaker poll. Called from loop
 /// headers every `JIT_POLL_STRIDE` iterations: the embedder performs
@@ -620,6 +806,22 @@ pub fn register_call_method_helper(helper: CallMethodHelper) {
 #[must_use]
 pub(crate) fn call_method_helper_addr() -> usize {
     CALL_METHOD_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+static STR_METHOD_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide native `str`-method helper (RFC 0073
+/// WS3). Shares [`CallMethodHelper`]'s shape — the `token` parameter
+/// carries the burned [`crate::ir::StrMethod`] discriminant instead
+/// of a site token. Must precede the first compile of a frame
+/// containing `CallStrMethod` ops.
+pub fn register_str_method_helper(helper: CallMethodHelper) {
+    STR_METHOD_HELPER.store(helper as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn str_method_helper_addr() -> usize {
+    STR_METHOD_HELPER.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// RFC 0069 WS2 — a unary libm-backed math helper (`sin`/`cos`),

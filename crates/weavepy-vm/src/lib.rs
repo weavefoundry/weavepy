@@ -213,6 +213,16 @@ struct Frame {
     /// re-pushed on resume instead of rebuilt (eight `Arc` clones per
     /// `next()`). `None` for ordinary frames, which run exactly once.
     shell_cache: Option<Rc<crate::object::FrameShell>>,
+    /// RFC 0073 WS4 — a suspended generator's *parked* native
+    /// activation: the compiled frame's marshal buffers and pin table,
+    /// kept live across the yield so the next resume re-enters
+    /// natively with zero re-marshaling. While `Some`, this box (not
+    /// `locals`/`stack`) is the frame's truth — every interpreter
+    /// or observer access goes through
+    /// [`crate::tier2::materialize_parked`] first. `None` for ordinary
+    /// frames and interpreted suspensions.
+    #[cfg(feature = "jit")]
+    parked_native: Option<Box<crate::tier2::NativeActivation>>,
 }
 
 impl Frame {
@@ -346,6 +356,14 @@ fn generator_frame_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
                 }
             }
         }
+        // RFC 0073 WS4 — a parked native activation's pin table is the
+        // real owner of everything the compiled frame still holds
+        // (locals visited above are the stale park-time snapshot; the
+        // live edges are the pins).
+        #[cfg(feature = "jit")]
+        if let Some(act) = &frame.parked_native {
+            act.visit_objects(visit);
+        }
     }
 }
 
@@ -437,6 +455,19 @@ fn frame_reapables(g: &Rc<PyGenerator>) -> Vec<Object> {
             && seen.insert(crate::weakref_registry::id_of(o))
         {
             out.push(o.clone());
+        }
+    }
+    // RFC 0073 WS4 — a parked native activation's pin table holds the
+    // live values (the locals above are the stale park-time snapshot).
+    #[cfg(feature = "jit")]
+    if let Some(act) = &frame.parked_native {
+        for o in act.pinned_objects() {
+            if (Interpreter::local_needs_prompt_reap(&o)
+                || crate::weakref_registry::count_for(crate::weakref_registry::id_of(&o)) > 0)
+                && seen.insert(crate::weakref_registry::id_of(&o))
+            {
+                out.push(o);
+            }
         }
     }
     out
@@ -4580,6 +4611,8 @@ impl Interpreter {
             suppress_call_event: false,
             gen_first_resume: false,
             shell_cache: None,
+            #[cfg(feature = "jit")]
+            parked_native: None,
         }
     }
 
@@ -4855,6 +4888,23 @@ impl Interpreter {
                         return Err(other);
                     }
                 },
+                // RFC 0073 WS4 — a compiled generator body yielded and
+                // parked its native activation; the frame already sits
+                // at the yield continuation. Peel this activation's
+                // handled-exception entries exactly like the
+                // interpreted yield exit below (compiled bodies push
+                // none — the invariant stays explicit).
+                crate::tier2::JitEntry::Yielded(v) => {
+                    self.pop_frame_shell();
+                    {
+                        let mut stack = self.exc_info_stack.borrow_mut();
+                        if stack.len() > exc_depth_on_entry {
+                            frame.saved_exc_info = stack.split_off(exc_depth_on_entry);
+                        }
+                    }
+                    self.recycle_frame_shell(shell);
+                    return Ok(FrameOutcome::Yielded(v));
+                }
                 crate::tier2::JitEntry::Deopt | crate::tier2::JitEntry::Skip => {}
             }
         }
@@ -4885,9 +4935,30 @@ impl Interpreter {
                         return Err(other);
                     }
                 },
+                // RFC 0073 WS4 — the parked activation resumed
+                // natively and yielded again (re-parked in place):
+                // suspend without touching the interpreter state.
+                crate::tier2::JitEntry::Yielded(v) => {
+                    self.pop_frame_shell();
+                    {
+                        let mut stack = self.exc_info_stack.borrow_mut();
+                        if stack.len() > exc_depth_on_entry {
+                            frame.saved_exc_info = stack.split_off(exc_depth_on_entry);
+                        }
+                    }
+                    self.recycle_frame_shell(shell);
+                    return Ok(FrameOutcome::Yielded(v));
+                }
                 crate::tier2::JitEntry::Deopt | crate::tier2::JitEntry::Skip => {}
             }
         }
+        // RFC 0073 WS4 — a parked native activation that did not
+        // re-enter natively above (observers on, JIT gated off, or the
+        // resume block never ran) must be written back before the
+        // interpreter touches the frame. No-op without a parked box —
+        // `try_enter_resume`'s own refusals already materialized.
+        #[cfg(feature = "jit")]
+        crate::tier2::materialize_parked(frame);
         // RFC 0051 (WS4): line-event bookkeeping, mirroring CPython
         // 3.13's monitoring model. `prev_pc` is the index of the last
         // instruction that actually executed in this frame (CPython's
@@ -6350,6 +6421,13 @@ impl Interpreter {
             GeneratorState::Created(boxed) | GeneratorState::Suspended(boxed) => {
                 match boxed.downcast_mut::<Frame>() {
                     Some(frame) => {
+                        // RFC 0073 WS4 — a Python-visible frame shares
+                        // the locals storage; write a parked native
+                        // activation back before exposing one (park
+                        // refuses whenever a `PyFrame` already exists,
+                        // so this is the only creation path to guard).
+                        #[cfg(feature = "jit")]
+                        crate::tier2::materialize_parked(frame);
                         if let Some(py) = frame.py_frame.clone() {
                             if py.gen_owner.borrow().is_none() {
                                 *py.gen_owner.borrow_mut() = Some(Rc::downgrade(g));
@@ -8919,6 +8997,14 @@ impl Interpreter {
                         // dispatch loop's normal error path; the frame
                         // state is already the post-CALL point.
                         crate::tier2::JitEntry::Raised(err) => return Err(err),
+                        // RFC 0073 WS4 — the OSR'd generator body
+                        // yielded and parked its activation; surface
+                        // the value through the normal yield exit
+                        // (`frame.pc` already sits at the
+                        // continuation, like an executed YIELD_VALUE).
+                        crate::tier2::JitEntry::Yielded(v) => {
+                            return Ok(StepOutcome::Yield(v));
+                        }
                         crate::tier2::JitEntry::Deopt | crate::tier2::JitEntry::Skip => {}
                     }
                 }
@@ -20933,6 +21019,11 @@ impl Interpreter {
                 )));
             }
         };
+        // RFC 0073 WS4 — a parked native activation's locals/stack are
+        // stale until written back; the yield-from detection and the
+        // exception machinery below both read them.
+        #[cfg(feature = "jit")]
+        crate::tier2::materialize_parked(&mut frame);
         // PEP 3134: an exception thrown into a generator suspended inside
         // an `except`/`with` block chains to the exception that block was
         // handling. Done before delegation/handling so the `__context__`
@@ -33602,6 +33693,8 @@ impl Interpreter {
             suppress_call_event: false,
             gen_first_resume: false,
             shell_cache: None,
+            #[cfg(feature = "jit")]
+            parked_native: None,
         };
         self.run_frame(&mut frame)
     }
@@ -46702,20 +46795,23 @@ mod tests {
 
     #[cfg(feature = "jit")]
     #[test]
-    fn jit_generator_trailing_yield_stays_interpreted() {
-        // RFC 0071 WS5 measurements — a yield-dense body (every cycle
-        // passes through the yield) executes a bounded straight-line
-        // stretch per resume, and the native entry + spill round trip
-        // per element loses to the interpreter's resume path. The
-        // profitability gate rules it `Trivial`; results stay exact.
+    fn jit_generator_trailing_yield_parks_natively() {
+        // RFC 0073 WS4 — parked activations changed the yield-dense
+        // economics that RFC 0071 WS5 measured: a trailing-yield body
+        // now compiles (the admission gate admits resume entries
+        // without a native cycle) and each yield parks the activation
+        // in place, so resumes skip the marshal/spill round trip
+        // entirely. Results stay exact.
         let src = "def g(n):\n    for i in range(n):\n        yield i * 2\n\
                    t = 0\nk = 0\n\
                    while k < 60:\n\
                    \x20   for v in g(20):\n        t = t + v\n\
                    \x20   k = k + 1\n\
                    print(t)\n";
-        let (out, _compiled, resumes, _yields) = run_jit_resume(src);
-        assert_eq!(resumes, 0, "yield-dense body must not resume natively");
+        let (out, compiled, resumes, yields) = run_jit_resume(src);
+        assert!(compiled >= 1, "yield-dense body never compiled");
+        assert!(resumes >= 1, "yield-dense body never resumed natively");
+        assert!(yields >= 1, "no native yield exit was taken");
         assert_eq!(out, "22800\n");
         assert_eq!(out, run(src));
     }
@@ -46828,6 +46924,156 @@ mod tests {
                    print(t)\n";
         let (out, _compiled, _deopts, _osr, _yields) = run_jit_gen(src);
         assert_eq!(out, "33\n42900\n");
+        assert_eq!(out, run(src));
+    }
+
+    /// RFC 0073 WS4 — like [`run_jit_gen`], but reports the persistent-
+    /// activation counters: `(stdout, parks, parked_resumes,
+    /// materialized)`.
+    #[cfg(feature = "jit")]
+    fn run_jit_park(src: &str) -> (String, u64, u64, u64) {
+        let src = src.to_owned();
+        std::thread::spawn(move || {
+            crate::tier2::force_enable_for_test(2);
+            let out = run(&src);
+            let (parks, parked_resumes, materialized) = crate::tier2::gen_park_stats_for_test();
+            (out, parks, parked_resumes, materialized)
+        })
+        .join()
+        .expect("jit worker thread")
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_generator_parks_and_resumes_persistently() {
+        // RFC 0073 WS4 — the hot yield/resume cycle must run entirely
+        // on the parked activation: the first native yield parks the
+        // buffers on the frame, and every later resume re-enters on
+        // them (no re-marshal, no locals writeback, no stack rebuild).
+        // Nothing observes the suspended frames, so no materialization
+        // may happen either.
+        let src = "def g(n):\n\
+                   \x20   for i in range(n):\n\
+                   \x20       s = 0\n\
+                   \x20       j = 0\n\
+                   \x20       while j < 25:\n\
+                   \x20           s = s + i + j\n\
+                   \x20           j = j + 1\n\
+                   \x20       yield s\n\
+                   t = 0\nk = 0\n\
+                   while k < 60:\n\
+                   \x20   for v in g(20):\n        t = t + v\n\
+                   \x20   k = k + 1\n\
+                   print(t)\n";
+        let (out, parks, parked_resumes, materialized) = run_jit_park(src);
+        assert!(parks >= 1, "no native yield parked its activation");
+        assert!(
+            parked_resumes >= 1,
+            "no resume re-entered a parked activation natively"
+        );
+        assert_eq!(
+            materialized, 0,
+            "an unobserved yield/resume cycle materialized a parked activation"
+        );
+        assert_eq!(out, "645000\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_generator_parked_gi_frame_materializes() {
+        // RFC 0073 WS4 — touching `gi_frame` on a *parked* suspension
+        // must write the boxed activation back before the Python-
+        // visible frame (which shares the locals storage) exists; the
+        // `f_locals` read then sees the post-yield values, exactly as
+        // an interpreted suspension would.
+        let src = "def g(n):\n    acc = 0\n\
+                   \x20   for i in range(n):\n\
+                   \x20       j = 0\n\
+                   \x20       while j < 10:\n            acc = acc + 1\n            j = j + 1\n\
+                   \x20       acc = acc + i\n\
+                   \x20       yield acc\n\
+                   k = 0\nt = 0\n\
+                   while k < 60:\n\
+                   \x20   it = g(30)\n    j = 0\n\
+                   \x20   while j < 10:\n        t = t + next(it)\n        j = j + 1\n\
+                   \x20   k = k + 1\n\
+                   it = g(30)\n\
+                   next(it)\nnext(it)\nnext(it)\n\
+                   f = it.gi_frame\n\
+                   print(f.f_locals['acc'])\n\
+                   print(f.f_locals['i'])\n\
+                   print(next(it))\n\
+                   print(t)\n";
+        let (out, parks, _parked_resumes, materialized) = run_jit_park(src);
+        assert!(parks >= 1, "no native yield parked its activation");
+        assert!(
+            materialized >= 1,
+            "gi_frame on a parked suspension never materialized the box"
+        );
+        assert_eq!(out, "33\n2\n46\n42900\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_generator_parked_close_and_throw() {
+        // RFC 0073 WS4 — `close()` / `throw()` inject at a *parked*
+        // suspension: `generator_throw` materializes the box first, so
+        // the injection machinery sees an ordinary interpreted frame
+        // (and the pinned state dies with the frame, promptly).
+        let src = "def g(n):\n    i = 0\n\
+                   \x20   while i < n:\n\
+                   \x20       s = 0\n\
+                   \x20       j = 0\n\
+                   \x20       while j < 10:\n            s = s + 1\n            j = j + 1\n\
+                   \x20       yield i + s\n\
+                   \x20       i = i + 1\n\
+                   k = 0\nc = 0\n\
+                   while k < 60:\n\
+                   \x20   it = g(50)\n    s = 0\n    j = 0\n\
+                   \x20   while j < 5:\n        s = s + next(it)\n        j = j + 1\n\
+                   \x20   it.close()\n    c = c + s\n    k = k + 1\n\
+                   it2 = g(50)\n\
+                   next(it2)\nnext(it2)\n\
+                   try:\n    it2.throw(ValueError('boom'))\n\
+                   except ValueError as e:\n    print(e)\n\
+                   print(c)\n";
+        let (out, parks, _parked_resumes, materialized) = run_jit_park(src);
+        assert!(parks >= 1, "no native yield parked its activation");
+        assert!(
+            materialized >= 1,
+            "close/throw on a parked suspension never materialized the box"
+        );
+        assert_eq!(out, "boom\n3600\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_generator_parked_abandoned_mid_iteration() {
+        // RFC 0073 WS4 — dropping a parked generator without
+        // exhausting it: `close()` (from the drop path) throws
+        // GeneratorExit into the materialized frame, and the pinned
+        // native state dies with the box — no leak, no stale reads.
+        let src = "def g(n):\n\
+                   \x20   for i in range(n):\n\
+                   \x20       s = 0\n\
+                   \x20       j = 0\n\
+                   \x20       while j < 25:\n\
+                   \x20           s = s + i + j\n\
+                   \x20           j = j + 1\n\
+                   \x20       yield s\n\
+                   t = 0\nk = 0\n\
+                   while k < 80:\n\
+                   \x20   it = g(50)\n\
+                   \x20   t = t + next(it) + next(it) + next(it)\n\
+                   \x20   it = None\n\
+                   \x20   k = k + 1\n\
+                   print(t)\n";
+        let (out, parks, _parked_resumes, _materialized) = run_jit_park(src);
+        assert!(parks >= 1, "no native yield parked its activation");
+        assert_eq!(out, "78000\n");
         assert_eq!(out, run(src));
     }
 
@@ -47278,6 +47524,872 @@ mod tests {
 
     #[cfg(feature = "jit")]
     #[test]
+    fn jit_listcomp_int_compiles_clean() {
+        // RFC 0073 WS1 — the PEP-709 inlined listcomp shape: the
+        // save/clear/restore of the target erases, the accumulator
+        // rides the loop's boundary stack, and `LIST_APPEND` runs
+        // native (`ListAppendKeep`).
+        let src = "def double(xs):\n    return [x * 2 for x in xs]\n\
+                   xs = [1, 2, 3, 4, 5]\n\
+                   r = 0\nk = 0\n\
+                   while k < 60:\n    r = r + double(xs)[4]\n    k = k + 1\n\
+                   print(r, double(xs))\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "listcomp kernel never compiled");
+        assert_eq!(deopts, 0, "clean listcomp should not deopt");
+        assert_eq!(out, "600 [2, 4, 6, 8, 10]\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_listcomp_with_filter() {
+        // RFC 0073 WS1 — comp `if` filters branch inside the loop with
+        // the accumulator riding the boundary stacks of every block.
+        let src = "def evens(xs):\n    return [x * 3 for x in xs if x % 2 == 0]\n\
+                   xs = [1, 2, 3, 4, 5, 6, 7, 8]\n\
+                   r = 0\nk = 0\n\
+                   while k < 60:\n    r = r + evens(xs)[0]\n    k = k + 1\n\
+                   print(r, evens(xs))\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "filtered listcomp never compiled");
+        assert_eq!(deopts, 0, "clean filtered listcomp should not deopt");
+        assert_eq!(out, "360 [6, 12, 18, 24]\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_listcomp_buried_in_expression_stack() {
+        // RFC 0073 WS1 — the comprehension evaluated with a live value
+        // beneath it on the operand stack: the saved target, the
+        // accumulator, and the erased iterator all sit above `t`, and
+        // the recorded interp depths place them exactly on a deopt.
+        let src = "def f(xs, n):\n    t = 0\n    i = 0\n\
+                   \x20   while i < n:\n\
+                   \x20       t = t + [x * x for x in xs][2]\n\
+                   \x20       i = i + 1\n\
+                   \x20   return t\n\
+                   xs = [1, 2, 3, 4]\n\
+                   r = 0\nk = 0\n\
+                   while k < 20:\n    r = f(xs, 50)\n    k = k + 1\n\
+                   print(r)\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "buried listcomp never compiled");
+        assert_eq!(deopts, 0, "clean buried listcomp should not deopt");
+        assert_eq!(out, "450\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_listcomp_lane_surprise_deopts_exactly() {
+        // RFC 0073 WS1 — a float in the int lane mid-comprehension
+        // deopts at the header; the rebuilt interpreter stack holds
+        // the parked `Unbound`, the partial accumulator, and the
+        // rebuilt iterator, so the interpreter finishes the
+        // comprehension (and its restore epilogue) exactly.
+        let src = "def double(xs):\n    return [x * 2 for x in xs]\n\
+                   xs = [1, 2, 3, 4, 5]\n\
+                   r = 0\nk = 0\n\
+                   while k < 60:\n    r = r + double(xs)[4]\n    k = k + 1\n\
+                   xs[3] = 0.5\n\
+                   print(double(xs))\n";
+        let (out, _compiled, deopts) = run_jit(src);
+        assert!(deopts >= 1, "the float element must deopt the comp loop");
+        assert_eq!(out, "[2, 4, 6, 1.0, 10]\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_listcomp_raise_mid_loop_restores_exactly() {
+        // RFC 0073 WS1 — a body raise deopts out of the loop; the
+        // interpreter's comprehension exception handler (restore the
+        // saved target, re-raise) runs on the rebuilt stack.
+        let src = "def inv(xs):\n    return [10 // x for x in xs]\n\
+                   xs = [1, 2, 5]\n\
+                   r = 0\nk = 0\n\
+                   while k < 60:\n    r = r + inv(xs)[2]\n    k = k + 1\n\
+                   xs[1] = 0\n\
+                   try:\n    inv(xs)\nexcept ZeroDivisionError:\n    print('raised', r)\n";
+        let (out, _compiled, _deopts) = run_jit(src);
+        assert_eq!(out, "raised 120\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_listcomp_object_lane() {
+        // RFC 0073 WS1 — an object-lane accumulator: `ListObj` builds
+        // from instance/None elements through the nullable object
+        // lane, and the comp result feeds a native `ForList` consumer.
+        let src = "def keep(xs):\n    return [p for p in xs if p is not None]\n\
+                   class P:\n    def __init__(self, v):\n        self.v = v\n\
+                   ps = []\n\
+                   j = 0\n\
+                   while j < 8:\n\
+                   \x20   if j % 2 == 0:\n        ps.append(None)\n\
+                   \x20   else:\n        ps.append(P(j))\n\
+                   \x20   j = j + 1\n\
+                   r = 0\nk = 0\n\
+                   while k < 60:\n    r = r + len(keep(ps))\n    k = k + 1\n\
+                   print(r)\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert!(compiled >= 1, "object listcomp never compiled");
+        assert_eq!(out, "240\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_listcomp_two_comps_share_target_slot() {
+        // RFC 0073 WS1 — two comprehensions over the same target name
+        // in one frame: both save/restore the same slot; the unbound
+        // proof spans both.
+        let src = "def f(xs):\n\
+                   \x20   a = [x + 1 for x in xs]\n\
+                   \x20   b = [x * 2 for x in xs]\n\
+                   \x20   return a[0] + b[3]\n\
+                   xs = [1, 2, 3, 4]\n\
+                   r = 0\nk = 0\n\
+                   while k < 60:\n    r = r + f(xs)\n    k = k + 1\n\
+                   print(r)\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "double-comp kernel never compiled");
+        assert_eq!(deopts, 0, "clean double comp should not deopt");
+        assert_eq!(out, "600\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_listcomp_target_read_after_comp_stays_interpreted() {
+        // RFC 0073 WS1 — reading the target after the comprehension:
+        // PEP 709 keeps the target scoped to the comprehension, so
+        // `return x` compiles as a *global* load (NameError at runtime,
+        // exactly like CPython); the interpreted semantics stay exact.
+        let src = "def f(xs):\n\
+                   \x20   ys = [x for x in xs]\n\
+                   \x20   try:\n        return x\n\
+                   \x20   except NameError:\n        return ys[0] - 1\n\
+                   xs = [7, 8]\n\
+                   r = 0\nk = 0\n\
+                   while k < 60:\n    r = r + f(xs)\n    k = k + 1\n\
+                   print(r)\n";
+        let (out, _compiled, _deopts) = run_jit(src);
+        assert_eq!(out, "360\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_listcomp_result_is_gc_tracked() {
+        // RFC 0073 WS1 — a natively built comprehension result is
+        // GC-tracked exactly like the interpreter's (`gc.is_tracked`
+        // on every list is True).
+        let src = "import gc\n\
+                   def double(xs):\n    return [x * 2 for x in xs]\n\
+                   xs = [1, 2, 3]\n\
+                   r = None\nk = 0\n\
+                   while k < 60:\n    r = double(xs)\n    k = k + 1\n\
+                   print(gc.is_tracked(r))\n";
+        let (out, _compiled, _deopts) = run_jit(src);
+        assert_eq!(out, "True\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_build_list_past_the_cap() {
+        // RFC 0073 WS1 — a 20-element literal (past the old 16-cap):
+        // one bulk-copy helper call, no interpreter round trip.
+        let src = "def f(a):\n\
+                   \x20   xs = [a, a + 1, a + 2, a + 3, a + 4, a + 5, a + 6, a + 7, a + 8, a + 9, \
+                   a + 10, a + 11, a + 12, a + 13, a + 14, a + 15, a + 16, a + 17, a + 18, a + 19]\n\
+                   \x20   return xs[19] - xs[0]\n\
+                   r = 0\nk = 0\n\
+                   while k < 60:\n    r = r + f(k)\n    k = k + 1\n\
+                   print(r)\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "20-element literal never compiled");
+        assert_eq!(deopts, 0, "clean literal build should not deopt");
+        assert_eq!(out, "1140\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_build_list_mixed_lanes() {
+        // RFC 0073 WS1 — mixed int/float lanes box per element onto
+        // the object-element lane; the interpreter's sum over the
+        // result agrees exactly.
+        let src = "def f(a, b):\n    return [a, b, a + 1, b * 2.0]\n\
+                   total = 0.0\nk = 0\n\
+                   while k < 60:\n\
+                   \x20   xs = f(k, 0.5)\n\
+                   \x20   total = total + xs[0] + xs[1] + xs[2] + xs[3]\n\
+                   \x20   k = k + 1\n\
+                   print(total)\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert!(compiled >= 1, "mixed-lane literal never compiled");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_build_tuple_compiles() {
+        // RFC 0073 WS1 — `BUILD_TUPLE` pins the fresh tuple on the
+        // object lane; returning it and unpacking interpreter-side
+        // preserves values and lanes.
+        let src = "def f(a, b):\n    return (a + b, a - b, 3.5)\n\
+                   r = 0\nq = 0.0\nk = 0\n\
+                   while k < 60:\n\
+                   \x20   t = f(k, 2)\n\
+                   \x20   r = r + t[0] + t[1]\n\
+                   \x20   q = q + t[2]\n\
+                   \x20   k = k + 1\n\
+                   print(r, q)\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "tuple builder never compiled");
+        assert_eq!(deopts, 0, "clean tuple build should not deopt");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_build_tuple_identity_and_type() {
+        // RFC 0073 WS1 — the natively built tuple is a real tuple
+        // whose elements preserve identity (the same list object
+        // rides through the pin).
+        let src = "def f(xs):\n    return (xs, xs)\n\
+                   xs = [1, 2]\nok = True\nk = 0\n\
+                   while k < 60:\n\
+                   \x20   t = f(xs)\n\
+                   \x20   ok = ok and type(t) is tuple and t[0] is xs and t[1] is xs\n\
+                   \x20   k = k + 1\n\
+                   print(ok)\n";
+        let (out, _compiled, _deopts) = run_jit(src);
+        assert_eq!(out, "True\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_ctor_attr_residue_compiles() {
+        // RFC 0073 WS1 — the receiver residue: `p` is (re)bound from a
+        // burned-in constructor call, so `p.x` has no live value to
+        // probe at compile time. The site resolves against the class's
+        // post-construction canonical shape (field lanes from the
+        // call's own arguments) and runs deopt-free.
+        let src = "class Vec:\n\
+                   \x20   def __init__(self, x, y):\n\
+                   \x20       self.x = x\n\
+                   \x20       self.y = y\n\
+                   def norm2(a, b):\n\
+                   \x20   p = Vec(a, b)\n\
+                   \x20   return p.x * p.x + p.y * p.y\n\
+                   r = 0.0\nk = 0\n\
+                   while k < 60:\n    r = r + norm2(1.5, 2.0)\n    k = k + 1\n\
+                   print(r)\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "ctor-residue kernel never compiled");
+        assert_eq!(deopts, 0, "canonical ctor shape should not deopt");
+        assert_eq!(out, "375.0\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_ctor_attr_residue_const_field_and_store() {
+        // RFC 0073 WS1 — constant-sourced fields type from the
+        // constant's lane, and a *store* through the residue site
+        // reaches the same indexed fingerprint.
+        let src = "class Acc:\n\
+                   \x20   def __init__(self, seed):\n\
+                   \x20       self.total = seed\n\
+                   \x20       self.count = 0\n\
+                   def bump(s):\n\
+                   \x20   a = Acc(s)\n\
+                   \x20   a.count = a.count + 1\n\
+                   \x20   return a.total + a.count\n\
+                   r = 0\nk = 0\n\
+                   while k < 60:\n    r = r + bump(k)\n    k = k + 1\n\
+                   print(r)\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "ctor const-field kernel never compiled");
+        assert_eq!(deopts, 0, "canonical ctor shape should not deopt");
+        // sum(k for k in 0..60) + 60 = 1770 + 60.
+        assert_eq!(out, "1830\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_ctor_attr_residue_class_swap_stays_exact() {
+        // RFC 0073 WS1 — rebinding the class global after warmup must
+        // invalidate the burned-in fingerprint (the entry guard
+        // re-resolves the name); results stay exact either way.
+        let src = "class P:\n\
+                   \x20   def __init__(self, x):\n\
+                   \x20       self.x = x\n\
+                   def get(v):\n\
+                   \x20   p = P(v)\n\
+                   \x20   return p.x + 1\n\
+                   r = 0\nk = 0\n\
+                   while k < 60:\n    r = r + get(k)\n    k = k + 1\n\
+                   class P:\n\
+                   \x20   def __init__(self, x):\n\
+                   \x20       self.pad = 100\n\
+                   \x20       self.x = x * 10\n\
+                   print(r, get(3))\n";
+        let (out, _compiled, _deopts) = run_jit(src);
+        assert_eq!(out, "1830 31\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_ctor_self_body_residue_compiles() {
+        // RFC 0073 WS1 — the *self-body* residue: `__init__` tiers up
+        // at entry with a still-empty instance, so `self.x` loads have
+        // no live value to probe; they resolve from the body's own
+        // new-key stores (lane + store-order index) and run deopt-free
+        // through the default construction pipeline.
+        let src = "class P:\n\
+                   \x20   def __init__(self, i):\n\
+                   \x20       self.x = i * 1.5\n\
+                   \x20       self.y = 2.0\n\
+                   \x20       self.z = self.x * self.x\n\
+                   k = 0\np = None\n\
+                   while k < 200:\n    p = P(k)\n    k = k + 1\n\
+                   print(p.z)\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "self-body residue __init__ never compiled");
+        assert_eq!(deopts, 0, "default-pipeline construction should not deopt");
+        // 199 * 1.5 = 298.5; 298.5² = 89102.25.
+        assert_eq!(out, "89102.25\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_ctor_self_body_residue_nonempty_dict_stays_exact() {
+        // RFC 0073 WS1 — the burned store-order index assumes an empty
+        // instance dict at entry; a manual `__init__` on a pre-seeded
+        // instance shifts the key indices, fails the key-at-index
+        // check, and deopts to the exact interpreter semantics.
+        let src = "class P:\n\
+                   \x20   def __init__(self, i):\n\
+                   \x20       self.x = i * 1.5\n\
+                   \x20       self.z = self.x + 1.0\n\
+                   k = 0\n\
+                   while k < 200:\n    p = P(k)\n    k = k + 1\n\
+                   q = P.__new__(P)\n\
+                   q.pad = 7.0\n\
+                   q.__init__(2)\n\
+                   print(q.pad, q.x, q.z)\n";
+        let (out, _compiled, _deopts) = run_jit(src);
+        assert_eq!(out, "7.0 3.0 4.0\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_elem_residue_osr_enters_first_loop() {
+        // RFC 0073 WS1 — the element residue plus unbound-local OSR
+        // admission, the `float_math` shape: `f` is called *once*, so
+        // only an OSR entry during the fill loop can compile the read
+        // loops — where `p` and `last` are still unbound. Their sites
+        // resolve against an exemplar element of the live `points`
+        // list, and the entry seeds the unbound object-lane locals as
+        // pinned `Unbound` (both are provably written before read).
+        let src = "class V:\n\
+                   \x20   def __init__(self, i):\n\
+                   \x20       self.x = i * 1.5\n\
+                   \x20       self.y = i * 2.0\n\
+                   \x20   def total(self):\n\
+                   \x20       return self.x + self.y\n\
+                   def f(n):\n\
+                   \x20   points = [None] * n\n\
+                   \x20   for i in range(n):\n\
+                   \x20       points[i] = V(i)\n\
+                   \x20   acc = 0.0\n\
+                   \x20   for p in points:\n\
+                   \x20       acc = acc + p.total()\n\
+                   \x20   last = points[0]\n\
+                   \x20   return acc + last.x + last.y\n\
+                   print(f(200))\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert!(compiled >= 1, "elem-residue kernel never compiled");
+        // sum(3.5 * i for i in 0..200) = 3.5 * 19900 = 69650; + V(0).
+        assert_eq!(out, "69650.0\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_elem_residue_class_surprise_stays_exact() {
+        // RFC 0073 WS1 — the exemplar fingerprint is a prediction: a
+        // list whose tail holds a differently-shaped class fails the
+        // per-access guard and deopts to exact interpreter semantics.
+        let src = "class A:\n\
+                   \x20   def __init__(self, i):\n\
+                   \x20       self.x = i * 1.0\n\
+                   class B:\n\
+                   \x20   def __init__(self, i):\n\
+                   \x20       self.pad = 0.0\n\
+                   \x20       self.x = i * 10.0\n\
+                   def f(n):\n\
+                   \x20   points = [None] * n\n\
+                   \x20   for i in range(n):\n\
+                   \x20       if i < n - 1:\n\
+                   \x20           points[i] = A(i)\n\
+                   \x20       else:\n\
+                   \x20           points[i] = B(i)\n\
+                   \x20   acc = 0.0\n\
+                   \x20   for p in points:\n\
+                   \x20       acc = acc + p.x\n\
+                   \x20   return acc\n\
+                   print(f(200))\n";
+        let (out, _compiled, _deopts) = run_jit(src);
+        // sum(i for i in 0..199) + 199 * 10 = 19701.0
+        assert_eq!(out, "21691.0\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_fluent_method_return_compiles() {
+        // RFC 0073 WS1 — `returns_self_syntactically`: `merge` reads
+        // attributes off its non-`self` parameter, so its nested
+        // analysis fails; the syntactic `return self` scan still
+        // predicts the object-lane return, admitting the caller's
+        // burned-in method call.
+        let src = "class Box:\n\
+                   \x20   def __init__(self, v):\n\
+                   \x20       self.v = v * 1.0\n\
+                   \x20   def merge(self, other):\n\
+                   \x20       self.v = self.v if self.v > other.v else other.v\n\
+                   \x20       return self\n\
+                   def f(n):\n\
+                   \x20   points = [None] * n\n\
+                   \x20   for i in range(n):\n\
+                   \x20       points[i] = Box(i)\n\
+                   \x20   top = points[0]\n\
+                   \x20   for p in points:\n\
+                   \x20       top = top.merge(p)\n\
+                   \x20   return top.v\n\
+                   print(f(150))\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert!(compiled >= 1, "fluent-return kernel never compiled");
+        assert_eq!(out, "149.0\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_probe_miss_retries_other_entries() {
+        // RFC 0073 WS1 — retriable probe misses: the fill loop's OSR
+        // attempt fires while `q` (bound between the loops) is still
+        // unbound *and* its class is not yet resolvable through any
+        // residue (it comes from an opaque helper), so the compile
+        // probe-misses. The code object must stay retriable: the
+        // second loop's own OSR entry — with `q` live — compiles.
+        let src = "class C:\n\
+                   \x20   def __init__(self):\n\
+                   \x20       self.w = 2.0\n\
+                   def make():\n\
+                   \x20   return C()\n\
+                   def f(n):\n\
+                   \x20   s = 0\n\
+                   \x20   for i in range(n):\n\
+                   \x20       s = s + i\n\
+                   \x20   q = make()\n\
+                   \x20   acc = 0.0\n\
+                   \x20   for i in range(n):\n\
+                   \x20       acc = acc + q.w\n\
+                   \x20   return s + acc\n\
+                   print(f(200))\n";
+        let (out, _compiled, _deopts) = run_jit(src);
+        // sum(0..200) + 200 * 2.0 = 19900 + 400.
+        assert_eq!(out, "20300.0\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_dict_str_key_get_set_compiles() {
+        // RFC 0073 WS2 — the dict lane: `d[k]` read-modify-write with a
+        // str-lane key parameter runs native and deopt-free (the key
+        // local's lane is inferred from the dict's trained key lane).
+        let src = "def bump(d, k, n):\n\
+                   \x20   i = 0\n\
+                   \x20   while i < n:\n\
+                   \x20       d[k] = d[k] + 1\n\
+                   \x20       i = i + 1\n\
+                   \x20   return d[k]\n\
+                   d = {}\n\
+                   d['x'] = 5\n\
+                   print(bump(d, 'x', 200))\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "dict str-key kernel never compiled");
+        assert_eq!(deopts, 0, "stable dict lanes should not deopt");
+        assert_eq!(out, "205\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_dict_int_key_fill_from_empty() {
+        // RFC 0073 WS2 — stores admit on an *empty* dict (no lane
+        // evidence; the op lanes come from the operands), and `len(d)`
+        // rides the pinned dict.
+        let src = "def fill(d, n):\n\
+                   \x20   i = 0\n\
+                   \x20   while i < n:\n\
+                   \x20       d[i] = i * 2\n\
+                   \x20       i = i + 1\n\
+                   \x20   return len(d)\n\
+                   print(fill({}, 200))\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert!(compiled >= 1, "dict fill kernel never compiled");
+        assert_eq!(out, "200\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_dict_contains_and_negate() {
+        // RFC 0073 WS2 — `in` / `not in` on the pinned dict lane.
+        let src = "def count(d, n):\n\
+                   \x20   c = 0\n\
+                   \x20   i = 0\n\
+                   \x20   while i < n:\n\
+                   \x20       if i in d:\n\
+                   \x20           c = c + 1\n\
+                   \x20       if i not in d:\n\
+                   \x20           c = c + 10\n\
+                   \x20       i = i + 1\n\
+                   \x20   return c\n\
+                   d = {}\n\
+                   j = 0\n\
+                   while j < 100:\n    d[j * 2] = j\n    j = j + 1\n\
+                   print(count(d, 200))\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "dict contains kernel never compiled");
+        assert_eq!(deopts, 0, "stable dict membership should not deopt");
+        // 100 even keys present, 100 odd keys absent.
+        assert_eq!(out, "1100\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_dict_missing_key_raises_exact_keyerror() {
+        // RFC 0073 WS2 — a missing key takes the `Raised` exit with the
+        // exact `KeyError` (whose `args[0]` is the key object), never
+        // charging the deopt budget.
+        let src = "def read(d, k, n):\n\
+                   \x20   t = 0\n\
+                   \x20   i = 0\n\
+                   \x20   while i < n:\n\
+                   \x20       t = t + d[k]\n\
+                   \x20       i = i + 1\n\
+                   \x20   return t\n\
+                   d = {}\n\
+                   d['x'] = 3\n\
+                   r = read(d, 'x', 200)\n\
+                   msg = ''\n\
+                   try:\n\
+                   \x20   read(d, 'nope', 200)\n\
+                   except KeyError as e:\n\
+                   \x20   msg = e.args[0]\n\
+                   print(r, msg)\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "dict read kernel never compiled");
+        assert_eq!(deopts, 0, "a missing key must raise, not deopt");
+        assert_eq!(out, "600 nope\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_dict_value_lane_surprise_stays_exact() {
+        // RFC 0073 WS2 — a value outside the trained lane (an int in a
+        // float-valued dict) deopts at the access and the interpreter
+        // computes the exact result.
+        let src = "def total(d, n):\n\
+                   \x20   t = 0.0\n\
+                   \x20   i = 0\n\
+                   \x20   while i < n:\n\
+                   \x20       t = t + d[i]\n\
+                   \x20       i = i + 1\n\
+                   \x20   return t\n\
+                   d = {}\n\
+                   j = 0\n\
+                   while j < 200:\n    d[j] = j * 0.5\n    j = j + 1\n\
+                   d[150] = 7\n\
+                   print(total(d, 200))\n";
+        let (out, _compiled, _deopts) = run_jit(src);
+        // sum(0.5*j for j != 150) + 7 = 9950 - 75 + 7.
+        assert_eq!(out, "9882.0\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_dict_obj_values_feed_attr_lane() {
+        // RFC 0073 WS2 — object-lane dict values pin on read and feed
+        // the existing attribute lanes.
+        let src = "class P:\n\
+                   \x20   def __init__(self, v):\n\
+                   \x20       self.v = v * 1.0\n\
+                   def total(d, n):\n\
+                   \x20   t = 0.0\n\
+                   \x20   i = 0\n\
+                   \x20   while i < n:\n\
+                   \x20       p = d[i]\n\
+                   \x20       t = t + p.v\n\
+                   \x20       i = i + 1\n\
+                   \x20   return t\n\
+                   d = {}\n\
+                   j = 0\n\
+                   while j < 200:\n    d[j] = P(j)\n    j = j + 1\n\
+                   print(total(d, 200))\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert!(compiled >= 1, "dict obj-value kernel never compiled");
+        assert_eq!(out, "19900.0\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_dict_literal_builds_native() {
+        // RFC 0073 WS2 — `BUILD_MAP`: the `{}` literal and a populated
+        // literal (with a duplicate key keeping the last value) build
+        // native, pin on the dict lane, and feed the dict ops.
+        let src = "def f(a, b, n):\n\
+                   \x20   t = 0\n\
+                   \x20   i = 0\n\
+                   \x20   while i < n:\n\
+                   \x20       d = {'x': a, 'y': b, 'x': a + 1}\n\
+                   \x20       e = {}\n\
+                   \x20       e[i] = i\n\
+                   \x20       t = t + d['x'] + d['y'] + len(d) + len(e)\n\
+                   \x20       i = i + 1\n\
+                   \x20   return t\n\
+                   print(f(10, 20, 200))\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert!(compiled >= 1, "dict-literal kernel never compiled");
+        // (11 + 20 + 2 + 1) * 200.
+        assert_eq!(out, "6800\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_str_concat_index_and_fstring() {
+        // RFC 0073 WS3 — the string write lanes: exact-`str` `+`,
+        // ASCII `s[i]`, and the f-string `BUILD_STRING`/`FORMAT_SIMPLE`
+        // shape, all native and deopt-free on stable lanes.
+        let src = "def weld(a, b, n):\n\
+                   \x20   out = ''\n\
+                   \x20   i = 0\n\
+                   \x20   while i < n:\n\
+                   \x20       c = a[i % 3] + b[i % 2]\n\
+                   \x20       out = f'{c}|{a}'\n\
+                   \x20       i = i + 1\n\
+                   \x20   return out\n\
+                   print(weld('abc', 'xy', 200))\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "str write kernel never compiled");
+        assert_eq!(deopts, 0, "stable str lanes should not deopt");
+        // Last iteration: i=199 → a[1] + b[1] = "by".
+        assert_eq!(out, "by|abc\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_str_get_non_ascii_stays_exact() {
+        // RFC 0073 WS3 — a non-ASCII receiver never enters the O(1)
+        // byte lane: the access deopts and the interpreter indexes by
+        // code point exactly.
+        let src = "def pick(s, n):\n\
+                   \x20   out = ''\n\
+                   \x20   i = 0\n\
+                   \x20   while i < n:\n\
+                   \x20       out = s[1] + s[2]\n\
+                   \x20       i = i + 1\n\
+                   \x20   return out\n\
+                   print(pick('h\u{e9}llo', 200))\n\
+                   print(pick('plain', 200))\n";
+        let (out, _compiled, _deopts) = run_jit(src);
+        assert_eq!(out, "\u{e9}l\nla\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_str_method_scalar_lanes() {
+        // RFC 0073 WS3 — the native `str`-method call lane: `upper`
+        // (fresh `Str` pin), `startswith` (`Bool`), `count`/`find`
+        // (`Int`), all direct builtin invocations, deopt-free on
+        // stable lanes.
+        let src = "def scan(s, t, n):\n\
+                   \x20   hits = 0\n\
+                   \x20   i = 0\n\
+                   \x20   while i < n:\n\
+                   \x20       u = s.upper()\n\
+                   \x20       if s.startswith(t):\n\
+                   \x20           hits = hits + 1\n\
+                   \x20       hits = hits + s.count(t) + s.find(t) + len(u)\n\
+                   \x20       i = i + 1\n\
+                   \x20   return hits\n\
+                   print(scan('banana', 'an', 200))\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "str-method kernel never compiled");
+        assert_eq!(deopts, 0, "stable str-method lanes should not deopt");
+        // Per iteration: count=2, find=1, len('BANANA')=6 → 9 × 200.
+        assert_eq!(out, "1800\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_str_split_iter_join_roundtrip() {
+        // RFC 0073 WS3 — `split` returns a pinned `ListObj` whose
+        // `ForList` consumer hands elements out natively, and `join`
+        // takes its direct list fast path on the same pin.
+        let src = "def rejoin(s, n):\n\
+                   \x20   out = ''\n\
+                   \x20   total = 0\n\
+                   \x20   i = 0\n\
+                   \x20   while i < n:\n\
+                   \x20       parts = s.split(',')\n\
+                   \x20       for p in parts:\n\
+                   \x20           total = total + 1\n\
+                   \x20       out = '-'.join(parts) + s.upper()\n\
+                   \x20       i = i + 1\n\
+                   \x20   return out\n\
+                   print(rejoin('a,b,c', 150))\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "split/join kernel never compiled");
+        assert_eq!(deopts, 0, "split/iterate/join round trip should not deopt");
+        assert_eq!(out, "a-b-cA,B,C\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_str_method_raise_is_exact() {
+        // RFC 0073 WS3 — a raising builtin (`index` with no match)
+        // routes through `CallStatus::Raised` with the interpreter's
+        // own exception, wording included.
+        let src = "def probe(s, t, n):\n\
+                   \x20   r = 0\n\
+                   \x20   i = 0\n\
+                   \x20   while i < n:\n\
+                   \x20       r = r + s.find(t)\n\
+                   \x20       i = i + 1\n\
+                   \x20   return r + s.index(t)\n\
+                   print(probe('banana', 'an', 100))\n\
+                   try:\n\
+                   \x20   print(probe('banana', 'zz', 100))\n\
+                   except ValueError as e:\n\
+                   \x20   print('caught:', e)\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert!(compiled >= 1, "raising str-method kernel never compiled");
+        // 100 × find('an')=1, plus index('an')=1.
+        assert_eq!(out, "101\ncaught: substring not found\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_dict_iterate_int_keys() {
+        // RFC 0073 WS2 — `for k in d:` over an int-keyed dict rides the
+        // materialized `DictKeys` iterator; keys come back in insertion
+        // order on the `Int` lane, deopt-free.
+        let src = "def total(d):\n\
+                   \x20   t = 0\n\
+                   \x20   for k in d:\n\
+                   \x20       t = t * 2 + k\n\
+                   \x20   return t\n\
+                   d = {}\n\
+                   j = 0\n\
+                   while j < 50:\n    d[j] = j\n    j = j + 1\n\
+                   s = 0\n\
+                   i = 0\n\
+                   while i < 100:\n    s = s + total(d)\n    i = i + 1\n\
+                   print(s)\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "dict-iteration kernel never compiled");
+        assert_eq!(deopts, 0, "stable dict iteration should not deopt");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_dict_iterate_str_keys_feed_dict_get() {
+        // RFC 0073 WS2 — str keys iterate on the `Str` lane and feed
+        // the dict subscript lane inside the same loop.
+        let src = "def total(d):\n\
+                   \x20   t = 0\n\
+                   \x20   for k in d:\n\
+                   \x20       t = t + d[k]\n\
+                   \x20   return t\n\
+                   d = {'a': 1, 'b': 2, 'c': 3}\n\
+                   s = 0\n\
+                   i = 0\n\
+                   while i < 200:\n    s = s + total(d)\n    i = i + 1\n\
+                   print(s)\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(
+            compiled >= 1,
+            "str-key dict-iteration kernel never compiled"
+        );
+        assert_eq!(deopts, 0, "stable str-key iteration should not deopt");
+        assert_eq!(out, "1200\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_dict_mutation_during_iteration_stays_exact() {
+        // RFC 0073 WS2 — a structural mutation mid-iteration surfaces
+        // the exact CPython RuntimeError (the checked iterator step
+        // raises it; wording parity asserted against the interpreter).
+        let src = "def boom(d, grow):\n\
+                   \x20   t = 0\n\
+                   \x20   for k in d:\n\
+                   \x20       t = t + k\n\
+                   \x20       if grow:\n\
+                   \x20           d[t + 100] = 1\n\
+                   \x20   return t\n\
+                   d = {}\n\
+                   j = 0\n\
+                   while j < 50:\n    d[j] = j\n    j = j + 1\n\
+                   i = 0\n\
+                   while i < 100:\n    boom(d, False)\n    i = i + 1\n\
+                   msg = ''\n\
+                   try:\n\
+                   \x20   boom(d, True)\n\
+                   except RuntimeError as e:\n\
+                   \x20   msg = str(e)\n\
+                   print(msg)\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert!(compiled >= 1, "mutation kernel never compiled");
+        assert_eq!(out, run(src));
+        assert!(
+            out.contains("changed size during iteration"),
+            "expected the exact CPython wording, got: {out}"
+        );
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
     fn jit_to_bool_int_and_float_branches() {
         // CPython 3.13's `TO_BOOL` on non-bool scalars (`if i & 1:`,
         // `if f:`): lowered as a double negation on the existing
@@ -47302,10 +48414,10 @@ mod tests {
 
     #[cfg(feature = "jit")]
     #[test]
-    fn jit_generator_while_trailing_yield_stays_interpreted() {
-        // RFC 0071 WS5 measurements — the `while`-shaped counter is
-        // yield-dense too (increment + test + yield per resume): the
-        // profitability gate keeps it interpreted, results exact.
+    fn jit_generator_while_trailing_yield_parks_natively() {
+        // RFC 0073 WS4 — the `while`-shaped yield-dense counter now
+        // compiles and parks per yield (see the `for`-shaped sibling
+        // above); the park keeps the whole resume cycle native.
         let src = "def counter(n):\n    i = 0\n\
                    \x20   while i < n:\n        yield i\n        i = i + 1\n\
                    t = 0\nk = 0\n\
@@ -47313,8 +48425,10 @@ mod tests {
                    \x20   for v in counter(20):\n        t = t + v\n\
                    \x20   k = k + 1\n\
                    print(t)\n";
-        let (out, _compiled, resumes, _yields) = run_jit_resume(src);
-        assert_eq!(resumes, 0, "yield-dense body must not resume natively");
+        let (out, compiled, resumes, yields) = run_jit_resume(src);
+        assert!(compiled >= 1, "yield-dense body never compiled");
+        assert!(resumes >= 1, "yield-dense body never resumed natively");
+        assert!(yields >= 1, "no native yield exit was taken");
         assert_eq!(out, "11400\n");
         assert_eq!(out, run(src));
     }
@@ -47473,6 +48587,151 @@ mod tests {
         );
         assert_eq!(deopts, 0, "clean fib should not deopt a native callee");
         assert_eq!(out, "144\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_native_call_defaults_splice() {
+        // RFC 0073 WS5 — an under-arity call site splices the trailing
+        // defaults natively: both shapes of `add` below must take the
+        // native-to-native path (no interpreter fallback per call).
+        let src = "def add(a, b, c=7):\n\
+                   \x20   return a * 100 + b * 10 + c\n\
+                   def driver(n):\n\
+                   \x20   t = 0\n\
+                   \x20   i = 0\n\
+                   \x20   while i < n:\n\
+                   \x20       t = t + add(i, 2) + add(i, 2, 3)\n\
+                   \x20       i = i + 1\n\
+                   \x20   return t\n\
+                   r = 0\nk = 0\n\
+                   while k < 60:\n    r = driver(40)\n    k = k + 1\n\
+                   print(r)\n";
+        let (out, calls, fallbacks, deopts) = run_jit_native(src);
+        assert!(calls >= 1, "defaults-window calls never went native");
+        assert_eq!(deopts, 0, "clean defaults splice should not deopt");
+        assert_eq!(
+            fallbacks, 0,
+            "the under-arity site fell back to the interpreter call path"
+        );
+        assert_eq!(out, "158000\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_native_call_defaults_rebind_honored() {
+        // RFC 0073 WS5 — `f.__defaults__ = …` lands in the slot store;
+        // the native splice must refuse (the compiled tuple no longer
+        // governs) and the interpreter's generic binder honours the
+        // override. Function identity is unchanged, so the caller
+        // stays compiled throughout.
+        let src = "def f(a, b=1):\n    return a * 10 + b\n\
+                   def driver(n):\n\
+                   \x20   t = 0\n\
+                   \x20   i = 0\n\
+                   \x20   while i < n:\n        t = t + f(3)\n        i = i + 1\n\
+                   \x20   return t\n\
+                   t = 0\nk = 0\n\
+                   while k < 50:\n    t = t + driver(20)\n    k = k + 1\n\
+                   f.__defaults__ = (5,)\n\
+                   j = 0\n\
+                   while j < 50:\n    t = t + driver(20)\n    j = j + 1\n\
+                   print(t)\n";
+        let (out, _calls, _fallbacks, _deopts) = run_jit_native(src);
+        // 50*20*31 + 50*20*35
+        assert_eq!(out, "66000\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_native_call_kwnames() {
+        // RFC 0073 WS5 — keyword call sites: the analyzer burns the
+        // name → slot permutation, so both the in-order and the
+        // shuffled keyword shapes marshal as plain positional prefixes
+        // and take the native-to-native path.
+        let src = "def add(a, b, c):\n\
+                   \x20   return a * 100 + b * 10 + c\n\
+                   def driver(n):\n\
+                   \x20   t = 0\n\
+                   \x20   i = 0\n\
+                   \x20   while i < n:\n\
+                   \x20       t = t + add(i, b=2, c=3) + add(i, c=5, b=4)\n\
+                   \x20       i = i + 1\n\
+                   \x20   return t\n\
+                   r = 0\nk = 0\n\
+                   while k < 60:\n    r = driver(40)\n    k = k + 1\n\
+                   print(r)\n";
+        let (out, calls, fallbacks, deopts) = run_jit_native(src);
+        assert!(calls >= 1, "keyword calls never went native");
+        assert_eq!(deopts, 0, "clean keyword calls should not deopt");
+        assert_eq!(
+            fallbacks, 0,
+            "a keyword site fell back to the interpreter call path"
+        );
+        // sum_{i<40} (100i + 23) + (100i + 45) = 2*100*780 + 40*68
+        assert_eq!(out, "158720\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_native_call_kwnames_defaults_window() {
+        // RFC 0073 WS5 — a keyword call that fills a *prefix* of the
+        // parameters, with the tail bound from trailing defaults: the
+        // filled set is contiguous, so the site composes with the
+        // defaults splice.
+        let src = "def add(a, b, c=7):\n\
+                   \x20   return a * 100 + b * 10 + c\n\
+                   def driver(n):\n\
+                   \x20   t = 0\n\
+                   \x20   i = 0\n\
+                   \x20   while i < n:\n\
+                   \x20       t = t + add(i, b=2)\n\
+                   \x20       i = i + 1\n\
+                   \x20   return t\n\
+                   r = 0\nk = 0\n\
+                   while k < 60:\n    r = driver(40)\n    k = k + 1\n\
+                   print(r)\n";
+        let (out, calls, fallbacks, deopts) = run_jit_native(src);
+        assert!(
+            calls >= 1,
+            "keyword defaults-window calls never went native"
+        );
+        assert_eq!(deopts, 0, "clean keyword defaults window should not deopt");
+        assert_eq!(
+            fallbacks, 0,
+            "the keyword site fell back to the interpreter"
+        );
+        // sum_{i<40} 100i + 27 = 78000 + 1080
+        assert_eq!(out, "79080\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_native_call_kwnames_gap_stays_interpreted() {
+        // RFC 0073 WS5 — a keyword that *skips* a defaulted parameter
+        // (`a`, then `c`, leaving the `b` gap to its default) is not a
+        // contiguous fill: the frame stays interpreted and the output
+        // is exact either way.
+        let src = "def add(a, b=2, c=7):\n\
+                   \x20   return a * 100 + b * 10 + c\n\
+                   def driver(n):\n\
+                   \x20   t = 0\n\
+                   \x20   i = 0\n\
+                   \x20   while i < n:\n\
+                   \x20       t = t + add(i, c=9)\n\
+                   \x20       i = i + 1\n\
+                   \x20   return t\n\
+                   r = 0\nk = 0\n\
+                   while k < 60:\n    r = driver(40)\n    k = k + 1\n\
+                   print(r)\n";
+        let (out, _calls, _fallbacks, _deopts) = run_jit_native(src);
+        // sum_{i<40} 100i + 29 = 78000 + 1160
+        assert_eq!(out, "79160\n");
         assert_eq!(out, run(src));
     }
 
