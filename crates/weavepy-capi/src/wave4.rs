@@ -1220,7 +1220,10 @@ pub extern "C" fn PyOS_AfterFork_Child() {}
 
 /// `PyOS_setsig(sig, handler)` — install a signal handler via
 /// `sigaction` (empty mask, no flags — CPython's exact recipe) and
-/// return the previous handler, or `SIG_ERR` on failure.
+/// return the previous handler, or `SIG_ERR` on failure. On Windows
+/// CPython has no `HAVE_SIGACTION` and falls back to `signal(2)`;
+/// so do we.
+#[cfg(unix)]
 #[no_mangle]
 pub unsafe extern "C" fn PyOS_setsig(
     sig: c_int,
@@ -1237,6 +1240,15 @@ pub unsafe extern "C" fn PyOS_setsig(
         }
         ocontext.sa_sigaction
     }
+}
+
+#[cfg(windows)]
+#[no_mangle]
+pub unsafe extern "C" fn PyOS_setsig(
+    sig: c_int,
+    handler: libc::sighandler_t,
+) -> libc::sighandler_t {
+    unsafe { libc::signal(sig, handler) }
 }
 
 /// `PyThread_get_thread_ident()` — the same ident `_thread.get_ident()`

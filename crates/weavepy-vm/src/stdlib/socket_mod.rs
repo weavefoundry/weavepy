@@ -634,10 +634,12 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("EAI_NODATA")),
             Object::Int(i64::from(libc::EAI_NODATA)),
         );
+        // glibc netdb.h value; the libc crate doesn't expose the
+        // deprecated EAI_ADDRFAMILY for linux-gnu.
         #[cfg(all(target_os = "linux", target_env = "gnu"))]
         d.insert(
             DictKey(Object::from_static("EAI_ADDRFAMILY")),
-            Object::Int(i64::from(libc::EAI_ADDRFAMILY)),
+            Object::Int(-9),
         );
         // Darwin-only codes CPython also publishes there (netdb.h values;
         // the libc crate doesn't carry the deprecated EAI_ADDRFAMILY).
