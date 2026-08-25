@@ -81,6 +81,9 @@ struct Lowerer<'a, 'b> {
     /// Imported signature shared by the `wpjit_list_len`/`_append`
     /// helpers — `(frame, pin) -> i64` (RFC 0065 WS5, lazy).
     pin_sig: Option<SigRef>,
+    /// RFC 0073 WS2 — imported signature shared by the dict-lane
+    /// helpers — `(frame, pin, key, key_tag, val_tag) -> i64` (lazy).
+    dict_sig: Option<SigRef>,
     /// RFC 0071 WS4 — imported signature shared by the
     /// `wpjit_build_list`/`wpjit_list_slice` helpers — all
     /// `(frame, i64, i64, i64) -> i64` (lazy).
@@ -118,6 +121,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             math_binary_sig: None,
             list_sig: None,
             pin_sig: None,
+            dict_sig: None,
             quad_sig: None,
             poll_sig: None,
             poll_countdown: None,
@@ -140,7 +144,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             JitType::ListInt | JitType::ListFloat | JitType::ListObj => SlotTag::ListPin as i64,
             // RFC 0071 WS6 — `Str`/`Bytes` pins spill like object pins
             // (the rebuild resolves the pin to the real payload).
-            JitType::Obj | JitType::Str | JitType::Bytes => SlotTag::ObjPin as i64,
+            // RFC 0073 WS2 — `Dict` pins ride the same tag.
+            JitType::Obj | JitType::Str | JitType::Bytes | JitType::Dict => SlotTag::ObjPin as i64,
             JitType::Unknown => SlotTag::Int as i64,
         }
     }
@@ -175,12 +180,15 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     TOp::BuildList {
                         none_fill: false,
                         ..
-                    }
+                    } | TOp::BuildTuple { .. }
+                        | TOp::BuildMap { .. }
+                        | TOp::BuildString { .. }
                 )
             })
         });
         if !self.tfunc.callee_spans.is_empty()
             || !self.tfunc.method_sites.is_empty()
+            || !self.tfunc.str_method_sites.is_empty()
             || stages_elements
         {
             self.call_args_base =
@@ -312,6 +320,15 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 .map(|e| e.pc)
             {
                 self.emit_poll(cd_var, header_pc);
+            } else if let TTerm::ForList { pc, .. } | TTerm::ForIter { pc, .. } =
+                self.tfunc.blocks[bi].term
+            {
+                // RFC 0073 WS1 — a comprehension loop header is not
+                // OSR-enterable (its boundary stack is non-empty), but
+                // it is still a loop header: poll here too, spilling
+                // the live entry stack so the pending-work deopt
+                // resumes exactly at the `FOR_ITER`.
+                self.emit_poll(cd_var, pc);
             }
         }
         let block = self.tfunc.blocks[bi].clone();
@@ -397,6 +414,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let loop_var = self.vars[var_slot as usize].expect("managed loop var");
                 let seq = self.b.use_var(seq_var);
                 let idx = self.b.use_var(idx_var);
+                // RFC 0073 WS1 — a comprehension loop carries its
+                // accumulator (and any surrounding expression stack)
+                // through the header: successors take it as block
+                // args, and a header deopt spills it.
+                let snapshot = self.vstack.clone();
+                let args = self.block_args();
                 let sig = self.list_helper_sig();
                 let helper = self
                     .b
@@ -420,14 +443,14 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let next = self.b.ins().iadd_imm(idx, 1);
                 self.b.def_var(idx_var, next);
                 let bb = self.cl_blocks[body];
-                self.b.ins().jump(bb, &[]);
+                self.b.ins().jump(bb, &args);
                 self.b.switch_to_block(rest_b);
                 let deopt_b = self.b.create_block();
                 let eb = self.cl_blocks[exit];
                 let is_done = self.b.ins().icmp_imm(IntCC::Equal, status, 1);
-                self.b.ins().brif(is_done, eb, &[], deopt_b, &[]);
+                self.b.ins().brif(is_done, eb, &args, deopt_b, &[]);
                 self.b.switch_to_block(deopt_b);
-                self.emit_exit(pc, &[], JitStatus::Deopt);
+                self.emit_exit(pc, &snapshot, JitStatus::Deopt);
             }
             // RFC 0071 WS4 — the opaque-iterator step: the registered
             // `wpjit_iter_next` helper advances the pinned iterator
@@ -453,12 +476,25 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let iter_var = self.vars[iter_slot as usize].expect("managed iter slot");
                 let loop_var = self.vars[var_slot as usize].expect("managed loop var");
                 let iter = self.b.use_var(iter_var);
+                // RFC 0073 WS1 — see `ForList`: a comprehension loop's
+                // boundary stack rides through the header.
+                let snapshot = self.vstack.clone();
+                let args = self.block_args();
                 let sig = self.list_helper_sig();
                 let helper = self
                     .b
                     .ins()
                     .iconst(self.ptr_ty, runtime::iter_next_helper_addr() as i64);
-                let tag = self.b.ins().iconst(types::I64, Self::tag(elem));
+                // RFC 0073 WS2 — an exact-`str` element lane (dict-keys
+                // loops) needs its own discriminant: `tag` collapses
+                // `Str` into `ObjPin`, whose packing only admits
+                // instances.
+                let elem_disc = if elem == JitType::Str {
+                    runtime::ITER_ELEM_STR
+                } else {
+                    Self::tag(elem)
+                };
+                let tag = self.b.ins().iconst(types::I64, elem_disc);
                 let call = self
                     .b
                     .ins()
@@ -475,12 +511,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         .load(Self::cl_ty(elem), trusted, self.frame_ptr, OFF_RET_BITS);
                 self.b.def_var(loop_var, res);
                 let bb = self.cl_blocks[body];
-                self.b.ins().jump(bb, &[]);
+                self.b.ins().jump(bb, &args);
                 self.b.switch_to_block(rest_b);
                 let more_b = self.b.create_block();
                 let eb = self.cl_blocks[exit];
                 let is_done = self.b.ins().icmp_imm(IntCC::Equal, status, 1);
-                self.b.ins().brif(is_done, eb, &[], more_b, &[]);
+                self.b.ins().brif(is_done, eb, &args, more_b, &[]);
                 self.b.switch_to_block(more_b);
                 let lane_b = self.b.create_block();
                 let hdr_b = self.b.create_block();
@@ -491,16 +527,18 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .b
                     .ins()
                     .load(types::I64, trusted, self.frame_ptr, OFF_RET_BITS);
-                self.emit_exit(store_pc, &[(elem_pin, JitType::Obj)], JitStatus::Deopt);
+                let mut lane_spill = snapshot.clone();
+                lane_spill.push((elem_pin, JitType::Obj));
+                self.emit_exit(store_pc, &lane_spill, JitStatus::Deopt);
                 self.b.switch_to_block(hdr_b);
                 let raise_b = self.b.create_block();
                 let deopt_b = self.b.create_block();
                 let is_raise = self.b.ins().icmp_imm(IntCC::Equal, status, 4);
                 self.b.ins().brif(is_raise, raise_b, &[], deopt_b, &[]);
                 self.b.switch_to_block(raise_b);
-                self.emit_exit(pc, &[], JitStatus::Raised);
+                self.emit_exit(pc, &snapshot, JitStatus::Raised);
                 self.b.switch_to_block(deopt_b);
-                self.emit_exit(pc, &[], JitStatus::Deopt);
+                self.emit_exit(pc, &snapshot, JitStatus::Deopt);
             }
             // RFC 0070 WS2 — a yield is an unconditional deopt-shaped
             // exit parked *at* the `YIELD_VALUE` pc: the full stack
@@ -619,11 +657,19 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let depth = self.vstack.len() - 2;
                 self.emit_int_to_float(depth, guarded, stmt.pc);
             }
-            TOp::CallPy { token, argc, ret } => self.emit_call_py(token, argc, ret, stmt.pc),
+            TOp::CallPy { token, argc, ret } => self.emit_call_py(token, argc, 0, 0, ret, stmt.pc),
+            TOp::CallPyKw {
+                token,
+                argc,
+                kwc,
+                perm,
+                ret,
+            } => self.emit_call_py(token, argc, kwc, perm, ret, stmt.pc),
             TOp::ListGet { elem } => self.emit_list_get(elem, stmt.pc),
             TOp::ListSet => self.emit_list_set(stmt.pc),
             TOp::ListLen => self.emit_list_len(stmt.pc),
             TOp::ListAppend => self.emit_list_append(stmt.pc),
+            TOp::ListAppendKeep => self.emit_list_append_keep(stmt.pc),
             TOp::AttrGet { site, out } => self.emit_attr_get(site, out, stmt.pc),
             TOp::AttrSet { site } => self.emit_attr_set(site, stmt.pc),
             // RFC 0070 WS1 — nullable object lanes: `None` is the
@@ -654,14 +700,33 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             TOp::CallMethod { token, argc, ret } => {
                 self.emit_call_method(token, argc, ret, stmt.pc);
             }
+            TOp::CallStrMethod { site, argc, ret } => {
+                self.emit_call_str_method(site, argc, ret, stmt.pc);
+            }
             TOp::StrEq { negate } => self.emit_str_eq(negate, stmt.pc),
             TOp::StrLen => self.emit_pin_len(runtime::str_len_helper_addr(), stmt.pc),
             TOp::BytesLen => self.emit_pin_len(runtime::bytes_len_helper_addr(), stmt.pc),
             TOp::BytesGetItem => self.emit_bytes_get(stmt.pc),
+            TOp::DictGet { key, val } => self.emit_dict_get(key, val, stmt.pc),
+            TOp::DictSet { key, val } => self.emit_dict_set(key, val, stmt.pc),
+            TOp::DictContains { negate, key } => self.emit_dict_contains(negate, key, stmt.pc),
+            TOp::DictLen => self.emit_pin_len(runtime::dict_len_helper_addr(), stmt.pc),
             TOp::IterCapture { iter_slot } => self.emit_iter_capture(iter_slot, stmt.pc),
-            TOp::BuildList { n, elem, none_fill } => {
-                self.emit_build_list(n, elem, none_fill, stmt.pc);
+            TOp::DictIterNew { iter_slot } => self.emit_dict_iter_new(iter_slot, stmt.pc),
+            TOp::BuildList {
+                n,
+                elem,
+                none_fill,
+                mixed,
+            } => {
+                self.emit_build_list(n, elem, none_fill, mixed, stmt.pc);
             }
+            TOp::BuildTuple { n } => self.emit_build_tuple(n, stmt.pc),
+            TOp::BuildMap { n } => self.emit_build_map(n, stmt.pc),
+            TOp::PushConstStr { idx } => self.emit_const_str(idx, stmt.pc),
+            TOp::StrConcat => self.emit_str_concat(stmt.pc),
+            TOp::StrGetItem => self.emit_str_get(stmt.pc),
+            TOp::BuildString { n } => self.emit_build_string(n, stmt.pc),
             TOp::ListRepeat => self.emit_list_repeat(stmt.pc),
             TOp::ListSlice { start, stop } => self.emit_list_slice(start, stop, stmt.pc),
         }
@@ -692,13 +757,41 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.b.def_var(iter_var, pin);
     }
 
+    /// RFC 0073 WS2 — the dict-loop capture behind an erased
+    /// `GET_ITER`: `wpjit_dict_iter_new` materializes the pinned
+    /// dict's real `DictKeys` iterator and answers its fresh pin,
+    /// which lands in the iter slot. A negative status deopts with
+    /// the dict spilled and the interpreter executes the `GET_ITER` —
+    /// and the loop — generically.
+    fn emit_dict_iter_new(&mut self, iter_slot: u32, pc: u32) {
+        let snapshot = self.vstack.clone();
+        let (pin, _) = self.pop();
+        let sig = self.pin_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::dict_iter_helper_addr() as i64);
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, pin]);
+        let res = self.b.inst_results(call)[0];
+        let bad = self.b.ins().icmp_imm(IntCC::SignedLessThan, res, 0);
+        let cont = self.guard(bad, pc, &snapshot);
+        self.b.switch_to_block(cont);
+        let iter_var = self.vars[iter_slot as usize].expect("managed iter slot");
+        self.b.def_var(iter_var, res);
+    }
+
     /// RFC 0071 WS4 — `BUILD_LIST k`: the elements are staged through
     /// the marshal buffer (like `CallPy` arguments); `none_fill`
-    /// passes an empty buffer and the helper writes `n` `None`s. The
-    /// helper answers the fresh pin index, negative on cap pressure
-    /// (deopt: the interpreter re-executes the `BUILD_LIST`).
-    fn emit_build_list(&mut self, n: u32, elem: JitType, none_fill: bool, pc: u32) {
-        let trusted = MemFlags::trusted();
+    /// passes an empty buffer and the helper writes `n` `None`s. RFC
+    /// 0073 WS1 — a `mixed` literal also stages per-element tags and
+    /// passes `-1` as the lane tag, telling the helper to box each
+    /// element by its own tag. The helper answers the fresh pin
+    /// index, negative on cap pressure (deopt: the interpreter
+    /// re-executes the `BUILD_LIST`).
+    fn emit_build_list(&mut self, n: u32, elem: JitType, none_fill: bool, mixed: bool, pc: u32) {
         // The deopt re-executes the `BUILD_LIST`, so the spill must
         // hold all `n` elements: the natives still on the stack, or —
         // for `none_fill` — materialized `None` markers (`-1` on the
@@ -710,12 +803,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 snapshot.push((none, JitType::Obj));
             }
         } else {
-            let base = self.vstack.len() - n as usize;
-            for (j, &(v, _)) in self.vstack[base..].iter().enumerate() {
-                let voff = (j as i32) * 8;
-                self.b.ins().store(trusted, v, self.call_args_base, voff);
-            }
-            self.vstack.truncate(base);
+            self.stage_elements(n, mixed);
         }
         let sig = self.quad_helper_sig();
         let helper = self
@@ -723,7 +811,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .ins()
             .iconst(self.ptr_ty, runtime::build_list_helper_addr() as i64);
         let nv = self.b.ins().iconst(types::I64, i64::from(n));
-        let tag = self.b.ins().iconst(types::I64, Self::tag(elem));
+        let tag_imm = if mixed { -1 } else { Self::tag(elem) };
+        let tag = self.b.ins().iconst(types::I64, tag_imm);
         let fill = self.b.ins().iconst(types::I64, i64::from(none_fill));
         let call = self
             .b
@@ -735,6 +824,168 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.b.switch_to_block(cont);
         let lane = JitType::list_of(elem).unwrap_or(JitType::ListObj);
         self.vstack.push((res, lane));
+    }
+
+    /// Pop the top `n` native stack values into the marshal buffer
+    /// (bottom-to-top); with `tags`, also write each value's
+    /// [`SlotTag`] into the parallel tag buffer.
+    fn stage_elements(&mut self, n: u32, tags: bool) {
+        let trusted = MemFlags::trusted();
+        let base = self.vstack.len() - n as usize;
+        for (j, &(v, ty)) in self.vstack[base..].iter().enumerate() {
+            let voff = (j as i32) * 8;
+            self.b.ins().store(trusted, v, self.call_args_base, voff);
+            if tags {
+                let t = self.b.ins().iconst(types::I32, Self::tag(ty));
+                let toff = (j as i32) * 4;
+                self.b.ins().store(trusted, t, self.call_tags_base, toff);
+            }
+        }
+        self.vstack.truncate(base);
+    }
+
+    /// RFC 0073 WS1 — `BUILD_TUPLE k` through `wpjit_build_tuple`:
+    /// elements stage with per-element tags (a tuple literal mixes
+    /// lanes freely), the fresh tuple pins on the object lane.
+    /// Negative status deopts (cap pressure) and the interpreter
+    /// re-executes the `BUILD_TUPLE`.
+    fn emit_build_tuple(&mut self, n: u32, pc: u32) {
+        let snapshot = self.vstack.clone();
+        self.stage_elements(n, true);
+        let sig = self.pin_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::build_tuple_helper_addr() as i64);
+        let nv = self.b.ins().iconst(types::I64, i64::from(n));
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, nv]);
+        let res = self.b.inst_results(call)[0];
+        let bad = self.b.ins().icmp_imm(IntCC::SignedLessThan, res, 0);
+        let cont = self.guard(bad, pc, &snapshot);
+        self.b.switch_to_block(cont);
+        self.vstack.push((res, JitType::Obj));
+    }
+
+    /// RFC 0073 WS2 — `BUILD_MAP n` through `wpjit_build_map`:
+    /// `2n` interleaved key/value entries stage with per-element tags,
+    /// the fresh dict pins on the dict lane. Negative status deopts
+    /// (cap pressure, key-lane surprise) and the interpreter
+    /// re-executes the `BUILD_MAP`.
+    fn emit_build_map(&mut self, n: u32, pc: u32) {
+        let snapshot = self.vstack.clone();
+        self.stage_elements(2 * n, true);
+        let sig = self.pin_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::build_map_helper_addr() as i64);
+        let nv = self.b.ins().iconst(types::I64, i64::from(n));
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, nv]);
+        let res = self.b.inst_results(call)[0];
+        let bad = self.b.ins().icmp_imm(IntCC::SignedLessThan, res, 0);
+        let cont = self.guard(bad, pc, &snapshot);
+        self.b.switch_to_block(cont);
+        self.vstack.push((res, JitType::Dict));
+    }
+
+    /// RFC 0073 WS3 — `BUILD_STRING n` through `wpjit_build_string`:
+    /// `str`-pin parts stage in order, the joined string pins on the
+    /// `Str` lane. Negative status deopts (cap pressure, pin
+    /// surprise) and the interpreter re-executes the `BUILD_STRING`.
+    fn emit_build_string(&mut self, n: u32, pc: u32) {
+        let snapshot = self.vstack.clone();
+        self.stage_elements(n, false);
+        let sig = self.pin_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::build_string_helper_addr() as i64);
+        let nv = self.b.ins().iconst(types::I64, i64::from(n));
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, nv]);
+        let res = self.b.inst_results(call)[0];
+        let bad = self.b.ins().icmp_imm(IntCC::SignedLessThan, res, 0);
+        let cont = self.guard(bad, pc, &snapshot);
+        self.b.switch_to_block(cont);
+        self.vstack.push((res, JitType::Str));
+    }
+
+    /// RFC 0073 WS3 — guarded exact-`str` `+` through
+    /// `wpjit_str_concat`: pops the two pins, pushes the fresh joined
+    /// pin. Negative status deopts (cap pressure, pin surprise) and
+    /// the interpreter re-executes the add.
+    fn emit_str_concat(&mut self, pc: u32) {
+        let snapshot = self.vstack.clone();
+        let (b_pin, _) = self.pop();
+        let (a_pin, _) = self.pop();
+        let sig = self.list_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::str_concat_helper_addr() as i64);
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, a_pin, b_pin]);
+        let res = self.b.inst_results(call)[0];
+        let bad = self.b.ins().icmp_imm(IntCC::SignedLessThan, res, 0);
+        let cont = self.guard(bad, pc, &snapshot);
+        self.b.switch_to_block(cont);
+        self.vstack.push((res, JitType::Str));
+    }
+
+    /// RFC 0073 WS3 — `s[i]` through `wpjit_str_get`: ASCII-only O(1)
+    /// byte indexing, single-codepoint result pinned. A non-ASCII
+    /// receiver or an out-of-range index deopts at this pc (the exact
+    /// `IndexError` comes from the interpreter's re-execution).
+    fn emit_str_get(&mut self, pc: u32) {
+        let snapshot = self.vstack.clone();
+        let (idx, _) = self.pop();
+        let (pin, _) = self.pop();
+        let sig = self.list_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::str_get_helper_addr() as i64);
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, pin, idx]);
+        let res = self.b.inst_results(call)[0];
+        let bad = self.b.ins().icmp_imm(IntCC::SignedLessThan, res, 0);
+        let cont = self.guard(bad, pc, &snapshot);
+        self.b.switch_to_block(cont);
+        self.vstack.push((res, JitType::Str));
+    }
+
+    /// RFC 0073 WS2 — an exact-`str` constant through the memoizing
+    /// `wpjit_const_str` helper. Negative status deopts (cap
+    /// pressure) and the interpreter re-executes the `LOAD_CONST`.
+    fn emit_const_str(&mut self, idx: u32, pc: u32) {
+        let snapshot = self.vstack.clone();
+        let sig = self.pin_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::const_str_helper_addr() as i64);
+        let idxv = self.b.ins().iconst(types::I64, i64::from(idx));
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, idxv]);
+        let res = self.b.inst_results(call)[0];
+        let bad = self.b.ins().icmp_imm(IntCC::SignedLessThan, res, 0);
+        let cont = self.guard(bad, pc, &snapshot);
+        self.b.switch_to_block(cont);
+        self.vstack.push((res, JitType::Str));
     }
 
     /// RFC 0071 WS4 — `list * int` through `wpjit_list_repeat`
@@ -906,6 +1157,146 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .ins()
             .load(types::I64, trusted, self.frame_ptr, OFF_RET_BITS);
         self.vstack.push((res, JitType::Int));
+    }
+
+    /// RFC 0073 WS2 — the per-site dict key-lane discriminant the
+    /// helpers dispatch on.
+    fn dict_key_tag(key: JitType) -> i64 {
+        match key {
+            JitType::Str => runtime::DICT_KEY_STR,
+            _ => runtime::DICT_KEY_INT,
+        }
+    }
+
+    /// RFC 0073 WS2 — the per-site dict value-lane discriminant.
+    fn dict_val_tag(val: JitType) -> i64 {
+        match val {
+            JitType::Float => runtime::DICT_VAL_FLOAT,
+            JitType::Obj => runtime::DICT_VAL_OBJ,
+            _ => runtime::DICT_VAL_INT,
+        }
+    }
+
+    /// RFC 0073 WS2 — `d[k]` on a pinned exact dict. Three-way status:
+    /// ok (value in `ret_bits`, trained lane), *raised* (a missing key
+    /// — the helper parked the exact `KeyError(key)`; the exit resumes
+    /// past the subscript with the operands consumed), or deopt (lane
+    /// surprise — the interpreter re-executes the subscript with both
+    /// operands restored).
+    fn emit_dict_get(&mut self, key: JitType, val: JitType, pc: u32) {
+        let trusted = MemFlags::trusted();
+        let snapshot_full = self.vstack.clone();
+        let (k, _) = self.pop();
+        let (pin, _) = self.pop();
+        let snapshot = self.vstack.clone();
+        let status = self.emit_dict_call(runtime::dict_get_helper_addr(), pin, k, key, val);
+        let ok_b = self.b.create_block();
+        let bad_b = self.b.create_block();
+        let is_ok = self.b.ins().icmp_imm(IntCC::Equal, status, 0);
+        self.b.ins().brif(is_ok, ok_b, &[], bad_b, &[]);
+        self.b.switch_to_block(bad_b);
+        let raised_b = self.b.create_block();
+        let deopt_b = self.b.create_block();
+        let is_raised = self.b.ins().icmp_imm(IntCC::Equal, status, 2);
+        self.b.ins().brif(is_raised, raised_b, &[], deopt_b, &[]);
+        self.b.switch_to_block(raised_b);
+        self.emit_exit(pc, &snapshot, JitStatus::Raised);
+        self.b.switch_to_block(deopt_b);
+        self.emit_exit(pc, &snapshot_full, JitStatus::Deopt);
+        self.b.switch_to_block(ok_b);
+        let res = self
+            .b
+            .ins()
+            .load(Self::cl_ty(val), trusted, self.frame_ptr, OFF_RET_BITS);
+        self.vstack.push((res, val));
+    }
+
+    /// RFC 0073 WS2 — `d[k] = v` on a pinned exact dict. The value is
+    /// staged through `ret_bits` (the `emit_list_set` trick); any
+    /// helper refusal (watchers active, reapable displaced value, lane
+    /// surprise) deopts at this pc and the interpreter re-executes the
+    /// store generically.
+    fn emit_dict_set(&mut self, key: JitType, val: JitType, pc: u32) {
+        let trusted = MemFlags::trusted();
+        let snapshot = self.vstack.clone();
+        let (k, _) = self.pop();
+        let (pin, _) = self.pop();
+        let (v, _) = self.pop();
+        self.b.ins().store(trusted, v, self.frame_ptr, OFF_RET_BITS);
+        let status = self.emit_dict_call(runtime::dict_set_helper_addr(), pin, k, key, val);
+        let bad = self.b.ins().icmp_imm(IntCC::NotEqual, status, 0);
+        let cont = self.guard(bad, pc, &snapshot);
+        self.b.switch_to_block(cont);
+    }
+
+    /// RFC 0073 WS2 — `k in d` / `k not in d` on a pinned exact dict.
+    /// The membership result lands in `ret_bits`; `negate` inverts it
+    /// natively.
+    fn emit_dict_contains(&mut self, negate: bool, key: JitType, pc: u32) {
+        let trusted = MemFlags::trusted();
+        let snapshot = self.vstack.clone();
+        let (pin, _) = self.pop();
+        let (k, _) = self.pop();
+        let status = self.emit_dict_call(
+            runtime::dict_contains_helper_addr(),
+            pin,
+            k,
+            key,
+            JitType::Int,
+        );
+        let bad = self.b.ins().icmp_imm(IntCC::NotEqual, status, 0);
+        let cont = self.guard(bad, pc, &snapshot);
+        self.b.switch_to_block(cont);
+        let res = self
+            .b
+            .ins()
+            .load(types::I64, trusted, self.frame_ptr, OFF_RET_BITS);
+        let res = if negate {
+            self.b.ins().bxor_imm(res, 1)
+        } else {
+            res
+        };
+        self.vstack.push((res, JitType::Bool));
+    }
+
+    /// Shared dict-helper invocation: `(frame, pin, key_bits, key_tag,
+    /// val_tag) -> status`.
+    fn emit_dict_call(
+        &mut self,
+        helper_addr: usize,
+        pin: Value,
+        key_bits: Value,
+        key: JitType,
+        val: JitType,
+    ) -> Value {
+        let sig = self.dict_helper_sig();
+        let helper = self.b.ins().iconst(self.ptr_ty, helper_addr as i64);
+        let key_tag = self.b.ins().iconst(types::I64, Self::dict_key_tag(key));
+        let val_tag = self.b.ins().iconst(types::I64, Self::dict_val_tag(val));
+        let call = self.b.ins().call_indirect(
+            sig,
+            helper,
+            &[self.frame_ptr, pin, key_bits, key_tag, val_tag],
+        );
+        self.b.inst_results(call)[0]
+    }
+
+    /// The shared `(frame, pin, key, key_tag, val_tag) -> status`
+    /// signature of the dict-lane helpers (RFC 0073 WS2, lazy).
+    fn dict_helper_sig(&mut self) -> SigRef {
+        if let Some(sig) = self.dict_sig {
+            return sig;
+        }
+        let mut sig = Signature::new(self.b.func.signature.call_conv);
+        sig.params.push(AbiParam::new(self.ptr_ty)); // frame
+        sig.params.push(AbiParam::new(types::I64)); // pin
+        sig.params.push(AbiParam::new(types::I64)); // key bits
+        sig.params.push(AbiParam::new(types::I64)); // key tag
+        sig.params.push(AbiParam::new(types::I64)); // val tag
+        sig.returns.push(AbiParam::new(types::I64)); // status
+        let r = self.b.import_signature(sig);
+        self.dict_sig = Some(r);
+        r
     }
 
     /// RFC 0069 WS2 — a burned-in `math` intrinsic. The domain guard
@@ -1100,6 +1491,85 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         }
     }
 
+    /// RFC 0073 WS3 — burned-in native `str`-method call via the
+    /// registered `wpjit_str_method` helper (the [`Self::emit_call_method`]
+    /// discipline, sharing its signature). The helper receives the
+    /// burned [`crate::ir::StrMethod`] discriminant in the token
+    /// parameter; the receiver pin pops natively; the `argc`
+    /// lane-typed arguments ride the marshal buffer with per-slot
+    /// tags. Status: 0 = result in `ret_bits` on the expected lane,
+    /// 1 = raised, 2 = lane-surprise deopt *after* the call (the
+    /// parked result rides the interpreter stack), else = reject
+    /// (deopt re-executing the `CALL` — pure `str` methods make the
+    /// re-execution exact).
+    fn emit_call_str_method(&mut self, site: u32, argc: u8, ret: JitType, pc: u32) {
+        let trusted = MemFlags::trusted();
+        let method = self.tfunc.str_method_sites[site as usize];
+        let n = argc as usize;
+        // Snapshot *including* receiver + args: the Reject exit re-runs
+        // the CALL in the interpreter.
+        let snapshot_full = self.vstack.clone();
+        let base = self.vstack.len() - n;
+        for (j, &(v, ty)) in self.vstack[base..].iter().enumerate() {
+            let voff = (j as i32) * 8;
+            let toff = (j as i32) * 4;
+            self.b.ins().store(trusted, v, self.call_args_base, voff);
+            let tagv = self.b.ins().iconst(types::I32, Self::tag(ty));
+            self.b.ins().store(trusted, tagv, self.call_tags_base, toff);
+        }
+        self.vstack.truncate(base);
+        let (pin, _) = self.pop();
+        let snapshot = self.vstack.clone();
+
+        self.writeback_locals();
+
+        let sig = self.call_method_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::str_method_helper_addr() as i64);
+        let methodv = self.b.ins().iconst(types::I32, i64::from(method as u32));
+        let argcv = self.b.ins().iconst(types::I32, i64::from(argc));
+        let expectv = self.b.ins().iconst(types::I32, Self::tag(ret));
+        let call = self.b.ins().call_indirect(
+            sig,
+            helper,
+            &[self.frame_ptr, methodv, pin, argcv, expectv],
+        );
+        let status = self.b.inst_results(call)[0];
+
+        let ok_b = self.b.create_block();
+        let bad_b = self.b.create_block();
+        let is_ok = self.b.ins().icmp_imm(IntCC::Equal, status, 0);
+        self.b.ins().brif(is_ok, ok_b, &[], bad_b, &[]);
+
+        self.b.switch_to_block(bad_b);
+        let raised_b = self.b.create_block();
+        let not_raised_b = self.b.create_block();
+        let is_raised = self.b.ins().icmp_imm(IntCC::Equal, status, 1);
+        self.b
+            .ins()
+            .brif(is_raised, raised_b, &[], not_raised_b, &[]);
+        self.b.switch_to_block(raised_b);
+        self.emit_exit(pc, &snapshot, JitStatus::Raised);
+        self.b.switch_to_block(not_raised_b);
+        let boxed_b = self.b.create_block();
+        let reject_b = self.b.create_block();
+        let is_boxed = self.b.ins().icmp_imm(IntCC::Equal, status, 2);
+        self.b.ins().brif(is_boxed, boxed_b, &[], reject_b, &[]);
+        self.b.switch_to_block(boxed_b);
+        self.emit_exit(pc + 1, &snapshot, JitStatus::Deopt);
+        self.b.switch_to_block(reject_b);
+        self.emit_exit(pc, &snapshot_full, JitStatus::Deopt);
+
+        self.b.switch_to_block(ok_b);
+        let res = self
+            .b
+            .ins()
+            .load(Self::cl_ty(ret), trusted, self.frame_ptr, OFF_RET_BITS);
+        self.vstack.push((res, ret));
+    }
+
     /// The imported signature of the `wpjit_call_method` helper
     /// (RFC 0069 WS1, lazy).
     fn call_method_helper_sig(&mut self) -> SigRef {
@@ -1172,6 +1642,33 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.b.switch_to_block(cont);
         // `append` returns `None`, which the following `POP_TOP`
         // consumes — neither ever exists on the native stack.
+    }
+
+    /// RFC 0073 WS1 — `LIST_APPEND` inside an inlined comprehension:
+    /// identical to [`Self::emit_list_append`] except the accumulator
+    /// pin stays on the native stack (it is live across the whole
+    /// loop, consumed only after the loop exits).
+    fn emit_list_append_keep(&mut self, pc: u32) {
+        let trusted = MemFlags::trusted();
+        let snapshot = self.vstack.clone();
+        let (val, _) = self.pop();
+        let &(pin, _) = self.vstack.last().expect("comp append on empty stack");
+        self.b
+            .ins()
+            .store(trusted, val, self.frame_ptr, OFF_RET_BITS);
+        let sig = self.pin_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::list_append_helper_addr() as i64);
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, pin]);
+        let status = self.b.inst_results(call)[0];
+        let bad = self.b.ins().icmp_imm(IntCC::NotEqual, status, 0);
+        let cont = self.guard(bad, pc, &snapshot);
+        self.b.switch_to_block(cont);
     }
 
     /// RFC 0065 WS5 — pinned-instance attribute read via
@@ -1261,7 +1758,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let has_work = self.b.ins().icmp_imm(IntCC::NotEqual, pending, 0);
         self.b.ins().brif(has_work, exit_b, &[], cont_b, &[]);
         self.b.switch_to_block(exit_b);
-        self.emit_exit(header_pc, &[], JitStatus::Deopt);
+        // RFC 0073 WS1 — spill the live entry stack (empty for OSR
+        // headers; the accumulator for comprehension headers).
+        let snapshot = self.vstack.clone();
+        self.emit_exit(header_pc, &snapshot, JitStatus::Deopt);
 
         self.b.switch_to_block(cont_b);
     }
@@ -1384,13 +1884,24 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     ///   side effects): exit with [`JitStatus::Deopt`] at `pc + 1`; the
     ///   embedder pushes the parked result after rebuilding the stack.
     ///   The call is never re-executed.
-    fn emit_call_py(&mut self, token: u32, argc: u8, ret: JitType, pc: u32) {
+    /// RFC 0073 WS5 — the keyword form (`kwc > 0`) marshals the same
+    /// way with a compile-time slot shuffle: the top `kwc` stack values
+    /// are keyword values whose destination slots come from `perm`
+    /// (4 bits each, tier-1's `CallPyKwNames` packing). The analyzer
+    /// validated the filled set to be exactly `0..argc+kwc`, so the
+    /// helper still sees a plain positional prefix.
+    fn emit_call_py(&mut self, token: u32, argc: u8, kwc: u8, perm: u32, ret: JitType, pc: u32) {
         let trusted = MemFlags::trusted();
-        let n = argc as usize;
+        let n = argc as usize + kwc as usize;
         let base = self.vstack.len() - n;
         for (j, &(v, ty)) in self.vstack[base..].iter().enumerate() {
-            let voff = (j as i32) * 8;
-            let toff = (j as i32) * 4;
+            let dst = if j < argc as usize {
+                j
+            } else {
+                ((perm >> (4 * (j - argc as usize))) & 0xF) as usize
+            };
+            let voff = (dst as i32) * 8;
+            let toff = (dst as i32) * 4;
             // Store f64 lanes by value (same bit pattern, typed store).
             self.b.ins().store(trusted, v, self.call_args_base, voff);
             let tagv = self.b.ins().iconst(types::I32, Self::tag(ty));
@@ -1410,7 +1921,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .ins()
             .iconst(self.ptr_ty, runtime::call_py_helper_addr() as i64);
         let tokenv = self.b.ins().iconst(types::I32, i64::from(token));
-        let argcv = self.b.ins().iconst(types::I32, i64::from(argc));
+        // The helper receives the *filled* count — keyword values were
+        // shuffled into a contiguous positional prefix above.
+        let argcv = self.b.ins().iconst(types::I32, n as i64);
         let expect = self.b.ins().iconst(types::I32, Self::tag(ret));
         let call =
             self.b

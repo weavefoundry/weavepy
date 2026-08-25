@@ -154,6 +154,25 @@ pub enum TOp {
     /// `ret` lane (or a caller guard invalidated by the callee's side
     /// effects) deopts *after* the call with the result spilled.
     CallPy { token: u32, argc: u8, ret: JitType },
+    /// RFC 0073 WS5 — a Python-to-Python *keyword* call (`CALL_KW`)
+    /// through the same `wpjit_call_py` helper. Pops `argc + kwc`
+    /// values (positionals below, keyword values above, interpreter
+    /// stack order); the analyzer resolved each keyword to its
+    /// parameter slot at compile time, packed 4 bits per keyword in
+    /// `perm` (keyword value `j` → slot `(perm >> 4j) & 0xF`, tier-1's
+    /// `CallPyKwNames` encoding). The filled slots are validated to be
+    /// exactly `0..argc+kwc`, so lowering marshals a plain positional
+    /// prefix and the call helper needs no keyword awareness (the
+    /// trailing-defaults window binds any remaining tail). The names
+    /// tuple's `LOAD_CONST` is erased from the trace; it never exists
+    /// on the native stack. Exits mirror [`TOp::CallPy`].
+    CallPyKw {
+        token: u32,
+        argc: u8,
+        kwc: u8,
+        perm: u32,
+        ret: JitType,
+    },
     /// RFC 0061 WS5 — `BINARY_SUBSCR` on a pinned list: pops the `int`
     /// index and the pin reference, calls the registered
     /// `wpjit_list_get` helper (bounds + element-lane checked against
@@ -181,6 +200,15 @@ pub enum TOp {
     /// pinned shape; a non-zero status (defensive) deopts at this pc,
     /// where the interpreter re-executes the `CALL`.
     ListAppend,
+    /// RFC 0073 WS1 — `LIST_APPEND` inside an inlined comprehension
+    /// loop: pops the value (staged through `ret_bits` like
+    /// [`Self::ListAppend`]) but *keeps* the accumulator pin on the
+    /// stack — the comprehension's accumulator stays live across the
+    /// whole loop. The analyzer guarantees the value's lane matches
+    /// the accumulator's element lane; a non-zero status (defensive)
+    /// deopts at this pc, where the interpreter re-executes the
+    /// `LIST_APPEND`.
+    ListAppendKeep,
     /// RFC 0065 WS5 — `LOAD_ATTR` on a pinned instance: pops the pin
     /// reference, calls the registered `wpjit_attr_get` helper with
     /// `site` (an index into [`TFunc::attr_sites`]), and pushes the
@@ -260,6 +288,82 @@ pub enum TOp {
     /// deopts at this pc and the interpreter re-executes the subscript
     /// to raise exactly.
     BytesGetItem,
+    /// RFC 0073 WS2 — `d[k]` on a pinned exact `dict`: pops the key
+    /// (`key` lane: `Int` bits, or a `Str` pin) and the dict pin, and
+    /// calls the registered `wpjit_dict_get` helper. A hit whose value
+    /// matches the trained `val` lane pushes it (a fresh pin for
+    /// `Obj`); a *missing key* takes the `Raised` exit with the exact
+    /// `KeyError(key)` parked — missing keys are control flow in real
+    /// code, so they must not charge the deopt budget; a key/value
+    /// lane surprise deopts at this pc and the interpreter re-executes
+    /// the subscript generically.
+    DictGet { key: JitType, val: JitType },
+    /// RFC 0073 WS2 — `d[k] = v` on a pinned exact `dict`: pops the
+    /// key, the dict pin, and the value (staged through `ret_bits`,
+    /// interpreted per the trained `val` lane), and calls the
+    /// registered `wpjit_dict_set` helper — the interpreter's own
+    /// `dict_insert` chokepoint, so PEP 509 / watcher discipline is
+    /// identical. A displaced value that would run the prompt-reap
+    /// cascade deopts *before* the store (the `wpjit_attr_set`
+    /// discipline), as do active C-API dict watchers and any key-lane
+    /// surprise.
+    DictSet { key: JitType, val: JitType },
+    /// RFC 0073 WS2 — `k in d` / `k not in d` on a pinned exact
+    /// `dict`: pops the dict pin and the key, calls the registered
+    /// `wpjit_dict_contains` helper, and pushes the `bool` (inverted
+    /// when `negate`). A key-lane surprise deopts at this pc.
+    DictContains { negate: bool, key: JitType },
+    /// RFC 0073 WS2 — `len(d)` on a pinned exact `dict`: like
+    /// [`Self::ListLen`] but for the dict pin.
+    DictLen,
+    /// RFC 0073 WS3 — a burned-in native `str`-method call on a
+    /// pinned exact-`str` receiver: pops `argc` lane-typed arguments
+    /// (staged through the marshal buffer with per-slot tags) and the
+    /// receiver pin, and calls the registered `wpjit_str_method`
+    /// helper, which dispatches on the burned [`StrMethod`] to the
+    /// interpreter's own builtin body (identical validation, arity
+    /// wording, and raise behavior). `site` indexes
+    /// [`TFunc::str_method_sites`]. The result must wear the method's
+    /// static return lane (`Str`/`Int`/`Bool`/`ListObj`); a lane
+    /// surprise (e.g. a `WStr`-producing `join`) deopts at this pc —
+    /// `str` methods are pure, so the interpreter's re-execution is
+    /// exact. A raise takes the `Raised` exit.
+    CallStrMethod { site: u32, argc: u8, ret: JitType },
+    /// RFC 0073 WS3 — guarded exact-`str` `+` (the
+    /// `BINARY_OP_ADD_UNICODE` shape): pops two `str` pins, calls the
+    /// registered `wpjit_str_concat` helper (which allocates the
+    /// joined `Rc<str>`), and pushes the fresh pin. Cap pressure or a
+    /// pin surprise deopts at this pc and the interpreter re-executes
+    /// the add.
+    StrConcat,
+    /// RFC 0073 WS3 — `s[i]` on a pinned exact `str` with an `int`
+    /// index (the `SubscrStrInt` shape): O(1) byte indexing on an
+    /// ASCII payload, single-codepoint result pinned on the `Str`
+    /// lane. A non-ASCII receiver, an out-of-range index (the exact
+    /// `IndexError` comes from the interpreter's re-execution), or
+    /// cap pressure deopts at this pc.
+    StrGetItem,
+    /// RFC 0073 WS3 — `BUILD_STRING n` (the f-string join): pops `n`
+    /// `str` pins (staged through the marshal buffer), concatenates
+    /// them in order through the registered `wpjit_build_string`
+    /// helper, and pushes the fresh pin. Cap pressure deopts at this
+    /// pc.
+    BuildString { n: u32 },
+    /// RFC 0073 WS2 — an exact-`str` constant (`LOAD_CONST`): pushes a
+    /// pin of the materialized `str` through the registered
+    /// `wpjit_const_str` helper, which memoizes per `(activation,
+    /// constant index)` — a loop re-executing the load reuses one pin,
+    /// so the pin table stays bounded. Cap pressure deopts at this pc.
+    PushConstStr { idx: u32 },
+    /// RFC 0073 WS2 — `BUILD_MAP n` (`n` *pairs*): pops `2n`
+    /// interleaved key/value entries (staged through the marshal
+    /// buffer with per-slot tags), builds a fresh GC-tracked dict
+    /// through the registered `wpjit_build_map` helper, and pushes the
+    /// pinned dict. Keys must box to exact `str`/`int` (the analyzer
+    /// enforces the lanes; the helper re-validates). Cap pressure
+    /// deopts at this pc and the interpreter re-executes the
+    /// `BUILD_MAP`.
+    BuildMap { n: u32 },
     /// RFC 0071 WS4 — the opaque-iterator capture behind an erased
     /// `GET_ITER` whose operand rides the object lane: pops the pin
     /// and calls the registered `wpjit_get_iter` helper, which admits
@@ -269,18 +373,47 @@ pub enum TOp {
     /// pc with the operand spilled, and the interpreter executes the
     /// `GET_ITER` — and the whole loop — generically.
     IterCapture { iter_slot: u32 },
+    /// RFC 0073 WS2 — the dict-loop capture behind an erased
+    /// `GET_ITER` whose operand is a pinned exact `dict`: pops the
+    /// pin and calls the registered `wpjit_dict_iter_new` helper,
+    /// which materializes the *real* `DictKeys` iterator (the same
+    /// object the interpreter's `GET_ITER` builds — carrying the
+    /// creation-time length snapshot for the mutation guard) and
+    /// stores its fresh pin into `iter_slot`. The loop then rides
+    /// [`TTerm::ForIter`]: each step goes through the interpreter's
+    /// own checked iterator step, so a structural mutation raises the
+    /// exact CPython `RuntimeError`, and a deopt mid-loop re-inserts
+    /// the live iterator object itself. Cap pressure deopts at this
+    /// pc with the dict spilled.
+    DictIterNew { iter_slot: u32 },
     /// RFC 0071 WS4 — `BUILD_LIST k`: pops `n` same-lane elements
     /// (staged through the frame's marshal buffer) and pushes a fresh
     /// pinned list of the `elem` lane. `none_fill` covers the
     /// `[None, ...]` literal shape: nothing is popped (the `None`
     /// constants never reached the native stack) and the helper
-    /// writes `n` `None` elements. Pin-cap pressure deopts at this pc
-    /// and the interpreter re-executes the `BUILD_LIST`.
+    /// writes `n` `None` elements. RFC 0073 WS1 — `mixed` marks a
+    /// literal whose elements wear different lanes: per-element
+    /// [`SlotTag`](crate::SlotTag)s ride the marshal tag buffer, the
+    /// helper boxes each element by its own tag, and the result rides
+    /// the object-element lane (`elem` is `Obj`). Pin-cap pressure
+    /// deopts at this pc and the interpreter re-executes the
+    /// `BUILD_LIST`.
     BuildList {
         n: u32,
         elem: JitType,
         none_fill: bool,
+        mixed: bool,
     },
+    /// RFC 0073 WS1 — `BUILD_TUPLE k`: pops `n` elements (staged
+    /// through the marshal buffer with per-element tags, exactly like
+    /// a mixed `BuildList`) and pushes the fresh tuple as an
+    /// object-lane pin. Tuples are immutable, so no element-lane
+    /// tracking survives construction — and unlike lists, the
+    /// interpreter does not GC-track fresh tuples (refcount-only;
+    /// a tuple cannot close a cycle it wasn't born into). Pin-cap
+    /// pressure deopts at this pc and the interpreter re-executes
+    /// the `BUILD_TUPLE`.
+    BuildTuple { n: u32 },
     /// RFC 0071 WS4 — `list * int` (`BINARY_OP *` with a pinned-list
     /// lhs): pops the count and the pin, calls the registered
     /// `wpjit_list_repeat` helper (element `Arc`s are shared, exactly
@@ -453,6 +586,14 @@ pub enum ResolvedGlobal {
         min_args: u32,
         is_self: bool,
         ret: Option<JitType>,
+        /// RFC 0071 WS2 / RFC 0073 WS1 — the callee is a burned-in
+        /// *class constructor* (the call returns a fresh instance on
+        /// the object lane). Attribute sites on a local bound from
+        /// such a call may resolve their fingerprint against the
+        /// class's post-construction canonical shape when the local
+        /// has no live value to probe (RFC 0073 WS1 — the receiver
+        /// residue).
+        ctor: bool,
     },
     /// RFC 0069 WS2 — the canonical `math` module. Only consumable by
     /// an immediately following method-form attribute load of a
@@ -545,6 +686,266 @@ pub struct AttrSiteMeta {
     /// single-probe insert-or-replace (mirroring tier-1's
     /// `StoreAttrNewKey`) instead of an indexed overwrite.
     pub new_key: bool,
+    /// RFC 0073 WS1 — the site resolved against a class's
+    /// *post-construction canonical shape* instead of a live probe
+    /// (the receiver local had no value at compile time — it is
+    /// (re)bound from a burned-in constructor call). `(class global
+    /// name, field index in construction order)`: the embedder's
+    /// guard snapshot resolves the class by name and burns
+    /// `Indexed(field index)` with the class's `(rc_id,
+    /// attr_version)` — exactly the fingerprint the site would have
+    /// learned from a live instance one call later.
+    pub ctor: Option<(String, u32)>,
+    /// RFC 0073 WS1 — the *self-body* residue: the receiver's live
+    /// value is a fresh instance mid-construction (an `__init__`
+    /// compiled at entry), and this load follows same-body *new-key*
+    /// stores of the name. `Some(k)` = the name is the `k`-th
+    /// first-store in this body's store order on the same receiver
+    /// local; the guard snapshot burns `Indexed(k)` from the live
+    /// receiver's class, with new-key *store* eligibility standing in
+    /// for the (necessarily failing) load probe. The runtime helper
+    /// re-validates `(type_id, ver, key-at-index, lane)` per access,
+    /// so a body entered with a non-empty instance dict deopts.
+    pub self_ctor: Option<u32>,
+}
+
+/// RFC 0073 WS1 — where one canonical constructor field's value comes
+/// from, in a class whose `__init__` is the pure store prologue
+/// (`self.a = <param or const>` repeated, then `return None`). Lets a
+/// caller type `inst.a` from its *own* constructor-call argument
+/// lanes without a live instance to probe.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CtorFieldSrc {
+    /// The field holds the caller's positional argument `i`
+    /// (0-based, `self` excluded).
+    Param(u32),
+    /// The field holds a constant of this lane (`Obj` for `None`).
+    Lane(JitType),
+}
+
+/// RFC 0073 WS3 — the burnable native `str` method set. Exact `str`'s
+/// method table is immutable (builtin types reject attribute stores),
+/// so a site whose receiver wears the pinned `Str` lane can burn the
+/// method *statically* — no fingerprint, no per-call revalidation
+/// beyond the receiver pin itself. The VM helper dispatches on this
+/// discriminant to the same builtin bodies tier-1's
+/// `CallNativeMethod` invokes, so argument validation, arity wording,
+/// and raises are identical to the interpreter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum StrMethod {
+    Upper,
+    Lower,
+    Casefold,
+    Strip,
+    Lstrip,
+    Rstrip,
+    Replace,
+    Startswith,
+    Endswith,
+    Find,
+    Rfind,
+    Index,
+    Rindex,
+    Count,
+    Split,
+    Rsplit,
+    Join,
+    Title,
+    Capitalize,
+    Swapcase,
+    Zfill,
+    Removeprefix,
+    Removesuffix,
+    Isdigit,
+    Isnumeric,
+    Isdecimal,
+    Isalpha,
+    Isalnum,
+    Isspace,
+    Isupper,
+    Islower,
+    Istitle,
+    Isascii,
+    Isidentifier,
+    Isprintable,
+}
+
+impl StrMethod {
+    /// Every burnable method, in discriminant order (the helper's
+    /// decode table).
+    pub const ALL: [StrMethod; 35] = [
+        StrMethod::Upper,
+        StrMethod::Lower,
+        StrMethod::Casefold,
+        StrMethod::Strip,
+        StrMethod::Lstrip,
+        StrMethod::Rstrip,
+        StrMethod::Replace,
+        StrMethod::Startswith,
+        StrMethod::Endswith,
+        StrMethod::Find,
+        StrMethod::Rfind,
+        StrMethod::Index,
+        StrMethod::Rindex,
+        StrMethod::Count,
+        StrMethod::Split,
+        StrMethod::Rsplit,
+        StrMethod::Join,
+        StrMethod::Title,
+        StrMethod::Capitalize,
+        StrMethod::Swapcase,
+        StrMethod::Zfill,
+        StrMethod::Removeprefix,
+        StrMethod::Removesuffix,
+        StrMethod::Isdigit,
+        StrMethod::Isnumeric,
+        StrMethod::Isdecimal,
+        StrMethod::Isalpha,
+        StrMethod::Isalnum,
+        StrMethod::Isspace,
+        StrMethod::Isupper,
+        StrMethod::Islower,
+        StrMethod::Istitle,
+        StrMethod::Isascii,
+        StrMethod::Isidentifier,
+        StrMethod::Isprintable,
+    ];
+
+    /// Decode a `u32` discriminant the compiled code burned in.
+    #[must_use]
+    pub fn from_raw(v: u32) -> Option<StrMethod> {
+        Self::ALL.get(v as usize).copied()
+    }
+
+    /// Resolve a method name to its discriminant (the analyzer's
+    /// admission check).
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<StrMethod> {
+        Some(match name {
+            "upper" => StrMethod::Upper,
+            "lower" => StrMethod::Lower,
+            "casefold" => StrMethod::Casefold,
+            "strip" => StrMethod::Strip,
+            "lstrip" => StrMethod::Lstrip,
+            "rstrip" => StrMethod::Rstrip,
+            "replace" => StrMethod::Replace,
+            "startswith" => StrMethod::Startswith,
+            "endswith" => StrMethod::Endswith,
+            "find" => StrMethod::Find,
+            "rfind" => StrMethod::Rfind,
+            "index" => StrMethod::Index,
+            "rindex" => StrMethod::Rindex,
+            "count" => StrMethod::Count,
+            "split" => StrMethod::Split,
+            "rsplit" => StrMethod::Rsplit,
+            "join" => StrMethod::Join,
+            "title" => StrMethod::Title,
+            "capitalize" => StrMethod::Capitalize,
+            "swapcase" => StrMethod::Swapcase,
+            "zfill" => StrMethod::Zfill,
+            "removeprefix" => StrMethod::Removeprefix,
+            "removesuffix" => StrMethod::Removesuffix,
+            "isdigit" => StrMethod::Isdigit,
+            "isnumeric" => StrMethod::Isnumeric,
+            "isdecimal" => StrMethod::Isdecimal,
+            "isalpha" => StrMethod::Isalpha,
+            "isalnum" => StrMethod::Isalnum,
+            "isspace" => StrMethod::Isspace,
+            "isupper" => StrMethod::Isupper,
+            "islower" => StrMethod::Islower,
+            "istitle" => StrMethod::Istitle,
+            "isascii" => StrMethod::Isascii,
+            "isidentifier" => StrMethod::Isidentifier,
+            "isprintable" => StrMethod::Isprintable,
+            _ => return None,
+        })
+    }
+
+    /// The method name (for the deopt-span bound-method rebuild).
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            StrMethod::Upper => "upper",
+            StrMethod::Lower => "lower",
+            StrMethod::Casefold => "casefold",
+            StrMethod::Strip => "strip",
+            StrMethod::Lstrip => "lstrip",
+            StrMethod::Rstrip => "rstrip",
+            StrMethod::Replace => "replace",
+            StrMethod::Startswith => "startswith",
+            StrMethod::Endswith => "endswith",
+            StrMethod::Find => "find",
+            StrMethod::Rfind => "rfind",
+            StrMethod::Index => "index",
+            StrMethod::Rindex => "rindex",
+            StrMethod::Count => "count",
+            StrMethod::Split => "split",
+            StrMethod::Rsplit => "rsplit",
+            StrMethod::Join => "join",
+            StrMethod::Title => "title",
+            StrMethod::Capitalize => "capitalize",
+            StrMethod::Swapcase => "swapcase",
+            StrMethod::Zfill => "zfill",
+            StrMethod::Removeprefix => "removeprefix",
+            StrMethod::Removesuffix => "removesuffix",
+            StrMethod::Isdigit => "isdigit",
+            StrMethod::Isnumeric => "isnumeric",
+            StrMethod::Isdecimal => "isdecimal",
+            StrMethod::Isalpha => "isalpha",
+            StrMethod::Isalnum => "isalnum",
+            StrMethod::Isspace => "isspace",
+            StrMethod::Isupper => "isupper",
+            StrMethod::Islower => "islower",
+            StrMethod::Istitle => "istitle",
+            StrMethod::Isascii => "isascii",
+            StrMethod::Isidentifier => "isidentifier",
+            StrMethod::Isprintable => "isprintable",
+        }
+    }
+
+    /// The method's static return lane. `Str` results are validated
+    /// per call (a `WStr`-producing `join` deopts); `split`/`rsplit`
+    /// produce fresh lists of exact strings on the `ListObj` lane.
+    #[must_use]
+    pub fn ret(self) -> JitType {
+        match self {
+            StrMethod::Upper
+            | StrMethod::Lower
+            | StrMethod::Casefold
+            | StrMethod::Strip
+            | StrMethod::Lstrip
+            | StrMethod::Rstrip
+            | StrMethod::Replace
+            | StrMethod::Join
+            | StrMethod::Title
+            | StrMethod::Capitalize
+            | StrMethod::Swapcase
+            | StrMethod::Zfill
+            | StrMethod::Removeprefix
+            | StrMethod::Removesuffix => JitType::Str,
+            StrMethod::Find
+            | StrMethod::Rfind
+            | StrMethod::Index
+            | StrMethod::Rindex
+            | StrMethod::Count => JitType::Int,
+            StrMethod::Split | StrMethod::Rsplit => JitType::ListObj,
+            StrMethod::Startswith
+            | StrMethod::Endswith
+            | StrMethod::Isdigit
+            | StrMethod::Isnumeric
+            | StrMethod::Isdecimal
+            | StrMethod::Isalpha
+            | StrMethod::Isalnum
+            | StrMethod::Isspace
+            | StrMethod::Isupper
+            | StrMethod::Islower
+            | StrMethod::Istitle
+            | StrMethod::Isascii
+            | StrMethod::Isidentifier
+            | StrMethod::Isprintable => JitType::Bool,
+        }
+    }
 }
 
 /// RFC 0069 WS1 — one burned-in method-call site, indexed by
@@ -584,12 +985,21 @@ pub struct MathGuardMeta {
 /// One OSR entry point (RFC 0059 WS3b): a backward-jump target block
 /// with an empty boundary stack, enterable mid-frame via
 /// [`crate::JitFrame::entry_pc`].
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct OsrEntry {
     /// The bytecode pc of the block leader (the backward jump's target).
     pub pc: u32,
     /// The [`TBlock`] to enter.
     pub block: BlockId,
+    /// RFC 0073 WS1 — local slots that MAY be read before being
+    /// written on some native path from this entry (the complement of
+    /// per-entry definite assignment). An *object-lane* local that is
+    /// unbound in the entering activation is admissible iff its slot
+    /// is **not** listed here: the embedder seeds it as a pinned
+    /// `Unbound` (so a deopt writes back exactly the unbound state)
+    /// and the definite-assignment guarantee means native code writes
+    /// the slot before any read.
+    pub unassigned_reads: Vec<u32>,
 }
 
 /// Deopt-reconstruction metadata for one rewritten `range` loop: at any
@@ -606,6 +1016,14 @@ pub struct RangeLoopMeta {
     pub live_from: u32,
     /// The `END_FOR` pc; the iterator is dead from here on.
     pub live_to: u32,
+    /// RFC 0073 WS1 — the *interpreter-stack depth* at which the
+    /// rebuilt iterator sits. Statement-level loops keep the historic
+    /// bottom-of-stack position (their boundary stack is empty, so
+    /// this is just the enclosing-loop nesting depth); a loop inside
+    /// an inlined comprehension sits above the saved locals, the
+    /// accumulator, and whatever expression stack surrounds the
+    /// comprehension. Filled during emission.
+    pub interp_depth: u32,
 }
 
 /// RFC 0071 WS4 — deopt-reconstruction metadata for one rewritten
@@ -623,6 +1041,9 @@ pub struct ListLoopMeta {
     pub live_from: u32,
     /// The `END_FOR` pc; the iterator is dead from here on.
     pub live_to: u32,
+    /// RFC 0073 WS1 — interpreter-stack depth of the rebuilt
+    /// iterator (see [`RangeLoopMeta::interp_depth`]).
+    pub interp_depth: u32,
 }
 
 /// RFC 0071 WS4 — deopt-reconstruction metadata for one rewritten
@@ -639,6 +1060,29 @@ pub struct IterLoopMeta {
     pub live_from: u32,
     /// The `END_FOR` pc; the iterator is dead from here on.
     pub live_to: u32,
+    /// RFC 0073 WS1 — interpreter-stack depth of the rebuilt
+    /// iterator (see [`RangeLoopMeta::interp_depth`]).
+    pub interp_depth: u32,
+}
+
+/// RFC 0073 WS1 — deopt-reconstruction metadata for one inlined
+/// comprehension's *saved target local*: the `LOAD_FAST_AND_CLEAR`
+/// prologue parked the local's prior value on the interpreter stack
+/// beneath the accumulator, and the analyzer admitted the shape only
+/// after proving that value is `Unbound` (the target slot is stored
+/// nowhere outside recognized comprehension loops). At any deopt pc in
+/// `[live_from, live_to)` the embedder re-inserts `Object::Unbound` at
+/// `interp_depth`, and the interpreter's own epilogue (or its
+/// exception handler) performs the restore exactly as if the loop had
+/// run interpreted from the start.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CompSavedMeta {
+    /// The `LOAD_FAST_AND_CLEAR` pc (span start).
+    pub live_from: u32,
+    /// The epilogue's restoring `STORE_FAST` pc (span end, exclusive).
+    pub live_to: u32,
+    /// Interpreter-stack depth of the parked `Unbound`.
+    pub interp_depth: u32,
 }
 
 /// A fully analyzed, JITable function body.
@@ -673,6 +1117,11 @@ pub struct TFunc {
     /// `live_from`, for deopt stack reconstruction (interleaved with
     /// the other loop kinds by `live_from` when rebuilding).
     pub iter_loops: Vec<IterLoopMeta>,
+    /// RFC 0073 WS1 — inlined-comprehension saved-local spans: at any
+    /// deopt pc inside a span, `Object::Unbound` re-inserts at the
+    /// recorded interpreter depth (the parked prior value of the
+    /// comprehension target, proven unbound at admission).
+    pub comp_saved: Vec<CompSavedMeta>,
     /// Erased Python callees (RFC 0059 WS3), ascending `live_from`, for
     /// deopt stack reconstruction during argument computation.
     pub callee_spans: Vec<CalleeSpanMeta>,
@@ -693,6 +1142,15 @@ pub struct TFunc {
     /// [`TOp::CallMethod`]'s `token`. The embedder's method table is
     /// parallel to this.
     pub method_sites: Vec<MethodSiteMeta>,
+    /// RFC 0073 WS3 — burned-in native `str`-method sites, indexed by
+    /// [`TOp::CallStrMethod`]'s `site` (deduplicated by method, in
+    /// first-use order). Static — no embedder table.
+    pub str_method_sites: Vec<StrMethod>,
+    /// RFC 0073 WS3 — erased `str`-method receivers (the
+    /// [`MethodSpanMeta`] discipline; `token` indexes
+    /// [`Self::str_method_sites`], and the bound method rebuilds by
+    /// name on the pinned `str`).
+    pub str_method_spans: Vec<MethodSpanMeta>,
     /// RFC 0069 WS2 — burned-in math-intrinsic guards, one per
     /// distinct `(name, attr)` pair, in first-use order.
     pub math_guards: Vec<MathGuardMeta>,
@@ -744,6 +1202,7 @@ impl TOp {
                 | TOp::IntToFloatTos { guarded: true }
                 | TOp::IntToFloatSecond { guarded: true }
                 | TOp::CallPy { .. }
+                | TOp::CallPyKw { .. }
                 | TOp::CallMethod { .. }
                 | TOp::MathIntrinsic(_)
                 | TOp::FloatArith(ArithKind::FloorDiv | ArithKind::Mod)
@@ -751,6 +1210,7 @@ impl TOp {
                 | TOp::ListSet
                 | TOp::ListLen
                 | TOp::ListAppend
+                | TOp::ListAppendKeep
                 | TOp::AttrGet { .. }
                 | TOp::AttrSet { .. }
                 | TOp::GuardNotNone
@@ -758,8 +1218,20 @@ impl TOp {
                 | TOp::StrLen
                 | TOp::BytesLen
                 | TOp::BytesGetItem
+                | TOp::DictGet { .. }
+                | TOp::DictSet { .. }
+                | TOp::DictContains { .. }
+                | TOp::DictLen
+                | TOp::BuildMap { .. }
+                | TOp::PushConstStr { .. }
+                | TOp::StrConcat
+                | TOp::StrGetItem
+                | TOp::BuildString { .. }
+                | TOp::CallStrMethod { .. }
                 | TOp::IterCapture { .. }
+                | TOp::DictIterNew { .. }
                 | TOp::BuildList { .. }
+                | TOp::BuildTuple { .. }
                 | TOp::ListRepeat
                 | TOp::ListSlice { .. }
         )

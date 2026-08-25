@@ -61,6 +61,14 @@ pub enum JitType {
     /// `Unknown`); same discipline as [`JitType::Str`]. `BytesGetItem`
     /// reads bytes as `Int`s through the registered helper.
     Bytes,
+    /// RFC 0073 WS2 — a *pinned* exact `dict` (subclasses stay
+    /// `Unknown`). Unlike the list lanes the key/value lanes are not
+    /// part of the type: they are burned *per access site* into the
+    /// dict ops (`DictGet`/`DictSet`/`DictContains`) from the
+    /// embedder's shape probe, and every helper re-validates the
+    /// runtime key/value lanes per access and deopts on any surprise —
+    /// the same discipline as the per-site `AttrGet` lanes.
+    Dict,
     /// Anything the JIT can't represent. Its presence as an operand to a
     /// supported opcode makes the enclosing region non-JITable.
     Unknown,
@@ -109,6 +117,7 @@ impl JitType {
                 | JitType::Obj
                 | JitType::Str
                 | JitType::Bytes
+                | JitType::Dict
         )
     }
 

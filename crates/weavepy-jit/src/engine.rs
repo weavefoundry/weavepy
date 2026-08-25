@@ -18,9 +18,9 @@ use cranelift_module::{Linkage, Module};
 
 use crate::analyze::{JitVerdict, Probes};
 use crate::ir::{
-    ArithKind, AttrSiteMeta, CalleeSpanMeta, GlobalGuard, IterLoopMeta, ListLoopMeta, MathFunc,
-    MathGuardMeta, MethodSiteMeta, MethodSpanMeta, OsrEntry, RangeLoopMeta, ResolvedGlobal, TFunc,
-    TOp,
+    ArithKind, AttrSiteMeta, CalleeSpanMeta, CompSavedMeta, GlobalGuard, IterLoopMeta,
+    ListLoopMeta, MathFunc, MathGuardMeta, MethodSiteMeta, MethodSpanMeta, OsrEntry, RangeLoopMeta,
+    ResolvedGlobal, StrMethod, TFunc, TOp,
 };
 use crate::lower::build_function;
 use crate::runtime::{self, JitFrame, JitStatus};
@@ -58,6 +58,9 @@ pub struct CompiledFrame {
     /// `live_from` (the pinned iterator object rebuilds directly onto
     /// the interpreter stack).
     pub iter_loops: Vec<IterLoopMeta>,
+    /// RFC 0073 WS1 — inlined-comprehension saved-target spans (the
+    /// parked `Unbound` re-inserted at its depth on a mid-span deopt).
+    pub comp_saved: Vec<CompSavedMeta>,
     /// Erased Python callees (RFC 0059 WS3), for rebuilding the callee
     /// object on the interpreter stack after a mid-arguments deopt.
     pub callee_spans: Vec<CalleeSpanMeta>,
@@ -72,6 +75,12 @@ pub struct CompiledFrame {
     /// `wpjit_call_method` token; the embedder keeps its method table
     /// parallel to this.
     pub method_sites: Vec<MethodSiteMeta>,
+    /// RFC 0073 WS3 — burned-in native `str`-method sites (static —
+    /// no embedder table).
+    pub str_method_sites: Vec<StrMethod>,
+    /// RFC 0073 WS3 — erased `str`-method receivers (`token` indexes
+    /// [`Self::str_method_sites`]).
+    pub str_method_spans: Vec<MethodSpanMeta>,
     /// RFC 0069 WS2 — burned-in math-intrinsic guards; the embedder
     /// snapshots the resolved `(module, function)` pair per guard and
     /// re-validates it at entry and per poll stride.
@@ -336,11 +345,14 @@ impl JitEngine {
             range_loops: tfunc.range_loops.clone(),
             list_loops: tfunc.list_loops.clone(),
             iter_loops: tfunc.iter_loops.clone(),
+            comp_saved: tfunc.comp_saved.clone(),
             callee_spans: tfunc.callee_spans.clone(),
             len_spans: tfunc.len_spans.clone(),
             method_spans: tfunc.method_spans.clone(),
             attr_sites: tfunc.attr_sites.clone(),
             method_sites: tfunc.method_sites.clone(),
+            str_method_sites: tfunc.str_method_sites.clone(),
+            str_method_spans: tfunc.str_method_spans.clone(),
             math_guards: tfunc.math_guards.clone(),
             math_spans: tfunc.math_spans.clone(),
             osr_entries: tfunc.osr_entries.clone(),
