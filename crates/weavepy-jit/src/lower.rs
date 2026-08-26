@@ -65,6 +65,9 @@ struct Lowerer<'a, 'b> {
     call_tags_base: Value,
     /// Imported signature of the `wpjit_call_py` helper (lazy).
     call_sig: Option<SigRef>,
+    /// RFC 0074 WS2 — imported signature of the `wpjit_call_dyn`
+    /// helper (lazy).
+    call_dyn_sig: Option<SigRef>,
     /// RFC 0069 WS1 — imported signature of the `wpjit_call_method`
     /// helper (lazy).
     call_method_sig: Option<SigRef>,
@@ -116,6 +119,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             call_args_base: dummy,
             call_tags_base: dummy,
             call_sig: None,
+            call_dyn_sig: None,
             call_method_sig: None,
             math_unary_sig: None,
             math_binary_sig: None,
@@ -173,18 +177,24 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // RFC 0071 WS4 — `BuildList` stages its elements through the
         // same marshal buffer as call arguments, so a call-free
         // function that builds lists still needs the base loaded.
+        // RFC 0074 — the opaque-call and generic-store lanes stage
+        // through it too, and the pair-loop terminator reads its
+        // second element back from it.
         let stages_elements = self.tfunc.blocks.iter().any(|tb| {
-            tb.stmts.iter().any(|s| {
-                matches!(
-                    s.op,
-                    TOp::BuildList {
-                        none_fill: false,
-                        ..
-                    } | TOp::BuildTuple { .. }
-                        | TOp::BuildMap { .. }
-                        | TOp::BuildString { .. }
-                )
-            })
+            matches!(tb.term, TTerm::ForIterPair { .. })
+                || tb.stmts.iter().any(|s| {
+                    matches!(
+                        s.op,
+                        TOp::BuildList {
+                            none_fill: false,
+                            ..
+                        } | TOp::BuildTuple { .. }
+                            | TOp::BuildMap { .. }
+                            | TOp::BuildString { .. }
+                            | TOp::CallDyn { .. }
+                            | TOp::DynAttrSet { .. }
+                    )
+                })
         });
         if !self.tfunc.callee_spans.is_empty()
             || !self.tfunc.method_sites.is_empty()
@@ -320,8 +330,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 .map(|e| e.pc)
             {
                 self.emit_poll(cd_var, header_pc);
-            } else if let TTerm::ForList { pc, .. } | TTerm::ForIter { pc, .. } =
-                self.tfunc.blocks[bi].term
+            } else if let TTerm::ForList { pc, .. }
+            | TTerm::ForIter { pc, .. }
+            | TTerm::ForIterPair { pc, .. } = self.tfunc.blocks[bi].term
             {
                 // RFC 0073 WS1 — a comprehension loop header is not
                 // OSR-enterable (its boundary stack is non-empty), but
@@ -540,6 +551,99 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 self.b.switch_to_block(deopt_b);
                 self.emit_exit(pc, &snapshot, JitStatus::Deopt);
             }
+            // RFC 0074 WS3 — the tuple-target step: the registered
+            // `wpjit_iter_next_pair` helper advances the pinned
+            // iterator through the interpreter core (it *runs
+            // Python*) and unpacks the yielded 2-sequence. `0` →
+            // elements in `ret_bits` / `call_args[0]` (store into
+            // both loop variables, enter the body); `1` → exhausted;
+            // `2` → deopt at the header (nothing consumed); `3` → the
+            // consumed element is not a 2-sequence in the compiled
+            // lanes: deopt at the erased `UNPACK_SEQUENCE`'s pc with
+            // the raw element (pinned, `ret_bits`) spilled on top;
+            // `4` → raise at the header pc.
+            TTerm::ForIterPair {
+                iter_slot,
+                var1_slot,
+                var2_slot,
+                elem1,
+                elem2,
+                pc,
+                store_pc,
+                body,
+                exit,
+            } => {
+                let trusted = MemFlags::trusted();
+                let iter_var = self.vars[iter_slot as usize].expect("managed iter slot");
+                let var1 = self.vars[var1_slot as usize].expect("managed loop var");
+                let var2 = self.vars[var2_slot as usize].expect("managed loop var");
+                let iter = self.b.use_var(iter_var);
+                let snapshot = self.vstack.clone();
+                let args = self.block_args();
+                let sig = self.quad_helper_sig();
+                let helper = self
+                    .b
+                    .ins()
+                    .iconst(self.ptr_ty, runtime::iter_next_pair_helper_addr() as i64);
+                let disc = |e: JitType| {
+                    if e == JitType::Str {
+                        runtime::ITER_ELEM_STR
+                    } else {
+                        Self::tag(e)
+                    }
+                };
+                let tag1 = self.b.ins().iconst(types::I64, disc(elem1));
+                let tag2 = self.b.ins().iconst(types::I64, disc(elem2));
+                let call =
+                    self.b
+                        .ins()
+                        .call_indirect(sig, helper, &[self.frame_ptr, iter, tag1, tag2]);
+                let status = self.b.inst_results(call)[0];
+                let got_b = self.b.create_block();
+                let rest_b = self.b.create_block();
+                let is_got = self.b.ins().icmp_imm(IntCC::Equal, status, 0);
+                self.b.ins().brif(is_got, got_b, &[], rest_b, &[]);
+                self.b.switch_to_block(got_b);
+                let e1 =
+                    self.b
+                        .ins()
+                        .load(Self::cl_ty(elem1), trusted, self.frame_ptr, OFF_RET_BITS);
+                self.b.def_var(var1, e1);
+                let e2 = self
+                    .b
+                    .ins()
+                    .load(Self::cl_ty(elem2), trusted, self.call_args_base, 0);
+                self.b.def_var(var2, e2);
+                let bb = self.cl_blocks[body];
+                self.b.ins().jump(bb, &args);
+                self.b.switch_to_block(rest_b);
+                let more_b = self.b.create_block();
+                let eb = self.cl_blocks[exit];
+                let is_done = self.b.ins().icmp_imm(IntCC::Equal, status, 1);
+                self.b.ins().brif(is_done, eb, &args, more_b, &[]);
+                self.b.switch_to_block(more_b);
+                let lane_b = self.b.create_block();
+                let hdr_b = self.b.create_block();
+                let is_lane = self.b.ins().icmp_imm(IntCC::Equal, status, 3);
+                self.b.ins().brif(is_lane, lane_b, &[], hdr_b, &[]);
+                self.b.switch_to_block(lane_b);
+                let elem_pin = self
+                    .b
+                    .ins()
+                    .load(types::I64, trusted, self.frame_ptr, OFF_RET_BITS);
+                let mut lane_spill = snapshot.clone();
+                lane_spill.push((elem_pin, JitType::Obj));
+                self.emit_exit(store_pc, &lane_spill, JitStatus::Deopt);
+                self.b.switch_to_block(hdr_b);
+                let raise_b = self.b.create_block();
+                let deopt_b = self.b.create_block();
+                let is_raise = self.b.ins().icmp_imm(IntCC::Equal, status, 4);
+                self.b.ins().brif(is_raise, raise_b, &[], deopt_b, &[]);
+                self.b.switch_to_block(raise_b);
+                self.emit_exit(pc, &snapshot, JitStatus::Raised);
+                self.b.switch_to_block(deopt_b);
+                self.emit_exit(pc, &snapshot, JitStatus::Deopt);
+            }
             // RFC 0070 WS2 — a yield is an unconditional deopt-shaped
             // exit parked *at* the `YIELD_VALUE` pc: the full stack
             // (yielded value on top) spills, and the embedder resumes
@@ -711,7 +815,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             TOp::DictSet { key, val } => self.emit_dict_set(key, val, stmt.pc),
             TOp::DictContains { negate, key } => self.emit_dict_contains(negate, key, stmt.pc),
             TOp::DictLen => self.emit_pin_len(runtime::dict_len_helper_addr(), stmt.pc),
-            TOp::IterCapture { iter_slot } => self.emit_iter_capture(iter_slot, stmt.pc),
+            TOp::IterCapture {
+                iter_slot,
+                materialize,
+            } => {
+                if materialize {
+                    self.emit_iter_new(iter_slot, stmt.pc);
+                } else {
+                    self.emit_iter_capture(iter_slot, stmt.pc);
+                }
+            }
             TOp::DictIterNew { iter_slot } => self.emit_dict_iter_new(iter_slot, stmt.pc),
             TOp::BuildList {
                 n,
@@ -729,7 +842,388 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             TOp::BuildString { n } => self.emit_build_string(n, stmt.pc),
             TOp::ListRepeat => self.emit_list_repeat(stmt.pc),
             TOp::ListSlice { start, stop } => self.emit_list_slice(start, stop, stmt.pc),
+            TOp::PushGlobalObj { token, lane } => self.emit_push_global_obj(token, lane, stmt.pc),
+            TOp::CallDyn { argc, kwc, names } => self.emit_call_dyn(argc, kwc, names, stmt.pc),
+            TOp::DynAttrGet { name } => self.emit_dyn_attr_get(name, stmt.pc),
+            TOp::DynAttrSet { name } => self.emit_dyn_attr_set(name, stmt.pc),
+            TOp::StrMod => self.emit_str_mod(stmt.pc),
+            TOp::StrSlice { start, stop } => self.emit_str_slice(start, stop, stmt.pc),
         }
+    }
+
+    /// RFC 0074 WS1 — an identity-guarded obj-global pin via the
+    /// memoizing `wpjit_global_obj` helper. Negative status deopts
+    /// (cap pressure; a lane surprise is impossible while the
+    /// identity guard holds) and the interpreter re-executes the
+    /// `LOAD_GLOBAL`.
+    fn emit_push_global_obj(&mut self, token: u32, lane: JitType, pc: u32) {
+        let snapshot = self.vstack.clone();
+        let sig = self.pin_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::global_obj_helper_addr() as i64);
+        let tokenv = self.b.ins().iconst(types::I64, i64::from(token));
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, tokenv]);
+        let res = self.b.inst_results(call)[0];
+        let bad = self.b.ins().icmp_imm(IntCC::SignedLessThan, res, 0);
+        let cont = self.guard(bad, pc, &snapshot);
+        self.b.switch_to_block(cont);
+        self.vstack.push((res, lane));
+    }
+
+    /// RFC 0074 WS3 — the *generic* iterator capture (the
+    /// materializing arm of `IterCapture`): `wpjit_iter_new` builds
+    /// `iter(x)` through the interpreter core and answers the fresh
+    /// iterator's pin, which lands in the iter slot. A negative
+    /// status deopts with the iterable spilled and the interpreter
+    /// executes the `GET_ITER` — and the loop — generically.
+    fn emit_iter_new(&mut self, iter_slot: u32, pc: u32) {
+        let snapshot = self.vstack.clone();
+        let (pin, _) = self.pop();
+        let sig = self.pin_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::iter_new_helper_addr() as i64);
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, pin]);
+        let res = self.b.inst_results(call)[0];
+        let bad = self.b.ins().icmp_imm(IntCC::SignedLessThan, res, 0);
+        let cont = self.guard(bad, pc, &snapshot);
+        self.b.switch_to_block(cont);
+        let iter_var = self.vars[iter_slot as usize].expect("managed iter slot");
+        self.b.def_var(iter_var, res);
+    }
+
+    /// RFC 0074 WS2 — the opaque-call lane via `wpjit_call_dyn`:
+    /// marshal the `argc + kwc` tag-typed values, pop the callee pin,
+    /// and dispatch on the returned [`crate::runtime::CallStatus`] —
+    /// `Ok` pushes the pinned object-lane result and native execution
+    /// continues; `Raised` exits at the call pc; `Boxed` deopts at
+    /// `pc + 1` with the parked result (never re-executed); `Reject`
+    /// (defensive pin miss) deopts at the call pc with the callee and
+    /// arguments spilled, so the interpreter re-executes the call.
+    fn emit_call_dyn(&mut self, argc: u8, kwc: u8, names: u32, pc: u32) {
+        let trusted = MemFlags::trusted();
+        let n = argc as usize + kwc as usize;
+        // Snapshot *including* callee + args for the Reject exit.
+        let snapshot_full = self.vstack.clone();
+        let base = self.vstack.len() - n;
+        for (j, &(v, ty)) in self.vstack[base..].iter().enumerate() {
+            let voff = (j as i32) * 8;
+            let toff = (j as i32) * 4;
+            self.b.ins().store(trusted, v, self.call_args_base, voff);
+            let tagv = self.b.ins().iconst(types::I32, Self::tag(ty));
+            self.b.ins().store(trusted, tagv, self.call_tags_base, toff);
+        }
+        self.vstack.truncate(base);
+        let (callee, _) = self.pop();
+        let snapshot = self.vstack.clone();
+
+        self.writeback_locals();
+
+        let sig = self.call_dyn_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::call_dyn_helper_addr() as i64);
+        let argcv = self.b.ins().iconst(types::I32, i64::from(argc));
+        let kwcv = self.b.ins().iconst(types::I32, i64::from(kwc));
+        let namesv = self.b.ins().iconst(types::I32, i64::from(names));
+        let call =
+            self.b
+                .ins()
+                .call_indirect(sig, helper, &[self.frame_ptr, callee, argcv, kwcv, namesv]);
+        let status = self.b.inst_results(call)[0];
+
+        let ok_b = self.b.create_block();
+        let bad_b = self.b.create_block();
+        let is_ok = self.b.ins().icmp_imm(IntCC::Equal, status, 0);
+        self.b.ins().brif(is_ok, ok_b, &[], bad_b, &[]);
+
+        self.b.switch_to_block(bad_b);
+        let raised_b = self.b.create_block();
+        let not_raised_b = self.b.create_block();
+        let is_raised = self.b.ins().icmp_imm(IntCC::Equal, status, 1);
+        self.b
+            .ins()
+            .brif(is_raised, raised_b, &[], not_raised_b, &[]);
+        self.b.switch_to_block(raised_b);
+        self.emit_exit(pc, &snapshot, JitStatus::Raised);
+        self.b.switch_to_block(not_raised_b);
+        let boxed_b = self.b.create_block();
+        let reject_b = self.b.create_block();
+        let is_boxed = self.b.ins().icmp_imm(IntCC::Equal, status, 2);
+        self.b.ins().brif(is_boxed, boxed_b, &[], reject_b, &[]);
+        self.b.switch_to_block(boxed_b);
+        self.emit_exit(pc + 1, &snapshot, JitStatus::Deopt);
+        self.b.switch_to_block(reject_b);
+        self.emit_exit(pc, &snapshot_full, JitStatus::Deopt);
+
+        self.b.switch_to_block(ok_b);
+        let res = self
+            .b
+            .ins()
+            .load(types::I64, trusted, self.frame_ptr, OFF_RET_BITS);
+        self.vstack.push((res, JitType::Obj));
+    }
+
+    /// The imported signature of the `wpjit_call_dyn` helper (RFC
+    /// 0074 WS2, lazy).
+    fn call_dyn_helper_sig(&mut self) -> SigRef {
+        if let Some(sig) = self.call_dyn_sig {
+            return sig;
+        }
+        let mut sig = Signature::new(self.b.func.signature.call_conv);
+        sig.params.push(AbiParam::new(self.ptr_ty)); // frame
+        sig.params.push(AbiParam::new(types::I64)); // callee pin
+        sig.params.push(AbiParam::new(types::I32)); // argc
+        sig.params.push(AbiParam::new(types::I32)); // kwc
+        sig.params.push(AbiParam::new(types::I32)); // names const idx
+        sig.returns.push(AbiParam::new(types::I64)); // CallStatus
+        let r = self.b.import_signature(sig);
+        self.call_dyn_sig = Some(r);
+        r
+    }
+
+    /// RFC 0074 WS2/WS4 — the eager generic attribute load via
+    /// `wpjit_dyn_attr_get`: pop the receiver pin, run the
+    /// interpreter's exact lookup, push the fresh object-lane pin.
+    /// `1` = raised at this pc (receiver consumed); `2` = completed
+    /// but a guard was invalidated / cap pressure — deopt at the
+    /// *next* pc with the parked result (never re-executed); `3` =
+    /// rejected before any Python ran — deopt at this pc with the
+    /// receiver spilled and re-execute generically.
+    fn emit_dyn_attr_get(&mut self, name: u32, pc: u32) {
+        let trusted = MemFlags::trusted();
+        let snapshot_full = self.vstack.clone();
+        let (pin, _) = self.pop();
+        let snapshot = self.vstack.clone();
+
+        self.writeback_locals();
+
+        let sig = self.list_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::dyn_attr_get_helper_addr() as i64);
+        let namev = self.b.ins().iconst(types::I64, i64::from(name));
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, pin, namev]);
+        let status = self.b.inst_results(call)[0];
+
+        let ok_b = self.b.create_block();
+        let bad_b = self.b.create_block();
+        let is_ok = self.b.ins().icmp_imm(IntCC::Equal, status, 0);
+        self.b.ins().brif(is_ok, ok_b, &[], bad_b, &[]);
+
+        self.b.switch_to_block(bad_b);
+        let raised_b = self.b.create_block();
+        let not_raised_b = self.b.create_block();
+        let is_raised = self.b.ins().icmp_imm(IntCC::Equal, status, 1);
+        self.b
+            .ins()
+            .brif(is_raised, raised_b, &[], not_raised_b, &[]);
+        self.b.switch_to_block(raised_b);
+        self.emit_exit(pc, &snapshot, JitStatus::Raised);
+        self.b.switch_to_block(not_raised_b);
+        let boxed_b = self.b.create_block();
+        let reject_b = self.b.create_block();
+        let is_boxed = self.b.ins().icmp_imm(IntCC::Equal, status, 2);
+        self.b.ins().brif(is_boxed, boxed_b, &[], reject_b, &[]);
+        self.b.switch_to_block(boxed_b);
+        self.emit_exit(pc + 1, &snapshot, JitStatus::Deopt);
+        self.b.switch_to_block(reject_b);
+        self.emit_exit(pc, &snapshot_full, JitStatus::Deopt);
+
+        self.b.switch_to_block(ok_b);
+        let res = self
+            .b
+            .ins()
+            .load(types::I64, trusted, self.frame_ptr, OFF_RET_BITS);
+        self.vstack.push((res, JitType::Obj));
+    }
+
+    /// RFC 0074 WS4 — the eager generic attribute store via
+    /// `wpjit_dyn_attr_set`: the value (below the receiver) is staged
+    /// tag-typed in `call_args[0]` / `call_tags[0]`; the receiver pin
+    /// pops natively. Status protocol as [`Self::emit_dyn_attr_get`]
+    /// (no result on ok; `Boxed` means the store *completed* with
+    /// invalidated guards — deopt at the next pc, never re-executed).
+    fn emit_dyn_attr_set(&mut self, name: u32, pc: u32) {
+        let trusted = MemFlags::trusted();
+        let snapshot_full = self.vstack.clone();
+        let (pin, _) = self.pop();
+        let (val, vty) = self.pop();
+        self.b.ins().store(trusted, val, self.call_args_base, 0);
+        let tagv = self.b.ins().iconst(types::I32, Self::tag(vty));
+        self.b.ins().store(trusted, tagv, self.call_tags_base, 0);
+        let snapshot = self.vstack.clone();
+
+        self.writeback_locals();
+
+        let sig = self.list_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::dyn_attr_set_helper_addr() as i64);
+        let namev = self.b.ins().iconst(types::I64, i64::from(name));
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, pin, namev]);
+        let status = self.b.inst_results(call)[0];
+
+        let ok_b = self.b.create_block();
+        let bad_b = self.b.create_block();
+        let is_ok = self.b.ins().icmp_imm(IntCC::Equal, status, 0);
+        self.b.ins().brif(is_ok, ok_b, &[], bad_b, &[]);
+
+        self.b.switch_to_block(bad_b);
+        let raised_b = self.b.create_block();
+        let not_raised_b = self.b.create_block();
+        let is_raised = self.b.ins().icmp_imm(IntCC::Equal, status, 1);
+        self.b
+            .ins()
+            .brif(is_raised, raised_b, &[], not_raised_b, &[]);
+        self.b.switch_to_block(raised_b);
+        self.emit_exit(pc, &snapshot, JitStatus::Raised);
+        self.b.switch_to_block(not_raised_b);
+        let boxed_b = self.b.create_block();
+        let reject_b = self.b.create_block();
+        let is_boxed = self.b.ins().icmp_imm(IntCC::Equal, status, 2);
+        self.b.ins().brif(is_boxed, boxed_b, &[], reject_b, &[]);
+        self.b.switch_to_block(boxed_b);
+        self.emit_exit(pc + 1, &snapshot, JitStatus::Deopt);
+        self.b.switch_to_block(reject_b);
+        self.emit_exit(pc, &snapshot_full, JitStatus::Deopt);
+
+        self.b.switch_to_block(ok_b);
+    }
+
+    /// RFC 0074 WS5 — `str % x` via `wpjit_str_mod`: pop the rhs (any
+    /// lane, passed with its tag) and the lhs pin; on ok push the
+    /// fresh exact-`str` pin. `1` = raised at this pc; `2` = the
+    /// format *completed* but the result surprised (or guards
+    /// invalidated / cap pressure) — deopt at the next pc with the
+    /// parked result, formatting side effects never re-run; `3` =
+    /// rejected before running — deopt at this pc and re-execute.
+    fn emit_str_mod(&mut self, pc: u32) {
+        let trusted = MemFlags::trusted();
+        let snapshot_full = self.vstack.clone();
+        let (rhs, rty) = self.pop();
+        let (lhs, _) = self.pop();
+        let snapshot = self.vstack.clone();
+
+        self.writeback_locals();
+
+        let sig = self.quad_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::str_mod_helper_addr() as i64);
+        // An f64 rhs travels through an i64 parameter: bitcast.
+        let rhs_bits = if rty == JitType::Float {
+            self.b.ins().bitcast(types::I64, MemFlags::new(), rhs)
+        } else {
+            rhs
+        };
+        let tagv = self.b.ins().iconst(types::I64, Self::tag(rty));
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, lhs, rhs_bits, tagv]);
+        let status = self.b.inst_results(call)[0];
+
+        let ok_b = self.b.create_block();
+        let bad_b = self.b.create_block();
+        let is_ok = self.b.ins().icmp_imm(IntCC::Equal, status, 0);
+        self.b.ins().brif(is_ok, ok_b, &[], bad_b, &[]);
+
+        self.b.switch_to_block(bad_b);
+        let raised_b = self.b.create_block();
+        let not_raised_b = self.b.create_block();
+        let is_raised = self.b.ins().icmp_imm(IntCC::Equal, status, 1);
+        self.b
+            .ins()
+            .brif(is_raised, raised_b, &[], not_raised_b, &[]);
+        self.b.switch_to_block(raised_b);
+        self.emit_exit(pc, &snapshot, JitStatus::Raised);
+        self.b.switch_to_block(not_raised_b);
+        let boxed_b = self.b.create_block();
+        let reject_b = self.b.create_block();
+        let is_boxed = self.b.ins().icmp_imm(IntCC::Equal, status, 2);
+        self.b.ins().brif(is_boxed, boxed_b, &[], reject_b, &[]);
+        self.b.switch_to_block(boxed_b);
+        self.emit_exit(pc + 1, &snapshot, JitStatus::Deopt);
+        self.b.switch_to_block(reject_b);
+        self.emit_exit(pc, &snapshot_full, JitStatus::Deopt);
+
+        self.b.switch_to_block(ok_b);
+        let res = self
+            .b
+            .ins()
+            .load(types::I64, trusted, self.frame_ptr, OFF_RET_BITS);
+        self.vstack.push((res, JitType::Str));
+    }
+
+    /// RFC 0074 WS5 — `s[a:b]` (unit step) via `wpjit_str_slice`,
+    /// mirroring [`Self::emit_list_slice`]: absent bounds pass as
+    /// `i64::MIN`, a negative status deopts at the *erased
+    /// `BUILD_SLICE`'s* pc with the bound operands spilled (absent
+    /// ones as materialized `None`s) so the interpreter rebuilds the
+    /// slice object and executes the subscript generically.
+    fn emit_str_slice(&mut self, start: bool, stop: bool, pc: u32) {
+        let missing = i64::MIN;
+        let stop_v = if stop {
+            self.pop().0
+        } else {
+            self.b.ins().iconst(types::I64, missing)
+        };
+        let start_v = if start {
+            self.pop().0
+        } else {
+            self.b.ins().iconst(types::I64, missing)
+        };
+        let (pin, _) = self.pop();
+        // Spill shape at the erased BUILD_SLICE: [.., str, start,
+        // stop, step=None], `None` bounds as object-lane `-1`.
+        let mut snapshot = self.vstack.clone();
+        snapshot.push((pin, JitType::Str));
+        let none = self.b.ins().iconst(types::I64, -1);
+        snapshot.push(if start {
+            (start_v, JitType::Int)
+        } else {
+            (none, JitType::Obj)
+        });
+        snapshot.push(if stop {
+            (stop_v, JitType::Int)
+        } else {
+            (none, JitType::Obj)
+        });
+        snapshot.push((none, JitType::Obj));
+        let sig = self.quad_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::str_slice_helper_addr() as i64);
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, pin, start_v, stop_v]);
+        let res = self.b.inst_results(call)[0];
+        let bad = self.b.ins().icmp_imm(IntCC::SignedLessThan, res, 0);
+        let cont = self.guard(bad, pc, &snapshot);
+        self.b.switch_to_block(cont);
+        self.vstack.push((res, JitType::Str));
     }
 
     /// RFC 0071 WS4 — the opaque-iterator capture behind an erased

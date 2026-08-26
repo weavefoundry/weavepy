@@ -278,6 +278,37 @@ work.
 > `deltablue` 1.2× faster and `attr_access` 1.16×; the deferred
 > object-lane consumers (class-call construction, object
 > arguments/returns, iterator pipelines) carry to the next wave.
+>
+> `RFC 0071` (performance wave 8) lands the **object call ABI**
+> (object-typed arguments and returns across native call boundaries,
+> class-call construction with `__init__` burn-in) and the collection
+> lanes it unlocks; committed baseline moves to geomean **2.96×
+> CPython**. `RFC 0073` (performance wave 9) adds the **dict and
+> string lanes**, PEP-709 comprehension shapes, and **persistent
+> native generator activations** (zero-materialization park/resume);
+> committed baseline **2.85× CPython**, with `float_math` 1.41×,
+> `generators` 1.25×, and `attr_access` 1.22× faster — and a
+> measured verdict that the remaining fixtures reject on *frame
+> coverage*, not lane quality.
+>
+> `RFC 0074` (performance wave 10) is the **frame-coverage wave**:
+> `LOAD_GLOBAL` burns arbitrary object globals under the existing
+> snapshot guard, an **opaque-call lane** (`CallDyn`) runs any
+> callable through the interpreter and resumes natively, dynamic
+> attribute access falls back to generic get/set helpers instead of
+> rejecting the frame, `dict.items()` / `enumerate` drive fused
+> pair loops with trained key/value lanes, and `%`-formatting and
+> str slices compile. Geomean held at **2.85×** — the gated fixtures
+> now reject on the *next* shape stratum (closure cells, escaping
+> callees, heterogeneous list builds, object-lane truthiness),
+> enumerated as wave 11's charter. The wave's sleeper win is
+> correctness: the broader coverage exposed and fixed a latent
+> tier-2 bug where a method-guard miss deopted into a rebuild that
+> fabricated a `None` callee (breaking CPython's
+> `test_multiprocessing_spawn`/`_forkserver` packages); guard
+> misses now resolve generically through a surprise-receiver lane
+> and continue natively. The 438-row regrtest sweep grades
+> **unexpected 0** and the 40-row ecosystem lane holds its baseline.
 
 ## Repository layout
 

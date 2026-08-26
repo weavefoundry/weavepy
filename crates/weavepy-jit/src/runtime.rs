@@ -876,3 +876,201 @@ pub(crate) fn float_floordiv_helper_addr() -> usize {
 pub(crate) fn float_mod_helper_addr() -> usize {
     FLOAT_MOD_HELPER.load(std::sync::atomic::Ordering::Acquire)
 }
+
+/// RFC 0074 WS2 — the embedder's *opaque-call* helper
+/// ([`crate::ir::TOp::CallDyn`]). Compiled code marshals the `argc`
+/// positional (plus `kwc` keyword) values into [`JitFrame::call_args`]
+/// / [`JitFrame::call_tags`] (bottom-to-top, callee *not* included),
+/// then calls this with the callee's pin index, both counts, and —
+/// for the keyword form — the constant-pool index of the interned
+/// kwnames tuple. The helper boxes everything, runs the call through
+/// the interpreter core (**arbitrary Python runs**; the dirtiness
+/// discipline applies), and returns a [`CallStatus`]:
+///
+/// - `Ok` — the pinned result's index is in [`JitFrame::ret_bits`]
+///   (`None` as `-1`); native execution continues;
+/// - `Raised` — the exception is parked; exit `Raised` at the call pc;
+/// - `Boxed` — the call *completed* but a caller guard was
+///   invalidated (or pin-cap pressure): the result is parked and the
+///   caller deopts *after* the call — never re-executed;
+/// - `Reject` — the callee pin didn't resolve (defensive, before any
+///   Python ran): deopt at the call pc and re-execute generically.
+///
+/// # Safety contract (for implementors)
+///
+/// Same as [`CallPyHelper`].
+pub type CallDynHelper = unsafe extern "C" fn(
+    frame: *mut JitFrame,
+    callee_pin: i64,
+    argc: u32,
+    kwc: u32,
+    names: u32,
+) -> i64;
+
+static CALL_DYN_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide opaque-call helper (RFC 0074 WS2). Must
+/// precede the first compile of a frame containing `CallDyn` ops.
+pub fn register_call_dyn_helper(helper: CallDynHelper) {
+    CALL_DYN_HELPER.store(helper as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn call_dyn_helper_addr() -> usize {
+    CALL_DYN_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// RFC 0074 WS2/WS4 — the embedder's *generic attribute* helpers
+/// ([`crate::ir::TOp::DynAttrGet`] / [`crate::ir::TOp::DynAttrSet`]).
+/// Shape: `(frame, pin, name_idx) -> status` (the [`ListGetHelper`]
+/// signature). Both run the interpreter's exact attribute machinery
+/// (**arbitrary Python may run** — descriptors, `__getattr__`,
+/// `__setattr__`; the dirtiness discipline applies). For the store,
+/// the value is staged in `call_args[0]` / `call_tags[0]`. Status:
+///
+/// - `0` — ok; for the get, the loaded value's fresh pin index is in
+///   [`JitFrame::ret_bits`] (`None` as `-1`);
+/// - `1` — raised (exact `AttributeError` and friends): exit `Raised`
+///   at this pc, receiver consumed;
+/// - `2` — the access *completed* but a guard was invalidated (or,
+///   for the get, pin-cap pressure): the result (get) is parked and
+///   the caller deopts at the *next* pc — never re-executed;
+/// - `3` — rejected before any Python ran (pin miss — defensive):
+///   deopt at this pc and re-execute generically.
+pub type DynAttrHelper = unsafe extern "C" fn(frame: *mut JitFrame, pin: i64, name: i64) -> i64;
+
+static DYN_ATTR_GET_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DYN_ATTR_SET_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide generic attribute helpers (RFC 0074
+/// WS2/WS4). Must precede the first compile of a frame containing
+/// `DynAttrGet`/`DynAttrSet` ops.
+pub fn register_dyn_attr_helpers(get: DynAttrHelper, set: DynAttrHelper) {
+    DYN_ATTR_GET_HELPER.store(get as usize, std::sync::atomic::Ordering::Release);
+    DYN_ATTR_SET_HELPER.store(set as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn dyn_attr_get_helper_addr() -> usize {
+    DYN_ATTR_GET_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
+pub(crate) fn dyn_attr_set_helper_addr() -> usize {
+    DYN_ATTR_SET_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+static GLOBAL_OBJ_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide obj-global helper (RFC 0074 WS1,
+/// [`crate::ir::TOp::PushGlobalObj`]): pin the snapshotted object
+/// behind obj-global table index `token`, memoized per
+/// `(activation, token)`, and return the pin index — or a negative
+/// value to deopt (lane surprise — impossible while the identity
+/// guard holds — or cap pressure). Never runs Python code. Shares the
+/// [`StrLenHelper`] `(frame, i64) -> i64` shape. Must precede the
+/// first compile of a frame containing `PushGlobalObj`.
+pub fn register_global_obj_helper(f: StrLenHelper) {
+    GLOBAL_OBJ_HELPER.store(f as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn global_obj_helper_addr() -> usize {
+    GLOBAL_OBJ_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+static ITER_NEW_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide *generic* iterator-capture helper (RFC
+/// 0074 WS3, the materializing arm of [`crate::ir::TOp::IterCapture`]):
+/// build `iter(x)` through the interpreter core for the pinned
+/// iterable (**a user `__iter__` may run**; the dirtiness discipline
+/// applies — invalidated guards report through the negative status)
+/// and answer the fresh iterator's pin index — or a negative value to
+/// deopt (non-iterable → the interpreter re-executes the `GET_ITER`
+/// and raises exactly; dirty guards; cap pressure). Shares the
+/// [`StrLenHelper`] `(frame, pin) -> i64` shape. Must precede the
+/// first compile of a frame containing a materializing `IterCapture`.
+pub fn register_iter_new_helper(f: StrLenHelper) {
+    ITER_NEW_HELPER.store(f as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn iter_new_helper_addr() -> usize {
+    ITER_NEW_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// RFC 0074 WS3 — the embedder's tuple-target *step* helper, called
+/// by the [`crate::ir::TTerm::ForIterPair`] terminator each iteration
+/// with the pinned iterator and both compiled element lanes
+/// ([`SlotTag`] discriminants, [`ITER_ELEM_STR`] admitted). **Runs
+/// Python code** (the iterator protocol through the interpreter
+/// core). Returns:
+///
+/// - `0` — a 2-sequence element was yielded and unpacked in the
+///   compiled lanes: the first element's bits are in
+///   [`JitFrame::ret_bits`], the second's in `call_args[0]`;
+/// - `1` — the iterator is exhausted;
+/// - `2` — deopt at the header pc, nothing consumed (pin miss);
+/// - `3` — the element was consumed but is not a 2-sequence in the
+///   compiled lanes: its raw object was pinned (index in `ret_bits`)
+///   and the deopt resumes at the erased `UNPACK_SEQUENCE`'s pc with
+///   the element spilled on top (the interpreter re-executes the
+///   unpack, raising the exact error when malformed);
+/// - `4` — the iterator raised; the exception is parked for the
+///   ordinary `Raised` exit at the header pc.
+pub type IterNextPairHelper =
+    unsafe extern "C" fn(frame: *mut JitFrame, pin: i64, tag1: i64, tag2: i64) -> i64;
+
+static ITER_NEXT_PAIR_HELPER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide tuple-target step helper (RFC 0074 WS3).
+/// Must precede the first compile of a frame containing a
+/// `ForIterPair` terminator.
+pub fn register_iter_next_pair_helper(f: IterNextPairHelper) {
+    ITER_NEXT_PAIR_HELPER.store(f as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn iter_next_pair_helper_addr() -> usize {
+    ITER_NEXT_PAIR_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// RFC 0074 WS5 — the embedder's `str % x` helper
+/// ([`crate::ir::TOp::StrMod`]): `(frame, lhs_pin, rhs_bits,
+/// rhs_tag) -> status`, running the interpreter's `%`-formatting
+/// (**`__str__`/`__repr__` of the operands may run**; the dirtiness
+/// discipline applies). Status: `0` = ok, the fresh exact-`str`
+/// result's pin index in [`JitFrame::ret_bits`]; `1` = raised (exit
+/// `Raised` at this pc); `2` = the format *completed* but the result
+/// is not an exact `str`, a guard was invalidated, or cap pressure:
+/// the result is parked and the caller deopts at the *next* pc —
+/// formatting side effects never re-run; `3` = rejected before any
+/// Python ran (pin/tag miss — defensive): deopt at this pc.
+pub type StrModHelper =
+    unsafe extern "C" fn(frame: *mut JitFrame, lhs_pin: i64, rhs_bits: i64, rhs_tag: i64) -> i64;
+
+static STR_MOD_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static STR_SLICE_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide `str` formatting/slicing helpers (RFC
+/// 0074 WS5). `slice` shares the [`ListSliceHelper`]
+/// `(frame, pin, start, stop) -> pin-or-negative` shape (CPython
+/// slice clamping, `i64::MIN` = absent bound; never runs Python
+/// code). Must precede the first compile of a frame containing
+/// `StrMod`/`StrSlice` ops.
+pub fn register_str_format_helpers(mod_: StrModHelper, slice: ListSliceHelper) {
+    STR_MOD_HELPER.store(mod_ as usize, std::sync::atomic::Ordering::Release);
+    STR_SLICE_HELPER.store(slice as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn str_mod_helper_addr() -> usize {
+    STR_MOD_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
+pub(crate) fn str_slice_helper_addr() -> usize {
+    STR_SLICE_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}

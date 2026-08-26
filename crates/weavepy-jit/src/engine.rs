@@ -88,6 +88,10 @@ pub struct CompiledFrame {
     /// RFC 0069 WS2 — erased `math` intrinsic callables riding the
     /// interpreter stack (`token` indexes [`Self::math_guards`]).
     pub math_spans: Vec<CalleeSpanMeta>,
+    /// RFC 0074 WS2 — interpreter-only self-or-null `Unbound` markers
+    /// of opaque-call sites (`token` unused; a deopt strictly inside
+    /// the span re-inserts the marker at `interp_depth`).
+    pub null_spans: Vec<CalleeSpanMeta>,
     /// RFC 0069 WS1 — every return site is provably `None` (the
     /// procedure shape; feeds callers' [`crate::ir::MethodRet::None`]).
     pub ret_none: bool,
@@ -287,6 +291,41 @@ impl JitEngine {
                 "math sin/cos (no helper registered)",
             ));
         }
+        // RFC 0074 — the frame-coverage helpers (obj globals, the
+        // opaque-call lane, dynamic attributes, generic/pair
+        // iteration, str %-format and slice), checked as a group.
+        let needs_wave10 = tfunc.blocks.iter().any(|b| {
+            matches!(b.term, crate::ir::TTerm::ForIterPair { .. })
+                || b.stmts.iter().any(|s| {
+                    matches!(
+                        s.op,
+                        TOp::PushGlobalObj { .. }
+                            | TOp::CallDyn { .. }
+                            | TOp::DynAttrGet { .. }
+                            | TOp::DynAttrSet { .. }
+                            | TOp::StrMod
+                            | TOp::StrSlice { .. }
+                            | TOp::IterCapture {
+                                materialize: true,
+                                ..
+                            }
+                    )
+                })
+        });
+        if needs_wave10
+            && (runtime::call_dyn_helper_addr() == 0
+                || runtime::dyn_attr_get_helper_addr() == 0
+                || runtime::dyn_attr_set_helper_addr() == 0
+                || runtime::global_obj_helper_addr() == 0
+                || runtime::iter_new_helper_addr() == 0
+                || runtime::iter_next_pair_helper_addr() == 0
+                || runtime::str_mod_helper_addr() == 0
+                || runtime::str_slice_helper_addr() == 0)
+        {
+            return Err(JitVerdict::UnsupportedOpcode(
+                "frame coverage (no helper registered)",
+            ));
+        }
         let needs_float_divmod = tfunc.blocks.iter().any(|b| {
             b.stmts
                 .iter()
@@ -355,6 +394,7 @@ impl JitEngine {
             str_method_spans: tfunc.str_method_spans.clone(),
             math_guards: tfunc.math_guards.clone(),
             math_spans: tfunc.math_spans.clone(),
+            null_spans: tfunc.null_spans.clone(),
             osr_entries: tfunc.osr_entries.clone(),
             resume_entries: tfunc.resume_entries.clone(),
             max_call_args: tfunc.max_call_args,

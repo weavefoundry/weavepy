@@ -48283,6 +48283,277 @@ mod tests {
 
     #[cfg(feature = "jit")]
     #[test]
+    fn jit_obj_global_pins_with_identity() {
+        // RFC 0074 WS1 — an arbitrary object global burns as an
+        // identity-guarded pin: the load compiles (no frame
+        // rejection) and hands back the very same object.
+        let src = "class Marker:\n\
+                   \x20   pass\n\
+                   PICK = Marker()\n\
+                   def grab(n):\n\
+                   \x20   out = None\n\
+                   \x20   i = 0\n\
+                   \x20   while i < n:\n\
+                   \x20       out = PICK\n\
+                   \x20       i = i + 1\n\
+                   \x20   return out\n\
+                   r = None\n\
+                   j = 0\n\
+                   while j < 80:\n    r = grab(50)\n    j = j + 1\n\
+                   print(r is PICK)\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "obj-global kernel never compiled");
+        assert_eq!(deopts, 0, "obj-global load should be deopt-free");
+        assert_eq!(out, "True\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_call_dyn_param_callee() {
+        // RFC 0074 WS2 — a callable parameter rides the opaque-call
+        // lane: the interpreter performs each call and native
+        // execution resumes with the result pinned.
+        let src = "def apply(f, n):\n\
+                   \x20   out = None\n\
+                   \x20   i = 0\n\
+                   \x20   while i < n:\n\
+                   \x20       out = f(i)\n\
+                   \x20       i = i + 1\n\
+                   \x20   return out\n\
+                   def dub(x):\n\
+                   \x20   return x + x\n\
+                   r = 0\n\
+                   j = 0\n\
+                   while j < 80:\n    r = apply(dub, 60)\n    j = j + 1\n\
+                   print(r)\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert!(compiled >= 1, "opaque-call kernel never compiled");
+        assert_eq!(out, "118\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_call_dyn_raise_propagates() {
+        // RFC 0074 WS2 — a raising dynamic callee routes through the
+        // `Raised` exit with the interpreter's own exception.
+        let src = "def apply(f, n):\n\
+                   \x20   out = None\n\
+                   \x20   i = 0\n\
+                   \x20   while i < n:\n\
+                   \x20       out = f(i)\n\
+                   \x20       i = i + 1\n\
+                   \x20   return out\n\
+                   def pick(x):\n\
+                   \x20   return [0, 1, 2][x]\n\
+                   j = 0\n\
+                   while j < 80:\n    apply(pick, 3)\n    j = j + 1\n\
+                   try:\n\
+                   \x20   apply(pick, 4)\n\
+                   except IndexError as e:\n\
+                   \x20   print('caught:', e)\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert!(compiled >= 1, "raising dyn-call kernel never compiled");
+        assert_eq!(out, "caught: list index out of range\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_dict_items_pair_loop() {
+        // RFC 0074 WS3 — `for k, v in d.items():` trains (Str, Int)
+        // pair lanes and steps the checked items iterator natively.
+        let src = "def total(d):\n\
+                   \x20   t = 0\n\
+                   \x20   for k, v in d.items():\n\
+                   \x20       t = t * 2 + v\n\
+                   \x20   return t\n\
+                   d = {'a': 1, 'b': 2, 'c': 3}\n\
+                   s = 0\n\
+                   i = 0\n\
+                   while i < 100:\n    s = s + total(d)\n    i = i + 1\n\
+                   print(s)\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "items pair loop never compiled");
+        assert_eq!(deopts, 0, "items pair loop should be deopt-free");
+        assert_eq!(out, "1100\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_dict_items_mutation_raises_exact() {
+        // RFC 0074 WS3 — a structural mutation mid-loop raises
+        // CPython's exact RuntimeError through the checked step.
+        let src = "def poison(d):\n\
+                   \x20   t = 0\n\
+                   \x20   for k, v in d.items():\n\
+                   \x20       t = t + v\n\
+                   \x20       if t > 100:\n\
+                   \x20           d['boom'] = 1\n\
+                   \x20   return t\n\
+                   d = {'a': 1, 'b': 2}\n\
+                   i = 0\n\
+                   while i < 80:\n    poison(d)\n    i = i + 1\n\
+                   big = {'a': 60, 'b': 60}\n\
+                   try:\n\
+                   \x20   poison(big)\n\
+                   except RuntimeError as e:\n\
+                   \x20   print('caught:', e)\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert!(compiled >= 1, "mutating items loop never compiled");
+        assert_eq!(out, "caught: dictionary changed size during iteration\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_enumerate_pair_loop() {
+        // RFC 0074 WS3 — `for i, x in enumerate(xs):` over an int list
+        // trains (Int, Int) and both variables feed arithmetic.
+        let src = "def weigh(xs):\n\
+                   \x20   t = 0\n\
+                   \x20   for i, x in enumerate(xs):\n\
+                   \x20       t = t + i * x\n\
+                   \x20   return t\n\
+                   xs = []\n\
+                   j = 0\n\
+                   while j < 40:\n    xs.append(j + 1)\n    j = j + 1\n\
+                   s = 0\n\
+                   i = 0\n\
+                   while i < 100:\n    s = s + weigh(xs)\n    i = i + 1\n\
+                   print(s)\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "enumerate pair loop never compiled");
+        assert_eq!(deopts, 0, "enumerate pair loop should be deopt-free");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_pair_loop_lane_surprise_deopts_correctly() {
+        // RFC 0074 WS3 — a post-compile value outside the trained lane
+        // surrenders through the consumed-element deopt at the erased
+        // `UNPACK_SEQUENCE`; results stay exact.
+        let src = "def last(d):\n\
+                   \x20   out = 0\n\
+                   \x20   for k, v in d.items():\n\
+                   \x20       out = v\n\
+                   \x20   return out\n\
+                   d = {'a': 1, 'b': 2}\n\
+                   i = 0\n\
+                   while i < 80:\n    last(d)\n    i = i + 1\n\
+                   d['b'] = 'str-now'\n\
+                   print(last(d))\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert!(compiled >= 1, "pair loop never compiled");
+        assert_eq!(out, "str-now\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_dyn_attr_property_roundtrip() {
+        // RFC 0074 WS4 — property get/set on an unprobeable receiver
+        // rides the generic attribute lane (arbitrary Python runs in
+        // the helper; native execution resumes after each access).
+        let src = "class Fancy:\n\
+                   \x20   def __init__(self):\n\
+                   \x20       self._v = 0\n\
+                   \x20   @property\n\
+                   \x20   def value(self):\n\
+                   \x20       return self._v\n\
+                   \x20   @value.setter\n\
+                   \x20   def value(self, x):\n\
+                   \x20       self._v = x + 1\n\
+                   def pump(o, n):\n\
+                   \x20   out = None\n\
+                   \x20   i = 0\n\
+                   \x20   while i < n:\n\
+                   \x20       o.value = i\n\
+                   \x20       out = o.value\n\
+                   \x20       i = i + 1\n\
+                   \x20   return out\n\
+                   f = Fancy()\n\
+                   r = None\n\
+                   j = 0\n\
+                   while j < 80:\n    r = pump(f, 50)\n    j = j + 1\n\
+                   print(r)\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert!(compiled >= 1, "property kernel never compiled");
+        assert_eq!(out, "50\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_method_guard_miss_raises_exact_attribute_error() {
+        // RFC 0074 — the surprise-receiver lane: a burned method site
+        // hit with a receiver of a different class must not deopt into
+        // a rebuild that fabricates a `None` callee (the shape that
+        // broke `_test_multiprocessing.get_value` on
+        // `threading.Semaphore`). A receiver *lacking* the attribute
+        // raises the exact `AttributeError`; one *having* it under a
+        // different class calls through generically.
+        let src = "class Has:\n\
+                   \x20   def get_value(self):\n\
+                   \x20       return 7\n\
+                   class Also:\n\
+                   \x20   def get_value(self):\n\
+                   \x20       return 9\n\
+                   class Lacks:\n\
+                   \x20   pass\n\
+                   def f(o):\n\
+                   \x20   return o.get_value()\n\
+                   h = Has()\n\
+                   t = 0\n\
+                   i = 0\n\
+                   while i < 3000:\n\
+                   \x20   t = t + f(h)\n\
+                   \x20   i = i + 1\n\
+                   print(t)\n\
+                   print(f(Also()))\n\
+                   try:\n\
+                   \x20   f(Lacks())\n\
+                   except AttributeError as e:\n\
+                   \x20   print('AttributeError:', e)\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert!(compiled >= 1, "method-call kernel never compiled");
+        assert_eq!(
+            out,
+            "21000\n9\nAttributeError: 'Lacks' object has no attribute 'get_value'\n"
+        );
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_str_mod_and_slice_roundtrip() {
+        // RFC 0074 WS5 — `%`-formatting and open/closed str slices
+        // compile natively; results stay exact strs.
+        let src = "def fmt(n):\n\
+                   \x20   u = ''\n\
+                   \x20   i = 0\n\
+                   \x20   while i < n:\n\
+                   \x20       s = 'item-%d' % i\n\
+                   \x20       u = s[:4] + s[5:] + s[2:6]\n\
+                   \x20       i = i + 1\n\
+                   \x20   return u\n\
+                   r = ''\n\
+                   j = 0\n\
+                   while j < 80:\n    r = fmt(60)\n    j = j + 1\n\
+                   print(r)\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "str mod/slice kernel never compiled");
+        assert_eq!(deopts, 0, "str mod/slice should be deopt-free");
+        // s = 'item-59': s[:4]='item', s[5:]='59', s[2:6]='em-5'.
+        assert_eq!(out, "item59em-5\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
     fn jit_str_method_raise_is_exact() {
         // RFC 0073 WS3 — a raising builtin (`index` with no match)
         // routes through `CallStatus::Raised` with the interpreter's
