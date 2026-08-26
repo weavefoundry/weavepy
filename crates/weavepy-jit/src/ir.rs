@@ -372,7 +372,17 @@ pub enum TOp {
     /// (an instance with `__iter__`, a non-iterable) deopts at this
     /// pc with the operand spilled, and the interpreter executes the
     /// `GET_ITER` — and the whole loop — generically.
-    IterCapture { iter_slot: u32 },
+    /// RFC 0074 WS3 — `materialize` switches the helper to the
+    /// *generic* capture: `iter(x)` is built through the interpreter
+    /// core for any pinned iterable (dict views, `enumerate`/`zip`
+    /// objects, lists — the tuple-target loop's shape) and the fresh
+    /// iterator's pin lands in `iter_slot`; a non-iterable raises the
+    /// exact `TypeError` at this pc. A user `__iter__` may run
+    /// arbitrary Python (the dirtiness discipline applies) —
+    /// invalidated guards deopt at the *next* pc with the built
+    /// iterator spilled on top (the interpreter's `FOR_ITER` accepts
+    /// an iterator it didn't build).
+    IterCapture { iter_slot: u32, materialize: bool },
     /// RFC 0073 WS2 — the dict-loop capture behind an erased
     /// `GET_ITER` whose operand is a pinned exact `dict`: pops the
     /// pin and calls the registered `wpjit_dict_iter_new` helper,
@@ -429,6 +439,73 @@ pub enum TOp {
     /// and pushes the fresh pinned list on the same lane. Cap
     /// pressure deopts at this pc.
     ListSlice { start: bool, stop: bool },
+    /// RFC 0074 WS1 — a `LOAD_GLOBAL` resolving to an arbitrary
+    /// object (a builtin, a class, a `*args`/`**kwargs` function, a
+    /// module-level container or string — anything the specialized
+    /// resolutions don't cover): pushes a pin of the snapshotted
+    /// object through the registered `wpjit_global_obj` helper, which
+    /// memoizes per `(activation, token)` so a loop re-executing the
+    /// load reuses one pin. The identity guard rides the ordinary
+    /// global-guard snapshot (`token` indexes the embedder's
+    /// obj-global table, parallel to resolution order); `lane` is the
+    /// snapshot value's graded lane (`Str`/`Bytes`/`Dict`/a list
+    /// lane/`Obj`), re-validated by the helper — a lane surprise
+    /// (impossible while the identity guard holds) or cap pressure
+    /// deopts at this pc.
+    PushGlobalObj { token: u32, lane: JitType },
+    /// RFC 0074 WS2 — the opaque-call lane: `CALL argc` on a callee
+    /// that is a plain native value (any lane) instead of a burned-in
+    /// mark. Pops `argc` arguments (staged through the marshal buffer
+    /// with per-slot tags) and the callee value, and calls the
+    /// registered `wpjit_call_dyn` helper, which boxes everything and
+    /// runs the call through the interpreter core — arbitrary Python
+    /// may run (the dirtiness discipline applies). The result rides
+    /// the object lane. Statuses mirror `CallPy`: `Ok` pushes the
+    /// pinned result and native execution *continues*; `Raised` exits
+    /// at this pc; `Boxed` (guards invalidated by callee side effects,
+    /// or pin-cap pressure on the result) deopts *after* the call
+    /// with the parked result — the call is never re-executed.
+    /// The keyword form (`kwc > 0`) stages `kwc` keyword values above
+    /// the positionals; `names` is the constant-pool index of the
+    /// interned kwnames tuple (the erased `LOAD_CONST` of the
+    /// `CALL_KW` shape).
+    CallDyn { argc: u8, kwc: u8, names: u32 },
+    /// RFC 0074 WS2/WS4 — an eager generic `LOAD_ATTR` (either form)
+    /// on a receiver the burned-fingerprint lanes don't cover: pops
+    /// the receiver pin and performs the interpreter's exact
+    /// attribute load *at this pc* (bound methods materialize,
+    /// descriptors run, `AttributeError` raises exactly here),
+    /// pushing the loaded value as a fresh object-lane pin. No
+    /// fingerprint guard — the lookup is generic per execution. For
+    /// the method form, the implicit self-or-null marker above the
+    /// result is interpreter-only (a null span re-inserts `Unbound`
+    /// on deopt), so the following `CALL` consumes the loaded value
+    /// through the opaque-call lane. `name` is the `names` index.
+    /// Cap pressure deopts at this pc.
+    DynAttrGet { name: u32 },
+    /// RFC 0074 WS4 — the matching `STORE_ATTR` fallback: pops the
+    /// receiver pin (stack top) and the value below it (staged
+    /// through the marshal buffer with its tag), and performs the
+    /// interpreter's exact attribute store at this pc (`__setattr__`
+    /// dispatch included — arbitrary Python may run, so the
+    /// dirtiness discipline applies; invalidated guards deopt at the
+    /// *next* pc with the store already performed).
+    DynAttrSet { name: u32 },
+    /// RFC 0074 WS5 — `str % x` (`BINARY_OP %` with a pinned exact-
+    /// `str` lhs): pops the rhs (any plain lane, staged with its tag)
+    /// and the lhs pin, and runs the interpreter's `%`-formatting.
+    /// An exact-`str` result pushes a fresh pin; a raise exits at
+    /// this pc; a non-`str` result (a `str` subclass lhs is already
+    /// excluded by the pin lane) or cap pressure parks the computed
+    /// result and deopts *after* the op — formatting side effects
+    /// (`__str__`/`__repr__` of the operands) never re-run.
+    StrMod,
+    /// RFC 0074 WS5 — `s[a:b]` on a pinned exact `str` (the erased
+    /// `BUILD_SLICE` marker shape, unit step): pops the present
+    /// bounds (`stop` above `start`) and the pin, applies CPython's
+    /// slice clamping through the interpreter's subscript core, and
+    /// pushes the fresh `str` pin. Cap pressure deopts at this pc.
+    StrSlice { start: bool, stop: bool },
 }
 
 /// One IR statement: a [`TOp`] tagged with its originating bytecode pc
@@ -529,6 +606,38 @@ pub enum TTerm {
         body: BlockId,
         exit: BlockId,
     },
+    /// RFC 0074 WS3 — a recognized tuple-target `FOR_ITER`
+    /// (`for a, b in it:`, the `UNPACK_SEQUENCE 2` + two-store
+    /// prologue), stepped through the registered
+    /// `wpjit_iter_next_pair` helper over the pinned iterator in
+    /// `iter_slot` (captured at the erased `GET_ITER`). Each step
+    /// advances the iterator through the interpreter core and unpacks
+    /// the yielded 2-sequence: elements in the compiled lanes →
+    /// stores into `var1_slot`/`var2_slot`, branch to `body`;
+    /// exhaustion → branch to `exit`; a non-2-sequence element or a
+    /// lane surprise → the element was already *consumed*, so the
+    /// deopt resumes at `store_pc` (the `UNPACK_SEQUENCE`) with the
+    /// raw element spilled on top of the rebuilt stack (the
+    /// interpreter re-executes the unpack, raising the exact
+    /// `ValueError`/`TypeError` when malformed); a raise inside the
+    /// iterator propagates through the `Raised` exit at the header pc.
+    ForIterPair {
+        iter_slot: u32,
+        var1_slot: u32,
+        var2_slot: u32,
+        /// The first element's lane (`var1_slot`'s lane).
+        elem1: JitType,
+        /// The second element's lane (`var2_slot`'s lane).
+        elem2: JitType,
+        /// The `FOR_ITER` pc (raise site; also the deopt point when
+        /// the pin is not steppable — nothing consumed yet).
+        pc: u32,
+        /// The `UNPACK_SEQUENCE` pc — the resume point for a
+        /// consumed-element deopt.
+        store_pc: u32,
+        body: BlockId,
+        exit: BlockId,
+    },
     /// RFC 0070 WS2 — `YIELD_VALUE`: an unconditional deopt-shaped
     /// side exit with [`crate::runtime::JitStatus::Yielded`]. Locals
     /// are written back and the abstract stack is spilled with the
@@ -570,6 +679,15 @@ pub enum ResolvedGlobal {
     /// pinned-list length callee (lowered to [`TOp::ListLen`], never a
     /// real call).
     LenBuiltin,
+    /// RFC 0074 WS3 — the canonical builtin `enumerate`. Burns like any
+    /// obj-global (the plan gate routes it through the obj-global
+    /// probe, so its `LOAD_GLOBAL` pushes an identity-guarded pin and
+    /// its `CALL` rides the opaque-call lane); the classification only
+    /// *certifies* canonicality, so the tuple-target loop recognizer
+    /// may train the pair lanes (`i` is `Int`, the element wears the
+    /// iterable's probed lane). The per-step lane tags re-validate at
+    /// runtime, so the certification is a prediction like every burn.
+    EnumerateBuiltin,
     /// RFC 0059 WS3 — a plain Python function, callable natively through
     /// the `wpjit_call_py` helper. `token` indexes the embedder's callee
     /// table (parallel to resolution order); `arg_count` is the callee's
@@ -599,7 +717,18 @@ pub enum ResolvedGlobal {
     /// an immediately following method-form attribute load of a
     /// burned-in intrinsic name; any other use disqualifies the frame.
     MathModule,
-    /// Anything else — not representable; the load disqualifies the frame.
+    /// RFC 0074 WS1 — any other *resolvable* object: burned in as an
+    /// identity-guarded object-lane pin ([`TOp::PushGlobalObj`]).
+    /// `token` indexes the embedder's obj-global table (parallel to
+    /// resolution order); `lane` is the snapshot value's graded lane.
+    /// Also the fallback for specialized resolutions used outside
+    /// their recognized shapes (`range` as a value, `len` passed
+    /// around) — the embedder's resolver reports the specialized
+    /// variant and the analyzer downgrades through the
+    /// `obj_global` probe.
+    ObjGlobal { token: u32, lane: JitType },
+    /// A name that did not resolve at analysis time (a genuine
+    /// `NameError` at runtime) — the load disqualifies the frame.
     Opaque,
 }
 
@@ -1159,6 +1288,15 @@ pub struct TFunc {
     /// reconstruction contract as [`Self::len_spans`] (`token` indexes
     /// [`Self::math_guards`], `live_to` is the pc after the `CALL`).
     pub math_spans: Vec<CalleeSpanMeta>,
+    /// RFC 0074 WS2 — the self-or-null `Unbound` markers of
+    /// opaque-call sites: between a `PUSH_NULL` (the plain-call
+    /// shape, marker *above* the native callee value) or a
+    /// method-form [`TOp::DynAttrGet`] (marker above the loaded bound
+    /// method) and the consuming `CALL`, the interpreter's stack holds
+    /// `Object::Unbound` at `interp_depth` while the native stack
+    /// holds nothing. A deopt strictly inside `(live_from, live_to)`
+    /// re-inserts it (the `token` field is unused).
+    pub null_spans: Vec<CalleeSpanMeta>,
     /// OSR entry points (RFC 0059 WS3b): backward-jump target blocks
     /// enterable via `entry_pc`.
     pub osr_entries: Vec<OsrEntry>,
@@ -1234,6 +1372,12 @@ impl TOp {
                 | TOp::BuildTuple { .. }
                 | TOp::ListRepeat
                 | TOp::ListSlice { .. }
+                | TOp::PushGlobalObj { .. }
+                | TOp::CallDyn { .. }
+                | TOp::DynAttrGet { .. }
+                | TOp::DynAttrSet { .. }
+                | TOp::StrMod
+                | TOp::StrSlice { .. }
         )
     }
 }

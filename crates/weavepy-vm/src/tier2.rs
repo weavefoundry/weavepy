@@ -138,6 +138,10 @@ struct CompiledEntry {
     cf: StdRc<CompiledFrame>,
     guard_snapshot: StdRc<Vec<(String, Object)>>,
     callees: StdRc<CalleeTable>,
+    /// RFC 0074 WS1 — the obj-global table: `obj_globals[token]` is
+    /// the identity-guarded object `PushGlobalObj { token }` pins
+    /// (parallel to the analyzer's first-probe token order).
+    obj_globals: StdRc<Vec<Object>>,
     /// RFC 0065 WS5 — one guard per burned-in attribute site, in
     /// `site`-token order (parallel to `cf.attr_sites`).
     attr_guards: StdRc<Vec<AttrGuard>>,
@@ -172,6 +176,8 @@ struct NativeCallee {
     cf: StdRc<CompiledFrame>,
     snap: StdRc<Vec<(String, Object)>>,
     callees: StdRc<CalleeTable>,
+    /// RFC 0074 WS1 — the callee's own obj-global table.
+    obj_globals: StdRc<Vec<Object>>,
     attr_guards: StdRc<Vec<AttrGuard>>,
     methods: StdRc<MethodTable>,
     math: StdRc<MathTable>,
@@ -209,6 +215,10 @@ struct Artifacts {
     cf: StdRc<CompiledFrame>,
     snap: StdRc<Vec<(String, Object)>>,
     callees: StdRc<CalleeTable>,
+    /// RFC 0074 WS1 — `obj_globals[token]` is the snapshotted object
+    /// behind each `PushGlobalObj` token (identity-guarded through
+    /// the ordinary guard snapshot; the helper pins it on demand).
+    obj_globals: StdRc<Vec<Object>>,
     attr_guards: StdRc<Vec<AttrGuard>>,
     methods: StdRc<MethodTable>,
     math: StdRc<MathTable>,
@@ -430,6 +440,15 @@ impl JitState {
             wpjit_float_floordiv,
             wpjit_float_mod,
         );
+        // RFC 0074 — the frame-coverage lanes: obj globals, the
+        // opaque-call lane, dynamic attributes, generic/pair
+        // iteration, str %-format and slice.
+        weavepy_jit::register_global_obj_helper(wpjit_global_obj);
+        weavepy_jit::register_call_dyn_helper(wpjit_call_dyn);
+        weavepy_jit::register_dyn_attr_helpers(wpjit_dyn_attr_get, wpjit_dyn_attr_set);
+        weavepy_jit::register_iter_new_helper(wpjit_iter_new);
+        weavepy_jit::register_iter_next_pair_helper(wpjit_iter_next_pair);
+        weavepy_jit::register_str_format_helpers(wpjit_str_mod, wpjit_str_slice);
         JitState {
             enabled,
             threshold,
@@ -469,6 +488,7 @@ impl JitState {
                         cf: a.cf.clone(),
                         guard_snapshot: a.snap.clone(),
                         callees: a.callees.clone(),
+                        obj_globals: a.obj_globals.clone(),
                         attr_guards: a.attr_guards.clone(),
                         methods: a.methods.clone(),
                         math: a.math.clone(),
@@ -551,10 +571,17 @@ impl JitState {
         // `TypeUnknown` failure triggers a seeded retry, so shapes the
         // fixpoint can type on its own never pick up extra entry
         // guards or seed-vs-assignment conflicts.
+        // RFC 0074 WS1 — `resolve_obj` is shared between `classify` and
+        // the obj-global probe (sibling `&mut` closures alive across
+        // the same `compile_frame`), so it rides a `RefCell`; every
+        // call site's borrow is transient.
+        let resolve_cell: std::cell::RefCell<&mut dyn FnMut(&str) -> Option<Object>> =
+            std::cell::RefCell::new(&mut **resolve_obj);
         let mut run = |seed_params: bool| -> (
             Result<weavepy_jit::CompiledFrame, weavepy_jit::JitVerdict>,
             CalleeTable,
             MethodTable,
+            Vec<String>,
         ) {
             // RFC 0059 WS3 — classify each LOAD_GLOBAL. A plain Python
             // function becomes a `PyFunc` callee: it gets a token in the
@@ -567,7 +594,7 @@ impl JitState {
             // grows it — both live across the same `compile_frame`.
             let callees: std::cell::RefCell<CalleeTable> = std::cell::RefCell::new(Vec::new());
             let mut classify = |name: &str| {
-                let obj = resolve_obj(name);
+                let obj = (resolve_cell.borrow_mut())(name);
                 if let Some(Object::Function(f)) = obj.as_ref() {
                     let fcode = f.code.borrow().clone();
                     if !py_callee_ok(&fcode) {
@@ -692,6 +719,26 @@ impl JitState {
                 }
                 u32::try_from(slot).ok()
             };
+            // RFC 0074 WS1 — the obj-global token table: names in
+            // first-probe order, memoized per name (the analyzer
+            // probes during both passes), graded once per name. The
+            // object table snapshots from these names on success.
+            let obj_names: std::cell::RefCell<Vec<(String, JitType)>> =
+                std::cell::RefCell::new(Vec::new());
+            let mut probe_obj_global = |name: &str| -> Option<(u32, JitType)> {
+                {
+                    let tbl = obj_names.borrow();
+                    if let Some(i) = tbl.iter().position(|(n, _)| n == name) {
+                        return Some((i as u32, tbl[i].1));
+                    }
+                }
+                let obj = (resolve_cell.borrow_mut())(name)?;
+                let lane = grade_obj_global(&obj);
+                let mut tbl = obj_names.borrow_mut();
+                let token = tbl.len() as u32;
+                tbl.push((name.to_owned(), lane));
+                Some((token, lane))
+            };
             let mut path_arena = weavepy_jit::PathArena::default();
             let mut jit_probes = Probes {
                 list: &mut **list,
@@ -702,12 +749,14 @@ impl JitState {
                 ctor_field: &mut **ctor_field,
                 param: &mut probe_param,
                 kw_slot: &mut probe_kw_slot,
+                obj_global: &mut probe_obj_global,
                 paths: &mut path_arena,
             };
             let r = engine.compile_frame(code, &mut classify, &mut jit_probes);
-            (r, callees.into_inner(), methods)
+            let obj_names = obj_names.into_inner().into_iter().map(|(n, _)| n).collect();
+            (r, callees.into_inner(), methods, obj_names)
         };
-        let (res, callees, methods) = {
+        let (res, callees, methods, obj_names) = {
             let first = run(false);
             if matches!(first.0, Err(weavepy_jit::JitVerdict::TypeUnknown)) {
                 run(true)
@@ -725,7 +774,17 @@ impl JitState {
                 let snap: Vec<(String, Object)> = cf
                     .global_guards
                     .iter()
-                    .filter_map(|g| resolve_obj(&g.name).map(|o| (g.name.clone(), o)))
+                    .filter_map(|g| {
+                        (resolve_cell.borrow_mut())(&g.name).map(|o| (g.name.clone(), o))
+                    })
+                    .collect();
+                // RFC 0074 WS1 — the obj-global object table, in token
+                // order. Every probed name resolved during analysis,
+                // so it resolves here too; each is identity-guarded
+                // through the ordinary guard snapshot above.
+                let obj_globals: Vec<Object> = obj_names
+                    .iter()
+                    .map(|n| (resolve_cell.borrow_mut())(n).unwrap_or(Object::None))
                     .collect();
                 // RFC 0065 WS5 — snapshot one guard fingerprint per
                 // burned-in attribute site. Every site probed during
@@ -762,6 +821,7 @@ impl JitState {
                         cf: StdRc::new(cf),
                         snap: StdRc::new(snap),
                         callees: StdRc::new(callees),
+                        obj_globals: StdRc::new(obj_globals),
                         attr_guards: StdRc::new(attr_guards),
                         methods: StdRc::new(methods),
                         math: StdRc::new(math_tbl),
@@ -777,6 +837,7 @@ impl JitState {
                         cf: artifacts.cf.clone(),
                         guard_snapshot: artifacts.snap.clone(),
                         callees: artifacts.callees.clone(),
+                        obj_globals: artifacts.obj_globals.clone(),
                         attr_guards: artifacts.attr_guards.clone(),
                         methods: artifacts.methods.clone(),
                         math: artifacts.math.clone(),
@@ -842,6 +903,7 @@ impl JitState {
             cf: art.cf,
             guard_snapshot: art.snap,
             callees: art.callees,
+            obj_globals: art.obj_globals,
             attr_guards: art.attr_guards,
             methods: art.methods,
             math: art.math,
@@ -1013,6 +1075,7 @@ impl JitState {
             cf: a.cf.clone(),
             snap: a.snap.clone(),
             callees: a.callees.clone(),
+            obj_globals: a.obj_globals.clone(),
             attr_guards: a.attr_guards.clone(),
             methods: a.methods.clone(),
             math: a.math.clone(),
@@ -1509,6 +1572,10 @@ fn method_ret_info(
         param: &mut param,
         // Depth bound: no keyword-call recognition in the nested view.
         kw_slot: &mut |_, _| None,
+        // Depth bound: no obj-global burning in the nested view (the
+        // caller only wants the return lane; a body that needs the
+        // frame-coverage lanes types through its own compilation).
+        obj_global: &mut |_| None,
         paths: &mut path_arena,
     };
     match weavepy_jit::analyze_frame(fcode, &mut classify, &mut probes) {
@@ -2232,6 +2299,19 @@ fn resolve_plain_dicts(
 /// holds the function-flavoured `BuiltinFn` — and both call through
 /// `b_range`. Builtin types reject attribute mutation, so identity
 /// implies unmodified call semantics.
+/// RFC 0074 WS1 — grade an obj-global's compiled lane. Exact `str`s
+/// ride the `str` lane (the read/write/method lanes apply to them);
+/// everything else rides the generic object lane, where the dynamic
+/// ops (`CallDyn`, `DynAttrGet`/`Set`, iterator capture) apply and
+/// every other access helper deopts on the lane surprise. The identity
+/// guard makes the grade stable for the compilation's whole life.
+fn grade_obj_global(obj: &Object) -> JitType {
+    match obj {
+        Object::Str(_) => JitType::Str,
+        _ => JitType::Obj,
+    }
+}
+
 fn classify_global(obj: Option<&Object>) -> ResolvedGlobal {
     match obj {
         Some(Object::Builtin(b)) if b.name == "range" => ResolvedGlobal::RangeBuiltin,
@@ -2242,6 +2322,16 @@ fn classify_global(obj: Option<&Object>) -> ResolvedGlobal {
         // Builtins reject attribute mutation, so identity (the entry
         // guard) implies unmodified call semantics.
         Some(Object::Builtin(b)) if b.name == "len" => ResolvedGlobal::LenBuiltin,
+        // RFC 0074 WS3 — canonical `enumerate` (builtins hold the
+        // function flavour; module globals may hold the type object).
+        // Certifies the tuple-target recognizer's lane training; the
+        // burn itself rides the ordinary obj-global machinery.
+        Some(Object::Builtin(b)) if b.name == "enumerate" => ResolvedGlobal::EnumerateBuiltin,
+        Some(Object::Type(t))
+            if Rc::ptr_eq(t, &crate::builtin_types::builtin_types().enumerate_) =>
+        {
+            ResolvedGlobal::EnumerateBuiltin
+        }
         Some(Object::Int(v)) => ResolvedGlobal::ConstInt(*v),
         Some(Object::Float(v)) => ResolvedGlobal::ConstFloat(v.to_bits()),
         Some(Object::Bool(v)) => ResolvedGlobal::ConstBool(*v),
@@ -2274,6 +2364,12 @@ struct CallCtx {
     /// loop re-executing a `LOAD_CONST` reuses one pin. Small linear
     /// scan — real functions carry a handful of hot str constants.
     const_pins: Vec<(u32, u64)>,
+    /// RFC 0074 WS1 — the compile-time obj-global table (`token` →
+    /// snapshotted object), read by `wpjit_global_obj`.
+    obj_globals: StdRc<Vec<Object>>,
+    /// RFC 0074 WS1 — memoized obj-global pins (`token`, pin bits),
+    /// the `const_pins` discipline: one pin per token per activation.
+    obj_global_pins: Vec<(u32, u64)>,
     /// RFC 0061/0065 WS5 — this activation's pinned objects, indexed
     /// by the pin bits native code carries in `ListPin`/`ObjPin` slots.
     pins: PinTable,
@@ -2751,6 +2847,8 @@ unsafe fn try_native_call(
         raised: None,
         const_pins: Vec::new(),
         pins,
+        obj_globals: nc.obj_globals.clone(),
+        obj_global_pins: Vec::new(),
         attr_guards: nc.attr_guards.clone(),
         methods: nc.methods.clone(),
         math: nc.math.clone(),
@@ -3045,6 +3143,7 @@ fn finish_deopted_callee(
         cf: nc.cf.clone(),
         guard_snapshot: nc.snap.clone(),
         callees: nc.callees.clone(),
+        obj_globals: nc.obj_globals.clone(),
         attr_guards: nc.attr_guards.clone(),
         methods: nc.methods.clone(),
         math: nc.math.clone(),
@@ -3232,18 +3331,90 @@ unsafe extern "C" fn wpjit_call_py(
     }
 }
 
+/// Shared result protocol for interpreter-executed calls made on
+/// behalf of native code (`wpjit_call_method`'s fallback and surprise
+/// lanes): pack the result into the expected lane and continue
+/// (`Ok`), park an unrepresentable result or invalidated guards
+/// (`Boxed` — deopt *after* the call), or park the raised exception
+/// (`Raised`).
+fn finish_interp_call(
+    jf: &mut JitFrame,
+    ctx: &mut CallCtx,
+    interp: &mut super::Interpreter,
+    res: Result<Object, RuntimeError>,
+    expect_tag: u32,
+) -> i64 {
+    match res {
+        Err(err) => {
+            ctx.raised = Some(err);
+            CallStatus::Raised as i64
+        }
+        Ok(v) => {
+            let still_valid = guards_hold(
+                interp,
+                &ctx.globals,
+                &ctx.builtins,
+                &ctx.guard_snapshot,
+                &ctx.callees,
+                &ctx.math,
+            );
+            if still_valid {
+                match SlotTag::from_raw(expect_tag) {
+                    // The procedure lane: nothing to write back, the
+                    // compiled code pushes no result.
+                    SlotTag::None => {
+                        if matches!(v, Object::None) {
+                            return CallStatus::Ok as i64;
+                        }
+                    }
+                    SlotTag::Int | SlotTag::Float | SlotTag::Bool => {
+                        let expect = match SlotTag::from_raw(expect_tag) {
+                            SlotTag::Int => JitType::Int,
+                            SlotTag::Float => JitType::Float,
+                            _ => JitType::Bool,
+                        };
+                        if let Some(bits) = pack(&v, expect) {
+                            jf.ret_bits = bits;
+                            jf.ret_tag = expect_tag;
+                            return CallStatus::Ok as i64;
+                        }
+                    }
+                    // RFC 0071 WS1 — an object-lane result pins into
+                    // this activation's table.
+                    SlotTag::ObjPin => {
+                        if let Some(bits) = obj_ret_bits(&v, &mut ctx.pins) {
+                            jf.ret_bits = bits;
+                            jf.ret_tag = expect_tag;
+                            return CallStatus::Ok as i64;
+                        }
+                    }
+                    SlotTag::Boxed | SlotTag::ListPin => {}
+                }
+            }
+            ctx.parked = Some(v);
+            CallStatus::Boxed as i64
+        }
+    }
+}
+
 /// The `wpjit_call_method` helper (RFC 0069 WS1): native code calls
 /// this with a burned-in method token, the receiver's pin, and the
 /// marshaled scalar arguments (receiver excluded). The guard is
 /// re-validated *before* the call runs — receiver class identity +
 /// attr-version (which pins the MRO hit), no instance-dict shadowing,
 /// and the resolved function still wearing its compile-time
-/// `__code__` — and any mismatch returns [`CallStatus::Reject`], a
-/// deopt at the call's pc where the interpreter re-executes the call
-/// generically. A validated call runs through the interpreter and
-/// reports like [`wpjit_call_py`], with one more lane:
-/// [`SlotTag::None`] as `expect_tag` accepts exactly the `None`
-/// result (the procedure shape) and parks anything else.
+/// `__code__`. A mismatch takes the *surprise-receiver lane* (RFC
+/// 0074): the attribute resolves generically through the interpreter
+/// — raising the exact `AttributeError` a re-executed `LOAD_ATTR`
+/// would — and the bound result is called generically, reporting
+/// through the same protocol. (The old `CallStatus::Reject` deopt is
+/// wrong here: the rebuild re-binds the open method span with a
+/// fresh attribute load on the receiver, which on a receiver that
+/// never matched the guard can *fail*, leaving `None` where the
+/// interpreter expects the callable.) A validated call runs through
+/// the interpreter and reports like [`wpjit_call_py`], with one more
+/// lane: [`SlotTag::None`] as `expect_tag` accepts exactly the
+/// `None` result (the procedure shape) and parks anything else.
 ///
 /// # Safety
 ///
@@ -3279,18 +3450,43 @@ unsafe extern "C" fn wpjit_call_method(
         Some(Pin::Obj(o)) => o.clone(),
         _ => return guard_miss(),
     };
-    let Object::Instance(inst) = &recv else {
-        return guard_miss();
+    let guard_ok = match &recv {
+        Object::Instance(inst) => {
+            let cls_ok = {
+                let cls = inst.class.borrow();
+                crate::specialize::rc_id(&cls) == entry.type_id
+                    && cls.attr_version.get() == entry.ver
+            };
+            cls_ok
+                && inst.dict.borrow().get(&StrKey(&entry.name)).is_none()
+                && Rc::ptr_eq(&entry.func.code.borrow(), &entry.code)
+        }
+        _ => false,
     };
-    let guard_ok = {
-        let cls = inst.class.borrow();
-        crate::specialize::rc_id(&cls) == entry.type_id && cls.attr_version.get() == entry.ver
-    };
-    if !guard_ok
-        || inst.dict.borrow().get(&StrKey(&entry.name)).is_some()
-        || !Rc::ptr_eq(&entry.func.code.borrow(), &entry.code)
-    {
-        return guard_miss();
+    if !guard_ok {
+        // RFC 0074 — surprise-receiver lane: the burned resolution
+        // doesn't apply (different class, shadowed name, swapped
+        // `__code__`, or a non-instance receiver). Resolve and call
+        // generically instead of deopting: a missing attribute raises
+        // here exactly as the interpreter's `LOAD_ATTR` would.
+        NATIVE_CALL_STATS.with(|s| s.method_guard_misses.set(s.method_guard_misses.get() + 1));
+        ctx.dirty = true;
+        let bound = match interp.load_attr_public(&recv, &entry.name) {
+            Err(err) => {
+                ctx.raised = Some(err);
+                return CallStatus::Raised as i64;
+            }
+            Ok(b) => b,
+        };
+        let mut args: Vec<Object> = Vec::with_capacity(argc as usize);
+        for j in 0..argc as usize {
+            // SAFETY: native code wrote `argc` entries, and the buffers
+            // are `max_call_args` wide.
+            let (bits, tag) = unsafe { (*jf.call_args.add(j), *jf.call_tags.add(j)) };
+            args.push(unpack_pins(bits, tag, &ctx.pins));
+        }
+        let res = interp.call(&bound, &args, &[], &ctx.globals);
+        return finish_interp_call(jf, ctx, interp, res, expect_tag);
     }
 
     // RFC 0069 WS1 — the native fast path: the guarded method's own
@@ -3351,57 +3547,8 @@ unsafe extern "C" fn wpjit_call_method(
         args.push(unpack_pins(bits, tag, &ctx.pins));
     }
 
-    match interp.call(&callee, &args, &[], &ctx.globals) {
-        Err(err) => {
-            ctx.raised = Some(err);
-            CallStatus::Raised as i64
-        }
-        Ok(v) => {
-            let still_valid = guards_hold(
-                interp,
-                &ctx.globals,
-                &ctx.builtins,
-                &ctx.guard_snapshot,
-                &ctx.callees,
-                &ctx.math,
-            );
-            if still_valid {
-                match SlotTag::from_raw(expect_tag) {
-                    // The procedure lane: nothing to write back, the
-                    // compiled code pushes no result.
-                    SlotTag::None => {
-                        if matches!(v, Object::None) {
-                            return CallStatus::Ok as i64;
-                        }
-                    }
-                    SlotTag::Int | SlotTag::Float | SlotTag::Bool => {
-                        let expect = match SlotTag::from_raw(expect_tag) {
-                            SlotTag::Int => JitType::Int,
-                            SlotTag::Float => JitType::Float,
-                            _ => JitType::Bool,
-                        };
-                        if let Some(bits) = pack(&v, expect) {
-                            jf.ret_bits = bits;
-                            jf.ret_tag = expect_tag;
-                            return CallStatus::Ok as i64;
-                        }
-                    }
-                    // RFC 0071 WS1 — an object-lane result pins into
-                    // this activation's table.
-                    SlotTag::ObjPin => {
-                        if let Some(bits) = obj_ret_bits(&v, &mut ctx.pins) {
-                            jf.ret_bits = bits;
-                            jf.ret_tag = expect_tag;
-                            return CallStatus::Ok as i64;
-                        }
-                    }
-                    SlotTag::Boxed | SlotTag::ListPin => {}
-                }
-            }
-            ctx.parked = Some(v);
-            CallStatus::Boxed as i64
-        }
-    }
+    let res = interp.call(&callee, &args, &[], &ctx.globals);
+    finish_interp_call(jf, ctx, interp, res, expect_tag)
 }
 
 /// RFC 0073 WS3 — the per-method resolved `str` builtin bodies,
@@ -4932,6 +5079,546 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
     }
 }
 
+/// RFC 0074 WS1 — the `wpjit_global_obj` helper: pin the snapshotted
+/// object behind obj-global table index `token`, memoized per
+/// `(activation, token)` like `wpjit_const_str`. The identity guard
+/// (validated at entry and after every dirty call) makes the table
+/// entry exact, so the helper never re-resolves the name. Negative
+/// deopts (cap pressure, or a defensive table miss). Never runs
+/// Python code.
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`].
+unsafe extern "C" fn wpjit_global_obj(frame: *mut JitFrame, token: i64) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    let token = token as u32;
+    if let Some(&(_, pin)) = ctx.obj_global_pins.iter().find(|&&(t, _)| t == token) {
+        return pin as i64;
+    }
+    if ctx.pins.len() >= RUNTIME_PIN_CAP {
+        return -1;
+    }
+    let Some(obj) = ctx.obj_globals.get(token as usize).cloned() else {
+        return -1;
+    };
+    let pin = ctx.pins.len() as u64;
+    ctx.pins.push(Pin::Obj(obj));
+    ctx.obj_global_pins.push((token, pin));
+    pin as i64
+}
+
+/// Pin an arbitrary object-lane value (RFC 0074 WS2): `None` rides
+/// the nullable `-1`; anything else gets a fresh runtime pin. `None`
+/// (the Option) only on cap pressure.
+fn pin_any(v: Object, pins: &mut PinTable) -> Option<u64> {
+    if matches!(v, Object::None) {
+        return Some(u64::MAX);
+    }
+    if pins.len() >= RUNTIME_PIN_CAP {
+        return None;
+    }
+    pins.push(Pin::Obj(v));
+    Some((pins.len() - 1) as u64)
+}
+
+/// The `wpjit_call_dyn` helper (RFC 0074 WS2): call an arbitrary
+/// pinned callee through the interpreter core with the `argc + kwc`
+/// tag-staged arguments (keyword names from the interned constant
+/// tuple `names` when `kwc > 0`). Arbitrary Python runs — the
+/// activation goes dirty and burned-in resolutions are revalidated
+/// after the call. Statuses per [`weavepy_jit::CallDynHelper`]:
+/// `Ok` (pinned result in `ret_bits`, native execution continues),
+/// `Raised`, `Boxed` (completed; parked result, deopt after the
+/// call), `Reject` (defensive pin miss before any Python ran).
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`] — `argc + kwc` marshal entries
+/// and tags are initialized.
+unsafe extern "C" fn wpjit_call_dyn(
+    frame: *mut JitFrame,
+    callee_pin: i64,
+    argc: u32,
+    kwc: u32,
+    names: u32,
+) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    // SAFETY: the `&mut Interpreter` that entered native code is
+    // dormant while the helper runs.
+    let interp = unsafe { &mut *ctx.interp };
+    // The callee rode a pinned lane; `-1` is the nullable `None`
+    // (calling `None` raises) — both misses re-execute generically.
+    let callee = match ctx.pins.get(callee_pin as usize) {
+        Some(p) => p.to_object(),
+        None => return CallStatus::Reject as i64,
+    };
+    let n = (argc + kwc) as usize;
+    let mut args: Vec<Object> = Vec::with_capacity(n);
+    for j in 0..n {
+        // SAFETY: native code wrote `argc + kwc` entries, and the
+        // buffers are `max_call_args` wide.
+        let (bits, tag) = unsafe { (*jf.call_args.add(j), *jf.call_tags.add(j)) };
+        args.push(unpack_pins(bits, tag, &ctx.pins));
+    }
+    // The keyword tail pairs with the interned names tuple (the plan
+    // scan admitted only a non-empty all-`str` tuple constant).
+    let mut kwargs: Vec<(String, Object)> = Vec::new();
+    if kwc > 0 {
+        // SAFETY: per the function contract, the activation keeps its
+        // code object alive.
+        let code = unsafe { &*ctx.code_ptr };
+        let Some(weavepy_compiler::Constant::Tuple(items)) = code.constants.get(names as usize)
+        else {
+            return CallStatus::Reject as i64;
+        };
+        if items.len() != kwc as usize {
+            return CallStatus::Reject as i64;
+        }
+        for (c, v) in items.iter().zip(args.split_off(argc as usize)) {
+            let weavepy_compiler::Constant::Str(s) = c else {
+                return CallStatus::Reject as i64;
+            };
+            kwargs.push((s.clone(), v));
+        }
+    }
+    // Arbitrary Python runs on behalf of this activation (RFC 0067
+    // WS1's dirtiness discipline).
+    ctx.dirty = true;
+    match interp.call_object_with_globals(&callee, &args, &kwargs, &ctx.globals) {
+        Err(err) => {
+            ctx.raised = Some(err);
+            CallStatus::Raised as i64
+        }
+        Ok(v) => {
+            let still_valid = guards_hold(
+                interp,
+                &ctx.globals,
+                &ctx.builtins,
+                &ctx.guard_snapshot,
+                &ctx.callees,
+                &ctx.math,
+            );
+            if still_valid {
+                if let Some(bits) = pin_any(v.clone(), &mut ctx.pins) {
+                    jf.ret_bits = bits;
+                    jf.ret_tag = SlotTag::ObjPin as u32;
+                    return CallStatus::Ok as i64;
+                }
+            }
+            ctx.parked = Some(v);
+            CallStatus::Boxed as i64
+        }
+    }
+}
+
+/// The attribute name behind `names` index `idx` of the activation's
+/// code object (RFC 0074 WS2/WS4).
+///
+/// # Safety
+///
+/// `ctx.code_ptr` stays alive for the whole activation (the entering
+/// frame / native-callee entry holds the `Rc`).
+unsafe fn ctx_name(ctx: &CallCtx, idx: i64) -> Option<&str> {
+    // SAFETY: per the function contract.
+    let code = unsafe { &*ctx.code_ptr };
+    code.names.get(idx as usize).map(String::as_str)
+}
+
+/// The `wpjit_dyn_attr_get` helper (RFC 0074 WS2/WS4): the
+/// interpreter's exact attribute load on a pinned receiver (bound
+/// methods materialize, descriptors and `__getattr__` run — arbitrary
+/// Python; the dirtiness discipline applies). Statuses: `0` ok (fresh
+/// pin in `ret_bits`), `1` raised, `2` completed but guards fell / cap
+/// pressure (result parked; deopt at the *next* pc — never
+/// re-executed), `3` rejected before any Python ran (deopt here,
+/// re-execute generically).
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`].
+unsafe extern "C" fn wpjit_dyn_attr_get(frame: *mut JitFrame, pin: i64, name: i64) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    // SAFETY: the `&mut Interpreter` is dormant while the helper runs.
+    let interp = unsafe { &mut *ctx.interp };
+    let recv = match ctx.pins.get(pin as usize) {
+        Some(p) => p.to_object(),
+        // `-1` (the nullable `None`) loads attributes of `None` —
+        // legitimate (`None.__class__`) but cold; re-execute.
+        None => return 3,
+    };
+    // SAFETY: the activation keeps its code object alive.
+    let Some(attr) = (unsafe { ctx_name(ctx, name) }) else {
+        return 3;
+    };
+    let attr = attr.to_owned();
+    ctx.dirty = true;
+    match interp.load_attr_public(&recv, &attr) {
+        Err(err) => {
+            ctx.raised = Some(err);
+            1
+        }
+        Ok(v) => {
+            let still_valid = guards_hold(
+                interp,
+                &ctx.globals,
+                &ctx.builtins,
+                &ctx.guard_snapshot,
+                &ctx.callees,
+                &ctx.math,
+            );
+            if still_valid {
+                if let Some(bits) = pin_any(v.clone(), &mut ctx.pins) {
+                    jf.ret_bits = bits;
+                    return 0;
+                }
+            }
+            ctx.parked = Some(v);
+            2
+        }
+    }
+}
+
+/// The `wpjit_dyn_attr_set` helper (RFC 0074 WS4): the interpreter's
+/// exact attribute store on a pinned receiver (`__setattr__` dispatch
+/// included — arbitrary Python; the dirtiness discipline applies).
+/// The value is staged tag-typed in `call_args[0]` / `call_tags[0]`.
+/// Statuses as [`wpjit_dyn_attr_get`], with no result on ok (`Boxed`
+/// means the store *completed* with invalidated guards — deopt at the
+/// next pc, never re-executed).
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`] — one marshal entry and tag are
+/// initialized.
+unsafe extern "C" fn wpjit_dyn_attr_set(frame: *mut JitFrame, pin: i64, name: i64) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    // SAFETY: the `&mut Interpreter` is dormant while the helper runs.
+    let interp = unsafe { &mut *ctx.interp };
+    let recv = match ctx.pins.get(pin as usize) {
+        Some(p) => p.to_object(),
+        None => return 3,
+    };
+    // SAFETY: the activation keeps its code object alive.
+    let Some(attr) = (unsafe { ctx_name(ctx, name) }) else {
+        return 3;
+    };
+    let attr = attr.to_owned();
+    // SAFETY: native code staged the value in slot 0.
+    let (bits, tag) = unsafe { (*jf.call_args, *jf.call_tags) };
+    let value = unpack_pins(bits, tag, &ctx.pins);
+    ctx.dirty = true;
+    match interp.store_attr_public(&recv, &attr, value) {
+        Err(err) => {
+            ctx.raised = Some(err);
+            1
+        }
+        Ok(()) => {
+            let still_valid = guards_hold(
+                interp,
+                &ctx.globals,
+                &ctx.builtins,
+                &ctx.guard_snapshot,
+                &ctx.callees,
+                &ctx.math,
+            );
+            if still_valid {
+                0
+            } else {
+                2
+            }
+        }
+    }
+}
+
+/// The `wpjit_iter_new` helper (RFC 0074 WS3): materialize `iter(x)`
+/// for a pinned iterable and answer the fresh iterator's pin — the
+/// materializing arm of `IterCapture`. Receivers whose `iter()` would
+/// dispatch Python (`__iter__` on instances, metaclass `__iter__`,
+/// object-backed mapping proxies) deopt *before* anything runs, so
+/// the interpreter executes the `GET_ITER` — and its side effects —
+/// exactly once, generically. Everything else builds the iterator
+/// through the interpreter core without running Python. Negative
+/// deopts (Python-dispatching receiver, non-iterable — the
+/// re-execution raises exactly — cap pressure).
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`].
+unsafe extern "C" fn wpjit_iter_new(frame: *mut JitFrame, pin: i64) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    // SAFETY: the `&mut Interpreter` is dormant while the helper runs.
+    let interp = unsafe { &mut *ctx.interp };
+    if ctx.pins.len() >= RUNTIME_PIN_CAP {
+        return -1;
+    }
+    let recv = match ctx.pins.get(pin as usize) {
+        Some(Pin::Obj(o)) => o.clone(),
+        Some(Pin::List(l, _)) => Object::List(l.clone()),
+        None => return -1,
+    };
+    // `make_iter` dispatches Python for exactly these receiver
+    // shapes; a fresh compile would double `__iter__`'s side effects
+    // on a post-hoc deopt, so they never enter the helper.
+    if matches!(
+        recv,
+        Object::Instance(_) | Object::Type(_) | Object::MappingProxyObj(_)
+    ) {
+        return -1;
+    }
+    match interp.make_iter(&recv, &ctx.globals) {
+        Ok(it) => {
+            let idx = ctx.pins.len() as i64;
+            ctx.pins.push(Pin::Obj(it));
+            idx
+        }
+        Err(_) => -1,
+    }
+}
+
+/// Pack one yielded element into a compiled loop-variable lane
+/// (RFC 0074 WS3 — the [`weavepy_jit::ITER_ELEM_STR`]-aware sibling
+/// of `wpjit_iter_next`'s packing). `None` = outside the lane.
+fn pack_iter_elem(v: &Object, tag: i64, pins: &mut PinTable) -> Option<u64> {
+    if tag == weavepy_jit::ITER_ELEM_STR {
+        return match v {
+            Object::Str(_) if pins.len() < RUNTIME_PIN_CAP => {
+                pins.push(Pin::Obj(v.clone()));
+                Some((pins.len() - 1) as u64)
+            }
+            _ => None,
+        };
+    }
+    match SlotTag::from_raw(tag as u32) {
+        SlotTag::Int => pack(v, JitType::Int),
+        SlotTag::Float => pack(v, JitType::Float),
+        SlotTag::Bool => pack(v, JitType::Bool),
+        SlotTag::ObjPin => obj_ret_bits(v, pins),
+        _ => None,
+    }
+}
+
+/// The `wpjit_iter_next_pair` helper (RFC 0074 WS3): one step of a
+/// [`weavepy_jit::TTerm`]`::ForIterPair` loop — advance the pinned
+/// iterator through the interpreter core (**runs Python** for
+/// generator sources) and unpack the yielded 2-tuple into the
+/// compiled element lanes. Statuses per
+/// [`weavepy_jit::IterNextPairHelper`]: `0` unpacked (`ret_bits` /
+/// `call_args[0]`), `1` exhausted, `2` deopt at the header (nothing
+/// consumed), `3` consumed but not a 2-tuple in the lanes (raw
+/// element pinned; resume at the erased `UNPACK_SEQUENCE`), `4`
+/// raised.
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`].
+unsafe extern "C" fn wpjit_iter_next_pair(
+    frame: *mut JitFrame,
+    pin: i64,
+    tag1: i64,
+    tag2: i64,
+) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    // SAFETY: the `&mut Interpreter` is dormant while the helper runs.
+    let interp = unsafe { &mut *ctx.interp };
+    // The loop's poll point — see `wpjit_iter_next`.
+    crate::gil::yield_checkpoint();
+    if crate::hot_gates::load() != 0 || crate::trace::any_observers_active() {
+        return 2;
+    }
+    let it = match ctx.pins.get(pin as usize) {
+        Some(Pin::Obj(o @ (Object::Generator(_) | Object::Iter(_) | Object::LazyIter(_)))) => {
+            o.clone()
+        }
+        _ => return 2,
+    };
+    // A builtin-iterator step is pure native code; generator resumes
+    // (and lazy iterators, which may drive Python) run arbitrary
+    // Python on behalf of this activation.
+    let runs_python = !matches!(it, Object::Iter(_));
+    if runs_python {
+        ctx.dirty = true;
+    }
+    match interp.iter_next(&it, &ctx.globals) {
+        Err(err) => {
+            ctx.raised = Some(err);
+            4
+        }
+        Ok(None) => 1,
+        Ok(Some(v)) => {
+            let still_valid = !runs_python
+                || guards_hold(
+                    interp,
+                    &ctx.globals,
+                    &ctx.builtins,
+                    &ctx.guard_snapshot,
+                    &ctx.callees,
+                    &ctx.math,
+                );
+            if still_valid {
+                // Exactly a 2-tuple unpacks in the lanes (the erased
+                // `UNPACK_SEQUENCE 2` admits lists and general
+                // iterables too — those surrender through the
+                // store-pc deopt and unpack generically).
+                if let Object::Tuple(items) = &v {
+                    if items.len() == 2 {
+                        let packed1 = pack_iter_elem(&items[0], tag1, &mut ctx.pins);
+                        let packed2 =
+                            packed1.and_then(|_| pack_iter_elem(&items[1], tag2, &mut ctx.pins));
+                        if let (Some(b1), Some(b2)) = (packed1, packed2) {
+                            jf.ret_bits = b1;
+                            // SAFETY: the marshal buffer is at least
+                            // one slot wide (`max_call_args.max(1)`).
+                            unsafe {
+                                *jf.call_args = b2;
+                            }
+                            return 0;
+                        }
+                    }
+                }
+            }
+            // Consumed but not unpacked (or the guards fell): pin the
+            // raw element and resume interpreted at the erased
+            // `UNPACK_SEQUENCE`, which consumes it exactly once.
+            jf.ret_bits = if matches!(v, Object::None) {
+                u64::MAX
+            } else {
+                ctx.pins.push(Pin::Obj(v));
+                (ctx.pins.len() - 1) as u64
+            };
+            3
+        }
+    }
+}
+
+/// The `wpjit_str_mod` helper (RFC 0074 WS5): `str % x` through the
+/// interpreter's `%`-formatting core (`__str__`/`__repr__` of the
+/// staged operand may run — the dirtiness discipline applies when it
+/// can). Statuses per [`weavepy_jit::StrModHelper`]: `0` ok (fresh
+/// exact-`str` pin in `ret_bits`), `1` raised, `2` completed but the
+/// result surprised / guards fell / cap pressure (parked; deopt at
+/// the next pc — formatting side effects never re-run), `3` rejected
+/// before running.
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`].
+unsafe extern "C" fn wpjit_str_mod(
+    frame: *mut JitFrame,
+    lhs_pin: i64,
+    rhs_bits: i64,
+    rhs_tag: i64,
+) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    // SAFETY: the `&mut Interpreter` is dormant while the helper runs.
+    let interp = unsafe { &mut *ctx.interp };
+    let lhs = match ctx.pins.get(lhs_pin as usize) {
+        Some(Pin::Obj(o @ Object::Str(_))) => o.clone(),
+        _ => return 3,
+    };
+    let rhs = unpack_pins(rhs_bits as u64, rhs_tag as u32, &ctx.pins);
+    // Scalar and exact-`str`/tuple-of-scalar operands format without
+    // running Python; anything else may dispatch `__str__`/`__repr__`.
+    let may_run_python = !matches!(
+        rhs,
+        Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::Str(_) | Object::None
+    );
+    if may_run_python {
+        ctx.dirty = true;
+    }
+    match interp.percent_mod_left_slot(&lhs, &rhs, &ctx.globals) {
+        Err(err) => {
+            ctx.raised = Some(err);
+            1
+        }
+        Ok(v) => {
+            let still_valid = !may_run_python
+                || guards_hold(
+                    interp,
+                    &ctx.globals,
+                    &ctx.builtins,
+                    &ctx.guard_snapshot,
+                    &ctx.callees,
+                    &ctx.math,
+                );
+            if still_valid {
+                if matches!(v, Object::Str(_)) && ctx.pins.len() < RUNTIME_PIN_CAP {
+                    jf.ret_bits = ctx.pins.len() as u64;
+                    ctx.pins.push(Pin::Obj(v));
+                    return 0;
+                }
+            }
+            ctx.parked = Some(v);
+            2
+        }
+    }
+}
+
+/// The `wpjit_str_slice` helper (RFC 0074 WS5): `s[a:b]` (unit step)
+/// on a pinned exact `str` — the tier-1 `SubscrStrInt` discipline
+/// extended to slices: O(1) byte slicing on an ASCII payload only
+/// (code points and bytes coincide), CPython clamping, `i64::MIN` =
+/// absent bound. Negative deopts (non-ASCII receiver — the generic
+/// path slices by code point — pin surprise, cap pressure). Never
+/// runs Python code.
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`].
+unsafe extern "C" fn wpjit_str_slice(frame: *mut JitFrame, pin: i64, start: i64, stop: i64) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    let Some(s) = pin_str(ctx, pin) else {
+        return -1;
+    };
+    if !s.is_ascii() || ctx.pins.len() >= RUNTIME_PIN_CAP {
+        return -1;
+    }
+    let len = s.len() as i64;
+    let clamp = |b: i64, absent: i64| {
+        if b == i64::MIN {
+            absent
+        } else if b < 0 {
+            (b + len).clamp(0, len)
+        } else {
+            b.min(len)
+        }
+    };
+    let a = clamp(start, 0);
+    let b = clamp(stop, len);
+    let out = if a < b {
+        &s[a as usize..b as usize]
+    } else {
+        ""
+    };
+    let idx = ctx.pins.len() as i64;
+    ctx.pins.push(Pin::Obj(Object::from_str(out)));
+    idx
+}
+
 /// RFC 0069 WS3b — a frameless interpreter→native call. When the
 /// tier-1 exact-arity call fast path targets a function whose code is
 /// already tier-2 compiled and native-enterable, enter the compiled
@@ -5070,6 +5757,8 @@ pub(crate) fn try_call_native_direct(
         raised: None,
         const_pins: Vec::new(),
         pins,
+        obj_globals: entry.art.obj_globals.clone(),
+        obj_global_pins: Vec::new(),
         attr_guards: entry.art.attr_guards.clone(),
         methods: entry.art.methods.clone(),
         math: entry.art.math.clone(),
@@ -5145,6 +5834,7 @@ pub(crate) fn try_call_native_direct(
                 cf: entry.art.cf.clone(),
                 snap: entry.art.snap.clone(),
                 callees: entry.art.callees.clone(),
+                obj_globals: entry.art.obj_globals.clone(),
                 attr_guards: entry.art.attr_guards.clone(),
                 methods: entry.art.methods.clone(),
                 math: entry.art.math.clone(),
@@ -5732,6 +6422,8 @@ fn enter_compiled(
         raised: None,
         const_pins: Vec::new(),
         pins,
+        obj_globals: entry.obj_globals.clone(),
+        obj_global_pins: Vec::new(),
         attr_guards: entry.attr_guards.clone(),
         methods: entry.methods.clone(),
         math: entry.math.clone(),
@@ -5786,6 +6478,7 @@ fn enter_compiled(
                 call_tags,
                 pins: ctx.pins,
                 const_pins: ctx.const_pins,
+                obj_global_pins: ctx.obj_global_pins,
                 entry_pin_count,
                 dirty: ctx.dirty,
                 local_types: cf.local_types.clone(),
@@ -6040,6 +6733,16 @@ fn rebuild_stack(
         inserts.push((s.interp_depth, f));
         inserts.push((s.interp_depth + 1, Object::Unbound));
     }
+    // RFC 0074 WS2 — open opaque-call null spans: only the `Unbound`
+    // self-or-null marker is interpreter-side (the loaded callee
+    // itself is an ordinary spilled native value below it).
+    for s in cf
+        .null_spans
+        .iter()
+        .filter(|s| s.live_from < jf.deopt_pc && jf.deopt_pc < s.live_to)
+    {
+        inserts.push((s.interp_depth, Object::Unbound));
+    }
     inserts.sort_unstable_by_key(|(depth, _)| *depth);
     // Open method spans: the spilled entry at `native_index` must
     // rebuild as the bound method, not the bare pin — via a fresh
@@ -6155,6 +6858,9 @@ pub(crate) struct NativeActivation {
     /// [`Self::visit_objects`]).
     pins: PinTable,
     const_pins: Vec<(u32, u64)>,
+    /// RFC 0074 WS1 — the memoized obj-global pins, parked alongside
+    /// `const_pins` so a resumed activation reuses them.
+    obj_global_pins: Vec<(u32, u64)>,
     /// Pin-table size at the *first* native entry; the eventual
     /// `Returned`/deopt exit drains runtime pins from here.
     entry_pin_count: usize,
@@ -6310,6 +7016,15 @@ fn park_plan(frame: &super::Frame, entry: &CompiledEntry, jf: &JitFrame) -> Opti
             .map_or(Object::None, |(_, _, f)| f.clone());
         inserts.push((s.interp_depth, PlanSlot::Obj(f)));
         inserts.push((s.interp_depth + 1, PlanSlot::Obj(Object::Unbound)));
+    }
+    // RFC 0074 WS2 — an open opaque-call null span parks its
+    // interpreter-only `Unbound` marker at its recorded depth.
+    for s in cf
+        .null_spans
+        .iter()
+        .filter(|s| s.live_from < pc && pc < s.live_to)
+    {
+        inserts.push((s.interp_depth, PlanSlot::Obj(Object::Unbound)));
     }
     inserts.sort_by_key(|(depth, _)| *depth);
     // With the single spill (the yielded value) delivered at park, the
@@ -6481,6 +7196,8 @@ fn resume_parked(interp: &mut super::Interpreter, frame: &mut super::Frame) -> J
         raised: None,
         const_pins: std::mem::take(&mut act.const_pins),
         pins,
+        obj_globals: entry.obj_globals.clone(),
+        obj_global_pins: std::mem::take(&mut act.obj_global_pins),
         attr_guards: entry.attr_guards.clone(),
         methods: entry.methods.clone(),
         math: entry.math.clone(),
@@ -6522,6 +7239,7 @@ fn resume_parked(interp: &mut super::Interpreter, frame: &mut super::Frame) -> J
             let yielded = unpack_pins(act.spill[0], act.tags[0], &ctx.pins);
             act.pins = ctx.pins;
             act.const_pins = ctx.const_pins;
+            act.obj_global_pins = ctx.obj_global_pins;
             act.dirty = ctx.dirty;
             act.yield_pc = jf.deopt_pc;
             act.plan = plan;
