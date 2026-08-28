@@ -69,6 +69,54 @@ static PyObject *st_oops(PyObject *self, PyObject *args) {
     return NULL;
 }
 
+/* `et`-converter round-trip in Pillow's getfont shape ("etf|nsy#n"):
+ * the encoded filename must arrive as a PyMem_Malloc'd NUL-terminated
+ * copy the callee frees, and the units *after* the two-char `et` must
+ * stay bound to their own destinations (a desync here is how the
+ * missing converter corrupted every later slot; RFC 0075 WS9). Returns
+ * (filename, size*100 as int, index, tail_len). */
+static PyObject *st_encoded(PyObject *self, PyObject *args, PyObject *kw) {
+    (void)self;
+    char *filename = NULL;
+    float size = 0.0f;
+    Py_ssize_t index = -1;
+    const char *tail = NULL;
+    Py_ssize_t tail_len = -1;
+    static char *kwlist[] = {"filename", "size", "index", "tail", NULL};
+    if (!PyArg_ParseTupleAndKeywords(
+            args, kw, "etf|ny#", kwlist,
+            NULL, &filename, &size, &index, &tail, &tail_len)) {
+        return NULL;
+    }
+    PyObject *out = Py_BuildValue(
+        "(sinn)", filename, (int)(size * 100.0f), index, tail_len);
+    if (filename) {
+        PyMem_Free(filename);
+    }
+    return out;
+}
+
+/* `_PyEval_SliceIndex` consumer in lxml's shape (`python.pxd` cimports
+ * the private symbol; `_isFullSlice`/`_findChildSlice` call it for
+ * every explicit-step child slice — when the export was missing the
+ * lazy binding resolved to NULL and `del root[::-1]` jumped to address
+ * zero; RFC 0075 WS9). Takes one argument, returns (rc, value); None
+ * must leave the preset value untouched with rc=1. */
+extern int _PyEval_SliceIndex(PyObject *v, Py_ssize_t *pi);
+static PyObject *st_slice_index(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *v = NULL;
+    if (!PyArg_ParseTuple(args, "O", &v)) {
+        return NULL;
+    }
+    Py_ssize_t out = -777; /* sentinel: None must not overwrite it */
+    int rc = _PyEval_SliceIndex(v, &out);
+    if (rc == 0) {
+        return NULL; /* exception already set */
+    }
+    return Py_BuildValue("(in)", rc, out);
+}
+
 static PyObject *st_identity(PyObject *self, PyObject *o) {
     (void)self;
     Py_INCREF(o);
@@ -124,6 +172,10 @@ static PyMethodDef _smalltest_methods[] = {
     {"concat", st_concat, METH_VARARGS, "concatenate two strings"},
     {"make_pair", st_make_pair, METH_VARARGS, "build a 2-tuple"},
     {"oops", st_oops, METH_VARARGS, "raise ValueError"},
+    {"encoded", (PyCFunction)(void (*)(void))st_encoded,
+     METH_VARARGS | METH_KEYWORDS, "et-converter round-trip"},
+    {"slice_index", st_slice_index, METH_VARARGS,
+     "_PyEval_SliceIndex round-trip"},
     {"identity", st_identity, METH_O, "return arg unchanged"},
     {"dict_new", st_dict_new, METH_NOARGS, "build a sample dict"},
     {NULL, NULL, 0, NULL},

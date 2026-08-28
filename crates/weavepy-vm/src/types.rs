@@ -744,6 +744,16 @@ impl TypeObject {
                     return v & (SEQUENCE | MAPPING);
                 }
             }
+            // A bridged extension type declares the bit straight in its C
+            // `tp_flags` — numpy 2.x stamps `Py_TPFLAGS_SEQUENCE` on
+            // `ndarray`, so `match arr: case [a, b, c]` matches, memmap
+            // included (RFC 0075 WS8, test_memmap TestPatternMatching).
+            if let Some(c_flags) = crate::descr_registry::ext_type_c_flags(t) {
+                let v = c_flags as i64 & (SEQUENCE | MAPPING);
+                if v != 0 {
+                    return v;
+                }
+            }
         }
         0
     }
@@ -1009,7 +1019,16 @@ impl TypeObject {
             Some(Object::Str(s)) => Some(s.as_ref().to_owned()),
             _ => None,
         };
-        let module = as_str("__module__");
+        // A *static* extension type carries no `__module__` dict entry
+        // (CPython leaves it out so pickle's `whichmodule` scan works; RFC
+        // 0075 WS8) — its module is the dotted prefix of the C `tp_name`,
+        // exactly how CPython's `type_repr` → `type_module` derives it
+        // (`<class 'numpy.timedelta64'>`, not `<class 'timedelta64'>`).
+        let module = as_str("__module__").or_else(|| {
+            let full = self.c_tp_name.get()?;
+            let (m, _) = full.rsplit_once('.')?;
+            Some(m.to_owned())
+        });
         let qual = as_str("__qualname__")
             .or_else(|| self.qualname.borrow().clone())
             .unwrap_or_else(|| self.name.clone());

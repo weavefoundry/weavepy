@@ -917,7 +917,12 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "__setstate__" if f.is_memory() => Some(method("__setstate__", file_setstate_mem)),
             "seek" => Some(method("seek", file_seek)),
             "tell" => Some(method("tell", file_tell)),
-            "getvalue" => Some(method("getvalue", file_getvalue)),
+            // `getvalue()` exists only on the in-memory streams in CPython.
+            // Exposing it on every file made `hasattr(f, 'getvalue')` lie
+            // for OS-backed streams — lxml's `_parseDocument` probes exactly
+            // that to pick the StringIO fast path and called it (RFC 0075
+            // WS9, lxml selftest lane, `etree.parse(open(p, 'rb'))`).
+            "getvalue" if f.is_memory() => Some(method("getvalue", file_getvalue)),
             // `detach()` always refuses on the collapsed native stream:
             // CPython's `BytesIO`/`StringIO`/`TextIOWrapper` raise
             // `UnsupportedOperation` when there is no underlying buffer to
@@ -5448,19 +5453,54 @@ fn bytes_to_bigint(data: &[u8], byteorder: &str, signed: bool) -> Result<BigInt,
 
 // ---------- float methods (RFC 0019) ----------
 
+/// The C double behind a `float` method receiver. Plain floats and
+/// pure-Python float-subclass instances arrive here already unwrapped
+/// to `Object::Float`; a *foreign* float subclass — numpy's `float64`,
+/// whose C struct is PyFloatObject-compatible — needs the bridge's
+/// `PyFloat_AsDouble` (RFC 0075 WS8: the object-loop ufuncs call the
+/// inherited `float.__ceil__`/`__floor__`/`__trunc__` on np.float64
+/// subclass elements). Guarded by an MRO check so `float.__ceil__`
+/// keeps rejecting non-float receivers like CPython.
+fn float_receiver(v: &Object) -> Option<f64> {
+    match v {
+        Object::Float(f) => Some(*f),
+        Object::Instance(_) | Object::Foreign(_) => {
+            // Pure-Python float subclass: the payload rides on the
+            // instance itself.
+            if let Some(inner) = v.native_value() {
+                return float_receiver(&inner);
+            }
+            let bt = crate::builtin_types::builtin_types();
+            let is_float = class_of(v)
+                .mro
+                .borrow()
+                .iter()
+                .any(|t| crate::sync::Rc::ptr_eq(t, &bt.float_));
+            if !is_float {
+                return None;
+            }
+            match crate::foreign::as_float_obj(v) {
+                Ok(Object::Float(f)) => Some(f),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 fn float_is_integer(args: &[Object]) -> Result<Object, RuntimeError> {
     let v = one(args, "is_integer")?;
-    match v {
-        Object::Float(f) => Ok(Object::Bool(f.is_finite() && f.fract() == 0.0)),
-        _ => Err(type_error("is_integer: float expected")),
+    match float_receiver(v) {
+        Some(f) => Ok(Object::Bool(f.is_finite() && f.fract() == 0.0)),
+        None => Err(type_error("is_integer: float expected")),
     }
 }
 
 fn float_hex(args: &[Object]) -> Result<Object, RuntimeError> {
     let v = one(args, "hex")?;
-    match v {
-        Object::Float(f) => Ok(Object::from_str(format_float_hex(*f))),
-        _ => Err(type_error("hex: float expected")),
+    match float_receiver(v) {
+        Some(f) => Ok(Object::from_str(format_float_hex(f))),
+        None => Err(type_error("hex: float expected")),
     }
 }
 
@@ -5503,9 +5543,8 @@ fn float_fromhex_wrap(cls: Option<&Object>, x: f64) -> Result<Object, RuntimeErr
 
 fn float_as_integer_ratio(args: &[Object]) -> Result<Object, RuntimeError> {
     let v = one(args, "as_integer_ratio")?;
-    let f = match v {
-        Object::Float(f) => *f,
-        _ => return Err(type_error("as_integer_ratio: float expected")),
+    let Some(f) = float_receiver(v) else {
+        return Err(type_error("as_integer_ratio: float expected"));
     };
     if f.is_nan() {
         return Err(value_error("cannot convert NaN to integer ratio"));
@@ -5552,11 +5591,11 @@ fn float_conjugate(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn float_trunc(args: &[Object]) -> Result<Object, RuntimeError> {
     let v = one(args, "__trunc__")?;
-    match v {
-        Object::Float(f) => Ok(Object::int_from_bigint(
+    match float_receiver(v) {
+        Some(f) => Ok(Object::int_from_bigint(
             crate::object::bigint_from_f64_trunc(f.trunc()),
         )),
-        _ => Err(type_error("__trunc__: float expected")),
+        None => Err(type_error("__trunc__: float expected")),
     }
 }
 
@@ -5565,8 +5604,8 @@ fn float_trunc(args: &[Object]) -> Result<Object, RuntimeError> {
 /// for ±inf). Kept behaviourally identical to the type-dict `float.__int__`
 /// so instance- and type-level access agree.
 fn float_int(args: &[Object]) -> Result<Object, RuntimeError> {
-    match one(args, "__int__")? {
-        Object::Float(f) => {
+    match float_receiver(one(args, "__int__")?) {
+        Some(f) => {
             if f.is_nan() {
                 return Err(value_error("cannot convert float NaN to integer"));
             }
@@ -5579,21 +5618,21 @@ fn float_int(args: &[Object]) -> Result<Object, RuntimeError> {
                 crate::object::bigint_from_f64_trunc(f.trunc()),
             ))
         }
-        _ => Err(type_error("__int__: float expected")),
+        None => Err(type_error("__int__: float expected")),
     }
 }
 
 fn float_floor(args: &[Object]) -> Result<Object, RuntimeError> {
-    match one(args, "__floor__")? {
-        Object::Float(f) => float_int_part(f.floor()),
-        _ => Err(type_error("__floor__: float expected")),
+    match float_receiver(one(args, "__floor__")?) {
+        Some(f) => float_int_part(f.floor()),
+        None => Err(type_error("__floor__: float expected")),
     }
 }
 
 fn float_ceil(args: &[Object]) -> Result<Object, RuntimeError> {
-    match one(args, "__ceil__")? {
-        Object::Float(f) => float_int_part(f.ceil()),
-        _ => Err(type_error("__ceil__: float expected")),
+    match float_receiver(one(args, "__ceil__")?) {
+        Some(f) => float_int_part(f.ceil()),
+        None => Err(type_error("__ceil__: float expected")),
     }
 }
 
@@ -5615,9 +5654,8 @@ fn float_int_part(f: f64) -> Result<Object, RuntimeError> {
 
 fn float_round(args: &[Object]) -> Result<Object, RuntimeError> {
     let v = one(args, "__round__")?;
-    let f = match v {
-        Object::Float(f) => *f,
-        _ => return Err(type_error("__round__: float expected")),
+    let Some(f) = float_receiver(v) else {
+        return Err(type_error("__round__: float expected"));
     };
     let ndigits = match args.get(1) {
         Some(Object::Int(i)) => Some(*i),
@@ -6281,6 +6319,24 @@ pub fn b_complex(args: &[Object]) -> Result<Object, RuntimeError> {
                 .map(|&c| char::from_u32(c).unwrap_or('\u{FFFD}'))
                 .collect(),
         ),
+        // CPython's `complex_new` accepts any `PyUnicode_Check` — subclasses
+        // included — before consulting numeric hooks. numpy's U→complex cast
+        // loop calls the complex type with an `np.str_` through C `tp_new`
+        // (RFC 0075 WS8, test_casting_unittests
+        // test_simple_string_casts_roundtrip).
+        v @ (Object::Instance(_) | Object::Foreign(_))
+            if class_of(v).mro.borrow().iter().any(|t| {
+                crate::sync::Rc::ptr_eq(t, &crate::builtin_types::builtin_types().str_)
+            }) =>
+        {
+            match v {
+                Object::Foreign(s) => Some(crate::foreign::str_(s)?),
+                _ => match v.native_value() {
+                    Some(Object::Str(s)) => Some(s.to_string()),
+                    _ => None,
+                },
+            }
+        }
         _ => None,
     };
     if let Some(s) = str_first {
@@ -8614,6 +8670,15 @@ pub fn hash_object(obj: &Object) -> Result<Object, RuntimeError> {
     // by allocation identity. Keeping `hash()` and dict bucketing in lockstep
     // is what makes custom `__hash__`/`__eq__` keys interoperate with built-in
     // values in a `set`/`dict`.
+    // A foreign scalar's `tp_hash` can *raise* — numpy's generic-unit
+    // `timedelta64(123)` raises ValueError ("Can't hash generic
+    // timedelta64"). `py_hash_value` returns `Option` and its callers fall
+    // back to identity, so dispatch here where the error can propagate
+    // (RFC 0075 WS8, test_datetime.test_timedelta_hash_generic).
+    if let Object::Foreign(s) = obj {
+        let _no_yield = crate::gil::no_gil_handoff();
+        return Ok(Object::Int(crate::foreign::hash(s)?));
+    }
     if let Some(h) = crate::object::py_hash_value(obj) {
         return Ok(Object::Int(h));
     }

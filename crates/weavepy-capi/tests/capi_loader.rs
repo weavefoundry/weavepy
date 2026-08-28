@@ -162,6 +162,87 @@ fn smalltest_oops_raises_value_error() {
     );
 }
 
+/// The `et` encoded-string converter in Pillow's getfont shape
+/// ("etf|ny#" here): the filename must round-trip through a
+/// PyMem_Malloc'd copy (the C side frees it — a non-heap pointer
+/// aborts), and the slots *after* the two-char unit must stay bound to
+/// their own destinations (RFC 0075 WS9, Pillow selftest lane).
+#[test]
+fn smalltest_et_converter_round_trips() {
+    let Some((_lock, mut interp, module)) = load_module() else {
+        return;
+    };
+    let encoded = lookup_module_member(&module, "encoded").expect("module missing `encoded`");
+    let font_bytes: weavepy_vm::sync::Rc<[u8]> = b"FONTDATA".to_vec().into();
+    let result = interp
+        .call_object(
+            encoded,
+            &[
+                Object::Str("Fonts/Frée.ttf".into()),
+                Object::Float(20.0),
+                Object::Int(3),
+            ],
+            &[("tail".to_owned(), Object::Bytes(font_bytes))],
+        )
+        .expect("calling encoded should succeed");
+    let items = match result {
+        Object::Tuple(t) => t,
+        other => panic!("expected tuple, got {other:?}"),
+    };
+    assert_eq!(items.len(), 4, "expected 4-tuple");
+    match &items[0] {
+        Object::Str(s) => assert_eq!(&**s, "Fonts/Frée.ttf"),
+        other => panic!("filename: expected str, got {other:?}"),
+    }
+    assert!(
+        matches!(items[1], Object::Int(2000)),
+        "size: {:?}",
+        items[1]
+    );
+    assert!(matches!(items[2], Object::Int(3)), "index: {:?}", items[2]);
+    assert!(
+        matches!(items[3], Object::Int(8)),
+        "tail_len: {:?}",
+        items[3]
+    );
+}
+
+/// `_PyEval_SliceIndex` semantics (`Python/ceval.c`): ints convert,
+/// `None` returns 1 leaving the output untouched, huge ints clamp to
+/// the Py_ssize_t range instead of raising (RFC 0075 WS9, the lxml
+/// explicit-step slice crash).
+#[test]
+fn smalltest_slice_index_semantics() {
+    let Some((_lock, mut interp, module)) = load_module() else {
+        return;
+    };
+    let f = lookup_module_member(&module, "slice_index").expect("module missing `slice_index`");
+    let call = |interp: &mut Interpreter, arg: Object| interp.call_object(f.clone(), &[arg], &[]);
+    match call(&mut interp, Object::Int(-3)).expect("int should convert") {
+        Object::Tuple(t) => {
+            assert!(matches!(t[0], Object::Int(1)));
+            assert!(matches!(t[1], Object::Int(-3)));
+        }
+        other => panic!("expected tuple, got {other:?}"),
+    }
+    match call(&mut interp, Object::None).expect("None is accepted") {
+        Object::Tuple(t) => {
+            assert!(matches!(t[0], Object::Int(1)));
+            // The sentinel must survive: None leaves *pi untouched.
+            assert!(matches!(t[1], Object::Int(-777)), "sentinel: {:?}", t[1]);
+        }
+        other => panic!("expected tuple, got {other:?}"),
+    }
+    let huge = Object::int_from_bigint(num_bigint::BigInt::from(isize::MAX) + 10);
+    match call(&mut interp, huge).expect("huge int clamps, not raises") {
+        Object::Tuple(t) => {
+            assert!(matches!(t[1], Object::Int(n) if n == i64::try_from(isize::MAX).unwrap()));
+        }
+        other => panic!("expected tuple, got {other:?}"),
+    }
+    call(&mut interp, Object::Str("x".into())).expect_err("str must raise TypeError");
+}
+
 #[test]
 fn smalltest_module_constants_are_set() {
     let Some((_lock, _interp, module)) = load_module() else {

@@ -123,6 +123,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("getpagesize")),
             builtin("getpagesize", resource_getpagesize),
         );
+        d.insert(
+            DictKey(Object::from_static("struct_rusage")),
+            Object::Type(struct_rusage_type()),
+        );
     }
     Rc::new(PyModule {
         name: "resource".to_owned(),
@@ -244,7 +248,11 @@ fn resource_getrusage(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let utime = ru.ru_utime_sec as f64 + (ru.ru_utime_usec as f64) / 1.0e6;
     let stime = ru.ru_stime_sec as f64 + (ru.ru_stime_usec as f64) / 1.0e6;
-    Ok(Object::Tuple(Rc::from(
+    // CPython returns a `struct_rusage` struct sequence, not a bare tuple —
+    // Pillow's leak-test helper reads `.ru_maxrss` by name (RFC 0075 WS9).
+    Ok(super::os::struct_seq_instance(
+        struct_rusage_type(),
+        &RUSAGE_FIELDS,
         vec![
             Object::Float(utime),
             Object::Float(stime),
@@ -262,9 +270,33 @@ fn resource_getrusage(args: &[Object]) -> Result<Object, RuntimeError> {
             Object::Int(ru.ru_nsignals as i64),
             Object::Int(ru.ru_nvcsw as i64),
             Object::Int(ru.ru_nivcsw as i64),
-        ]
-        .into_boxed_slice(),
-    )))
+        ],
+    ))
+}
+
+/// `resource.struct_rusage` field names (CPython's `struct_rusage` docs
+/// order, `Modules/resource.c`).
+const RUSAGE_FIELDS: [&str; 16] = [
+    "ru_utime",
+    "ru_stime",
+    "ru_maxrss",
+    "ru_ixrss",
+    "ru_idrss",
+    "ru_isrss",
+    "ru_minflt",
+    "ru_majflt",
+    "ru_nswap",
+    "ru_inblock",
+    "ru_oublock",
+    "ru_msgsnd",
+    "ru_msgrcv",
+    "ru_nsignals",
+    "ru_nvcsw",
+    "ru_nivcsw",
+];
+
+fn struct_rusage_type() -> Rc<crate::types::TypeObject> {
+    super::os::struct_seq_type("struct_rusage", "resource", &RUSAGE_FIELDS)
 }
 
 fn resource_getpagesize(_args: &[Object]) -> Result<Object, RuntimeError> {

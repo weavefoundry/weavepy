@@ -79,6 +79,11 @@ pub unsafe extern "C" fn PyObject_Repr(o: *mut PyObject) -> *mut PyObject {
         if !r.is_null() {
             return r;
         }
+        // NULL with a pending exception: the slot *raised* — propagate,
+        // like CPython. NULL without one: no usable slot — placeholder.
+        if crate::errors::pending().is_some() {
+            return ptr::null_mut();
+        }
     }
     // A VM object with a Python-level `__repr__` (a user/extension class
     // instance, or a class with a metaclass `__repr__`) must dispatch that
@@ -133,6 +138,10 @@ pub unsafe extern "C" fn PyObject_Str(o: *mut PyObject) -> *mut PyObject {
         let r = unsafe { foreign_repr_or_str(o, false) };
         if !r.is_null() {
             return r;
+        }
+        // Propagate a raised `tp_str`/`tp_repr` (see `PyObject_Repr`).
+        if crate::errors::pending().is_some() {
+            return ptr::null_mut();
         }
     }
     // Dispatch a Python-level `__str__` (defined *or inherited*) for VM
@@ -198,15 +207,13 @@ unsafe fn foreign_repr_or_str(o: *mut PyObject, want_repr: bool) -> *mut PyObjec
     }
     let f: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject =
         unsafe { std::mem::transmute(slot) };
-    let r = unsafe { f(o) };
-    // When the slot raises (returns NULL with a pending exception), the
-    // caller falls back to the VM placeholder. We must consume the pending
-    // exception here so it does not leak into the next VM operation — the
-    // fallback is a best-effort cosmetic repr/str, not a propagated error.
-    if r.is_null() {
-        let _ = crate::errors::take_pending();
-    }
-    r
+    // A raised slot error stays pending for the caller to propagate —
+    // CPython's `PyObject_Str`/`PyObject_Repr` return NULL when
+    // `tp_str`/`tp_repr` raise. numpy's generic-unit `datetime64` scalar
+    // *must* raise ValueError from `str()` (RFC 0075 WS8,
+    // test_casting_unittests.test_numeric_to_times); the old swallow-and-
+    // placeholder path turned that contract into `<foreign …>` text.
+    unsafe { f(o) }
 }
 
 /// Resolve the effective `tp_repr` (when `want_repr`) or `tp_str` for `ty`,
@@ -3242,6 +3249,19 @@ pub unsafe extern "C" fn PyNumber_Absolute(o: *mut PyObject) -> *mut PyObject {
     }
 }
 
+/// CPython's `_PyLong_FromBytes`: decode the buffer as an ASCII integer
+/// literal (base 10) with the full string-parser rules — whitespace, sign,
+/// `_` separators, arbitrary precision.
+fn long_from_ascii_bytes(bytes: &[u8]) -> *mut PyObject {
+    match std::ffi::CString::new(bytes) {
+        Ok(cs) => unsafe { crate::numbers::PyLong_FromString(cs.as_ptr(), ptr::null_mut(), 10) },
+        Err(_) => {
+            crate::errors::set_value_error("invalid literal for int() with base 10");
+            ptr::null_mut()
+        }
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn PyNumber_Long(o: *mut PyObject) -> *mut PyObject {
     if o.is_null() {
@@ -3276,6 +3296,17 @@ pub unsafe extern "C" fn PyNumber_Long(o: *mut PyObject) -> *mut PyObject {
                     ptr::null_mut()
                 }
             }
+        }
+        // CPython's `PyNumber_Long` accepts bytes/bytearray via
+        // `_PyLong_FromBytes` — ASCII digits parsed base-10. numpy's
+        // `LONG_setitem` funnels `np.array([b"423"], dtype="l")` through
+        // here (RFC 0075 WS8, test_ufunc.test_addition_string_types[U-l]);
+        // the missing arms drew the "not 'bytes'" TypeError whose message
+        // ironically lists bytes-like as accepted.
+        Object::Bytes(b) => long_from_ascii_bytes(&b),
+        Object::ByteArray(b) => {
+            let bytes = b.borrow().clone();
+            long_from_ascii_bytes(&bytes)
         }
         other => {
             // RFC 0046 (wave 4): CPython's `PyNumber_Long` consults
@@ -4825,9 +4856,33 @@ pub unsafe extern "C" fn PySequence_GetSlice(
             let collected: String = chars[lo..hi].iter().collect();
             crate::object::into_owned(Object::from_str(collected))
         }
-        _ => {
-            crate::errors::set_type_error("PySequence_GetSlice: not a sequence");
-            ptr::null_mut()
+        obj => {
+            // Generic path, like CPython (`mp_subscript` with a slice
+            // object): `obj[lo:hi]` through the VM's full subscript
+            // dispatch, so bytes/bytearray/memoryview, instance
+            // `__getitem__`, and extension slot wrappers all slice.
+            // RFC 0075 WS7 — grpcio's cygrpc server poller slices a
+            // `bytes` tag through this entry point; the old
+            // list/tuple/str-only table killed the serving thread with
+            // a TypeError on the first inbound RPC.
+            let key = Object::Slice(weavepy_vm::sync::Rc::new(weavepy_vm::object::PySlice {
+                start: Object::Int(lo as i64),
+                stop: Object::Int(hi as i64),
+                step: Object::None,
+            }));
+            match crate::interp::ensure_active(|| {
+                crate::interp::with_interp_mut(|interp| interp.subscr_get_public(&obj, &key))
+            }) {
+                Some(Ok(v)) => crate::object::into_owned(v),
+                Some(Err(e)) => {
+                    crate::errors::set_pending_from_runtime(e);
+                    ptr::null_mut()
+                }
+                None => {
+                    crate::errors::set_type_error("PySequence_GetSlice: not a sequence");
+                    ptr::null_mut()
+                }
+            }
         }
     }
 }

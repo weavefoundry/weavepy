@@ -18,10 +18,42 @@ use std::collections::HashMap;
 
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 
-use crate::error::{type_error, value_error, RuntimeError};
+use crate::error::{type_error, value_error, PyException, RuntimeError};
 use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
-use crate::types::{PyInstance, TypeObject};
+use crate::types::{PyInstance, TypeFlags, TypeObject};
+use std::sync::OnceLock;
+
+/// The `zlib.error` exception type — a plain `Exception` subclass, exactly
+/// as CPython's `Modules/zlibmodule.c` creates it. It must NOT alias
+/// `ValueError`: Pillow's PNG `chunk_iCCP` handler catches `ValueError`
+/// first (re-raise) and `zlib.error` second (profile → None), so aliasing
+/// turned every malformed-iCCP open into a hard failure (RFC 0075 WS9,
+/// Pillow selftest lane).
+fn zlib_error_class() -> Rc<TypeObject> {
+    static CLS: OnceLock<Rc<TypeObject>> = OnceLock::new();
+    CLS.get_or_init(|| {
+        let bt = crate::builtin_types::builtin_types();
+        TypeObject::new_with_flags(
+            "error",
+            vec![bt.exception.clone()],
+            DictData::default(),
+            TypeFlags {
+                is_exception: true,
+                is_builtin: true,
+            },
+        )
+        .expect("zlib.error must linearise")
+    })
+    .clone()
+}
+
+/// Raise `zlib.error(msg)` — used for stream-level failures (bad data,
+/// truncated input, invalid init options), mirroring CPython's `zlib_error`.
+fn zlib_error(msg: impl Into<String>) -> RuntimeError {
+    let inst = crate::builtin_types::make_exception_with_class(zlib_error_class(), msg.into());
+    RuntimeError::PyException(PyException::new(inst))
+}
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     let dict = Rc::new(RefCell::new(DictData::default()));
@@ -93,7 +125,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         );
         d.insert(
             DictKey(Object::from_static("error")),
-            Object::Type(crate::builtin_types::builtin_types().value_error.clone()),
+            Object::Type(zlib_error_class()),
         );
         d.insert(
             DictKey(Object::from_static("compress")),
@@ -181,13 +213,15 @@ fn check_level(level: i64) -> Result<(), RuntimeError> {
     if level == -1 || (0..=9).contains(&level) {
         Ok(())
     } else {
-        Err(value_error("Bad compression level"))
+        Err(zlib_error("Bad compression level"))
     }
 }
 
 /// `compressobj` accepts zlib (`9..=15`), raw (`-15..=-9`) and gzip
 /// (`25..=31`) window sizes. Anything else (e.g. `0`, `16`) is rejected,
-/// matching `test_badcompressobj`.
+/// matching `test_badcompressobj` — with *ValueError*, CPython's surface
+/// for a `Z_STREAM_ERROR` out of `deflateInit2` ("Invalid initialization
+/// option"), not `zlib.error`.
 fn check_compress_wbits(wbits: i64) -> Result<(), RuntimeError> {
     if (9..=15).contains(&wbits.abs()) || (25..=31).contains(&wbits) {
         Ok(())
@@ -197,7 +231,8 @@ fn check_compress_wbits(wbits: i64) -> Result<(), RuntimeError> {
 }
 
 /// `decompressobj` additionally accepts `8` and `0`/`32+` (auto-detect)
-/// window sizes. `test_baddecompressobj` checks that `-1` is rejected.
+/// window sizes. `test_baddecompressobj` checks that `-1` is rejected —
+/// as ValueError, per `inflateInit2`'s `Z_STREAM_ERROR` surface.
 fn check_decompress_wbits(wbits: i64) -> Result<(), RuntimeError> {
     let ok = wbits == 0
         || (8..=15).contains(&wbits)
@@ -263,7 +298,7 @@ fn zlib_decompress(args: &[Object], kwargs: &[(String, Object)]) -> Result<Objec
     let mut d = build_decompress(wbits, &data, &[]);
     let (out, _consumed, stream_end) = inflate_step(&mut d, &data, None, &[])?;
     if !stream_end {
-        return Err(value_error(
+        return Err(zlib_error(
             "Error -5 while decompressing data: incomplete or truncated stream",
         ));
     }
@@ -392,7 +427,7 @@ fn deflate_step(
         let before_in = c.total_in();
         let status = c
             .compress(&input[consumed..], &mut buf, flush)
-            .map_err(|e| value_error(format!("zlib: {e}")))?;
+            .map_err(|e| zlib_error(format!("zlib: {e}")))?;
         let din = (c.total_in() - before_in) as usize;
         let dout = (c.total_out() - before_out) as usize;
         out.extend_from_slice(&buf[..dout]);
@@ -467,7 +502,7 @@ fn inflate_step(
                 // with `Z_NEED_DICT`; install the dictionary and resume.
                 if e.needs_dictionary().is_some() && !dict.is_empty() && !dict_set {
                     d.set_dictionary(dict)
-                        .map_err(|se| value_error(format!("zlib: {se}")))?;
+                        .map_err(|se| zlib_error(format!("zlib: {se}")))?;
                     dict_set = true;
                     continue;
                 }
@@ -477,7 +512,7 @@ fn inflate_step(
                     -3
                 };
                 let detail = e.message().unwrap_or("invalid input data");
-                return Err(value_error(format!(
+                return Err(zlib_error(format!(
                     "Error {code} while decompressing data: {detail}"
                 )));
             }
@@ -675,7 +710,7 @@ fn compress_compress(args: &[Object]) -> Result<Object, RuntimeError> {
     let state = state.ok_or_else(|| value_error("zlib: stale compressor"))?;
     let mut st = state.borrow_mut();
     if st.done {
-        return Err(value_error("compress() after flush(Z_FINISH)"));
+        return Err(zlib_error("compress() after flush(Z_FINISH)"));
     }
     let out = deflate_step(&mut st.c, &data, FlushCompress::None)?;
     Ok(Object::new_bytes(out))
@@ -688,7 +723,7 @@ fn compress_flush(args: &[Object]) -> Result<Object, RuntimeError> {
     let state = state.ok_or_else(|| value_error("zlib: stale compressor"))?;
     let mut st = state.borrow_mut();
     if st.done {
-        return Err(value_error("inconsistent flush state"));
+        return Err(zlib_error("inconsistent flush state"));
     }
     let flush = match mode {
         0 => FlushCompress::None,
@@ -999,7 +1034,7 @@ fn zlibdecompressor_decompress(
         return Err(eof_error("End of stream already reached"));
     }
     if st.broken {
-        return Err(value_error(
+        return Err(zlib_error(
             "Error -3 while decompressing data: invalid input data",
         ));
     }

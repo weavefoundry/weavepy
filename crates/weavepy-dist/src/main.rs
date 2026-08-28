@@ -9,11 +9,17 @@
 //! │   ├── weavepy                  # the release binary
 //! │   ├── python3.13 -> weavepy    # POSIX symlinks
 //! │   ├── python3    -> weavepy
-//! │   └── python     -> weavepy
+//! │   ├── python     -> weavepy
+//! │   └── python3-config           # RFC 0075 WS5 (relocatable sh)
 //! ├── lib/
 //! │   ├── weavepy3.13/             # full stdlib tree + .weavepy-complete
 //! │   │   └── site-packages/       #   marker + config-3.13*/Makefile
-//! │   └── python3.13 -> weavepy3.13
+//! │   ├── python3.13 -> weavepy3.13
+//! │   ├── libpython3.13.dylib      # RFC 0075 WS5 (the weavepy-pylib
+//! │   │                            #   cdylib; .so.1.0 + .so on Linux)
+//! │   └── pkgconfig/
+//! │       ├── python-3.13.pc       # + python-3.13-embed.pc and the
+//! │       └── ...                  #   python3{,-embed}.pc symlinks
 //! ├── include/
 //! │   └── python3.13/              # RFC 0062 WS2 header set (Python.h,
 //! │       └── ...                  #   pyconfig.h, cpython/, internal/)
@@ -64,7 +70,14 @@
 //!    shipped headers: unix via the `sysconfig` compiler vars (needs cc),
 //!    Windows via MSVC `cl /LD` against `libs\python313.lib` (RFC 0064
 //!    WS3; SKIP when no toolchain is installed).
-//! 7. `decoy-cache` — the decoy stdlib cache stayed empty, proving every
+//! 7. `embed`    — RFC 0075 WS5: compile a C program against the shipped
+//!    headers with `bin/python3-config --cflags/--ldflags --embed`, link
+//!    it to `libpython3.13`, and run it: two full
+//!    `Py_InitializeFromConfig` → `PyRun_SimpleString` → `Py_FinalizeEx`
+//!    cycles plus a `Py_AtExit` callback, under the same scrubbed
+//!    environment — the embedded runtime must self-locate the stdlib
+//!    from the shared library's own path (unix; SKIP without cc).
+//! 8. `decoy-cache` — the decoy stdlib cache stayed empty, proving every
 //!    leg ran off the artifact tree itself.
 
 use std::ffi::OsString;
@@ -234,13 +247,39 @@ fn resolve_weavepy(workspace: &Path, explicit: Option<&Path>) -> Result<PathBuf>
     };
     if !path.is_file() {
         bail!(
-            "weavepy binary not found at {} — build it with `cargo build --release -p weavepy-cli{}` \
-             or pass --weavepy",
+            "weavepy binary not found at {} — build it with \
+             `cargo build --release -p weavepy-cli -p weavepy-pylib` or pass --weavepy",
             path.display(),
-            if cfg!(windows) { " -p weavepy-pylib" } else { "" },
         );
     }
     Ok(path)
+}
+
+/// The POSIX runtime shared library (RFC 0075 WS5), which must sit
+/// next to the exe being packaged (cargo writes both into
+/// `target/<profile>/`). The artifact ships it renamed to CPython's
+/// conventional `libpython3.13.*` spelling — `weavepy-pylib`'s
+/// build.rs already stamped that install name/soname — so embedders
+/// built with the shipped `python3-config` link and run against it.
+#[cfg(unix)]
+fn resolve_posix_runtime(weavepy: &Path) -> Result<PathBuf> {
+    let dir = weavepy
+        .parent()
+        .context("weavepy binary path has no parent directory")?;
+    let file = if cfg!(target_os = "macos") {
+        "libpython313.dylib"
+    } else {
+        "libpython313.so"
+    };
+    let lib = dir.join(file);
+    if !lib.is_file() {
+        bail!(
+            "{file} not found next to {} — the artifact ships the embedding runtime \
+             (RFC 0075 WS5); build it with `cargo build --release -p weavepy-cli -p weavepy-pylib`",
+            weavepy.display()
+        );
+    }
+    Ok(lib)
 }
 
 /// The runtime DLL and its MSVC import library, which must sit next
@@ -332,9 +371,16 @@ fn build_artifact(workspace: &Path, weavepy: &Path, out: &Path, format: Format) 
         .with_context(|| format!("failed to canonicalize {}", cache.display()))?;
 
     let env = scrubbed_env(&cache);
+    // One probe run materializes the tree *and* reports the config
+    // vars the generated `python3-config` bakes in (RFC 0075 WS5).
     let output = run_captured(
         weavepy,
-        &["-c", "import sys; print(sys.prefix)"],
+        &[
+            "-c",
+            "import sys, sysconfig\n\
+             print(sys.prefix)\n\
+             print(sysconfig.get_config_var('EXT_SUFFIX') or '.so')",
+        ],
         &env,
         None,
     )
@@ -348,7 +394,10 @@ fn build_artifact(workspace: &Path, weavepy: &Path, out: &Path, format: Format) 
             String::from_utf8_lossy(&output.stderr),
         );
     }
-    let printed = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines().map(str::trim);
+    let printed = lines.next().unwrap_or_default().to_owned();
+    let ext_suffix = lines.next().unwrap_or(".so").to_owned();
     let prefix = PathBuf::from(&printed)
         .canonicalize()
         .map(strip_verbatim)
@@ -439,7 +488,13 @@ fn build_artifact(workspace: &Path, weavepy: &Path, out: &Path, format: Format) 
                     .with_context(|| format!("failed to copy bin shim {}", shim_dest.display()))?;
             }
         }
+        // RFC 0075 WS5 — the embedding kit: the shared runtime under
+        // its CPython-conventional name, a relocatable python3-config,
+        // and pkg-config metadata.
+        #[cfg(unix)]
+        write_embed_kit(weavepy, &staging, &ext_suffix)?;
     }
+    let _ = &ext_suffix;
 
     // Artifact-level docs + licenses.
     std::fs::write(staging.join("README.md"), artifact_readme(&name))
@@ -469,6 +524,200 @@ fn build_artifact(workspace: &Path, weavepy: &Path, out: &Path, format: Format) 
             Ok(archive)
         }
     }
+}
+
+/// RFC 0075 WS5 — assemble the POSIX embedding kit into `staging`:
+///
+/// * `lib/libpython3.13.dylib` (macOS) or `lib/libpython3.13.so.1.0`
+///   plus the `libpython3.13.so` linker-name symlink (ELF) — the
+///   `weavepy-pylib` cdylib, renamed to the identity its install
+///   name/soname already carries (stamped by that crate's build.rs).
+/// * `bin/python3-config` — CPython's sh flavour, relocatable: the
+///   prefix is computed from the script's own location at run time.
+/// * `lib/pkgconfig/python-3.13{,-embed}.pc` + `python3{,-embed}.pc`
+///   symlinks, relocatable through `${pcfiledir}`.
+#[cfg(unix)]
+fn write_embed_kit(weavepy: &Path, staging: &Path, ext_suffix: &str) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let runtime = resolve_posix_runtime(weavepy)?;
+    let lib_dir = staging.join("lib");
+    std::fs::create_dir_all(&lib_dir)
+        .with_context(|| format!("failed to create {}", lib_dir.display()))?;
+    let shipped_name = if cfg!(target_os = "macos") {
+        "libpython3.13.dylib"
+    } else {
+        "libpython3.13.so.1.0"
+    };
+    let lib_dest = lib_dir.join(shipped_name);
+    std::fs::copy(&runtime, &lib_dest).with_context(|| {
+        format!(
+            "failed to copy {} to {}",
+            runtime.display(),
+            lib_dest.display()
+        )
+    })?;
+    std::fs::set_permissions(&lib_dest, std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("failed to chmod {}", lib_dest.display()))?;
+    if !cfg!(target_os = "macos") {
+        // The ELF linker name (`-lpython3.13` resolves this); the
+        // soname inside the file points loaders at the `.so.1.0`.
+        std::os::unix::fs::symlink(shipped_name, lib_dir.join("libpython3.13.so"))
+            .context("failed to symlink lib/libpython3.13.so")?;
+    }
+
+    let config_path = staging.join("bin").join("python3-config");
+    std::fs::write(&config_path, python3_config_script(ext_suffix))
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("failed to chmod {}", config_path.display()))?;
+    std::os::unix::fs::symlink(
+        "python3-config",
+        staging.join("bin").join("python3.13-config"),
+    )
+    .context("failed to symlink bin/python3.13-config")?;
+
+    let pc_dir = lib_dir.join("pkgconfig");
+    std::fs::create_dir_all(&pc_dir)
+        .with_context(|| format!("failed to create {}", pc_dir.display()))?;
+    std::fs::write(pc_dir.join("python-3.13.pc"), pkgconfig_pc(false))
+        .context("failed to write python-3.13.pc")?;
+    std::fs::write(pc_dir.join("python-3.13-embed.pc"), pkgconfig_pc(true))
+        .context("failed to write python-3.13-embed.pc")?;
+    std::os::unix::fs::symlink("python-3.13.pc", pc_dir.join("python3.pc"))
+        .context("failed to symlink python3.pc")?;
+    std::os::unix::fs::symlink("python-3.13-embed.pc", pc_dir.join("python3-embed.pc"))
+        .context("failed to symlink python3-embed.pc")?;
+    Ok(())
+}
+
+/// The generated `bin/python3-config` (RFC 0075 WS5). CPython ships
+/// two flavours (a Python script and `Misc/python-config.sh.in`);
+/// this is the sh flavour with one deliberate difference: the prefix
+/// is derived from the script's own location instead of configure's
+/// baked-in path, because the artifact is relocatable. `--ldflags`
+/// also emits `-Wl,-rpath,{libdir}` so an embedder binary runs
+/// without `LD_LIBRARY_PATH`/`DYLD_LIBRARY_PATH` gymnastics — the
+/// shipped library's install name is `@rpath/…` on macOS.
+#[cfg(unix)]
+fn python3_config_script(ext_suffix: &str) -> String {
+    format!(
+        r#"#!/bin/sh
+# python3-config for WeavePy (RFC 0075 WS5) — CPython's sh flavour,
+# made relocatable: the prefix is this script's grandparent.
+
+exit_with_usage ()
+{{
+    echo "Usage: $0 --prefix|--exec-prefix|--includes|--libs|--cflags|--ldflags|--extension-suffix|--help|--abiflags|--configdir|--embed"
+    exit "$1"
+}}
+
+if [ "$1" = "" ] ; then
+    exit_with_usage 1
+fi
+
+bindir=$(cd "$(dirname -- "$0")" && pwd -P)
+prefix=$(dirname -- "$bindir")
+exec_prefix="$prefix"
+
+VERSION="3.13"
+ABIFLAGS=""
+EXT_SUFFIX="{ext_suffix}"
+includedir="$prefix/include"
+libdir="$prefix/lib"
+INCDIR="-I$includedir/python$VERSION$ABIFLAGS"
+PLATINCDIR="$INCDIR"
+SYSLIBS="-lm"
+LIBS="$SYSLIBS"
+LIBS_EMBED="-lpython$VERSION$ABIFLAGS $SYSLIBS"
+BASECFLAGS=""
+CFLAGS=""
+LDFLAGS_BASE="-L$libdir -Wl,-rpath,$libdir"
+LIBPL=$(ls -d "$libdir/weavepy$VERSION/config-$VERSION"* 2>/dev/null | head -n 1)
+
+# Scan for --embed first: like CPython 3.8+, --libs/--ldflags only
+# name the python library when embedding was requested (PEP 587 era).
+PY_EMBED=0
+for ARG in "$@" ; do
+    if [ "$ARG" = "--embed" ] ; then
+        PY_EMBED=1
+    fi
+done
+if [ "$PY_EMBED" = 1 ] ; then
+    LIBS="$LIBS_EMBED"
+fi
+
+for ARG in "$@" ; do
+    case "$ARG" in
+        --help)
+            exit_with_usage 0
+            ;;
+        --embed)
+            ;;
+        --prefix)
+            echo "$prefix"
+            ;;
+        --exec-prefix)
+            echo "$exec_prefix"
+            ;;
+        --includes)
+            echo "$INCDIR $PLATINCDIR"
+            ;;
+        --cflags)
+            echo "$INCDIR $PLATINCDIR $BASECFLAGS $CFLAGS"
+            ;;
+        --libs)
+            echo "$LIBS"
+            ;;
+        --ldflags)
+            echo "$LDFLAGS_BASE $LIBS"
+            ;;
+        --extension-suffix)
+            echo "$EXT_SUFFIX"
+            ;;
+        --abiflags)
+            echo "$ABIFLAGS"
+            ;;
+        --configdir)
+            echo "$LIBPL"
+            ;;
+        *)
+            exit_with_usage 1
+            ;;
+    esac
+done
+"#
+    )
+}
+
+/// A relocatable pkg-config file (`python-3.13.pc` /
+/// `python-3.13-embed.pc`): `${pcfiledir}` is the directory holding
+/// the `.pc` file itself (`{prefix}/lib/pkgconfig`), so the prefix
+/// travels with the artifact. The embed flavour links the runtime;
+/// the plain flavour (extension builds) does not, per PEP 587-era
+/// CPython.
+#[cfg(unix)]
+fn pkgconfig_pc(embed: bool) -> String {
+    let (name, libs) = if embed {
+        ("Python (embed)", "-L${libdir} -lpython3.13")
+    } else {
+        ("Python", "")
+    };
+    format!(
+        "# WeavePy (RFC 0075 WS5) — relocatable via ${{pcfiledir}}.\n\
+         prefix=${{pcfiledir}}/../..\n\
+         exec_prefix=${{prefix}}\n\
+         libdir=${{prefix}}/lib\n\
+         includedir=${{prefix}}/include\n\
+         \n\
+         Name: {name}\n\
+         Description: Embed WeavePy (CPython 3.13-compatible) into an application\n\
+         Requires:\n\
+         Version: 3.13\n\
+         Libs.private: -lm\n\
+         Libs: {libs}\n\
+         Cflags: -I${{includedir}}/python3.13\n"
+    )
 }
 
 /// Create `archive` by invoking the system `tar` with `flags` (e.g.
@@ -611,6 +860,20 @@ fn artifact_readme(name: &str) -> String {
              (what `sysconfig.get_paths()[\"include\"]` reports), so building\n\
              C extensions from source — `pip install --no-binary` of sdists —\n\
              works with a C compiler on PATH.\n\
+             \n\
+             ## Embedding\n\
+             \n\
+             The runtime also ships as a shared library (`lib/libpython3.13.*`)\n\
+             with `bin/python3-config` and pkg-config files, so applications\n\
+             that embed CPython can link WeavePy the same way:\n\
+             \n\
+             ```sh\n\
+             cc app.c $(./bin/python3-config --cflags --embed --ldflags --embed) -o app\n\
+             ```\n\
+             \n\
+             The emitted `-Wl,-rpath` makes the binary find the library\n\
+             wherever the artifact lives; the embedded runtime self-locates\n\
+             its stdlib from the library's own path.\n\
              \n\
              ## License\n\
              \n\
@@ -849,7 +1112,23 @@ fn run_check(
         leg_cext(&python3, scratch, &env)
     });
 
-    // Leg 7: the decoy cache must still be empty — anything in it means
+    // Leg 7: embedding (RFC 0075 WS5, unix) — compile, link, and run a
+    // C program against the shipped libpython through the shipped
+    // python3-config. The scrubbed env + decoy cache still apply: the
+    // embedded runtime must self-locate the stdlib from the shared
+    // library's own path (the dladdr probe), not from any env var.
+    #[cfg(unix)]
+    legs.push(if which("cc").is_none() {
+        Leg {
+            name: "embed",
+            status: LegStatus::Skip,
+            detail: "no `cc` on PATH".to_owned(),
+        }
+    } else {
+        leg_embed(&prefix, scratch, &env)
+    });
+
+    // Leg 8: the decoy cache must still be empty — anything in it means
     // the binary fell back to materializing a stdlib tree, i.e. the
     // artifact layout failed to self-locate.
     legs.push(leg_decoy(&decoy));
@@ -1149,6 +1428,147 @@ fn leg_cext(python3: &Path, scratch: &Path, env: &[(OsString, OsString)]) -> Leg
         }
     }
     grade_output("cext", result)
+}
+
+/// The embed leg's C program: two full init → run → finalize cycles
+/// (the `test_embed` bread and butter — a leaked global or a
+/// non-reinitialisable runtime fails round 2), a PEP 587 config
+/// entry, and a `Py_AtExit` callback per cycle.
+#[cfg(unix)]
+const EMBED_SMOKE_C: &str = r#"
+#include <Python.h>
+#include <stdio.h>
+
+static int atexit_ran = 0;
+static void note_atexit(void) { atexit_ran++; }
+
+int main(void)
+{
+    for (int round = 0; round < 2; round++) {
+        PyConfig config;
+        PyConfig_InitPythonConfig(&config);
+        PyStatus status = Py_InitializeFromConfig(&config);
+        PyConfig_Clear(&config);
+        if (PyStatus_Exception(status)) {
+            fprintf(stderr, "Py_InitializeFromConfig failed (round %d)\n", round);
+            return 1;
+        }
+        if (!Py_IsInitialized()) {
+            fprintf(stderr, "Py_IsInitialized() == 0 after init (round %d)\n", round);
+            return 1;
+        }
+        if (Py_AtExit(note_atexit) != 0) {
+            fprintf(stderr, "Py_AtExit failed (round %d)\n", round);
+            return 1;
+        }
+        char buf[256];
+        snprintf(buf, sizeof buf,
+                 "import sys\nprint('embed ok round', %d, tuple(sys.version_info[:2]))",
+                 round);
+        if (PyRun_SimpleString(buf) != 0) {
+            fprintf(stderr, "PyRun_SimpleString failed (round %d)\n", round);
+            return 1;
+        }
+        if (Py_FinalizeEx() != 0) {
+            fprintf(stderr, "Py_FinalizeEx failed (round %d)\n", round);
+            return 1;
+        }
+        if (atexit_ran != round + 1) {
+            fprintf(stderr, "Py_AtExit callback ran %d times after round %d\n",
+                    atexit_ran, round);
+            return 1;
+        }
+    }
+    printf("embed smoke ok\n");
+    return 0;
+}
+"#;
+
+/// RFC 0075 WS5 — the compile-link-run embedding leg. Everything
+/// flows through the *shipped* `bin/python3-config`, so a broken
+/// script, a missing header, an unlinkable library, or a runtime
+/// that cannot self-locate its stdlib all surface here.
+#[cfg(unix)]
+fn leg_embed(prefix: &Path, scratch: &Path, env: &[(OsString, OsString)]) -> Leg {
+    let fail = |detail: String| Leg {
+        name: "embed",
+        status: LegStatus::Fail,
+        detail,
+    };
+    let config = prefix.join("bin").join("python3-config");
+    if !config.is_file() {
+        return fail(format!("artifact has no {}", config.display()));
+    }
+    // Flag harvest through the shipped script (whitespace-split, like
+    // every Makefile consuming `python3-config` output does).
+    let mut flags: Vec<String> = Vec::new();
+    for args in [&["--cflags", "--embed"], &["--ldflags", "--embed"]] {
+        match run_captured(&config, args, env, None) {
+            Err(err) => return fail(format!("failed to run python3-config: {err:#}")),
+            Ok(out) if !out.status.success() => {
+                return fail(format!(
+                    "`python3-config {}` exited {}\n{}",
+                    args.join(" "),
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr),
+                ))
+            }
+            Ok(out) => flags.extend(
+                String::from_utf8_lossy(&out.stdout)
+                    .split_whitespace()
+                    .map(str::to_owned),
+            ),
+        }
+    }
+    let embed_dir = scratch.join("embed");
+    if let Err(err) = std::fs::create_dir_all(&embed_dir) {
+        return fail(format!("failed to create {}: {err}", embed_dir.display()));
+    }
+    let src = embed_dir.join("smoke_embed.c");
+    if let Err(err) = std::fs::write(&src, EMBED_SMOKE_C) {
+        return fail(format!("failed to write {}: {err}", src.display()));
+    }
+    let exe = embed_dir.join("smoke_embed");
+    let mut cc_args: Vec<String> = vec![src.display().to_string()];
+    cc_args.extend(flags);
+    cc_args.extend(["-o".to_owned(), exe.display().to_string()]);
+    let cc_args_ref: Vec<&str> = cc_args.iter().map(String::as_str).collect();
+    match run_captured(Path::new("cc"), &cc_args_ref, env, None) {
+        Err(err) => return fail(format!("failed to spawn cc: {err:#}")),
+        Ok(out) if !out.status.success() => {
+            return fail(format!(
+                "cc failed ({}) compiling the embed smoke:\ncc {}\n{}",
+                out.status,
+                cc_args.join(" "),
+                String::from_utf8_lossy(&out.stderr),
+            ))
+        }
+        Ok(_) => {}
+    }
+    match run_captured(&exe, &[], env, None) {
+        Err(err) => fail(format!("failed to run the embed smoke: {err:#}")),
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let want = [
+                "embed ok round 0 (3, 13)",
+                "embed ok round 1 (3, 13)",
+                "embed smoke ok",
+            ];
+            if out.status.success() && want.iter().all(|w| stdout.contains(w)) {
+                Leg {
+                    name: "embed",
+                    status: LegStatus::Pass,
+                    detail: "two init→run→finalize cycles through libpython3.13".to_owned(),
+                }
+            } else {
+                fail(format!(
+                    "embed smoke exited {} (want all of {want:?})\nstdout:\n{stdout}\nstderr:\n{}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr),
+                ))
+            }
+        }
+    }
 }
 
 fn leg_decoy(decoy: &Path) -> Leg {

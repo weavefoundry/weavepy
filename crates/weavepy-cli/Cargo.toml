@@ -19,12 +19,22 @@ path = "src/lib.rs"
 name = "weavepy"
 path = "src/main.rs"
 
+# RFC 0075 WS6 — the `_testembed` twin (CPython's Programs/_testembed):
+# the command-driven embedding exerciser `Lib/test/test_embed.py`
+# spawns. Auto-named from `src/bin/_testembed.rs`; the regrtest
+# harness stages it at `{bindir}/Programs/_testembed`, the path the
+# vendored test derives from `sys.executable`.
+[[bin]]
+name = "_testembed"
+path = "src/bin/_testembed.rs"
+
 [dependencies]
 weavepy            = { workspace = true }
 weavepy-vm         = { workspace = true }
 weavepy-parser     = { workspace = true }
 weavepy-compiler   = { workspace = true }
 weavepy-conformance = { workspace = true }
+libc               = { workspace = true }
 anyhow             = { workspace = true }
 clap               = { workspace = true }
 serde_json         = { workspace = true }

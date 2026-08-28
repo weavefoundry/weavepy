@@ -22,7 +22,15 @@
 #                      tested unbuilt (numpy). `source` is forbidden
 #                      here; the pin lives on the row requirement.
 #   source           — `==`-pinned requirement whose sdist carries the
-#                      test suite (sdist mode only)
+#                      test suite (sdist mode; also required by overlay)
+#   overlay          — RFC 0075 WS9, installed mode only:
+#                      "<sdist subtree> -> <stage path>". For wheels
+#                      that ship no tests whose sdist also cannot run
+#                      in place (lxml): stages a PYTHONPATH copy of the
+#                      installed top-level package with the sdist's
+#                      test subtree grafted in, so `--pyargs
+#                      <pkg>.tests` imports the real compiled package
+#                      plus the upstream suite.
 #   requirements     — extra test-only deps installed into the same venv
 #   command          — pytest target path inside the extracted sdist
 #                      root (or `--pyargs <module>` in installed mode);
@@ -297,14 +305,51 @@ requirements = "scipy numpy"
 probe = "probes/scipy_probe.py"
 timeout_seconds = 1200
 
+# RFC 0075 WS9: installed mode (same shape as numpy — the sdist tree
+# cannot be tested unbuilt), scoped to the C-API-heavy heart: f2py/
+# LAPACK bindings (linalg) and pybind11 pocketfft (fft). The full
+# suite is a measured non-starter under current interpreter speed,
+# and scipy.sparse was measured out of the scope: the three-subpackage
+# run was OOM-killed (rc=137) after 2.2–4.3 h in two attempts; linalg
+# + fft complete in ~80 min. sparse rejoins when a perf wave pays for
+# it.
+[packages.scipy.selftest]
+mode = "installed"
+requirements = "pytest==8.4.2 hypothesis==6.155.7 pooch==1.9.0"
+command = "--pyargs scipy.linalg scipy.fft"
+timeout_seconds = 14400
+
 [packages.pillow]
 requirements = "pillow numpy"
 probe = "probes/pillow_probe.py"
 timeout_seconds = 900
 
+# RFC 0075 WS9: sdist mode — `Tests/` (with its images/fonts fixture
+# tree) ships in the sdist and runs against the installed wheel from
+# the sdist root, upstream's own layout.
+[packages.pillow.selftest]
+source = "pillow==12.3.0"
+requirements = "pytest==8.4.2"
+command = "Tests"
+timeout_seconds = 7200
+
 [packages.lxml]
 requirements = "lxml"
 probe = "probes/lxml_probe.py"
+
+# RFC 0075 WS9: the lxml wheel ships no tests and the sdist cannot run
+# in place (its unbuilt src/lxml would shadow the installed package —
+# the numpy problem, except the suite *only* exists in the sdist).
+# `overlay` grafts the sdist's test subtree onto a PYTHONPATH copy of
+# the installed package, so `--pyargs lxml.tests` imports the real
+# compiled etree plus the upstream suite. Doctest-heavy.
+[packages.lxml.selftest]
+mode = "installed"
+source = "lxml==6.1.2"
+overlay = "src/lxml/tests -> lxml/tests"
+requirements = "pytest==8.4.2"
+command = "--pyargs lxml.tests"
+timeout_seconds = 7200
 
 # RFC 0066 WS4: the bundled native greenlet. Installs nothing — a pip
 # cp313 greenlet wheel cannot work under WeavePy (its assembly switches
@@ -361,6 +406,28 @@ timeout_seconds = 900
 [packages.grpcio]
 requirements = "grpcio"
 probe = "probes/grpcio_probe.py"
+timeout_seconds = 900
+
+# --- ecosystem wave 5 (RFC 0075 WS9) -----------------------------------------
+
+# scikit-learn: the first row exercising loky's spawn-with-memmap
+# process model. The probe fits LogisticRegression, runs
+# RandomForestClassifier with n_jobs=2 (the loky process pool),
+# GridSearchCV over a pipeline, and a joblib.Memory cache round-trip.
+[packages.scikit_learn]
+requirements = "scikit-learn"
+probe = "probes/scikit_learn_probe.py"
+timeout_seconds = 1200
+
+# gunicorn -k gevent capstone: launches `gunicorn --workers 2 -k
+# gevent` serving a Django WSGI app under the scratch venv's WeavePy,
+# drives concurrent requests through the patched-socket path, SIGTERMs
+# the master, and asserts worker responses + clean shutdown. Rides the
+# pre-fork master → os.fork → monkey.patch_all-in-child surfaces plus
+# pwd/grp and the fd leg of os.utime (worker heartbeat).
+[packages.gunicorn_gevent]
+requirements = "gunicorn gevent django"
+probe = "probes/gunicorn_gevent_probe.py"
 timeout_seconds = 900
 
 # --- source-build proof rows (RFC 0062 WS2) ----------------------------------

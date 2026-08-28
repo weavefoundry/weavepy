@@ -78,8 +78,19 @@ pub struct SelftestSpec {
     /// (`attrs==26.1.0`). Pinning keeps the row hermetic and the offline
     /// cache deterministic. Required in `sdist` mode; forbidden in
     /// `installed` mode (the suite ships inside the row's own wheel, so
-    /// the pin lives on the row requirement instead).
+    /// the pin lives on the row requirement instead) unless `overlay`
+    /// is present (the sdist then only donates its test subtree).
     pub source: Option<String>,
+    /// Overlay staging (RFC 0075 WS9): `"<sdist subtree> -> <stage
+    /// path>"`, installed mode only, requires `source`. For wheels that
+    /// ship no tests (lxml) whose sdist also cannot run in place (the
+    /// unbuilt source tree would shadow the installed package — the
+    /// numpy problem, except here the suite *only* exists in the
+    /// sdist). Builds a PYTHONPATH stage holding a copy of the
+    /// installed top-level package with the sdist's test subtree
+    /// grafted in, so `--pyargs <pkg>.tests` imports the real compiled
+    /// package plus its upstream suite.
+    pub overlay: Option<String>,
     /// Extra test-only requirements installed into the row's venv.
     pub requirements: Vec<String>,
     /// pytest target path inside the extracted sdist root (e.g.
@@ -219,11 +230,26 @@ impl Manifest {
             .get("source")
             .and_then(simple_tables::Value::as_str)
             .map(str::to_owned);
+        let overlay = kv
+            .get("overlay")
+            .and_then(simple_tables::Value::as_str)
+            .map(str::to_owned);
+        if let Some(o) = &overlay {
+            if mode != SelftestMode::Installed {
+                anyhow::bail!("[{section}] overlay requires mode = \"installed\"");
+            }
+            if source.is_none() {
+                anyhow::bail!("[{section}] overlay requires a pinned source sdist");
+            }
+            if o.split_once("->").is_none() {
+                anyhow::bail!("[{section}] overlay must be \"<sdist subtree> -> <stage path>\"");
+            }
+        }
         match (mode, &source) {
             (SelftestMode::Sdist, None) => anyhow::bail!("[{section}] missing source"),
-            (SelftestMode::Installed, Some(_)) => anyhow::bail!(
+            (SelftestMode::Installed, Some(_)) if overlay.is_none() => anyhow::bail!(
                 "[{section}] source is meaningless with mode = \"installed\" \
-                 (pin the row requirement instead)"
+                 (pin the row requirement instead) unless overlay is set"
             ),
             _ => {}
         }
@@ -253,6 +279,7 @@ impl Manifest {
         Ok(SelftestSpec {
             mode,
             source,
+            overlay,
             requirements,
             command,
             deselect,
@@ -976,40 +1003,52 @@ fn run_selftest_stage(
         }
         SelftestMode::Sdist => {
             let source = spec.source.as_deref().expect("sdist mode carries source");
-            let sdist = match obtain_sdist(source, python, opts, &scratch, deadline) {
-                Ok(p) => p,
-                Err(e) => return fail(format!("selftest sdist fetch failed: {e}")),
-            };
-            let extract_dir = scratch.join("src");
-            if let Err(e) = fs::create_dir_all(&extract_dir) {
-                return fail(format!("failed to create {}: {e}", extract_dir.display()));
-            }
-            let out = run_with_deadline(
-                Command::new("tar")
-                    .arg("-xzf")
-                    .arg(&sdist)
-                    .arg("-C")
-                    .arg(&extract_dir),
-                deadline,
-            );
-            match out {
-                Ok(o) if o.success => {}
-                Ok(o) => return fail(format!("sdist extract failed: {}", o.tail())),
-                Err(TimedOut) => {
-                    return fail("sdist extract exceeded the selftest budget".to_owned())
-                }
-            }
-            match single_subdir(&extract_dir) {
-                Some(d) => d,
-                None => {
-                    return fail(format!(
-                        "sdist {} did not extract to a single root directory",
-                        sdist.display()
-                    ))
-                }
+            match fetch_and_extract_sdist(source, python, opts, &scratch, "src", deadline) {
+                Ok(d) => d,
+                Err(e) => return fail(e),
             }
         }
     };
+
+    // 2b. overlay staging (RFC 0075 WS9): graft the sdist's test subtree
+    // onto a copy of the *installed* package inside a PYTHONPATH stage,
+    // so `--pyargs <pkg>.tests` imports the real compiled package plus
+    // the upstream suite the wheel doesn't ship (lxml).
+    let mut stage_pythonpath: Option<PathBuf> = None;
+    if let Some(overlay) = &spec.overlay {
+        let (from, to) = overlay
+            .split_once("->")
+            .map(|(a, b)| (a.trim(), b.trim()))
+            .expect("overlay format validated at parse time");
+        let source = spec.source.as_deref().expect("overlay carries source");
+        let sdist_root = match fetch_and_extract_sdist(
+            source,
+            python,
+            opts,
+            &scratch,
+            "overlay-src",
+            deadline,
+        ) {
+            Ok(d) => d,
+            Err(e) => return fail(e),
+        };
+        let top_pkg = match to.split(['/', '\\']).next().filter(|s| !s.is_empty()) {
+            Some(p) => p,
+            None => return fail(format!("overlay stage path {to:?} has no top package")),
+        };
+        let purelib = match venv_purelib(python, deadline) {
+            Ok(p) => p,
+            Err(e) => return fail(format!("overlay: cannot locate site-packages: {e}")),
+        };
+        let stage = scratch.join("stage");
+        if let Err(e) = copy_dir_recursive(&purelib.join(top_pkg), &stage.join(top_pkg)) {
+            return fail(format!("overlay: staging installed {top_pkg}: {e}"));
+        }
+        if let Err(e) = copy_dir_recursive(&sdist_root.join(from), &stage.join(to)) {
+            return fail(format!("overlay: grafting sdist {from}: {e}"));
+        }
+        stage_pythonpath = Some(stage);
+    }
 
     // 3. test-only requirements into the same venv
     if !spec.requirements.is_empty() {
@@ -1045,6 +1084,9 @@ fn run_selftest_stage(
         cmd.arg("--deselect").arg(d);
     }
     cmd.current_dir(&suite_cwd);
+    if let Some(stage) = &stage_pythonpath {
+        cmd.env("PYTHONPATH", stage);
+    }
     for (k, v) in &opts.probe_env {
         cmd.env(k, v);
     }
@@ -1053,6 +1095,90 @@ fn run_selftest_stage(
         Ok(o) => fail(format!("selftest failed: {}", o.tail_n(50))),
         Err(TimedOut) => fail(format!("selftest exceeded the {budget}s selftest budget")),
     }
+}
+
+/// Fetch the pinned `source` sdist and extract it under
+/// `scratch/<subdir>`, returning the single root directory it unpacks
+/// to. Shared by the sdist-mode suite location and overlay staging.
+fn fetch_and_extract_sdist(
+    source: &str,
+    python: &Path,
+    opts: &EcosystemOptions,
+    scratch: &Path,
+    subdir: &str,
+    deadline: Instant,
+) -> std::result::Result<PathBuf, String> {
+    let sdist = obtain_sdist(source, python, opts, scratch, deadline)
+        .map_err(|e| format!("selftest sdist fetch failed: {e}"))?;
+    let extract_dir = scratch.join(subdir);
+    fs::create_dir_all(&extract_dir)
+        .map_err(|e| format!("failed to create {}: {e}", extract_dir.display()))?;
+    let out = run_with_deadline(
+        Command::new("tar")
+            .arg("-xzf")
+            .arg(&sdist)
+            .arg("-C")
+            .arg(&extract_dir),
+        deadline,
+    );
+    match out {
+        Ok(o) if o.success => {}
+        Ok(o) => return Err(format!("sdist extract failed: {}", o.tail())),
+        Err(TimedOut) => return Err("sdist extract exceeded the selftest budget".to_owned()),
+    }
+    single_subdir(&extract_dir).ok_or_else(|| {
+        format!(
+            "sdist {} did not extract to a single root directory",
+            sdist.display()
+        )
+    })
+}
+
+/// The venv's `site-packages` directory, asked of the venv interpreter
+/// itself (`sysconfig`) so platform layout differences don't leak here.
+fn venv_purelib(python: &Path, deadline: Instant) -> std::result::Result<PathBuf, String> {
+    let mut cmd = Command::new(python);
+    cmd.args([
+        "-c",
+        "import sysconfig; print(sysconfig.get_paths()['purelib'])",
+    ]);
+    match run_with_deadline(&mut cmd, deadline) {
+        Ok(o) if o.success => {
+            // stdout and stderr are drained into one stream; the probe
+            // prints exactly one line, so take the last non-empty one.
+            let p = o
+                .combined
+                .lines()
+                .rev()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or_default()
+                .to_owned();
+            if p.is_empty() {
+                return Err("sysconfig returned an empty purelib".to_owned());
+            }
+            Ok(PathBuf::from(p))
+        }
+        Ok(o) => Err(format!("sysconfig probe failed: {}", o.tail())),
+        Err(TimedOut) => Err("sysconfig probe exceeded the selftest budget".to_owned()),
+    }
+}
+
+/// Minimal recursive directory copy (symlinks followed; the staged
+/// trees are plain package dirs).
+fn copy_dir_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let src = entry.path();
+        let dst = to.join(entry.file_name());
+        if src.is_dir() {
+            copy_dir_recursive(&src, &dst)?;
+        } else {
+            fs::copy(&src, &dst)?;
+        }
+    }
+    Ok(())
 }
 
 /// The single directory an sdist extracts to (`<name>-<version>/`).
@@ -1778,6 +1904,61 @@ timeout_seconds = 900
             vec!["tests/test_mypy.py", "tests/test_abc.py::test_x[a-b]"]
         );
         assert_eq!(st.timeout_seconds, Some(900));
+    }
+
+    /// The RFC 0075 WS9 overlay shape (lxml): installed mode carrying a
+    /// pinned `source` whose sdist donates the test subtree.
+    #[test]
+    fn manifest_parses_overlay_selftest() {
+        let body = r#"
+[packages.lxml]
+requirements = "lxml"
+probe = "p.py"
+
+[packages.lxml.selftest]
+mode = "installed"
+source = "lxml==6.1.2"
+overlay = "src/lxml/tests -> lxml/tests"
+requirements = "pytest"
+command = "--pyargs lxml.tests"
+"#;
+        let m = Manifest::from_body(body, Path::new(".")).unwrap();
+        let st = m.rows[0].selftest.as_ref().expect("selftest spec");
+        assert_eq!(st.mode, SelftestMode::Installed);
+        assert_eq!(st.source.as_deref(), Some("lxml==6.1.2"));
+        assert_eq!(st.overlay.as_deref(), Some("src/lxml/tests -> lxml/tests"));
+    }
+
+    #[test]
+    fn manifest_rejects_overlay_without_source() {
+        let body = r#"
+[packages.x]
+requirements = "x"
+probe = "p.py"
+
+[packages.x.selftest]
+mode = "installed"
+overlay = "src/tests -> x/tests"
+command = "--pyargs x.tests"
+"#;
+        let err = Manifest::from_body(body, Path::new(".")).unwrap_err();
+        assert!(err.to_string().contains("overlay requires"), "{err}");
+    }
+
+    #[test]
+    fn manifest_rejects_overlay_in_sdist_mode() {
+        let body = r#"
+[packages.x]
+requirements = "x"
+probe = "p.py"
+
+[packages.x.selftest]
+source = "x==1.0"
+overlay = "src/tests -> x/tests"
+command = "tests"
+"#;
+        let err = Manifest::from_body(body, Path::new(".")).unwrap_err();
+        assert!(err.to_string().contains("mode = \"installed\""), "{err}");
     }
 
     #[test]

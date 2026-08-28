@@ -413,6 +413,17 @@ pub unsafe extern "C" fn PyObject_CheckBuffer(o: *mut PyObject) -> c_int {
         return 1;
     }
     let obj = unsafe { crate::object::clone_object(o) };
+    // The VM's `mmap` exports a buffer through `PyObject_GetBuffer`'s
+    // shared-region arm (RFC 0075 WS8); the *predicate* must agree or
+    // gated callers never reach it — Pillow's `map_buffer` probes
+    // `PyImaging_CheckBuffer` first and mapped every L/P/I;16 file load
+    // into "expected string or buffer" (RFC 0075 WS9, Pillow lane).
+    if let Object::Instance(inst) = &obj {
+        if inst.cls().name == "mmap" && weavepy_vm::stdlib::mmap_mod::shared_buffer(inst).is_some()
+        {
+            return 1;
+        }
+    }
     (matches!(
         obj,
         Object::Bytes(_) | Object::ByteArray(_) | Object::MemoryView(_)
@@ -551,6 +562,24 @@ fn describe_native_export(obj: &Object) -> Result<NativeExport, ()> {
             }
         }
         other => {
+            // `mmap.mmap` exports the buffer protocol over its raw mapping
+            // (CPython mmapmodule.c `mmap_buffer`). The VM's mmap is a plain
+            // `Object::Instance` over a native region, so mirror the
+            // `memoryview(mmap)` constructor path: wrap the shared region
+            // and export that view. numpy's `memmap` hands the mmap object
+            // to `ndarray.__new__(buffer=mm)`, which lands here through
+            // `PyObject_GetBuffer` (RFC 0075 WS8 — the whole test_memmap
+            // file failed with "a bytes-like object is required").
+            if let Object::Instance(inst) = other {
+                if inst.cls().name == "mmap" {
+                    if let Some(buf) = weavepy_vm::stdlib::mmap_mod::shared_buffer(inst) {
+                        let mv = weavepy_vm::sync::Rc::new(
+                            weavepy_vm::object::PyMemoryView::from_shared(buf),
+                        );
+                        return describe_native_export(&Object::MemoryView(mv));
+                    }
+                }
+            }
             // A PEP 688 exporter (`array.array`, a user class with
             // `__buffer__`) crossing into C: take its view and export that —
             // the memoryview pins the storage, so the export stays valid

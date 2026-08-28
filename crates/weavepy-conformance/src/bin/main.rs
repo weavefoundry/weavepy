@@ -498,14 +498,23 @@ fn cmd_regrtest(workspace: &Path, report_dir: &Path, args: RegrtestArgs<'_>) -> 
         .unwrap_or(regrtest::DEFAULT_TIMEOUT_SECS);
     let timeout = Duration::from_secs(timeout_secs);
 
-    // Honour an explicit `--cpython-dir` (canonicalised so the runner's
-    // `is_dir()` probe and the spawned child agree on the path) and the
-    // `--all-cpython` opt-in for full-directory scheduling.
+    // Honour an explicit `--cpython-dir` (made absolute so the runner's
+    // `is_dir()` probe and the spawned child agree on the path — but NOT
+    // `canonicalize`d: `vendor/cpython/Lib` is often a symlink into a
+    // live install, and resolving it would tear `Lib/test` away from its
+    // `Modules/getpath.py` sibling, breaking test_getpath's source-tree
+    // probe and hashing the sanitized-lib shim over a foreign path) and
+    // the `--all-cpython` opt-in for full-directory scheduling.
     let cpython_dir = match args.cpython_dir {
-        Some(dir) => Some(
-            dir.canonicalize()
-                .with_context(|| format!("--cpython-dir does not exist: {}", dir.display()))?,
-        ),
+        Some(dir) => {
+            if !dir.is_dir() {
+                anyhow::bail!("--cpython-dir does not exist: {}", dir.display());
+            }
+            Some(
+                std::path::absolute(&dir)
+                    .with_context(|| format!("--cpython-dir not resolvable: {}", dir.display()))?,
+            )
+        }
         None => None,
     };
     let discovery = regrtest::DiscoveryOptions {

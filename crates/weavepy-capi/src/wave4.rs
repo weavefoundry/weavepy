@@ -702,6 +702,29 @@ pub unsafe extern "C" fn PyOS_strtoul(
 // Object tail
 // ---------------------------------------------------------------------------
 
+/// CPython's `PyOS_FSPath` (`Objects/object.c`): return `path` itself for
+/// `str`/`bytes`, otherwise the `os.PathLike` `__fspath__()` result
+/// (which must be `str`/`bytes`), else `TypeError`. lxml's
+/// `_getFSPathOrObject` calls this on *every* `etree.parse()` source —
+/// the symbol was previously absent, so the extension's lazy binding
+/// resolved it to NULL and the first file-like parse jumped to address
+/// zero (RFC 0075 WS9, lxml selftest lane).
+#[no_mangle]
+pub unsafe extern "C" fn PyOS_FSPath(path: *mut PyObject) -> *mut PyObject {
+    if path.is_null() {
+        crate::errors::set_type_error("expected str, bytes or os.PathLike object, not NoneType");
+        return core::ptr::null_mut();
+    }
+    let obj = unsafe { crate::object::clone_object(path) };
+    match weavepy_vm::stdlib::os::os_fspath(&[obj]) {
+        Ok(r) => crate::object::into_owned(r),
+        Err(e) => {
+            crate::errors::set_pending_from_runtime(e);
+            core::ptr::null_mut()
+        }
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn PyObject_AsFileDescriptor(o: *mut PyObject) -> c_int {
     if let Object::Int(i) = unsafe { crate::object::clone_object(o) } {

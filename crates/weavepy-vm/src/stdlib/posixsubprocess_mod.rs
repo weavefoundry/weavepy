@@ -288,13 +288,19 @@ fn fork_exec(args: &[Object]) -> Result<Object, RuntimeError> {
         .filter_map(|o| opt_int(Some(o)).map(|n| n as i32))
         .collect();
 
-    let groups: Vec<libc::gid_t> = match extra_groups {
-        Object::None => Vec::new(),
-        other => crate::stdlib::os::sequence_items(other)
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|o| opt_int(Some(o)).map(|n| n as libc::gid_t))
-            .collect(),
+    // `None` (no `extra_groups=`) means "leave supplementary groups
+    // alone"; an *empty list* still calls `setgroups(0, …)` — CPython's
+    // `extra_groups=[]` drops every supplementary group (or dies with
+    // EPERM unprivileged, which the parent must see as PermissionError).
+    let groups: Option<Vec<libc::gid_t>> = match extra_groups {
+        Object::None => None,
+        other => Some(
+            crate::stdlib::os::sequence_items(other)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|o| opt_int(Some(o)).map(|n| n as libc::gid_t))
+                .collect(),
+        ),
     };
 
     let has_preexec = !matches!(preexec_fn, Object::None);
@@ -418,8 +424,15 @@ fn fork_exec(args: &[Object]) -> Result<Object, RuntimeError> {
             child_report(errpipe_write, b"OSError", errno(), b"noexec:setpgid");
         }
 
-        if !groups.is_empty() {
-            libc::setgroups(groups.len() as _, groups.as_ptr());
+        if let Some(ref groups) = groups {
+            let ptr = if groups.is_empty() {
+                std::ptr::null()
+            } else {
+                groups.as_ptr()
+            };
+            if libc::setgroups(groups.len() as _, ptr) != 0 {
+                child_report(errpipe_write, b"OSError", errno(), b"noexec:setgroups");
+            }
         }
         if let Some(g) = gid {
             if libc::setgid(g as libc::gid_t) != 0 {

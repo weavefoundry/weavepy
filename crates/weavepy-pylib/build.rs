@@ -54,6 +54,22 @@ pub const VARARGS_C_EXPORTS: &[&str] = &[
 fn main() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    // RFC 0075 WS5 — the shipped shared library carries CPython's
+    // conventional identity, not cargo's. Cargo names the file
+    // `libpython313.{dylib,so}` (crate lib names cannot contain dots),
+    // but what an embedder's binary *records* at link time is the
+    // library's install name (macOS) / soname (ELF). Stamp those with
+    // the CPython spelling here so `weavepy-dist` can rename the file
+    // to `libpython3.13.dylib` / `libpython3.13.so.1.0` and a program
+    // linked with `python3-config --libs --embed` (`-lpython3.13`)
+    // resolves it at run time. `@rpath` + the `-Wl,-rpath,{libdir}`
+    // in the generated `python3-config --ldflags --embed` keeps the
+    // artifact relocatable.
+    if target_os == "macos" {
+        println!("cargo:rustc-cdylib-link-arg=-Wl,-install_name,@rpath/libpython3.13.dylib");
+    } else if target_os == "linux" {
+        println!("cargo:rustc-cdylib-link-arg=-Wl,-soname,libpython3.13.so.1.0");
+    }
     if target_os == "windows" && target_env == "msvc" {
         for sym in VARARGS_C_EXPORTS {
             // `/INCLUDE` forces the symbol (and so its archive

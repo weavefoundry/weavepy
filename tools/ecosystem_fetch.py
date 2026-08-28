@@ -117,8 +117,10 @@ def load_manifest(manifest_path: Path, skip=frozenset()):
             if selftest:
                 group.extend(selftest.get("requirements", "").split())
                 # `mode = "installed"` selftests (RFC 0066 WS5) run out of
-                # the wheel already fetched via `requirements`; only sdist
-                # selftests carry a `source` tarball to cache.
+                # the wheel already fetched via `requirements`; sdist
+                # selftests — and installed-mode rows with an `overlay`
+                # (RFC 0075 WS9: the sdist donates its test subtree) —
+                # carry a `source` tarball to cache.
                 if "source" in selftest:
                     sdist_reqs.append(selftest["source"])
             if group:

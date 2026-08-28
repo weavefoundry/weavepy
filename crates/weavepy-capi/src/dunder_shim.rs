@@ -69,7 +69,11 @@ type NewFunc = unsafe extern "C" fn(
 /// Build the `(name, callable)` pairs to install into the type's
 /// dict from a populated [`SlotTable`]. Returns an empty vec if the
 /// table has no relevant slots.
-pub fn install_dunder_shims(table: &SlotTable, type_name: String) -> Vec<(String, Object)> {
+pub fn install_dunder_shims(
+    table: &SlotTable,
+    type_name: String,
+    new_null_raises: bool,
+) -> Vec<(String, Object)> {
     let mut out = Vec::new();
     let name = Rc::<str>::from(type_name.as_str());
 
@@ -312,7 +316,7 @@ pub fn install_dunder_shims(table: &SlotTable, type_name: String) -> Vec<(String
     install_anext(&mut out, table, ids::Py_am_anext, "__anext__", &name);
 
     // Construction → __new__ (RFC 0044, WS3).
-    install_new(&mut out, table, ids::Py_tp_new, &name);
+    install_new(&mut out, table, ids::Py_tp_new, &name, new_null_raises);
 
     out
 }
@@ -1044,15 +1048,17 @@ fn install_call(
             }
             unwrap_pyobject(raw)
         };
-    out.push((
-        mname,
-        Object::Builtin(Rc::new(BuiltinFn {
-            name: static_name,
-            binds_instance: true,
-            call: Box::new(f_pos),
-            call_kw: Some(Box::new(f_kw)),
-        })),
-    ));
+    let shim = Object::Builtin(Rc::new(BuiltinFn {
+        name: static_name,
+        binds_instance: true,
+        call: Box::new(f_pos),
+        call_kw: Some(Box::new(f_kw)),
+    }));
+    // CPython's slot wrapper for `tp_call` publishes the slotdef clinic
+    // string, so `inspect.signature(np.ufunc.__call__)` resolves
+    // (numpy test_ufunc_method_signatures — RFC 0075 WS8).
+    weavepy_vm::descr_registry::register_text_signature(&shim, "($self, /, *args, **kwargs)");
+    out.push((mname, shim));
 }
 
 fn install_init(
@@ -1468,9 +1474,39 @@ fn install_new(
     table: &SlotTable,
     slot_id: c_int,
     type_name: &Rc<str>,
+    new_null_raises: bool,
 ) {
     let slot = table.get(slot_id);
     if slot.is_null() {
+        // CPython inherits `tp_new` from the base only when the base is
+        // *not* `object` (`inherit_special` in `Objects/typeobject.c`), so
+        // a readied extension type whose slot is still NULL *and* whose
+        // base is `object` is genuinely non-instantiable: `type_call`
+        // raises "cannot create ... instances". Falling through to
+        // `object.__new__` minted a bare VM instance instead — Pillow's
+        // `CmsProfile()` / `CmsTransform()` "does not segfault" typesafety
+        // tests expect the TypeError (RFC 0075 WS9, Pillow selftest lane).
+        // With a non-`object` base the caller passes `new_null_raises =
+        // false` and we install nothing, so the VM's MRO lookup reaches
+        // the base's usable `__new__` (pybind11's
+        // `pybind11_static_property` extends `property` this way).
+        if !new_null_raises {
+            return;
+        }
+        let tn = type_name.clone();
+        let msg = move || type_error(format!("cannot create '{tn}' instances"));
+        let msg_kw = msg.clone();
+        out.push((
+            "__new__".to_owned(),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "__new__",
+                binds_instance: false,
+                call: Box::new(move |_args: &[Object]| Err(msg())),
+                call_kw: Some(Box::new(
+                    move |_args: &[Object], _kwargs: &[(String, Object)]| Err(msg_kw()),
+                )),
+            })),
+        ));
         return;
     }
     fn cls_ptr(

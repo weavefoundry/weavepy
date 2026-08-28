@@ -364,6 +364,22 @@ pub fn get_buffer_obj(obj: &Object) -> Result<Object, RuntimeError> {
     (hooks()?.get_buffer_obj)(obj)
 }
 
+/// `PyNumber_Float` over an arbitrary VM object, marshalled through the
+/// bridge. The float method receivers use it for instances of *foreign*
+/// float subclasses (numpy's `float64` and Python subclasses of it)
+/// whose double lives only in C storage — CPython's `float.__ceil__`
+/// reads `ob_fval` straight off any float instance (RFC 0075 WS8).
+pub fn as_float_obj(obj: &Object) -> Result<Object, RuntimeError> {
+    let h = hooks()?;
+    let p = (h.object_to_owned_ptr)(obj);
+    if p == 0 {
+        return Err(crate::error::type_error("float expected"));
+    }
+    let r = (h.as_float)(p);
+    (h.release_object_ptr)(p);
+    r
+}
+
 /// Bind a foreign descriptor through its C type's `tp_descr_get`
 /// (RFC 0066 WS3). `Ok(None)` ⇒ the foreign type is not a descriptor
 /// (no slot) and the caller should use the value unchanged. Absent

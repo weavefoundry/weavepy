@@ -335,7 +335,7 @@ fn semlock_type() -> Rc<TypeObject> {
         );
         d.insert(
             DictKey(Object::from_static("__new__")),
-            b("__new__", semlock_new),
+            crate::stdlib::os::builtin_kw("__new__", semlock_new),
         );
         d.insert(
             DictKey(Object::from_static("__init__")),
@@ -394,9 +394,34 @@ fn semlock_init(_args: &[Object]) -> Result<Object, RuntimeError> {
 /// the name immediately and forgets it; otherwise the name is kept so a
 /// `spawn`ed child can re-open it and `resource_tracker` can clean up.
 #[cfg(unix)]
-fn semlock_new(args: &[Object]) -> Result<Object, RuntimeError> {
+fn semlock_new(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     // args[0] is the class object (SemLock); the constructor params
-    // follow it.
+    // follow it. CPython parses with `PyArg_ParseTupleAndKeywords`
+    // (kwlist: kind, value, maxvalue, name, unlink) — joblib's
+    // `_multiprocessing_helpers` calls `SemLock(0, 0, 1, name=..,
+    // unlink=True)` by keyword (RFC 0075 WS9 scikit-learn lane).
+    let mut args: Vec<Object> = args.to_vec();
+    // Slot 0 is the class object; keyword slots follow in kwlist order.
+    for (i, kw_name) in ["kind", "value", "maxvalue", "name", "unlink"]
+        .iter()
+        .enumerate()
+    {
+        let slot = 1 + i;
+        if let Some((_, v)) = kwargs.iter().find(|(k, _)| k == kw_name) {
+            if args.len() > slot {
+                return Err(type_error(format!(
+                    "argument for SemLock() given by name ('{kw_name}') and position ({slot})"
+                )));
+            }
+            if args.len() < slot {
+                return Err(type_error(format!(
+                    "SemLock() missing required argument before '{kw_name}'"
+                )));
+            }
+            args.push(v.clone());
+        }
+    }
+    let args = &args[..];
     let kind = sem_arg_int(args, 1, "kind")?;
     let value = sem_arg_int(args, 2, "value")?;
     let maxvalue = sem_arg_int(args, 3, "maxvalue")?;
