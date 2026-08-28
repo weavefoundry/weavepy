@@ -73,7 +73,11 @@ command = "tests"
 timeout_seconds = 2400
 
 [packages.click]
-requirements = "click"
+# Pinned to the selftest sdist below: the suite must test the version
+# it shipped with. A floating requirement broke 2026-08-26 when click
+# 8.5.0 released mid-wave and the 8.4.2 suite started failing on the
+# new "removed in Click 9.0" deprecation warnings.
+requirements = "click==8.4.2"
 probe = "probes/click_probe.py"
 
 [packages.click.selftest]
@@ -134,7 +138,8 @@ requirements = "requests"
 probe = "probes/requests_probe.py"
 
 [packages.dateutil]
-requirements = "python-dateutil"
+# Pinned to the selftest sdist (see the click row for the drift class).
+requirements = "python-dateutil==2.9.0.post0"
 probe = "probes/dateutil_probe.py"
 
 [packages.dateutil.selftest]
@@ -165,7 +170,8 @@ requirements = "typing_extensions"
 probe = "probes/typing_extensions_probe.py"
 
 [packages.packaging]
-requirements = "packaging"
+# Pinned to the selftest sdist (see the click row for the drift class).
+requirements = "packaging==26.3"
 probe = "probes/packaging_probe.py"
 
 [packages.packaging.selftest]
@@ -320,7 +326,9 @@ command = "--pyargs scipy.linalg scipy.fft"
 timeout_seconds = 14400
 
 [packages.pillow]
-requirements = "pillow numpy"
+# pillow pinned to the selftest sdist (see the click row for the
+# drift class); numpy stays floating (probe-only dependency).
+requirements = "pillow==12.3.0 numpy"
 probe = "probes/pillow_probe.py"
 timeout_seconds = 900
 
@@ -334,7 +342,8 @@ command = "Tests"
 timeout_seconds = 7200
 
 [packages.lxml]
-requirements = "lxml"
+# Pinned to the selftest sdist (see the click row for the drift class).
+requirements = "lxml==6.1.2"
 probe = "probes/lxml_probe.py"
 
 # RFC 0075 WS9: the lxml wheel ships no tests and the sdist cannot run
