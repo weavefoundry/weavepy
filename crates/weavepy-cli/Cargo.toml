@@ -1,6 +1,9 @@
 [package]
 name = "weavepy-cli"
 description = "Command-line entry point for the WeavePy interpreter (the `weavepy` binary)."
+# Two [[bin]] targets live here (`weavepy` + the `_testembed` twin), so
+# a bare `cargo run -p weavepy-cli` needs the tie broken.
+default-run = "weavepy"
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true

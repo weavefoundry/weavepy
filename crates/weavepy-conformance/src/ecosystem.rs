@@ -219,6 +219,49 @@ impl Manifest {
         })
     }
 
+    /// Keep only the `k`-th of `n` load-balanced shards (1-based) — the
+    /// CI fan-out knob behind `ecosystem --shard K/N`. Deterministic
+    /// longest-processing-time assignment: rows sorted by descending
+    /// cost (name as tiebreak) each land in the currently-lightest bin,
+    /// so for a fixed manifest + flag set every row lands in exactly
+    /// one shard and the union of the shards is the full schedule. The
+    /// cost proxy is the row's wall budget plus, when the selftest tier
+    /// runs, its selftest budget: timeouts are the only committed
+    /// runtime signal, and balance only needs the right order of
+    /// magnitude (the heavy selftest rows carry explicit budgets).
+    pub fn retain_shard(&mut self, k: usize, n: usize, selftests: bool) {
+        assert!(n >= 1 && (1..=n).contains(&k), "shard {k}/{n} out of range");
+        let cost = |row: &ManifestRow| -> u64 {
+            let probe = row.timeout_seconds.unwrap_or(DEFAULT_ROW_TIMEOUT_SECS);
+            let selftest = match (&row.selftest, selftests) {
+                (Some(spec), true) => spec
+                    .timeout_seconds
+                    .unwrap_or(DEFAULT_SELFTEST_TIMEOUT_SECS),
+                _ => 0,
+            };
+            probe + selftest
+        };
+        let mut order: Vec<usize> = (0..self.rows.len()).collect();
+        order.sort_by(|&a, &b| {
+            cost(&self.rows[b])
+                .cmp(&cost(&self.rows[a]))
+                .then_with(|| self.rows[a].name.cmp(&self.rows[b].name))
+        });
+        let mut loads = vec![0u64; n];
+        let mut shard_of = vec![0usize; self.rows.len()];
+        for idx in order {
+            let lightest = (0..n).min_by_key(|&bin| loads[bin]).unwrap_or(0);
+            loads[lightest] += cost(&self.rows[idx]);
+            shard_of[idx] = lightest;
+        }
+        let mut i = 0;
+        self.rows.retain(|_| {
+            let keep = shard_of[i] == k - 1;
+            i += 1;
+            keep
+        });
+    }
+
     fn parse_selftest(parent: &str, kv: &simple_tables::Table) -> Result<SelftestSpec> {
         let section = format!("packages.{parent}.selftest");
         let mode = match kv.get("mode").and_then(simple_tables::Value::as_str) {
@@ -2312,5 +2355,74 @@ measured_os = ["macos"]
                 "host {host}"
             );
         }
+    }
+
+    fn shard_fixture() -> Manifest {
+        let row = |name: &str, timeout: Option<u64>, selftest: Option<u64>| ManifestRow {
+            name: name.to_owned(),
+            requirements: Vec::new(),
+            no_binary: Vec::new(),
+            probe: "probe.py".to_owned(),
+            timeout_seconds: timeout,
+            selftest: selftest.map(|t| SelftestSpec {
+                mode: SelftestMode::Installed,
+                source: None,
+                overlay: None,
+                requirements: Vec::new(),
+                command: "tests".to_owned(),
+                deselect: Vec::new(),
+                timeout_seconds: Some(t),
+            }),
+        };
+        Manifest {
+            rows: vec![
+                row("scipy", None, Some(14400)),
+                row("pillow", None, Some(7200)),
+                row("six", None, None),
+                row("numpy", None, Some(2400)),
+                row("aiohttp", Some(1200), None),
+            ],
+            base_dir: PathBuf::from("."),
+        }
+    }
+
+    /// The `--shard K/N` partition: every row lands in exactly one
+    /// shard, the union of the shards is the full schedule, and the
+    /// budget-heaviest row is isolated from the next-heaviest.
+    #[test]
+    fn shards_partition_every_row_exactly_once() {
+        const N: usize = 3;
+        let full: Vec<String> = shard_fixture()
+            .rows
+            .iter()
+            .map(|r| r.name.clone())
+            .collect();
+        let mut seen = Vec::new();
+        for k in 1..=N {
+            let mut m = shard_fixture();
+            m.retain_shard(k, N, true);
+            assert!(!m.rows.is_empty(), "shard {k}/{N} is empty");
+            seen.extend(m.rows.iter().map(|r| r.name.clone()));
+            let names: Vec<&str> = m.rows.iter().map(|r| r.name.as_str()).collect();
+            assert!(
+                !(names.contains(&"scipy") && names.contains(&"pillow")),
+                "two heaviest rows share shard {k}/{N}: {names:?}"
+            );
+        }
+        seen.sort();
+        let mut expected = full;
+        expected.sort();
+        assert_eq!(seen, expected, "shards must partition the schedule");
+    }
+
+    /// Without `--selftests` the selftest budgets must not skew the
+    /// balance — a probe-only lane weighs scipy like any other row.
+    #[test]
+    fn shard_cost_ignores_selftests_when_disabled() {
+        let mut m = shard_fixture();
+        m.retain_shard(1, 2, false);
+        // aiohttp (1200s probe budget) is the heaviest probe-only row;
+        // LPT places it first, into shard 1.
+        assert!(m.rows.iter().any(|r| r.name == "aiohttp"));
     }
 }

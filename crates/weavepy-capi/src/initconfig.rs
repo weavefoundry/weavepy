@@ -1416,12 +1416,16 @@ mod tests {
     /// and `PyConfig_Clear` free()d it — a malloc abort inside Pillow's
     /// getfont, which wraps every truetype load in init → parse → clear
     /// (RFC 0075 WS9). Poison the buffer first so the test sees exactly
-    /// what a dirty C stack would.
+    /// what a dirty C stack would. The slot must be `MaybeUninit`, not a
+    /// `[u8; N]` cast: a byte array is 1-aligned and the cast pointer
+    /// trips Rust's misaligned-dereference check (a C embedder's struct
+    /// is aligned by its declaration, so only the test needs this care).
     #[test]
     fn init_zeroes_a_poisoned_struct() {
         unsafe {
-            let mut buf = [0xAAu8; std::mem::size_of::<PyConfig>()];
-            let c = buf.as_mut_ptr().cast::<PyConfig>();
+            let mut slot = std::mem::MaybeUninit::<PyConfig>::uninit();
+            std::ptr::write_bytes(slot.as_mut_ptr().cast::<u8>(), 0xAA, size_of::<PyConfig>());
+            let c = slot.as_mut_ptr();
             PyConfig_InitPythonConfig(c);
             assert!((*c).dump_refs_file.is_null());
             assert!((*c).filesystem_encoding.is_null());
@@ -1434,8 +1438,13 @@ mod tests {
             // Must be a no-op free-wise: every pointer is NULL.
             PyConfig_Clear(c);
 
-            let mut buf = [0x55u8; std::mem::size_of::<PyPreConfig>()];
-            let p = buf.as_mut_ptr().cast::<PyPreConfig>();
+            let mut slot = std::mem::MaybeUninit::<PyPreConfig>::uninit();
+            std::ptr::write_bytes(
+                slot.as_mut_ptr().cast::<u8>(),
+                0x55,
+                size_of::<PyPreConfig>(),
+            );
+            let p = slot.as_mut_ptr();
             PyPreConfig_InitPythonConfig(p);
             assert_eq!((*p).utf8_mode, -1);
             assert_eq!((*p).allocator, 0);
