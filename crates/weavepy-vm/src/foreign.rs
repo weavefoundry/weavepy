@@ -58,8 +58,21 @@ impl std::fmt::Debug for PyForeignSoul {
     }
 }
 
+/// Cached `WEAVEPY_FOREIGN_TRACE` gate: log every soul wrap/drop (the
+/// incref/decref pairs the VM holds on extension objects) — the tool
+/// for foreign over-release hunts (a `Py_DecRef` on freed memory in a
+/// soul drop means the C object died while a soul still pinned it).
+pub fn soul_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WEAVEPY_FOREIGN_TRACE").is_some())
+}
+
 impl Drop for PyForeignSoul {
     fn drop(&mut self) {
+        if soul_trace_enabled() {
+            eprintln!("[SOUL-DROP] ptr=0x{:x} type={}", self.ptr, self.tp_name);
+        }
         if let Some(h) = HOOKS.get() {
             (h.decref)(self.ptr);
         }
@@ -201,6 +214,9 @@ fn hooks() -> Result<&'static ForeignHooks, RuntimeError> {
 /// `type_name` is the *bare* tail; `tp_name` is the full C `tp_name`.
 /// Returns the raw soul; the caller wraps it in [`Object::Foreign`].
 pub fn wrap(ptr: usize, type_name: Rc<str>, tp_name: Rc<str>) -> Rc<PyForeignSoul> {
+    if soul_trace_enabled() {
+        eprintln!("[SOUL-WRAP] ptr=0x{ptr:x} type={tp_name}");
+    }
     if let Some(h) = HOOKS.get() {
         (h.incref)(ptr);
     }

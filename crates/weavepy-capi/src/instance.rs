@@ -343,6 +343,13 @@ pub unsafe fn release_c_ownership(p: *mut PyObject) {
     } else if unsafe { crate::mirror::is_orphaned_instance_body(p) }
         && !body_free_in_flight(p as usize)
     {
+        if crate::mirror::body_trace_enabled() {
+            eprintln!(
+                "[ORPHAN-REAP] body=0x{:x} refcnt={} — deferred dealloc",
+                p as usize,
+                unsafe { (*p).ob_refcnt }
+            );
+        }
         // RFC 0075 WS9: no pin *and* the owning instance is already
         // collected — this is an orphaned body (the free hook deferred its
         // dealloc because C still held inline-acquired references; see the
@@ -369,7 +376,7 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-fn body_free_in_flight(body: usize) -> bool {
+pub(crate) fn body_free_in_flight(body: usize) -> bool {
     // `try_with`: this is reachable from `Object` drops that run while
     // the thread's own TLS is being destroyed (a parked
     // `PENDING_CEXT_DROPS` queue dying at thread exit) — `with` would

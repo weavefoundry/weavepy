@@ -110,9 +110,19 @@ fn to_string(raw: *mut PyObject) -> Result<String, RuntimeError> {
 fn fwd_incref(p: usize) {
     crate::object::soul_inc(p);
     unsafe { crate::object::Py_IncRef(p as *mut PyObject) };
+    if weavepy_vm::foreign::soul_trace_enabled() {
+        eprintln!("[SOUL-INCREF] ptr=0x{p:x} refcnt_after={}", unsafe {
+            (*(p as *mut PyObject)).ob_refcnt
+        });
+    }
 }
 
 fn fwd_decref(p: usize) {
+    if weavepy_vm::foreign::soul_trace_enabled() {
+        eprintln!("[SOUL-DECREF] ptr=0x{p:x} refcnt_before={}", unsafe {
+            (*(p as *mut PyObject)).ob_refcnt
+        });
+    }
     // Drop the live-soul count *before* the decref: the last soul's own
     // decref frees the box, and free_box must then see a zero count.
     crate::object::soul_dec(p);

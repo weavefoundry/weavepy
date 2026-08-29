@@ -261,6 +261,15 @@ jobs:
             --selftests \
             --shard ${{ matrix.shard }}/3 \
             --check
+      # The job-log table truncates each row's failure reason to one cell;
+      # ecosystem.json keeps the full text (faulthandler tracebacks, stage
+      # markers), which is what a crash triage actually needs.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ecosystem-report-${{ matrix.os }}-shard${{ matrix.shard }}
+          path: target/conformance/
+          if-no-files-found: warn
 
   dist-check:
     name: dist check (blocking, ${{ matrix.os }})
