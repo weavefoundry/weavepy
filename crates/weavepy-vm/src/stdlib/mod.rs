@@ -32,6 +32,8 @@ pub mod faulthandler_mod;
 pub mod fcntl_mod;
 pub mod functools_mod;
 pub mod gc_mod;
+#[cfg(unix)]
+pub mod grp_mod;
 pub mod gzip_mod;
 pub mod hashlib_mod;
 pub mod heapq_accel;
@@ -63,6 +65,8 @@ pub mod os_process;
 pub mod overlapped_mod;
 #[cfg(unix)]
 pub mod posixsubprocess_mod;
+#[cfg(unix)]
+pub mod pwd_mod;
 pub mod pyexpat_mod;
 #[cfg(unix)]
 pub mod resource_mod;
@@ -303,6 +307,13 @@ pub fn register_all(cache: &ModuleCache) {
     // `adjust_rlimit_nofile` dying on `getrlimit`), so don't register it.
     #[cfg(unix)]
     cache.register_builtin("resource", resource_mod::build);
+    // RFC 0075 WS9 — user/group database access (CPython's pwdmodule.c /
+    // grpmodule.c). gunicorn imports both at module level for its
+    // user-switching surface; POSIX-only like CPython.
+    #[cfg(unix)]
+    cache.register_builtin("pwd", pwd_mod::build);
+    #[cfg(unix)]
+    cache.register_builtin("grp", grp_mod::build);
     // RFC 0055 WS6 — real POSIX terminal control (CPython's termios is a
     // core C extension; `tty`/`pty` above are pure-Python over it).
     #[cfg(unix)]

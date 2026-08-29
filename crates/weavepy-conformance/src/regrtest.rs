@@ -891,28 +891,68 @@ fn sanitized_lib_dir(lib_dir: &Path) -> String {
         // second. CPython never runs with two Libs on sys.path; hiding
         // the vendored copy (module resolution never reaches it — the
         // staged tree wins) keeps the single-landmark invariant.
-        let shim = std::env::temp_dir().join(format!("weavepy-cpython-lib-v3-{:016x}", h.finish()));
+        //
+        // "v4" (RFC 0075 WS6): the shim gains a checkout-shaped layout —
+        // entries under `Lib/`, with `Modules/getpath.py` symlinked as a
+        // sibling when the vendored tree carries it. test_getpath locates
+        // CPython's path-computation script *relative to the test file*
+        // (`__file__/../../../Modules/getpath.py`), so the mirror must
+        // reproduce the Lib/Modules siblinghood of a real checkout.
+        let shim = std::env::temp_dir().join(format!("weavepy-cpython-lib-v4-{:016x}", h.finish()));
         let done = shim.join(".weavepy-shim-complete");
         if !done.is_file() {
             // Populate a staging dir, then rename into place so parallel
             // workers never observe a half-built shim; the loser of the
             // rename race just discards its staging copy.
+            //
+            // Every staging step is *checked*: an ENOSPC sweep once
+            // poisoned a shim — the entry symlinks failed silently, the
+            // 0-byte completion marker still landed, and the "complete"
+            // husk (no `Modules/`, junk `Lib/`) was never rebuilt. A
+            // failed step now aborts marker creation, this run falls
+            // back to the raw lib dir, and the next run retries.
             let stage = shim.with_extension(format!("stage-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&stage);
-            if std::fs::create_dir_all(&stage).is_ok() {
-                if let Ok(entries) = std::fs::read_dir(lib_dir) {
-                    for entry in entries.flatten() {
-                        let name = entry.file_name();
-                        if name == "sitecustomize.py"
-                            || name == "usercustomize.py"
-                            || name == "os.py"
-                        {
-                            continue;
+            let mut ok = std::fs::create_dir_all(stage.join("Lib")).is_ok();
+            if ok {
+                match std::fs::read_dir(lib_dir) {
+                    Ok(entries) => {
+                        for entry in entries.flatten() {
+                            let name = entry.file_name();
+                            if name == "sitecustomize.py"
+                                || name == "usercustomize.py"
+                                || name == "os.py"
+                            {
+                                continue;
+                            }
+                            if std::os::unix::fs::symlink(
+                                entry.path(),
+                                stage.join("Lib").join(&name),
+                            )
+                            .is_err()
+                            {
+                                ok = false;
+                                break;
+                            }
                         }
-                        let _ = std::os::unix::fs::symlink(entry.path(), stage.join(&name));
+                    }
+                    Err(_) => ok = false,
+                }
+            }
+            if ok {
+                if let Some(root) = lib_dir.parent() {
+                    let getpath = root.join("Modules").join("getpath.py");
+                    if getpath.is_file() {
+                        ok = std::fs::create_dir_all(stage.join("Modules")).is_ok()
+                            && std::os::unix::fs::symlink(
+                                &getpath,
+                                stage.join("Modules").join("getpath.py"),
+                            )
+                            .is_ok();
                     }
                 }
-                let _ = std::fs::File::create(stage.join(".weavepy-shim-complete"));
+            }
+            if ok && std::fs::File::create(stage.join(".weavepy-shim-complete")).is_ok() {
                 if std::fs::rename(&stage, &shim).is_err() {
                     if done.is_file() {
                         // Lost the race to a parallel worker — its copy
@@ -932,10 +972,12 @@ fn sanitized_lib_dir(lib_dir: &Path) -> String {
                         }
                     }
                 }
+            } else {
+                let _ = std::fs::remove_dir_all(&stage);
             }
         }
         if done.is_file() {
-            return shim.display().to_string();
+            return shim.join("Lib").display().to_string();
         }
     }
     raw
@@ -1181,6 +1223,38 @@ fn run_inprocess(
     }
 }
 
+/// Stage `{bindir}/Programs/_testembed` (RFC 0075 WS6). Best-effort:
+/// when the twin was not built, `test_embed`'s setUp skips every test
+/// with "'…/_testembed' doesn't exist", same as a CPython checkout
+/// that never built the exerciser.
+fn stage_testembed_twin(weavepy_bin: &Path) {
+    let Some(bindir) = weavepy_bin.parent() else {
+        return;
+    };
+    let exe = if cfg!(windows) {
+        "_testembed.exe"
+    } else {
+        "_testembed"
+    };
+    let src = bindir.join(exe);
+    if !src.is_file() {
+        return;
+    }
+    // Windows expects the exerciser in the bin dir itself; POSIX under
+    // `Programs/` (test_embed.EmbeddingTestsMixin.setUp).
+    if cfg!(windows) {
+        return; // already in place: src == expected location
+    }
+    let programs = bindir.join("Programs");
+    let dst = programs.join(exe);
+    let _ = std::fs::create_dir_all(&programs);
+    let _ = std::fs::remove_file(&dst);
+    #[cfg(unix)]
+    let _ = std::os::unix::fs::symlink(Path::new("..").join(exe), &dst);
+    #[cfg(not(unix))]
+    let _ = std::fs::copy(&src, &dst);
+}
+
 fn run_subprocess(
     file: &RegrtestFile,
     expected: Option<TestStatus>,
@@ -1192,6 +1266,13 @@ fn run_subprocess(
         .clone()
         .or_else(|| std::env::current_exe().ok())
         .unwrap_or_else(|| PathBuf::from("weavepy"));
+    // RFC 0075 WS6: test_embed derives its exerciser's path from
+    // `sys.executable` — `{bindir}/Programs/_testembed` on POSIX.
+    // Stage the twin (a weavepy-cli bin target, built next to the
+    // `weavepy` binary) there so the vendored test finds it.
+    if file.label.ends_with("test_embed.py") {
+        stage_testembed_twin(&weavepy_bin);
+    }
     let start = Instant::now();
     let mut cmd = std::process::Command::new(&weavepy_bin);
     match libregrtest_bootstrap(file) {
@@ -1428,10 +1509,18 @@ fn divergence_matches(output: &str, ids: &[String]) -> bool {
         };
         // "testInt (test.test_marshal.InstancingTestCase.testInt)" —
         // prefer the parenthesized full id; fall back to the bare name
-        // (module-level errors print without parentheses).
-        let id = match (rest.rfind('('), rest.rfind(')')) {
-            (Some(open), Some(close)) if open < close => &rest[open + 1..close],
-            _ => rest.trim(),
+        // (module-level errors print without parentheses). The *first*
+        // paren group is the id: subtest headers append a second group
+        // with the parametrization ("FAIL: test_flags (test.….test_flags)
+        // (sys='debug', key='parser_debug', value=1)"), and every
+        // parametrization of one method collapses to the one enumerated
+        // id (RFC 0075 WS6 — test_embed's SetConfigTests).
+        let id = match rest.find('(') {
+            Some(open) => match rest[open..].find(')') {
+                Some(off) => &rest[open + 1..open + off],
+                None => rest.trim(),
+            },
+            None => rest.trim(),
         };
         observed.insert(id.to_owned());
     }

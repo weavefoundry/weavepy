@@ -842,7 +842,10 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
                 DictKey(Object::from_static("supports_dir_fd")),
                 Object::new_set_from(dir_fd_objs),
             );
-            let fd_objs: Vec<Object> = ["scandir", "listdir"]
+            // `utime` joined for RFC 0075 WS9 (futimens over a raw fd —
+            // gunicorn's worker heartbeat); test_os asserts the fd form
+            // raises TypeError exactly when utime is *absent* here.
+            let fd_objs: Vec<Object> = ["scandir", "listdir", "utime"]
                 .iter()
                 .filter_map(|n| d.get(&DictKey(Object::from_static(n))).cloned())
                 .collect();
@@ -3040,7 +3043,7 @@ fn os_chdir(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
-pub(crate) fn os_fspath(args: &[Object]) -> Result<Object, RuntimeError> {
+pub fn os_fspath(args: &[Object]) -> Result<Object, RuntimeError> {
     let obj = match args.first() {
         Some(o) => o,
         None => return Err(type_error("fspath() takes exactly one argument")),
@@ -5794,6 +5797,57 @@ fn os_chmod(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runt
 /// neither → "now". `shutil.copystat` drives the `ns=` path.
 fn os_utime(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     reject_dir_fd(kwargs, "utime")?;
+    // CPython's `os.utime` accepts an open file descriptor for `path`
+    // (`futimens(2)`; `os.supports_fd` lists it on POSIX). gunicorn's
+    // worker heartbeat is exactly `os.utime(tmp.fileno(), (t, t))`
+    // (workertmp.py) — without this every worker dies at first notify
+    // (RFC 0075 WS9 gevent capstone).
+    #[cfg(unix)]
+    if let Some(Object::Int(fd)) = args.first() {
+        let fd = i32::try_from(*fd).map_err(|_| {
+            crate::error::overflow_error("Python int too large to convert to C int")
+        })?;
+        let times = match args.get(1).cloned().filter(|o| !matches!(o, Object::None)) {
+            Some(t) => Some(t),
+            None => kwargs
+                .iter()
+                .find(|(k, _)| k == "times")
+                .map(|(_, v)| v.clone())
+                .filter(|o| !matches!(o, Object::None)),
+        };
+        let ns = kwargs
+            .iter()
+            .find(|(k, _)| k == "ns")
+            .map(|(_, v)| v.clone())
+            .filter(|o| !matches!(o, Object::None));
+        if times.is_some() && ns.is_some() {
+            return Err(value_error(
+                "utime: you may specify either 'times' or 'ns' but not both",
+            ));
+        }
+        let (atspec, mtspec) = if let Some(ns_obj) = ns {
+            let (a, m) = utime_pair_int(&ns_obj, "ns")?;
+            (ns_to_timespec(a), ns_to_timespec(m))
+        } else if let Some(t_obj) = times {
+            let (a, m) = utime_pair_float(&t_obj, "times")?;
+            (secs_to_timespec(a), secs_to_timespec(m))
+        } else {
+            let now = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_NOW,
+            };
+            (now, now)
+        };
+        let specs = [atspec, mtspec];
+        // SAFETY: `specs` outlives the call; `futimens` only reads it.
+        let rc = unsafe { libc::futimens(fd, specs.as_ptr()) };
+        if rc != 0 {
+            return Err(crate::error::io_error_to_py(
+                &std::io::Error::last_os_error(),
+            ));
+        }
+        return Ok(Object::None);
+    }
     let p = first_path(args, "utime")?;
     let kw = |name: &str| {
         kwargs

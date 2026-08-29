@@ -134,6 +134,14 @@ enum Cmd {
         #[arg(long, value_name = "FILTER")]
         filter: Option<String>,
 
+        /// Run only the `K`-th of `N` deterministic, budget-balanced
+        /// shards of the scheduled rows (1-based, e.g. `2/3`). Lets CI
+        /// fan the lane out across parallel jobs; for a fixed manifest
+        /// every row lands in exactly one shard, so the union of the
+        /// `N` shard runs is the full lane.
+        #[arg(long, value_name = "K/N")]
+        shard: Option<String>,
+
         /// Per-row wall budget (venv + install + probe), in seconds.
         #[arg(long, value_name = "SECS")]
         timeout: Option<u64>,
@@ -274,6 +282,7 @@ fn real_main() -> Result<()> {
             manifest,
             expectations,
             filter,
+            shard,
             timeout,
             wheels,
             weavepy,
@@ -288,6 +297,7 @@ fn real_main() -> Result<()> {
                 manifest,
                 expectations,
                 filter,
+                shard,
                 timeout,
                 wheels,
                 weavepy,
@@ -304,12 +314,25 @@ struct EcosystemArgs {
     manifest: Option<PathBuf>,
     expectations: Option<PathBuf>,
     filter: Option<String>,
+    shard: Option<String>,
     timeout: Option<u64>,
     wheels: Option<PathBuf>,
     weavepy: Option<PathBuf>,
     selftests: bool,
     keep_venvs: bool,
     strict: bool,
+}
+
+/// Parse a `--shard K/N` spec into 1-based `(k, n)`.
+fn parse_shard_spec(spec: &str) -> Result<(usize, usize)> {
+    let parsed = spec.split_once('/').and_then(|(k, n)| {
+        let k = k.trim().parse::<usize>().ok()?;
+        let n = n.trim().parse::<usize>().ok()?;
+        (n >= 1 && (1..=n).contains(&k)).then_some((k, n))
+    });
+    parsed.ok_or_else(|| {
+        anyhow::anyhow!("bad --shard {spec:?}: expected K/N with 1 <= K <= N (e.g. 2/3)")
+    })
 }
 
 fn cmd_ecosystem(workspace: &Path, report_dir: &Path, args: EcosystemArgs) -> Result<()> {
@@ -322,11 +345,26 @@ fn cmd_ecosystem(workspace: &Path, report_dir: &Path, args: EcosystemArgs) -> Re
     if let Some(needle) = &args.filter {
         manifest.rows.retain(|r| r.name.contains(needle.as_str()));
     }
+    if let Some(spec) = &args.shard {
+        let (k, n) = parse_shard_spec(spec)?;
+        manifest.retain_shard(k, n, args.selftests);
+        eprintln!(
+            "[ecosystem] shard {k}/{n}: {} row(s) — {}",
+            manifest.rows.len(),
+            manifest
+                .rows
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
     if manifest.rows.is_empty() {
         anyhow::bail!(
-            "no ecosystem rows scheduled from {} (filter={:?})",
+            "no ecosystem rows scheduled from {} (filter={:?}, shard={:?})",
             manifest_path.display(),
             args.filter,
+            args.shard,
         );
     }
 
@@ -498,14 +536,23 @@ fn cmd_regrtest(workspace: &Path, report_dir: &Path, args: RegrtestArgs<'_>) -> 
         .unwrap_or(regrtest::DEFAULT_TIMEOUT_SECS);
     let timeout = Duration::from_secs(timeout_secs);
 
-    // Honour an explicit `--cpython-dir` (canonicalised so the runner's
-    // `is_dir()` probe and the spawned child agree on the path) and the
-    // `--all-cpython` opt-in for full-directory scheduling.
+    // Honour an explicit `--cpython-dir` (made absolute so the runner's
+    // `is_dir()` probe and the spawned child agree on the path — but NOT
+    // `canonicalize`d: `vendor/cpython/Lib` is often a symlink into a
+    // live install, and resolving it would tear `Lib/test` away from its
+    // `Modules/getpath.py` sibling, breaking test_getpath's source-tree
+    // probe and hashing the sanitized-lib shim over a foreign path) and
+    // the `--all-cpython` opt-in for full-directory scheduling.
     let cpython_dir = match args.cpython_dir {
-        Some(dir) => Some(
-            dir.canonicalize()
-                .with_context(|| format!("--cpython-dir does not exist: {}", dir.display()))?,
-        ),
+        Some(dir) => {
+            if !dir.is_dir() {
+                anyhow::bail!("--cpython-dir does not exist: {}", dir.display());
+            }
+            Some(
+                std::path::absolute(&dir)
+                    .with_context(|| format!("--cpython-dir not resolvable: {}", dir.display()))?,
+            )
+        }
         None => None,
     };
     let discovery = regrtest::DiscoveryOptions {

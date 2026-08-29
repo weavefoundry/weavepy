@@ -640,7 +640,15 @@ class Popen:
 
     def _resolve_group(self, group):
         if isinstance(group, int):
-            return group
+            # gid_t is an unsigned 32-bit integer; validate in the parent
+            # like `_Py_Gid_Converter` (-1 -> ValueError before the fork,
+            # 2**64 -> OverflowError), never handing a bad gid to the
+            # child's setregid() to die with EPERM.
+            if group > 2 ** 32 - 1:
+                raise OverflowError("group id is greater than maximum")
+            if group < 0:
+                raise ValueError("group id is not within the allowed range")
+            return int(group)
         if isinstance(group, str):
             try:
                 import grp

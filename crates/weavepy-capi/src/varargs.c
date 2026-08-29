@@ -468,10 +468,28 @@ static int parse_one(fmt_state *st, PyObject *arg, va_list *ap) {
         case 'O': {
             char modifier = st->fmt[1];
             if (modifier == '!') {
-                /* O! takes a type and an object pointer. */
-                /* discard the type */
-                (void)va_arg(*ap, PyTypeObject *);
+                /* O! takes a type and an object pointer. CPython's
+                 * `convertsimple` REJECTS a mismatched argument with a
+                 * TypeError — silently accepting it hands the callee a
+                 * pointer it will treat as its own struct. Pillow's
+                 * `profile_tobytes` parses "O!" against CmsProfile_Type
+                 * and immediately reads `profile->profile`; an `int`
+                 * passed through crashed inside liblcms
+                 * (test_profile_typesafety — literally named "does not
+                 * segfault"; RFC 0075 WS9, Pillow selftest lane). */
+                PyTypeObject *type = va_arg(*ap, PyTypeObject *);
                 PyObject **dest = va_arg(*ap, PyObject **);
+                if (type != NULL && !PyObject_TypeCheck(arg, type)) {
+                    /* `PyTypeObject` is opaque to this TU; go through
+                     * `PyType_GetName` for the message names. */
+                    PyObject *want = PyType_GetName(type);
+                    PyObject *got = PyType_GetName(Py_TYPE(arg));
+                    PyErr_Format(PyExc_TypeError, "must be %S, not %S",
+                                 want ? want : Py_None, got ? got : Py_None);
+                    Py_XDECREF(want);
+                    Py_XDECREF(got);
+                    return -1;
+                }
                 if (_WeavePy_Arg_Object(arg, dest) != 0) return -1;
                 st->fmt += 2;
             } else if (modifier == '&') {
@@ -499,6 +517,99 @@ static int parse_one(fmt_state *st, PyObject *arg, va_list *ap) {
             }
             if (_WeavePy_Arg_Object(arg, dest) != 0) return -1;
             st->fmt++;
+            return 0;
+        }
+        case 'S': case 'Y': {
+            /* CPython `convertsimple`: 'S' stores a *bytes* object (and
+             * 'Y' a bytearray) through `PyObject **`, rejecting anything
+             * else. Falling to `default` consumed the destination slot
+             * without writing it, so Pillow's `_anim_decoder_new`
+             * ("S" → `PyBytesObject *webp_string`) read uninitialised
+             * stack and every webp decode failed with "could not create
+             * decoder object" (RFC 0075 WS9, Pillow selftest lane). */
+            PyObject **dest = va_arg(*ap, PyObject **);
+            bool ok = (unit == 'S') ? PyBytes_Check(arg) : PyByteArray_Check(arg);
+            if (!ok) {
+                PyErr_SetString(PyExc_TypeError,
+                                unit == 'S' ? "expected bytes"
+                                            : "expected bytearray");
+                return -1;
+            }
+            if (_WeavePy_Arg_Object(arg, dest) != 0) return -1;
+            st->fmt++;
+            return 0;
+        }
+        case 'e': {
+            /* CPython's encoded-string converters `es`/`et` (+`#`)
+             * (getargs.c `convertsimple`): two C varargs — the encoding
+             * *by value* (NULL = default) and a `char **` destination
+             * that receives a NUL-terminated PyMem_Malloc'd copy the
+             * CALLER must PyMem_Free; `#` adds a `Py_ssize_t *` length.
+             * `es` accepts only str; `et` passes bytes/bytearray through
+             * untouched (assumed already in the requested encoding).
+             * Pillow's getfont parses "etf|nsy#n" and frees the filename
+             * with PyMem_Free — before this case existed the unit fell
+             * to `default`, desyncing every later slot (RFC 0075 WS9,
+             * Pillow selftest lane). */
+            char sub = st->fmt[1];
+            if (sub != 's' && sub != 't') {
+                PyErr_SetString(PyExc_SystemError,
+                                "unknown parser marker combination");
+                return -1;
+            }
+            bool e_len = (st->fmt[2] == '#');
+            const char *encoding = va_arg(*ap, const char *);
+            char **buffer = va_arg(*ap, char **);
+            Py_ssize_t *plen = e_len ? va_arg(*ap, Py_ssize_t *) : NULL;
+            if (buffer == NULL) {
+                PyErr_SetString(PyExc_SystemError, "(buffer is NULL)");
+                return -1;
+            }
+            const char *src = NULL;
+            Py_ssize_t srclen = 0;
+            PyObject *encoded = NULL;
+            if (sub == 't' && PyBytes_Check(arg)) {
+                if (PyBytes_AsStringAndSize(arg, (char **)&src, &srclen) != 0) {
+                    return -1;
+                }
+            } else if (sub == 't' && PyByteArray_Check(arg)) {
+                src = PyByteArray_AsString(arg);
+                srclen = PyByteArray_Size(arg);
+                if (src == NULL) return -1;
+            } else if (PyUnicode_Check(arg)) {
+                encoded = PyUnicode_AsEncodedString(
+                    arg, encoding ? encoding : "utf-8", NULL);
+                if (!encoded) return -1;
+                if (PyBytes_AsStringAndSize(encoded, (char **)&src, &srclen) != 0) {
+                    Py_DECREF(encoded);
+                    return -1;
+                }
+            } else {
+                PyErr_SetString(PyExc_TypeError,
+                                sub == 't'
+                                    ? "argument must be str, bytes or bytearray"
+                                    : "argument must be str");
+                return -1;
+            }
+            /* Without `#` there is no length out-slot, so an embedded
+             * NUL would silently truncate — CPython raises. */
+            if (!e_len && srclen > 0 && memchr(src, '\0', (size_t)srclen) != NULL) {
+                Py_XDECREF(encoded);
+                PyErr_SetString(PyExc_ValueError, "embedded null character");
+                return -1;
+            }
+            char *out = (char *)PyMem_Malloc((size_t)srclen + 1);
+            if (!out) {
+                Py_XDECREF(encoded);
+                PyErr_SetString(PyExc_MemoryError, "out of memory");
+                return -1;
+            }
+            memcpy(out, src, (size_t)srclen);
+            out[srclen] = '\0';
+            Py_XDECREF(encoded);
+            *buffer = out;
+            if (plen) *plen = srclen;
+            st->fmt += e_len ? 3 : 2;
             return 0;
         }
         default:
@@ -641,9 +752,20 @@ static void skip_one(fmt_state *st, va_list *ap) {
         case 'i': case 'I': case 'h': case 'H': case 'b': case 'B':
         case 'l': case 'k': case 'L': case 'q': case 'K': case 'Q':
         case 'n': case 'f': case 'd': case 'p': case 'U':
-        case 'c': case 'C':
+        case 'S': case 'Y': case 'c': case 'C':
             (void)va_arg(*ap, void *);
             st->fmt++;
+            return;
+        case 'e':
+            /* `es`/`et` (+`#`): encoding value + buffer dest (+ length). */
+            (void)va_arg(*ap, void *);
+            (void)va_arg(*ap, void *);
+            if ((modifier == 's' || modifier == 't') && st->fmt[2] == '#') {
+                (void)va_arg(*ap, void *);
+                st->fmt += 3;
+            } else {
+                st->fmt += 2;
+            }
             return;
         default:
             /* Unknown conversion code: consume one pointer to stay in sync
@@ -732,10 +854,11 @@ static int parse_args_from(PyObject *args, const char *fmt, va_list *ap) {
                 PyErr_SetString(PyExc_TypeError, "missing required argument");
                 return 0;
             }
-            /* Consume the missing format unit so the va_list is left
-             * untouched (no more args to read). */
-            st.fmt++;
-            if (*st.fmt == '#') st.fmt++;
+            /* CPython `skipitem`: advance over the missing unit AND its
+             * va_arg destination slots (multi-char units like `et#`
+             * carry several; a bare `st.fmt++` would leave the trailing
+             * `t`/`#` to be re-parsed as fresh units). */
+            skip_one(&st, ap);
             continue;
         }
         PyObject *arg = fetch_arg(args, idx);

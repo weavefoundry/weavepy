@@ -23,9 +23,11 @@ use crate::capsule;
 use crate::code_obj;
 use crate::containers;
 use crate::datetime_api as dt;
+use crate::embed;
 use crate::errors;
 use crate::gc_bridge;
 use crate::genericalloc;
+use crate::initconfig;
 use crate::instancemethod;
 use crate::lifecycle;
 use crate::memory;
@@ -37,6 +39,7 @@ use crate::mypyc_tail;
 use crate::numbers;
 use crate::object;
 use crate::pystate;
+use crate::pythonrun;
 use crate::singletons;
 use crate::slice;
 use crate::strings;
@@ -525,6 +528,8 @@ static FORCE_LINK: &[FnPtr] = &[
     addr!(slice::PySlice_AdjustIndices),
     addr!(slice::PySlice_GetIndicesEx),
     addr!(slice::PySlice_GetIndices),
+    addr!(slice::_PyEval_SliceIndex),
+    addr!(slice::_PyEval_SliceIndexNotNone),
     // lifecycle.rs
     addr_static!(mut lifecycle::Py_OptimizeFlag),
     addr!(lifecycle::Py_Initialize),
@@ -532,7 +537,65 @@ static FORCE_LINK: &[FnPtr] = &[
     addr!(lifecycle::Py_Finalize),
     addr!(lifecycle::Py_FinalizeEx),
     addr!(lifecycle::Py_IsInitialized),
-    addr!(memory::Py_AtExit),
+    // embed.rs (RFC 0075 — embedding lifecycle)
+    addr!(embed::Py_AtExit),
+    addr!(embed::Py_RunMain),
+    addr!(embed::PyImport_AppendInittab),
+    addr!(embed::PyImport_ExtendInittab),
+    addr!(embed::Py_NewInterpreter),
+    addr!(embed::Py_NewInterpreterFromConfig),
+    addr!(embed::Py_EndInterpreter),
+    // initconfig.rs (RFC 0075 — PEP 587)
+    addr!(initconfig::PyStatus_Ok),
+    addr!(initconfig::PyStatus_Error),
+    addr!(initconfig::PyStatus_NoMemory),
+    addr!(initconfig::PyStatus_Exit),
+    addr!(initconfig::PyStatus_IsError),
+    addr!(initconfig::PyStatus_IsExit),
+    addr!(initconfig::PyStatus_Exception),
+    addr!(initconfig::Py_ExitStatusException),
+    addr!(initconfig::PyWideStringList_Append),
+    addr!(initconfig::PyWideStringList_Insert),
+    addr!(initconfig::PyPreConfig_InitPythonConfig),
+    addr!(initconfig::PyPreConfig_InitIsolatedConfig),
+    addr!(initconfig::Py_PreInitialize),
+    addr!(initconfig::Py_PreInitializeFromArgs),
+    addr!(initconfig::Py_PreInitializeFromBytesArgs),
+    addr!(initconfig::PyConfig_InitPythonConfig),
+    addr!(initconfig::PyConfig_InitIsolatedConfig),
+    addr!(initconfig::PyConfig_Clear),
+    addr!(initconfig::PyConfig_SetString),
+    addr!(initconfig::PyConfig_SetBytesString),
+    addr!(initconfig::PyConfig_SetArgv),
+    addr!(initconfig::PyConfig_SetBytesArgv),
+    addr!(initconfig::PyConfig_SetWideStringList),
+    addr!(initconfig::PyConfig_Read),
+    addr!(initconfig::Py_InitializeFromConfig),
+    addr!(initconfig::Py_GetArgcArgv),
+    // pythonrun.rs (RFC 0075 — PyRun_* family)
+    addr!(pythonrun::PyRun_SimpleString),
+    addr!(pythonrun::PyRun_SimpleStringFlags),
+    addr!(pythonrun::PyRun_String),
+    addr!(pythonrun::PyRun_StringFlags),
+    addr!(pythonrun::PyRun_File),
+    addr!(pythonrun::PyRun_FileEx),
+    addr!(pythonrun::PyRun_FileFlags),
+    addr!(pythonrun::PyRun_FileExFlags),
+    addr!(pythonrun::PyRun_SimpleFile),
+    addr!(pythonrun::PyRun_SimpleFileEx),
+    addr!(pythonrun::PyRun_SimpleFileExFlags),
+    addr!(pythonrun::PyRun_AnyFile),
+    addr!(pythonrun::PyRun_AnyFileEx),
+    addr!(pythonrun::PyRun_AnyFileFlags),
+    addr!(pythonrun::PyRun_AnyFileExFlags),
+    addr!(pythonrun::PyRun_InteractiveOne),
+    addr!(pythonrun::PyRun_InteractiveOneFlags),
+    addr!(pythonrun::PyRun_InteractiveLoop),
+    addr!(pythonrun::PyRun_InteractiveLoopFlags),
+    addr!(pythonrun::Py_CompileString),
+    addr!(pythonrun::Py_CompileStringFlags),
+    addr!(pythonrun::Py_CompileStringExFlags),
+    addr!(pythonrun::PyEval_EvalCode),
     addr!(lifecycle::Py_GetVersion),
     addr!(lifecycle::Py_GetPlatform),
     addr!(lifecycle::Py_GetCompiler),
@@ -802,6 +865,7 @@ static FORCE_LINK: &[FnPtr] = &[
     addr!(wave4::_PyUnicode_IsWhitespace),
     addr_static!(wave4::_Py_ascii_whitespace),
     // wave4.rs — OS string parsing
+    addr!(wave4::PyOS_FSPath),
     addr!(wave4::PyOS_string_to_double),
     addr!(wave4::PyOS_strtol),
     addr!(wave4::PyOS_strtoul),

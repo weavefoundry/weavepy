@@ -2125,11 +2125,24 @@ class CFuncPtr(_CData, metaclass=PyCFuncPtrType):
         self._write(0, (int(addr) & ((1 << (8 * _PTR)) - 1))
                     .to_bytes(_PTR, _BO))
 
+    def _handle(self):
+        try:
+            return self._handle_addr
+        except AttributeError:
+            # Materialized straight from memory (struct/array field view,
+            # from_buffer, pointer deref) — ``__init__`` never ran. CPython
+            # reads the function pointer out of the instance buffer on
+            # every call (PyCFuncPtr_call: ``*(void **)self->b_ptr``), so
+            # serve it live: numpy's ``_resolve_dtypes_and_context`` hands
+            # back a capsule-wrapped struct whose ``strided_loop`` field is
+            # exactly such a view (RFC 0075 WS8).
+            return int.from_bytes(self._read(0, _PTR), _BO)
+
     def __bool__(self):
-        return self._handle_addr != 0 or self._callable is not None
+        return self._handle() != 0 or getattr(self, "_callable", None) is not None
 
     def __call__(self, *args):
-        handle = self._handle_addr
+        handle = self._handle()
         argtypes = self.argtypes
         if len(args) > CTYPES_MAX_ARGCOUNT:
             raise ArgumentError(
@@ -2142,8 +2155,9 @@ class CFuncPtr(_CData, metaclass=PyCFuncPtrType):
             # implementations receive the raw Python objects. Skip argtype
             # conversion so e.g. cast()'s `py_object` args stay unwrapped.
             return thunk(*args)
-        if self._callable is not None and handle == 0:
-            return self._callable(*args)
+        _callable = getattr(self, "_callable", None)
+        if _callable is not None and handle == 0:
+            return _callable(*args)
         restype = self.restype
         flags = type(self)._flags_
         result = _ffi_invoke(handle, restype, argtypes, flags, args)

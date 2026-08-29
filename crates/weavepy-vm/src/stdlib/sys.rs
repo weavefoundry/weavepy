@@ -1099,7 +1099,9 @@ fn builtin_module_names_value() -> Object {
         "_posixshmem",
         "_posixsubprocess",
         "fcntl",
+        "grp",
         "posix",
+        "pwd",
         "resource",
         "termios",
     ]);

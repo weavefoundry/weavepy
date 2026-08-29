@@ -72,6 +72,11 @@ pub struct MethodEntry {
     pub doc: Option<String>,
     pub func: Option<unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject>,
     pub flags: c_int,
+    /// Address of the C `PyMethodDef` entry this was harvested from
+    /// (0 when synthesized). Retained so `__doc__`/`__text_signature__`
+    /// re-read `ml_doc` *live*: numpy's `add_docstring` writes method
+    /// docs into the static def table after harvest (RFC 0075 WS8).
+    pub def_addr: usize,
 }
 
 impl MethodEntry {
@@ -84,7 +89,29 @@ impl MethodEntry {
     /// module → dict → builtin → module cycle, which is fine: modules
     /// are process-immortal (they sit in `sys.modules`).
     pub fn bind(&self, module: Object) -> Object {
-        wrap_c_function(self.name.clone(), self.func, self.flags, Some(module))
+        let obj = wrap_c_function(
+            self.name.clone(),
+            self.func,
+            self.flags,
+            Some(module.clone()),
+        );
+        self.register_live_doc(&obj, Some(module));
+        obj
+    }
+
+    /// Wire the harvested `PyMethodDef` entry behind `obj` (RFC 0075
+    /// WS8): attach the live `ml_doc` reader so `__doc__` /
+    /// `__text_signature__` re-read the C field, and pin the def in the
+    /// mirror extras so a minted `PyCFunctionObject`'s `m_ml` points at
+    /// the *real* def — numpy's `add_docstring` writes docs through
+    /// `f->m_ml->ml_doc`, and the write must land in the table the
+    /// reader consults, not in a zeroed inline dummy that dies with the
+    /// mirror.
+    fn register_live_doc(&self, obj: &Object, self_obj: Option<Object>) {
+        if self.def_addr != 0 {
+            weavepy_vm::descr_registry::register_live_c_doc(obj, self.def_addr, read_ml_doc);
+            note_method_def(obj, self.def_addr, self_obj);
+        }
     }
 
     /// Bind this method as an unbound class member: invocations
@@ -101,8 +128,27 @@ impl MethodEntry {
         &self,
         defining_class: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) -> Object {
-        wrap_c_method_function(self.name.clone(), self.func, self.flags, defining_class)
+        let obj = wrap_c_method_function(self.name.clone(), self.func, self.flags, defining_class);
+        // `m_self` stays `None` — an unbound descriptor has no receiver
+        // (the mirror already advertised the `None` singleton).
+        self.register_live_doc(&obj, Some(Object::None));
+        obj
     }
+}
+
+/// [`weavepy_vm::descr_registry::LiveDocReader`] over a harvested
+/// `PyMethodDef` entry: decode whatever `ml_doc` points at *now* (the
+/// extension may have rewritten it since harvest).
+unsafe fn read_ml_doc(def_addr: usize) -> Option<String> {
+    let doc = unsafe { (*(def_addr as *const PyMethodDef)).ml_doc };
+    if doc.is_null() {
+        return None;
+    }
+    Some(
+        unsafe { CStr::from_ptr(doc) }
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 /// Walk a null-terminated `PyMethodDef` array, decoding entries.
@@ -140,6 +186,7 @@ pub unsafe fn collect_methods(mut defs: *mut PyMethodDef) -> Vec<MethodEntry> {
             doc,
             func: entry.ml_meth,
             flags: entry.ml_flags,
+            def_addr: defs as usize,
         });
         defs = unsafe { defs.add(1) };
     }
@@ -1381,11 +1428,14 @@ pub unsafe extern "C" fn PyImport_AddModule(name: *const c_char) -> *mut PyObjec
     let s = unsafe { CStr::from_ptr(name) }
         .to_string_lossy()
         .into_owned();
-    let result = crate::interp::with_current(|ctx| {
-        let interp = unsafe { &mut *ctx.interp };
+    // RFC 0075: resolve through the *effective* interpreter (active
+    // extension context, published VM pointer, or the embed-owned
+    // interpreter) — a C embedder calls this with no extension frame
+    // on the stack.
+    let result = crate::interp::with_interp_mut(|interp| {
         let cache = interp.module_cache().clone();
         if let Some(m) = cache.get(&s) {
-            return Some(m);
+            return m;
         }
         let dict = Rc::new(RefCell::new(DictData::default()));
         dict.borrow_mut().insert(
@@ -1398,9 +1448,9 @@ pub unsafe extern "C" fn PyImport_AddModule(name: *const c_char) -> *mut PyObjec
             dict,
         }));
         cache.insert(&s, module.clone());
-        Some(module)
+        module
     });
-    match result.flatten() {
+    match result {
         Some(m) => crate::object::into_owned(m),
         None => ptr::null_mut(),
     }
@@ -1563,6 +1613,25 @@ fn cfunc_extra_key(callable: &Object) -> Option<usize> {
 pub(crate) fn cfunction_extra(obj: &Object) -> Option<(Option<Object>, usize)> {
     let key = cfunc_extra_key(obj)?;
     CFUNC_EXTRAS.with(|t| t.borrow().get(&key).map(|e| (e.self_obj.clone(), e.ml)))
+}
+
+/// Pin the harvested `PyMethodDef*` behind a table-installed builtin
+/// (RFC 0075 WS8), so every mirror minted for it carries the real def
+/// in `m_ml`. `self_obj` preserves the visible `m_self` (`None` for
+/// unbound descriptors, the module for module-level functions).
+fn note_method_def(obj: &Object, ml: usize, self_obj: Option<Object>) {
+    if let Some(key) = cfunc_extra_key(obj) {
+        CFUNC_EXTRAS.with(|t| {
+            t.borrow_mut().insert(
+                key,
+                CFuncExtra {
+                    _pinned: obj.clone(),
+                    self_obj,
+                    ml,
+                },
+            );
+        });
+    }
 }
 
 /// `PyCFunction_NewEx(ml, self, module)` — build a builtin function/method

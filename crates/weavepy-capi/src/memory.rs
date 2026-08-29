@@ -19,8 +19,6 @@
 //! needs no size bookkeeping, so any pointer from any malloc-family
 //! source is freeable everywhere.
 
-use std::os::raw::c_int;
-
 extern "C" {
     fn malloc(size: usize) -> *mut std::ffi::c_void;
     fn calloc(nelem: usize, elsize: usize) -> *mut std::ffi::c_void;
@@ -130,9 +128,5 @@ pub unsafe extern "C" fn PyObject_Free(p: *mut std::ffi::c_void) {
     unsafe { PyMem_Free(p) };
 }
 
-/// `Py_AtExit` — accept and silently drop. Real cleanup happens
-/// when the host binary exits.
-#[no_mangle]
-pub unsafe extern "C" fn Py_AtExit(_func: Option<unsafe extern "C" fn()>) -> c_int {
-    0
-}
+// `Py_AtExit` lives in `crate::embed` since RFC 0075: registered
+// callbacks run LIFO inside the real `Py_FinalizeEx`.

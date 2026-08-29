@@ -28,115 +28,17 @@ pub use weavepy_vm as vm;
 /// Wire the C-extension loader (RFC 0022) into the VM. Called once
 /// at process startup before any user code runs. Idempotent — safe
 /// to call multiple times.
+///
+/// RFC 0075 moved the loader body into `weavepy-capi`
+/// ([`capi::loader::install_vm_extension_loader`]) so a pure-capi
+/// embedder — a C program linking `libpython313` — imports
+/// extensions without this umbrella crate in the picture. The
+/// umbrella keeps this entry point for its Rust consumers.
 pub fn install_capi_loader() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        capi::force_link();
-        vm::ext_loader::install_extension_loader(load_extension);
+        capi::loader::install_vm_extension_loader();
     });
-}
-
-fn load_extension(
-    interp: &mut vm::Interpreter,
-    full_name: &str,
-) -> Result<Option<vm::object::Object>, vm::RuntimeError> {
-    // An explicit path stashed by `_imp.create_dynamic` /
-    // `_imp._load_dynamic` wins over the `sys.path` scan — the spec's
-    // origin may name a multi-init `.so` whose filename doesn't match the
-    // module (CPython's `_testmultiphase` exports thirty-odd
-    // `PyInit_<variant>` symbols from one file; RFC 0068 WS4).
-    let path = match vm::ext_loader::take_explicit_path(full_name)
-        .or_else(|| capi::loader::find_extension_on_path(interp, full_name))
-    {
-        Some(p) => p,
-        None => return Ok(None),
-    };
-    let interp_ptr: *mut vm::Interpreter = interp;
-    match capi::load_extension_module(interp_ptr, &path, full_name) {
-        Ok(module) => Ok(Some(module)),
-        // The init function (or PEP 489 slot machinery) raised: propagate
-        // the original exception verbatim — extension.test_loader asserts
-        // SystemError (not an ImportError wrapper) for the bad-module
-        // fixtures (RFC 0068 WS4).
-        //
-        // …unless we're importing from inside a sub-interpreter. CPython
-        // runs the init function while switched to the *main* interpreter,
-        // and an exception object cannot be handed across the boundary:
-        // it's reported through the main interpreter's unraisable hook and
-        // replaced by a blanket ImportError in the calling interpreter
-        // (gh-144601; test_import SubinterpImportTests
-        // test_pyinit_function_raises_exception).
-        Err(capi::loader::LoadError::Raised(err)) => {
-            // The sub-interpreter compatibility gate
-            // (`_PyImport_CheckSubinterpIncompatibleExtensionAllowed` /
-            // the PEP 489 multi-interpreter slot checks) raises *in the
-            // importing interpreter*, before any switch to main — CPython
-            // propagates that ImportError verbatim (test_import
-            // SubinterpImportTests check_incompatible_here asserts the
-            // exact "does not support loading in subinterpreters" text).
-            let is_compat_gate = matches!(
-                &err,
-                vm::RuntimeError::PyException(exc)
-                    if exc.type_name() == "ImportError"
-                        && exc
-                            .message()
-                            .ends_with("does not support loading in subinterpreters")
-            );
-            if !is_compat_gate && vm::stdlib::interpreters_mod::in_subinterpreter() {
-                if let Some(main_ptr) = vm::stdlib::interpreters_mod::main_host_interpreter_ptr() {
-                    // SAFETY: the host interpreter is parked on this
-                    // thread's call stack for the duration of the
-                    // sub-interpreter call; the GIL makes the access
-                    // exclusive.
-                    let main = unsafe { &mut *main_ptr };
-                    main.write_unraisable_msg(
-                        &err,
-                        &vm::object::Object::None,
-                        "",
-                        Some("Exception while importing from subinterpreter"),
-                    );
-                }
-                let e = vm::RuntimeError::PyException(vm::PyException::from_builtin(
-                    "ImportError",
-                    "failed to import from subinterpreter due to exception".to_owned(),
-                ));
-                return Err(e);
-            }
-            Err(err)
-        }
-        Err(err) => {
-            // The Windows load-failure variant is already CPython's
-            // exact ImportError text ("DLL load failed while
-            // importing X: …" — RFC 0064 WS2); surface it verbatim.
-            // Other failures keep the WeavePy-prefixed shape.
-            let message = match &err {
-                capi::loader::LoadError::DllLoadFailed { .. } => err.to_string(),
-                // CPython's dynload wording; `.name` is asserted by
-                // extension.test_loader's test_unloadable.
-                capi::loader::LoadError::MissingInit(sym) => {
-                    format!("dynamic module does not define module export function ({sym})")
-                }
-                _ => format!("could not load extension '{full_name}': {err}"),
-            };
-            let e = vm::RuntimeError::PyException(vm::PyException::from_builtin(
-                "ImportError",
-                message,
-            ));
-            // ImportError carries the module name and origin path
-            // (CPython sets both on every dynload failure).
-            vm::error::set_exception_attr(
-                &e,
-                "name",
-                vm::object::Object::from_str(full_name.to_owned()),
-            );
-            vm::error::set_exception_attr(
-                &e,
-                "path",
-                vm::object::Object::from_str(path.display().to_string()),
-            );
-            Err(e)
-        }
-    }
 }
 
 /// Errors that can surface from the high-level [`run_source`] entry point.

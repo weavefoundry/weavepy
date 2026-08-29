@@ -209,12 +209,13 @@ jobs:
           if-no-files-found: warn
 
   ecosystem:
-    name: ecosystem (blocking, ${{ matrix.os }})
+    name: ecosystem (blocking, ${{ matrix.os }}, shard ${{ matrix.shard }}/3)
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        shard: [1, 2, 3]
     # RFC 0062 WS3 — the ecosystem lane in CI. Installs the manifest's
     # packages from an offline wheel cache into venvs running under the
     # built weavepy, runs each row's probe (and package self-tests),
@@ -222,6 +223,12 @@ jobs:
     # policy as regrtest. The host CPython is only used by the wheel
     # fetcher (pip download needs a real Python); the runners' system
     # cc covers source builds.
+    #
+    # The lane fans out over three budget-balanced shards per OS
+    # (`--shard K/3`): run serially, the RFC 0075 selftest tier (scipy
+    # alone budgets 4 h) pushed the single job past 3 h wall. The
+    # partition is deterministic from the manifest, so the three shard
+    # verdicts together grade every row exactly once.
     #
     # The windows leg is advisory via the baseline's `measured_os`
     # stamp (RFC 0063 WS7), not via CI config — see the regrtest job.
@@ -252,7 +259,17 @@ jobs:
           cargo run --release -p weavepy-conformance -- ecosystem \
             --wheels target/ecosystem-wheels \
             --selftests \
+            --shard ${{ matrix.shard }}/3 \
             --check
+      # The job-log table truncates each row's failure reason to one cell;
+      # ecosystem.json keeps the full text (faulthandler tracebacks, stage
+      # markers), which is what a crash triage actually needs.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ecosystem-report-${{ matrix.os }}-shard${{ matrix.shard }}
+          path: target/conformance/
+          if-no-files-found: warn
 
   dist-check:
     name: dist check (blocking, ${{ matrix.os }})

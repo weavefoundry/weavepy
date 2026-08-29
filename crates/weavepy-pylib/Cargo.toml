@@ -13,8 +13,12 @@ categories.workspace   = true
 
 # RFC 0064 WS1: the library artifact is named for the CPython ABI it
 # implements — `python313.dll` on Windows (what every `.pyd`'s PE
-# import table references), `libpython313.{so,dylib}` elsewhere
-# (built for workspace honesty, not shipped — see the RFC Non-goals).
+# import table references), `libpython313.{so,dylib}` elsewhere.
+# RFC 0075 WS5 ships the POSIX library too: `build.rs` stamps the
+# CPython-conventional install name/soname (`libpython3.13.…`) and
+# `weavepy-dist` renames the file into the artifact's `lib/` next to
+# a generated `python3-config`, making WeavePy embeddable the way an
+# `--enable-shared` CPython is.
 [lib]
 name = "python313"
 crate-type = ["cdylib"]

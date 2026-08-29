@@ -100,6 +100,7 @@ pub(super) fn register(d: &mut DictData) {
         reg!("setegid", os_setegid);
         reg!("seteuid", os_seteuid);
         reg!("setgroups", os_setgroups);
+        reg!("getgroups", os_getgroups);
 
         // `sched_yield` is `HAVE_SCHED_H` surface — absent on Windows.
         reg!("sched_yield", os_sched_yield);
@@ -1592,6 +1593,29 @@ fn os_setegid(args: &[Object]) -> Result<Object, RuntimeError> {
 fn os_setgroups(_args: &[Object]) -> Result<Object, RuntimeError> {
     // Rarely needed; accept and no-op-validate to keep privilege-drop code paths working.
     Ok(Object::None)
+}
+
+/// `os.getgroups()` → supplementary group ids (RFC 0075: test_subprocess's
+/// `extra_groups` legs un-skipped once `grp` landed, and they probe group
+/// membership through `os.getgroups()` in the child).
+#[cfg(unix)]
+fn os_getgroups(args: &[Object]) -> Result<Object, RuntimeError> {
+    if !args.is_empty() {
+        return Err(type_error("getgroups() takes no arguments"));
+    }
+    let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if n < 0 {
+        return Err(last_os_err());
+    }
+    let mut buf = vec![0 as libc::gid_t; n as usize];
+    let n = unsafe { libc::getgroups(n, buf.as_mut_ptr()) };
+    if n < 0 {
+        return Err(last_os_err());
+    }
+    buf.truncate(n as usize);
+    Ok(Object::new_list(
+        buf.into_iter().map(|g| Object::Int(i64::from(g))).collect(),
+    ))
 }
 
 // ---------------------------------------------------------------------------

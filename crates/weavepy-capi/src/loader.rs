@@ -560,6 +560,232 @@ pub fn extension_suffixes() -> &'static [&'static str] {
     }
 }
 
+// ---------------------------------------------------------------------------
+// RFC 0075: the VM-facing extension loader
+// ---------------------------------------------------------------------------
+//
+// Historically this function lived in the `weavepy` umbrella crate
+// (`install_capi_loader`), which meant a pure-capi embedder (a C
+// program linking `libpython313`) could not import extensions. It
+// only uses `weavepy_vm` + this crate, so it lives here now; the
+// umbrella delegates.
+
+/// Wire the C-extension loader into the VM. Idempotent.
+pub fn install_vm_extension_loader() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        crate::force_link();
+        weavepy_vm::ext_loader::install_extension_loader(vm_load_extension);
+        // RFC 0075 WS8: serve bridged types' *current* C `tp_doc`
+        // through `type.__doc__`/`__text_signature__` (numpy's
+        // add_newdoc writes it post-ready).
+        weavepy_vm::descr_registry::install_ext_type_doc_hook(crate::types::live_tp_doc);
+        weavepy_vm::descr_registry::install_ext_type_flags_hook(crate::types::live_tp_flags);
+    });
+}
+
+fn vm_load_extension(
+    interp: &mut weavepy_vm::Interpreter,
+    full_name: &str,
+) -> Result<Option<Object>, weavepy_vm::RuntimeError> {
+    // Embedder-registered built-ins (`PyImport_AppendInittab`) win over
+    // the filesystem scan, matching CPython's builtin-module priority.
+    if let Some(init_fn) = crate::embed::inittab_lookup(full_name) {
+        let interp_ptr: *mut weavepy_vm::Interpreter = interp;
+        return match load_inittab_module(interp_ptr, full_name, init_fn) {
+            Ok(module) => Ok(Some(module)),
+            Err(LoadError::Raised(err)) => Err(err),
+            Err(err) => Err(weavepy_vm::error::import_error(format!(
+                "could not initialize built-in module '{full_name}': {err}"
+            ))),
+        };
+    }
+    // An explicit path stashed by `_imp.create_dynamic` /
+    // `_imp._load_dynamic` wins over the `sys.path` scan — the spec's
+    // origin may name a multi-init `.so` whose filename doesn't match
+    // the module (CPython's `_testmultiphase` exports thirty-odd
+    // `PyInit_<variant>` symbols from one file; RFC 0068 WS4).
+    let path = match weavepy_vm::ext_loader::take_explicit_path(full_name)
+        .or_else(|| find_extension_on_path(interp, full_name))
+    {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    let interp_ptr: *mut weavepy_vm::Interpreter = interp;
+    match load_extension_module(interp_ptr, &path, full_name) {
+        Ok(module) => Ok(Some(module)),
+        // The init function (or PEP 489 slot machinery) raised: propagate
+        // the original exception verbatim — extension.test_loader asserts
+        // SystemError (not an ImportError wrapper) for the bad-module
+        // fixtures (RFC 0068 WS4).
+        //
+        // …unless we're importing from inside a sub-interpreter. CPython
+        // runs the init function while switched to the *main* interpreter,
+        // and an exception object cannot be handed across the boundary:
+        // it's reported through the main interpreter's unraisable hook and
+        // replaced by a blanket ImportError in the calling interpreter
+        // (gh-144601; test_import SubinterpImportTests
+        // test_pyinit_function_raises_exception).
+        Err(LoadError::Raised(err)) => {
+            // The sub-interpreter compatibility gate
+            // (`_PyImport_CheckSubinterpIncompatibleExtensionAllowed` /
+            // the PEP 489 multi-interpreter slot checks) raises *in the
+            // importing interpreter*, before any switch to main — CPython
+            // propagates that ImportError verbatim (test_import
+            // SubinterpImportTests check_incompatible_here asserts the
+            // exact "does not support loading in subinterpreters" text).
+            let is_compat_gate = matches!(
+                &err,
+                weavepy_vm::RuntimeError::PyException(exc)
+                    if exc.type_name() == "ImportError"
+                        && exc
+                            .message()
+                            .ends_with("does not support loading in subinterpreters")
+            );
+            if !is_compat_gate && weavepy_vm::stdlib::interpreters_mod::in_subinterpreter() {
+                if let Some(main_ptr) =
+                    weavepy_vm::stdlib::interpreters_mod::main_host_interpreter_ptr()
+                {
+                    // SAFETY: the host interpreter is parked on this
+                    // thread's call stack for the duration of the
+                    // sub-interpreter call; the GIL makes the access
+                    // exclusive.
+                    let main = unsafe { &mut *main_ptr };
+                    main.write_unraisable_msg(
+                        &err,
+                        &Object::None,
+                        "",
+                        Some("Exception while importing from subinterpreter"),
+                    );
+                }
+                let e =
+                    weavepy_vm::RuntimeError::PyException(weavepy_vm::PyException::from_builtin(
+                        "ImportError",
+                        "failed to import from subinterpreter due to exception".to_owned(),
+                    ));
+                return Err(e);
+            }
+            Err(err)
+        }
+        Err(err) => {
+            // The Windows load-failure variant is already CPython's
+            // exact ImportError text ("DLL load failed while
+            // importing X: …" — RFC 0064 WS2); surface it verbatim.
+            // Other failures keep the WeavePy-prefixed shape.
+            let message = match &err {
+                LoadError::DllLoadFailed { .. } => err.to_string(),
+                // CPython's dynload wording; `.name` is asserted by
+                // extension.test_loader's test_unloadable.
+                LoadError::MissingInit(sym) => {
+                    format!("dynamic module does not define module export function ({sym})")
+                }
+                _ => format!("could not load extension '{full_name}': {err}"),
+            };
+            let e = weavepy_vm::RuntimeError::PyException(weavepy_vm::PyException::from_builtin(
+                "ImportError",
+                message,
+            ));
+            // ImportError carries the module name and origin path
+            // (CPython sets both on every dynload failure).
+            weavepy_vm::error::set_exception_attr(
+                &e,
+                "name",
+                Object::from_str(full_name.to_owned()),
+            );
+            weavepy_vm::error::set_exception_attr(
+                &e,
+                "path",
+                Object::from_str(path.display().to_string()),
+            );
+            Err(e)
+        }
+    }
+}
+
+/// RFC 0075 WS2 — initialise an embedder-registered built-in module
+/// from its `PyInit_*` function pointer (`PyImport_AppendInittab`).
+/// The post-init discipline mirrors [`load_extension_module`] minus
+/// the dlopen/leak: multi-phase defs run their slots, NULL-without-
+/// exception is a SystemError, unreported exceptions chain.
+pub fn load_inittab_module(
+    interp: *mut weavepy_vm::Interpreter,
+    module_name: &str,
+    init_fn: unsafe extern "C" fn() -> *mut PyObject,
+) -> Result<Object, LoadError> {
+    crate::interp::ensure_initialised();
+    let placeholder = Object::Module(Rc::new(PyModule {
+        name: module_name.to_owned(),
+        filename: None,
+        dict: Rc::new(weavepy_vm::sync::RefCell::new(DictData::default())),
+    }));
+    let ctx = ActiveContext {
+        interp,
+        globals: None,
+        current_module: Some(placeholder),
+    };
+    let raw = crate::interp::enter_extension_call(ctx, || {
+        let r = unsafe { init_fn() };
+        if r.is_null() {
+            return r;
+        }
+        if unsafe { (*r).ob_type.is_null() } {
+            crate::errors::set_pending(
+                Some(
+                    weavepy_vm::builtin_types::builtin_types()
+                        .system_error
+                        .clone(),
+                ),
+                Object::from_str(format!(
+                    "init function of {module_name} returned uninitialized object"
+                )),
+            );
+            return std::ptr::null_mut();
+        }
+        if unsafe { crate::module::is_module_def(r) } {
+            match unsafe {
+                crate::module::run_multiphase_init(
+                    r as *mut crate::module::PyModuleDef,
+                    module_name,
+                )
+            } {
+                Ok(m) => m,
+                Err(e) => {
+                    if !crate::errors::has_pending() {
+                        crate::errors::set_runtime_error(format!("multi-phase init failed: {e}"));
+                    }
+                    std::ptr::null_mut()
+                }
+            }
+        } else {
+            r
+        }
+    });
+    if raw.is_null() {
+        if let Some(p) = crate::errors::take_pending() {
+            return Err(LoadError::Raised(crate::errors::to_runtime_error(p)));
+        }
+        return Err(LoadError::Raised(system_error_runtime(format!(
+            "initialization of {module_name} failed without raising an exception"
+        ))));
+    }
+    if crate::errors::has_pending() {
+        unsafe { crate::object::Py_DecRef(raw) };
+        crate::errors::set_pending_system_error_from_cause(format!(
+            "initialization of {module_name} raised unreported exception"
+        ));
+        let p = crate::errors::take_pending().expect("just set");
+        return Err(LoadError::Raised(crate::errors::to_runtime_error(p)));
+    }
+    let module_obj = unsafe { crate::object::clone_object(raw) };
+    unsafe { crate::object::Py_DecRef(raw) };
+    if let Object::Module(module) = &module_obj {
+        let mut d = module.dict.borrow_mut();
+        d.entry(DictKey(Object::from_static("__name__")))
+            .or_insert_with(|| Object::from_str(module_name.to_owned()));
+    }
+    Ok(module_obj)
+}
+
 /// Convenience for tests: run a closure with a freshly initialised
 /// interpreter pointer and the given module pre-populated.
 #[allow(dead_code)]

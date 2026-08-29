@@ -78,8 +78,19 @@ pub struct SelftestSpec {
     /// (`attrs==26.1.0`). Pinning keeps the row hermetic and the offline
     /// cache deterministic. Required in `sdist` mode; forbidden in
     /// `installed` mode (the suite ships inside the row's own wheel, so
-    /// the pin lives on the row requirement instead).
+    /// the pin lives on the row requirement instead) unless `overlay`
+    /// is present (the sdist then only donates its test subtree).
     pub source: Option<String>,
+    /// Overlay staging (RFC 0075 WS9): `"<sdist subtree> -> <stage
+    /// path>"`, installed mode only, requires `source`. For wheels that
+    /// ship no tests (lxml) whose sdist also cannot run in place (the
+    /// unbuilt source tree would shadow the installed package — the
+    /// numpy problem, except here the suite *only* exists in the
+    /// sdist). Builds a PYTHONPATH stage holding a copy of the
+    /// installed top-level package with the sdist's test subtree
+    /// grafted in, so `--pyargs <pkg>.tests` imports the real compiled
+    /// package plus its upstream suite.
+    pub overlay: Option<String>,
     /// Extra test-only requirements installed into the row's venv.
     pub requirements: Vec<String>,
     /// pytest target path inside the extracted sdist root (e.g.
@@ -208,6 +219,49 @@ impl Manifest {
         })
     }
 
+    /// Keep only the `k`-th of `n` load-balanced shards (1-based) — the
+    /// CI fan-out knob behind `ecosystem --shard K/N`. Deterministic
+    /// longest-processing-time assignment: rows sorted by descending
+    /// cost (name as tiebreak) each land in the currently-lightest bin,
+    /// so for a fixed manifest + flag set every row lands in exactly
+    /// one shard and the union of the shards is the full schedule. The
+    /// cost proxy is the row's wall budget plus, when the selftest tier
+    /// runs, its selftest budget: timeouts are the only committed
+    /// runtime signal, and balance only needs the right order of
+    /// magnitude (the heavy selftest rows carry explicit budgets).
+    pub fn retain_shard(&mut self, k: usize, n: usize, selftests: bool) {
+        assert!(n >= 1 && (1..=n).contains(&k), "shard {k}/{n} out of range");
+        let cost = |row: &ManifestRow| -> u64 {
+            let probe = row.timeout_seconds.unwrap_or(DEFAULT_ROW_TIMEOUT_SECS);
+            let selftest = match (&row.selftest, selftests) {
+                (Some(spec), true) => spec
+                    .timeout_seconds
+                    .unwrap_or(DEFAULT_SELFTEST_TIMEOUT_SECS),
+                _ => 0,
+            };
+            probe + selftest
+        };
+        let mut order: Vec<usize> = (0..self.rows.len()).collect();
+        order.sort_by(|&a, &b| {
+            cost(&self.rows[b])
+                .cmp(&cost(&self.rows[a]))
+                .then_with(|| self.rows[a].name.cmp(&self.rows[b].name))
+        });
+        let mut loads = vec![0u64; n];
+        let mut shard_of = vec![0usize; self.rows.len()];
+        for idx in order {
+            let lightest = (0..n).min_by_key(|&bin| loads[bin]).unwrap_or(0);
+            loads[lightest] += cost(&self.rows[idx]);
+            shard_of[idx] = lightest;
+        }
+        let mut i = 0;
+        self.rows.retain(|_| {
+            let keep = shard_of[i] == k - 1;
+            i += 1;
+            keep
+        });
+    }
+
     fn parse_selftest(parent: &str, kv: &simple_tables::Table) -> Result<SelftestSpec> {
         let section = format!("packages.{parent}.selftest");
         let mode = match kv.get("mode").and_then(simple_tables::Value::as_str) {
@@ -219,11 +273,26 @@ impl Manifest {
             .get("source")
             .and_then(simple_tables::Value::as_str)
             .map(str::to_owned);
+        let overlay = kv
+            .get("overlay")
+            .and_then(simple_tables::Value::as_str)
+            .map(str::to_owned);
+        if let Some(o) = &overlay {
+            if mode != SelftestMode::Installed {
+                anyhow::bail!("[{section}] overlay requires mode = \"installed\"");
+            }
+            if source.is_none() {
+                anyhow::bail!("[{section}] overlay requires a pinned source sdist");
+            }
+            if o.split_once("->").is_none() {
+                anyhow::bail!("[{section}] overlay must be \"<sdist subtree> -> <stage path>\"");
+            }
+        }
         match (mode, &source) {
             (SelftestMode::Sdist, None) => anyhow::bail!("[{section}] missing source"),
-            (SelftestMode::Installed, Some(_)) => anyhow::bail!(
+            (SelftestMode::Installed, Some(_)) if overlay.is_none() => anyhow::bail!(
                 "[{section}] source is meaningless with mode = \"installed\" \
-                 (pin the row requirement instead)"
+                 (pin the row requirement instead) unless overlay is set"
             ),
             _ => {}
         }
@@ -253,6 +322,7 @@ impl Manifest {
         Ok(SelftestSpec {
             mode,
             source,
+            overlay,
             requirements,
             command,
             deselect,
@@ -976,40 +1046,52 @@ fn run_selftest_stage(
         }
         SelftestMode::Sdist => {
             let source = spec.source.as_deref().expect("sdist mode carries source");
-            let sdist = match obtain_sdist(source, python, opts, &scratch, deadline) {
-                Ok(p) => p,
-                Err(e) => return fail(format!("selftest sdist fetch failed: {e}")),
-            };
-            let extract_dir = scratch.join("src");
-            if let Err(e) = fs::create_dir_all(&extract_dir) {
-                return fail(format!("failed to create {}: {e}", extract_dir.display()));
-            }
-            let out = run_with_deadline(
-                Command::new("tar")
-                    .arg("-xzf")
-                    .arg(&sdist)
-                    .arg("-C")
-                    .arg(&extract_dir),
-                deadline,
-            );
-            match out {
-                Ok(o) if o.success => {}
-                Ok(o) => return fail(format!("sdist extract failed: {}", o.tail())),
-                Err(TimedOut) => {
-                    return fail("sdist extract exceeded the selftest budget".to_owned())
-                }
-            }
-            match single_subdir(&extract_dir) {
-                Some(d) => d,
-                None => {
-                    return fail(format!(
-                        "sdist {} did not extract to a single root directory",
-                        sdist.display()
-                    ))
-                }
+            match fetch_and_extract_sdist(source, python, opts, &scratch, "src", deadline) {
+                Ok(d) => d,
+                Err(e) => return fail(e),
             }
         }
     };
+
+    // 2b. overlay staging (RFC 0075 WS9): graft the sdist's test subtree
+    // onto a copy of the *installed* package inside a PYTHONPATH stage,
+    // so `--pyargs <pkg>.tests` imports the real compiled package plus
+    // the upstream suite the wheel doesn't ship (lxml).
+    let mut stage_pythonpath: Option<PathBuf> = None;
+    if let Some(overlay) = &spec.overlay {
+        let (from, to) = overlay
+            .split_once("->")
+            .map(|(a, b)| (a.trim(), b.trim()))
+            .expect("overlay format validated at parse time");
+        let source = spec.source.as_deref().expect("overlay carries source");
+        let sdist_root = match fetch_and_extract_sdist(
+            source,
+            python,
+            opts,
+            &scratch,
+            "overlay-src",
+            deadline,
+        ) {
+            Ok(d) => d,
+            Err(e) => return fail(e),
+        };
+        let top_pkg = match to.split(['/', '\\']).next().filter(|s| !s.is_empty()) {
+            Some(p) => p,
+            None => return fail(format!("overlay stage path {to:?} has no top package")),
+        };
+        let purelib = match venv_purelib(python, deadline) {
+            Ok(p) => p,
+            Err(e) => return fail(format!("overlay: cannot locate site-packages: {e}")),
+        };
+        let stage = scratch.join("stage");
+        if let Err(e) = copy_dir_recursive(&purelib.join(top_pkg), &stage.join(top_pkg)) {
+            return fail(format!("overlay: staging installed {top_pkg}: {e}"));
+        }
+        if let Err(e) = copy_dir_recursive(&sdist_root.join(from), &stage.join(to)) {
+            return fail(format!("overlay: grafting sdist {from}: {e}"));
+        }
+        stage_pythonpath = Some(stage);
+    }
 
     // 3. test-only requirements into the same venv
     if !spec.requirements.is_empty() {
@@ -1045,6 +1127,9 @@ fn run_selftest_stage(
         cmd.arg("--deselect").arg(d);
     }
     cmd.current_dir(&suite_cwd);
+    if let Some(stage) = &stage_pythonpath {
+        cmd.env("PYTHONPATH", stage);
+    }
     for (k, v) in &opts.probe_env {
         cmd.env(k, v);
     }
@@ -1053,6 +1138,90 @@ fn run_selftest_stage(
         Ok(o) => fail(format!("selftest failed: {}", o.tail_n(50))),
         Err(TimedOut) => fail(format!("selftest exceeded the {budget}s selftest budget")),
     }
+}
+
+/// Fetch the pinned `source` sdist and extract it under
+/// `scratch/<subdir>`, returning the single root directory it unpacks
+/// to. Shared by the sdist-mode suite location and overlay staging.
+fn fetch_and_extract_sdist(
+    source: &str,
+    python: &Path,
+    opts: &EcosystemOptions,
+    scratch: &Path,
+    subdir: &str,
+    deadline: Instant,
+) -> std::result::Result<PathBuf, String> {
+    let sdist = obtain_sdist(source, python, opts, scratch, deadline)
+        .map_err(|e| format!("selftest sdist fetch failed: {e}"))?;
+    let extract_dir = scratch.join(subdir);
+    fs::create_dir_all(&extract_dir)
+        .map_err(|e| format!("failed to create {}: {e}", extract_dir.display()))?;
+    let out = run_with_deadline(
+        Command::new("tar")
+            .arg("-xzf")
+            .arg(&sdist)
+            .arg("-C")
+            .arg(&extract_dir),
+        deadline,
+    );
+    match out {
+        Ok(o) if o.success => {}
+        Ok(o) => return Err(format!("sdist extract failed: {}", o.tail())),
+        Err(TimedOut) => return Err("sdist extract exceeded the selftest budget".to_owned()),
+    }
+    single_subdir(&extract_dir).ok_or_else(|| {
+        format!(
+            "sdist {} did not extract to a single root directory",
+            sdist.display()
+        )
+    })
+}
+
+/// The venv's `site-packages` directory, asked of the venv interpreter
+/// itself (`sysconfig`) so platform layout differences don't leak here.
+fn venv_purelib(python: &Path, deadline: Instant) -> std::result::Result<PathBuf, String> {
+    let mut cmd = Command::new(python);
+    cmd.args([
+        "-c",
+        "import sysconfig; print(sysconfig.get_paths()['purelib'])",
+    ]);
+    match run_with_deadline(&mut cmd, deadline) {
+        Ok(o) if o.success => {
+            // stdout and stderr are drained into one stream; the probe
+            // prints exactly one line, so take the last non-empty one.
+            let p = o
+                .combined
+                .lines()
+                .rev()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or_default()
+                .to_owned();
+            if p.is_empty() {
+                return Err("sysconfig returned an empty purelib".to_owned());
+            }
+            Ok(PathBuf::from(p))
+        }
+        Ok(o) => Err(format!("sysconfig probe failed: {}", o.tail())),
+        Err(TimedOut) => Err("sysconfig probe exceeded the selftest budget".to_owned()),
+    }
+}
+
+/// Minimal recursive directory copy (symlinks followed; the staged
+/// trees are plain package dirs).
+fn copy_dir_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let src = entry.path();
+        let dst = to.join(entry.file_name());
+        if src.is_dir() {
+            copy_dir_recursive(&src, &dst)?;
+        } else {
+            fs::copy(&src, &dst)?;
+        }
+    }
+    Ok(())
 }
 
 /// The single directory an sdist extracts to (`<name>-<version>/`).
@@ -1780,6 +1949,61 @@ timeout_seconds = 900
         assert_eq!(st.timeout_seconds, Some(900));
     }
 
+    /// The RFC 0075 WS9 overlay shape (lxml): installed mode carrying a
+    /// pinned `source` whose sdist donates the test subtree.
+    #[test]
+    fn manifest_parses_overlay_selftest() {
+        let body = r#"
+[packages.lxml]
+requirements = "lxml"
+probe = "p.py"
+
+[packages.lxml.selftest]
+mode = "installed"
+source = "lxml==6.1.2"
+overlay = "src/lxml/tests -> lxml/tests"
+requirements = "pytest"
+command = "--pyargs lxml.tests"
+"#;
+        let m = Manifest::from_body(body, Path::new(".")).unwrap();
+        let st = m.rows[0].selftest.as_ref().expect("selftest spec");
+        assert_eq!(st.mode, SelftestMode::Installed);
+        assert_eq!(st.source.as_deref(), Some("lxml==6.1.2"));
+        assert_eq!(st.overlay.as_deref(), Some("src/lxml/tests -> lxml/tests"));
+    }
+
+    #[test]
+    fn manifest_rejects_overlay_without_source() {
+        let body = r#"
+[packages.x]
+requirements = "x"
+probe = "p.py"
+
+[packages.x.selftest]
+mode = "installed"
+overlay = "src/tests -> x/tests"
+command = "--pyargs x.tests"
+"#;
+        let err = Manifest::from_body(body, Path::new(".")).unwrap_err();
+        assert!(err.to_string().contains("overlay requires"), "{err}");
+    }
+
+    #[test]
+    fn manifest_rejects_overlay_in_sdist_mode() {
+        let body = r#"
+[packages.x]
+requirements = "x"
+probe = "p.py"
+
+[packages.x.selftest]
+source = "x==1.0"
+overlay = "src/tests -> x/tests"
+command = "tests"
+"#;
+        let err = Manifest::from_body(body, Path::new(".")).unwrap_err();
+        assert!(err.to_string().contains("mode = \"installed\""), "{err}");
+    }
+
     #[test]
     fn manifest_rejects_unpinned_no_binary() {
         let body = r#"
@@ -2131,5 +2355,74 @@ measured_os = ["macos"]
                 "host {host}"
             );
         }
+    }
+
+    fn shard_fixture() -> Manifest {
+        let row = |name: &str, timeout: Option<u64>, selftest: Option<u64>| ManifestRow {
+            name: name.to_owned(),
+            requirements: Vec::new(),
+            no_binary: Vec::new(),
+            probe: "probe.py".to_owned(),
+            timeout_seconds: timeout,
+            selftest: selftest.map(|t| SelftestSpec {
+                mode: SelftestMode::Installed,
+                source: None,
+                overlay: None,
+                requirements: Vec::new(),
+                command: "tests".to_owned(),
+                deselect: Vec::new(),
+                timeout_seconds: Some(t),
+            }),
+        };
+        Manifest {
+            rows: vec![
+                row("scipy", None, Some(14400)),
+                row("pillow", None, Some(7200)),
+                row("six", None, None),
+                row("numpy", None, Some(2400)),
+                row("aiohttp", Some(1200), None),
+            ],
+            base_dir: PathBuf::from("."),
+        }
+    }
+
+    /// The `--shard K/N` partition: every row lands in exactly one
+    /// shard, the union of the shards is the full schedule, and the
+    /// budget-heaviest row is isolated from the next-heaviest.
+    #[test]
+    fn shards_partition_every_row_exactly_once() {
+        const N: usize = 3;
+        let full: Vec<String> = shard_fixture()
+            .rows
+            .iter()
+            .map(|r| r.name.clone())
+            .collect();
+        let mut seen = Vec::new();
+        for k in 1..=N {
+            let mut m = shard_fixture();
+            m.retain_shard(k, N, true);
+            assert!(!m.rows.is_empty(), "shard {k}/{N} is empty");
+            seen.extend(m.rows.iter().map(|r| r.name.clone()));
+            let names: Vec<&str> = m.rows.iter().map(|r| r.name.as_str()).collect();
+            assert!(
+                !(names.contains(&"scipy") && names.contains(&"pillow")),
+                "two heaviest rows share shard {k}/{N}: {names:?}"
+            );
+        }
+        seen.sort();
+        let mut expected = full;
+        expected.sort();
+        assert_eq!(seen, expected, "shards must partition the schedule");
+    }
+
+    /// Without `--selftests` the selftest budgets must not skew the
+    /// balance — a probe-only lane weighs scipy like any other row.
+    #[test]
+    fn shard_cost_ignores_selftests_when_disabled() {
+        let mut m = shard_fixture();
+        m.retain_shard(1, 2, false);
+        // aiohttp (1200s probe budget) is the heaviest probe-only row;
+        // LPT places it first, into shard 1.
+        assert!(m.rows.iter().any(|r| r.name == "aiohttp"));
     }
 }

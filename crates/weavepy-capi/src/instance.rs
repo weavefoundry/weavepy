@@ -340,8 +340,60 @@ pub unsafe fn release_c_ownership(p: *mut PyObject) {
         if weavepy_vm::gc_trace::is_tracked(weavepy_vm::weakref_registry::id_of(&obj)) {
             weavepy_vm::vm_singletons::queue_cext_dropped(&obj);
         }
+    } else if unsafe { crate::mirror::is_orphaned_instance_body(p) }
+        && !body_free_in_flight(p as usize)
+    {
+        if crate::mirror::body_trace_enabled() {
+            eprintln!(
+                "[ORPHAN-REAP] body=0x{:x} refcnt={} — deferred dealloc",
+                p as usize,
+                unsafe { (*p).ob_refcnt }
+            );
+        }
+        // RFC 0075 WS9: no pin *and* the owning instance is already
+        // collected — this is an orphaned body (the free hook deferred its
+        // dealloc because C still held inline-acquired references; see the
+        // orphan branch there). This zero-crossing is the last reference
+        // anywhere, so run the deferred dealloc + free now. Both decref
+        // routes land here: our exported `Py_DecRef` via `free_box`, and
+        // the stock inlined `Py_DECREF` via `_Py_Dealloc` → `free_box`.
+        // The in-flight guard breaks the re-entry loop: the dealloc's own
+        // self-refcount guard (Cython increfs/decrefs `o` around
+        // `__dealloc__`) crosses zero again and lands back here.
+        unsafe { dealloc_and_free_body(p) };
+        return;
     }
     drop(pinned);
+}
+
+thread_local! {
+    /// Bodies whose deferred dealloc ([`dealloc_and_free_body`]) is
+    /// currently on the stack (RFC 0075 WS9). A Cython `tp_dealloc`
+    /// increfs/decrefs `self` around `__dealloc__`, re-crossing zero and
+    /// re-entering [`release_c_ownership`]'s orphan arm — without this
+    /// guard the same body deallocs recursively until the stack blows.
+    static BODY_FREE_IN_FLIGHT: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn body_free_in_flight(body: usize) -> bool {
+    // `try_with`: this is reachable from `Object` drops that run while
+    // the thread's own TLS is being destroyed (a parked
+    // `PENDING_CEXT_DROPS` queue dying at thread exit) — `with` would
+    // panic-abort inside a destructor. See [`tls_dead`].
+    BODY_FREE_IN_FLIGHT
+        .try_with(|s| s.borrow().contains(&body))
+        .unwrap_or(false)
+}
+
+/// True when this thread's TLS has already been (or is being) torn
+/// down. Extension `tp_dealloc` code must not run past that point —
+/// the reentrancy/consent guards it depends on are gone, and the VM
+/// state it may re-enter is dying with the thread. Callers leak the
+/// body instead, matching CPython's own no-finalization-guarantee at
+/// thread/process exit.
+fn tls_dead() -> bool {
+    BODY_FREE_IN_FLIGHT.try_with(|_| ()).is_err()
 }
 
 thread_local! {
@@ -358,7 +410,7 @@ thread_local! {
 /// Called by the absorbing `tp_free` paths: record that the extension's
 /// `tp_dealloc` explicitly released `body` (see [`BODY_FREE_CONSENT`]).
 pub(crate) fn note_body_free_consented(body: usize) {
-    BODY_FREE_CONSENT.with(|c| {
+    let _ = BODY_FREE_CONSENT.try_with(|c| {
         let (ptr, _) = c.get();
         if ptr == body {
             c.set((ptr, true));
@@ -413,6 +465,69 @@ fn free_instance_body_hook(body: usize) {
         Err(_) => return,
     }
 
+    // RFC 0075 WS9: the body's C refcount can be positive here even though
+    // the pin is gone. The pin tracks references acquired through *our*
+    // entry points, but an extension that keeps a borrowed registry of its
+    // objects re-acquires one with the **inlined** `Py_INCREF` macro — a
+    // direct field increment we never observe. lxml's per-document proxy
+    // registry is the motivating case: the root `_Element` proxy's C refs
+    // dropped to zero during iteration (pin released, body kept by the VM
+    // instance), then `_FeedParser.close()`'s `getProxy()` re-increfed the
+    // *same* body and Cython stored it in `iterparse.root`. Deallocating
+    // now would leave that reference dangling — a use-after-free plus a
+    // second dealloc when `iterparse` dies, the source of the lxml suite's
+    // mid-run segfaults (`tostring(context.root)` jumped through a zeroed
+    // `ob_type`). Orphan the block instead: it lives on as a C-owned
+    // object (crossings proxy it as foreign — see `clone_object`), and the
+    // deferred dealloc runs when C's refcount finally reaches zero
+    // (`release_c_ownership`'s dead-`Weak` arm).
+    let live = unsafe { (*p).ob_refcnt };
+    if crate::mirror::body_trace_enabled() {
+        eprintln!("[FREE-HOOK-RC] body=0x{body:x} refcnt={live}");
+    }
+    if live > 0 {
+        if crate::mirror::body_trace_enabled() {
+            eprintln!("[ORPHAN] body=0x{body:x} outlives its instance (C refcnt={live})");
+        }
+        return;
+    }
+
+    unsafe { dealloc_and_free_body(p) };
+}
+
+/// Run the extension type's custom `tp_dealloc` (with the freelist
+/// neutralisation + consent protocol) and release the body's storage.
+/// Shared by [`free_instance_body_hook`] (instance collected, no C refs)
+/// and [`release_c_ownership`]'s orphan arm (last C ref died *after* the
+/// instance was collected — RFC 0075 WS9).
+///
+/// # Safety
+/// `p` must be a faithful instance body with no remaining C references.
+unsafe fn dealloc_and_free_body(p: *mut PyObject) {
+    // Thread teardown: the guards below are TLS and already destroyed
+    // (this drop is running from another TLS value's destructor — a
+    // thread-exit `run_dtors` draining a parked drop queue). Running an
+    // extension `tp_dealloc` here would re-enter the dying VM; leak the
+    // body instead (CPython guarantees no finalization at exit either).
+    if tls_dead() {
+        return;
+    }
+    let _ = BODY_FREE_IN_FLIGHT.try_with(|s| s.borrow_mut().push(p as usize));
+    // The block is released before this scope ends, so the guard entry is
+    // popped via a drop guard rather than after the free (the free itself
+    // can re-enter through the dealloc's decref chains).
+    struct Unmark(usize);
+    impl Drop for Unmark {
+        fn drop(&mut self) {
+            let _ = BODY_FREE_IN_FLIGHT.try_with(|s| {
+                let mut v = s.borrow_mut();
+                if let Some(i) = v.iter().rposition(|&b| b == self.0) {
+                    v.remove(i);
+                }
+            });
+        }
+    }
+    let _unmark = Unmark(p as usize);
     unsafe {
         let ty = (*p).ob_type;
         if !ty.is_null() {
@@ -502,9 +617,14 @@ fn free_instance_body_hook(body: usize) {
                     // divert it — keeps the pointer live past this call, and
                     // freeing the block would hand the next reuse recycled
                     // garbage (charset-normalizer's `coherence_ratio_env`).
-                    let saved_consent = BODY_FREE_CONSENT.with(|c| c.replace((p as usize, false)));
+                    let saved_consent = BODY_FREE_CONSENT
+                        .try_with(|c| c.replace((p as usize, false)))
+                        .unwrap_or((0, false));
                     dealloc(p);
-                    let consented = BODY_FREE_CONSENT.with(|c| c.replace(saved_consent)).1;
+                    let consented = BODY_FREE_CONSENT
+                        .try_with(|c| c.replace(saved_consent))
+                        .map(|prev| prev.1)
+                        .unwrap_or(false);
                     drop(_cext_guard);
                     (*ty).tp_basicsize = orig_basicsize;
                     if !consented {

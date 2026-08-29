@@ -12661,6 +12661,17 @@ impl Interpreter {
                     Ok(Object::from_static("builtins"))
                 }
                 "__doc__" => {
+                    // A bridged extension method's doc lives in a
+                    // mutable C `PyMethodDef.ml_doc` that numpy-style
+                    // `add_docstring` rewrites after harvest — re-read
+                    // it live, serving the text after the signature
+                    // line (RFC 0075 WS8).
+                    if let Some(raw) = crate::descr_registry::live_c_doc_of(obj) {
+                        let bare = b.name.strip_prefix("_capi:").unwrap_or(b.name);
+                        return Ok(c_doc_without_signature(bare, &raw)
+                            .map(Object::from_str)
+                            .unwrap_or(Object::None));
+                    }
                     if let Some(doc) = builtin_doc(b.name) {
                         return Ok(Object::from_static(doc));
                     }
@@ -12728,9 +12739,20 @@ impl Interpreter {
                 }
                 // Argument-Clinic style introspection string; `None`
                 // when the builtin doesn't publish one (CPython).
-                "__text_signature__" => Ok(builtin_text_signature_for(obj, b.name)
-                    .map(Object::from_static)
-                    .unwrap_or(Object::None)),
+                "__text_signature__" => {
+                    // A live C doc trumps the static tables: CPython
+                    // derives `__text_signature__` solely from the
+                    // current `ml_doc` (RFC 0075 WS8).
+                    if let Some(raw) = crate::descr_registry::live_c_doc_of(obj) {
+                        let bare = b.name.strip_prefix("_capi:").unwrap_or(b.name);
+                        return Ok(internal_doc_text_signature(bare, &raw)
+                            .map(Object::from_str)
+                            .unwrap_or(Object::None));
+                    }
+                    Ok(builtin_text_signature_for(obj, b.name)
+                        .map(Object::from_static)
+                        .unwrap_or(Object::None))
+                }
                 // Method-descriptor protocol: CPython's built-in methods
                 // (`str.__dict__['title']`, …) have a `__get__` that binds
                 // the receiver. `enum._is_descriptor` and similar
@@ -14041,6 +14063,16 @@ impl Interpreter {
             {
                 return Ok(Object::Str(s.clone()));
             }
+            // A bridged extension type's `tp_doc` is mutable C state
+            // that numpy-style `add_docstring` rewrites after ready —
+            // re-read it live, exactly like CPython's
+            // `type_get_text_signature` reads `tp_doc` directly for
+            // static types (RFC 0075 WS8).
+            if let Some(raw) = crate::descr_registry::ext_type_doc(ty) {
+                return Ok(internal_doc_text_signature(&ty.name, &raw)
+                    .map(Object::from_str)
+                    .unwrap_or(Object::None));
+            }
             let doc = ty
                 .dict
                 .borrow()
@@ -14052,6 +14084,28 @@ impl Interpreter {
                 }
             }
             return Ok(Object::None);
+        }
+
+        // `type.__doc__` for a bridged extension type whose class dict
+        // carries no docstring: CPython's `type_get_doc` reads the
+        // static type's *current* `tp_doc` (signature line stripped),
+        // and numpy's `add_newdoc` writes `tp_doc` long after the type
+        // was readied (RFC 0075 WS8). A class-dict docstring (pure-
+        // Python classes, harvest-time C docs) still wins below via
+        // the normal MRO path.
+        if name == "__doc__"
+            && !matches!(
+                ty.dict
+                    .borrow()
+                    .get(&DictKey(Object::from_static("__doc__"))),
+                Some(Object::Str(_))
+            )
+        {
+            if let Some(raw) = crate::descr_registry::ext_type_doc(ty) {
+                return Ok(c_doc_without_signature(&ty.name, &raw)
+                    .map(Object::from_str)
+                    .unwrap_or(Object::None));
+            }
         }
 
         // `type.__abstractmethods__` — a data-descriptor getset on `type`
@@ -14164,7 +14218,23 @@ impl Interpreter {
             // must go through `setattr`). The proxy *shares* the dict, so
             // reads stay live.
             "__dict__" => return Ok(Object::MappingProxy(ty.dict.clone())),
-            "__flags__" => return Ok(Object::Int(ty.flags_bits())),
+            "__flags__" => {
+                let mut bits = ty.flags_bits();
+                // RFC 0075 WS8: a class bridged from a *static* C type is
+                // not a heap type, whatever the VM's synthesis says — the
+                // backing struct's `tp_flags` is authoritative for the
+                // bit. numpy's `_needs_add_docstring` keys on it (a static
+                // type's docs can only arrive through `add_docstring`);
+                // misreporting HEAPTYPE drew the "add_newdoc was used on a
+                // pure-python object" UserWarning for every scalar type.
+                const HEAPTYPE: i64 = 1 << 9;
+                if let Some(c_flags) = crate::descr_registry::ext_type_c_flags(ty) {
+                    if c_flags as i64 & HEAPTYPE == 0 {
+                        bits &= !HEAPTYPE;
+                    }
+                }
+                return Ok(Object::Int(bits));
+            }
             // CPython `tp_basicsize`/`tp_itemsize`. Only `int` reports a
             // nonzero itemsize among the types tests interrogate
             // (`test_long.test___sizeof__` cross-checks it against
@@ -14249,6 +14319,15 @@ impl Interpreter {
                     .get(&DictKey(Object::from_static("__module__")))
                 {
                     return Ok(v.clone());
+                }
+                // A static extension type carries no dict entry (its
+                // *instances* must not see one — RFC 0075 WS8, ufunc
+                // pickling); the class-level value parses the dotted
+                // C `tp_name`, CPython's `type_get_module`.
+                if let Some(tn) = ty.c_tp_name.get() {
+                    if let Some(idx) = tn.rfind('.') {
+                        return Ok(Object::from_str(&tn[..idx]));
+                    }
                 }
                 return Ok(Object::from_static("builtins"));
             }
@@ -14671,6 +14750,13 @@ impl Interpreter {
 
         // Destination: an explicit `file=`, else a reassigned `sys.stdout`;
         // `None` means the default native sink (single joined write).
+        // CPython's `builtin_print_impl` returns silently when the resolved
+        // destination is `None` (`sys.stdout = None`, or a child started
+        // with fd 1 closed — test_subprocess's CLOEXEC probes print into
+        // exactly that state).
+        if file.is_none() && matches!(self.current_sys_attr("stdout"), Some(Object::None)) {
+            return Ok(Object::None);
+        }
         let py_sink: Option<Object> = match &file {
             Some(f) => Some(f.clone()),
             None => self.current_sys_attr("stdout").filter(|t| {
@@ -15657,6 +15743,29 @@ impl Interpreter {
         allow_complex: bool,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
+        // CPython's `complex_new` checks `PyUnicode_Check(r)` — subclasses
+        // included — *before* any numeric hook, so a `str` subclass parses
+        // as a string. numpy's U→complex cast loop hands `np.str_('1+2j')`
+        // to `complex()` (RFC 0075 WS8, test_casting_unittests
+        // test_simple_string_casts_roundtrip); the numeric-hook-first order
+        // sent it down `__float__` and raised "could not convert string to
+        // float" instead of parsing the complex literal.
+        if matches!(a, Object::Instance(_) | Object::Foreign(_)) {
+            let bt = crate::builtin_types::builtin_types();
+            let is_str = crate::builtins::class_of(a)
+                .mro
+                .borrow()
+                .iter()
+                .any(|t| Rc::ptr_eq(t, &bt.str_));
+            if is_str {
+                if let Object::Foreign(s) = a {
+                    return Ok(Object::from_str(crate::foreign::str_(s)?));
+                }
+                if let Some(native) = a.native_value() {
+                    return Ok(native);
+                }
+            }
+        }
         if let Object::Instance(_) = a {
             // Real arg only: `__complex__` is consulted first and must return
             // a `complex` (a strict subclass is accepted with a
@@ -16713,6 +16822,27 @@ impl Interpreter {
             }
             _ => {}
         }
+        // A *foreign* mapping (C-extension object like lxml's `_Attrib`)
+        // takes CPython's `dict_merge` route too: bind `keys` through
+        // regular attribute access — which yields a bound method on the
+        // instance — and walk key → subscript. Falling through to the
+        // generic ctor called the class-level `keys` descriptor unbound
+        // ("keys() needs an argument"), so `dict(el.attrib)` — lxml's
+        // `_Attrib.__richcmp__` conversion — collapsed every attrib
+        // comparison to NotImplemented (RFC 0075 WS9, lxml lane).
+        if let Object::Foreign(_) = v {
+            if let Ok(keys_fn) = self.load_attr(v, "keys") {
+                let keys = self.call(&keys_fn, &[], &[], globals)?;
+                let mut d = DictData::default();
+                let it = self.make_iter(&keys, globals)?;
+                while let Some(k) = self.iter_next(&it, globals)? {
+                    let val = self.subscr_via_protocol(v, &k, globals)?;
+                    d.insert(DictKey(k), val);
+                }
+                return Ok(Some(Object::Dict(Rc::new(RefCell::new(d)))));
+            }
+            return Ok(None);
+        }
         let Object::Instance(inst) = v else {
             return Ok(None);
         };
@@ -16751,7 +16881,16 @@ impl Interpreter {
         let Some(keys_fn) = keys_attr else {
             return Ok(None);
         };
-        let bound = self.maybe_bind(v, keys_fn);
+        // Bind through regular attribute access when possible: a *bridged*
+        // extension type's `keys` is a class-dict builtin with
+        // `binds_instance = false` (self arrives as an explicit leading
+        // argument), which `maybe_bind` passes through unbound —
+        // `dict(el.attrib)` on lxml's `_Attrib` then died with "keys()
+        // needs an argument" and `_Attrib.__richcmp__`'s dict conversion
+        // collapsed to NotImplemented (RFC 0075 WS9, lxml lane).
+        let bound = self
+            .load_attr(v, "keys")
+            .unwrap_or_else(|_| self.maybe_bind(v, keys_fn));
         let keys = self.call(&bound, &[], &[], globals)?;
         let mut d = DictData::default();
         let it = self.make_iter(&keys, globals)?;
@@ -22346,7 +22485,25 @@ impl Interpreter {
             match crate::foreign::binop(op, a, b) {
                 Ok(r) if !r.is_same(&not_impl) => return Ok(r),
                 Ok(_) => {}
-                Err(e) if is_type_error(&e) => {}
+                // The bridge funnels through `PyNumber_*`, which conflates
+                // two very different TypeErrors: the canonical "both slots
+                // declined" message (CPython `binop_type_error`) — which we
+                // must treat as NotImplemented and keep dispatching — and a
+                // TypeError *raised by the slot itself*, which CPython
+                // propagates verbatim. numpy's timedelta64 `%`/`//` raises
+                // "Cannot get a common metadata divisor for Numpy datetime
+                // metadata" from inside `nb_remainder`; swallowing it drew
+                // the generic message instead (RFC 0075 WS8, test_datetime
+                // test_timedelta_modulus_error). Key on the canonical text.
+                Err(e)
+                    if is_type_error(&e) && {
+                        let msg = match &e {
+                            RuntimeError::PyException(pe) => pe.message(),
+                            _ => String::new(),
+                        };
+                        msg.starts_with("unsupported operand type(s) for")
+                            || msg.starts_with("bad operand type for")
+                    } => {}
                 Err(e) => return Err(e),
             }
         }
@@ -42130,6 +42287,23 @@ fn internal_doc_text_signature(name: &str, doc: &str) -> Option<String> {
     }
     let end = rest.find(")\n--\n\n")?;
     Some(rest[..=end].to_owned())
+}
+
+/// CPython's `_PyType_DocWithoutSignature`: a C docstring shaped
+/// `Name(sig)\n--\n\n<body>` serves only `<body>` through `__doc__`
+/// (the signature line is `__text_signature__`'s); a docstring without
+/// the marker is served whole. An empty body reads as no doc (`None`).
+pub(crate) fn c_doc_without_signature(name: &str, doc: &str) -> Option<String> {
+    let short = name.rsplit('.').next().unwrap_or(name);
+    if let Some(rest) = doc.strip_prefix(short) {
+        if rest.starts_with('(') {
+            if let Some(end) = rest.find(")\n--\n\n") {
+                let body = &rest[end + ")\n--\n\n".len()..];
+                return (!body.is_empty()).then(|| body.to_owned());
+            }
+        }
+    }
+    (!doc.is_empty()).then(|| doc.to_owned())
 }
 
 /// Full resolution chain for a builtin's `__text_signature__`:

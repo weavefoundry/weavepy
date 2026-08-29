@@ -764,6 +764,26 @@ pub unsafe fn is_instance_body(p: *mut PyObject) -> bool {
     unsafe { (*pre).magic == MIRROR_MAGIC && (*pre).inst.is_some() }
 }
 
+/// True if `p` is an instance body whose owning `PyInstance` is already
+/// collected — the prefix's `Weak` no longer upgrades. Such a body was
+/// *orphaned* by the free hook (RFC 0075 WS9): the instance died while a
+/// C extension still held references acquired with the inlined
+/// `Py_INCREF` macro (lxml's proxy registry), so the block is kept alive
+/// as a C-owned object until its last C reference dies.
+///
+/// # Safety
+/// `p` must be a valid, live `PyObject*`.
+pub unsafe fn is_orphaned_instance_body(p: *mut PyObject) -> bool {
+    if !unsafe { is_instance_body(p) } {
+        return false;
+    }
+    let pre = unsafe { prefix_of(p) };
+    match unsafe { (*pre).inst.as_ref() } {
+        Some(w) => w.upgrade().is_none(),
+        None => false,
+    }
+}
+
 /// Free a faithful instance body's allocation (RFC 0045, wave 3). Called
 /// from the `register_instance_body_free` hook when the owning native
 /// instance is collected — never from the C refcount path. Drops the

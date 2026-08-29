@@ -238,6 +238,89 @@ pub unsafe extern "C" fn PySlice_GetIndices(
     unsafe { PySlice_GetIndicesEx(slice, length, start, stop, step, &raw mut slicelen) }
 }
 
+/// Clamped slice-component conversion shared by [`_PyEval_SliceIndex`] /
+/// [`_PyEval_SliceIndexNotNone`]: CPython converts through
+/// `PyNumber_AsSsize_t(v, NULL)`, which clamps out-of-range integers to
+/// `PY_SSIZE_T_MIN`/`MAX` instead of raising.
+unsafe fn slice_component_to_ssize(v: *mut PyObject, pi: *mut PySsizeT) -> c_int {
+    let x = match unsafe { crate::object::clone_object(v) } {
+        Object::Int(i) => i as PySsizeT,
+        Object::Bool(b) => PySsizeT::from(b),
+        Object::Long(big) => big
+            .to_isize()
+            .unwrap_or(if big.sign() == num_bigint::Sign::Minus {
+                PySsizeT::MIN
+            } else {
+                PySsizeT::MAX
+            }),
+        other => {
+            // `_PyIndex_Check` + conversion: anything with `__index__`
+            // passes; everything else gets the canonical slice message.
+            let p = crate::object::into_owned(other);
+            let idx = unsafe { crate::abstract_::PyNumber_Index(p) };
+            unsafe { crate::object::Py_DecRef(p) };
+            if idx.is_null() {
+                crate::errors::clear_thread_local();
+                crate::errors::set_type_error(
+                    "slice indices must be integers or None or have an __index__ method",
+                );
+                return 0;
+            }
+            let v = match unsafe { crate::object::clone_object(idx) } {
+                Object::Int(i) => i as PySsizeT,
+                Object::Bool(b) => PySsizeT::from(b),
+                Object::Long(big) => {
+                    big.to_isize()
+                        .unwrap_or(if big.sign() == num_bigint::Sign::Minus {
+                            PySsizeT::MIN
+                        } else {
+                            PySsizeT::MAX
+                        })
+                }
+                _ => 0,
+            };
+            unsafe { crate::object::Py_DecRef(idx) };
+            v
+        }
+    };
+    unsafe { *pi = x };
+    1
+}
+
+/// CPython's `_PyEval_SliceIndex` (`Python/ceval.c`): extract one slice
+/// component into a `Py_ssize_t`, leaving `*pi` untouched for `None`.
+/// Returns 1 on success, 0 with an exception set on failure. Private,
+/// but a documented part of the stable-in-practice extension surface:
+/// lxml's `python.pxd` cimports it and `_isFullSlice`/`_findChildSlice`
+/// call it for every explicit-step child slice — the missing symbol
+/// lazily bound to NULL, so `del root[::-1]` jumped to address zero
+/// (RFC 0075 WS9, lxml selftest lane, test_delslice_step_negative).
+#[no_mangle]
+pub unsafe extern "C" fn _PyEval_SliceIndex(v: *mut PyObject, pi: *mut PySsizeT) -> c_int {
+    if v.is_null() || pi.is_null() {
+        return 1;
+    }
+    if matches!(unsafe { crate::object::clone_object(v) }, Object::None) {
+        return 1;
+    }
+    unsafe { slice_component_to_ssize(v, pi) }
+}
+
+/// CPython's `_PyEval_SliceIndexNotNone` (`Python/ceval.c`): same as
+/// [`_PyEval_SliceIndex`] but `None` is a TypeError (used for
+/// `__getslice__`-era components that must be present).
+#[no_mangle]
+pub unsafe extern "C" fn _PyEval_SliceIndexNotNone(v: *mut PyObject, pi: *mut PySsizeT) -> c_int {
+    if v.is_null() || pi.is_null() {
+        return 0;
+    }
+    if matches!(unsafe { crate::object::clone_object(v) }, Object::None) {
+        crate::errors::set_type_error("slice indices must be integers or have an __index__ method");
+        return 0;
+    }
+    unsafe { slice_component_to_ssize(v, pi) }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn _WeavePy_LastResort() {
     // Placeholder export so tooling that scans for `_WeavePy_*`

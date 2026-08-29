@@ -2046,7 +2046,12 @@ pub(crate) fn synth_type_for_class(cls: &Rc<TypeObject>) -> Option<*mut PyTypeOb
     // then wrote the `PyArrayObject` fields over the Rust `obj` payload and a
     // later `clone_object` dereferenced the clobbered pointer (a SIGBUS in
     // `numpy.ma.core`'s `array_view → __array_finalize__`).
-    let (inline_base_ptr, base_inline, basicsize) = inherit_inline_base_layout(cls, 16);
+    let (inline_base_ptr, base_inline, mut basicsize) = inherit_inline_base_layout(cls, 16);
+    if !base_inline {
+        if let Some(sz) = faithful_purepy_basicsize(cls) {
+            basicsize = basicsize.max(sz);
+        }
+    }
     let owned_name = format!("{}\0", cls.name).into_bytes();
     let mut ty = PyTypeObject::new_zeroed();
     ty.head.ob_refcnt = IMMORTAL_REFCNT;
@@ -2404,6 +2409,34 @@ fn inherit_inline_base_layout(
 /// installing one on demand for user-defined classes (e.g. heap
 /// types created without `PyType_FromSpec` — usually never; this is
 /// a fallback path).
+/// Stock CPython 3.13 `tp_basicsize` for VM classes that stand in for
+/// CPython *C* built-ins (WeavePy reimplements them in pure Python).
+/// Cython's `__Pyx_ImportType` validates such a type at extension-import
+/// time by comparing the live `tp_basicsize` against the `sizeof(...)`
+/// its headers baked in, and errors when the live value is *smaller*
+/// ("array.array size changed, may indicate binary incompatibility.
+/// Expected 64 from C header, got 16 from PyObject" — scikit-learn's
+/// `_svmlight_format_fast` cimports `cpython.array`; RFC 0075 WS9).
+/// Reporting-only, exactly like the static-builtin `set_size` table:
+/// these classes are never registered as inline-instance types, so the
+/// value never diverts allocation.
+fn faithful_purepy_basicsize(t: &Rc<TypeObject>) -> Option<PySsizeT> {
+    let module = match t
+        .dict
+        .borrow()
+        .get(&DictKey(Object::from_static("__module__")))
+    {
+        Some(Object::Str(s)) => s.to_string(),
+        _ => return None,
+    };
+    match (module.as_str(), t.name.as_str()) {
+        // `sizeof(arrayobject)`: VAR_HEAD(24) + ob_item(8) + allocated(8)
+        // + ob_descr(8) + weakreflist(8) + ob_exports(8).
+        ("array", "array") => Some(64),
+        _ => None,
+    }
+}
+
 pub fn install_user_type(t: &Rc<TypeObject>) -> *mut PyTypeObject {
     if let Some(p) = find_type_ptr(t) {
         return p;
@@ -2460,10 +2493,15 @@ pub fn install_user_type(t: &Rc<TypeObject>) -> *mut PyTypeObject {
     // `numpy.ndarray` gets a faithful body, not a `PyObjectBox` the base's
     // fixed-offset field writes would corrupt. A non-inline base keeps the
     // identity-box size.
-    let (base_ptr, base_inline, basicsize) = inherit_inline_base_layout(
+    let (base_ptr, base_inline, mut basicsize) = inherit_inline_base_layout(
         t,
         std::mem::size_of::<crate::object::PyObjectBox>() as PySsizeT,
     );
+    if !base_inline {
+        if let Some(sz) = faithful_purepy_basicsize(t) {
+            basicsize = basicsize.max(sz);
+        }
+    }
     // RFC 0046 (wave 4/5): mirror CPython's `PyType_Ready` defaults for
     // `tp_alloc`/`tp_free` (inherited from `object`). A *foreign* C `tp_new`
     // that subclasses this VM type allocates through `subtype->tp_alloc(
@@ -2629,6 +2667,7 @@ fn assemble_type_dict(
     member_pairs: Vec<(String, Object)>,
     doc: Option<&str>,
     defining_class: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    new_null_raises: bool,
 ) -> DictData {
     let mut dict = DictData::default();
     if let Some(d) = doc {
@@ -2661,7 +2700,8 @@ fn assemble_type_dict(
     for (name, obj) in member_pairs {
         dict.insert(DictKey(Object::from_str(name)), obj);
     }
-    let dunder_pairs = crate::dunder_shim::install_dunder_shims(slot_table, qualified.to_owned());
+    let dunder_pairs =
+        crate::dunder_shim::install_dunder_shims(slot_table, qualified.to_owned(), new_null_raises);
     for (name, obj) in dunder_pairs {
         dict.insert(DictKey(Object::from_str(name)), obj);
     }
@@ -2881,6 +2921,35 @@ pub fn readied_bridge(ty: *mut PyTypeObject) -> Option<Rc<TypeObject>> {
 /// pure-Python class (no C `PyTypeObject` exists to consult).
 pub fn type_ptr_for_class(cls: &Rc<TypeObject>) -> Option<*mut PyTypeObject> {
     find_type_ptr(cls)
+}
+
+/// The VM's `type.__doc__` / `type.__text_signature__` live-doc hook
+/// (RFC 0075 WS8): the *current* `tp_doc` of the C type backing `cls`.
+/// numpy's `add_newdoc` writes scalar-type docstrings into `tp_doc`
+/// long after `PyType_Ready` — CPython's `type_get_doc` reads the
+/// field on every access for static types, so we must too. Pure
+/// lookup: `find_type_ptr` never mints a pointer, and a pure-Python
+/// class (or a bridged type with a NULL `tp_doc`) reads as `None`,
+/// letting the VM's normal resolution run.
+/// The VM's `type.__flags__` hook (RFC 0075 WS8): the C `tp_flags` of
+/// the type backing `cls`, used to correct the synthesized heap-type
+/// bit for static extension types.
+pub(crate) fn live_tp_flags(cls: &Rc<TypeObject>) -> Option<u64> {
+    let p = find_type_ptr(cls)?;
+    Some(unsafe { (*p).tp_flags } as u64)
+}
+
+pub(crate) fn live_tp_doc(cls: &Rc<TypeObject>) -> Option<String> {
+    let p = find_type_ptr(cls)?;
+    let doc = unsafe { (*p).tp_doc };
+    if doc.is_null() {
+        return None;
+    }
+    Some(
+        unsafe { CStr::from_ptr(doc) }
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 /// Build a faithful C-level tuple of the canonical `PyTypeObject*` for
@@ -3154,6 +3223,11 @@ pub unsafe extern "C" fn PyType_FromMetaclass(
     // Late-bound defining-class cell for METH_METHOD entries; stamped
     // with the heap type's pointer once the box exists (below).
     let defining_class = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // CPython's `type_ready_set_new`: *heap* types always inherit `tp_new`
+    // from the base — even from `object` — so a FromSpec type without a
+    // `Py_tp_new` slot stays instantiable. Only an explicit
+    // `Py_TPFLAGS_DISALLOW_INSTANTIATION` in the spec forbids creation.
+    let new_null_raises = (spec_ref.flags & PY_TPFLAGS_DISALLOW_INSTANTIATION) != 0;
     let dict = assemble_type_dict(
         &qualified,
         &bare,
@@ -3163,6 +3237,7 @@ pub unsafe extern "C" fn PyType_FromMetaclass(
         member_pairs,
         doc.as_deref(),
         &defining_class,
+        new_null_raises,
     );
 
     let ty = match TypeObject::new_user(&bare, bases_resolved, dict) {
@@ -3867,7 +3942,17 @@ pub unsafe extern "C" fn PyType_Ready(t: *mut PyTypeObject) -> c_int {
     // `PyType_Ready` path: the caller's static struct *is* the type
     // pointer, so METH_METHOD's defining class is known up front.
     let defining_class = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(t as usize));
-    let dict = assemble_type_dict(
+    // CPython's `type_ready_set_new`: a *static* type whose `tp_new` is
+    // NULL and whose base is `object` gets `Py_TPFLAGS_DISALLOW_INSTANTIATION`
+    // ("a precaution so that old extension types don't suddenly become
+    // callable"); any other base donates its `tp_new`. Pillow's readied
+    // `CmsProfile` / `CmsTransform` land in the raising arm.
+    let new_null_raises = h
+        .base
+        .as_ref()
+        .is_none_or(|b| Rc::ptr_eq(b, &weavepy_vm::builtin_types::builtin_types().object_))
+        || (unsafe { (*t).tp_flags } & PY_TPFLAGS_DISALLOW_INSTANTIATION as u64) != 0;
+    let mut dict = assemble_type_dict(
         &qualified,
         &bare,
         &h.slot_table,
@@ -3876,7 +3961,20 @@ pub unsafe extern "C" fn PyType_Ready(t: *mut PyTypeObject) -> c_int {
         h.member_pairs,
         h.doc.as_deref(),
         &defining_class,
+        new_null_raises,
     );
+    // A *static* type's tp_dict carries no `__module__` in CPython —
+    // the class-level value comes from the `type.__module__` getset
+    // parsing tp_name, and **instances have no `__module__` at all**.
+    // pickle depends on the miss: `_ufunc_reduce` returns a bare name
+    // and `whichmodule` must scan `sys.modules` for the module that
+    // really holds the ufunc (numpy test_pickle pickles
+    // `_rational_tests.test_add`, which a planted class-dict
+    // `__module__ == "numpy"` misroutes to "numpy.test_add").
+    // RFC 0075 WS8; the VM's class-attr synthetic re-derives the
+    // dotted prefix from `c_tp_name` below. Heap/FromSpec types keep
+    // their dict entry (CPython plants one there too).
+    dict.shift_remove(&DictKey(Object::from_static("__module__")));
 
     let ty = if multi_bases.len() >= 2 {
         // Retry with only the primary `tp_base` if the full dual-inheritance
@@ -4038,7 +4136,27 @@ pub unsafe extern "C" fn PyType_Ready(t: *mut PyTypeObject) -> c_int {
         if (*t).tp_dict.is_null() {
             (*t).tp_dict = tp_dict_box;
         } else {
-            crate::object::Py_DecRef(tp_dict_box);
+            // A *pre-seeded* tp_dict: CPython's `PyType_Ready` keeps the
+            // existing dict and readies *into* it — numpy builds
+            // `PyUFunc_Type.tp_dict = {"__signature__": descriptor}`
+            // before calling ready (multiarraymodule.c), and every ufunc
+            // instance's `inspect.signature` support hangs off that
+            // entry (RFC 0075 WS8). Fold the seeded entries into the
+            // bridge dict (they win over harvested names, matching
+            // CPython where `add_methods` skips existing keys), then
+            // swap in the shared box so later direct `tp_dict`
+            // mutations stay visible to the VM's MRO lookups.
+            if let Object::Dict(pre) = crate::object::clone_object((*t).tp_dict) {
+                for (k, v) in pre.borrow().iter() {
+                    readied
+                        .bridge
+                        .dict
+                        .borrow_mut()
+                        .insert(k.clone(), v.clone());
+                }
+            }
+            crate::object::Py_DecRef((*t).tp_dict);
+            (*t).tp_dict = tp_dict_box;
         }
         if (*t).tp_base.is_null() {
             if let Some(bp) = base_for_c {

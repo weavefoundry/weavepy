@@ -3127,12 +3127,25 @@ pub fn install_type_dunders(type_: &Rc<TypeObject>) {
             .get(&DictKey(Object::from_static("__doc__")))
             .cloned();
         match entry {
-            None => Ok(Object::None),
-            // A plain docstring (or `None`) is returned verbatim; the rare
+            // No (or a `None`) class-dict docstring: a bridged extension
+            // type may still carry one in its C `tp_doc` — mutable state
+            // numpy's `add_newdoc` writes long after `PyType_Ready`, which
+            // CPython's `type_get_doc` re-reads on every access for static
+            // types (RFC 0075 WS8). Signature line stripped, like
+            // `_PyType_DocWithoutSignature`.
+            None | Some(Object::None) => {
+                if let Some(raw) = crate::descr_registry::ext_type_doc(ty) {
+                    return Ok(crate::c_doc_without_signature(&ty.name, &raw)
+                        .map(Object::from_str)
+                        .unwrap_or(Object::None));
+                }
+                Ok(Object::None)
+            }
+            // A plain docstring is returned verbatim; the rare
             // descriptor-valued `__doc__` (`__doc__ = SomeDescr()`) has the
             // descriptor protocol applied, matching CPython's `type_get_doc`
             // (test_descr test_doc_descriptor).
-            Some(v @ (Object::Str(_) | Object::None)) => Ok(v),
+            Some(v @ Object::Str(_)) => Ok(v),
             Some(v) => {
                 let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
                     crate::error::runtime_error(

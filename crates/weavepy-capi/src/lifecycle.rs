@@ -29,25 +29,37 @@ pub static mut Py_OptimizeFlag: c_int = 0;
 
 #[no_mangle]
 pub unsafe extern "C" fn Py_Initialize() {
-    crate::interp::ensure_initialised();
+    // RFC 0075: under a WeavePy host this stays a bridge-wiring no-op;
+    // in a C embedder it constructs the owned interpreter. A failure
+    // here is CPython's `Py_FatalError` contract.
+    let status = crate::embed::initialize(None);
+    if !status.is_ok() {
+        unsafe { crate::initconfig::Py_ExitStatusException(status) };
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn Py_InitializeEx(_init_sigs: c_int) {
-    crate::interp::ensure_initialised();
+    unsafe { Py_Initialize() };
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn Py_FinalizeEx() -> c_int {
-    0
+    // RFC 0075 WS3: the real teardown — atexit (Python then the
+    // Py_AtExit C table), non-daemon thread join, shutdown
+    // finalizers, stream flush — leaving the process re-initialisable.
+    // Host mode (the CLI owns the interpreter) stays a no-op.
+    crate::embed::finalize()
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn Py_Finalize() {}
+pub unsafe extern "C" fn Py_Finalize() {
+    let _ = crate::embed::finalize();
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn Py_IsInitialized() -> c_int {
-    1
+    crate::embed::is_initialized() as c_int
 }
 
 #[no_mangle]

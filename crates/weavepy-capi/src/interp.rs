@@ -185,6 +185,20 @@ pub fn ensure_active<R>(body: impl FnOnce() -> R) -> R {
     r
 }
 
+/// RFC 0075 (embedding): publish an interpreter the capi layer owns
+/// (created by `Py_Initialize*` in a C host process) so every entry
+/// point that consults [`effective_interpreter_mut`] finds it.
+pub(crate) fn note_interpreter(ptr: *mut Interpreter) {
+    LAST_INTERPRETER.store(ptr, Ordering::SeqCst);
+}
+
+/// RFC 0075 (embedding): forget the published interpreter at
+/// `Py_FinalizeEx` so a post-fini capi call fails cleanly instead of
+/// dereferencing a dropped interpreter.
+pub(crate) fn clear_interpreter() {
+    LAST_INTERPRETER.store(std::ptr::null_mut(), Ordering::SeqCst);
+}
+
 static INIT: Once = Once::new();
 
 /// Initialise everything that needs to be live before any

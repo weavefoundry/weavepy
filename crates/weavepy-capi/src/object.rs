@@ -451,13 +451,14 @@ pub fn into_owned(obj: Object) -> *mut PyObject {
                 "mint_box"
             };
             eprintln!(
-                "[CTOR] into_owned name={} ty={:p} inline={} basicsize={} cls={} path={}",
+                "[CTOR] into_owned name={} ty={:p} inline={} basicsize={} cls={} path={} c_body=0x{:x}",
                 crate::types::ctor_trace_name(ty),
                 ty,
                 crate::types::is_inline_instance_type(ty),
                 unsafe { (*ty).tp_basicsize },
                 inst.cls().name,
                 path,
+                inst.c_body.get(),
             );
         }
         if crate::types::is_inline_instance_type(ty) {
@@ -948,6 +949,37 @@ pub unsafe fn clone_object(p: *mut PyObject) -> Object {
         return unsafe { crate::capsule::capsule_soul(p) };
     }
     let raw = if unsafe { crate::mirror::is_mirror(p) } {
+        // RFC 0075 WS9: an *orphaned* instance body — the owning
+        // `PyInstance` died while C still held inline-acquired references
+        // (see `instance::free_instance_body_hook`) — is now a C-owned
+        // object. Its dead `Weak` makes `native_of` collapse to `None`;
+        // proxy it opaquely instead, like any foreign pointer, so a read
+        // through it (lxml's `iterparse.root` after iteration) reaches
+        // the live extension object.
+        // A dead `Weak` alone is *not* proof of orphanhood: the body may be
+        // **mid-dealloc** right now — `dealloc_and_free_body` is running the
+        // extension's `tp_dealloc` above us on this very stack (a Cython
+        // generator's scope-struct dealloc closes the generator, whose
+        // `finally:` code crosses `self` back in; psycopg's failed-connect
+        // teardown). Wrapping that body as a foreign proxy would pin a block
+        // that is freed the moment the dealloc returns — the proxy's later
+        // decref lands on freed memory (glibc's `free(): invalid pointer`
+        // abort on the psycopg ecosystem row). The in-flight list names
+        // exactly the bodies in that window; collapse their crossings to
+        // `None` via `native_of`'s dead-`Weak` arm, the pre-orphan behavior.
+        if unsafe { crate::mirror::is_orphaned_instance_body(p) }
+            && !crate::instance::body_free_in_flight(p as usize)
+        {
+            if crate::mirror::body_trace_enabled() {
+                eprintln!(
+                    "[ORPHAN-CROSS] p=0x{:x} refcnt={}\n{}",
+                    p as usize,
+                    unsafe { (*p).ob_refcnt },
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
+            return unsafe { crate::foreign::wrap_foreign(p) };
+        }
         unsafe { crate::mirror::native_of(p) }
     } else {
         let bx = unsafe { &*(p as *const PyObjectBox) };

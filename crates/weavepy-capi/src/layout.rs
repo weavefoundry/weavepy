@@ -834,3 +834,39 @@ pub mod tpflags {
 
 /// Sanity: `c_int` is 4 bytes on every target we model.
 const _: () = assert!(std::mem::size_of::<c_int>() == 4);
+
+// ---------------------------------------------------------------------------
+// PEP 587 initialization structs (RFC 0075 WS1)
+// ---------------------------------------------------------------------------
+//
+// `PyConfig`/`PyPreConfig` are *stack-allocated by the embedder* against
+// CPython's real headers, then passed to our `PyConfig_Init*` /
+// `PyConfig_Clear`. Any size/offset drift means we zero/free the wrong
+// bytes of the caller's frame (Pillow's `getfont` does init → PyArg →
+// Clear around every truetype load). Offsets measured from the vendored
+// `include/cpython313/cpython/initconfig.h` on LP64 (macOS arm64 probe,
+// identical on x86-64 Linux — no conditional fields differ off-Windows).
+#[cfg(not(windows))]
+const _: () = {
+    use crate::initconfig::{PyConfig, PyPreConfig};
+    assert!(std::mem::size_of::<PyPreConfig>() == 40);
+    assert!(std::mem::offset_of!(PyPreConfig, utf8_mode) == 28);
+    assert!(std::mem::offset_of!(PyPreConfig, allocator) == 36);
+
+    assert!(std::mem::size_of::<PyConfig>() == 448);
+    assert!(std::mem::offset_of!(PyConfig, hash_seed) == 24);
+    assert!(std::mem::offset_of!(PyConfig, dump_refs_file) == 64);
+    assert!(std::mem::offset_of!(PyConfig, filesystem_encoding) == 80);
+    assert!(std::mem::offset_of!(PyConfig, orig_argv) == 112);
+    assert!(std::mem::offset_of!(PyConfig, argv) == 128);
+    assert!(std::mem::offset_of!(PyConfig, warnoptions) == 160);
+    assert!(std::mem::offset_of!(PyConfig, stdio_encoding) == 232);
+    assert!(std::mem::offset_of!(PyConfig, check_hash_pycs_mode) == 248);
+    assert!(std::mem::offset_of!(PyConfig, program_name) == 280);
+    assert!(std::mem::offset_of!(PyConfig, module_search_paths) == 320);
+    assert!(std::mem::offset_of!(PyConfig, executable) == 344);
+    assert!(std::mem::offset_of!(PyConfig, run_command) == 400);
+    assert!(std::mem::offset_of!(PyConfig, run_filename) == 416);
+    assert!(std::mem::offset_of!(PyConfig, sys_path_0) == 424);
+    assert!(std::mem::offset_of!(PyConfig, _is_python_build) == 440);
+};

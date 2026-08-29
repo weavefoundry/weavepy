@@ -147,6 +147,20 @@ pub fn prefix() -> Option<&'static Path> {
     stdlib_dir().and_then(|d| d.parent()).and_then(Path::parent)
 }
 
+/// Whether `prefix` carries an installed WeavePy home — a complete
+/// `{prefix}/lib/weavepy3.13` tree. RFC 0075 (embedding): CPython's
+/// getpath falls back to computing the prefix from the *shared
+/// library's* location when the program itself is a foreign embedder
+/// binary; `Py_InitializeFromConfig` uses this predicate to run the
+/// same probe over the `libpython3.13` on-disk path (dladdr).
+pub fn is_home_prefix(prefix: &Path) -> bool {
+    prefix
+        .join("lib")
+        .join(LIB_DIR_NAME)
+        .join(COMPLETE_MARKER)
+        .is_file()
+}
+
 /// The on-disk path a frozen module's `__file__`/`co_filename` should
 /// carry, or `None` when the tree is unavailable. The path is
 /// guaranteed to exist and hold exactly the embedded source.
@@ -343,6 +357,18 @@ fn pip_wheel_bytes() -> Vec<u8> {
     out
 }
 
+/// RFC 0075 (embedding): `PyConfig.program_name` override for
+/// [`program_exe`]. An embedder's process argv[0] names the *host*
+/// binary; CPython's getpath computes `program_full_path` from the
+/// configured program name instead (bare names PATH-searched, then
+/// cwd-joined). Set by `Py_InitializeFromConfig` before the owned
+/// interpreter is constructed.
+static PROGRAM_NAME_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+pub fn set_program_name_override(name: Option<PathBuf>) {
+    *PROGRAM_NAME_OVERRIDE.lock().unwrap() = name;
+}
+
 /// The interpreter's program path, symlink identity preserved.
 ///
 /// CPython's getpath computes `program_full_path` from argv[0] (made
@@ -355,6 +381,27 @@ fn pip_wheel_bytes() -> Vec<u8> {
 /// dodges this). Falls back to `current_exe()` when argv[0] is absent
 /// or doesn't name a real file (misleading custom argv0).
 pub(crate) fn program_exe() -> Option<PathBuf> {
+    if let Some(name) = PROGRAM_NAME_OVERRIDE.lock().unwrap().clone() {
+        // getpath's program_full_path: relative-with-separator paths
+        // are cwd-anchored; bare names are PATH-searched, and an
+        // unresolved bare name still lands as `{cwd}/{name}`
+        // (test_embed's test_pre_initialization_api expects exactly
+        // that for the never-on-PATH name "spam").
+        if name.components().count() > 1 {
+            return std::path::absolute(&name).ok();
+        }
+        let found = std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .filter(|d| !d.as_os_str().is_empty())
+                .map(|d| d.join(&name))
+                .find(|p| p.is_file())
+        });
+        return Some(found.unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|d| d.join(&name))
+                .unwrap_or(name)
+        }));
+    }
     let argv0 = std::env::args_os().next().map(PathBuf::from);
     if let Some(argv0) = argv0 {
         let candidate = if argv0.components().count() > 1 {

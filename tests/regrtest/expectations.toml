@@ -140,7 +140,10 @@ timeout_seconds = 180
 
 [tests."cpython/Lib/test/test_asyncio/test_events.py"]
 status = "pass"
-timeout_seconds = 180
+# ~19s idle, but the suite is real-timer-heavy and a fully saturated
+# -j8 sweep (RFC 0075 WS10) pushed it past 180s once — verdict stable
+# at every solo re-measure, raise headroom only.
+timeout_seconds = 600
 
 [tests."cpython/Lib/test/test_asyncio/test_selector_events.py"]
 status = "pass"
@@ -462,8 +465,33 @@ timeout_seconds = 300
 reason = "RFC 0068 WS6: 1782 run, 0F/0E (1 skip). Last residual was test__encoded_words' test_invalid_character_in_charset: bytes.decode with a lone-surrogate-bearing encoding name (a WStr) now raises the codec lookup's LookupError('unknown encoding: …') instead of TypeError — email._encoded_words catches it and records the CharsetError defect."
 
 [tests."cpython/Lib/test/test_embed.py"]
-status = "skip"
-reason = "principled skip (RFC 0055 WS4): exercises CPython's embedding artifacts — the `_testembed` binary built by CPython's own build system and Py_InitializeFromConfig C API shapes. Not meaningful for a Rust interpreter; same policy as the tkinter family."
+status = "divergence"
+# InitConfigTests (35): the `test_init_*` config-dump family — each
+# test runs a `_testembed` command that prints the live PyConfig/
+# PyPreConfig as JSON via `_testinternalcapi.get_configs` and diffs
+# it against CPython's build-specific defaults (frozen-module blobs,
+# allocator domains, pybuilddir landmarks). The WS6 twin does not
+# implement the dump family (GraalPy's posture); each exits 1 with
+# an "unimplemented command" note.
+# SetConfigTests (1): `_PyInterpreterState_SetConfig` via
+# `_testinternalcapi.set_config` — a CPython-internal mutation
+# surface with no PEP 587 analogue. `test_set_config` shells out to
+# `test._test_embed_set_config`; the inner run's per-method failures
+# echo on stdout and grade through this one outer id.
+# AuditingTests (7): the audit-hook command family
+# (`PySys_AddAuditHook` from C before init, open-code hooks,
+# incomplete-frame probes) — unimplemented twin commands.
+# EmbeddingTests residuals (5): four unimplemented twin commands
+# (finalize_structseq, getargs static-parser reset, and the two
+# inittab-submodule legs exercise `_testcapi`-internal C fixtures)
+# plus test_static_types_inherited_slots — a slot-wrapper identity
+# residual (`range.__ge__` is its own wrapper object where CPython
+# shares `object.__ge__`'s), the test_marshal-shaped object-model
+# divergence.
+# MiscTests (1): Py_FrozenMain over a frozen-module blob — a
+# CPython-build artifact (bpo-44133 already skips it on Windows).
+divergence_tests = ["test.test_embed.InitConfigTests.test_global_pathconfig", "test.test_embed.InitConfigTests.test_init_compat_config", "test.test_embed.InitConfigTests.test_init_compat_env", "test.test_embed.InitConfigTests.test_init_default_config", "test.test_embed.InitConfigTests.test_init_dev_mode", "test.test_embed.InitConfigTests.test_init_dont_configure_locale", "test.test_embed.InitConfigTests.test_init_dont_parse_argv", "test.test_embed.InitConfigTests.test_init_env_dev_mode", "test.test_embed.InitConfigTests.test_init_env_dev_mode_alloc", "test.test_embed.InitConfigTests.test_init_from_config", "test.test_embed.InitConfigTests.test_init_global_config", "test.test_embed.InitConfigTests.test_init_is_python_build_with_home", "test.test_embed.InitConfigTests.test_init_isolated_config", "test.test_embed.InitConfigTests.test_init_isolated_flag", "test.test_embed.InitConfigTests.test_init_main", "test.test_embed.InitConfigTests.test_init_parse_argv", "test.test_embed.InitConfigTests.test_init_pybuilddir", "test.test_embed.InitConfigTests.test_init_python_config", "test.test_embed.InitConfigTests.test_init_python_env", "test.test_embed.InitConfigTests.test_init_pyvenv_cfg", "test.test_embed.InitConfigTests.test_init_run_main", "test.test_embed.InitConfigTests.test_init_set_config", "test.test_embed.InitConfigTests.test_init_setpath", "test.test_embed.InitConfigTests.test_init_setpath_config", "test.test_embed.InitConfigTests.test_init_setpythonhome", "test.test_embed.InitConfigTests.test_init_sys_add", "test.test_embed.InitConfigTests.test_init_use_frozen_modules", "test.test_embed.InitConfigTests.test_init_warnoptions", "test.test_embed.InitConfigTests.test_preinit_compat_config", "test.test_embed.InitConfigTests.test_preinit_dont_parse_argv", "test.test_embed.InitConfigTests.test_preinit_isolated1", "test.test_embed.InitConfigTests.test_preinit_isolated2", "test.test_embed.InitConfigTests.test_preinit_isolated_config", "test.test_embed.InitConfigTests.test_preinit_parse_argv", "test.test_embed.InitConfigTests.test_preinit_python_config", "test.test_embed.SetConfigTests.test_set_config", "test.test_embed.AuditingTests.test_audit", "test.test_embed.AuditingTests.test_audit_run_interactivehook", "test.test_embed.AuditingTests.test_audit_run_startup", "test.test_embed.AuditingTests.test_audit_subinterpreter", "test.test_embed.AuditingTests.test_audit_tuple", "test.test_embed.AuditingTests.test_get_incomplete_frame", "test.test_embed.AuditingTests.test_open_code_hook", "test.test_embed.EmbeddingTests.test_finalize_structseq", "test.test_embed.EmbeddingTests.test_getargs_reset_static_parser", "test.test_embed.EmbeddingTests.test_inittab_submodule_multiphase", "test.test_embed.EmbeddingTests.test_inittab_submodule_singlephase", "test.test_embed.EmbeddingTests.test_static_types_inherited_slots", "test.test_embed.MiscTests.test_frozenmain"]
+reason = "measured (RFC 0075 WS6): the skip retires — 77 run, 21 pass, 6 skip, 49 enumerated divergences (56 failing methods; SetConfigTests' inner subprocess ids grade through its one outer id) via the `_testembed` twin (`crates/weavepy-cli/src/bin/_testembed.rs`, staged at `{bindir}/Programs/_testembed`). The lifecycle heart passes measured: test_repeated_init_exec, test_repeated_simple_init, test_repeated_init_and_subinterpreters, test_repeated_init_and_inittab, test_forced_io_encoding (PYTHONIOENCODING halves fill unset EmbedConfig stdio fields per config_init_stdio_encoding), test_unicode_id_init, test_init_in_background_thread, test_bpo20891, test_initialize_twice, test_run_main(_loop), test_get_argc_argv, test_init_main_interpreter_settings, plus the audit-free EmbeddingTests legs (subinterps ids/distinct-state, ucnhash reset). The divergences cluster: the InitConfigTests config-dump matrix (35 — `_testinternalcapi.get_configs` JSON vs CPython build defaults; the twin does not implement the dump family, GraalPy's posture), SetConfigTests (8 — `_PyInterpreterState_SetConfig`, internal), the audit-hook command family (7), four `_testcapi`-fixture commands + one slot-wrapper identity residual (5), and Py_FrozenMain (1)."
 
 [tests."cpython/Lib/test/test_ensurepip.py"]
 status = "pass"
@@ -583,6 +611,9 @@ reason = "RFC 0039 WS4/WS5: all 53 tests pass (11 skips for CPython-only refcoun
 
 [tests."cpython/Lib/test/test_generators.py"]
 status = "pass"
+# ~4s idle; a fully saturated -j8 sweep (RFC 0075 WS10) pushed it past
+# the 60s default once — verdict stable at every solo re-measure.
+timeout_seconds = 300
 reason = "measured (RFC 0037 WS7): passes end-to-end (skipped=1). Generator finalization (del-site/close-site frame reap, gc tracking), real sys.getrefcount, PEP 667 live f_locals on generator frames, frame chaining through yield-from throws, and CPython-exact yield-assignment SyntaxError messages."
 
 [tests."cpython/Lib/test/test_genericalias.py"]
@@ -602,8 +633,8 @@ status = "pass"
 reason = "measured: passes end-to-end after vendoring CPython's `getopt` verbatim (frozen module) together with the `gettext` fallback it imports for localized error messages."
 
 [tests."cpython/Lib/test/test_getpath.py"]
-status = "skip"
-reason = "principled skip (RFC 0055 WS4): interprets CPython's `Modules/getpath.py` (a build artifact outside `Lib/`, absent from the vendored tree) under a mock host to test CPython's own path-computation script. WeavePy's path initialization is tested behaviorally via test_sysconfig/test_venv/test_site instead."
+status = "pass"
+reason = "measured (RFC 0075 WS6): CPython's `Modules/getpath.py` is now vendored verbatim under `vendor/cpython/Modules/`, and the test's source-tree probe (`__file__/../../../Modules/getpath.py`) finds it — including under the harness's sanitized lib mirror, whose v4 layout reproduces the checkout's Lib/Modules siblinghood (entries under `Lib/`, `Modules/getpath.py` symlinked beside them). All 25 mock-host path-computation cases pass in <1s — pure Python, graded on its own merits."
 
 [tests."cpython/Lib/test/test_gettext.py"]
 status = "pass"
@@ -697,8 +728,10 @@ reason = "RFC 0037 WS3/WS9: passes end-to-end (47 tests, 7 skipped). int() strin
 [tests."cpython/Lib/test/test_interpreters.py"]
 status = "pass"
 # ~22s idle; a -j8 sweep pushed the package past the 60s default
-# (RFC 0068 WS9 re-measure) — verdict is stable, raise headroom only.
-timeout_seconds = 180
+# (RFC 0068 WS9 re-measure), and a fully saturated sweep (RFC 0075
+# WS10, parallel ecosystem lanes on the same host) past 180s. The
+# verdict is stable at every solo re-measure — raise headroom only.
+timeout_seconds = 600
 reason = "measured (RFC 0068 WS9): the full PEP 734 package passes — test_api (85, incl. C-API-created interpreters via the _testinternalcapi create/exec/destroy fixtures, whence tracking, get_config round-trips, capture_exception snapshots), test_channels (36, ChannelID refcount-driven destruction, unbound-item ops REMOVE/ERROR/REPLACE on sender teardown), test_queues (31, syncobj/unbound semantics with NotShareableError retyping), test_lifecycle, and test_stress (set_nomemory-injected create failure raises InterpreterError). The list_all bookkeeping matches CPython's refcount timing: exhausted FOR_ITER temporaries now route finalizable backing-list elements through the prompt-reap cascade, so ChannelID.__del__ decrefs channels at loop end."
 
 [tests."cpython/Lib/test/test_io.py"]

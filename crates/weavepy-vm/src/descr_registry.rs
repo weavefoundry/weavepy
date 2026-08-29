@@ -288,6 +288,84 @@ pub fn text_signature_of(obj: &Object) -> Option<&'static str> {
     TEXT_SIGNATURE.with(|m| m.borrow().get(&k).copied())
 }
 
+// ------------------------------------------------------------------
+// Live C docstrings (RFC 0075 WS8).
+//
+// numpy's `add_docstring`/`add_newdoc` machinery attaches docstrings
+// *after* type-ready time by writing straight into mutable C struct
+// fields — `PyTypeObject.tp_doc` for classes, `PyMethodDef.ml_doc`
+// for methods (numpy `compiled_base.c::arr_add_docstring`). WeavePy
+// harvests docstrings once, when the extension type is bridged, so
+// those post-hoc writes were invisible: `np.float64.__doc__` stayed
+// empty and `inspect.signature(np.float64)` — which parses the
+// `name(sig)\n--\n\n` line out of the C doc — raised ValueError for
+// every scalar type and method (96 rows of numpy's own
+// test_scalar_methods TestSignature). These registries let the
+// bridge attach a *reader* that consults the C field on each access,
+// so whatever the extension wrote after ready is served live.
+
+/// Decodes the current docstring behind `addr`, a C struct address
+/// whose meaning the installer fixed (`weavepy-capi` passes the
+/// `PyMethodDef` entry address and re-reads its `ml_doc`).
+pub type LiveDocReader = unsafe fn(usize) -> Option<String>;
+
+/// Per-object doc readers. PROCESS-GLOBAL for the same reason as
+/// [`BUILTIN_MODULE`]: the descriptor objects travel across threads
+/// through the shared module cache. The addresses point into the
+/// extension's method tables, which live for the process lifetime.
+static LIVE_C_DOC: LazyLock<parking_lot::RwLock<HashMap<usize, (usize, LiveDocReader)>>> =
+    LazyLock::new(|| parking_lot::RwLock::new(HashMap::new()));
+
+/// Attach a live C-doc reader to `obj` (a bridged method descriptor).
+pub fn register_live_c_doc(obj: &Object, addr: usize, read: LiveDocReader) {
+    if let Some(k) = key(obj) {
+        LIVE_C_DOC.write().insert(k, (addr, read));
+    }
+}
+
+/// The current C-side docstring for `obj`, re-read on every call.
+pub fn live_c_doc_of(obj: &Object) -> Option<String> {
+    let k = key(obj)?;
+    let (addr, read) = *LIVE_C_DOC.read().get(&k)?;
+    unsafe { read(addr) }
+}
+
+/// Class-doc hook: given a class, returns the current `tp_doc` of the
+/// backing C `PyTypeObject`, or `None` for pure-Python classes.
+/// Installed once by `weavepy-capi`'s extension loader.
+static EXT_TYPE_DOC_HOOK: std::sync::OnceLock<fn(&Rc<TypeObject>) -> Option<String>> =
+    std::sync::OnceLock::new();
+
+pub fn install_ext_type_doc_hook(f: fn(&Rc<TypeObject>) -> Option<String>) {
+    let _ = EXT_TYPE_DOC_HOOK.set(f);
+}
+
+/// The bridged class's current C `tp_doc`, if `cls` is an extension type.
+pub fn ext_type_doc(cls: &Rc<TypeObject>) -> Option<String> {
+    EXT_TYPE_DOC_HOOK.get()?(cls)
+}
+
+/// Class-flags hook: the C `tp_flags` of the type backing `cls`, or
+/// `None` for pure-Python classes. Lets `type.__flags__` correct the
+/// heap-type bit for *static* extension types: the VM synthesizes
+/// `Py_TPFLAGS_HEAPTYPE` for every non-builtin class, but numpy's
+/// `_needs_add_docstring` keys on that bit to decide whether a type's
+/// docstring can only be attached through `add_docstring`, and a
+/// static scalar type misreported as a heap type draws the
+/// "add_newdoc was used on a pure-python object" UserWarning at import
+/// (RFC 0075 WS8).
+static EXT_TYPE_FLAGS_HOOK: std::sync::OnceLock<fn(&Rc<TypeObject>) -> Option<u64>> =
+    std::sync::OnceLock::new();
+
+pub fn install_ext_type_flags_hook(f: fn(&Rc<TypeObject>) -> Option<u64>) {
+    let _ = EXT_TYPE_FLAGS_HOOK.set(f);
+}
+
+/// The bridged class's C `tp_flags`, if `cls` is an extension type.
+pub fn ext_type_c_flags(cls: &Rc<TypeObject>) -> Option<u64> {
+    EXT_TYPE_FLAGS_HOOK.get()?(cls)
+}
+
 /// The CPython descriptor *type* for `obj`, if tagged — used by `class_of`.
 pub fn descr_type(obj: &Object) -> Option<Rc<TypeObject>> {
     let meta = lookup(obj)?;
