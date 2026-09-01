@@ -530,7 +530,9 @@ pub struct InterpreterGuard {
 
 impl Drop for InterpreterGuard {
     fn drop(&mut self) {
-        CURRENT_INTERPRETER_PTR.with(|cell| {
+        // `try_with`: guards can unwind during thread teardown after the
+        // TLS slot is gone; the stack died with it, so popping is moot.
+        let _ = CURRENT_INTERPRETER_PTR.try_with(|cell| {
             let _ = cell.borrow_mut().pop();
         });
     }
@@ -1150,8 +1152,16 @@ pub fn publish_interpreter_ptr(interp: *mut crate::Interpreter) -> InterpreterGu
 
 /// Read the most recently published interpreter pointer, or
 /// `None` if no VM entry frame is on this thread.
+///
+/// Teardown-tolerant: C++ static destructors in extensions (e.g.
+/// libtorch's `SafePyObject` maps, run from `exit()` in a forked
+/// shm-manager child) probe `Py_IsInitialized` after this thread's
+/// TLS has been destroyed — report "no interpreter" rather than
+/// aborting the process (RFC 0076 WS5).
 pub fn current_interpreter_ptr() -> Option<*mut crate::Interpreter> {
-    CURRENT_INTERPRETER_PTR.with(|cell| cell.borrow().last().copied())
+    CURRENT_INTERPRETER_PTR
+        .try_with(|cell| cell.borrow().last().copied())
+        .unwrap_or(None)
 }
 
 /// `quit` and `exit` — interactive sentinels that raise `SystemExit`.

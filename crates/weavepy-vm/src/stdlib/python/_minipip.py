@@ -33,6 +33,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import zipfile
@@ -397,7 +398,14 @@ def _install_wheel(wheel_path, *, dest=None, scheme='purelib'):
             with zf.open(name) as src, open(target, 'wb') as dst:
                 shutil.copyfileobj(src, dst)
             installed.append(target)
-            if section == 'scripts' or _is_extension_module(name):
+            # Restore the executable bit the wheel recorded in
+            # `external_attr` — real pip's `zip_item_is_executable` —
+            # so packaged helper binaries stay runnable (torch ships
+            # `torch/bin/torch_shm_manager`, which the DataLoader
+            # worker leg exec()s — RFC 0076 WS5).
+            mode = zf.getinfo(name).external_attr >> 16
+            executable = bool(mode and stat.S_ISREG(mode) and mode & 0o111)
+            if executable or section == 'scripts' or _is_extension_module(name):
                 try:
                     os.chmod(target, 0o755)
                 except OSError:

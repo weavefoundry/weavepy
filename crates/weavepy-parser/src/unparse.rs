@@ -341,6 +341,15 @@ fn write_expr(out: &mut String, e: &Expr, level: Level) -> Option<()> {
             write_str_repr(out, &body);
             Some(())
         }
+        // PEP 750 t-strings (`-X lang=next`): same body machinery as
+        // f-strings, with a `t` prefix.
+        ExprKind::TemplateStr(_) | ExprKind::Interpolation { .. } => {
+            let mut body = String::new();
+            write_fstring_body(&mut body, e, false)?;
+            out.push('t');
+            write_str_repr(out, &body);
+            Some(())
+        }
         // Compiler-internal node: no faithful unparse — the caller
         // falls back to raw source.
         ExprKind::TypeParamFn { .. } => None,
@@ -351,7 +360,7 @@ fn write_expr(out: &mut String, e: &Expr, level: Level) -> Option<()> {
 /// Inside a format spec (`is_format_spec`), nested constants append raw.
 fn write_fstring_body(out: &mut String, e: &Expr, is_format_spec: bool) -> Option<()> {
     match &e.kind {
-        ExprKind::JoinedStr(parts) => {
+        ExprKind::JoinedStr(parts) | ExprKind::TemplateStr(parts) => {
             for p in parts {
                 write_fstring_body(out, p, is_format_spec)?;
             }
@@ -361,6 +370,12 @@ fn write_fstring_body(out: &mut String, e: &Expr, is_format_spec: bool) -> Optio
             value,
             conversion,
             format_spec,
+        }
+        | ExprKind::Interpolation {
+            value,
+            conversion,
+            format_spec,
+            ..
         } => {
             out.push('{');
             let mut inner = String::new();

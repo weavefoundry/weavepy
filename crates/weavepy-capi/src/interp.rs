@@ -53,13 +53,22 @@ pub fn with_active<R>(ctx: ActiveContext, body: impl FnOnce() -> R) -> R {
 
 /// Read the active context. Returns `None` when no extension call
 /// is on the stack.
+///
+/// `try_with` on the read paths: C++ static destructors in extensions
+/// probe the C-API (`Py_IsInitialized`, `Py_DECREF`) from `exit()`
+/// after this thread's TLS is destroyed — answer "no context" instead
+/// of aborting (RFC 0076 WS5, libtorch shm-manager child).
 pub fn with_current<R>(f: impl FnOnce(&ActiveContext) -> R) -> Option<R> {
-    ACTIVE.with(|cell| cell.borrow().as_ref().map(f))
+    ACTIVE
+        .try_with(|cell| cell.borrow().as_ref().map(f))
+        .unwrap_or(None)
 }
 
 /// Live interpreter pointer if any.
 pub fn current_interpreter_mut() -> Option<*mut Interpreter> {
-    ACTIVE.with(|cell| cell.borrow().as_ref().map(|c| c.interp))
+    ACTIVE
+        .try_with(|cell| cell.borrow().as_ref().map(|c| c.interp))
+        .unwrap_or(None)
 }
 
 /// Run a closure with a `&mut Interpreter` borrow if a context is
@@ -144,7 +153,16 @@ pub fn ensure_active<R>(body: impl FnOnce() -> R) -> R {
         // Context is already live here — a safe point to publish the static
         // builtins' `tp_bases`/`tp_mro` (run-once; needs the allocator).
         crate::types::publish_static_type_hierarchy();
-        return body();
+        let r = body();
+        // A `PySequence_Fast` result is read through raw macros between the
+        // extension's nested VM callbacks; republish just those watched
+        // lists so a callback's mutation is visible immediately (RFC 0076
+        // WS1 — numpy's "Content of sequences changed" detection). The
+        // empty-set check is one TLS read in the steady state.
+        if !crate::mirror::no_watched_lists() {
+            unsafe { crate::mirror::sync_watched_lists() };
+        }
+        return r;
     }
     if ea_trace_enabled() {
         eprintln!("[EA] outermost (flush)");
@@ -182,6 +200,10 @@ pub fn ensure_active<R>(body: impl FnOnce() -> R) -> R {
     // their own (orjson's iterative deserializer; see
     // `reconcile_seeded_lists`).
     unsafe { crate::mirror::reconcile_seeded_lists() };
+    // The macro-read watches (RFC 0076 WS1) are scoped to one extension-call
+    // window; the extension's `PySequence_Fast` results are dead past this
+    // return.
+    crate::mirror::clear_watched_lists();
     r
 }
 

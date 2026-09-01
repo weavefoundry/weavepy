@@ -1008,6 +1008,10 @@ class chain:
         self._core = _chain_core(iter(args), None)
         return self
 
+    # Overridden below with the native classmethod when available: the
+    # bound attribute must present as `builtin_function_or_method`, like
+    # CPython's METH_CLASS original (torch._dynamo's substitute_in_graph
+    # gates on it) — RFC 0076 WS5.
     @classmethod
     def from_iterable(cls, iterable):
         self = object.__new__(cls)
@@ -1049,6 +1053,13 @@ class chain:
         import types
 
         return types.GenericAlias(cls, item)
+
+
+if _HAVE_NATIVE and hasattr(_n, "chain_from_iterable"):
+    # Native classmethod: `type(chain.from_iterable)` must be
+    # `builtin_function_or_method`, matching CPython's METH_CLASS slot
+    # (see chain_from_iterable in itertools_mod.rs — RFC 0076 WS5).
+    chain.from_iterable = classmethod(_n.chain_from_iterable)
 
 
 # ---------------------------------------------------------------------------

@@ -383,12 +383,15 @@ fn fold_expr(e: &mut Expr, load: bool) {
         ExprKind::Yield(Some(v)) => fold_expr(v, true),
         ExprKind::Yield(None) => {}
         ExprKind::YieldFrom(v) | ExprKind::Await(v) => fold_expr(v, true),
-        ExprKind::JoinedStr(values) => {
+        ExprKind::JoinedStr(values) | ExprKind::TemplateStr(values) => {
             for v in values {
                 fold_expr(v, true);
             }
         }
         ExprKind::FormattedValue {
+            value, format_spec, ..
+        }
+        | ExprKind::Interpolation {
             value, format_spec, ..
         } => {
             fold_expr(value, true);

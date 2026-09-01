@@ -500,7 +500,16 @@ pub unsafe extern "C" fn PyLong_AsDouble(o: *mut PyObject) -> f64 {
     }
     match unsafe { crate::object::clone_object(o) } {
         Object::Int(i) => i as f64,
-        Object::Long(big) => big.to_f64().unwrap_or(f64::INFINITY),
+        // CPython raises OverflowError past the finite double range —
+        // numpy's NEP 50 scalar path pins `np.float64(1) + 2*DBL_MAX_int`
+        // raising rather than yielding inf (test_nep50_promotions).
+        Object::Long(big) => match big.to_f64() {
+            Some(f) if f.is_finite() => f,
+            _ => {
+                crate::errors::set_overflow_error("int too large to convert to float");
+                -1.0
+            }
+        },
         Object::Bool(b) => f64::from(b as i32),
         Object::Float(f) => f,
         _ => {
@@ -733,7 +742,10 @@ pub(crate) unsafe fn float_number_protocol(o: *mut PyObject, obj: &Object) -> Fl
                 Object::Float(f) => return FloatProtocol::Value(f),
                 Object::Int(i) => return FloatProtocol::Value(i as f64),
                 Object::Long(big) => {
-                    return FloatProtocol::Value(big.to_f64().unwrap_or(f64::INFINITY))
+                    return match checked_big_to_double(&big) {
+                        Some(f) => FloatProtocol::Value(f),
+                        None => FloatProtocol::Raised,
+                    }
                 }
                 Object::Bool(b) => return FloatProtocol::Value(f64::from(b as i32)),
                 // A misbehaving `nb_float` returned a non-float; fall through
@@ -752,9 +764,10 @@ pub(crate) unsafe fn float_number_protocol(o: *mut PyObject, obj: &Object) -> Fl
             return match result {
                 Some(Object::Float(f)) => FloatProtocol::Value(f),
                 Some(Object::Int(i)) => FloatProtocol::Value(i as f64),
-                Some(Object::Long(big)) => {
-                    FloatProtocol::Value(big.to_f64().unwrap_or(f64::INFINITY))
-                }
+                Some(Object::Long(big)) => match checked_big_to_double(&big) {
+                    Some(f) => FloatProtocol::Value(f),
+                    None => FloatProtocol::Raised,
+                },
                 Some(Object::Bool(b)) => FloatProtocol::Value(f64::from(b as i32)),
                 Some(_) => {
                     crate::errors::set_type_error("__float__ returned non-float");
@@ -765,6 +778,20 @@ pub(crate) unsafe fn float_number_protocol(o: *mut PyObject, obj: &Object) -> Fl
         }
     }
     FloatProtocol::NoProtocol
+}
+
+/// CPython's int→double conversion tail (`PyLong_AsDouble`): a finite
+/// double, or `None` with an `OverflowError` pending — never a
+/// saturated ±inf (RFC 0076 WS1; numpy test_nep50_promotions pins
+/// `np.float64(1) + 2*DBL_MAX_int` raising).
+pub(crate) fn checked_big_to_double(big: &num_bigint::BigInt) -> Option<f64> {
+    match big.to_f64() {
+        Some(f) if f.is_finite() => Some(f),
+        _ => {
+            crate::errors::set_overflow_error("int too large to convert to float");
+            None
+        }
+    }
 }
 
 #[no_mangle]
@@ -779,7 +806,7 @@ pub unsafe extern "C" fn PyFloat_AsDouble(o: *mut PyObject) -> f64 {
         // CPython's `ob_fval` would hold.
         Object::Float(f) => weavepy_vm::object::untag_nan(f),
         Object::Int(i) => i as f64,
-        Object::Long(big) => big.to_f64().unwrap_or(f64::INFINITY),
+        Object::Long(big) => checked_big_to_double(&big).unwrap_or(-1.0),
         Object::Bool(b) => f64::from(b as i32),
         other => match unsafe { float_number_protocol(o, &other) } {
             FloatProtocol::Value(v) => weavepy_vm::object::untag_nan(v),
@@ -976,7 +1003,7 @@ pub unsafe extern "C" fn PyComplex_RealAsDouble(o: *mut PyObject) -> f64 {
         Object::Complex(c) => weavepy_vm::object::untag_nan(c.real),
         Object::Float(f) => weavepy_vm::object::untag_nan(f),
         Object::Int(i) => i as f64,
-        Object::Long(big) => big.to_f64().unwrap_or(f64::INFINITY),
+        Object::Long(big) => checked_big_to_double(&big).unwrap_or(-1.0),
         _ => {
             // RFC 0046 (wave 4): CPython tries `__complex__` (real part),
             // then falls back to the float protocol (`__float__` /

@@ -52,14 +52,14 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 call_kw: None,
             })),
         );
+        // The *class* itself, as in CPython's C module — torch._dynamo
+        // classifies wrapped callables with
+        // `isinstance(value, functools._lru_cache_wrapper)` (RFC 0076
+        // WS5), so a bare constructor function is not enough. The class
+        // carries a `__new__` shim that runs the native constructor.
         d.insert(
             DictKey(Object::from_static("_lru_cache_wrapper")),
-            Object::Builtin(Rc::new(BuiltinFn {
-                name: "_lru_cache_wrapper",
-                binds_instance: false,
-                call: Box::new(lru_cache_wrapper_new),
-                call_kw: None,
-            })),
+            Object::Type(lru_type()),
         );
     }
     Rc::new(PyModule {
@@ -217,6 +217,19 @@ fn lru_type() -> Rc<crate::types::TypeObject> {
         method("__copy__", "__copy__", lru_identity);
         method("__deepcopy__", "__deepcopy__", lru_identity);
         method("__reduce__", "__reduce__", lru_reduce);
+        // `_lru_cache_wrapper(user_function, maxsize, typed, _CacheInfo)`
+        // instantiation — the class is what the module exports (CPython
+        // parity), so construction runs through `__new__`, which drops
+        // the implicit `cls` and defers to the native constructor.
+        dict.insert(
+            DictKey(Object::from_static("__new__")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "__new__",
+                binds_instance: false,
+                call: Box::new(|args| lru_cache_wrapper_new(args.get(1..).unwrap_or(&[]))),
+                call_kw: None,
+            })),
+        );
         let cls = crate::types::TypeObject::new_user(
             "_lru_cache_wrapper",
             vec![bt.object_.clone()],

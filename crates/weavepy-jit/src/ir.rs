@@ -192,6 +192,24 @@ pub enum TOp {
     /// only on a pin-table miss (defensive — cannot happen by
     /// construction), which deopts at this pc.
     ListLen,
+    /// RFC 0076 WS6 — `LOAD_DEREF idx`: read the activation's closure
+    /// cell `idx` (cellvars then freevars, the interpreter layout)
+    /// through the registered `wpjit_cell_get` helper and push the
+    /// `lane`-typed value. The helper re-validates the burned lane per
+    /// access — cells are shared mutable state, so an aliased write
+    /// through another closure (or an unbound cell) deopts at this pc
+    /// and the interpreter re-executes the load (raising the exact
+    /// `NameError` for the unbound case). The nullable [`JitType::Obj`]
+    /// lane re-reads and freshly pins the payload per access — no
+    /// burn-in, because closures exist to be mutated.
+    CellGet { idx: u32, lane: JitType },
+    /// RFC 0076 WS6 — `STORE_DEREF idx`: pop the `lane`-typed value
+    /// (staged through `ret_bits`) and write it into closure cell
+    /// `idx` through the registered `wpjit_cell_set` helper. A
+    /// displaced heap value must drop on the interpreter's store path
+    /// (prompt reap, parked finalizers), so the helper deopts before
+    /// the store in that case and the interpreter re-executes it.
+    CellSet { idx: u32, lane: JitType },
     /// RFC 0065 WS5 — `x.append(v)` on a pinned list: pops the value
     /// (staged through the frame's `ret_bits`, interpreted per the
     /// pin's element lane) and the pin reference, and calls
@@ -491,6 +509,35 @@ pub enum TOp {
     /// dirtiness discipline applies; invalidated guards deopt at the
     /// *next* pc with the store already performed).
     DynAttrSet { name: u32 },
+    /// RFC 0076 WS8 — `TO_BOOL` on a pinned/object-lane value: pops
+    /// the pin (the nullable `-1` is falsy without a lookup) and
+    /// calls the registered `wpjit_truth` helper, pushing the `Bool`.
+    /// The pure kinds (`None`, scalars, container emptiness) never
+    /// run Python; an instance with `__bool__`/`__len__` (or a
+    /// foreign value's `nb_bool`) dispatches through the interpreter
+    /// protocol — the dirtiness discipline applies, and invalidated
+    /// guards park the computed bool and deopt at the *next* pc (the
+    /// dunder never re-runs). A raise exits at this pc.
+    Truth,
+    /// RFC 0076 WS8 — `CONTAINS_OP` on a pinned non-dict container
+    /// (a set through the object lane, a list, a str, an instance):
+    /// the item stages tag-typed in the marshal buffer, the container
+    /// pin pops natively, and the registered `wpjit_contains_dyn`
+    /// helper runs the interpreter's exact membership protocol
+    /// (`__contains__`, native container tests, the iteration
+    /// fallback — **arbitrary Python may run**, the dirtiness
+    /// discipline applies), pushing the `Bool` (already negated for
+    /// the `not in` form). Statuses as [`TOp::Truth`].
+    ContainsDyn { negate: bool },
+    /// RFC 0076 WS8 — `BUILD_SET k`: elements stage with per-element
+    /// tags (like [`TOp::BuildTuple`]) and the registered
+    /// `wpjit_build_set` helper builds the fresh set, pinned on the
+    /// object lane. The helper admits only elements whose hashing
+    /// and de-duplication never run Python (scalars, `None`, exact
+    /// `str`/`bytes`); anything else answers negative *before* any
+    /// mutation and the interpreter re-executes the `BUILD_SET`
+    /// generically (raising exactly for the unhashable case).
+    BuildSet { n: u32 },
     /// RFC 0074 WS5 — `str % x` (`BINARY_OP %` with a pinned exact-
     /// `str` lhs): pops the rhs (any plain lane, staged with its tag)
     /// and the lhs pin, and runs the interpreter's `%`-formatting.
@@ -1347,6 +1394,8 @@ impl TOp {
                 | TOp::ListGet { .. }
                 | TOp::ListSet
                 | TOp::ListLen
+                | TOp::CellGet { .. }
+                | TOp::CellSet { .. }
                 | TOp::ListAppend
                 | TOp::ListAppendKeep
                 | TOp::AttrGet { .. }
@@ -1376,6 +1425,9 @@ impl TOp {
                 | TOp::CallDyn { .. }
                 | TOp::DynAttrGet { .. }
                 | TOp::DynAttrSet { .. }
+                | TOp::Truth
+                | TOp::ContainsDyn { .. }
+                | TOp::BuildSet { .. }
                 | TOp::StrMod
                 | TOp::StrSlice { .. }
         )

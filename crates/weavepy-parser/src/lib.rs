@@ -25,6 +25,7 @@ pub use parser::{
     set_unicode_name_resolver, TypeComments, UnicodeNameResolution,
 };
 pub use weavepy_lexer::EscapeWarning;
+pub use weavepy_lexer::{lang_preview, set_lang_preview};
 
 /// Parse a Python source buffer into a [`Module`].
 pub fn parse_module(source: &str) -> Result<Module, ParseError> {

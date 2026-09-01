@@ -93,6 +93,14 @@ build_time_vars = {
     "LDCXXSHARED": _ldcxxshared,
     "LDFLAGS": "",
     "LDLIBRARY": "libpython%s.a" % _version_short,
+    # Extension modules must not link against libpython (there is none to
+    # link — symbols resolve from the host binary at load time). CPython's
+    # static/framework builds publish the empty string here and meson's
+    # `links_against_libpython()` keys off it; leaving it unset makes
+    # meson add `-lpython3.13` and fail its sysconfig dependency check
+    # (numpy test_mem_policy builds a test extension with meson —
+    # RFC 0076 WS1).
+    "LIBPYTHON": "",
     "LDSHARED": _ldshared,
     "BLDSHARED": _ldshared,
     "LDVERSION": _version_short,

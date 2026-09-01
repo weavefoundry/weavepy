@@ -276,6 +276,12 @@ pub unsafe extern "C" fn PyList_SetSlice(
             None => return -1,
         }
     };
+    // `collect_iterable` above can run arbitrary extension code (the
+    // iteration protocol) that macro-writes this very list; adopt any such
+    // write *before* splicing, or the pre-publish reconcile inside
+    // `sync_list_ob_item` would see the moved buffer and adopt it wholesale,
+    // undoing the splice (RFC 0076 WS3).
+    unsafe { crate::mirror::adopt_c_list_writes(list) };
     {
         let mut v = rc.borrow_mut();
         let len = v.len() as PySsizeT;

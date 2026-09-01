@@ -923,8 +923,11 @@ fn module_mentions_super(body: &[Stmt]) -> bool {
             }
             ExprKind::Yield(v) => v.as_deref().is_some_and(in_expr),
             ExprKind::YieldFrom(v) | ExprKind::Await(v) => in_expr(v),
-            ExprKind::JoinedStr(parts) => parts.iter().any(in_expr),
+            ExprKind::JoinedStr(parts) | ExprKind::TemplateStr(parts) => parts.iter().any(in_expr),
             ExprKind::FormattedValue {
+                value, format_spec, ..
+            }
+            | ExprKind::Interpolation {
                 value, format_spec, ..
             } => in_expr(value) || format_spec.as_deref().is_some_and(in_expr),
         }
@@ -6664,10 +6667,17 @@ impl Compiler {
         // already carries `__class__` (a method, or a PEP 695 hidden
         // scope inside a class body) forwards it to nested functions
         // the same way.
+        // `Binding::Local` too (RFC 0076 WS4): CPython resolves the
+        // implicit `__class__` through *normal* lexical scoping, so a
+        // plain enclosing-function local satisfies it — attrs' generated
+        // slots-`__getattr__` is compiled inside `def wrapper(_cls):
+        // __class__ = _cls; def __getattr__(self, …): … super().…`, and
+        // zero-arg `super()` must close over that local (the generic
+        // child-free promotion below turns it into the wrapper's cell).
         let parent_forwards_class = self.inside_class_body
             || matches!(
                 self.bindings.get("__class__"),
-                Some(Binding::Free | Binding::Cell)
+                Some(Binding::Free | Binding::Cell | Binding::Local)
             );
         if parent_forwards_class && method_references_class(body) {
             inner.bindings.insert("__class__".to_owned(), Binding::Free);
@@ -9589,6 +9599,17 @@ impl Compiler {
             } => {
                 self.compile_formatted_value(value, *conversion, format_spec.as_deref())?;
             }
+            ExprKind::TemplateStr(parts) => {
+                self.compile_template_str(parts)?;
+            }
+            // Only reachable inside a `TemplateStr` (handled there); a
+            // bare node can only come from a caller-built `ast` tree.
+            ExprKind::Interpolation { .. } => {
+                return Err(CompileError::spanned(
+                    "t-string interpolation outside t-string",
+                    e.span,
+                ));
+            }
             ExprKind::Yield(value) => {
                 // `yield` is only legal in a function body. At module or
                 // class scope (or inside a comprehension's own frame) it is
@@ -10006,6 +10027,102 @@ impl Compiler {
             self.compile_expr(p)?;
         }
         self.emit(OpCode::BuildString, parts.len() as u32);
+        Ok(())
+    }
+
+    /// PEP 750 t-string (`-X lang=next`, RFC 0076 WS15). Lowers to
+    /// CPython 3.14's opcode shape:
+    ///
+    /// ```text
+    /// LOAD_CONST s0 … LOAD_CONST sn; BUILD_TUPLE n+1     (strings)
+    /// per field: value; LOAD_CONST expr_text; [spec];
+    ///            BUILD_INTERPOLATION conv|spec_flag
+    /// BUILD_TUPLE n                                      (interpolations)
+    /// BUILD_TEMPLATE
+    /// ```
+    ///
+    /// The `strings` tuple is the PEP 750 canonical form: exactly
+    /// `n_interpolations + 1` entries, with `""` fillers between
+    /// adjacent fields and at the ends.
+    fn compile_template_str(&mut self, parts: &[Expr]) -> Result<(), CompileError> {
+        // Code-point accumulation so surrogate-bearing (`WStr`) literal
+        // fragments survive concatenation, as in `parse_string_concat`.
+        fn cps_of(c: &AstConstant) -> Vec<u32> {
+            match c {
+                AstConstant::Str(s) => s.chars().map(|ch| ch as u32).collect(),
+                AstConstant::WStr(cps) => cps.clone(),
+                _ => unreachable!("checked by caller"),
+            }
+        }
+        fn cps_to_const(cps: Vec<u32>) -> Constant {
+            if cps.iter().all(|&cp| char::from_u32(cp).is_some()) {
+                Constant::Str(
+                    cps.iter()
+                        .map(|&cp| char::from_u32(cp).expect("checked"))
+                        .collect(),
+                )
+            } else {
+                Constant::WStr(cps)
+            }
+        }
+        let mut strings: Vec<Constant> = Vec::new();
+        let mut interps: Vec<&Expr> = Vec::new();
+        let mut cur: Vec<u32> = Vec::new();
+        for p in parts {
+            match &p.kind {
+                ExprKind::Constant(c @ (AstConstant::Str(_) | AstConstant::WStr(_))) => {
+                    cur.extend(cps_of(c));
+                }
+                ExprKind::Interpolation { .. } => {
+                    strings.push(cps_to_const(std::mem::take(&mut cur)));
+                    interps.push(p);
+                }
+                _ => {
+                    return Err(CompileError::spanned("invalid t-string part", p.span));
+                }
+            }
+        }
+        strings.push(cps_to_const(cur));
+        for s in strings.iter().cloned() {
+            let idx = self.co.intern_constant(s);
+            self.emit(OpCode::LoadConst, idx);
+        }
+        self.emit(OpCode::BuildTuple, strings.len() as u32);
+        for p in &interps {
+            let ExprKind::Interpolation {
+                value,
+                text,
+                conversion,
+                format_spec,
+            } = &p.kind
+            else {
+                unreachable!("collected above");
+            };
+            self.compile_expr(value)?;
+            let idx = self.co.intern_constant(Constant::Str(text.clone()));
+            self.emit(OpCode::LoadConst, idx);
+            let conv: u32 = match *conversion {
+                -1 => 0,
+                115 => 1, // 's'
+                114 => 2, // 'r'
+                97 => 3,  // 'a'
+                other => {
+                    return Err(CompileError::internal(format!(
+                        "unknown t-string conversion {other}"
+                    )));
+                }
+            };
+            let mut arg = conv;
+            if let Some(spec) = format_spec {
+                // The spec is a JoinedStr, eagerly evaluated to a str at
+                // template construction time (PEP 750).
+                self.compile_expr(spec)?;
+                arg |= 0x04;
+            }
+            self.emit(OpCode::BuildInterpolation, arg);
+        }
+        self.emit(OpCode::BuildTuple, interps.len() as u32);
+        self.emit(OpCode::BuildTemplate, 0);
         Ok(())
     }
 
@@ -10793,12 +10910,15 @@ fn collect_comp_scope_walruses(
                 }
             }
             ExprKind::YieldFrom(v) | ExprKind::Await(v) => visit(v, out),
-            ExprKind::JoinedStr(parts) => {
+            ExprKind::JoinedStr(parts) | ExprKind::TemplateStr(parts) => {
                 for p in parts {
                     visit(p, out);
                 }
             }
             ExprKind::FormattedValue {
+                value, format_spec, ..
+            }
+            | ExprKind::Interpolation {
                 value, format_spec, ..
             } => {
                 visit(value, out);
@@ -10957,13 +11077,16 @@ fn reject_walrus_in_iterable(e: &Expr) -> Result<(), CompileError> {
                 None => Ok(()),
             },
             ExprKind::YieldFrom(v) | ExprKind::Await(v) => scan(v),
-            ExprKind::JoinedStr(parts) => {
+            ExprKind::JoinedStr(parts) | ExprKind::TemplateStr(parts) => {
                 for p in parts {
                     scan(p)?;
                 }
                 Ok(())
             }
             ExprKind::FormattedValue {
+                value, format_spec, ..
+            }
+            | ExprKind::Interpolation {
                 value, format_spec, ..
             } => {
                 scan(value)?;
@@ -11142,13 +11265,16 @@ fn check_comp_walrus_nest(
                 None => Ok(()),
             },
             ExprKind::YieldFrom(v) | ExprKind::Await(v) => visit(v, in_class_body, stack),
-            ExprKind::JoinedStr(parts) => {
+            ExprKind::JoinedStr(parts) | ExprKind::TemplateStr(parts) => {
                 for p in parts {
                     visit(p, in_class_body, stack)?;
                 }
                 Ok(())
             }
             ExprKind::FormattedValue {
+                value, format_spec, ..
+            }
+            | ExprKind::Interpolation {
                 value, format_spec, ..
             } => {
                 visit(value, in_class_body, stack)?;
@@ -11842,8 +11968,13 @@ fn expr_contains_typeparamfn(e: &Expr) -> bool {
             }
         }
         ExprKind::YieldFrom(v) | ExprKind::Await(v) => check(v),
-        ExprKind::JoinedStr(parts) => parts.iter().for_each(&mut check),
+        ExprKind::JoinedStr(parts) | ExprKind::TemplateStr(parts) => {
+            parts.iter().for_each(&mut check)
+        }
         ExprKind::FormattedValue {
+            value, format_spec, ..
+        }
+        | ExprKind::Interpolation {
             value, format_spec, ..
         } => {
             check(value);
@@ -11945,6 +12076,17 @@ fn collect_inner_free(
             let mut inner_reads = HashSet::new();
             for s in body {
                 collect_reads_stmt(s, &mut inner_reads);
+            }
+            // Zero-arg `super()` implicitly captures `__class__` through
+            // normal lexical scoping (RFC 0076 WS4): if the inner function
+            // uses `super`, surface `__class__` as needed-from-outer so an
+            // enclosing function's `__class__ = _cls` local is promoted to
+            // a cell *before* emission — attrs' generated slots-
+            // `__getattr__` wrapper is exactly this shape, and a post-hoc
+            // promotion left the already-emitted store writing the dead
+            // local slot ("cannot access free variable '__class__'").
+            if inner_reads.contains("super") && !inner_locals.contains("__class__") {
+                out.insert("__class__".to_owned());
             }
             for r in inner_reads {
                 if !inner_locals.contains(&r) && !inner_globals.contains(&r) {
@@ -12330,8 +12472,11 @@ fn body_has_top_level_await(body: &[Stmt]) -> bool {
             }
             ExprKind::Yield(v) => v.as_deref().is_some_and(expr_hit),
             ExprKind::YieldFrom(v) => expr_hit(v),
-            ExprKind::JoinedStr(parts) => parts.iter().any(expr_hit),
+            ExprKind::JoinedStr(parts) | ExprKind::TemplateStr(parts) => parts.iter().any(expr_hit),
             ExprKind::FormattedValue {
+                value, format_spec, ..
+            }
+            | ExprKind::Interpolation {
                 value, format_spec, ..
             } => expr_hit(value) || format_spec.as_deref().is_some_and(expr_hit),
             ExprKind::BinOp { left, right, .. } => expr_hit(left) || expr_hit(right),
@@ -12544,8 +12689,13 @@ fn expr_contains_yield(expr: &Expr) -> bool {
         ExprKind::GeneratorExp { generators, .. } => generators
             .first()
             .is_some_and(|g| expr_contains_yield(&g.iter)),
-        ExprKind::JoinedStr(parts) => parts.iter().any(expr_contains_yield),
+        ExprKind::JoinedStr(parts) | ExprKind::TemplateStr(parts) => {
+            parts.iter().any(expr_contains_yield)
+        }
         ExprKind::FormattedValue {
+            value, format_spec, ..
+        }
+        | ExprKind::Interpolation {
             value, format_spec, ..
         } => expr_contains_yield(value) || format_spec.as_deref().is_some_and(expr_contains_yield),
         ExprKind::BinOp { left, right, .. } => {
@@ -12632,8 +12782,13 @@ fn expr_yields_in_scope(expr: &Expr) -> bool {
             .first()
             .is_some_and(|g| expr_yields_in_scope(&g.iter)),
         ExprKind::Await(v) => expr_yields_in_scope(v),
-        ExprKind::JoinedStr(parts) => parts.iter().any(expr_yields_in_scope),
+        ExprKind::JoinedStr(parts) | ExprKind::TemplateStr(parts) => {
+            parts.iter().any(expr_yields_in_scope)
+        }
         ExprKind::FormattedValue {
+            value, format_spec, ..
+        }
+        | ExprKind::Interpolation {
             value, format_spec, ..
         } => {
             expr_yields_in_scope(value) || format_spec.as_deref().is_some_and(expr_yields_in_scope)
@@ -12693,8 +12848,13 @@ fn expr_contains_await(expr: &Expr) -> bool {
         | ExprKind::ListComp { .. }
         | ExprKind::SetComp { .. }
         | ExprKind::DictComp { .. } => false,
-        ExprKind::JoinedStr(parts) => parts.iter().any(expr_contains_await),
+        ExprKind::JoinedStr(parts) | ExprKind::TemplateStr(parts) => {
+            parts.iter().any(expr_contains_await)
+        }
         ExprKind::FormattedValue {
+            value, format_spec, ..
+        }
+        | ExprKind::Interpolation {
             value, format_spec, ..
         } => expr_contains_await(value) || format_spec.as_deref().is_some_and(expr_contains_await),
         ExprKind::BinOp { left, right, .. } => {
@@ -12783,8 +12943,13 @@ fn expr_contains_async_comp(expr: &Expr) -> bool {
         ExprKind::Await(_) => false,
         ExprKind::Yield(v) => v.as_deref().is_some_and(expr_contains_async_comp),
         ExprKind::YieldFrom(v) => expr_contains_async_comp(v),
-        ExprKind::JoinedStr(parts) => parts.iter().any(expr_contains_async_comp),
+        ExprKind::JoinedStr(parts) | ExprKind::TemplateStr(parts) => {
+            parts.iter().any(expr_contains_async_comp)
+        }
         ExprKind::FormattedValue {
+            value, format_spec, ..
+        }
+        | ExprKind::Interpolation {
             value, format_spec, ..
         } => {
             expr_contains_async_comp(value)
@@ -12990,13 +13155,16 @@ fn collect_inner_free_expr(
         }
         ExprKind::FormattedValue {
             value, format_spec, ..
+        }
+        | ExprKind::Interpolation {
+            value, format_spec, ..
         } => {
             collect_inner_free_expr(value, outer_bindings, out);
             if let Some(fs) = format_spec.as_deref() {
                 collect_inner_free_expr(fs, outer_bindings, out);
             }
         }
-        ExprKind::JoinedStr(parts) => {
+        ExprKind::JoinedStr(parts) | ExprKind::TemplateStr(parts) => {
             for p in parts {
                 collect_inner_free_expr(p, outer_bindings, out);
             }
@@ -13542,12 +13710,15 @@ fn collect_walrus_expr(expr: &Expr, out: &mut HashSet<String>) {
             }
         }
         ExprKind::YieldFrom(v) | ExprKind::Await(v) => collect_walrus_expr(v, out),
-        ExprKind::JoinedStr(parts) => {
+        ExprKind::JoinedStr(parts) | ExprKind::TemplateStr(parts) => {
             for p in parts {
                 collect_walrus_expr(p, out);
             }
         }
         ExprKind::FormattedValue {
+            value, format_spec, ..
+        }
+        | ExprKind::Interpolation {
             value, format_spec, ..
         } => {
             collect_walrus_expr(value, out);
@@ -14763,12 +14934,15 @@ fn collect_reads_deep(expr: &Expr, out: &mut HashSet<String>) {
         ExprKind::YieldFrom(v) | ExprKind::Await(v) => {
             collect_reads_deep(v, out);
         }
-        ExprKind::JoinedStr(parts) => {
+        ExprKind::JoinedStr(parts) | ExprKind::TemplateStr(parts) => {
             for p in parts {
                 collect_reads_deep(p, out);
             }
         }
         ExprKind::FormattedValue {
+            value, format_spec, ..
+        }
+        | ExprKind::Interpolation {
             value, format_spec, ..
         } => {
             collect_reads_deep(value, out);
@@ -14907,13 +15081,16 @@ fn collect_reads_expr(expr: &Expr, out: &mut HashSet<String>) {
         }
         ExprKind::FormattedValue {
             value, format_spec, ..
+        }
+        | ExprKind::Interpolation {
+            value, format_spec, ..
         } => {
             collect_reads_expr(value, out);
             if let Some(fs) = format_spec.as_deref() {
                 collect_reads_expr(fs, out);
             }
         }
-        ExprKind::JoinedStr(parts) => {
+        ExprKind::JoinedStr(parts) | ExprKind::TemplateStr(parts) => {
             for p in parts {
                 collect_reads_expr(p, out);
             }

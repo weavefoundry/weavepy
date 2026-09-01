@@ -105,6 +105,7 @@ pub struct BuiltinTypes {
     pub frame_: Rc<TypeObject>,
     pub code_: Rc<TypeObject>,
     pub traceback_: Rc<TypeObject>,
+    pub capsule_: Rc<TypeObject>,
     /// `types.CellType` — real closure cells (RFC 0056 WS4):
     /// constructible (`CellType()` / `CellType(v)`), with writable
     /// `cell_contents` and contents-based rich comparison, so
@@ -721,6 +722,9 @@ impl BuiltinTypes {
             crate::builtins::code_dunder_replace_object(),
         );
         let traceback_ = mk("traceback", vec![object_.clone()]);
+        // `type(capsule)` is `<class 'PyCapsule'>` in CPython (Pillow's
+        // `test_image_getim` asserts the name appears in the type repr).
+        let capsule_ = mk("PyCapsule", vec![object_.clone()]);
         let cell_ = mk("cell", vec![object_.clone()]);
         let module_ = mk("module", vec![object_.clone()]);
         install_module_init(&module_);
@@ -977,6 +981,7 @@ impl BuiltinTypes {
             frame_,
             code_,
             traceback_,
+            capsule_,
             cell_,
             module_,
             base_exception,
@@ -2741,6 +2746,17 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
                         .borrow_mut()
                         .insert(DictKey(Object::from_str(name)), args[2].clone());
                 }
+                Ok(Object::None)
+            }
+            // A re-classed module's `__setattr__` override chains here via
+            // `super().__setattr__(name, value)` (RFC 0076 WS5 — torch's
+            // `ConfigModule` bypass keys); the default module store is a
+            // plain dict insert (CPython `module_setattro` ends in the
+            // generic dict write too).
+            Object::Module(m) => {
+                m.dict
+                    .borrow_mut()
+                    .insert(DictKey(Object::from_str(name)), args[2].clone());
                 Ok(Object::None)
             }
             // CPython's "Carlo Verre hack" guard (`hackcheck`): applying the

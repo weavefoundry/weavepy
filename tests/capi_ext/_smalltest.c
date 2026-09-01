@@ -146,8 +146,42 @@ static PyObject *Counter_tick(PyObject *self, PyObject *args) {
     return PyLong_FromLong(c->count);
 }
 
+/* METH_CLASS constructor in PyO3's `#[classmethod]` shape (RFC 0076
+ * WS5: polars' `PyOptFlags.default()` at import time). `self` must be
+ * the *type* object; returns a Counter seeded at `n`. */
+static PyObject *Counter_make(PyObject *cls, PyObject *args) {
+    long n = 0;
+    if (!PyArg_ParseTuple(args, "l", &n)) {
+        return NULL;
+    }
+    /* The mini header has no PyType_Check; a NULL receiver is the
+     * failure mode this guards (METH_CLASS not binding the class).
+     * If `cls` were some other object, PyType_GenericAlloc below and
+     * the tick() assertions in the Rust test would catch it. */
+    if (cls == NULL) {
+        PyErr_SetString(PyExc_TypeError, "make() did not receive the class");
+        return NULL;
+    }
+    PyObject *obj = PyType_GenericAlloc((PyTypeObject *)cls, 0);
+    if (!obj) return NULL;
+    ((CounterObject *)obj)->count = n;
+    return obj;
+}
+
+/* METH_STATIC: no receiver ever reaches the C function (CPython passes
+ * NULL self through the staticmethod wrapper). */
+static PyObject *Counter_origin(PyObject *self, PyObject *args) {
+    (void)self;
+    (void)args;
+    return PyLong_FromLong(0);
+}
+
 static PyMethodDef Counter_methods[] = {
     {"tick", Counter_tick, METH_NOARGS, "increment and return the new count"},
+    {"make", Counter_make, METH_VARARGS | METH_CLASS,
+     "classmethod constructor: Counter.make(n)"},
+    {"origin", Counter_origin, METH_NOARGS | METH_STATIC,
+     "staticmethod: the zero count"},
     {NULL, NULL, 0, NULL},
 };
 

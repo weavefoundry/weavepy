@@ -521,6 +521,23 @@ unsafe impl Send for Inittab {}
 
 static INITTAB: Mutex<Inittab> = Mutex::new(Inittab(Vec::new()));
 
+/// Register an inittab entry from Rust (the PEP 741
+/// `PyInitConfig_AddModule` path; pre-init only, like the C entry
+/// points).
+pub(crate) fn inittab_push(name: String, initfunc: PyInitFn) -> bool {
+    if matches!(*STATE.lock().unwrap(), State::OwnedInit | State::HostInit) {
+        return false;
+    }
+    INITTAB.lock().unwrap().0.push((name, initfunc));
+    true
+}
+
+/// A clone of the config `Py_InitializeFromConfig` ran with, for the
+/// PEP 741 runtime read surface (`PyConfig_Get`).
+pub(crate) fn run_config_snapshot() -> Option<EmbedConfig> {
+    RUN_CONFIG.lock().unwrap().clone()
+}
+
 /// Look up an embedder-registered built-in module init function.
 pub fn inittab_lookup(name: &str) -> Option<PyInitFn> {
     INITTAB

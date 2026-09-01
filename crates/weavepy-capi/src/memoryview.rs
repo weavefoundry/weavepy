@@ -153,6 +153,30 @@ pub unsafe extern "C" fn PyMemoryView_FromObject(exporter: *mut PyObject) -> *mu
             // fused-type dispatch: `map_fused_type` resolves `ndarray[object]`
             // only when `memoryview(arr)` reports `itemsize == sizeof(void*)`
             // and a parseable `'O'` format (pandas' `lib.map_infer_mask`).
+            const PYBUF_FULL_RO: c_int = 0x011C; // INDIRECT | STRIDES | ND | FORMAT
+            return unsafe { PyMemoryView_FromObjectAndFlags(exporter, PYBUF_FULL_RO) };
+        }
+    };
+    crate::object::into_owned(Object::MemoryView(weavepy_vm::sync::Rc::new(mv)))
+}
+
+/// `PyMemoryView_FromObjectAndFlags(exporter, flags)` — like
+/// [`PyMemoryView_FromObject`] but forwarding the caller's exact buffer
+/// request. This is the engine behind the PEP 688 `__buffer__(flags)`
+/// dunder shim (numpy's `arr.__buffer__(inspect.BufferFlags.WRITABLE)` —
+/// test_multithreading's `__buffer__` thread-safety tests, RFC 0076 WS1).
+#[no_mangle]
+pub unsafe extern "C" fn PyMemoryView_FromObjectAndFlags(
+    exporter: *mut PyObject,
+    flags: c_int,
+) -> *mut PyObject {
+    if exporter.is_null() {
+        crate::errors::set_buffer_error("PyMemoryView_FromObjectAndFlags: NULL argument");
+        return ptr::null_mut();
+    }
+    let obj = unsafe { crate::object::clone_object(exporter) };
+    let mv = {
+        {
             // CPython checks `PyObject_CheckBuffer` up front and raises
             // TypeError with the "memoryview: " prefix (memoryobject.c);
             // `test_urlparse` relies on the TypeError class.
@@ -163,11 +187,8 @@ pub unsafe extern "C" fn PyMemoryView_FromObject(exporter: *mut PyObject) -> *mu
                 ));
                 return ptr::null_mut();
             }
-            const PYBUF_FULL_RO: c_int = 0x011C; // INDIRECT | STRIDES | ND | FORMAT
             let mut view = Py_buffer::zeroed();
-            let rc = unsafe {
-                crate::buffer::PyObject_GetBuffer(exporter, &raw mut view, PYBUF_FULL_RO)
-            };
+            let rc = unsafe { crate::buffer::PyObject_GetBuffer(exporter, &raw mut view, flags) };
             if rc != 0 {
                 return ptr::null_mut();
             }
@@ -205,6 +226,11 @@ pub unsafe extern "C" fn PyMemoryView_FromObject(exporter: *mut PyObject) -> *mu
                 (0..ndim)
                     .map(|i| unsafe { *view.shape.add(i) }.max(0) as usize)
                     .collect()
+            } else if ndim == 1 {
+                // A `PyBUF_SIMPLE`-style request leaves `shape` NULL for a
+                // 1-D exporter; CPython synthesizes `len/itemsize` (a
+                // `__buffer__(SIMPLE)` call lands here — RFC 0076 WS1).
+                vec![view_len / view_itemsize.max(1)]
             } else {
                 Vec::new()
             };

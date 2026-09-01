@@ -193,6 +193,26 @@ pub struct Probes<'a> {
     /// only when the name doesn't resolve at all (a genuine
     /// `NameError` shape — the frame stays interpreted).
     pub obj_global: &'a mut dyn FnMut(&str) -> Option<(u32, JitType)>,
+    /// RFC 0076 WS6 — the *observed* lane of closure cell `idx` (the
+    /// interpreter's `cellvars` ++ `freevars` layout) in the
+    /// requesting activation: an unboxed scalar lane, or the nullable
+    /// object lane for any other bound payload (re-read and freshly
+    /// pinned per access — no burn-in). `None` = unbound or no live
+    /// activation to observe. A prediction like every probe: the
+    /// cell helpers re-validate the lane per access (cells are shared
+    /// mutable state — another closure can rebind between accesses),
+    /// so a lane surprise deopts, never misbehaves.
+    pub cell: &'a mut dyn FnMut(u32) -> Option<JitType>,
+    /// RFC 0076 WS8 — whether local `slot` currently holds *some* live
+    /// value in the requesting activation (any object at all; no
+    /// grading). Consulted only by the generic-attribute fallback to
+    /// separate the residue classes: a live receiver whose shape
+    /// grading failed (a shadowed slot, a version-tag miss on a
+    /// long-lived instance, a non-instance object) rides the
+    /// object lane and the eager [`TOp::DynAttrGet`] helper; an
+    /// *unbound* slot keeps the retriable probe-miss verdict, so a
+    /// later training point can still specialize.
+    pub obj: &'a mut dyn FnMut(u32) -> bool,
     /// RFC 0071 WS3 — the analysis-local attribute-path interner (the
     /// analyzer owns the entries; it lives here so both passes and the
     /// probe adapters share it without threading another parameter).
@@ -236,6 +256,17 @@ pub enum JitVerdict {
     /// when the local is live — may succeed, so the embedder should
     /// not retire the code object on it.
     ProbeMiss(&'static str),
+    /// RFC 0076 WS7 — a burned `LOAD_GLOBAL`-born callee marker
+    /// escaped into data flow (stored, passed as an argument, tested,
+    /// returned). Carries the escaping load's name index; the
+    /// analyzer's demotion retry consumes it internally — re-planning
+    /// the frame with that name's loads riding identity-guarded
+    /// object pins ([`crate::ir::TOp::PushGlobalObj`]) so the value
+    /// is plain and its uses (including a `CALL` through the
+    /// opaque-call lane) admit. It surfaces to the embedder only when
+    /// the retry budget is exhausted, and is then terminal like any
+    /// `UnsupportedOpcode`.
+    CalleeEscapes(u32),
 }
 
 /// A raw basic block over the original instruction indices.
@@ -478,6 +509,8 @@ pub fn analyze_with_probes(
         param: &mut |_| None,
         kw_slot: &mut |_, _| None,
         obj_global: &mut |_| None,
+        cell: &mut |_| None,
+        obj: &mut |_| false,
         paths: &mut arena,
     };
     analyze_impl(code, resolve, &mut probes)
@@ -498,6 +531,40 @@ fn analyze_impl(
     resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
     probes: &mut Probes<'_>,
 ) -> Result<TFunc, JitVerdict> {
+    // RFC 0076 WS7 — the demotion retry: a burned global-callee
+    // marker that escapes into data flow (stored, passed as an
+    // argument, tested, returned) re-plans with that name's loads
+    // riding identity-guarded object pins, so the value is plain and
+    // its uses — including a `CALL` through the opaque-call lane —
+    // admit. Each retry demotes one more name; the budget bounds
+    // pathological frames (every retry is a full re-analysis).
+    let mut demote: HashSet<u32> = HashSet::new();
+    loop {
+        match analyze_once(code, resolve, probes, &demote) {
+            Err(JitVerdict::CalleeEscapes(name_idx)) => {
+                if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
+                    eprintln!(
+                        "jit demote {:?} name {:?} (set {:?})",
+                        code.name,
+                        code.names.get(name_idx as usize),
+                        demote
+                    );
+                }
+                if demote.len() >= 8 || !demote.insert(name_idx) {
+                    return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+                }
+            }
+            other => return other,
+        }
+    }
+}
+
+fn analyze_once(
+    code: &CodeObject,
+    resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
+    probes: &mut Probes<'_>,
+    demote: &HashSet<u32>,
+) -> Result<TFunc, JitVerdict> {
     // RFC 0070 WS2 — sync generator bodies are admitted (yields become
     // `Yielded` side exits; entry is OSR-only). Coroutines and async
     // generators stay excluded this wave.
@@ -512,7 +579,7 @@ fn analyze_impl(
         return Err(JitVerdict::Trivial);
     }
 
-    let plan = plan_rewrite(code, resolve, probes.obj_global)?;
+    let plan = plan_rewrite(code, resolve, probes.obj_global, demote)?;
 
     let raw = build_blocks(code)?;
     let reachable = reachable_blocks(&raw);
@@ -969,6 +1036,7 @@ fn plan_rewrite(
     code: &CodeObject,
     resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
     obj_global: &mut dyn FnMut(&str) -> Option<(u32, JitType)>,
+    demote: &HashSet<u32>,
 ) -> Result<Plan, JitVerdict> {
     let ins = &code.instructions;
     let n = ins.len();
@@ -1349,7 +1417,25 @@ fn plan_rewrite(
             continue;
         }
         let resolved = plan.globals[&item.arg];
+        // RFC 0076 WS7 — a demoted name (its burned marker escaped
+        // into data flow on an earlier attempt) skips the specialized
+        // resolutions and rides an identity-guarded object pin: the
+        // value is then plain, and a `CALL` on it dispatches through
+        // the opaque-call lane.
         match resolved {
+            _ if demote.contains(&item.arg) => {
+                let name = &code.names[item.arg as usize];
+                let Some((token, lane)) = obj_global(name) else {
+                    return Err(JitVerdict::UnsupportedOpcode("LOAD_GLOBAL"));
+                };
+                plan.obj_globals.insert(item.arg, (token, lane));
+                if !plan.guards.iter().any(|g| g.name == *name) {
+                    plan.guards.push(GlobalGuard {
+                        name: name.clone(),
+                        expect: ResolvedGlobal::ObjGlobal { token, lane },
+                    });
+                }
+            }
             ResolvedGlobal::ConstInt(_)
             | ResolvedGlobal::ConstFloat(_)
             | ResolvedGlobal::ConstBool(_)
@@ -2291,6 +2377,33 @@ impl SE {
     }
 }
 
+/// RFC 0076 WS7 — the verdict for a marker consumed by a value op. A
+/// `LOAD_GLOBAL`-born marker — a burned callee (a Python function, a
+/// class, `len`) or the math module — *demotes*: the retry re-plans
+/// the frame with that name's loads riding identity-guarded object
+/// pins (`PushGlobalObj`), so the value is plain and its uses
+/// (including a `CALL` through the opaque-call lane) admit. Every
+/// other marker kind (bound-method receivers, poison, null, slice,
+/// `None`) keeps the static verdict — their reconstruction metadata
+/// has no object-pin equivalent.
+fn escape_verdict(code: &CodeObject, vs: &[&SE], what: &'static str) -> JitVerdict {
+    for v in vs {
+        if v.is_plain() {
+            continue;
+        }
+        if let Some((name_idx, _)) = v.math_mod {
+            return JitVerdict::CalleeEscapes(name_idx);
+        }
+        let Some(mark) = v.callee else { continue };
+        if let Some(load) = code.instructions.get(mark.load_pc as usize) {
+            if matches!(load.op, OpCode::LoadGlobal) {
+                return JitVerdict::CalleeEscapes(load.arg);
+            }
+        }
+    }
+    JitVerdict::UnsupportedOpcode(what)
+}
+
 /// RFC 0073 WS5 — the keyword names of a recognized `CALL_KW` site.
 /// The plan scan admitted only a non-empty all-`Str` tuple constant.
 fn kw_call_names(code: &CodeObject, cidx: u32) -> Vec<&str> {
@@ -2430,7 +2543,7 @@ fn infer_block(
                 }
             } else {
                 if !v.is_plain() {
-                    return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+                    return Err(escape_verdict(code, &[&v], "CALL (callee escapes)"));
                 }
                 if !ret.saw_scalar {
                     ret.saw_scalar = true;
@@ -2523,7 +2636,7 @@ fn infer_block(
         OpCode::PopJumpIfFalse | OpCode::PopJumpIfTrue => {
             let c = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             if !c.is_plain() {
-                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+                return Err(escape_verdict(code, &[&c], "CALL (callee escapes)"));
             }
             // RFC 0061/0065 WS5 — a pinned value's truth (list length,
             // instance `__bool__`) is not expressible on the pin-index
@@ -2747,6 +2860,17 @@ fn dyn_attr_fallback(
                 set_local(local_types, s, l, changed)?;
                 return Ok(true);
             }
+            // RFC 0076 WS8 — the probe-miss residue: the slot holds a
+            // live value the shape grading couldn't specialize (a
+            // shadowed slot, a version-tag miss on a long-lived
+            // instance, a non-instance receiver). It rides the object
+            // lane and the generic helper. An *unbound* slot falls
+            // through — the miss stays retriable so a later training
+            // point can still specialize.
+            if (probes.obj)(s) {
+                set_local(local_types, s, JitType::Obj, changed)?;
+                return Ok(true);
+            }
         }
     }
     Ok(false)
@@ -2800,6 +2924,13 @@ fn step_abstract(
     }
     match ins.op {
         OpCode::Nop | OpCode::Resume => {}
+        // RFC 0076 WS6 — cell-array setup is a no-op in the VM (cells
+        // are prebuilt at frame creation; `MAKE_CELL` is a bounds
+        // check, `COPY_FREE_VARS` does nothing), so both admit as
+        // nops. `LOAD_CLOSURE`/`MAKE_FUNCTION` still reject, so a
+        // closure-*defining* body only compiles once its function
+        // construction does.
+        OpCode::MakeCell | OpCode::CopyFreeVars => {}
         // RFC 0071 WS4 — a recognized list-loop `GET_ITER`: pop the
         // iterable (it must be, or probe as, a pinned list) into the
         // seq synthetic slot and type the index slot. Anything
@@ -3089,7 +3220,7 @@ fn step_abstract(
                 return Ok(());
             }
             if !v.is_plain() {
-                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+                return Err(escape_verdict(code, &[&v], "CALL (callee escapes)"));
             }
             // RFC 0073 WS1 — track constructor provenance for the
             // attribute-probe fallback.
@@ -3107,12 +3238,48 @@ fn step_abstract(
                 }
             }
         }
+        // RFC 0076 WS6 — closure-cell access. The lane comes from the
+        // embedder's live-cell probe (the unboxed scalars, or the
+        // nullable object lane for any other bound payload); the
+        // runtime helpers re-validate it per access, because cells are
+        // shared mutable state — another closure can rebind between
+        // accesses.
+        OpCode::LoadDeref => {
+            let lane = (probes.cell)(ins.arg)
+                .ok_or(JitVerdict::UnsupportedOpcode("LOAD_DEREF (cell lane)"))?;
+            stack.push(SE::known(lane));
+        }
+        OpCode::StoreDeref => {
+            let v = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
+            if !v.is_plain() {
+                return Err(escape_verdict(code, &[&v], "CALL (callee escapes)"));
+            }
+            let lane = (probes.cell)(ins.arg)
+                .ok_or(JitVerdict::UnsupportedOpcode("STORE_DEREF (cell lane)"))?;
+            if v.ty == lane {
+                // Typed and matching — nothing to learn.
+            } else if v.ty == JitType::Unknown {
+                if let Some(src) = v.src {
+                    // Back-propagate the cell's lane to the untyped
+                    // source local, the `StoreFast` copy discipline.
+                    set_local(local_types, src, lane, changed)?;
+                }
+                // No provenance: transient — a later iteration may
+                // type it; emission bails if it never resolves.
+            } else {
+                // Exact-lane stores only, so every native store keeps
+                // the cell on its observed lane — a `bool` into an
+                // int-observed cell would silently retype the cell for
+                // every other reader's burned `CellGet` lane.
+                return Err(JitVerdict::UnsupportedOpcode("STORE_DEREF (lane mismatch)"));
+            }
+        }
         OpCode::BinaryOp => {
             let kind = bin_kind(ins.arg)?;
             let b = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             let a = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             if !a.is_plain() || !b.is_plain() {
-                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+                return Err(escape_verdict(code, &[&a, &b], "CALL (callee escapes)"));
             }
             // RFC 0071 WS4 — `list * int` repeats a pinned list on the
             // same lane (`[None] * n`, padding shapes).
@@ -3130,7 +3297,7 @@ fn step_abstract(
             let b = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             let a = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             if !a.is_plain() || !b.is_plain() {
-                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+                return Err(escape_verdict(code, &[&a, &b], "CALL (callee escapes)"));
             }
             let (a, b) = resolve_pair(a, b, local_types, changed);
             cmp_check(kind, a.ty, b.ty)?;
@@ -3152,7 +3319,7 @@ fn step_abstract(
                 _ => return Err(JitVerdict::UnsupportedOpcode("IS_OP shape")),
             };
             if !val.is_plain() {
-                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+                return Err(escape_verdict(code, &[&val], "CALL (callee escapes)"));
             }
             match val.ty {
                 JitType::Obj => {}
@@ -3171,22 +3338,26 @@ fn step_abstract(
             let kind = unary_kind(ins.arg)?;
             let a = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             if !a.is_plain() {
-                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+                return Err(escape_verdict(code, &[&a], "CALL (callee escapes)"));
             }
             let res = unary_result_type(kind, a.ty)?;
             stack.push(SE::known(res));
         }
         // CPython 3.13's `TO_BOOL` — the exact-bool coercion inserted
         // before a branch (or `not`) on a non-bool operand. Scalar
-        // lanes only; a transient `Unknown` is tolerated for a later
+        // lanes lower to native negations; RFC 0076 WS8 — the pinned
+        // lanes ride the `wpjit_truth` helper (pure for container
+        // emptiness, the `__bool__`/`__len__` protocol for
+        // instances). A transient `Unknown` is tolerated for a later
         // iteration.
         OpCode::ToBool => {
             let a = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             if !a.is_plain() {
-                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+                return Err(escape_verdict(code, &[&a], "CALL (callee escapes)"));
             }
             if a.ty.is_representable()
                 && !matches!(a.ty, JitType::Int | JitType::Float | JitType::Bool)
+                && !a.ty.is_pinned()
             {
                 return Err(JitVerdict::UnsupportedOpcode("TO_BOOL lane"));
             }
@@ -3211,7 +3382,7 @@ fn step_abstract(
                 return Ok(());
             }
             if !recv.is_plain() {
-                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+                return Err(escape_verdict(code, &[&recv], "CALL (callee escapes)"));
             }
             match infer_load_attr(
                 code,
@@ -3267,7 +3438,7 @@ fn step_abstract(
                 return Ok(());
             }
             if !recv.is_plain() {
-                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+                return Err(escape_verdict(code, &[&recv], "CALL (callee escapes)"));
             }
             // RFC 0073 WS3 — a native `str` method on a pinned
             // exact-`str` receiver: statically resolved (the builtin
@@ -3404,12 +3575,12 @@ fn step_abstract(
             let recv = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             let val = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             if !recv.is_plain() {
-                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+                return Err(escape_verdict(code, &[&recv], "CALL (callee escapes)"));
             }
             // RFC 0070 WS1 — `x.attr = None` is legal on an object-lane
             // site (the unboxed `None` is the machine value `-1`).
             if !val.is_plain() && !val.none_const {
-                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+                return Err(escape_verdict(code, &[&val], "CALL (callee escapes)"));
             }
             match infer_store_attr(code, name, recv, val, local_types, changed, probes, ctor) {
                 Ok(()) => {}
@@ -3436,7 +3607,7 @@ fn step_abstract(
             for _ in 0..argc {
                 let v = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
                 if !v.is_plain() {
-                    return Err(JitVerdict::UnsupportedOpcode("CALL (callee as argument)"));
+                    return Err(escape_verdict(code, &[&v], "CALL (callee as argument)"));
                 }
                 args.push(v);
             }
@@ -3600,7 +3771,7 @@ fn step_abstract(
             for _ in 0..n {
                 let v = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
                 if !v.is_plain() {
-                    return Err(JitVerdict::UnsupportedOpcode("CALL (callee as argument)"));
+                    return Err(escape_verdict(code, &[&v], "CALL (callee as argument)"));
                 }
             }
             let slot = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
@@ -3637,13 +3808,13 @@ fn step_abstract(
                 return Ok(());
             }
             if !v.is_plain() {
-                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+                return Err(escape_verdict(code, &[&v], "CALL (callee escapes)"));
             }
         }
         OpCode::CopyTop => {
             let v = *stack.last().ok_or(JitVerdict::StackUnderflow)?;
             if !v.is_plain() {
-                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+                return Err(escape_verdict(code, &[&v], "CALL (callee escapes)"));
             }
             stack.push(v);
         }
@@ -3658,7 +3829,8 @@ fn step_abstract(
             // A marker's recorded interp-stack position must stay fixed
             // between load and call; reordering it disqualifies.
             if !stack[len - 1].is_plain() || !stack[len - 2].is_plain() {
-                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+                let (a, b) = (stack[len - 1], stack[len - 2]);
+                return Err(escape_verdict(code, &[&a, &b], "CALL (callee escapes)"));
             }
             stack.swap(len - 1, len - 2);
         }
@@ -3672,7 +3844,7 @@ fn step_abstract(
             // marker: the result is a fresh list on the *same* lane.
             if idx.slice.is_some() {
                 if !cont.is_plain() {
-                    return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+                    return Err(escape_verdict(code, &[&cont], "CALL (callee escapes)"));
                 }
                 // RFC 0074 WS5 — `s[a:b]` on a pinned exact `str`
                 // (unit step): a fresh `str` pin.
@@ -3688,7 +3860,11 @@ fn step_abstract(
                 return Ok(());
             }
             if !idx.is_plain() || !cont.is_plain() {
-                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+                return Err(escape_verdict(
+                    code,
+                    &[&idx, &cont],
+                    "CALL (callee escapes)",
+                ));
             }
             // RFC 0073 WS2 — dict subscript, resolved *before* the int
             // index check (a str key must not be forced into the int
@@ -3784,7 +3960,11 @@ fn step_abstract(
             }
             let k = ins.arg as usize;
             if k == 0 {
-                return Err(JitVerdict::UnsupportedOpcode("BUILD_LIST (shape)"));
+                // RFC 0076 WS8 — the `[]` literal: an empty list on the
+                // object-element lane (`self.xs = []` prologues, list
+                // accumulators the appends type later).
+                stack.push(SE::known(JitType::ListObj));
+                return Ok(());
             }
             let base = stack
                 .len()
@@ -3799,7 +3979,7 @@ fn step_abstract(
             let mut mixed = false;
             for e in &elems {
                 if !e.is_plain() {
-                    return Err(JitVerdict::UnsupportedOpcode("BUILD_LIST (marker element)"));
+                    return Err(escape_verdict(code, &[e], "BUILD_LIST (marker element)"));
                 }
                 if !e.ty.is_representable() {
                     // Transient — a later iteration may type it.
@@ -3836,9 +4016,25 @@ fn step_abstract(
                 .ok_or(JitVerdict::StackUnderflow)?;
             for e in &stack[base..] {
                 if !e.is_plain() {
-                    return Err(JitVerdict::UnsupportedOpcode(
-                        "BUILD_TUPLE (marker element)",
-                    ));
+                    return Err(escape_verdict(code, &[e], "BUILD_TUPLE (marker element)"));
+                }
+            }
+            stack.truncate(base);
+            stack.push(SE::known(JitType::Obj));
+        }
+        // RFC 0076 WS8 — `BUILD_SET k`: elements box per their own
+        // lanes like a tuple literal; the fresh set pins on the
+        // object lane (construction admits at runtime only when no
+        // element's hashing runs Python).
+        OpCode::BuildSet => {
+            let k = ins.arg as usize;
+            let base = stack
+                .len()
+                .checked_sub(k)
+                .ok_or(JitVerdict::StackUnderflow)?;
+            for e in &stack[base..] {
+                if !e.is_plain() {
+                    return Err(escape_verdict(code, &[e], "BUILD_SET (marker element)"));
                 }
             }
             stack.truncate(base);
@@ -3897,7 +4093,7 @@ fn step_abstract(
                 .ok_or(JitVerdict::StackUnderflow)?;
             for (j, e) in stack[base..].iter().enumerate() {
                 if !e.is_plain() {
-                    return Err(JitVerdict::UnsupportedOpcode("BUILD_MAP (marker element)"));
+                    return Err(escape_verdict(code, &[e], "BUILD_MAP (marker element)"));
                 }
                 // Even offsets are keys.
                 if j % 2 == 0
@@ -3951,7 +4147,11 @@ fn step_abstract(
             let cont = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             let val = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             if !idx.is_plain() || !cont.is_plain() || !val.is_plain() {
-                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+                return Err(escape_verdict(
+                    code,
+                    &[&idx, &cont, &val],
+                    "CALL (callee escapes)",
+                ));
             }
             // RFC 0073 WS2 — dict store: the key lane comes from the
             // key operand (or the trained lane), the value lane from
@@ -3976,22 +4176,43 @@ fn step_abstract(
                 }
             }
         }
-        // RFC 0073 WS2 — `k in d` / `k not in d` on an exact dict
-        // (the only membership container this wave). A container that
-        // never resolves to a dict rejects at emission.
+        // RFC 0073 WS2 — `k in d` / `k not in d` on an exact dict.
+        // RFC 0076 WS8 — any other *pinned* container (a set through
+        // the object lane, a list, a str, an instance) rides the
+        // generic membership helper. A container that never resolves
+        // rejects at emission.
         OpCode::ContainsOp => {
             let cont = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             let item = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
             if !cont.is_plain() || !item.is_plain() {
-                return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
+                return Err(escape_verdict(
+                    code,
+                    &[&cont, &item],
+                    "CALL (callee escapes)",
+                ));
             }
             if cont.ty.is_representable() && cont.ty != JitType::Dict {
-                return Err(JitVerdict::UnsupportedOpcode(
-                    "CONTAINS_OP (container lane)",
-                ));
+                if !cont.ty.is_pinned() {
+                    return Err(JitVerdict::UnsupportedOpcode(
+                        "CONTAINS_OP (container lane)",
+                    ));
+                }
+                // The generic lane: any plain item, `Bool` result.
+                stack.push(SE::known(JitType::Bool));
+                return Ok(());
             }
             if let Some((pk, _)) = resolve_dict_container(&cont, local_types, changed, probes)? {
                 check_dict_key(&item, pk, local_types, changed)?;
+            } else if !cont.ty.is_representable() {
+                // RFC 0076 WS8 — an untyped local container that isn't
+                // a dict (a set, a tuple): a live value pins the slot
+                // to the object lane and the site rides the generic
+                // membership helper; an unbound slot stays transient.
+                if let Some(s) = cont.src {
+                    if (probes.obj)(s) {
+                        set_local(local_types, s, JitType::Obj, changed)?;
+                    }
+                }
             }
             stack.push(SE::known(JitType::Bool));
         }
@@ -5147,6 +5368,8 @@ fn emit_instr(
     }
     match ins.op {
         OpCode::Nop | OpCode::Resume => {}
+        // RFC 0076 WS6 — no-op cell-array setup (see inference pass).
+        OpCode::MakeCell | OpCode::CopyFreeVars => {}
         // RFC 0071 WS4 — a recognized list-loop `GET_ITER`: capture
         // the pinned list into the seq synthetic slot and zero the
         // index slot (inference already typed both).
@@ -5162,25 +5385,24 @@ fn emit_instr(
                 let v = stack.pop().ok_or(JitVerdict::StackUnderflow)?;
                 // RFC 0073 WS2 — a pinned exact dict materializes its
                 // real `DictKeys` iterator (the same object the
-                // interpreter's `GET_ITER` builds) into the iter slot;
-                // everything else is the identity-iterable capture.
+                // interpreter's `GET_ITER` builds) into the iter slot.
                 // RFC 0074 WS3 — a tuple-target loop takes the
                 // *generic* materializing capture (dict views,
                 // `enumerate`/`zip` objects, lists of pairs all
-                // admit).
-                let op = if plan.pair_headers.contains_key(&(i + 1)) {
-                    TOp::IterCapture {
-                        iter_slot: seq_slot,
-                        materialize: true,
-                    }
-                } else if v.ty == JitType::Dict {
+                // admit). RFC 0076 WS8 — the single-target loop
+                // materializes too: `iter(x)` is the identity for a
+                // generator/iterator operand (the historic capture)
+                // and builds the real iterator for any other
+                // non-Python-dispatching iterable on the object lane
+                // (a set, a tuple), instead of deopting per entry.
+                let op = if v.ty == JitType::Dict {
                     TOp::DictIterNew {
                         iter_slot: seq_slot,
                     }
                 } else {
                     TOp::IterCapture {
                         iter_slot: seq_slot,
-                        materialize: false,
+                        materialize: true,
                     }
                 };
                 push(op, None, stack, stmts);
@@ -5330,6 +5552,28 @@ fn emit_instr(
             pop_val(stack)?;
             push(TOp::StoreLocal(ins.arg), None, stack, stmts);
         }
+        // RFC 0076 WS6 — closure-cell access. The lane was probed
+        // (and stability-checked) by the fixpoint; re-probe here so
+        // the burned lane matches the converged typing.
+        OpCode::LoadDeref => {
+            let lane = (probes.cell)(ins.arg)
+                .ok_or(JitVerdict::UnsupportedOpcode("LOAD_DEREF (cell lane)"))?;
+            push(
+                TOp::CellGet { idx: ins.arg, lane },
+                Some(lane),
+                stack,
+                stmts,
+            );
+        }
+        OpCode::StoreDeref => {
+            let lane = (probes.cell)(ins.arg)
+                .ok_or(JitVerdict::UnsupportedOpcode("STORE_DEREF (cell lane)"))?;
+            let v = pop_val(stack)?;
+            if v != lane {
+                return Err(JitVerdict::UnsupportedOpcode("STORE_DEREF (lane mismatch)"));
+            }
+            push(TOp::CellSet { idx: ins.arg, lane }, None, stack, stmts);
+        }
         OpCode::BinaryOp => {
             let kind = bin_kind(ins.arg)?;
             let b = pop_val(stack)?;
@@ -5467,7 +5711,8 @@ fn emit_instr(
         // CPython 3.13's `TO_BOOL`: `bool` is the identity;
         // `int`/`float` lower as a double negation (`x != 0`) on the
         // existing `Not` ops — two cheap native instructions, no new
-        // IR.
+        // IR. RFC 0076 WS8 — the pinned lanes ride the `wpjit_truth`
+        // helper (see [`TOp::Truth`]).
         OpCode::ToBool => {
             let a = pop_val(stack)?;
             match a {
@@ -5481,6 +5726,9 @@ fn emit_instr(
                     push(TOp::FloatNot, Some(JitType::Bool), stack, stmts);
                     stack.pop();
                     push(TOp::IntNot, Some(JitType::Bool), stack, stmts);
+                }
+                t if t.is_pinned() => {
+                    push(TOp::Truth, Some(JitType::Bool), stack, stmts);
                 }
                 _ => return Err(JitVerdict::UnsupportedOpcode("TO_BOOL lane")),
             }
@@ -6452,7 +6700,19 @@ fn emit_instr(
             }
             let k = ins.arg as usize;
             if k == 0 {
-                return Err(JitVerdict::UnsupportedOpcode("BUILD_LIST (shape)"));
+                // RFC 0076 WS8 — the `[]` literal (see inference).
+                push(
+                    TOp::BuildList {
+                        n: 0,
+                        elem: JitType::Obj,
+                        none_fill: false,
+                        mixed: false,
+                    },
+                    Some(JitType::ListObj),
+                    stack,
+                    stmts,
+                );
+                return Ok(());
             }
             let base = stack
                 .len()
@@ -6531,6 +6791,33 @@ fn emit_instr(
             *max_call_args = (*max_call_args).max(k as u32);
             push(
                 TOp::BuildTuple { n: k as u32 },
+                Some(JitType::Obj),
+                stack,
+                stmts,
+            );
+        }
+        // RFC 0076 WS8 — `BUILD_SET k`: per-element tags, object-lane
+        // pin result. The helper admits only elements whose hashing
+        // never runs Python; anything else deopts back to the
+        // interpreter's `BUILD_SET`.
+        OpCode::BuildSet => {
+            let k = ins.arg as usize;
+            let base = stack
+                .len()
+                .checked_sub(k)
+                .ok_or(JitVerdict::StackUnderflow)?;
+            for e in &stack[base..] {
+                if !e.is_plain() {
+                    return Err(JitVerdict::UnsupportedOpcode("BUILD_SET (marker element)"));
+                }
+                if !e.ty.is_representable() {
+                    return Err(JitVerdict::TypeUnknown);
+                }
+            }
+            stack.truncate(base);
+            *max_call_args = (*max_call_args).max(k as u32);
+            push(
+                TOp::BuildSet { n: k as u32 },
                 Some(JitType::Obj),
                 stack,
                 stmts,
@@ -6797,14 +7084,27 @@ fn emit_instr(
             push(TOp::ListSet, None, stack, stmts);
         }
         // RFC 0073 WS2 — `k in d` / `k not in d` on a pinned exact
-        // dict (the only membership container this wave).
+        // dict. RFC 0076 WS8 — any other pinned container rides the
+        // generic membership helper (`ContainsDyn`).
         OpCode::ContainsOp => {
             let cont = pop_val(stack)?;
             let key = pop_val(stack)?;
             if cont != JitType::Dict {
-                return Err(JitVerdict::UnsupportedOpcode(
-                    "CONTAINS_OP (container lane)",
-                ));
+                if !cont.is_pinned() {
+                    return Err(JitVerdict::UnsupportedOpcode(
+                        "CONTAINS_OP (container lane)",
+                    ));
+                }
+                *max_call_args = (*max_call_args).max(1);
+                push(
+                    TOp::ContainsDyn {
+                        negate: ins.arg == 1,
+                    },
+                    Some(JitType::Bool),
+                    stack,
+                    stmts,
+                );
+                return Ok(());
             }
             if !matches!(key, JitType::Int | JitType::Str) {
                 return Err(JitVerdict::UnsupportedOpcode("dict key lane"));

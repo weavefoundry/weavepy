@@ -193,32 +193,38 @@ pub fn is_native_descr_accessor(b: &Rc<crate::object::BuiltinFn>) -> bool {
     NATIVE_DESCR_ACCESSOR.read().contains(&k)
 }
 
-thread_local! {
-    /// Writable `__module__` for a `builtin_function_or_method` (RFC 0046,
-    /// wave 4). CPython's `PyCFunctionObject` exposes `m_module` as a
-    /// writable member, and extensions assign it at import time — numpy's
-    /// `multiarray.py` does `_reconstruct.__module__ = 'numpy._core.multiarray'`
-    /// so the reconstructor pickles by reference. We store the assigned
-    /// object keyed by the builtin's `Rc` identity (stable for the process
-    /// lifetime) and let [`module_of`]'s static attribution remain the
-    /// fallback. Thread-local: extension import runs on one interpreter
-    /// thread, matching [`DESCR_META`].
-    static BUILTIN_WRITABLE_MODULE: RefCell<HashMap<usize, Object>> =
-        RefCell::new(HashMap::new());
-}
+/// Writable `__module__` for a `builtin_function_or_method` (RFC 0046,
+/// wave 4). CPython's `PyCFunctionObject` exposes `m_module` as a
+/// writable member, and extensions assign it at import time — numpy's
+/// `multiarray.py` does `_reconstruct.__module__ = 'numpy._core.multiarray'`
+/// so the reconstructor pickles by reference. We store the assigned
+/// object keyed by the builtin's `Rc` identity (stable for the process
+/// lifetime) and let [`module_of`]'s static attribution remain the
+/// fallback.
+///
+/// PROCESS-GLOBAL for the same reason as [`BUILTIN_MODULE`]: the builtin
+/// crosses threads through the module cache, and pickling an ndarray from
+/// a `threading.Thread` (a `multiprocessing.Pool` task feeder — scipy's
+/// fft `test_multiprocess`) reads `_reconstruct.__module__` from a thread
+/// that never ran the import-time assignment. A thread-local map made
+/// `whichmodule` fall back to the extension's short `m_name` there,
+/// so `pickle.dumps` failed with "it's not found as
+/// `_multiarray_umath._reconstruct`" (RFC 0076 WS2).
+static BUILTIN_WRITABLE_MODULE: LazyLock<parking_lot::RwLock<HashMap<usize, Object>>> =
+    LazyLock::new(|| parking_lot::RwLock::new(HashMap::new()));
 
 /// Record a runtime `__module__` assignment on a builtin function.
 /// Returns `false` if `obj` is not a taggable representation.
 pub fn set_builtin_module(obj: &Object, value: Object) -> bool {
     let Some(k) = key(obj) else { return false };
-    BUILTIN_WRITABLE_MODULE.with(|m| m.borrow_mut().insert(k, value));
+    BUILTIN_WRITABLE_MODULE.write().insert(k, value);
     true
 }
 
 /// A runtime `__module__` assigned via [`set_builtin_module`], if any.
 pub fn builtin_module_value(obj: &Object) -> Option<Object> {
     let k = key(obj)?;
-    BUILTIN_WRITABLE_MODULE.with(|m| m.borrow().get(&k).cloned())
+    BUILTIN_WRITABLE_MODULE.read().get(&k).cloned()
 }
 
 /// The pointer key for a descriptor object, or `None` if `obj` is not a

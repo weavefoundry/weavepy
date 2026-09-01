@@ -949,15 +949,18 @@ class PyCSimpleType(_CDataMeta):
 
 
 def _simple_param(cls, code, value):
+    # A bytes/str argument marshals to a pointer that CPython aims *into
+    # the object's own buffer* — valid for the object's lifetime, and
+    # callees legally stash it past the call (lxml compares a capsule
+    # context set by an earlier PyCapsule_SetContext(cap, b"...")).
+    # `intern_buffer` returns a process-lifetime deduplicated copy, so
+    # the pointer never dangles (RFC 0076 WS3).
     if code == "z":
         if value is None:
             return None
         if isinstance(value, bytes):
             parg = _new_parg("z", value, value)
-            shadow = bytearray(value)
-            shadow.append(0)
-            parg._shadow = shadow
-            parg._value = _nat.addressof_buffer(shadow)
+            parg._value = _nat.intern_buffer(value + b"\0")
             return parg
         if isinstance(value, _SimpleCData) and \
                 _info_req(type(value)).code in ("z", "P"):
@@ -970,8 +973,7 @@ def _simple_param(cls, code, value):
             return None
         if isinstance(value, str):
             parg = _new_parg("Z", value, value)
-            parg._shadow = _wchar_buffer(value)
-            parg._value = _nat.addressof_buffer(parg._shadow)
+            parg._value = _nat.intern_buffer(bytes(_wchar_buffer(value)))
             return parg
         if isinstance(value, _SimpleCData) and \
                 _info_req(type(value)).code in ("Z", "P"):
@@ -986,15 +988,11 @@ def _simple_param(cls, code, value):
             return _new_parg("P", value, value)
         if isinstance(value, bytes):
             parg = _new_parg("z", value, value)
-            shadow = bytearray(value)
-            shadow.append(0)
-            parg._shadow = shadow
-            parg._value = _nat.addressof_buffer(shadow)
+            parg._value = _nat.intern_buffer(value + b"\0")
             return parg
         if isinstance(value, str):
             parg = _new_parg("Z", value, value)
-            parg._shadow = _wchar_buffer(value)
-            parg._value = _nat.addressof_buffer(parg._shadow)
+            parg._value = _nat.intern_buffer(bytes(_wchar_buffer(value)))
             return parg
         if isinstance(value, _CArgObject):
             return value

@@ -558,6 +558,23 @@ pub enum ExprKind {
         /// `None` for `{x}`; `Some(JoinedStr(...))` for `{x:spec}`.
         format_spec: Option<Box<Expr>>,
     },
+    /// PEP 750 t-string body (`-X lang=next` preview, RFC 0076 WS15) — a
+    /// list of `Constant(Str)` and `Interpolation` nodes, mirroring
+    /// CPython 3.14's `TemplateStr`.
+    TemplateStr(Vec<Expr>),
+    /// One `{value!conv:spec}` inside a t-string (CPython 3.14
+    /// `Interpolation`). Unlike `FormattedValue`, the verbatim source
+    /// text of the expression is kept for `Interpolation.expression`.
+    Interpolation {
+        value: Box<Expr>,
+        /// Source text of the interpolated expression.
+        text: String,
+        /// `-1` (none), `'s'`, `'r'`, or `'a'`.
+        conversion: i32,
+        /// `None` for `{x}`; `Some(JoinedStr(...))` for `{x:spec}` —
+        /// eagerly evaluated to a `str` at template construction time.
+        format_spec: Option<Box<Expr>>,
+    },
 }
 
 /// CPython's `_PyPegen_get_expr_name`: how an expression is described in
@@ -589,6 +606,7 @@ pub fn expr_name(expr: &Expr) -> &'static str {
         ExprKind::SetComp { .. } => "set comprehension",
         ExprKind::DictComp { .. } => "dict comprehension",
         ExprKind::JoinedStr(_) | ExprKind::FormattedValue { .. } => "f-string expression",
+        ExprKind::TemplateStr(_) | ExprKind::Interpolation { .. } => "t-string expression",
         ExprKind::Compare { .. } => "comparison",
         ExprKind::IfExp { .. } => "conditional expression",
         ExprKind::NamedExpr { .. } => "named expression",
@@ -1693,6 +1711,35 @@ fn dump_expr(out: &mut String, e: &Expr, depth: usize) {
         } => {
             out.push_str("FormattedValue(value=");
             dump_expr(out, value, depth);
+            out.push_str(", conversion=");
+            out.push_str(&conversion.to_string());
+            out.push_str(", format_spec=");
+            match format_spec {
+                Some(s) => dump_expr(out, s, depth),
+                None => out.push_str("None"),
+            }
+            out.push(')');
+        }
+        E::TemplateStr(parts) => {
+            out.push_str("TemplateStr(values=[");
+            for (i, p) in parts.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                dump_expr(out, p, depth);
+            }
+            out.push_str("])");
+        }
+        E::Interpolation {
+            value,
+            text,
+            conversion,
+            format_spec,
+        } => {
+            out.push_str("Interpolation(value=");
+            dump_expr(out, value, depth);
+            out.push_str(", str=");
+            dump_constant(out, &Constant::Str(text.clone()));
             out.push_str(", conversion=");
             out.push_str(&conversion.to_string());
             out.push_str(", format_spec=");

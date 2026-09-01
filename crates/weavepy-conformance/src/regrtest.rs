@@ -391,6 +391,14 @@ pub fn discover_with(
         }
     }
 
+    // RFC 0076 WS12: a lane driven purely by its expectations file
+    // (the `--gil0` free-threaded lane) drops everything unkeyed.
+    if opts.only_expected {
+        if let Some(exp) = expectations {
+            out.retain(|f| exp.tests.contains_key(&f.label));
+        }
+    }
+
     out.sort_by(|a, b| a.label.cmp(&b.label));
     out.dedup_by(|a, b| a.label == b.label);
     out
@@ -456,6 +464,11 @@ pub struct DiscoveryOptions {
     /// directory is scheduled (subject to expectations). Defaults to
     /// `false` so the harness stays predictable.
     pub include_all_cpython: bool,
+    /// RFC 0076 WS12: schedule *only* the labels keyed in the
+    /// expectations file — bundled and CPython alike. This is how the
+    /// free-threaded (`--gil0`) lane stays a small curated set rather
+    /// than re-running the whole baseline under `-X gil=0`.
+    pub only_expected: bool,
 }
 
 /// Curated CPython regression tests we attempt. Add to this list (and
@@ -686,6 +699,12 @@ pub struct RunnerOptions {
     /// When `true`, the per-test result is printed to stderr as it
     /// completes (useful while a long CPython run is in flight).
     pub stream_results: bool,
+    /// RFC 0076 WS12: interpreter arguments inserted before the test
+    /// script/`-c` payload in [`ExecutionMode::Subprocess`] children —
+    /// the free-threaded lane passes `["-X", "gil=0"]`. Ignored by
+    /// [`ExecutionMode::InProcess`] (the mode is process-wide and
+    /// decided at startup, so it cannot apply in-process).
+    pub interpreter_args: Vec<String>,
 }
 
 impl Default for RunnerOptions {
@@ -696,6 +715,7 @@ impl Default for RunnerOptions {
             workers: 1,
             weavepy_binary: None,
             stream_results: false,
+            interpreter_args: Vec::new(),
         }
     }
 }
@@ -1275,6 +1295,9 @@ fn run_subprocess(
     }
     let start = Instant::now();
     let mut cmd = std::process::Command::new(&weavepy_bin);
+    // RFC 0076 WS12: lane-wide interpreter flags (`-X gil=0`) precede
+    // the payload.
+    cmd.args(&runner.interpreter_args);
     match libregrtest_bootstrap(file) {
         Some(bootstrap) => {
             cmd.arg("-c").arg(bootstrap);

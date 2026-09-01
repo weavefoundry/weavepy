@@ -881,7 +881,9 @@ impl<'src> Scanner<'src> {
         // terminate the literal. We still emit a single `String` token
         // (the parser re-scans the interior); this just finds the true
         // extent. Non-f strings keep the simple fast paths below.
-        if prefix.fstring {
+        // t-strings (PEP 750, `-X lang=next`) share the same field
+        // structure and reuse the scan unchanged.
+        if prefix.interpolated() {
             if triple {
                 self.pos += 3;
             } else {
@@ -1350,7 +1352,7 @@ impl<'src> Scanner<'src> {
         } else {
             self.pos += 1;
         }
-        if prefix.fstring {
+        if prefix.interpolated() {
             let mut warned = false;
             return self.scan_fstring_extent(self.pos, quote, triple, prefix.raw, &mut warned);
         }

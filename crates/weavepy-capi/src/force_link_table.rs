@@ -38,11 +38,13 @@ use crate::monitoring;
 use crate::mypyc_tail;
 use crate::numbers;
 use crate::object;
+use crate::pep741;
 use crate::pystate;
 use crate::pythonrun;
 use crate::singletons;
 use crate::slice;
 use crate::strings;
+use crate::torch_tail;
 use crate::types;
 use crate::vectorcall;
 use crate::wave4;
@@ -545,6 +547,24 @@ static FORCE_LINK: &[FnPtr] = &[
     addr!(embed::Py_NewInterpreter),
     addr!(embed::Py_NewInterpreterFromConfig),
     addr!(embed::Py_EndInterpreter),
+    // pep741.rs (RFC 0076 WS14 — PEP 741)
+    addr!(pep741::PyInitConfig_Create),
+    addr!(pep741::PyInitConfig_Free),
+    addr!(pep741::PyInitConfig_GetError),
+    addr!(pep741::PyInitConfig_GetExitCode),
+    addr!(pep741::PyInitConfig_HasOption),
+    addr!(pep741::PyInitConfig_GetInt),
+    addr!(pep741::PyInitConfig_GetStr),
+    addr!(pep741::PyInitConfig_GetStrList),
+    addr!(pep741::PyInitConfig_FreeStrList),
+    addr!(pep741::PyInitConfig_SetInt),
+    addr!(pep741::PyInitConfig_SetStr),
+    addr!(pep741::PyInitConfig_SetStrList),
+    addr!(pep741::PyInitConfig_AddModule),
+    addr!(pep741::Py_InitializeFromInitConfig),
+    addr!(pep741::PyConfig_Get),
+    addr!(pep741::PyConfig_GetInt),
+    addr!(pep741::PyConfig_Names),
     // initconfig.rs (RFC 0075 — PEP 587)
     addr!(initconfig::PyStatus_Ok),
     addr!(initconfig::PyStatus_Error),
@@ -1232,6 +1252,42 @@ static FORCE_LINK: &[FnPtr] = &[
     addr!(strings::PyUnicode_IsIdentifier),
     addr!(strings::PyUnicode_RichCompare),
     addr!(strings::PyUnicode_Splitlines),
+    // torch_tail — the surface `libtorch_python` binds at dlopen
+    // (RFC 0076 WS5): struct sequences, function/code introspection,
+    // dict watchers, code-extra slots, frame-eval hooks, thread walk.
+    addr!(torch_tail::PyLong_AsSize_t),
+    addr!(torch_tail::PyErr_WarnExplicit),
+    addr!(torch_tail::PyEval_GetFrame),
+    addr!(torch_tail::PyEval_SetProfileAllThreads),
+    addr!(torch_tail::PyFrame_GetLasti),
+    addr!(torch_tail::PyFunction_GetCode),
+    addr!(torch_tail::PyFunction_GetClosure),
+    addr!(torch_tail::PyFunction_GetDefaults),
+    addr!(torch_tail::PyFunction_GetKwDefaults),
+    addr!(torch_tail::PyCode_Addr2Line),
+    addr!(torch_tail::PyCode_GetVarnames),
+    addr!(torch_tail::PyDict_AddWatcher),
+    addr!(torch_tail::PyDict_Watch),
+    addr!(torch_tail::PyDict_Unwatch),
+    addr!(torch_tail::PyUnstable_Eval_RequestCodeExtraIndex),
+    addr!(torch_tail::PyUnstable_Code_GetExtra),
+    addr!(torch_tail::PyUnstable_Code_SetExtra),
+    addr!(torch_tail::_PyEval_EvalFrameDefault),
+    addr!(torch_tail::_PyInterpreterState_GetEvalFrameFunc),
+    addr!(torch_tail::_PyInterpreterState_SetEvalFrameFunc),
+    addr!(torch_tail::PyInterpreterState_ThreadHead),
+    addr!(torch_tail::PyThreadState_Next),
+    addr!(torch_tail::_PyThreadState_GetCurrent),
+    addr!(torch_tail::PyObject_GetArenaAllocator),
+    addr!(torch_tail::PyStructSequence_InitType),
+    addr!(torch_tail::PyStructSequence_InitType2),
+    addr!(torch_tail::PyStructSequence_New),
+    addr!(torch_tail::PyStructSequence_SetItem),
+    addr!(torch_tail::PyStructSequence_GetItem),
+    addr_static!(types::PyCell_Type),
+    addr_static!(types::_PyWeakref_RefType),
+    addr_static!(types::_PyWeakref_ProxyType),
+    addr_static!(types::_PyWeakref_CallableProxyType),
 ];
 
 /// Hand-out of the table to ensure the static is referenced from

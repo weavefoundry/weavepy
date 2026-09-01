@@ -78,6 +78,14 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         reg!("xor", |a| binary(a, BinOpKind::BitXor, "xor"));
         reg!("matmul", |a| binary(a, BinOpKind::MatMult, "matmul"));
 
+        // -- sequence concatenation ---------------------------------------
+        // CPython's `_operator.concat` is `PySequence_Concat` — the *left
+        // slot* protocol, not the expression `a + b`: no `__radd__`
+        // fallback, and a C type's real `sq_concat` runs even when it
+        // only exists to raise (numpy's `array_concat`; RFC 0076 WS1,
+        // test_shape_base.test_operator_concat).
+        reg!("concat", op_concat);
+
         // -- in-place variants ------------------------------------------
         reg!("iadd", |a| inplace(a, BinOpKind::Add, "iadd"));
         reg!("isub", |a| inplace(a, BinOpKind::Sub, "isub"));
@@ -287,6 +295,36 @@ fn op_not(args: &[Object]) -> Result<Object, RuntimeError> {
 fn op_truth(args: &[Object]) -> Result<Object, RuntimeError> {
     let a = one_arg(args, "truth")?;
     Ok(Object::Bool(with_interp(|interp| interp.op_truth(a))?))
+}
+
+/// `operator.concat` — `PySequence_Concat` semantics (see the `reg!`
+/// site). Native sequences take the VM's left-slot concat directly;
+/// C-typed operands (foreign objects, instances wearing a real C type)
+/// go through the cpyext bridge so an extension's `sq_concat` slot
+/// runs; everything else is CPython's "can't be concatenated".
+fn op_concat(args: &[Object]) -> Result<Object, RuntimeError> {
+    let (a, b) = two_args(args, "concat")?;
+    match a {
+        Object::List(_)
+        | Object::Tuple(_)
+        | Object::Str(_)
+        | Object::WStr(_)
+        | Object::Bytes(_)
+        | Object::ByteArray(_) => crate::sequence_concat_native(a, b),
+        Object::Foreign(_) | Object::Instance(_) if crate::foreign::has_seq_concat() => {
+            crate::foreign::seq_concat(a, b)
+        }
+        // No bridge (pure-VM build): a user class defining `__getitem__`
+        // is a sequence, so the `nb_add` fallback applies; anything else
+        // can't be concatenated (CPython `PySequence_Concat`'s tail).
+        Object::Instance(inst) if inst.cls().lookup("__getitem__").is_some() => {
+            with_interp(|interp| interp.op_binary(a, b, BinOpKind::Add))
+        }
+        _ => Err(type_error(format!(
+            "'{}' object can't be concatenated",
+            a.type_name_owned()
+        ))),
+    }
 }
 
 fn op_is(args: &[Object]) -> Result<Object, RuntimeError> {

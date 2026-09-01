@@ -110,4 +110,61 @@ fn embedding_lifecycle_end_to_end() {
     assert_eq!(run_simple("import sys; n = len(sys.argv)"), 0);
     assert!(eval_int("n").is_some(), "sys.argv populated from config");
     assert_eq!(unsafe { Py_FinalizeEx() }, 0);
+
+    // --- Round 4: PEP 741 PyInitConfig (RFC 0076 WS14) --------------
+    unsafe {
+        use weavepy_capi::pep741::{
+            PyConfig_GetInt as RtGetInt, PyConfig_Names, PyInitConfig_Create, PyInitConfig_Free,
+            PyInitConfig_GetError, PyInitConfig_SetInt, PyInitConfig_SetStrList,
+            Py_InitializeFromInitConfig,
+        };
+        let config = PyInitConfig_Create();
+        assert!(!config.is_null());
+        // Isolated defaults + explicit argv, the canonical PEP 741 recipe.
+        assert_eq!(PyInitConfig_SetInt(config, c"verbose".as_ptr(), 0), 0);
+        let argv0 = CString::new("pep741-embedder").unwrap();
+        let argv1 = CString::new("tail").unwrap();
+        let argv = [argv0.as_ptr(), argv1.as_ptr()];
+        assert_eq!(
+            PyInitConfig_SetStrList(config, c"argv".as_ptr(), 2, argv.as_ptr()),
+            0
+        );
+        if Py_InitializeFromInitConfig(config) != 0 {
+            let mut msg: *const std::os::raw::c_char = std::ptr::null();
+            PyInitConfig_GetError(config, &raw mut msg);
+            let text = if msg.is_null() {
+                "<no message>".to_owned()
+            } else {
+                std::ffi::CStr::from_ptr(msg).to_string_lossy().into_owned()
+            };
+            panic!("Py_InitializeFromInitConfig failed: {text}");
+        }
+        assert_eq!(Py_IsInitialized(), 1);
+        assert_eq!(run_simple("import sys; m = len(sys.argv)"), 0);
+        assert_eq!(eval_int("m"), Some(2), "PEP 741 argv reaches sys.argv");
+
+        // Runtime read surface.
+        let mut gil: c_int = -1;
+        assert_eq!(RtGetInt(c"gil".as_ptr(), &raw mut gil), 0);
+        assert_eq!(gil, 1, "default build runs with the GIL");
+        let names = PyConfig_Names();
+        assert!(!names.is_null(), "PyConfig_Names returns a set");
+        let has_argv = {
+            let n = weavepy_capi::containers::PySet_Size(names);
+            assert!(n > 40, "names cover the full option table (got {n})");
+            let argv_str =
+                weavepy_capi::object::into_owned(weavepy_vm::object::Object::from_static("argv"));
+            let hit = weavepy_capi::containers::PySet_Contains(names, argv_str) == 1;
+            weavepy_capi::object::Py_DecRef(argv_str);
+            hit
+        };
+        assert!(has_argv, "\"argv\" is an option name");
+        weavepy_capi::object::Py_DecRef(names);
+        let argv_obj = weavepy_capi::pep741::PyConfig_Get(c"argv".as_ptr());
+        assert!(!argv_obj.is_null(), "PyConfig_Get(argv) works at runtime");
+        weavepy_capi::object::Py_DecRef(argv_obj);
+
+        PyInitConfig_Free(config);
+        assert_eq!(Py_FinalizeEx(), 0);
+    }
 }

@@ -1000,6 +1000,31 @@ impl Builder<'_> {
                 sp,
                 self.lm,
             ),
+            // PEP 750 t-strings (`-X lang=next`): CPython 3.14 node
+            // shapes (`TemplateStr(values)`, `Interpolation(value, str,
+            // conversion, format_spec)`).
+            E::TemplateStr(parts) => node(
+                "TemplateStr",
+                vec![("values", self.joinedstr_values(parts))],
+                sp,
+                self.lm,
+            ),
+            E::Interpolation {
+                value,
+                text,
+                conversion,
+                format_spec,
+            } => node(
+                "Interpolation",
+                vec![
+                    ("value", self.expr(value)),
+                    ("str", Object::from_str(text.clone())),
+                    ("conversion", Object::Int(i64::from(*conversion))),
+                    ("format_spec", self.opt_boxed(format_spec.as_deref())),
+                ],
+                sp,
+                self.lm,
+            ),
         }
     }
 

@@ -355,6 +355,10 @@ fn plain_effect(code: &CodeObject, i: usize, ins: Instruction) -> Option<(u32, u
         // Pops [sub_iter, last_sent, exc], pushes [None, value].
         O::CleanupThrow => (3, 2),
         O::StopIterationError | O::AsyncGenWrap => (1, 1),
+        // PEP 750 t-strings: value + expr text (+ spec when bit 2 set)
+        // -> Interpolation; strings + interpolations tuples -> Template.
+        O::BuildInterpolation => (if arg & 0x04 != 0 { 3 } else { 2 }, 1),
+        O::BuildTemplate => (2, 1),
         O::DeleteFast | O::DeleteGlobal | O::DeleteName | O::DeleteDeref => (0, 0),
         O::LoadConst
         | O::LoadName

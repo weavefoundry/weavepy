@@ -3508,16 +3508,40 @@ fn property_init_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Obje
 /// `property_descr_get`: class access (obj is None) returns the property
 /// itself; instance access invokes `fget`.
 fn property_dunder_get(args: &[Object]) -> Result<Object, RuntimeError> {
-    let p = property_self(args, "__get__")?;
     match args.get(1) {
         Some(obj) if !matches!(obj, Object::None) => {
-            let fget = p.fget();
-            if matches!(fget, Object::None) {
-                return Err(property_unreachable_error(&p, obj, "getter"));
-            }
+            let fget = match property_self(args, "__get__") {
+                Ok(p) => {
+                    let fget = p.fget();
+                    if matches!(fget, Object::None) {
+                        return Err(property_unreachable_error(&p, obj, "getter"));
+                    }
+                    fget
+                }
+                // A *foreign* instance of a property subclass — pybind11's
+                // `pybind11_static_property`, whose C constructor bypassed
+                // `instantiate`'s native-payload path — carries its members
+                // on the C object; `fget` resolves through the bridged
+                // type's descriptors (RFC 0076 WS5: torch's
+                // `ReduceOp.RedOpType.__members__`).
+                Err(e) => match args.first() {
+                    Some(recv @ Object::Foreign(_)) => {
+                        match reentrant_load_attr_opt(recv, "fget")? {
+                            Some(f) if !matches!(f, Object::None) => f,
+                            _ => return Err(e),
+                        }
+                    }
+                    _ => return Err(e),
+                },
+            };
             reentrant_call(&fget, &[obj.clone()])
         }
-        _ => Ok(args[0].clone()),
+        _ => {
+            let recv = args
+                .first()
+                .ok_or_else(|| type_error("descriptor '__get__' requires a 'property' object"))?;
+            Ok(recv.clone())
+        }
     }
 }
 
@@ -4839,7 +4863,7 @@ pub(crate) fn code_docstring(c: &weavepy_compiler::CodeObject) -> Option<Object>
 /// introspection ecosystem checks for: vararg / kwarg presence,
 /// generator / coroutine / async-generator status, and the implicit
 /// `OPTIMIZED | NEWLOCALS` pair every function frame uses.
-pub(crate) fn code_flags(c: &weavepy_compiler::CodeObject) -> u32 {
+pub fn code_flags(c: &weavepy_compiler::CodeObject) -> u32 {
     const CO_OPTIMIZED: u32 = 0x0001;
     const CO_NEWLOCALS: u32 = 0x0002;
     const CO_VARARGS: u32 = 0x0004;
@@ -8358,7 +8382,9 @@ pub fn class_of(obj: &Object) -> crate::sync::Rc<crate::types::TypeObject> {
                 bt.async_generator_athrow_.clone()
             }
         },
-        Object::Module(_) => bt.module_.clone(),
+        // A module re-classed via `m.__class__ = ModuleSubclass` (RFC 0076
+        // WS5) reports the assigned class; see `object::module_class`.
+        Object::Module(m) => crate::object::module_class(m).unwrap_or_else(|| bt.module_.clone()),
         Object::SlotDescriptor(_) => bt.member_descriptor_.clone(),
         Object::Code(_) => bt.code_.clone(),
         Object::Cell(_) => bt.cell_.clone(),
@@ -8384,11 +8410,9 @@ pub fn class_of(obj: &Object) -> crate::sync::Rc<crate::types::TypeObject> {
         }
         Object::Frame(_) => bt.frame_.clone(),
         Object::Traceback(_) => bt.traceback_.clone(),
-        // A C-API capsule is an opaque cpyext token with no dedicated
-        // VM type; report the base `object` type (it never reaches a
-        // Python-level `type()` in practice — capsules flow C -> module
-        // dict -> C). See RFC 0045.
-        Object::Capsule(_) => bt.object_.clone(),
+        // A C-API capsule reports CPython's dedicated `PyCapsule` type
+        // (Pillow's `test_image_getim` reads `str(type(im.getim()))`).
+        Object::Capsule(_) => bt.capsule_.clone(),
         // A foreign cpyext object's true type is its (often un-bridged)
         // C `PyTypeObject`. When the extension's type is bridged the
         // foreign `get_type` hook yields an `Object::Type`; otherwise we
@@ -9765,12 +9789,15 @@ pub(crate) fn b_divmod(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::new_tuple(vec![q, r]))
 }
 
-/// `round(number, ndigits=None)` with clinic keyword binding
-/// (test_builtin test_round calls `round(number=-8.0, ndigits=-1)`).
-pub(crate) fn b_round_kw(
+/// Clinic-bind `round(number, ndigits=None)` keywords into a positional
+/// vector (`[number]` or `[number, ndigits]`). Shared by `b_round_kw` and
+/// the interpreter's `round` fast path so the keyword form takes the same
+/// `__round__` dispatch as the positional one (numpy's scalar
+/// `round(s, ndigits=None)` — test_numeric test_dunder_round).
+pub(crate) fn bind_round_args(
     args: &[Object],
     kwargs: &[(String, Object)],
-) -> Result<Object, RuntimeError> {
+) -> Result<Vec<Object>, RuntimeError> {
     let slots = bind_named_args("round", &["number", "ndigits"], args, kwargs)?;
     let mut bound: Vec<Object> = Vec::new();
     match &slots[0] {
@@ -9784,7 +9811,16 @@ pub(crate) fn b_round_kw(
     if let Some(nd) = &slots[1] {
         bound.push(nd.clone());
     }
-    b_round(&bound)
+    Ok(bound)
+}
+
+/// `round(number, ndigits=None)` with clinic keyword binding
+/// (test_builtin test_round calls `round(number=-8.0, ndigits=-1)`).
+pub(crate) fn b_round_kw(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
+    b_round(&bind_round_args(args, kwargs)?)
 }
 
 pub(crate) fn b_round(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -11084,15 +11120,23 @@ fn str_encode(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
     if !recv.is_str() {
         return Err(type_error("expected str method receiver"));
     }
+    // The names accept any str-shaped object, not just `Object::Str`:
+    // CPython's clinic checks `PyUnicode_Check`, which is subtype-inclusive.
+    // numpy's `_vec_string` broadcasts the method args to arrays and hands
+    // each call `np.str_` *scalars* — `'abc'.encode(np.str_('utf-8'))` must
+    // work (RFC 0076 WS1, np.strings.encode/decode).
     let encoding = match arg_or_kw(args, 1, kwargs, "encoding") {
-        Some(Object::Str(e)) => e.to_string(),
+        Some(o) => match str_arg_bridged(o) {
+            Some(e) => e.into_owned(),
+            None => return Err(type_error("encode() expected str")),
+        },
         None => "utf-8".to_owned(),
-        _ => return Err(type_error("encode() expected str")),
     };
     let errors = match arg_or_kw(args, 2, kwargs, "errors") {
-        Some(Object::Str(e)) => e.to_string(),
+        Some(o) => str_arg_bridged(o)
+            .map(|e| e.into_owned())
+            .unwrap_or_else(|| "strict".to_owned()),
         None => "strict".to_owned(),
-        _ => "strict".to_owned(),
     };
     let bytes = crate::stdlib::codecs_mod::encode_obj(recv, &encoding, &errors)?;
     Ok(Object::new_bytes(bytes))
@@ -12174,6 +12218,12 @@ fn dict_items(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn dict_pop(args: &[Object]) -> Result<Object, RuntimeError> {
     let d = dict_self(args)?;
+    if args.len() > 3 {
+        return Err(type_error(format!(
+            "pop expected at most 2 arguments, got {}",
+            args.len() - 1
+        )));
+    }
     let key = args
         .get(1)
         .ok_or_else(|| type_error("dict.pop() expected at least 1 argument"))?;
@@ -13122,10 +13172,19 @@ fn bytes_decode_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Objec
             )))
         }
         None => "utf-8".to_owned(),
-        _ => return Err(type_error("decode() expected str")),
+        // A `str`-subclass instance is accepted anywhere str is (CPython
+        // checks `PyUnicode_Check`): numpy's `_vec_string` broadcast hands
+        // `bytes.decode` an `np.str_` scalar (RFC 0076 WS1).
+        Some(other) => match str_arg_bridged(other) {
+            Some(e) => e.into_owned(),
+            None => return Err(type_error("decode() expected str")),
+        },
     };
     let errors = match arg_or_kw(args, 2, kwargs, "errors") {
         Some(Object::Str(e)) => e.to_string(),
+        Some(other) => str_arg_bridged(other)
+            .map(|e| e.into_owned())
+            .unwrap_or_else(|| "strict".to_owned()),
         _ => "strict".to_owned(),
     };
     // Produces a surrogate-bearing `WStr` for `surrogateescape`/`surrogatepass`.
@@ -13142,14 +13201,20 @@ pub fn has_buffer_dunder(obj: &Object) -> bool {
     crate::instance_method(obj, "__buffer__").is_some()
 }
 
-pub fn buffer_exported_view(obj: &Object) -> Option<Rc<crate::object::PyMemoryView>> {
+/// `PyBUF_FULL_RO`: the request `memory_richcompare` makes of the other
+/// operand's exporter, so the served view keeps its format/shape/strides
+/// (a `PyBUF_SIMPLE` request would flatten a typed exporter to 'B' bytes
+/// and make every structural comparison fail).
+pub const PYBUF_FULL_RO: i64 = 0x13C;
+
+pub fn buffer_exported_view(obj: &Object, flags: i64) -> Option<Rc<crate::object::PyMemoryView>> {
     let method = crate::instance_method(obj, "__buffer__")?;
     let ptr = crate::vm_singletons::current_interpreter_ptr()?;
     // SAFETY: published by an enclosing VM frame still live on this thread;
     // the GIL keeps the access exclusive.
     let interp = unsafe { &mut *ptr };
     let globals = interp.builtins_dict();
-    match interp.call_object_with_globals(&method, &[Object::Int(0)], &[], &globals) {
+    match interp.call_object_with_globals(&method, &[Object::Int(flags)], &[], &globals) {
         Ok(Object::MemoryView(mv)) => Some(mv),
         _ => None,
     }
@@ -15941,7 +16006,7 @@ fn memoryview_eq_option(mv: &Rc<crate::object::PyMemoryView>, other: &Object) ->
             Some(mv.buffer_eq(&view))
         }
         other => {
-            if let Some(b) = buffer_exported_view(other) {
+            if let Some(b) = buffer_exported_view(other, PYBUF_FULL_RO) {
                 return Some(mv.buffer_eq(&b));
             }
             match crate::foreign::get_buffer_obj(other) {

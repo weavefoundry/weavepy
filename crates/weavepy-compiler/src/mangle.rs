@@ -585,12 +585,15 @@ impl Mangler {
             | ExprKind::YieldFrom(inner)
             | ExprKind::Await(inner) => self.expr(inner),
             ExprKind::Yield(None) => {}
-            ExprKind::JoinedStr(parts) => {
+            ExprKind::JoinedStr(parts) | ExprKind::TemplateStr(parts) => {
                 for p in parts {
                     self.expr(p);
                 }
             }
             ExprKind::FormattedValue {
+                value, format_spec, ..
+            }
+            | ExprKind::Interpolation {
                 value, format_spec, ..
             } => {
                 self.expr(value);

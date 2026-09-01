@@ -546,6 +546,60 @@ exc_cell! {
     PyExc_ResourceWarning;
 }
 
+/// `BaseException_traverse` (CPython `Objects/exceptions.c`): visit the
+/// exception tail's dict/args/notes/traceback/context/cause. `self` is
+/// any box carrying the faithful [`crate::object::ExcFields`] tail — the
+/// leading `PyBaseExceptionObject` region of a C-defined exception
+/// subclass instance (psycopg2's `errorObject`) has the same layout.
+unsafe extern "C" fn exception_tp_traverse(
+    slf: *mut PyObject,
+    visit: unsafe extern "C" fn(*mut PyObject, *mut std::ffi::c_void) -> c_int,
+    arg: *mut std::ffi::c_void,
+) -> c_int {
+    if slf.is_null() {
+        return 0;
+    }
+    let exc = unsafe { &(*(slf as *mut crate::object::PyObjectBox)).exc };
+    for p in [
+        exc.dict,
+        exc.args,
+        exc.notes,
+        exc.traceback,
+        exc.context,
+        exc.cause,
+    ] {
+        if !p.is_null() {
+            let r = unsafe { visit(p, arg) };
+            if r != 0 {
+                return r;
+            }
+        }
+    }
+    0
+}
+
+/// `BaseException_clear`: drop the exception tail's references.
+unsafe extern "C" fn exception_tp_clear(slf: *mut PyObject) -> c_int {
+    if slf.is_null() {
+        return 0;
+    }
+    let exc = unsafe { &mut (*(slf as *mut crate::object::PyObjectBox)).exc };
+    for p in [
+        &mut exc.dict,
+        &mut exc.args,
+        &mut exc.notes,
+        &mut exc.traceback,
+        &mut exc.context,
+        &mut exc.cause,
+    ] {
+        let old = std::mem::replace(p, ptr::null_mut());
+        if !old.is_null() {
+            unsafe { crate::object::Py_DecRef(old) };
+        }
+    }
+    0
+}
+
 pub fn init_static_exceptions() {
     static INIT_LOCK: Mutex<bool> = Mutex::new(false);
     let mut done = INIT_LOCK.lock().unwrap();
@@ -566,10 +620,26 @@ pub fn init_static_exceptions() {
     // existing one if `bt.value_error` is the same `Rc` as a
     // built-in like `bt.unicode_error`).
     let publish = |slot: *mut *mut PyObject, ty: Rc<TypeObject>| {
-        let p = crate::types::install_user_type(&ty) as *mut PyObject;
+        let p = crate::types::install_user_type(&ty);
+        // RFC 0076 WS5: extensions that define GC'd exception subclasses
+        // in C *chain* to the base's slots directly — psycopg2's
+        // `error_traverse`/`error_clear` end with
+        // `((PyTypeObject *)PyExc_StandardError)->tp_traverse(self, …)`.
+        // A NULL slot there is a jump through zero the first time the
+        // collector (or `exc_has_finalizable`) walks an OperationalError.
+        // Install CPython's `BaseException_traverse`/`_clear` shape over
+        // the faithful exception tail.
+        unsafe {
+            if (*p).tp_traverse.is_null() {
+                (*p).tp_traverse = exception_tp_traverse as *mut std::ffi::c_void;
+            }
+            if (*p).tp_clear.is_null() {
+                (*p).tp_clear = exception_tp_clear as *mut std::ffi::c_void;
+            }
+        }
         // The type singleton is immortal; we don't need to track
         // an extra reference.
-        unsafe { *slot = p };
+        unsafe { *slot = p as *mut PyObject };
     };
     unsafe {
         publish(&raw mut PyExc_BaseException, bt.base_exception.clone());

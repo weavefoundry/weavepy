@@ -34,8 +34,8 @@ status = "pass"
 
 [packages.attrs]
 status = "pass"
-selftest_status = "skip"
-selftest_reason = "re-measured 2026-08 on the wave-4 interpreter (RFC 0072 WS5): still exceeds the 2400s budget (graded run killed at 2403.1s). Fresh pacing datapoint: a 300s sample completes ~311 of 1385 collected tests (~1 test/s), and the hypothesis @given loops woven through the core files (test_make, test_funcs, test_dunders) dominate the un-reached tail — interpreter-speed-bound, not a correctness signal; there is no honest property-lane trim like packaging's. Revisit when the interpreter is faster or upstream splits its property lanes."
+selftest_status = "pass"
+selftest_reason = "re-measured 2026-08 on the wave-11 interpreter (RFC 0076 WS4): full suite, no hypothesis profile trim — 1379 passed / 0 failed / 6 skipped / 1 xfailed in 17:20, well inside the 2400s budget the wave-4 interpreter blew (killed at 2403s, tail unreached). Load-bearing engine fix before the clean run: zero-arg super() inside a method compiled by an enclosing function (attrs' generated slots-__getattr__ wrapper sets `__class__ = _cls` as a plain local) now resolves __class__ through normal lexical scoping — the local is promoted to a cell before emission. Canary: tests/regrtest/test_rfc0076_burn_regressions.py."
 
 [packages.click]
 status = "pass"
@@ -98,7 +98,7 @@ status = "pass"
 status = "pass"
 notes = "PyPI binary wheel (not source build), pinned 2.5.2 (RFC 0066 WS5): dtype arithmetic, broadcasting, linalg.norm, memoryview round-trip."
 selftest_status = "fail"
-selftest_reason = "measured 2026-08 (RFC 0075 WS8 re-census, per-module under a 1200s/module budget): all four wave-4 headline clusters are burned green — test_scalar_methods 232 passed (was 96 failed; live C docstring/__text_signature__ reads), test_ufunc 859 passed (was 32 failed; ufunc pickling, object-loop calls, ctypes loop access), test_casting_unittests 960 passed (was 28; slot-error propagation + cast-safety), test_memmap 24 passed (was 24 failed; mmap exports the buffer protocol across the bridge) — and test_datetime went 7-red to 490 passed. Zero crash anywhere, again. Fresh census: 39/66 modules fully green, 21 modules carry ~74 failures + ~11 errors (largest: test_numeric 19, test_conversion_utils 9, test_mem_policy 9 errors, test_regression 7, test_defchararray 6, test_array_coercion 5, test_nditer 4, test_nep50_promotions 4), 6 stay interpreter-speed-bound past the per-module budget (test_multiarray, test_dtype, test_strings, test_stringdtype, test_mem_overlap, test_scalarmath). The graded single-invocation lane stays speed-bound: `--pyargs numpy._core` collection alone previously measured 2170.6s against the 2400s budget, so the row cannot pass as one pytest run regardless of test health. The remaining-cluster burn-down is the wave-6 worklist."
+selftest_reason = "re-measured 2026-08 (RFC 0076 WS1 burn, per-module): the RFC 0075 census (~74 fail + ~11 err across 21 modules) is burned — test_numeric (was 19), test_regression (7), test_conversion_utils (9), test_defchararray (6), test_array_coercion (5), test_nep50_promotions (4), test_mem_policy (9 err), test_multithreading, test_longdouble, and test_arrayprint are fully green; test_umath completes (was budget-bound) at 4680 passed / 2 failed in ~7 min and test_nditer at 930 passed / 1 failed. The six speed-bound modules now grade on the wave-11 interpreter: test_multiarray 14246 passed / 22 failed (1:18:32 — clusters: VM↔C Py_buffer re-export of non-contiguous shapes 11, ob_refcnt-visibility asserts 4, intp-converter error wording 2, fromfile-on-closed-fd error shape 2, singletons 3), test_strings 2011 passed / 0 residual (partition dispatch + _PyUnicode_IsTitlecase burned; canaries in test_rfc0076_burn_regressions.py), test_mem_overlap 25 passed / 0, test_scalarmath 1580 passed / 1, test_dtype 1176 passed / 3, test_stringdtype 2549 passed / 399 (one family: StringDType(coerce=False)'s C-side string check rejects values crossing the bridge — a follow-up burn target, not 399 root causes). Documented per-module deltas beyond those: exact-refcount-of-int asserts (unboxed immediates, architectural), test_out_wrap_no_leak (raw C-ref imbalance on the ndarray-subclass wrap path, tracked wave 7), np.add.__dict__ completeness, and one hypothesis too_slow health check. The graded single-invocation lane stays speed-bound regardless of test health: `--pyargs numpy._core` cannot fit the 2400s budget while test_multiarray alone runs 1:18 h — the stringdtype family + lane sharding are the wave-7 worklist."
 
 [packages.markupsafe]
 status = "pass"
@@ -159,20 +159,20 @@ notes = "C sdist built through the local-index no_binary lane; probe asserts the
 [packages.scipy]
 status = "pass"
 notes = "measured 2026-08: linalg (LU/eig/f2py LAPACK), sparse CSR + spsolve, optimize (pybind11 _highspy HiGHS linprog + minimize), integrate.quad, stats.norm rvs/fit (PEP 604 union isinstance over ABC members), fft (pybind11 pocketfft), ndimage. First pybind11 rows: instancemethod type, TSS, interpreter-state identity, heap-type metaclass allocation, faithful PyCFunction m_self/m_ml, cyfunction __code__ as genuine types.CodeType."
-selftest_status = "fail"
-selftest_reason = "measured 2026-08 (RFC 0075 WS9, installed lane scoped `--pyargs scipy.linalg scipy.fft` — scipy.sparse measured out, see manifest): 46 failed / 16908 passed / 448 skipped in 1:20 h. A CPython 3.13.13 control over the identical scope measures 1 failed (TestEig::test_singular — an Accelerate-LAPACK environmental flake WeavePy incidentally passes) / 16945 passed, so all 46 are WeavePy-attributable, in three clusters: `scipy.linalg.interpolative` (40 — the pythran backend's 3-positional-arg `numpy.matmul(a, b, out)` lands on the dunder bridge as `numpy.ndarray.__matmul__() takes 2 args (3 given)`), fft multiprocess pickling (5 — `Can't pickle <built-in function _reconstruct>: not found as builtins._reconstruct`; the capi builtin-function mirror reports `__module__ = 'builtins'` instead of `numpy._core.multiarray`), and `TestHadamard::test_basic` (1 — power-of-two validation rejects a valid n). Two root causes cover 45 of 46; both are wave-6 worklist items."
+selftest_status = "pass"
+selftest_reason = "re-measured 2026-08 (RFC 0076 WS2 burn, installed lane scoped `--pyargs scipy.linalg scipy.fft`): 16954 passed / 0 failed / 448 skipped / 12 xfailed / 2 xpassed — a genuine zero, no deselects (even TestEig::test_singular, the Accelerate-LAPACK environmental flake the CPython 3.13.13 control fails, passes here). The RFC 0075 census's 46 deltas resolved to three root causes, none the predicted ones: interpolative's 40 were PyNumber_MatrixMultiply passing the bound receiver again (ndarray's 2-arg __matmul__ saw 3 args — now routed through the same nb_matrix_multiply/BinOpKind::MatMult dispatch as every operator), the 5 fft multiprocess-pickling failures were BUILTIN_WRITABLE_MODULE being thread-local (numpy's import-time `_reconstruct.__module__ = 'numpy._core.multiarray'` was invisible to the Pool task-feeder thread — now process-global), and Hadamard was math.log(4, 2) one ULP off (loghelper used _PyLong_Frexp for every int where CPython converts to double first). Wall 5:04 h under a concurrent full-sweep load; ~1:20 h quiet, inside the 14400s budget. Canaries in tests/regrtest/test_rfc0076_burn_regressions.py; scipy.sparse re-joining the scope stays the wave-7 question."
 
 [packages.pillow]
 status = "pass"
 notes = "measured 2026-08: draw primitives, geometry ops, PNG/JPEG encoder round-trips through PyArg_ParseTuple y*/y#/z# and true-aliasing PyBytes_AsString, raw byte access, numpy interop, EXIF."
-selftest_status = "fail"
-selftest_reason = "measured 2026-08 (RFC 0075 WS9, sdist lane, 12.3.0 `Tests/` against the installed wheel): 11 failed / 4839 passed / 312 skipped / 3 xfailed in 9:36 min. A CPython 3.13.13 control over the identical lane measures 1 failed (test_imagegrab — macOS `screencapture` denied headless; environmental) / 5034 passed / 127 skipped, so the WeavePy-attributable delta is 10 tests: no ResourceWarning from unclosed image files (4 — the finalizer-emitted warning path), `Image.getextrema` returning (None, None) through the C bridge (2), `im.getim()` not a real PyCapsule (1 — `<class 'object'>`), ImageCms exception surface (1 — TypeError 'object cannot be interpreted as an integer' pre-empts the PyCMSError message contract), ImageFontPIL missing UnicodeEncodeError on non-Latin-1 text (1), and the default-font leak ceiling (1 — memory growth by iteration 28). The extra 185 skips vs CPython are feature-detection (deferred codecs/plugins) and are enumerated in the lane log, not verdict-bearing. Cluster burn-down is a wave-6 worklist."
+selftest_status = "pass"
+selftest_reason = "re-measured 2026-08 (RFC 0076 WS3, sdist lane, 12.3.0 `Tests/` against the installed wheel): 4850 passed / 0 failed / 312 skipped / 3 xfailed in 40:30. All ten RFC 0075-era WeavePy-attributable deltas are burned down: the unclosed-file ResourceWarning quartet (POP_EXCEPT finalizable cascade), getextrema on I;16 (Py_BuildValue 'HH'), the getim PyCapsule type, the ImageCms PyNumber_Index TypeError surface, ImageFontPIL's strict Latin-1 UnicodeEncodeError, and the default-font leak ceiling (byte-accounted scalar-pin + AsUTF8 C-string cache sweeps — the caches previously pinned each marshaled ~10 KB text copy forever, ~60 KB/draw.text call). The extra ~185 skips vs CPython are feature-detection (deferred codecs/plugins), enumerated in the lane log, not verdict-bearing."
 
 [packages.lxml]
 status = "pass"
 notes = "measured 2026-08: etree round-trip, namespaced XPath, XSLT (spec-struct protocol slots incl. tp_descr_get), iterparse, lxml.html rewrite, XMLSchema validation, deepcopy/pickle."
 selftest_status = "fail"
-selftest_reason = "measured 2026-08 (RFC 0075 WS9, overlay lane over the 6.1.2 sdist tests): 412 failed / 1847 passed / 19 skipped in 1:49 h. The lane is intrinsically red under `pytest --pyargs lxml.tests`: a CPython 3.13.13 control over the identical overlay measures 368 failed / 1888 passed — pytest collects the module-level abstract unittest bases (`_ETreeTestCaseBase` &co. run with `etree = None`) and the doctest-loading `test_suite()` functions FileNotFoundError outside the sdist root. The WeavePy-attributable delta is 44 tests, clustered: three-arg raise through Cython except paths (14 — `TypeError: raise: arg 3 must be a traceback or None`; parser-target error propagation, resolver/xmlfile/IO error paths, XPath/XSLT extension raises), lxml.sax element-close mismatches (12 — `SaxError: Unexpected element closed`), C14N2 exclusion/whitespace serialization diffs (6), element slicing with steps (4 — `slice indices must be integers or None or have an __index__ method`), objectify child-attribute lookup (3), char/uchar `array.array` as parse buffer (2), plus attrib-pop arity, external-document PyCapsule naming, and objectify `dir()` ordering (1 each). The cluster burn-down is a wave-6 worklist; the CPython-control delta is this row's grading basis."
+selftest_reason = "re-measured 2026-08 (RFC 0076 WS3 burn, overlay lane over the 6.1.2 sdist tests): 368 failed / 1892 passed / 54 skipped in 1:07:32 — the CPython 3.13.13 control over the identical overlay measures 368 failed / 1888 passed, so the WeavePy-attributable delta is 0 (was 44). The lane stays intrinsically red under `pytest --pyargs lxml.tests` on both interpreters: pytest collects the module-level abstract unittest bases (`_ETreeTestCaseBase` &co. run with `etree = None`) and the doctest-loading `test_suite()` functions FileNotFoundError outside the sdist root — upstream collection artifacts, this row's grading basis. The 44-delta burn's load-bearing fixes: Cython 3-arg raise (traceback/frame type identity), dunder-shim precedence for tp_methods already in tp_dict, faithful-list mirror reconciliation for never-registered mirrors (lxml.sax `_element_stack`), `note_c_agreement` Rc fingerprinting (descendantpaths accumulation), PySlice_Unpack overflow clamping, pyexpat y# parse args, `__delattr__` from tp_setattro, dir() through a C type's __dict__ property override, and ctypes c_char_p interned-buffer marshalling (adopt_external_document strcmp). Canaries: tests/regrtest/test_rfc0076_burn_regressions.py."
 
 [packages.greenlet]
 status = "pass"
@@ -195,6 +195,26 @@ notes = "measured 2026-08 (RFC 0075 WS9): LogisticRegression fit/predict/score, 
 [packages.gunicorn_gevent]
 status = "pass"
 notes = "measured 2026-08 (RFC 0075 WS9 capstone): gunicorn --workers 2 -k gevent serving a Django WSGI app — readiness-polled startup, concurrent requests through the patched-socket path answered by both workers, SIGTERM graceful shutdown with exit code 0. Landed on the way: pwd/grp built-in modules (gunicorn imports both at module level for its user-switching surface), os.utime on a file descriptor (futimens — the worker heartbeat is os.utime(tmp.fileno(), (t, t)) and every worker died at first notify without it)."
+
+# --- ecosystem wave 6 (RFC 0076 WS5) -------------------------------------------
+
+[packages.polars]
+status = "pass"
+
+[packages.psycopg2]
+status = "pass"
+
+[packages.celery]
+status = "pass"
+
+[packages.uvicorn]
+status = "pass"
+
+[packages.alembic]
+status = "pass"
+
+[packages.torch]
+status = "pass"
 
 # --- infrastructure-native tail (RFC 0072 WS3/WS4) -----------------------------
 

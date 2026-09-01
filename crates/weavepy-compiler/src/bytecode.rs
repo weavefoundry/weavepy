@@ -589,6 +589,18 @@ pub enum OpCode {
     /// `PyAsyncGenWrappedValue`) so `__anext__` can tell it apart from
     /// a value passed through by an inner await's send dance.
     AsyncGenWrap,
+
+    /// PEP 750 t-strings (`-X lang=next`, RFC 0076 WS15; CPython 3.14
+    /// `BUILD_INTERPOLATION`). Builds one `string.templatelib.
+    /// Interpolation`. Stack on entry: `[value, expr_text_str,
+    /// (spec_str)]` — the spec is present when `arg & 0x04` is set.
+    /// `arg & 0x03` is the conversion (0 none, 1 `s`, 2 `r`, 3 `a`),
+    /// the same encoding as `FormatValue`.
+    BuildInterpolation,
+    /// PEP 750 t-strings (CPython 3.14 `BUILD_TEMPLATE`). Stack on
+    /// entry: `[strings_tuple, interpolations_tuple]`; pushes the
+    /// `string.templatelib.Template`.
+    BuildTemplate,
 }
 
 impl OpCode {
@@ -700,6 +712,8 @@ impl OpCode {
             OpCode::CleanupThrow => "CLEANUP_THROW",
             OpCode::StopIterationError => "CALL_INTRINSIC_1",
             OpCode::AsyncGenWrap => "CALL_INTRINSIC_1",
+            OpCode::BuildInterpolation => "BUILD_INTERPOLATION",
+            OpCode::BuildTemplate => "BUILD_TEMPLATE",
         }
     }
 }

@@ -568,7 +568,19 @@ pub unsafe extern "C" fn _PyType_Lookup(
     let Some(descr) = class.lookup(&name_s) else {
         return ptr::null_mut();
     };
+    if std::env::var_os("WEAVEPY_TRACE_TYPELOOKUP").is_some() {
+        eprintln!(
+            "[TYPELOOKUP] {}.{name_s}: variant={}",
+            class.name,
+            descr.type_name()
+        );
+    }
     let p = crate::object::into_owned(descr);
+    if std::env::var_os("WEAVEPY_TRACE_TYPELOOKUP").is_some() {
+        let otp = unsafe { (*p).ob_type };
+        let tn = unsafe { std::ffi::CStr::from_ptr((*otp).tp_name) };
+        eprintln!("[TYPELOOKUP]   box={p:p} ob_type={otp:p} tp_name={tn:?}");
+    }
     type_lookup_cache().lock().unwrap().insert(key, p as usize);
     p
 }

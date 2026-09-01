@@ -74,6 +74,14 @@ unsafe extern "C" fn sq_inplace_concat(a: *mut PyObject, b: *mut PyObject) -> *m
     unsafe { crate::abstract_::PySequence_InPlaceConcat(a, b) }
 }
 
+/// True when `f` is one of the generic concat bridges above, which
+/// forward straight back to `PySequence_Concat` — a caller about to
+/// dispatch a type's `sq_concat` slot must skip them or it recurses
+/// (RFC 0076 WS1).
+pub(crate) fn is_generic_concat_bridge(f: *mut c_void) -> bool {
+    f == sq_concat as *mut c_void || f == sq_inplace_concat as *mut c_void
+}
+
 unsafe extern "C" fn sq_inplace_repeat(o: *mut PyObject, n: PySsizeT) -> *mut PyObject {
     unsafe { crate::abstract_::PySequence_InPlaceRepeat(o, n) }
 }
@@ -88,6 +96,36 @@ unsafe extern "C" fn mp_length(o: *mut PyObject) -> PySsizeT {
 
 unsafe extern "C" fn mp_subscript(o: *mut PyObject, k: *mut PyObject) -> *mut PyObject {
     unsafe { crate::abstract_::PyObject_GetItem(o, k) }
+}
+
+/// `tuple`'s own `mp_subscript` — CPython's `tuplesubscript` reads the
+/// tuple layout directly, *never* re-dispatching on `Py_TYPE(o)`. That
+/// distinction matters for C tuple subclasses that capture the base
+/// slot and delegate to it: torch's `THPSize_subscript` is
+/// `wrap_tuple_fn<&PyTuple_Type.tp_as_mapping->mp_subscript>` — with the
+/// generic `PyObject_GetItem` bridge here, the delegate dispatched right
+/// back into `THPSize_subscript` and `bx.shape[0]` recursed to death
+/// (RFC 0076 WS5). Subscript the receiver's *native tuple payload*
+/// re-boxed as an exact tuple instead, which keeps full int/slice/
+/// `__index__` key semantics without ever consulting the subtype's slots.
+unsafe extern "C" fn tuple_mp_subscript(o: *mut PyObject, k: *mut PyObject) -> *mut PyObject {
+    let base: Option<Object> = match unsafe { crate::object::clone_object(o) } {
+        t @ Object::Tuple(_) => Some(t),
+        Object::Instance(inst) => match inst.native.get() {
+            Some(n @ Object::Tuple(_)) => Some(n.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(tup) = base else {
+        // Not tuple-shaped (shouldn't happen for callers of this slot);
+        // keep the generic dispatch as the safe fallback.
+        return unsafe { crate::abstract_::PyObject_GetItem(o, k) };
+    };
+    let tmp = crate::object::into_owned(tup);
+    let r = unsafe { crate::abstract_::PyObject_GetItem(tmp, k) };
+    unsafe { crate::object::Py_DecRef(tmp) };
+    r
 }
 
 /// `mp_ass_subscript` carries both assignment and deletion;
@@ -486,6 +524,13 @@ pub fn install() {
         // tuple / str / bytes — immutable sequences.
         install_sequence(&PyTuple_Type, immutable_seq);
         install_mapping(&PyTuple_Type, immutable_map);
+        // Layout-direct subscript (see `tuple_mp_subscript`): C tuple
+        // subclasses (torch's `THPSize`) capture and delegate to this
+        // exact slot; the generic re-dispatching bridge would recurse.
+        {
+            let mm = (*PyTuple_Type.as_ptr()).tp_as_mapping as *mut PyMappingMethods;
+            (*mm).mp_subscript = tuple_mp_subscript as *mut c_void;
+        }
         set_iter(&PyTuple_Type);
 
         install_sequence(&PyUnicode_Type, immutable_seq);

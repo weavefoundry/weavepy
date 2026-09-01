@@ -15,16 +15,6 @@ class error(Exception):
     """Raised when packing or unpacking fails."""
 
 
-def _wrap(fn):
-    def call(*args, **kwargs):
-        try:
-            return fn(*args, **kwargs)
-        except ValueError as e:
-            raise error(str(e)) from None
-    call.__name__ = getattr(fn, "__name__", "wrapped")
-    return call
-
-
 _INT_CODES = frozenset("bBhHiIlLqQnNP")
 _FLOAT_CODES = frozenset("fde")
 
@@ -104,28 +94,39 @@ def _readable(buffer):
     return buffer
 
 
-calcsize = _wrap(_impl.calcsize)
+# The public signatures below mirror CPython's `_struct` text signatures
+# exactly (parameter names and positional-only markers): `inspect.signature`
+# on these functions must agree with the C originals — torch._dynamo's
+# `substitute_in_graph` polyfills for `struct.pack`/`struct.unpack` verify
+# the match at import time (RFC 0076 WS5).
 
 
-def unpack(fmt, buffer):
+def calcsize(format, /):
     try:
-        return _impl.unpack(fmt, _readable(buffer))
+        return _impl.calcsize(format)
     except ValueError as e:
         raise error(str(e)) from None
 
 
-def unpack_from(fmt, buffer, offset=0):
+def unpack(format, buffer, /):
     try:
-        return _impl.unpack_from(fmt, _readable(buffer), offset)
+        return _impl.unpack(format, _readable(buffer))
     except ValueError as e:
         raise error(str(e)) from None
 
 
-def pack(fmt, *values):
-    if _needs_coercion(values):
-        values = _coerce_values(fmt, values)
+def unpack_from(format, /, buffer, offset=0):
     try:
-        return _impl.pack(fmt, *values)
+        return _impl.unpack_from(format, _readable(buffer), offset)
+    except ValueError as e:
+        raise error(str(e)) from None
+
+
+def pack(format, /, *v):
+    if _needs_coercion(v):
+        v = _coerce_values(format, v)
+    try:
+        return _impl.pack(format, *v)
     except ValueError as e:
         raise error(str(e)) from None
 
@@ -164,12 +165,12 @@ def _writable(buffer):
     return mv
 
 
-def pack_into(fmt, buffer, offset, *values):
+def pack_into(format, buffer, offset, /, *v):
     target = _writable(buffer)
-    if _needs_coercion(values):
-        values = _coerce_values(fmt, values)
+    if _needs_coercion(v):
+        v = _coerce_values(format, v)
     try:
-        return _impl.pack_into(fmt, target, offset, *values)
+        return _impl.pack_into(format, target, offset, *v)
     except ValueError as e:
         raise error(str(e)) from None
 
@@ -226,9 +227,9 @@ def _make_unpack_iterator(fmt, buffer, size):
     return it
 
 
-def iter_unpack(fmt, buffer):
-    """Iterate over `buffer` in `calcsize(fmt)` chunks."""
-    return _make_unpack_iterator(fmt, buffer, calcsize(fmt))
+def iter_unpack(format, buffer, /):
+    """Iterate over `buffer` in `calcsize(format)` chunks."""
+    return _make_unpack_iterator(format, buffer, calcsize(format))
 
 
 def _clearcache():

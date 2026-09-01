@@ -350,6 +350,37 @@ fn fwd_binop(op: BinOpKind, a: &Object, b: &Object) -> Result<Object, RuntimeErr
     unwrap(raw)
 }
 
+/// [`ForeignHooks::seq_concat`] — `operator.concat`'s left-slot protocol
+/// through the real `PySequence_Concat` (RFC 0076 WS1): a C type's
+/// `sq_concat` (numpy's raise-only `array_concat`), the `nb_add`
+/// fallback for `PySequence_Check` pairs, or the canonical
+/// "can't be concatenated" TypeError.
+fn fwd_seq_concat(a: &Object, b: &Object) -> Result<Object, RuntimeError> {
+    let ap = crate::object::into_owned(a.clone());
+    let bp = crate::object::into_owned(b.clone());
+    let raw = c_call(|| unsafe { crate::abstract_::PySequence_Concat(ap, bp) });
+    unsafe {
+        crate::object::Py_DecRef(ap);
+        crate::object::Py_DecRef(bp);
+    }
+    unwrap(raw)
+}
+
+/// [`ForeignHooks::type_flags`] — the raw `tp_flags` word of a readied
+/// C extension type (RFC 0076 WS1).
+fn fwd_type_flags(ptr: usize) -> u64 {
+    if ptr == 0 {
+        return 0;
+    }
+    unsafe { (*(ptr as *mut crate::layout::PyTypeObjectFull)).tp_flags }
+}
+
+/// [`ForeignHooks::getset_live_doc`] — read the faithful getset box's
+/// current `d_getset->doc` (RFC 0076 WS1).
+fn fwd_getset_live_doc(prop: &Object) -> Option<String> {
+    crate::object::getset_live_doc(prop)
+}
+
 fn fwd_compare(op: CompareKind, a: &Object, b: &Object) -> Result<Object, RuntimeError> {
     use CompareKind as C;
     // Mirror Python.h's Py_LT..Py_GE opcodes.
@@ -518,6 +549,9 @@ pub fn install() {
         iter: fwd_iter,
         iternext: fwd_iternext,
         binop: fwd_binop,
+        seq_concat: fwd_seq_concat,
+        type_flags: fwd_type_flags,
+        getset_live_doc: fwd_getset_live_doc,
         compare: fwd_compare,
         get_type: fwd_get_type,
         as_float: fwd_as_float,
@@ -531,6 +565,9 @@ pub fn install() {
         descr_get: fwd_descr_get,
         handled_exception: fwd_handled_exception,
     });
+    weavepy_vm::types::TypeObject::install_metaclass_drift_hook(
+        crate::types::metaclass_drift_probe,
+    );
 }
 
 /// [`ForeignHooks::handled_exception`] — the C-API handled-exception slot

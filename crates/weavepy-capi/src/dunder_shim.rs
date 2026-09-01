@@ -305,6 +305,13 @@ pub fn install_dunder_shims(
         &name,
     );
     install_setattro(&mut out, table, ids::Py_tp_setattro, "__setattr__", &name);
+    // CPython's `add_operators` derives *both* `__setattr__` and
+    // `__delattr__` from `tp_setattro` (deletion calls the slot with a
+    // NULL value). Without the delete half, `del root.c1` on lxml's
+    // `ObjectifiedElement` (whose Cython `__delattr__` unlinks the child
+    // element) fell through to the VM's generic instance-dict delete and
+    // raised AttributeError (RFC 0076 WS3).
+    install_delattro(&mut out, table, ids::Py_tp_setattro, "__delattr__", &name);
 
     // Descriptor protocol → __get__ / __set__ (RFC 0044, WS3).
     install_descr_get(&mut out, table, ids::Py_tp_descr_get, &name);
@@ -318,7 +325,85 @@ pub fn install_dunder_shims(
     // Construction → __new__ (RFC 0044, WS3).
     install_new(&mut out, table, ids::Py_tp_new, &name, new_null_raises);
 
+    // PEP 688 → __buffer__ / __release_buffer__ (RFC 0076 WS1). CPython
+    // 3.12+ synthesizes these wrappers for every buffer-exporting type
+    // (`add_operators`' bufferprocs slotdefs); numpy's thread-safety
+    // tests call `arr.__buffer__(inspect.BufferFlags.WRITABLE)` directly.
+    install_buffer_dunders(&mut out, table, &name);
+
     out
+}
+
+/// Install `__buffer__(flags)` (and a paired `__release_buffer__`) when
+/// the type exports `bf_getbuffer`. The shim crosses `self` into C and
+/// builds a memoryview honouring the caller's exact flags via
+/// [`crate::memoryview::PyMemoryView_FromObjectAndFlags`] — precisely
+/// CPython's `__buffer__` wrapper around the C slot.
+fn install_buffer_dunders(out: &mut Vec<(String, Object)>, table: &SlotTable, type_name: &Rc<str>) {
+    if table.get(ids::Py_bf_getbuffer).is_null() {
+        return;
+    }
+    let tn = type_name.clone();
+    let f = move |args: &[Object]| -> Result<Object, RuntimeError> {
+        if args.len() != 2 {
+            return Err(type_error(format!(
+                "{}.__buffer__() takes 2 args ({} given)",
+                tn,
+                args.len()
+            )));
+        }
+        let flags: c_int = match &args[1] {
+            Object::Int(i) => *i as c_int,
+            Object::Bool(b) => c_int::from(*b),
+            // `inspect.BufferFlags` is an IntFlag instance — unwrap the
+            // native int payload.
+            other => match other.native_value() {
+                Some(Object::Int(i)) => i as c_int,
+                _ => {
+                    return Err(type_error(
+                        "__buffer__: flags must be an integer".to_owned(),
+                    ))
+                }
+            },
+        };
+        let self_p = crate::object::into_owned(args[0].clone());
+        let raw = crate::interp::ensure_active(|| unsafe {
+            crate::memoryview::PyMemoryView_FromObjectAndFlags(self_p, flags)
+        });
+        unsafe { crate::object::Py_DecRef(self_p) };
+        unwrap_pyobject(raw)
+    };
+    out.push((
+        "__buffer__".to_owned(),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__buffer__",
+            binds_instance: true,
+            call: Box::new(f),
+            call_kw: None,
+        })),
+    ));
+    let g = move |args: &[Object]| -> Result<Object, RuntimeError> {
+        // `__release_buffer__(self, view)`: release the memoryview taken
+        // by `__buffer__` (CPython forwards to `bf_releasebuffer`; our
+        // memoryview owns its `Py_buffer`, so releasing the view is the
+        // faithful equivalent).
+        if args.len() != 2 {
+            return Err(type_error("__release_buffer__ takes 2 args".to_owned()));
+        }
+        if let Object::MemoryView(mv) = &args[1] {
+            mv.release();
+        }
+        Ok(Object::None)
+    };
+    out.push((
+        "__release_buffer__".to_owned(),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__release_buffer__",
+            binds_instance: true,
+            call: Box::new(g),
+            call_kw: None,
+        })),
+    ));
 }
 
 fn install_unary(
@@ -1257,6 +1342,63 @@ fn install_setattro(
             crate::object::Py_DecRef(self_p);
             crate::object::Py_DecRef(name_p);
             crate::object::Py_DecRef(val_p);
+        }
+        if r < 0 {
+            return Err(take_pending_or_default());
+        }
+        Ok(Object::None)
+    };
+    out.push((
+        mname,
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: static_name,
+            binds_instance: true,
+            call: Box::new(f),
+            call_kw: None,
+        })),
+    ));
+}
+
+/// `tp_setattro` → `__delattr__(self, name)`: the delete half of the
+/// slot (CPython's `wrap_delattr` — the slot is invoked with a NULL
+/// value). Installed alongside [`install_setattro`] from the same slot.
+fn install_delattro(
+    out: &mut Vec<(String, Object)>,
+    table: &SlotTable,
+    slot_id: c_int,
+    name: &str,
+    type_name: &Rc<str>,
+) {
+    let slot = table.get(slot_id);
+    if slot.is_null() {
+        return;
+    }
+    // Same guard as `install_setattro`: the generic default must not be
+    // wrapped (it would recurse through `PyObject_SetAttr`).
+    let generic_setattro = crate::genericalloc::PyObject_GenericSetAttr
+        as unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut PyObject) -> c_int
+        as usize;
+    if slot.as_void() as usize == generic_setattro {
+        return;
+    }
+    let mname = name.to_owned();
+    let static_name: &'static str = Box::leak(name.to_string().into_boxed_str());
+    let _ = type_name;
+    let f = move |args: &[Object]| -> Result<Object, RuntimeError> {
+        let func: SetAttroFunc = unsafe { slot.cast() };
+        if args.len() != 2 {
+            return Err(type_error(format!(
+                "{static_name}() takes 2 args ({} given)",
+                args.len()
+            )));
+        }
+        let self_p = crate::object::into_owned(args[0].clone());
+        let name_p = crate::object::into_owned(args[1].clone());
+        let r =
+            crate::interp::ensure_active(|| unsafe { func(self_p, name_p, std::ptr::null_mut()) });
+        unsafe {
+            crate::object::Py_DecRef(self_p);
+            crate::object::Py_DecRef(name_p);
         }
         if r < 0 {
             return Err(take_pending_or_default());

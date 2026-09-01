@@ -113,6 +113,12 @@ def load_manifest(manifest_path: Path, skip=frozenset()):
                     if _normalize(_requirement_name(r)) == _normalize(pkg)
                 )
                 sdist_reqs.append(pinned)
+                # A `no_binary` package is fetched as an sdist below; keep
+                # it out of the wheel group — `pip download --only-binary
+                # :all:` fails outright for a package that publishes no
+                # wheel for the target platform (psycopg2 on macOS), which
+                # aborted the fetch before later rows' groups ran.
+                group.remove(pinned)
             selftest = row.get("selftest")
             if selftest:
                 group.extend(selftest.get("requirements", "").split())
@@ -161,6 +167,11 @@ def load_manifest(manifest_path: Path, skip=frozenset()):
         for r in group
         if "==" in r and _normalize(_requirement_name(r)) in no_binary_names
     )
+    # As in the tomllib path: no-binary packages fetch as sdists only.
+    wheel_groups = [
+        [r for r in group if _normalize(_requirement_name(r)) not in no_binary_names]
+        for group in wheel_groups
+    ]
     return wheel_groups, sdist_reqs
 
 

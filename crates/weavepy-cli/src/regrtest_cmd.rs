@@ -139,6 +139,7 @@ pub(crate) fn run(argv: Vec<String>) -> Result<i32> {
     let discovery = DiscoveryOptions {
         cpython_dir: cli.cpython_dir.clone(),
         include_all_cpython: cli.include_all_cpython,
+        only_expected: false,
     };
     let mut files = discover_regrtest_with(&workspace, &discovery, Some(&expectations));
     if let Some(needle) = cli.filter.as_deref() {
@@ -165,6 +166,7 @@ pub(crate) fn run(argv: Vec<String>) -> Result<i32> {
         workers,
         weavepy_binary: cli.weavepy_binary.clone(),
         stream_results: cli.stream,
+        interpreter_args: Vec::new(),
     };
     let reports = run_all_with(&files, &expectations, &runner_opts);
     let summary = RegrtestSummary::from_reports(&reports);

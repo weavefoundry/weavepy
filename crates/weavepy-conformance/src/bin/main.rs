@@ -114,6 +114,14 @@ enum Cmd {
         /// watching a long subprocess sweep make progress.
         #[arg(long, action = clap::ArgAction::SetTrue)]
         stream: bool,
+
+        /// RFC 0076 WS12: run the free-threaded lane — every test is
+        /// spawned with `-X gil=0`, the baseline defaults to
+        /// `tests/regrtest/expectations-gil0.toml`, only the labels
+        /// keyed there are scheduled, and execution is forced to
+        /// subprocess mode (the flag is process-wide at startup).
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        gil0: bool,
     },
 
     /// Validate WeavePy against real PyPI packages: per manifest row,
@@ -259,6 +267,7 @@ fn real_main() -> Result<()> {
             jobs,
             weavepy,
             stream,
+            gil0,
         } => {
             let strict = check && !no_check;
             cmd_regrtest(
@@ -275,6 +284,7 @@ fn real_main() -> Result<()> {
                     jobs,
                     weavepy,
                     stream,
+                    gil0,
                 },
             )
         }
@@ -456,6 +466,7 @@ struct RegrtestArgs<'a> {
     jobs: usize,
     weavepy: Option<PathBuf>,
     stream: bool,
+    gil0: bool,
 }
 
 fn cmd_run(workspace: &Path, report_dir: &Path) -> Result<()> {
@@ -527,7 +538,19 @@ fn cmd_diff(workspace: &Path, report_dir: &Path, phase: Phase) -> Result<()> {
 }
 
 fn cmd_regrtest(workspace: &Path, report_dir: &Path, args: RegrtestArgs<'_>) -> Result<()> {
-    let default_expectations = workspace.join("tests/regrtest/expectations.toml");
+    // RFC 0076 WS12: the free-threaded lane reads its own baseline and
+    // must run in subprocess mode — `-X gil=0` is a startup-time,
+    // process-wide switch an in-process interpreter can't apply.
+    let mode = if args.gil0 {
+        regrtest::ExecutionMode::Subprocess
+    } else {
+        args.mode
+    };
+    let default_expectations = if args.gil0 {
+        workspace.join("tests/regrtest/expectations-gil0.toml")
+    } else {
+        workspace.join("tests/regrtest/expectations.toml")
+    };
     let exp_path = args.expectations.unwrap_or(&default_expectations);
     let expectations = regrtest::Expectations::load(exp_path)?;
     let timeout_secs = args
@@ -558,6 +581,7 @@ fn cmd_regrtest(workspace: &Path, report_dir: &Path, args: RegrtestArgs<'_>) -> 
     let discovery = regrtest::DiscoveryOptions {
         cpython_dir,
         include_all_cpython: args.all_cpython,
+        only_expected: args.gil0,
     };
 
     let mut files = regrtest::discover_with(workspace, &discovery, Some(&expectations));
@@ -574,10 +598,15 @@ fn cmd_regrtest(workspace: &Path, report_dir: &Path, args: RegrtestArgs<'_>) -> 
 
     let runner = regrtest::RunnerOptions {
         timeout,
-        mode: args.mode,
+        mode,
         workers: args.jobs.max(1),
-        weavepy_binary: resolve_weavepy_binary(args.weavepy, args.mode, workspace),
+        weavepy_binary: resolve_weavepy_binary(args.weavepy, mode, workspace),
         stream_results: args.stream,
+        interpreter_args: if args.gil0 {
+            vec!["-X".to_owned(), "gil=0".to_owned()]
+        } else {
+            Vec::new()
+        },
     };
     let reports = regrtest::run_all_with(&files, &expectations, &runner);
     let summary = regrtest::RegrtestSummary::from_reports(&reports);

@@ -161,6 +161,13 @@ pub mod op {
     pub const UNPACK_SEQUENCE: u8 = 117;
     pub const YIELD_VALUE: u8 = 118;
     pub const RESUME: u8 = 149;
+    // WeavePy extensions for PEP 750 t-strings (`-X lang=next`,
+    // RFC 0076 WS15): CPython 3.13 has no such opcodes. These numbers
+    // sit in 3.13's specialized/quickened range, which never appears
+    // in unquickened code, so they cannot collide with anything
+    // `map_from_cpython` recognizes.
+    pub const BUILD_TEMPLATE: u8 = 150;
+    pub const BUILD_INTERPOLATION: u8 = 151;
 }
 
 /// CPython 3.13 `HAVE_ARGUMENT` boundary: opcodes `>=` this take an
@@ -470,6 +477,8 @@ fn map_to_cpython(ins: Instruction, slots: &DerefSlots) -> MappedOp {
         O::CleanupThrow => (op::CLEANUP_THROW, 0),
         O::StopIterationError => (op::CALL_INTRINSIC_1, INTRINSIC_STOPITERATION_ERROR),
         O::AsyncGenWrap => (op::CALL_INTRINSIC_1, INTRINSIC_ASYNC_GEN_WRAP),
+        O::BuildInterpolation => (op::BUILD_INTERPOLATION, ins.arg),
+        O::BuildTemplate => (op::BUILD_TEMPLATE, 0),
         O::LoadAssertionError => (op::LOAD_ASSERTION_ERROR, 0),
         O::FormatValue => {
             // Neither wire form carries an oparg; the spec-on-stack bit
@@ -1879,6 +1888,17 @@ fn stack_effects(opcode: OpCode, arg: u32) -> (i64, i64) {
                 0
             }
         }
+        // Pops value + expression text (+ spec when bit 2 is set),
+        // pushes the Interpolation.
+        O::BuildInterpolation => {
+            if arg & 0x04 != 0 {
+                -2
+            } else {
+                -1
+            }
+        }
+        // Pops the strings and interpolations tuples, pushes the Template.
+        O::BuildTemplate => -1,
         O::RaiseVarargs => -a,
         O::Reraise => {
             if arg == 0 {
@@ -2685,6 +2705,8 @@ fn map_from_cpython(cp_op: u8, arg: u32, slots: &SlotMap) -> Option<(OpCode, u32
         }
         op::CALL_INTRINSIC_2 => (O::PrepReraiseStar, 0),
         op::CLEANUP_THROW => (O::CleanupThrow, 0),
+        op::BUILD_INTERPOLATION => (O::BuildInterpolation, arg),
+        op::BUILD_TEMPLATE => (O::BuildTemplate, 0),
         op::LOAD_ASSERTION_ERROR => (O::LoadAssertionError, 0),
         op::COMPARE_OP => (O::CompareOp, CompareKind::from_arg(arg >> 5)?.as_arg()),
         op::IS_OP => (O::IsOp, arg),

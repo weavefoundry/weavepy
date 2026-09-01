@@ -1862,6 +1862,13 @@ class ZipFile:
              open(targetpath, "wb") as target:
             shutil.copyfileobj(source, target)
 
+        # CPython restores Unix permissions recorded in the upper bits
+        # of external_attr (e.g. the executable bit on packaged
+        # binaries).
+        attr = member.external_attr >> 16
+        if attr != 0:
+            os.chmod(targetpath, attr)
+
         return targetpath
 
     def _writecheck(self, zinfo):

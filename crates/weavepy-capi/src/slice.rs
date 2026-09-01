@@ -67,11 +67,24 @@ pub unsafe extern "C" fn PySlice_Unpack(
             return -1;
         }
     };
+    // CPython converts components through `_PyEval_SliceIndex` →
+    // `PyNumber_AsSsize_t(v, NULL)`, which *clamps* an out-of-range
+    // integer to `PY_SSIZE_T_MIN`/`MAX` rather than raising —
+    // `e[3::sys.maxsize<<64]` is a valid slice on every sequence
+    // (lxml's ETreeElementSlicingTest, RFC 0076 WS3).
+    let clamp_big = |big: &num_bigint::BigInt| -> PySsizeT {
+        big.to_isize()
+            .unwrap_or(if big.sign() == num_bigint::Sign::Minus {
+                PySsizeT::MIN
+            } else {
+                PySsizeT::MAX
+            })
+    };
     let resolve = |o: &Object, default: PySsizeT| -> Option<PySsizeT> {
         match o {
             Object::None => Some(default),
             Object::Int(i) => Some(*i as PySsizeT),
-            Object::Long(big) => big.to_isize(),
+            Object::Long(big) => Some(clamp_big(big)),
             Object::Bool(b) => Some(if *b { 1 } else { 0 }),
             // CPython's `_PyEval_SliceIndex` accepts any object exposing
             // `__index__` — a numpy `int64`/`intp` scalar, a pandas block
@@ -92,7 +105,7 @@ pub unsafe extern "C" fn PySlice_Unpack(
                 }
                 let v = match unsafe { crate::object::clone_object(idx) } {
                     Object::Int(i) => Some(i as PySsizeT),
-                    Object::Long(big) => big.to_isize(),
+                    Object::Long(big) => Some(clamp_big(&big)),
                     Object::Bool(b) => Some(if b { 1 } else { 0 }),
                     _ => None,
                 };
@@ -106,7 +119,9 @@ pub unsafe extern "C" fn PySlice_Unpack(
             crate::errors::set_value_error("slice step cannot be zero");
             return -1;
         }
-        Some(v) => v,
+        // CPython caps a negative step at `-PY_SSIZE_T_MAX` (not MIN) so
+        // `-step` can never overflow (PySlice_Unpack, sliceobject.c).
+        Some(v) => v.max(-PySsizeT::MAX),
         None => {
             // CPython's `PySlice_Unpack` reports one uniform message for a
             // non-integer / no-`__index__` component (via `_PyEval_SliceIndex`),

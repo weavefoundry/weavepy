@@ -95,10 +95,13 @@ pub unsafe extern "C" fn PyObject_Repr(o: *mut PyObject) -> *mut PyObject {
     // *elements* need the same dunder treatment (pandas' ujson stringifies a
     // MultiIndex key tuple holding a `Timestamp`, whose Cython `__repr__`
     // the native renderer cannot run).
-    if matches!(
-        obj,
-        Object::Instance(_) | Object::Type(_) | Object::Tuple(_) | Object::List(_)
-    ) {
+    // In fact *every* VM object routes through the interpreter's canonical
+    // repr when one is live: the `repr_for` fallback below is a crude last
+    // resort whose bytes/str arms are lossy (`b'\xff'` printed as
+    // `b'\u{fffd}'` broke numpy's `string_converter_helper` ValueError
+    // message — RFC 0076 WS1); it is only for the no-interpreter embedding
+    // window.
+    {
         match crate::interp::ensure_active(|| {
             crate::interp::with_interp_mut(|interp| interp.repr_object(&obj))
         }) {
@@ -152,10 +155,11 @@ pub unsafe extern "C" fn PyObject_Str(o: *mut PyObject) -> *mut PyObject {
     // placeholder from `str_for`, corrupting the value. Containers route
     // through the interpreter too so their *elements'* dunders run (pandas'
     // ujson `str(...)`s MultiIndex key tuples holding `Timestamp`s).
-    if matches!(
-        obj,
-        Object::Instance(_) | Object::Type(_) | Object::Tuple(_) | Object::List(_)
-    ) {
+    // Same as `PyObject_Repr`: dispatch every VM object through the live
+    // interpreter's canonical `str` (the `str_for` fallback is lossy for
+    // bytes and knows no dunders); fallback only when no interpreter is
+    // active.
+    {
         match crate::interp::ensure_active(|| {
             crate::interp::with_interp_mut(|interp| interp.str_object(&obj))
         }) {
@@ -557,6 +561,20 @@ fn attr_lookup(o: &Object, key: &str) -> Option<Object> {
             // `PyObject_GetItem(PyObject_GetAttr(cls, "__dict__"), …)`
             // and subscripted the raw descriptor).
             if matches!(raw, Object::SlotDescriptor(_)) {
+                return None;
+            }
+            // Same metatype hazard for a `property` found in the class's
+            // own MRO: normally `C.prop` returns the descriptor raw
+            // (`__get__(None, C)`), but when the receiver is a *metaclass*
+            // (its MRO contains `type`, e.g. polars' `DataTypeClass`), the
+            // name may be `type`'s own instance surface (`__qualname__`,
+            // `__name__`), which the metatype's data descriptor serves
+            // *evaluated*. PyO3's abi3 `qualname()` fetches
+            // `cls.__qualname__` through `PyObject_GetAttr` and downcasts
+            // to `str` — the raw property broke every `Wrap<DataType>`
+            // extraction of a DataType *class* (RFC 0076 WS5). The VM's
+            // `LOAD_ATTR` runs the full metatype protocol; defer to it.
+            if matches!(raw, Object::Property(_)) {
                 return None;
             }
             Some(bind_type_attr(t, raw))
@@ -2680,6 +2698,50 @@ pub unsafe extern "C" fn PyIter_NextItem(it: *mut PyObject, finished: *mut c_int
 // PyNumber_*
 // ----------------------------------------------------------------
 
+/// Types whose C `sq_repeat` participates in the `seq * int` fallback
+/// (mirror of the VM's `is_repeatable_sequence`).
+fn is_native_repeatable(o: &Object) -> bool {
+    matches!(
+        o,
+        Object::List(_)
+            | Object::Tuple(_)
+            | Object::Str(_)
+            | Object::WStr(_)
+            | Object::Bytes(_)
+            | Object::ByteArray(_)
+    )
+}
+
+/// CPython `binop_type_error` — the canonical both-slots-declined
+/// message. The exact prefix matters: the VM's `dispatch_binary_op`
+/// treats a bridge TypeError starting "unsupported operand type(s) for"
+/// as *NotImplemented* and keeps dispatching (a right operand's Python
+/// `__rop__`, the sequence fallbacks); the old bespoke
+/// "unsupported operand type for Mul" text propagated as a hard error
+/// instead (RFC 0076 WS1).
+fn binop_decline_message(op: BinOp, a: *mut PyObject, b: *mut PyObject) -> String {
+    let sym = match op {
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::MatMul => "@",
+        BinOp::TrueDiv => "/",
+        BinOp::FloorDiv => "//",
+        BinOp::Rem => "%",
+        BinOp::Pow => "** or pow()",
+        BinOp::And => "&",
+        BinOp::Or => "|",
+        BinOp::Xor => "^",
+        BinOp::Lshift => "<<",
+        BinOp::Rshift => ">>",
+    };
+    format!(
+        "unsupported operand type(s) for {sym}: '{}' and '{}'",
+        unsafe { crate::object::debug_type_name(a) },
+        unsafe { crate::object::debug_type_name(b) }
+    )
+}
+
 fn binop(a: *mut PyObject, b: *mut PyObject, op: BinOp) -> *mut PyObject {
     if a.is_null() || b.is_null() {
         return ptr::null_mut();
@@ -2719,7 +2781,52 @@ fn binop(a: *mut PyObject, b: *mut PyObject, op: BinOp) -> *mut PyObject {
             if std::env::var_os("WEAVEPY_TSDBG").is_some() {
                 eprintln!("[TSDBG] binop {op:?} foreign-slot RESULT=NotImplemented");
             }
-            crate::errors::set_type_error(format!("unsupported operand type for {op:?}"));
+            // CPython `PyNumber_Multiply`: once the number slots decline,
+            // a sequence operand repeats by the *other* operand's
+            // `__index__` — `[1] * np.int_(3)` lands here because numpy's
+            // scalar `nb_multiply` deliberately declines for sequences
+            // (RFC 0076 WS1; numpy test_seq_repeat). The VM's `Mult`
+            // protocol carries the exact repeat-and-error semantics once
+            // both operands are native.
+            if matches!(op, BinOp::Mul) {
+                let (seq, count_ptr) = if is_native_repeatable(&oa) {
+                    (Some(&oa), b)
+                } else if is_native_repeatable(&ob) {
+                    (Some(&ob), a)
+                } else {
+                    (None, ptr::null_mut())
+                };
+                if let Some(seq) = seq {
+                    let idx = unsafe { PyNumber_Index(count_ptr) };
+                    if idx.is_null() {
+                        unsafe { crate::errors::PyErr_Clear() };
+                        crate::errors::set_type_error(format!(
+                            "can't multiply sequence by non-int of type '{}'",
+                            unsafe { crate::object::debug_type_name(count_ptr) }
+                        ));
+                        return ptr::null_mut();
+                    }
+                    let n = unsafe { crate::object::clone_object(idx) };
+                    unsafe { crate::object::Py_DecRef(idx) };
+                    let r = crate::interp::ensure_active(|| {
+                        crate::interp::with_interp_mut(|interp| {
+                            interp.binary_op_public(seq, &n, weavepy_compiler::BinOpKind::Mult)
+                        })
+                    });
+                    return match r {
+                        Some(Ok(v)) => crate::object::into_owned(v),
+                        Some(Err(e)) => {
+                            install_runtime_error(e);
+                            ptr::null_mut()
+                        }
+                        None => {
+                            crate::errors::set_type_error("sequence repeat: no active interpreter");
+                            ptr::null_mut()
+                        }
+                    };
+                }
+            }
+            crate::errors::set_type_error(binop_decline_message(op, a, b));
             return ptr::null_mut();
         }
         if std::env::var_os("WEAVEPY_TSDBG").is_some() {
@@ -2745,7 +2852,7 @@ fn binop(a: *mut PyObject, b: *mut PyObject, op: BinOp) -> *mut PyObject {
             ptr::null_mut()
         }
         None => {
-            crate::errors::set_type_error(format!("unsupported operand type for {op:?}"));
+            crate::errors::set_type_error(binop_decline_message(op, a, b));
             ptr::null_mut()
         }
     }
@@ -2759,6 +2866,7 @@ fn binop_kind(op: BinOp) -> weavepy_compiler::BinOpKind {
         BinOp::Add => K::Add,
         BinOp::Sub => K::Sub,
         BinOp::Mul => K::Mult,
+        BinOp::MatMul => K::MatMult,
         BinOp::TrueDiv => K::Div,
         BinOp::FloorDiv => K::FloorDiv,
         BinOp::Rem => K::Mod,
@@ -2802,6 +2910,7 @@ unsafe fn number_slot_binop(a: *mut PyObject, b: *mut PyObject, op: BinOp) -> *m
                 BinOp::Add => (*nb).nb_add,
                 BinOp::Sub => (*nb).nb_subtract,
                 BinOp::Mul => (*nb).nb_multiply,
+                BinOp::MatMul => (*nb).nb_matrix_multiply,
                 BinOp::TrueDiv => (*nb).nb_true_divide,
                 BinOp::FloorDiv => (*nb).nb_floor_divide,
                 BinOp::Rem => (*nb).nb_remainder,
@@ -2943,6 +3052,7 @@ enum BinOp {
     Add,
     Sub,
     Mul,
+    MatMul,
     TrueDiv,
     FloorDiv,
     Rem,
@@ -2995,6 +3105,8 @@ fn apply_binop(a: &Object, b: &Object, op: BinOp) -> Option<Object> {
             // count; defer to the VM for the faithful arbitrary-precision
             // result rather than truncating.
             BinOp::Lshift | BinOp::Rshift => None,
+            // `int @ int` is a TypeError; let the VM raise it.
+            BinOp::MatMul => None,
         },
         (O::Float(x), O::Float(y)) => match op {
             // `fresh_float`: a NaN result gets a fresh identity tag, matching
@@ -3016,8 +3128,10 @@ fn apply_binop(a: &Object, b: &Object, op: BinOp) -> Option<Object> {
             // negative base with a fractional exponent produces a *complex*
             // result. All three live in the VM's faithful implementation.
             BinOp::FloorDiv | BinOp::Rem | BinOp::Pow => None,
-            // Bitwise/shift on floats is a TypeError; let the VM raise it.
-            BinOp::And | BinOp::Or | BinOp::Xor | BinOp::Lshift | BinOp::Rshift => None,
+            // Bitwise/shift/`@` on floats is a TypeError; let the VM raise it.
+            BinOp::And | BinOp::Or | BinOp::Xor | BinOp::Lshift | BinOp::Rshift | BinOp::MatMul => {
+                None
+            }
         },
         (O::Float(x), O::Int(y)) => apply_binop(&O::Float(*x), &O::Float(*y as f64), op),
         (O::Int(x), O::Float(y)) => apply_binop(&O::Float(*x as f64), &O::Float(*y), op),
@@ -3378,8 +3492,10 @@ pub unsafe extern "C" fn PyNumber_Float(o: *mut PyObject) -> *mut PyObject {
         Object::Float(f) => return crate::object::into_owned(Object::Float(*f)),
         Object::Int(i) => return crate::object::into_owned(Object::Float(*i as f64)),
         Object::Long(big) => {
-            use num_traits::ToPrimitive;
-            return crate::object::into_owned(Object::Float(big.to_f64().unwrap_or(f64::INFINITY)));
+            return match crate::numbers::checked_big_to_double(big) {
+                Some(f) => crate::object::into_owned(Object::Float(f)),
+                None => ptr::null_mut(),
+            };
         }
         Object::Bool(b) => return crate::object::into_owned(Object::Float(f64::from(*b as i32))),
         _ => {}
@@ -3544,7 +3660,18 @@ pub unsafe extern "C" fn PySequence_Check(o: *mut PyObject) -> c_int {
 fn sequence_object_has_sq_item(o: &Object) -> bool {
     use Object as O;
     match o {
-        O::List(_) | O::Tuple(_) | O::Str(_) | O::Bytes(_) | O::ByteArray(_) | O::Range(_) => true,
+        // memoryview carries `sq_item` (CPython's `memory_item`), so
+        // `PySequence_Check(memoryview)` is 1 — numpy's `PyArray_Pack`
+        // relies on that to reject a 0-D memoryview element with
+        // "setting an array element with a sequence" instead of falling
+        // through to `float(mv)` (RFC 0076 WS1, test_0d_generic_special_case).
+        O::List(_)
+        | O::Tuple(_)
+        | O::Str(_)
+        | O::Bytes(_)
+        | O::ByteArray(_)
+        | O::Range(_)
+        | O::MemoryView(_) => true,
         // A subclass of a built-in sequence *is* that sequence — it wraps the
         // primitive in `native` — so it inherits `sq_item` just like CPython.
         O::Instance(inst) => matches!(
@@ -4286,12 +4413,29 @@ pub unsafe extern "C" fn PyNumber_Index(o: *mut PyObject) -> *mut PyObject {
             let dunder = match attr_lookup(&unsafe { crate::object::clone_object(o) }, attr) {
                 Some(d) => d,
                 None => {
-                    crate::errors::set_type_error("object cannot be interpreted as an integer");
+                    // CPython names the offender: "'NoneType' object cannot
+                    // be interpreted as an integer" (Pillow's ImageCms
+                    // asserts the exact text).
+                    crate::errors::set_type_error(format!(
+                        "'{}' object cannot be interpreted as an integer",
+                        other.type_name()
+                    ));
                     return ptr::null_mut();
                 }
             };
+            // `attr_lookup` binds an instance method to its receiver (see
+            // the matching note in `PyNumber_Long`): a `BoundMethod`
+            // already carries `self` — passing `o` again raised
+            // "__index__() takes 1 positional argument but 2 were given"
+            // (numpy's `PyArray_PyIntAsIntp` on a custom `__index__`
+            // object, RFC 0076 WS1).
+            let is_bound = matches!(dunder, Object::BoundMethod(_));
             let dunder_o = crate::object::into_owned(dunder);
-            let result = unsafe { PyObject_CallOneArg(dunder_o, o) };
+            let result = if is_bound {
+                unsafe { PyObject_CallNoArgs(dunder_o) }
+            } else {
+                unsafe { PyObject_CallOneArg(dunder_o, o) }
+            };
             unsafe { crate::object::Py_DecRef(dunder_o) };
             result
         }
@@ -4341,23 +4485,14 @@ pub unsafe extern "C" fn PyNumber_MatrixMultiply(
     a: *mut PyObject,
     b: *mut PyObject,
 ) -> *mut PyObject {
-    // Default: delegate to __matmul__ via the type lookup if
-    // available. For now, error out on missing operator.
-    if a.is_null() || b.is_null() {
-        return ptr::null_mut();
-    }
-    let lhs = unsafe { crate::object::clone_object(a) };
-    let m = match attr_lookup(&lhs, "__matmul__") {
-        Some(m) => m,
-        None => {
-            crate::errors::set_type_error("unsupported operand type for @");
-            return ptr::null_mut();
-        }
-    };
-    let m_o = crate::object::into_owned(m);
-    let result = unsafe { PyObject_CallTwoArgs(m_o, a, b) };
-    unsafe { crate::object::Py_DecRef(m_o) };
-    result
+    // `binary_op(v, w, NB_SLOT(nb_matrix_multiply), "@")` — the same
+    // slot/VM dispatch as every other operator. The previous bespoke
+    // path looked up `__matmul__` (which `attr_lookup` returns *bound*
+    // for an instance receiver) and then passed the receiver again, so
+    // any 2-arg `__matmul__` saw three arguments (RFC 0076 WS2 —
+    // scipy.linalg.interpolative's Cython backend computes `A @ B[:, k]`
+    // through this entry).
+    binop(a, b, BinOp::MatMul)
 }
 
 #[no_mangle]
@@ -4449,6 +4584,7 @@ unsafe fn number_inplace_slot(
                 BinOp::Add => (*nb).nb_inplace_add,
                 BinOp::Sub => (*nb).nb_inplace_subtract,
                 BinOp::Mul => (*nb).nb_inplace_multiply,
+                BinOp::MatMul => (*nb).nb_inplace_matrix_multiply,
                 BinOp::TrueDiv => (*nb).nb_inplace_true_divide,
                 BinOp::FloorDiv => (*nb).nb_inplace_floor_divide,
                 BinOp::Rem => (*nb).nb_inplace_remainder,
@@ -4602,28 +4738,11 @@ pub unsafe extern "C" fn PyNumber_InPlaceMatrixMultiply(
     a: *mut PyObject,
     b: *mut PyObject,
 ) -> *mut PyObject {
-    // `@=` — read `nb_inplace_matrix_multiply` directly (no `BinOp` variant).
-    if !a.is_null() && !b.is_null() {
-        let ty = unsafe { (*a).ob_type } as *mut crate::layout::PyTypeObjectFull;
-        if !ty.is_null() {
-            let nb = unsafe { (*ty).tp_as_number };
-            if !nb.is_null() {
-                let slot = unsafe { (*nb).nb_inplace_matrix_multiply };
-                if !slot.is_null() {
-                    type BinaryFunc =
-                        unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject;
-                    let f: BinaryFunc = unsafe { std::mem::transmute(slot) };
-                    let r = unsafe { f(a, b) };
-                    if r.is_null() {
-                        return ptr::null_mut();
-                    }
-                    if r != crate::singletons::not_implemented_ptr() {
-                        return r;
-                    }
-                    unsafe { crate::object::Py_DecRef(r) };
-                }
-            }
-        }
+    if a.is_null() || b.is_null() {
+        return ptr::null_mut();
+    }
+    if let Some(r) = unsafe { number_inplace_slot(a, b, BinOp::MatMul) } {
+        return r;
     }
     unsafe { PyNumber_MatrixMultiply(a, b) }
 }
@@ -4711,28 +4830,85 @@ pub unsafe extern "C" fn PyNumber_ToBase(o: *mut PyObject, base: c_int) -> *mut 
 // RFC 0029 — additional `PySequence_*` surface.
 // ----------------------------------------------------------------
 
+/// CPython's `PySequence_Concat` — the *left slot* protocol, distinct
+/// from `PyNumber_Add`: the left type's `sq_concat` runs first (numpy's
+/// `array_concat` exists only to raise its canonical TypeError), then
+/// the `nb_add` fallback applies when *both* operands pass
+/// `PySequence_Check`, and everything else is "'…' object can't be
+/// concatenated". No `__radd__` rescue anywhere — `operator.concat(a,
+/// ndarray)` raises where `a + ndarray` broadcasts (RFC 0076 WS1,
+/// numpy test_shape_base.test_operator_concat).
 #[no_mangle]
 pub unsafe extern "C" fn PySequence_Concat(a: *mut PyObject, b: *mut PyObject) -> *mut PyObject {
     if a.is_null() || b.is_null() {
         return ptr::null_mut();
     }
-    match (unsafe { crate::object::clone_object(a) }, unsafe {
-        crate::object::clone_object(b)
-    }) {
-        (Object::List(la), Object::List(lb)) => {
-            let mut combined = la.borrow().clone();
-            combined.extend(lb.borrow().iter().cloned());
-            crate::object::into_owned(Object::new_list(combined))
-        }
-        (Object::Tuple(ia), Object::Tuple(ib)) => {
-            let combined: Vec<Object> = ia.iter().cloned().chain(ib.iter().cloned()).collect();
-            crate::object::into_owned(Object::new_tuple(combined))
-        }
-        _ => {
-            crate::errors::set_type_error("PySequence_Concat: incompatible types");
-            ptr::null_mut()
+    // 1. The left type's real C `sq_concat`. Skip our own generic
+    //    bridges, which forward straight back here.
+    unsafe {
+        let ty = (*a).ob_type as *mut crate::layout::PyTypeObjectFull;
+        if !ty.is_null() {
+            let sq = (*ty).tp_as_sequence;
+            if !sq.is_null() {
+                let f = (*sq).sq_concat;
+                if !f.is_null() && !crate::builtin_slots::is_generic_concat_bridge(f) {
+                    let func: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject =
+                        std::mem::transmute(f);
+                    return func(a, b);
+                }
+            }
         }
     }
+    let oa = unsafe { crate::object::clone_object(a) };
+    let ob = unsafe { crate::object::clone_object(b) };
+    // 2. Built-in sequences: the VM's left-slot concat — compatible
+    //    pairs concatenate, anything else gets the canonical
+    //    "can only concatenate …" TypeError, with no reflected fallback.
+    if matches!(
+        oa,
+        Object::List(_)
+            | Object::Tuple(_)
+            | Object::Str(_)
+            | Object::WStr(_)
+            | Object::Bytes(_)
+            | Object::ByteArray(_)
+    ) {
+        return match weavepy_vm::sequence_concat_native(&oa, &ob) {
+            Ok(v) => crate::object::into_owned(v),
+            Err(e) => {
+                install_runtime_error(e);
+                ptr::null_mut()
+            }
+        };
+    }
+    // 3. `nb_add` fallback: user classes carry `__add__` in `nb_add`
+    //    (never `sq_concat`), so two sequence-shaped operands add.
+    if unsafe { PySequence_Check(a) } != 0 && unsafe { PySequence_Check(b) } != 0 {
+        let r = unsafe { binop(a, b, BinOp::Add) };
+        if !r.is_null() {
+            return r;
+        }
+        // A both-slots-declined TypeError becomes CPython's concat
+        // message; a slot's own error propagates verbatim.
+        match crate::errors::take_pending_error_runtime() {
+            Some(err) => {
+                let declined = matches!(&err,
+                    weavepy_vm::error::RuntimeError::PyException(pe)
+                        if pe.type_name() == "TypeError"
+                            && pe.message()
+                                .starts_with("unsupported operand type(s) for"));
+                if !declined {
+                    install_runtime_error(err);
+                    return ptr::null_mut();
+                }
+            }
+            None => return ptr::null_mut(),
+        }
+    }
+    crate::errors::set_type_error(format!("'{}' object can't be concatenated", unsafe {
+        crate::object::debug_type_name(a)
+    }));
+    ptr::null_mut()
 }
 
 #[no_mangle]

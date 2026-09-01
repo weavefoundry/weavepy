@@ -124,6 +124,51 @@ jobs:
           path: target/regrtest/
           if-no-files-found: warn
 
+  regrtest-gil0:
+    name: regrtest -X gil=0 lane (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    # RFC 0076 WS12 — the free-threaded conformance lane. Every test is
+    # spawned with `-X gil=0` and graded against the curated baseline in
+    # tests/regrtest/expectations-gil0.toml (only the labels keyed there
+    # are scheduled). Without the vendored CPython checkout the lane
+    # degrades to its bundled rows, which is the blocking core; the
+    # vendored thread-suite rows grade in local sweeps. The ubuntu leg
+    # is advisory via the baseline's `measured_os` stamp until a
+    # measured Linux baseline lands (RFC 0063 WS7).
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build weavepy CLI + conformance harness
+        run: cargo build --release -p weavepy-cli -p weavepy-conformance
+      - name: Run free-threaded regrtest lane
+        shell: bash
+        run: |
+          target/release/weavepy-conformance regrtest \
+            --gil0 \
+            --jobs 4 \
+            --stream \
+            --check
+      - name: Append gil=0 lane report to job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## WeavePy regrtest (-X gil=0 lane)"
+            echo
+            cat target/conformance/regrtest.md || echo "(no report produced)"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: regrtest-gil0-report-${{ matrix.os }}
+          path: target/conformance/
+          if-no-files-found: warn
+
   bench:
     name: bench gate (blocking, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}

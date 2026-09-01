@@ -334,6 +334,13 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("ftruncate")),
             builtin("ftruncate", os_ftruncate),
         );
+        // `os.fsync` — POSIX `fsync(2)` / CRT `_commit`. meson calls it
+        // after writing coredata (numpy's test_mem_policy builds a test
+        // extension with meson — RFC 0076 WS1).
+        d.insert(
+            DictKey(Object::from_static("fsync")),
+            builtin("fsync", os_fsync),
+        );
         d.insert(
             DictKey(Object::from_static("truncate")),
             builtin("truncate", os_truncate),
@@ -763,13 +770,6 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             d.insert(
                 DictKey(Object::from_static("startfile")),
                 builtin_kw("startfile", os_startfile),
-            );
-            // `os.fsync` (CRT `_commit`). Registered Windows-only for now: the
-            // POSIX build never exposed `fsync`, and adding it there would
-            // change the measured host surface outside this wave's scope.
-            d.insert(
-                DictKey(Object::from_static("fsync")),
-                builtin("fsync", os_fsync),
             );
             d.insert(
                 DictKey(Object::from_static("_getfullpathname")),
@@ -6146,9 +6146,9 @@ fn os_startfile(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
     Ok(Object::None)
 }
 
-/// `os.fsync(fd)` on Windows — the CRT's `_commit` (which is
-/// `FlushFileBuffers` on the fd's handle), CPython's `os_fsync_impl`.
-#[cfg(windows)]
+/// `os.fsync(fd)` — POSIX `fsync(2)`; on Windows the CRT's `_commit`
+/// (which is `FlushFileBuffers` on the fd's handle), CPython's
+/// `os_fsync_impl`.
 fn os_fsync(args: &[Object]) -> Result<Object, RuntimeError> {
     let fd = match args.first() {
         Some(Object::Int(i)) => *i as i32,
@@ -6158,11 +6158,24 @@ fn os_fsync(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         _ => return Err(type_error("fsync() arg must be int")),
     };
-    let rc = unsafe { crate::stdlib::nt_support::crt::_commit(fd) };
-    if rc != 0 {
-        return Err(crate::stdlib::nt_support::last_crt_error_to_py(None));
+    #[cfg(unix)]
+    {
+        let rc = unsafe { libc::fsync(fd) };
+        if rc != 0 {
+            return Err(crate::error::io_error_to_py(
+                &std::io::Error::last_os_error(),
+            ));
+        }
+        Ok(Object::None)
     }
-    Ok(Object::None)
+    #[cfg(windows)]
+    {
+        let rc = unsafe { crate::stdlib::nt_support::crt::_commit(fd) };
+        if rc != 0 {
+            return Err(crate::stdlib::nt_support::last_crt_error_to_py(None));
+        }
+        Ok(Object::None)
+    }
 }
 
 /// `os.add_dll_directory(path)` — RFC 0064 WS2, CPython's

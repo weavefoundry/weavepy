@@ -310,6 +310,22 @@ impl Keyword {
     }
 }
 
+/// Process-wide gate for the `-X lang=next` 3.14 language preview
+/// (RFC 0076 WS15): PEP 750 t-strings and PEP 758 unparenthesized
+/// except lists. Set once at interpreter startup by the VM; read by
+/// the lexer (`t` string prefix) and the parser (except grammar).
+static LANG_PREVIEW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enable/disable the 3.14 language preview (`-X lang=next`).
+pub fn set_lang_preview(enabled: bool) {
+    LANG_PREVIEW.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the 3.14 language preview (`-X lang=next`) is active.
+pub fn lang_preview() -> bool {
+    LANG_PREVIEW.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Prefix on a string literal. Parsed lazily — the lexer just notes
 /// which prefix appeared so the parser/compiler can decode the body
 /// correctly.
@@ -319,6 +335,9 @@ pub struct StringPrefix {
     pub bytes: bool,
     pub fstring: bool,
     pub unicode: bool,
+    /// PEP 750 t-string (`t"..."`) — only recognized under the
+    /// `-X lang=next` preview gate.
+    pub template: bool,
 }
 
 impl StringPrefix {
@@ -331,20 +350,30 @@ impl StringPrefix {
                 'b' if !p.bytes => p.bytes = true,
                 'f' if !p.fstring => p.fstring = true,
                 'u' if !p.unicode => p.unicode = true,
+                't' if !p.template && lang_preview() => p.template = true,
                 _ => return None,
             }
         }
         // CPython rejects every combination of the `u` prefix with another
         // marker (`ur`, `ru`, `bu`, `fu`) and of bytes with `f`. The `u`
         // prefix is only valid standing alone (kept for Py2 source compat).
+        // The 3.14 grammar treats `t` like `f`: it combines with `r` only
+        // (`bt`, `ut`, and `ft` are all rejected).
         if (p.bytes && p.unicode)
             || (p.bytes && p.fstring)
             || (p.fstring && p.unicode)
             || (p.raw && p.unicode)
+            || (p.template && (p.bytes || p.fstring || p.unicode))
         {
             return None;
         }
         Some(p)
+    }
+
+    /// Whether the literal carries `{...}` interpolation fields that need
+    /// the PEP 701 structure-aware extent scan (f-strings and t-strings).
+    pub fn interpolated(&self) -> bool {
+        self.fstring || self.template
     }
 }
 

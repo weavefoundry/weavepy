@@ -73,6 +73,12 @@ static STRONG: Mutex<Option<HashMap<usize, Rc<PyInstance>>>> = Mutex::new(None);
 /// [`crate::interp::ensure_initialised`].
 pub fn install() {
     weavepy_vm::types::register_instance_body_free(free_instance_body_hook);
+    // RFC 0076 WS1: let `sys.getrefcount` discount clones held only by
+    // the pin caches (parked identity boxes, dead scalar/tuple pins).
+    weavepy_vm::gc_trace::register_pin_clone_count(crate::object::pin_clone_count_hook);
+    // …and *add* raw C refs an extension took with the inline Py_INCREF
+    // macro (no Rc clone to count — test_nditer test_iter_refcount).
+    weavepy_vm::gc_trace::register_extra_c_refs(crate::object::extra_c_refs_hook);
 }
 
 /// Hand `inst` to C as its single, stable faithful body (RFC 0045).

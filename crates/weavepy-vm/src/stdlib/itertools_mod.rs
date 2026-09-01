@@ -55,6 +55,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         reg!("count_core", count_core);
         reg!("cycle_core", cycle_core);
         reg!("chain_core", chain_core);
+        reg!("chain_from_iterable", chain_from_iterable);
         reg!("compress_core", compress_core);
         reg!("dropwhile_core", dropwhile_core);
         reg!("takewhile_core", takewhile_core);
@@ -344,6 +345,38 @@ fn chain_core(args: &[Object]) -> Result<Object, RuntimeError> {
         source: opt_obj(source),
         active: opt_obj(active),
     }))
+}
+
+/// `chain_from_iterable(cls, iterable)` — the native body behind
+/// `chain.from_iterable` (RFC 0076 WS5). The frozen `itertools.py`
+/// splices it in as `classmethod(_n.chain_from_iterable)`, so the bound
+/// attribute presents as `builtin_function_or_method` exactly like
+/// CPython's METH_CLASS original — torch._dynamo's `substitute_in_graph`
+/// gates its polyfill registration on that type surface (a Python
+/// classmethod bound as `method` was rejected). The body mirrors the
+/// Python spelling: `object.__new__(cls)` + `_chain_core(iter(x), None)`.
+fn chain_from_iterable(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [cls_obj, iterable] = args else {
+        return Err(type_error("from_iterable expected 2 arguments"));
+    };
+    let Object::Type(cls) = cls_obj else {
+        return Err(type_error("from_iterable expects a chain subclass"));
+    };
+    let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() else {
+        return Err(type_error(
+            "chain.from_iterable requires a running interpreter",
+        ));
+    };
+    // SAFETY: published by the enclosing VM frame on this thread.
+    let interp = unsafe { &mut *ptr };
+    let globals = interp.builtins_dict();
+    let it = interp.make_iter(iterable, &globals)?;
+    let core = chain_core(&[it, Object::None])?;
+    let inst = Rc::new(crate::types::PyInstance::new(cls.clone()));
+    inst.dict
+        .borrow_mut()
+        .insert(DictKey(Object::from_static("_core")), core);
+    Ok(Object::Instance(inst))
 }
 
 /// `compress_core(data, selectors)`.

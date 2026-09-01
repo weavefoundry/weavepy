@@ -243,6 +243,45 @@ fn smalltest_slice_index_semantics() {
     call(&mut interp, Object::Str("x".into())).expect_err("str must raise TypeError");
 }
 
+/// `METH_CLASS` / `METH_STATIC` entries in a `PyType_FromSpec` method
+/// table (RFC 0076 WS5): CPython wraps them in classmethod /
+/// staticmethod descriptors, so `Counter.make(7)` must run without an
+/// instance with the *type* as the C `self` (PyO3's `#[classmethod]`
+/// shape — polars' `PyOptFlags.default()` at import), and
+/// `Counter.origin()` must run with no receiver at all.
+#[test]
+fn smalltest_class_and_static_methods_bind() {
+    let Some((_lock, mut interp, module)) = load_module() else {
+        return;
+    };
+    let counter_ty = lookup_module_member(&module, "Counter").expect("module missing `Counter`");
+
+    let make = interp
+        .load_attr_public(&counter_ty, "make")
+        .expect("Counter.make resolves on the class");
+    let obj = interp
+        .call_object(make, &[Object::Int(7)], &[])
+        .expect("Counter.make(7) runs without an instance");
+    let tick = interp
+        .load_attr_public(&obj, "tick")
+        .expect("made instance has tick");
+    match interp.call_object(tick, &[], &[]).expect("tick runs") {
+        Object::Int(n) => assert_eq!(n, 8, "make(7).tick() should be 8"),
+        other => panic!("expected int, got {other:?}"),
+    }
+
+    let origin = interp
+        .load_attr_public(&counter_ty, "origin")
+        .expect("Counter.origin resolves on the class");
+    match interp
+        .call_object(origin, &[], &[])
+        .expect("staticmethod runs with no receiver")
+    {
+        Object::Int(n) => assert_eq!(n, 0),
+        other => panic!("expected int, got {other:?}"),
+    }
+}
+
 #[test]
 fn smalltest_module_constants_are_set() {
     let Some((_lock, _interp, module)) = load_module() else {

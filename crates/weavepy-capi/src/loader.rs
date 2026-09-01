@@ -327,6 +327,11 @@ pub fn load_extension_module(
                 std::ptr::null_mut()
             } else {
                 single_phase.set(true);
+                // PEP 703 / RFC 0076 WS11: a single-phase module can
+                // never declare `Py_mod_gil_not_used` — under `-X
+                // gil=0` its import re-enables the GIL (with the
+                // RuntimeWarning), unless `PYTHON_GIL=0` forced.
+                crate::module::note_extension_gil_declaration(module_name, false);
                 r
             }
         }
@@ -388,8 +393,17 @@ pub fn load_extension_module(
         let mut d = module.dict.borrow_mut();
         d.entry(DictKey(Object::from_static("__file__")))
             .or_insert_with(|| Object::from_str(path.display().to_string()));
-        d.entry(DictKey(Object::from_static("__name__")))
-            .or_insert_with(|| Object::from_str(module_name.to_owned()));
+        // Always the *dotted import name*, not the def's `m_name` leaf:
+        // CPython swaps `_Py_PackageContext` around the init call, so a
+        // single-phase `PyModule_Create2` names the fresh module
+        // `package._leaf` even when `m_name` is just `_leaf`. psycopg2
+        // asserts `psycopg2._psycopg.__name__ == "psycopg2._psycopg"`
+        // (RFC 0076 WS5); pickle's `whichmodule` needs the dotted
+        // spelling to resolve C functions back to their module.
+        d.insert(
+            DictKey(Object::from_static("__name__")),
+            Object::from_str(module_name.to_owned()),
+        );
         // `PyModule_Create2` seeds the `__spec__`/`__loader__` = None
         // placeholders CPython's `module_init_dict` puts in every fresh
         // module; `_bootstrap._load` normally replaces them. The native
@@ -419,6 +433,15 @@ pub fn load_extension_module(
         unsafe {
             let f = std::ptr::addr_of!(module.filename).cast_mut();
             *f = Some(path.display().to_string());
+        }
+    }
+    // Keep the struct-level name coherent with the dict's `__name__`
+    // (same package-context rationale as above; same publication-safety
+    // argument as the `filename` patch).
+    if module.name != module_name {
+        unsafe {
+            let n = std::ptr::addr_of!(module.name).cast_mut();
+            *n = module_name.to_owned();
         }
     }
 
