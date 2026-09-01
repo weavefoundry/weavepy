@@ -248,4 +248,28 @@ _init(_c, 2)
 assert _c.x == 4.5, _c.x
 assert _c.y == 2
 
+# ------------- 8. POINTER(T) argtypes accept a bare T instance -------------
+#
+# polars' `_cpu_check` builds a CFUNCTYPE over `POINTER(CPUID_struct)` and
+# passes the struct itself; CPython's PyCPointerType_from_param takes the
+# instance by reference. The shim raised ArgumentError.
+
+
+class _Regs(ctypes.Structure):
+    _fields_ = [("eax", ctypes.c_uint32), ("ecx", ctypes.c_uint32)]
+
+
+def _fill(regs, eax, ecx):
+    regs.contents.eax = eax
+    regs.contents.ecx = ecx
+
+
+_FILL = ctypes.CFUNCTYPE(None, ctypes.POINTER(_Regs), ctypes.c_uint32, ctypes.c_uint32)
+_fill_c = _FILL(_fill)
+_regs = _Regs()
+_fill_c(_regs, 7, 9)
+assert (_regs.eax, _regs.ecx) == (7, 9), (_regs.eax, _regs.ecx)
+_fill_c(ctypes.byref(_regs), 1, 2)
+assert (_regs.eax, _regs.ecx) == (1, 2), (_regs.eax, _regs.ecx)
+
 print("rfc0076-burn-regressions: ok")

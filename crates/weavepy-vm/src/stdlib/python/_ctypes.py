@@ -1127,6 +1127,11 @@ class PyCPointerType(_CDataMeta):
         tgt = info.proto
         if isinstance(value, cls):
             return value
+        # A bare <type> instance where POINTER(<type>) is declared is
+        # accepted by reference, as CPython's PyCPointerType_from_param
+        # does (polars' cpuid thunk passes its struct straight in).
+        if tgt is not None and isinstance(value, tgt):
+            return byref(value)
         if isinstance(value, _CArgObject):
             obj = value._obj
             if isinstance(obj, _CData) and type(obj) is tgt:

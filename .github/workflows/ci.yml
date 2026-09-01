@@ -302,10 +302,19 @@ jobs:
         # The psycopg2 row is a forced sdist build (`no_binary`), a real
         # pg_config-configured C compile. Ubuntu and Windows runner
         # images ship PostgreSQL; the macOS arm64 image does not.
+        # Homebrew's libpq is built against openssl@3, so psycopg2 links
+        # `-lssl -lcrypto`, but only libpq's own libdir comes from
+        # pg_config; the OpenSSL keg is off the default linker path
+        # (measured: `ld: library 'ssl' not found`). setuptools appends
+        # $LDFLAGS / $CPPFLAGS to the extension build lines.
         if: runner.os == 'macOS'
         run: |
-          brew install libpq
+          brew install libpq openssl@3
           echo "$(brew --prefix libpq)/bin" >> "$GITHUB_PATH"
+          {
+            echo "LDFLAGS=-L$(brew --prefix libpq)/lib -L$(brew --prefix openssl@3)/lib"
+            echo "CPPFLAGS=-I$(brew --prefix libpq)/include -I$(brew --prefix openssl@3)/include"
+          } >> "$GITHUB_ENV"
       - name: Run ecosystem harness
         shell: bash
         run: |
