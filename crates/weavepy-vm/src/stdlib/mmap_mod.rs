@@ -426,13 +426,40 @@ fn bytes_like(o: Option<&Object>, func: &str) -> Result<Vec<u8>, RuntimeError> {
         Some(Object::Bytes(b)) => Ok(b.to_vec()),
         Some(Object::ByteArray(b)) => Ok(b.borrow().clone()),
         Some(Object::MemoryView(mv)) => Ok(mv.to_bytes()),
-        Some(other) => Err(type_error(format!(
-            "{func}() argument must be a bytes-like object, not '{}'",
-            other.type_name_owned()
-        ))),
+        Some(other) => {
+            // Any other buffer-protocol exporter reads through its PEP 688
+            // `__buffer__` hook, as CPython's `y*` does through
+            // `bf_getbuffer` — polars' CPUID check hands `mmap.write` a
+            // raw ctypes array (`(c_ubyte * n)(...)`).
+            if let Some(v) = buffer_via_dunder(other)? {
+                return Ok(v);
+            }
+            Err(type_error(format!(
+                "{func}() argument must be a bytes-like object, not '{}'",
+                other.type_name_owned()
+            )))
+        }
         None => Err(type_error(format!(
             "{func}() takes at least 1 argument (0 given)"
         ))),
+    }
+}
+
+/// Read an object's buffer through the PEP 688 `__buffer__` hook (the
+/// WeavePy stand-in for `bf_getbuffer`), on the interpreter published by
+/// the enclosing VM frame. `Ok(None)` when the object exports no buffer.
+fn buffer_via_dunder(obj: &Object) -> Result<Option<Vec<u8>>, RuntimeError> {
+    let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() else {
+        return Ok(None);
+    };
+    // SAFETY: the pointer was published by an enclosing VM frame still
+    // live on this thread; the GIL keeps the access exclusive (mirrors
+    // binascii's `buffer_via_tobytes`).
+    let interp = unsafe { &mut *ptr };
+    let globals = interp.builtins_dict();
+    match interp.memoryview_from_object_and_flags(obj, 0, &globals)? {
+        Some(Object::MemoryView(mv)) => Ok(Some(mv.to_bytes())),
+        _ => Ok(None),
     }
 }
 

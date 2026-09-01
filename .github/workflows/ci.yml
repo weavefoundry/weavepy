@@ -298,6 +298,14 @@ jobs:
         # ubuntu/macos (same 3.13 interpreter) but only `python` on
         # windows runners.
         run: python tools/ecosystem_fetch.py --dest target/ecosystem-wheels
+      - name: Install libpq for the psycopg2 sdist row (macOS)
+        # The psycopg2 row is a forced sdist build (`no_binary`), a real
+        # pg_config-configured C compile. Ubuntu and Windows runner
+        # images ship PostgreSQL; the macOS arm64 image does not.
+        if: runner.os == 'macOS'
+        run: |
+          brew install libpq
+          echo "$(brew --prefix libpq)/bin" >> "$GITHUB_PATH"
       - name: Run ecosystem harness
         shell: bash
         run: |

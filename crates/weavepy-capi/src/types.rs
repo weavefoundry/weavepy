@@ -1925,17 +1925,29 @@ unsafe extern "C" fn type_generic_getattro(o: *mut PyObject, name: *mut PyObject
     if o.is_null() || name.is_null() {
         return ptr::null_mut();
     }
-    let obj = unsafe { crate::object::clone_object(o) };
-    if let Object::Type(ty) = &obj {
-        let key = match unsafe { crate::object::clone_object(name) } {
-            Object::Str(s) => s.to_string(),
-            _ => {
-                crate::errors::set_type_error("attribute name must be string");
-                return ptr::null_mut();
-            }
-        };
+    let key = match unsafe { crate::object::clone_object(name) } {
+        Object::Str(s) => s.to_string(),
+        _ => {
+            crate::errors::set_type_error("attribute name must be string");
+            return ptr::null_mut();
+        }
+    };
+    // This slot only ever runs on *type* instances, so a receiver that
+    // does not already clone to `Object::Type` is a `PyTypeObject*` the
+    // VM has not bridged yet (e.g. a Cython class instantiated before
+    // anything imported it through the bridge) — ready + bridge it and
+    // resolve through the same default protocol. Falling back to the
+    // full `PyObject_GetAttr` here re-dispatches this very slot and
+    // recurses without progress (measured: gevent `local()`, whose
+    // Cython `__cinit__` walks the MRO fetching `__get__` off unbridged
+    // C descriptor types, overflowed with RecursionError).
+    let ty = match unsafe { crate::object::clone_object(o) } {
+        Object::Type(t) => Some(t),
+        _ => unsafe { bridge_or_ready(o.cast::<PyTypeObject>()) },
+    };
+    if let Some(ty) = ty {
         if let Some(res) = crate::interp::ensure_active(|| {
-            crate::interp::with_interp_mut(|interp| interp.type_getattr_default(ty, &key))
+            crate::interp::with_interp_mut(|interp| interp.type_getattr_default(&ty, &key))
         }) {
             return match res {
                 Ok(v) => crate::object::into_owned(v),
@@ -1946,8 +1958,9 @@ unsafe extern "C" fn type_generic_getattro(o: *mut PyObject, name: *mut PyObject
             };
         }
     }
-    // Not a bridged type (or no interpreter): full dispatch is safe.
-    unsafe { crate::abstract_::PyObject_GetAttr(o, name) }
+    // No interpreter (or an unbridgeable pointer): resolve through the
+    // generic instance protocol, which never re-enters this slot.
+    unsafe { crate::genericalloc::PyObject_GenericGetAttr(o, name) }
 }
 
 /// `PyType_Type.tp_setattro` — CPython's `type_setattro` default body

@@ -2742,13 +2742,20 @@ fn binop_decline_message(op: BinOp, a: *mut PyObject, b: *mut PyObject) -> Strin
     )
 }
 
+/// The `WEAVEPY_TSDBG` trace flag, resolved once (a raw `getenv` locks
+/// process-wide and `binop` is the `PyNumber_*` hot path).
+fn tsdbg() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WEAVEPY_TSDBG").is_some())
+}
+
 fn binop(a: *mut PyObject, b: *mut PyObject, op: BinOp) -> *mut PyObject {
     if a.is_null() || b.is_null() {
         return ptr::null_mut();
     }
     let oa = unsafe { crate::object::clone_object(a) };
     let ob = unsafe { crate::object::clone_object(b) };
-    if std::env::var_os("WEAVEPY_TSDBG").is_some() {
+    if tsdbg() {
         eprintln!(
             "[TSDBG] binop {op:?} a_type={} a_kind={} b_type={} b_kind={}",
             unsafe { crate::object::debug_type_name(a) },
@@ -2771,14 +2778,14 @@ fn binop(a: *mut PyObject, b: *mut PyObject, op: BinOp) -> *mut PyObject {
         let r = unsafe { number_slot_binop(a, b, op) };
         if r.is_null() {
             // A slot raised; its exception is pending.
-            if std::env::var_os("WEAVEPY_TSDBG").is_some() {
+            if tsdbg() {
                 eprintln!("[TSDBG] binop {op:?} foreign-slot RESULT=NULL (slot raised)");
             }
             return ptr::null_mut();
         }
         if r == crate::singletons::not_implemented_ptr() {
             unsafe { crate::object::Py_DecRef(r) };
-            if std::env::var_os("WEAVEPY_TSDBG").is_some() {
+            if tsdbg() {
                 eprintln!("[TSDBG] binop {op:?} foreign-slot RESULT=NotImplemented");
             }
             // CPython `PyNumber_Multiply`: once the number slots decline,
@@ -2829,7 +2836,7 @@ fn binop(a: *mut PyObject, b: *mut PyObject, op: BinOp) -> *mut PyObject {
             crate::errors::set_type_error(binop_decline_message(op, a, b));
             return ptr::null_mut();
         }
-        if std::env::var_os("WEAVEPY_TSDBG").is_some() {
+        if tsdbg() {
             eprintln!("[TSDBG] binop {op:?} foreign-slot RESULT type={}", unsafe {
                 crate::object::debug_type_name(r)
             });
@@ -3015,7 +3022,7 @@ unsafe fn number_slot_binop(a: *mut PyObject, b: *mut PyObject, op: BinOp) -> *m
         );
     }
 
-    let dbg = std::env::var_os("WEAVEPY_TSDBG").is_some();
+    let dbg = tsdbg();
     for (idx, slot) in [slot_a, slot_b].into_iter().enumerate() {
         if slot.is_null() {
             if dbg {
@@ -3283,7 +3290,7 @@ pub unsafe extern "C" fn PyNumber_Negative(o: *mut PyObject) -> *mut PyObject {
         return ptr::null_mut();
     }
     let obj = unsafe { crate::object::clone_object(o) };
-    if std::env::var_os("WEAVEPY_TSDBG").is_some() {
+    if tsdbg() {
         eprintln!(
             "[TSDBG] PyNumber_Negative in_type={} cloned={:?}",
             unsafe { crate::object::debug_type_name(o) },
@@ -3307,7 +3314,7 @@ pub unsafe extern "C" fn PyNumber_Negative(o: *mut PyObject) -> *mut PyObject {
             )
         },
     };
-    if std::env::var_os("WEAVEPY_TSDBG").is_some() && !res.is_null() {
+    if tsdbg() && !res.is_null() {
         eprintln!("[TSDBG] PyNumber_Negative RESULT type={}", unsafe {
             crate::object::debug_type_name(res)
         });

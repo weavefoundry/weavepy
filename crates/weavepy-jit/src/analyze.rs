@@ -6496,10 +6496,17 @@ fn emit_instr(
             if ret.is_pinned() && ret != JitType::Obj {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (pinned return)"));
             }
+            // `live_to: pc + 1` — the span *includes* the consuming
+            // CALL pc, matching the null/math/len span convention: an
+            // inner call's parked-result deopt resumes exactly at this
+            // CALL's pc, and the pending callee + `Unbound` marker
+            // must rebuild for it to execute (measured: attrs'
+            // generated `__init__`, converter over a factory call,
+            // underflowed here when the factory's lane guard broke).
             callee_spans.push(CalleeSpanMeta {
                 token: mark.token,
                 live_from: mark.load_pc,
-                live_to: pc,
+                live_to: pc + 1,
                 interp_depth: mark.interp_depth,
             });
             *max_call_args = (*max_call_args).max(argc as u32);
@@ -6604,10 +6611,12 @@ fn emit_instr(
             if ret.is_pinned() && ret != JitType::Obj {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (pinned return)"));
             }
+            // `live_to: pc + 1` — includes the consuming CALL_KW pc
+            // (same rationale as the `CallPy` span above).
             callee_spans.push(CalleeSpanMeta {
                 token: mark.token,
                 live_from: mark.load_pc,
-                live_to: pc,
+                live_to: pc + 1,
                 interp_depth: mark.interp_depth,
             });
             *max_call_args = (*max_call_args).max(n as u32);

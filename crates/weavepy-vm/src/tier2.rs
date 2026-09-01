@@ -7328,9 +7328,10 @@ fn rebuild_stack(
             inserts.push((s.interp_depth, Object::Unbound));
         }
     }
-    // Callee spans open at the deopt pc (strictly between the erased
-    // LOAD_GLOBAL and its CALL) and `len` spans likewise (their
-    // `live_to` is already past the CALL).
+    // Callee spans open at the deopt pc. Every span family records
+    // `live_to` = pc *after* the consuming CALL, so a deopt landing
+    // exactly on that CALL (an inner call's parked-result exit resumes
+    // there) still sees the span open and rebuilds the pending callee.
     // RFC 0068 — every erased callee load is immediately followed by a
     // PUSH_NULL in the self-or-null calling convention, so each open
     // span reinserts the callee *and* the `Unbound` marker above it.
@@ -7414,6 +7415,26 @@ fn rebuild_stack(
                 (s.native_index, name)
             }),
     );
+    if std::env::var_os("WEAVEPY_JIT_TRACE").is_some() {
+        eprintln!(
+            "jit rebuild {:?} deopt_pc {} stack_len {} inserts {:?} null_spans {:?} callee_spans {:?}",
+            frame.code.name,
+            jf.deopt_pc,
+            jf.stack_len,
+            inserts
+                .iter()
+                .map(|(d, o)| (*d, o.type_name()))
+                .collect::<Vec<_>>(),
+            cf.null_spans
+                .iter()
+                .map(|s| (s.live_from, s.live_to, s.interp_depth))
+                .collect::<Vec<_>>(),
+            cf.callee_spans
+                .iter()
+                .map(|s| (s.live_from, s.live_to, s.interp_depth))
+                .collect::<Vec<_>>(),
+        );
+    }
     let mut next = 0usize;
     for i in 0..jf.stack_len as usize {
         while next < inserts.len() && inserts[next].0 as usize == frame.stack.len() {

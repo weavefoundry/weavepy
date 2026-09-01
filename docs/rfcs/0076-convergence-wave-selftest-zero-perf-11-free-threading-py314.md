@@ -629,9 +629,9 @@ missed, the closing census enumerates the *new* front line and the
 baseline is re-committed from what measured.
 
 > **Landing note (measured outcome, honest miss).** The gate was
-> missed: the suite closed at **3.02× CPython geomean** (5 samples,
+> missed: the suite closed at **2.91× CPython geomean** (5 samples,
 > macOS-aarch64, baseline re-committed from what measured, per the
-> protocol above). Two findings from the closing measurement:
+> protocol above). Three findings from the closing measurement:
 >
 > 1. **The escaping-callee lane needed a backoff.** WS7's `CallDyn`
 >    admission compiles call-shaped frames whose callees are *not*
@@ -648,14 +648,22 @@ baseline is re-committed from what measured.
 >    with the JIT sits at parity-or-better vs tier-1 (432ms vs
 >    447ms timed region) instead of 25% behind, and the suite
 >    recovered from 3.04× (pre-backoff) to 3.02×.
-> 2. **The per-fixture floors did not materialize.** The WS6–WS8
+> 2. **Debug-trace `getenv` probes were a measurable interpreter
+>    tax.** The wave's tracing hooks checked `WEAVEPY_TSDBG` /
+>    `WEAVEPY_TRACE_TYPELOOKUP` with a raw `env::var_os` on the
+>    binary-op and type-lookup hot paths; `getenv` takes a
+>    process-global lock per call. Caching each flag in a
+>    `OnceLock<bool>` recovered `pyaes` 16.5× → 13.3×, `dict_ops`
+>    8.2× → 6.3×, `list_ops` 15.9× → 13.6×, `generators`
+>    10.2× → 9.2×, and the suite from 3.02× to the closing 2.91×.
+> 3. **The per-fixture floors did not materialize.** The WS6–WS8
 >    lanes landed and admit the frames they chartered (closure
 >    cells, escaping callees, list shapes, `TO_BOOL`,
 >    `LOAD_ATTR` residue), but admission ≠ win: the call-heavy
 >    fixtures' time lives in the *callee bodies* and the generic
 >    round-trips between them, not in the caller's loop scaffolding
->    the new lanes compile. `deltablue` (22.0×), `richards`
->    (11.8×), `pyaes` (17.2×), `list_ops` (16.9×) hold their
+>    the new lanes compile. `deltablue` (22.6×), `richards`
+>    (11.1×), `pyaes` (13.3×), `list_ops` (13.6×) hold their
 >    wave-10 envelope but not the chartered improvement ratios.
 >    The new front line, measured: (a) `guards_hold` re-validation
 >    cost per generic call — the epoch infrastructure WS9 deferred

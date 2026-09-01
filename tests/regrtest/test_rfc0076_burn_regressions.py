@@ -203,4 +203,49 @@ if _fn is not None:
     assert _fn(ord("A")) == 0, "'A' (Lu) is not titlecase"
     assert _fn(ord("a")) == 0, "'a' (Ll) is not titlecase"
 
+# ------------- 7. deopt at an outer pending CALL rebuilds its callee --------
+#
+# attrs' generated `__init__` (a converter applied over a factory call:
+# `self.x = conv(fac())`) compiled, then a hypothesis example flipped the
+# factory's return lane and the inner call's parked-result deopt resumed
+# exactly *at* the outer CALL's pc. The outer callee span recorded
+# `live_to` = its CALL pc (exclusive under the rebuild filter), so the
+# pending `[conv, NULL]` pair was not re-inserted and the frame died with
+# "InternalError: Call stack underflow". Spans now record the pc *after*
+# the consuming CALL, like every other span family.
+
+_val = 3
+
+
+def _factory():
+    return _val
+
+
+def _converter(v):
+    return v + 1
+
+
+_NS = {"__attr_converter_x": _converter, "__attr_factory_x": _factory}
+exec(
+    "def __init__(self, y):\n"
+    "    self.y = y\n"
+    "    self.x = __attr_converter_x(__attr_factory_x())\n",
+    _NS,
+)
+_init = _NS["__init__"]
+
+
+class _Rec:
+    pass
+
+
+for _i in range(3000):  # enough to tier the frame up at default thresholds
+    _c = _Rec()
+    _init(_c, 2)
+_val = 3.5  # flip the factory's return lane -> deopt mid-frame
+_c = _Rec()
+_init(_c, 2)
+assert _c.x == 4.5, _c.x
+assert _c.y == 2
+
 print("rfc0076-burn-regressions: ok")

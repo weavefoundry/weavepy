@@ -8337,11 +8337,15 @@ impl Interpreter {
             // self_or_null, callable. `Unbound` is the NULL marker.
             OpCode::Call => {
                 let argc = ins.arg as usize;
-                let self_slot = frame
-                    .stack
-                    .len()
-                    .checked_sub(argc + 1)
-                    .ok_or_else(|| RuntimeError::Internal("Call stack underflow".to_owned()))?;
+                let self_slot = frame.stack.len().checked_sub(argc + 1).ok_or_else(|| {
+                    RuntimeError::Internal(format!(
+                        "Call stack underflow in {:?} ({}) pc {} (argc {argc}, stack {})",
+                        frame.code.qualname,
+                        frame.code.filename,
+                        frame.pc,
+                        frame.stack.len()
+                    ))
+                })?;
                 if matches!(frame.stack[self_slot], Object::Unbound) {
                     frame.stack.remove(self_slot);
                     self.dispatch_call(frame, cache_pc, argc)?;
@@ -22608,7 +22612,7 @@ impl Interpreter {
             }
         }
         let (dunder, rdunder) = binop_dunders(op);
-        if std::env::var_os("WEAVEPY_TSDBG").is_some() {
+        if tsdbg() {
             eprintln!(
                 "[TSDBG] vm dispatch_binary_op {op:?} a={} ({:?}) b={} ({:?})",
                 a.type_name(),
@@ -43893,6 +43897,14 @@ fn is_type_error(e: &RuntimeError) -> bool {
     false
 }
 
+/// The `WEAVEPY_TSDBG` trace flag, resolved once. A raw `getenv` takes
+/// a process-global lock; an uncached check on the generic binary-op
+/// dispatch path measured 17-38% on the container-heavy bench fixtures.
+fn tsdbg() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WEAVEPY_TSDBG").is_some())
+}
+
 fn binop_dunders(op: BinOpKind) -> (&'static str, &'static str) {
     use BinOpKind as B;
     match op {
@@ -44836,7 +44848,7 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
         // Every compatible combination returned from an earlier arm, so a
         // sequence on the left here means an incompatible right operand.
         (O::Str(_) | O::WStr(_), _, B::Add) => {
-            if std::env::var_os("WEAVEPY_TSDBG").is_some() {
+            if tsdbg() {
                 eprintln!(
                     "[TSDBG] str-concat raise, b={} backtrace:\n{}",
                     b.type_name(),
@@ -44866,7 +44878,7 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
         ))),
 
         _ => {
-            if std::env::var_os("WEAVEPY_TSDBG").is_some() {
+            if tsdbg() {
                 eprintln!(
                     "[TSDBG] binary_op tail: a={a:?} b={b:?} names=({}, {})",
                     orig_name(a_was_bool, &a),

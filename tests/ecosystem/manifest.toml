@@ -67,8 +67,11 @@ requirements = "pytest==8.4.2 hypothesis==6.155.7"
 # skipped / 1 xfailed in 17:20, well inside the budget the wave-4
 # interpreter blew (killed at 2403s with the tail unreached).
 # Baselined `selftest_status = "pass"` in expectations.toml.
+# Budget: 17:20 measured locally; GitHub runners pace ~2x slower
+# (CI measured ~10% of the suite in 256s), so 2400s leaves no
+# headroom — 4800s does.
 command = "tests"
-timeout_seconds = 2400
+timeout_seconds = 4800
 
 [packages.click]
 # Pinned to the selftest sdist below: the suite must test the version
@@ -336,7 +339,11 @@ timeout_seconds = 900
 [packages.pillow.selftest]
 source = "pillow==12.3.0"
 requirements = "pytest==8.4.2"
-command = "Tests"
+# test_tiff_crashes deselected: its crash-corpus images live in
+# upstream's git repo but not the sdist, and the test re-raises the
+# FileNotFoundError only when it detects CI (`on_ci()`) — it skips
+# locally, fails on GitHub Actions, and never exercises WeavePy.
+command = "Tests --deselect Tests/test_tiff_crashes.py"
 timeout_seconds = 7200
 
 [packages.lxml]
@@ -494,7 +501,13 @@ timeout_seconds = 900
 # (the multiprocessing leg). torch.compile is out of scope — it
 # requires a host toolchain and is gated upstream.
 [packages.torch]
-requirements = "torch numpy"
+# torch pinned (the click row's drift class): the struct.py shim's
+# public signatures mirror `_struct`'s text signatures, and
+# torch._dynamo's `substitute_in_graph` polyfills verify them at
+# import — 2.13.0 names the parameter `format`; a floating resolve
+# gave the Linux lane an older wheel whose polyfill names it `fmt`
+# and fails the import-time signature check.
+requirements = "torch==2.13.0 numpy"
 probe = "probes/torch_probe.py"
 timeout_seconds = 1800
 

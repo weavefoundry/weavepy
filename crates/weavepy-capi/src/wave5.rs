@@ -568,7 +568,13 @@ pub unsafe extern "C" fn _PyType_Lookup(
     let Some(descr) = class.lookup(&name_s) else {
         return ptr::null_mut();
     };
-    if std::env::var_os("WEAVEPY_TRACE_TYPELOOKUP").is_some() {
+    // Resolved once: a raw `getenv` locks process-wide, and this is
+    // the per-miss leg of the type-lookup cache.
+    fn trace_typelookup() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("WEAVEPY_TRACE_TYPELOOKUP").is_some())
+    }
+    if trace_typelookup() {
         eprintln!(
             "[TYPELOOKUP] {}.{name_s}: variant={}",
             class.name,
@@ -576,7 +582,7 @@ pub unsafe extern "C" fn _PyType_Lookup(
         );
     }
     let p = crate::object::into_owned(descr);
-    if std::env::var_os("WEAVEPY_TRACE_TYPELOOKUP").is_some() {
+    if trace_typelookup() {
         let otp = unsafe { (*p).ob_type };
         let tn = unsafe { std::ffi::CStr::from_ptr((*otp).tp_name) };
         eprintln!("[TYPELOOKUP]   box={p:p} ob_type={otp:p} tp_name={tn:?}");
