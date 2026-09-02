@@ -244,11 +244,33 @@ pub extern "C" fn PyMutex_Unlock(_m: *mut c_void) {}
 #[no_mangle]
 pub extern "C" fn PyObject_ClearWeakRefs(_o: *mut PyObject) {}
 
-/// Discard the pending exception (CPython prints it to `sys.stderr`;
-/// numpy calls this only on best-effort cleanup paths).
+/// CPython's default `sys.unraisablehook`: report the pending exception
+/// on `stderr` (with the offending object when given), then clear it.
+/// numpy relies on the message being *visible* — a buffered-cast error
+/// deferred to `NpyIter` deallocation is flushed through here, and
+/// test_nditer's test_buffered_cast_error_paths_unraisable greps a
+/// subprocess's stderr for "ValueError" (RFC 0076 WS1).
 #[no_mangle]
-pub extern "C" fn PyErr_WriteUnraisable(_o: *mut PyObject) {
-    crate::errors::clear_thread_local();
+pub extern "C" fn PyErr_WriteUnraisable(o: *mut PyObject) {
+    if let Some(p) = crate::errors::take_pending() {
+        if !o.is_null() {
+            let obj = unsafe { crate::object::clone_object(o) };
+            eprintln!(
+                "Exception ignored in: <{} object at 0x{:x}>",
+                obj.type_name_owned(),
+                o as usize
+            );
+        }
+        let name =
+            p.ty.as_ref()
+                .map_or_else(|| "Exception".to_owned(), |t| t.name.clone());
+        let msg = crate::errors::message_for(&p.value);
+        if msg.is_empty() {
+            eprintln!("{name}");
+        } else {
+            eprintln!("{name}: {msg}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -628,7 +650,11 @@ ucs4_classifier! {
     _PyUnicode_IsNumeric => |c: char| weavepy_vm::unicode_numeric::is_numeric_char(c);
     _PyUnicode_IsLowercase => |c: char| c.is_lowercase();
     _PyUnicode_IsUppercase => |c: char| c.is_uppercase();
-    _PyUnicode_IsTitlecase => |c: char| c.is_uppercase() && !c.is_lowercase() && c.is_alphabetic() && false;
+    // Category Lt (U+01C5 'ǅ', U+1FFC 'ῼ'): the old body was hardwired
+    // false, so numpy's C `istitle` loop (`Py_UNICODE_ISTITLE`) denied
+    // every titlecase leader (test_strings' `test_istitle_unicode`,
+    // RFC 0076 WS1).
+    _PyUnicode_IsTitlecase => |c: char| weavepy_vm::unicode_case::is_titlecase(c);
     _PyUnicode_IsWhitespace => |c: char| c.is_whitespace();
 }
 
@@ -660,22 +686,127 @@ extern "C" {
     fn strtoul(s: *const c_char, endptr: *mut *mut c_char, base: c_int) -> c_ulong;
 }
 
+/// Longest valid prefix of CPython's float grammar at the start of
+/// `bytes`: `[+-]? (digits [. digits*]? | . digits) ([eE] [+-]? digits)?`
+/// or a case-insensitive `inf`/`infinity`/`nan`. Returns the consumed
+/// byte count (0 when nothing parses).
+fn ascii_float_prefix(bytes: &[u8]) -> usize {
+    let mut i = 0;
+    if matches!(bytes.first(), Some(b'+') | Some(b'-')) {
+        i += 1;
+    }
+    // inf / infinity / nan (CPython's _Py_parse_inf_and_nan).
+    let rest = &bytes[i..];
+    let ci_starts =
+        |pat: &[u8]| rest.len() >= pat.len() && rest[..pat.len()].eq_ignore_ascii_case(pat);
+    if ci_starts(b"infinity") {
+        return i + 8;
+    }
+    if ci_starts(b"inf") {
+        return i + 3;
+    }
+    if ci_starts(b"nan") {
+        return i + 3;
+    }
+    let mut int_digits = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+        int_digits += 1;
+    }
+    let mut frac_digits = 0;
+    if i < bytes.len() && bytes[i] == b'.' {
+        let dot = i;
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+            frac_digits += 1;
+        }
+        // A bare '.' with no digits on either side is not a float.
+        if int_digits == 0 && frac_digits == 0 {
+            return 0;
+        }
+        let _ = dot;
+    } else if int_digits == 0 {
+        return 0;
+    }
+    // Optional exponent — consumed only when at least one digit follows.
+    if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+        let mut j = i + 1;
+        if j < bytes.len() && (bytes[j] == b'+' || bytes[j] == b'-') {
+            j += 1;
+        }
+        let exp_start = j;
+        while j < bytes.len() && bytes[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j > exp_start {
+            i = j;
+        }
+    }
+    i
+}
+
+/// CPython's `PyOS_string_to_double`: **locale-independent** ASCII
+/// float parsing. The previous implementation delegated to the C
+/// library's `strtod`, which honours `LC_NUMERIC` — under a comma-
+/// decimal locale (`fr_FR`) it stopped at the '.' in "1.234", so
+/// numpy's `fromstring(repr(f), sep=' ')` failed with "unmatched data"
+/// (test_longdouble's TestCommaDecimalPointLocale — RFC 0076 WS1).
 #[no_mangle]
 pub unsafe extern "C" fn PyOS_string_to_double(
     s: *const c_char,
     endptr: *mut *mut c_char,
-    _overflow_exception: *mut PyObject,
+    overflow_exception: *mut PyObject,
 ) -> c_double {
-    let mut local: *mut c_char = ptr::null_mut();
-    let v = unsafe { strtod(s, &mut local) };
-    if endptr.is_null() {
+    if s.is_null() {
+        crate::errors::set_value_error("could not convert string to float");
+        return -1.0;
+    }
+    let cstr = unsafe { core::ffi::CStr::from_ptr(s) };
+    let bytes = cstr.to_bytes();
+    let consumed = ascii_float_prefix(bytes);
+    if consumed == 0 {
+        crate::errors::set_value_error(format!(
+            "could not convert string to float: '{}'",
+            String::from_utf8_lossy(bytes)
+        ));
+        if !endptr.is_null() {
+            unsafe { *endptr = s as *mut c_char };
+        }
+        return -1.0;
+    }
+    if endptr.is_null() && consumed != bytes.len() {
         // No endptr means the whole string must convert.
-        if !local.is_null() && unsafe { *local } != 0 {
-            crate::errors::set_value_error("could not convert string to float");
+        crate::errors::set_value_error(format!(
+            "could not convert string to float: '{}'",
+            String::from_utf8_lossy(bytes)
+        ));
+        return -1.0;
+    }
+    // The accepted prefix is ASCII and valid Rust float syntax
+    // (Rust's parser is correctly rounded, like CPython's dtoa).
+    let text = core::str::from_utf8(&bytes[..consumed]).unwrap_or("0");
+    let v: f64 = text.parse().unwrap_or(f64::NAN);
+    // Overflow: a finite-looking literal that lands on ±inf. CPython
+    // raises `overflow_exception` when the caller supplied one,
+    // otherwise returns ±HUGE_VAL like strtod.
+    if v.is_infinite()
+        && !text[..]
+            .trim_start_matches(['+', '-'])
+            .starts_with(['i', 'I'])
+    {
+        if !overflow_exception.is_null() {
+            unsafe {
+                crate::errors::PyErr_SetString(
+                    overflow_exception,
+                    c"value too large to convert to float".as_ptr(),
+                );
+            }
             return -1.0;
         }
-    } else {
-        unsafe { *endptr = local };
+    }
+    if !endptr.is_null() {
+        unsafe { *endptr = s.add(consumed) as *mut c_char };
     }
     v
 }
@@ -1351,7 +1482,10 @@ pub unsafe extern "C" fn PyOS_double_to_string(
                     return ptr::null_mut();
                 }
                 let n = (n as usize).min(buf.len() - 1);
-                String::from_utf8_lossy(&buf[..n]).into_owned()
+                // CPython's `PyOS_double_to_string` is locale-independent;
+                // C `snprintf` honours `LC_NUMERIC` (fr_FR renders "1,5"),
+                // so normalise the decimal point back to '.' (RFC 0076 WS1).
+                String::from_utf8_lossy(&buf[..n]).replace(',', ".")
             }
             _ => {
                 crate::errors::set_value_error("PyOS_double_to_string: unknown format code");

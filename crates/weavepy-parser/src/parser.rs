@@ -1668,13 +1668,46 @@ impl<'src> Parser<'src> {
                     });
                 }
                 let t = self.parse_expression(false)?;
-                // `except A, B:` — pegen `invalid_except_stmt`.
-                if self.check(&TokenKind::Comma) {
-                    return Err(ParseError::Unexpected {
-                        span: t.span,
-                        message: "multiple exception types must be parenthesized".to_owned(),
-                    });
-                }
+                // `except A, B:` — pegen `invalid_except_stmt` on 3.13;
+                // under `-X lang=next` (PEP 758, 3.14) an unparenthesized
+                // comma list is a tuple of exception types, valid only
+                // without an `as` clause.
+                let t = if self.check(&TokenKind::Comma) {
+                    if !weavepy_lexer::lang_preview() {
+                        return Err(ParseError::Unexpected {
+                            span: t.span,
+                            message: "multiple exception types must be parenthesized".to_owned(),
+                        });
+                    }
+                    let mut elts = vec![t];
+                    while self.check(&TokenKind::Comma) {
+                        self.bump();
+                        // Trailing comma is allowed (`except A, B,:`).
+                        if self.check(&TokenKind::Colon) || self.at_keyword(Keyword::As) {
+                            break;
+                        }
+                        elts.push(self.parse_expression(false)?);
+                    }
+                    if self.at_keyword(Keyword::As) {
+                        return Err(ParseError::Unexpected {
+                            span: self.peek_token().span,
+                            message:
+                                "multiple exception types must be parenthesized when using 'as'"
+                                    .to_owned(),
+                        });
+                    }
+                    let tup_span = elts
+                        .first()
+                        .map(|e| e.span)
+                        .unwrap_or(kw_span)
+                        .merge(elts.last().map(|e| e.span).unwrap_or(kw_span));
+                    Expr {
+                        kind: ExprKind::Tuple(elts),
+                        span: tup_span,
+                    }
+                } else {
+                    t
+                };
                 let n = if self.at_keyword(Keyword::As) {
                     self.bump();
                     let nt = self.expect(&TokenKind::Name, "name after `as`")?;
@@ -4847,7 +4880,9 @@ impl<'src> Parser<'src> {
     fn parse_string_concat(&mut self, first: Token) -> Result<Expr, ParseError> {
         let mut span = first.span;
         let first_prefix = self.string_prefix(&first)?;
-        let mut accum: AccumString = if first_prefix.fstring {
+        let mut accum: AccumString = if first_prefix.template {
+            AccumString::Template(self.fstring_parts_for(&first)?)
+        } else if first_prefix.fstring {
             AccumString::Joined(self.fstring_parts_for(&first)?)
         } else if first_prefix.bytes {
             match self.decode_string(&first)? {
@@ -4863,7 +4898,30 @@ impl<'src> Parser<'src> {
             let next_prefix = self.string_prefix(&next_tok)?;
             span = span.merge(next_tok.span);
             self.bump();
+            // PEP 750: t-strings only concatenate with other t-strings.
+            let accum_is_template = matches!(accum, AccumString::Template(_));
+            if next_prefix.template != accum_is_template {
+                return Err(ParseError::Unexpected {
+                    span: next_tok.span,
+                    message: "cannot mix t-string literals with string or bytes literals"
+                        .to_owned(),
+                });
+            }
+            if let AccumString::Template(mut parts) = accum {
+                let new_parts = self.fstring_parts_for(&next_tok)?;
+                for p in new_parts {
+                    if let ExprKind::Constant(c @ (Constant::Str(_) | Constant::WStr(_))) = p.kind {
+                        join_str_into_parts(&mut parts, c, p.span);
+                    } else {
+                        parts.push(p);
+                    }
+                }
+                accum = AccumString::Template(parts);
+                continue;
+            }
             accum = match (accum, next_prefix.fstring, next_prefix.bytes) {
+                // Handled above (both sides template, or mix error).
+                (AccumString::Template(_), _, _) => unreachable!(),
                 (AccumString::Bytes(mut a), false, true) => match self.decode_string(&next_tok)? {
                     Constant::Bytes(b) => {
                         a.extend_from_slice(&b);
@@ -4931,6 +4989,10 @@ impl<'src> Parser<'src> {
             // (CPython AST shape; not a docstring candidate).
             AccumString::Joined(parts) => Ok(Expr {
                 kind: ExprKind::JoinedStr(parts),
+                span,
+            }),
+            AccumString::Template(parts) => Ok(Expr {
+                kind: ExprKind::TemplateStr(parts),
                 span,
             }),
         }
@@ -5010,18 +5072,24 @@ impl<'src> Parser<'src> {
     fn parse_fstring_token(&self, tok: &Token) -> Result<Expr, ParseError> {
         let lex = self.lexeme(tok.span);
         let (_, rest) = split_string_prefix(lex);
-        let raw = self.string_prefix(tok)?.raw;
+        let prefix = self.string_prefix(tok)?;
+        let raw = prefix.raw;
         let body = strip_quotes(rest);
         // Absolute byte offset of `body` in the source — `body` is a
         // subslice of the token's lexeme, so pointer arithmetic gives
         // the prefix+quote length. Interior parse errors are reported
         // at their real source location (PEP 701), not the f-string's.
         let body_abs = tok.span.start.0 + (body.as_ptr() as usize - lex.as_ptr() as usize) as u32;
-        let parts = self.parse_fstring_body(body, raw, tok.span, body_abs)?;
+        let parts = self.parse_fstring_body(body, raw, tok.span, body_abs, prefix.template)?;
         // CPython keeps even a pure-literal f-string as a `JoinedStr`
         // (`ast.parse("f'x'")` is JoinedStr([Constant])): it is *not* a
         // docstring candidate and `ast.literal_eval` rejects it. Constant
         // folding happens in the compiler, not here.
+        //
+        // t-string tokens are wrapped in `JoinedStr` here too; the caller
+        // (`parse_string_concat`) re-wraps the flattened parts in
+        // `TemplateStr` — only the parts differ (`Interpolation` instead
+        // of `FormattedValue`).
         Ok(Expr {
             kind: ExprKind::JoinedStr(parts),
             span: tok.span,
@@ -5034,8 +5102,9 @@ impl<'src> Parser<'src> {
         raw: bool,
         anchor: Span,
         body_abs: u32,
+        template: bool,
     ) -> Result<Vec<Expr>, ParseError> {
-        self.parse_fstring_body_inner(body, raw, anchor, body_abs, false)
+        self.parse_fstring_body_inner(body, raw, anchor, body_abs, false, template)
     }
 
     /// `spec_mode` parses a format spec, where `{{`/`}}` are *not*
@@ -5049,6 +5118,7 @@ impl<'src> Parser<'src> {
         anchor: Span,
         body_abs: u32,
         spec_mode: bool,
+        template: bool,
     ) -> Result<Vec<Expr>, ParseError> {
         let mut parts = Vec::new();
         let mut literal = String::new();
@@ -5134,6 +5204,7 @@ impl<'src> Parser<'src> {
                                 body_abs + (i as u32) + 1,
                                 raw,
                                 true,
+                                template,
                             )?;
                         }
                         return Err(scan_err);
@@ -5145,6 +5216,7 @@ impl<'src> Parser<'src> {
                     body_abs + (i as u32) + 1,
                     raw,
                     false,
+                    template,
                 )?;
                 // The debug form `{x=}` comes back as a synthetic
                 // JoinedStr([Constant("x="), FormattedValue]); CPython
@@ -5302,6 +5374,7 @@ impl<'src> Parser<'src> {
         field_abs: u32,
         raw: bool,
         partial: bool,
+        template: bool,
     ) -> Result<Expr, ParseError> {
         // PEP 701 (3.12+): backslashes *are* allowed inside replacement
         // fields (e.g. `f"{d["a\tb"]}"`). The expression is re-tokenized
@@ -5556,8 +5629,17 @@ impl<'src> Parser<'src> {
         let format_spec = match spec_start {
             Some(s) if !partial => {
                 let spec = &field[s..];
-                let inner =
-                    self.parse_fstring_body_inner(spec, raw, anchor, field_abs + s as u32, true)?;
+                // A t-string's format spec is eagerly evaluated to a str
+                // at template construction time; its own nested fields
+                // stay `FormattedValue` (template=false).
+                let inner = self.parse_fstring_body_inner(
+                    spec,
+                    raw,
+                    anchor,
+                    field_abs + s as u32,
+                    true,
+                    false,
+                )?;
                 // CPython spans the format-spec JoinedStr from its `:`
                 // through the end of the spec text (before the `}`).
                 let spec_span = Span::new(field_abs + s as u32 - 1, field_abs + field.len() as u32);
@@ -5577,10 +5659,21 @@ impl<'src> Parser<'src> {
             field_abs + field.len() as u32 + 1,
         );
         let fv = Expr {
-            kind: ExprKind::FormattedValue {
-                value: Box::new(value),
-                conversion,
-                format_spec,
+            kind: if template {
+                // PEP 750: keep the verbatim expression text for
+                // `Interpolation.expression`.
+                ExprKind::Interpolation {
+                    value: Box::new(value),
+                    text: expr_text.to_owned(),
+                    conversion,
+                    format_spec,
+                }
+            } else {
+                ExprKind::FormattedValue {
+                    value: Box::new(value),
+                    conversion,
+                    format_spec,
+                }
             },
             span: fv_span,
         };
@@ -5740,12 +5833,15 @@ fn remap_expr_spans(e: &mut Expr, map: &dyn Fn(u32) -> u32) {
                 remap_expr_spans(i, map);
             }
         }
-        ExprKind::JoinedStr(parts) => {
+        ExprKind::JoinedStr(parts) | ExprKind::TemplateStr(parts) => {
             for p in parts {
                 remap_expr_spans(p, map);
             }
         }
         ExprKind::FormattedValue {
+            value, format_spec, ..
+        }
+        | ExprKind::Interpolation {
             value, format_spec, ..
         } => {
             remap_expr_spans(value, map);
@@ -6227,6 +6323,10 @@ enum AccumString {
     Plain(Vec<u32>),
     Bytes(Vec<u8>),
     Joined(Vec<Expr>),
+    /// PEP 750 t-string parts (`-X lang=next`). Only t-strings may join
+    /// the concatenation; mixing with str/bytes/f-strings is a
+    /// SyntaxError.
+    Template(Vec<Expr>),
 }
 
 /// Code points of a string [`Constant`] (`Str` or `WStr`); panics on a
@@ -6292,7 +6392,7 @@ pub(crate) fn partial_fstring_field_error(
     let tokens = weavepy_lexer::tokenize("").ok()?;
     let p = Parser::new("", tokens);
     let anchor = Span::new(field_start, limit);
-    match p.parse_fstring_field(field, anchor, field_start, false, true) {
+    match p.parse_fstring_field(field, anchor, field_start, false, true, false) {
         Err(e) => {
             // Errors CPython's pegen reports from the tokens it has
             // already seen win over the tokenizer's unterminated-field
@@ -7027,8 +7127,11 @@ fn expr_children(e: &Expr) -> Vec<&Expr> {
         ExprKind::Starred(inner) => out.push(inner),
         ExprKind::Yield(v) => out.extend(v.as_deref()),
         ExprKind::YieldFrom(v) | ExprKind::Await(v) => out.push(v),
-        ExprKind::JoinedStr(parts) => out.extend(parts.iter()),
+        ExprKind::JoinedStr(parts) | ExprKind::TemplateStr(parts) => out.extend(parts.iter()),
         ExprKind::FormattedValue {
+            value, format_spec, ..
+        }
+        | ExprKind::Interpolation {
             value, format_spec, ..
         } => {
             out.push(value);

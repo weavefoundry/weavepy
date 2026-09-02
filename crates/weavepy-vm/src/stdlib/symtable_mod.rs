@@ -858,12 +858,15 @@ impl Builder {
                 }
             }
             E::YieldFrom(value) | E::Await(value) => self.visit_expr(value),
-            E::JoinedStr(parts) => {
+            E::JoinedStr(parts) | E::TemplateStr(parts) => {
                 for p in parts {
                     self.visit_expr(p);
                 }
             }
             E::FormattedValue {
+                value, format_spec, ..
+            }
+            | E::Interpolation {
                 value, format_spec, ..
             } => {
                 self.visit_expr(value);

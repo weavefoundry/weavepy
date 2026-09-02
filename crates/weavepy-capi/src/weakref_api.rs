@@ -130,17 +130,25 @@ fn ensure_weakref_type() -> *mut PyTypeObject {
         return existing as *mut PyTypeObject;
     }
     let cname = CString::new("weakref.ReferenceType").expect("static name");
-    let mut ty = PyTypeObject::new_zeroed();
-    ty.head.ob_type = crate::types::PyType_Type.as_ptr();
-    ty.tp_name = cname.into_raw();
-    ty.tp_basicsize = SIZE_WEAKREF;
-    ty.tp_itemsize = 0;
-    ty.tp_dealloc = Some(crate::object::_PyWeavePy_Dealloc);
-    ty.tp_flags = tpflags::DEFAULT | tpflags::BASETYPE | tpflags::READY;
-    ty.tp_base = crate::types::PyBaseObject_Type.as_ptr();
-    ty.tp_new = weakref_tp_new as *mut c_void;
-    ty.bridge = ptr::null_mut();
-    let p = Box::into_raw(Box::new(ty));
+    // The shell lives in the *exported* `_PyWeakref_RefType` static
+    // (RFC 0076 WS5): torch's `libtorch_python` binds the data symbol at
+    // dlopen and its `PyWeakref_CheckRef` expands to
+    // `Py_IS_TYPE(op, &_PyWeakref_RefType)` — identity only holds when
+    // the crossed VM refs' type *is* that storage.
+    let p = crate::types::_PyWeakref_RefType.as_ptr();
+    unsafe {
+        let ty = &mut *p;
+        ty.head.ob_refcnt = crate::object::IMMORTAL_REFCNT;
+        ty.head.ob_type = crate::types::PyType_Type.as_ptr();
+        ty.tp_name = cname.into_raw();
+        ty.tp_basicsize = SIZE_WEAKREF;
+        ty.tp_itemsize = 0;
+        ty.tp_dealloc = Some(crate::object::_PyWeavePy_Dealloc);
+        ty.tp_flags = tpflags::DEFAULT | tpflags::BASETYPE | tpflags::READY;
+        ty.tp_base = crate::types::PyBaseObject_Type.as_ptr();
+        ty.tp_new = weakref_tp_new as *mut c_void;
+        ty.bridge = ptr::null_mut();
+    }
     crate::types::register_heap_type(p);
     crate::types::maybe_register_inline_type(p);
     PTR_REF.store(p as usize, Ordering::Release);

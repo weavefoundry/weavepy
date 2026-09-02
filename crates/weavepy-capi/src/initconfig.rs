@@ -50,7 +50,7 @@ pub unsafe fn decode_wide(ptr: *const wchar_t) -> String {
 }
 
 /// Decode a possibly-NULL wide string to `Option<String>`.
-unsafe fn decode_wide_opt(ptr: *const wchar_t) -> Option<String> {
+pub(crate) unsafe fn decode_wide_opt(ptr: *const wchar_t) -> Option<String> {
     if ptr.is_null() {
         None
     } else {
@@ -98,7 +98,7 @@ unsafe fn clear_wide(slot: &mut *mut wchar_t) {
 }
 
 /// Replace a config-owned wide-string slot with a copy of `value`.
-unsafe fn set_wide(slot: &mut *mut wchar_t, value: &str) -> bool {
+pub(crate) unsafe fn set_wide(slot: &mut *mut wchar_t, value: &str) -> bool {
     let fresh = alloc_wide(value);
     if fresh.is_null() {
         return false;
@@ -262,7 +262,7 @@ impl PyWideStringList {
 }
 
 /// Decode a list into owned Rust strings.
-unsafe fn list_to_vec(list: &PyWideStringList) -> Vec<String> {
+pub(crate) unsafe fn list_to_vec(list: &PyWideStringList) -> Vec<String> {
     let mut out = Vec::new();
     if list.items.is_null() {
         return out;
@@ -292,7 +292,7 @@ unsafe fn clear_list(list: &mut PyWideStringList) {
 }
 
 /// Rebuild a list from Rust strings (frees the previous storage).
-unsafe fn set_list(list: &mut PyWideStringList, values: &[String]) -> bool {
+pub(crate) unsafe fn set_list(list: &mut PyWideStringList, values: &[String]) -> bool {
     let items = unsafe { libc::malloc(values.len().max(1) * std::mem::size_of::<*mut wchar_t>()) }
         as *mut *mut wchar_t;
     if items.is_null() {

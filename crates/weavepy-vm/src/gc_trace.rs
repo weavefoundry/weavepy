@@ -1965,6 +1965,49 @@ impl GcState {
     }
 }
 
+/// Process-global hook counting `Object` clones held *only* by the C-API
+/// layer's pin caches (parked argument-pinned identity boxes, dead
+/// scalar/tuple pins) — infrastructure references `sys.getrefcount` must
+/// discount (RFC 0076 WS1). Registered once by `weavepy-capi` at init,
+/// same additive-hook pattern as `register_instance_body_free`; inert
+/// (always 0) in a pure-VM build.
+static PIN_CLONE_COUNT: std::sync::OnceLock<fn(&Object) -> usize> = std::sync::OnceLock::new();
+
+/// Register the pin-clone counter hook. Idempotent.
+pub fn register_pin_clone_count(f: fn(&Object) -> usize) {
+    let _ = PIN_CLONE_COUNT.set(f);
+}
+
+/// Clones of `obj` held only by C-API pin caches (0 without the hook).
+pub fn pin_clone_count(obj: &Object) -> usize {
+    match PIN_CLONE_COUNT.get() {
+        Some(f) => f(obj),
+        None => 0,
+    }
+}
+
+/// Process-global hook counting **surplus raw C references** to `obj`'s
+/// faithful body — `ob_refcnt` beyond the single `Rc` pin the C layer
+/// holds while any C reference exists. An extension bumping the body with
+/// the inline `Py_INCREF` macro (numpy's `NpyIter_Copy` increfs its
+/// operands this way) never creates an `Rc` clone, so without this the
+/// reference is invisible to `sys.getrefcount`
+/// (test_nditer's test_iter_refcount — RFC 0076 WS1).
+static EXTRA_C_REFS: std::sync::OnceLock<fn(&Object) -> usize> = std::sync::OnceLock::new();
+
+/// Register the surplus-C-refs counter hook. Idempotent.
+pub fn register_extra_c_refs(f: fn(&Object) -> usize) {
+    let _ = EXTRA_C_REFS.set(f);
+}
+
+/// Raw C references to `obj` beyond the pin `Rc` (0 without the hook).
+pub fn extra_c_refs(obj: &Object) -> usize {
+    match EXTRA_C_REFS.get() {
+        Some(f) => f(obj),
+        None => 0,
+    }
+}
+
 /// `Rc::strong_count`-like accessor that knows about every
 /// container Object variant.
 pub fn strong_count_for(obj: &Object) -> usize {

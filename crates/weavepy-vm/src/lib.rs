@@ -655,6 +655,14 @@ pub struct InterpreterFlags {
     /// and suppressing every other path source. The CLI parses the
     /// file and pairs this with `no_site`/`safe_path` as CPython does.
     pub pth_paths: Option<Vec<String>>,
+    /// PEP 703 / RFC 0076 WS11: `-X gil=N` / `PYTHON_GIL=N` (the CLI
+    /// applied the xoption-beats-env precedence). `Some(0)` starts the
+    /// experimental free-threaded mode; `None`/`Some(1)` keep the GIL.
+    pub gil: Option<u8>,
+    /// The effective `gil=0` came from `PYTHON_GIL=0` in the
+    /// environment: importing a non-declaring extension still warns
+    /// but does *not* re-enable the GIL (CPython 3.13t semantics).
+    pub gil_forced_by_env: bool,
 }
 
 /// The effective `LC_CTYPE` locale name, resolved the way `setlocale(LC_CTYPE,
@@ -1227,6 +1235,26 @@ impl Interpreter {
         }
     }
 
+    /// Compile options for `exec`/`eval` of *string* sources: CPython
+    /// merges the calling frame's `co_flags & PyCF_MASK` into the compile
+    /// (`PyEval_MergeCompilerFlags`), so an `exec` inside a module with
+    /// `from __future__ import annotations` compiles the generated code
+    /// under PEP 563 too. Alembic's `operations/base.py` relies on this:
+    /// its generated op functions annotate with `TYPE_CHECKING`-only names
+    /// that must stay unevaluated strings (RFC 0076 WS5).
+    fn exec_eval_compile_options(&self) -> weavepy_compiler::CompileOptions {
+        let inherited = self
+            .frame_stack
+            .borrow()
+            .last()
+            .map(|f| f.code.future_flags & weavepy_compiler::flags::PYCF_MASK)
+            .unwrap_or(0);
+        weavepy_compiler::CompileOptions {
+            flags: inherited,
+            optimize: self.optimize_level,
+        }
+    }
+
     /// Replace `sys.argv` with the given values. The first entry is
     /// the script name; subsequent entries are passed-through args.
     ///
@@ -1305,6 +1333,25 @@ impl Interpreter {
             .iter()
             .any(|x| x == "dev" || x.starts_with("dev="));
         crate::vm_singletons::set_dev_mode(dev_mode);
+        // RFC 0076 WS15: `-X lang=next` enables the CPython 3.14
+        // language preview (PEP 750 t-strings, PEP 758 unparenthesized
+        // except lists) in the lexer/parser.
+        weavepy_parser::set_lang_preview(flags.xoptions.iter().any(|x| x == "lang=next"));
+        // RFC 0076 WS11 / PEP 703: `-X gil=0` / `PYTHON_GIL=0` starts
+        // the experimental free-threaded mode. Embedders (PEP 741's
+        // `SetInt("gil", 0)`) forward the request as the `gil=0`
+        // xoption, so honour both the CLI-resolved field and a raw
+        // xoption (last occurrence wins, matching CPython's parse).
+        let gil_xopt = flags.xoptions.iter().rev().find_map(|x| match x.as_str() {
+            "gil=0" => Some(0u8),
+            "gil=1" | "gil" => Some(1u8),
+            _ => None,
+        });
+        let gil = gil_xopt.or(flags.gil);
+        if gil == Some(0) {
+            crate::gil::set_free_threading(true);
+            crate::gil::set_free_threading_forced(flags.gil_forced_by_env);
+        }
         // (`-X tracemalloc` / `PYTHONTRACEMALLOC` startup tracing is applied
         // below from the CLI-validated `flags.tracemalloc` nframe.)
         // Resolve `PYTHONIOENCODING`'s encoding half to its canonical codec
@@ -2307,6 +2354,25 @@ impl Interpreter {
             // gh-106558). Route such containers through the cascade, which
             // recurses through untracked containers to reap the tracked
             // descendants.
+            //
+            // Untracked *instances* are the same shape (RFC 0076 WS3): the
+            // canonical case is a dying handled exception. `except E as e:`
+            // compiles to POP_EXCEPT (while `e` still binds the exception —
+            // the reap there sees it alive) followed by `e = None; del e`,
+            // so the actual death site is the STORE displacing `e` — this
+            // path. The exception is untracked and non-finalizable, but
+            // through `__traceback__` → frame → locals it is routinely the
+            // *sole* holder of tracked instances from the unwound frames.
+            // Pillow's `Image.open` is the motivating case: each failed
+            // plugin candidate (`ImImageFile(fp)` raising SyntaxError in
+            // `__init__`) lives only in the constructor frame the traceback
+            // pins; skipping the cascade here left the candidates handle-
+            // pinned holding `fp`, so the "unclosed file" ResourceWarning
+            // fired at the next amortized acyclic sweep instead of at
+            // handler exit (mpo/psd/spider/tiff `test_unclosed_file`).
+            // The deadness pre-check keeps the common alive-rebind
+            // (`self.x = ...` displacing a shared value) at two cheap
+            // lookups; `anchors_tracked_child` is node-capped.
             if !(matches!(
                 dropped,
                 Object::Tuple(_)
@@ -2314,7 +2380,9 @@ impl Interpreter {
                     | Object::Dict(_)
                     | Object::Set(_)
                     | Object::FrozenSet(_)
-            ) && Self::anchors_tracked_child(&dropped, 6))
+                    | Object::Instance(_)
+            ) && Self::is_refcount_dead(&dropped, 1)
+                && Self::anchors_tracked_child(&dropped, 6))
             {
                 // A dead plain tuple's allocation is recycled (CPython's
                 // tuple freelist; see `maybe_donate_tuple`).
@@ -7590,7 +7658,18 @@ impl Interpreter {
                 // its `__del__` now, matching `DeleteDeref` and `StoreFast`. The
                 // cell already holds the new value, so a re-entrant finalizer
                 // observing this free var through the closure sees the rebind.
-                if Self::local_needs_prompt_reap(&old) {
+                //
+                // A displaced *closure function* is reaped here too, exactly
+                // like the frame-teardown locals sweep: a self-referential
+                // closure (`def recurser(...): … recurser(…)`) is GC-tracked,
+                // so after `recurser = None` breaks the cell cycle the GC
+                // handle is the sole owner and the function — plus every
+                // captured cell, including a Foreign array's C reference —
+                // stays pinned until the next cyclic collection. numpy's
+                // `_formatArray` breaks its recurser cycle this way and
+                // test_arrayprint's test_refcount asserts the array's
+                // refcount recovers without a collect (RFC 0076 WS1).
+                if Self::local_needs_prompt_reap(&old) || matches!(old, Object::Function(_)) {
                     self.sync_py_locals(frame);
                     self.prompt_reap_dropped(old);
                 }
@@ -8258,11 +8337,15 @@ impl Interpreter {
             // self_or_null, callable. `Unbound` is the NULL marker.
             OpCode::Call => {
                 let argc = ins.arg as usize;
-                let self_slot = frame
-                    .stack
-                    .len()
-                    .checked_sub(argc + 1)
-                    .ok_or_else(|| RuntimeError::Internal("Call stack underflow".to_owned()))?;
+                let self_slot = frame.stack.len().checked_sub(argc + 1).ok_or_else(|| {
+                    RuntimeError::Internal(format!(
+                        "Call stack underflow in {:?} ({}) pc {} (argc {argc}, stack {})",
+                        frame.code.qualname,
+                        frame.code.filename,
+                        frame.pc,
+                        frame.stack.len()
+                    ))
+                })?;
                 if matches!(frame.stack[self_slot], Object::Unbound) {
                     frame.stack.remove(self_slot);
                     self.dispatch_call(frame, cache_pc, argc)?;
@@ -10579,6 +10662,52 @@ impl Interpreter {
                     frame.push(Object::from_str(formatted));
                 }
             }
+            // PEP 750 t-strings (`-X lang=next`, RFC 0076 WS15). Builds
+            // one `string.templatelib.Interpolation`; arg encoding
+            // mirrors FORMAT_VALUE (conversion in bits 0-1, spec-on-stack
+            // in bit 2).
+            OpCode::BuildInterpolation => {
+                let arg = ins.arg;
+                let spec = if arg & 0x04 != 0 {
+                    frame.pop()?
+                } else {
+                    Object::from_static("")
+                };
+                let text = frame.pop()?;
+                let value = frame.pop()?;
+                let conversion = match arg & 0x03 {
+                    1 => Object::from_static("s"),
+                    2 => Object::from_static("r"),
+                    3 => Object::from_static("a"),
+                    _ => Object::None,
+                };
+                let globals = frame.globals.clone();
+                let cls = self.templatelib_attr("Interpolation", &globals)?;
+                let interp = self.call(&cls, &[value, text, conversion, spec], &[], &globals)?;
+                frame.push(interp);
+            }
+            // PEP 750: pops the interpolations tuple and the strings
+            // tuple, interleaves them, and calls
+            // `string.templatelib.Template(*parts)` (whose constructor
+            // canonicalizes — a no-op for the compiler-emitted shape).
+            OpCode::BuildTemplate => {
+                let interps = frame.pop()?;
+                let strings = frame.pop()?;
+                let (Object::Tuple(ss), Object::Tuple(ii)) = (&strings, &interps) else {
+                    return Err(type_error("BUILD_TEMPLATE expects two tuples"));
+                };
+                let mut args: Vec<Object> = Vec::with_capacity(ss.len() + ii.len());
+                for (idx, s) in ss.iter().enumerate() {
+                    args.push(s.clone());
+                    if let Some(i) = ii.get(idx) {
+                        args.push(i.clone());
+                    }
+                }
+                let globals = frame.globals.clone();
+                let cls = self.templatelib_attr("Template", &globals)?;
+                let template = self.call(&cls, &args, &[], &globals)?;
+                frame.push(template);
+            }
             OpCode::YieldValue => {
                 let v = frame.pop()?;
                 // CPython 3.13 encoding: arg 0 = the source-level `yield`
@@ -12009,6 +12138,15 @@ impl Interpreter {
                     // CPython `property.__init__`: a missing explicit doc
                     // falls back to the getter's docstring.
                     let doc = p.doc();
+                    if matches!(doc, Object::None) {
+                        // A harvested C getset's docstring can be written
+                        // into the C struct after harvest (numpy's
+                        // `add_docstring(np.ndarray.flat, …)`); read the
+                        // live slot through the bridge (RFC 0076 WS1).
+                        if let Some(s) = crate::foreign::getset_live_doc(obj) {
+                            return Ok(Object::from_str(s));
+                        }
+                    }
                     let fget = p.fget();
                     if matches!(doc, Object::None) && !matches!(fget, Object::None) {
                         return Ok(self.load_attr(&fget, "__doc__").unwrap_or(Object::None));
@@ -12139,6 +12277,33 @@ impl Interpreter {
             Object::Module(m) => {
                 if let Some(v) = m.dict.borrow().get(&crate::object::StrKey(name)) {
                     return Ok(v.clone());
+                }
+                // A module re-classed via `m.__class__ = ModuleSubclass`
+                // (RFC 0076 WS5) resolves misses through the class:
+                // methods and class attributes bind like instance
+                // attribute access, then the class's own `__getattr__`
+                // runs (torch's `ConfigModule.__getattr__` serves the
+                // config entries deleted from the module dict).
+                if let Some(cls) = crate::object::module_class(m) {
+                    if name == "__class__" {
+                        return Ok(Object::Type(cls));
+                    }
+                    if !matches!(name, "__dict__" | "__name__" | "__annotations__") {
+                        if let Some(v) = cls.lookup(name) {
+                            return self.descriptor_get(&v, obj, &Object::Type(cls.clone()));
+                        }
+                        if name != "__getattr__" {
+                            if let Some(ga) = cls.lookup("__getattr__") {
+                                let g = self.builtins.clone();
+                                return self.call(
+                                    &ga,
+                                    &[obj.clone(), Object::from_str(name)],
+                                    &[],
+                                    &g,
+                                );
+                            }
+                        }
+                    }
                 }
                 match name {
                     "__name__" => return Ok(Object::from_str(&m.name)),
@@ -16101,8 +16266,10 @@ impl Interpreter {
 
     /// Emit a `RuntimeWarning` through the live `warnings` machinery so
     /// filters / `catch_warnings` apply. Used for "coroutine … was
-    /// never awaited" at finalization.
-    fn emit_runtime_warning(&mut self, message: String) -> Result<(), RuntimeError> {
+    /// never awaited" at finalization, and (RFC 0076 WS11, via the
+    /// C-API loader) for the "GIL has been enabled to load module"
+    /// warning under `-X gil=0`.
+    pub fn emit_runtime_warning(&mut self, message: String) -> Result<(), RuntimeError> {
         let Some(warn) = self.module_attr("warnings", "warn") else {
             return Ok(());
         };
@@ -16586,8 +16753,23 @@ impl Interpreter {
                 .cls()
                 .lookup("__buffer_delegates_exporter__")
                 .is_some());
+        // A *synthesized* `__buffer__` over a foreign C `bf_getbuffer`
+        // slot (the mirror's dunder shim installs it as a builtin — RFC
+        // 0076 WS1) is not a Python-level hook: CPython would dispatch
+        // the C slot directly, and the slot owns `view->obj` — an
+        // ND_REDIRECT exporter points it at the *root* exporter
+        // (test_buffer's redirect chains assert `memoryview(z).obj is x`)
+        // and a legacy getbufferproc leaves it NULL (`m.obj is None`).
+        // The bridge recorded that `view->obj` as the returned view's
+        // exporter; keep it. The provider must be a mirrored C type
+        // (`c_ext_ptr`): a *native* builtin `__buffer__` (bytearray) and
+        // a Python-defined one both keep CPython's slot-wrapper
+        // behaviour instead — `view->obj` is the receiver itself.
+        let c_slot_export = matches!(other, Object::Instance(inst)
+            if inst.cls().lookup_with_owner("__buffer__").is_some_and(
+                |(m, owner)| matches!(m, Object::Builtin(_)) && owner.c_ext_ptr.get() != 0));
         let out = Object::MemoryView(Rc::new(v.shallow_clone()));
-        let exporter = if delegates {
+        let exporter = if delegates || c_slot_export {
             v.exporter.borrow().clone()
         } else {
             Some(other.clone())
@@ -16740,6 +16922,27 @@ impl Interpreter {
             )?)),
             None => Ok(None),
         }
+    }
+
+    /// Resolve `string.templatelib.<attr>` for the PEP 750 t-string
+    /// opcodes (`-X lang=next`, RFC 0076 WS15). The frozen module import
+    /// is a `sys.modules` hit after the first call.
+    fn templatelib_attr(
+        &mut self,
+        attr: &'static str,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        let fromlist = Object::new_tuple(vec![Object::from_static(attr)]);
+        let module = self.do_import("string.templatelib", &fromlist, 0, globals)?;
+        let val = match &module {
+            Object::Module(m) => m
+                .dict
+                .borrow()
+                .get(&DictKey(Object::from_static(attr)))
+                .cloned(),
+            _ => None,
+        };
+        val.ok_or_else(|| type_error(format!("string.templatelib has no attribute '{attr}'")))
     }
 
     /// `anext(aiter, default)` — wrap the `__anext__` awaitable in a frozen
@@ -17834,6 +18037,15 @@ impl Interpreter {
                             true
                         }
                         Object::Instance(d) => d.cls().lookup("__get__").is_some(),
+                        // A foreign descriptor binds through its C type's
+                        // `tp_descr_get` (`descriptor_get`'s Foreign arm) —
+                        // pybind11 wraps every `def("__hash__", …)` in a C
+                        // `instancemethod`; calling it *raw* passes no
+                        // receiver ("__hash__(): incompatible function
+                        // arguments", torch's `TransformType` enum keys,
+                        // RFC 0076 WS5). A foreign non-descriptor passes
+                        // through `descriptor_get` unchanged.
+                        Object::Foreign(_) => true,
                         _ => false,
                     };
                     let target = if is_descr {
@@ -22400,6 +22612,15 @@ impl Interpreter {
             }
         }
         let (dunder, rdunder) = binop_dunders(op);
+        if tsdbg() {
+            eprintln!(
+                "[TSDBG] vm dispatch_binary_op {op:?} a={} ({:?}) b={} ({:?})",
+                a.type_name(),
+                std::mem::discriminant(a),
+                b.type_name(),
+                std::mem::discriminant(b)
+            );
+        }
         let not_impl = crate::vm_singletons::not_implemented();
         let mut a_declined = false;
         let mut b_declined = false;
@@ -22471,15 +22692,37 @@ impl Interpreter {
             // `nb_add` (which converts a D-unit scalar to `datetime.date`)
             // win over it.
             if !matches!(a, Object::Foreign(_)) {
-                if let Some(method) =
-                    instance_method(a, dunder).or_else(|| metaclass_method(a, dunder))
-                {
-                    a_tried = true;
-                    let r = self.call(&method, std::slice::from_ref(b), &[], globals)?;
-                    if !r.is_same(&not_impl) {
-                        return Ok(r);
+                // …but only a *Python-defined class-dict* dunder outranks the
+                // C suite. A builtin dunder shim mirrors a C slot — and a
+                // native sequence's concat/repeat is `sq_concat`/`sq_repeat`,
+                // which CPython's `PyNumber_Add` fallback consults only after
+                // BOTH operands' `nb_*` slots decline. numpy `str_`'s
+                // inherited `str.__add__` shim raises "can only concatenate
+                // str …" (exactly like CPython's wrapper) instead of
+                // returning NotImplemented, so calling it here pre-empted the
+                // foreign operand's C `nb_add`: `np.str_ + ndarray`
+                // concatenates through numpy's slot in CPython (test_strings'
+                // partition round-trip, RFC 0076 WS1). Skip *builtin*
+                // resolutions — the C slot protocol below runs both sides in
+                // CPython's order — and pre-call only Python functions (the
+                // pandas Timedelta class-dict assignment this exists for).
+                let inherited_builtin_wrapper = match a {
+                    Object::Instance(ai) => {
+                        matches!(ai.cls().lookup(dunder), Some(Object::Builtin(_)))
                     }
-                    a_declined = true;
+                    _ => false,
+                };
+                if !inherited_builtin_wrapper {
+                    if let Some(method) =
+                        instance_method(a, dunder).or_else(|| metaclass_method(a, dunder))
+                    {
+                        a_tried = true;
+                        let r = self.call(&method, std::slice::from_ref(b), &[], globals)?;
+                        if !r.is_same(&not_impl) {
+                            return Ok(r);
+                        }
+                        a_declined = true;
+                    }
                 }
             }
             match crate::foreign::binop(op, a, b) {
@@ -22545,14 +22788,49 @@ impl Interpreter {
         // own MRO, so fall back to the metaclass dunder for `Type` operands
         // (`metaclass_method` returns `None` for the plain `type` metaclass,
         // so built-in classes like `int`/`str` are unaffected).
-        if !a_tried {
+        // CPython's `binary_op1` consults only the *number* slots —
+        // `sq_concat`/`sq_repeat` are a `PyNumber_Add`/`Multiply` fallback
+        // reached after BOTH operands' `nb_*` slots decline. An instance
+        // whose `__add__`/`__mul__` resolves to the *inherited builtin*
+        // sequence wrapper (numpy `str_`'s `str.__add__`, which raises "can
+        // only concatenate str …" rather than returning NotImplemented,
+        // exactly like CPython's wrapper) therefore must not pre-empt the
+        // partner's reflected dunder: `np.str_ + ndarray` concatenates
+        // through ndarray's `__radd__` in CPython (test_strings' partition
+        // round-trip, RFC 0076 WS1). Defer the wrapper — run the reflected
+        // pass first — when the partner is a *different* class (CPython
+        // never reorders same-type operands, and the wrapper stays the last
+        // resort so `str_ + str_` still concatenates through it).
+        let defer_seq_wrapper = matches!(op, BinOpKind::Add | BinOpKind::Mult)
+            && match a {
+                Object::Instance(ai) => {
+                    matches!(ai.cls().lookup(dunder), Some(Object::Builtin(_))) && {
+                        let bt = builtin_types();
+                        let ac = ai.cls();
+                        [&bt.str_, &bt.bytes_, &bt.bytearray_, &bt.list_, &bt.tuple_]
+                            .iter()
+                            .any(|t| ac.is_subclass_of(t))
+                            && !Rc::ptr_eq(&ac, &crate::builtins::class_of(b))
+                    }
+                }
+                _ => false,
+            };
+        let run_a_pass = |interp: &mut Self,
+                          a_declined: &mut bool|
+         -> Result<Option<Object>, RuntimeError> {
             if let Some(method) = instance_method(a, dunder).or_else(|| metaclass_method(a, dunder))
             {
-                let r = self.call(&method, std::slice::from_ref(b), &[], globals)?;
+                let r = interp.call(&method, std::slice::from_ref(b), &[], globals)?;
                 if !r.is_same(&not_impl) {
-                    return Ok(r);
+                    return Ok(Some(r));
                 }
-                a_declined = true;
+                *a_declined = true;
+            }
+            Ok(None)
+        };
+        if !a_tried && !defer_seq_wrapper {
+            if let Some(r) = run_a_pass(self, &mut a_declined)? {
+                return Ok(r);
             }
         }
         if !reflected_tried {
@@ -22564,6 +22842,11 @@ impl Interpreter {
                     return Ok(r);
                 }
                 b_declined = true;
+            }
+        }
+        if !a_tried && defer_seq_wrapper {
+            if let Some(r) = run_a_pass(self, &mut a_declined)? {
+                return Ok(r);
             }
         }
         // Both operands defined the operator and *declined* via
@@ -25380,6 +25663,57 @@ impl Interpreter {
                 self.set_type_attr_direct(ty, name, value)
             }
             Object::Module(m) => {
+                // `m.__class__ = ModuleSubclass` (RFC 0076 WS5): CPython's
+                // `object_set_class` waives the immutable-type/layout
+                // guards when both old and new classes are `ModuleType`
+                // subtypes. torch's `install_config_module` re-points
+                // every `torch.*.config` module at a `ConfigModule`
+                // subclass this way.
+                if name == "__class__" {
+                    let Object::Type(new_cls) = &value else {
+                        return Err(type_error(format!(
+                            "__class__ must be set to a class, not '{}' object",
+                            value.type_name()
+                        )));
+                    };
+                    crate::stdlib::sys::audit_event(
+                        "object.__setattr__",
+                        &[obj.clone(), Object::from_static("__class__"), value.clone()],
+                    )?;
+                    let module_ty = builtin_types().module_.clone();
+                    if !new_cls.is_subclass_of(&module_ty) {
+                        return Err(type_error(
+                            "__class__ assignment only supported for mutable types \
+                             or ModuleType subclasses",
+                        ));
+                    }
+                    crate::object::set_module_class(m, value.clone());
+                    crate::rare_events::bump(crate::rare_events::SET_CLASS);
+                    return Ok(());
+                }
+                // A re-classed module routes stores through the class's
+                // user `__setattr__` (CPython: `type(m)->tp_setattro`).
+                // `ConfigModule.__setattr__` chains to
+                // `super().__setattr__` for its bypass keys, which lands
+                // in `object.__setattr__`'s module arm — the plain dict
+                // insert below.
+                if let Some(cls) = crate::object::module_class(m) {
+                    if let Some(setattr) = cls.lookup("__setattr__") {
+                        if matches!(
+                            setattr,
+                            Object::Function(_) | Object::BoundMethod(_) | Object::Instance(_)
+                        ) {
+                            let g = self.builtins.clone();
+                            self.call(
+                                &setattr,
+                                &[obj.clone(), Object::from_str(name), value],
+                                &[],
+                                &g,
+                            )?;
+                            return Ok(());
+                        }
+                    }
+                }
                 // The `builtins` module's dict *is* the interpreter's
                 // ambient lookup namespace (RFC 0052 WS5), so no
                 // mirroring is needed: this plain insert is immediately
@@ -26254,6 +26588,22 @@ impl Interpreter {
             // `del module.attr` removes the name from the module dict
             // (CPython `module_setattro` with a NULL value).
             Object::Module(m) => {
+                // A re-classed module (RFC 0076 WS5) routes deletes
+                // through the class's user `__delattr__` (torch's
+                // `ConfigModule.__delattr__` — mock.patch deletes config
+                // entries and recreates them).
+                if let Some(cls) = crate::object::module_class(m) {
+                    if let Some(delattr) = cls.lookup("__delattr__") {
+                        if matches!(
+                            delattr,
+                            Object::Function(_) | Object::BoundMethod(_) | Object::Instance(_)
+                        ) {
+                            let g = self.builtins.clone();
+                            self.call(&delattr, &[obj.clone(), Object::from_str(name)], &[], &g)?;
+                            return Ok(());
+                        }
+                    }
+                }
                 let removed = m
                     .dict
                     .borrow_mut()
@@ -27738,6 +28088,14 @@ impl Interpreter {
                     {
                         return self.do_round_call(args, outer_globals);
                     }
+                    if b.name == "round" && !kwargs.is_empty() && args.len() <= 2 {
+                        // Keyword form (`round(s, ndigits=None)`) — clinic-bind
+                        // and take the same `__round__` dispatch path as the
+                        // positional call so instance/foreign scalars (numpy
+                        // int8 etc.) round through their own dunder.
+                        let bound = crate::builtins::bind_round_args(args, kwargs)?;
+                        return self.do_round_call(&bound, outer_globals);
+                    }
                     if b.name == "divmod" && args.len() == 2 {
                         return self.do_divmod_call(args, outer_globals);
                     }
@@ -28577,6 +28935,37 @@ impl Interpreter {
                                 return Ok(Object::new_list(
                                     names.into_iter().map(Object::from_str).collect(),
                                 ));
+                            }
+                        }
+                        // CPython's `object.__dir__` merges the type-MRO names
+                        // with `obj.__dict__` fetched *through the type's
+                        // descriptor*. A C type can override `__dict__` with a
+                        // property — lxml's `ObjectifiedElement` fakes one
+                        // listing its XML children so `dir(root)` includes
+                        // them (RFC 0076 WS3). The plain instance-dict walk in
+                        // `b_dir` can't see that; dispatch the property here
+                        // and merge.
+                        if let Object::Instance(inst) = &args[0] {
+                            if matches!(inst.cls().lookup("__dict__"), Some(Object::Property(_))) {
+                                if let Ok(Object::Dict(dd)) = self.load_attr(&args[0], "__dict__") {
+                                    let base =
+                                        crate::builtins::b_dir(std::slice::from_ref(&args[0]))?;
+                                    let mut names: std::collections::BTreeSet<String> = match &base
+                                    {
+                                        Object::List(items) => {
+                                            items.borrow().iter().map(|o| o.to_str()).collect()
+                                        }
+                                        _ => std::collections::BTreeSet::default(),
+                                    };
+                                    for k in dd.borrow().keys() {
+                                        if let Object::Str(s) = &k.0 {
+                                            names.insert(s.to_string());
+                                        }
+                                    }
+                                    return Ok(Object::new_list(
+                                        names.into_iter().map(Object::from_str).collect(),
+                                    ));
+                                }
                             }
                         }
                         let method = instance_method(&args[0], "__dir__")
@@ -30020,6 +30409,7 @@ impl Interpreter {
                     )));
                 }
             }
+            TypeObject::validate_python_bases(&bases)?;
             let ty = TypeObject::new_user(&name, bases.clone(), dict)?;
             ty.set_metaclass(metaclass.clone());
             // PEP 3135: fill the `__class__` cell before any hook runs.
@@ -30614,6 +31004,7 @@ impl Interpreter {
                 )));
             }
         }
+        TypeObject::validate_python_bases(&effective_bases)?;
         let ty = TypeObject::new_user(&name, effective_bases.clone(), ns)?;
         ty.set_metaclass(metaclass.clone());
         // gh-132176: bases passed as a tuple *subclass* instance are kept
@@ -35599,7 +35990,7 @@ impl Interpreter {
                     &module,
                     &src,
                     "<string>",
-                    self.default_compile_options(),
+                    self.exec_eval_compile_options(),
                 )
                 .map_err(|e| compile_error_to_syntax_error(&e, &src, "<string>"))?;
                 Rc::new(compiled)
@@ -35810,7 +36201,7 @@ impl Interpreter {
             &module,
             trimmed,
             "<string>",
-            self.default_compile_options(),
+            self.exec_eval_compile_options(),
         )
         .map_err(|e| compile_error_to_syntax_error(&e, trimmed, "<string>"))?;
         let mut frame = self.make_frame(Rc::new(code), Vec::new(), Vec::new(), globals_dict, None);
@@ -38112,12 +38503,15 @@ fn collect_compiler_syntax_warnings(
                 visit_expr(value, out);
                 visit_generators(generators, out);
             }
-            ExprKind::JoinedStr(parts) => {
+            ExprKind::JoinedStr(parts) | ExprKind::TemplateStr(parts) => {
                 for p in parts {
                     visit_expr(p, out);
                 }
             }
             ExprKind::FormattedValue {
+                value, format_spec, ..
+            }
+            | ExprKind::Interpolation {
                 value, format_spec, ..
             } => {
                 visit_expr(value, out);
@@ -42255,6 +42649,32 @@ fn builtin_text_signature(name: &str) -> Option<&'static str> {
 /// internal name would collide with `cmath.sin`'s different clinic
 /// string).
 fn builtin_text_signature_qual(qualname: &str) -> Option<&'static str> {
+    // The `_operator` accelerator's whole surface — CPython's Argument-
+    // Clinic strings, so `inspect.signature(operator.pos)` yields
+    // `(a, /)`. torch._dynamo sizes its bytecode-to-operator dispatch
+    // tables with exactly that call (`symbolic_convert.stack_op` does
+    // `len(inspect.signature(fn).parameters)` for every stack op) —
+    // RFC 0076 WS5.
+    if let Some(op) = qualname.strip_prefix("_operator.") {
+        let sig = match op {
+            "neg" | "pos" | "invert" | "inv" | "abs" | "index" | "not_" | "truth" => {
+                Some("($module, a, /)")
+            }
+            "add" | "sub" | "mul" | "truediv" | "floordiv" | "mod" | "pow" | "lshift"
+            | "rshift" | "and_" | "or_" | "xor" | "matmul" | "concat" | "contains" | "countOf"
+            | "indexOf" | "getitem" | "delitem" | "is_" | "is_not" | "lt" | "le" | "eq" | "ne"
+            | "gt" | "ge" | "iadd" | "isub" | "imul" | "itruediv" | "ifloordiv" | "imod"
+            | "ipow" | "ilshift" | "irshift" | "iand" | "ior" | "ixor" | "imatmul" | "iconcat" => {
+                Some("($module, a, b, /)")
+            }
+            "setitem" => Some("($module, a, b, c, /)"),
+            "length_hint" => Some("($module, obj, default=0, /)"),
+            _ => None,
+        };
+        if sig.is_some() {
+            return sig;
+        }
+    }
     match qualname {
         "str.lower" => Some("($self, /)"),
         "set.add" => Some("($self, object, /)"),
@@ -43477,6 +43897,14 @@ fn is_type_error(e: &RuntimeError) -> bool {
     false
 }
 
+/// The `WEAVEPY_TSDBG` trace flag, resolved once. A raw `getenv` takes
+/// a process-global lock; an uncached check on the generic binary-op
+/// dispatch path measured 17-38% on the container-heavy bench fixtures.
+fn tsdbg() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WEAVEPY_TSDBG").is_some())
+}
+
 fn binop_dunders(op: BinOpKind) -> (&'static str, &'static str) {
     use BinOpKind as B;
     match op {
@@ -43947,6 +44375,17 @@ fn dict_view_set_elems(obj: &Object) -> Option<Vec<Object>> {
     }
 }
 
+/// CPython's built-in `sq_concat` analogue for a native-sequence left
+/// operand: compatible pairs concatenate, everything else raises the
+/// canonical *left-slot* TypeError ("can only concatenate list …") —
+/// crucially with **no** `__radd__` fallback, which is what separates
+/// `operator.concat` / `PySequence_Concat` from `a + b` (RFC 0076 WS1;
+/// numpy test_shape_base.test_operator_concat pins `concat([1, 2],
+/// ndarray)` raising where `[1, 2] + ndarray` broadcasts).
+pub fn sequence_concat_native(a: &Object, b: &Object) -> Result<Object, RuntimeError> {
+    binary_op(a, b, BinOpKind::Add)
+}
+
 fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeError> {
     use BinOpKind as B;
     use Object as O;
@@ -44408,10 +44847,19 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
         // only when the left operand has no `sq_concat`, e.g. `1 + "a"`).
         // Every compatible combination returned from an earlier arm, so a
         // sequence on the left here means an incompatible right operand.
-        (O::Str(_) | O::WStr(_), _, B::Add) => Err(type_error(format!(
-            "can only concatenate str (not \"{}\") to str",
-            orig_name(b_was_bool, &b)
-        ))),
+        (O::Str(_) | O::WStr(_), _, B::Add) => {
+            if tsdbg() {
+                eprintln!(
+                    "[TSDBG] str-concat raise, b={} backtrace:\n{}",
+                    b.type_name(),
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
+            Err(type_error(format!(
+                "can only concatenate str (not \"{}\") to str",
+                orig_name(b_was_bool, &b)
+            )))
+        }
         (O::List(_), _, B::Add) => Err(type_error(format!(
             "can only concatenate list (not \"{}\") to list",
             orig_name(b_was_bool, &b)
@@ -44430,7 +44878,7 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
         ))),
 
         _ => {
-            if std::env::var_os("WEAVEPY_TSDBG").is_some() {
+            if tsdbg() {
                 eprintln!(
                     "[TSDBG] binary_op tail: a={a:?} b={b:?} names=({}, {})",
                     orig_name(a_was_bool, &a),
@@ -44985,9 +45433,25 @@ fn bignum_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
                 };
                 return Ok(Object::Float(conv(&x)?.powf(conv(&y)?)));
             }
-            let exp = y
-                .to_u32()
-                .ok_or_else(|| value_error("exponent too large for int.__pow__"))?;
+            let exp = match y.to_u32() {
+                Some(e) => e,
+                None => {
+                    // CPython evaluates `|base| <= 1` with any exponent
+                    // instantly (`1 ** 2**63 == 1`; numpy's NEP 50 object
+                    // loop pins this — test_nep50_huge_integers). A larger
+                    // base with a > u32 exponent would need astronomic
+                    // memory; CPython attempts it, our bigint backend
+                    // range-checks instead.
+                    return match x.to_i64() {
+                        Some(0) | Some(1) => Ok(Object::int_from_bigint(x)),
+                        Some(-1) => {
+                            let even = (&y % 2u8) == num_bigint::BigInt::from(0u8);
+                            Ok(Object::Int(if even { 1 } else { -1 }))
+                        }
+                        _ => Err(value_error("exponent too large for int.__pow__")),
+                    };
+                }
+            };
             Ok(Object::int_from_bigint(x.pow(exp)))
         }
         B::LShift => {

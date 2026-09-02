@@ -317,6 +317,46 @@ pub(crate) fn list_append_helper_addr() -> usize {
     LIST_APPEND_HELPER.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// RFC 0076 WS6 — the embedder's closure-cell *read* helper. `idx`
+/// indexes the activation's cell array (`cellvars` then `freevars`,
+/// the interpreter's `LOAD_DEREF` layout) and `lane` is the site's
+/// burned [`crate::value::JitType::cell_lane_code`] — both
+/// compile-time constants. Returns `0` (Ok) with the cell value's bits in
+/// [`JitFrame::ret_bits`], or non-zero to deopt — the cell is unbound
+/// (the interpreter re-executes and raises the exact
+/// `NameError`/`UnboundLocalError`) or its value left the burned lane
+/// (an aliased write through another closure). Never runs Python code;
+/// same safety contract as [`ListGetHelper`].
+pub type CellGetHelper = unsafe extern "C" fn(frame: *mut JitFrame, idx: i64, lane: i64) -> i64;
+
+/// RFC 0076 WS6 — the embedder's closure-cell *write* helper. The
+/// value is pre-staged in [`JitFrame::ret_bits`], interpreted per the
+/// site's burned `lane` code; returns `0` (Ok) or non-zero to deopt
+/// (a displaced heap value must drop on the interpreter's store
+/// path). Same safety contract as [`ListGetHelper`].
+pub type CellSetHelper = unsafe extern "C" fn(frame: *mut JitFrame, idx: i64, lane: i64) -> i64;
+
+static CELL_GET_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static CELL_SET_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide closure-cell helpers (RFC 0076 WS6).
+/// Must precede the first compile of a frame containing
+/// `CellGet`/`CellSet` ops.
+pub fn register_cell_helpers(get: CellGetHelper, set: CellSetHelper) {
+    CELL_GET_HELPER.store(get as usize, std::sync::atomic::Ordering::Release);
+    CELL_SET_HELPER.store(set as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn cell_get_helper_addr() -> usize {
+    CELL_GET_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
+pub(crate) fn cell_set_helper_addr() -> usize {
+    CELL_SET_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// RFC 0071 WS4 — the embedder's list-loop *step* helper, called by
 /// the [`crate::ir::TTerm::ForList`] terminator each iteration with
 /// the pinned list and the current index. Re-checks the index against
@@ -958,6 +998,69 @@ pub(crate) fn dyn_attr_get_helper_addr() -> usize {
 #[must_use]
 pub(crate) fn dyn_attr_set_helper_addr() -> usize {
     DYN_ATTR_SET_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+static TRUTH_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// RFC 0076 WS8 — register the process-wide truthiness helper
+/// ([`crate::ir::TOp::Truth`]). Shape: `(frame, pin, reserved) ->
+/// status` (the [`ListGetHelper`] signature; `reserved` is unused).
+/// The pure kinds (`None`, scalars, container emptiness) answer
+/// without running Python; an instance carrying `__bool__`/`__len__`
+/// (or a foreign value's `nb_bool`) dispatches the interpreter's
+/// exact protocol — **arbitrary Python may run**, the dirtiness
+/// discipline applies. Status protocol as [`DynAttrHelper`]: `0` ok
+/// (the bool's bits in [`JitFrame::ret_bits`]), `1` raised, `2`
+/// completed-but-guards-fell (parked bool, deopt at the *next* pc —
+/// the dunder never re-runs), `3` rejected before any Python ran.
+/// Must precede the first compile of a frame containing `Truth` ops.
+pub fn register_truth_helper(f: DynAttrHelper) {
+    TRUTH_HELPER.store(f as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn truth_helper_addr() -> usize {
+    TRUTH_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+static CONTAINS_DYN_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// RFC 0076 WS8 — register the process-wide generic membership helper
+/// ([`crate::ir::TOp::ContainsDyn`]). Shape: `(frame, pin, negate) ->
+/// status` (the [`DynAttrHelper`] signature). The item is staged
+/// tag-typed in `call_args[0]` / `call_tags[0]`; the helper runs the
+/// interpreter's exact `in` protocol (**arbitrary Python may run** —
+/// `__contains__`, `__eq__` per element; the dirtiness discipline
+/// applies) and answers the already-negated bool in
+/// [`JitFrame::ret_bits`]. Status protocol as the truth helper. Must
+/// precede the first compile of a frame containing `ContainsDyn` ops.
+pub fn register_contains_dyn_helper(f: DynAttrHelper) {
+    CONTAINS_DYN_HELPER.store(f as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn contains_dyn_helper_addr() -> usize {
+    CONTAINS_DYN_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+static BUILD_SET_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// RFC 0076 WS8 — register the process-wide set-construction helper
+/// ([`crate::ir::TOp::BuildSet`]). Shares the [`BuildTupleHelper`]
+/// `(frame, n) -> pin-or-negative` shape: `n` per-element-tagged
+/// entries stage in the marshal buffer; the helper builds the fresh
+/// set and answers its pin index — or negative to deopt (cap
+/// pressure, or an element whose hashing could run Python — the
+/// interpreter re-executes the `BUILD_SET` generically). Never runs
+/// Python code. Must precede the first compile of a frame containing
+/// `BuildSet` ops.
+pub fn register_build_set_helper(f: BuildTupleHelper) {
+    BUILD_SET_HELPER.store(f as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn build_set_helper_addr() -> usize {
+    BUILD_SET_HELPER.load(std::sync::atomic::Ordering::Acquire)
 }
 
 static GLOBAL_OBJ_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

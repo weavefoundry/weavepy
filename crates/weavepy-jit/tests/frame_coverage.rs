@@ -81,6 +81,8 @@ fn analyze_cfg(src: &str, cfg: &Cfg) -> Result<TFunc, JitVerdict> {
         },
         kw_slot: &mut |_, _| None,
         obj_global: &mut obj_global,
+        cell: &mut |_| None,
+        obj: &mut |_| false,
         paths: &mut paths,
     };
     analyze_frame(&code, &mut resolve, &mut probes)
@@ -259,6 +261,8 @@ fn shadowed_enumerate_gets_no_trained_lanes() {
         param: &mut |_| None,
         kw_slot: &mut |_, _| None,
         obj_global: &mut obj_global,
+        cell: &mut |_| None,
+        obj: &mut |_| false,
         paths: &mut paths,
     };
     let err = analyze_frame(&code, &mut resolve, &mut probes).unwrap_err();

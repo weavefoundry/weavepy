@@ -1127,6 +1127,14 @@ static PyObject *build_one(const char **fmt, va_list *ap) {
             unsigned int v = va_arg(*ap, unsigned int);
             return _WeavePy_Build_FromU64((unsigned long long)v);
         }
+        case 'H': {
+            /* unsigned short, promoted to int in varargs. Pillow's
+             * `getextrema` returns `Py_BuildValue("HH", …)` for I;16
+             * images; the missing case fell to the forgiving default and
+             * yielded a (None, None) extrema tuple. */
+            unsigned int v = va_arg(*ap, unsigned int);
+            return _WeavePy_Build_FromU64((unsigned long long)(unsigned short)v);
+        }
         case 'l': {
             long v = va_arg(*ap, long);
             return _WeavePy_Build_FromI64((long long)v);
@@ -1150,6 +1158,41 @@ static PyObject *build_one(const char **fmt, va_list *ap) {
         case 'f': case 'd': {
             double v = va_arg(*ap, double);
             return _WeavePy_Build_FromDouble(v);
+        }
+        case 'c': {
+            /* C int → bytes of length 1. numpy's `array_reduce` builds
+             * the `_reconstruct(subtype, (0,), b'b')` pickle args with
+             * `Py_BuildValue("(ONc)", …, 'b')`; the missing case fell to
+             * the forgiving default and pickled `None`, so unpickling a
+             * chararray raised "Can only create a chararray from string
+             * data" (test_regression test_char_dump — RFC 0076 WS1). */
+            int v = va_arg(*ap, int);
+            char ch = (char)v;
+            return _WeavePy_Build_FromBytesAndSize(&ch, 1);
+        }
+        case 'C': {
+            /* C int (code point) → str of length 1. */
+            unsigned int cp = (unsigned int)va_arg(*ap, int);
+            char utf8[4];
+            int n8;
+            if (cp < 0x80) { utf8[0] = (char)cp; n8 = 1; }
+            else if (cp < 0x800) {
+                utf8[0] = (char)(0xC0 | (cp >> 6));
+                utf8[1] = (char)(0x80 | (cp & 0x3F));
+                n8 = 2;
+            } else if (cp < 0x10000) {
+                utf8[0] = (char)(0xE0 | (cp >> 12));
+                utf8[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                utf8[2] = (char)(0x80 | (cp & 0x3F));
+                n8 = 3;
+            } else {
+                utf8[0] = (char)(0xF0 | (cp >> 18));
+                utf8[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+                utf8[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                utf8[3] = (char)(0x80 | (cp & 0x3F));
+                n8 = 4;
+            }
+            return _WeavePy_Build_FromStringAndSize(utf8, n8);
         }
         case 's': {
             const char *s = va_arg(*ap, const char *);

@@ -16,6 +16,13 @@ use crate::sync::Weak;
 use crate::error::{type_error, RuntimeError};
 use crate::object::{DictData, DictKey, Object};
 
+/// The C-API bridge's metaclass-drift probe (RFC 0076 WS5): given a
+/// readied stock type's own `PyTypeObject*` and its VM bridge, adopt any
+/// raw `Py_SET_TYPE` re-seat of the struct's `ob_type` into the bridge's
+/// metaclass slot. See [`TypeObject::c_ext_ptr`].
+static METACLASS_DRIFT_HOOK: std::sync::OnceLock<fn(usize, &TypeObject)> =
+    std::sync::OnceLock::new();
+
 /// A Python class.
 ///
 /// The dict stores methods and class attributes — the same dict you
@@ -131,6 +138,15 @@ pub struct TypeObject {
     /// Decimal` compiles to `PyType_CheckExact`, which demands
     /// `Py_TYPE(Decimal) == &PyType_Type` (pandas `_libs.missing`).
     pub immutable: Cell<bool>,
+    /// The extension's own static `PyTypeObject*` when this class bridges
+    /// a *readied stock* C type, else 0 (RFC 0076 WS5). A C extension may
+    /// re-seat such a type's metaclass with a raw `Py_SET_TYPE(&MyType,
+    /// meta)` field write that no C-API call announces (torch's
+    /// `_set_generator_metaclass`); [`Self::metaclass_or_type`] hands this
+    /// pointer to the bridge-installed [`install_metaclass_drift_hook`]
+    /// so the drift is adopted the moment Python asks for the class of
+    /// the class.
+    pub c_ext_ptr: Cell<usize>,
 }
 
 /// Per-class resolution of the `type.__call__` protocol, cached on the
@@ -339,6 +355,30 @@ impl TypeObject {
         Ok(())
     }
 
+    /// `type_new`-only base validation: a foreign C type advertises
+    /// subclassability through `Py_TPFLAGS_BASETYPE`, and CPython's
+    /// `best_base` refuses a base without it — but only on the *Python*
+    /// class-statement / `type()` path. `PyType_Ready` never checks the
+    /// flag: static C types legally extend non-BASETYPE bases (numpy's
+    /// `PyCharacterArrType` extends the abstract `flexible` scalar whose
+    /// Python subclassing must still raise — test_gh_23737, RFC 0076 WS1).
+    pub fn validate_python_bases(bases: &[Rc<TypeObject>]) -> Result<(), RuntimeError> {
+        for b in bases {
+            let ext = b.c_ext_ptr.get();
+            if ext != 0 {
+                const BASETYPE: u64 = 1 << 10;
+                let fl = crate::foreign::type_flags(ext);
+                if fl != 0 && fl & BASETYPE == 0 {
+                    return Err(type_error(format!(
+                        "type '{}' is not an acceptable base type",
+                        b.name
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Construct a user-defined class from a class statement.
     pub fn new_user(
         name: &str,
@@ -426,6 +466,7 @@ impl TypeObject {
             c_tp_name: Cell::new(None),
             c_sq_item: Cell::new(false),
             immutable: Cell::new(false),
+            c_ext_ptr: Cell::new(0),
         });
         let mro = compute_c3(&ty, &bases, name)?;
         *ty.mro.borrow_mut() = mro;
@@ -907,9 +948,25 @@ impl TypeObject {
         *self.metaclass.borrow_mut() = Some(meta);
     }
 
+    /// Install the C-API bridge's metaclass-drift probe (RFC 0076 WS5,
+    /// see [`TypeObject::c_ext_ptr`]). Idempotent.
+    pub fn install_metaclass_drift_hook(f: fn(usize, &TypeObject)) {
+        let _ = METACLASS_DRIFT_HOOK.set(f);
+    }
+
     /// The metaclass slot, falling back to `type` for any type that
     /// hasn't had one installed yet.
     pub fn metaclass_or_type(&self) -> Rc<TypeObject> {
+        // A readied stock C type first re-checks its struct's live
+        // `ob_type` for a raw `Py_SET_TYPE` metaclass re-seat (RFC 0076
+        // WS5, see [`Self::c_ext_ptr`]); the hook installs any drift into
+        // `self.metaclass` before the read below.
+        let ext = self.c_ext_ptr.get();
+        if ext != 0 {
+            if let Some(h) = METACLASS_DRIFT_HOOK.get() {
+                h(ext, self);
+            }
+        }
         if let Some(m) = self.metaclass.borrow().as_ref() {
             return m.clone();
         }

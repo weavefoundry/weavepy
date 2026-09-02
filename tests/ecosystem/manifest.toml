@@ -62,15 +62,16 @@ source = "attrs==26.1.0"
 # from PyPI, which cold wheel caches (e.g. the new Windows CI lane)
 # surface as a resolution error; warm POSIX caches masked it.
 requirements = "pytest==8.4.2 hypothesis==6.155.7"
-# Measured 2026-08: the suite cannot finish inside any sane budget —
-# hypothesis @given loops woven through the core files (test_make,
-# test_funcs, test_dunders) are interpreter-speed-bound under WeavePy
-# (tests/test_funcs.py::TestAsDict::test_recurse_property alone ran
-# >5 min without completing). Baselined `selftest_status = "skip"` in
-# expectations.toml, which keeps the stage from running; the spec stays
-# so the row re-measures the moment the baseline flips.
+# Re-measured 2026-08 on the wave-11 interpreter (RFC 0076 WS4): the
+# full suite — no hypothesis profile trim — runs 1379 passed / 6
+# skipped / 1 xfailed in 17:20, well inside the budget the wave-4
+# interpreter blew (killed at 2403s with the tail unreached).
+# Baselined `selftest_status = "pass"` in expectations.toml.
+# Budget: 17:20 measured locally; GitHub runners pace ~2x slower
+# (CI measured ~10% of the suite in 256s), so 2400s leaves no
+# headroom — 4800s does.
 command = "tests"
-timeout_seconds = 2400
+timeout_seconds = 4800
 
 [packages.click]
 # Pinned to the selftest sdist below: the suite must test the version
@@ -338,7 +339,11 @@ timeout_seconds = 900
 [packages.pillow.selftest]
 source = "pillow==12.3.0"
 requirements = "pytest==8.4.2"
-command = "Tests"
+# test_tiff_crashes deselected: its crash-corpus images live in
+# upstream's git repo but not the sdist, and the test re-raises the
+# FileNotFoundError only when it detects CI (`on_ci()`) — it skips
+# locally, fails on GitHub Actions, and never exercises WeavePy.
+command = "Tests --deselect Tests/test_tiff_crashes.py"
 timeout_seconds = 7200
 
 [packages.lxml]
@@ -438,6 +443,73 @@ timeout_seconds = 1200
 requirements = "gunicorn gevent django"
 probe = "probes/gunicorn_gevent_probe.py"
 timeout_seconds = 900
+
+# --- ecosystem wave 6 (RFC 0076 WS5) -----------------------------------------
+
+# polars: the matrix's first large PyO3/abi3 Rust-native consumer —
+# the Rust analogue of what grpcio was for C++. The probe drives the
+# stable ABI hard: DataFrame construction, group_by().agg(), lazy
+# collect(), join, parquet round-trip (abi3 buffer + PyBytes), and
+# map_elements with a Python callable (the Rust→Python re-entry leg).
+[packages.polars]
+requirements = "polars"
+probe = "probes/polars_probe.py"
+timeout_seconds = 900
+
+# psycopg2: the RFC 0072 deferral, closed. The classic C extension
+# over libpq, forced through pip's sdist path (a real pg_config-
+# configured C compile — the RFC 0062 no_binary lane). Serverless
+# probe like the psycopg v3 row.
+[packages.psycopg2]
+requirements = "setuptools psycopg2==2.9.12"
+no_binary = "psycopg2"
+probe = "probes/psycopg2_probe.py"
+timeout_seconds = 900
+
+# celery: task round-trip over the in-process memory:// transport +
+# cache+memory:// result backend, with a real worker (--pool=solo)
+# started in a thread. Pure-Python but concurrency-shaped: kombu's
+# event loop, billiard's shims, vine promises.
+[packages.celery]
+requirements = "celery"
+probe = "probes/celery_probe.py"
+timeout_seconds = 900
+
+# uvicorn: the deployment twin of the gunicorn-gevent capstone —
+# a real `python -m uvicorn` process serving the FastAPI app shape
+# people actually deploy (h11 protocol stack), driven concurrently
+# over loopback, SIGTERMed, and asserted to exit clean.
+[packages.uvicorn]
+requirements = "uvicorn fastapi"
+probe = "probes/uvicorn_probe.py"
+timeout_seconds = 900
+
+# alembic: init + autogenerate (twice — create-table and add-column
+# diffs) + upgrade head + downgrade -1 against a sqlalchemy model
+# over sqlite, asserting schema and data each step. Exercises the
+# migration-script compile+exec path end to end.
+[packages.alembic]
+requirements = "alembic sqlalchemy"
+probe = "probes/alembic_probe.py"
+timeout_seconds = 900
+
+# torch (CPU) capstone: the heaviest wheel on PyPI (~70 MB macOS
+# arm64, ~200 MB Linux — the wheel cache's largest entries by far,
+# accepted per the RFC 0056 posture). Probe scope per RFC 0076 WS5:
+# tensor/matmul vs numpy, autograd backward, a 3-epoch MLP loop with
+# monotone loss, state_dict round-trip, DataLoader num_workers=2
+# (the multiprocessing leg). torch.compile is out of scope — it
+# requires a host toolchain and is gated upstream.
+[packages.torch]
+# torch pinned (the click row's drift class): the struct.py shim's
+# public signatures mirror `_struct`'s text signatures, and
+# torch._dynamo's `substitute_in_graph` polyfills verify them at
+# import — 2.13.0 names the parameter `format`; a floating resolve
+# gave the Linux lane an older wheel whose polyfill names it `fmt`
+# and fails the import-time signature check.
+requirements = "torch==2.13.0 numpy"
+probe = "probes/torch_probe.py"
+timeout_seconds = 1800
 
 # --- source-build proof rows (RFC 0062 WS2) ----------------------------------
 #

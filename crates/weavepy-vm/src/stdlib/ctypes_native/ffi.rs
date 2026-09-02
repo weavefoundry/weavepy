@@ -301,6 +301,25 @@ fn int_object_from_bits(bits: u64, size: usize, signed: bool) -> Object {
     }
 }
 
+/// Process-lifetime intern table for NUL-terminated string payloads: the
+/// pointer handed to C stays valid forever, mirroring CPython's semantics
+/// where the pointer lives as long as the (usually constant) bytes object.
+/// Deduplicated by content, so repeated calls with the same string cost one
+/// allocation total.
+pub(super) fn interned_cstr(buf: Vec<u8>) -> usize {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static INTERN: Mutex<Option<HashSet<&'static [u8]>>> = Mutex::new(None);
+    let mut g = INTERN.lock().unwrap_or_else(|e| e.into_inner());
+    let set = g.get_or_insert_with(HashSet::new);
+    if let Some(existing) = set.get(buf.as_slice()) {
+        return existing.as_ptr() as usize;
+    }
+    let leaked: &'static [u8] = Box::leak(buf.into_boxed_slice());
+    set.insert(leaked);
+    leaked.as_ptr() as usize
+}
+
 /// Resolve a pointer-class argument to a machine address, allocating a
 /// NUL-terminated temporary for `char*`/`wchar_t*` bytes/str payloads and
 /// stashing it in `keep` so it outlives the call. A `py_object` argument
@@ -327,7 +346,22 @@ fn pointer_payload(
     }
     match payload {
         Object::None => Ok(0),
-        Object::Bytes(_) | Object::ByteArray(_) if code == 'z' => {
+        Object::Bytes(_) if code == 'z' => {
+            // CPython passes a pointer into the bytes object's *own* buffer
+            // (`ob_sval`, NUL-terminated), valid for the object's lifetime —
+            // and callees exploit that by stashing the pointer past the call
+            // (lxml's `adopt_external_document` `strcmp`s the capsule context
+            // set by an earlier `PyCapsule_SetContext(cap, b"destructor:…")`).
+            // A per-call temporary dangles for that pattern, so hand out a
+            // process-lifetime interned copy instead: one small allocation
+            // per distinct string, matching the usual "module-level constant"
+            // lifetime on the CPython side.
+            let mut buf = payload.as_bytes_view().unwrap_or_default();
+            buf.push(0); // C-string NUL terminator
+            Ok(interned_cstr(buf))
+        }
+        Object::ByteArray(_) if code == 'z' => {
+            // Mutable buffer: contents may differ per call, keep per-call.
             let mut buf = payload.as_bytes_view().unwrap_or_default();
             buf.push(0); // C-string NUL terminator
             let ptr = buf.as_ptr() as usize;
@@ -342,9 +376,9 @@ fn pointer_payload(
                 buf.extend_from_slice(&cp.to_ne_bytes()[..wsize]);
             }
             buf.extend_from_slice(&0u32.to_ne_bytes()[..wsize]);
-            let ptr = buf.as_ptr() as usize;
-            keep.push(buf);
-            Ok(ptr)
+            // Same lifetime hazard as the `'z'` arm (CPython's wchar
+            // conversion is cached on the str object for its lifetime).
+            Ok(interned_cstr(buf))
         }
         _ => payload
             .as_usize()

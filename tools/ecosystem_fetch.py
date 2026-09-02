@@ -113,6 +113,12 @@ def load_manifest(manifest_path: Path, skip=frozenset()):
                     if _normalize(_requirement_name(r)) == _normalize(pkg)
                 )
                 sdist_reqs.append(pinned)
+                # A `no_binary` package is fetched as an sdist below; keep
+                # it out of the wheel group — `pip download --only-binary
+                # :all:` fails outright for a package that publishes no
+                # wheel for the target platform (psycopg2 on macOS), which
+                # aborted the fetch before later rows' groups ran.
+                group.remove(pinned)
             selftest = row.get("selftest")
             if selftest:
                 group.extend(selftest.get("requirements", "").split())
@@ -161,6 +167,11 @@ def load_manifest(manifest_path: Path, skip=frozenset()):
         for r in group
         if "==" in r and _normalize(_requirement_name(r)) in no_binary_names
     )
+    # As in the tomllib path: no-binary packages fetch as sdists only.
+    wheel_groups = [
+        [r for r in group if _normalize(_requirement_name(r)) not in no_binary_names]
+        for group in wheel_groups
+    ]
     return wheel_groups, sdist_reqs
 
 
@@ -198,10 +209,14 @@ def main() -> int:
         # 2014/2_17-only ladder can't see them (`numpy==2.5.2` resolved
         # nothing on the ubuntu CI lane). Offer the glibc ladder up
         # through the runner's own floor; pip picks the newest tag the
-        # project ships.
+        # project ships. The ladder must be dense: an explicit
+        # `--platform` list matches wheel tags *literally* (pip does no
+        # glibc-compat inference for it), and projects tag against
+        # whatever minor they build on — nvidia-nccl-cu13 2.29.7 (a
+        # torch==2.13.0 dependency) ships manylinux_2_18 only, which a
+        # ladder that jumps 2_17 -> 2_24 can't see.
         plats = [f"manylinux2014_{machine}"] + [
-            f"manylinux_{v}_{machine}"
-            for v in ("2_17", "2_24", "2_27", "2_28", "2_31", "2_34", "2_35")
+            f"manylinux_2_{minor}_{machine}" for minor in range(17, 40)
         ]
     elif sys.platform == "win32":
         # RFC 0063: the Windows CI lane. Without a binary platform tag,

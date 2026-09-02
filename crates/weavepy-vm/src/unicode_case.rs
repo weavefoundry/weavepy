@@ -157,6 +157,13 @@ pub fn is_xid_continue(c: char) -> bool {
     ucd::case_flags(c as u32) & ucd::FLAG_XID_CONTINUE != 0
 }
 
+/// `Py_UNICODE_ISTITLE`: category Lt (U+01C5 'ǅ', U+1FFC 'ῼ', …). Rust's
+/// `char` API has no Lt predicate, so this is the UCD flag the VM's own
+/// `str.istitle` uses.
+pub fn is_titlecase(c: char) -> bool {
+    ucd::case_flags(c as u32) & ucd::FLAG_TITLE != 0
+}
+
 /// `unicode_isupper_impl`: no lower/title chars and at least one upper.
 pub fn str_isupper(s: &str) -> bool {
     let mut cased = false;

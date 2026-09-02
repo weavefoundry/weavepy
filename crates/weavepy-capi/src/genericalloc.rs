@@ -98,8 +98,14 @@ pub unsafe extern "C" fn PyType_GenericAlloc(
     if is_type_metatype(ty) {
         let basicsize = unsafe { (*ty).tp_basicsize };
         let itemsize = unsafe { (*ty).tp_itemsize };
-        let total = basicsize.max(std::mem::size_of::<PyObject>() as PySsizeT)
-            + nitems.max(0) * itemsize.max(0);
+        // A type instance is always at least a `PyHeapTypeObject` (928
+        // bytes on CPython 3.13) — the caller writes `ht_type` slots and
+        // the embedded `as_number`/`as_sequence`/… suites straight into
+        // the block. Clamp for a metaclass whose struct under-reports its
+        // size (e.g. never readied, so `tp_basicsize` was never
+        // inherited); a short block here is silent heap corruption.
+        const HEAPTYPE_SIZE: PySsizeT = 928;
+        let total = basicsize.max(HEAPTYPE_SIZE) + nitems.max(0) * itemsize.max(0);
         let raw = unsafe { crate::memory::PyObject_Calloc(1, total as usize) } as *mut PyObject;
         if raw.is_null() {
             crate::errors::set_runtime_error("PyType_GenericAlloc: out of memory");

@@ -532,6 +532,59 @@ pub unsafe extern "C" fn complex_new(
 }
 
 // ====================================================================
+// tuple
+// ====================================================================
+
+/// `tuple.__new__(type, iterable=())` — RFC 0076 WS5.
+///
+/// For the exact `tuple` type returns a native [`Object::Tuple`]; for a
+/// subtype allocates the faithful variable-length body through the
+/// subtype's `tp_alloc` and fills the inline `ob_item` slots with owned
+/// references, mirroring CPython's `tuple_subtype_new`.
+///
+/// torch is the motivating case: `THPSize_pynew` is literally
+/// `PyTuple_Type.tp_new(type, args, kwargs)` + dim checks, so with the
+/// generic-alloc default `torch.Size((4, 8))` came back *empty*
+/// (`ob_size == 0`, no items) — which broke `Size` unpickling in
+/// DataLoader spawn workers ("unequal size length (0) and stride
+/// length (2)").
+pub unsafe extern "C" fn tuple_new(
+    ty: *mut PyTypeObject,
+    args: *mut PyObject,
+    _kwds: *mut PyObject,
+) -> *mut PyObject {
+    let items: Vec<Object> = match unsafe { single_arg(args) } {
+        None => Vec::new(),
+        Some(it) => match unsafe { clone_object(it) } {
+            Object::Tuple(t) => t.iter().cloned().collect(),
+            Object::List(rc) => rc.borrow().clone(),
+            _ => match unsafe { crate::abstract_::collect_iterable(it) } {
+                Some(v) => v,
+                None => return std::ptr::null_mut(),
+            },
+        },
+    };
+    if unsafe { is_exact(ty, &crate::types::PyTuple_Type) } {
+        return crate::object::into_owned(Object::new_tuple(items));
+    }
+    let n = items.len() as PySsizeT;
+    let obj = unsafe { subtype_alloc(ty, n) };
+    if obj.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        let vo = obj as *mut crate::layout::PyVarObject;
+        (*vo).ob_size = n;
+        let to = obj as *mut crate::layout::PyTupleObject;
+        let base = std::ptr::addr_of_mut!((*to).ob_item) as *mut *mut PyObject;
+        for (i, item) in items.into_iter().enumerate() {
+            *base.add(i) = crate::object::into_owned(item);
+        }
+    }
+    obj
+}
+
+// ====================================================================
 // Installation
 // ====================================================================
 
@@ -564,5 +617,11 @@ pub fn install_builtin_constructors() {
             *mut PyObject,
         ) -> *mut PyObject = complex_new;
         (*crate::types::PyComplex_Type.as_ptr()).tp_new = cnew as *mut c_void;
+        let tnew: unsafe extern "C" fn(
+            *mut PyTypeObject,
+            *mut PyObject,
+            *mut PyObject,
+        ) -> *mut PyObject = tuple_new;
+        (*crate::types::PyTuple_Type.as_ptr()).tp_new = tnew as *mut c_void;
     }
 }

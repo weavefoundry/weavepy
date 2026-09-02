@@ -74,35 +74,146 @@ unsafe fn cstr_or(p: *const c_char, default: &str) -> std::borrow::Cow<'_, str> 
     }
 }
 
-// Cache of `(rc str, leaked bytes)` so that `PyUnicode_AsUTF8`
-// returns a stable pointer for the lifetime of the string. CPython
-// caches the UTF-8 representation on the str object itself; we
-// approximate by leaking a `\0`-terminated copy on first call.
+// Cache of NUL-terminated copies so that `PyUnicode_AsUTF8` (and
+// `PyBytes_AsString` on a value-crossed bytes) returns a stable pointer.
+// CPython caches the UTF-8 representation on the str object itself and
+// frees it with the object; we approximate with a process-global table
+// keyed by the VM `Rc`'s data pointer, holding a `Weak` liveness handle.
 //
 // Process-global (RFC 0047, wave 5): C extensions retain the returned
 // `char*` beyond the calling thread's lifetime (numpy stashes dtype/field
 // names in statics), so a per-thread pin list would dangle every pointer
-// minted on a `threading.Thread` when that thread exits.
-static UTF8_CACHE: std::sync::Mutex<Vec<Rc<[u8]>>> = std::sync::Mutex::new(Vec::new());
+// minted on a `threading.Thread` when that thread exits. The extension's
+// C reference keeps the box prefix's `Rc` clone — and so the entry —
+// alive, exactly CPython's "valid while the object lives" contract.
+//
+// Bounded (RFC 0076 WS3): the previous design pinned a *fresh copy per
+// call* forever — Pillow's default-font leak test marshals the same
+// ~10 KB text through `PyArg_ParseTuple("s#")` every `draw.text` call
+// and grew ~60 KB/iteration, blowing its 1 MB RSS ceiling. Entries now
+// dedupe by `Rc` identity, and once the table holds more than
+// [`UTF8_CACHE_BYTE_HWM`] payload bytes an insert first sweeps entries
+// whose string has died (CPython would have freed those buffers with
+// the object).
+static UTF8_CACHE: std::sync::Mutex<Option<CStrCache>> = std::sync::Mutex::new(None);
 
-/// Pin `rc` for the life of the process so the raw pointer handed to C
-/// stays valid. On a poisoned lock, leak instead — never hand back a
-/// pointer that dies with `rc` at the end of the caller's scope.
-fn pin_buffer(rc: Rc<[u8]>) {
-    if let Ok(mut g) = UTF8_CACHE.lock() {
-        g.push(rc);
-    } else {
-        std::mem::forget(rc);
+/// Sweep threshold for [`UTF8_CACHE`] payload bytes.
+const UTF8_CACHE_BYTE_HWM: usize = 512 * 1024;
+
+/// Liveness handle for one cached buffer: the owning VM allocation.
+enum CStrOwner {
+    Str(weavepy_vm::sync::Weak<str>),
+    Bytes(weavepy_vm::sync::Weak<[u8]>),
+}
+
+impl CStrOwner {
+    fn alive(&self) -> bool {
+        match self {
+            CStrOwner::Str(w) => w.strong_count() > 0,
+            CStrOwner::Bytes(w) => w.strong_count() > 0,
+        }
     }
 }
 
-fn cache_cstr(s: &str) -> *const c_char {
-    let mut bytes: Vec<u8> = s.as_bytes().to_vec();
-    bytes.push(0);
-    let rc: Rc<[u8]> = bytes.into();
-    let p = rc.as_ptr() as *const c_char;
-    pin_buffer(rc);
-    p
+struct CStrEntry {
+    owner: CStrOwner,
+    buf: Box<[u8]>,
+}
+
+#[derive(Default)]
+struct CStrCache {
+    /// Keyed by the owning `Rc`'s data pointer. A dead entry's key can be
+    /// reused by a fresh allocation; the `owner` liveness check catches
+    /// that and the stale entry is replaced.
+    map: std::collections::HashMap<usize, CStrEntry>,
+    /// Total payload bytes across `map` (sweep accounting).
+    bytes: usize,
+}
+
+impl CStrCache {
+    fn sweep(&mut self) {
+        let bytes = &mut self.bytes;
+        self.map.retain(|_, e| {
+            if e.owner.alive() {
+                true
+            } else {
+                *bytes -= e.buf.len();
+                false
+            }
+        });
+    }
+
+    fn get_or_insert(&mut self, key: usize, data: &[u8], owner: CStrOwner) -> *const c_char {
+        if let Some(e) = self.map.get(&key) {
+            if e.owner.alive() {
+                return e.buf.as_ptr() as *const c_char;
+            }
+        }
+        let nbytes = data.len() + 1;
+        if crate::mirror::pin_trace_enabled() && nbytes > 4096 {
+            eprintln!(
+                "[utf8] insert {nbytes}B total={} entries={}",
+                self.bytes,
+                self.map.len()
+            );
+        }
+        if self.bytes + nbytes > UTF8_CACHE_BYTE_HWM {
+            self.sweep();
+            if crate::mirror::pin_trace_enabled() {
+                eprintln!(
+                    "[utf8] post-sweep total={} entries={}",
+                    self.bytes,
+                    self.map.len()
+                );
+            }
+        }
+        let mut bytes: Vec<u8> = data.to_vec();
+        bytes.push(0);
+        let buf: Box<[u8]> = bytes.into_boxed_slice();
+        let p = buf.as_ptr() as *const c_char;
+        if let Some(old) = self.map.insert(key, CStrEntry { owner, buf }) {
+            self.bytes -= old.buf.len();
+        }
+        self.bytes += nbytes;
+        p
+    }
+}
+
+/// The canonical NUL-terminated UTF-8 buffer for `s`, valid while the
+/// string is alive. On a poisoned lock, leak a copy instead — never hand
+/// back a pointer that dies with `s` at the end of the caller's scope.
+fn cache_cstr(s: &Rc<str>) -> *const c_char {
+    let key = Rc::as_ptr(s) as *const u8 as usize;
+    match UTF8_CACHE.lock() {
+        Ok(mut g) => g.get_or_insert_with(CStrCache::default).get_or_insert(
+            key,
+            s.as_bytes(),
+            CStrOwner::Str(Rc::downgrade(s)),
+        ),
+        Err(_) => {
+            let mut bytes: Vec<u8> = s.as_bytes().to_vec();
+            bytes.push(0);
+            Box::leak(bytes.into_boxed_slice()).as_ptr() as *const c_char
+        }
+    }
+}
+
+/// [`cache_cstr`]'s bytes twin (the `PyBytes_AsString` value-crossing
+/// path).
+fn cache_bytes_cstr(b: &Rc<[u8]>) -> *const c_char {
+    let key = Rc::as_ptr(b) as *const u8 as usize;
+    match UTF8_CACHE.lock() {
+        Ok(mut g) => g.get_or_insert_with(CStrCache::default).get_or_insert(
+            key,
+            b,
+            CStrOwner::Bytes(Rc::downgrade(b)),
+        ),
+        Err(_) => {
+            let mut bytes: Vec<u8> = b.to_vec();
+            bytes.push(0);
+            Box::leak(bytes.into_boxed_slice()).as_ptr() as *const c_char
+        }
+    }
 }
 
 /// Raise CPython's strict-UTF-8 `UnicodeEncodeError` for the first lone
@@ -382,14 +493,7 @@ pub unsafe extern "C" fn PyBytes_AsString(o: *mut PyObject) -> *mut c_char {
         return unsafe { std::ptr::addr_of_mut!((*bo).ob_sval) as *mut c_char };
     }
     match unsafe { crate::object::clone_object_value(o) } {
-        Object::Bytes(b) => {
-            let mut owned = b.to_vec();
-            owned.push(0);
-            let rc: Rc<[u8]> = owned.into();
-            let p = rc.as_ptr() as *mut c_char;
-            pin_buffer(rc);
-            p
-        }
+        Object::Bytes(b) => cache_bytes_cstr(&b) as *mut c_char,
         _ => {
             crate::errors::set_type_error("expected bytes");
             ptr::null_mut()
@@ -959,6 +1063,27 @@ pub unsafe extern "C" fn PyUnicode_IsIdentifier(o: *mut PyObject) -> c_int {
 /// `PyUnicode_Find(haystack, needle, start, end, direction)` —
 /// return the index of `needle` in `haystack`, or -1 if missing,
 /// or -2 on error.
+/// CPython's `ADJUST_INDICES` (unicodeobject.c): negative indices count
+/// from the end (numpy's `fix_name_if_typeerror` calls
+/// `PyUnicode_Tailmatch(msg, name, 0, -1, -1)` and expects a prefix
+/// match against `msg[:-1]`, not an empty window).
+fn adjust_indices(start: PySsizeT, end: PySsizeT, len: usize) -> (usize, usize) {
+    let len = len as PySsizeT;
+    let end = if end > len {
+        len
+    } else if end < 0 {
+        (end + len).max(0)
+    } else {
+        end
+    };
+    let start = if start < 0 {
+        (start + len).max(0)
+    } else {
+        start
+    };
+    (start as usize, end as usize)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn PyUnicode_Find(
     haystack: *mut PyObject,
@@ -980,8 +1105,7 @@ pub unsafe extern "C" fn PyUnicode_Find(
             return -2;
         }
     };
-    let start = start.max(0) as usize;
-    let end = end.max(0) as usize;
+    let (start, end) = adjust_indices(start, end, h.chars().count());
     let slice: String = h
         .chars()
         .skip(start)
@@ -1038,8 +1162,7 @@ pub unsafe extern "C" fn PyUnicode_Tailmatch(
         _ => return -1,
     };
     let chars: Vec<char> = o_s.chars().collect();
-    let start = start.max(0) as usize;
-    let end = (end.max(0) as usize).min(chars.len());
+    let (start, end) = adjust_indices(start, end, chars.len());
     if start > end {
         return 0;
     }
@@ -1339,10 +1462,26 @@ pub unsafe extern "C" fn PyUnicode_AsLatin1String(o: *mut PyObject) -> *mut PyOb
     }
     match unsafe { crate::object::clone_object_value(o) } {
         Object::Str(s) => {
-            let bytes: Vec<u8> = s
-                .chars()
-                .map(|c| if (c as u32) < 256 { c as u8 } else { b'?' })
-                .collect();
+            // Strict codec, like CPython: an out-of-range code point raises
+            // UnicodeEncodeError (Pillow's bitmap-font path encodes text to
+            // latin-1 and its tests assert the raise — issue #2826).
+            let mut bytes: Vec<u8> = Vec::with_capacity(s.len());
+            for (pos, c) in s.chars().enumerate() {
+                if (c as u32) < 256 {
+                    bytes.push(c as u8);
+                } else {
+                    crate::errors::set_pending_from_runtime(
+                        weavepy_vm::error::unicode_encode_error_obj(
+                            "latin-1",
+                            Object::Str(s.clone()),
+                            pos,
+                            pos + 1,
+                            "ordinal not in range(256)",
+                        ),
+                    );
+                    return ptr::null_mut();
+                }
+            }
             let rc: Rc<[u8]> = bytes.into();
             crate::object::into_owned(Object::Bytes(rc))
         }

@@ -368,6 +368,15 @@ pub fn into_owned(obj: Object) -> *mut PyObject {
     if weavepy_vm::vm_singletons::is_not_implemented(&obj) {
         return crate::singletons::not_implemented_ptr();
     }
+    // RFC 0076 WS5: a VM code object crosses as a faithful `PyCodeObject`
+    // facade (identity-cached), so compiled `PyCode_Check` passes —
+    // torch._dynamo's `skip_code(fn.__code__)` guards on exactly that.
+    if matches!(obj, Object::Code(_)) {
+        if let Some(p) = crate::code_obj::facade_for_vm_code(&obj) {
+            unsafe { Py_IncRef(p) };
+            return p;
+        }
+    }
     // RFC 0046 (wave 4): a foreign proxy round-trips back to the *same*
     // `PyObject*` the extension first gave us (identity is load-bearing —
     // numpy compares descrs/types by pointer). Hand C a fresh reference.
@@ -423,6 +432,46 @@ pub fn into_owned(obj: Object) -> *mut PyObject {
     // expect).
     if let Object::Module(m) = &obj {
         return stable_module_box(m);
+    }
+    // RFC 0076 WS1: a `property` crosses as one canonical box per native
+    // property (keyed by `Rc` identity), like builtins do through the
+    // mirror path's canonical cache. Extensions compare descriptors by
+    // *pointer*: numpy's `PyArray_View` decides its dtype-propagation
+    // path by testing `getattr(subtype, "dtype")` against the descriptor
+    // it captured at import (`npy_static_pydata.ndarray_dtype_descr`);
+    // a fresh box per crossing made every ndarray subclass look like it
+    // overrode `dtype`, silently bypassing subclass `dtype` setters
+    // (test_view_dtype_property_setter). The box is refcounted like any
+    // legacy box; `free_box` evicts the cache entry.
+    if let Object::Property(rc) = &obj {
+        let key = weavepy_vm::sync::Rc::as_ptr(rc) as usize;
+        // RFC 0076 WS5: a *harvested C getset* crosses as a byte-faithful
+        // `getset_descriptor` (see [`GetSetDescrBox`]) — extensions
+        // classify descriptors by `tp_name` and poke the struct directly
+        // (torch's `add_docstr`).
+        if let Some(meta) = weavepy_vm::descr_registry::lookup(&obj) {
+            if matches!(meta.kind, weavepy_vm::descr_registry::DescrKind::GetSet) {
+                let p = getset_descr_box(key, &obj, &meta);
+                unsafe { Py_IncRef(p) };
+                return p;
+            }
+        }
+        if let Some(p) = cached_property_box(key) {
+            return p;
+        }
+        let ty = crate::types::type_for_object(&obj);
+        let boxed = Box::new(PyObjectBox {
+            head: PyObject {
+                ob_refcnt: 1,
+                ob_type: ty,
+            },
+            exc: ExcFields::default(),
+            payload: PayloadCell::from_object(obj),
+        });
+        let raw = Box::into_raw(boxed) as *mut PyObject;
+        register_minted(raw);
+        register_property_box(key, raw);
+        return raw;
     }
     // Faithful built-in types cross into C as layout-faithful mirrors
     // (RFC 0043) so a stock extension's *inlined* field reads land on
@@ -498,6 +547,167 @@ pub fn into_owned(obj: Object) -> *mut PyObject {
     let raw = Box::into_raw(boxed) as *mut PyObject;
     register_minted(raw);
     raw
+}
+
+/// CPython's `PyGetSetDef` — the writable slot record a faithful
+/// getset-descriptor box points its `d_getset` at.
+#[repr(C)]
+pub struct PyGetSetDefC {
+    pub name: *const std::os::raw::c_char,
+    pub get: *mut std::ffi::c_void,
+    pub set: *mut std::ffi::c_void,
+    pub doc: *const std::os::raw::c_char,
+    pub closure: *mut std::ffi::c_void,
+}
+
+/// A byte-faithful `PyGetSetDescrObject` (RFC 0076 WS5). A harvested C
+/// getset crosses back into C wearing `getset_descriptor` with a real
+/// `d_getset` record: torch's `add_docstr(torch.Generator.device, …)`
+/// gates on `strcmp(Py_TYPE(obj)->tp_name, "getset_descriptor")` and then
+/// writes `((PyGetSetDescrObject *) obj)->d_getset->doc` straight into
+/// the struct — a generic `property` box both failed the name check
+/// ("don't know how to add docstring to type 'property'") and carries no
+/// memory at offset 40 to take the write. The `PyGetSetDef` lives inline
+/// so the box is self-contained; VM recovery goes through the
+/// [`GETSET_DESCR_PAYLOAD`] side table (the layout has no payload slot).
+#[repr(C)]
+struct GetSetDescrBox {
+    head: PyObject,                          // + 0
+    d_type: *mut crate::types::PyTypeObject, // +16
+    d_name: *mut PyObject,                   // +24
+    d_qualname: *mut PyObject,               // +32
+    d_getset: *mut PyGetSetDefC,             // +40
+    getset: PyGetSetDefC,                    // +48 (d_getset points here)
+}
+
+/// One immortal faithful box per harvested getset descriptor, keyed by
+/// the property's `Rc` identity. Descriptors live exactly as long as
+/// their (immortal, readied) owning class, so the boxes are immortal too.
+static GETSET_DESCR_BOXES: std::sync::Mutex<Option<std::collections::HashMap<usize, usize>>> =
+    std::sync::Mutex::new(None);
+
+/// Box pointer → the VM `Object::Property` it stands for, consulted by
+/// [`clone_object`] (the faithful layout carries no Rust payload).
+static GETSET_DESCR_PAYLOAD: std::sync::Mutex<Option<std::collections::HashMap<usize, Object>>> =
+    std::sync::Mutex::new(None);
+
+/// The faithful `getset_descriptor` box for `obj` (a registry-tagged
+/// harvested getset property), minting on first crossing.
+fn getset_descr_box(
+    rc_key: usize,
+    obj: &Object,
+    meta: &weavepy_vm::descr_registry::DescrMeta,
+) -> *mut PyObject {
+    if let Ok(g) = GETSET_DESCR_BOXES.lock() {
+        if let Some(&p) = g.as_ref().and_then(|m| m.get(&rc_key)) {
+            return p as *mut PyObject;
+        }
+    }
+    let d_type = crate::types::type_ptr_for_class(&meta.objclass).unwrap_or(std::ptr::null_mut());
+    let name_c = std::ffi::CString::new(meta.name.as_str())
+        .unwrap_or_default()
+        .into_raw();
+    let d_name = crate::object::into_owned(Object::from_str(meta.name.clone()));
+    let mut bx = Box::new(GetSetDescrBox {
+        head: PyObject {
+            ob_refcnt: IMMORTAL_REFCNT,
+            ob_type: crate::types::PyGetSetDescr_Type.as_ptr(),
+        },
+        d_type,
+        d_name,
+        d_qualname: std::ptr::null_mut(),
+        d_getset: std::ptr::null_mut(),
+        getset: PyGetSetDefC {
+            name: name_c,
+            get: std::ptr::null_mut(),
+            set: std::ptr::null_mut(),
+            doc: meta
+                .doc
+                .and_then(|d| std::ffi::CString::new(d).ok())
+                .map_or(std::ptr::null(), |c| c.into_raw() as *const _),
+            closure: std::ptr::null_mut(),
+        },
+    });
+    bx.d_getset = &mut bx.getset as *mut PyGetSetDefC;
+    let raw = Box::into_raw(bx) as *mut PyObject;
+    register_minted(raw);
+    if let Ok(mut g) = GETSET_DESCR_BOXES.lock() {
+        g.get_or_insert_with(Default::default)
+            .insert(rc_key, raw as usize);
+    }
+    if let Ok(mut g) = GETSET_DESCR_PAYLOAD.lock() {
+        g.get_or_insert_with(Default::default)
+            .insert(raw as usize, obj.clone());
+    }
+    raw
+}
+
+/// The VM object behind a faithful getset-descriptor box, or `None` for
+/// every other pointer.
+pub(crate) fn getset_descr_payload(p: *mut PyObject) -> Option<Object> {
+    let g = GETSET_DESCR_PAYLOAD.lock().ok()?;
+    g.as_ref()?.get(&(p as usize)).cloned()
+}
+
+/// Live `d_getset->doc` of the faithful box minted for `prop` — an
+/// extension may have written it after harvest (numpy's
+/// `add_docstring(np.ndarray.flat, …)` stores the docstring straight into
+/// the C struct at import time — test_umath TestAddDocstring, RFC 0076
+/// WS1). `None` when no box exists or the slot is still NULL.
+pub(crate) fn getset_live_doc(prop: &Object) -> Option<String> {
+    let Object::Property(rc) = prop else {
+        return None;
+    };
+    let key = weavepy_vm::sync::Rc::as_ptr(rc) as usize;
+    let bp = {
+        let g = GETSET_DESCR_BOXES.lock().ok()?;
+        *g.as_ref()?.get(&key)?
+    };
+    let bx = unsafe { &*(bp as *mut GetSetDescrBox) };
+    let doc = unsafe { (*bx.d_getset).doc };
+    if doc.is_null() {
+        return None;
+    }
+    Some(
+        unsafe { std::ffi::CStr::from_ptr(doc) }
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+/// One canonical box per native `property`, keyed by `Rc` identity (see
+/// the `Object::Property` arm of [`into_owned`]). Unlike [`MODULE_BOXES`]
+/// these are ordinary refcounted boxes; [`free_box`] evicts the entry
+/// when the box is released, so the map only ever holds live pointers.
+static PROPERTY_BOXES: std::sync::Mutex<Option<std::collections::HashMap<usize, usize>>> =
+    std::sync::Mutex::new(None);
+
+/// Live canonical box for property identity `key`, as a fresh reference
+/// (matching the mint path's "+1" contract); `None` when uncached.
+fn cached_property_box(key: usize) -> Option<*mut PyObject> {
+    let g = PROPERTY_BOXES.lock().ok()?;
+    let p = *g.as_ref()?.get(&key)? as *mut PyObject;
+    unsafe { Py_IncRef(p) };
+    Some(p)
+}
+
+fn register_property_box(key: usize, p: *mut PyObject) {
+    if let Ok(mut g) = PROPERTY_BOXES.lock() {
+        g.get_or_insert_with(Default::default)
+            .insert(key, p as usize);
+    }
+}
+
+/// Evict `p` from the canonical property cache (no-op when a racing mint
+/// already replaced the entry).
+fn evict_property_box(key: usize, p: *mut PyObject) {
+    if let Ok(mut g) = PROPERTY_BOXES.lock() {
+        if let Some(map) = g.as_mut() {
+            if map.get(&key) == Some(&(p as usize)) {
+                map.remove(&key);
+            }
+        }
+    }
 }
 
 /// One immortal box per module, keyed by the module's native `Rc`
@@ -714,6 +924,87 @@ unsafe fn pinned_box_is_dead(bp: *mut PyObject) -> bool {
     }
 }
 
+/// Count the `Object` clones of `target` held *only* by the C-API pin
+/// caches — a **parked** argument-pinned identity box whose payload is
+/// `target`, or a dead-except-pin scalar/tuple pin that is (or directly
+/// contains) `target`. `sys.getrefcount` discounts these (RFC 0076 WS1):
+/// on CPython the corresponding memory is already freed, so the clones
+/// must not read as program-visible references
+/// (test_cleanup_with_refs_non_contig asserts the count returns to
+/// baseline after the arrays die, while the pin caches deliberately hold
+/// their boxes past C refcount zero).
+pub(crate) fn pin_clone_count_hook(target: &Object) -> usize {
+    let mut n = 0;
+    if let Ok(g) = INSTANCE_ARG_PINS.lock() {
+        if let Some(set) = g.as_ref() {
+            for &bp in set.iter() {
+                let p = bp as *mut PyObject;
+                let bx = unsafe { &*(p as *mut PyObjectBox) };
+                if !same_native_identity(&bx.payload.obj, target) {
+                    continue;
+                }
+                // Parked (refcount ≤ 0), or held *only* by dead
+                // scalar-pinned tuple mirrors — storage the program can no
+                // longer reach (a released args tuple's `ob_item` slot). A
+                // box with any genuinely live C reference plays the role of
+                // CPython's own C-side refs and stays visible.
+                let rc = unsafe { (*p).ob_refcnt };
+                if ibox_trace_enabled() {
+                    eprintln!(
+                        "[PIN-COUNT] box=0x{:x} rc={} deadrefs={}",
+                        bp,
+                        rc,
+                        crate::mirror::dead_pin_c_refs_to(p)
+                    );
+                }
+                if rc <= 0 || (rc as usize) <= crate::mirror::dead_pin_c_refs_to(p) {
+                    n += 1;
+                }
+            }
+        }
+    }
+    n + crate::mirror::dead_pin_clones_of(target)
+}
+
+/// Surplus raw C references to an instance's faithful body: `ob_refcnt`
+/// beyond the single `Rc` the [`crate::instance::STRONG`] pin holds while
+/// any C reference exists, minus refs held only by dead scalar-pinned
+/// tuple mirrors (a released args tuple's `ob_item` slot). An extension
+/// bumping the body with the inline `Py_INCREF` macro (numpy's
+/// `NpyIter_Copy` increfs its operands this way) never mints an `Rc`
+/// clone, so `sys.getrefcount` adds this on top of the `Rc` count
+/// (test_nditer's test_iter_refcount — RFC 0076 WS1).
+pub(crate) fn extra_c_refs_hook(target: &Object) -> usize {
+    let Object::Instance(inst) = target else {
+        return 0;
+    };
+    let body = inst.c_body.get();
+    if body == 0 {
+        return 0;
+    }
+    let p = body as *mut PyObject;
+    let rc = unsafe { (*p).ob_refcnt };
+    if rc <= 1 {
+        return 0;
+    }
+    (rc as usize - 1).saturating_sub(unsafe { crate::mirror::dead_pin_c_refs_to(p) })
+}
+
+/// Identity (`is`) comparison for the payload variants the pin caches can
+/// hold. Conservative: unknown variants compare unequal.
+pub(crate) fn same_native_identity(a: &Object, b: &Object) -> bool {
+    use weavepy_vm::sync::Rc;
+    match (a, b) {
+        (Object::Instance(x), Object::Instance(y)) => Rc::ptr_eq(x, y),
+        (Object::Tuple(x), Object::Tuple(y)) => Rc::ptr_eq(x, y),
+        (Object::Bytes(x), Object::Bytes(y)) => Rc::ptr_eq(x, y),
+        (Object::Str(x), Object::Str(y)) => Rc::ptr_eq(x, y),
+        (Object::Long(x), Object::Long(y)) => Rc::ptr_eq(x, y),
+        (Object::Complex(x), Object::Complex(y)) => Rc::ptr_eq(x, y),
+        _ => false,
+    }
+}
+
 /// Park decision for `free_box`: keep an argument-pinned identity box
 /// alive past C refcount zero while the VM instance is still reachable
 /// elsewhere. Returns `true` when the box must survive (caller returns
@@ -919,6 +1210,12 @@ pub unsafe fn clone_object(p: *mut PyObject) -> Object {
     if let Some(t) = unsafe { crate::types::bridge_type(p as *mut crate::types::PyTypeObject) } {
         return Object::Type(t);
     }
+    // RFC 0076 WS5: a faithful getset-descriptor box carries no Rust
+    // payload (byte-faithful `PyGetSetDescrObject` layout); resolve it
+    // through the side table before any payload-offset read.
+    if let Some(o) = getset_descr_payload(p) {
+        return o;
+    }
     // RFC 0046 (wave 4): a pointer WeavePy did not mint — a static numpy
     // `PyArray_Descr`, an extension-built function object, an un-bridged
     // type — is *foreign*. It is none of the shapes below, so interpreting
@@ -932,6 +1229,12 @@ pub unsafe fn clone_object(p: *mut PyObject) -> Object {
         // value rather than proxying the pointer.
         if crate::mypyc_tail::is_raw_long(p) {
             return unsafe { crate::mypyc_tail::decode_raw_long(p) };
+        }
+        // RFC 0076 WS5: a facade minted for a *VM* code object crossing
+        // into C hands back the original `Object::Code` (identity), not
+        // a decode of the facade bytes.
+        if let Some(code) = crate::code_obj::vm_code_payload(p) {
+            return code;
         }
         // RFC 0066 WS3: a C-minted facade code object (a cyfunction's
         // `__code__`) decodes into a genuine `types.CodeType` instance —
@@ -1348,6 +1651,11 @@ pub(crate) unsafe fn free_box(p: *mut PyObject) {
         if inst.c_body.get() == p as usize {
             inst.c_body.set(0);
         }
+    }
+    // RFC 0076 WS1: likewise drop a canonical property box from its cache
+    // so the next crossing re-mints instead of handing out freed memory.
+    if let Object::Property(rc) = &bx.payload.obj {
+        evict_property_box(weavepy_vm::sync::Rc::as_ptr(rc) as usize, p);
     }
     // RFC 0047 (wave 5): C is dropping what may be the payload's last
     // program-visible reference, from inside an extension call the VM's

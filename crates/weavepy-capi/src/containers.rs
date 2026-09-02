@@ -1214,6 +1214,10 @@ pub unsafe extern "C" fn PyDict_Merge(
     override_: c_int,
 ) -> c_int {
     if a.is_null() || b.is_null() {
+        // CPython's `dict_merge` raises through `PyErr_BadInternalCall`;
+        // a bare -1 here left torch's `throw python_error()` with nothing
+        // to restore ("returned NULL without setting an exception").
+        crate::errors::set_runtime_error("PyDict_Merge: NULL argument");
         return -1;
     }
     let dst = match as_dict_rc(&unsafe { crate::object::clone_object(a) }) {
@@ -1821,18 +1825,32 @@ pub unsafe extern "C" fn PySequence_Fast(o: *mut PyObject, msg: *const c_char) -
     }
     match unsafe { crate::object::clone_object(o) } {
         Object::List(_) | Object::Tuple(_) => unsafe {
+            // Handing the same pointer back means the caller will read it
+            // through the `PySequence_Fast_GET_SIZE`/`GET_ITEM` *macros* —
+            // raw `ob_size`/`ob_item` loads — possibly after arbitrary
+            // Python code has run. Seed + register the list mirror now so
+            // the VM→C boundary flush republishes VM mutations into the
+            // inline buffer; numpy's `PyArray_AssignFromCache` depends on
+            // observing a mid-coercion `list.append` from a malicious
+            // `__len__` to raise its "Content of sequences changed"
+            // RuntimeError (RFC 0076 WS1, test_array_coercion
+            // TestBadSequences).
+            if crate::mirror::is_faithful_list(o) {
+                crate::mirror::list_prefix_seed_once(o);
+                crate::mirror::watch_list_for_macro_reads(o);
+            }
             crate::object::Py_IncRef(o);
             o
         },
-        Object::Str(_) => {
-            crate::errors::set_type_error(if msg.is_null() {
-                "expected list or tuple".to_owned()
-            } else {
-                unsafe { CStr::from_ptr(msg) }
-                    .to_string_lossy()
-                    .into_owned()
-            });
-            ptr::null_mut()
+        // A str *is* a sequence to CPython's `PySequence_Fast` — the
+        // non-fast path runs `PySequence_List`, yielding the list of
+        // 1-char strings. numpy's dtype='c' coercion depends on it
+        // (`np.array('abc1', dtype='c')` iterates the string's chars —
+        // RFC 0076 WS1); the old hard TypeError predates the iterable
+        // fallback below.
+        Object::Str(s) => {
+            let items: Vec<Object> = s.chars().map(|c| Object::from_str(c.to_string())).collect();
+            crate::object::into_owned(Object::new_list(items))
         }
         _ => {
             // Try to coerce iterables into a list.

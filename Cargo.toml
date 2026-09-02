@@ -101,6 +101,13 @@ byteorder   = "1.5"
 encoding_rs = "0.8"
 bzip2       = { version = "0.4", features = ["static"] }
 xz2         = "0.1"
+# RFC 0076 WS15 — PEP 784 `compression.zstd`. `experimental` unlocks the
+# static-linking-only zstd surface (ZDICT_finalizeDictionary for
+# `finalize_dict`); `zdict_builder` the ZDICT training API. libzstd is
+# vendored/static, matching the bzip2/lzma posture.
+zstd        = { version = "0.13", features = ["experimental", "zdict_builder"] }
+zstd-safe   = { version = "7", features = ["experimental", "zdict_builder"] }
+zstd-sys    = { version = "2", features = ["experimental", "zdict_builder"] }
 lzma-sys    = "0.1"
 rusqlite    = { version = "0.31", features = ["bundled", "column_decltype"] }
 rust_decimal = "1.36"

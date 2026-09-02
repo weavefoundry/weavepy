@@ -95,6 +95,19 @@ impl MethodEntry {
             self.flags,
             Some(module.clone()),
         );
+        // CPython's `_add_methods_to_object` stamps `m_module` with the
+        // module's `__name__`, and `builtin_function.__module__` serves
+        // it — which is what lets pickle find the function by reference
+        // (`numpy._core.multiarray._reconstruct`). Without this the
+        // mirror answered the `"builtins"` fallback and every
+        // pickle-by-qualified-name of a C module function failed
+        // ("not found as builtins._reconstruct" — the scipy.fft
+        // multiprocess cluster, RFC 0076 WS2).
+        if let Object::Module(m) = &module {
+            if m.name != "builtins" {
+                weavepy_vm::descr_registry::register_module(&obj, intern_module_name(&m.name));
+            }
+        }
         self.register_live_doc(&obj, Some(module));
         obj
     }
@@ -128,12 +141,51 @@ impl MethodEntry {
         &self,
         defining_class: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) -> Object {
+        // RFC 0076 WS5 — `METH_CLASS` / `METH_STATIC` entries are not
+        // instance methods. CPython's `type_add_method` wraps them in
+        // classmethod/staticmethod descriptors; mirror that with the
+        // VM's own wrappers so `T.m()` works without an instance
+        // (polars' PyO3 `#[classmethod]` constructors —
+        // `PyOptFlags.default()` — hit this at import).
+        if (self.flags & METH_CLASS) != 0 {
+            // The ClassMethod descriptor binds the *class* as args[0],
+            // which the method bridge routes to the C `self` — exactly
+            // `PyDescr_NewClassMethod`'s calling convention.
+            let obj =
+                wrap_c_method_function(self.name.clone(), self.func, self.flags, defining_class);
+            self.register_live_doc(&obj, Some(Object::None));
+            return Object::ClassMethod(MethodWrapper::new(obj));
+        }
+        if (self.flags & METH_STATIC) != 0 {
+            // CPython builds `PyCFunction_NewEx(ml, NULL, NULL)` inside
+            // a staticmethod: no receiver ever reaches the C function.
+            let obj = wrap_c_function(self.name.clone(), self.func, self.flags, None);
+            self.register_live_doc(&obj, Some(Object::None));
+            return Object::StaticMethod(MethodWrapper::new(obj));
+        }
         let obj = wrap_c_method_function(self.name.clone(), self.func, self.flags, defining_class);
         // `m_self` stays `None` — an unbound descriptor has no receiver
         // (the mirror already advertised the `None` singleton).
         self.register_live_doc(&obj, Some(Object::None));
         obj
     }
+}
+
+/// Intern a module name as `&'static str` for the descr registry's
+/// `__module__` attribution. One leak per *distinct* module name (not
+/// per function): extension modules bind dozens to hundreds of
+/// functions each, all sharing the module's name.
+fn intern_module_name(name: &str) -> &'static str {
+    static INTERNED: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashSet<&'static str>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let mut set = INTERNED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = set.get(name) {
+        return s;
+    }
+    let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
+    set.insert(leaked);
+    leaked
 }
 
 /// [`weavepy_vm::descr_registry::LiveDocReader`] over a harvested
@@ -676,8 +728,39 @@ pub unsafe extern "C" fn PyModule_Create2(def: *mut PyModuleDef, _api: c_int) ->
 pub const PY_MOD_CREATE: c_int = 1;
 pub const PY_MOD_EXEC: c_int = 2;
 pub const PY_MOD_MULTIPLE_INTERPRETERS: c_int = 3;
+/// PEP 703: `Py_mod_gil`, value `Py_MOD_GIL_USED` (0) or
+/// `Py_MOD_GIL_NOT_USED` (1).
+pub const PY_MOD_GIL: c_int = 4;
 /// `_Py_mod_LAST_SLOT` — 3.13 defines create/exec/multiple_interpreters/gil.
 pub const PY_MOD_LAST_SLOT: c_int = 4;
+
+/// RFC 0076 WS11: apply the `Py_mod_gil` extension contract at import.
+/// Under active free-threading (`-X gil=0` / `PYTHON_GIL=0`), a module
+/// that did not declare `Py_MOD_GIL_NOT_USED` re-enables the GIL for
+/// the rest of the process — unless `PYTHON_GIL=0` forced the mode —
+/// and a `RuntimeWarning` names the module (CPython 3.13t wording).
+/// Single-phase modules can never declare, so they always trigger this.
+pub(crate) fn note_extension_gil_declaration(full_name: &str, declares_gil_not_used: bool) {
+    if declares_gil_not_used || !weavepy_vm::gil::free_threading_enabled() {
+        return;
+    }
+    let warn = weavepy_vm::gil::reenable_gil_for_extension();
+    if !warn {
+        return;
+    }
+    if let Some(p) = crate::interp::effective_interpreter_mut() {
+        // SAFETY: pointer published by the enclosing extension-call
+        // context (import machinery), live for this call's duration.
+        let _ = unsafe {
+            (*p).emit_runtime_warning(format!(
+                "The global interpreter lock (GIL) has been enabled to load module \
+                 '{full_name}', which has not declared that it can run safely without \
+                 the GIL. To override this behavior and keep the GIL disabled (at your \
+                 own risk), run with PYTHON_GIL=0 or -Xgil=0."
+            ))
+        };
+    }
+}
 
 /// `PyModuleDef_Init(def)` — entry point for a multi-phase (PEP 489)
 /// extension. Unlike single-phase `PyModule_Create2`, the def is *not*
@@ -1000,6 +1083,13 @@ pub unsafe fn run_multiphase_init(
             return Err(msg);
         }
     }
+    // PEP 703 / RFC 0076 WS11: apply the `Py_mod_gil` declaration now
+    // that the module loaded successfully (a failed init must not
+    // re-enable the GIL).
+    let declares_gil_not_used = slots
+        .iter()
+        .any(|s| s.slot == PY_MOD_GIL && s.value as usize == 1);
+    note_extension_gil_declaration(full_name, declares_gil_not_used);
     Ok(module)
 }
 

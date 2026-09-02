@@ -146,6 +146,39 @@ impl JitType {
         }
     }
 
+    /// RFC 0076 WS6 — the lane code burned into a closure-cell access
+    /// site and re-validated by the runtime helpers
+    /// (`wpjit_cell_get`/`_set`). The unboxed scalar lanes read/write
+    /// their machine values; the nullable [`JitType::Obj`] lane
+    /// re-reads (and freshly pins) the payload per access — no
+    /// burn-in, because closures exist to be mutated. The remaining
+    /// pinned lanes stay out: their specialized helpers assume a
+    /// payload identity that shared mutable cell storage can't offer.
+    #[inline]
+    #[must_use]
+    pub fn cell_lane_code(self) -> Option<i64> {
+        match self {
+            JitType::Int => Some(0),
+            JitType::Float => Some(1),
+            JitType::Bool => Some(2),
+            JitType::Obj => Some(3),
+            _ => None,
+        }
+    }
+
+    /// Inverse of [`Self::cell_lane_code`].
+    #[inline]
+    #[must_use]
+    pub fn from_cell_lane_code(code: i64) -> Option<JitType> {
+        match code {
+            0 => Some(JitType::Int),
+            1 => Some(JitType::Float),
+            2 => Some(JitType::Bool),
+            3 => Some(JitType::Obj),
+            _ => None,
+        }
+    }
+
     /// Dataflow join at a control-flow merge. Two equal types join to
     /// themselves; everything else collapses to [`JitType::Unknown`].
     /// `Bool`/`Int` are kept distinct (they join to `Unknown`) so a slot

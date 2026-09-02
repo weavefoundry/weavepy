@@ -584,7 +584,7 @@ fn describe_native_export(obj: &Object) -> Result<NativeExport, ()> {
             // `__buffer__`) crossing into C: take its view and export that —
             // the memoryview pins the storage, so the export stays valid
             // (test_buffer builds `_testbuffer.ndarray(array.array(...))`).
-            if let Some(mv) = weavepy_vm::builtins::buffer_exported_view(other) {
+            if let Some(mv) = weavepy_vm::builtins::buffer_exported_view(other, 0) {
                 return describe_native_export(&Object::MemoryView(mv));
             }
             // CPython's `PyObject_GetBuffer` raises *TypeError* for a

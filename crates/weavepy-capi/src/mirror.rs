@@ -260,6 +260,18 @@ pub struct MirrorPrefix {
     /// stays alive (and identity-stable for later crossings of the same
     /// value) until evicted by [`sweep_scalar_pins`].
     pub scalar_pinned: bool,
+    /// For a faithful **list** mirror minted VM→C ([`mirror_out`]):
+    /// the `(ob_item digest, prefix-`Rc` fingerprint)` pair captured at
+    /// mint, when buffer and `Rc` agree by construction (RFC 0076 WS3).
+    /// A mirror that is only ever *macro*-mutated by the extension —
+    /// Cython's inlined `list.pop()` decrements `ob_size` with no C-API
+    /// call — and then freed without a C→VM read-back never enters
+    /// `SEEDED_LISTS`, so [`reconcile_list_from_c`] has no snapshot to
+    /// compare against and the mutation dies with the box (lxml.sax's
+    /// `_element_stack.pop()` "un-popped" on the next crossing). This
+    /// mint-time pair lets the free-path reconcile adopt the C write iff
+    /// C moved and the VM side did not. `None` for non-list mirrors.
+    pub list_mint: Option<((u64, usize), (u64, usize))>,
     /// A small magic so debugging tools (and assertions) can recognise
     /// a mirror prefix.
     pub magic: u64,
@@ -605,6 +617,13 @@ fn mirror_out_fresh_inner(
             );
         }
     }
+    if pin_trace_enabled() {
+        if let Object::Bytes(b) = &obj {
+            if b.len() > 4096 {
+                eprintln!("[pin] mint-bytes {}B", b.len());
+            }
+        }
+    }
     let plan = BodyPlan::for_object(&obj);
     let total = PREFIX_SIZE + plan.body_size;
     let layout = Layout::from_size_align(total, BODY_ALIGN).expect("mirror layout");
@@ -651,9 +670,19 @@ fn mirror_out_fresh_inner(
                 bytes_buffer: false,
                 list_synced: false,
                 scalar_pinned: false,
+                list_mint: None,
                 magic: MIRROR_MAGIC,
             },
         );
+    }
+    // Capture the mint-time agreement for a VM-shared list (buffer was
+    // just built *from* the `Rc`, so the two agree by construction) —
+    // the free-path reconcile's baseline for adopting macro writes on a
+    // never-registered mirror (RFC 0076 WS3; see `MirrorPrefix::list_mint`).
+    if let Object::List(rc) = unsafe { &(*pre).obj } {
+        let c = unsafe { list_ptr_snapshot(body) };
+        let fp = digest_objects(rc.borrow().iter());
+        unsafe { (*pre).list_mint = Some((c, fp)) };
     }
     crate::object::register_minted(body);
     body
@@ -710,6 +739,7 @@ pub fn alloc_instance_body(
                 bytes_buffer: false,
                 list_synced: false,
                 scalar_pinned: false,
+                list_mint: None,
                 magic: MIRROR_MAGIC,
             },
         );
@@ -818,6 +848,9 @@ pub unsafe fn free_instance_body(p: *mut PyObject) {
     // inline array. Ordinary instance bodies have neither (aux is null,
     // both predicates false), so this is dead code for them.
     if unsafe { is_faithful_list(p) } {
+        // Adopt pending direct C writes before the mirror dies — see the
+        // matching reconcile in [`free_mirror`] (RFC 0076 WS3).
+        unsafe { reconcile_list_from_c(p) };
         unregister_seeded_list(p);
         if !aux_ptr.is_null() && aux_size > 0 {
             // Live prefix only (`ob_size`), like CPython's `list_dealloc`:
@@ -1004,6 +1037,37 @@ pub unsafe fn native_of(p: *mut PyObject) -> Object {
                 let _ = inst.native.set(Object::Bytes(rc));
             }
         }
+        // And for a faithful **tuple-subtype** body (RFC 0076 WS5):
+        // torch's `Size` is a readied static subtype of tuple, built via
+        // `tp_alloc(&THPSizeType, ndim)` + `PyTuple_SET_ITEM` macro
+        // writes into the inline `ob_item` — the `PyInstance` minted at
+        // alloc time has no tuple payload, so `len(t.shape)` collapsed to
+        // "'object' has no len()". Tuples are immutable and the macro
+        // fills complete before the object is exposed, so a once-seed at
+        // first crossing is faithful.
+        if inst.native.get().is_none()
+            && !head.ob_type.is_null()
+            && !std::ptr::eq(head.ob_type, types::PyTuple_Type.as_ptr())
+            && unsafe { crate::types::PyType_IsSubtype(head.ob_type, types::PyTuple_Type.as_ptr()) }
+                != 0
+        {
+            let vo = p as *const layout::PyVarObject;
+            let n = unsafe { (*vo).ob_size };
+            if n >= 0 {
+                let to = p as *const layout::PyTupleObject;
+                let base = unsafe { ptr::addr_of!((*to).ob_item) } as *const *mut PyObject;
+                let mut items = Vec::with_capacity(n as usize);
+                for i in 0..n as usize {
+                    let slot = unsafe { *base.add(i) };
+                    items.push(if slot.is_null() {
+                        Object::None
+                    } else {
+                        unsafe { crate::object::clone_object(slot) }
+                    });
+                }
+                let _ = inst.native.set(Object::new_tuple(items));
+            }
+        }
         // RFC 0047 (wave 5): a **list-subclass container body** can carry
         // direct C macro writes (`PyList_SET_ITEM` + `__Pyx_SET_SIZE`, the
         // Cython append fast path); adopt them into the instance's native
@@ -1152,7 +1216,16 @@ pub unsafe fn is_faithful_tuple(p: *mut PyObject) -> bool {
     // crosses as a faithful `PyTupleObject`-shaped container body, so the
     // inlined `PyTuple_Check` → `PyTuple_GET_ITEM`/`Py_SIZE` macro sequence
     // reads real slots.
-    types::is_container_body_type(ty)
+    //
+    // RFC 0076 WS5: a readied *foreign* tuple subclass (torch's
+    // `THPSizeType`) takes the inline-instance path instead — its body is
+    // equally a real `PyTupleObject` (`ob_size` stamped by
+    // `make_inline_instance`, `ob_item` filled by the extension's
+    // `PyTuple_SET_ITEM` macros). Without this arm, `PyTuple_Size(self)`
+    // fell through to `clone_object` → `Object::Instance` → -1, and
+    // `THPSize_repr`/`THPSize_reduce` saw an empty tuple (`torch.Size`
+    // pickled as `Size(())`, killing DataLoader spawn workers).
+    (types::is_container_body_type(ty) || types::is_inline_instance_type(ty))
         && unsafe { (*ty).tp_flags } & layout::tpflags::TUPLE_SUBCLASS != 0
 }
 
@@ -2012,6 +2085,33 @@ enum ScalarPinKey {
 static SCALAR_PIN_CACHE: Mutex<Option<FxHashMap<ScalarPinKey, usize>>> = Mutex::new(None);
 /// Eviction sweep threshold (entries).
 const SCALAR_PIN_HWM: usize = 1 << 16;
+/// Approximate payload bytes held by the cache's entries (RFC 0076 WS3).
+/// The entry-count HWM alone lets a *few* huge dead pins retain megabytes
+/// — Pillow's font leak test marshals a fresh ~10 KB text string per
+/// `draw.text` call, and 100 dead ~50 KB string mirrors blow its 1 MB
+/// RSS ceiling long before 64Ki entries. Registrations past
+/// [`SCALAR_PIN_BYTE_HWM`] sweep dead entries just like the count HWM.
+static SCALAR_PIN_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Byte-accounted sweep threshold.
+const SCALAR_PIN_BYTE_HWM: usize = 512 * 1024;
+
+/// Approximate payload bytes a pinned mirror of `obj` retains (the C-side
+/// data copy; prefix/box overhead is ignored — it is bounded by the entry
+/// count HWM).
+fn pin_payload_bytes(obj: &Object) -> usize {
+    match obj {
+        // A str mirror carries up to a UCS4 copy plus a UTF-8 cache.
+        Object::Str(s) => s.len() * 5,
+        Object::Bytes(b) => b.len(),
+        // A pinned tuple mirror holds a C reference to each element's
+        // mirror until it is swept (`free_mirror` decrefs `ob_item`), so
+        // it retains its elements' payloads too. This is the args-tuple
+        // shape: `font.getmask(text)` pins a fresh 2-tuple whose ~10 KB
+        // text mirror the 16-bytes-per-slot estimate missed entirely.
+        Object::Tuple(t) => t.iter().map(|e| 16 + pin_payload_bytes(e)).sum(),
+        _ => 16,
+    }
+}
 
 thread_local! {
     /// Non-zero while marshaling VM arguments into a C call on this thread.
@@ -2138,20 +2238,47 @@ fn cached_scalar_pin(key: ScalarPinKey, ty: *mut PyTypeObject) -> Option<*mut Py
 /// Record `p` as the canonical pinned box for `key`, sweeping the cache
 /// first when it is past the high-water mark. A displaced previous entry
 /// is unpinned (and freed at once if C no longer references it).
+/// Diagnostic: gate scalar-pin/UTF-8-cache accounting traces on
+/// `WEAVEPY_PIN_TRACE` (RFC 0076 WS3 leak hunting).
+pub(crate) fn pin_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WEAVEPY_PIN_TRACE").is_some())
+}
+
 fn register_scalar_pin(key: ScalarPinKey, p: *mut PyObject) {
+    use std::sync::atomic::Ordering;
     unsafe { (*prefix_of(p)).scalar_pinned = true };
+    let nbytes = pin_payload_bytes(unsafe { &(*prefix_of(p)).obj });
+    if pin_trace_enabled() && nbytes > 4096 {
+        eprintln!(
+            "[pin] register {nbytes}B total={} refcnt={}",
+            SCALAR_PIN_BYTES.load(Ordering::Relaxed),
+            unsafe { (*p).ob_refcnt },
+        );
+    }
     let displaced = {
         let mut g = match SCALAR_PIN_CACHE.lock() {
             Ok(g) => g,
             Err(_) => return,
         };
         let map = g.get_or_insert_with(FxHashMap::default);
-        if map.len() >= SCALAR_PIN_HWM {
+        if map.len() >= SCALAR_PIN_HWM
+            || SCALAR_PIN_BYTES.load(Ordering::Relaxed) + nbytes > SCALAR_PIN_BYTE_HWM
+        {
             sweep_scalar_pins_locked(map);
         }
+        SCALAR_PIN_BYTES.fetch_add(nbytes, Ordering::Relaxed);
         map.insert(key, p as usize)
     };
     if let Some(old) = displaced {
+        let old_bytes = if old == p as usize {
+            // Re-registered the same box: the insert above double-counted.
+            nbytes
+        } else {
+            pin_payload_bytes(unsafe { &(*prefix_of(old as *mut PyObject)).obj })
+        };
+        SCALAR_PIN_BYTES.fetch_sub(old_bytes, Ordering::Relaxed);
         if old != p as usize {
             unsafe { unpin_scalar_box(old as *mut PyObject) };
         }
@@ -2173,19 +2300,123 @@ unsafe fn unpin_scalar_box(p: *mut PyObject) {
 /// freeing the boxes. Entries C still holds stay registered (identity
 /// remains stable for future crossings).
 fn sweep_scalar_pins_locked(map: &mut FxHashMap<ScalarPinKey, usize>) {
+    use std::sync::atomic::Ordering;
     let dead: Vec<(ScalarPinKey, usize)> = map
         .iter()
         .filter(|(_, &bp)| unsafe { (*(bp as *mut PyObject)).ob_refcnt } <= 0)
         .map(|(k, &bp)| (*k, bp))
         .collect();
+    if pin_trace_enabled() {
+        eprintln!(
+            "[pin] sweep: {} dead of {} entries, {}B total",
+            dead.len(),
+            map.len(),
+            SCALAR_PIN_BYTES.load(Ordering::Relaxed),
+        );
+    }
     for (k, bp) in dead {
         map.remove(&k);
         let p = bp as *mut PyObject;
+        SCALAR_PIN_BYTES.fetch_sub(
+            pin_payload_bytes(unsafe { &(*prefix_of(p)).obj }),
+            Ordering::Relaxed,
+        );
         unsafe {
             (*prefix_of(p)).scalar_pinned = false;
             free_mirror(p);
         }
     }
+}
+
+/// Count the clones of `target` held by **dead** scalar pins (C refcount
+/// zero — CPython would already have freed the memory): a pin that *is*
+/// `target`, or a dead tuple pin whose only strong reference is the pin
+/// itself and whose elements include `target`. The `sys.getrefcount`
+/// discount half of RFC 0076 WS1 (see `object::pin_clone_count_hook`);
+/// the tuple case is what a marshaled `np.array((obj, 2), dtype=...)`
+/// argument leaves behind — the pinned args-tuple mirror keeps the VM
+/// tuple (and through it `obj`) alive past the call.
+pub(crate) fn dead_pin_clones_of(target: &Object) -> usize {
+    let g = match SCALAR_PIN_CACHE.lock() {
+        Ok(g) => g,
+        Err(_) => return 0,
+    };
+    let Some(map) = g.as_ref() else { return 0 };
+    let mut n = 0;
+    for &bp in map.values() {
+        let p = bp as *mut PyObject;
+        if unsafe { (*p).ob_refcnt } > 0 {
+            continue;
+        }
+        let obj = unsafe { &(*prefix_of(p)).obj };
+        if crate::object::same_native_identity(obj, target) {
+            n += 1;
+            continue;
+        }
+        if let Object::Tuple(t) = obj {
+            // Only when the pin is the tuple's sole owner — otherwise the
+            // program can still reach the tuple and the element reference
+            // is genuinely visible.
+            if weavepy_vm::sync::Rc::strong_count(t) == 1
+                && t.iter()
+                    .any(|e| crate::object::same_native_identity(e, target))
+            {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Count the C references to box `bp` held by **dead** scalar-pinned
+/// tuple mirrors (C refcount ≤ 0) — both the `ob_item` slot references
+/// and the aux identity-snapshot references (a tuple mirror owns one of
+/// each per element; see `fill_body`'s tuple arm). On CPython the args
+/// tuple dies at call end and decrefs its elements; a pinned tuple parks
+/// *without* releasing them (identity stability for re-crossings), so an
+/// element identity box can be kept at refcount ≥ 1 by storage the
+/// program can no longer reach. `pin_clone_count_hook` treats such a box
+/// as parked when these refs account for its whole refcount
+/// (RFC 0076 WS1, test_cleanup_with_refs_non_contig: the dead `(obj, 2)`
+/// args-tuple pin held `obj`'s box at 2, keeping the box's payload clone
+/// visible to `sys.getrefcount`).
+pub(crate) fn dead_pin_c_refs_to(bp: *mut PyObject) -> usize {
+    let g = match SCALAR_PIN_CACHE.lock() {
+        Ok(g) => g,
+        Err(_) => return 0,
+    };
+    let Some(map) = g.as_ref() else { return 0 };
+    let mut n = 0;
+    for &pin in map.values() {
+        let p = pin as *mut PyObject;
+        if unsafe { (*p).ob_refcnt } > 0 {
+            continue;
+        }
+        let pre = unsafe { prefix_of(p) };
+        if !matches!(unsafe { &(*pre).obj }, Object::Tuple(_)) {
+            continue;
+        }
+        let vo = p as *const layout::PyVarObject;
+        let len = unsafe { (*vo).ob_size };
+        let len = if len < 0 { 0 } else { len as usize };
+        let to = p as *const layout::PyTupleObject;
+        let base = unsafe { ptr::addr_of!((*to).ob_item) } as *const *mut PyObject;
+        for i in 0..len {
+            if unsafe { *base.add(i) } == bp {
+                n += 1;
+            }
+        }
+        let snap = unsafe { (*pre).aux_ptr } as *const *mut PyObject;
+        let snap_n = unsafe { (*pre).aux_size } / std::mem::size_of::<*mut PyObject>();
+        if !snap.is_null() {
+            for i in 0..snap_n {
+                if unsafe { *snap.add(i) } == bp {
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
 }
 
 /// True iff `p` is a canonical pinned scalar box whose storage must
@@ -2238,15 +2469,34 @@ unsafe fn list_ptr_snapshot(p: *mut PyObject) -> (u64, usize) {
 /// # Safety
 /// `p` must satisfy [`is_faithful_list`].
 unsafe fn note_c_agreement(p: *mut PyObject) {
-    if SEEDED_LIST_COUNT.load(Ordering::Relaxed) == 0 {
-        return;
-    }
     let cur = unsafe { list_ptr_snapshot(p) };
-    if let Ok(mut g) = SEEDED_LISTS.lock() {
-        if let Some(map) = g.as_mut() {
-            if let Some(slot) = map.get_mut(&(p as usize)) {
-                slot.c_ptrs = cur;
+    // Every caller (`list_append` / `list_insert` / `list_store` /
+    // `list_permute`) has just written *both* sides — buffer and `Rc` —
+    // so record the `Rc` fingerprint alongside the buffer snapshot.
+    // Refreshing only `c_ptrs` left `rc_fp` at the last *sync*'s value; a
+    // later `Rc` mutation that happened to land back on that stale
+    // fingerprint (lxml's append → `del path[-1]` → append cycle returns
+    // to the same two-element path) made `sync_list_ob_item` early-return
+    // as "unmutated" and the delete never reached `ob_item` (RFC 0076
+    // WS3: `descendantpaths()` accumulated every sibling segment).
+    let fp = unsafe { list_rc_of(p) }.map(|rc| digest_objects(rc.borrow().iter()));
+    if SEEDED_LIST_COUNT.load(Ordering::Relaxed) != 0 {
+        if let Ok(mut g) = SEEDED_LISTS.lock() {
+            if let Some(map) = g.as_mut() {
+                if let Some(slot) = map.get_mut(&(p as usize)) {
+                    slot.c_ptrs = cur;
+                    if let Some(fp) = fp {
+                        slot.rc_fp = Some(fp);
+                    }
+                }
             }
+        }
+    }
+    // Keep the never-registered baseline current too (see `list_mint`).
+    let pre = unsafe { prefix_of(p) };
+    if unsafe { (*pre).list_mint.is_some() } {
+        if let Some(fp) = fp {
+            unsafe { (*pre).list_mint = Some((cur, fp)) };
         }
     }
 }
@@ -2295,22 +2545,65 @@ unsafe fn list_rc_of(
 /// # Safety
 /// `p` must satisfy [`is_faithful_list`].
 unsafe fn reconcile_list_from_c(p: *mut PyObject) {
-    if SEEDED_LIST_COUNT.load(Ordering::Relaxed) == 0 {
+    if SEEDED_LIST_COUNT.load(Ordering::Relaxed) == 0
+        && unsafe { (*prefix_of(p)).list_mint.is_none() }
+    {
         return;
     }
     let cur = unsafe { list_ptr_snapshot(p) };
     // Cheap gate: an unchanged buffer means C wrote nothing; the `Rc`
     // (possibly ahead with un-flushed VM mutations) stays authoritative.
     // A missing entry ⇒ leave the `Rc` alone (never clobber VM state).
-    let changed = match SEEDED_LISTS.lock() {
-        Ok(g) => g
-            .as_ref()
-            .and_then(|m| m.get(&(p as usize)))
-            .map(|st| st.c_ptrs != cur)
-            .unwrap_or(false),
+    let (present, changed) = match SEEDED_LISTS.lock() {
+        Ok(g) => match g.as_ref().and_then(|m| m.get(&(p as usize))) {
+            Some(st) => (true, st.c_ptrs != cur),
+            None => (false, false),
+        },
         Err(_) => return,
     };
+    if !present {
+        // Never-registered mirror (minted VM→C, no C→VM read-back, no
+        // C-API mutator): the mint-time agreement in the prefix is the
+        // baseline. Adopt the buffer iff C moved it and the VM side did
+        // not — Cython's inlined `list.pop()` shrinks `ob_size` through
+        // a bare macro, so a mirror freed right after (lxml.sax's
+        // per-event `_element_stack` crossing) is this exact shape
+        // (RFC 0076 WS3).
+        let pre = unsafe { prefix_of(p) };
+        if let Some((mint_c, mint_fp)) = unsafe { (*pre).list_mint } {
+            if cur != mint_c {
+                if let Some(rc) = unsafe { list_rc_of(p) } {
+                    let rc_now = digest_objects(rc.borrow().iter());
+                    if rc_now == mint_fp {
+                        let adopted = unsafe { read_list_vec(p) };
+                        let n = adopted.len();
+                        *rc.borrow_mut() = adopted;
+                        unsafe {
+                            (*pre).list_mint = Some((cur, digest_objects(rc.borrow().iter())))
+                        };
+                        if listsync_trace_enabled() {
+                            eprintln!("[LISTSYNC] adopt-unseeded {p:p} ob_size={n}");
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+        if listsync_trace_enabled() {
+            eprintln!(
+                "[LISTSYNC] reconcile-skip {p:p} present=false cur=({:x},{})",
+                cur.0, cur.1
+            );
+        }
+        return;
+    }
     if !changed {
+        if listsync_trace_enabled() {
+            eprintln!(
+                "[LISTSYNC] reconcile-skip {p:p} present={present} cur=({:x},{})",
+                cur.0, cur.1
+            );
+        }
         return;
     }
     let rc = match unsafe { list_rc_of(p) } {
@@ -2331,6 +2624,24 @@ unsafe fn reconcile_list_from_c(p: *mut PyObject) {
     }
     if listsync_trace_enabled() {
         eprintln!("[LISTSYNC] adopt {p:p} ob_size={n}");
+    }
+}
+
+/// Public wrapper over [`reconcile_list_from_c`] for C-API mutators that
+/// update the prefix `Rc` *directly* (slice deletion, `PySequence_DelItem`,
+/// `PyObject_SetItem`) and then republish via [`sync_list_ob_item`]. They
+/// must adopt any pending *macro* write (Cython's inlined append/pop)
+/// **before** mutating the `Rc`: otherwise the pre-publish reconcile inside
+/// the sync sees the changed buffer and adopts it wholesale — undoing the
+/// mutation just made (lxml.objectify's `del path[-1]` between two macro
+/// appends became a no-op, so `descendantpaths()` accumulated every
+/// sibling segment into one path — RFC 0076 WS3).
+///
+/// # Safety
+/// `p` must be a live pointer; non-list mirrors are ignored.
+pub unsafe fn adopt_c_list_writes(p: *mut PyObject) {
+    if unsafe { is_faithful_list(p) } {
+        unsafe { reconcile_list_from_c(p) };
     }
 }
 
@@ -2666,6 +2977,14 @@ pub unsafe fn sync_list_ob_item(p: *mut PyObject) {
             }
         }
     }
+    // Advance the mint-time agreement too: a never-registered mirror
+    // (RFC 0076 WS3) relies on `list_mint` as its reconcile baseline, and
+    // leaving the stale pre-publish snapshot there would make the *next*
+    // C macro write look like a two-sided divergence (both `cur != mint_c`
+    // and `rc != mint_fp`) and be skipped.
+    if unsafe { (*pre).list_mint.is_some() } {
+        unsafe { (*pre).list_mint = Some((c_ptrs, fp)) };
+    }
 }
 
 /// Re-sync every seeded faithful list mirror's `ob_item` from its prefix
@@ -2739,6 +3058,95 @@ pub unsafe fn flush_seeded_lists() {
     for pu in dirty {
         unsafe { sync_list_ob_item(pu as *mut PyObject) };
     }
+}
+
+// ---------------------------------------------------------------------------
+// Macro-read watch set (RFC 0076 WS1).
+// ---------------------------------------------------------------------------
+//
+// [`flush_seeded_lists`] runs only at the *outermost* VM→C transition — a
+// deliberate cost choice (it digests every seeded list). But an extension
+// holding a `PySequence_Fast` result reads it through the raw
+// `PySequence_Fast_GET_SIZE`/`GET_ITEM` macros *between* its own nested
+// callbacks into the VM, and expects a callback's list mutation to be
+// visible immediately (same object on CPython). numpy's coercion is the
+// canonical case: a malicious `__len__` appends to the outer list mid
+// `np.array(obj)`, and `PyArray_AssignFromCache` re-reads `Py_SIZE(seq)`
+// to raise "Content of sequences changed" — with the mirror republished
+// only at the outermost return, the mutation was invisible and the
+// RuntimeError never fired (test_array_coercion, TestBadSequences).
+//
+// So `PySequence_Fast` registers its (seeded) list result in a small
+// thread-local watch set, and every *nested* `ensure_active` exit re-syncs
+// just those watched lists. The set is capped (pathological detection is
+// best-effort, per numpy's own "we do not test a shrinking list" caveat)
+// and cleared at the outermost C→VM return, so steady-state VM code pays
+// one empty-TLS check per bridged call.
+
+thread_local! {
+    static MACRO_WATCHED_LISTS: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+const MACRO_WATCH_CAP: usize = 8;
+
+/// Watch `p` (a seeded faithful list mirror) for macro reads: nested
+/// VM→C boundary exits will republish its prefix `Rc` into `ob_item`.
+pub fn watch_list_for_macro_reads(p: *mut PyObject) {
+    let _ = MACRO_WATCHED_LISTS.try_with(|w| {
+        let mut v = w.borrow_mut();
+        let k = p as usize;
+        if v.contains(&k) {
+            return;
+        }
+        if v.len() >= MACRO_WATCH_CAP {
+            v.remove(0);
+        }
+        v.push(k);
+    });
+}
+
+/// Drop `p` from the watch set — called from [`free_mirror`] so a nested
+/// sync can never touch freed storage.
+fn unwatch_list(p: *mut PyObject) {
+    let _ = MACRO_WATCHED_LISTS.try_with(|w| {
+        let mut v = w.borrow_mut();
+        if !v.is_empty() {
+            v.retain(|&k| k != p as usize);
+        }
+    });
+}
+
+/// True iff the watch set is empty (the common steady state) — lets the
+/// nested-boundary caller skip the sync without cloning the TLS vec.
+pub fn no_watched_lists() -> bool {
+    MACRO_WATCHED_LISTS
+        .try_with(|w| w.borrow().is_empty())
+        .unwrap_or(true)
+}
+
+/// Republish every watched list's prefix `Rc` into its `ob_item` buffer.
+/// Called at *nested* VM→C boundary exits (see module comment above).
+///
+/// # Safety
+/// May only be called at a VM→C transition (no C code mid-read of a
+/// watched list's `ob_item`).
+pub unsafe fn sync_watched_lists() {
+    let snapshot: Vec<usize> = match MACRO_WATCHED_LISTS.try_with(|w| w.borrow().clone()) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    for k in snapshot {
+        let p = k as *mut PyObject;
+        if unsafe { is_faithful_list(p) } {
+            unsafe { sync_list_ob_item(p) };
+        }
+    }
+}
+
+/// Clear the watch set — called at the outermost C→VM return, scoping the
+/// watches to a single extension-call window.
+pub fn clear_watched_lists() {
+    let _ = MACRO_WATCHED_LISTS.try_with(|w| w.borrow_mut().clear());
 }
 
 /// Adopt direct `PyList_SET_ITEM`-macro writes made to the **nested** seeded
@@ -3120,6 +3528,7 @@ pub fn new_unicode_mirror(len: usize, maxchar: u32) -> *mut PyObject {
                 bytes_buffer: false,
                 list_synced: false,
                 scalar_pinned: false,
+                list_mint: None,
                 magic: MIRROR_MAGIC,
             },
         );
@@ -3382,7 +3791,7 @@ unsafe fn list_reserve(p: *mut PyObject, min_cap: usize) -> *mut *mut PyObject {
 ///
 /// # Safety
 /// `p` must satisfy [`is_faithful_list`].
-unsafe fn list_prefix_seed_once(p: *mut PyObject) {
+pub(crate) unsafe fn list_prefix_seed_once(p: *mut PyObject) {
     let pre = unsafe { prefix_of(p) };
     if unsafe { (*pre).list_synced } {
         return;
@@ -3565,20 +3974,39 @@ pub unsafe fn user_data(p: *mut PyObject) -> *mut c_void {
 /// `p` must satisfy [`is_mirror`] and have a zero (or about-to-be-zero)
 /// refcount; it must not be used afterwards.
 pub unsafe fn free_mirror(p: *mut PyObject) {
+    if pin_trace_enabled() {
+        if let Object::Bytes(b) = unsafe { &(*prefix_of(p)).obj } {
+            if b.len() > 4096 {
+                eprintln!("[pin] free-bytes {}B", b.len());
+            }
+        }
+    }
     unsafe { record_mirror_free(p) };
     crate::object::unregister_minted(p);
     // Release any argument references `PyArg_ParseTuple` tethered to this
     // owner's lifetime (RFC 0047, wave 5); no-op unless tethers exist.
     crate::argparse::drop_tethered(p);
-    // Drop a seeded list mirror from the write-through set. Gated on the
-    // atomic so an ordinary mirror free (float/int/…) never takes the lock.
-    if SEEDED_LIST_COUNT.load(Ordering::Relaxed) > 0 && unsafe { is_faithful_list(p) } {
-        unregister_seeded_list(p);
+    // Drop a seeded list mirror from the write-through set.
+    if unsafe { is_faithful_list(p) } {
+        // RFC 0076 WS3: adopt any pending *direct* C write first — Cython's
+        // inlined `list.pop()` shrinks `ob_size` via `__Pyx_SET_SIZE` with
+        // no C-API call, so if this mirror dies before the next boundary
+        // flush the mutation would die with it and the next crossing would
+        // republish the stale prefix `Rc` (lxml.sax's `_element_stack.pop()`
+        // "un-popped", failing every saxify round-trip with "Unexpected
+        // element closed"). Covers both the registered case (snapshot in
+        // `SEEDED_LISTS`) and the never-registered one (mint snapshot in
+        // the prefix).
+        unsafe { reconcile_list_from_c(p) };
+        if SEEDED_LIST_COUNT.load(Ordering::Relaxed) > 0 {
+            unregister_seeded_list(p);
+        }
     }
     // RFC 0047 (wave 5): drop this box from the canonical list cache before
     // its prefix (and the native `Rc` the key is derived from) is dropped.
     if unsafe { is_faithful_list(p) } {
         unsafe { unregister_list_box(p) };
+        unwatch_list(p);
     }
     // RFC 0047 (wave 5): drop this box from the canonical set cache before
     // its prefix (and the native `Rc` the key is derived from) is dropped.

@@ -2700,6 +2700,37 @@ impl fmt::Debug for PyModule {
     }
 }
 
+/// `module.__class__ = ModuleSubclass` support (RFC 0076 WS5). CPython's
+/// `object_set_class` waives the layout guard when both classes are
+/// `ModuleType` subtypes, and torch's config system leans on it:
+/// `install_config_module` re-points every `torch.*.config` module at a
+/// `ConfigModule` subclass whose `__getattr__`/`__setattr__` serve the
+/// config entries. `PyModule` has no class field (modules predate the
+/// feature and are built in ~100 places), so the assigned class lives in
+/// this side registry keyed by `Rc` identity. Process-global: modules
+/// cross threads through the import cache, and a worker thread's
+/// `torch._dynamo` import must observe the class the main thread set.
+/// Modules are effectively immortal (the import cache pins them), so
+/// stale-key reuse is not a practical concern.
+static MODULE_CLASS: std::sync::LazyLock<
+    parking_lot::RwLock<std::collections::HashMap<usize, Object>>,
+> = std::sync::LazyLock::new(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
+
+/// Record `m.__class__ = cls`. The caller validates that `cls` is a
+/// `ModuleType` subclass.
+pub fn set_module_class(m: &Rc<PyModule>, cls: Object) {
+    MODULE_CLASS.write().insert(Rc::as_ptr(m) as usize, cls);
+}
+
+/// The class assigned via [`set_module_class`], if any. `None` means the
+/// stock `types.ModuleType`.
+pub fn module_class(m: &Rc<PyModule>) -> Option<Rc<crate::types::TypeObject>> {
+    match MODULE_CLASS.read().get(&(Rc::as_ptr(m) as usize)) {
+        Some(Object::Type(t)) => Some(t.clone()),
+        _ => None,
+    }
+}
+
 /// Dictionary key: a hashable [`Object`] wrapped to satisfy the
 /// `Hash + Eq` requirements imposed by `HashMap` / `IndexMap`.
 #[derive(Clone, Debug)]
@@ -2859,6 +2890,11 @@ pub(crate) fn key_needs_interp_eq(obj: &Object) -> bool {
         Object::Foreign(_) => true,
         Object::Tuple(items) => items.iter().any(key_needs_interp_eq),
         Object::FrozenSet(s) => s.iter().any(|k| key_needs_interp_eq(&k.0)),
+        // A PEP 604 union compares as a *set* of members (CPython
+        // `union_richcompare`), including against typing's
+        // `_UnionGenericAlias` — structural namespace equality can't
+        // express either (RFC 0076 WS5).
+        Object::SimpleNamespace(_) => crate::is_pep604_union(obj).is_some(),
         _ => instance_has_custom_dunder(obj, "__eq__"),
     }
 }
@@ -8266,7 +8302,9 @@ impl Object {
                 if a.released.get() {
                     return false;
                 }
-                if let Some(b) = crate::builtins::buffer_exported_view(other) {
+                if let Some(b) =
+                    crate::builtins::buffer_exported_view(other, crate::builtins::PYBUF_FULL_RO)
+                {
                     return a.buffer_eq(&b);
                 }
                 // A C-extension exporter (`_testbuffer.ndarray`, numpy)
@@ -10695,6 +10733,29 @@ pub(crate) fn recorded_key_hash(obj: &Object) -> Option<i64> {
     }
 }
 
+/// CPython's `frozenset_hash` mixing (Objects/setobject.c) over
+/// pre-computed element hashes. Shared by the frozenset arm of
+/// [`py_hash_value`] and the PEP 604 union arm (`union_hash` is defined
+/// as `hash(frozenset(args))`).
+fn frozenset_style_hash<I: Iterator<Item = i64>>(lanes: I) -> i64 {
+    let mut acc: u64 = 0;
+    let mut n: u64 = 0;
+    for eh in lanes {
+        let eh = eh as u64;
+        acc ^= (eh ^ (eh << 16) ^ 89_869_747).wrapping_mul(3_644_798_167);
+        n += 1;
+    }
+    acc ^= n.wrapping_add(1).wrapping_mul(1_927_868_237);
+    acc ^= (acc >> 11) ^ (acc >> 25);
+    acc = acc.wrapping_mul(69_069).wrapping_add(907_133_923);
+    let v = acc as i64;
+    if v == -1 {
+        590_923_713
+    } else {
+        v
+    }
+}
+
 pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
     if let Some(h) = numeric_hash(obj) {
         return Some(h);
@@ -10758,18 +10819,26 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
             // CPython's `frozenset_hash` (Objects/setobject.c), bit-exact:
             // `collections.abc.Set._hash` reimplements the same algorithm
             // in Python and the two must agree (`hash(fs) == Set._hash(fs)`).
-            let mut acc: u64 = 0;
-            for k in s.iter() {
-                let eh = py_hash_value(&k.0).unwrap_or_else(|| identity_hash(&k.0)) as u64;
-                acc ^= (eh ^ (eh << 16) ^ 89_869_747).wrapping_mul(3_644_798_167);
-            }
-            acc ^= (s.len() as u64).wrapping_add(1).wrapping_mul(1_927_868_237);
-            acc ^= (acc >> 11) ^ (acc >> 25);
-            acc = acc.wrapping_mul(69_069).wrapping_add(907_133_923);
-            let v = acc as i64;
-            let v = if v == -1 { 590_923_713 } else { v };
+            let v = frozenset_style_hash(
+                s.iter()
+                    .map(|k| py_hash_value(&k.0).unwrap_or_else(|| identity_hash(&k.0))),
+            );
             s.store_hash(v);
             Some(v)
+        }
+        // A PEP 604 union hashes as `hash(frozenset(__args__))` (CPython
+        // `union_hash`) — the same value typing's `_UnionGenericAlias.
+        // __hash__` computes, so `d[typing.Optional[T]]` is findable with
+        // the `T | None` spelling (RFC 0076 WS5: torch's `infer_schema`
+        // keys `SUPPORTED_PARAM_TYPES` by the typing forms and probes
+        // with the annotation as written). Without this arm the union
+        // fell to `identity_hash` and the probe landed in the wrong
+        // bucket even though `==` and builtin `hash()` both agreed.
+        Object::SimpleNamespace(_) => {
+            let members = crate::is_pep604_union(obj)?;
+            Some(frozenset_style_hash(members.iter().map(|m| {
+                py_hash_value(m).unwrap_or_else(|| identity_hash(m))
+            })))
         }
         Object::Instance(inst) => {
             // A `weakref.ref` hashes as its referent (CPython `weakref_hash`),

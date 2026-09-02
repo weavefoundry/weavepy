@@ -104,6 +104,7 @@ pub mod winapi_mod;
 #[cfg(windows)]
 pub mod winreg_mod;
 pub mod zlib_mod;
+pub mod zstd_mod;
 // RFC 0023 — drop-in stdlib parity.
 pub mod abc_mod;
 pub mod atexit_mod;
@@ -228,6 +229,9 @@ pub fn register_all(cache: &ModuleCache) {
     // like CPython's `Lib/ssl.py` over its `_ssl` C extension.
     cache.register_builtin("_ssl", ssl_real::build);
     cache.register_builtin("zlib", zlib_mod::build);
+    // RFC 0076 WS15 — PEP 784: the native core under the verbatim
+    // `compression.zstd` package (see `frozen_sources`).
+    cache.register_builtin("_zstd", zstd_mod::build);
     cache.register_builtin("_struct", struct_mod::build);
     cache.register_builtin("_codecs", codecs_mod::build);
     cache.register_builtin("marshal", marshal_mod::build);
@@ -381,6 +385,54 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
         // on the native `_ctypes_native` primitive module (memory, dlopen,
         // platform C type sizes, libffi). pandas imports `ctypes`
         // unconditionally (`pandas.errors`).
+        // RFC 0076 WS15 — PEP 784: the verbatim CPython 3.14
+        // `compression` package (zstd + the bz2/gzip/lzma/zlib
+        // re-export shims) over the native `_zstd` core.
+        FrozenSource {
+            name: "compression",
+            source: include_str!("python/compression/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "compression.bz2",
+            source: include_str!("python/compression/bz2.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "compression.gzip",
+            source: include_str!("python/compression/gzip.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "compression.lzma",
+            source: include_str!("python/compression/lzma.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "compression.zlib",
+            source: include_str!("python/compression/zlib.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "compression._common",
+            source: include_str!("python/compression/_common/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "compression._common._streams",
+            source: include_str!("python/compression/_common/_streams.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "compression.zstd",
+            source: include_str!("python/compression/zstd/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "compression.zstd._zstdfile",
+            source: include_str!("python/compression/zstd/_zstdfile.py"),
+            is_package: false,
+        },
         FrozenSource {
             name: "_ctypes",
             source: include_str!("python/_ctypes.py"),
@@ -648,10 +700,17 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
         },
         // RFC 0036 — `string` (constants + `Template` + `Formatter` over
         // the native `_string`) and `platform`, carried verbatim from
-        // CPython 3.13.
+        // CPython 3.13. RFC 0076 WS15 turns `string` into a package
+        // (CPython 3.14 layout) so the PEP 750 `string.templatelib`
+        // submodule is importable; the `__init__` body is unchanged.
         FrozenSource {
             name: "string",
-            source: include_str!("python/string.py"),
+            source: include_str!("python/string/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "string.templatelib",
+            source: include_str!("python/string/templatelib.py"),
             is_package: false,
         },
         // `base64` is CPython's `Lib/base64.py` ported verbatim (pure Python

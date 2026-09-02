@@ -1030,23 +1030,26 @@ fn build_flags(cli: &Cli, env: &EnvOverrides) -> InterpreterFlags {
             }
         }
     });
-    // `-X gil` / `PYTHON_GIL` (PEP 703): only "1" is meaningful on a
-    // build whose GIL can't be disabled; "0" is a startup fatal error.
-    let gil = match xoption_value(&cli.xoptions, "gil") {
+    // `-X gil` / `PYTHON_GIL` (PEP 703 / RFC 0076 WS11): "0" starts
+    // the experimental free-threaded mode, "1" keeps the GIL. The
+    // xoption beats the env var; `PYTHON_GIL=0` from the environment
+    // additionally *forces* the mode (a non-declaring extension import
+    // warns but does not re-enable the GIL).
+    let gil_from_xoption = xoption_value(&cli.xoptions, "gil").is_some();
+    let gil_raw = match xoption_value(&cli.xoptions, "gil") {
         Some(v) => v.map(str::to_owned),
         None => env.gil.clone(),
     };
-    match gil.as_deref() {
-        None | Some("1") => {}
-        Some("0") => config_fatal_error(
-            "config_read_gil",
-            "Disabling the GIL is not supported by this build",
-        ),
+    let gil = match gil_raw.as_deref() {
+        None => None,
+        Some("0") => Some(0u8),
+        Some("1") => Some(1u8),
         Some(_) => config_fatal_error(
             "config_read_gil",
             "PYTHON_GIL / -X gil must be \"0\" or \"1\"",
         ),
-    }
+    };
+    let gil_forced_by_env = gil == Some(0) && !gil_from_xoption;
     // `-X tracemalloc[=NFRAME]` beats `PYTHONTRACEMALLOC` (CPython
     // `config_init_tracemalloc`): a parse failure or negative value is a
     // startup fatal error; `0` means disabled; a value beyond
@@ -1128,6 +1131,8 @@ fn build_flags(cli: &Cli, env: &EnvOverrides) -> InterpreterFlags {
         // that either one turns it on (CPython `config_init_faulthandler`;
         // there is no "off" spelling).
         faulthandler: env.faulthandler || xoption_value(&cli.xoptions, "faulthandler").is_some(),
+        gil,
+        gil_forced_by_env,
     }
 }
 

@@ -1690,13 +1690,46 @@ fn parse_data_arg(st: &StateRef, arg: Option<&Object>) -> Result<Vec<u8>, Runtim
                 )))
             }
         }
-        Some(other) => Err(type_error(format!(
-            "a bytes-like object is required, not '{}'",
-            other.type_name_owned()
-        ))),
+        Some(other) => {
+            // Generic buffer-protocol producers (`array.array`, bytes
+            // subclasses) expose their bytes through the native payload or
+            // a `tobytes()` reentry — the WeavePy stand-in for CPython's
+            // `y#` getbuffer (pyexpat.c Parse accepts any read buffer).
+            // lxml's ElementTree comparison suite feeds `array('B', …)`
+            // straight into `fromstring` (RFC 0076 WS3).
+            if let Object::Instance(_) = other {
+                if let Some(native) = other.native_value() {
+                    if let Some(v) = native.as_bytes_view() {
+                        return Ok(v);
+                    }
+                }
+                if let Some(v) = buffer_via_tobytes(other)? {
+                    return Ok(v);
+                }
+            }
+            Err(type_error(format!(
+                "a bytes-like object is required, not '{}'",
+                other.type_name_owned()
+            )))
+        }
         None => Err(type_error(
             "Parse() missing 1 required positional argument: 'data'",
         )),
+    }
+}
+
+/// Buffer-protocol fallback mirroring `binascii_mod::buffer_via_tobytes`:
+/// call the object's `tobytes()` through interpreter reentry. `Ok(None)`
+/// when the method doesn't exist, so the caller raises its own TypeError.
+fn buffer_via_tobytes(obj: &Object) -> Result<Option<Vec<u8>>, RuntimeError> {
+    let Some(method) = crate::instance_method(obj, "tobytes") else {
+        return Ok(None);
+    };
+    let ip = interp()?;
+    let out = call(ip, &method, &[])?;
+    match out {
+        Object::Bytes(b) => Ok(Some(b.to_vec())),
+        _ => Ok(None),
     }
 }
 

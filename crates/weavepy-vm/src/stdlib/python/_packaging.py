@@ -454,10 +454,15 @@ class Specifier:
 
         if not isinstance(spec_v, Version):
             return False
-        if op == '==':
-            return v.public == spec_v.public
-        if op == '!=':
-            return v.public != spec_v.public
+        if op in ('==', '!='):
+            # PEP 440 equality pads release segments (`==13.0.3` matches
+            # `13.0.3.0`) and ignores the candidate's local segment unless
+            # the specifier carries one -- packaging's `_compare_equal`.
+            # A public-string comparison did neither (measured: the
+            # cuda_toolkit-13.0.3.0 wheel invisible to torch's ==13.0.3).
+            candidate = v if spec_v.local else Version(v.public)
+            equal = candidate == spec_v
+            return equal if op == '==' else not equal
         if op == '<':
             return v < spec_v
         if op == '<=':

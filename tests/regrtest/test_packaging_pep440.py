@@ -71,6 +71,15 @@ def test_specifier_set():
     assert_true(SpecifierSet('~=2.2').contains('2.5.0'))
     assert_false(SpecifierSet('~=2.2').contains('3.0.0'))
     assert_true(SpecifierSet('!=1.0').contains('1.0.1'))
+    # PEP 440 equality zero-pads the release (cuda_toolkit-13.0.3.0 must
+    # satisfy torch's `==13.0.3`) and ignores the candidate's local
+    # segment unless the specifier names one.
+    assert_true(SpecifierSet('==13.0.3').contains('13.0.3.0'), 'zero-pad')
+    assert_true(SpecifierSet('==1.0').contains('1.0.0'), 'zero-pad')
+    assert_false(SpecifierSet('!=1.0').contains('1.0.0'), 'zero-pad !=')
+    assert_true(SpecifierSet('==1.0').contains('1.0+local'), 'local ignored')
+    assert_false(SpecifierSet('==1.0+other').contains('1.0+local'), 'local kept')
+    assert_true(SpecifierSet('==1.0+local').contains('1.0+local'))
     assert_raises(InvalidSpecifier, SpecifierSet, 'wat')
 
 

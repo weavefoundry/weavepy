@@ -205,6 +205,20 @@ fn b_addressof_buffer(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
+/// `intern_buffer(data) -> addr` — a process-lifetime copy of `data`
+/// (already NUL-terminated by the caller), deduplicated by content.
+/// Backs `c_char_p`/`c_wchar_p` argument marshalling: CPython passes a
+/// pointer into the bytes/str object's own buffer, which callees may
+/// legally stash past the call (lxml's `adopt_external_document`
+/// `strcmp`s a capsule context set by an earlier `PyCapsule_SetContext`);
+/// a per-call shadow buffer dangles for that pattern.
+fn b_intern_buffer(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = arg(args, 0)?
+        .as_bytes_view()
+        .ok_or_else(|| type_error("intern_buffer: bytes-like expected"))?;
+    Ok(addr_obj(ffi::interned_cstr(data)))
+}
+
 /// `read_mem(addr, n) -> bytes` — copy `n` bytes from raw memory.
 fn b_read_mem(args: &[Object]) -> Result<Object, RuntimeError> {
     let addr = arg_usize(args, 0)?;
@@ -694,6 +708,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         register(&mut d, "sizeof_code", b_sizeof_code);
         register(&mut d, "alignment_code", b_alignment_code);
         register(&mut d, "addressof_buffer", b_addressof_buffer);
+        register(&mut d, "intern_buffer", b_intern_buffer);
         register(&mut d, "read_mem", b_read_mem);
         register(&mut d, "write_mem", b_write_mem);
         register(&mut d, "memmove", b_memmove);

@@ -249,6 +249,18 @@ impl GilState {
     /// Acquire the GIL on behalf of the calling thread. Returns
     /// a guard that releases on drop.
     pub fn acquire(self: &Arc<Self>) -> GilGuard {
+        // RFC 0076 WS11: free-threaded mode skips the lock entirely.
+        // The guard is a no-op token — threads run concurrently and
+        // rely on `Arc` refcounts + per-cell `GilCell` locks. Checked
+        // per-acquire (not cached) so an extension re-enabling the
+        // GIL mid-run takes effect on the next acquire.
+        if free_threading_enabled() {
+            return GilGuard {
+                state: Arc::clone(self),
+                _lock_guard: None,
+                lock_free: true,
+            };
+        }
         self.breaker.add_waiter();
         // Timed parked waits in a loop rather than a single untimed
         // `lock()`, mirroring CPython's `take_gil` (`COND_TIMED_WAIT` on
@@ -280,11 +292,19 @@ impl GilState {
         GilGuard {
             state: Arc::clone(self),
             _lock_guard: Some(static_guard),
+            lock_free: false,
         }
     }
 
     /// Try to acquire without blocking.
     pub fn try_acquire(self: &Arc<Self>) -> Option<GilGuard> {
+        if free_threading_enabled() {
+            return Some(GilGuard {
+                state: Arc::clone(self),
+                _lock_guard: None,
+                lock_free: true,
+            });
+        }
         let lock_guard = self.lock.try_lock()?;
         self.note_acquired();
         let me = current_thread_id();
@@ -295,6 +315,7 @@ impl GilState {
         Some(GilGuard {
             state: Arc::clone(self),
             _lock_guard: Some(static_guard),
+            lock_free: false,
         })
     }
 
@@ -348,8 +369,12 @@ impl GilState {
 pub struct GilGuard {
     state: Arc<GilState>,
     /// Holds the underlying parking_lot guard. `None` only
-    /// briefly while `allow_threads` is borrowing it out.
+    /// briefly while `allow_threads` is borrowing it out —
+    /// or permanently for a free-threaded (`lock_free`) guard.
     _lock_guard: Option<parking_lot::ReentrantMutexGuard<'static, ()>>,
+    /// RFC 0076 WS11: a guard handed out under `-X gil=0` holds no
+    /// lock and must skip the holder/depth bookkeeping on drop.
+    lock_free: bool,
 }
 
 impl GilGuard {
@@ -363,6 +388,10 @@ impl GilGuard {
     /// system call.
     #[allow(clippy::used_underscore_binding)]
     pub fn allow_threads<R>(&mut self, f: impl FnOnce() -> R) -> R {
+        if self.lock_free {
+            // Free-threaded guard: nothing to release or re-take.
+            return f();
+        }
         let saved = self.state.depth.load(Ordering::Acquire);
         // Drop the lock guard, run the closure, then re-acquire.
         let guard = self._lock_guard.take();
@@ -391,11 +420,91 @@ impl GilGuard {
 
 impl Drop for GilGuard {
     fn drop(&mut self) {
+        if self.lock_free {
+            // Never touched holder/depth on acquire.
+            return;
+        }
         self.state.depth.fetch_sub(1, Ordering::AcqRel);
         if self.state.depth.load(Ordering::Acquire) == 0 {
             self.state.holder.store(0, Ordering::Release);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// RFC 0076 WS11 — the free-threading runtime mode.
+//
+// One binary, no second ABI: `-X gil=0` / `PYTHON_GIL=0` starts the
+// interpreter with the *global* serialization disabled. The heap is
+// already safe without it (`sync::Rc = Arc`, and every container cell
+// is a `GilCell` with its own reentrant mutex); what the mode changes
+// is *scheduling*: bytecode threads run concurrently instead of
+// handing one lock around. The flag is process-wide, decided at
+// startup before the second thread can exist, and readable from the
+// hot path with one relaxed load.
+//
+// A C extension that does not declare free-threading support
+// (`Py_mod_gil_not_used`) re-enables the GIL at import time with a
+// `RuntimeWarning`, matching CPython 3.13t (`gil_reenabled` below).
+// ---------------------------------------------------------------------------
+
+static FREE_THREADING: AtomicBool = AtomicBool::new(false);
+static GIL_REENABLED: AtomicBool = AtomicBool::new(false);
+static FT_FORCED: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable the free-threading mode. Called once at startup by
+/// the CLI's `-X gil` / `PYTHON_GIL` handling (and by
+/// `Py_InitializeFromInitConfig` for `SetInt("gil", 0)`), before
+/// worker threads exist.
+pub fn set_free_threading(enabled: bool) {
+    FREE_THREADING.store(enabled, Ordering::Release);
+    if enabled {
+        GIL_REENABLED.store(false, Ordering::Release);
+    }
+}
+
+/// Mark the mode as forced by `PYTHON_GIL=0` in the environment:
+/// importing a non-declaring extension still warns, but the GIL stays
+/// off (CPython 3.13t's documented override semantics). `-X gil=0`
+/// alone is *not* forced — the extension contract re-enables.
+pub fn set_free_threading_forced(forced: bool) {
+    FT_FORCED.store(forced, Ordering::Release);
+}
+
+/// Whether the process is running free-threaded *right now* (the mode
+/// was requested and no non-declaring extension re-enabled the GIL).
+#[inline]
+pub fn free_threading_enabled() -> bool {
+    FREE_THREADING.load(Ordering::Relaxed) && !GIL_REENABLED.load(Ordering::Relaxed)
+}
+
+/// Whether `-X gil=0` / `PYTHON_GIL=0` was requested at startup
+/// (regardless of a later extension re-enable).
+pub fn free_threading_requested() -> bool {
+    FREE_THREADING.load(Ordering::Relaxed)
+}
+
+/// A non-declaring C extension was imported under `gil=0`: re-enable
+/// the GIL for the rest of the process (CPython 3.13t's contract).
+/// Returns `true` when the caller should emit the `RuntimeWarning`
+/// naming the module (first non-declaring import). Under
+/// `PYTHON_GIL=0` (forced) the warning still fires once, but the GIL
+/// stays disabled.
+pub fn reenable_gil_for_extension() -> bool {
+    if !free_threading_requested() {
+        return false;
+    }
+    if FT_FORCED.load(Ordering::Acquire) {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        return !WARNED.swap(true, Ordering::AcqRel);
+    }
+    !GIL_REENABLED.swap(true, Ordering::AcqRel)
+}
+
+/// Whether an extension re-enabled the GIL (for diagnostics and
+/// `sys._is_gil_enabled()` truthfulness).
+pub fn gil_reenabled_by_extension() -> bool {
+    GIL_REENABLED.load(Ordering::Acquire)
 }
 
 /// Process-wide GIL singleton. Accessed by the C-API
@@ -737,6 +846,11 @@ pub fn yield_checkpoint() {
 /// waiter can take it, then re-acquires. No-op when nobody is
 /// waiting or when this thread doesn't hold the GIL via the stack.
 fn maybe_yield_gil() {
+    // RFC 0076 WS11: free-threaded mode has nothing to hand off —
+    // every thread already runs concurrently on lock-free guards.
+    if free_threading_enabled() {
+        return;
+    }
     // RFC 0039 (WS5): never hand off the GIL while this thread is in a
     // no-yield critical section — i.e. holding a container's `GilCell`
     // mutex across a re-entrant Python `__hash__`/`__eq__`. Yielding

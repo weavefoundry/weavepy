@@ -379,11 +379,15 @@ pub fn build_with_state(
             );
         }
 
-        // PEP 703 introspection (3.13): this is a GIL build, and the GIL
-        // cannot be disabled.
+        // PEP 703 introspection (3.13): truthful under RFC 0076 WS11 —
+        // False while `-X gil=0` / `PYTHON_GIL=0` free-threading is
+        // active, flipping back to True if a non-declaring extension
+        // re-enables the GIL at import.
         d.insert(
             DictKey(Object::from_static("_is_gil_enabled")),
-            builtin("_is_gil_enabled", |_| Ok(Object::Bool(true))),
+            builtin("_is_gil_enabled", |_| {
+                Ok(Object::Bool(!crate::gil::free_threading_enabled()))
+            }),
         );
         d.insert(
             DictKey(Object::from_static("getswitchinterval")),
@@ -1780,11 +1784,39 @@ pub(crate) fn sizeof_estimate(o: &Object) -> i64 {
 }
 
 fn sys_getsizeof(args: &[Object]) -> Result<Object, RuntimeError> {
+    // A foreign extension object reports its real C `__sizeof__`
+    // (CPython's `sys.getsizeof` calls the type slot) — a numpy
+    // scalar's struct size, not our 16-byte proxy guess
+    // (test_scalarmath.TestSizeOf pins `getsizeof(x) > x.nbytes`,
+    // which 16 fails for complex128/longdouble — RFC 0076 WS1).
+    if let Some(Object::Foreign(s)) = args.first() {
+        if let Ok(m) = crate::foreign::getattr(s, "__sizeof__") {
+            if let Ok(v @ (Object::Int(_) | Object::Long(_))) = obj_call_no_args(&m) {
+                return Ok(v);
+            }
+        }
+    }
     // CPython's `getsizeof` is a per-object slot. We answer with a
     // best-effort estimate so user code doesn't crash, but make no
     // promise of accuracy.
     let size = args.first().map(sizeof_estimate).unwrap_or(0);
     Ok(Object::Int(size))
+}
+
+/// Call an already-bound zero-argument callable (a foreign
+/// `__sizeof__` method), preferring the bridge, falling back to the
+/// running interpreter for VM-shaped callables.
+fn obj_call_no_args(m: &Object) -> Result<Object, RuntimeError> {
+    if let Object::Foreign(f) = m {
+        return crate::foreign::call(f, &[], &[]);
+    }
+    let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() else {
+        return Err(crate::error::type_error("no active interpreter"));
+    };
+    // SAFETY: published by the enclosing VM frame on this thread.
+    let interp = unsafe { &mut *ptr };
+    let g = interp.builtins_dict();
+    interp.call(m, &[], &[], &g)
 }
 
 /// CPython 3.13 `sys.flags` struct-sequence field order. `tuple(sys.flags)`
@@ -2440,12 +2472,23 @@ fn sys_getrefcount(args: &[Object]) -> Result<Object, RuntimeError> {
     // A dropped-but-registry-pinned memoryview (dead under CPython
     // refcounting) must not count through its exporter edge.
     let zombie_refs = crate::gc_trace::zombie_memoryview_refs_to(id);
+    // Clones held only by the C-API layer's pin caches (a parked
+    // argument-pinned identity box, a dead-except-pin scalar/tuple pin —
+    // RFC 0076 WS1) are infrastructure too: on CPython the corresponding
+    // memory is already freed, so the references must not count.
+    let pinned = crate::gc_trace::pin_clone_count(obj);
+    // Raw C refs taken with the inline `Py_INCREF` macro carry no `Rc`
+    // clone; count the body's surplus over the C layer's single pin
+    // (test_nditer test_iter_refcount — RFC 0076 WS1).
+    let extra_c = crate::gc_trace::extra_c_refs(obj);
     // The clone in our `args` slice plays the role of CPython's
     // "+1 for the argument reference" — no extra increment needed.
     let visible = strong
         .saturating_sub(registry)
         .saturating_sub(weak_clones)
-        .saturating_sub(zombie_refs);
+        .saturating_sub(zombie_refs)
+        .saturating_sub(pinned)
+        .saturating_add(extra_c);
     Ok(Object::Int(visible.max(1) as i64))
 }
 

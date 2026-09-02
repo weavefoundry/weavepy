@@ -23,6 +23,9 @@
 //!   committed baseline's cross-machine envelope; the committed
 //!   baseline demotes to an advisory report plus a blocking
 //!   suite-geomean drift ratchet (`--baseline-pct`, default 25).
+//! - `scaling` — RFC 0076 WS12: runs the `threads=8` parallel fixture
+//!   under the default (GIL) mode and `-X gil=0` and reports
+//!   serial/parallel scaling per mode. A measurement, never a gate.
 //!
 //! For maximum portability we hand-roll arg parsing rather than
 //! pull in `clap` — the tool has at most a handful of flags.
@@ -36,7 +39,8 @@ use std::process::ExitCode;
 use weavepy_bench::fixtures::{baseline_path, discover_fixtures, platform_key};
 use weavepy_bench::report::Report;
 use weavepy_bench::runner::{
-    resolve_python, resolve_weavepy, run_one, run_one_ab, run_suite, run_suite_ab, RunOpts,
+    resolve_python, resolve_weavepy, run_one, run_one_ab, run_scaling, run_suite, run_suite_ab,
+    RunOpts,
 };
 
 fn main() -> ExitCode {
@@ -53,6 +57,13 @@ fn main() -> ExitCode {
         "gate" => match cmd_gate(&args[2..]) {
             Ok(true) => ExitCode::SUCCESS,
             Ok(false) => ExitCode::FAILURE,
+            Err(e) => {
+                eprintln!("weavepy-bench: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        "scaling" => match cmd_scaling(&args[2..]) {
+            Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("weavepy-bench: {e}");
                 ExitCode::FAILURE
@@ -77,9 +88,12 @@ fn print_help() {
     eprintln!("    weavepy-bench [run|gate|help] [flags]");
     eprintln!();
     eprintln!("COMMANDS:");
-    eprintln!("    run    Run the suite and print a markdown report.");
-    eprintln!("    gate   Run the suite and compare ratios against the baseline.");
-    eprintln!("    help   Print this message.");
+    eprintln!("    run      Run the suite and print a markdown report.");
+    eprintln!("    gate     Run the suite and compare ratios against the baseline.");
+    eprintln!("    scaling  RFC 0076 WS12: run the threads=8 parallel fixture under the");
+    eprintln!("             default (GIL) mode and -X gil=0, and report serial/parallel");
+    eprintln!("             scaling per mode (a measurement, never gated).");
+    eprintln!("    help     Print this message.");
     eprintln!();
     eprintln!("COMMON FLAGS:");
     eprintln!("    --weavepy=PATH        weavepy binary under test (default: $WEAVEPY_BIN,");
@@ -170,6 +184,48 @@ fn cmd_run(args: &[String]) -> io::Result<()> {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!("{}", report.to_markdown());
+    }
+    Ok(())
+}
+
+/// RFC 0076 WS12 — the thread-scaling measurement: the
+/// `parallel_scaling.py` fixture pair under gil=1 and gil=0. Always
+/// exits 0 on a successful measurement; the number is the deliverable
+/// (the acceptance shape — ~1× under the GIL, >1× under `-X gil=0` —
+/// is asserted by eyes and the RFC, not by this tool).
+fn cmd_scaling(args: &[String]) -> io::Result<()> {
+    let mut opts = RunOpts {
+        samples: 3,
+        include_cpython: false,
+        ..RunOpts::default()
+    };
+    let mut work: u32 = 3_000_000;
+    for a in args {
+        if parse_common(&mut opts, a) {
+            continue;
+        }
+        match a.as_str() {
+            x if x.starts_with("--work=") => {
+                work = x[7..].parse().unwrap_or(work);
+            }
+            other => {
+                return Err(io::Error::other(format!("unknown flag '{other}'")));
+            }
+        }
+    }
+    let rows = run_scaling(&opts, work)?;
+    println!("# WeavePy thread-scaling (RFC 0076 WS12, threads=8, work={work})");
+    println!();
+    println!("| mode | serial (8× kernel) | 8-thread wall | scaling (serial/parallel) |");
+    println!("|---|---|---|---|");
+    for r in &rows {
+        println!(
+            "| {} | {:.1}ms | {:.1}ms | **{:.2}×** |",
+            r.mode,
+            r.serial_ns / 1e6,
+            r.parallel_ns / 1e6,
+            r.scaling()
+        );
     }
     Ok(())
 }

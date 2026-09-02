@@ -267,6 +267,59 @@ PyAPI_FUNC(PyStatus) PyConfig_SetWideStringList(PyConfig *config,
    See also PyConfig.orig_argv. */
 PyAPI_FUNC(void) Py_GetArgcArgv(int *argc, wchar_t ***argv);
 
+/* --- PyInitConfig (PEP 741, CPython 3.14; WeavePy RFC 0076 WS14) ---
+ *
+ * The string-keyed, stable-ABI configuration surface. WeavePy ships
+ * it against the 3.13 core so dual-version embedders (PyO3,
+ * pybind11) compile unchanged. The struct is opaque; option names
+ * are the PyConfig field names plus the pre-configuration names and
+ * "gil". */
+
+typedef struct PyInitConfig PyInitConfig;
+
+PyAPI_FUNC(PyInitConfig*) PyInitConfig_Create(void);
+PyAPI_FUNC(void) PyInitConfig_Free(PyInitConfig *config);
+
+PyAPI_FUNC(int) PyInitConfig_GetError(PyInitConfig* config,
+    const char **err_msg);
+PyAPI_FUNC(int) PyInitConfig_GetExitCode(PyInitConfig* config,
+    int *exitcode);
+
+PyAPI_FUNC(int) PyInitConfig_HasOption(PyInitConfig *config,
+    const char *name);
+PyAPI_FUNC(int) PyInitConfig_GetInt(PyInitConfig *config,
+    const char *name,
+    int64_t *value);
+PyAPI_FUNC(int) PyInitConfig_GetStr(PyInitConfig *config,
+    const char *name,
+    char **value);
+PyAPI_FUNC(int) PyInitConfig_GetStrList(PyInitConfig *config,
+    const char *name,
+    size_t *length,
+    char ***items);
+PyAPI_FUNC(void) PyInitConfig_FreeStrList(size_t length, char **items);
+
+PyAPI_FUNC(int) PyInitConfig_SetInt(PyInitConfig *config,
+    const char *name,
+    int64_t value);
+PyAPI_FUNC(int) PyInitConfig_SetStr(PyInitConfig *config,
+    const char *name,
+    const char *value);
+PyAPI_FUNC(int) PyInitConfig_SetStrList(PyInitConfig *config,
+    const char *name,
+    size_t length,
+    char * const *items);
+PyAPI_FUNC(int) PyInitConfig_AddModule(PyInitConfig *config,
+    const char *name,
+    PyObject* (*initfunc)(void));
+
+PyAPI_FUNC(int) Py_InitializeFromInitConfig(PyInitConfig *config);
+
+/* Runtime read surface (PEP 741). */
+PyAPI_FUNC(PyObject*) PyConfig_Get(const char *name);
+PyAPI_FUNC(int) PyConfig_GetInt(const char *name, int *value);
+PyAPI_FUNC(PyObject*) PyConfig_Names(void);
+
 #ifdef __cplusplus
 }
 #endif

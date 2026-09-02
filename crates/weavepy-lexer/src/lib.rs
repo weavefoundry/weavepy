@@ -30,7 +30,10 @@ pub mod token;
 
 pub use error::LexError;
 pub use scanner::{tokenize, tokenize_with_escapes};
-pub use token::{BytePos, EscapeWarning, Keyword, Span, StringPrefix, Token, TokenKind};
+pub use token::{
+    lang_preview, set_lang_preview, BytePos, EscapeWarning, Keyword, Span, StringPrefix, Token,
+    TokenKind,
+};
 
 #[cfg(test)]
 mod tests {
@@ -321,5 +324,24 @@ mod flufl_probe_tests {
         let toks = crate::tokenize("2 <> 3\n").unwrap();
         let kinds: Vec<_> = toks.iter().map(|t| format!("{:?}", t.kind)).collect();
         assert!(kinds.contains(&"NotEqual".to_string()), "{kinds:?}");
+    }
+}
+
+#[cfg(test)]
+mod lang_preview_tests {
+    use super::*;
+
+    #[test]
+    fn t_prefix_gated() {
+        assert!(StringPrefix::parse("t").is_none());
+        set_lang_preview(true);
+        let p = StringPrefix::parse("t").expect("t accepted under gate");
+        assert!(p.template && !p.fstring);
+        assert!(StringPrefix::parse("rt").is_some());
+        assert!(StringPrefix::parse("tb").is_none());
+        assert!(StringPrefix::parse("ft").is_none());
+        let toks = tokenize("x = t'a{1}b'\n").expect("t-string tokenizes");
+        assert!(toks.iter().any(|t| t.kind == TokenKind::String));
+        set_lang_preview(false);
     }
 }

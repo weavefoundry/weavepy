@@ -365,6 +365,16 @@ decl_static_type! {
     // the type by address. Instances carry CPython's faithful 24-byte
     // layout (see `crate::instancemethod`).
     pub PyInstanceMethod_Type;
+    // RFC 0076 WS5 (torch): data symbols `libtorch_python` binds at
+    // dlopen. `PyCell_Type` bridges to the VM's real `cell`; the weakref
+    // trio are the identity anchors for `PyWeakref_Check*` macros —
+    // `_PyWeakref_RefType`'s storage doubles as the faithful
+    // `PyWeakReference` shell minted by [`crate::weakref_api`], so
+    // `Py_IS_TYPE(wr, &_PyWeakref_RefType)` holds for crossed VM refs.
+    pub PyCell_Type;
+    pub _PyWeakref_RefType;
+    pub _PyWeakref_ProxyType;
+    pub _PyWeakref_CallableProxyType;
 }
 
 /// Initialise the static type table from the running interpreter's
@@ -521,6 +531,19 @@ pub fn init_static_types() {
         "instancemethod",
     );
     crate::instancemethod::init_type_slots();
+    // RFC 0076 WS5 (torch): `cell` bridges to the VM's real cell class;
+    // the weakref proxy types are synthetic (symbol + identity only —
+    // proxy behaviour lives VM-side in `weakref_real`). The `ref` static
+    // is populated lazily by `crate::weakref_api::ensure_weakref_type`
+    // (it needs the faithful 64-byte `PyWeakReference` shell, not the
+    // generic install).
+    install(&PyCell_Type, b"cell\0", bt.cell_.clone());
+    install_synth(&_PyWeakref_ProxyType, b"weakproxy\0", "weakproxy");
+    install_synth(
+        &_PyWeakref_CallableProxyType,
+        b"weakcallableproxy\0",
+        "weakcallableproxy",
+    );
 
     // RFC 0047 (wave 5): wire the iteration protocol (`tp_iter` → self,
     // `tp_iternext` → `PyIter_Next`) onto the iterator umbrella type and the
@@ -552,6 +575,14 @@ pub fn init_static_types() {
         (*PyClassMethod_Type.as_ptr()).tp_descr_get = descriptor_descr_get as *mut c_void;
         (*PyStaticMethod_Type.as_ptr()).tp_descr_get = descriptor_descr_get as *mut c_void;
         (*PyProperty_Type.as_ptr()).tp_descr_get = descriptor_descr_get as *mut c_void;
+        (*PyProperty_Type.as_ptr()).tp_descr_set = property_descr_set as *mut c_void;
+        // RFC 0076 WS5: a harvested C getset crosses as a faithful
+        // `getset_descriptor` box (see `object::GetSetDescrBox`) whose
+        // VM payload is still a property — give the shell type the same
+        // descriptor slots so numpy's `tp_descr_set != NULL` gate and
+        // C-level `tp_descr_get` binding keep working on those boxes.
+        (*PyGetSetDescr_Type.as_ptr()).tp_descr_get = descriptor_descr_get as *mut c_void;
+        (*PyGetSetDescr_Type.as_ptr()).tp_descr_set = property_descr_set as *mut c_void;
         // RFC 0066 WS3: `type`'s attribute slots. pybind11's metaclass
         // reads `PyType_Type.tp_getattro` / `tp_setattro` straight off
         // the struct and chains to them from its own overrides; NULL was
@@ -566,6 +597,11 @@ pub fn init_static_types() {
         // read straight off the struct; NULL was a jump through address
         // zero the moment matplotlib's font manager built `ft2font.FT2Font`.
         (*PyType_Type.as_ptr()).tp_call = type_tp_call as *mut c_void;
+        // RFC 0076 WS5: `type`/`object` init slots, for extension
+        // metaclasses that chain `PyType_Type.tp_init(...)` off the
+        // struct (torch's `THPVariableMetaType_init`).
+        (*PyType_Type.as_ptr()).tp_init = type_tp_init as *mut c_void;
+        (*PyBaseObject_Type.as_ptr()).tp_init = object_tp_init as *mut c_void;
     }
 
     // RFC 0047 (wave 5): advertise `tp_call` on the callable built-in types.
@@ -841,6 +877,18 @@ pub fn type_for_object(o: &Object) -> *mut PyTypeObject {
         // Cython's `__Pyx_PyObject_GetItem` reads `tp_as_mapping` straight
         // off `ob_type` and reported "'object' object is not subscriptable".
         O::MappingProxy(_) | O::MappingProxyObj(_) => PyDictProxy_Type.as_ptr(),
+        // RFC 0076 WS3: tracebacks and frames cross wearing their
+        // identity statics so compiled `PyTraceBack_Check` /
+        // `PyFrame_Check` pass. Cython's `__Pyx_Raise` guards its
+        // third argument with `PyTraceBack_Check(tb)` — a traceback
+        // boxed as bare `object` failed every 3-arg
+        // `raise T, v, tb` in lxml's error-propagation paths
+        // ("raise: arg 3 must be a traceback or None").
+        O::Traceback(_) => crate::code_obj::traceback_type_ptr(),
+        O::Frame(_) => crate::code_obj::frame_type_ptr(),
+        // RFC 0076 WS5: VM code objects wear the faithful `PyCode_Type`
+        // (they cross as facades — see `code_obj::facade_for_vm_code`).
+        O::Code(_) => crate::code_obj::code_type_ptr(),
         _ => PyBaseObject_Type.as_ptr(),
     }
 }
@@ -1147,6 +1195,42 @@ unsafe extern "C" fn type_tp_call(
             }
         }
     })
+}
+
+/// `type.__init__` (CPython `type_init`): everything real happened in
+/// `tp_new`, so the body only validates arity. Exists so an extension
+/// metaclass `tp_init` can chain to `PyType_Type.tp_init(cls, args,
+/// kwargs)` read straight off the exported static — torch's
+/// `THPVariableMetaType_init` does exactly that before patching
+/// `tp_dealloc` onto every `Tensor` subclass (RFC 0076 WS5); NULL was a
+/// jump through address zero at `class Tensor(torch._C.TensorBase)`.
+unsafe extern "C" fn type_tp_init(
+    _cls: *mut PyObject,
+    args: *mut PyObject,
+    _kwds: *mut PyObject,
+) -> c_int {
+    let nargs = if args.is_null() {
+        0
+    } else {
+        unsafe { crate::containers::PyTuple_Size(args) }
+    };
+    if !(1..=3).contains(&nargs) {
+        crate::errors::set_type_error("type.__init__() takes 1 or 3 arguments");
+        return -1;
+    }
+    0
+}
+
+/// `object.__init__` (CPython `object_init`) for the same
+/// chain-off-the-static pattern on `PyBaseObject_Type.tp_init`. The
+/// excess-argument diagnostics live in the VM's real `__init__`; a
+/// direct C caller chaining here gets the successful no-op.
+unsafe extern "C" fn object_tp_init(
+    _slf: *mut PyObject,
+    _args: *mut PyObject,
+    _kwds: *mut PyObject,
+) -> c_int {
+    0
 }
 
 unsafe extern "C" fn synth_tp_repr(o: *mut PyObject) -> *mut PyObject {
@@ -1744,8 +1828,86 @@ unsafe extern "C" fn descriptor_descr_get(
             unsafe { crate::object::Py_DecRef(f) };
             r
         }
+        // RFC 0076 WS5: a *foreign* instance of a property subclass.
+        // pybind11's `pybind11_static_property` chains its own
+        // `tp_descr_get` (`pybind11_static_get`) to
+        // `PyProperty_Type.tp_descr_get(self, cls, cls)` — this slot —
+        // with the class as the receiver, expecting `fget` evaluation
+        // (that is the whole point of a *static* property). The members
+        // live on the C object; resolve `fget` through the attribute
+        // protocol and call it. No `fget` → fall through to the raw
+        // descriptor, the historical behaviour.
+        Object::Foreign(_) | Object::Instance(_) => {
+            if obj.is_null() {
+                return take_descr();
+            }
+            let recv = unsafe { crate::object::clone_object(obj) };
+            if matches!(recv, Object::None) {
+                return take_descr();
+            }
+            let f = unsafe { crate::abstract_::PyObject_GetAttrString(descr, c"fget".as_ptr()) };
+            if f.is_null() {
+                crate::errors::clear_thread_local();
+                return take_descr();
+            }
+            if matches!(unsafe { crate::object::clone_object(f) }, Object::None) {
+                unsafe { crate::object::Py_DecRef(f) };
+                return take_descr();
+            }
+            let r = unsafe { crate::abstract_::PyObject_CallOneArg(f, obj) };
+            unsafe { crate::object::Py_DecRef(f) };
+            r
+        }
         _ => take_descr(),
     }
+}
+
+/// `PyProperty_Type.tp_descr_set` — CPython's `property_descr_set`:
+/// call `fset(obj, value)` (`fdel(obj)` when `value` is NULL).
+///
+/// The slot's *presence* matters as much as its body: numpy's
+/// `PyArray_View` decides between its `_set_dtype` and legacy in-place
+/// paths by testing `Py_TYPE(sub_dtype)->tp_descr_set != NULL` on the
+/// subclass's `dtype` attribute — with the slot NULL a subclass `dtype`
+/// property setter was silently bypassed (Path 4) instead of invoked
+/// with the 2.5 deprecation (Path 3) (RFC 0076 WS1,
+/// test_view_dtype_property_setter). `PyObject_GenericSetAttr` also
+/// consults it for the data-descriptor branch.
+unsafe extern "C" fn property_descr_set(
+    descr: *mut PyObject,
+    obj: *mut PyObject,
+    value: *mut PyObject,
+) -> c_int {
+    if descr.is_null() || obj.is_null() {
+        crate::errors::set_type_error("__set__(None, None) is invalid");
+        return -1;
+    }
+    let d = unsafe { crate::object::clone_object(descr) };
+    let Object::Property(p) = &d else {
+        crate::errors::set_type_error("descriptor __set__ requires a property");
+        return -1;
+    };
+    let f = if value.is_null() { p.fdel() } else { p.fset() };
+    if matches!(f, Object::None) {
+        crate::errors::set_attribute_error(if value.is_null() {
+            "property has no deleter"
+        } else {
+            "property has no setter"
+        });
+        return -1;
+    }
+    let fp = crate::object::into_owned(f);
+    let r = if value.is_null() {
+        unsafe { crate::abstract_::PyObject_CallOneArg(fp, obj) }
+    } else {
+        unsafe { crate::abstract_::PyObject_CallTwoArgs(fp, obj, value) }
+    };
+    unsafe { crate::object::Py_DecRef(fp) };
+    if r.is_null() {
+        return -1;
+    }
+    unsafe { crate::object::Py_DecRef(r) };
+    0
 }
 
 /// `PyType_Type.tp_getattro` — CPython's `type_getattro` **default
@@ -1763,17 +1925,29 @@ unsafe extern "C" fn type_generic_getattro(o: *mut PyObject, name: *mut PyObject
     if o.is_null() || name.is_null() {
         return ptr::null_mut();
     }
-    let obj = unsafe { crate::object::clone_object(o) };
-    if let Object::Type(ty) = &obj {
-        let key = match unsafe { crate::object::clone_object(name) } {
-            Object::Str(s) => s.to_string(),
-            _ => {
-                crate::errors::set_type_error("attribute name must be string");
-                return ptr::null_mut();
-            }
-        };
+    let key = match unsafe { crate::object::clone_object(name) } {
+        Object::Str(s) => s.to_string(),
+        _ => {
+            crate::errors::set_type_error("attribute name must be string");
+            return ptr::null_mut();
+        }
+    };
+    // This slot only ever runs on *type* instances, so a receiver that
+    // does not already clone to `Object::Type` is a `PyTypeObject*` the
+    // VM has not bridged yet (e.g. a Cython class instantiated before
+    // anything imported it through the bridge) — ready + bridge it and
+    // resolve through the same default protocol. Falling back to the
+    // full `PyObject_GetAttr` here re-dispatches this very slot and
+    // recurses without progress (measured: gevent `local()`, whose
+    // Cython `__cinit__` walks the MRO fetching `__get__` off unbridged
+    // C descriptor types, overflowed with RecursionError).
+    let ty = match unsafe { crate::object::clone_object(o) } {
+        Object::Type(t) => Some(t),
+        _ => unsafe { bridge_or_ready(o.cast::<PyTypeObject>()) },
+    };
+    if let Some(ty) = ty {
         if let Some(res) = crate::interp::ensure_active(|| {
-            crate::interp::with_interp_mut(|interp| interp.type_getattr_default(ty, &key))
+            crate::interp::with_interp_mut(|interp| interp.type_getattr_default(&ty, &key))
         }) {
             return match res {
                 Ok(v) => crate::object::into_owned(v),
@@ -1784,8 +1958,9 @@ unsafe extern "C" fn type_generic_getattro(o: *mut PyObject, name: *mut PyObject
             };
         }
     }
-    // Not a bridged type (or no interpreter): full dispatch is safe.
-    unsafe { crate::abstract_::PyObject_GetAttr(o, name) }
+    // No interpreter (or an unbridgeable pointer): resolve through the
+    // generic instance protocol, which never re-enters this slot.
+    unsafe { crate::genericalloc::PyObject_GenericGetAttr(o, name) }
 }
 
 /// `PyType_Type.tp_setattro` — CPython's `type_setattro` default body
@@ -2027,7 +2202,14 @@ fn synth_protocol_slots(ty: &mut PyTypeObject, cls: &Rc<TypeObject>) {
 pub(crate) fn synth_type_for_class(cls: &Rc<TypeObject>) -> Option<*mut PyTypeObject> {
     let is_iter = class_has_dunder(cls, "__iter__") || class_has_dunder(cls, "__next__");
     let is_ctx = class_has_dunder(cls, "__enter__") || class_has_dunder(cls, "__exit__");
-    if !is_iter && !is_ctx {
+    // RFC 0076 WS1: `__index__` too — `PyIndex_Check` is a header *macro*
+    // (`tp_as_number->nb_index != NULL`), compiled inline into extensions.
+    // numpy's `PyArray_IntpConverter` gates every shape argument on it, so
+    // a plain-`PyBaseObject_Type` crossing turned `np.zeros(IntLike())`
+    // (and the dtype shape tuple of `test_dtype::test_shape_sequence`)
+    // into "expected a sequence of integers or a single integer".
+    let is_index = class_has_dunder(cls, "__index__");
+    if !is_iter && !is_ctx && !is_index {
         return None;
     }
     let _guard = SYNTH_LOCK.lock().ok()?;
@@ -2134,6 +2316,11 @@ pub(crate) fn synth_type_for_class(cls: &Rc<TypeObject>) -> Option<*mut PyTypeOb
         if !tp_mro_box.is_null() {
             (*p).tp_mro = tp_mro_box;
         }
+        // RFC 0076 WS5: publish `tp_dict` sharing the bridge's `DictData`
+        // (see the matching note in [`install_user_type`] — torch's
+        // `get_tensor_dict` reads `torch.Tensor`'s `tp_dict` off the
+        // struct, and `Tensor` defines `__iter__`, so it mints here).
+        (*p).tp_dict = crate::object::into_owned(Object::Dict(cls.dict.clone()));
     }
     // Mirror the inline base: instances need the same faithful inline body
     // (RFC 0045) so fixed-offset field reads/writes land on real
@@ -2216,6 +2403,7 @@ pub unsafe fn bridge_type(ty: *mut PyTypeObject) -> Option<Rc<TypeObject>> {
     // registry — their struct is only 416 bytes and has no `bridge`
     // field to read. Check that first.
     if let Some(rt) = readied_for(ty) {
+        adopt_ob_type_drift(rt);
         return Some(rt.bridge.clone());
     }
     // RFC 0046 (wave 4): the private `bridge` field sits at offset 424 —
@@ -2232,6 +2420,33 @@ pub unsafe fn bridge_type(ty: *mut PyTypeObject) -> Option<Rc<TypeObject>> {
         return None;
     }
     Some(unsafe { (*bridge).clone() })
+}
+
+/// Adopt a raw `Py_SET_TYPE(&MyType, meta)` metaclass re-seat of a
+/// readied stock type into its VM bridge (RFC 0076 WS5, see
+/// [`ReadiedType::ob_type_seen`]). One relaxed load + pointer compare on
+/// the common no-drift path.
+fn adopt_ob_type_drift(rt: &ReadiedType) {
+    let live = unsafe { (*rt.ext_ptr).head.ob_type } as usize;
+    if live == 0 || live == rt.ob_type_seen.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    rt.ob_type_seen
+        .store(live, std::sync::atomic::Ordering::Relaxed);
+    if let Some(meta) = unsafe { bridge_type(live as *mut PyTypeObject) } {
+        rt.bridge.set_metaclass(meta);
+    }
+}
+
+/// [`TypeObject::metaclass_or_type`]'s drift probe (see
+/// [`weavepy_vm::types::TypeObject::c_ext_ptr`]): re-check the readied
+/// struct's live `ob_type` the moment Python asks for the class of the
+/// class. `_bridge` is `rt.bridge` for a registered pointer; the lookup
+/// keys on the pointer alone.
+pub(crate) fn metaclass_drift_probe(ext: usize, _bridge: &TypeObject) {
+    if let Some(rt) = readied_for(ext as *mut PyTypeObject) {
+        adopt_ob_type_drift(rt);
+    }
 }
 
 /// Resolve a `PyTypeObject*` to its bridged [`TypeObject`], readying it
@@ -2621,6 +2836,14 @@ pub fn install_user_type(t: &Rc<TypeObject>) -> *mut PyTypeObject {
         if !tp_mro_box.is_null() {
             (*ty_ptr).tp_mro = tp_mro_box;
         }
+        // RFC 0076 WS5: publish `tp_dict` too, exactly as the
+        // `PyType_Ready` path does — a dict box sharing the bridge's
+        // `DictData`, so direct C reads and the VM observe the same
+        // storage. torch's `get_tensor_dict` reads `tp_dict` straight
+        // off the `torch.Tensor` (VM class) struct and hands it to
+        // `PyDict_Merge` to copy the method table onto every legacy
+        // `torch.FloatTensor` type; a NULL here failed `_initExtension`.
+        (*ty_ptr).tp_dict = crate::object::into_owned(Object::Dict(t.dict.clone()));
     }
     // Mirror the inline base: instances of this subclass need the same
     // faithful inline body (RFC 0045) so fixed-offset field reads/writes
@@ -2700,10 +2923,26 @@ fn assemble_type_dict(
     for (name, obj) in member_pairs {
         dict.insert(DictKey(Object::from_str(name)), obj);
     }
+    // CPython's `add_operators` (typeobject.c) skips a slot wrapper
+    // whose name is already in `tp_dict` — a `tp_methods` entry wins
+    // over the synthesized slot shim. numpy's ndarray defines
+    // `__matmul__` in its method table (FASTCALL|KEYWORDS, with the
+    // `out=` third argument) *and* fills `nb_matrix_multiply`;
+    // overwriting the method with the 2-arg shim broke every
+    // 3-arg `a.__matmul__(b, out)` call (scipy.linalg.interpolative's
+    // pythran backend — RFC 0076 WS2). Only names present *before*
+    // shim installation are protected: a later shim may still replace
+    // an earlier one (the `mp_subscript` `__getitem__` supersedes the
+    // `sq_item` one, matching CPython's slotdefs priority).
+    #[allow(clippy::mutable_key_type)]
+    let preexisting: std::collections::HashSet<DictKey> = dict.keys().cloned().collect();
     let dunder_pairs =
         crate::dunder_shim::install_dunder_shims(slot_table, qualified.to_owned(), new_null_raises);
     for (name, obj) in dunder_pairs {
-        dict.insert(DictKey(Object::from_str(name)), obj);
+        let key = DictKey(Object::from_str(name));
+        if !preexisting.contains(&key) {
+            dict.insert(key, obj);
+        }
     }
     dict
 }
@@ -2738,6 +2977,14 @@ pub struct ReadiedType {
     pub bridge: Rc<TypeObject>,
     /// Slots decoded from the faithful struct + method suites.
     pub slot_table: SlotTable,
+    /// The struct's `ob_type` as last observed (RFC 0076 WS5). A C
+    /// extension may re-seat a *static* type's metaclass with a raw
+    /// `Py_SET_TYPE(&MyType, meta)` field write — torch's
+    /// `_set_generator_metaclass` late-binds `OpaqueBaseMeta` onto
+    /// `THPGeneratorType` this way — which no C-API call announces.
+    /// [`bridge_type`] compares the live field against this snapshot on
+    /// every crossing and adopts drift into the VM bridge's metaclass.
+    pub ob_type_seen: std::sync::atomic::AtomicUsize,
 }
 
 unsafe impl Send for ReadiedType {}
@@ -3952,6 +4199,8 @@ pub unsafe extern "C" fn PyType_Ready(t: *mut PyTypeObject) -> c_int {
         .as_ref()
         .is_none_or(|b| Rc::ptr_eq(b, &weavepy_vm::builtin_types::builtin_types().object_))
         || (unsafe { (*t).tp_flags } & PY_TPFLAGS_DISALLOW_INSTANTIATION as u64) != 0;
+    let getset_names: Vec<String> = h.getset_pairs.iter().map(|(n, _)| n.clone()).collect();
+    let member_names: Vec<String> = h.member_pairs.iter().map(|(n, _)| n.clone()).collect();
     let mut dict = assemble_type_dict(
         &qualified,
         &bare,
@@ -4007,6 +4256,52 @@ pub unsafe extern "C" fn PyType_Ready(t: *mut PyTypeObject) -> c_int {
             .set(Some(Box::leak(qualified.clone().into_boxed_str())));
     }
 
+    // RFC 0076 WS5: tag every harvested `tp_getset` property in the
+    // descriptor registry with its owning class, so the crossing back
+    // into C mints the byte-faithful `getset_descriptor` box (see
+    // `object::GetSetDescrBox`) instead of a generic `property` box —
+    // torch's `add_docstr(torch.Generator.device, …)` classifies by
+    // `tp_name` and writes `d_getset->doc` into the struct.
+    for name in &getset_names {
+        let entry = ty
+            .dict
+            .borrow()
+            .get(&weavepy_vm::object::StrKey(name))
+            .cloned();
+        if let Some(prop @ Object::Property(_)) = entry {
+            weavepy_vm::descr_registry::register(
+                &prop,
+                weavepy_vm::descr_registry::DescrKind::GetSet,
+                ty.clone(),
+                name,
+                None,
+            );
+        }
+    }
+    // Same for harvested `tp_members`: CPython types them
+    // `member_descriptor`, and numpy's `_needs_add_docstring` keys off
+    // `isinstance(obj, property)` — an unregistered member surfaced as a
+    // plain `property` and every `add_newdoc('…', 'dtype', ('alignment',
+    // …))` warned "used on a pure-python object" (the warning text also
+    // pollutes subprocess stdout asserted by test_nditer's
+    // test_buffered_cast_error_paths_unraisable — RFC 0076 WS1).
+    for name in &member_names {
+        let entry = ty
+            .dict
+            .borrow()
+            .get(&weavepy_vm::object::StrKey(name))
+            .cloned();
+        if let Some(prop @ Object::Property(_)) = entry {
+            weavepy_vm::descr_registry::register(
+                &prop,
+                weavepy_vm::descr_registry::DescrKind::Member,
+                ty.clone(),
+                name,
+                None,
+            );
+        }
+    }
+
     // RFC 0047 (wave 5): publish the C-level `tp_dict`. Cython-generated
     // module init writes into `type->tp_dict` *directly*
     // (`__Pyx_SetVtable` does `PyDict_SetItem(type->tp_dict,
@@ -4039,10 +4334,12 @@ pub unsafe extern "C" fn PyType_Ready(t: *mut PyTypeObject) -> c_int {
         ty.c_sq_item.set(true);
     }
 
+    ty.c_ext_ptr.set(t as usize);
     let readied: &'static ReadiedType = Box::leak(Box::new(ReadiedType {
         ext_ptr: t,
         bridge: ty,
         slot_table: h.slot_table,
+        ob_type_seen: std::sync::atomic::AtomicUsize::new(unsafe { (*t).head.ob_type } as usize),
     }));
     if std::env::var_os("WEAVEPY_TRACE_TYPEPTR").is_some() {
         eprintln!(
@@ -4163,6 +4460,26 @@ pub unsafe extern "C" fn PyType_Ready(t: *mut PyTypeObject) -> c_int {
                 (*t).tp_base = bp;
             }
         }
+        // RFC 0076 WS5: CPython's `inherit_special` copies the base's
+        // `tp_basicsize`/`tp_itemsize` **into the caller's struct** when
+        // the subtype declares none. pybind11's `make_default_metaclass`
+        // relies on exactly that: it allocates a metaclass off
+        // `PyType_Type.tp_alloc`, sets *no* sizes, readies it, and later
+        // calls `metaclass->tp_alloc(metaclass, 0)` to mint each class as
+        // a full `PyHeapTypeObject`. Without the write-back the metaclass
+        // reads `tp_basicsize = 0`, the class block comes back 16 bytes
+        // wide, and pybind11's writes to `ht_type.tp_*`/`as_number`/…
+        // shred the heap (torch's `initModule` crashed inside
+        // `PyType_Ready` on a neighbour allocation's bytes).
+        if !(*t).tp_base.is_null() {
+            let b = (*t).tp_base;
+            if (*t).tp_basicsize == 0 {
+                (*t).tp_basicsize = (*b).tp_basicsize;
+            }
+            if (*t).tp_itemsize == 0 {
+                (*t).tp_itemsize = (*b).tp_itemsize;
+            }
+        }
         if (*t).tp_bases.is_null() {
             (*t).tp_bases = tp_bases_box;
         } else if !tp_bases_box.is_null() {
@@ -4208,18 +4525,20 @@ pub unsafe extern "C" fn PyType_Ready(t: *mut PyTypeObject) -> c_int {
     // `arraydescr_repr` / `.name` read `type(dtype)._legacy`. Without the
     // metaclass link `metaclass_or_type()` collapses to `type`, those reads
     // raise `AttributeError`, and dtype `repr`/`str`/`.name` degrade to the
-    // foreign placeholder. Only adopt a genuine *foreign* metatype (never
-    // our own `PyType_Type`, never the type itself), readied on demand so
-    // its getsets are harvested.
+    // foreign placeholder. Adopt any metatype other than our own
+    // `PyType_Type` (and never the type itself), readied on demand so its
+    // getsets are harvested. RFC 0076 WS5: a WeavePy-*owned* metatype box
+    // counts too — pybind11's `py::metaclass(OpaqueBaseMeta)` hands a VM
+    // class's C mirror as `ob_type` (torch's `ProcessGroup`), and the
+    // bridged class must report it so `isinstance(cls, OpaqueBaseMeta)`
+    // holds.
     unsafe {
         let meta_ptr = (*t).head.ob_type;
-        if !meta_ptr.is_null()
-            && meta_ptr != t
-            && meta_ptr != PyType_Type.as_ptr()
-            && !is_weavepy_owned_type(meta_ptr)
-        {
+        if !meta_ptr.is_null() && meta_ptr != t && meta_ptr != PyType_Type.as_ptr() {
             if let Some(meta_t) = bridge_or_ready(meta_ptr) {
-                readied.bridge.set_metaclass(meta_t);
+                if !Rc::ptr_eq(&meta_t, &weavepy_vm::builtin_types::builtin_types().type_) {
+                    readied.bridge.set_metaclass(meta_t);
+                }
             }
         }
     }

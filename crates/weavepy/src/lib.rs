@@ -312,6 +312,11 @@ fn run_source_with_options_impl(
     // `\N{NAME}` escapes resolve through the VM's UCD tables even for this
     // pre-interpreter parse of the main module.
     vm::install_parser_unicode_hook();
+    // RFC 0076 WS15: the `-X lang=next` language preview (PEP 750
+    // t-strings, PEP 758 unparenthesized except lists) must gate this
+    // pre-interpreter parse too, not just the runtime `compile()`/import
+    // paths configured in `apply_run_options`.
+    parser::set_lang_preview(opts.flags.xoptions.iter().any(|x| x == "lang=next"));
     // Tokenizer-collected invalid-escape diagnostics (CPython's
     // `SyntaxWarning`s) are replayed through the `warnings` machinery
     // once the interpreter is up, just before the module body runs.

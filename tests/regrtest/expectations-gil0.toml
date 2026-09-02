@@ -1,0 +1,55 @@
+# RFC 0076 WS12 — free-threaded conformance lane baseline.
+#
+# Run with:
+#   weavepy-conformance regrtest --gil0 --jobs 4 --stream
+#
+# Every scheduled test is spawned with `-X gil=0` (subprocess mode is
+# forced — the flag is process-wide at startup). Unlike the main
+# baseline, this lane schedules *only* the labels keyed here: the mode
+# is experimental, so the lane is a curated thread-heavy subset that
+# proves concurrent bytecode execution stays correct, not a re-run of
+# the full conformance sweep.
+#
+# Statuses are measured on the release binary. `measured_os` mirrors
+# the main baseline's advisory-gate semantics (RFC 0063 WS7).
+
+measured_os = ["macos"]
+timeout_seconds = 120
+
+# --- bundled fixtures -------------------------------------------------
+
+[tests."bundled/test_threading_primitives.py"]
+status = "pass"
+
+[tests."bundled/test_cross_thread_heap.py"]
+status = "pass"
+
+[tests."bundled/test_eval_breaker.py"]
+status = "pass"
+
+[tests."bundled/test_multiprocessing_dummy.py"]
+status = "pass"
+
+[tests."bundled/test_rfc0076_gil0.py"]
+status = "pass"
+reason = "spawns its own gated subprocesses; outer -X gil=0 is harmless"
+timeout_seconds = 240
+
+# --- CPython Lib/test (vendored) --------------------------------------
+
+[tests."cpython/Lib/test/test_thread.py"]
+status = "pass"
+
+[tests."cpython/Lib/test/test_threading_local.py"]
+status = "pass"
+
+[tests."cpython/Lib/test/test_queue.py"]
+status = "pass"
+timeout_seconds = 300
+
+[tests."cpython/Lib/test/test_threadedtempfile.py"]
+status = "pass"
+
+[tests."cpython/Lib/test/test_threading.py"]
+status = "pass"
+timeout_seconds = 600

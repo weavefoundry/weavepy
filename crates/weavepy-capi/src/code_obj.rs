@@ -131,6 +131,26 @@ fn ensure_types() {
     }
 }
 
+/// `&PyTraceBack_Type`, wired. Used by `type_for_object` so a VM
+/// traceback crosses into C wearing the identity static that compiled
+/// `PyTraceBack_Check` macros compare against.
+pub(crate) fn traceback_type_ptr() -> *mut crate::types::PyTypeObject {
+    ensure_types();
+    PyTraceBack_Type.as_ptr()
+}
+
+/// `&PyFrame_Type`, wired. See [`traceback_type_ptr`].
+pub(crate) fn frame_type_ptr() -> *mut crate::types::PyTypeObject {
+    ensure_types();
+    PyFrame_Type.as_ptr()
+}
+
+/// `&PyCode_Type`, wired. See [`traceback_type_ptr`].
+pub(crate) fn code_type_ptr() -> *mut crate::types::PyTypeObject {
+    ensure_types();
+    PyCode_Type.as_ptr()
+}
+
 #[inline]
 unsafe fn write_int(base: *mut u8, off: usize, v: c_int) {
     unsafe { ptr::write_unaligned(base.add(off) as *mut c_int, v) };
@@ -235,6 +255,107 @@ pub(crate) unsafe fn native_code_object(p: *mut PyObject) -> Option<weavepy_vm::
         read_int(OFF_FLAGS),
         varnames,
     ))
+}
+
+// ---------------------------------------------------------------------------
+// VM code objects crossing INTO C (RFC 0076 WS5). A VM `Object::Code`
+// used to cross as a generic `object` box, so a compiled `PyCode_Check`
+// rejected it — torch._dynamo's `skip_code(code)` (module scope of
+// `torch/_dynamo/decorators.py`) failed its `THPUtils` guard with
+// "expected a code object" and killed the whole lazy `_dynamo` import.
+// Mint a faithful facade instead — same layout the C constructors above
+// produce — cached per `Rc<CodeObject>` identity, with a reverse payload
+// map so the same VM code object round-trips (pointer-keyed C-side
+// registries stay coherent and `co is co2` holds back in Python).
+// ---------------------------------------------------------------------------
+
+/// `Rc<CodeObject>` address → facade pointer (facades are immortal:
+/// the payload map below pins the VM object, and the boxed struct is
+/// never freed — code objects that cross are module-lifetime).
+static VM_CODE_FACADES: Mutex<Option<std::collections::HashMap<usize, usize>>> = Mutex::new(None);
+/// Facade pointer → the original VM `Object::Code`.
+static VM_CODE_PAYLOAD: Mutex<
+    Option<std::collections::HashMap<usize, weavepy_vm::object::Object>>,
+> = Mutex::new(None);
+
+/// Mint (or fetch) the faithful facade for a VM code object crossing
+/// into C. Returns a borrowed pointer; the caller increfs per its
+/// ownership contract.
+pub(crate) fn facade_for_vm_code(obj: &weavepy_vm::object::Object) -> Option<*mut PyObject> {
+    use weavepy_vm::object::Object;
+    let Object::Code(c) = obj else { return None };
+    let key = weavepy_vm::sync::Rc::as_ptr(c) as usize;
+    if let Ok(g) = VM_CODE_FACADES.lock() {
+        if let Some(m) = g.as_ref() {
+            if let Some(&p) = m.get(&key) {
+                return Some(p as *mut PyObject);
+            }
+        }
+    }
+    let p = unsafe { alloc_code() };
+    if p.is_null() {
+        return None;
+    }
+    let base = p as *mut u8;
+    let mk_str =
+        |s: &str| -> *mut PyObject { crate::object::into_owned(Object::from_str(s.to_owned())) };
+    unsafe {
+        write_int(base, OFF_ARGCOUNT, c.arg_count as c_int);
+        write_int(base, OFF_POSONLY, c.posonly_count as c_int);
+        write_int(base, OFF_KWONLY, c.kwonly_count as c_int);
+        write_int(base, OFF_NLOCALS, c.varnames.len() as c_int);
+        write_int(
+            base,
+            OFF_FLAGS,
+            weavepy_vm::builtins::code_flags(c) as c_int,
+        );
+        let firstlineno = if c.name == "<module>" {
+            1
+        } else {
+            c.linetable.iter().copied().find(|l| *l > 0).unwrap_or(1)
+        };
+        write_int(base, OFF_FIRSTLINENO, firstlineno as c_int);
+        // Fresh owned references; installed directly (no extra incref).
+        ptr::write_unaligned(
+            base.add(OFF_FILENAME) as *mut *mut PyObject,
+            mk_str(&c.filename),
+        );
+        ptr::write_unaligned(base.add(OFF_NAME) as *mut *mut PyObject, mk_str(&c.name));
+        ptr::write_unaligned(
+            base.add(OFF_QUALNAME) as *mut *mut PyObject,
+            mk_str(&c.qualname),
+        );
+        let names: Vec<Object> = c
+            .varnames
+            .iter()
+            .map(|n| Object::from_str(n.clone()))
+            .collect();
+        ptr::write_unaligned(
+            base.add(OFF_LOCALSPLUSNAMES) as *mut *mut PyObject,
+            crate::object::into_owned(Object::new_tuple(names)),
+        );
+    }
+    if let Ok(mut g) = VM_CODE_FACADES.lock() {
+        g.get_or_insert_with(std::collections::HashMap::new)
+            .insert(key, p as usize);
+    }
+    if let Ok(mut g) = VM_CODE_PAYLOAD.lock() {
+        g.get_or_insert_with(std::collections::HashMap::new)
+            .insert(p as usize, obj.clone());
+    }
+    // Immortal: the facade is shared by every crossing of this code
+    // object and registered in the payload map for the reverse trip.
+    unsafe { (*p).ob_refcnt = IMMORTAL_REFCNT };
+    Some(p)
+}
+
+/// The original VM `Object::Code` a facade minted by
+/// [`facade_for_vm_code`] stands for, if `p` is one.
+pub(crate) fn vm_code_payload(p: *mut PyObject) -> Option<weavepy_vm::object::Object> {
+    VM_CODE_PAYLOAD
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|m| m.get(&(p as usize)).cloned()))
 }
 
 /// `PyUnstable_Code_NewWithPosOnlyArgs` — the 3.13 public code-object

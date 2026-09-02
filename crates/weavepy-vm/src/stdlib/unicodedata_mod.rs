@@ -273,11 +273,21 @@ fn impl_east_asian_width(args: &[Object], old: bool) -> Result<Object, RuntimeEr
 }
 
 fn arg_unistr_codepoints(args: &[Object], fname: &str) -> Result<Vec<u32>, RuntimeError> {
-    match args.get(1) {
-        Some(Object::Str(s)) => Ok(s.chars().map(|c| c as u32).collect()),
-        Some(Object::WStr(cps)) => Ok(cps.to_vec()),
-        _ => Err(type_error(format!("{fname}() unistr must be str"))),
+    // CPython's clinic uses `PyUnicode_Check`, which is subtype-inclusive:
+    // a `str` *subclass* instance (numpy's `str_` scalar in
+    // test_multiarray's `TestUnicodeEncoding.test_round_trip`) is accepted
+    // anywhere str is (RFC 0076 WS1).
+    fn cps(o: &Object) -> Option<Vec<u32>> {
+        match o {
+            Object::Str(s) => Some(s.chars().map(|c| c as u32).collect()),
+            Object::WStr(cps) => Some(cps.to_vec()),
+            Object::Instance(inst) => inst.native.get().and_then(cps),
+            _ => None,
+        }
     }
+    args.get(1)
+        .and_then(cps)
+        .ok_or_else(|| type_error(format!("{fname}() unistr must be str")))
 }
 
 fn arg_form<'a>(args: &'a [Object], fname: &str) -> Result<&'a str, RuntimeError> {

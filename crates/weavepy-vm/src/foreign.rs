@@ -126,6 +126,24 @@ pub struct ForeignHooks {
     /// returns the VM `NotImplemented` singleton when C declines so the
     /// VM's dispatcher can keep looking.
     pub binop: fn(BinOpKind, &Object, &Object) -> Result<Object, RuntimeError>,
+    /// `PySequence_Concat(a, b)` — the *left slot* concatenation protocol
+    /// (`operator.concat`): the left type's real C `sq_concat` (numpy's
+    /// `array_concat` raises its canonical TypeError here), then the
+    /// `nb_add` fallback for `PySequence_Check` pairs, else
+    /// "'…' object can't be concatenated" (RFC 0076 WS1).
+    pub seq_concat: fn(&Object, &Object) -> Result<Object, RuntimeError>,
+    /// `tp_flags` of a readied C extension type (`TypeObject::c_ext_ptr`).
+    /// Lets `validate_bases` honour a foreign type's missing
+    /// `Py_TPFLAGS_BASETYPE` — `class Y(np.flexible)` must raise "not an
+    /// acceptable base type" (RFC 0076 WS1, numpy test_gh_23737).
+    pub type_flags: fn(usize) -> u64,
+    /// Live `d_getset->doc` of a harvested C getset descriptor. An
+    /// extension can write the docstring into the C struct *after* the
+    /// type was readied (numpy's `add_docstring(np.ndarray.flat, …)` at
+    /// import), so the VM `Property`'s harvested snapshot goes stale;
+    /// `__doc__` reads through here first (RFC 0076 WS1, test_umath
+    /// TestAddDocstring).
+    pub getset_live_doc: fn(&Object) -> Option<String>,
     /// `PyObject_RichCompare`. Returns `NotImplemented` when C declines.
     pub compare: fn(CompareKind, &Object, &Object) -> Result<Object, RuntimeError>,
     /// Resolve `type(ptr)` to a VM object (an [`Object::Type`] when the
@@ -347,6 +365,31 @@ pub fn iternext(s: &PyForeignSoul) -> Result<Option<Object>, RuntimeError> {
 
 pub fn binop(op: BinOpKind, a: &Object, b: &Object) -> Result<Object, RuntimeError> {
     (hooks()?.binop)(op, a, b)
+}
+
+/// `PySequence_Concat(a, b)` — the left operand's `sq_concat` slot
+/// protocol (`operator.concat`; RFC 0076 WS1). `Err` when the bridge
+/// is absent so the caller can apply its pure fallback.
+pub fn seq_concat(a: &Object, b: &Object) -> Result<Object, RuntimeError> {
+    (hooks()?.seq_concat)(a, b)
+}
+
+/// True when the cpyext bridge is installed (so [`seq_concat`] can
+/// dispatch a real C `sq_concat` slot).
+pub fn has_seq_concat() -> bool {
+    HOOKS.get().is_some()
+}
+
+/// `tp_flags` of a readied foreign type; 0 when the bridge is absent.
+pub fn type_flags(ptr: usize) -> u64 {
+    HOOKS.get().map_or(0, |h| (h.type_flags)(ptr))
+}
+
+/// Live C-side docstring of a harvested getset descriptor (`None` when
+/// the bridge is absent, the property has no faithful box, or the C
+/// `doc` slot is still NULL).
+pub fn getset_live_doc(prop: &Object) -> Option<String> {
+    HOOKS.get().and_then(|h| (h.getset_live_doc)(prop))
 }
 
 pub fn compare(op: CompareKind, a: &Object, b: &Object) -> Result<Object, RuntimeError> {

@@ -190,9 +190,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                             ..
                         } | TOp::BuildTuple { .. }
                             | TOp::BuildMap { .. }
+                            | TOp::BuildSet { .. }
                             | TOp::BuildString { .. }
                             | TOp::CallDyn { .. }
                             | TOp::DynAttrSet { .. }
+                            | TOp::ContainsDyn { .. }
                     )
                 })
         });
@@ -771,6 +773,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             } => self.emit_call_py(token, argc, kwc, perm, ret, stmt.pc),
             TOp::ListGet { elem } => self.emit_list_get(elem, stmt.pc),
             TOp::ListSet => self.emit_list_set(stmt.pc),
+            TOp::CellGet { idx, lane } => self.emit_cell_get(idx, lane, stmt.pc),
+            TOp::CellSet { idx, lane } => self.emit_cell_set(idx, lane, stmt.pc),
             TOp::ListLen => self.emit_list_len(stmt.pc),
             TOp::ListAppend => self.emit_list_append(stmt.pc),
             TOp::ListAppendKeep => self.emit_list_append_keep(stmt.pc),
@@ -846,16 +850,21 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             TOp::CallDyn { argc, kwc, names } => self.emit_call_dyn(argc, kwc, names, stmt.pc),
             TOp::DynAttrGet { name } => self.emit_dyn_attr_get(name, stmt.pc),
             TOp::DynAttrSet { name } => self.emit_dyn_attr_set(name, stmt.pc),
+            TOp::Truth => self.emit_truth(stmt.pc),
+            TOp::ContainsDyn { negate } => self.emit_contains_dyn(negate, stmt.pc),
+            TOp::BuildSet { n } => self.emit_build_set(n, stmt.pc),
             TOp::StrMod => self.emit_str_mod(stmt.pc),
             TOp::StrSlice { start, stop } => self.emit_str_slice(start, stop, stmt.pc),
         }
     }
 
     /// RFC 0074 WS1 — an identity-guarded obj-global pin via the
-    /// memoizing `wpjit_global_obj` helper. Negative status deopts
-    /// (cap pressure; a lane surprise is impossible while the
-    /// identity guard holds) and the interpreter re-executes the
-    /// `LOAD_GLOBAL`.
+    /// memoizing `wpjit_global_obj` helper. `-1` is a *value* — the
+    /// object lane's nullable `None` encoding, answered when the
+    /// snapshot itself is `None` (so a downstream `IsNone` fence sees
+    /// it; RFC 0076 WS5). `-2` deopts (cap pressure; a lane surprise
+    /// is impossible while the identity guard holds) and the
+    /// interpreter re-executes the `LOAD_GLOBAL`.
     fn emit_push_global_obj(&mut self, token: u32, lane: JitType, pc: u32) {
         let snapshot = self.vstack.clone();
         let sig = self.pin_helper_sig();
@@ -869,7 +878,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .ins()
             .call_indirect(sig, helper, &[self.frame_ptr, tokenv]);
         let res = self.b.inst_results(call)[0];
-        let bad = self.b.ins().icmp_imm(IntCC::SignedLessThan, res, 0);
+        let bad = self.b.ins().icmp_imm(IntCC::SignedLessThan, res, -1);
         let cont = self.guard(bad, pc, &snapshot);
         self.b.switch_to_block(cont);
         self.vstack.push((res, lane));
@@ -927,6 +936,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let snapshot = self.vstack.clone();
 
         self.writeback_locals();
+        self.store_call_site_pc(pc);
 
         let sig = self.call_dyn_helper_sig();
         let helper = self
@@ -990,6 +1000,126 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let r = self.b.import_signature(sig);
         self.call_dyn_sig = Some(r);
         r
+    }
+
+    /// RFC 0076 WS8 — truthiness on a pinned/object-lane value via
+    /// `wpjit_truth`: pop the pin, compute the interpreter's exact
+    /// `bool(x)` (pure for `None`/scalars/container emptiness; the
+    /// `__bool__`/`__len__` protocol for instances — arbitrary
+    /// Python), push the `Bool`. Status protocol as
+    /// [`Self::emit_dyn_attr_get`].
+    fn emit_truth(&mut self, pc: u32) {
+        let trusted = MemFlags::trusted();
+        let snapshot_full = self.vstack.clone();
+        let (pin, _) = self.pop();
+        let snapshot = self.vstack.clone();
+
+        self.writeback_locals();
+
+        let sig = self.list_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::truth_helper_addr() as i64);
+        let zero = self.b.ins().iconst(types::I64, 0);
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, pin, zero]);
+        let status = self.b.inst_results(call)[0];
+
+        let ok_b = self.b.create_block();
+        let bad_b = self.b.create_block();
+        let is_ok = self.b.ins().icmp_imm(IntCC::Equal, status, 0);
+        self.b.ins().brif(is_ok, ok_b, &[], bad_b, &[]);
+
+        self.b.switch_to_block(bad_b);
+        let raised_b = self.b.create_block();
+        let not_raised_b = self.b.create_block();
+        let is_raised = self.b.ins().icmp_imm(IntCC::Equal, status, 1);
+        self.b
+            .ins()
+            .brif(is_raised, raised_b, &[], not_raised_b, &[]);
+        self.b.switch_to_block(raised_b);
+        self.emit_exit(pc, &snapshot, JitStatus::Raised);
+        self.b.switch_to_block(not_raised_b);
+        let boxed_b = self.b.create_block();
+        let reject_b = self.b.create_block();
+        let is_boxed = self.b.ins().icmp_imm(IntCC::Equal, status, 2);
+        self.b.ins().brif(is_boxed, boxed_b, &[], reject_b, &[]);
+        self.b.switch_to_block(boxed_b);
+        self.emit_exit(pc + 1, &snapshot, JitStatus::Deopt);
+        self.b.switch_to_block(reject_b);
+        self.emit_exit(pc, &snapshot_full, JitStatus::Deopt);
+
+        self.b.switch_to_block(ok_b);
+        let res = self
+            .b
+            .ins()
+            .load(types::I64, trusted, self.frame_ptr, OFF_RET_BITS);
+        self.vstack.push((res, JitType::Bool));
+    }
+
+    /// RFC 0076 WS8 — generic membership via `wpjit_contains_dyn`:
+    /// the item (below the container) stages tag-typed in
+    /// `call_args[0]` / `call_tags[0]`, the container pin pops
+    /// natively, and the helper runs the interpreter's exact `in`
+    /// protocol (arbitrary Python), pushing the already-negated
+    /// `Bool`. Status protocol as [`Self::emit_truth`].
+    fn emit_contains_dyn(&mut self, negate: bool, pc: u32) {
+        let trusted = MemFlags::trusted();
+        let snapshot_full = self.vstack.clone();
+        let (pin, _) = self.pop();
+        let (val, vty) = self.pop();
+        self.b.ins().store(trusted, val, self.call_args_base, 0);
+        let tagv = self.b.ins().iconst(types::I32, Self::tag(vty));
+        self.b.ins().store(trusted, tagv, self.call_tags_base, 0);
+        let snapshot = self.vstack.clone();
+
+        self.writeback_locals();
+
+        let sig = self.list_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::contains_dyn_helper_addr() as i64);
+        let negv = self.b.ins().iconst(types::I64, i64::from(negate));
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, pin, negv]);
+        let status = self.b.inst_results(call)[0];
+
+        let ok_b = self.b.create_block();
+        let bad_b = self.b.create_block();
+        let is_ok = self.b.ins().icmp_imm(IntCC::Equal, status, 0);
+        self.b.ins().brif(is_ok, ok_b, &[], bad_b, &[]);
+
+        self.b.switch_to_block(bad_b);
+        let raised_b = self.b.create_block();
+        let not_raised_b = self.b.create_block();
+        let is_raised = self.b.ins().icmp_imm(IntCC::Equal, status, 1);
+        self.b
+            .ins()
+            .brif(is_raised, raised_b, &[], not_raised_b, &[]);
+        self.b.switch_to_block(raised_b);
+        self.emit_exit(pc, &snapshot, JitStatus::Raised);
+        self.b.switch_to_block(not_raised_b);
+        let boxed_b = self.b.create_block();
+        let reject_b = self.b.create_block();
+        let is_boxed = self.b.ins().icmp_imm(IntCC::Equal, status, 2);
+        self.b.ins().brif(is_boxed, boxed_b, &[], reject_b, &[]);
+        self.b.switch_to_block(boxed_b);
+        self.emit_exit(pc + 1, &snapshot, JitStatus::Deopt);
+        self.b.switch_to_block(reject_b);
+        self.emit_exit(pc, &snapshot_full, JitStatus::Deopt);
+
+        self.b.switch_to_block(ok_b);
+        let res = self
+            .b
+            .ins()
+            .load(types::I64, trusted, self.frame_ptr, OFF_RET_BITS);
+        self.vstack.push((res, JitType::Bool));
     }
 
     /// RFC 0074 WS2/WS4 — the eager generic attribute load via
@@ -1351,6 +1481,31 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .b
             .ins()
             .iconst(self.ptr_ty, runtime::build_tuple_helper_addr() as i64);
+        let nv = self.b.ins().iconst(types::I64, i64::from(n));
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, nv]);
+        let res = self.b.inst_results(call)[0];
+        let bad = self.b.ins().icmp_imm(IntCC::SignedLessThan, res, 0);
+        let cont = self.guard(bad, pc, &snapshot);
+        self.b.switch_to_block(cont);
+        self.vstack.push((res, JitType::Obj));
+    }
+
+    /// RFC 0076 WS8 — `BUILD_SET k` through `wpjit_build_set`:
+    /// elements stage with per-element tags (like a tuple literal),
+    /// the fresh set pins on the object lane. Negative status deopts
+    /// (cap pressure, or an element whose hashing could run Python)
+    /// and the interpreter re-executes the `BUILD_SET`.
+    fn emit_build_set(&mut self, n: u32, pc: u32) {
+        let snapshot = self.vstack.clone();
+        self.stage_elements(n, true);
+        let sig = self.pin_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::build_set_helper_addr() as i64);
         let nv = self.b.ins().iconst(types::I64, i64::from(n));
         let call = self
             .b
@@ -1932,6 +2087,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let snapshot = self.vstack.clone();
 
         self.writeback_locals();
+        self.store_call_site_pc(pc);
 
         let expect = match ret {
             MethodRet::None => SlotTag::None as i64,
@@ -2222,6 +2378,71 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.b.switch_to_block(cont);
     }
 
+    /// RFC 0076 WS6 — closure-cell read via `wpjit_cell_get`. The cell
+    /// index is a compile-time constant (the frame's cell array is
+    /// fixed for the activation's lifetime); the helper re-validates
+    /// the burned lane per access and a non-zero status deopts at this
+    /// pc, so the interpreter re-executes the `LOAD_DEREF` (raising
+    /// the exact `NameError` for an unbound cell).
+    fn emit_cell_get(&mut self, idx: u32, lane: JitType, pc: u32) {
+        let trusted = MemFlags::trusted();
+        let snapshot = self.vstack.clone();
+        let sig = self.list_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::cell_get_helper_addr() as i64);
+        let idxv = self.b.ins().iconst(types::I64, i64::from(idx));
+        let lanev = self.b.ins().iconst(
+            types::I64,
+            lane.cell_lane_code().expect("analyzer admits scalar lanes"),
+        );
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, idxv, lanev]);
+        let status = self.b.inst_results(call)[0];
+        let bad = self.b.ins().icmp_imm(IntCC::NotEqual, status, 0);
+        let cont = self.guard(bad, pc, &snapshot);
+        self.b.switch_to_block(cont);
+        let res = self
+            .b
+            .ins()
+            .load(Self::cl_ty(lane), trusted, self.frame_ptr, OFF_RET_BITS);
+        self.vstack.push((res, lane));
+    }
+
+    /// RFC 0076 WS6 — closure-cell write via `wpjit_cell_set`. The
+    /// value is staged through `ret_bits`; a non-zero status (displaced
+    /// heap value, lane surprise) deopts at this pc with the value
+    /// spilled, so the interpreter re-executes the `STORE_DEREF`.
+    fn emit_cell_set(&mut self, idx: u32, lane: JitType, pc: u32) {
+        let trusted = MemFlags::trusted();
+        let snapshot = self.vstack.clone();
+        let (val, _) = self.pop();
+        self.b
+            .ins()
+            .store(trusted, val, self.frame_ptr, OFF_RET_BITS);
+        let sig = self.list_helper_sig();
+        let helper = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::cell_set_helper_addr() as i64);
+        let idxv = self.b.ins().iconst(types::I64, i64::from(idx));
+        let lanev = self.b.ins().iconst(
+            types::I64,
+            lane.cell_lane_code().expect("analyzer admits scalar lanes"),
+        );
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.frame_ptr, idxv, lanev]);
+        let status = self.b.inst_results(call)[0];
+        let bad = self.b.ins().icmp_imm(IntCC::NotEqual, status, 0);
+        let cont = self.guard(bad, pc, &snapshot);
+        self.b.switch_to_block(cont);
+    }
+
     /// RFC 0067 WS2 — the loop-header poll: decrement the countdown;
     /// on expiry call the embedder's poll helper (which performs the
     /// GIL hand-off inline), reset the countdown, and take the
@@ -2408,6 +2629,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // call (`sys._getframe`, tracebacks through this frame, and the
         // Raised/Boxed exits below all read them).
         self.writeback_locals();
+        self.store_call_site_pc(pc);
 
         let sig = self.call_py_sig();
         let helper = self
@@ -2446,6 +2668,24 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .ins()
             .load(Self::cl_ty(ret), trusted, self.frame_ptr, OFF_RET_BITS);
         self.vstack.push((res, ret));
+    }
+
+    /// Store the call site's bytecode pc into the frame's `deopt_pc`
+    /// slot right before a call helper runs (RFC 0076). A *frameless*
+    /// activation (native call lanes, direct interpreter→native entry)
+    /// has no interpreter frame; when its call falls back to the
+    /// interpreter, the VM pushes a spine shell for this activation so
+    /// callee-side stack walkers (`sys._getframe`,
+    /// `traceback.walk_stack`) still observe it — and the shell reads
+    /// this slot for its `f_lineno`. The slot is dead between exits
+    /// (every exit path overwrites it), so the store is unconditional
+    /// and costs one word.
+    fn store_call_site_pc(&mut self, pc: u32) {
+        let trusted = MemFlags::trusted();
+        let pcv = self.b.ins().iconst(types::I32, i64::from(pc));
+        self.b
+            .ins()
+            .store(trusted, pcv, self.frame_ptr, OFF_DEOPT_PC);
     }
 
     /// The imported signature of the `wpjit_call_py` helper (lazy).

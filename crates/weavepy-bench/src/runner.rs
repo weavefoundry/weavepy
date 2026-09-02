@@ -445,9 +445,130 @@ fn parse_bench_ns(stdout: &[u8]) -> Option<f64> {
         .map(|v| v as f64)
 }
 
+/// One mode's thread-scaling measurement (RFC 0076 WS12): the
+/// `parallel_scaling.py` fixture's serial and 8-thread walls for the
+/// same total work, under one GIL mode.
+#[derive(Debug, Clone)]
+pub struct ScalingRow {
+    /// Human-readable mode label (`gil=1 (default)` / `gil=0`).
+    pub mode: &'static str,
+    /// Median serial wall across samples, ns.
+    pub serial_ns: f64,
+    /// Median 8-thread wall across samples, ns.
+    pub parallel_ns: f64,
+}
+
+impl ScalingRow {
+    /// serial / parallel — ~1× means the threads serialized (the GIL
+    /// build's expected shape), >1× means real parallel speedup.
+    pub fn scaling(&self) -> f64 {
+        self.serial_ns / self.parallel_ns
+    }
+}
+
+/// Run the RFC 0076 WS12 thread-scaling fixture under the default
+/// (GIL) mode and `-X gil=0`, returning one row per mode. This is a
+/// *measurement*, not a gated suite member: the fixture is not in
+/// [`crate::fixtures::FIXTURES`], so the committed baseline and the
+/// CI gate never see it — the scaling claim is reported, per the
+/// RFC's "measured, not marketing" clause.
+pub fn run_scaling(opts: &RunOpts, work: u32) -> io::Result<Vec<ScalingRow>> {
+    let weavepy = resolve_weavepy(opts)?;
+    let fixture = crate::fixtures::fixtures_dir().join("parallel_scaling.py");
+    if !fixture.is_file() {
+        return Err(io::Error::other(format!(
+            "scaling fixture missing: {}",
+            fixture.display()
+        )));
+    }
+    let modes: [(&'static str, &[&str]); 2] =
+        [("gil=1 (default)", &[]), ("gil=0", &["-X", "gil=0"])];
+    let mut rows = Vec::with_capacity(modes.len());
+    for (mode, extra_args) in modes {
+        let runs = if opts.warmup {
+            opts.samples + 1
+        } else {
+            opts.samples
+        };
+        let mut serial = Vec::with_capacity(opts.samples as usize);
+        let mut parallel = Vec::with_capacity(opts.samples as usize);
+        for i in 0..runs {
+            let (s, p) = time_scaling_subprocess(&weavepy, extra_args, &fixture, work)?;
+            if !opts.warmup || i > 0 {
+                serial.push(s);
+                parallel.push(p);
+            }
+        }
+        rows.push(ScalingRow {
+            mode,
+            serial_ns: median(&mut serial),
+            parallel_ns: median(&mut parallel),
+        });
+    }
+    Ok(rows)
+}
+
+fn median(samples: &mut [f64]) -> f64 {
+    samples.sort_by(|a, b| a.total_cmp(b));
+    match samples.len() {
+        0 => f64::NAN,
+        n if n % 2 == 1 => samples[n / 2],
+        n => f64::midpoint(samples[n / 2 - 1], samples[n / 2]),
+    }
+}
+
+/// Run `weavepy [extra_args] parallel_scaling.py` once and parse the
+/// fixture's `WEAVEPY_BENCH_SERIAL_NS` / `WEAVEPY_BENCH_PARALLEL_NS`
+/// marker pair.
+fn time_scaling_subprocess(
+    weavepy: &Path,
+    extra_args: &[&str],
+    fixture: &Path,
+    work: u32,
+) -> io::Result<(f64, f64)> {
+    let mut cmd = Command::new(weavepy);
+    cmd.args(extra_args)
+        .arg(fixture)
+        .env("WEAVEPY_BENCH_WORK", work.to_string())
+        .env_remove("WEAVEPY_JIT")
+        .env_remove("WEAVEPY_VM_STATS")
+        // The mode under test comes from `extra_args` alone — an
+        // exported PYTHON_GIL in the invoking shell would skew a leg.
+        .env_remove("PYTHON_GIL");
+    let out = run_with_rusage(&mut cmd)?;
+    if !out.status.success() {
+        return Err(io::Error::other(format!(
+            "{} {} exited {} on {}: {}",
+            weavepy.display(),
+            extra_args.join(" "),
+            out.status.code().unwrap_or(-1),
+            fixture.display(),
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let find = |marker: &str| {
+        text.lines()
+            .rev()
+            .find_map(|line| line.trim().strip_prefix(marker))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|v| v as f64)
+    };
+    match (
+        find("WEAVEPY_BENCH_SERIAL_NS="),
+        find("WEAVEPY_BENCH_PARALLEL_NS="),
+    ) {
+        (Some(s), Some(p)) => Ok((s, p)),
+        _ => Err(io::Error::other(format!(
+            "scaling fixture did not print both WEAVEPY_BENCH_SERIAL_NS and \
+             WEAVEPY_BENCH_PARALLEL_NS; stdout was: {text}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_bench_ns;
+    use super::{median, parse_bench_ns, ScalingRow};
 
     #[test]
     fn parses_last_ns_line() {
@@ -458,5 +579,21 @@ mod tests {
     #[test]
     fn rejects_missing_marker() {
         assert_eq!(parse_bench_ns(b"hello\n"), None);
+    }
+
+    #[test]
+    fn median_of_odd_and_even_sample_sets() {
+        assert_eq!(median(&mut [3.0, 1.0, 2.0]), 2.0);
+        assert_eq!(median(&mut [4.0, 1.0, 2.0, 3.0]), 2.5);
+    }
+
+    #[test]
+    fn scaling_is_serial_over_parallel() {
+        let row = ScalingRow {
+            mode: "gil=0",
+            serial_ns: 8.0e9,
+            parallel_ns: 2.0e9,
+        };
+        assert!((row.scaling() - 4.0).abs() < 1e-9);
     }
 }

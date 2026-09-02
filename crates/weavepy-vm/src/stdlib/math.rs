@@ -544,9 +544,19 @@ fn loghelper(o: &Object, func: fn(f64) -> f64, name: &str) -> Result<f64, Runtim
         .as_bigint()
         .or_else(|| o.native_value().and_then(|n| n.as_bigint()));
     if let Some(n) = as_int {
-        use num_traits::Signed;
+        use num_traits::{Signed, ToPrimitive};
         if !n.is_positive() {
             return Err(value_error("math domain error"));
+        }
+        // CPython's `loghelper` converts to double *first* and only falls
+        // back to the `_PyLong_Frexp` decomposition when the int overflows
+        // a double. The decomposition is one ULP off for values libm
+        // handles exactly — `log(4) = log(0.5) + 3·log(2)` rounds to
+        // …904 instead of …906, so `int(math.log(n, 2))` under-reported
+        // the exponent for exact powers of two (scipy's `hadamard(n)`
+        // power-of-2 validation; RFC 0076 WS2).
+        if let Some(x) = n.to_f64().filter(|x| x.is_finite()) {
+            return Ok(func(x));
         }
         let (m, e) = bigint_frexp(&n);
         return Ok(func(m) + func(2.0) * (e as f64));

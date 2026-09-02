@@ -127,12 +127,28 @@ pub unsafe fn collect_getsets(mut defs: *mut PyGetSetDef) -> Vec<(String, Object
             Some(s) => make_setter(static_name, s, entry.closure as usize),
             None => Object::None,
         };
-        let prop = Object::Property(Rc::new(PyProperty::new(
-            fget,
-            fset,
-            Object::None,
-            Object::None,
-        )));
+        // CPython's `getset_set` also serves *deletion*: `del obj.attr`
+        // calls the same C setter with `value == NULL` (numpy's ufunc
+        // `__doc__` setter resets the docstring on NULL — test_umath
+        // TestSpecialMethods::test_ufunc_docstring, RFC 0076 WS1).
+        let fdel = match entry.set {
+            Some(s) => make_deleter(static_name, s, entry.closure as usize),
+            None => Object::None,
+        };
+        // Surface `PyGetSetDef.doc` as the descriptor's `__doc__` —
+        // CPython's `getset_get_doc` (numpy's add_docstring no-ops when
+        // the docstring is already set and reads it via `__doc__`;
+        // test_umath TestAddDocstring — RFC 0076 WS1).
+        let doc = if entry.doc.is_null() {
+            Object::None
+        } else {
+            Object::Str(Rc::from(
+                unsafe { CStr::from_ptr(entry.doc) }
+                    .to_string_lossy()
+                    .as_ref(),
+            ))
+        };
+        let prop = Object::Property(Rc::new(PyProperty::new(fget, fset, fdel, doc)));
         out.push((name, prop));
         defs = unsafe { defs.add(1) };
     }
@@ -238,6 +254,42 @@ fn make_setter(
     setter
 }
 
+/// Deleter for a C getset: CPython's `getset_set` with `value == NULL`.
+fn make_deleter(
+    name: &'static str,
+    s: unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut std::ffi::c_void) -> c_int,
+    closure: usize,
+) -> Object {
+    let body = move |args: &[Object]| -> Result<Object, RuntimeError> {
+        if args.len() != 1 {
+            return Err(type_error(format!(
+                "deleter for '{name}' expects 1 argument (self)"
+            )));
+        }
+        let self_p = crate::object::into_owned(args[0].clone());
+        let r = crate::interp::ensure_active(|| unsafe {
+            s(
+                self_p,
+                std::ptr::null_mut(),
+                closure as *mut std::ffi::c_void,
+            )
+        });
+        unsafe { crate::object::Py_DecRef(self_p) };
+        if r < 0 {
+            return Err(take_pending_or_default());
+        }
+        Ok(Object::None)
+    };
+    let deleter = Object::Builtin(Rc::new(BuiltinFn {
+        name,
+        binds_instance: false,
+        call: Box::new(body),
+        call_kw: None,
+    }));
+    weavepy_vm::descr_registry::mark_native_descr_accessor(&deleter);
+    deleter
+}
+
 /// Decode a null-terminated `PyMemberDef[]` array into descriptor pairs.
 ///
 /// Each member projects its declared `T_*` field, at its `offset`, in the
@@ -296,6 +348,11 @@ fn make_member(name: &'static str, ty: c_int, offset: PySsizeT, readonly: bool) 
             // dict-backed instance the offset names no real field, so it
             // reads as `None`.
             let has_field = matches!(self_obj, Object::Foreign(_))
+                // A member declared on a *metaclass* reads from the class
+                // object itself (numpy's `_DTypeMeta.type` projects
+                // `PyArray_DTypeMeta.scalar_type`, so `StrDType.type` must
+                // read the real C type struct — RFC 0076 WS1).
+                || matches!(self_obj, Object::Type(t) if t.c_ext_ptr.get() != 0)
                 || unsafe { crate::mirror::is_instance_body(self_p) };
             let out = if has_field {
                 unsafe { read_member(self_p, ty, offset) }
@@ -325,6 +382,7 @@ fn make_member(name: &'static str, ty: c_int, offset: PySsizeT, readonly: bool) 
             }
             let self_p = crate::object::into_owned(args[0].clone());
             let has_field = matches!(&args[0], Object::Foreign(_))
+                || matches!(&args[0], Object::Type(t) if t.c_ext_ptr.get() != 0)
                 || unsafe { crate::mirror::is_instance_body(self_p) };
             let res = if has_field {
                 unsafe { write_member(self_p, ty, offset, &args[1]) }

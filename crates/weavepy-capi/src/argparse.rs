@@ -141,10 +141,13 @@ pub unsafe extern "C" fn _WeavePy_Arg_Double(arg: *mut PyObject, dest: *mut f64)
             unsafe { *dest = i as f64 };
             0
         }
-        Object::Long(big) => {
-            unsafe { *dest = big.to_f64().unwrap_or(f64::INFINITY) };
-            0
-        }
+        Object::Long(big) => match crate::numbers::checked_big_to_double(&big) {
+            Some(f) => {
+                unsafe { *dest = f };
+                0
+            }
+            None => -1,
+        },
         Object::Bool(b) => {
             unsafe { *dest = f64::from(b as i32) };
             0
