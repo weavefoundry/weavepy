@@ -521,8 +521,8 @@ impl<'src> Parser<'src> {
                 message: "unexpected indent".to_owned(),
             });
         }
+        let start_span = self.peek_token().span;
         let first = self.parse_eval_element()?;
-        let start_span = first.span;
         let expr = if self.check(&TokenKind::Comma) {
             let mut items = vec![first];
             while self.eat(&TokenKind::Comma) {
@@ -531,7 +531,9 @@ impl<'src> Parser<'src> {
                 }
                 items.push(self.parse_eval_element()?);
             }
-            let end_span = items.last().expect("nonempty").span;
+            // `expressions` ends at the last consumed token (a closing
+            // paren or trailing comma included), like the other tuples.
+            let end_span = self.prev_token_span();
             Expr {
                 kind: ExprKind::Tuple(items),
                 span: start_span.merge(end_span),
@@ -766,10 +768,7 @@ impl<'src> Parser<'src> {
     }
 
     /// Parse a PEP 695 type-alias statement into the first-class
-    /// [`StmtKind::TypeAlias`] node. The compiler lowers it to the
-    /// lazy `__weavepy_type_alias__` assignment via
-    /// [`lower_type_alias_stmt`] just before compilation, so
-    /// `ast.parse` and `symtable` observe the real node.
+    /// [`StmtKind::TypeAlias`] node.
     fn parse_type_alias_stmt(&mut self) -> Result<Stmt, ParseError> {
         let type_tok = self.bump(); // `type`
         let name_tok = self.expect(&TokenKind::Name, "type alias name")?;
@@ -1667,6 +1666,7 @@ impl<'src> Parser<'src> {
                         message: "expected ':'".to_owned(),
                     });
                 }
+                let first_tok_span = self.peek_token().span;
                 let t = self.parse_expression(false)?;
                 // `except A, B:` — pegen `invalid_except_stmt` on 3.13;
                 // under `-X lang=next` (PEP 758, 3.14) an unparenthesized
@@ -1696,11 +1696,7 @@ impl<'src> Parser<'src> {
                                     .to_owned(),
                         });
                     }
-                    let tup_span = elts
-                        .first()
-                        .map(|e| e.span)
-                        .unwrap_or(kw_span)
-                        .merge(elts.last().map(|e| e.span).unwrap_or(kw_span));
+                    let tup_span = first_tok_span.merge(self.prev_token_span());
                     Expr {
                         kind: ExprKind::Tuple(elts),
                         span: tup_span,
@@ -2648,11 +2644,11 @@ impl<'src> Parser<'src> {
     fn parse_match_subject(&mut self) -> Result<Expr, ParseError> {
         // `subject_expr` admits named expressions (`match y := f():`).
         self.walrus_ok = true;
+        let start_span = self.peek_token().span;
         let first = self.parse_ternary()?;
         if !self.check(&TokenKind::Comma) {
             return Ok(first);
         }
-        let start_span = first.span;
         let mut items = vec![first];
         while self.eat(&TokenKind::Comma) {
             if self.check(&TokenKind::Colon) {
@@ -2661,7 +2657,7 @@ impl<'src> Parser<'src> {
             self.walrus_ok = true;
             items.push(self.parse_ternary()?);
         }
-        let end_span = items.last().expect("nonempty").span;
+        let end_span = self.prev_token_span();
         Ok(Expr {
             kind: ExprKind::Tuple(items),
             span: start_span.merge(end_span),
@@ -3346,12 +3342,15 @@ impl<'src> Parser<'src> {
     /// general iterable-unpacking case in collection literals fall
     /// out of a single parse.
     fn parse_expression_list(&mut self, _allow_trailing_comma: bool) -> Result<Expr, ParseError> {
+        // An unparenthesized tuple starts at its first *token*, which
+        // is the opening paren when the first element is parenthesized
+        // (`(a), b` spans from the `(`; the element itself does not).
+        let start_span = self.peek_token().span;
         let first = self.parse_ternary_or_starred()?;
         if !self.check(&TokenKind::Comma) {
             return Ok(first);
         }
         let mut items = vec![first];
-        let start_span = items[0].span;
         while self.eat(&TokenKind::Comma) {
             if matches!(
                 self.peek(),
@@ -4246,6 +4245,7 @@ impl<'src> Parser<'src> {
         // Parse a single (sub)slice (`a`, `a:b`, `a:b:c`, etc.) — the
         // comma-separated form (`x[a, b, c]`) is handled by the outer
         // loop after this call returns.
+        let start_tok_span = self.peek_token().span;
         let first = self.parse_subscript_single()?;
         if !self.check(&TokenKind::Comma) {
             // PEP 646: a lone starred element still forms a one-element tuple
@@ -4271,10 +4271,7 @@ impl<'src> Parser<'src> {
             }
             elts.push(self.parse_subscript_single()?);
         }
-        let span = match (elts.first(), elts.last()) {
-            (Some(f), Some(l)) => f.span.merge(l.span),
-            _ => self.peek_token().span,
-        };
+        let span = start_tok_span.merge(self.prev_token_span());
         Ok(Expr {
             kind: ExprKind::Tuple(elts),
             span,
@@ -4340,6 +4337,10 @@ impl<'src> Parser<'src> {
                 Some(TokenKind::ColonEqual)
             );
         self.walrus_ok = true;
+        // pegen's `slice` rule spans from its first *token*, so a
+        // parenthesized lower bound (`x[(a+1):]`) starts the Slice at
+        // the `(`, not at the inner expression.
+        let first_tok_span = self.peek_token().span;
         let first = self.parse_ternary()?;
         if !self.check(&TokenKind::Colon) {
             return Ok(first);
@@ -4371,7 +4372,7 @@ impl<'src> Parser<'src> {
         } else {
             None
         };
-        let span = first.span.merge(self.prev_token_span());
+        let span = first_tok_span.merge(self.prev_token_span());
         Ok(Expr {
             kind: ExprKind::Slice {
                 lower: Some(Box::new(first)),
@@ -4832,6 +4833,7 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_target_list_no_tuple(&mut self) -> Result<Expr, ParseError> {
+        let start_tok_span = self.peek_token().span;
         let first = self.parse_target_or_star()?;
         if !self.check(&TokenKind::Comma) {
             return Ok(first);
@@ -4843,7 +4845,7 @@ impl<'src> Parser<'src> {
             }
             items.push(self.parse_target_or_star()?);
         }
-        let span = items[0].span.merge(items.last().unwrap().span);
+        let span = start_tok_span.merge(self.prev_token_span());
         Ok(Expr {
             kind: ExprKind::Tuple(items),
             span,
@@ -4896,6 +4898,7 @@ impl<'src> Parser<'src> {
         while matches!(self.peek(), TokenKind::String) {
             let next_tok = self.peek_token().clone();
             let next_prefix = self.string_prefix(&next_tok)?;
+            let prev_span = span;
             span = span.merge(next_tok.span);
             self.bump();
             // PEP 750: t-strings only concatenate with other t-strings.
@@ -4950,10 +4953,21 @@ impl<'src> Parser<'src> {
                     if !a.is_empty() {
                         parts.push(Expr {
                             kind: ExprKind::Constant(cps_to_constant(a)),
-                            span: first.span,
+                            // All plain fragments accumulated so far.
+                            span: prev_span,
                         });
                     }
-                    parts.extend(self.fstring_parts_for(&next_tok)?);
+                    // The f-string's leading literal fuses with the plain
+                    // prefix (`"a, " f"not {x}"` is one Constant part).
+                    for p in self.fstring_parts_for(&next_tok)? {
+                        if let ExprKind::Constant(c @ (Constant::Str(_) | Constant::WStr(_))) =
+                            p.kind
+                        {
+                            join_str_into_parts(&mut parts, c, p.span);
+                        } else {
+                            parts.push(p);
+                        }
+                    }
                     AccumString::Joined(parts)
                 }
                 (AccumString::Joined(mut parts), false, false) => {
@@ -5224,8 +5238,22 @@ impl<'src> Parser<'src> {
                 // values list (crucially also *inside a format spec* —
                 // `f"{2:{y=}}"` has Constant/FormattedValue as siblings,
                 // never a nested JoinedStr).
+                // The debug text fuses with a preceding literal run
+                // (`_PyPegen_concatenate_strings` merges every run of
+                // adjacent Constant parts: `f"abc {m=}"` is
+                // `[Constant("abc m="), FormattedValue]`).
                 match parsed.kind {
-                    ExprKind::JoinedStr(debug_parts) => parts.extend(debug_parts),
+                    ExprKind::JoinedStr(debug_parts) => {
+                        for p in debug_parts {
+                            if let ExprKind::Constant(c @ (Constant::Str(_) | Constant::WStr(_))) =
+                                p.kind
+                            {
+                                join_str_into_parts(&mut parts, c, p.span);
+                            } else {
+                                parts.push(p);
+                            }
+                        }
+                    }
                     _ => parts.push(parsed),
                 }
                 i = end + 1; // skip past the closing `}`
@@ -5683,11 +5711,22 @@ impl<'src> Parser<'src> {
             // parse_fstring_field appends parts directly, so we
             // package both into a synthetic JoinedStr that will
             // get flattened by the outer JoinedStr later.
+            //
+            // `_PyPegen_formatted_value` locates the debug text from
+            // just after the `{` to just before the terminator: the
+            // `!` of a conversion, the `:` of a format spec, or the
+            // `}`.
+            let debug_end = field_abs
+                + match (conv_start, spec_start) {
+                    (Some(c), _) => c - 1,
+                    (None, Some(s)) => s - 1,
+                    (None, None) => field.len(),
+                } as u32;
             return Ok(Expr {
                 kind: ExprKind::JoinedStr(vec![
                     Expr {
                         kind: ExprKind::Constant(Constant::Str(lit)),
-                        span: anchor,
+                        span: Span::new(field_abs, debug_end),
                     },
                     fv,
                 ]),
@@ -6847,166 +6886,6 @@ fn big_to_i64(b: &num_bigint::BigInt) -> Option<i64> {
         }
         _ => None,
     }
-}
-
-/// PEP 695 helper — lower a `type` alias to a **lazy** `TypeAliasType`
-/// constructor call so the alias body is *not* evaluated at definition
-/// time (matching CPython 3.12+ `typing.TypeAliasType`):
-///
-/// ```python
-/// type Name[T, U] = body
-/// # lowers to
-/// Name = __weavepy_type_alias__('Name', ('T', 'U'), lambda T, U: body)
-///
-/// type Name = body
-/// # lowers to
-/// Name = __weavepy_type_alias__('Name', (), lambda: body)
-/// ```
-///
-/// The `__weavepy_type_alias__` intrinsic hands the tuple of real
-/// `_typing` type-parameter objects (built by each `TypeParam`'s
-/// constructor expression, RFC 0051) plus a zero-argument thunk to
-/// `_typing.TypeAliasType`, which only invokes the thunk the first
-/// time `Name.__value__` is read. Deferring the body is what lets
-/// numpy's `_typing` aliases — e.g. `type ArrayLike = Buffer |
-/// _DualArrayLike[np.dtype, …]` — be defined without eagerly building
-/// unions / subscripting other aliases.
-///
-/// A generic alias nests one immediately-invoked lambda per type
-/// parameter (CPython's hidden PEP 695 scope): a later parameter's
-/// lazy bound/default and the value thunk each *close over* the
-/// earlier parameters, so `type A[T, U: T] = X[T, U]` resolves `T` in
-/// `U`'s bound and both names in the body without leaking either into
-/// the enclosing scope:
-///
-/// ```python
-/// A = (lambda T:
-///         (lambda U:
-///             __weavepy_type_alias__('A', (T, U), lambda: X[T, U])
-///         )(<ctor U>)
-///     )(<ctor T>)
-/// ```
-/// Lower a first-class [`StmtKind::TypeAlias`] statement to the
-/// runtime assignment form the compiler executes:
-/// `Name = __weavepy_type_alias__('Name', (…), <thunk>)` (see
-/// [`build_lazy_type_alias`]). Called by the compiler front-end so
-/// every later pass (mangling, scope analysis, codegen) sees the
-/// same shape the parser used to emit directly.
-///
-/// # Panics
-///
-/// Panics if `stmt` is not a [`StmtKind::TypeAlias`].
-pub fn lower_type_alias_stmt(stmt: &Stmt) -> Stmt {
-    let StmtKind::TypeAlias {
-        name,
-        name_span,
-        type_params,
-        value,
-    } = &stmt.kind
-    else {
-        panic!("lower_type_alias_stmt on non-TypeAlias statement");
-    };
-    let target = Expr {
-        kind: ExprKind::Name(name.clone()),
-        span: *name_span,
-    };
-    let rhs = build_lazy_type_alias(name, (**value).clone(), type_params, *name_span);
-    Stmt {
-        kind: StmtKind::Assign {
-            targets: vec![target],
-            value: rhs,
-        },
-        span: stmt.span,
-    }
-}
-
-pub fn build_lazy_type_alias(name: &str, body: Expr, params: &[TypeParam], span: Span) -> Expr {
-    let thunk = Expr {
-        kind: ExprKind::TypeParamFn {
-            args: Arguments::default(),
-            body: Box::new(body),
-        },
-        span,
-    };
-    let name_str = Expr {
-        kind: ExprKind::Constant(Constant::Str(name.to_owned())),
-        span,
-    };
-    let params_tuple = Expr {
-        kind: ExprKind::Tuple(
-            params
-                .iter()
-                .map(|p| Expr {
-                    kind: ExprKind::Name(p.name.clone()),
-                    span,
-                })
-                .collect(),
-        ),
-        span,
-    };
-    let mut acc = Expr {
-        kind: ExprKind::Call {
-            func: Box::new(Expr {
-                kind: ExprKind::Name("__weavepy_type_alias__".to_owned()),
-                span,
-            }),
-            args: vec![name_str, params_tuple, thunk],
-            keywords: Vec::new(),
-        },
-        span,
-    };
-    // Wrap innermost-last: each parameter's constructor runs in the
-    // scope of every parameter declared before it. PEP 696 defaults
-    // attach *inside* the binder (after the name is bound) so a
-    // default can reference the parameter itself
-    // (`type X[T = [T for T in [T]]] = T`); the `(<set default>,
-    // <rest>)[1]` tuple sequences the mutation before the inner body.
-    for p in params.iter().rev() {
-        let inner_body = if p.default.is_some() {
-            let set_default = p.apply_default_expr(Expr {
-                kind: ExprKind::Name(p.name.clone()),
-                span,
-            });
-            Expr {
-                kind: ExprKind::Subscript {
-                    value: Box::new(Expr {
-                        kind: ExprKind::Tuple(vec![set_default, acc]),
-                        span,
-                    }),
-                    slice: Box::new(Expr {
-                        kind: ExprKind::Constant(Constant::Int(1)),
-                        span,
-                    }),
-                },
-                span,
-            }
-        } else {
-            acc
-        };
-        let binder = Expr {
-            kind: ExprKind::TypeParamFn {
-                args: Arguments {
-                    args: vec![Arg {
-                        name: p.name.clone(),
-                        annotation: None,
-                        span,
-                    }],
-                    ..Arguments::default()
-                },
-                body: Box::new(inner_body),
-            },
-            span,
-        };
-        acc = Expr {
-            kind: ExprKind::Call {
-                func: Box::new(binder),
-                args: vec![p.constructor_expr()],
-                keywords: Vec::new(),
-            },
-            span,
-        };
-    }
-    acc
 }
 
 /// PEP 695 annotation scopes (type-parameter bounds/constraints/

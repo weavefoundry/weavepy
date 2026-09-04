@@ -191,32 +191,22 @@ impl Mangler {
                 for d in decorator_list {
                     self.expr(d);
                 }
-                // A *class's* type parameters mangle against the class
-                // itself (CPython: `class Foo[__T]` binds `_Foo__T`
-                // even at module level) — applied by the compiler's
-                // hidden-scope lowering, so this pass must leave the
-                // parameter names (and references to them in the
-                // header, which evaluates inside the hidden scope)
-                // untouched.
-                let own: HashSet<String> = type_params.iter().map(|tp| tp.name.clone()).collect();
-                let sub = Mangler {
-                    prefix: self.prefix.clone(),
-                    skip: self.skip.union(&own).cloned().collect(),
-                    only: self.only.clone(),
-                };
-                for tp in type_params {
-                    if let TypeParamKind::TypeVar { bound: Some(b) } = &mut tp.kind {
-                        sub.expr(b);
-                    }
-                    if let Some(d) = &mut tp.default {
-                        sub.expr(d);
-                    }
+                // A *generic* class's header (type-parameter bounds and
+                // defaults, bases, keywords) evaluates inside its hidden
+                // scope, where CPython mangles *only* the class's own
+                // type parameters, against the class itself
+                // (`ste_mangled_names`: `class Foo[__T: __B](__Base)`
+                // binds `_Foo__T` and reads `__B` / `__Base` verbatim).
+                // The compiler's hidden-scope lowering applies that
+                // mangling; this pass must leave the header untouched.
+                if !type_params.is_empty() {
+                    return;
                 }
                 for b in bases {
-                    sub.expr(b);
+                    self.expr(b);
                 }
                 for k in keywords {
-                    sub.expr(&mut k.value);
+                    self.expr(&mut k.value);
                 }
             }
             StmtKind::TypeAlias {
@@ -225,11 +215,11 @@ impl Mangler {
                 value,
                 ..
             } => {
-                // Normally dead — the compiler lowers `type` statements
-                // to their assignment form before mangling — but kept
-                // faithful for safety: the binding and the type-parameter
-                // names mangle; bounds/defaults/value are ordinary
-                // expressions (matching what the lowered form produces).
+                // The binding and the type-parameter names mangle
+                // against the enclosing class, as do the bounds,
+                // defaults, and value (CPython: `type __A[__T: __B] =
+                // __C` inside `Outer` reads `_Outer__B` / `_Outer__C`;
+                // an alias's hidden scope has no `ste_mangled_names`).
                 self.name(name);
                 for tp in type_params {
                     self.name(&mut tp.name);

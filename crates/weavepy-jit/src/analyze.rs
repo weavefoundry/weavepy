@@ -22,6 +22,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use weavepy_compiler::{
     BinOpKind, CodeObject, CompareKind, Constant, OpCode, UnaryKind, BINARY_OP_INPLACE_FLAG,
+    COMPARE_OP_TO_BOOL_FLAG,
 };
 
 use crate::ir::{
@@ -1107,7 +1108,7 @@ fn plan_rewrite(
             plan.nop.insert(i + 2);
             plan.nop.insert(i + 3);
             plan.nop.insert(exit);
-            if exit + 1 < n && matches!(ins[exit + 1].op, OpCode::PopTop) {
+            if exit + 1 < n && matches!(ins[exit + 1].op, OpCode::PopIter | OpCode::PopTop) {
                 plan.nop.insert(exit + 1);
             }
             plan.iter_headers
@@ -1175,7 +1176,7 @@ fn plan_rewrite(
             plan.nop.insert(exit);
             // The POP_TOP paired with END_FOR (CPython 3.13 loop-exit
             // shape) is equally dead in the compiled trace.
-            if exit + 1 < n && matches!(ins[exit + 1].op, OpCode::PopTop) {
+            if exit + 1 < n && matches!(ins[exit + 1].op, OpCode::PopIter | OpCode::PopTop) {
                 plan.nop.insert(exit + 1);
             }
             plan.calls.insert(i - 2, (pops, cur_slot, stop_slot));
@@ -1209,7 +1210,7 @@ fn plan_rewrite(
             plan.n_synth += 2;
             plan.get_iter.insert(i - 1, (seq_slot, idx_slot));
             plan.nop.insert(exit);
-            if exit + 1 < n && matches!(ins[exit + 1].op, OpCode::PopTop) {
+            if exit + 1 < n && matches!(ins[exit + 1].op, OpCode::PopIter | OpCode::PopTop) {
                 plan.nop.insert(exit + 1);
             }
             plan.iter_headers.insert(i, (seq_slot, idx_slot, var_slot));
@@ -1226,7 +1227,7 @@ fn plan_rewrite(
         // RFC 0073 WS1 — the PEP-709 inlined single-target listcomp:
         //   GET_ITER; LOAD_FAST_AND_CLEAR t; SWAP 2; BUILD_LIST 0;
         //   SWAP 2; FOR_ITER; STORE_FAST t; <body>; JUMP_BACKWARD;
-        //   END_FOR; POP_TOP; SWAP 2; STORE_FAST t; JUMP_FORWARD
+        //   END_FOR; POP_ITER; SWAP 2; STORE_FAST t; JUMP_FORWARD
         // The saved target and the iterator erase from the model
         // (deopt spans re-insert them); the accumulator stays a real
         // stack value across the loop. Set/dict comprehensions wait
@@ -1242,9 +1243,9 @@ fn plan_rewrite(
             && matches!(ins[i - 5].op, OpCode::GetIter)
             && ins[i - 4].arg == var_slot
         {
-            // Epilogue: END_FOR; POP_TOP; SWAP 2; STORE_FAST t.
+            // Epilogue: END_FOR; POP_ITER; SWAP 2; STORE_FAST t.
             if exit + 3 >= n
-                || !matches!(ins[exit + 1].op, OpCode::PopTop)
+                || !matches!(ins[exit + 1].op, OpCode::PopIter | OpCode::PopTop)
                 || !matches!(ins[exit + 2].op, OpCode::Swap)
                 || ins[exit + 2].arg != 2
                 || !matches!(ins[exit + 3].op, OpCode::StoreFast)
@@ -1521,7 +1522,7 @@ fn range_prefix(
     let args_start = i - 2 - k;
     for arg_ins in &ins[args_start..(i - 2)] {
         match arg_ins.op {
-            OpCode::LoadFast => {}
+            OpCode::LoadFast | OpCode::LoadSmallInt => {}
             OpCode::LoadConst
                 if matches!(
                     code.constants.get(arg_ins.arg as usize),
@@ -1536,12 +1537,15 @@ fn range_prefix(
     let mut step_nop = None;
     if k == 3 {
         let step_pc = i - 3;
-        if !matches!(ins[step_pc].op, OpCode::LoadConst)
-            || !matches!(
+        let step_is_one = match ins[step_pc].op {
+            OpCode::LoadSmallInt => ins[step_pc].arg == 1,
+            OpCode::LoadConst => matches!(
                 code.constants.get(ins[step_pc].arg as usize),
                 Some(Constant::Int(1))
-            )
-        {
+            ),
+            _ => false,
+        };
+        if !step_is_one {
             return None;
         }
         step_nop = Some(step_pc);
@@ -2923,13 +2927,24 @@ fn step_abstract(
         return Ok(());
     }
     match ins.op {
-        OpCode::Nop | OpCode::Resume => {}
+        OpCode::Nop | OpCode::Resume | OpCode::NotTaken => {}
         // RFC 0076 WS6 — cell-array setup is a no-op in the VM (cells
         // are prebuilt at frame creation; `MAKE_CELL` is a bounds
         // check, `COPY_FREE_VARS` does nothing), so both admit as
         // nops. `LOAD_CLOSURE`/`MAKE_FUNCTION` still reject, so a
         // closure-*defining* body only compiles once its function
-        // construction does.
+        // construction does. A `MAKE_CELL` past the prologue is a
+        // PEP 709 comprehension minting a fresh cell (RFC 0077 WS9):
+        // that one does real work, so it rejects.
+        OpCode::MakeCell
+            if code.instructions[..i]
+                .iter()
+                .any(|x| x.op == OpCode::Resume) =>
+        {
+            return Err(JitVerdict::UnsupportedOpcode(
+                "MAKE_CELL (comprehension cell)",
+            ));
+        }
         OpCode::MakeCell | OpCode::CopyFreeVars => {}
         // RFC 0071 WS4 — a recognized list-loop `GET_ITER`: pop the
         // iterable (it must be, or probe as, a pinned list) into the
@@ -3177,6 +3192,10 @@ fn step_abstract(
             }
             let ty = const_type(c).ok_or(JitVerdict::UnsupportedConst)?;
             stack.push(SE::known(ty));
+        }
+        // CPython 3.14 LOAD_SMALL_INT: the constant rides in the oparg.
+        OpCode::LoadSmallInt => {
+            stack.push(SE::known(JitType::Int));
         }
         OpCode::LoadFast => {
             // `src` is kept even for typed loads: RFC 0065 WS5 attribute
@@ -3793,7 +3812,7 @@ fn step_abstract(
             let ret = if mark.is_self { ret_lane } else { mark.ret };
             stack.push(SE::known(ret.unwrap_or(JitType::Unknown)));
         }
-        OpCode::PopTop => {
+        OpCode::PopTop | OpCode::PopIter => {
             // `break` inside a rewritten range loop pops the *iterator*,
             // which the rewrite never pushed — erase the pop. (When the
             // rewritten stack is empty inside a loop span, the
@@ -3812,7 +3831,10 @@ fn step_abstract(
             }
         }
         OpCode::CopyTop => {
-            let v = *stack.last().ok_or(JitVerdict::StackUnderflow)?;
+            // `COPY n` pushes the n-th entry from the top (CPython
+            // 3.14's chained comparison is `SWAP 2; COPY 2; COMPARE_OP`).
+            let depth = copy_depth(ins.arg, stack.len())?;
+            let v = stack[stack.len() - depth];
             if !v.is_plain() {
                 return Err(escape_verdict(code, &[&v], "CALL (callee escapes)"));
             }
@@ -4796,8 +4818,20 @@ fn bin_kind(arg: u32) -> Result<ArithKind, JitVerdict> {
     Ok(k)
 }
 
+/// The stack depth a `COPY n` reads (1 = TOS), checked against the
+/// modeled stack. The interpreter treats `COPY 0` like `COPY 1`.
+fn copy_depth(arg: u32, stack_len: usize) -> Result<usize, JitVerdict> {
+    let depth = (arg.max(1)) as usize;
+    if depth > stack_len {
+        return Err(JitVerdict::StackUnderflow);
+    }
+    Ok(depth)
+}
+
 fn cmp_kind(arg: u32) -> Result<CmpKind, JitVerdict> {
-    let k = match arg {
+    // Bit 4 asks for a `bool` result; the typed comparisons the JIT
+    // emits already produce one.
+    let k = match arg & !COMPARE_OP_TO_BOOL_FLAG {
         x if x == CompareKind::Lt as u32 => CmpKind::Lt,
         x if x == CompareKind::LtE as u32 => CmpKind::Le,
         x if x == CompareKind::Eq as u32 => CmpKind::Eq,
@@ -5367,8 +5401,9 @@ fn emit_instr(
         return Ok(());
     }
     match ins.op {
-        OpCode::Nop | OpCode::Resume => {}
-        // RFC 0076 WS6 — no-op cell-array setup (see inference pass).
+        OpCode::Nop | OpCode::Resume | OpCode::NotTaken => {}
+        // RFC 0076 WS6 — no-op cell-array setup (see inference pass,
+        // which already rejected a post-prologue `MAKE_CELL`).
         OpCode::MakeCell | OpCode::CopyFreeVars => {}
         // RFC 0071 WS4 — a recognized list-loop `GET_ITER`: capture
         // the pinned list into the seq synthetic slot and zero the
@@ -5514,6 +5549,14 @@ fn emit_instr(
                 _ => return Err(JitVerdict::UnsupportedConst),
             };
             push(op, Some(ty), stack, stmts);
+        }
+        OpCode::LoadSmallInt => {
+            push(
+                TOp::PushConstInt(i64::from(ins.arg)),
+                Some(JitType::Int),
+                stack,
+                stmts,
+            );
         }
         OpCode::LoadFast => {
             let ty = local_types
@@ -6633,7 +6676,7 @@ fn emit_instr(
                 stmts,
             );
         }
-        OpCode::PopTop => {
+        OpCode::PopTop | OpCode::PopIter => {
             // RFC 0065 WS5 — `append`'s poison result never existed on
             // the native stack; consume it silently.
             if stack.last().is_some_and(|s| s.poison) {
@@ -6656,14 +6699,20 @@ fn emit_instr(
             push(TOp::PushNone, Some(JitType::Obj), stack, stmts);
         }
         OpCode::CopyTop => {
-            let t = *stack.last().ok_or(JitVerdict::StackUnderflow)?;
+            let depth = copy_depth(ins.arg, stack.len())?;
+            let t = stack[stack.len() - depth];
             if !t.is_plain() {
                 return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
             }
             // Manual push: the copy keeps the slot provenance so an
             // augmented attribute assignment (`p.a += 1`, which dups
             // the receiver) still knows its receiver slot.
-            stmts.push(TStmt { pc, op: TOp::Dup });
+            stmts.push(TStmt {
+                pc,
+                op: TOp::Dup {
+                    depth: depth as u32,
+                },
+            });
             stack.push(t);
             *max_stack = (*max_stack).max(stack.len() as u32);
         }

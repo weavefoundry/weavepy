@@ -1064,7 +1064,7 @@ fn check_annotation_expr(expr: &Expr) -> Result<(), CompileError> {
 }
 
 /// Call `f` on every direct child expression of `expr`.
-fn for_each_child_expr<'a>(expr: &'a Expr, f: &mut dyn FnMut(&'a Expr)) {
+pub(crate) fn for_each_child_expr<'a>(expr: &'a Expr, f: &mut dyn FnMut(&'a Expr)) {
     match &expr.kind {
         ExprKind::BoolOp { values, .. } => values.iter().for_each(f),
         ExprKind::BinOp { left, right, .. } => {

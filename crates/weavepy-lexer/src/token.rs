@@ -32,6 +32,17 @@ impl Span {
         }
     }
 
+    /// CPython's `NO_LOCATION` on a synthesized AST node (the AST
+    /// preprocessor builds the pieces of a folded `%` format with `-1`
+    /// positions). Instructions emitted under it carry no line and
+    /// inherit one from their predecessor in the flowgraph.
+    pub const NO_LOCATION: Span = Span::new(u32::MAX, u32::MAX);
+
+    #[inline]
+    pub fn is_no_location(self) -> bool {
+        self == Self::NO_LOCATION
+    }
+
     #[inline]
     pub fn merge(self, other: Self) -> Self {
         Self {
@@ -310,18 +321,20 @@ impl Keyword {
     }
 }
 
-/// Process-wide gate for the `-X lang=next` 3.14 language preview
-/// (RFC 0076 WS15): PEP 750 t-strings and PEP 758 unparenthesized
-/// except lists. Set once at interpreter startup by the VM; read by
-/// the lexer (`t` string prefix) and the parser (except grammar).
-static LANG_PREVIEW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Process-wide gate for the 3.14 grammar additions: PEP 750 t-strings
+/// and PEP 758 unparenthesized except lists. RFC 0076 WS15 shipped them
+/// behind `-X lang=next`; RFC 0077 WS11 made them the default (the
+/// interpreter now identifies as 3.14) and the flag is accepted as a
+/// no-op. The gate stays so embedders that pin the 3.13 grammar can
+/// still turn it off.
+static LANG_PREVIEW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
-/// Enable/disable the 3.14 language preview (`-X lang=next`).
+/// Enable/disable the 3.14 grammar additions (default: enabled).
 pub fn set_lang_preview(enabled: bool) {
     LANG_PREVIEW.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Whether the 3.14 language preview (`-X lang=next`) is active.
+/// Whether the 3.14 grammar additions are active (default: yes).
 pub fn lang_preview() -> bool {
     LANG_PREVIEW.load(std::sync::atomic::Ordering::Relaxed)
 }

@@ -1,6 +1,6 @@
 //! Bytecode instruction set for the WeavePy VM.
 //!
-//! Opcode names track CPython 3.13's `Lib/opcode.py` where applicable
+//! Opcode names track CPython 3.14's `Lib/opcode.py` where applicable
 //! so `dis` listings look familiar. Each instruction is a fixed
 //! `{ op, arg }` pair — the slice favours simplicity of emission and
 //! dispatch over CPython's 16-bit-packed encoding, which is RFC 0007
@@ -19,6 +19,56 @@
 /// regular binary fallback. Kept above `0xFF` so `arg as u8` recovers
 /// the operator kind unchanged.
 pub const BINARY_OP_INPLACE_FLAG: u32 = 0x100;
+
+/// [`OpCode::CompareOp`] argument bit: the result is converted to a
+/// `bool` (CPython's `COMPARE_OP` oparg bit 4, set when the flowgraph
+/// fuses a following `TO_BOOL` into the compare). The low nibble is
+/// the [`CompareKind`].
+pub const COMPARE_OP_TO_BOOL_FLAG: u32 = 0x10;
+
+/// [`OpCode::LoadSpecial`] operands, in CPython 3.14's
+/// `_Py_SpecialMethods` order (`opcode._special_method_names`).
+pub const SPECIAL_ENTER: u32 = 0;
+pub const SPECIAL_EXIT: u32 = 1;
+pub const SPECIAL_AENTER: u32 = 2;
+pub const SPECIAL_AEXIT: u32 = 3;
+
+/// [`OpCode::LoadCommonConstant`] operands, in CPython 3.14's
+/// `_Py_CommonConstants` order (`opcode._common_constants`).
+pub const COMMON_CONSTANT_ASSERTION_ERROR: u32 = 0;
+pub const COMMON_CONSTANT_NOT_IMPLEMENTED_ERROR: u32 = 1;
+pub const COMMON_CONSTANT_TUPLE: u32 = 2;
+pub const COMMON_CONSTANT_ALL: u32 = 3;
+pub const COMMON_CONSTANT_ANY: u32 = 4;
+
+/// The PEP 695/696 intrinsic ids [`OpCode::CallIntrinsic1`] and
+/// [`OpCode::CallIntrinsic2`] carry as their `arg` (CPython
+/// `Include/internal/pycore_intrinsics.h`; the same numbers travel on
+/// the wire as the `CALL_INTRINSIC_1` / `CALL_INTRINSIC_2` oparg).
+pub mod intrinsic {
+    /// `INTRINSIC_TYPEVAR(name)`: a `TypeVar` with no bound.
+    pub const TYPEVAR: u32 = 7;
+    /// `INTRINSIC_PARAMSPEC(name)`.
+    pub const PARAMSPEC: u32 = 8;
+    /// `INTRINSIC_TYPEVARTUPLE(name)`.
+    pub const TYPEVARTUPLE: u32 = 9;
+    /// `INTRINSIC_SUBSCRIPT_GENERIC(params)`: `Generic[*params]`, the
+    /// implicit trailing base of a generic class.
+    pub const SUBSCRIPT_GENERIC: u32 = 10;
+    /// `INTRINSIC_TYPEALIAS((name, type_params | None, evaluate_value))`.
+    pub const TYPEALIAS: u32 = 11;
+
+    /// `INTRINSIC_TYPEVAR_WITH_BOUND(name, evaluate_bound)`.
+    pub const TYPEVAR_WITH_BOUND: u32 = 2;
+    /// `INTRINSIC_TYPEVAR_WITH_CONSTRAINTS(name, evaluate_constraints)`.
+    pub const TYPEVAR_WITH_CONSTRAINTS: u32 = 3;
+    /// `INTRINSIC_SET_FUNCTION_TYPE_PARAMS(func, type_params)`: stamps
+    /// `func.__type_params__` and returns `func`.
+    pub const SET_FUNCTION_TYPE_PARAMS: u32 = 4;
+    /// `INTRINSIC_SET_TYPEPARAM_DEFAULT(type_param, evaluate_default)`:
+    /// attaches the PEP 696 default and returns the parameter.
+    pub const SET_TYPEPARAM_DEFAULT: u32 = 5;
+}
 
 /// Sub-operation tag for [`OpCode::BinaryOp`]. Mirrors CPython 3.11+'s
 /// `_NB_*` enumeration.
@@ -69,9 +119,10 @@ impl CompareKind {
         self as u32
     }
 
-    /// Recover a [`CompareKind`] from its opcode argument.
+    /// Recover a [`CompareKind`] from its opcode argument (ignoring
+    /// [`COMPARE_OP_TO_BOOL_FLAG`]).
     pub fn from_arg(arg: u32) -> Option<Self> {
-        Some(match arg {
+        Some(match arg & !COMPARE_OP_TO_BOOL_FLAG {
             0 => Self::Lt,
             1 => Self::LtE,
             2 => Self::Eq,
@@ -185,6 +236,32 @@ impl UnaryKind {
     }
 }
 
+/// How the codec presents an instruction on the CPython wire
+/// ([`crate::CodeObject::wire_marks`], one byte per instruction).
+/// CPython 3.14's flowgraph refines `LOAD_FAST` into borrowing and
+/// checked forms and fuses adjacent fast-local moves (and `LOAD_GLOBAL;
+/// PUSH_NULL`) into superinstructions; WeavePy executes the plain
+/// forms and records the refinement here, so the wire view is
+/// byte-identical to CPython's while the VM, its inline caches, and the
+/// JIT keep seeing one simple opcode per stack effect.
+pub mod wire {
+    /// Plain presentation: the instruction's own opcode.
+    pub const PLAIN: u8 = 0;
+    /// `LOAD_FAST` presented as `LOAD_FAST_BORROW` (on a fusion head,
+    /// the pair as `LOAD_FAST_BORROW_LOAD_FAST_BORROW`).
+    pub const BORROW: u8 = 1;
+    /// `LOAD_FAST` presented as `LOAD_FAST_CHECK`.
+    pub const CHECK: u8 = 2;
+    /// Head of a two-instruction fusion: this instruction and the next
+    /// (marked [`FUSE_TAIL`]) form one wire instruction —
+    /// `LOAD_FAST_LOAD_FAST`, `STORE_FAST_LOAD_FAST`,
+    /// `STORE_FAST_STORE_FAST`, or the callable-flagged `LOAD_GLOBAL`.
+    pub const FUSE_HEAD: u8 = 4;
+    /// Tail of a fusion: zero-width on the wire (shares the head's
+    /// offset, location, and exception coverage).
+    pub const FUSE_TAIL: u8 = 8;
+}
+
 /// Opcodes emitted by the WeavePy compiler. The argument's meaning
 /// depends on the opcode — see comments per variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -237,11 +314,11 @@ pub enum OpCode {
     /// synthesizes the prologue.
     CopyFreeVars,
 
-    /// Stack no-op in the WeavePy VM (its `Call` convention carries no
-    /// self-or-null slot); encodes as CPython's `PUSH_NULL` on the wire
-    /// so `co_code`/`dis`/`co_stacksize` match CPython's call shapes
-    /// exactly (RFC 0068 WS1). The compiler emits it after every
-    /// callable load that CPython pairs with a NULL push.
+    /// Push the NULL marker (`Object::Unbound` in the VM) that fills
+    /// CPython's self-or-null call slot (RFC 0068 WS1) and, since 3.14,
+    /// the kwargs slot of a `CALL_FUNCTION_EX` without `**`. The
+    /// compiler emits it after every callable load that CPython pairs
+    /// with a NULL push.
     PushNull,
 
     // Attributes / subscripts
@@ -292,8 +369,10 @@ pub enum OpCode {
     Swap,
 
     // Calls
-    /// Call a callable with `arg` positional arguments.
-    /// Stack layout (top-down): `arg_n, arg_(n-1), ..., arg_1, callable`.
+    /// Call a callable with `arg` positional arguments. Stack layout
+    /// (top-down): `arg_n, ..., arg_1, self_or_null, callable`; a
+    /// non-NULL self slot rides as the first positional argument
+    /// (CPython's `CALL` convention, RFC 0068 WS1).
     Call,
     /// Same runtime behaviour as [`OpCode::Call`], but encodes as
     /// CPython's self-slot shape: `CALL arg-1` with the first argument
@@ -304,10 +383,11 @@ pub enum OpCode {
     /// Call with keyword arguments. `arg` = positional arg count;
     /// stack also carries kw arg names (tuple) and values.
     CallKw,
-    /// Call with packed args. `arg = 0` means the stack carries only
-    /// `(callable, args_tuple)`; `arg = 1` means `(callable,
-    /// args_tuple, kwargs_dict)`. Used for `*args` and `**kwargs`
-    /// splats that can't be lowered to a static arg count.
+    /// Call with packed args (CPython 3.14 `CALL_FUNCTION_EX`). The
+    /// stack carries `(callable, self_or_null, args_tuple,
+    /// kwargs_or_null)`; a call without `**` pushes NULL in the kwargs
+    /// slot. Used for `*args` and `**kwargs` splats that can't be
+    /// lowered to a static arg count. `arg` is unused (always 0).
     CallEx,
     /// Return TOS from the current frame.
     ReturnValue,
@@ -353,6 +433,9 @@ pub enum OpCode {
     /// `CALL_INTRINSIC_1` / `INTRINSIC_LIST_TO_TUPLE`).
     ListToTuple,
     SetAdd,
+    /// Pop an iterable and update the set `arg` entries below TOS with
+    /// it (CPython `SET_UPDATE`).
+    SetUpdate,
     MapAdd,
     /// Unpack iterable at TOS into `arg` values, push them in
     /// reverse order (so the first element ends up at the bottom).
@@ -366,9 +449,13 @@ pub enum OpCode {
     /// order. Mirrors CPython's `UNPACK_EX`.
     UnpackEx,
     /// `dict.update(other)` as a pure stack op. Stack on entry:
-    /// `[..., dict, other]`. Pops `other`, applies it to `dict`
-    /// (which is left at TOS for further updates). Used for `{**d}`
-    /// dict-literal spreads.
+    /// `[..., dict, unused[depth - 1], other]`. Pops `other`, applies
+    /// it to the `dict` sitting `depth` slots below it (CPython's
+    /// `DICT_UPDATE oparg`). Arg layout: bit 0 selects the call-site
+    /// `DICT_MERGE` semantics (mapping required, duplicate keyword is a
+    /// `TypeError`), `arg >> 1` is `depth - 1`. `0` is therefore the
+    /// `{**d}` dict-display spread, `1` the `f(**kw)` splat, `2` the
+    /// mapping-pattern `**rest` copy (`DICT_UPDATE 2`).
     DictUpdate,
     /// CPython `SETUP_ANNOTATIONS`: bind `__annotations__` to a fresh
     /// empty dict in the current scope *unless it is already bound*.
@@ -397,15 +484,15 @@ pub enum OpCode {
     // Classes
     /// Push the magic `__build_class__` builtin onto the stack.
     LoadBuildClass,
-    /// Class-scope deref: like `LOAD_DEREF` but first tries the active
-    /// class namespace (for forward references inside a class body).
-    LoadClassderef,
-    /// PEP 695 lazy-scope deref (CPython `LOAD_FROM_DICT_OR_DEREF`):
-    /// pops a mapping (the `__classdict__` cell's contents) and pushes
-    /// `mapping[name]` if present, else falls back to the cell at
-    /// `arg` (like `LoadClassderef`'s cell path). Emitted for free-
-    /// variable loads inside annotation scopes that can see a class
-    /// namespace.
+    /// Push the frame's locals mapping (CPython `LOAD_LOCALS`): the
+    /// class namespace inside a class body. Always followed by
+    /// `LoadClassdictOrDeref` / `LoadClassdictOrGlobal`, which is how
+    /// 3.14 spells a class body's class-namespace-first deref load.
+    LoadLocals,
+    /// `LOAD_FROM_DICT_OR_DEREF`: pops a mapping (the class namespace
+    /// from `LoadLocals`, or the `__classdict__` cell's contents inside
+    /// a PEP 695 annotation scope) and pushes `mapping[name]` if
+    /// present, else the cell at `arg`.
     LoadClassdictOrDeref,
     /// PEP 695 lazy-scope global (CPython `LOAD_FROM_DICT_OR_GLOBALS`):
     /// pops a mapping and pushes `mapping[name]` if present, else
@@ -443,14 +530,24 @@ pub enum OpCode {
     /// remainder (possibly `None`) as its last element.
     PrepReraiseStar,
 
-    /// Push the builtin `AssertionError` type, ignoring any shadowing
-    /// binding of that name (CPython `LOAD_ASSERTION_ERROR`, bpo-34880).
-    LoadAssertionError,
+    /// CPython 3.14 `LOAD_COMMON_CONSTANT`: push one of the interpreter's
+    /// well-known objects regardless of any shadowing binding. `arg`
+    /// indexes `_Py_CommonConstants`: 0 `AssertionError` (the `assert`
+    /// statement, bpo-34880), 1 `NotImplementedError` (PEP 649
+    /// `__annotate__` bodies), 2 `tuple`, 3 `all`, 4 `any`.
+    LoadCommonConstant,
 
     // Context managers
-    /// `with` enter: pop cm, push `__exit__` bound to cm, then push
-    /// the result of `__enter__()`.
-    BeforeWith,
+    /// CPython 3.14 `LOAD_SPECIAL`: pop `owner`, look `arg` up in the
+    /// special-method table (0 `__enter__`, 1 `__exit__`, 2 `__aenter__`,
+    /// 3 `__aexit__`) on `type(owner)`, and push `[method, owner]` in
+    /// the method-call shape (`CALL 0` then binds `owner` as `self`).
+    /// A missing method raises the 3.14 `TypeError` ("'X' object does
+    /// not support the context manager protocol (missed __exit__
+    /// method)"). Replaces 3.13's `BEFORE_WITH`/`BEFORE_ASYNC_WITH` in
+    /// the `with`/`async with` prologue, which is now `COPY 1;
+    /// LOAD_SPECIAL exit; SWAP 2; SWAP 3; LOAD_SPECIAL enter; CALL 0`.
+    LoadSpecial,
     /// `with` exception path. Stack on entry: `[__exit__, exc]`.
     /// Calls `__exit__(type(exc), exc, None)` and leaves `[exc, result]`
     /// on the stack so the compiler can branch on the result.
@@ -531,12 +628,11 @@ pub enum OpCode {
     GetAnext,
     /// `async for` cleanup: caught `StopAsyncIteration`; pop the
     /// exception and the underlying iterator. Stack on entry:
-    /// `[..., aiter, exc]`. Stack on exit: `[...]`.
+    /// `[..., aiter, exc]`. Stack on exit: `[...]`. CPython 3.14 gives
+    /// it an oparg (the backward distance to the loop's `SEND`, an
+    /// instrumentation anchor); WeavePy's `arg` is the same
+    /// instruction delta so the codec can present it.
     EndAsyncFor,
-    /// `async with` enter: pop the context manager, push its
-    /// `__aexit__` method (saved for the exit path), then push
-    /// `cm.__aenter__()` (the awaitable that yields the bound value).
-    BeforeAsyncWith,
 
     // Pattern matching (RFC 0009)
     /// Peek TOS, push True if it's a sequence (list/tuple/range).
@@ -589,18 +685,123 @@ pub enum OpCode {
     /// `PyAsyncGenWrappedValue`) so `__anext__` can tell it apart from
     /// a value passed through by an inner await's send dance.
     AsyncGenWrap,
+    /// PEP 695/696 type-parameter intrinsics (CPython
+    /// `CALL_INTRINSIC_1`, `Python/intrinsics.c`): `arg` is the
+    /// intrinsic id, one of [`intrinsic::TYPEVAR`], [`intrinsic::PARAMSPEC`],
+    /// [`intrinsic::TYPEVARTUPLE`], [`intrinsic::SUBSCRIPT_GENERIC`], or
+    /// [`intrinsic::TYPEALIAS`]. Pops one operand, pushes the result.
+    /// The other one-operand intrinsics have their own opcodes above
+    /// ([`OpCode::ImportStar`], [`OpCode::StopIterationError`], ...).
+    CallIntrinsic1,
+    /// PEP 695/696 type-parameter intrinsics taking two operands
+    /// (CPython `CALL_INTRINSIC_2`): [`intrinsic::TYPEVAR_WITH_BOUND`],
+    /// [`intrinsic::TYPEVAR_WITH_CONSTRAINTS`],
+    /// [`intrinsic::SET_FUNCTION_TYPE_PARAMS`], or
+    /// [`intrinsic::SET_TYPEPARAM_DEFAULT`]. Stack on entry:
+    /// `[value1, value2]`; pushes `intrinsic(value1, value2)`.
+    CallIntrinsic2,
 
     /// PEP 750 t-strings (`-X lang=next`, RFC 0076 WS15; CPython 3.14
     /// `BUILD_INTERPOLATION`). Builds one `string.templatelib.
     /// Interpolation`. Stack on entry: `[value, expr_text_str,
-    /// (spec_str)]` — the spec is present when `arg & 0x04` is set.
-    /// `arg & 0x03` is the conversion (0 none, 1 `s`, 2 `r`, 3 `a`),
-    /// the same encoding as `FormatValue`.
+    /// (spec_str)]` — CPython's oparg layout: the spec is present when
+    /// `arg & 1` is set, bit 1 is the always-set base (`2`), and
+    /// `arg >> 2` is the FVC_* conversion (0 none, 1 `s`, 2 `r`, 3 `a`).
     BuildInterpolation,
     /// PEP 750 t-strings (CPython 3.14 `BUILD_TEMPLATE`). Stack on
     /// entry: `[strings_tuple, interpolations_tuple]`; pushes the
     /// `string.templatelib.Template`.
     BuildTemplate,
+
+    // CPython 3.14 additions (RFC 0077 WS9)
+    /// Push the `int` `arg` (`0..=255`) directly, without a constant-pool
+    /// slot (CPython 3.14 `LOAD_SMALL_INT`). The compiler's late
+    /// `convert_small_int_consts` pass rewrites `LOAD_CONST` of such an
+    /// int to this form and prunes the pool entry (except slot 0, which
+    /// CPython keeps for the docstring rule).
+    LoadSmallInt,
+    /// Instrumentation anchor placed on the not-taken edge of a
+    /// conditional branch (CPython 3.14 `NOT_TAKEN`); a runtime no-op.
+    /// The compiler emits it only where CPython's *codegen* does (the
+    /// `async for` success path); the codec synthesizes the copies
+    /// CPython's flowgraph appends after every `POP_JUMP_IF_*`.
+    NotTaken,
+    /// Pop the exhausted iterator closing a `for` loop (CPython 3.14
+    /// `POP_ITER`). Same runtime effect as [`OpCode::PopTop`]; a
+    /// distinct opcode so `sys.monitoring` can tell loop exits from
+    /// ordinary pops.
+    PopIter,
+    /// `stop = pop; start = pop; container = pop; push
+    /// container[start:stop]` (CPython 3.12+ `BINARY_SLICE`) — the
+    /// two-element slice shape the compiler uses for non-constant
+    /// `a[x:y]`.
+    BinarySlice,
+    /// `stop = pop; start = pop; container = pop; value = pop;
+    /// container[start:stop] = value` (CPython 3.12+ `STORE_SLICE`).
+    StoreSlice,
+
+    // Flowgraph-only refinements of the fast-local and global loads.
+    // CPython's optimizer produces them as real opcodes; WeavePy's
+    // runtime keeps the plain forms (its ICs and the JIT key on
+    // `LoadFast`/`StoreFast`/`LoadGlobal`/`PushNull`), so
+    // `flowgraph::flatten` lowers each of them back to the plain
+    // instruction(s) plus a [`wire`] mark, and the codec re-derives the
+    // CPython opcode from the mark. They never reach the VM.
+    /// `LOAD_FAST` whose reference the flowgraph's `optimize_load_fast`
+    /// proved is consumed before the slot can be rebound (CPython
+    /// `LOAD_FAST_BORROW`). Lowers to `LoadFast` + [`wire::BORROW`].
+    LoadFastBorrow,
+    /// `LOAD_FAST` of a slot the flowgraph's uninitialized-locals
+    /// analysis could not prove bound on every path (CPython
+    /// `LOAD_FAST_CHECK`); never fuses into a superinstruction. Lowers
+    /// to `LoadFast` + [`wire::CHECK`].
+    LoadFastCheck,
+    /// `LOAD_GLOBAL` followed by `PUSH_NULL` (CPython's `LOAD_GLOBAL`
+    /// with the low oparg bit set). `arg` is the name index. Lowers to
+    /// `LoadGlobal` [`wire::FUSE_HEAD`] + `PushNull` [`wire::FUSE_TAIL`].
+    LoadGlobalPushNull,
+    /// `LOAD_FAST a; LOAD_FAST b` (CPython `LOAD_FAST_LOAD_FAST`):
+    /// `arg = (a << 4) | b`, both slots `< 16`. Lowers to two
+    /// `LoadFast`s marked head/tail.
+    LoadFastLoadFast,
+    /// The borrowing pair (CPython `LOAD_FAST_BORROW_LOAD_FAST_BORROW`):
+    /// head marked `FUSE_HEAD | BORROW`.
+    LoadFastBorrowLoadFastBorrow,
+    /// `LOAD_CLOSURE` (a `LOAD_FAST` of a cell slot on the CPython wire)
+    /// whose reference `optimize_load_fast` proved consumed (CPython
+    /// `LOAD_FAST_BORROW`). Lowers to `LoadClosure` + [`wire::BORROW`].
+    LoadClosureBorrow,
+    /// `STORE_FAST a; LOAD_FAST b` (CPython `STORE_FAST_LOAD_FAST`).
+    StoreFastLoadFast,
+    /// `STORE_FAST a; STORE_FAST b` (CPython `STORE_FAST_STORE_FAST`).
+    StoreFastStoreFast,
+
+    // Flowgraph pseudo-ops (CPython `pycore_opcode_metadata.h`
+    // `IS_PSEUDO_INSTR`). They exist only inside the flowgraph
+    // optimizer between construction and flattening; the VM never
+    // sees them.
+    /// Direction-agnostic unconditional jump that polls the eval
+    /// breaker (`JUMP`); flattens to `JumpForward` / `JumpBackward`.
+    Jump,
+    /// `JUMP_NO_INTERRUPT`: flattens to `JumpForward` or a
+    /// `JumpBackward` recorded in [`crate::CodeObject::no_interrupt_jumps`].
+    JumpNoInterrupt,
+    /// `JUMP_IF_FALSE`: peek-and-branch; `convert_pseudo_conditional_jumps`
+    /// expands it to `COPY 1; TO_BOOL; POP_JUMP_IF_FALSE`.
+    JumpIfFalse,
+    /// `JUMP_IF_TRUE`, likewise.
+    JumpIfTrue,
+    /// `SETUP_FINALLY`: pushes an exception handler (the target).
+    SetupFinally,
+    /// `SETUP_CLEANUP`: pushes a `lasti` handler.
+    SetupCleanup,
+    /// `SETUP_WITH`: pushes a `lasti` handler at depth +1.
+    SetupWith,
+    /// `POP_BLOCK`: pops the innermost handler.
+    PopBlock,
+    /// `STORE_FAST_MAYBE_NULL`: a store that may write `NULL` (the
+    /// inlined-comprehension restore); becomes `STORE_FAST`.
+    StoreFastMaybeNull,
 }
 
 impl OpCode {
@@ -664,6 +865,7 @@ impl OpCode {
             OpCode::ListExtend => "LIST_EXTEND",
             OpCode::ListToTuple => "LIST_TO_TUPLE",
             OpCode::SetAdd => "SET_ADD",
+            OpCode::SetUpdate => "SET_UPDATE",
             OpCode::MapAdd => "MAP_ADD",
             OpCode::UnpackSequence => "UNPACK_SEQUENCE",
             OpCode::UnpackEx => "UNPACK_EX",
@@ -673,18 +875,18 @@ impl OpCode {
             OpCode::SetFunctionAttribute => "SET_FUNCTION_ATTRIBUTE",
             OpCode::BuildSlice => "BUILD_SLICE",
             OpCode::LoadBuildClass => "LOAD_BUILD_CLASS",
-            OpCode::LoadClassderef => "LOAD_CLASSDEREF",
+            OpCode::LoadLocals => "LOAD_LOCALS",
             OpCode::LoadClassdictOrDeref => "LOAD_FROM_DICT_OR_DEREF",
             OpCode::LoadClassdictOrGlobal => "LOAD_FROM_DICT_OR_GLOBALS",
             OpCode::RaiseVarargs => "RAISE_VARARGS",
             OpCode::CheckExcMatch => "CHECK_EXC_MATCH",
             OpCode::CheckEGMatch => "CHECK_EG_MATCH",
             OpCode::PrepReraiseStar => "PREP_RERAISE_STAR",
-            OpCode::LoadAssertionError => "LOAD_ASSERTION_ERROR",
+            OpCode::LoadCommonConstant => "LOAD_COMMON_CONSTANT",
             OpCode::PushExcInfo => "PUSH_EXC_INFO",
             OpCode::PopExcept => "POP_EXCEPT",
             OpCode::Reraise => "RERAISE",
-            OpCode::BeforeWith => "BEFORE_WITH",
+            OpCode::LoadSpecial => "LOAD_SPECIAL",
             OpCode::WithExceptStart => "WITH_EXCEPT_START",
             OpCode::ImportName => "IMPORT_NAME",
             OpCode::ImportFrom => "IMPORT_FROM",
@@ -701,7 +903,6 @@ impl OpCode {
             OpCode::GetAiter => "GET_AITER",
             OpCode::GetAnext => "GET_ANEXT",
             OpCode::EndAsyncFor => "END_ASYNC_FOR",
-            OpCode::BeforeAsyncWith => "BEFORE_ASYNC_WITH",
             OpCode::MatchSequence => "MATCH_SEQUENCE",
             OpCode::MatchMapping => "MATCH_MAPPING",
             OpCode::MatchClass => "MATCH_CLASS",
@@ -712,8 +913,32 @@ impl OpCode {
             OpCode::CleanupThrow => "CLEANUP_THROW",
             OpCode::StopIterationError => "CALL_INTRINSIC_1",
             OpCode::AsyncGenWrap => "CALL_INTRINSIC_1",
+            OpCode::CallIntrinsic1 => "CALL_INTRINSIC_1",
+            OpCode::CallIntrinsic2 => "CALL_INTRINSIC_2",
             OpCode::BuildInterpolation => "BUILD_INTERPOLATION",
             OpCode::BuildTemplate => "BUILD_TEMPLATE",
+            OpCode::LoadSmallInt => "LOAD_SMALL_INT",
+            OpCode::LoadFastCheck => "LOAD_FAST_CHECK",
+            OpCode::LoadGlobalPushNull => "LOAD_GLOBAL",
+            OpCode::LoadFastBorrow => "LOAD_FAST_BORROW",
+            OpCode::LoadClosureBorrow => "LOAD_FAST_BORROW",
+            OpCode::LoadFastLoadFast => "LOAD_FAST_LOAD_FAST",
+            OpCode::LoadFastBorrowLoadFastBorrow => "LOAD_FAST_BORROW_LOAD_FAST_BORROW",
+            OpCode::StoreFastLoadFast => "STORE_FAST_LOAD_FAST",
+            OpCode::StoreFastStoreFast => "STORE_FAST_STORE_FAST",
+            OpCode::Jump => "JUMP",
+            OpCode::JumpNoInterrupt => "JUMP_NO_INTERRUPT",
+            OpCode::JumpIfFalse => "JUMP_IF_FALSE",
+            OpCode::JumpIfTrue => "JUMP_IF_TRUE",
+            OpCode::SetupFinally => "SETUP_FINALLY",
+            OpCode::SetupCleanup => "SETUP_CLEANUP",
+            OpCode::SetupWith => "SETUP_WITH",
+            OpCode::PopBlock => "POP_BLOCK",
+            OpCode::StoreFastMaybeNull => "STORE_FAST_MAYBE_NULL",
+            OpCode::NotTaken => "NOT_TAKEN",
+            OpCode::PopIter => "POP_ITER",
+            OpCode::BinarySlice => "BINARY_SLICE",
+            OpCode::StoreSlice => "STORE_SLICE",
         }
     }
 }

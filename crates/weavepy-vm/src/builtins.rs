@@ -3446,6 +3446,109 @@ pub(crate) fn reentrant_call(callable: &Object, args: &[Object]) -> Result<Objec
     interp.call_object_with_globals(callable, args, &[], &globals)
 }
 
+/// PEP 649 (RFC 0077 WS10) — the annotate-call core shared by the
+/// module and type getters: a callable `annotate` is invoked with
+/// `Format.VALUE` (1) and must return a dict; anything else yields a
+/// fresh empty dict (CPython's `module_get_annotations` /
+/// `type_get_annotations` `else` branches).
+pub(crate) fn call_annotate_value(annotate: Option<&Object>) -> Result<Object, RuntimeError> {
+    match annotate {
+        Some(a) if object_is_callable(a) => {
+            let result = reentrant_call(a, &[Object::Int(1)])?;
+            if !matches!(result, Object::Dict(_)) {
+                return Err(type_error(format!(
+                    "__annotate__ returned non-dict of type '{}'",
+                    result.type_name()
+                )));
+            }
+            Ok(result)
+        }
+        _ => Ok(Object::new_dict()),
+    }
+}
+
+/// CPython `_PyModuleSpec_IsInitializing`: `__spec__._initializing` is
+/// truthy while the import system is still executing the module body.
+fn module_spec_is_initializing(dict: &Rc<RefCell<DictData>>) -> bool {
+    let spec = dict
+        .borrow()
+        .get(&crate::object::StrKey("__spec__"))
+        .cloned();
+    let Some(spec) = spec else {
+        return false;
+    };
+    if matches!(spec, Object::None) {
+        return false;
+    }
+    let ptr = crate::vm_singletons::current_interpreter_ptr();
+    let Some(ptr) = ptr else {
+        return false;
+    };
+    // SAFETY: the pointer was published by an enclosing VM frame still
+    // live on this thread; the GIL keeps the access exclusive.
+    let interp = unsafe { &mut *ptr };
+    match interp.load_attr_public(&spec, "_initializing") {
+        Ok(v) => interp.op_truth(&v).unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+/// CPython `module_get_annotations` over a module namespace dict: a
+/// stored `__annotations__` wins; otherwise a callable `__annotate__`
+/// supplies the dict (cached unless the module is still initializing,
+/// so a partially executed module reports the annotations seen so far
+/// without freezing them); otherwise an empty dict is created and
+/// cached.
+pub(crate) fn module_annotations_get_dict(
+    dict: &Rc<RefCell<DictData>>,
+) -> Result<Object, RuntimeError> {
+    if let Some(v) = dict.borrow().get(&crate::object::StrKey("__annotations__")) {
+        return Ok(v.clone());
+    }
+    let is_initializing = module_spec_is_initializing(dict);
+    let annotate = dict
+        .borrow()
+        .get(&crate::object::StrKey("__annotate__"))
+        .cloned();
+    let annotations = call_annotate_value(annotate.as_ref())?;
+    if !is_initializing {
+        dict.borrow_mut().insert(
+            DictKey(Object::from_static("__annotations__")),
+            annotations.clone(),
+        );
+    }
+    Ok(annotations)
+}
+
+/// CPython `module_get_annotate`: a missing `__annotate__` is stored as
+/// `None` on first read.
+pub(crate) fn module_annotate_get_dict(dict: &Rc<RefCell<DictData>>) -> Object {
+    if let Some(v) = dict.borrow().get(&crate::object::StrKey("__annotate__")) {
+        return v.clone();
+    }
+    dict.borrow_mut()
+        .insert(DictKey(Object::from_static("__annotate__")), Object::None);
+    Object::None
+}
+
+/// CPython `module_set_annotate`: `None` or a callable; a callable
+/// drops any cached `__annotations__`.
+pub(crate) fn module_annotate_set_dict(
+    dict: &Rc<RefCell<DictData>>,
+    value: Object,
+) -> Result<(), RuntimeError> {
+    let is_none = matches!(value, Object::None);
+    if !is_none && !object_is_callable(&value) {
+        return Err(type_error("__annotate__ must be callable or None"));
+    }
+    let mut d = dict.borrow_mut();
+    d.insert(DictKey(Object::from_static("__annotate__")), value);
+    if !is_none {
+        d.shift_remove(&DictKey(Object::from_static("__annotations__")));
+    }
+    Ok(())
+}
+
 fn property_self(args: &[Object], op: &str) -> Result<Rc<crate::object::PyProperty>, RuntimeError> {
     args.first()
         .and_then(property_payload)
@@ -4022,7 +4125,11 @@ pub(crate) fn code_synthetic_attr(
         // CPython-3.13 wire view (RFC 0033). Computed on demand; a raw
         // override pinned by `CodeType(...)`/`replace()` (RFC 0060) wins
         // so constructor/replace round-trips are byte-exact.
-        "co_code" => Some(Object::Bytes(
+        // `_co_code_adaptive` is CPython's quickened stream; WeavePy
+        // specializes out of band, so `dis` sees the canonical bytes
+        // (its `_get_code_array(adaptive=True)` path then finds no
+        // executors and shows the same listing).
+        "co_code" | "_co_code_adaptive" => Some(Object::Bytes(
             match c.wire.as_ref().and_then(|w| w.co_code.as_deref()) {
                 Some(b) => Rc::from(b.to_vec()),
                 None => Rc::from(c.to_cpython().co_code.clone()),
@@ -4238,6 +4345,9 @@ fn code_replace(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
                 nc.is_coroutine = flags & 0x0080 != 0;
                 nc.is_iterable_coroutine = flags & 0x0100 != 0;
                 nc.is_async_generator = flags & 0x0200 != 0;
+                nc.has_docstring = flags & 0x0400_0000 != 0;
+                nc.is_method = flags & 0x0800_0000 != 0;
+                nc.is_nested = flags & 0x0010 != 0;
             }
             "co_consts" => {
                 let items: Vec<Object> = match v {
@@ -4377,6 +4487,9 @@ pub fn foreign_code_object(
         is_coroutine: flags & CO_COROUTINE != 0,
         is_iterable_coroutine: flags & CO_ITERABLE_COROUTINE != 0,
         is_async_generator: flags & CO_ASYNC_GENERATOR != 0,
+        has_docstring: flags & 0x0400_0000 != 0,
+        is_method: flags & 0x0800_0000 != 0,
+        is_nested: flags & 0x0010 != 0,
         ..Default::default()
     };
     nc.linetable = vec![firstlineno.max(1)];
@@ -4572,6 +4685,9 @@ pub(crate) fn code_type_call(
         is_coroutine: flags & CO_COROUTINE != 0,
         is_iterable_coroutine: flags & CO_ITERABLE_COROUTINE != 0,
         is_async_generator: flags & CO_ASYNC_GENERATOR != 0,
+        has_docstring: flags & 0x0400_0000 != 0,
+        is_method: flags & 0x0800_0000 != 0,
+        is_nested: flags & 0x0010 != 0,
         future_flags: flags & weavepy_compiler::flags::PYCF_MASK,
         ..Default::default()
     };
@@ -4828,12 +4944,14 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-/// Return the docstring extracted from a code object, if its first
-/// constant is a string literal — CPython's `__doc__` convention.
-/// The compiler keeps the leading bare string expression as
-/// ``constants[0]``; functions / modules / classes pick it up at
-/// runtime via this helper.
+/// Return a function code object's docstring: CPython 3.14's
+/// `func_get_doc` reads `co_consts[0]` only when `CO_HAS_DOCSTRING` is
+/// set, and only when that constant is a `str` (`code.replace(
+/// co_consts=(1,))` on a documented function yields `__doc__ = None`).
 pub(crate) fn code_docstring(c: &weavepy_compiler::CodeObject) -> Option<Object> {
+    if !c.has_docstring {
+        return None;
+    }
     match c.constants.first() {
         Some(weavepy_compiler::Constant::Str(s)) => Some(DOCSTRING_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
@@ -4858,59 +4976,10 @@ pub(crate) fn code_docstring(c: &weavepy_compiler::CodeObject) -> Option<Object>
     }
 }
 
-/// Compose CPython-shaped `co_flags` for a [`weavepy_compiler::CodeObject`].
-/// We carry the same flag bits CPython does for the cases the
-/// introspection ecosystem checks for: vararg / kwarg presence,
-/// generator / coroutine / async-generator status, and the implicit
-/// `OPTIMIZED | NEWLOCALS` pair every function frame uses.
+/// CPython-shaped `co_flags` for a [`weavepy_compiler::CodeObject`]
+/// (`CodeObject::co_flags`, CPython's `compute_code_flags`).
 pub fn code_flags(c: &weavepy_compiler::CodeObject) -> u32 {
-    const CO_OPTIMIZED: u32 = 0x0001;
-    const CO_NEWLOCALS: u32 = 0x0002;
-    const CO_VARARGS: u32 = 0x0004;
-    const CO_VARKEYWORDS: u32 = 0x0008;
-    const CO_NESTED: u32 = 0x0010;
-    const CO_GENERATOR: u32 = 0x0020;
-    const CO_COROUTINE: u32 = 0x0080;
-    const CO_ITERABLE_COROUTINE: u32 = 0x0100;
-    const CO_ASYNC_GENERATOR: u32 = 0x0200;
-    // Only *function* scopes are OPTIMIZED|NEWLOCALS (fast locals +
-    // fresh namespace). Module and class bodies run over a mapping and
-    // report 0x0, as CPython's compiler_enter_scope sets them
-    // (test_dis's code_info asserts `Flags: 0x0` on compiled source).
-    let mut f = if c.is_class_body || c.name == "<module>" {
-        0
-    } else {
-        CO_OPTIMIZED | CO_NEWLOCALS
-    };
-    // CO_NESTED marks code compiled inside a function scope. The
-    // qualname records exactly that nesting ("outer.<locals>.inner",
-    // PEP 3155), so it is the compile-time signal we retained.
-    // (CPython 3.13 no longer sets CO_NOFREE — the 0x40 bit is dead.)
-    if c.qualname.contains("<locals>.") {
-        f |= CO_NESTED;
-    }
-    if c.has_varargs {
-        f |= CO_VARARGS;
-    }
-    if c.has_varkeywords {
-        f |= CO_VARKEYWORDS;
-    }
-    if c.is_generator {
-        f |= CO_GENERATOR;
-    }
-    if c.is_coroutine {
-        f |= CO_COROUTINE;
-    }
-    if c.is_iterable_coroutine {
-        f |= CO_ITERABLE_COROUTINE;
-    }
-    if c.is_async_generator {
-        f |= CO_ASYNC_GENERATOR;
-    }
-    // `CO_FUTURE_*` bits recorded at compile time (RFC 0052) — what
-    // lets `compile(..., dont_inherit=False)` inherit the caller's
-    // future statements, like CPython.
-    f | c.future_flags
+    c.co_flags()
 }
 
 fn attr_set(obj: &Object, name: &str, value: Object) -> Result<(), RuntimeError> {
@@ -8739,6 +8808,7 @@ const CODE_ATTR_NAMES: &[&str] = &[
     "co_varnames",
     "replace",
     "_varname_from_oparg",
+    "_co_code_adaptive",
 ];
 
 /// `dir(obj)` — return a sorted list of names available on *obj*.
@@ -9209,16 +9279,6 @@ fn b_input_unsupported(_args: &[Object]) -> Result<Object, RuntimeError> {
     Err(runtime_error("input() must be called through the VM"))
 }
 
-/// Placeholder for the PEP 695 `__weavepy_*__` intrinsics; the VM
-/// intercepts them (they need interpreter state to import `_typing`
-/// and mint type parameters), so reaching this body means the
-/// dispatcher missed one.
-fn b_type_alias_unsupported(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(runtime_error(
-        "PEP 695 intrinsics must be called through the VM",
-    ))
-}
-
 /// `__weavepy_pep604_union__(a, b)` — build the native PEP 604 union
 /// object from Python. `_typing.TypeAliasType.__or__` uses this to
 /// mirror CPython's `_Py_union_type_or` slot (a `types.UnionType`
@@ -9265,28 +9325,6 @@ pub fn vm_intrinsic(name: &str) -> Option<Object> {
             "__weavepy_pep604_union__",
             b_pep604_union,
         );
-        // PEP 695 intrinsics (RFC 0051): VM-intercepted via the `__vm:`
-        // name prefix (they need interpreter access to import the frozen
-        // `_typing` module); see `Interpreter::do_typing_intrinsic`.
-        for (public, vm_name) in [
-            ("__weavepy_type_alias__", "__vm:type_alias"),
-            ("__weavepy_typevar__", "__vm:typevar"),
-            ("__weavepy_typevar_with_bound__", "__vm:typevar_with_bound"),
-            (
-                "__weavepy_typevar_with_constraints__",
-                "__vm:typevar_with_constraints",
-            ),
-            ("__weavepy_paramspec__", "__vm:paramspec"),
-            ("__weavepy_typevartuple__", "__vm:typevartuple"),
-            ("__weavepy_typeparam_default__", "__vm:typeparam_default"),
-            (
-                "__weavepy_typeparam_default_starred__",
-                "__vm:typeparam_default_starred",
-            ),
-            ("__weavepy_generic_base__", "__vm:generic_base"),
-        ] {
-            put(public, vm_name, b_type_alias_unsupported);
-        }
         t
     }
     thread_local! {

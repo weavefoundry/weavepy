@@ -72,7 +72,7 @@
 //! generation than it strictly has to).
 
 use crate::sync::RefCell;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::object::Object;
@@ -172,6 +172,51 @@ pub struct TrackedHandle {
     /// re-tracked object gets a *fresh* handle, so a set flag
     /// definitively means "this handle is dead".
     pub untracked: AtomicBool,
+    /// RFC 0077 (WS2): set while this finalizable-index entry is *cold*:
+    /// its strong count sat more than [`FIN_COLD_MARGIN`] above the
+    /// dead line at the last probe, so it can't die at a single drop
+    /// safe point without a cascade that frees many holders at once.
+    /// Cold entries are re-probed every [`FIN_COLD_STRIDE`]-th scan
+    /// instead of every one; the ABC machinery alone keeps dozens of
+    /// weakref-callback-enrolled classes live for the process lifetime,
+    /// and probing them at every reference-dropping opcode was a
+    /// first-order interpreter cost. Only meaningful for handles in the
+    /// finalizable index.
+    pub fin_cold: AtomicBool,
+    /// Position in `GcState::finalizable_hot` while hot (RFC 0077 WS2);
+    /// only valid under that vector's lock, fixed up on swap-remove
+    /// exactly like [`Self::slot`].
+    pub fin_hot_slot: AtomicUsize,
+    /// Strong count seen at the previous hot probe and the number of
+    /// consecutive probes it has held (RFC 0077 WS2); a count unchanged
+    /// for [`FIN_STABLE_PROBES`] probes demotes the entry to cold.
+    pub fin_last_sc: AtomicUsize,
+    pub fin_stable: AtomicU8,
+}
+
+/// RFC 0077 (WS2): a finalizable entry whose strong count exceeds the
+/// dead line (`1 + weak clones`) by more than this many references
+/// goes cold. Sixteen references dying between two consecutive drop
+/// safe points takes a cascade, and the cold stride bounds even that
+/// case's latency.
+const FIN_COLD_MARGIN: usize = 16;
+/// Cold finalizable entries are re-probed on every N-th scan.
+const FIN_COLD_STRIDE: u64 = 32;
+/// A hot entry whose strong count is unchanged across this many
+/// consecutive probes goes cold regardless of the margin. The margin
+/// alone left deltablue's one finalizable (a callback-weakref'd class,
+/// three references above its dead line for the whole run) hot for
+/// 2.6M probes; a fixed set of holders is the signature of a long-lived
+/// object, and the cold stride still finds its eventual death within
+/// `FIN_COLD_STRIDE` drop safe points — the direct paths
+/// (`prompt_reap_dropped` and the cascade) catch the common shapes
+/// sooner regardless.
+const FIN_STABLE_PROBES: u8 = 64;
+
+/// `WEAVEPY_NO_FIN_COLD=1` pins every finalizable entry hot (bisection).
+fn fin_no_cold() -> bool {
+    static NO_FIN_COLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NO_FIN_COLD.get_or_init(|| std::env::var_os("WEAVEPY_NO_FIN_COLD").is_some())
 }
 
 #[allow(non_upper_case_globals)]
@@ -195,6 +240,10 @@ impl TrackedHandle {
             finalize_queued: AtomicBool::new(false),
             weak_clones: AtomicUsize::new(0),
             untracked: AtomicBool::new(false),
+            fin_cold: AtomicBool::new(false),
+            fin_hot_slot: AtomicUsize::new(usize::MAX),
+            fin_last_sc: AtomicUsize::new(0),
+            fin_stable: AtomicU8::new(0),
         }
     }
 }
@@ -338,6 +387,20 @@ pub struct GcState {
     /// a window scan, keeping the steady-state per-opcode cost a counter
     /// bump instead of 256 atomic strong-count loads.
     fin_scan_tick: std::sync::atomic::AtomicU64,
+    /// RFC 0077 (WS2): the *hot* (not `fin_cold`) subset of
+    /// [`Self::finalizable`], so the per-drop scan walks only entries
+    /// that could plausibly die this safe point. Membership is mirrored
+    /// by each handle's `fin_cold` flag and `fin_hot_slot` index.
+    finalizable_hot: RefCell<Vec<Arc<TrackedHandle>>>,
+    /// `finalizable_hot.len()`, published for the lock-free gate: when
+    /// zero, a scan that isn't on the cold stride returns without
+    /// borrowing anything — the steady state of a program whose
+    /// finalizables are all long-lived classes.
+    fin_hot_count: AtomicUsize,
+    /// Rotating index into `finalizable_hot` for over-budget hot scans.
+    fin_hot_cursor: AtomicUsize,
+    /// Scan counter for the cold stride (RFC 0077 WS2).
+    fin_cold_tick: std::sync::atomic::AtomicU64,
 }
 
 impl Default for GcState {
@@ -412,7 +475,89 @@ impl GcState {
             finalizable_count: AtomicUsize::new(0),
             fin_scan_cursor: std::sync::atomic::AtomicU64::new(0),
             fin_scan_tick: std::sync::atomic::AtomicU64::new(0),
+            finalizable_hot: RefCell::new(Vec::new()),
+            fin_hot_count: AtomicUsize::new(0),
+            fin_hot_cursor: AtomicUsize::new(0),
+            fin_cold_tick: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Insert `h` into the finalizable index (RFC 0077 WS2: one place
+    /// for the population and hot-set bookkeeping). New entries start
+    /// hot; the next scan grades them. Returns whether it was new.
+    fn fin_insert(&self, id: ObjectId, h: Arc<TrackedHandle>) -> bool {
+        let mut fin = self.finalizable.borrow_mut();
+        if fin.contains_key(&id) {
+            return false;
+        }
+        fin.insert(id, h.clone());
+        drop(fin);
+        self.fin_make_hot(&h);
+        if self.finalizable_count.fetch_add(1, Ordering::AcqRel) == 0 {
+            // RFC 0065 (WS1): 0→1 population transition — kick
+            // dispatch loops off the quiet path.
+            crate::hot_gates::bump_loop_gen();
+        }
+        true
+    }
+
+    /// Remove `id` from the finalizable index, if present, keeping the
+    /// population and hot set exact.
+    fn fin_remove(&self, id: ObjectId) -> bool {
+        let removed = self.finalizable.borrow_mut().remove(&id);
+        let Some(h) = removed else {
+            return false;
+        };
+        self.fin_remove_bookkeeping(&h);
+        true
+    }
+
+    /// The hot-set and population half of [`Self::fin_remove`], for the
+    /// one caller that already holds the finalizable lock.
+    fn fin_remove_bookkeeping(&self, h: &Arc<TrackedHandle>) {
+        self.fin_make_cold(h);
+        if self.finalizable_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // RFC 0065 (WS1): population reached zero — dispatch loops
+            // may re-enter the quiet path.
+            crate::hot_gates::bump_loop_gen();
+        }
+    }
+
+    /// Move `h` into the hot set (no-op if already hot).
+    fn fin_make_hot(&self, h: &Arc<TrackedHandle>) {
+        let mut hot = self.finalizable_hot.borrow_mut();
+        if !h.fin_cold.swap(false, Ordering::AcqRel)
+            && h.fin_hot_slot.load(Ordering::Relaxed) != usize::MAX
+        {
+            return;
+        }
+        h.fin_hot_slot.store(hot.len(), Ordering::Relaxed);
+        h.fin_stable.store(0, Ordering::Relaxed);
+        hot.push(h.clone());
+        self.fin_hot_count.store(hot.len(), Ordering::Release);
+    }
+
+    /// Move `h` out of the hot set (no-op if already cold). O(1) via
+    /// the handle's cached slot, with the swap-remove fixup.
+    fn fin_make_cold(&self, h: &Arc<TrackedHandle>) {
+        let mut hot = self.finalizable_hot.borrow_mut();
+        h.fin_cold.store(true, Ordering::Release);
+        let slot = h.fin_hot_slot.swap(usize::MAX, Ordering::AcqRel);
+        if slot == usize::MAX {
+            return;
+        }
+        if slot < hot.len() && Arc::ptr_eq(&hot[slot], h) {
+            hot.swap_remove(slot);
+            if let Some(moved) = hot.get(slot) {
+                moved.fin_hot_slot.store(slot, Ordering::Relaxed);
+            }
+        } else if let Some(pos) = hot.iter().position(|x| Arc::ptr_eq(x, h)) {
+            hot.swap_remove(pos);
+            if let Some(moved) = hot.get(pos) {
+                moved.fin_hot_slot.store(pos, Ordering::Relaxed);
+            }
+        }
+        self.fin_hot_count.store(hot.len(), Ordering::Release);
     }
 
     /// Reinitialise the collector's locks in a `fork(2)` child, preserving the
@@ -450,6 +595,7 @@ impl GcState {
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).stats));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).finalized_ids));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).finalizable));
+            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).finalizable_hot));
             // A peer may have vanished mid-collection with this set.
             (*this).collecting.store(false, Ordering::Release);
         }
@@ -509,14 +655,7 @@ impl GcState {
                     crate::weakref_registry::strong_clone_count(new_id),
                     Ordering::Release,
                 );
-                let mut fin = self.finalizable.borrow_mut();
-                if fin.insert(new_id, handle.clone()).is_none()
-                    && self.finalizable_count.fetch_add(1, Ordering::AcqRel) == 0
-                {
-                    // RFC 0065 (WS1): 0→1 population transition — kick
-                    // dispatch loops off the quiet path.
-                    crate::hot_gates::bump_loop_gen();
-                }
+                self.fin_insert(new_id, handle.clone());
             }
             let mut gens = self.generations.borrow_mut();
             handle.slot.store(gens[0].handles.len(), Ordering::Release);
@@ -569,13 +708,7 @@ impl GcState {
         }
         // Drop the finalizable-index entry in lock-step with the main index so
         // the cheap prompt-finalization scan never sees a reclaimed object.
-        if self.finalizable.borrow_mut().remove(&id).is_some()
-            && self.finalizable_count.fetch_sub(1, Ordering::AcqRel) == 1
-        {
-            // RFC 0065 (WS1): population reached zero — dispatch loops
-            // may re-enter the quiet path.
-            crate::hot_gates::bump_loop_gen();
-        }
+        self.fin_remove(id);
         // O(1) removal via the handle's cached `slot`. The index is the
         // dedupe authority, so exactly one handle existed for `id`, and
         // its `slot`/`generation`/`color` pinpoint its position without a
@@ -690,7 +823,7 @@ impl GcState {
                     None => false,
                 };
                 if still_dead {
-                    if std::env::var_os("WEAVEPY_REAP_TRACE").is_some() {
+                    if crate::hot_gates::env_flags::reap_trace() {
                         if let Some(h) = self.index.borrow().get(&id) {
                             eprintln!("[ACYCLIC-REAP] {}", h.object.type_name_owned());
                         }
@@ -727,12 +860,10 @@ impl GcState {
             // fast-path filter (see `TrackedHandle::weak_clones`).
             let clones = crate::weakref_registry::strong_clone_count(id);
             h.weak_clones.store(clones, Ordering::Release);
-            let mut fin = self.finalizable.borrow_mut();
-            if fin.insert(id, h).is_none()
-                && self.finalizable_count.fetch_add(1, Ordering::AcqRel) == 0
-            {
-                // RFC 0065 (WS1): 0→1 population transition.
-                crate::hot_gates::bump_loop_gen();
+            // A fresh callback-weakref means somebody expects prompt
+            // notification: re-grade an already-enrolled cold entry.
+            if !self.fin_insert(id, h.clone()) {
+                self.fin_make_hot(&h);
             }
         }
     }
@@ -767,6 +898,21 @@ impl GcState {
     /// the finalizable index, which holds just the `__del__`/callback-weakref
     /// objects (typically a handful).
     pub fn reap_dead_finalizable(&self) -> usize {
+        // RFC 0077 (WS2): the hot/cold gate runs *before* the claim below.
+        // With every finalizable cold (the steady state: the ABC
+        // machinery's callback-weakref'd type, a long-lived `__del__`
+        // object) and no cold tick due, the whole scan is two relaxed
+        // loads and a counter bump, not a CAS on the shared claim word.
+        // `WEAVEPY_NO_FIN_COLD=1` pins every entry hot for bisection.
+        let cold_tick = fin_no_cold()
+            || take_force_cold_tick()
+            || self
+                .fin_cold_tick
+                .fetch_add(1, Ordering::Relaxed)
+                .is_multiple_of(FIN_COLD_STRIDE);
+        if !cold_tick && self.fin_hot_count.load(Ordering::Relaxed) == 0 {
+            return 0;
+        }
         // Atomic claim (see `collect_impl`): the untrack path below mutates
         // the shared index/generations, which must not overlap a
         // collection's mark walk on another thread.
@@ -777,14 +923,14 @@ impl GcState {
         {
             return 0;
         }
-        let n = self.reap_dead_finalizable_locked();
+        let n = self.reap_dead_finalizable_locked(cold_tick);
         self.collecting.store(false, Ordering::Release);
         n
     }
 
     /// [`Self::reap_dead_finalizable`] body, called with the `collecting`
     /// claim held.
-    fn reap_dead_finalizable_locked(&self) -> usize {
+    fn reap_dead_finalizable_locked(&self, cold_tick: bool) -> usize {
         // Borrow-only scan: collect just the dead handles. The common case —
         // all finalizables still reachable — allocates nothing (an empty
         // `Vec::new()` doesn't heap-allocate) and pays only a cheap
@@ -805,74 +951,182 @@ impl GcState {
         /// window per drop opcode dominates the run; deaths are batched,
         /// so probing less often loses nothing but a little latency.
         const FIN_SCAN_STRIDE: u64 = 8;
-        if self.finalizable.borrow().len() > FIN_SCAN_BUDGET {
+        // RFC 0077 (WS2): the hot/cold gate (decided by the caller, see
+        // `reap_dead_finalizable`). Cold entries — strong count far above
+        // the dead line, or unchanged across `FIN_STABLE_PROBES`
+        // consecutive probes — are re-probed only on the cold stride.
+        let no_cold = fin_no_cold();
+        // The over-budget stride applies to whichever population this
+        // scan walks: the hot set on an ordinary scan, the whole index
+        // on a cold tick.
+        let walk_len = if cold_tick {
+            self.finalizable.borrow().len()
+        } else {
+            self.fin_hot_count.load(Ordering::Relaxed)
+        };
+        if walk_len > FIN_SCAN_BUDGET {
             let tick = self.fin_scan_tick.fetch_add(1, Ordering::Relaxed);
             if !tick.is_multiple_of(FIN_SCAN_STRIDE) {
                 return 0;
             }
         }
-        let dead: Vec<Arc<TrackedHandle>> = {
-            let fin = self.finalizable.borrow();
-            let mut out: Vec<Arc<TrackedHandle>> = Vec::new();
-            let mut check = |h: &Arc<TrackedHandle>| {
-                let sc = strong_count_for(&h.object);
-                let cached = h.weak_clones.load(Ordering::Acquire);
-                if fin_trace {
-                    let tn = h.object.type_name_owned();
-                    if tn.contains("Transport") || tn.contains("SSLContext") || tn == "SSLProtocol"
-                    {
-                        eprintln!(
-                            "[FIN-SCAN] {tn} sc={sc} cached={cached} clones={}",
-                            crate::weakref_registry::strong_clone_count(h.id)
-                        );
-                    }
+        floor_stats::bump(&floor_stats::FIN_SCANS, 1);
+        let mut probed = 0u64;
+        /// Outcome of one probe: keep hot, go cold, or dead.
+        enum Grade {
+            Hot,
+            Cold,
+        }
+        let mut out: Vec<Arc<TrackedHandle>> = Vec::new();
+        let mut probe = |h: &Arc<TrackedHandle>, out: &mut Vec<Arc<TrackedHandle>>| -> Grade {
+            probed += 1;
+            let sc = strong_count_for(&h.object);
+            let cached = h.weak_clones.load(Ordering::Acquire);
+            if fin_trace {
+                let tn = h.object.type_name_owned();
+                if tn.contains("Transport") || tn.contains("SSLContext") || tn == "SSLProtocol" {
+                    eprintln!(
+                        "[FIN-SCAN] {tn} sc={sc} cached={cached} clones={}",
+                        crate::weakref_registry::strong_clone_count(h.id)
+                    );
                 }
-                // Fast reject: more strong refs than our handle plus all of its
-                // (cached, upper-bound) weakref clones ⇒ a program reference is
-                // still live. Skip without touching the registry.
-                if sc > 1 + cached {
-                    return;
-                }
-                // Borderline: compute the exact live clone count and test for
-                // an effective program refcount of zero.
-                let clones = crate::weakref_registry::strong_clone_count(h.id);
-                // Refresh the cached bound with the exact value. A cleared or
-                // died weakref leaves the cache stale-high, and a stale-high
-                // bound keeps a live object "borderline" — paying this
-                // registry lookup again at *every* reference-dropping safe
-                // point. This scan runs per drop opcode while any finalizable
-                // is live, so a single stale entry costs a whole test run
-                // (statistics.kde's hot sum-loop spent ~40% of its time
-                // here). New weakrefs refresh the cache upward via
-                // `note_weakref_finalizable`, so tightening it is safe.
-                h.weak_clones.store(clones, Ordering::Release);
-                if sc.saturating_sub(1).saturating_sub(clones) == 0 {
-                    out.push(h.clone());
-                }
-            };
-            if fin.len() <= FIN_SCAN_BUDGET {
-                for h in fin.values() {
-                    check(h);
-                }
-            } else {
-                let start = self.fin_scan_cursor.load(Ordering::Relaxed);
-                let mut next_cursor = start;
-                for (scanned, (id, h)) in fin.range(start..).chain(fin.range(..start)).enumerate() {
-                    if scanned == FIN_SCAN_BUDGET {
-                        next_cursor = *id;
-                        break;
-                    }
-                    check(h);
-                }
-                // budget < len guarantees the break above ran and set the
-                // resume point to the first unscanned id.
-                self.fin_scan_cursor.store(next_cursor, Ordering::Relaxed);
             }
-            out
+            // Fast reject: more strong refs than our handle plus all of its
+            // (cached, upper-bound) weakref clones ⇒ a program reference is
+            // still live. Skip without touching the registry. Far above the
+            // dead line grades cold; so does a count that hasn't moved in
+            // `FIN_STABLE_PROBES` consecutive probes (a long-lived object
+            // with a fixed set of holders — the shape that otherwise pays
+            // a probe at every drop safe point for the process lifetime).
+            // Near the dead line and changing stays hot.
+            if sc > 1 + cached {
+                if no_cold {
+                    return Grade::Hot;
+                }
+                if sc > 1 + cached + FIN_COLD_MARGIN {
+                    return Grade::Cold;
+                }
+                // Already cold and still above the dead line: stay cold.
+                // Only reaching the borderline (handled below) re-arms it,
+                // so a long-lived object whose count merely jitters
+                // doesn't oscillate between the sets.
+                if h.fin_cold.load(Ordering::Relaxed) {
+                    return Grade::Cold;
+                }
+                if h.fin_last_sc.swap(sc, Ordering::Relaxed) == sc {
+                    let stable = h.fin_stable.fetch_add(1, Ordering::Relaxed) + 1;
+                    if stable >= FIN_STABLE_PROBES {
+                        h.fin_stable.store(0, Ordering::Relaxed);
+                        return Grade::Cold;
+                    }
+                } else {
+                    h.fin_stable.store(0, Ordering::Relaxed);
+                }
+                return Grade::Hot;
+            }
+            // Borderline: compute the exact live clone count and test for
+            // an effective program refcount of zero.
+            let clones = crate::weakref_registry::strong_clone_count(h.id);
+            // Refresh the cached bound with the exact value. A cleared or
+            // died weakref leaves the cache stale-high, and a stale-high
+            // bound keeps a live object "borderline" — paying this
+            // registry lookup again at *every* reference-dropping safe
+            // point. This scan runs per drop opcode while any finalizable
+            // is live, so a single stale entry costs a whole test run
+            // (statistics.kde's hot sum-loop spent ~40% of its time
+            // here). New weakrefs refresh the cache upward via
+            // `note_weakref_finalizable`, so tightening it is safe.
+            h.weak_clones.store(clones, Ordering::Release);
+            if sc.saturating_sub(1).saturating_sub(clones) == 0 {
+                out.push(h.clone());
+            }
+            Grade::Hot
         };
+        if cold_tick {
+            // Walk the whole index (or a rotating window of it) and
+            // re-grade every entry; collect the transitions and apply
+            // them after the index borrow ends.
+            let mut to_cold: Vec<Arc<TrackedHandle>> = Vec::new();
+            let mut to_hot: Vec<Arc<TrackedHandle>> = Vec::new();
+            {
+                let fin = self.finalizable.borrow();
+                let mut grade = |h: &Arc<TrackedHandle>| {
+                    let was_cold = h.fin_cold.load(Ordering::Relaxed);
+                    match probe(h, &mut out) {
+                        Grade::Cold if !was_cold => to_cold.push(h.clone()),
+                        Grade::Hot if was_cold => to_hot.push(h.clone()),
+                        _ => {}
+                    }
+                };
+                if fin.len() <= FIN_SCAN_BUDGET {
+                    for h in fin.values() {
+                        grade(h);
+                    }
+                } else {
+                    let start = self.fin_scan_cursor.load(Ordering::Relaxed);
+                    let mut next_cursor = start;
+                    for (scanned, (id, h)) in
+                        fin.range(start..).chain(fin.range(..start)).enumerate()
+                    {
+                        if scanned == FIN_SCAN_BUDGET {
+                            next_cursor = *id;
+                            break;
+                        }
+                        grade(h);
+                    }
+                    // budget < len guarantees the break above ran and set the
+                    // resume point to the first unscanned id.
+                    self.fin_scan_cursor.store(next_cursor, Ordering::Relaxed);
+                }
+            }
+            for h in &to_cold {
+                self.fin_make_cold(h);
+            }
+            for h in &to_hot {
+                self.fin_make_hot(h);
+            }
+        } else {
+            // Ordinary scan: only the hot set, demoting in place. Over
+            // budget, a rotating window (the cursor is an index here)
+            // keeps every hot entry visited within len/budget scans.
+            let mut hot = self.finalizable_hot.borrow_mut();
+            let len = hot.len();
+            let budget = len.min(FIN_SCAN_BUDGET);
+            let mut i = if len > FIN_SCAN_BUDGET {
+                self.fin_hot_cursor.load(Ordering::Relaxed) % len
+            } else {
+                0
+            };
+            let mut scanned = 0usize;
+            while scanned < budget && !hot.is_empty() {
+                if i >= hot.len() {
+                    i = 0;
+                }
+                scanned += 1;
+                let h = hot[i].clone();
+                match probe(&h, &mut out) {
+                    Grade::Cold => {
+                        h.fin_cold.store(true, Ordering::Release);
+                        h.fin_hot_slot.store(usize::MAX, Ordering::Relaxed);
+                        hot.swap_remove(i);
+                        if let Some(moved) = hot.get(i) {
+                            moved.fin_hot_slot.store(i, Ordering::Relaxed);
+                        }
+                    }
+                    Grade::Hot => i += 1,
+                }
+            }
+            if len > FIN_SCAN_BUDGET {
+                self.fin_hot_cursor.store(i, Ordering::Relaxed);
+            }
+            self.fin_hot_count.store(hot.len(), Ordering::Release);
+        }
+        let dead = out;
+        floor_stats::bump(&floor_stats::FIN_PROBED, probed);
         if dead.is_empty() {
             return 0;
         }
+        floor_stats::bump(&floor_stats::FIN_DEAD, dead.len() as u64);
         let mut progressed = 0;
         for h in dead {
             // Re-validate under fresh counts: an earlier finalizer in this batch
@@ -1495,7 +1749,7 @@ impl GcState {
             .cloned()
             .collect();
 
-        if std::env::var_os("WP_REAP_DBG").is_some() {
+        if crate::hot_gates::env_flags::reap_dbg() {
             let dbg_class = std::env::var("WP_REAP_DBG_CLASS").unwrap_or("Executor".into());
             for h in &candidate_set {
                 let matches_dbg = match &h.object {
@@ -1947,11 +2201,11 @@ impl GcState {
                 // RFC 0061 (WS1b): mirror `untrack_id`'s flag so a stale
                 // suspect entry self-identifies as reclaimed.
                 h.untracked.store(true, Ordering::Release);
-                if fin.remove(&h.id).is_some()
-                    && self.finalizable_count.fetch_sub(1, Ordering::AcqRel) == 1
-                {
-                    // RFC 0065 (WS1): population reached zero.
-                    crate::hot_gates::bump_loop_gen();
+                // Same bookkeeping as `fin_remove`, under the locks
+                // already held (lock order: index, finalizable,
+                // generations — as in `track`).
+                if let Some(fh) = fin.remove(&h.id) {
+                    self.fin_remove_bookkeeping(&fh);
                 }
                 continue;
             }
@@ -2710,13 +2964,7 @@ pub fn track_prompt_reclaim(obj: Object) {
         s.track(obj);
         let handle = s.index.borrow().get(&id).cloned();
         if let Some(h) = handle {
-            let mut fin = s.finalizable.borrow_mut();
-            if fin.insert(id, h).is_none()
-                && s.finalizable_count.fetch_add(1, Ordering::AcqRel) == 0
-            {
-                // RFC 0065 (WS1): 0→1 population transition.
-                crate::hot_gates::bump_loop_gen();
-            }
+            s.fin_insert(id, h);
         }
     });
 }
@@ -2963,7 +3211,19 @@ pub fn has_any_finalizable() -> bool {
 /// frames — and through their locals the SSL transport, protocol, and
 /// `SSLContext` that test_ssl's leak tests watch via weakref.
 const SUSPECT_CAP: usize = 256;
-const SUSPECT_BUDGET: u8 = 64;
+/// RFC 0077 (WS2): active probes an entry gets before it goes dormant.
+/// Was 64; the census showed the per-drop `retain` walk over the
+/// active population as a first-order interpreter cost on object-heavy
+/// fixtures. A suspect pinned by a Rust-side transient that "dies a few
+/// opcodes later" is caught within 16 drop safe points; one that
+/// outlives them (a live object the cascade merely couldn't prove
+/// dead, or a transient held across a long native call) moves to the
+/// dormant stride as before, so nothing is forgotten — it just stops
+/// being re-probed at every drop. (A "reset the budget when the count
+/// moves" variant was measured and rejected: live objects churn their
+/// counts constantly, which kept ~65 entries permanently active on
+/// `deltablue`.)
+const SUSPECT_BUDGET: u8 = 16;
 /// Aged-out (budget-exhausted) suspects turn *dormant* rather than being
 /// forgotten: they are re-probed only every `DORMANT_STRIDE`-th sweep, so
 /// a long-lived skipped object costs two atomic loads per stride instead
@@ -2974,11 +3234,42 @@ const SUSPECT_BUDGET: u8 = 64;
 /// Task machinery lets go, and with eager eviction the web stayed pinned
 /// by its collector handle until a full `gc.collect()`.)
 const DORMANT_STRIDE: u64 = 64;
+/// RFC 0077 (WS2): a *dormant* entry probed at more than this many strong
+/// references above its dead line is forgotten outright. The dormant
+/// stride exists for the transient-pinned shape — an object one or two
+/// Rust-side clones away from death that no Python-visible drop will
+/// re-notice. An entry that has outlived its active budget *and* still
+/// carries several extra references is simply a live object the cascade
+/// couldn't prove dead; its eventual death is re-noticed the ordinary way
+/// (the holder's own `prompt_reap_dropped` cascade walks to it), so
+/// keeping it enrolled only made every stride sweep pay for the whole
+/// live population. `deltablue` filled the map with ~200 such entries
+/// and re-probed all of them 40K times per run (the census's ~9.4M
+/// suspect probes).
+const SUSPECT_LIVE_MARGIN: usize = 3;
+/// RFC 0077 (WS2): stride probes a dormant entry survives before it is
+/// forgotten regardless of its count. The margin above can't tell "one
+/// live holder forever" (deltablue's `Variable`s: one list reference
+/// each, 191 of them filling the map to its cap) from "one transient
+/// about to die", so dormancy is bounded in time instead: 16 active
+/// probes then 16 stride probes gives every suspect ~1000 drop safe
+/// points to have its transient released — an order of magnitude past
+/// the test_ssl cancellation chain that motivated dormancy — after which
+/// its death is left to the cascade through its holders (or a full
+/// collection). Cost per enrollment is now bounded at 32 probes.
+const SUSPECT_DORMANT_PROBES: u8 = 16;
 /// RFC 0061 (WS1b): keyed by [`ObjectId`] so `remove_suspect` (called in
 /// lock-step with every `untrack_id`) and enrollment dedup are O(1)
 /// map hits instead of linear scans of the list — `remove_suspect`'s
 /// `retain` was a measurable share of drop-heavy profiles (`list_ops`).
-type SuspectMap = indexmap::IndexMap<ObjectId, (Arc<TrackedHandle>, u8)>;
+/// One enrolled suspect: its handle, remaining active probe budget, and
+/// (once dormant) the number of stride probes it has survived.
+struct Suspect {
+    handle: Arc<TrackedHandle>,
+    budget: u8,
+    dormant_probes: u8,
+}
+type SuspectMap = indexmap::IndexMap<ObjectId, Suspect>;
 static SUSPECTS: std::sync::LazyLock<parking_lot::Mutex<SuspectMap>> =
     std::sync::LazyLock::new(|| parking_lot::Mutex::new(SuspectMap::new()));
 static SUSPECT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -2992,17 +3283,168 @@ static SUSPECT_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// lock for the overwhelming never-enrolled majority.
 static SUSPECT_FILTER: crate::hot_filter::AtomicBloom = crate::hot_filter::AtomicBloom::new();
 
-/// Recompute the count gates from the locked suspect map.
-fn publish_suspect_counts(s: &SuspectMap) {
-    SUSPECT_COUNT.store(s.len(), Ordering::Release);
-    SUSPECT_ACTIVE.store(
-        s.values().filter(|(_, b)| *b > 0).count(),
-        Ordering::Release,
-    );
-    // RFC 0065 (WS1): population changes invalidate the dispatch
-    // loops' quiet-path snapshots (the quiet predicate consults
-    // `suspects_present`).
-    crate::hot_gates::bump_loop_gen();
+/// RFC 0077 (WS1): floor counters for the `WEAVEPY_VM_STATS` shutdown
+/// print — how often the drop-path probes ran and what they found.
+pub mod floor_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub static SUSPECT_ENROLLED: AtomicU64 = AtomicU64::new(0);
+    pub static SUSPECT_SWEEPS: AtomicU64 = AtomicU64::new(0);
+    pub static SUSPECT_PROBED: AtomicU64 = AtomicU64::new(0);
+    pub static SUSPECT_DEAD: AtomicU64 = AtomicU64::new(0);
+    pub static SUSPECT_FORGOTTEN: AtomicU64 = AtomicU64::new(0);
+    pub static FIN_SCANS: AtomicU64 = AtomicU64::new(0);
+    pub static FIN_PROBED: AtomicU64 = AtomicU64::new(0);
+    pub static FIN_DEAD: AtomicU64 = AtomicU64::new(0);
+    pub static DROP_NOTES: AtomicU64 = AtomicU64::new(0);
+    pub static DROP_NOTES_MARKED: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    pub fn bump(c: &AtomicU64, n: u64) {
+        if crate::specialize::stats_enabled() {
+            c.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// Coarse "operand stack shrank ⇒ maybe dead" marks by opcode name
+    /// (stats-only; the eval loop calls this under `stats_enabled`).
+    static COARSE_MARKS: std::sync::LazyLock<
+        parking_lot::Mutex<std::collections::BTreeMap<&'static str, u64>>,
+    > = std::sync::LazyLock::new(Default::default);
+
+    #[cold]
+    pub fn coarse_mark(op: &'static str) {
+        *COARSE_MARKS.lock().entry(op).or_insert(0) += 1;
+    }
+
+    /// Markdown block for the shutdown stats print; `None` when nothing
+    /// was counted.
+    pub fn markdown() -> Option<String> {
+        let rows = [
+            (
+                "drop notes (audited handlers)",
+                DROP_NOTES.load(Ordering::Relaxed),
+            ),
+            (
+                "drop notes that marked maybe-dead",
+                DROP_NOTES_MARKED.load(Ordering::Relaxed),
+            ),
+            (
+                "suspects enrolled",
+                SUSPECT_ENROLLED.load(Ordering::Relaxed),
+            ),
+            ("suspect sweeps", SUSPECT_SWEEPS.load(Ordering::Relaxed)),
+            (
+                "suspect entries probed",
+                SUSPECT_PROBED.load(Ordering::Relaxed),
+            ),
+            ("suspects found dead", SUSPECT_DEAD.load(Ordering::Relaxed)),
+            (
+                "dormant suspects forgotten (live)",
+                SUSPECT_FORGOTTEN.load(Ordering::Relaxed),
+            ),
+            ("finalizable scans", FIN_SCANS.load(Ordering::Relaxed)),
+            (
+                "finalizable entries probed",
+                FIN_PROBED.load(Ordering::Relaxed),
+            ),
+            ("finalizables found dead", FIN_DEAD.load(Ordering::Relaxed)),
+        ];
+        if rows.iter().all(|(_, v)| *v == 0) {
+            return None;
+        }
+        let mut out =
+            String::from("\n## Drop-path floor (RFC 0077 WS2)\n\n| counter | value |\n|---|---|\n");
+        for (name, v) in rows {
+            out.push_str(&format!("| {name} | {v} |\n"));
+        }
+        // Residual populations at exit: what the per-drop scans were
+        // actually walking. Type name, strong count above the dead line.
+        let mut census = |title: &str, rows: Vec<(String, usize)>| {
+            if rows.is_empty() {
+                return;
+            }
+            out.push_str(&format!("\n{title} at exit ({}):\n", rows.len()));
+            let mut grouped: std::collections::BTreeMap<String, Vec<usize>> =
+                std::collections::BTreeMap::new();
+            for (tn, excess) in rows {
+                grouped.entry(tn).or_default().push(excess);
+            }
+            for (tn, mut ex) in grouped {
+                ex.sort_unstable();
+                let shown: Vec<String> = ex.iter().take(8).map(|e| e.to_string()).collect();
+                out.push_str(&format!(
+                    "- {tn} x{} (excess refs: {}{})\n",
+                    ex.len(),
+                    shown.join(","),
+                    if ex.len() > 8 { ",…" } else { "" }
+                ));
+            }
+        };
+        census("hot finalizables", super::residual_hot_finalizables());
+        census("enrolled suspects", super::residual_suspects());
+        let marks = COARSE_MARKS.lock();
+        if !marks.is_empty() {
+            let mut by_count: Vec<(&&str, &u64)> = marks.iter().collect();
+            by_count.sort_by(|a, b| b.1.cmp(a.1));
+            out.push_str("\ncoarse maybe-dead marks by opcode:\n");
+            for (op, n) in by_count.into_iter().take(12) {
+                out.push_str(&format!("- {op}: {n}\n"));
+            }
+        }
+        Some(out)
+    }
+}
+
+/// Stats-only snapshot of the hot finalizable set: `(type name, strong
+/// refs above the dead line)` per entry.
+fn residual_hot_finalizables() -> Vec<(String, usize)> {
+    with_state(|gc| {
+        gc.finalizable_hot
+            .borrow()
+            .iter()
+            .map(|h| {
+                let sc = strong_count_for(&h.object);
+                let cached = h.weak_clones.load(Ordering::Relaxed);
+                (h.object.type_name_owned(), sc.saturating_sub(1 + cached))
+            })
+            .collect()
+    })
+}
+
+/// Stats-only snapshot of the suspect map, same shape.
+fn residual_suspects() -> Vec<(String, usize)> {
+    SUSPECTS
+        .lock()
+        .values()
+        .map(|e| {
+            let h = &e.handle;
+            let sc = strong_count_for(&h.object);
+            let cached = h.weak_clones.load(Ordering::Relaxed);
+            (h.object.type_name_owned(), sc.saturating_sub(1 + cached))
+        })
+        .collect()
+}
+
+/// Publish the count gates after the locked suspect map changed.
+/// `active` is the caller's count of budget-remaining entries (kept
+/// incrementally; RFC 0077 WS2 retired the O(n) recount this used to
+/// do on every enrollment and removal).
+fn publish_suspect_counts(s: &SuspectMap, active: usize) {
+    let was_active = SUSPECT_ACTIVE.swap(active, Ordering::AcqRel) > 0;
+    let was_present = SUSPECT_COUNT.swap(s.len(), Ordering::AcqRel) > 0;
+    // RFC 0065 (WS1): the dispatch loops' quiet-path snapshots consult
+    // `active_suspects_present` / the population gates, so a
+    // transition of either invalidates them. Same-state churn (one
+    // active suspect replacing another) doesn't.
+    if was_active != (active > 0) || was_present != (!s.is_empty()) {
+        crate::hot_gates::bump_loop_gen();
+    }
+}
+
+/// Count of budget-remaining entries in the locked map (used only on
+/// the cold eviction path, where the map is at capacity anyway).
+fn count_active(s: &SuspectMap) -> usize {
+    s.values().filter(|e| e.budget > 0).count()
 }
 
 /// RFC 0065 (WS1): *active*-population probe for the dispatch loop's
@@ -3043,6 +3485,7 @@ pub fn note_suspect(h: Arc<TrackedHandle>) {
         crate::weakref_registry::strong_clone_count(h.id),
         Ordering::Release,
     );
+    let mut active = SUSPECT_ACTIVE.load(Ordering::Relaxed);
     if s.len() >= SUSPECT_CAP {
         // Full: evict the most-probed entry (lowest remaining budget,
         // dormant first) — it has had the most chances to die and is
@@ -3055,17 +3498,26 @@ pub fn note_suspect(h: Arc<TrackedHandle>) {
         match s
             .values()
             .enumerate()
-            .min_by_key(|(_, (_, b))| *b)
+            .min_by_key(|(_, e)| e.budget)
             .map(|(i, _)| i)
         {
             Some(i) => {
                 s.swap_remove_index(i);
+                active = count_active(&s);
             }
             None => return,
         }
     }
-    s.insert(h.id, (h, SUSPECT_BUDGET));
-    publish_suspect_counts(&s);
+    floor_stats::bump(&floor_stats::SUSPECT_ENROLLED, 1);
+    s.insert(
+        h.id,
+        Suspect {
+            handle: h,
+            budget: SUSPECT_BUDGET,
+            dormant_probes: 0,
+        },
+    );
+    publish_suspect_counts(&s, active + 1);
 }
 
 /// Cheap gate for the eval loop's safe point: always sweep while an
@@ -3107,8 +3559,14 @@ pub fn remove_suspect(id: ObjectId) {
         return;
     }
     let mut s = SUSPECTS.lock();
-    if s.swap_remove(&id).is_some() {
-        publish_suspect_counts(&s);
+    if let Some(removed) = s.swap_remove(&id) {
+        let active = SUSPECT_ACTIVE.load(Ordering::Relaxed);
+        let active = if removed.budget > 0 {
+            active.saturating_sub(1)
+        } else {
+            active
+        };
+        publish_suspect_counts(&s, active);
     }
 }
 
@@ -3125,11 +3583,16 @@ pub fn take_dead_suspects() -> Vec<Object> {
         || SUSPECT_TICK
             .fetch_add(1, Ordering::Relaxed)
             .is_multiple_of(DORMANT_STRIDE);
-    s.retain(|_, (h, budget)| {
+    floor_stats::bump(&floor_stats::SUSPECT_SWEEPS, 1);
+    let mut active = 0usize;
+    let mut probed = 0u64;
+    s.retain(|_, e| {
         // Dormant (aged-out) entries only pay on the stride tick.
-        if *budget == 0 && !probe_dormant {
+        if e.budget == 0 && !probe_dormant {
             return true;
         }
+        probed += 1;
+        let h = &e.handle;
         // RFC 0061 (WS1b): the handle self-identifies as reclaimed (set
         // in lock-step with every index removal) — no registry lookup.
         if h.untracked.load(Ordering::Acquire) {
@@ -3149,10 +3612,28 @@ pub fn take_dead_suspects() -> Vec<Object> {
                 return false;
             }
         }
-        *budget = budget.saturating_sub(1);
+        // A dormant entry still well above its dead line, or one that has
+        // sat through its dormant allowance, is plainly alive: drop it
+        // from the map (see `SUSPECT_LIVE_MARGIN` / `SUSPECT_DORMANT_PROBES`).
+        if e.budget == 0 {
+            e.dormant_probes = e.dormant_probes.saturating_add(1);
+            if sc > 1 + cached + SUSPECT_LIVE_MARGIN || e.dormant_probes > SUSPECT_DORMANT_PROBES {
+                floor_stats::bump(&floor_stats::SUSPECT_FORGOTTEN, 1);
+                return false;
+            }
+            return true;
+        }
+        e.budget -= 1;
+        if e.budget > 0 {
+            active += 1;
+        }
         true
     });
-    publish_suspect_counts(&s);
+    floor_stats::bump(&floor_stats::SUSPECT_PROBED, probed);
+    floor_stats::bump(&floor_stats::SUSPECT_DEAD, out.len() as u64);
+    // Entries skipped as dormant stayed dormant; entries probed were
+    // recounted above, so `active` is exact.
+    publish_suspect_counts(&s, active);
     out
 }
 
@@ -3175,6 +3656,36 @@ pub fn mark_maybe_dead() {
     MAYBE_DEAD.with(|c| c.set(true));
 }
 
+/// RFC 0077 (WS2): set by [`mark_bulk_drop`], consumed by the next
+/// finalizable scan, which then re-grades the *whole* index (a forced
+/// cold tick) instead of only the hot set.
+static FORCE_COLD_TICK: AtomicBool = AtomicBool::new(false);
+
+/// Note that the current thread just released many references at once
+/// without grading them individually: a frame torn down by a
+/// propagating exception. Its locals and operands drop wholesale, and
+/// any of them may have been the last holder of a finalizable that the
+/// hot/cold gate had already demoted to cold (a coroutine created,
+/// passed to a call that raised, and never awaited: its count was
+/// stable across the exception's construction). The ordinary hot-set
+/// scan would find it only on the cold stride, up to `FIN_COLD_STRIDE`
+/// safe points later, which is past the `with assertWarns(...)` block
+/// that expects the "never awaited" warning (test_asyncio's
+/// `test_run_until_complete_nesting`). Exceptional unwinds are rare
+/// relative to drop safe points, so forcing a full re-grade here keeps
+/// promptness without giving back the steady-state gate.
+#[inline]
+pub fn mark_bulk_drop() {
+    MAYBE_DEAD.with(|c| c.set(true));
+    FORCE_COLD_TICK.store(true, Ordering::Relaxed);
+}
+
+/// Consume the forced-cold-tick request (see [`mark_bulk_drop`]).
+#[inline]
+pub(crate) fn take_force_cold_tick() -> bool {
+    FORCE_COLD_TICK.load(Ordering::Relaxed) && FORCE_COLD_TICK.swap(false, Ordering::Relaxed)
+}
+
 /// Precise per-value drop note (RFC 0059 WS1b). Called by the audited
 /// opcode handlers (`POP_TOP`, `STORE_FAST`, the generic `BINARY_OP` /
 /// `COMPARE_OP` paths) with each value they discard; the eval loop
@@ -3189,8 +3700,24 @@ pub fn mark_maybe_dead() {
 /// (`total = total + i`, the RFC 0059 `nested_loops` profile) from
 /// paying a `reap_dead_finalizable` scan per iteration whenever *some*
 /// `__del__`-bearing object is alive anywhere in the process.
-/// Everything else conservatively marks: the sweep itself refcount-
-/// checks, so a false positive costs one scan, never correctness.
+/// Everything else is graded by its strong count (RFC 0077 WS2). The
+/// drop about to happen decrements `obj`'s count by one and, only if
+/// that was the last reference, frees `obj` and cascades into whatever
+/// it held. So a tracked finalizable or suspect can become dead here in
+/// exactly two ways:
+///
+/// * `obj` is about to be freed (`strong_count == 1`): the cascade may
+///   release the last program reference to anything — mark.
+/// * `obj` itself is tracked and this drop takes it to handle-only
+///   (`strong_count == 2`), or `obj` is tracked and weakref clones make
+///   the dead line unknowable cheaply — mark.
+///
+/// A drop of an untracked object that survives it (`strong_count >= 2`,
+/// e.g. `self` rebound in a local, a shared list popped off the stack)
+/// changes nothing observable and schedules no sweep. The filters are
+/// insert-only Bloom bits (false positives take the conservative
+/// path), and the sweep itself refcount-checks, so a false positive
+/// costs one scan, never correctness.
 #[inline]
 pub fn note_dropped(obj: &crate::object::Object) {
     use crate::object::Object as O;
@@ -3207,7 +3734,28 @@ pub fn note_dropped(obj: &crate::object::Object) {
         | O::Bytes(_)
         | O::Range(_)
         | O::Code(_) => {}
-        _ => mark_maybe_dead(),
+        // A dying bound method (the `obj.m(...)` call temporary, freed at
+        // every method call) owns exactly one object: its receiver. Grade
+        // that instead of marking on the method's own count of one.
+        O::BoundMethod(bm) if crate::sync::Rc::strong_count(bm) <= 1 => {
+            note_dropped(&bm.receiver);
+        }
+        _ => {
+            floor_stats::bump(&floor_stats::DROP_NOTES, 1);
+            let sc = strong_count_for(obj);
+            if sc <= 1 {
+                floor_stats::bump(&floor_stats::DROP_NOTES_MARKED, 1);
+                mark_maybe_dead();
+                return;
+            }
+            let id = crate::weakref_registry::id_of(obj);
+            if TRACKED_FILTER.may_contain(id)
+                && (sc == 2 || crate::weakref_registry::may_have_weakrefs(id))
+            {
+                floor_stats::bump(&floor_stats::DROP_NOTES_MARKED, 1);
+                mark_maybe_dead();
+            }
+        }
     }
 }
 

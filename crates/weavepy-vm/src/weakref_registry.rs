@@ -440,6 +440,16 @@ pub fn queue_callbacks(cleared: Vec<(Arc<WeakRefSlot>, Option<Object>)>) {
     }
 }
 
+/// RFC 0077 (WS2): two relaxed loads answering "was a weakref ever
+/// registered for `id`?" (false positives possible, never false
+/// negatives). The precise drop note uses it to decide whether a
+/// non-final drop of a tracked object could still collapse its
+/// effective refcount through registry-held clones.
+#[inline]
+pub fn may_have_weakrefs(id: ObjectId) -> bool {
+    WEAKREF_FILTER.may_contain(id)
+}
+
 /// Convenience: weakref count for `id` in the current thread.
 pub fn count_for(id: ObjectId) -> usize {
     // RFC 0065 (WS4): usually-miss probe — skip the registry borrow.

@@ -2782,6 +2782,33 @@ impl indexmap::Equivalent<DictKey> for StrKey<'_> {
     }
 }
 
+/// [`StrKey`] with its Python hash precomputed (RFC 0077 WS4). The
+/// interpreter's attribute-name probes hash the same `co_names` entry on
+/// every execution of a site — a siphash per probe — so the VM memoises
+/// `py_str_hash` per code object (see `code_name_key` in the eval loop)
+/// and probes with this key instead. Hash and equality are bit-for-bit
+/// those of `StrKey`; the caller is responsible for `hash ==
+/// py_str_hash(s)`.
+#[derive(Debug, Clone, Copy)]
+pub struct StrKeyHashed<'a> {
+    pub s: &'a str,
+    pub hash: i64,
+}
+
+impl Hash for StrKeyHashed<'_> {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.hash.hash(state);
+    }
+}
+
+impl indexmap::Equivalent<DictKey> for StrKeyHashed<'_> {
+    #[inline]
+    fn equivalent(&self, key: &DictKey) -> bool {
+        indexmap::Equivalent::equivalent(&StrKey(self.s), key)
+    }
+}
+
 /// Count of "exotic" keys ever inserted into a *class* dict: any key
 /// that is not a plain `Object::Str`. While zero (every real-world
 /// program), `TypeObject::lookup`'s native [`StrKey`] walk is
@@ -3690,6 +3717,7 @@ pub fn is_function_slot(name: &str) -> bool {
             | "__doc__"
             | "__module__"
             | "__annotations__"
+            | "__annotate__"
             | "__type_params__"
             | "__defaults__"
             | "__kwdefaults__"
@@ -8506,7 +8534,7 @@ impl Object {
                 seq_cmp(&a, &b)
             }
             _ => {
-                if std::env::var_os("WEAVEPY_CMP_BT").is_some() {
+                if crate::hot_gates::env_flags::cmp_bt() {
                     eprintln!(
                         "[CMP_BT vm-lt] '{}' vs '{}'\n{:?}",
                         self.type_name_owned(),
@@ -9815,7 +9843,7 @@ impl Object {
             Object::Instance(inst) => match inst.native.get() {
                 Some(native) => native.len(),
                 None => {
-                    if std::env::var_os("WEAVEPY_LEN_DBG").is_some() {
+                    if crate::hot_gates::env_flags::len_dbg() {
                         eprintln!(
                             "[LEN_DBG] Instance cls={} c_body={:#x} native=None",
                             inst.cls().name,
@@ -10430,9 +10458,28 @@ fn siphash13(k0: u64, k1: u64, data: &[u8]) -> u64 {
         round(&mut v0, &mut v1, &mut v2, &mut v3);
         v0 ^= mi;
     }
-    let mut tail = [0u8; 8];
-    tail[..rem.len()].copy_from_slice(rem);
-    let b = ((data.len() as u64) << 56) | u64::from_le_bytes(tail);
+    // Little-endian assemble of the 0..7 tail bytes with fixed-width
+    // loads: byte `i` of the tail lands at bits `8*i`, exactly as
+    // `u64::from_le_bytes` of a zero-padded buffer would place it, but
+    // without the variable-length `copy_from_slice` (a `memcpy` call that
+    // the RFC 0077 census showed under every short-string hash).
+    let mut tail: u64 = 0;
+    let mut rest = rem;
+    let mut shift = 0u32;
+    if rest.len() >= 4 {
+        tail |= u64::from(u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]));
+        rest = &rest[4..];
+        shift = 32;
+    }
+    if rest.len() >= 2 {
+        tail |= u64::from(u16::from_le_bytes([rest[0], rest[1]])) << shift;
+        rest = &rest[2..];
+        shift += 16;
+    }
+    if let Some(&byte) = rest.first() {
+        tail |= u64::from(byte) << shift;
+    }
+    let b = ((data.len() as u64) << 56) | tail;
     v3 ^= b;
     round(&mut v0, &mut v1, &mut v2, &mut v3);
     v0 ^= b;
@@ -11482,6 +11529,28 @@ impl Object {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `hash(b"...")` under `PYTHONHASHSEED=0` on CPython 3.13 (an all-zero
+    /// siphash13 key), one value per tail length 0..=7 plus two multi-chunk
+    /// inputs, so every branch of the fixed-width tail assembly is pinned
+    /// bit-for-bit against the reference implementation.
+    #[test]
+    fn siphash13_tail_lengths_match_cpython() {
+        let pinned: [(&[u8], u64); 9] = [
+            (b"a", 4_644_417_185_603_328_019),
+            (b"ab", 6_148_830_537_548_944_441),
+            (b"abc", 13_851_880_170_939_887_858),
+            (b"abcd", 16_416_137_402_921_954_953),
+            (b"abcde", 2_674_923_165_546_153_122),
+            (b"abcdef", 7_070_790_388_344_807_208),
+            (b"abcdefg", 7_904_145_750_247_929_094),
+            (b"abcdefgh", 4_574_395_652_268_504_554),
+            (b"abcdefghijk", 1_450_545_860_578_130_900),
+        ];
+        for (data, want) in pinned.iter() {
+            assert_eq!(siphash13(0, 0, data), *want, "{data:?}");
+        }
+    }
 
     #[test]
     fn truthiness_matches_python_basics() {

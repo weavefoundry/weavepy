@@ -9,18 +9,18 @@ speed — the semantics are fully observable from Python and are graded
 by ``test_typing`` / ``test_type_params`` / ``test_type_aliases``.
 
 This module is a faithful Python port of ``Objects/typevarobject.c``
-(v3.13). Where the C code delegates back into ``typing.py`` helpers
+(v3.13, plus 3.14's ``evaluate_bound`` / ``evaluate_constraints`` /
+``evaluate_default`` / ``evaluate_value`` surface and its
+``_ConstEvaluator``). Where the C code delegates back into ``typing.py`` helpers
 (``_type_check``, ``_make_union``, ``_typevar_subst``, …) we lazily
 import ``typing`` exactly like ``call_typing_func_object`` does.
 
-WeavePy's PEP 695 compiler lowering constructs these objects through
-the ``__weavepy_typevar__`` / ``__weavepy_paramspec__`` /
-``__weavepy_typevartuple__`` / ``__weavepy_type_alias__`` VM
-intrinsics, mirroring CPython's ``CALL_INTRINSIC_*`` opcodes; the
-``_weavepy_*`` constructors at the bottom of this file are their
-entry points (they correspond to ``_Py_make_typevar``,
-``_Py_make_paramspec``, ``_Py_make_typevartuple``,
-``_Py_make_typealias`` and ``_Py_set_typeparam_default``).
+WeavePy's ``CALL_INTRINSIC_1`` / ``CALL_INTRINSIC_2`` opcodes (the
+PEP 695 compiler shape shared with CPython) construct these objects
+through the ``_weavepy_*`` constructors at the bottom of this file
+(they correspond to ``_Py_make_typevar``, ``_Py_make_paramspec``,
+``_Py_make_typevartuple``, ``_Py_make_typealias``,
+``_Py_subscript_generic`` and ``_Py_set_typeparam_default``).
 """
 
 import sys
@@ -129,6 +129,74 @@ def _make_union(self, other):
     return _call_typing_func("_make_union", self, other)
 
 
+_ANNOTATE_FORMAT_STRING = 4
+
+
+def _typing_type_repr(p):
+    # C `_Py_typing_type_repr`: how the STRING format spells one value.
+    if p is Ellipsis:
+        return "..."
+    if p is type(None):
+        return "None"
+    if hasattr(p, "__origin__") and hasattr(p, "__args__"):
+        # It looks like a GenericAlias
+        return repr(p)
+    qualname = getattr(p, "__qualname__", None)
+    if qualname is None:
+        return repr(p)
+    module = getattr(p, "__module__", None)
+    if module is None:
+        return repr(p)
+    # Looks like a class
+    if module == "builtins":
+        return str(qualname)
+    return f"{module}.{qualname}"
+
+
+class _ConstEvaluator:
+    """`_typing._ConstEvaluator` (3.14 `constevaluatorobject`): the
+    evaluate function reported for a type parameter or alias whose
+    bound, constraints, default, or value was given eagerly
+    (`TypeVar("T", bound=int).evaluate_bound`). Called with an
+    annotation format it returns the stored value, or its
+    `_Py_typing_type_repr` spelling for the STRING format.
+
+    A static C type: not instantiable from Python and immutable.
+    """
+
+    __weave_immutable_type__ = True
+    __module__ = "_typing"
+    __slots__ = ("_value",)
+
+    def __new__(cls, *args, **kwargs):
+        raise TypeError("cannot create '_typing._ConstEvaluator' instances")
+
+    def __init_subclass__(cls, /, *args, **kwargs):
+        raise TypeError("type '_typing._ConstEvaluator' is not an acceptable base type")
+
+    def __call__(self, format, /):
+        if not isinstance(format, int):
+            raise TypeError(
+                f"'{type(format).__name__}' object cannot be interpreted as an integer"
+            )
+        value = self._value
+        if format == _ANNOTATE_FORMAT_STRING:
+            if isinstance(value, tuple):
+                return "(" + ", ".join(_typing_type_repr(item) for item in value) + ")"
+            return _typing_type_repr(value)
+        return value
+
+    def __repr__(self):
+        return f"<constevaluator {self._value!r}>"
+
+
+def _const_evaluator(value):
+    # C `constevaluator_alloc`.
+    self = object.__new__(_ConstEvaluator)
+    object.__setattr__(self, "_value", value)
+    return self
+
+
 class TypeVar:
     """Type variable.
 
@@ -179,6 +247,9 @@ class TypeVar:
         self._evaluate_constraints = None
         self._default_value = default
         self._evaluate_default = None
+        # C `default_value` is non-NULL here even for `NoDefault`
+        # (`evaluate_default` reports a `<constevaluator typing.NoDefault>`).
+        self._default_stored = True
         self._covariant = covariant
         self._contravariant = contravariant
         self._infer_variance = infer_variance
@@ -200,6 +271,7 @@ class TypeVar:
         self._evaluate_constraints = evaluate_constraints
         self._default_value = NoDefault
         self._evaluate_default = None
+        self._default_stored = False
         self._covariant = False
         self._contravariant = False
         self._infer_variance = True
@@ -252,6 +324,33 @@ class TypeVar:
         if self._evaluate_default is not None:
             return True
         return self._default_value is not NoDefault
+
+    # 3.14 `typevar_evaluate_{bound,constraints,default}`: the lazy
+    # evaluate function when the compiler supplied one, a
+    # `_ConstEvaluator` over an eagerly given value, else None.
+    @property
+    def evaluate_bound(self):
+        if self._evaluate_bound is not None:
+            return self._evaluate_bound
+        if self._bound is not None:
+            return _const_evaluator(self._bound)
+        return None
+
+    @property
+    def evaluate_constraints(self):
+        if self._evaluate_constraints is not None:
+            return self._evaluate_constraints
+        if self._constraints is not None:
+            return _const_evaluator(self._constraints)
+        return None
+
+    @property
+    def evaluate_default(self):
+        if self._evaluate_default is not None:
+            return self._evaluate_default
+        if self._default_stored:
+            return _const_evaluator(self._default_value)
+        return None
 
     def __repr__(self):
         if self._infer_variance:
@@ -411,6 +510,7 @@ class ParamSpec:
         self._bound = bound
         self._default_value = default
         self._evaluate_default = None
+        self._default_stored = True
         self._covariant = covariant
         self._contravariant = contravariant
         self._infer_variance = infer_variance
@@ -428,6 +528,7 @@ class ParamSpec:
         self._bound = None
         self._default_value = NoDefault
         self._evaluate_default = None
+        self._default_stored = False
         self._covariant = False
         self._contravariant = False
         self._infer_variance = True
@@ -476,6 +577,15 @@ class ParamSpec:
         if self._evaluate_default is not None:
             return True
         return self._default_value is not NoDefault
+
+    @property
+    def evaluate_default(self):
+        # 3.14 `paramspec_evaluate_default`.
+        if self._evaluate_default is not None:
+            return self._evaluate_default
+        if self._default_stored:
+            return _const_evaluator(self._default_value)
+        return None
 
     def __repr__(self):
         if self._infer_variance:
@@ -526,6 +636,7 @@ class TypeVarTuple:
         self._name = name
         self._default_value = default
         self._evaluate_default = None
+        self._default_stored = True
         # Stored even when None (plain-dict exec): CPython's C
         # constructor records the NULL module and `__module__` reads
         # back as None rather than the class default.
@@ -540,6 +651,7 @@ class TypeVarTuple:
         self._name = name
         self._default_value = NoDefault
         self._evaluate_default = None
+        self._default_stored = False
         return self
 
     def __init_subclass__(cls, /, *args, **kwargs):
@@ -559,6 +671,15 @@ class TypeVarTuple:
         if self._evaluate_default is not None:
             return True
         return self._default_value is not NoDefault
+
+    @property
+    def evaluate_default(self):
+        # 3.14 `typevartuple_evaluate_default`.
+        if self._evaluate_default is not None:
+            return self._evaluate_default
+        if self._default_stored:
+            return _const_evaluator(self._default_value)
+        return None
 
     def __repr__(self):
         return self._name
@@ -792,6 +913,7 @@ class TypeAliasType:
         if not type_params:
             self._type_params = None
         else:
+            _typealias_check_type_params(type_params)
             self._type_params = type_params
         self._compute_value = None
         self._value = value
@@ -829,6 +951,14 @@ class TypeAliasType:
         return self._value
 
     @property
+    def evaluate_value(self):
+        # 3.14 `typealias_evaluate_value`: the compiler's value thunk,
+        # or a `_ConstEvaluator` over an eagerly given value.
+        if self._compute_value is not None:
+            return self._compute_value
+        return _const_evaluator(self._value)
+
+    @property
     def __type_params__(self):
         if self._type_params is None:
             return ()
@@ -857,6 +987,13 @@ class TypeAliasType:
             args = (args,)
         return types.GenericAlias(self, args)
 
+    def __iter__(self):
+        # 3.14 `tp_iter = unpack_iter`: `*Alias` yields `Unpack[Alias]`
+        # (gh-133311), like a TypeVarTuple.
+        import typing
+
+        yield typing.Unpack[self]
+
     def __or__(self, right):
         # C uses `_Py_union_type_or` (a types.UnionType union); the
         # VM builtin builds the same native PEP 604 union.
@@ -864,6 +1001,24 @@ class TypeAliasType:
 
     def __ror__(self, left):
         return __weavepy_pep604_union__(left, self)
+
+
+def _typealias_check_type_params(type_params):
+    # 3.14 `typealias_check_type_params`: every entry is a TypeVar,
+    # ParamSpec, or TypeVarTuple, and no parameter without a default
+    # follows one that has a default.
+    default_seen = False
+    for type_param in type_params:
+        if type(type_param) not in (TypeVar, ParamSpec, TypeVarTuple):
+            raise TypeError(f"Expected a type param, got {type_param!r}")
+        if type_param.__default__ is NoDefault:
+            if default_seen:
+                raise TypeError(
+                    f"non-default type parameter '{type_param!r}' "
+                    "follows default type parameter"
+                )
+        else:
+            default_seen = True
 
 
 _SENTINEL = object()
@@ -900,8 +1055,9 @@ class Generic:
 
 
 # ---------------------------------------------------------------------
-# PEP 695 intrinsic entry points (the VM's `__weavepy_*__` lowering
-# calls these; CPython equivalents in pycore_typevarobject.h).
+# PEP 695 intrinsic entry points (the VM's `CALL_INTRINSIC_1` /
+# `CALL_INTRINSIC_2` handlers call these; CPython equivalents in
+# pycore_typevarobject.h).
 # ---------------------------------------------------------------------
 
 
@@ -918,11 +1074,10 @@ def _weavepy_make_typevartuple(name):
 
 
 def _weavepy_make_typealias(name, type_params, compute_value):
-    # The parser's lowering passes the alias body as a zero-argument
-    # lambda that *closes over* the type parameters (each parameter is
-    # bound by an immediately-invoked lambda standing in for CPython's
-    # hidden PEP 695 scope), so it already has the shape CPython's
-    # `typealias_alloc` stores.
+    # `_Py_make_typealias`: the compiler passes the alias body as a
+    # `(.format, /)` annotation-scope function that closes over the
+    # type parameters bound in the hidden `<generic parameters of X>`
+    # scope, the shape CPython's `typealias_alloc` stores.
     return TypeAliasType._weavepy_lazy(name, tuple(type_params), compute_value)
 
 
@@ -952,14 +1107,3 @@ def _weavepy_set_typeparam_default(typeparam, evaluate_default):
         object.__setattr__(typeparam, "_evaluate_default", evaluate_default)
         return typeparam
     raise TypeError(f"Expected a type param, got {typeparam!r}")
-
-
-def _weavepy_set_typeparam_default_starred(typeparam, evaluate_default):
-    # `*Ts = *tuple[int, str]` — the default is the *unpacked* form of
-    # the evaluated operand, matching CPython's compiled
-    # `<operand>; UNPACK / next(iter(...))` shape (test_type_params
-    # asserts `Ts.__default__ == next(iter(operand))`).
-    def evaluate_starred():
-        return next(iter(evaluate_default()))
-
-    return _weavepy_set_typeparam_default(typeparam, evaluate_starred)

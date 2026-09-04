@@ -541,8 +541,6 @@ impl Conv<'_> {
                 simple: int_field(&self.req_node(&inst, "simple", "AnnAssign")?, "simple")? != 0,
             },
             "TypeAlias" => {
-                // The parser desugars `type X = v` to `X =
-                // __weavepy_type_alias__(...)`; mirror it for trees.
                 let target = self.expr(&self.req_node(&inst, "name", "TypeAlias")?)?;
                 let alias_name = match &target.kind {
                     past::ExprKind::Name(n) => n.clone(),
@@ -551,15 +549,11 @@ impl Conv<'_> {
                 };
                 let value = self.expr(&self.req_node(&inst, "value", "TypeAlias")?)?;
                 let type_params = self.type_params(field(&inst, "type_params"))?;
-                let rhs = weavepy_parser::build_lazy_type_alias(
-                    &alias_name,
-                    value,
-                    &type_params,
-                    target.span,
-                );
-                past::StmtKind::Assign {
-                    targets: vec![target],
-                    value: rhs,
+                past::StmtKind::TypeAlias {
+                    name: alias_name,
+                    name_span: target.span,
+                    type_params,
+                    value: Box::new(value),
                 }
             }
             "For" | "AsyncFor" => {

@@ -39,7 +39,7 @@ use std::sync::OnceLock;
 /// `weavepy3.13`, not `python3.13`, so a WeavePy tree and a CPython
 /// install can never shadow each other (same trade as the
 /// `weavepy-313` bytecode cache tag from RFC 0033).
-pub const LIB_DIR_NAME: &str = "weavepy3.13";
+pub const LIB_DIR_NAME: &str = weavepy_version::LIB_DIR_NAME;
 
 const COMPLETE_MARKER: &str = ".weavepy-complete";
 

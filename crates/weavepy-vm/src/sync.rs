@@ -121,6 +121,15 @@ pub type RefCell<T> = GilCell<T>;
 /// `T: Copy`) for the classic `Cell` ergonomics.
 pub type Cell<T> = GilCell<T>;
 
+/// A plain `std::cell::RefCell` for state that one interpreter owns
+/// outright and never publishes to another thread: the frame, stack,
+/// scratch, and shell free-lists (RFC 0077 WS3). Those are touched on
+/// every Python call, and a [`GilCell`] borrow there bought nothing
+/// but a thread-id lookup and two atomic RMWs. `ThreadCell` is `Send`
+/// (a worker thread takes its interpreter by move) and, like the
+/// `std` cell, not `Sync`: the compiler refuses the day one is shared.
+pub type ThreadCell<T> = std::cell::RefCell<T>;
+
 std::thread_local! {
     /// Number of live [`GilCell`] borrow guards ([`Ref`]/[`RefMut`]) on
     /// this thread. Guards are `!Send` (they wrap a
@@ -136,28 +145,60 @@ std::thread_local! {
     /// multi-thread `read_csv` (a container `repr` re-entering Python
     /// yielded the GIL with the container's borrow held; a sibling's
     /// `len()` on the same container then deadlocked the process).
-    static LIVE_CELL_GUARDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    ///
+    /// RFC 0077 (WS3): shares one thread-local block with the cached
+    /// native thread id. On macOS every distinct `thread_local!` costs
+    /// a `_tlv_get_addr` call, and a borrow used to pay two (the id for
+    /// the lock word, then this counter); the acquire path now takes
+    /// one, reading both fields through a single reference.
+    pub(crate) static CELL_TLS: CellTls = const {
+        CellTls {
+            thread_id: std::cell::Cell::new(0),
+            live_guards: std::cell::Cell::new(0),
+        }
+    };
+}
+
+/// The per-thread state [`GilCell`] consults on every borrow.
+pub(crate) struct CellTls {
+    /// Cached [`crate::gil::current_thread_id`]; `0` until derived (never
+    /// a valid id: pthread ids are pointers, Windows ids are non-zero for
+    /// live threads, and the hash fallback re-derives on collision).
+    pub(crate) thread_id: std::cell::Cell<u64>,
+    /// Live [`Ref`]/[`RefMut`] guards on this thread.
+    live_guards: std::cell::Cell<usize>,
+}
+
+impl CellTls {
+    #[inline]
+    fn thread_id(&self) -> u64 {
+        let id = self.thread_id.get();
+        if id != 0 {
+            id
+        } else {
+            let id = crate::gil::derive_thread_id();
+            self.thread_id.set(id);
+            id
+        }
+    }
 }
 
 // `try_with`, not `with`, throughout: guards can be dropped from TLS
 // destructors at thread teardown, where the counter cell itself may
 // already be gone — the count is then irrelevant, so a no-op is right.
 #[inline]
-fn note_cell_guard_acquired() {
-    let _ = LIVE_CELL_GUARDS.try_with(|c| c.set(c.get() + 1));
-}
-
-#[inline]
 fn note_cell_guard_released() {
-    let _ = LIVE_CELL_GUARDS.try_with(|c| c.set(c.get().saturating_sub(1)));
+    let _ = CELL_TLS.try_with(|t| t.live_guards.set(t.live_guards.get().saturating_sub(1)));
 }
 
 /// True iff the calling thread holds at least one live [`GilCell`]
 /// borrow guard. The GIL hand-off checkpoint refuses to yield while
-/// this is true (see [`LIVE_CELL_GUARDS`]).
+/// this is true (see [`CELL_TLS`]).
 #[inline]
 pub fn cell_guards_live() -> bool {
-    LIVE_CELL_GUARDS.try_with(|c| c.get() > 0).unwrap_or(false)
+    CELL_TLS
+        .try_with(|t| t.live_guards.get() > 0)
+        .unwrap_or(false)
 }
 
 /// Error returned by [`GilCell::try_borrow`] when the cell is
@@ -240,7 +281,12 @@ impl<T: ?Sized> GilCell<T> {
     /// and `fork(2)` recovery live in the cold path.
     #[inline]
     fn lock_acquire(&self) {
-        let me = crate::gil::current_thread_id();
+        self.lock_acquire_as(crate::gil::current_thread_id());
+    }
+
+    /// [`Self::lock_acquire`] with the caller's thread id in hand.
+    #[inline]
+    fn lock_acquire_as(&self, me: u64) {
         // Same-thread reentry: the owner field can only equal `me` if
         // this thread stored it, so the relaxed load is authoritative.
         if self.owner.load(Ordering::Relaxed) == me {
@@ -354,14 +400,25 @@ impl<T: ?Sized> GilCell<T> {
     /// Non-panicking variant of [`borrow`](Self::borrow). Returns
     /// [`BorrowError`] if a mutable borrow is live.
     pub fn try_borrow(&self) -> Result<Ref<'_, T>, BorrowError> {
-        self.lock_acquire();
-        // Bump the borrow counter. If we observed a negative value
-        // (a mutable borrow is live on this thread — the reentrant
-        // lock let us in), unwind and refuse.
-        let prev = self.borrow.fetch_add(1, Ordering::Acquire);
-        if prev < 0 {
-            self.borrow.fetch_sub(1, Ordering::Release);
-            self.lock_release();
+        // One thread-local access covers the lock word's owner id and
+        // the live-guard count. If the block is already torn down (a
+        // guard taken from a TLS destructor) fall back to the uncached
+        // id and skip the count, which is irrelevant by then.
+        let ok = CELL_TLS
+            .try_with(|t| {
+                self.lock_acquire_as(t.thread_id());
+                if self.borrow_shared() {
+                    t.live_guards.set(t.live_guards.get() + 1);
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or_else(|_| {
+                self.lock_acquire();
+                self.borrow_shared()
+            });
+        if !ok {
             return Err(BorrowError);
         }
         // SAFETY: we hold the reentrant lock (so no other thread
@@ -370,7 +427,6 @@ impl<T: ?Sized> GilCell<T> {
         // reference valid for as long as the guard (and thus the
         // lock) is held.
         let value: &T = unsafe { &*self.data.get() };
-        note_cell_guard_acquired();
         Ok(Ref {
             cell: self,
             value,
@@ -378,25 +434,60 @@ impl<T: ?Sized> GilCell<T> {
         })
     }
 
-    /// Non-panicking variant of [`borrow_mut`](Self::borrow_mut).
-    /// Returns [`BorrowMutError`] if any borrow is live.
-    pub fn try_borrow_mut(&self) -> Result<RefMut<'_, T>, BorrowMutError> {
-        self.lock_acquire();
-        // Only succeed if the counter is exactly zero — i.e. no
-        // shared borrow and no nested mutable borrow.
+    /// Bump the borrow counter under the held lock. If we observed a
+    /// negative value (a mutable borrow is live on this thread — the
+    /// reentrant lock let us in), unwind, release, and report failure.
+    #[inline]
+    fn borrow_shared(&self) -> bool {
+        let prev = self.borrow.fetch_add(1, Ordering::Acquire);
+        if prev < 0 {
+            self.borrow.fetch_sub(1, Ordering::Release);
+            self.lock_release();
+            return false;
+        }
+        true
+    }
+
+    /// Claim the exclusive borrow under the held lock: only succeeds if
+    /// the counter is exactly zero (no shared borrow and no nested
+    /// mutable borrow); releases the lock and reports failure otherwise.
+    #[inline]
+    fn borrow_exclusive(&self) -> bool {
         if self
             .borrow
             .compare_exchange(0, -1, Ordering::Acquire, Ordering::Acquire)
             .is_err()
         {
             self.lock_release();
+            return false;
+        }
+        true
+    }
+
+    /// Non-panicking variant of [`borrow_mut`](Self::borrow_mut).
+    /// Returns [`BorrowMutError`] if any borrow is live.
+    pub fn try_borrow_mut(&self) -> Result<RefMut<'_, T>, BorrowMutError> {
+        let ok = CELL_TLS
+            .try_with(|t| {
+                self.lock_acquire_as(t.thread_id());
+                if self.borrow_exclusive() {
+                    t.live_guards.set(t.live_guards.get() + 1);
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or_else(|_| {
+                self.lock_acquire();
+                self.borrow_exclusive()
+            });
+        if !ok {
             return Err(BorrowMutError);
         }
         // SAFETY: reentrant lock held; borrow counter is `-1` so
         // no other `&T` or `&mut T` to the data exists. Safe to
         // hand out an exclusive `&mut T` for the lock's lifetime.
         let value: &mut T = unsafe { &mut *self.data.get() };
-        note_cell_guard_acquired();
         Ok(RefMut {
             cell: self,
             value,
@@ -453,7 +544,7 @@ impl<T> GilCell<T> {
 impl<T: Copy> GilCell<T> {
     /// Get the inner value (copying it). Equivalent to
     /// `*self.borrow()` but skips guard construction and the
-    /// [`LIVE_CELL_GUARDS`] bookkeeping (RFC 0058 WS2): a `Copy`
+    /// [`CELL_TLS`] live-guard bookkeeping (RFC 0058 WS2): a `Copy`
     /// read cannot re-enter Python, so no GIL hand-off can occur
     /// while the lock is held — the yield-refusal counter exists
     /// only for guards that outlive a re-entrant call. `Cell::get`
@@ -467,7 +558,7 @@ impl<T: Copy> GilCell<T> {
         // racing a live same-thread `borrow_mut`) still surfaces as a
         // panic under `cargo test`; release builds read the payload
         // directly under the owner lock — no borrow-counter RMWs, no
-        // guard construction, no `LIVE_CELL_GUARDS` thread-local
+        // guard construction, no `CELL_TLS` thread-local
         // touches.
         #[cfg(debug_assertions)]
         {

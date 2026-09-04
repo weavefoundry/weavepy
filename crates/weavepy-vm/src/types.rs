@@ -23,6 +23,195 @@ use crate::object::{DictData, DictKey, Object};
 static METACLASS_DRIFT_HOOK: std::sync::OnceLock<fn(usize, &TypeObject)> =
     std::sync::OnceLock::new();
 
+/// Process-wide allocator for [`AttrVersion`] values. Starts at 1 so a
+/// zeroed [`type_cache`] entry can never match a live type.
+static NEXT_TYPE_VERSION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+/// A type's attribute-resolution version, WeavePy's `tp_version_tag`.
+///
+/// Values are *globally unique across all types and their lifetimes*
+/// (drawn from [`NEXT_TYPE_VERSION`]) rather than a per-type counter, so
+/// `(version)` alone identifies one resolution state of one type: a class
+/// freed and another allocated at the same address can never alias a
+/// cached entry (RFC 0077 WS4, [`type_cache`]). Reads are relaxed atomic
+/// loads — the previous `Cell<u32>` paid a `GilCell` lock round-trip on
+/// every inline-cache guard.
+pub struct AttrVersion(std::sync::atomic::AtomicU32);
+
+impl AttrVersion {
+    /// A never-before-used version.
+    pub fn fresh() -> Self {
+        Self(std::sync::atomic::AtomicU32::new(next_type_version()))
+    }
+
+    #[inline]
+    pub fn get(&self) -> u32 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn set(&self, v: u32) {
+        self.0.store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Move to a fresh, never-before-used version.
+    #[inline]
+    pub fn bump(&self) {
+        self.set(next_type_version());
+    }
+}
+
+impl std::fmt::Debug for AttrVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.get())
+    }
+}
+
+fn next_type_version() -> u32 {
+    let v = NEXT_TYPE_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Wrapped past `u32::MAX` (four billion class mutations): skip the
+    // reserved 0 so the "never matches" sentinel stays sound.
+    if v == 0 {
+        NEXT_TYPE_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    } else {
+        v
+    }
+}
+
+/// RFC 0077 WS4: the per-thread type attribute cache, WeavePy's analogue
+/// of CPython's `_PyType_Lookup` method cache.
+///
+/// Keyed by `(type address, attr_version, name)`, an entry records
+/// *where* the MRO walk found `name` — the owning class's MRO index and
+/// the key's slot in that class dict — or that the walk found nothing.
+/// It deliberately stores no `Object`: a cached value would pin class
+/// attributes past their `del`, visible to weakref tests, and a cached
+/// owner `Rc` would pin the class itself. On a hit the value is re-read
+/// through `mro[idx].dict.get_index(slot)`, so the cost is two `GilCell`
+/// borrows and a key compare instead of one siphash plus one probe per
+/// MRO level; negative hits (the common `__getattr__`/`__set_name__`-style
+/// probes) return without touching any dict.
+///
+/// Validity rests on the same invariant the LOAD_ATTR inline caches
+/// already depend on: every class-dict mutation or `__bases__` reshaping
+/// that can change resolution goes through [`TypeObject::bump_attr_version`]
+/// (for the type and its transitive subclasses). Versions are globally
+/// unique ([`AttrVersion`]), so a freed-and-reallocated type cannot alias
+/// a stale entry; positive hits additionally confirm the key at the
+/// recorded slot spells `name`, falling back to the walk otherwise. The
+/// name is identified by a 64-bit Fx hash plus length; two distinct
+/// attribute names of one type colliding on both is not a practical
+/// concern (the same trust CPython places in interned pointer identity).
+pub(crate) mod type_cache {
+    use std::cell::RefCell;
+    use std::hash::Hasher;
+
+    /// Entries per thread (CPython's `MCACHE_SIZE_EXP` is 12 too). 32 B
+    /// each, 128 KiB per thread, allocated on first use.
+    const SIZE: usize = 1 << 12;
+    const MASK: usize = SIZE - 1;
+    /// `mro_idx` value recording "the walk found nothing".
+    const ABSENT: u32 = u32::MAX;
+
+    #[derive(Clone, Copy)]
+    struct Entry {
+        ty: usize,
+        name_hash: u64,
+        ver: u32,
+        name_len: u32,
+        mro_idx: u32,
+        dict_idx: u32,
+    }
+
+    const EMPTY: Entry = Entry {
+        ty: 0,
+        name_hash: 0,
+        ver: 0,
+        name_len: 0,
+        mro_idx: ABSENT,
+        dict_idx: 0,
+    };
+
+    thread_local! {
+        static CACHE: RefCell<Option<Box<[Entry]>>> = const { RefCell::new(None) };
+    }
+
+    /// Where an MRO walk for a name landed.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) enum Hit {
+        /// The name resolves at `mro[mro_idx].dict[dict_idx]`.
+        At { mro_idx: u32, dict_idx: u32 },
+        /// The whole MRO was walked and the name is absent.
+        Absent,
+    }
+
+    #[inline]
+    pub(crate) fn name_hash(name: &str) -> u64 {
+        let mut h = crate::fasthash::FxHasher::default();
+        h.write(name.as_bytes());
+        h.finish()
+    }
+
+    #[inline]
+    fn slot(ty: usize, ver: u32, name_hash: u64) -> usize {
+        // Mix the type identity in so the same dunder on many classes
+        // does not pile into one slot; the version keeps a class's
+        // entries moving after each mutation so stale slots recycle.
+        ((name_hash ^ (ty as u64 >> 4).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ u64::from(ver))
+            as usize)
+            & MASK
+    }
+
+    /// Probe the cache. `ver` is the type's *current* version.
+    #[inline]
+    pub(crate) fn probe(ty: usize, ver: u32, name: &str, name_hash: u64) -> Option<Hit> {
+        CACHE.with(|c| {
+            let c = c.try_borrow().ok()?;
+            let table = c.as_ref()?;
+            let e = &table[slot(ty, ver, name_hash)];
+            if e.ty == ty
+                && e.ver == ver
+                && e.name_hash == name_hash
+                && e.name_len as usize == name.len()
+            {
+                Some(if e.mro_idx == ABSENT {
+                    Hit::Absent
+                } else {
+                    Hit::At {
+                        mro_idx: e.mro_idx,
+                        dict_idx: e.dict_idx,
+                    }
+                })
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Record the outcome of a full walk.
+    #[inline]
+    pub(crate) fn fill(ty: usize, ver: u32, name: &str, name_hash: u64, hit: Hit) {
+        CACHE.with(|c| {
+            let Ok(mut c) = c.try_borrow_mut() else {
+                return;
+            };
+            let table = c.get_or_insert_with(|| vec![EMPTY; SIZE].into_boxed_slice());
+            let (mro_idx, dict_idx) = match hit {
+                Hit::At { mro_idx, dict_idx } => (mro_idx, dict_idx),
+                Hit::Absent => (ABSENT, 0),
+            };
+            table[slot(ty, ver, name_hash)] = Entry {
+                ty,
+                name_hash,
+                ver,
+                name_len: name.len() as u32,
+                mro_idx,
+                dict_idx,
+            };
+        });
+    }
+}
+
 /// A Python class.
 ///
 /// The dict stores methods and class attributes — the same dict you
@@ -86,6 +275,16 @@ pub struct TypeObject {
     /// dispatch. Invalidated alongside `getattribute_kind` (same walk)
     /// and on `__setattr__` assignment / deletion / MRO changes.
     pub setattr_kind: Cell<u8>,
+    /// Cached MRO-membership answers for the hot "is this a subclass of
+    /// `super` / of `type`?" questions (RFC 0077 WS4), as a bitset:
+    /// `1` = super answer known, `2` = is a `super` subclass, `4` = type
+    /// answer known, `8` = is a `type` subclass. The generic instance
+    /// attribute load consults the first to skip the three super-proxy
+    /// dict probes (`__self_class__`/`__self__`/`__thisclass__`, each a
+    /// siphash) on ordinary instances; `instantiate` consults the second
+    /// on every constructor call. Reset by [`Self::bump_attr_version`],
+    /// which every MRO reshaping runs.
+    pub mro_kind: std::sync::atomic::AtomicU8,
     /// Attribute-resolution version, WeavePy's analogue of CPython's
     /// `tp_version_tag`: bumped (for the type and every transitive
     /// subclass) whenever the class dict or MRO changes in a way that can
@@ -93,8 +292,9 @@ pub struct TypeObject {
     /// `__bases__` reshaping. LOAD_ATTR/STORE_ATTR inline caches embed
     /// the value observed at specialisation time and deopt on mismatch,
     /// so installing e.g. a `property` over a name that instances carry
-    /// in `__dict__` is seen by already-specialised call sites.
-    pub attr_version: Cell<u32>,
+    /// in `__dict__` is seen by already-specialised call sites. Also keys
+    /// the per-thread [`type_cache`] (RFC 0077 WS4).
+    pub attr_version: AttrVersion,
     /// Cached "do instances of this type carry a `__del__` finalizer
     /// anywhere in their MRO?" answer, so [`crate::object::PyInstance`]'s
     /// `Drop` safety net can skip an MRO walk on the hot per-instance drop
@@ -460,7 +660,8 @@ impl TypeObject {
             subclasses: RefCell::new(Vec::new()),
             getattribute_kind: Cell::new(0),
             setattr_kind: Cell::new(0),
-            attr_version: Cell::new(0),
+            mro_kind: std::sync::atomic::AtomicU8::new(0),
+            attr_version: AttrVersion::fresh(),
             has_del: Cell::new(0),
             instance_plan: RefCell::new(None),
             c_tp_name: Cell::new(None),
@@ -829,9 +1030,10 @@ impl TypeObject {
     /// can change what an attribute name resolves to; specialised
     /// LOAD_ATTR/STORE_ATTR sites guard on the version and deopt.
     pub fn bump_attr_version(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
         let mut visited: Vec<*const TypeObject> = vec![std::ptr::from_ref::<TypeObject>(self)];
-        self.attr_version
-            .set(self.attr_version.get().wrapping_add(1));
+        self.attr_version.bump();
+        self.mro_kind.store(0, Relaxed);
         let mut queue: Vec<Rc<TypeObject>> = self.subclasses();
         while let Some(t) = queue.pop() {
             let ptr = Rc::as_ptr(&t);
@@ -839,9 +1041,41 @@ impl TypeObject {
                 continue;
             }
             visited.push(ptr);
-            t.attr_version.set(t.attr_version.get().wrapping_add(1));
+            t.attr_version.bump();
+            t.mro_kind.store(0, Relaxed);
             queue.extend(t.subclasses());
         }
+    }
+
+    /// Cached MRO-membership probe behind [`Self::mro_kind`]: `known` and
+    /// `yes` are the bit pair for one question.
+    #[inline]
+    fn mro_kind_probe(&self, known: u8, yes: u8, target: &TypeObject) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let bits = self.mro_kind.load(Relaxed);
+        if bits & known != 0 {
+            return bits & yes != 0;
+        }
+        let is = self.is_subclass_of(target);
+        // Other bits may have been filled concurrently; keep them.
+        self.mro_kind
+            .fetch_or(known | if is { yes } else { 0 }, Relaxed);
+        is
+    }
+
+    /// Is this `super` itself or a user subclass of it, i.e. can its
+    /// instances be super proxies carrying `__self_class__`? Cached in
+    /// [`Self::mro_kind`].
+    #[inline]
+    pub fn is_super_proxy_type(&self) -> bool {
+        self.mro_kind_probe(1, 2, &crate::builtin_types::builtin_types().super_)
+    }
+
+    /// Is this `type` itself or a metaclass (a subclass of `type`)?
+    /// Cached in [`Self::mro_kind`].
+    #[inline]
+    pub fn is_type_subclass(&self) -> bool {
+        self.mro_kind_probe(4, 8, &crate::builtin_types::builtin_types().type_)
     }
 
     /// Classify this type's resolved `__setattr__`: `true` when it is the
@@ -990,22 +1224,7 @@ impl TypeObject {
         // `str` — the comparisons are then pure native code and can
         // never re-enter Python to reassign `__bases__` mid-walk.
         if !crate::object::exotic_str_keys_possible() {
-            let key = crate::object::StrKey(name);
-            let mro = self.mro.borrow();
-            for ty in mro.iter() {
-                if let Some(v) = ty.dict.borrow().get(&key).cloned() {
-                    // Introspection-only entries (RFC 0056 WS4) are
-                    // invisible to dispatch — keep walking as if absent.
-                    // Only in *builtin* dicts, where the docs surface pass
-                    // installed them: a user class that aliases one
-                    // (`__str__ = object.__str__`) means it, per CPython.
-                    if ty.flags.is_builtin && crate::descr_registry::is_surface_only(&v) {
-                        continue;
-                    }
-                    return Some(v);
-                }
-            }
-            return None;
+            return self.lookup_cached(name).map(|(v, _)| v);
         }
         let key = DictKey(Object::from_str(name));
         // Snapshot the MRO before walking it (CPython `_PyType_Lookup`
@@ -1032,18 +1251,9 @@ impl TypeObject {
     pub fn lookup_with_owner(&self, name: &str) -> Option<(Object, Rc<TypeObject>)> {
         // Fast pass — see `lookup` for the gate rationale.
         if !crate::object::exotic_str_keys_possible() {
-            let key = crate::object::StrKey(name);
-            let mro = self.mro.borrow();
-            for ty in mro.iter() {
-                if let Some(v) = ty.dict.borrow().get(&key).cloned() {
-                    // Builtin-dict-only skip — see `lookup`.
-                    if ty.flags.is_builtin && crate::descr_registry::is_surface_only(&v) {
-                        continue;
-                    }
-                    return Some((v, ty.clone()));
-                }
-            }
-            return None;
+            let (v, idx) = self.lookup_cached(name)?;
+            let owner = self.mro.borrow().get(idx)?.clone();
+            return Some((v, owner));
         }
         let key = DictKey(Object::from_str(name));
         // Snapshot for reentrancy — see `lookup`.
@@ -1056,6 +1266,63 @@ impl TypeObject {
                 return Some((v, ty.clone()));
             }
         }
+        None
+    }
+
+    /// The plain-`str`-keys MRO walk behind [`Self::lookup`] and
+    /// [`Self::lookup_with_owner`], fronted by the per-thread
+    /// [`type_cache`]. Returns the value and the MRO index of its owner.
+    #[inline]
+    fn lookup_cached(&self, name: &str) -> Option<(Object, usize)> {
+        let ty = std::ptr::from_ref::<TypeObject>(self) as usize;
+        let ver = self.attr_version.get();
+        let h = type_cache::name_hash(name);
+        match type_cache::probe(ty, ver, name, h) {
+            Some(type_cache::Hit::Absent) => return None,
+            Some(type_cache::Hit::At { mro_idx, dict_idx }) => {
+                let mro = self.mro.borrow();
+                if let Some(owner) = mro.get(mro_idx as usize) {
+                    let d = owner.dict.borrow();
+                    if let Some((k, v)) = d.get_index(dict_idx as usize) {
+                        if matches!(&k.0, Object::Str(s) if s.as_ref() == name) {
+                            return Some((v.clone(), mro_idx as usize));
+                        }
+                    }
+                }
+                // The slot moved under an unbumped mutation: fall through
+                // to the walk, which refreshes the entry.
+            }
+            None => {}
+        }
+        let key = crate::object::StrKey(name);
+        let mro = self.mro.borrow();
+        for (i, owner) in mro.iter().enumerate() {
+            let d = owner.dict.borrow();
+            if let Some((dict_idx, _, v)) = d.get_full(&key) {
+                // Introspection-only entries (RFC 0056 WS4) are invisible
+                // to dispatch — keep walking as if absent. Only in
+                // *builtin* dicts, where the docs surface pass installed
+                // them: a user class that aliases one
+                // (`__str__ = object.__str__`) means it, per CPython.
+                if owner.flags.is_builtin && crate::descr_registry::is_surface_only(v) {
+                    continue;
+                }
+                let v = v.clone();
+                drop(d);
+                type_cache::fill(
+                    ty,
+                    ver,
+                    name,
+                    h,
+                    type_cache::Hit::At {
+                        mro_idx: i as u32,
+                        dict_idx: dict_idx as u32,
+                    },
+                );
+                return Some((v, i));
+            }
+        }
+        type_cache::fill(ty, ver, name, h, type_cache::Hit::Absent);
         None
     }
 
@@ -1399,7 +1666,7 @@ impl Drop for PyInstance {
     /// a shallow copy that shares the dying instance's `__dict__`/slots/native
     /// value onto the VM's pending-finalizer queue so `__del__` still runs.
     fn drop(&mut self) {
-        if std::env::var_os("WEAVEPY_REAP_TRACE").is_some() {
+        if crate::hot_gates::env_flags::reap_trace() {
             let name = self.cls().name.clone();
             if name.contains("Block") || name.contains("DataFrame") {
                 eprintln!("[INST-DROP] {name} body={:#x}", self.c_body.get());

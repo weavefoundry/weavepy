@@ -37,8 +37,11 @@ pub struct RunOpts {
     pub include_cpython: bool,
     /// Also collect a WeavePy column with `WEAVEPY_JIT=0` (RFC 0067
     /// WS4). The default binary ships with the tier-2 JIT on, so the
-    /// gated `weavepy` column measures the JIT; this extra column
-    /// keeps interpreter-only progress a measured, reported number.
+    /// `weavepy` column measures the JIT. RFC 0077 WS1 makes this
+    /// column default-on and *gated* (`interp_ratio`): the tier-1
+    /// floor is what every non-compiled frame, deopt, and generic
+    /// call runs on, and it had never been measured against a
+    /// baseline. `--no-interp` opts out for quick local runs.
     pub include_interp: bool,
     /// Explicit path to the host Python. When `None`, `python3.13`
     /// is preferred and `python3` is the fallback.
@@ -56,7 +59,7 @@ impl Default for RunOpts {
             samples: 5,
             warmup: true,
             include_cpython: true,
-            include_interp: false,
+            include_interp: true,
             python_path: None,
             weavepy_path: None,
         }
@@ -566,9 +569,337 @@ fn time_scaling_subprocess(
     }
 }
 
+/// A flat top-of-stack profile of one fixture run (RFC 0077 WS1).
+#[derive(Debug, Clone, Default)]
+pub struct Census {
+    /// Samples attributed to the interpreter thread (the thread with
+    /// the most samples; the others are idle helpers).
+    pub total_samples: u64,
+    /// `(self samples, demangled symbol)`, descending.
+    pub top: Vec<(u64, String)>,
+}
+
+/// Run `weavepy fixture.py` with an inflated work size and sample its
+/// interpreter thread for `secs` seconds; return the flat self-time
+/// census. macOS uses `sample(1)`; Linux uses `perf record` +
+/// `perf report --no-children`. Other platforms are an error.
+pub fn profile_fixture(
+    weavepy: &Path,
+    fix: &Fixture,
+    work: u32,
+    secs: u32,
+    jit: bool,
+) -> io::Result<Census> {
+    // The fixture must outlive the sampling window; the runner's
+    // baseline work sizes finish in well under a second, so scale the
+    // work up and let the profiler stop first (`-mayDie` tolerates a
+    // fixture that finishes early).
+    let inflated = work.saturating_mul(secs.max(1) * 4);
+    let mut cmd = Command::new(weavepy);
+    cmd.arg(&fix.path)
+        .env("WEAVEPY_BENCH_WORK", inflated.to_string())
+        .env_remove("WEAVEPY_VM_STATS")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if jit {
+        cmd.env_remove("WEAVEPY_JIT");
+    } else {
+        cmd.env("WEAVEPY_JIT", "0");
+    }
+    if cfg!(target_os = "macos") {
+        let mut child = cmd.spawn()?;
+        // Let startup and the fixture's warm-up finish before sampling.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let out = Command::new("sample")
+            .arg(child.id().to_string())
+            .arg(secs.to_string())
+            .arg("1")
+            .arg("-mayDie")
+            .output();
+        let _ = child.kill();
+        let _ = child.wait();
+        let out = out?;
+        if !out.status.success() {
+            return Err(io::Error::other(format!(
+                "sample(1) failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        if let Ok(path) = std::env::var("WEAVEPY_BENCH_PROFILE_RAW") {
+            std::fs::write(path, text.as_bytes())?;
+        }
+        Ok(parse_sample_output(&text))
+    } else if cfg!(target_os = "linux") {
+        let data =
+            std::env::temp_dir().join(format!("weavepy-bench-perf-{}.data", std::process::id()));
+        let mut perf = Command::new("perf");
+        perf.arg("record")
+            .arg("-F")
+            .arg("999")
+            .arg("-g")
+            .arg("-o")
+            .arg(&data)
+            .arg("--")
+            .arg(weavepy)
+            .arg(&fix.path)
+            .env("WEAVEPY_BENCH_WORK", inflated.to_string())
+            .env_remove("WEAVEPY_VM_STATS")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if jit {
+            perf.env_remove("WEAVEPY_JIT");
+        } else {
+            perf.env("WEAVEPY_JIT", "0");
+        }
+        let status = perf.status()?;
+        if !status.success() {
+            return Err(io::Error::other("perf record failed"));
+        }
+        let out = Command::new("perf")
+            .arg("report")
+            .arg("--no-children")
+            .arg("--stdio")
+            .arg("-i")
+            .arg(&data)
+            .output()?;
+        let _ = std::fs::remove_file(&data);
+        Ok(parse_perf_report(&String::from_utf8_lossy(&out.stdout)))
+    } else {
+        Err(io::Error::other(
+            "profile: no sampler on this platform (macOS `sample` and Linux `perf` are supported)",
+        ))
+    }
+}
+
+/// Parse `sample(1)`'s call-tree text into a flat self-time census.
+/// Each line is `<prefix><count> <symbol>  (in <image>) ...` where
+/// the prefix's width encodes depth; a node's self samples are its
+/// count minus the sum of its children's counts. Only the thread with
+/// the most samples is counted.
+fn parse_sample_output(text: &str) -> Census {
+    // Every thread is sampled the same number of times, and the CLI
+    // runs the interpreter on a spawned big-stack thread (the process
+    // main thread just waits on it), so the interpreter thread is the
+    // one with the richest call tree: idle helpers sit in one wait
+    // syscall.
+    struct Block {
+        total: u64,
+        nodes: Vec<(usize, u64, String)>,
+    }
+    let better =
+        |a: &Block, b: &Block| -> bool { (a.nodes.len(), a.total) > (b.nodes.len(), b.total) };
+    let mut best: Option<Block> = None;
+    let mut cur: Option<Block> = None;
+    let flush = |cur: &mut Option<Block>, best: &mut Option<Block>| {
+        if let Some(b) = cur.take() {
+            if !b.nodes.is_empty() && best.as_ref().is_none_or(|bb| better(&b, bb)) {
+                *best = Some(b);
+            }
+        }
+    };
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let is_thread_header = trimmed.contains(" Thread_") && !trimmed.starts_with('+');
+        if is_thread_header {
+            if let Some((count, _)) = parse_count_symbol(trimmed) {
+                flush(&mut cur, &mut best);
+                cur = Some(Block {
+                    total: count,
+                    nodes: Vec::new(),
+                });
+            }
+            continue;
+        }
+        if line.starts_with("Total number in stack")
+            || line.starts_with("Sort by top of stack")
+            || line.starts_with("Binary Images:")
+        {
+            flush(&mut cur, &mut best);
+            break;
+        }
+        let Some(pos) = line.find(|c: char| c.is_ascii_digit()) else {
+            continue;
+        };
+        let prefix = &line[..pos];
+        if !prefix
+            .chars()
+            .all(|c| matches!(c, ' ' | '+' | '!' | ':' | '|'))
+        {
+            continue;
+        }
+        if let Some((count, sym)) = parse_count_symbol(&line[pos..]) {
+            if let Some(b) = cur.as_mut() {
+                b.nodes.push((prefix.len(), count, sym));
+            }
+        }
+    }
+    flush(&mut cur, &mut best);
+    let Some(Block { total, nodes, .. }) = best else {
+        return Census::default();
+    };
+    // Self samples: count minus the sum of the immediate children.
+    let mut selfs: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for (i, (depth, count, sym)) in nodes.iter().enumerate() {
+        let mut children = 0u64;
+        for (d2, c2, _) in &nodes[i + 1..] {
+            if d2 <= depth {
+                break;
+            }
+            if *d2 == depth + 2 {
+                children += c2;
+            }
+        }
+        // Some `sample` versions indent by 2, others by more; fall back
+        // to "next-deeper" when no child sat at depth + 2.
+        if children == 0 {
+            let mut next_depth = None;
+            for (d2, c2, _) in &nodes[i + 1..] {
+                if d2 <= depth {
+                    break;
+                }
+                match next_depth {
+                    None => {
+                        next_depth = Some(*d2);
+                        children += c2;
+                    }
+                    Some(nd) if *d2 == nd => children += c2,
+                    _ => {}
+                }
+            }
+        }
+        let self_n = count.saturating_sub(children);
+        if self_n > 0 {
+            *selfs.entry(sym.clone()).or_insert(0) += self_n;
+        }
+    }
+    let mut top: Vec<(u64, String)> = selfs.into_iter().map(|(s, n)| (n, s)).collect();
+    top.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    Census {
+        total_samples: total,
+        top,
+    }
+}
+
+/// `"<count> <symbol>  (in image) + off  [addr]"` -> `(count, demangled symbol)`.
+fn parse_count_symbol(s: &str) -> Option<(u64, String)> {
+    let mut it = s.splitn(2, ' ');
+    let count: u64 = it.next()?.parse().ok()?;
+    let rest = it.next()?.trim_start();
+    let sym = match rest.find("  (in ") {
+        Some(p) => &rest[..p],
+        None => rest.split("  [").next().unwrap_or(rest),
+    };
+    Some((count, demangle_rust(sym.trim())))
+}
+
+/// Parse `perf report --no-children --stdio` into a census.
+fn parse_perf_report(text: &str) -> Census {
+    let mut top = Vec::new();
+    let mut total = 0u64;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("# Samples: ") {
+            let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            total = num.parse().unwrap_or(0);
+            if rest.contains('K') {
+                total *= 1000;
+            } else if rest.contains('M') {
+                total *= 1_000_000;
+            }
+        }
+        let t = line.trim_start();
+        if t.is_empty() || t.starts_with('#') || !t.contains("[.] ") && !t.contains("[k] ") {
+            continue;
+        }
+        // "    12.34%  weavepy  weavepy  [.] symbol"
+        let mut cols = t.split_whitespace();
+        let Some(pct) = cols.next().and_then(|p| p.strip_suffix('%')) else {
+            continue;
+        };
+        let Ok(pct) = pct.parse::<f64>() else {
+            continue;
+        };
+        let sym = t
+            .split("[.] ")
+            .nth(1)
+            .or_else(|| t.split("[k] ").nth(1))
+            .unwrap_or("")
+            .trim();
+        if sym.is_empty() {
+            continue;
+        }
+        let n = (pct / 100.0 * total as f64).round() as u64;
+        top.push((n, demangle_rust(sym)));
+    }
+    top.sort_by_key(|b| std::cmp::Reverse(b.0));
+    Census {
+        total_samples: total,
+        top,
+    }
+}
+
+/// Demangle a Rust symbol (legacy `_ZN…E` or v0 `_R…`) for the census,
+/// dropping the legacy hash suffix; non-Rust symbols pass through.
+/// `sample(1)` strips the leading underscore on macOS, so both spellings
+/// are tried.
+fn demangle_rust(sym: &str) -> String {
+    let candidates = [sym.to_owned(), format!("_{sym}")];
+    for c in &candidates {
+        if let Ok(d) = rustc_demangle::try_demangle(c) {
+            return format!("{d:#}");
+        }
+    }
+    sym.to_owned()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{median, parse_bench_ns, ScalingRow};
+    use super::{demangle_rust, median, parse_bench_ns, parse_sample_output, ScalingRow};
+
+    #[test]
+    fn demangles_legacy_rust_symbols() {
+        assert_eq!(
+            demangle_rust("_ZN10weavepy_vm11Interpreter4step17h0123456789abcdefE"),
+            "weavepy_vm::Interpreter::step"
+        );
+        // macOS `sample` drops the leading underscore of v0 symbols.
+        assert_eq!(
+            demangle_rust("RNvMs2_Cse9Klhfpw3ze_10weavepy_vmNtB5_11Interpreter4step"),
+            "<weavepy_vm::Interpreter>::step"
+        );
+        assert_eq!(
+            demangle_rust(
+                "_ZN4core3ptr47drop_in_place$LT$weavepy_vm..object..Object$GT$17h0123456789abcdefE"
+            ),
+            "core::ptr::drop_in_place<weavepy_vm::object::Object>"
+        );
+        assert_eq!(demangle_rust("malloc"), "malloc");
+    }
+
+    #[test]
+    fn sample_tree_self_samples() {
+        let text = "\
+Call graph:
+    100 Thread_1   DispatchQueue_1: com.apple.main-thread  (serial)
+    + 100 start  (in dyld) + 6076  [0x1]
+    +   100 main  (in weavepy) + 40  [0x2]
+    +     70 _ZN10weavepy_vm11Interpreter4step17h0123456789abcdefE  (in weavepy) + 4  [0x3]
+    +     ! 30 malloc  (in libsystem_malloc.dylib) + 4  [0x4]
+    +     30 free  (in libsystem_malloc.dylib) + 4  [0x5]
+    5 Thread_2
+    + 5 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x6]
+
+Total number in stack (recursive counted multiple, when >=5):
+";
+        let c = parse_sample_output(text);
+        assert_eq!(c.total_samples, 100);
+        let get = |name: &str| c.top.iter().find(|(_, s)| s == name).map(|(n, _)| *n);
+        assert_eq!(get("weavepy_vm::Interpreter::step"), Some(40));
+        assert_eq!(get("malloc"), Some(30));
+        assert_eq!(get("free"), Some(30));
+        assert_eq!(get("main"), None);
+        assert_eq!(get("__psynch_cvwait"), None);
+    }
 
     #[test]
     fn parses_last_ns_line() {

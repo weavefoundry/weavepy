@@ -117,3 +117,56 @@ pub fn clear(bits: u32) {
     HOT.fetch_and(!bits, Ordering::Relaxed);
     bump_loop_gen();
 }
+
+/// RFC 0077 (WS2): once-read debug/bisection environment flags for
+/// paths hot enough that a `getenv` per call showed up in the census
+/// (`__findenv_locked` on `list_ops`). Each is read on first use and
+/// cached for the process lifetime, which is also how CPython treats
+/// its `PYTHON*` variables.
+pub mod env_flags {
+    macro_rules! once_flag {
+        ($(#[$m:meta])* $name:ident, $var:literal) => {
+            $(#[$m])*
+            #[inline]
+            pub fn $name() -> bool {
+                static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                *FLAG.get_or_init(|| std::env::var_os($var).is_some())
+            }
+        };
+    }
+    once_flag!(
+        /// `WEAVEPY_REAP_TRACE`: prompt-reap tracing.
+        reap_trace,
+        "WEAVEPY_REAP_TRACE"
+    );
+    once_flag!(
+        /// `WEAVEPY_NO_QUIET`: pin the dispatch loop to its full prologue.
+        no_quiet,
+        "WEAVEPY_NO_QUIET"
+    );
+    once_flag!(
+        /// `WP_DBG_SAMPLE`: periodic frame-entry sampling to stderr.
+        dbg_sample,
+        "WP_DBG_SAMPLE"
+    );
+    once_flag!(
+        /// `WP_REAP_DBG`: reap-cascade debugging.
+        reap_dbg,
+        "WP_REAP_DBG"
+    );
+    once_flag!(
+        /// `WEAVEPY_CMP_BT`: backtrace on unsupported comparisons.
+        cmp_bt,
+        "WEAVEPY_CMP_BT"
+    );
+    once_flag!(
+        /// `WEAVEPY_LEN_DBG`: `len()` fallback debugging.
+        len_dbg,
+        "WEAVEPY_LEN_DBG"
+    );
+    once_flag!(
+        /// `WEAVEPY_TRACE_INIT`: builtin-kwargs rejection tracing.
+        trace_init,
+        "WEAVEPY_TRACE_INIT"
+    );
+}

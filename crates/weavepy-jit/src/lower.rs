@@ -747,9 +747,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             TOp::Pop => {
                 self.pop();
             }
-            TOp::Dup => {
-                let top = *self.vstack.last().expect("dup on empty");
-                self.vstack.push(top);
+            TOp::Dup { depth } => {
+                let len = self.vstack.len();
+                let entry = self.vstack[len - depth as usize];
+                self.vstack.push(entry);
             }
             TOp::Swap2 => {
                 let len = self.vstack.len();

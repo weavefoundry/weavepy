@@ -1298,8 +1298,10 @@ fn ctor_field_plan(icode: &CodeObject) -> Option<Vec<(String, CtorFieldSrc)>> {
             }
             // `self.<name> = <param or const>`: value load, self load,
             // STORE_ATTR.
-            OpCode::LoadFast | OpCode::LoadConst => {
+            OpCode::LoadFast | OpCode::LoadConst | OpCode::LoadSmallInt => {
                 let src = match ins[i].op {
+                    // CPython 3.14 LOAD_SMALL_INT (`self.x = 0`).
+                    OpCode::LoadSmallInt => CtorFieldSrc::Lane(JitType::Int),
                     OpCode::LoadFast => {
                         let slot = ins[i].arg;
                         if slot == 0 {

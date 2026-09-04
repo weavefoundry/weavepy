@@ -69,11 +69,10 @@ pub enum StmtKind {
         /// PEP 695 type parameters (`class C[T](…)`).
         type_params: Vec<TypeParam>,
     },
-    /// PEP 695 `type Name[T, …] = value`. Kept first-class in the
-    /// parse AST so `ast.parse` and `symtable` see the real node;
-    /// the compiler lowers it to the lazy `__weavepy_type_alias__`
-    /// assignment (see `parser::lower_type_alias_stmt`) before any
-    /// other pass runs.
+    /// PEP 695 `type Name[T, …] = value`. The compiler emits
+    /// `CALL_INTRINSIC_1 INTRINSIC_TYPEALIAS` over the name, the
+    /// type-parameter tuple, and a lazy value thunk (CPython
+    /// `codegen_typealias`).
     TypeAlias {
         name: String,
         /// Span of the alias-name token (for `ast.TypeAlias.name`).
@@ -223,107 +222,6 @@ pub enum TypeParamKind {
     TypeVarTuple,
     /// `**P`.
     ParamSpec,
-}
-
-impl TypeParam {
-    /// Synthesize the runtime-constructor call expression for this
-    /// type parameter — the WeavePy analogue of CPython's
-    /// `CALL_INTRINSIC_1 INTRINSIC_TYPEVAR{_WITH_BOUND,…}` lowering.
-    ///
-    /// - `T`            → `__weavepy_typevar__('T')`
-    /// - `T: int`       → `__weavepy_typevar_with_bound__('T', <thunk> int)`
-    /// - `T: (a, b)`    → `__weavepy_typevar_with_constraints__('T', <thunk> (a, b))`
-    /// - `*Ts`          → `__weavepy_typevartuple__('Ts')`
-    /// - `**P`          → `__weavepy_paramspec__('P')`
-    ///
-    /// Bounds compile as zero-argument [`ExprKind::TypeParamFn`]
-    /// thunks so their evaluation is deferred to first attribute
-    /// access (PEP 695 lazy semantics). A PEP 696 `= default` is *not*
-    /// part of the constructor: it must be attached only after the
-    /// parameter's name is bound, because the default expression can
-    /// reference the parameter itself (see
-    /// [`Self::apply_default_expr`]).
-    ///
-    /// The `__name__` string constant uses [`Self::source_name`], not
-    /// the (possibly mangled) binding name.
-    pub fn constructor_expr(&self) -> Expr {
-        let span = self.span;
-        let name_str = Expr {
-            kind: ExprKind::Constant(Constant::Str(self.source_name.clone())),
-            span,
-        };
-        let lazy_thunk = |body: Expr| Expr {
-            kind: ExprKind::TypeParamFn {
-                args: Arguments::default(),
-                body: Box::new(body),
-            },
-            span,
-        };
-        let call = |func: &str, args: Vec<Expr>| Expr {
-            kind: ExprKind::Call {
-                func: Box::new(Expr {
-                    kind: ExprKind::Name(func.to_owned()),
-                    span,
-                }),
-                args,
-                keywords: Vec::new(),
-            },
-            span,
-        };
-        match &self.kind {
-            TypeParamKind::TypeVar { bound: None } => call("__weavepy_typevar__", vec![name_str]),
-            TypeParamKind::TypeVar { bound: Some(b) } => {
-                // A parenthesized tuple bound is a constraints list.
-                let intrinsic = if matches!(b.kind, ExprKind::Tuple(_)) {
-                    "__weavepy_typevar_with_constraints__"
-                } else {
-                    "__weavepy_typevar_with_bound__"
-                };
-                call(intrinsic, vec![name_str, lazy_thunk((**b).clone())])
-            }
-            TypeParamKind::TypeVarTuple => call("__weavepy_typevartuple__", vec![name_str]),
-            TypeParamKind::ParamSpec => call("__weavepy_paramspec__", vec![name_str]),
-        }
-    }
-
-    /// `__weavepy_typeparam_default__(<param>, <thunk> default)` — the
-    /// PEP 696 default application (CPython's
-    /// `INTRINSIC_SET_TYPEPARAM_DEFAULT`). Emitted *after* the
-    /// parameter's binding is live so the thunk can close over the
-    /// parameter itself (`type X[T = [T for T in [T]]] = T`).
-    pub fn apply_default_expr(&self, param: Expr) -> Expr {
-        let span = self.span;
-        let Some(d) = &self.default else {
-            return param;
-        };
-        // A starred TypeVarTuple default (`*Ts = *tuple[int]`) lazily
-        // evaluates to the *unpacked* form — CPython's
-        // `next(iter(value))` on the evaluated operand.
-        let (intrinsic, body) = match &d.kind {
-            ExprKind::Starred(inner) => {
-                ("__weavepy_typeparam_default_starred__", (**inner).clone())
-            }
-            _ => ("__weavepy_typeparam_default__", (**d).clone()),
-        };
-        let thunk = Expr {
-            kind: ExprKind::TypeParamFn {
-                args: Arguments::default(),
-                body: Box::new(body),
-            },
-            span,
-        };
-        Expr {
-            kind: ExprKind::Call {
-                func: Box::new(Expr {
-                    kind: ExprKind::Name(intrinsic.to_owned()),
-                    span,
-                }),
-                args: vec![param, thunk],
-                keywords: Vec::new(),
-            },
-            span,
-        }
-    }
 }
 
 /// One `case` clause inside a `match` statement (RFC 0009).

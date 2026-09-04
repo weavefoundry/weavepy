@@ -169,7 +169,13 @@ class deque:
     # attribute assignment, and a subclass may list '__dict__' in its
     # own `__slots__` (test_deque DequeWithSlots). It *does* set
     # `tp_weaklistoffset`, so weak references work (test_weakref).
-    __slots__ = ("_data", "_maxlen", "_state", "__weakref__")
+    # `_head` is the count of consumed slots at the front of `_data`
+    # (RFC 0077 WS6): `popleft` advances it in O(1) instead of shifting
+    # the whole list, and the dead prefix is dropped once it reaches half
+    # the list, so the queue-shaped `append`/`popleft` traffic asyncio's
+    # ready queue and `queue.Queue` generate is amortized O(1) per
+    # operation. Every other method flattens through `_flat()` first.
+    __slots__ = ("_data", "_maxlen", "_state", "_head", "__weakref__")
 
     # CPython's C deque carries Py_TPFLAGS_SEQUENCE, so `case [..]:`
     # patterns match deques (PEP 634). WeavePy's VM reads the flag off
@@ -184,6 +190,7 @@ class deque:
             if maxlen < 0:
                 raise ValueError("maxlen must be non-negative")
         self._data = []
+        self._head = 0
         self._maxlen = maxlen
         # Mutation counter (CPython's `deque->state`): live iterators
         # compare against their snapshot and raise "deque mutated during
@@ -195,6 +202,14 @@ class deque:
     def maxlen(self):
         return self._maxlen
 
+    def _flat(self):
+        """The backing list with the consumed prefix removed."""
+        h = self._head
+        if h:
+            del self._data[:h]
+            self._head = 0
+        return self._data
+
     def append(self, x):
         # CPython's method descriptor rejects unbound calls with a
         # foreign receiver (`deque.append(thing, x)` — gh-92063).
@@ -205,64 +220,94 @@ class deque:
             )
         self._state += 1
         self._data.append(x)
-        if self._maxlen is not None and len(self._data) > self._maxlen:
-            del self._data[0]
+        if self._maxlen is not None and len(self._data) - self._head > self._maxlen:
+            self.popleft()
 
     def appendleft(self, x):
+        # Fill the consumed prefix from the right; when there is none,
+        # open a block of slack proportional to the size so a run of
+        # `appendleft` calls is amortized O(1) like CPython's block
+        # deque (rather than `list.insert(0, x)`'s O(n) shift).
         self._state += 1
-        self._data.insert(0, x)
-        if self._maxlen is not None and len(self._data) > self._maxlen:
-            self._data.pop()
+        data = self._data
+        h = self._head
+        if h == 0:
+            h = max(8, len(data) // 2)
+            data[0:0] = [None] * h
+        h -= 1
+        data[h] = x
+        self._head = h
+        if self._maxlen is not None and len(data) - h > self._maxlen:
+            data.pop()
 
     def pop(self):
-        if not self._data:
+        data = self._data
+        if len(data) <= self._head:
             raise IndexError("pop from an empty deque")
         self._state += 1
-        return self._data.pop()
+        x = data.pop()
+        if len(data) == self._head and self._head:
+            del data[:]
+            self._head = 0
+        return x
 
     def popleft(self):
-        if not self._data:
+        data = self._data
+        h = self._head
+        if h >= len(data):
             raise IndexError("pop from an empty deque")
         self._state += 1
-        return self._data.pop(0)
+        x = data[h]
+        data[h] = None
+        h += 1
+        if h >= len(data):
+            del data[:]
+            h = 0
+        elif h >= 32 and h * 2 >= len(data):
+            del data[:h]
+            h = 0
+        self._head = h
+        return x
 
     def extend(self, iterable):
         # `d.extend(d)` iterates a snapshot (CPython special-cases
         # self-extension the same way).
         if iterable is self:
-            iterable = list(self._data)
+            iterable = list(self._flat())
         for item in iterable:
             self.append(item)
 
     def extendleft(self, iterable):
         if iterable is self:
-            iterable = list(self._data)
+            iterable = list(self._flat())
         for item in iterable:
             self.appendleft(item)
 
     def rotate(self, n=1):
-        if not self._data:
+        data = self._flat()
+        if not data:
             return
-        size = len(self._data)
+        size = len(data)
         n = n % size
         if n == 0:
             return
         self._state += 1
-        self._data = self._data[-n:] + self._data[:-n]
+        self._data = data[-n:] + data[:-n]
 
     def clear(self):
         self._state += 1
         del self._data[:]
+        self._head = 0
 
     def copy(self):
-        return type(self)(self._data, self._maxlen)
+        return type(self)(self._flat(), self._maxlen)
 
     __copy__ = copy
 
     def count(self, value):
         # CPython `deque_count`: per-comparison mutation trip-wire — an
         # `__eq__` that mutates the deque raises RuntimeError.
-        data = self._data
+        data = self._flat()
         state = self._state
         n = len(data)
         result = 0
@@ -277,7 +322,7 @@ class deque:
         return result
 
     def index(self, value, start=0, stop=None):
-        data = self._data
+        data = self._flat()
         state = self._state
         if stop is None:
             stop = len(data)
@@ -296,15 +341,15 @@ class deque:
         raise ValueError(f"{value!r} is not in deque")
 
     def insert(self, i, x):
-        if self._maxlen is not None and len(self._data) >= self._maxlen:
+        if self._maxlen is not None and len(self) >= self._maxlen:
             raise IndexError("deque already at its maximum size")
         self._state += 1
-        self._data.insert(i, x)
+        self._flat().insert(i, x)
 
     def remove(self, value):
         # CPython `deque_remove`: a size change caused by a comparison's
         # side effects is an IndexError, distinct from the iteration guard.
-        data = self._data
+        data = self._flat()
         n = len(data)
         i = 0
         while i < n:
@@ -321,13 +366,13 @@ class deque:
 
     def reverse(self):
         self._state += 1
-        self._data.reverse()
+        self._flat().reverse()
 
     def __len__(self):
-        return len(self._data)
+        return len(self._data) - self._head
 
     def __bool__(self):
-        return bool(self._data)
+        return len(self._data) > self._head
 
     def __iter__(self):
         return _deque_iterator(self)
@@ -337,7 +382,7 @@ class deque:
 
     def __contains__(self, x):
         # CPython `deque_contains`: mutation during a comparison raises.
-        data = self._data
+        data = self._flat()
         state = self._state
         i = 0
         while i < len(data):
@@ -352,26 +397,41 @@ class deque:
             i += 1
         return False
 
+    def _slot(self, idx):
+        # Translate a logical index into a `_data` slot, honoring the
+        # consumed prefix without flattening (`d[0]`/`d[-1]` peeks stay
+        # O(1) on a queue that is being drained from the left).
+        try:
+            i = idx.__index__()
+        except AttributeError:
+            raise TypeError(
+                "sequence index must be integer, not '%s'" % type(idx).__name__
+            ) from None
+        n = len(self._data) - self._head
+        if i < 0:
+            i += n
+        if i < 0 or i >= n:
+            raise IndexError("deque index out of range")
+        return self._head + i
+
     def __getitem__(self, idx):
-        if isinstance(idx, slice):
-            raise TypeError("sequence index must be integer, not 'slice'")
-        return self._data[idx]
+        return self._data[self._slot(idx)]
 
     def __setitem__(self, idx, value):
         # In-place replacement does NOT invalidate live iterators (CPython's
         # `deque_ass_item` leaves `state` alone; test_deque
         # test_iterator_pickle mutates through `d[i] = x` mid-iteration).
-        self._data[idx] = value
+        self._data[self._slot(idx)] = value
 
     def __delitem__(self, idx):
         self._state += 1
-        del self._data[idx]
+        del self._flat()[idx]
 
     def __add__(self, other):
         if not isinstance(other, deque):
             return NotImplemented
         new = self.copy()
-        new.extend(other._data)
+        new.extend(other._flat())
         return new
 
     def __iadd__(self, other):
@@ -381,49 +441,50 @@ class deque:
     def __mul__(self, n):
         if not isinstance(n, int):
             return NotImplemented
-        return type(self)(self._data * n, self._maxlen)
+        return type(self)(self._flat() * n, self._maxlen)
 
     __rmul__ = __mul__
 
     def __imul__(self, n):
         self._state += 1
-        self._data *= n
-        if self._maxlen is not None and len(self._data) > self._maxlen:
-            del self._data[: len(self._data) - self._maxlen]
+        data = self._flat()
+        data *= n
+        if self._maxlen is not None and len(data) > self._maxlen:
+            del data[: len(data) - self._maxlen]
         return self
 
     def _cmp_seq(self, other):
-        return other._data if isinstance(other, deque) else NotImplemented
+        return other._flat() if isinstance(other, deque) else NotImplemented
 
     def __eq__(self, other):
         if not isinstance(other, deque):
             return NotImplemented
-        return self._data == other._data
+        return self._flat() == other._flat()
 
     def __ne__(self, other):
         if not isinstance(other, deque):
             return NotImplemented
-        return self._data != other._data
+        return self._flat() != other._flat()
 
     def __lt__(self, other):
         if not isinstance(other, deque):
             return NotImplemented
-        return self._data < other._data
+        return self._flat() < other._flat()
 
     def __le__(self, other):
         if not isinstance(other, deque):
             return NotImplemented
-        return self._data <= other._data
+        return self._flat() <= other._flat()
 
     def __gt__(self, other):
         if not isinstance(other, deque):
             return NotImplemented
-        return self._data > other._data
+        return self._flat() > other._flat()
 
     def __ge__(self, other):
         if not isinstance(other, deque):
             return NotImplemented
-        return self._data >= other._data
+        return self._flat() >= other._flat()
 
     __hash__ = None
 
@@ -440,7 +501,7 @@ class deque:
         dictstate = {
             k: v
             for k, v in getattr(self, "__dict__", {}).items()
-            if k not in ("_data", "_state", "_maxlen")
+            if k not in ("_data", "_state", "_maxlen", "_head")
         } or None
         # Mirror `object.__getstate__`: subclass __slots__ values travel in
         # the second half of a (dict, slots) pair. The deque-internal slots
@@ -474,9 +535,10 @@ class deque:
             return "[...]"
         _repr_running.add(k)
         try:
+            data = self._flat()
             if self._maxlen is None:
-                return f"{type(self).__name__}({self._data!r})"
-            return f"{type(self).__name__}({self._data!r}, maxlen={self._maxlen})"
+                return f"{type(self).__name__}({data!r})"
+            return f"{type(self).__name__}({data!r}, maxlen={self._maxlen})"
         finally:
             _repr_running.discard(k)
 
@@ -510,17 +572,17 @@ class _deque_iterator:
             self._deq = None
             raise RuntimeError("deque mutated during iteration")
         i = self._index
-        if i >= len(deq._data):
+        if i >= len(deq._data) - deq._head:
             self._deq = None
             raise StopIteration
         self._index = i + 1
-        return deq._data[i]
+        return deq._data[deq._head + i]
 
     def __length_hint__(self):
         deq = self._deq
         if deq is None or deq._state != self._deq_state:
             return 0
-        return len(deq._data) - self._index
+        return len(deq) - self._index
 
     def __reduce__(self):
         deq = self._deq
@@ -945,7 +1007,7 @@ class _deque_reverse_iterator:
             self._deq = None
             raise RuntimeError("deque mutated during iteration")
         i = len(deq._data) - 1 - self._index
-        if i < 0:
+        if i < deq._head:
             self._deq = None
             raise StopIteration
         self._index += 1
@@ -955,7 +1017,7 @@ class _deque_reverse_iterator:
         deq = self._deq
         if deq is None or deq._state != self._deq_state:
             return 0
-        return len(deq._data) - self._index
+        return len(deq) - self._index
 
     def __reduce__(self):
         deq = self._deq

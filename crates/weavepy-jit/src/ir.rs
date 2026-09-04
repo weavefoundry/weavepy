@@ -131,8 +131,10 @@ pub enum TOp {
     FloatNot,
     /// Discard TOS.
     Pop,
-    /// Duplicate TOS (`COPY`).
-    Dup,
+    /// Push a copy of the `depth`-th stack entry counted from the top
+    /// (`COPY n`: `depth == 1` duplicates TOS, `2` the entry below it —
+    /// the chained-comparison `SWAP 2; COPY 2` shape).
+    Dup { depth: u32 },
     /// Swap the top two stack entries (`SWAP 2`).
     Swap2,
     /// Convert the integral value at TOS to `float` (RFC 0058 WS4 mixed

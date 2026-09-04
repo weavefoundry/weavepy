@@ -43,10 +43,27 @@ impl Hasher for FxHasher {
         for c in chunks {
             self.fold(u64::from_ne_bytes(*c));
         }
+        // Fold the tail with fixed-width loads rather than a
+        // `copy_from_slice` into a scratch buffer: the variable-length copy
+        // lowers to a `memcpy` call, which for the short attribute names
+        // that dominate hashing traffic cost more than the hash itself
+        // (RFC 0077 WS4 census: 2.5% of deltablue in `_platform_memmove`
+        // under the type cache's name hash).
+        let mut rest = rem;
+        let mut tail: u64 = 0;
+        if rest.len() >= 4 {
+            tail = u64::from(u32::from_ne_bytes([rest[0], rest[1], rest[2], rest[3]]));
+            rest = &rest[4..];
+        }
+        if rest.len() >= 2 {
+            tail = (tail << 16) | u64::from(u16::from_ne_bytes([rest[0], rest[1]]));
+            rest = &rest[2..];
+        }
+        if let Some(&b) = rest.first() {
+            tail = (tail << 8) | u64::from(b);
+        }
         if !rem.is_empty() {
-            let mut tail = [0u8; 8];
-            tail[..rem.len()].copy_from_slice(rem);
-            self.fold(u64::from_ne_bytes(tail));
+            self.fold(tail);
         }
     }
 

@@ -57,7 +57,9 @@ fn stock_python_include(manifest_dir: &Path, out_dir: &Path) -> Option<Vec<PathB
         }
         return None;
     }
-    let tree = manifest_dir.join("include").join("cpython313");
+    let tree = manifest_dir
+        .join("include")
+        .join(weavepy_version::HEADER_TREE);
     if !tree.join("Python.h").is_file() {
         return None;
     }

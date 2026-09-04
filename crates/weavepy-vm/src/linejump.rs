@@ -354,22 +354,34 @@ fn plain_effect(code: &CodeObject, i: usize, ins: Instruction) -> Option<(u32, u
         O::ReturnGenerator => (0, 1),
         // Pops [sub_iter, last_sent, exc], pushes [None, value].
         O::CleanupThrow => (3, 2),
-        O::StopIterationError | O::AsyncGenWrap => (1, 1),
-        // PEP 750 t-strings: value + expr text (+ spec when bit 2 set)
+        O::StopIterationError | O::AsyncGenWrap | O::CallIntrinsic1 => (1, 1),
+        O::CallIntrinsic2 => (2, 1),
+        // PEP 750 t-strings: value + expr text (+ spec when bit 0 set)
         // -> Interpolation; strings + interpolations tuples -> Template.
-        O::BuildInterpolation => (if arg & 0x04 != 0 { 3 } else { 2 }, 1),
+        O::BuildInterpolation => (if arg & 1 != 0 { 3 } else { 2 }, 1),
         O::BuildTemplate => (2, 1),
         O::DeleteFast | O::DeleteGlobal | O::DeleteName | O::DeleteDeref => (0, 0),
         O::LoadConst
         | O::LoadName
         | O::LoadGlobal
         | O::LoadFast
+        | O::LoadFastBorrow
+        | O::LoadFastCheck
         | O::LoadFastAndClear
         | O::LoadDeref
         | O::LoadClosure
-        | O::LoadClassderef
+        | O::LoadClosureBorrow
+        | O::LoadLocals
         | O::LoadBuildClass
-        | O::LoadAssertionError => (0, 1),
+        | O::LoadCommonConstant
+        | O::LoadSmallInt => (0, 1),
+        O::LoadFastLoadFast | O::LoadFastBorrowLoadFastBorrow => (0, 2),
+        O::StoreFastLoadFast => (1, 1),
+        O::StoreFastStoreFast => (2, 0),
+        O::NotTaken => (0, 0),
+        O::PopIter => (1, 0),
+        O::BinarySlice => (3, 1),
+        O::StoreSlice => (4, 0),
         O::StoreFast | O::StoreGlobal | O::StoreName | O::StoreDeref => (1, 0),
         O::LoadClassdictOrDeref | O::LoadClassdictOrGlobal => (1, 1),
         O::LoadAttr | O::UnaryOp => (1, 1),
@@ -389,16 +401,18 @@ fn plain_effect(code: &CodeObject, i: usize, ins: Instruction) -> Option<(u32, u
             let kwc = u32::try_from(callkw_names_len(code, i)?).ok()?;
             (arg + kwc + 3, 1)
         }
-        O::CallEx => (3 + arg, 1),
+        // CPython 3.14 CALL_FUNCTION_EX always carries the kwargs slot
+        // (NULL when absent): [callable, self_or_null, args, kwargs].
+        O::CallEx => (4, 1),
         O::BuildList | O::BuildTuple | O::BuildSet | O::BuildString => (arg, 1),
         O::BuildMap => (2 * arg, 1),
-        O::ListAppend | O::ListExtend | O::SetAdd => (1, 0),
+        O::ListAppend | O::ListExtend | O::SetAdd | O::SetUpdate => (1, 0),
         O::ListToTuple => (1, 1),
         O::MapAdd => (2, 0),
         O::UnpackSequence => (1, arg),
         O::UnpackEx => (1, (arg >> 8) + 1 + (arg & 0xFF)),
         O::MakeFunction => (1 + (arg & 0xF).count_ones(), 1),
-        O::BuildSlice => (3, 1),
+        O::BuildSlice => (arg, 1),
         // Consumes both the `CopyTop`ed exc and the type, pushes the
         // match bool (see the VM opcode; CPython's version peeks the exc
         // instead, so its effect differs).
@@ -414,7 +428,6 @@ fn plain_effect(code: &CodeObject, i: usize, ins: Instruction) -> Option<(u32, u
         O::EndSend => (2, 1),
         O::GetAnext => (0, 1),
         O::EndAsyncFor => (2, 0),
-        O::BeforeWith | O::BeforeAsyncWith => (1, 2),
         O::MatchSequence | O::MatchMapping | O::GetLen => (0, 1),
         O::MatchClass => (3, 1),
         O::MatchKeys => (1, 1),
@@ -434,6 +447,8 @@ fn plain_effect(code: &CodeObject, i: usize, ins: Instruction) -> Option<(u32, u
         | O::CopyTop
         | O::Swap
         | O::PushNull
+        | O::LoadGlobalPushNull
+        | O::LoadSpecial
         | O::LoadMethodAttr
         | O::LoadSuperAttr
         | O::PushExcInfo
@@ -442,6 +457,16 @@ fn plain_effect(code: &CodeObject, i: usize, ins: Instruction) -> Option<(u32, u
         | O::ReturnValue
         | O::RaiseVarargs
         | O::Reraise => return None,
+        // Flowgraph pseudo-ops never reach the VM.
+        O::Jump
+        | O::JumpNoInterrupt
+        | O::JumpIfFalse
+        | O::JumpIfTrue
+        | O::SetupFinally
+        | O::SetupCleanup
+        | O::SetupWith
+        | O::PopBlock
+        | O::StoreFastMaybeNull => return None,
     })
 }
 
@@ -593,9 +618,16 @@ fn mark_stacks(code: &CodeObject) -> Marked {
                     let after = push_kind(cur, Kind::Null);
                     todo |= merge(&mut stacks, &mut exc_depths, next_i, after, exc);
                 }
-                O::LoadMethodAttr => {
-                    // LOAD_ATTR with the method flag: [obj] → [attr,
-                    // self-or-null]; CPython marks the extra slot Null.
+                O::LoadGlobalPushNull => {
+                    // LOAD_GLOBAL with the push-NULL bit: the callable,
+                    // then the Null self slot.
+                    let after = push_kind(push_kind(cur, Kind::Object), Kind::Null);
+                    todo |= merge(&mut stacks, &mut exc_depths, next_i, after, exc);
+                }
+                O::LoadMethodAttr | O::LoadSpecial => {
+                    // LOAD_ATTR with the method flag (and 3.14's
+                    // LOAD_SPECIAL): [obj] → [attr, self-or-null]; CPython
+                    // marks the extra slot Null.
                     let after = push_kind(push_kind(pop_kind(cur), Kind::Object), Kind::Null);
                     todo |= merge(&mut stacks, &mut exc_depths, next_i, after, exc);
                 }

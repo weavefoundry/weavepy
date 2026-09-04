@@ -41,7 +41,7 @@ mod shim {
 
     /// The runtime DLL the shim binds — the CPython-compatible ABI
     /// name that `.pyd` import tables reference.
-    const DLL_NAME: &str = "python313.dll";
+    const DLL_NAME: &str = weavepy_version::vconcat!(weavepy_version::PYLIB_STEM, ".dll");
 
     /// Exit code when the runtime DLL cannot be found or bound —
     /// well clear of Python's 1/2/120 conventions so scripts can

@@ -311,7 +311,7 @@ The following implementation-specific options are available:
 -X dev                 : enable runtime checks helpful for development.
 -X utf8                : enable UTF-8 mode for the interpreter.
 -X tracemalloc[=N]     : start tracing Python memory allocations, keeping N frames.
--X importtime          : show how long each import takes (no-op today).
+-X importtime          : show how long each import takes.
 -X showrefcount        : output the total reference count (no-op today).
 -X frozen_modules=on|off : whether frozen modules should be used.
 -X no_debug_ranges     : disable PEP 657 ranges (no-op today).
@@ -990,6 +990,13 @@ fn build_flags(cli: &Cli, env: &EnvOverrides) -> InterpreterFlags {
         if let Some(seed) = env.hash_seed {
             weavepy::vm::object::set_hash_seed(seed);
         }
+    }
+    // `-X importtime` / `PYTHONPROFILEIMPORTTIME` (RFC 0077 WS7): per-load
+    // timing lines on stderr, printed by the import walk itself.
+    if xoption_value(&cli.xoptions, "importtime").is_some()
+        || std::env::var_os("PYTHONPROFILEIMPORTTIME").is_some_and(|v| !v.is_empty())
+    {
+        weavepy::vm::import_time::set_enabled(true);
     }
     // `-X pycache_prefix[=PATH]` beats `PYTHONPYCACHEPREFIX` even when
     // given bare / with an empty value (which unsets the env prefix).

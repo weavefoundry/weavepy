@@ -69,6 +69,13 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        "profile" => match cmd_profile(&args[2..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("weavepy-bench: {e}");
+                ExitCode::FAILURE
+            }
+        },
         "help" | "-h" | "--help" => {
             print_help();
             ExitCode::SUCCESS
@@ -93,6 +100,9 @@ fn print_help() {
     eprintln!("    scaling  RFC 0076 WS12: run the threads=8 parallel fixture under the");
     eprintln!("             default (GIL) mode and -X gil=0, and report serial/parallel");
     eprintln!("             scaling per mode (a measurement, never gated).");
+    eprintln!("    profile  RFC 0077 WS1: flat-profile one fixture's interpreter thread");
+    eprintln!("             (macOS `sample`, Linux `perf`) and print the top-of-stack");
+    eprintln!("             census. `profile FIXTURE [--work=N] [--secs=S] [--jit]`.");
     eprintln!("    help     Print this message.");
     eprintln!();
     eprintln!("COMMON FLAGS:");
@@ -101,9 +111,11 @@ fn print_help() {
     eprintln!("    --python=PATH         Host CPython (default: python3.13, then python3).");
     eprintln!("    --no-cpython          Skip the host CPython column (absolute-only mode).");
     eprintln!("    --samples=N           Timing samples per fixture (default 5).");
-    eprintln!("    --interp              Add a WEAVEPY_JIT=0 column (reported, not gated).");
-    eprintln!("                          The default binary ships with the JIT on, so the");
-    eprintln!("                          gated WeavePy column already measures the JIT.");
+    eprintln!("    --no-interp           Skip the WEAVEPY_JIT=0 column. RFC 0077 WS1: the");
+    eprintln!("                          interpreter-only column is on by default and gated");
+    eprintln!("                          (its own ×CPython ratio and geomean), because the");
+    eprintln!("                          tier-1 floor is what every non-compiled frame runs on.");
+    eprintln!("    --interp              Accepted for compatibility (the column is default-on).");
     eprintln!();
     eprintln!("FLAGS for `run`:");
     eprintln!("    --json                Print report as JSON.");
@@ -132,6 +144,7 @@ fn parse_common(opts: &mut RunOpts, arg: &str) -> bool {
     match arg {
         "--no-cpython" => opts.include_cpython = false,
         "--interp" => opts.include_interp = true,
+        "--no-interp" => opts.include_interp = false,
         x if x.starts_with("--samples=") => {
             opts.samples = x[10..].parse().unwrap_or(opts.samples);
         }
@@ -226,6 +239,69 @@ fn cmd_scaling(args: &[String]) -> io::Result<()> {
             r.parallel_ns / 1e6,
             r.scaling()
         );
+    }
+    Ok(())
+}
+
+/// RFC 0077 WS1 — the profile census: run one fixture (interpreter-only
+/// by default, so the tier-1 floor is what gets sampled) and print the
+/// flat top-of-stack profile of the interpreter thread. This is the
+/// one-command form of the census RFC 0077 opened with, so the next
+/// perf wave's charter is a measurement, not a hypothesis.
+fn cmd_profile(args: &[String]) -> io::Result<()> {
+    let mut opts = RunOpts::default();
+    let mut work: Option<u32> = None;
+    let mut secs: u32 = 4;
+    let mut jit = false;
+    let mut name: Option<String> = None;
+    let mut top: usize = 40;
+    for a in args {
+        if parse_common(&mut opts, a) {
+            continue;
+        }
+        match a.as_str() {
+            x if x.starts_with("--work=") => work = x[7..].parse().ok(),
+            x if x.starts_with("--secs=") => secs = x[7..].parse().unwrap_or(secs),
+            x if x.starts_with("--top=") => top = x[6..].parse().unwrap_or(top),
+            "--jit" => jit = true,
+            x if x.starts_with("--") => {
+                return Err(io::Error::other(format!("unknown flag '{x}'")));
+            }
+            other => name = Some(other.to_owned()),
+        }
+    }
+    let name = name.ok_or_else(|| io::Error::other("profile: fixture name required"))?;
+    let fix = discover_fixtures()
+        .into_iter()
+        .find(|f| f.name == name)
+        .ok_or_else(|| io::Error::other(format!("profile: unknown fixture '{name}'")))?;
+    let weavepy = resolve_weavepy(&opts)?;
+    let census = weavepy_bench::runner::profile_fixture(
+        &weavepy,
+        &fix,
+        work.unwrap_or(fix.work),
+        secs,
+        jit,
+    )?;
+    println!(
+        "# WeavePy profile census: {} (work={}, {}s, {})",
+        fix.name,
+        work.unwrap_or(fix.work),
+        secs,
+        if jit { "JIT on" } else { "WEAVEPY_JIT=0" }
+    );
+    println!();
+    println!("interpreter-thread samples: {}", census.total_samples);
+    println!();
+    println!("| samples | share | symbol |");
+    println!("|---|---|---|");
+    for (n, sym) in census.top.iter().take(top) {
+        let share = if census.total_samples > 0 {
+            100.0 * *n as f64 / census.total_samples as f64
+        } else {
+            0.0
+        };
+        println!("| {n} | {share:.1}% | `{sym}` |");
     }
     Ok(())
 }

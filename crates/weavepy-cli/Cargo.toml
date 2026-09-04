@@ -37,6 +37,7 @@ weavepy-vm         = { workspace = true }
 weavepy-parser     = { workspace = true }
 weavepy-compiler   = { workspace = true }
 weavepy-conformance = { workspace = true }
+weavepy-version    = { workspace = true }
 libc               = { workspace = true }
 anyhow             = { workspace = true }
 clap               = { workspace = true }

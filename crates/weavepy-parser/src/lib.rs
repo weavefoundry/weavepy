@@ -21,8 +21,7 @@ pub mod unparse;
 pub use ast::{dump_module, Module};
 pub use error::ParseError;
 pub use parser::{
-    build_lazy_type_alias, lower_type_alias_stmt, set_int_literal_max_digits,
-    set_unicode_name_resolver, TypeComments, UnicodeNameResolution,
+    set_int_literal_max_digits, set_unicode_name_resolver, TypeComments, UnicodeNameResolution,
 };
 pub use weavepy_lexer::EscapeWarning;
 pub use weavepy_lexer::{lang_preview, set_lang_preview};

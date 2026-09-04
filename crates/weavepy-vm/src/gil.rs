@@ -925,40 +925,34 @@ fn maybe_yield_gil() {
     note_gil_acquired();
 }
 
-std::thread_local! {
-    /// Per-thread cache of [`current_thread_id`] (RFC 0059 WS1a). A
-    /// thread's native id is stable for its lifetime, but deriving it
-    /// via `libc::pthread_self` is a dyld-stub call — and `GilCell`
-    /// consults the id on **every** borrow, several times per bytecode
-    /// instruction. `const`-initialized to 0 (never a valid id: pthread
-    /// ids are pointers, Windows ids are non-zero for live threads, and
-    /// the hash fallback re-derives on the impossible collision) so the
-    /// fast path is one TLS load + branch with no lazy-init bookkeeping.
-    static THREAD_ID_CACHE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
 /// Best-effort current-thread native id. Returns the OS thread
 /// id on Linux/macOS via `libc::pthread_self`; uses
 /// `GetCurrentThreadId` on Windows. The exact representation
 /// is opaque; the only invariant is uniqueness within the
-/// running process. Cached per thread (RFC 0059): the derivation
-/// call runs once, every later lookup is a TLS load.
+/// running process. Cached per thread (RFC 0059): a thread's native
+/// id is stable for its lifetime, but deriving it is a dyld-stub call
+/// and `GilCell` consults the id on **every** borrow, several times
+/// per bytecode instruction. The cache lives in the cell layer's
+/// thread-local block ([`crate::sync::CELL_TLS`], RFC 0077 WS3) so a
+/// borrow reads it and the live-guard count through one TLS access.
 #[inline]
 pub fn current_thread_id() -> u64 {
-    let cached = THREAD_ID_CACHE.try_with(std::cell::Cell::get).unwrap_or(0);
+    let cached = crate::sync::CELL_TLS
+        .try_with(|t| t.thread_id.get())
+        .unwrap_or(0);
     if cached != 0 {
         return cached;
     }
     let id = derive_thread_id();
     // Cache best-effort: during TLS teardown the cell may be gone, in
     // which case every call re-derives — correct, just slower.
-    let _ = THREAD_ID_CACHE.try_with(|c| c.set(id));
+    let _ = crate::sync::CELL_TLS.try_with(|t| t.thread_id.set(id));
     id
 }
 
 /// Uncached [`current_thread_id`] body — the OS derivation call.
 #[cold]
-fn derive_thread_id() -> u64 {
+pub(crate) fn derive_thread_id() -> u64 {
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
     unsafe {
         let h = libc::pthread_self();

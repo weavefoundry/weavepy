@@ -63,7 +63,7 @@ fn main() {
         .expect("crates/ dir")
         .join("weavepy-capi")
         .join("include");
-    let tree = capi_include.join("cpython313");
+    let tree = capi_include.join(weavepy_version::HEADER_TREE);
     println!("cargo:rerun-if-changed={}", tree.display());
 
     let mut headers = Vec::new();

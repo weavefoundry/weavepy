@@ -189,7 +189,26 @@ pub const MAGIC: &[u8; 4] = b"\xf3\x0d\x0d\x0a";
 ///   is emitted with NO_LOCATION like CPython's codegen_expr_stmt
 ///   (gh-127321) — at a boolop merge target it stays location-less,
 ///   changing line tables.
-pub const CACHE_TAG: &str = "weavepy-313-48";
+/// - rev `49`: RFC 0077 WS9 (CPython 3.14 codegen): the compiler now owns
+///   the whole class-body prologue (`__module__ = __name__`, the
+///   `__classdict__` seed and `__classdictcell__` store, `COPY 1;
+///   RETURN_VALUE` of `__classcell__`), and `__build_class__` no longer
+///   injects `__module__`; the flowgraph port also changed instruction
+///   streams (wire marks, `BUILD_SLICE` 2/3, `NOT_TAKEN`, superinstruction
+///   lowering). Rev-48 artifacts would build classes without `__module__`.
+/// - rev `50`: RFC 0077 WS9 continued: `DICT_UPDATE` grew CPython's depth
+///   oparg (`arg >> 1`; the mapping-pattern `**rest` copy is `DICT_UPDATE
+///   2`), `BUILD_INTERPOLATION` adopted CPython's oparg layout (bit 0 =
+///   format spec, `>> 2` = conversion), constant set displays fold through
+///   `SET_UPDATE` (rev-49 artifacts written mid-wave folded to a set
+///   *containing* the frozenset), `import a.b as c` stores before its
+///   `POP_TOP`, and generator lambdas drop the StopIteration wrapper.
+/// - rev `51`: RFC 0077 WS10: PEP 695 generics compile to CPython's
+///   `CALL_INTRINSIC_1` / `CALL_INTRINSIC_2` shape (type-parameter
+///   binders, `INTRINSIC_SUBSCRIPT_GENERIC`, `INTRINSIC_TYPEALIAS`,
+///   `INTRINSIC_SET_FUNCTION_TYPE_PARAMS`) instead of calls to the
+///   `__weavepy_typevar__` builtin family, which no longer exists.
+pub const CACHE_TAG: &str = weavepy_version::vconcat!(weavepy_version::CACHE_TAG_PREFIX, "-51");
 
 const HEADER_LEN: usize = 16;
 

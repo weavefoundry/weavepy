@@ -1,7 +1,8 @@
 //! `marshal` — internal byte serialisation for Python objects (RFC 0019).
 //!
-//! Implements the version-4 marshal format used by CPython 3.4+ for
-//! `.pyc` files. The on-disk format is *not* compatible with
+//! Implements the version-5 marshal format used by CPython 3.14 for
+//! `.pyc` files (version 5 adds `TYPE_SLICE`; versions 0..=4 are still
+//! written on request). The on-disk format is *not* compatible with
 //! CPython's because the embedded code objects use WeavePy's own
 //! bytecode, but the surface and the value-encoding map line up so
 //! `marshal.dumps(...)` followed by `marshal.loads(...)` round-trips
@@ -20,7 +21,7 @@
 //! Surface:
 //! * `dump(value, file[, version])` / `dumps(value[, version])`.
 //! * `load(file)` / `loads(bytes)`.
-//! * `version` — the protocol version; always 4 for now.
+//! * `version` — the protocol version; 5 (RFC 0077 WS9).
 
 use crate::sync::Rc;
 use crate::sync::RefCell;
@@ -39,13 +40,17 @@ use crate::object::{
 // bits whose meaning WeavePy tracks on its own `CodeObject` are consumed on
 // read; the rest are informational (e.g. `dis`/`inspect` flag display).
 const CO_OPTIMIZED: u32 = 0x0001;
-const CO_NEWLOCALS: u32 = 0x0002;
 const CO_VARARGS: u32 = 0x0004;
 const CO_VARKEYWORDS: u32 = 0x0008;
+const CO_NESTED: u32 = 0x0010;
 const CO_GENERATOR: u32 = 0x0020;
 const CO_COROUTINE: u32 = 0x0080;
 const CO_ITERABLE_COROUTINE: u32 = 0x0100;
 const CO_ASYNC_GENERATOR: u32 = 0x0200;
+// CPython 3.14: `co_consts[0]` is the docstring / function-like scope
+// defined directly in a class body.
+const CO_HAS_DOCSTRING: u32 = 0x0400_0000;
+const CO_METHOD: u32 = 0x0800_0000;
 
 const TYPE_NULL: u8 = b'0';
 const TYPE_NONE: u8 = b'N';
@@ -79,11 +84,15 @@ const TYPE_ASCII_INTERNED: u8 = b'A';
 const TYPE_SMALL_TUPLE: u8 = b')';
 const TYPE_SHORT_ASCII: u8 = b'z';
 const TYPE_SHORT_ASCII_INTERNED: u8 = b'Z';
+/// CPython 3.14 (marshal version 5): a `slice` constant, three nested
+/// values `start`, `stop`, `step`. Needed because 3.14's compiler folds
+/// `a[1:2]` into a slice constant in `co_consts`.
+const TYPE_SLICE: u8 = b':';
 
 const FLAG_REF: u8 = 0x80;
 
-/// The version WeavePy writes by default (CPython 3.4+).
-const MARSHAL_VERSION: i64 = 4;
+/// The version WeavePy writes by default (CPython 3.14's `Py_MARSHAL_VERSION`).
+const MARSHAL_VERSION: i64 = 5;
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     let dict = Rc::new(RefCell::new(DictData::default()));
@@ -228,7 +237,7 @@ fn load_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runti
 }
 
 /// Args-only entry kept for internal callers (`pycache`, frozen-code
-/// cache). Writes the default version-4 form.
+/// cache). Writes the default version-5 form.
 pub fn b_dumps(args: &[Object]) -> Result<Object, RuntimeError> {
     dumps_kw(args, &[])
 }
@@ -497,6 +506,14 @@ impl MarshalWriter {
                 }
                 self.write_code(co, flag)?;
             }
+            // Slices are only representable from version 5 (CPython 3.14);
+            // older versions reject them like any other unknown object.
+            Object::Slice(s) if self.version >= 5 => {
+                self.write_byte(TYPE_SLICE | flag);
+                self.write_value(&s.start)?;
+                self.write_value(&s.stop)?;
+                self.write_value(&s.step)?;
+            }
             other => {
                 // Last resort: an instance exporting the buffer protocol
                 // (PEP 688 `__buffer__`, e.g. `array.array`) dumps as bytes.
@@ -601,37 +618,9 @@ fn instance_buffer_bytes(value: &Object) -> Option<Vec<u8>> {
     }
 }
 
-/// CPython `co_flags` for a WeavePy code object. Module/class bodies are
-/// not "optimized" (they use name-based locals); functions are.
+/// CPython `co_flags` for a WeavePy code object (`CodeObject::co_flags`).
 fn code_flags(co: &CodeObject) -> u32 {
-    // Only function scopes: CPython's compute_code_flags sets
-    // CO_OPTIMIZED|CO_NEWLOCALS for FunctionBlock alone — module *and*
-    // class bodies report 0 (plus feature bits below).
-    let mut f = 0u32;
-    if !co.is_class_body && co.name != "<module>" {
-        f |= CO_OPTIMIZED | CO_NEWLOCALS;
-    }
-    if co.has_varargs {
-        f |= CO_VARARGS;
-    }
-    if co.has_varkeywords {
-        f |= CO_VARKEYWORDS;
-    }
-    if co.is_generator {
-        f |= CO_GENERATOR;
-    }
-    if co.is_coroutine {
-        f |= CO_COROUTINE;
-    }
-    if co.is_iterable_coroutine {
-        f |= CO_ITERABLE_COROUTINE;
-    }
-    if co.is_async_generator {
-        f |= CO_ASYNC_GENERATOR;
-    }
-    // Persist active `__future__` bits so an unmarshalled code object
-    // still reports them on `co_flags` (RFC 0052).
-    f | co.future_flags
+    co.co_flags()
 }
 
 /// Pack a `BigInt` into CPython's marshal digit form: a signed count of
@@ -1024,6 +1013,15 @@ impl<'a> MarshalReader<'a> {
                 self.fill_ref(idx, &t);
                 return Ok(Some(t));
             }
+            TYPE_SLICE => {
+                let idx = self.reserve_ref(flag);
+                let start = self.read_value()?;
+                let stop = self.read_value()?;
+                let step = self.read_value()?;
+                let s = Object::Slice(Rc::new(crate::object::PySlice { start, stop, step }));
+                self.fill_ref(idx, &s);
+                return Ok(Some(s));
+            }
             TYPE_LIST => {
                 let len = self.read_int()? as usize;
                 let list = Object::new_list(Vec::new());
@@ -1159,10 +1157,15 @@ impl<'a> MarshalReader<'a> {
             is_coroutine: flags & CO_COROUTINE != 0,
             is_async_generator: flags & CO_ASYNC_GENERATOR != 0,
             is_iterable_coroutine: flags & CO_ITERABLE_COROUTINE != 0,
+            has_docstring: flags & CO_HAS_DOCSTRING != 0,
+            is_method: flags & CO_METHOD != 0,
+            is_nested: flags & CO_NESTED != 0,
             future_flags: flags & weavepy_compiler::flags::PYCF_MASK,
             cp_cache: cpython_code::CpCache::default(),
             wire: None,
             no_interrupt_jumps: decoded.no_interrupt_jumps,
+            wire_marks: decoded.wire_marks,
+            hidden_locals: decoded.hidden_locals,
         };
         Ok(Object::Code(Rc::new(co)))
     }

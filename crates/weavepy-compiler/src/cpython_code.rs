@@ -1,9 +1,10 @@
-//! CPython-3.13 bytecode wire-format codec (RFC 0033).
+//! CPython-3.14 bytecode wire-format codec (RFC 0033, re-pointed by
+//! RFC 0077 WS9).
 //!
 //! WeavePy executes its own flat `Vec<Instruction>` (see [`crate::bytecode`]).
 //! CPython tooling — `dis`, `marshal`, `.pyc`, and the `code` object's
 //! `co_code` / `co_linetable` / `co_exceptiontable` / `co_positions()`
-//! surface — expects the 16-bit `_Py_CODEUNIT` stream CPython 3.13 emits.
+//! surface — expects the 16-bit `_Py_CODEUNIT` stream CPython 3.14 emits.
 //!
 //! This module bridges the two. It is a *presentation* codec: the VM
 //! never runs the bytes produced here, so the encoding is computed on
@@ -11,171 +12,204 @@
 //! independent of the dispatch loop, the inline caches (RFC 0021), and
 //! the JIT (RFC 0032).
 //!
-//! The encoder is a faithful CPython-3.13 emitter:
+//! The encoder is a faithful CPython-3.14 emitter:
 //!
 //! - opcode numbers and the per-opcode inline-`CACHE` entry counts match
-//!   CPython 3.13 (`Include/opcode_ids.h`, `_PyOpcode_Caches`),
+//!   CPython 3.14 (`Include/opcode_ids.h`, `_PyOpcode_Caches`),
 //! - args wider than a byte are prefixed with `EXTENDED_ARG`,
 //! - relative jumps are recomputed in code units across the inserted
 //!   caches via a fixpoint,
-//! - the location table uses the PEP 626 "no-column" form (line-accurate;
-//!   full column plumbing is tracked as follow-up work),
+//! - the 3.14 assembler-stage shapes are reproduced: `NOT_TAKEN` after
+//!   every conditional jump (`normalize_jumps`), `LOAD_FAST_BORROW`
+//!   from the `optimize_load_fast` liveness pass, `LOAD_LOCALS` before a
+//!   class body's `LOAD_FROM_DICT_OR_DEREF`, `END_ASYNC_FOR`'s
+//!   `END_SEND`-relative oparg, superinstructions, and the callable-NULL
+//!   fold into `LOAD_GLOBAL`,
+//! - the location table uses the PEP 626/657 forms,
 //! - the exception table uses CPython's big-endian varint range format.
 //!
 //! The [`decode`] direction inverts [`encode`] for the canonical opcode
 //! set WeavePy emits, so `marshal`/`.pyc` round-trip to an executable
 //! [`CodeObject`].
 
-use crate::bytecode::{BinOpKind, CompareKind, Instruction, OpCode, UnaryKind};
+use crate::bytecode::{
+    BinOpKind, CompareKind, Instruction, OpCode, UnaryKind, COMPARE_OP_TO_BOOL_FLAG,
+};
 use crate::{CodeObject, Constant, ExcHandler};
 
-/// CPython 3.13 opcode numbers (subset WeavePy maps onto). Sourced from
-/// `Include/opcode_ids.h` in CPython v3.13.
+/// CPython 3.14 opcode numbers. Sourced from `Include/opcode_ids.h` in
+/// CPython v3.14.7 (every real, non-instrumented opcode; the
+/// pseudo-ops `>= 256` never reach the wire).
 pub mod op {
     pub const CACHE: u8 = 0;
-    pub const BEFORE_ASYNC_WITH: u8 = 1;
-    pub const BEFORE_WITH: u8 = 2;
-    pub const BINARY_SUBSCR: u8 = 5;
-    pub const CHECK_EG_MATCH: u8 = 6;
-    pub const CHECK_EXC_MATCH: u8 = 7;
-    pub const DELETE_SUBSCR: u8 = 9;
-    pub const END_ASYNC_FOR: u8 = 10;
-    pub const END_FOR: u8 = 11;
-    pub const CLEANUP_THROW: u8 = 8;
-    pub const END_SEND: u8 = 12;
-    pub const FORMAT_SIMPLE: u8 = 14;
-    pub const FORMAT_WITH_SPEC: u8 = 15;
-    pub const CONVERT_VALUE: u8 = 60;
-    pub const TO_BOOL: u8 = 40;
-    pub const GET_AITER: u8 = 16;
-    pub const GET_ANEXT: u8 = 18;
-    pub const GET_ITER: u8 = 19;
-    pub const GET_LEN: u8 = 20;
-    pub const GET_YIELD_FROM_ITER: u8 = 21;
-    pub const LOAD_BUILD_CLASS: u8 = 24;
-    pub const MAKE_FUNCTION: u8 = 26;
-    pub const MATCH_KEYS: u8 = 27;
-    pub const MATCH_MAPPING: u8 = 28;
-    pub const MATCH_SEQUENCE: u8 = 29;
-    pub const NOP: u8 = 30;
-    pub const POP_EXCEPT: u8 = 31;
-    pub const POP_TOP: u8 = 32;
-    pub const PUSH_EXC_INFO: u8 = 33;
-    pub const PUSH_NULL: u8 = 34;
-    pub const SET_FUNCTION_ATTRIBUTE: u8 = 106;
+    pub const BINARY_SLICE: u8 = 1;
+    pub const BUILD_TEMPLATE: u8 = 2;
+    pub const CALL_FUNCTION_EX: u8 = 4;
+    pub const CHECK_EG_MATCH: u8 = 5;
+    pub const CHECK_EXC_MATCH: u8 = 6;
+    pub const CLEANUP_THROW: u8 = 7;
+    pub const DELETE_SUBSCR: u8 = 8;
+    pub const END_FOR: u8 = 9;
+    pub const END_SEND: u8 = 10;
+    pub const EXIT_INIT_CHECK: u8 = 11;
+    pub const FORMAT_SIMPLE: u8 = 12;
+    pub const FORMAT_WITH_SPEC: u8 = 13;
+    pub const GET_AITER: u8 = 14;
+    pub const GET_ANEXT: u8 = 15;
+    pub const GET_ITER: u8 = 16;
+    pub const RESERVED: u8 = 17;
+    pub const GET_LEN: u8 = 18;
+    pub const GET_YIELD_FROM_ITER: u8 = 19;
+    pub const INTERPRETER_EXIT: u8 = 20;
+    pub const LOAD_BUILD_CLASS: u8 = 21;
+    /// Emitted by the encoder in front of a class body's
+    /// `LOAD_FROM_DICT_OR_DEREF` (WeavePy's single `LoadClassderef`
+    /// instruction is CPython's two-unit `LOAD_LOCALS; LOAD_FROM_DICT_OR_DEREF`
+    /// sequence). The decoder folds the pair back.
+    pub const LOAD_LOCALS: u8 = 22;
+    pub const MAKE_FUNCTION: u8 = 23;
+    pub const MATCH_KEYS: u8 = 24;
+    pub const MATCH_MAPPING: u8 = 25;
+    pub const MATCH_SEQUENCE: u8 = 26;
+    pub const NOP: u8 = 27;
+    /// Instrumentation anchor CPython's assembler places after every
+    /// conditional jump (`normalize_jumps`). The encoder synthesizes
+    /// it; the decoder folds a `POP_JUMP_IF_*; NOT_TAKEN` pair back
+    /// into the jump alone (a standalone unit decodes to `NotTaken`).
+    pub const NOT_TAKEN: u8 = 28;
+    pub const POP_EXCEPT: u8 = 29;
+    pub const POP_ITER: u8 = 30;
+    pub const POP_TOP: u8 = 31;
+    pub const PUSH_EXC_INFO: u8 = 32;
+    pub const PUSH_NULL: u8 = 33;
+    pub const RETURN_GENERATOR: u8 = 34;
+    pub const RETURN_VALUE: u8 = 35;
+    pub const SETUP_ANNOTATIONS: u8 = 36;
+    pub const STORE_SLICE: u8 = 37;
+    pub const STORE_SUBSCR: u8 = 38;
+    pub const TO_BOOL: u8 = 39;
+    pub const UNARY_INVERT: u8 = 40;
+    pub const UNARY_NEGATIVE: u8 = 41;
+    pub const UNARY_NOT: u8 = 42;
+    pub const WITH_EXCEPT_START: u8 = 43;
+    pub const BINARY_OP: u8 = 44;
+    pub const BUILD_INTERPOLATION: u8 = 45;
+    pub const BUILD_LIST: u8 = 46;
+    pub const BUILD_MAP: u8 = 47;
+    pub const BUILD_SET: u8 = 48;
+    pub const BUILD_SLICE: u8 = 49;
+    pub const BUILD_STRING: u8 = 50;
+    pub const BUILD_TUPLE: u8 = 51;
+    pub const CALL: u8 = 52;
+    pub const CALL_INTRINSIC_1: u8 = 53;
+    pub const CALL_INTRINSIC_2: u8 = 54;
+    pub const CALL_KW: u8 = 55;
+    pub const COMPARE_OP: u8 = 56;
+    pub const CONTAINS_OP: u8 = 57;
+    pub const CONVERT_VALUE: u8 = 58;
+    pub const COPY: u8 = 59;
     /// Function-entry prologue unit copying the closure tuple into the
     /// frame's free-variable slots. The encoder synthesizes it (WeavePy
     /// frame setup does the copy natively); see `insert_prologue`.
-    pub const COPY_FREE_VARS: u8 = 62;
-    pub const RETURN_GENERATOR: u8 = 35;
-    pub const RETURN_VALUE: u8 = 36;
-    /// Emitted by the encoder's `LOAD_CONST` + `RETURN_VALUE` fusion
-    /// (CPython 3.13 compiles `return <const>` to this single unit).
-    pub const RETURN_CONST: u8 = 103;
-    pub const STORE_SUBSCR: u8 = 39;
-    pub const UNARY_INVERT: u8 = 41;
-    pub const UNARY_NEGATIVE: u8 = 42;
-    pub const UNARY_NOT: u8 = 43;
-    pub const WITH_EXCEPT_START: u8 = 44;
-    pub const BINARY_OP: u8 = 45;
-    pub const BUILD_LIST: u8 = 47;
-    pub const BUILD_MAP: u8 = 48;
-    pub const BUILD_SET: u8 = 49;
-    pub const BUILD_SLICE: u8 = 50;
-    pub const BUILD_STRING: u8 = 51;
-    pub const BUILD_TUPLE: u8 = 52;
-    pub const CALL: u8 = 53;
-    pub const CALL_FUNCTION_EX: u8 = 54;
-    pub const CALL_INTRINSIC_1: u8 = 55;
-    pub const CALL_INTRINSIC_2: u8 = 56;
-    pub const LOAD_ASSERTION_ERROR: u8 = 23;
-    pub const CALL_KW: u8 = 57;
-    pub const COMPARE_OP: u8 = 58;
-    pub const CONTAINS_OP: u8 = 59;
-    pub const COPY: u8 = 61;
-    pub const DELETE_ATTR: u8 = 63;
-    pub const DELETE_DEREF: u8 = 64;
-    pub const DELETE_FAST: u8 = 65;
-    pub const DELETE_GLOBAL: u8 = 66;
-    pub const DELETE_NAME: u8 = 67;
-    pub const DICT_MERGE: u8 = 68;
-    pub const DICT_UPDATE: u8 = 69;
-    pub const SETUP_ANNOTATIONS: u8 = 37;
-    pub const EXTENDED_ARG: u8 = 71;
-    pub const FOR_ITER: u8 = 72;
-    pub const GET_AWAITABLE: u8 = 73;
-    pub const IMPORT_FROM: u8 = 74;
-    pub const IMPORT_NAME: u8 = 75;
-    pub const IS_OP: u8 = 76;
-    pub const JUMP_BACKWARD: u8 = 77;
-    pub const JUMP_BACKWARD_NO_INTERRUPT: u8 = 78;
-    pub const JUMP_FORWARD: u8 = 79;
-    pub const LIST_APPEND: u8 = 80;
-    pub const LIST_EXTEND: u8 = 81;
-    pub const LOAD_ATTR: u8 = 82;
-    pub const LOAD_CONST: u8 = 83;
-    pub const LOAD_DEREF: u8 = 84;
-    pub const LOAD_FAST: u8 = 85;
-    pub const LOAD_FAST_AND_CLEAR: u8 = 86;
+    pub const COPY_FREE_VARS: u8 = 60;
+    pub const DELETE_ATTR: u8 = 61;
+    pub const DELETE_DEREF: u8 = 62;
+    pub const DELETE_FAST: u8 = 63;
+    pub const DELETE_GLOBAL: u8 = 64;
+    pub const DELETE_NAME: u8 = 65;
+    pub const DICT_MERGE: u8 = 66;
+    pub const DICT_UPDATE: u8 = 67;
+    /// Carries an oparg since 3.14: the code-unit distance back to the
+    /// matching `END_SEND` (`sys.monitoring` pairs the two). WeavePy's
+    /// internal arg is unused; the encoder finds the dance's `SEND`
+    /// through the `__anext__` exception range this instruction
+    /// handles and applies CPython's fixed `END_SEND_OFFSET`.
+    pub const END_ASYNC_FOR: u8 = 68;
+    pub const EXTENDED_ARG: u8 = 69;
+    pub const FOR_ITER: u8 = 70;
+    pub const GET_AWAITABLE: u8 = 71;
+    pub const IMPORT_FROM: u8 = 72;
+    pub const IMPORT_NAME: u8 = 73;
+    pub const IS_OP: u8 = 74;
+    pub const JUMP_BACKWARD: u8 = 75;
+    pub const JUMP_BACKWARD_NO_INTERRUPT: u8 = 76;
+    pub const JUMP_FORWARD: u8 = 77;
+    pub const LIST_APPEND: u8 = 78;
+    pub const LIST_EXTEND: u8 = 79;
+    pub const LOAD_ATTR: u8 = 80;
+    pub const LOAD_COMMON_CONSTANT: u8 = 81;
+    pub const LOAD_CONST: u8 = 82;
+    pub const LOAD_DEREF: u8 = 83;
+    pub const LOAD_FAST: u8 = 84;
+    pub const LOAD_FAST_AND_CLEAR: u8 = 85;
+    /// Produced by the encoder's port of `flowgraph.c::optimize_load_fast`:
+    /// a `LOAD_FAST` whose reference is consumed before the local can
+    /// be rebound (and never stored or left on the stack across a
+    /// block boundary) pushes a borrowed reference. Decodes back to a
+    /// plain `LoadFast` (WeavePy's runtime has one load form).
+    pub const LOAD_FAST_BORROW: u8 = 86;
+    pub const LOAD_FAST_BORROW_LOAD_FAST_BORROW: u8 = 87;
     /// Emitted by the encoder's uninitialized-locals analysis
     /// (CPython's `add_checks_for_loads_of_uninitialized_variables`):
     /// a `LOAD_FAST` the compiler can't prove bound decodes back to a
     /// plain `LoadFast` (WeavePy's runtime op always checks).
-    pub const LOAD_FAST_CHECK: u8 = 87;
+    pub const LOAD_FAST_CHECK: u8 = 88;
     /// Superinstructions (CPython's `insert_superinstructions`): two
     /// adjacent fast-local ops fused into one unit, args packed as
     /// `(arg1 << 4) | arg2`.
-    pub const LOAD_FAST_LOAD_FAST: u8 = 88;
-    pub const STORE_FAST_LOAD_FAST: u8 = 111;
-    pub const STORE_FAST_STORE_FAST: u8 = 112;
-    pub const LOAD_FROM_DICT_OR_DEREF: u8 = 89;
-    pub const LOAD_FROM_DICT_OR_GLOBALS: u8 = 90;
-    /// WeavePy-private (no 3.13 equivalent): CPython lowers a class
-    /// body's free-variable load to `LOAD_LOCALS` +
-    /// `LOAD_FROM_DICT_OR_DEREF`, but our `LoadClassderef` is a single
-    /// instruction, so it needs its own number to round-trip — it must
-    /// not collide with `LoadClassdictOrDeref`'s encoding (which pops
-    /// an explicit mapping; `LoadClassderef` does not).
-    pub const LOAD_CLASSDEREF_WEAVEPY: u8 = 147;
-    pub const LOAD_GLOBAL: u8 = 91;
-    pub const LOAD_NAME: u8 = 92;
-    pub const LOAD_SUPER_ATTR: u8 = 93;
-    pub const MAKE_CELL: u8 = 94;
-    pub const MAP_ADD: u8 = 95;
-    pub const MATCH_CLASS: u8 = 96;
-    pub const POP_JUMP_IF_FALSE: u8 = 97;
-    pub const POP_JUMP_IF_NONE: u8 = 98;
-    pub const POP_JUMP_IF_NOT_NONE: u8 = 99;
-    pub const POP_JUMP_IF_TRUE: u8 = 100;
-    pub const RAISE_VARARGS: u8 = 101;
-    pub const RERAISE: u8 = 102;
-    pub const SEND: u8 = 104;
-    pub const SET_ADD: u8 = 105;
-    pub const STORE_ATTR: u8 = 108;
-    pub const STORE_DEREF: u8 = 109;
-    pub const STORE_FAST: u8 = 110;
-    pub const STORE_GLOBAL: u8 = 113;
-    pub const STORE_NAME: u8 = 114;
-    pub const SWAP: u8 = 115;
-    pub const UNPACK_EX: u8 = 116;
-    pub const UNPACK_SEQUENCE: u8 = 117;
-    pub const YIELD_VALUE: u8 = 118;
-    pub const RESUME: u8 = 149;
-    // WeavePy extensions for PEP 750 t-strings (`-X lang=next`,
-    // RFC 0076 WS15): CPython 3.13 has no such opcodes. These numbers
-    // sit in 3.13's specialized/quickened range, which never appears
-    // in unquickened code, so they cannot collide with anything
-    // `map_from_cpython` recognizes.
-    pub const BUILD_TEMPLATE: u8 = 150;
-    pub const BUILD_INTERPOLATION: u8 = 151;
+    pub const LOAD_FAST_LOAD_FAST: u8 = 89;
+    pub const LOAD_FROM_DICT_OR_DEREF: u8 = 90;
+    pub const LOAD_FROM_DICT_OR_GLOBALS: u8 = 91;
+    pub const LOAD_GLOBAL: u8 = 92;
+    pub const LOAD_NAME: u8 = 93;
+    pub const LOAD_SMALL_INT: u8 = 94;
+    pub const LOAD_SPECIAL: u8 = 95;
+    pub const LOAD_SUPER_ATTR: u8 = 96;
+    pub const MAKE_CELL: u8 = 97;
+    pub const MAP_ADD: u8 = 98;
+    pub const MATCH_CLASS: u8 = 99;
+    pub const POP_JUMP_IF_FALSE: u8 = 100;
+    pub const POP_JUMP_IF_NONE: u8 = 101;
+    pub const POP_JUMP_IF_NOT_NONE: u8 = 102;
+    pub const POP_JUMP_IF_TRUE: u8 = 103;
+    pub const RAISE_VARARGS: u8 = 104;
+    pub const RERAISE: u8 = 105;
+    pub const SEND: u8 = 106;
+    pub const SET_ADD: u8 = 107;
+    pub const SET_FUNCTION_ATTRIBUTE: u8 = 108;
+    pub const SET_UPDATE: u8 = 109;
+    pub const STORE_ATTR: u8 = 110;
+    pub const STORE_DEREF: u8 = 111;
+    pub const STORE_FAST: u8 = 112;
+    pub const STORE_FAST_LOAD_FAST: u8 = 113;
+    pub const STORE_FAST_STORE_FAST: u8 = 114;
+    pub const STORE_GLOBAL: u8 = 115;
+    pub const STORE_NAME: u8 = 116;
+    pub const SWAP: u8 = 117;
+    pub const UNPACK_EX: u8 = 118;
+    pub const UNPACK_SEQUENCE: u8 = 119;
+    pub const YIELD_VALUE: u8 = 120;
+    pub const RESUME: u8 = 128;
 }
 
-/// CPython 3.13 `HAVE_ARGUMENT` boundary: opcodes `>=` this take an
+/// CPython 3.14 `HAVE_ARGUMENT` boundary: opcodes `>=` this take an
 /// inline argument. Opcodes below it ignore the (still-present) arg byte.
-pub const HAVE_ARGUMENT: u8 = 44;
+pub const HAVE_ARGUMENT: u8 = 43;
 
-/// CPython's `MAGIC_NUMBER` for the 3.13 series (`importlib.util.MAGIC_NUMBER`).
-pub const MAGIC_NUMBER: [u8; 4] = [0xf3, 0x0d, 0x0d, 0x0a];
+/// CPython's `MAGIC_NUMBER` for the 3.14 series (`importlib.util.MAGIC_NUMBER`):
+/// 3627, little-endian, followed by `\r\n`.
+pub const MAGIC_NUMBER: [u8; 4] = [0x2b, 0x0e, 0x0d, 0x0a];
+
+/// `_nb_ops` index of `NB_SUBSCR`: since 3.14 `BINARY_SUBSCR` is a
+/// `BINARY_OP` flavour (`a[b]` is `BINARY_OP 26`).
+pub const NB_SUBSCR: u32 = 26;
+
+/// CPython's `END_SEND_OFFSET` (assemble.c): the fixed code-unit distance
+/// from a `SEND` to the `END_SEND` its exhausted edge targets in an
+/// `await`/`async for` dance (`SEND` + cache, `YIELD_VALUE`, `RESUME`,
+/// `JUMP_BACKWARD_NO_INTERRUPT`). `END_ASYNC_FOR`'s oparg is expressed
+/// through it.
+const END_SEND_OFFSET: usize = 5;
 
 /// CALL_INTRINSIC_1 sub-op: `INTRINSIC_IMPORT_STAR`.
 const INTRINSIC_IMPORT_STAR: u32 = 2;
@@ -192,20 +226,17 @@ const INTRINSIC_LIST_TO_TUPLE: u32 = 6;
 const INTRINSIC_PREP_RERAISE_STAR: u32 = 1;
 
 /// Number of inline-`CACHE` code units that follow `cp_op` in CPython
-/// 3.13 (`_PyOpcode_Caches`). Everything not listed has none.
+/// 3.14 (`_PyOpcode_Caches`). Everything not listed has none.
 #[must_use]
 pub fn cache_entries(cp_op: u8) -> usize {
     match cp_op {
-        op::LOAD_GLOBAL => 4,
         op::LOAD_ATTR => 9,
-        op::STORE_ATTR => 4,
-        op::CALL => 3,
-        op::TO_BOOL => 3,
-        op::BINARY_OP
-        | op::UNPACK_SEQUENCE
+        op::BINARY_OP => 5,
+        op::LOAD_GLOBAL | op::STORE_ATTR => 4,
+        op::CALL | op::CALL_KW | op::TO_BOOL => 3,
+        op::UNPACK_SEQUENCE
         | op::COMPARE_OP
         | op::CONTAINS_OP
-        | op::BINARY_SUBSCR
         | op::FOR_ITER
         | op::STORE_SUBSCR
         | op::SEND
@@ -219,7 +250,9 @@ pub fn cache_entries(cp_op: u8) -> usize {
     }
 }
 
-/// `True` if `cp_op` is a relative jump (its arg is a code-unit delta).
+/// `True` if `cp_op` is a relative jump (its arg is a code-unit delta
+/// and the internal arg an instruction delta). `END_ASYNC_FOR`'s
+/// `END_SEND`-relative oparg is derived separately (see `encode`).
 #[must_use]
 pub fn is_rel_jump(cp_op: u8) -> bool {
     matches!(
@@ -240,6 +273,19 @@ pub fn is_rel_jump(cp_op: u8) -> bool {
 #[must_use]
 pub fn is_backward_jump(cp_op: u8) -> bool {
     matches!(cp_op, op::JUMP_BACKWARD | op::JUMP_BACKWARD_NO_INTERRUPT)
+}
+
+/// `True` for the four `POP_JUMP_IF_*` opcodes: the conditional jumps
+/// CPython's `normalize_jumps` follows with a `NOT_TAKEN` unit.
+#[must_use]
+pub fn is_conditional_jump(cp_op: u8) -> bool {
+    matches!(
+        cp_op,
+        op::POP_JUMP_IF_FALSE
+            | op::POP_JUMP_IF_TRUE
+            | op::POP_JUMP_IF_NONE
+            | op::POP_JUMP_IF_NOT_NONE
+    )
 }
 
 /// CPython's `NB_INPLACE_ADD` — the in-place variants (`+=` and
@@ -332,6 +378,8 @@ impl DerefSlots {
     }
 }
 
+use crate::bytecode::wire;
+
 /// Map one WeavePy [`Instruction`] to its CPython opcode + arg. Deref
 /// opcodes index into the merged localsplus array via `slots`.
 fn map_to_cpython(ins: Instruction, slots: &DerefSlots) -> MappedOp {
@@ -344,6 +392,17 @@ fn map_to_cpython(ins: Instruction, slots: &DerefSlots) -> MappedOp {
         // CPython packs a "push NULL" flag in bit 0; the name index is arg >> 1.
         O::LoadGlobal => (op::LOAD_GLOBAL, ins.arg << 1),
         O::LoadFast => (op::LOAD_FAST, ins.arg),
+        O::LoadFastBorrow => (op::LOAD_FAST_BORROW, ins.arg),
+        O::LoadClosureBorrow => (op::LOAD_FAST_BORROW, slots.slot(ins.arg)),
+        O::LoadFastCheck => (op::LOAD_FAST_CHECK, ins.arg),
+        O::LoadFastLoadFast => (op::LOAD_FAST_LOAD_FAST, ins.arg),
+        O::LoadFastBorrowLoadFastBorrow => (op::LOAD_FAST_BORROW_LOAD_FAST_BORROW, ins.arg),
+        O::StoreFastLoadFast => (op::STORE_FAST_LOAD_FAST, ins.arg),
+        O::StoreFastStoreFast => (op::STORE_FAST_STORE_FAST, ins.arg),
+        // The callable-flagged form: name index in the high bits, bit 0
+        // set (CPython's `LOAD_GLOBAL` + `PUSH_NULL` fusion).
+        O::LoadGlobalPushNull => (op::LOAD_GLOBAL, (ins.arg << 1) | 1),
+        O::LoadLocals => (op::LOAD_LOCALS, 0),
         O::LoadFastAndClear => (op::LOAD_FAST_AND_CLEAR, ins.arg),
         O::StoreFast => (op::STORE_FAST, ins.arg),
         O::StoreGlobal => (op::STORE_GLOBAL, ins.arg),
@@ -356,8 +415,8 @@ fn map_to_cpython(ins: Instruction, slots: &DerefSlots) -> MappedOp {
         O::DeleteDeref => (op::DELETE_DEREF, slots.slot(ins.arg)),
         O::MakeCell => (op::MAKE_CELL, slots.slot(ins.arg)),
         O::CopyFreeVars => (op::COPY_FREE_VARS, ins.arg),
-        // 3.13 has no real LOAD_CLOSURE opcode; cells live in the fast
-        // array and are loaded with LOAD_FAST.
+        // LOAD_CLOSURE is a pseudo-op; cells live in the fast array
+        // and are loaded with LOAD_FAST.
         O::LoadClosure => (op::LOAD_FAST, slots.slot(ins.arg)),
         // bit 0 = "is method load"; the name index is arg >> 1.
         O::LoadAttr => (op::LOAD_ATTR, ins.arg << 1),
@@ -368,8 +427,11 @@ fn map_to_cpython(ins: Instruction, slots: &DerefSlots) -> MappedOp {
         O::PushNull => (op::PUSH_NULL, 0),
         O::StoreAttr => (op::STORE_ATTR, ins.arg),
         O::DeleteAttr => (op::DELETE_ATTR, ins.arg),
-        O::BinarySubscr => (op::BINARY_SUBSCR, 0),
+        // 3.14 folded BINARY_SUBSCR into the BINARY_OP family.
+        O::BinarySubscr => (op::BINARY_OP, NB_SUBSCR),
+        O::BinarySlice => (op::BINARY_SLICE, 0),
         O::StoreSubscr => (op::STORE_SUBSCR, 0),
+        O::StoreSlice => (op::STORE_SLICE, 0),
         O::DeleteSubscr => (op::DELETE_SUBSCR, 0),
         O::BinaryOp => {
             // Our arg carries the operator in the low byte plus an
@@ -385,7 +447,7 @@ fn map_to_cpython(ins: Instruction, slots: &DerefSlots) -> MappedOp {
             Some(UnaryKind::Neg) => (op::UNARY_NEGATIVE, 0),
             Some(UnaryKind::Not) => (op::UNARY_NOT, 0),
             Some(UnaryKind::Invert) => (op::UNARY_INVERT, 0),
-            // No dedicated opcode for unary `+` in 3.13.
+            // No dedicated opcode for unary `+`.
             _ => (op::CALL_INTRINSIC_1, INTRINSIC_UNARY_POSITIVE),
         },
         // bits 5+ carry the comparison index; the low nibble is CPython's
@@ -394,7 +456,10 @@ fn map_to_cpython(ins: Instruction, slots: &DerefSlots) -> MappedOp {
         // `encode` when the result feeds a conditional jump or `not`,
         // mirroring the COMPARE_OP+TO_BOOL fusion in CPython's optimizer.
         O::CompareOp => {
-            let mask: u32 = match ins.arg {
+            // CPython packs `op << 5 | to_bool << 4 | result-mask`.
+            let kind = ins.arg & !COMPARE_OP_TO_BOOL_FLAG;
+            let to_bool = ins.arg & COMPARE_OP_TO_BOOL_FLAG;
+            let mask: u32 = match kind {
                 0 => 2,         // <
                 1 => 2 | 8,     // <=
                 2 => 8,         // ==
@@ -403,7 +468,7 @@ fn map_to_cpython(ins: Instruction, slots: &DerefSlots) -> MappedOp {
                 5 => 4 | 8,     // >=
                 _ => 0,
             };
-            (op::COMPARE_OP, (ins.arg << 5) | mask)
+            (op::COMPARE_OP, (kind << 5) | to_bool | mask)
         }
         O::IsOp => (op::IS_OP, ins.arg),
         O::ContainsOp => (op::CONTAINS_OP, ins.arg),
@@ -420,7 +485,9 @@ fn map_to_cpython(ins: Instruction, slots: &DerefSlots) -> MappedOp {
         // the keyword count is folded in by `encode` (it needs the
         // kwnames tuple from the preceding LOAD_CONST).
         O::CallKw => (op::CALL_KW, ins.arg),
-        O::CallEx => (op::CALL_FUNCTION_EX, ins.arg),
+        // 3.14's CALL_FUNCTION_EX takes no oparg (the kwargs slot is
+        // always present, NULL when the call has no `**`).
+        O::CallEx => (op::CALL_FUNCTION_EX, 0),
         O::ReturnValue => (op::RETURN_VALUE, 0),
         O::PopJumpIfFalse => (op::POP_JUMP_IF_FALSE, ins.arg),
         O::PopJumpIfTrue => (op::POP_JUMP_IF_TRUE, ins.arg),
@@ -440,6 +507,7 @@ fn map_to_cpython(ins: Instruction, slots: &DerefSlots) -> MappedOp {
         O::ListExtend => (op::LIST_EXTEND, ins.arg),
         O::ListToTuple => (op::CALL_INTRINSIC_1, INTRINSIC_LIST_TO_TUPLE),
         O::SetAdd => (op::SET_ADD, ins.arg),
+        O::SetUpdate => (op::SET_UPDATE, ins.arg),
         O::MapAdd => (op::MAP_ADD, ins.arg),
         O::UnpackSequence => (op::UNPACK_SEQUENCE, ins.arg),
         // Our UNPACK_EX arg keeps the before-star count in the high
@@ -449,17 +517,16 @@ fn map_to_cpython(ins: Instruction, slots: &DerefSlots) -> MappedOp {
             ((ins.arg >> 8) & 0xFF) | ((ins.arg & 0xFF) << 8),
         ),
         // WeavePy folds CPython's DICT_UPDATE (dict display) and
-        // DICT_MERGE (call `**` splat) into one opcode keyed by arg;
-        // surface them as the distinct CPython opcodes, whose oparg is
-        // the stack offset of the target dict (always 1 here).
-        O::DictUpdate if ins.arg == 1 => (op::DICT_MERGE, 1),
-        O::DictUpdate => (op::DICT_UPDATE, 1),
+        // DICT_MERGE (call `**` splat) into one opcode: bit 0 selects
+        // the merge semantics, `arg >> 1` is the target dict's stack
+        // offset minus one (CPython's oparg is that offset).
+        O::DictUpdate if ins.arg & 1 != 0 => (op::DICT_MERGE, (ins.arg >> 1) + 1),
+        O::DictUpdate => (op::DICT_UPDATE, (ins.arg >> 1) + 1),
         O::SetupAnnotations => (op::SETUP_ANNOTATIONS, 0),
         O::MakeFunction => (op::MAKE_FUNCTION, ins.arg),
         O::SetFunctionAttribute => (op::SET_FUNCTION_ATTRIBUTE, ins.arg),
         O::BuildSlice => (op::BUILD_SLICE, ins.arg),
         O::LoadBuildClass => (op::LOAD_BUILD_CLASS, 0),
-        O::LoadClassderef => (op::LOAD_CLASSDEREF_WEAVEPY, slots.slot(ins.arg)),
         O::LoadClassdictOrDeref => (op::LOAD_FROM_DICT_OR_DEREF, slots.slot(ins.arg)),
         O::LoadClassdictOrGlobal => (op::LOAD_FROM_DICT_OR_GLOBALS, ins.arg),
         O::RaiseVarargs => (op::RAISE_VARARGS, ins.arg),
@@ -468,7 +535,8 @@ fn map_to_cpython(ins: Instruction, slots: &DerefSlots) -> MappedOp {
         O::PushExcInfo => (op::PUSH_EXC_INFO, 0),
         O::PopExcept => (op::POP_EXCEPT, 0),
         O::Reraise => (op::RERAISE, ins.arg),
-        O::BeforeWith => (op::BEFORE_WITH, 0),
+        O::LoadSpecial => (op::LOAD_SPECIAL, ins.arg),
+        O::LoadCommonConstant => (op::LOAD_COMMON_CONSTANT, ins.arg),
         O::WithExceptStart => (op::WITH_EXCEPT_START, 0),
         O::ImportName => (op::IMPORT_NAME, ins.arg),
         O::ImportFrom => (op::IMPORT_FROM, ins.arg),
@@ -477,9 +545,13 @@ fn map_to_cpython(ins: Instruction, slots: &DerefSlots) -> MappedOp {
         O::CleanupThrow => (op::CLEANUP_THROW, 0),
         O::StopIterationError => (op::CALL_INTRINSIC_1, INTRINSIC_STOPITERATION_ERROR),
         O::AsyncGenWrap => (op::CALL_INTRINSIC_1, INTRINSIC_ASYNC_GEN_WRAP),
+        O::CallIntrinsic1 => (op::CALL_INTRINSIC_1, ins.arg),
+        O::CallIntrinsic2 => (op::CALL_INTRINSIC_2, ins.arg),
         O::BuildInterpolation => (op::BUILD_INTERPOLATION, ins.arg),
         O::BuildTemplate => (op::BUILD_TEMPLATE, 0),
-        O::LoadAssertionError => (op::LOAD_ASSERTION_ERROR, 0),
+        O::LoadSmallInt => (op::LOAD_SMALL_INT, ins.arg),
+        O::NotTaken => (op::NOT_TAKEN, 0),
+        O::PopIter => (op::POP_ITER, 0),
         O::FormatValue => {
             // Neither wire form carries an oparg; the spec-on-stack bit
             // is implied by the opcode choice (and restored on decode).
@@ -499,16 +571,54 @@ fn map_to_cpython(ins: Instruction, slots: &DerefSlots) -> MappedOp {
         O::GetAwaitable => (op::GET_AWAITABLE, ins.arg),
         O::GetAiter => (op::GET_AITER, 0),
         O::GetAnext => (op::GET_ANEXT, 0),
+        // The wire oparg (END_SEND-relative) is resolved in `encode`'s
+        // fixpoint; the internal arg carries nothing.
         O::EndAsyncFor => (op::END_ASYNC_FOR, 0),
-        O::BeforeAsyncWith => (op::BEFORE_ASYNC_WITH, 0),
         O::MatchSequence => (op::MATCH_SEQUENCE, 0),
         O::MatchMapping => (op::MATCH_MAPPING, 0),
         O::MatchClass => (op::MATCH_CLASS, ins.arg),
         O::MatchKeys => (op::MATCH_KEYS, 0),
         O::GetLen => (op::GET_LEN, 0),
         O::PrintExpr => (op::NOP, 0),
+        // Flowgraph pseudo-ops never reach the wire: `flowgraph::flatten`
+        // lowers every one of them before the stream leaves the compiler.
+        O::Jump
+        | O::JumpNoInterrupt
+        | O::JumpIfFalse
+        | O::JumpIfTrue
+        | O::SetupFinally
+        | O::SetupCleanup
+        | O::SetupWith
+        | O::PopBlock
+        | O::StoreFastMaybeNull => {
+            unreachable!("flowgraph pseudo-op {:?} reached the wire encoder", ins.op)
+        }
     };
     MappedOp { cp_op, arg }
+}
+
+/// `(popped, pushed)` for one WeavePy instruction, as CPython's
+/// `_PyOpcode_num_popped` / `_PyOpcode_num_pushed` see the equivalent
+/// wire opcode. Flowgraph pseudo-ops follow `pycore_opcode_metadata.h`;
+/// the block-push family reports its *jump* shape (the fallthrough
+/// effect is zero, see `get_stack_effects`).
+pub(crate) fn stack_shape(op: OpCode, arg: u32) -> (usize, usize) {
+    use OpCode as O;
+    match op {
+        O::Jump | O::JumpNoInterrupt | O::PopBlock | O::Nop => (0, 0),
+        O::JumpIfFalse | O::JumpIfTrue => (1, 1),
+        O::SetupFinally | O::SetupWith => (0, 1),
+        O::SetupCleanup => (0, 2),
+        O::StoreFastMaybeNull => (1, 0),
+        // WeavePy's interactive-mode print pops its operand (CPython
+        // spells it `CALL_INTRINSIC_1 INTRINSIC_PRINT; POP_TOP`).
+        O::PrintExpr => (1, 0),
+        // Slot numbers do not affect the shape.
+        _ => {
+            let m = map_to_cpython(Instruction { op, arg }, &DerefSlots { slots: Vec::new() });
+            cp_stack_shape(m.cp_op, m.arg)
+        }
+    }
 }
 
 /// Number of `EXTENDED_ARG` code units needed to express `arg`.
@@ -534,7 +644,7 @@ pub struct Position {
     pub end_col: Option<u32>,
 }
 
-/// The CPython-3.13 wire view of a [`CodeObject`].
+/// The CPython-3.14 wire view of a [`CodeObject`].
 #[derive(Debug, Clone, Default)]
 pub struct CpythonCode {
     /// Packed `_Py_CODEUNIT` stream (2 bytes per unit: `[opcode, arg]`).
@@ -607,6 +717,10 @@ impl PartialEq for CpCache {
     }
 }
 
+pub const CO_FAST_ARG_POS: u8 = 0x02;
+pub const CO_FAST_ARG_KW: u8 = 0x04;
+pub const CO_FAST_ARG_VAR: u8 = 0x08;
+pub const CO_FAST_HIDDEN: u8 = 0x10;
 pub const CO_FAST_LOCAL: u8 = 0x20;
 pub const CO_FAST_CELL: u8 = 0x40;
 pub const CO_FAST_FREE: u8 = 0x80;
@@ -614,12 +728,40 @@ pub const CO_FAST_FREE: u8 = 0x80;
 /// Build the merged `co_localsplusnames` / `co_localspluskinds` pair.
 /// CPython's `compute_localsplus_info`: a cell that aliases a local
 /// (an escaping parameter) shares the local's slot with kind
-/// `CO_FAST_LOCAL|CO_FAST_CELL` rather than getting its own entry.
+/// `CO_FAST_LOCAL|CO_FAST_CELL` rather than getting its own entry;
+/// the argument slots carry their `CO_FAST_ARG_*` kind and hidden
+/// comprehension locals `CO_FAST_HIDDEN`.
 fn build_localsplus(code: &CodeObject) -> (Vec<String>, Vec<u8>) {
     let mut names = Vec::with_capacity(code.varnames.len() + code.cellvars.len());
     let mut kinds = Vec::with_capacity(names.capacity());
-    for v in &code.varnames {
-        let mut kind = CO_FAST_LOCAL;
+    // `argvarkinds`: pos-only, pos-or-kw, kw-only, *args, **kwargs.
+    let groups: [(usize, u8); 5] = [
+        (code.posonly_count as usize, CO_FAST_ARG_POS),
+        (
+            code.arg_count.saturating_sub(code.posonly_count) as usize,
+            CO_FAST_ARG_POS | CO_FAST_ARG_KW,
+        ),
+        (code.kwonly_count as usize, CO_FAST_ARG_KW),
+        (
+            usize::from(code.has_varargs),
+            CO_FAST_ARG_VAR | CO_FAST_ARG_POS,
+        ),
+        (
+            usize::from(code.has_varkeywords),
+            CO_FAST_ARG_VAR | CO_FAST_ARG_KW,
+        ),
+    ];
+    let mut arg_kind_of = Vec::with_capacity(code.varnames.len());
+    for (count, kind) in groups {
+        for _ in 0..count {
+            arg_kind_of.push(kind);
+        }
+    }
+    for (i, v) in code.varnames.iter().enumerate() {
+        let mut kind = CO_FAST_LOCAL | arg_kind_of.get(i).copied().unwrap_or(0);
+        if code.hidden_locals.iter().any(|h| h == v) {
+            kind |= CO_FAST_HIDDEN;
+        }
         if code.cellvars.iter().any(|c| c == v) {
             kind |= CO_FAST_CELL;
         }
@@ -640,267 +782,16 @@ fn build_localsplus(code: &CodeObject) -> (Vec<String>, Vec<u8>) {
     (names, kinds)
 }
 
-/// CPython's `add_checks_for_loads_of_uninitialized_variables`
-/// (flowgraph.c): mark every `LOAD_FAST` of a slot that may be unbound
-/// on some path to it as `LOAD_FAST_CHECK`. WeavePy's runtime
-/// `LoadFast` always checks, so this refines the *view* only — but
-/// `dis` output and test_peepholer's TestMarkingVariablesAsUnKnown
-/// grade the distinction. The dataflow is a faithful port: a 64-bit
-/// "may be unsafe" mask per basic block, seeded with the non-parameter
-/// locals at entry, propagated over fallthrough / jump / exception
-/// edges to a fixpoint; functions with more than 64 locals get the
-/// block-local `fast_scan_many_locals` treatment for the excess slots.
-// Index-driven on purpose: the loops walk instruction *offsets* shared
-// between `code.instructions`, `check`, and the per-block `starts`
-// table — an iterator/enumerate rewrite would obscure the offset math.
-#[allow(clippy::needless_range_loop)]
-fn add_uninitialized_checks(code: &CodeObject, mapped: &mut [MappedOp]) {
-    use OpCode as O;
-    let nlocals = code.varnames.len();
-    let n = code.instructions.len();
-    if nlocals == 0 || n == 0 {
-        return;
-    }
-    let nparams = (code.arg_count
-        + code.kwonly_count
-        + u32::from(code.has_varargs)
-        + u32::from(code.has_varkeywords)) as usize;
-
-    // Basic blocks over the flat stream: leaders are the entry, jump
-    // targets, handler entries, and the fallthrough of a block ender —
-    // the same boundaries CPython's cfg has.
-    let mut leader = vec![false; n];
-    leader[0] = true;
-    for i in 0..n {
-        let ins = code.instructions[i];
-        let from = i as u32 + 1;
-        match ins.op {
-            O::JumpForward
-            | O::PopJumpIfFalse
-            | O::PopJumpIfTrue
-            | O::PopJumpIfNone
-            | O::PopJumpIfNotNone
-            | O::ForIter
-            | O::Send => {
-                if let Some(l) = leader.get_mut((from + ins.arg) as usize) {
-                    *l = true;
-                }
-                if let Some(l) = leader.get_mut(i + 1) {
-                    *l = true;
-                }
-            }
-            O::JumpBackward => {
-                if let Some(l) = leader.get_mut(from.saturating_sub(ins.arg) as usize) {
-                    *l = true;
-                }
-                if let Some(l) = leader.get_mut(i + 1) {
-                    *l = true;
-                }
-            }
-            O::ReturnValue | O::RaiseVarargs | O::Reraise => {
-                if let Some(l) = leader.get_mut(i + 1) {
-                    *l = true;
-                }
-            }
-            _ => {}
-        }
-    }
-    for h in &code.exception_table {
-        if let Some(l) = leader.get_mut(h.handler as usize) {
-            *l = true;
-        }
-    }
-    let mut block_of = vec![0usize; n];
-    let mut starts: Vec<usize> = Vec::new();
-    for i in 0..n {
-        if leader[i] {
-            starts.push(i);
-        }
-        block_of[i] = starts.len() - 1;
-    }
-    let nb = starts.len();
-    let block_end = |b: usize| if b + 1 < nb { starts[b + 1] } else { n };
-
-    let mut check = vec![false; n];
-
-    // `fast_scan_many_locals`: slots >= 64 are only trusted within the
-    // basic block that stored them.
-    if nlocals > 64 {
-        let mut states = vec![0usize; nlocals - 64];
-        for b in 0..nb {
-            let blocknum = b + 1;
-            for i in starts[b]..block_end(b) {
-                let ins = code.instructions[i];
-                let arg = ins.arg as usize;
-                if arg < 64 {
-                    continue;
-                }
-                match ins.op {
-                    O::DeleteFast => states[arg - 64] = blocknum - 1,
-                    O::StoreFast => states[arg - 64] = blocknum,
-                    O::LoadFast if arg < nlocals => {
-                        if states[arg - 64] != blocknum {
-                            check[i] = true;
-                        }
-                        states[arg - 64] = blocknum;
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    let track = nlocals.min(64);
-    let start_mask: u64 = if nparams >= track {
-        0
-    } else {
-        (((1u128 << track) - (1u128 << nparams)) & u128::from(u64::MAX)) as u64
-    };
-
-    fn maybe_push(
-        b: usize,
-        mask: u64,
-        unsafe_mask: &mut [u64],
-        visited: &mut [bool],
-        stack: &mut Vec<usize>,
-    ) {
-        let both = unsafe_mask[b] | mask;
-        if unsafe_mask[b] != both {
-            unsafe_mask[b] = both;
-            if !visited[b] {
-                stack.push(b);
-                visited[b] = true;
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn scan_block(
-        b: usize,
-        code: &CodeObject,
-        starts: &[usize],
-        block_of: &[usize],
-        n: usize,
-        nb: usize,
-        unsafe_mask: &mut [u64],
-        visited: &mut [bool],
-        stack: &mut Vec<usize>,
-        check: &mut [bool],
-    ) {
-        use OpCode as O;
-        let end = if b + 1 < nb { starts[b + 1] } else { n };
-        let mut mask = unsafe_mask[b];
-        for i in starts[b]..end {
-            // Exception edges: an instruction inside a protected range
-            // may transfer to the handler with the mask as of here.
-            for h in &code.exception_table {
-                if (h.start as usize) <= i && i < (h.end as usize) && (h.handler as usize) < n {
-                    maybe_push(
-                        block_of[h.handler as usize],
-                        mask,
-                        unsafe_mask,
-                        visited,
-                        stack,
-                    );
-                }
-            }
-            let ins = code.instructions[i];
-            if ins.arg >= 64 {
-                continue;
-            }
-            let bit = 1u64 << ins.arg;
-            match ins.op {
-                O::DeleteFast => mask |= bit,
-                O::StoreFast => mask &= !bit,
-                O::LoadFast => {
-                    if !check[i] && mask & bit != 0 {
-                        check[i] = true;
-                    }
-                    mask &= !bit;
-                }
-                _ => {}
-            }
-        }
-        let last = code.instructions[end - 1];
-        let from = end as u32;
-        match last.op {
-            O::JumpForward => {
-                let t = (from + last.arg) as usize;
-                if t < n {
-                    maybe_push(block_of[t], mask, unsafe_mask, visited, stack);
-                }
-            }
-            O::JumpBackward => {
-                let t = from.saturating_sub(last.arg) as usize;
-                if t < n {
-                    maybe_push(block_of[t], mask, unsafe_mask, visited, stack);
-                }
-            }
-            O::PopJumpIfFalse
-            | O::PopJumpIfTrue
-            | O::PopJumpIfNone
-            | O::PopJumpIfNotNone
-            | O::ForIter
-            | O::Send => {
-                let t = (from + last.arg) as usize;
-                if t < n {
-                    maybe_push(block_of[t], mask, unsafe_mask, visited, stack);
-                }
-                if b + 1 < nb {
-                    maybe_push(b + 1, mask, unsafe_mask, visited, stack);
-                }
-            }
-            O::ReturnValue | O::RaiseVarargs | O::Reraise => {}
-            _ => {
-                if b + 1 < nb {
-                    maybe_push(b + 1, mask, unsafe_mask, visited, stack);
-                }
-            }
-        }
-    }
-
-    let mut unsafe_mask = vec![0u64; nb];
-    let mut visited = vec![false; nb];
-    let mut stack: Vec<usize> = Vec::new();
-    maybe_push(0, start_mask, &mut unsafe_mask, &mut visited, &mut stack);
-    for b in 0..nb {
-        scan_block(
-            b,
-            code,
-            &starts,
-            &block_of,
-            n,
-            nb,
-            &mut unsafe_mask,
-            &mut visited,
-            &mut stack,
-            &mut check,
-        );
-    }
-    while let Some(b) = stack.pop() {
-        visited[b] = false;
-        scan_block(
-            b,
-            code,
-            &starts,
-            &block_of,
-            n,
-            nb,
-            &mut unsafe_mask,
-            &mut visited,
-            &mut stack,
-            &mut check,
-        );
-    }
-
-    for i in 0..n {
-        if check[i] && mapped[i].cp_op == op::LOAD_FAST {
-            mapped[i].cp_op = op::LOAD_FAST_CHECK;
-        }
-    }
-}
-
-/// Encode `code` into its CPython-3.13 wire view.
+/// Encode `code` into its CPython-3.14 wire view.
+///
+/// The instruction stream is already in its final shape when it gets
+/// here: the flowgraph (`flowgraph::optimize`) has inserted the
+/// prologue, the `NOT_TAKEN`s, the superinstructions, the borrowing
+/// loads and the uninitialized-local checks, so every WeavePy
+/// instruction maps to exactly one wire instruction. What remains is
+/// the assembler's job (`assemble.c`): `EXTENDED_ARG` prefixes, cache
+/// entries, code-unit-relative jump operands, and the three side
+/// tables.
 // Index-driven on purpose: the passes below read `code.instructions[i]`
 // while rewriting the parallel `mapped[i]` — one offset indexes two
 // arrays, which enumerate can't express without losing clarity.
@@ -915,88 +806,58 @@ pub fn encode(code: &CodeObject) -> CpythonCode {
         .map(|ins| map_to_cpython(*ins, &slots))
         .collect();
 
-    // COMPARE_OP's "convert to bool" bit: CPython's optimizer fuses a
-    // trailing TO_BOOL into the compare when the result feeds a branch
-    // or `not`; WeavePy's stream has no TO_BOOL, so the consumer is the
-    // very next instruction.
+    // Wire marks: borrowing/checked loads and superinstruction fusion
+    // (`bytecode::wire`). A fusion head takes the superinstruction's
+    // opcode and packed oparg; its tail is zero-width.
+    let mark = |i: usize| code.wire_marks.get(i).copied().unwrap_or(wire::PLAIN);
+    let mut zero_width = vec![false; n];
     for i in 0..n {
-        if code.instructions[i].op == OpCode::CompareOp {
-            let feeds_bool = matches!(
-                code.instructions.get(i + 1),
-                Some(next) if matches!(next.op, OpCode::PopJumpIfFalse | OpCode::PopJumpIfTrue)
-                    || (next.op == OpCode::UnaryOp
-                        && next.arg == crate::bytecode::UnaryKind::Not as u32)
-            );
-            if feeds_bool {
-                mapped[i].arg |= 16;
+        let m = mark(i);
+        if m & wire::FUSE_HEAD != 0 {
+            let head = code.instructions[i];
+            let Some(tail) = code.instructions.get(i + 1).copied() else {
+                continue;
+            };
+            let fused = match (head.op, tail.op) {
+                (OpCode::LoadGlobal, OpCode::PushNull) => {
+                    Some((op::LOAD_GLOBAL, (head.arg << 1) | 1))
+                }
+                (OpCode::LoadFast, OpCode::LoadFast) if head.arg < 16 && tail.arg < 16 => Some((
+                    if m & wire::BORROW != 0 {
+                        op::LOAD_FAST_BORROW_LOAD_FAST_BORROW
+                    } else {
+                        op::LOAD_FAST_LOAD_FAST
+                    },
+                    (head.arg << 4) | tail.arg,
+                )),
+                (OpCode::StoreFast, OpCode::LoadFast) if head.arg < 16 && tail.arg < 16 => {
+                    Some((op::STORE_FAST_LOAD_FAST, (head.arg << 4) | tail.arg))
+                }
+                (OpCode::StoreFast, OpCode::StoreFast) if head.arg < 16 && tail.arg < 16 => {
+                    Some((op::STORE_FAST_STORE_FAST, (head.arg << 4) | tail.arg))
+                }
+                _ => None,
+            };
+            if let Some((cp_op, arg)) = fused {
+                mapped[i] = MappedOp { cp_op, arg };
+                zero_width[i + 1] = true;
+            }
+        } else if m & wire::FUSE_TAIL == 0
+            && matches!(
+                code.instructions[i].op,
+                OpCode::LoadFast | OpCode::LoadClosure
+            )
+        {
+            if m & wire::BORROW != 0 {
+                mapped[i].cp_op = op::LOAD_FAST_BORROW;
+            } else if m & wire::CHECK != 0 {
+                mapped[i].cp_op = op::LOAD_FAST_CHECK;
             }
         }
     }
 
-    // CPython's `insert_prefix_instructions`: the wire stream opens
-    // with `COPY_FREE_VARS n` (if the code has free variables) and one
-    // `MAKE_CELL` per cell variable in localsplus-slot order, all at
-    // NO_LOCATION. WeavePy's frame setup performs both natively, so
-    // the internal stream carries no prologue — synthesize it here
-    // (and strip it again in decode). Streams that already start with
-    // an explicit prologue (hand-built via `types.CodeType`) keep it.
-    let mut prologue: Vec<MappedOp> = Vec::new();
-    let has_explicit_prologue = matches!(
-        code.instructions.first().map(|i| i.op),
-        Some(OpCode::CopyFreeVars | OpCode::MakeCell)
-    );
-    if !has_explicit_prologue {
-        if !code.freevars.is_empty() {
-            prologue.push(MappedOp {
-                cp_op: op::COPY_FREE_VARS,
-                arg: code.freevars.len() as u32,
-            });
-        }
-        let mut cell_slots: Vec<u32> = slots.slots[..code.cellvars.len()].to_vec();
-        cell_slots.sort_unstable();
-        for s in cell_slots {
-            prologue.push(MappedOp {
-                cp_op: op::MAKE_CELL,
-                arg: s,
-            });
-        }
-    }
-    let prologue_units: usize = prologue.iter().map(|m| ext_count(m.arg) + 1).sum();
-
-    // Uninitialized-locals analysis: LOAD_FAST → LOAD_FAST_CHECK where
-    // the slot may be unbound (must run before superinstruction fusion,
-    // as in CPython — checked loads never fuse).
-    add_uninitialized_checks(code, &mut mapped);
-
-    // CPython 3.13 compiles `return <const>` to a single RETURN_CONST
-    // unit; WeavePy's internal stream keeps the LOAD_CONST +
-    // RETURN_VALUE pair. Fuse on the wire so instruction offsets (and
-    // `sys.monitoring` INSTRUCTION events keyed to them) line up. A
-    // pair is fusable only when nothing addresses the RETURN_VALUE
-    // itself (jump target, exception-range boundary, handler tag) and
-    // both halves share one source location (RETURN_CONST carries a
-    // single position).
-    // CPython emits the await / yield-from send-dance edges as
-    // JUMP_BACKWARD_NO_INTERRUPT (no eval-breaker poll between YIELD
-    // and the re-SEND, nor on a CLEANUP_THROW's hop to END_SEND).
-    // WeavePy lowers both with a plain JumpBackward; recover the
-    // distinction structurally: a backward jump targeting a SEND is
-    // the resend edge, and one straight after CLEANUP_THROW is a
-    // cold-moved cleanup block's exit edge.
-    for i in 0..n {
-        if mapped[i].cp_op != op::JUMP_BACKWARD {
-            continue;
-        }
-        let t = (i + 1).saturating_sub(args_target_delta(code.instructions[i]));
-        if mapped.get(t).map(|m| m.cp_op) == Some(op::SEND)
-            || (i > 0 && mapped[i - 1].cp_op == op::CLEANUP_THROW)
-        {
-            mapped[i].cp_op = op::JUMP_BACKWARD_NO_INTERRUPT;
-        }
-    }
-    // Compiler-flagged synthetic scope-exit jumps (handler exits,
-    // `with`-suppress exits, cold rejoins) — see
-    // `CodeObject::no_interrupt_jumps`.
+    // The internal stream folds both backward jumps into one opcode;
+    // `no_interrupt_jumps` says which ones are `JUMP_NO_INTERRUPT`.
     for &j in &code.no_interrupt_jumps {
         if let Some(m) = mapped.get_mut(j as usize) {
             if m.cp_op == op::JUMP_BACKWARD {
@@ -1019,111 +880,65 @@ pub fn encode(code: &CodeObject) -> CpythonCode {
             }
         }
     }
-    let mut fused = vec![false; n];
-    // Location source per emitted instruction: normally itself, but a
-    // fused RETURN_CONST takes the RETURN_VALUE's location (CPython
-    // stamps the whole `return <const>` statement span, not the
-    // constant expression's).
-    let mut loc_src: Vec<usize> = (0..n).collect();
-    {
-        let mut boundary = vec![false; n + 1];
-        for (i, m) in mapped.iter().enumerate() {
-            if is_rel_jump(m.cp_op) {
-                let t = if is_backward_jump(m.cp_op) {
-                    (i + 1).saturating_sub(args_target_delta(code.instructions[i]))
-                } else {
-                    i + 1 + args_target_delta(code.instructions[i])
-                };
-                boundary[t.min(n)] = true;
+
+    // END_ASYNC_FOR's oparg points back at the `END_SEND` of the
+    // `__anext__` dance it closes (assemble.c: `offset - SEND.offset -
+    // END_SEND_OFFSET`). The dance is the exception range this
+    // instruction handles; its SEND is the first one inside.
+    let eaf_send: Vec<Option<usize>> = (0..n)
+        .map(|i| {
+            if mapped[i].cp_op != op::END_ASYNC_FOR {
+                return None;
             }
-            if m.cp_op == op::PUSH_EXC_INFO {
-                boundary[(code.instructions[i].arg as usize).min(n)] = true;
-            }
-        }
-        for h in &code.exception_table {
-            boundary[(h.start as usize).min(n)] = true;
-            boundary[(h.end as usize).min(n)] = true;
-            boundary[(h.handler as usize).min(n)] = true;
-        }
-        for i in 1..n {
-            if mapped[i].cp_op == op::RETURN_VALUE
-                // arg 1 = codegen-origin constant return. CPython 3.13
-                // emits RETURN_CONST from codegen only; an optimizer's
-                // branch elimination leaving LOAD_CONST + RETURN_VALUE
-                // is never re-fused (test_consts_in_conditionals).
-                && code.instructions[i].arg == 1
-                && mapped[i - 1].cp_op == op::LOAD_CONST
-                && !boundary[i]
-                && code.linetable.get(i) == code.linetable.get(i - 1)
-            {
-                fused[i] = true;
-                mapped[i - 1].cp_op = op::RETURN_CONST;
-                loc_src[i - 1] = i;
-            }
-        }
-        // CPython folds the callable-NULL push into LOAD_GLOBAL's
-        // oparg bit 0 (there is no separate PUSH_NULL unit after a
-        // global callable load); every other callable load keeps the
-        // explicit PUSH_NULL instruction.
-        for i in 1..n {
-            if mapped[i].cp_op == op::PUSH_NULL
-                && mapped[i - 1].cp_op == op::LOAD_GLOBAL
-                && !fused[i - 1]
-                && !boundary[i]
-            {
-                fused[i] = true;
-                mapped[i - 1].arg |= 1;
-            }
-        }
-        // CPython's `insert_superinstructions`: adjacent fast-local
-        // pairs fuse into one unit with args packed 4 bits each. Only
-        // true locals participate — CPython's fusion runs before
-        // LOAD_CLOSURE lowers to LOAD_FAST, so closure loads (WeavePy's
-        // `LoadClosure`, mapped to LOAD_FAST above) stay unfused. Both
-        // halves must sit on one line (or carry no location), like
-        // `make_super_instruction`.
-        for i in 1..n {
-            if fused[i] || fused[i - 1] || boundary[i] {
-                continue;
-            }
-            let sop = match (mapped[i - 1].cp_op, mapped[i].cp_op) {
-                (op::LOAD_FAST, op::LOAD_FAST)
-                    if code.instructions[i - 1].op == OpCode::LoadFast
-                        && code.instructions[i].op == OpCode::LoadFast =>
-                {
-                    op::LOAD_FAST_LOAD_FAST
-                }
-                (op::STORE_FAST, op::LOAD_FAST) if code.instructions[i].op == OpCode::LoadFast => {
-                    op::STORE_FAST_LOAD_FAST
-                }
-                (op::STORE_FAST, op::STORE_FAST) => op::STORE_FAST_STORE_FAST,
-                _ => continue,
-            };
-            let (a1, a2) = (mapped[i - 1].arg, mapped[i].arg);
-            if a1 >= 16 || a2 >= 16 {
-                continue;
-            }
-            let (l1, l2) = (
-                code.linetable.get(i - 1).copied().unwrap_or(0),
-                code.linetable.get(i).copied().unwrap_or(0),
-            );
-            if l1 != 0 && l2 != 0 && l1 != l2 {
-                continue;
-            }
-            fused[i] = true;
-            mapped[i - 1].cp_op = sop;
-            mapped[i - 1].arg = (a1 << 4) | a2;
-        }
-    }
+            code.exception_table
+                .iter()
+                .filter(|h| h.handler as usize == i)
+                .find_map(|h| {
+                    (h.start as usize..(h.end as usize).min(n))
+                        .find(|&k| code.instructions[k].op == OpCode::Send)
+                })
+        })
+        .collect();
 
     // Fixpoint: jump args depend on code-unit offsets, which depend on
     // how many EXTENDED_ARG units precede each instruction.
+    //
+    // The iteration can have more than one fixpoint (a backward jump
+    // whose distance is 255 without its EXTENDED_ARG and 256 with it is
+    // self-consistent either way), so the seed decides the result.
+    // CPython's `resolve_jump_offsets` sizes every jump on its first
+    // pass from the *instruction index* of the target (`i_oparg` still
+    // holds the label-resolved index at that point), so a jump to the
+    // 300th instruction starts out with an EXTENDED_ARG and keeps it
+    // whenever the distance lands on the boundary. Seed the same way:
+    // the index counts wire instructions (fusion tails are invisible).
+    let cp_index: Vec<usize> = {
+        let mut v = Vec::with_capacity(n + 1);
+        let mut k = 0usize;
+        for &zw in zero_width.iter().take(n) {
+            v.push(k);
+            if !zw {
+                k += 1;
+            }
+        }
+        v.push(k);
+        v
+    };
     let mut ext: Vec<usize> = mapped
         .iter()
         .enumerate()
         .map(|(i, m)| {
-            if is_rel_jump(m.cp_op) || fused[i] {
+            if zero_width[i] {
                 0
+            } else if m.cp_op == op::END_ASYNC_FOR {
+                ext_count(eaf_send[i].map_or(0, |send| cp_index[send]) as u32)
+            } else if is_rel_jump(m.cp_op) {
+                let target_idx = if is_backward_jump(m.cp_op) {
+                    (i + 1).saturating_sub(args_target_delta(code.instructions[i]))
+                } else {
+                    i + 1 + args_target_delta(code.instructions[i])
+                };
+                ext_count(cp_index[target_idx.min(n)] as u32)
             } else {
                 ext_count(m.arg)
             }
@@ -1133,14 +948,10 @@ pub fn encode(code: &CodeObject) -> CpythonCode {
     let mut args: Vec<u32> = mapped.iter().map(|m| m.arg).collect();
 
     for _ in 0..16 {
-        // Recompute code-unit start offsets. The synthesized prologue
-        // occupies the first `prologue_units` units, so every start is
-        // already absolute (exception-table offsets and `f_lasti`
-        // include the prologue, exactly as in CPython).
-        let mut off = prologue_units;
+        let mut off = 0usize;
         for i in 0..n {
             starts[i] = off;
-            if !fused[i] {
+            if !zero_width[i] {
                 off += ext[i] + 1 + cache_entries(mapped[i].cp_op);
             }
         }
@@ -1148,30 +959,33 @@ pub fn encode(code: &CodeObject) -> CpythonCode {
 
         let mut changed = false;
         for i in 0..n {
-            // `PUSH_EXC_INFO` has no oparg in CPython, but WeavePy tags it
-            // with the pc just past the handler body (the unwinder's
-            // discard cue). The cache is WeavePy-only, so persist the tag
-            // as an *absolute code-unit offset* — losing it (decoding to
-            // the untagged 0) changes handled-exception unwinding, which
-            // is observable through `__context__` chaining.
-            if mapped[i].cp_op == op::PUSH_EXC_INFO {
-                let tag = code.instructions[i].arg as usize;
-                if tag != 0 {
-                    let oparg = starts[tag.min(n)] as u32;
-                    args[i] = oparg;
-                    let need = ext_count(oparg);
-                    if need != ext[i] {
-                        ext[i] = need;
-                        changed = true;
-                    }
+            // `PUSH_EXC_INFO` has no oparg in CPython. WeavePy's
+            // compiler tags its own copy with the pc past the handler
+            // body, but the VM no longer reads the tag (the exception
+            // table's cleanup handlers and frame-exit reconciliation
+            // keep `sys.exc_info()` balanced, exactly as for CPython-
+            // compiled `.pyc`s), so the wire carries 0 (RFC 0077 WS9).
+            if mapped[i].cp_op == op::END_ASYNC_FOR {
+                let next_unit = starts[i] + ext[i] + 1;
+                let oparg = eaf_send[i].map_or(0, |send| {
+                    next_unit
+                        .saturating_sub(starts[send])
+                        .saturating_sub(END_SEND_OFFSET)
+                }) as u32;
+                args[i] = oparg;
+                let need = ext_count(oparg);
+                if need != ext[i] {
+                    ext[i] = need;
+                    changed = true;
                 }
                 continue;
             }
-            if !is_rel_jump(mapped[i].cp_op) {
+            if !is_rel_jump(mapped[i].cp_op) || zero_width[i] {
                 continue;
             }
-            let size = ext[i] + 1 + cache_entries(mapped[i].cp_op);
-            let next_unit = starts[i] + size;
+            // Jumps are relative to the unit after the instruction's
+            // caches.
+            let next_unit = starts[i] + ext[i] + 1 + cache_entries(mapped[i].cp_op);
             // WeavePy jump arg is an instruction delta off the *next*
             // instruction (pc is pre-incremented). Resolve the absolute
             // target instruction, then re-express in code units.
@@ -1203,75 +1017,16 @@ pub fn encode(code: &CodeObject) -> CpythonCode {
     let mut co_code: Vec<u8> = Vec::with_capacity(starts[n] * 2);
     let mut positions: Vec<Position> = Vec::with_capacity(starts[n]);
     let mut inst_offsets: Vec<u32> = Vec::with_capacity(n);
-    // The prologue first, at CPython's NO_LOCATION.
-    const NO_LOCATION: Position = Position {
-        lineno: -1,
-        end_lineno: -1,
-        col: None,
-        end_col: None,
-    };
-    for m in &prologue {
-        for k in (1..=ext_count(m.arg)).rev() {
-            co_code.push(op::EXTENDED_ARG);
-            co_code.push(((m.arg >> (8 * k)) & 0xFF) as u8);
-            positions.push(NO_LOCATION);
-        }
-        co_code.push(m.cp_op);
-        co_code.push((m.arg & 0xFF) as u8);
-        positions.push(NO_LOCATION);
-    }
-    // A module code object always reports `co_firstlineno == 1` in CPython
-    // regardless of where its first statement sits (leading blank lines,
-    // comments — test_opcodes `test_setup_annotations_line`). Other code
-    // objects start at their first instruction's line.
-    let firstlineno = if code.name == "<module>" {
-        1
-    } else {
-        code.linetable.first().copied().unwrap_or(1)
-    };
+    let firstlineno = code_firstlineno(code);
     for i in 0..n {
-        if fused[i] {
-            // Zero-width: the RETURN_CONST unit emitted for `i - 1`
-            // stands for this instruction too (same `f_lasti`).
+        if zero_width[i] {
+            // A fusion tail: the head's superinstruction stands for it
+            // (same `f_lasti`).
             let prev = inst_offsets.last().copied().unwrap_or(0);
             inst_offsets.push(prev);
             continue;
         }
-        let li = loc_src[i];
-        // WeavePy's linetable uses 0 as the NO_LOCATION sentinel; the
-        // presentation layer uses -1 (CPython's convention) so that
-        // *real* line 0 — the module's opening RESUME, see below —
-        // stays representable.
-        let raw = code.linetable.get(li).copied().unwrap_or(firstlineno) as i32;
-        let line = if raw == 0 { -1 } else { raw };
-        // PEP-657 columns, when the compiler tracked them for this
-        // instruction. `col`/`end_col` are byte offsets (`-1` = unknown);
-        // `end_lineno` is `0` when unknown (fall back to the start line).
-        let cs = code.coltable.get(li).copied().unwrap_or_default();
-        let end_lineno = if cs.end_lineno != 0 {
-            cs.end_lineno as i32
-        } else {
-            line
-        };
-        let pos = if module_resume_at(code, i) {
-            // CPython stamps a module's opening RESUME with the real
-            // location (0, 1, 0, 0) — compile.c codegen_enter_anonymous_scope
-            // sets loc.lineno = 0 for module scope (test_compile's
-            // test_leading_newlines grades co_lines() starting at 0).
-            Position {
-                lineno: 0,
-                end_lineno: 1,
-                col: Some(0),
-                end_col: Some(0),
-            }
-        } else {
-            Position {
-                lineno: line,
-                end_lineno,
-                col: (cs.col >= 0).then_some(cs.col as u32),
-                end_col: (cs.end_col >= 0).then_some(cs.end_col as u32),
-            }
-        };
+        let pos = position_at(code, i, firstlineno);
         let arg = args[i];
         // EXTENDED_ARG units carry the high base-256 digits, MSB first.
         for k in (1..=ext[i]).rev() {
@@ -1295,15 +1050,7 @@ pub fn encode(code: &CodeObject) -> CpythonCode {
 
     let (localsplusnames, localspluskinds) = build_localsplus(code);
     CpythonCode {
-        co_linetable: encode_linetable(
-            code,
-            &ext,
-            &mapped,
-            &fused,
-            &loc_src,
-            firstlineno,
-            prologue_units,
-        ),
+        co_linetable: encode_linetable(code, &ext, &mapped, &zero_width, firstlineno),
         co_exceptiontable: encode_exception_table(code, &starts),
         co_code,
         localsplusnames,
@@ -1315,14 +1062,177 @@ pub fn encode(code: &CodeObject) -> CpythonCode {
     }
 }
 
+/// `co_firstlineno`: a module code object always reports 1 in CPython
+/// regardless of where its first statement sits (leading blank lines,
+/// comments — test_opcodes `test_setup_annotations_line`); anything
+/// else starts at its first located instruction (the flowgraph's
+/// `firstlineno`, which `resolve_line_numbers` also propagates onto
+/// the entry block's unlocated prefix).
+fn code_firstlineno(code: &CodeObject) -> u32 {
+    if code.name == "<module>" {
+        1
+    } else {
+        code.linetable.iter().copied().find(|&l| l > 0).unwrap_or(1)
+    }
+}
+
+/// The PEP 657 position of instruction `i` as the wire tables present
+/// it. WeavePy's linetable uses 0 as the NO_LOCATION sentinel; the
+/// presentation layer uses -1 (CPython's convention) so that *real*
+/// line 0 — the module's opening RESUME — stays representable.
+fn position_at(code: &CodeObject, i: usize, firstlineno: u32) -> Position {
+    if module_resume_at(code, i) {
+        // CPython stamps a module's opening RESUME with the real
+        // location (0, 1, 0, 0) — codegen_enter_anonymous_scope sets
+        // loc.lineno = 0 for module scope (test_compile's
+        // test_leading_newlines grades co_lines() starting at 0).
+        return Position {
+            lineno: 0,
+            end_lineno: 1,
+            col: Some(0),
+            end_col: Some(0),
+        };
+    }
+    let raw = code.linetable.get(i).copied().unwrap_or(firstlineno) as i32;
+    let line = if raw == 0 { -1 } else { raw };
+    // `col`/`end_col` are byte offsets (`-1` = unknown); `end_lineno`
+    // is `0` when unknown (fall back to the start line).
+    let cs = code.coltable.get(i).copied().unwrap_or_default();
+    let end_lineno = if cs.end_lineno != 0 {
+        cs.end_lineno as i32
+    } else {
+        line
+    };
+    Position {
+        lineno: line,
+        end_lineno,
+        col: (cs.col >= 0).then_some(cs.col as u32),
+        end_col: (cs.end_col >= 0).then_some(cs.end_col as u32),
+    }
+}
+
+/// `(popped, pushed)` for a CPython 3.14 wire opcode
+/// (`_PyOpcode_num_popped` / `_PyOpcode_num_pushed`, generated from
+/// `bytecodes.c`). Only the opcodes `encode` can produce are listed.
+fn cp_stack_shape(cp_op: u8, arg: u32) -> (usize, usize) {
+    let a = arg as usize;
+    match cp_op {
+        op::BINARY_SLICE => (3, 1),
+        op::BUILD_TEMPLATE => (2, 1),
+        op::CALL_FUNCTION_EX => (4, 1),
+        op::CHECK_EG_MATCH | op::CHECK_EXC_MATCH => (2, 2),
+        op::CLEANUP_THROW => (3, 2),
+        op::DELETE_SUBSCR => (2, 0),
+        op::END_FOR => (1, 0),
+        op::END_SEND => (2, 1),
+        op::FORMAT_SIMPLE => (1, 1),
+        op::FORMAT_WITH_SPEC => (2, 1),
+        op::GET_AITER | op::GET_ITER | op::GET_YIELD_FROM_ITER | op::GET_AWAITABLE => (1, 1),
+        op::GET_ANEXT | op::GET_LEN | op::MATCH_MAPPING | op::MATCH_SEQUENCE => (1, 2),
+        op::LOAD_BUILD_CLASS | op::LOAD_LOCALS | op::PUSH_NULL | op::RETURN_GENERATOR => (0, 1),
+        op::MAKE_FUNCTION => (1, 1),
+        op::MATCH_KEYS => (2, 3),
+        op::NOP | op::NOT_TAKEN | op::SETUP_ANNOTATIONS | op::RESUME | op::EXTENDED_ARG => (0, 0),
+        op::POP_EXCEPT | op::POP_ITER | op::POP_TOP => (1, 0),
+        op::PUSH_EXC_INFO => (1, 2),
+        op::RETURN_VALUE => (1, 1),
+        op::STORE_SLICE => (4, 0),
+        op::STORE_SUBSCR => (3, 0),
+        op::TO_BOOL | op::UNARY_INVERT | op::UNARY_NEGATIVE | op::UNARY_NOT => (1, 1),
+        op::WITH_EXCEPT_START => (5, 6),
+        op::BINARY_OP => (2, 1),
+        op::BUILD_INTERPOLATION => (2 + (a & 1), 1),
+        op::BUILD_LIST | op::BUILD_SET | op::BUILD_SLICE | op::BUILD_STRING | op::BUILD_TUPLE => {
+            (a, 1)
+        }
+        op::BUILD_MAP => (a * 2, 1),
+        op::CALL => (2 + a, 1),
+        op::CALL_INTRINSIC_1 => (1, 1),
+        op::CALL_INTRINSIC_2 => (2, 1),
+        op::CALL_KW => (3 + a, 1),
+        op::COMPARE_OP | op::CONTAINS_OP | op::IS_OP => (2, 1),
+        op::CONVERT_VALUE => (1, 1),
+        op::COPY => (a.max(1), a.max(1) + 1),
+        op::COPY_FREE_VARS | op::MAKE_CELL => (0, 0),
+        op::DELETE_ATTR => (1, 0),
+        op::DELETE_DEREF | op::DELETE_FAST | op::DELETE_GLOBAL | op::DELETE_NAME => (0, 0),
+        op::DICT_MERGE => (4 + a, 3 + a),
+        op::DICT_UPDATE | op::LIST_APPEND | op::LIST_EXTEND | op::SET_ADD | op::SET_UPDATE => {
+            (1 + a, a)
+        }
+        op::END_ASYNC_FOR => (2, 0),
+        op::FOR_ITER => (1, 2),
+        op::IMPORT_FROM => (1, 2),
+        op::IMPORT_NAME => (2, 1),
+        op::JUMP_BACKWARD | op::JUMP_BACKWARD_NO_INTERRUPT | op::JUMP_FORWARD => (0, 0),
+        op::LOAD_ATTR => (1, 1 + (a & 1)),
+        op::LOAD_COMMON_CONSTANT
+        | op::LOAD_CONST
+        | op::LOAD_DEREF
+        | op::LOAD_FAST
+        | op::LOAD_FAST_AND_CLEAR
+        | op::LOAD_FAST_BORROW
+        | op::LOAD_FAST_CHECK
+        | op::LOAD_NAME
+        | op::LOAD_SMALL_INT => (0, 1),
+        op::LOAD_FAST_BORROW_LOAD_FAST_BORROW | op::LOAD_FAST_LOAD_FAST => (0, 2),
+        op::LOAD_FROM_DICT_OR_DEREF | op::LOAD_FROM_DICT_OR_GLOBALS => (1, 1),
+        op::LOAD_GLOBAL => (0, 1 + (a & 1)),
+        op::LOAD_SPECIAL => (1, 2),
+        op::LOAD_SUPER_ATTR => (3, 1 + (a & 1)),
+        op::MAP_ADD => (2 + a, a),
+        op::MATCH_CLASS => (3, 1),
+        op::POP_JUMP_IF_FALSE
+        | op::POP_JUMP_IF_NONE
+        | op::POP_JUMP_IF_NOT_NONE
+        | op::POP_JUMP_IF_TRUE => (1, 0),
+        op::RAISE_VARARGS => (a, 0),
+        op::RERAISE => (1 + a, a),
+        op::SEND => (2, 2),
+        op::SET_FUNCTION_ATTRIBUTE => (2, 1),
+        op::STORE_ATTR => (2, 0),
+        op::STORE_DEREF | op::STORE_FAST | op::STORE_GLOBAL | op::STORE_NAME => (1, 0),
+        op::STORE_FAST_LOAD_FAST => (1, 1),
+        op::STORE_FAST_STORE_FAST => (2, 0),
+        op::SWAP => (a.max(2), a.max(2)),
+        op::UNPACK_EX => (1, 1 + (a & 0xFF) + (a >> 8)),
+        op::UNPACK_SEQUENCE => (1, a),
+        op::YIELD_VALUE => (1, 1),
+        _ => (0, 0),
+    }
+}
+
 /// Whether instruction `i` is a module's opening `RESUME`, which
 /// CPython locates at the synthetic (0, 1, 0, 0) span rather than
 /// NO_LOCATION (compile.c sets `loc.lineno = 0` for module scope).
+///
+/// The flowgraph stamps that RESUME with
+/// [`crate::flowgraph::MODULE_RESUME_LOCATION`], whose line the table
+/// spells as its NO_LOCATION sentinel `0` and whose column span
+/// `(1, 0, 0)` no NO_LOCATION instruction carries; `propagate_line_numbers`
+/// may have spread it to the instructions after RESUME (an empty
+/// module's `LOAD_CONST None; RETURN_VALUE`). The op-based test keeps a
+/// table without column data (an AST compiled elsewhere) honest.
+///
+/// The opening `RESUME` isn't necessarily instruction 0: the flowgraph's
+/// `insert_prefix_instructions` puts `MAKE_CELL`s ahead of it when the
+/// module owns a cell (PEP 649's `__conditional_annotations__`), and the
+/// top-level-await coroutine prefix (`RETURN_GENERATOR; POP_TOP`) does
+/// the same. Only those prefix ops may precede it.
 fn module_resume_at(code: &CodeObject, i: usize) -> bool {
-    i == 0
-        && code.name == "<module>"
-        && code.instructions.first().map(|x| x.op) == Some(OpCode::Resume)
-        && code.linetable.first().copied().unwrap_or(1) == 0
+    if code.name != "<module>" || code.linetable.get(i).copied().unwrap_or(1) != 0 {
+        return false;
+    }
+    if code.coltable.get(i).copied() == Some(crate::flowgraph::MODULE_RESUME_LOCATION.col) {
+        return true;
+    }
+    code.instructions.get(i).map(|x| x.op) == Some(OpCode::Resume)
+        && code.instructions[..i].iter().all(|x| {
+            matches!(
+                x.op,
+                OpCode::MakeCell | OpCode::CopyFreeVars | OpCode::ReturnGenerator | OpCode::PopTop
+            )
+        })
 }
 
 /// Read the raw instruction delta a WeavePy jump carries (its `arg`),
@@ -1370,52 +1280,32 @@ fn push_loc_svarint(out: &mut Vec<u8>, val: i32, first_mask: u8) {
 /// error-report tests compare them textually). Instructions without
 /// columns keep the "no-column" form (`code = 13`).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
+/// PEP 626 / PEP 657 location table (`write_location_info_entry`):
+/// one entry per instruction (all of its code units share the
+/// location), split into chunks of at most 8 units.
 fn encode_linetable(
     code: &CodeObject,
     ext: &[usize],
     mapped: &[MappedOp],
-    fused: &[bool],
-    loc_src: &[usize],
+    zero_width: &[bool],
     firstlineno: u32,
-    prologue_units: usize,
 ) -> Vec<u8> {
     const CODE_NO_COLUMNS: u8 = 13;
     const CODE_LONG: u8 = 14;
     const CODE_NO_LOCATION: u8 = 15;
     let mut out = Vec::new();
     let mut prev_line = firstlineno as i32;
-    // The synthesized MAKE_CELL/COPY_FREE_VARS prologue is NO_LOCATION.
-    let mut remaining = prologue_units;
-    while remaining > 0 {
-        let chunk = remaining.min(8);
-        out.push(0x80 | (CODE_NO_LOCATION << 3) | ((chunk - 1) as u8));
-        remaining -= chunk;
-    }
     for i in 0..code.instructions.len() {
-        if fused[i] {
-            // Zero-width on the wire; the RETURN_CONST entry for the
-            // preceding instruction covers the merged location.
+        if zero_width[i] {
             continue;
         }
-        let li = loc_src[i];
-        let line = code.linetable.get(li).copied().unwrap_or(firstlineno) as i32;
         let units = ext[i] + 1 + cache_entries(mapped[i].cp_op);
-        // Each location entry covers 1..=8 code units; split if longer.
+        let pos = position_at(code, i, firstlineno);
         let mut remaining = units;
-        // A module's opening RESUME carries the real location
-        // (0, 1, 0, 0) on the wire, like CPython's.
-        if module_resume_at(code, i) {
-            out.push(0x80 | (CODE_LONG << 3) | ((units.min(8) - 1) as u8));
-            push_loc_svarint(&mut out, -prev_line, 0);
-            push_loc_varint(&mut out, 1, 0); // end_line delta
-            push_loc_varint(&mut out, 1, 0); // col 0, stored +1
-            push_loc_varint(&mut out, 1, 0); // end_col 0, stored +1
-            prev_line = 0;
-            continue;
-        }
-        // Line 0 is WeavePy's NO_LOCATION sentinel — the entry form 15
-        // carries no line delta and doesn't advance the running line.
-        if line == 0 {
+        if pos.lineno < 0 {
+            // NO_LOCATION: the entry form carries no line delta and
+            // doesn't advance the running line.
             while remaining > 0 {
                 let chunk = remaining.min(8);
                 out.push(0x80 | (CODE_NO_LOCATION << 3) | ((chunk - 1) as u8));
@@ -1423,26 +1313,24 @@ fn encode_linetable(
             }
             continue;
         }
-        let cs = code.coltable.get(li).copied().unwrap_or_default();
-        let has_cols = cs.col >= 0 && cs.end_col >= 0;
-        let end_line_delta = if cs.end_lineno != 0 {
-            (cs.end_lineno as i32 - line).max(0) as u32
-        } else {
-            0
-        };
+        let line = pos.lineno;
+        let end_line_delta = (pos.end_lineno - line).max(0) as u32;
         let mut delta = line - prev_line;
         while remaining > 0 {
             let chunk = remaining.min(8);
-            if has_cols {
-                out.push(0x80 | (CODE_LONG << 3) | ((chunk - 1) as u8));
-                push_loc_svarint(&mut out, delta, 0);
-                push_loc_varint(&mut out, end_line_delta, 0);
-                // Columns are stored +1 so `0` means "None" (locations.md).
-                push_loc_varint(&mut out, (cs.col + 1) as u32, 0);
-                push_loc_varint(&mut out, (cs.end_col + 1) as u32, 0);
-            } else {
-                out.push(0x80 | (CODE_NO_COLUMNS << 3) | ((chunk - 1) as u8));
-                push_loc_svarint(&mut out, delta, 0);
+            match (pos.col, pos.end_col) {
+                (Some(col), Some(end_col)) => {
+                    out.push(0x80 | (CODE_LONG << 3) | ((chunk - 1) as u8));
+                    push_loc_svarint(&mut out, delta, 0);
+                    push_loc_varint(&mut out, end_line_delta, 0);
+                    // Columns are stored +1 so `0` means "None" (locations.md).
+                    push_loc_varint(&mut out, col + 1, 0);
+                    push_loc_varint(&mut out, end_col + 1, 0);
+                }
+                _ => {
+                    out.push(0x80 | (CODE_NO_COLUMNS << 3) | ((chunk - 1) as u8));
+                    push_loc_svarint(&mut out, delta, 0);
+                }
             }
             // Subsequent chunks of the same instruction repeat the line.
             delta = 0;
@@ -1482,25 +1370,42 @@ fn push_exc_varint(out: &mut Vec<u8>, val: u32, first_mask: u8) {
     }
 }
 
-/// Encode the exception range table. Offsets are converted to code units
-/// via `starts`.
+/// Encode the exception range table the way `assemble_exception_table`
+/// does: one owner per code unit, adjacent units with the same handler
+/// merged into one entry. Every unit of an instruction takes the
+/// instruction's entry (the flowgraph's per-instruction `i_except`,
+/// already flattened into ranges by `flowgraph::flatten`).
 fn encode_exception_table(code: &CodeObject, starts: &[usize]) -> Vec<u8> {
-    let mut out = Vec::new();
     let n = code.instructions.len();
+    let total = starts.get(n).copied().unwrap_or(0);
+    // (target unit, depth, lasti) per code unit.
+    let mut owner: Vec<Option<(u32, u32, bool)>> = vec![None; total];
     for h in &code.exception_table {
-        let start = starts.get(h.start as usize).copied().unwrap_or(0);
-        let end = starts
-            .get((h.end as usize).min(n))
-            .copied()
-            .unwrap_or(start);
-        let target = starts.get(h.handler as usize).copied().unwrap_or(0);
-        let length = end.saturating_sub(start);
+        let target = starts.get(h.handler as usize).copied().unwrap_or(0) as u32;
+        let k = (target, h.depth, h.push_lasti);
+        for i in (h.start as usize)..(h.end as usize).min(n) {
+            for u in starts[i]..starts[i + 1] {
+                owner[u] = Some(k);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut u = 0usize;
+    while u < total {
+        let Some(k) = owner[u] else {
+            u += 1;
+            continue;
+        };
+        let start = u;
+        while u < total && owner[u] == Some(k) {
+            u += 1;
+        }
         // First byte of the entry is marked with 0x80.
         push_exc_varint(&mut out, start as u32, 0x80);
-        push_exc_varint(&mut out, length as u32, 0);
-        push_exc_varint(&mut out, target as u32, 0);
+        push_exc_varint(&mut out, (u - start) as u32, 0);
+        push_exc_varint(&mut out, k.0, 0);
         // depth_and_lasti = (depth << 1) | lasti.
-        push_exc_varint(&mut out, (h.depth << 1) | u32::from(h.push_lasti), 0);
+        push_exc_varint(&mut out, (k.1 << 1) | u32::from(k.2), 0);
     }
     out
 }
@@ -1669,9 +1574,14 @@ fn compute_stacksize(code: &CodeObject) -> u32 {
         if h.depth & crate::HANDLER_DEPTH_ANCHOR_FLAG != 0 {
             continue;
         }
+        // CPython's `calculate_stackdepth` counts the `SETUP_*`
+        // pseudo-op's target depth toward `co_stacksize` even when the
+        // handler's first instruction only pops.
+        let entry_depth = i64::from(h.depth) + 1 + i64::from(h.push_lasti);
+        maxdepth = maxdepth.max(entry_depth);
         push(
             h.handler as usize,
-            i64::from(h.depth) + 1 + i64::from(h.push_lasti),
+            entry_depth,
             &mut startdepth,
             &mut worklist,
         );
@@ -1805,26 +1715,47 @@ fn stack_effects(opcode: OpCode, arg: u32) -> (i64, i64) {
     use OpCode as O;
     let a = i64::from(arg);
     let e = match opcode {
+        // Block-push pseudo-ops: the fallthrough effect is 0; the
+        // handler-entry depth is modeled at the seeding sites.
+        O::SetupFinally
+        | O::SetupCleanup
+        | O::SetupWith
+        | O::PopBlock
+        | O::Jump
+        | O::JumpNoInterrupt
+        | O::JumpIfFalse
+        | O::JumpIfTrue
+        | O::StoreFastLoadFast => 0,
+        O::LoadGlobalPushNull | O::LoadFastLoadFast | O::LoadFastBorrowLoadFastBorrow => 2,
+        O::StoreFastStoreFast => -2,
+        O::StoreFastMaybeNull => -1,
         O::LoadConst
         | O::LoadName
         | O::LoadGlobal
         | O::LoadFast
+        | O::LoadFastBorrow
+        | O::LoadFastCheck
         | O::LoadFastAndClear
         | O::LoadDeref
         | O::LoadClosure
-        | O::LoadClassderef
+        | O::LoadClosureBorrow
+        | O::LoadLocals
         | O::LoadBuildClass
-        | O::LoadAssertionError
+        | O::LoadCommonConstant
+        | O::LoadSmallInt
+        // Pops the owner, pushes `method, self_or_null` (3.14's with
+        // dance).
+        | O::LoadSpecial
         | O::PushNull
         | O::LoadMethodAttr
         | O::CopyTop
         | O::MatchSequence
         | O::MatchMapping
+        // `subject, keys -- subject, keys, values_or_none`.
+        | O::MatchKeys
         | O::GetLen
         | O::GetAnext
         | O::ImportFrom
-        | O::BeforeWith
-        | O::BeforeAsyncWith
         | O::WithExceptStart
         // Every resume pushes the sent value; the prologue's POP_TOP
         // (first resume) or the dance's SEND consumes it.
@@ -1832,6 +1763,7 @@ fn stack_effects(opcode: OpCode, arg: u32) -> (i64, i64) {
         // Inserts the previous exception under TOS (CPython 3.13).
         | O::PushExcInfo => 1,
         O::PopTop
+        | O::PopIter
         | O::StoreName
         | O::StoreGlobal
         | O::StoreFast
@@ -1851,6 +1783,7 @@ fn stack_effects(opcode: OpCode, arg: u32) -> (i64, i64) {
         | O::BinarySubscr
         | O::ListAppend
         | O::SetAdd
+        | O::SetUpdate
         | O::ListExtend
         | O::DictUpdate
         | O::EndSend
@@ -1861,9 +1794,15 @@ fn stack_effects(opcode: OpCode, arg: u32) -> (i64, i64) {
         | O::PopExcept
         // Pops [sub_iter, last_sent, exc], pushes [None, value].
         | O::CleanupThrow
-        | O::PrepReraiseStar => -1,
-        O::StoreAttr | O::MatchClass | O::DeleteSubscr | O::MapAdd | O::EndAsyncFor
-        | O::BuildSlice => -2,
+        | O::PrepReraiseStar
+        | O::CallIntrinsic2 => -1,
+        O::StoreAttr | O::MatchClass | O::DeleteSubscr | O::MapAdd | O::EndAsyncFor => -2,
+        // `start, stop[, step] -- slice`.
+        O::BuildSlice => 1 - a,
+        // `container, start, stop -- result`.
+        O::BinarySlice => -2,
+        // `value, container, start, stop --`.
+        O::StoreSlice => -4,
         // Pops self, class, global_super; pushes the attribute plus a
         // null self slot when the method flag (bit 0) is set.
         O::LoadSuperAttr => (1 + (a & 1)) - 3,
@@ -1875,7 +1814,9 @@ fn stack_effects(opcode: OpCode, arg: u32) -> (i64, i64) {
         O::Call => -a - 1,
         O::CallSelf => -a,
         O::CallKw => -a - 2,
-        O::CallEx => -a - 2,
+        // `callable, self_or_null, args, kwargs_or_null -- result`
+        // (3.14: the kwargs slot is always present).
+        O::CallEx => -3,
         O::MakeFunction => -i64::from(arg.count_ones()),
         O::BuildList | O::BuildTuple | O::BuildSet | O::BuildString => 1 - a,
         O::BuildMap => 1 - 2 * a,
@@ -1888,10 +1829,10 @@ fn stack_effects(opcode: OpCode, arg: u32) -> (i64, i64) {
                 0
             }
         }
-        // Pops value + expression text (+ spec when bit 2 is set),
+        // Pops value + expression text (+ spec when bit 0 is set),
         // pushes the Interpolation.
         O::BuildInterpolation => {
-            if arg & 0x04 != 0 {
+            if arg & 1 != 0 {
                 -2
             } else {
                 -1
@@ -1900,16 +1841,11 @@ fn stack_effects(opcode: OpCode, arg: u32) -> (i64, i64) {
         // Pops the strings and interpolations tuples, pushes the Template.
         O::BuildTemplate => -1,
         O::RaiseVarargs => -a,
-        O::Reraise => {
-            if arg == 0 {
-                -1
-            } else {
-                0
-            }
-        }
+        // `values[oparg], exc -- values[oparg]`; terminal either way.
+        O::Reraise => -1,
         O::ForIter => 1,
         // CPython's END_FOR pops the (statically modeled) next value; the
-        // trailing POP_TOP then pops the iterator. The pair is dead at
+        // trailing POP_ITER then pops the iterator. The pair is dead at
         // runtime (the exhausted FOR_ITER jumps past it) but the static
         // walk passes through it, so the effects must telescope: the
         // FOR_ITER jump edge lands on END_FOR at depth+1.
@@ -1929,6 +1865,10 @@ fn stack_effects(opcode: OpCode, arg: u32) -> (i64, i64) {
         // chained inlined async comprehensions (`[x async for … async
         // for …]` truncated away the inner aiter and underflowed).
         O::Send => 0,
+        // Block pushes: the handler entry sees the pushed exception
+        // (+ lasti for the cleanup forms).
+        O::SetupFinally | O::SetupWith => 1,
+        O::SetupCleanup => 2,
         _ => 0,
     };
     (e, jump)
@@ -1999,34 +1939,23 @@ fn unit_index_map(raws: &[DecodedRaw]) -> std::collections::HashMap<usize, usize
     unit_to_idx
 }
 
-/// Instruction count a raw expands to: `RETURN_CONST` unfuses back into
-/// `LOAD_CONST` + `RETURN_VALUE`, superinstructions into their two
-/// halves; everything else is 1:1.
+/// Instruction count a raw expands to: superinstructions unfuse into
+/// their two halves and a callable-flagged `LOAD_GLOBAL` into
+/// `LoadGlobal` + `PushNull` (both marked as a fusion for the
+/// re-encode); everything else is 1:1.
 fn raw_expansion(cp_op: u8, arg: u32) -> usize {
     match cp_op {
-        op::RETURN_CONST
-        | op::LOAD_FAST_LOAD_FAST
+        op::LOAD_FAST_LOAD_FAST
+        | op::LOAD_FAST_BORROW_LOAD_FAST_BORROW
         | op::STORE_FAST_LOAD_FAST
         | op::STORE_FAST_STORE_FAST => 2,
-        // Callable-flagged global load unfuses into LoadGlobal + PushNull.
         op::LOAD_GLOBAL if arg & 1 != 0 => 2,
         _ => 1,
     }
 }
 
-/// Per-raw expansion counts. The leading `MAKE_CELL`/`COPY_FREE_VARS`
-/// prologue expands to zero instructions: WeavePy's frame setup does
-/// both natively and [`encode`] re-synthesizes the prologue, so
-/// stripping it here keeps decode∘encode the identity.
 fn raw_expansions(raws: &[DecodedRaw]) -> Vec<usize> {
-    let mut out: Vec<usize> = raws.iter().map(|r| raw_expansion(r.cp_op, r.arg)).collect();
-    for (i, r) in raws.iter().enumerate() {
-        match r.cp_op {
-            op::MAKE_CELL | op::COPY_FREE_VARS => out[i] = 0,
-            _ => break,
-        }
-    }
-    out
+    raws.iter().map(|r| raw_expansion(r.cp_op, r.arg)).collect()
 }
 
 /// Per-raw index of its first WeavePy instruction (plus the total as a
@@ -2145,13 +2074,22 @@ enum SlotKind {
     Unknown,
 }
 
-/// Translate decoded raws into WeavePy instructions, recomputing relative
-/// jump args back into the instruction-delta domain.
+/// Decode the raw wire instructions into WeavePy instructions plus
+/// their [`wire`] marks. Superinstructions and the callable-flagged
+/// `LOAD_GLOBAL` unfuse into their two halves (marked head/tail);
+/// `LOAD_FAST_BORROW`/`LOAD_FAST_CHECK` decode to marked `LoadFast`s.
+/// The other reconstruction is the call shape: CPython's `CALL n` is
+/// WeavePy's `Call n` when the self-or-null slot holds NULL and
+/// `CallSelf n+1` when it holds a bound receiver, which a shadow stack
+/// of slot kinds tracks within each basic block.
+// Index-driven on purpose: the walk reads `raws[idx]` while consulting
+// its neighbours and the parallel `first` table.
+#[allow(clippy::needless_range_loop)]
 fn decode_instructions(
     raws: &[DecodedRaw],
     slots: &SlotMap,
     constants: &[Constant],
-) -> Option<Vec<Instruction>> {
+) -> Option<(Vec<Instruction>, Vec<u8>)> {
     let unit_to_idx = unit_index_map(raws);
     let expansions = raw_expansions(raws);
     let first = raw_first_instr(&expansions);
@@ -2175,15 +2113,60 @@ fn decode_instructions(
     }
     let mut shadow: Vec<SlotKind> = Vec::new();
     let mut out = Vec::with_capacity(total);
+    let mut marks: Vec<u8> = Vec::with_capacity(total);
     for (idx, r) in raws.iter().enumerate() {
-        if expansions[idx] == 0 {
-            // The MAKE_CELL/COPY_FREE_VARS prologue — stripped (the
-            // encoder re-synthesizes it; frame setup does the work).
-            continue;
-        }
         if leaders.contains(&r.start_unit) {
             shadow.clear();
         }
+        // Fused wire forms first: they expand to two marked
+        // instructions and drive the shadow stack directly.
+        match r.cp_op {
+            op::LOAD_GLOBAL if r.arg & 1 != 0 => {
+                shadow.push(SlotKind::Other);
+                shadow.push(SlotKind::Null);
+                out.push(Instruction::new(OpCode::LoadGlobal, r.arg >> 1));
+                marks.push(wire::FUSE_HEAD);
+                out.push(Instruction::new(OpCode::PushNull, 0));
+                marks.push(wire::FUSE_TAIL);
+                continue;
+            }
+            op::LOAD_FAST_LOAD_FAST
+            | op::LOAD_FAST_BORROW_LOAD_FAST_BORROW
+            | op::STORE_FAST_LOAD_FAST
+            | op::STORE_FAST_STORE_FAST => {
+                // Args packed 4 bits each; both are always true locals,
+                // never closures.
+                let (a1, a2) = (r.arg >> 4, r.arg & 0x0F);
+                let (op1, op2, extra) = match r.cp_op {
+                    op::LOAD_FAST_LOAD_FAST => (OpCode::LoadFast, OpCode::LoadFast, wire::PLAIN),
+                    op::LOAD_FAST_BORROW_LOAD_FAST_BORROW => {
+                        (OpCode::LoadFast, OpCode::LoadFast, wire::BORROW)
+                    }
+                    op::STORE_FAST_LOAD_FAST => (OpCode::StoreFast, OpCode::LoadFast, wire::PLAIN),
+                    _ => (OpCode::StoreFast, OpCode::StoreFast, wire::PLAIN),
+                };
+                for o in [op1, op2] {
+                    if o == OpCode::LoadFast {
+                        shadow.push(SlotKind::Other);
+                    } else {
+                        pop_slot(&mut shadow);
+                    }
+                }
+                out.push(Instruction::new(op1, a1));
+                marks.push(wire::FUSE_HEAD | extra);
+                out.push(Instruction::new(op2, a2));
+                marks.push(wire::FUSE_TAIL);
+                continue;
+            }
+            _ => {}
+        }
+        let mark = match r.cp_op {
+            // On a cell slot this decodes to `LoadClosure`; the mark
+            // still records the borrow so re-encoding round-trips.
+            op::LOAD_FAST_BORROW => wire::BORROW,
+            op::LOAD_FAST_CHECK => wire::CHECK,
+            _ => wire::PLAIN,
+        };
         // Update the shadow stack (kinds only matter for the
         // call-shape decisions below; generic ops apply their net
         // effect, which keeps slot positions honest because nothing
@@ -2210,6 +2193,14 @@ fn decode_instructions(
                     shadow.push(SlotKind::Null);
                 }
             }
+            // LOAD_SPECIAL is always the method-form pair
+            // (`__exit__`/`__enter__` + self-or-null), so the `CALL 0`
+            // that follows is a NULL-style call.
+            op::LOAD_SPECIAL => {
+                pop(&mut shadow);
+                shadow.push(SlotKind::Other);
+                shadow.push(SlotKind::Pair);
+            }
             op::LOAD_ATTR if r.arg & 1 != 0 => {
                 pop(&mut shadow);
                 shadow.push(SlotKind::Other);
@@ -2235,32 +2226,42 @@ fn decode_instructions(
                 shadow.push(SlotKind::Other);
             }
             op::CALL_FUNCTION_EX => {
-                if r.arg & 1 != 0 {
-                    pop(&mut shadow); // kwargs dict
-                }
+                pop(&mut shadow); // kwargs dict or NULL
                 pop(&mut shadow); // args tuple
                 pop(&mut shadow); // self-or-null (always NULL here)
                 pop(&mut shadow); // callable
                 shadow.push(SlotKind::Other);
             }
-            _ => {
-                let net = map_from_cpython(r.cp_op, r.arg, slots)
-                    .map(|(o, a)| stack_effects(o, a).0)
-                    .unwrap_or(0)
-                    + match r.cp_op {
-                        op::LOAD_FAST_LOAD_FAST => 2,
-                        op::STORE_FAST_LOAD_FAST => 0,
-                        op::STORE_FAST_STORE_FAST => -2,
-                        _ => 0,
-                    };
-                if net < 0 {
-                    for _ in 0..(-net) {
-                        pop(&mut shadow);
-                    }
+            // The 3.14 `with` prologue shuffles the `__exit__` pair
+            // under the manager with SWAP 2 / SWAP 3, so slot kinds
+            // have to move with the values for the exit `CALL 3` to
+            // decode as the NULL-style call it is.
+            op::SWAP if r.arg >= 2 => {
+                let n = r.arg as usize;
+                let len = shadow.len();
+                if len >= n {
+                    shadow.swap(len - 1, len - n);
                 } else {
-                    for _ in 0..net {
-                        shadow.push(SlotKind::Other);
-                    }
+                    shadow.clear();
+                }
+            }
+            op::COPY if r.arg >= 1 => {
+                let n = r.arg as usize;
+                let len = shadow.len();
+                let k = if len >= n {
+                    shadow[len - n]
+                } else {
+                    SlotKind::Unknown
+                };
+                shadow.push(k);
+            }
+            _ => {
+                let (popped, pushed) = cp_stack_shape(r.cp_op, r.arg);
+                for _ in 0..popped {
+                    pop(&mut shadow);
+                }
+                for _ in 0..pushed {
+                    shadow.push(SlotKind::Other);
                 }
             }
         }
@@ -2270,13 +2271,13 @@ fn decode_instructions(
                 | op::JUMP_BACKWARD
                 | op::JUMP_BACKWARD_NO_INTERRUPT
                 | op::RETURN_VALUE
-                | op::RETURN_CONST
                 | op::RERAISE
                 | op::RAISE_VARARGS
         ) {
             // Whatever follows starts a fresh block.
             shadow.clear();
         }
+        marks.push(mark);
         if r.cp_op == op::CALL {
             let internal = if popped_self == SlotKind::Other {
                 Instruction::new(OpCode::CallSelf, r.arg + 1)
@@ -2288,38 +2289,6 @@ fn decode_instructions(
         }
         if r.cp_op == op::CALL_KW {
             out.push(Instruction::new(OpCode::CallKw, call_kw_internal_arg));
-            continue;
-        }
-        if r.cp_op == op::LOAD_GLOBAL && r.arg & 1 != 0 {
-            out.push(Instruction::new(OpCode::LoadGlobal, r.arg >> 1));
-            out.push(Instruction::new(OpCode::PushNull, 0));
-            continue;
-        }
-        if r.cp_op == op::RETURN_CONST {
-            out.push(Instruction::new(OpCode::LoadConst, r.arg));
-            // arg 1 keeps the pair RETURN_CONST-fusable on re-encode
-            // (round-trip stability).
-            out.push(Instruction::new(OpCode::ReturnValue, 1));
-            continue;
-        }
-        // Superinstructions unfuse into their two halves (args packed
-        // 4 bits each; both are always true locals, never closures).
-        if matches!(
-            r.cp_op,
-            op::LOAD_FAST_LOAD_FAST | op::STORE_FAST_LOAD_FAST | op::STORE_FAST_STORE_FAST
-        ) {
-            let (a1, a2) = (r.arg >> 4, r.arg & 0x0F);
-            let (op1, op2) = match r.cp_op {
-                op::LOAD_FAST_LOAD_FAST => (OpCode::LoadFast, OpCode::LoadFast),
-                op::STORE_FAST_LOAD_FAST => (OpCode::StoreFast, OpCode::LoadFast),
-                _ => (OpCode::StoreFast, OpCode::StoreFast),
-            };
-            out.push(Instruction::new(op1, a1));
-            out.push(Instruction::new(op2, a2));
-            continue;
-        }
-        if r.cp_op == op::PUSH_NULL {
-            out.push(Instruction::new(OpCode::PushNull, 0));
             continue;
         }
         let op = map_from_cpython(r.cp_op, r.arg, slots)?;
@@ -2348,21 +2317,26 @@ fn decode_instructions(
         };
         out.push(Instruction::new(op.0, arg));
     }
-    Some(out)
+    debug_assert_eq!(out.len(), marks.len());
+    Some((out, marks))
 }
 
-/// Is `cp_op` outside CPython 3.13's known opcode set (including the
+fn pop_slot(shadow: &mut Vec<SlotKind>) -> SlotKind {
+    shadow.pop().unwrap_or(SlotKind::Unknown)
+}
+
+/// Is `cp_op` outside CPython 3.14's known opcode set (including the
 /// specialized adaptive forms)? `ceval` raises `SystemError: unknown
 /// opcode N` when it reaches one (test_code.test_invalid_bytecode).
 /// The unknown ranges come from `_opcode_metadata.opmap` ∪
 /// `_specialized_opmap`: every byte outside them is a real opcode.
 #[must_use]
 pub fn is_unknown_opcode(cp_op: u8) -> bool {
-    matches!(cp_op, 119..=148 | 223..=235 | 255)
+    matches!(cp_op, 121..=127 | 212..=233)
 }
 
 /// First unknown opcode byte in a raw `co_code` stream, if any. Even
-/// offsets are always opcode bytes in the 3.13 wire format (`CACHE`
+/// offsets are always opcode bytes in the 3.14 wire format (`CACHE`
 /// filler included), so a simple stride-2 scan suffices.
 #[must_use]
 pub fn first_unknown_opcode(co_code: &[u8]) -> Option<u8> {
@@ -2373,7 +2347,7 @@ pub fn first_unknown_opcode(co_code: &[u8]) -> Option<u8> {
         .find(|&o| is_unknown_opcode(o))
 }
 
-/// Decode a CPython-3.13 `co_code` stream back into WeavePy instructions.
+/// Decode a CPython-3.14 `co_code` stream back into WeavePy instructions.
 /// Inverts [`encode`] for the canonical opcode set WeavePy emits.
 /// `slots` maps wire localsplus slots back to internal deref indices.
 ///
@@ -2381,11 +2355,11 @@ pub fn first_unknown_opcode(co_code: &[u8]) -> Option<u8> {
 #[must_use]
 pub fn decode(co_code: &[u8], slots: &SlotMap, constants: &[Constant]) -> Option<Vec<Instruction>> {
     let raws = decode_raws(co_code);
-    decode_instructions(&raws, slots, constants)
+    decode_instructions(&raws, slots, constants).map(|(instructions, _)| instructions)
 }
 
 /// The reconstructed pieces of a [`CodeObject`] recovered from its
-/// CPython-3.13 wire form (RFC 0033). Constants, names, arg counts, and
+/// CPython-3.14 wire form (RFC 0033). Constants, names, arg counts, and
 /// flags live outside this struct because they round-trip through
 /// `marshal` directly; everything here is derived from the byte tables.
 #[derive(Debug, Clone, Default)]
@@ -2400,10 +2374,16 @@ pub struct DecodedCode {
     pub varnames: Vec<String>,
     pub cellvars: Vec<String>,
     pub freevars: Vec<String>,
+    /// Locals flagged `CO_FAST_HIDDEN` (see
+    /// [`crate::CodeObject::hidden_locals`]).
+    pub hidden_locals: Vec<String>,
     /// Instruction indices decoded from `JUMP_BACKWARD_NO_INTERRUPT`
     /// (see [`crate::CodeObject::no_interrupt_jumps`]); preserved so a
     /// re-encode round-trips the wire byte-for-byte.
     pub no_interrupt_jumps: Vec<u32>,
+    /// One [`wire`] mark per decoded instruction (see
+    /// [`crate::CodeObject::wire_marks`]); empty when all plain.
+    pub wire_marks: Vec<u8>,
 }
 
 /// Invert [`encode`]: reconstruct the byte-table-derived parts of a
@@ -2422,11 +2402,15 @@ pub fn decode_full(
     let mut varnames = Vec::new();
     let mut cellvars = Vec::new();
     let mut freevars = Vec::new();
+    let mut hidden_locals = Vec::new();
     for (name, &kind) in localsplusnames.iter().zip(localspluskinds.iter()) {
         // An escaping parameter carries LOCAL|CELL on one shared slot:
         // it belongs to *both* co_varnames and co_cellvars.
         if kind & CO_FAST_LOCAL != 0 {
             varnames.push(name.clone());
+            if kind & CO_FAST_HIDDEN != 0 {
+                hidden_locals.push(name.clone());
+            }
         }
         if kind & CO_FAST_CELL != 0 {
             cellvars.push(name.clone());
@@ -2437,19 +2421,21 @@ pub fn decode_full(
     }
     let slots = SlotMap::from_kinds(localspluskinds);
     let raws = decode_raws(co_code);
-    let instructions = decode_instructions(&raws, &slots, constants)?;
+    let (instructions, mut wire_marks) = decode_instructions(&raws, &slots, constants)?;
+    if wire_marks.iter().all(|&m| m == wire::PLAIN) {
+        wire_marks.clear();
+    }
     let (linetable, coltable) = decode_linetable(co_linetable, &raws, firstlineno);
     let exception_table = decode_exception_table(co_exceptiontable, &raws);
     // Recover the NO_INTERRUPT flag per decoded instruction index (the
     // internal stream folds both backward jumps into one opcode).
-    let expansions = raw_expansions(&raws);
-    let first = raw_first_instr(&expansions);
-    let mut no_interrupt_jumps = Vec::new();
-    for (idx, r) in raws.iter().enumerate() {
-        if r.cp_op == op::JUMP_BACKWARD_NO_INTERRUPT && expansions[idx] > 0 {
-            no_interrupt_jumps.push(first[idx] as u32);
-        }
-    }
+    let first = raw_first_instr(&raw_expansions(&raws));
+    let no_interrupt_jumps: Vec<u32> = raws
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.cp_op == op::JUMP_BACKWARD_NO_INTERRUPT)
+        .map(|(idx, _)| first[idx] as u32)
+        .collect();
     Some(DecodedCode {
         instructions,
         linetable,
@@ -2458,7 +2444,9 @@ pub fn decode_full(
         varnames,
         cellvars,
         freevars,
+        hidden_locals,
         no_interrupt_jumps,
+        wire_marks,
     })
 }
 
@@ -2565,15 +2553,13 @@ fn decode_linetable(
             unit_cols.push(span);
         }
     }
-    let mut lines = Vec::new();
-    let mut cols = Vec::new();
-    let expansions = raw_expansions(raws);
-    for (r, &exp) in raws.iter().zip(expansions.iter()) {
+    let mut lines = Vec::with_capacity(raws.len());
+    let mut cols = Vec::with_capacity(raws.len());
+    for r in raws {
         let line = unit_lines.get(r.start_unit).copied().unwrap_or(firstlineno);
         let col = unit_cols.get(r.start_unit).copied().unwrap_or_default();
-        // A RETURN_CONST raw expands to two instructions sharing the
-        // fused unit's location; the stripped prologue contributes none.
-        for _ in 0..exp {
+        // Both halves of an unfused superinstruction share its location.
+        for _ in 0..raw_expansion(r.cp_op, r.arg) {
             lines.push(line);
             cols.push(col);
         }
@@ -2598,8 +2584,10 @@ fn read_exc_field(table: &[u8], pos: &mut usize) -> u32 {
     val
 }
 
-/// Decode the exception range table back into [`ExcHandler`]s, converting
-/// code-unit offsets to WeavePy instruction indices.
+/// Decode the exception range table back into [`ExcHandler`]s,
+/// converting code-unit offsets to WeavePy instruction indices. The
+/// assembler merges adjacent same-handler units into one entry, and
+/// the codec is 1:1, so each wire entry is exactly one handler range.
 fn decode_exception_table(table: &[u8], raws: &[DecodedRaw]) -> Vec<ExcHandler> {
     let unit_to_idx = unit_index_map(raws);
     let first = raw_first_instr(&raw_expansions(raws));
@@ -2608,10 +2596,9 @@ fn decode_exception_table(table: &[u8], raws: &[DecodedRaw]) -> Vec<ExcHandler> 
         unit_to_idx
             .get(&unit)
             .and_then(|i| first.get(*i))
-            .map(|i| *i as u32)
-            .unwrap_or(total)
+            .map_or(total, |i| *i as u32)
     };
-    let mut out = Vec::new();
+    let mut out: Vec<ExcHandler> = Vec::new();
     let mut pos = 0usize;
     while pos < table.len() {
         let start_unit = read_exc_field(table, &mut pos) as usize;
@@ -2621,14 +2608,17 @@ fn decode_exception_table(table: &[u8], raws: &[DecodedRaw]) -> Vec<ExcHandler> 
         let length = read_exc_field(table, &mut pos) as usize;
         let target_unit = read_exc_field(table, &mut pos) as usize;
         let dl = read_exc_field(table, &mut pos);
-        out.push(ExcHandler {
+        let h = ExcHandler {
             start: map_unit(start_unit),
             end: map_unit(start_unit + length),
             handler: map_unit(target_unit),
             depth: dl >> 1,
             // Low bit of the depth/lasti word is CPython's lasti flag.
             push_lasti: dl & 1 != 0,
-        });
+        };
+        if h.start < h.end {
+            out.push(h);
+        }
     }
     out
 }
@@ -2644,18 +2634,18 @@ fn map_from_cpython(cp_op: u8, arg: u32, slots: &SlotMap) -> Option<(OpCode, u32
         op::LOAD_CONST => (O::LoadConst, arg),
         op::LOAD_NAME => (O::LoadName, arg),
         op::LOAD_GLOBAL => (O::LoadGlobal, arg >> 1),
-        op::LOAD_FAST => {
-            // On a cell/free slot LOAD_FAST pushes the cell object
-            // itself (closure building) — WeavePy's LoadClosure.
+        // The borrowing and checked forms are wire marks on a plain
+        // `LoadFast` (`decode_instructions` records them). On a
+        // cell/free slot LOAD_FAST pushes the cell object itself
+        // (closure building) — WeavePy's LoadClosure.
+        op::LOAD_FAST | op::LOAD_FAST_BORROW | op::LOAD_FAST_CHECK => {
             if slots.is_cellish(arg) {
                 (O::LoadClosure, slots.deref(arg))
             } else {
                 (O::LoadFast, arg)
             }
         }
-        // The checked form decodes to the same runtime op (WeavePy's
-        // LoadFast always checks); the distinction is view-only.
-        op::LOAD_FAST_CHECK => (O::LoadFast, arg),
+        op::LOAD_LOCALS => (O::LoadLocals, 0),
         op::LOAD_FAST_AND_CLEAR => (O::LoadFastAndClear, arg),
         op::STORE_FAST => (O::StoreFast, arg),
         op::STORE_GLOBAL => (O::StoreGlobal, arg),
@@ -2673,9 +2663,11 @@ fn map_from_cpython(cp_op: u8, arg: u32, slots: &SlotMap) -> Option<(OpCode, u32
         op::LOAD_SUPER_ATTR => (O::LoadSuperAttr, arg),
         op::STORE_ATTR => (O::StoreAttr, arg),
         op::DELETE_ATTR => (O::DeleteAttr, arg),
-        op::BINARY_SUBSCR => (O::BinarySubscr, 0),
+        op::BINARY_SLICE => (O::BinarySlice, 0),
+        op::STORE_SLICE => (O::StoreSlice, 0),
         op::STORE_SUBSCR => (O::StoreSubscr, 0),
         op::DELETE_SUBSCR => (O::DeleteSubscr, 0),
+        op::BINARY_OP if arg == NB_SUBSCR => (O::BinarySubscr, 0),
         op::BINARY_OP => {
             let (nb, flag) = if arg >= NB_INPLACE_OFFSET {
                 (
@@ -2699,16 +2691,26 @@ fn map_from_cpython(cp_op: u8, arg: u32, slots: &SlotMap) -> Option<(OpCode, u32
                 (O::StopIterationError, 0)
             } else if arg == INTRINSIC_ASYNC_GEN_WRAP {
                 (O::AsyncGenWrap, 0)
-            } else {
+            } else if arg == INTRINSIC_IMPORT_STAR {
                 (O::ImportStar, 0)
+            } else {
+                (O::CallIntrinsic1, arg)
             }
         }
-        op::CALL_INTRINSIC_2 => (O::PrepReraiseStar, 0),
+        op::CALL_INTRINSIC_2 if arg == INTRINSIC_PREP_RERAISE_STAR => (O::PrepReraiseStar, 0),
+        op::CALL_INTRINSIC_2 => (O::CallIntrinsic2, arg),
         op::CLEANUP_THROW => (O::CleanupThrow, 0),
         op::BUILD_INTERPOLATION => (O::BuildInterpolation, arg),
         op::BUILD_TEMPLATE => (O::BuildTemplate, 0),
-        op::LOAD_ASSERTION_ERROR => (O::LoadAssertionError, 0),
-        op::COMPARE_OP => (O::CompareOp, CompareKind::from_arg(arg >> 5)?.as_arg()),
+        op::LOAD_COMMON_CONSTANT => (O::LoadCommonConstant, arg),
+        op::LOAD_SPECIAL => (O::LoadSpecial, arg),
+        op::LOAD_SMALL_INT => (O::LoadSmallInt, arg),
+        op::NOT_TAKEN => (O::NotTaken, 0),
+        op::POP_ITER => (O::PopIter, 0),
+        op::COMPARE_OP => (
+            O::CompareOp,
+            CompareKind::from_arg(arg >> 5)?.as_arg() | (arg & COMPARE_OP_TO_BOOL_FLAG),
+        ),
         op::IS_OP => (O::IsOp, arg),
         op::CONTAINS_OP => (O::ContainsOp, arg),
         op::POP_TOP => (O::PopTop, 0),
@@ -2716,7 +2718,8 @@ fn map_from_cpython(cp_op: u8, arg: u32, slots: &SlotMap) -> Option<(OpCode, u32
         op::SWAP => (O::Swap, arg),
         op::CALL => (O::Call, arg),
         op::CALL_KW => (O::CallKw, arg),
-        op::CALL_FUNCTION_EX => (O::CallEx, arg),
+        op::CALL_FUNCTION_EX => (O::CallEx, 0),
+        op::PUSH_NULL => (O::PushNull, 0),
         op::RETURN_VALUE => (O::ReturnValue, 0),
         op::POP_JUMP_IF_FALSE => (O::PopJumpIfFalse, arg),
         op::POP_JUMP_IF_TRUE => (O::PopJumpIfTrue, arg),
@@ -2736,16 +2739,16 @@ fn map_from_cpython(cp_op: u8, arg: u32, slots: &SlotMap) -> Option<(OpCode, u32
         op::LIST_APPEND => (O::ListAppend, arg),
         op::LIST_EXTEND => (O::ListExtend, arg),
         op::SET_ADD => (O::SetAdd, arg),
+        op::SET_UPDATE => (O::SetUpdate, arg),
         op::MAP_ADD => (O::MapAdd, arg),
         op::UNPACK_SEQUENCE => (O::UnpackSequence, arg),
         op::UNPACK_EX => (O::UnpackEx, ((arg & 0xFF) << 8) | ((arg >> 8) & 0xFF)),
-        op::DICT_UPDATE => (O::DictUpdate, 0),
-        op::DICT_MERGE => (O::DictUpdate, 1),
+        op::DICT_UPDATE => (O::DictUpdate, arg.saturating_sub(1) << 1),
+        op::DICT_MERGE => (O::DictUpdate, (arg.saturating_sub(1) << 1) | 1),
         op::MAKE_FUNCTION => (O::MakeFunction, arg),
         op::SET_FUNCTION_ATTRIBUTE => (O::SetFunctionAttribute, arg),
         op::BUILD_SLICE => (O::BuildSlice, arg),
         op::LOAD_BUILD_CLASS => (O::LoadBuildClass, 0),
-        op::LOAD_CLASSDEREF_WEAVEPY => (O::LoadClassderef, slots.deref(arg)),
         op::LOAD_FROM_DICT_OR_DEREF => (O::LoadClassdictOrDeref, slots.deref(arg)),
         op::LOAD_FROM_DICT_OR_GLOBALS => (O::LoadClassdictOrGlobal, arg),
         op::RAISE_VARARGS => (O::RaiseVarargs, arg),
@@ -2754,7 +2757,6 @@ fn map_from_cpython(cp_op: u8, arg: u32, slots: &SlotMap) -> Option<(OpCode, u32
         op::PUSH_EXC_INFO => (O::PushExcInfo, 0),
         op::POP_EXCEPT => (O::PopExcept, 0),
         op::RERAISE => (O::Reraise, arg),
-        op::BEFORE_WITH => (O::BeforeWith, 0),
         op::WITH_EXCEPT_START => (O::WithExceptStart, 0),
         op::IMPORT_NAME => (O::ImportName, arg),
         op::IMPORT_FROM => (O::ImportFrom, arg),
@@ -2770,8 +2772,9 @@ fn map_from_cpython(cp_op: u8, arg: u32, slots: &SlotMap) -> Option<(OpCode, u32
         op::GET_AWAITABLE => (O::GetAwaitable, arg),
         op::GET_AITER => (O::GetAiter, 0),
         op::GET_ANEXT => (O::GetAnext, 0),
+        // The END_SEND-relative oparg is a derived view; the encoder
+        // recomputes it from the exception table.
         op::END_ASYNC_FOR => (O::EndAsyncFor, 0),
-        op::BEFORE_ASYNC_WITH => (O::BeforeAsyncWith, 0),
         op::MATCH_SEQUENCE => (O::MatchSequence, 0),
         op::MATCH_MAPPING => (O::MatchMapping, 0),
         op::MATCH_CLASS => (O::MatchClass, arg),
@@ -2783,7 +2786,7 @@ fn map_from_cpython(cp_op: u8, arg: u32, slots: &SlotMap) -> Option<(OpCode, u32
 }
 
 impl CodeObject {
-    /// The CPython-3.13 wire view of this code object (RFC 0033).
+    /// The CPython-3.14 wire view of this code object (RFC 0033).
     /// Encoded once per code object and memoised (the encoding is hot:
     /// trace functions hit `f_lasti` / `co_lines()` per event).
     #[must_use]
@@ -3122,9 +3125,13 @@ def body():
         .expect("decode");
         let norm = |ins: &crate::Instruction| -> crate::Instruction {
             // Legacy emit sites use `COPY 0` as a plain dup; the VM and
-            // the wire format both read it as `COPY 1`.
+            // the wire format both read it as `COPY 1`. The VM-only
+            // handler-end tag on `PUSH_EXC_INFO` isn't part of CPython's
+            // encoding (its oparg is always 0 on the wire).
             if ins.op == crate::bytecode::OpCode::CopyTop && ins.arg == 0 {
                 crate::Instruction::new(ins.op, 1)
+            } else if ins.op == crate::bytecode::OpCode::PushExcInfo {
+                crate::Instruction::new(ins.op, 0)
             } else {
                 *ins
             }
@@ -3155,4 +3162,71 @@ def body():
         }
     }
     walk(&code, "<module>".to_owned());
+}
+
+/// `stack_effects` (WeavePy VM view, drives `co_stacksize`) and
+/// `cp_stack_shape` (CPython wire view, drives the flowgraph depth
+/// walk) must agree on the net fallthrough effect of every opcode the
+/// decoder maps 1:1. A missing arm in either table silently skews
+/// `co_stacksize` (MATCH_KEYS was absent from `stack_effects` and every
+/// mapping pattern under-reported by one).
+#[test]
+fn stack_effects_agree_with_wire_shape() {
+    let slots = SlotMap::from_code_vars(&[], &[], &[]);
+    // Opcodes whose WeavePy arg is not the wire arg, or whose
+    // fallthrough effect legitimately differs from the wire shape
+    // (jumps take their real effect on the edge; FOR_ITER/END_FOR
+    // telescope; RETURN_VALUE is `retval -- res` on the wire because
+    // the result lands in the caller's frame; MAKE_FUNCTION's WeavePy
+    // arg is the legacy flags word the compiler no longer emits).
+    let skip: &[u8] = &[
+        op::RETURN_VALUE,
+        op::MAKE_FUNCTION,
+        op::FOR_ITER,
+        op::END_FOR,
+        op::SEND,
+        op::JUMP_FORWARD,
+        op::JUMP_BACKWARD,
+        op::JUMP_BACKWARD_NO_INTERRUPT,
+        op::POP_JUMP_IF_FALSE,
+        op::POP_JUMP_IF_TRUE,
+        op::POP_JUMP_IF_NONE,
+        op::POP_JUMP_IF_NOT_NONE,
+        op::CACHE,
+        op::EXTENDED_ARG,
+    ];
+    let mut diverging = Vec::new();
+    for cp_op in 0u8..=255 {
+        if skip.contains(&cp_op) {
+            continue;
+        }
+        for arg in [0u32, 1, 2, 3, 5] {
+            let Some((op, warg)) = map_from_cpython(cp_op, arg, &slots) else {
+                continue;
+            };
+            // Round-trip filter: only opcodes whose WeavePy arg maps
+            // back onto this exact wire pair are 1:1.
+            let m = map_to_cpython(
+                Instruction { op, arg: warg },
+                &DerefSlots { slots: Vec::new() },
+            );
+            if (m.cp_op, m.arg) != (cp_op, arg) {
+                continue;
+            }
+            let (popped, pushed) = cp_stack_shape(cp_op, arg);
+            let wire_net = pushed as i64 - popped as i64;
+            let (vm_net, _) = stack_effects(op, warg);
+            if wire_net != vm_net {
+                diverging.push(format!(
+                    "{}({cp_op}) arg={arg}: wire {wire_net} vs vm {vm_net}",
+                    op.name()
+                ));
+            }
+        }
+    }
+    assert!(
+        diverging.is_empty(),
+        "stack effect drift:\n{}",
+        diverging.join("\n")
+    );
 }

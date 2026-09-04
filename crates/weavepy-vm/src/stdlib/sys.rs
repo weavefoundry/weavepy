@@ -20,7 +20,11 @@ use crate::object::{BuiltinFn, DictData, DictKey, FileBackend, Object, PyFile, P
 /// `weavepy-cli/src/main.rs`); user code that inspects
 /// `sys.version_info` is checking *Python language* compatibility, not
 /// the WeavePy build identity.
-pub const PY_VERSION: (i64, i64, i64) = (3, 13, 0);
+pub const PY_VERSION: (i64, i64, i64) = (
+    weavepy_version::MAJOR as i64,
+    weavepy_version::MINOR as i64,
+    weavepy_version::MICRO as i64,
+);
 
 /// Build the `sys` module against the given interpreter handles.
 /// Most state lives on the [`ModuleCache`]; `frame_stack`,
@@ -567,7 +571,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             // MS_DLL_ID); `sysconfig`/`venv`/pip read it on Windows.
             d.insert(
                 DictKey(Object::from_static("winver")),
-                Object::from_static("3.13"),
+                Object::from_static(weavepy_version::SHORT),
             );
             // CPython publishes the HMODULE of python3xx.dll here. Since
             // RFC 0064 the runtime ships as a real `python313.dll` loaded

@@ -7,7 +7,7 @@
 
 use std::os::raw::{c_char, c_int};
 
-static VERSION: &str = "3.13.0 (WeavePy)\0";
+static VERSION: &str = weavepy_version::vconcat!(weavepy_version::FULL, " (WeavePy)\0");
 static COMPILER: &str = "[WeavePy/Rust]\0";
 static COPYRIGHT: &str = "Copyright (c) 2026 Weave Foundry. PSF licensed.\0";
 static PLATFORM: &str = if cfg!(target_os = "macos") {
