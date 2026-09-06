@@ -2,7 +2,7 @@
 //! (RFC 0054 WS1).
 //!
 //! The frozen `asyncio/futures.py`, `asyncio/tasks.py`, and
-//! `asyncio/events.py` are verbatim CPython 3.13 and carry the standard
+//! `asyncio/events.py` are verbatim CPython 3.14 and carry the standard
 //! adoption hooks (`try: from _asyncio import …`). This module makes
 //! those hooks bind, exactly as they do on CPython:
 //!
@@ -237,6 +237,13 @@ struct FutState {
     blocking: bool,
     source_traceback: Object,
     initialized: bool,
+    /// 3.14 `fut_awaited_by`: the native futures/tasks currently awaiting
+    /// this one (identity set; `_asyncio_awaited_by` exposes a frozenset).
+    awaited_by: Vec<Object>,
+    /// Set once anything has been recorded; CPython keeps the (possibly
+    /// emptied) set, so `_asyncio_awaited_by` then reports `frozenset()`
+    /// rather than `None`.
+    awaited_by_touched: bool,
     // Task-only fields.
     coro: Object,
     name: Object,
@@ -262,6 +269,8 @@ impl Default for FutState {
             blocking: false,
             source_traceback: Object::None,
             initialized: false,
+            awaited_by: Vec::new(),
+            awaited_by_touched: false,
             coro: Object::None,
             name: Object::None,
             context: Object::None,
@@ -338,6 +347,45 @@ fn state_of_obj(obj: &Object) -> Result<Rc<RefCell<FutState>>, RuntimeError> {
         Object::Instance(inst) => Ok(state_of_instance(inst)),
         _ => Err(type_error("expected a Future instance")),
     }
+}
+
+/// `TaskOrFuture_Check`: an instance of the native `Future` (or `Task`,
+/// or a Python subclass of either).
+fn is_native_future(obj: &Object) -> bool {
+    match obj {
+        Object::Instance(inst) => inst.cls().is_subclass_of(&future_class()),
+        _ => false,
+    }
+}
+
+/// 3.14 `future_awaited_by_add`: record that `waiter` awaits `fut`. Only
+/// native futures take part (foreign future-likes are ignored, matching
+/// the C accelerator and the pure-Python `_PyFuture`-only fallback).
+fn awaited_by_add(fut: &Object, waiter: &Object) {
+    if !is_native_future(fut) || !is_native_future(waiter) {
+        return;
+    }
+    let Object::Instance(inst) = fut else { return };
+    let st = state_of_instance(inst);
+    let mut s = st.borrow_mut();
+    s.awaited_by_touched = true;
+    if !s.awaited_by.iter().any(|w| same_object(w, waiter)) {
+        s.awaited_by.push(waiter.clone());
+    }
+}
+
+/// 3.14 `future_awaited_by_discard`.
+fn awaited_by_discard(fut: &Object, waiter: &Object) {
+    if !is_native_future(fut) || !is_native_future(waiter) {
+        return;
+    }
+    let Object::Instance(inst) = fut else { return };
+    let Some(st) = existing_state_of(inst) else {
+        return;
+    };
+    st.borrow_mut()
+        .awaited_by
+        .retain(|w| !same_object(w, waiter));
 }
 
 /// Drop the registry entry when the interpreter tears the instance down.
@@ -1153,6 +1201,26 @@ fn futprop_set_cancel_message(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
+/// `Future._asyncio_awaited_by` (3.14): `None` when nothing has ever
+/// awaited this future, else a frozenset snapshot of the awaiters.
+fn futprop_awaited_by(args: &[Object]) -> Result<Object, RuntimeError> {
+    let (inst, _) = state_of(args)?;
+    let Some(st) = existing_state_of(&inst) else {
+        return Ok(Object::None);
+    };
+    let s = st.borrow();
+    if s.awaited_by.is_empty() && !s.awaited_by_touched {
+        return Ok(Object::None);
+    }
+    let mut set = crate::object::SetData::default();
+    for w in &s.awaited_by {
+        set.insert(DictKey(w.clone()));
+    }
+    Ok(Object::FrozenSet(Rc::new(
+        crate::object::FrozenSetObj::new(set),
+    )))
+}
+
 fn futprop_blocking(args: &[Object]) -> Result<Object, RuntimeError> {
     let (_inst, st) = state_of(args)?;
     let out = Object::Bool(st.borrow().blocking);
@@ -1451,6 +1519,7 @@ fn task_wakeup_callable(task: Object) -> Object {
                     .cloned()
                     .ok_or_else(|| type_error("__wakeup() missing future"))?;
                 let interp = interp()?;
+                awaited_by_discard(&future, &task);
                 match call_method(interp, &future, "result", &[]) {
                     Ok(_) => task_step(&task, None)?,
                     Err(RuntimeError::PyException(pe)) => task_step(&task, Some(pe.instance))?,
@@ -1768,6 +1837,7 @@ fn task_step_handle_result(
                             &[("context".to_owned(), context.clone())],
                         )?;
                         st.borrow_mut().fut_waiter = result.clone();
+                        awaited_by_add(&result, task);
                         let must_cancel = st.borrow().must_cancel;
                         if must_cancel {
                             let msg = st.borrow().cancel_message.clone();
@@ -2245,6 +2315,7 @@ fn future_class() -> Rc<TypeObject> {
             futprop_blocking,
             Some(futprop_set_blocking),
         );
+        install_getset(&cls, "_asyncio_awaited_by", futprop_awaited_by, None);
         cls
     })
     .clone()
@@ -2453,6 +2524,74 @@ fn mod_swap_current_task(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(swap_current_task_impl(&loop_, &task))
 }
 
+fn mod_future_add_to_awaited_by(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [fut, waiter] = args else {
+        return Err(type_error(format!(
+            "future_add_to_awaited_by() takes exactly 2 arguments ({} given)",
+            args.len()
+        )));
+    };
+    awaited_by_add(fut, waiter);
+    Ok(Object::None)
+}
+
+fn mod_future_discard_from_awaited_by(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [fut, waiter] = args else {
+        return Err(type_error(format!(
+            "future_discard_from_awaited_by() takes exactly 2 arguments ({} given)",
+            args.len()
+        )));
+    };
+    awaited_by_discard(fut, waiter);
+    Ok(Object::None)
+}
+
+/// `_asyncio.all_tasks(loop=None)` (3.14): every pending task bound to
+/// `loop`, drawn from the shared scheduled (WeakSet) and eager (set)
+/// registries so duck-typed Python tasks are seen alongside native ones.
+fn mod_all_tasks(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let interp = interp()?;
+    let mut loop_ = args.first().cloned().unwrap_or(Object::None);
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "loop" => loop_ = v.clone(),
+            other => {
+                return Err(type_error(format!(
+                    "all_tasks() got an unexpected keyword argument '{other}'"
+                )))
+            }
+        }
+    }
+    let loop_ = if matches!(loop_, Object::None) {
+        get_running_loop_impl(interp)?
+    } else {
+        loop_
+    };
+    // Snapshot the eager set first (a task may graduate from eager to
+    // scheduled on another thread; snapshotting eager first cannot miss it).
+    let mut candidates: Vec<Object> = Vec::new();
+    for registry in [eager_tasks_obj().get(), scheduled_tasks_obj().get()] {
+        let Some(reg) = registry else { continue };
+        let it = interp.iter_object(reg.clone())?;
+        while let Some(t) = interp.iter_next_object(it.clone())? {
+            candidates.push(t);
+        }
+    }
+    let mut out = crate::object::SetData::default();
+    for t in candidates {
+        let t_loop = get_loop_of(interp, &t);
+        if !same_object(&t_loop, &loop_) {
+            continue;
+        }
+        let done = call_method(interp, &t, "done", &[])?;
+        if truthy(&done) {
+            continue;
+        }
+        out.insert(DictKey(t));
+    }
+    Ok(Object::Set(Rc::new(RefCell::new(out))))
+}
+
 // ---- module entry ----
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
@@ -2524,6 +2663,26 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         d.insert(
             DictKey(Object::from_static("_current_tasks")),
             Object::Dict(current_tasks_dict()),
+        );
+        d.insert(
+            DictKey(Object::from_static("all_tasks")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "all_tasks",
+                binds_instance: false,
+                call: Box::new(|args| mod_all_tasks(args, &[])),
+                call_kw: Some(Box::new(mod_all_tasks)),
+            })),
+        );
+        d.insert(
+            DictKey(Object::from_static("future_add_to_awaited_by")),
+            modfn("future_add_to_awaited_by", mod_future_add_to_awaited_by),
+        );
+        d.insert(
+            DictKey(Object::from_static("future_discard_from_awaited_by")),
+            modfn(
+                "future_discard_from_awaited_by",
+                mod_future_discard_from_awaited_by,
+            ),
         );
     }
     // The task registries shared with `tasks.py`: a `weakref.WeakSet` for

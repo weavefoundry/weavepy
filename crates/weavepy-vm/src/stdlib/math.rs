@@ -72,10 +72,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         // → OverflowError when `can_overflow`, else ValueError). Registered
         // through a shared trampoline so each gets the identical edge handling
         // CPython's C `math_1`/`math_1a` wrappers provide.
-        for &(name, f, can_overflow) in checked_f64() {
+        for &(name, f, can_overflow, err_msg) in checked_f64() {
             d.insert(
                 DictKey(Object::from_static(name)),
-                make_checked1(name, f, can_overflow),
+                make_checked1(name, f, can_overflow, err_msg),
             );
         }
 
@@ -335,15 +335,26 @@ fn total_f64() -> &'static [(&'static str, fn(&[Object]) -> Result<Object, Runti
 /// discipline. The third field is `can_overflow`: when an infinite result
 /// arises from a finite argument, `true` raises `OverflowError`
 /// (range error), `false` raises `ValueError` (domain error / pole).
-fn checked_f64() -> &'static [(&'static str, fn(f64) -> f64, bool)] {
+fn checked_f64() -> &'static [(&'static str, fn(f64) -> f64, bool, Option<&'static str>)] {
+    const FINITE: Option<&str> = Some("expected a finite input, got %s");
     &[
-        ("sin", f64::sin, false),
-        ("cos", f64::cos, false),
-        ("tan", f64::tan, false),
-        ("sinh", f64::sinh, true),
-        ("cosh", f64::cosh, true),
-        ("exp", f64::exp, true),
+        ("sin", f64::sin, false, FINITE),
+        ("cos", f64::cos, false, FINITE),
+        ("tan", f64::tan, false, FINITE),
+        ("sinh", f64::sinh, true, None),
+        ("cosh", f64::cosh, true, None),
+        ("exp", f64::exp, true, None),
     ]
+}
+
+/// 3.14 per-function domain error (`math_1`'s `err_msg`, formatted with
+/// `PyOS_double_to_string(x, 'r', 0, Py_DTSF_ADD_DOT_0)` -- the float
+/// repr). `None` keeps the generic "math domain error".
+fn domain_err(x: f64, err_msg: Option<&str>) -> RuntimeError {
+    match err_msg {
+        Some(m) => value_error(m.replace("%s", &crate::object::float_repr(x))),
+        None => value_error("math domain error"),
+    }
 }
 
 /// CPython's `math_1` result discipline applied to a computed value.
@@ -351,26 +362,40 @@ fn checked_f64() -> &'static [(&'static str, fn(f64) -> f64, bool)] {
 /// is an invalid-operation domain error; an infinite result from a finite
 /// input is either overflow (range) or a pole (domain), per `can_overflow`.
 fn finish1(x: f64, r: f64, can_overflow: bool) -> Result<Object, RuntimeError> {
+    finish1_msg(x, r, can_overflow, None)
+}
+
+fn finish1_msg(
+    x: f64,
+    r: f64,
+    can_overflow: bool,
+    err_msg: Option<&str>,
+) -> Result<Object, RuntimeError> {
     if r.is_nan() && !x.is_nan() {
-        return Err(value_error("math domain error"));
+        return Err(domain_err(x, err_msg));
     }
     if r.is_infinite() && x.is_finite() {
         return Err(if can_overflow {
             overflow_error("math range error")
         } else {
-            value_error("math domain error")
+            domain_err(x, err_msg)
         });
     }
     Ok(Object::Float(r))
 }
 
-fn make_checked1(name: &'static str, f: fn(f64) -> f64, can_overflow: bool) -> Object {
+fn make_checked1(
+    name: &'static str,
+    f: fn(f64) -> f64,
+    can_overflow: bool,
+    err_msg: Option<&'static str>,
+) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
         binds_instance: false,
         call: Box::new(move |args: &[Object]| {
             let x = to_f64(args, name, 0)?;
-            freshen_result(finish1(x, f(x), can_overflow))
+            freshen_result(finish1_msg(x, f(x), can_overflow, err_msg))
         }),
         call_kw: None,
     }))
@@ -487,7 +512,7 @@ fn expect_nargs(args: &[Object], name: &str, n: usize) -> Result<(), RuntimeErro
 fn math_sqrt(args: &[Object]) -> Result<Object, RuntimeError> {
     let x = to_f64(args, "sqrt", 0)?;
     if x < 0.0 {
-        return Err(value_error("math domain error"));
+        return Err(domain_err(x, Some("expected a nonnegative input, got %s")));
     }
     Ok(Object::Float(x.sqrt()))
 }
@@ -497,12 +522,22 @@ fn math_asin(args: &[Object]) -> Result<Object, RuntimeError> {
     // `asin(±inf)` produce a NaN from a non-NaN input, which `finish1`
     // turns into the CPython "math domain error".
     let x = to_f64(args, "asin", 0)?;
-    finish1(x, x.asin(), false)
+    finish1_msg(
+        x,
+        x.asin(),
+        false,
+        Some("expected a number in range from -1 up to 1, got %s"),
+    )
 }
 
 fn math_acos(args: &[Object]) -> Result<Object, RuntimeError> {
     let x = to_f64(args, "acos", 0)?;
-    finish1(x, x.acos(), false)
+    finish1_msg(
+        x,
+        x.acos(),
+        false,
+        Some("expected a number in range from -1 up to 1, got %s"),
+    )
 }
 
 fn math_atan(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -546,7 +581,7 @@ fn loghelper(o: &Object, func: fn(f64) -> f64, name: &str) -> Result<f64, Runtim
     if let Some(n) = as_int {
         use num_traits::{Signed, ToPrimitive};
         if !n.is_positive() {
-            return Err(value_error("math domain error"));
+            return Err(value_error("expected a positive input"));
         }
         // CPython's `loghelper` converts to double *first* and only falls
         // back to the `_PyLong_Frexp` decomposition when the int overflows
@@ -569,7 +604,7 @@ fn loghelper(o: &Object, func: fn(f64) -> f64, name: &str) -> Result<f64, Runtim
         return Ok(func(x)); // includes log(+inf) = +inf
     }
     // x == 0 (divide-by-zero), x < 0, or -inf — all domain errors.
-    Err(value_error("math domain error"))
+    Err(domain_err(x, Some("expected a positive input, got %s")))
 }
 
 fn math_log(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1422,7 +1457,12 @@ fn math_expm1(args: &[Object]) -> Result<Object, RuntimeError> {
 fn math_log1p(args: &[Object]) -> Result<Object, RuntimeError> {
     // log1p(x) is a domain error for x <= -1 (→ -inf or nan) → ValueError.
     let x = to_f64(args, "log1p", 0)?;
-    finish1(x, x.ln_1p(), false)
+    finish1_msg(
+        x,
+        x.ln_1p(),
+        false,
+        Some("expected argument value > -1, got %s"),
+    )
 }
 
 fn math_ldexp(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -2027,16 +2067,25 @@ fn m_tgamma(x: f64) -> Result<f64, RuntimeError> {
         if x.is_nan() || x > 0.0 {
             return Ok(x);
         }
-        return Err(value_error("math domain error"));
+        return Err(domain_err(
+            x,
+            Some("expected a noninteger or positive integer, got %s"),
+        ));
     }
     if x == 0.0 {
         // tgamma(±0) = ±inf — a pole (CPython raises ValueError).
-        return Err(value_error("math domain error"));
+        return Err(domain_err(
+            x,
+            Some("expected a noninteger or positive integer, got %s"),
+        ));
     }
     // Integer arguments: exact for small positive ints; a pole for n <= 0.
     if x == x.floor() {
         if x < 0.0 {
-            return Err(value_error("math domain error"));
+            return Err(domain_err(
+                x,
+                Some("expected a noninteger or positive integer, got %s"),
+            ));
         }
         if x <= NGAMMA_INTEGRAL as f64 {
             return Ok(GAMMA_INTEGRAL[x as usize - 1]);
@@ -2110,7 +2159,10 @@ fn m_lgamma(x: f64) -> Result<f64, RuntimeError> {
     // Integer arguments: lgamma(1)=lgamma(2)=0; a pole for n <= 0.
     if x == x.floor() && x <= 2.0 {
         if x <= 0.0 {
-            return Err(value_error("math domain error"));
+            return Err(domain_err(
+                x,
+                Some("expected a noninteger or positive integer, got %s"),
+            ));
         }
         return Ok(0.0);
     }
@@ -2234,7 +2286,12 @@ fn m_atanh(x: f64) -> f64 {
 
 fn math_atanh(args: &[Object]) -> Result<Object, RuntimeError> {
     let x = to_f64(args, "atanh", 0)?;
-    finish1(x, m_atanh(x), false)
+    finish1_msg(
+        x,
+        m_atanh(x),
+        false,
+        Some("expected a number between -1 and 1, got %s"),
+    )
 }
 
 fn math_asinh(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -2244,5 +2301,10 @@ fn math_asinh(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn math_acosh(args: &[Object]) -> Result<Object, RuntimeError> {
     let x = to_f64(args, "acosh", 0)?;
-    finish1(x, m_acosh(x), false)
+    finish1_msg(
+        x,
+        m_acosh(x),
+        false,
+        Some("expected argument value not less than 1, got %s"),
+    )
 }

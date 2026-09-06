@@ -189,6 +189,23 @@ pub fn build_with_state(
             DictKey(Object::from_static("monitoring")),
             crate::stdlib::sys_monitoring::build(),
         );
+        d.insert(DictKey(Object::from_static("_jit")), build_jit_module());
+        // PEP 768 (3.14): the remote-debugging posture is "built without
+        // remote debug support" -- `is_remote_debug_enabled()` is False
+        // and `remote_exec` raises, exactly like a `--without-remote-debug`
+        // CPython (test.support's `support_remote_exec_only` then skips).
+        d.insert(
+            DictKey(Object::from_static("is_remote_debug_enabled")),
+            builtin("is_remote_debug_enabled", |_args| Ok(Object::Bool(false))),
+        );
+        d.insert(
+            DictKey(Object::from_static("remote_exec")),
+            builtin("remote_exec", |_args| {
+                Err(crate::error::runtime_error(
+                    "Remote debugging is not enabled in this build of Python",
+                ))
+            }),
+        );
         d.insert(
             DictKey(Object::from_static("setprofile")),
             builtin("setprofile", sys_setprofile),
@@ -241,14 +258,12 @@ pub fn build_with_state(
             DictKey(Object::from_static("dont_write_bytecode")),
             Object::Bool(false),
         );
-        d.insert(
-            DictKey(Object::from_static("ps1")),
-            Object::from_static(">>> "),
-        );
-        d.insert(
-            DictKey(Object::from_static("ps2")),
-            Object::from_static("... "),
-        );
+        // `sys.ps1` / `sys.ps2` are *not* preset: CPython only defines
+        // them on entering the interactive loop (`PyRun_InteractiveLoop`),
+        // and `hasattr(sys, 'ps1')` is how pdb / code.interact tell a
+        // script run from a REPL (pdb's inline `quit` only asks "Quit
+        // anyway?" when the attribute is absent — test_pdb
+        // `PdbTestInline.test_quit`). The CLI REPL installs them.
         d.insert(
             DictKey(Object::from_static("warnoptions")),
             Object::new_list(Vec::new()),
@@ -636,9 +651,21 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         let executable = crate::stdlib_tree::program_exe().map_or(Object::from_static(""), |p| {
             Object::from_str(p.to_string_lossy().into_owned())
         });
+        // getpath: `PYTHONEXECUTABLE` (macOS only) or `__PYVENV_LAUNCHER__`
+        // override `sys.executable` (a venv launcher / framework stub
+        // reporting the path the user invoked) while `_base_executable`
+        // keeps following argv[0].
+        let launcher_override = [
+            ("PYTHONEXECUTABLE", cfg!(target_os = "macos")),
+            ("__PYVENV_LAUNCHER__", true),
+        ]
+        .iter()
+        .filter(|(_, enabled)| *enabled)
+        .find_map(|(var, _)| std::env::var_os(var).filter(|v| !v.is_empty()))
+        .map(|v| Object::from_str(v.to_string_lossy().into_owned()));
         d.insert(
             DictKey(Object::from_static("executable")),
-            executable.clone(),
+            launcher_override.unwrap_or_else(|| executable.clone()),
         );
         // `sys._base_executable` mirrors `sys.executable` outside a venv
         // (CPython sets it to the real interpreter; `test_os.PidTests` and
@@ -795,6 +822,10 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         d.insert(
             DictKey(Object::from_static("intern")),
             builtin("intern", sys_intern),
+        );
+        d.insert(
+            DictKey(Object::from_static("_clear_type_descriptors")),
+            builtin("_clear_type_descriptors", sys_clear_type_descriptors),
         );
         d.insert(
             DictKey(Object::from_static("is_finalizing")),
@@ -1352,6 +1383,20 @@ pub(crate) fn intern_name(name: &str) -> Object {
     })
 }
 
+/// CPython's `intern_string_constants` rule (codeobject.c): a str
+/// constant is interned when it is ASCII and every character is a name
+/// character (`Py_ISALNUM` or `_`); the empty string and every
+/// one-character latin-1 string are static singletons, interned too.
+pub(crate) fn cpython_interns_constant(s: &str) -> bool {
+    let mut chars = s.chars();
+    match (chars.next(), chars.next()) {
+        (None, _) => return true,
+        (Some(c), None) if (c as u32) < 256 => return true,
+        _ => {}
+    }
+    s.is_ascii() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
 /// Is `o` the pooled (`sys.intern`) instance for its value? `marshal`
 /// writes such strings with the `*_INTERNED` type codes so a round-trip
 /// preserves the interned identity (RFC 0060, test_marshal.testIntern).
@@ -1362,6 +1407,43 @@ pub(crate) fn str_is_interned(o: &Object) -> bool {
             .get(&o.to_str())
             .is_some_and(|pooled| pooled.is_same(o))
     })
+}
+
+/// `sys._clear_type_descriptors(type)` (3.14, gh-135228): drop the
+/// `__dict__` / `__weakref__` getset descriptors from a heap type's dict
+/// so `dataclasses._add_slots` can rebuild the class with `__slots__`
+/// without the original class being kept alive by its descriptors.
+fn sys_clear_type_descriptors(args: &[Object]) -> Result<Object, RuntimeError> {
+    let ty = match args {
+        [Object::Type(ty)] => ty,
+        [_] => {
+            return Err(type_error(
+                "_clear_type_descriptors() argument must be a type",
+            ))
+        }
+        _ => {
+            return Err(type_error(format!(
+                "_clear_type_descriptors() takes exactly one argument ({} given)",
+                args.len()
+            )))
+        }
+    };
+    if ty.flags.is_builtin || ty.immutable.get() {
+        return Err(type_error(format!(
+            "cannot clear descriptors of immutable type '{}'",
+            ty.qualified_display_name()
+        )));
+    }
+    {
+        let mut d = ty.dict.borrow_mut();
+        d.shift_remove(&DictKey(Object::from_static("__dict__")));
+        d.shift_remove(&DictKey(Object::from_static("__weakref__")));
+    }
+    ty.bump_attr_version();
+    if crate::capi_watchers::types_active() {
+        crate::capi_watchers::type_modified(ty);
+    }
+    Ok(Object::None)
 }
 
 fn sys_intern(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1730,6 +1812,44 @@ fn sys_setprofileallthreads(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
+/// `sys._jit` (CPython 3.14): the observation surface for CPython's
+/// experimental copy-and-patch JIT. WeavePy's own tier-2 JIT is not that
+/// machinery and does not tag frames the way `sys._jit.is_active` reports,
+/// so all three predicates answer `False`, like a CPython built without
+/// `--enable-experimental-jit` (`test.support` derives
+/// `requires_jit_enabled` / `requires_jit_disabled` from `is_enabled`).
+fn build_jit_module() -> Object {
+    let dict = Rc::new(RefCell::new(DictData::default()));
+    {
+        let mut d = dict.borrow_mut();
+        d.insert(
+            DictKey(Object::from_static("__name__")),
+            Object::from_static("sys._jit"),
+        );
+        d.insert(
+            DictKey(Object::from_static("__doc__")),
+            Object::from_static("Utilities for observing just-in-time compilation."),
+        );
+        d.insert(
+            DictKey(Object::from_static("is_available")),
+            builtin("is_available", |_args| Ok(Object::Bool(false))),
+        );
+        d.insert(
+            DictKey(Object::from_static("is_enabled")),
+            builtin("is_enabled", |_args| Ok(Object::Bool(false))),
+        );
+        d.insert(
+            DictKey(Object::from_static("is_active")),
+            builtin("is_active", |_args| Ok(Object::Bool(false))),
+        );
+    }
+    Object::Module(Rc::new(PyModule {
+        name: "sys._jit".to_owned(),
+        filename: None,
+        dict,
+    }))
+}
+
 fn sys_gettrace(_args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(crate::trace::trace_hook_raw().unwrap_or(Object::None))
 }
@@ -1823,7 +1943,7 @@ fn obj_call_no_args(m: &Object) -> Result<Object, RuntimeError> {
     interp.call(m, &[], &[], &g)
 }
 
-/// CPython 3.13 `sys.flags` struct-sequence field order. `tuple(sys.flags)`
+/// CPython 3.14 `sys.flags` struct-sequence field order. `tuple(sys.flags)`
 /// must yield these in exactly this order (`test_multiprocessing` /
 /// `test_sys` compare `sys.flags` across a spawned child via the tuple form).
 pub(crate) const SYS_FLAGS_FIELDS: &[&str] = &[
@@ -1846,6 +1966,11 @@ pub(crate) const SYS_FLAGS_FIELDS: &[&str] = &[
     "safe_path",
     "int_max_str_digits",
 ];
+
+/// The attribute-only tail of 3.14's `sys.flags` (`n_in_sequence` stops
+/// at `int_max_str_digits`, so these never appear in `tuple(sys.flags)`).
+pub(crate) const SYS_FLAGS_HIDDEN: &[&str] =
+    &["gil", "thread_inherit_context", "context_aware_warnings"];
 
 /// `sys.version_info` (and `sys.implementation.version`) — CPython's
 /// `PyStructSequence` with named fields; `sys.version_info.major` is
@@ -2016,14 +2141,16 @@ fn sys_flags_value() -> Object {
     // index, with `len()`/iteration over the field values. `tuple(sys.flags)`
     // is used by `test_multiprocessing` to round-trip flags through a spawned
     // child, so a plain namespace (not iterable) is insufficient.
-    // 3.13's `flags` carries `gil` as a *hidden* named field: reachable
-    // as `sys.flags.gil` but excluded from `len()`/indexing/iteration
+    // 3.14's `flags` carries `gil`, `thread_inherit_context`, and
+    // `context_aware_warnings` as *hidden* named fields: reachable by
+    // attribute but excluded from `len()`/indexing/iteration
     // (`len(sys.flags) == 18` in test_sys.test_sys_flags while
-    // test_cmd_line.test_python_gil reads `sys.flags.gil`).
+    // test_cmd_line.test_python_gil reads `sys.flags.gil` and
+    // `_py_warnings`/`threading` read the two context flags).
     let slots: Vec<Option<&'static str>> = SYS_FLAGS_FIELDS
         .iter()
+        .chain(SYS_FLAGS_HIDDEN.iter())
         .map(|f| Some(*f))
-        .chain(std::iter::once(Some("gil")))
         .collect();
     let ty =
         crate::stdlib::os::struct_seq_type_layout("flags", "sys", slots, SYS_FLAGS_FIELDS.len());
@@ -2044,10 +2171,20 @@ fn sys_flags_value() -> Object {
         .collect();
     let flags = crate::stdlib::os::struct_seq_instance(ty, SYS_FLAGS_FIELDS, values);
     if let Object::Instance(inst) = &flags {
-        // This build always runs with the GIL (no free-threading).
-        inst.dict
-            .borrow_mut()
-            .insert(DictKey(Object::from_static("gil")), Object::Int(1));
+        let mut dict = inst.dict.borrow_mut();
+        // This build always runs with the GIL (no free-threading), and
+        // the two PEP 649-era context flags take their 3.14 GIL-build
+        // defaults (both off; `-X thread_inherit_context=1` /
+        // `-X context_aware_warnings=1` flip them in apply_run_options).
+        dict.insert(DictKey(Object::from_static("gil")), Object::Int(1));
+        dict.insert(
+            DictKey(Object::from_static("thread_inherit_context")),
+            Object::Int(0),
+        );
+        dict.insert(
+            DictKey(Object::from_static("context_aware_warnings")),
+            Object::Int(0),
+        );
     }
     flags
 }
@@ -2152,14 +2289,18 @@ pub fn is_stdlib_module_name(name: &str) -> bool {
 }
 
 /// `sys.stdlib_module_names` — the documented set of standard-
-/// library module names. CPython 3.13 ships a frozenset; we
+/// library module names. CPython 3.14 ships a frozenset; we
 /// mirror that with a [`Object::FrozenSet`].
 fn stdlib_module_names_value() -> Object {
     use crate::object::SetData;
     let names: &[&'static str] = &[
+        "__future__",
         "_abc",
         "_aix_support",
+        "_android_support",
+        "_apple_support",
         "_ast",
+        "_ast_unparse",
         "_asyncio",
         "_bisect",
         "_blake2",
@@ -2173,23 +2314,30 @@ fn stdlib_module_names_value() -> Object {
         "_codecs_tw",
         "_collections",
         "_collections_abc",
+        "_colorize",
         "_compat_pickle",
-        "_compression",
         "_contextvars",
         "_csv",
         "_ctypes",
         "_curses",
         "_curses_panel",
         "_datetime",
+        "_dbm",
         "_decimal",
         "_elementtree",
         "_frozen_importlib",
         "_frozen_importlib_external",
         "_functools",
+        "_gdbm",
         "_hashlib",
         "_heapq",
+        "_hmac",
         "_imp",
+        "_interpchannels",
+        "_interpqueues",
+        "_interpreters",
         "_io",
+        "_ios_support",
         "_json",
         "_locale",
         "_lsprof",
@@ -2199,16 +2347,24 @@ fn stdlib_module_names_value() -> Object {
         "_multibytecodec",
         "_multiprocessing",
         "_opcode",
+        "_opcode_metadata",
         "_operator",
         "_osx_support",
+        "_overlapped",
         "_pickle",
         "_posixshmem",
         "_posixsubprocess",
         "_py_abc",
+        "_py_warnings",
+        "_pydatetime",
         "_pydecimal",
         "_pyio",
+        "_pylong",
+        "_pyrepl",
         "_queue",
         "_random",
+        "_remote_debugging",
+        "_scproxy",
         "_sha1",
         "_sha2",
         "_sha3",
@@ -2219,9 +2375,11 @@ fn stdlib_module_names_value() -> Object {
         "_sre",
         "_ssl",
         "_stat",
+        "_statistics",
         "_string",
         "_strptime",
         "_struct",
+        "_suggestions",
         "_symtable",
         "_sysconfig",
         "_thread",
@@ -2229,21 +2387,24 @@ fn stdlib_module_names_value() -> Object {
         "_tkinter",
         "_tokenize",
         "_tracemalloc",
+        "_types",
+        "_typing",
         "_uuid",
         "_warnings",
         "_weakref",
         "_weakrefset",
+        "_winapi",
+        "_wmi",
         "_zoneinfo",
+        "_zstd",
         "abc",
+        "annotationlib",
         "antigravity",
         "argparse",
         "array",
         "ast",
-        "asynchat",
         "asyncio",
-        "asyncore",
         "atexit",
-        "audioop",
         "base64",
         "bdb",
         "binascii",
@@ -2252,9 +2413,6 @@ fn stdlib_module_names_value() -> Object {
         "bz2",
         "cProfile",
         "calendar",
-        "cgi",
-        "cgitb",
-        "chunk",
         "cmath",
         "cmd",
         "code",
@@ -2263,13 +2421,13 @@ fn stdlib_module_names_value() -> Object {
         "collections",
         "colorsys",
         "compileall",
+        "compression",
         "concurrent",
         "configparser",
         "contextlib",
         "contextvars",
         "copy",
         "copyreg",
-        "crypt",
         "csv",
         "ctypes",
         "curses",
@@ -2309,8 +2467,6 @@ fn stdlib_module_names_value() -> Object {
         "http",
         "idlelib",
         "imaplib",
-        "imghdr",
-        "imp",
         "importlib",
         "inspect",
         "io",
@@ -2323,30 +2479,26 @@ fn stdlib_module_names_value() -> Object {
         "logging",
         "lzma",
         "mailbox",
-        "mailcap",
         "marshal",
         "math",
         "mimetypes",
         "mmap",
         "modulefinder",
-        "msilib",
         "msvcrt",
         "multiprocessing",
         "netrc",
-        "nis",
-        "nntplib",
+        "nt",
         "ntpath",
+        "nturl2path",
         "numbers",
         "opcode",
         "operator",
         "optparse",
         "os",
-        "ossaudiodev",
         "pathlib",
         "pdb",
         "pickle",
         "pickletools",
-        "pipes",
         "pkgutil",
         "platform",
         "plistlib",
@@ -2367,6 +2519,78 @@ fn stdlib_module_names_value() -> Object {
         "quopri",
         "random",
         "re",
+        "readline",
+        "reprlib",
+        "resource",
+        "rlcompleter",
+        "runpy",
+        "sched",
+        "secrets",
+        "select",
+        "selectors",
+        "shelve",
+        "shlex",
+        "shutil",
+        "signal",
+        "site",
+        "smtplib",
+        "socket",
+        "socketserver",
+        "sqlite3",
+        "sre_compile",
+        "sre_constants",
+        "sre_parse",
+        "ssl",
+        "stat",
+        "statistics",
+        "string",
+        "stringprep",
+        "struct",
+        "subprocess",
+        "symtable",
+        "sys",
+        "sysconfig",
+        "syslog",
+        "tabnanny",
+        "tarfile",
+        "tempfile",
+        "termios",
+        "textwrap",
+        "this",
+        "threading",
+        "time",
+        "timeit",
+        "tkinter",
+        "token",
+        "tokenize",
+        "tomllib",
+        "trace",
+        "traceback",
+        "tracemalloc",
+        "tty",
+        "turtle",
+        "turtledemo",
+        "types",
+        "typing",
+        "unicodedata",
+        "unittest",
+        "urllib",
+        "uuid",
+        "venv",
+        "warnings",
+        "wave",
+        "weakref",
+        "webbrowser",
+        "winreg",
+        "winsound",
+        "wsgiref",
+        "xml",
+        "xmlrpc",
+        "zipapp",
+        "zipfile",
+        "zipimport",
+        "zlib",
+        "zoneinfo",
     ];
     let mut set = SetData::default();
     for n in names {
@@ -2388,12 +2612,9 @@ fn stdlib_module_names_value() -> Object {
         "shutil",
         "signal",
         "site",
-        "smtpd",
         "smtplib",
-        "sndhdr",
         "socket",
         "socketserver",
-        "spwd",
         "sqlite3",
         "sre_compile",
         "sre_constants",
@@ -2405,17 +2626,14 @@ fn stdlib_module_names_value() -> Object {
         "stringprep",
         "struct",
         "subprocess",
-        "sunau",
         "symtable",
         "sys",
         "sysconfig",
         "syslog",
         "tabnanny",
         "tarfile",
-        "telnetlib",
         "tempfile",
         "termios",
-        "test",
         "textwrap",
         "threading",
         "time",
@@ -2435,7 +2653,6 @@ fn stdlib_module_names_value() -> Object {
         "unicodedata",
         "unittest",
         "urllib",
-        "uu",
         "uuid",
         "venv",
         "warnings",
@@ -2445,7 +2662,6 @@ fn stdlib_module_names_value() -> Object {
         "winreg",
         "winsound",
         "wsgiref",
-        "xdrlib",
         "xml",
         "xmlrpc",
         "zipapp",

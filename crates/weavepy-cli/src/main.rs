@@ -7,9 +7,9 @@
 //! on macOS).
 //!
 //! On Windows (RFC 0064 WS1) the binary is a *thin shim* over
-//! `python313.dll`, mirroring CPython's own NT split (`python.exe` →
+//! `python314.dll`, mirroring CPython's own NT split (`python.exe` →
 //! `Py_Main` in the core DLL): extension modules' PE import tables
-//! name `python313.dll`, so the interpreter must live in a DLL of
+//! name `python314.dll`, so the interpreter must live in a DLL of
 //! that name for `.pyd` imports to resolve in-process. The shim
 //! locates the DLL (its own directory first; then the `pyvenv.cfg`
 //! `home=` chain, because venvs copy the exe but not the DLL; then
@@ -71,7 +71,7 @@ mod shim {
         let Some(entry) = entry else {
             eprintln!(
                 "weavepy: {DLL_NAME} does not export weavepy_main — version-skewed or \
-                 foreign python313.dll on the search path?"
+                 foreign python314.dll on the search path?"
             );
             return EXIT_NO_RUNTIME;
         };

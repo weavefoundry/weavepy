@@ -76,8 +76,9 @@ pub fn is_ast_object(obj: &Object) -> bool {
     }
 }
 
-/// Lower a Python AST root object into a compilable module.
-pub fn convert_ast_root(obj: &Object, mode: RootMode) -> Result<ConvertedAst, RuntimeError> {
+/// `PyAST_obj2mod`'s root-type check: the tree handed to `compile()` must
+/// be the `mod` node the compile mode asks for (`Module` for exec, ...).
+pub fn check_ast_root(obj: &Object, mode: RootMode) -> Result<(), RuntimeError> {
     let inst = match obj {
         Object::Instance(inst) => inst,
         _ => {
@@ -96,6 +97,17 @@ pub fn convert_ast_root(obj: &Object, mode: RootMode) -> Result<ConvertedAst, Ru
             name
         )));
     }
+    Ok(())
+}
+
+/// Lower a Python AST root object into a compilable module.
+pub fn convert_ast_root(obj: &Object, mode: RootMode) -> Result<ConvertedAst, RuntimeError> {
+    check_ast_root(obj, mode)?;
+    let inst = match obj {
+        Object::Instance(inst) => inst,
+        _ => unreachable!("check_ast_root accepts instances only"),
+    };
+    let name = inst.cls().name.clone();
 
     // Pass 1: collect per-line maximum columns for span synthesis.
     let mut collector = PosCollector::default();
@@ -147,7 +159,9 @@ struct PosCollector {
 
 impl PosCollector {
     fn record(&mut self, line: i64, col: i64) {
-        if line >= 1 && col >= 0 {
+        // A negative column still pins the line: the node compiles to a
+        // "line known, column unknown" location.
+        if line >= 1 {
             let e = self.line_max.entry(line).or_insert(0);
             if col > *e {
                 *e = col;
@@ -212,7 +226,8 @@ impl PosCollector {
         let mut acc = 0u32;
         for len in &line_lengths {
             line_starts.push(acc);
-            acc += len + 1; // '\n'
+            // Spaces, the NO_COLUMN marker byte, then '\n'.
+            acc += len + 2;
         }
         PosMap {
             line_lengths,
@@ -228,12 +243,21 @@ struct PosMap {
 }
 
 impl PosMap {
+    /// Byte offset of `(line, col)`. A negative column (CPython's "line
+    /// known, column unknown" sentinel, see `_PyAST_SetLocation` /
+    /// `test_dis_with_linenos_but_no_columns`) maps to the line's
+    /// NO_COLUMN marker slot, which the compiler's line index recognises
+    /// and reports as `col == -1` so the linetable carries
+    /// `CODE_NO_COLUMNS` instead of a clamped `0`.
     fn byte(&self, line: i64, col: i64) -> u32 {
         if line < 1 || self.line_starts.is_empty() {
             return 0;
         }
         let idx = ((line - 1) as usize).min(self.line_starts.len() - 1);
-        let col = (col.max(0) as u32).min(self.line_lengths[idx]);
+        if col < 0 {
+            return self.line_starts[idx] + self.line_lengths[idx];
+        }
+        let col = (col as u32).min(self.line_lengths[idx].saturating_sub(1));
         self.line_starts[idx] + col
     }
 
@@ -241,13 +265,14 @@ impl PosMap {
         let total: usize = self
             .line_lengths
             .iter()
-            .map(|l| *l as usize + 1)
+            .map(|l| *l as usize + 2)
             .sum::<usize>();
         let mut s = String::with_capacity(total);
         for len in &self.line_lengths {
             for _ in 0..*len {
                 s.push(' ');
             }
+            s.push(weavepy_compiler::NO_COLUMN_MARKER);
             s.push('\n');
         }
         s
@@ -832,6 +857,25 @@ impl Conv<'_> {
             )?),
             "FormattedValue" => past::ExprKind::FormattedValue {
                 value: Box::new(self.expr(&self.req_node(&inst, "value", "FormattedValue")?)?),
+                conversion: match field(&inst, "conversion") {
+                    None | Some(Object::None) => -1,
+                    Some(v) => int_field(&v, "conversion")? as i32,
+                },
+                format_spec: self.opt_boxed(field(&inst, "format_spec"))?,
+            },
+            // PEP 750 t-strings.
+            "TemplateStr" => past::ExprKind::TemplateStr(self.expr_list(
+                &self.req(&inst, "values", "TemplateStr")?,
+                "TemplateStr",
+                "values",
+            )?),
+            "Interpolation" => past::ExprKind::Interpolation {
+                value: Box::new(self.expr(&self.req_node(&inst, "value", "Interpolation")?)?),
+                text: match field(&inst, "str") {
+                    Some(Object::Str(s)) => s.to_string(),
+                    None | Some(Object::None) => String::new(),
+                    Some(_) => return Err(type_error("Interpolation field \"str\" must be a str")),
+                },
                 conversion: match field(&inst, "conversion") {
                     None | Some(Object::None) => -1,
                     Some(v) => int_field(&v, "conversion")? as i32,

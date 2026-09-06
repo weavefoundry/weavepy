@@ -460,10 +460,14 @@ fn one_char(s: &str) -> Option<char> {
 fn set_char(name: &str, src: Option<&Object>, dflt: char) -> Result<char, RuntimeError> {
     match src {
         None => Ok(dflt),
-        Some(Object::Str(s)) => one_char(s)
-            .ok_or_else(|| type_error(format!("\"{name}\" must be a 1-character string"))),
+        Some(Object::Str(s)) => one_char(s).ok_or_else(|| {
+            type_error(format!(
+                "\"{name}\" must be a unicode character, not a string of length {}",
+                s.chars().count()
+            ))
+        }),
         Some(other) => Err(type_error(format!(
-            "\"{name}\" must be string, not {}",
+            "\"{name}\" must be a unicode character, not {}",
             other.type_name()
         ))),
     }
@@ -477,11 +481,14 @@ fn set_char_or_none(
     match src {
         None => Ok(dflt),
         Some(Object::None) => Ok(None),
-        Some(Object::Str(s)) => one_char(s)
-            .map(Some)
-            .ok_or_else(|| type_error(format!("\"{name}\" must be a 1-character string"))),
+        Some(Object::Str(s)) => one_char(s).map(Some).ok_or_else(|| {
+            type_error(format!(
+                "\"{name}\" must be a unicode character or None, not a string of length {}",
+                s.chars().count()
+            ))
+        }),
         Some(other) => Err(type_error(format!(
-            "\"{name}\" must be string or None, not {}",
+            "\"{name}\" must be a unicode character or None, not {}",
             other.type_name()
         ))),
     }
@@ -490,9 +497,11 @@ fn set_char_or_none(
 fn set_str(name: &str, src: Option<&Object>, dflt: &str) -> Result<Option<String>, RuntimeError> {
     match src {
         None => Ok(Some(dflt.to_owned())),
-        Some(Object::None) => Ok(None),
         Some(Object::Str(s)) => Ok(Some(s.to_string())),
-        Some(_) => Err(type_error(format!("\"{name}\" must be a string"))),
+        Some(other) => Err(type_error(format!(
+            "\"{name}\" must be a string, not {}",
+            other.type_name()
+        ))),
     }
 }
 
@@ -887,6 +896,13 @@ fn reader_iternext(args: &[Object]) -> Result<Object, RuntimeError> {
         let dialect_obj = dialect_obj.ok_or_else(|| type_error("reader is missing its dialect"))?;
         let cfg = read_cfg(&dialect_obj)?;
         let mut p = Parser::new(cfg);
+        // CPython's `parse_reset` allocates `self->fields`; a successful
+        // `__next__` hands it out and leaves NULL behind. A re-entrant
+        // `next(reader)` from inside the input iterator that completes
+        // therefore makes the outer call see NULL and raise (gh-145105).
+        inst.dict
+            .borrow_mut()
+            .insert(key("_fields_live"), Object::Bool(true));
         loop {
             match interp.iter_next_object(input_iter.clone())? {
                 None => {
@@ -912,6 +928,9 @@ fn reader_iternext(args: &[Object]) -> Result<Object, RuntimeError> {
                     };
                     {
                         let mut d = inst.dict.borrow_mut();
+                        if !matches!(d.get(&key("_fields_live")), Some(Object::Bool(true))) {
+                            return Err(csv_error("iterator has already advanced the reader"));
+                        }
                         let n = match d.get(&key("line_num")) {
                             Some(Object::Int(n)) => *n,
                             _ => 0,
@@ -928,6 +947,9 @@ fn reader_iternext(args: &[Object]) -> Result<Object, RuntimeError> {
                 break;
             }
         }
+        inst.dict
+            .borrow_mut()
+            .insert(key("_fields_live"), Object::Bool(false));
         Ok(Object::new_list(std::mem::take(&mut p.fields)))
     })
 }

@@ -34,7 +34,7 @@ struct ExtensionBuild<'a> {
 /// fixtures compile against.
 ///
 /// RFC 0062 WS2 vendored the stock `Include/` tree into
-/// `include/cpython313/` (plus per-OS generated `pyconfig.h`
+/// `include/cpython314/` (plus per-OS generated `pyconfig.h`
 /// variants), so the default is fully hermetic: stage the right
 /// `pyconfig.h` under `OUT_DIR` and compile against
 /// `[staged, tree]`. `WEAVEPY_STOCK_PYTHON` still overrides with a

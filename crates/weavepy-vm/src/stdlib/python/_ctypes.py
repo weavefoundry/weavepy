@@ -39,7 +39,9 @@ Faithfulness notes (all mirroring ``Modules/_ctypes``):
   integer address driven through ``read_mem``/``write_mem``.
 """
 
+import builtins as _builtins
 import sys as _sys
+import _weakref
 import _ctypes_native as _nat
 
 __version__ = "1.1.0"
@@ -78,6 +80,11 @@ FUNCFLAG_PYTHONAPI = 0x4
 FUNCFLAG_USE_ERRNO = 0x8
 FUNCFLAG_USE_LASTERROR = 0x10
 FUNCFLAG_STDCALL = 0x0
+
+# paramflags direction bits (ctypes.h).
+PARAMFLAG_FIN = 0x1
+PARAMFLAG_FOUT = 0x2
+PARAMFLAG_FLCID = 0x4
 
 TYPEFLAG_ISPOINTER = 0x100
 TYPEFLAG_HASPOINTER = 0x200
@@ -180,6 +187,8 @@ class _StgInfo:
         "fields",       # dict name -> CField (aggregates), in layout order
         "flags",
         "format",       # PEP 3118 format string, or None (=> "B")
+        "pointer_type", # cached POINTER(cls) (3.14 `__pointer_type__`)
+        "ffi_descr",    # cached by-value aggregate descriptor for the bridge
     )
 
     def __init__(self):
@@ -193,6 +202,8 @@ class _StgInfo:
         self.fields = None
         self.flags = 0
         self.format = None
+        self.pointer_type = None
+        self.ffi_descr = None
 
 
 _PEP_STD_SIZE = {"b": 1, "B": 1, "h": 2, "H": 2, "i": 4, "I": 4,
@@ -210,6 +221,19 @@ def _pep_simple_char(code, size):
     else:
         table = {1: "B", 2: "H", 4: "L", 8: "Q"}
     return table.get(size, code)
+
+
+_MISSING = object()  # getattr sentinel: "attribute absent" vs. a None value
+
+
+def _tp_full_name(tp):
+    """CPython's %T: the fully qualified type name ("ctypes.c_char_p",
+    "int" for builtins)."""
+    mod = getattr(tp, "__module__", None)
+    qn = getattr(tp, "__qualname__", tp.__name__)
+    if mod is None or mod == "builtins":
+        return qn
+    return "%s.%s" % (mod, qn)
 
 
 def _info(cls):
@@ -238,6 +262,11 @@ def _check_not_initialized(cls):
 # ---------------------------------------------------------------------------
 # Low-level value codecs for the simple ``_type_`` format codes
 # ---------------------------------------------------------------------------
+
+# The `_type_` codes a PyCSimpleType accepts (cfield.c SIMPLE_TYPE_CHARS);
+# 'X' (BSTR) exists on Windows only. Listed in CPython's order so the
+# "must be one of" message matches test_c_simple_type_meta.
+_SIMPLE_TYPE_CHARS = "cbBhHiIlLdfuzZqQP" + ("X" if _sys.platform == "win32" else "") + "Ov?g"
 
 # Integer codes -> (size, signed). 'v' is VARIANT_BOOL (a 2-byte short).
 _INT_CODES = {
@@ -428,29 +457,38 @@ def _simple_set(code, obj, value, off=0, swap=False):
             _write_at(obj, off, _long_double_set(value))
         return None, None
     if code == "c":
-        if isinstance(value, (bytes, bytearray)) and len(value) == 1:
-            b = bytes(value)
-        elif isinstance(value, int) and not isinstance(value, bool):
-            if not 0 <= value < 256:
+        # cfield.c c_set (3.14 wording).
+        if isinstance(value, (bytes, bytearray)):
+            if len(value) != 1:
                 raise TypeError(
-                    "one character bytes, bytearray or integer expected"
-                )
+                    "one character bytes, bytearray, or an integer in "
+                    "range(256) expected, not %s of length %d"
+                    % ("bytes" if isinstance(value, bytes) else "bytearray",
+                       len(value)))
+            b = bytes(value)
+        elif isinstance(value, int):
+            if not 0 <= value < 256:
+                raise TypeError("integer not in range(256)")
             b = bytes([value])
         else:
-            raise TypeError("one character bytes, bytearray or integer expected")
+            raise TypeError(
+                "one character bytes, bytearray, or an integer in "
+                "range(256) expected, not %s" % (_tp_full_name(type(value)),))
         _write_at(obj, off, b)
         return None, None
     if code == "?":
         _write_at(obj, off, b"\x01" if value else b"\x00")
         return None, None
     if code == "u":
+        # cfield.c u_set (3.14 wording).
         if not isinstance(value, str):
             raise TypeError(
-                "unicode string expected instead of %s instance"
-                % type(value).__name__
-            )
+                "a unicode character expected, not instance of %s"
+                % (_tp_full_name(type(value)),))
         if len(value) != 1:
-            raise TypeError("one character unicode string expected")
+            raise TypeError(
+                "a unicode character expected, not a string of length %d"
+                % (len(value),))
         _write_at(obj, off, ord(value).to_bytes(_WCHAR, _BO))
         return None, None
     if code == "P":
@@ -627,20 +665,143 @@ def _addr_of(x):
 
 
 class CField:
-    __slots__ = ("name", "type", "offset", "size", "index",
-                 "bit_size", "bit_offset", "_swapped")
-    __flags__ = _TPFLAGS_IMMUTABLETYPE | _TPFLAGS_DISALLOW_INSTANTIATION
+    """CPython 3.14 ``_ctypes.CField``: a struct/union field descriptor.
+
+    ``byte_offset``/``byte_size`` describe the storage unit; a bitfield
+    adds ``bit_size``/``bit_offset`` inside it. The legacy ``size`` is
+    ``byte_size`` for plain fields and ``(bit_size << 16) | bit_offset``
+    for bitfields (the packed value older code inspected).
+    """
+    __slots__ = ("name", "type", "byte_offset", "byte_size", "index",
+                 "_bitfield_size", "_bit_offset", "_anonymous", "_swapped")
+    __module__ = "ctypes"  # tp_name "ctypes.CField"
+    __flags__ = _TPFLAGS_IMMUTABLETYPE
+
+    def __new__(cls, *, name, type, byte_size, byte_offset, index,
+                _internal_use=False, bit_size=None, bit_offset=None):
+        if not _internal_use:
+            # Do not instantiate outside ctypes, yet.
+            raise TypeError("cannot create %s object" % (cls.__name__,))
+        if not isinstance(name, str):
+            raise TypeError(
+                "argument 'name' must be str, not %s" % (
+                    _builtins.type(name).__name__,))
+        byte_size = _index(byte_size)
+        byte_offset = _index(byte_offset)
+        index = _index(index)
+        if byte_size < 0:
+            raise ValueError(
+                "byte size of field %r must not be negative, got %d"
+                % (name, byte_size))
+        info = _info(type)
+        if info is None:
+            raise TypeError("type of field %r must be a C type" % (name,))
+        if byte_size != info.size:
+            raise ValueError(
+                "byte size of field %r (%d) does not match type size (%d)"
+                % (name, byte_size, info.size))
+        bitfield_size = 0
+        bitoff = 0
+        if bit_size is not None:
+            if not _bitfield_allowed(type, info):
+                raise TypeError(
+                    "bit fields not allowed for type %s" % (type.__name__,))
+            if byte_size > 100:
+                raise ValueError(
+                    "bit field %r size too large, got %d" % (name, byte_size))
+            bitfield_size = _index(bit_size)
+            if bitfield_size <= 0 or bitfield_size > 255:
+                raise ValueError(
+                    "bit size of field %r out of range, got %d"
+                    % (name, bitfield_size))
+            bitoff = _index(bit_offset)
+            if bitoff < 0 or bitoff > 255:
+                raise ValueError(
+                    "bit offset of field %r out of range, got %d"
+                    % (name, bitoff))
+            if bitfield_size + bitoff > byte_size * 8:
+                raise ValueError(
+                    "bit field %r overflows its type (%d + %d > %d)"
+                    % (name, bitoff, bitfield_size, byte_size * 8))
+        elif bit_offset is not None:
+            raise ValueError(
+                "field %r: bit_offset must be specified if bit_size is"
+                % (name,))
+        fld = object.__new__(cls)
+        # PyUnicode_FromObject: a str subclass is copied to an exact str
+        # (test_struct_fields.test_str_name).
+        if _builtins.type(name) is not str:
+            name = str.__str__(name)
+        object.__setattr__(fld, "name", name)
+        object.__setattr__(fld, "type", type)
+        object.__setattr__(fld, "byte_offset", byte_offset)
+        object.__setattr__(fld, "byte_size", byte_size)
+        object.__setattr__(fld, "index", index)
+        object.__setattr__(fld, "_bitfield_size", bitfield_size)
+        object.__setattr__(fld, "_bit_offset", bitoff)
+        object.__setattr__(fld, "_anonymous", False)
+        object.__setattr__(fld, "_swapped", False)
+        return fld
 
     def __init__(self, *args, **kwargs):
-        raise TypeError("cannot create 'CField' instances")
+        pass
+
+    def __setattr__(self, name, value):
+        raise AttributeError(
+            "readonly attribute" if name in CField.__slots__
+            else "'CField' object has no attribute '%s'" % (name,))
+
+    # -- 3.14 attribute surface ------------------------------------------
+
+    @property
+    def offset(self):
+        """offset in bytes of this field (same as byte_offset)"""
+        return self.byte_offset
+
+    @property
+    def size(self):
+        """size in bytes of this field. For bitfields, this is a legacy
+        packed value; use byte_size instead"""
+        if self._bitfield_size:
+            return (self._bitfield_size << 16) | self._bit_offset
+        return self.byte_size
+
+    @property
+    def bit_size(self):
+        """size of this field in bits"""
+        if self._bitfield_size:
+            return self._bitfield_size
+        return self.byte_size * 8
+
+    @property
+    def bit_offset(self):
+        """additional offset in bits (relative to byte_offset); zero for
+        non-bitfields"""
+        return self._bit_offset
+
+    @property
+    def is_bitfield(self):
+        """true if this is a bitfield"""
+        return bool(self._bitfield_size)
+
+    @property
+    def is_anonymous(self):
+        """true if this field is anonymous"""
+        return self._anonymous
 
     def __repr__(self):
-        bits = ""
-        if self.bit_size is not None:
-            bits = ", bit_size=%d, bit_offset=%d" % (self.bit_size,
-                                                     self.bit_offset)
-        return "<Field type=%s, ofs=%d%s, size=%d>" % (
-            self.type.__name__, self.offset, bits, self.size)
+        # cfield.c uses %T: the fully qualified type name.
+        tp = _builtins.type(self)
+        mod = tp.__module__
+        tname = tp.__qualname__ if mod == "builtins" else (
+            "%s.%s" % (mod, tp.__qualname__))
+        if self._bitfield_size:
+            return "<%s %r type=%s, ofs=%d, bit_size=%d, bit_offset=%d>" % (
+                tname, self.name, self.type.__name__,
+                self.byte_offset, self._bitfield_size, self._bit_offset)
+        return "<%s %r type=%s, ofs=%d, size=%d>" % (
+            tname, self.name, self.type.__name__,
+            self.byte_offset, self.byte_size)
 
     def __get__(self, obj, objtype=None):
         if obj is None:
@@ -649,32 +810,37 @@ class CField:
             raise TypeError("not a ctype instance")
         ftype = self.type
         finfo = _info_req(ftype)
-        if self.bit_size is not None:
+        if self._bitfield_size:
             return self._get_bits(obj)
         if finfo.code is not None and _is_direct_simple(ftype):
-            return _simple_get(finfo.code, obj, self.offset, finfo.swapped)
+            return _simple_get(finfo.code, obj, self.byte_offset, finfo.swapped)
         # Fields typed as c_char/c_wchar arrays read as bytes/str
         # (CPython installs s_get/U_get for them).
         akind = _char_array_kind(ftype)
         if akind == "c":
-            data = _read_at(obj, self.offset, finfo.size)
+            data = _read_at(obj, self.byte_offset, finfo.size)
             nul = data.find(b"\x00")
             return data if nul < 0 else data[:nul]
         if akind == "u":
-            return _wchar_decode(_read_at(obj, self.offset, finfo.size))
-        return _view(obj, ftype, self.offset, self.index)
+            return _wchar_decode(_read_at(obj, self.byte_offset, finfo.size))
+        return _view(obj, ftype, self.byte_offset, self.index)
 
     def __set__(self, obj, value):
         if not isinstance(obj, _CData):
             raise TypeError("not a ctype instance")
         ftype = self.type
         finfo = _info_req(ftype)
-        if self.bit_size is not None:
+        if self._bitfield_size:
             self._set_bits(obj, value)
             return
-        if finfo.code is not None and _is_direct_simple(ftype):
+        if finfo.code is not None and _is_direct_simple(ftype) \
+                and not isinstance(value, _CData):
+            # _PyCData_set: a plain Python value goes through the type's
+            # setfunc; a ctypes instance takes the generic path below
+            # (memcpy for an instance of the field type, else the
+            # "incompatible types" error).
             keep, shadow = _simple_set(
-                finfo.code, obj, value, self.offset, finfo.swapped)
+                finfo.code, obj, value, self.byte_offset, finfo.swapped)
             _keep_ref(obj, self.index, keep, shadow)
             return
         akind = _char_array_kind(ftype)
@@ -682,20 +848,20 @@ class CField:
             # CPython s_set: strlen-bounded copy plus NUL if it fits.
             if not isinstance(value, bytes):
                 raise TypeError(
-                    "expected bytes, %s found" % (type(value).__name__,))
+                    "expected bytes, %s found" % (_builtins.type(value).__name__,))
             nul = value.find(b"\x00")
             data = value if nul < 0 else value[:nul]
             if len(data) < finfo.size:
                 data += b"\x00"
             elif len(data) > finfo.size:
                 raise ValueError("byte string too long")
-            _write_at(obj, self.offset, data)
+            _write_at(obj, self.byte_offset, data)
             return
         if akind == "u":
             if not isinstance(value, str):
                 raise TypeError(
                     "unicode string expected instead of %s instance"
-                    % (type(value).__name__,))
+                    % (_builtins.type(value).__name__,))
             nchars = finfo.size // _WCHAR
             nul = value.find("\x00")
             data = value if nul < 0 else value[:nul]
@@ -704,12 +870,12 @@ class CField:
             raw = b"".join(ord(c).to_bytes(_WCHAR, _BO) for c in data)
             if len(data) < nchars:
                 raw += (0).to_bytes(_WCHAR, _BO)
-            _write_at(obj, self.offset, raw)
+            _write_at(obj, self.byte_offset, raw)
             return
-        _cdata_set(obj, ftype, self.offset, self.index, value)
+        _cdata_set(obj, ftype, self.byte_offset, self.index, value)
 
     def __delete__(self, obj):
-        raise TypeError("cannot delete attribute")
+        raise TypeError("can't delete attribute")
 
     # -- bitfields --------------------------------------------------------
 
@@ -717,37 +883,32 @@ class CField:
         finfo = _info(self.type)
         size, signed = _INT_CODES[finfo.code]
         bo = _BO_SWAP if finfo.swapped else _BO
-        v = int.from_bytes(_read_at(obj, self.offset, size), bo)
+        v = int.from_bytes(_read_at(obj, self.byte_offset, size), bo)
         return v, size, signed, bo
 
     def _get_bits(self, obj):
         v, size, signed, _bo = self._unit(obj)
-        v = (v >> self.bit_offset) & ((1 << self.bit_size) - 1)
-        if signed and v >= (1 << (self.bit_size - 1)):
-            v -= 1 << self.bit_size
+        v = (v >> self._bit_offset) & ((1 << self._bitfield_size) - 1)
+        if signed and v >= (1 << (self._bitfield_size - 1)):
+            v -= 1 << self._bitfield_size
         return v
 
     def _set_bits(self, obj, value):
         value = _index(value)
         v, size, _signed, bo = self._unit(obj)
-        mask = (1 << self.bit_size) - 1
-        v &= ~(mask << self.bit_offset)
-        v |= (value & mask) << self.bit_offset
-        _write_at(obj, self.offset, v.to_bytes(size, bo))
+        mask = (1 << self._bitfield_size) - 1
+        v &= ~(mask << self._bit_offset)
+        v |= (value & mask) << self._bit_offset
+        _write_at(obj, self.byte_offset, v.to_bytes(size, bo))
 
 
-def _make_cfield(name, ftype, offset, size, index, bit_size=None,
-                 bit_offset=0):
-    fld = object.__new__(CField)
-    object.__setattr__(fld, "name", name)
-    object.__setattr__(fld, "type", ftype)
-    object.__setattr__(fld, "offset", offset)
-    object.__setattr__(fld, "size", size)
-    object.__setattr__(fld, "index", index)
-    object.__setattr__(fld, "bit_size", bit_size)
-    object.__setattr__(fld, "bit_offset", bit_offset)
-    object.__setattr__(fld, "_swapped", False)
-    return fld
+def _bitfield_allowed(ftype, info):
+    """CPython's ffi-type switch: integer units only (no c_char/c_wchar,
+    no floats, pointers, or aggregates)."""
+    code = info.code
+    if code is None or code in ("c", "u"):
+        return False
+    return code in _INT_CODES
 
 
 def _is_direct_simple(t):
@@ -795,6 +956,32 @@ class _CDataMeta(type):
 
     def __rmul__(cls, length):
         return _create_array_type(cls, length)
+
+    # -- 3.14 `__pointer_type__` (ctype_get/set_pointer_type) --------------
+
+    @property
+    def __pointer_type__(cls):
+        info = _info(cls)
+        if info is None:
+            raise TypeError("%r must have storage info" % (cls,))
+        if info.pointer_type is not None:
+            return info.pointer_type
+        raise AttributeError(
+            "%r has no attribute '__pointer_type__'" % (cls,))
+
+    @__pointer_type__.setter
+    def __pointer_type__(cls, value):
+        info = _info(cls)
+        if info is None:
+            raise TypeError("%r must have storage info" % (cls,))
+        info.pointer_type = value
+
+    @__pointer_type__.deleter
+    def __pointer_type__(cls):
+        info = _info(cls)
+        if info is None:
+            raise TypeError("%r must have storage info" % (cls,))
+        info.pointer_type = None
 
     # -- construction from existing memory -------------------------------
 
@@ -901,11 +1088,11 @@ class PyCSimpleType(_CDataMeta):
             raise ValueError(
                 "class must define a '_type_' string attribute of length 1"
             )
-        if code not in "cbBhHiIlLqQdfguzZPXOv?":
+        if code not in _SIMPLE_TYPE_CHARS:
             raise AttributeError(
                 "class must define a '_type_' attribute which must be\n"
-                "a single character string containing one of "
-                "'cbBhHiIlLqQdfguzZPXOv?'."
+                "a single character string containing one of '%s'."
+                % (_SIMPLE_TYPE_CHARS,)
             )
         info = _StgInfo()
         info.code = code
@@ -938,14 +1125,29 @@ class PyCSimpleType(_CDataMeta):
         code = info.code
         try:
             return _simple_param(cls, code, value)
-        except TypeError as exc:
-            param = getattr(value, "_as_parameter_", None)
-            if param is None:
+        except TypeError:
+            # PyCSimpleType_from_param: `_as_parameter_` is evaluated
+            # recursively (a self-referential one ends in RecursionError).
+            param = getattr(value, "_as_parameter_", _MISSING)
+            if param is _MISSING:
                 raise
-            try:
-                return _simple_param(cls, code, param)
-            except TypeError:
-                raise exc
+            return cls.from_param(param)
+
+
+def _points_at_code(value, code):
+    """c_char_p_from_param / c_wchar_p_from_param: an array or pointer whose
+    element type has the given simple code, or a `byref()` cparam wrapping
+    an instance of such a type, is accepted as the string pointer."""
+    if isinstance(value, (_Pointer, Array)):
+        it = _info_req(type(value))
+        pinfo = _info(it.proto) if isinstance(it.proto, type) else None
+        return pinfo is not None and pinfo.code == code
+    if isinstance(value, _CArgObject):
+        obj = value._obj
+        if isinstance(obj, _CData):
+            oinfo = _info(type(obj))
+            return oinfo is not None and oinfo.code == code
+    return False
 
 
 def _simple_param(cls, code, value):
@@ -965,9 +1167,11 @@ def _simple_param(cls, code, value):
         if isinstance(value, _SimpleCData) and \
                 _info_req(type(value)).code in ("z", "P"):
             return value
-        if isinstance(value, (_Pointer, Array)):
+        if _points_at_code(value, "c"):
             return value
-        raise TypeError("wrong type")
+        raise TypeError(
+            "'%s' object cannot be interpreted as ctypes.c_char_p"
+            % (type(value).__name__,))
     if code == "Z":
         if value is None:
             return None
@@ -978,9 +1182,11 @@ def _simple_param(cls, code, value):
         if isinstance(value, _SimpleCData) and \
                 _info_req(type(value)).code in ("Z", "P"):
             return value
-        if isinstance(value, (_Pointer, Array)):
+        if _points_at_code(value, "u"):
             return value
-        raise TypeError("wrong type")
+        raise TypeError(
+            "'%s' object cannot be interpreted as ctypes.c_wchar_p"
+            % (type(value).__name__,))
     if code == "P":
         if value is None:
             return None
@@ -1001,7 +1207,9 @@ def _simple_param(cls, code, value):
         if isinstance(value, _SimpleCData) and \
                 _info_req(type(value)).code in ("z", "Z", "P"):
             return value
-        raise TypeError("wrong type")
+        raise TypeError(
+            "'%s' object cannot be interpreted as ctypes.c_void_p"
+            % (type(value).__name__,))
     # Numeric / char / bool codes: validate by writing into a fresh
     # instance, and pass a cparam wrapping it.
     inst = _alloc_instance(cls)
@@ -1077,17 +1285,25 @@ class PyCArrayType(_CDataMeta):
         info.align = einfo.align
         info.length = length
         info.proto = etype
-        # PEP 3118: nested array dims fold into one parenthesised group
-        # ("(2,3)<f" for c_float*3*2).
-        dims = [length]
-        t = etype
-        while isinstance(t, PyCArrayType):
-            ti = _info_req(t)
-            dims.append(ti.length)
-            t = ti.proto
-        base = _info_req(t).format or "B"
-        info.format = "(" + ",".join(str(d) for d in dims) + ")" + base
+        # PEP 3118 (PyCArrayType_init): `format` is the innermost element's
+        # format; the dims live in `shape` and are prefixed as one
+        # parenthesised group ("(2,3)<f" for c_float*3*2) by consumers.
+        info.format = einfo.format if einfo.format is not None else "B"
         _set_info(cls, info)
+
+
+def _pointer_set_proto(cls, info, proto):
+    """CPython PyCPointerType_SetProto: record the target type and, if the
+    target has no cached pointer type yet, make `cls` its
+    `__pointer_type__`."""
+    if not isinstance(proto, type):
+        raise TypeError("_type_ must be a type")
+    tinfo = _info(proto)
+    if tinfo is None:
+        raise TypeError("%r must have storage info" % (proto,))
+    info.proto = proto
+    if tinfo.pointer_type is None:
+        tinfo.pointer_type = cls
 
 
 class PyCPointerType(_CDataMeta):
@@ -1101,23 +1317,24 @@ class PyCPointerType(_CDataMeta):
         info.size = _PTR
         info.align = _PTR
         info.length = 2
-        info.proto = namespace.get("_type_", getattr(cls, "_type_", None))
-        if info.proto is not None:
-            if not isinstance(info.proto, type) or not issubclass(info.proto, _CData):
-                raise TypeError("_type_ must be a type")
-            # NB: creating a pointer type does NOT finalize the target —
-            # `POINTER(Incomplete)` before `_fields_` assignment is the
-            # documented forward-reference idiom (test_pep3118).
-        # PEP 3118 pointer format is snapshotted at creation time (an
-        # incomplete target that is completed later keeps "&B" — see the
-        # "not fixed" remark in test_pep3118).
-        tinfo = _info(info.proto) if isinstance(info.proto, type) else None
-        info.format = "&" + ((tinfo.format or "B") if tinfo is not None else "B")
         _set_info(cls, info)
+        # PyCPointerType_init reads `_type_` from the class body only: a
+        # subclass of POINTER(T) without its own `_type_` stays incomplete.
+        proto = namespace.get("_type_")
+        if proto is not None:
+            _pointer_set_proto(cls, info, proto)
+            # PEP 3118 pointer format is snapshotted at creation time (an
+            # incomplete target that is completed later keeps "&B" -- see
+            # the "not fixed" remark in test_pep3118). Creating a pointer
+            # type does NOT finalize the target: `POINTER(Incomplete)`
+            # before `_fields_` assignment is the forward-reference idiom.
+            tinfo = _info(proto)
+            fmt, _ndim, shape = buffer_info(proto)
+            info.format = "&" + _shape_prefix(shape) + (fmt or "B")
 
     def set_type(cls, t):
         info = _info_req(cls)
-        info.proto = t
+        _pointer_set_proto(cls, info, t)
         type.__setattr__(cls, "_type_", t)
 
     def from_param(cls, value):
@@ -1197,6 +1414,8 @@ def _aggregate_init(cls, bases, namespace, union):
     base = bases[0] if bases else None
     if namespace.get("_b_root_"):
         return  # Structure / Union themselves stay abstract
+    if "_abstract_" in namespace:
+        return  # kept for bw compatibility: no StgInfo => "abstract class"
     info = _StgInfo()
     binfo = _info(base) if isinstance(base, type) else None
     if binfo is not None:
@@ -1205,6 +1424,8 @@ def _aggregate_init(cls, bases, namespace, union):
         info.align = binfo.align
         info.length = binfo.length
         info.fields = dict(binfo.fields) if binfo.fields else {}
+        if "_fields_" not in namespace:
+            info.format = binfo.format  # PyCStgInfo_clone
     else:
         info.fields = {}
     _set_info(cls, info)
@@ -1221,185 +1442,114 @@ def _aggregate_init(cls, bases, namespace, union):
 
 
 def _set_fields(cls, value, union):
+    """CPython PyCStructUnionType_update_stginfo: delegate the layout to
+    ctypes._layout.get_layout (pure Python since 3.14) and install the
+    CField descriptors it produced."""
     info = _info(cls)
     if info is None:
         raise TypeError("ctypes state is not initialized")
     if info.final:
         raise AttributeError("_fields_ is final")
-    fields = list(value)
-
-    pack = getattr(cls, "_pack_", 0)
-    if pack:
-        if isinstance(pack, bool) or not isinstance(pack, int) or pack < 0:
-            raise ValueError("_pack_ must be a non-negative integer")
-    forced_align = getattr(cls, "_align_", 1)
-    if isinstance(forced_align, bool) or not isinstance(forced_align, int):
-        raise TypeError("_align_ must be a non-negative integer")
-    if forced_align < 0:
-        raise ValueError("_align_ must be a non-negative integer")
-    forced_align = max(forced_align, 1)
 
     base = cls.__mro__[1] if len(cls.__mro__) > 1 else None
     binfo = _info(base) if isinstance(base, type) else None
-    if binfo is not None:
-        base_size = binfo.size
-        base_align = binfo.align
-        base_fields = dict(binfo.fields) if binfo.fields else {}
-        base_len = binfo.length
-    else:
-        base_size = 0
-        base_align = 1
-        base_fields = {}
-        base_len = 0
 
-    layout = dict(base_fields)
-    offset = 0 if union else base_size
-    total_align = max(base_align, forced_align)
-    max_size = base_size
-    index = base_len
-    # Open bitfield storage unit: (unit_offset, unit_size, bits_used).
-    bit_state = None
+    from ctypes._layout import get_layout
+    layout = get_layout(cls, value, is_struct=not union,
+                        base=base if binfo is not None else None)
 
-    for i, item in enumerate(fields):
-        try:
-            fname = item[0]
-            ftype = item[1]
-        except (TypeError, IndexError):
+    total_align = _index(layout.align)
+    if total_align < 0:
+        raise ValueError("align must be a non-negative integer")
+    total_size = _index(layout.size)
+    if total_size < 0:
+        raise ValueError("size must be a non-negative integer")
+    format_spec = layout.format_spec
+    if not isinstance(format_spec, str):
+        raise TypeError("format_spec must be str")
+    layout_fields = tuple(layout.fields)
+
+    fields = dict(binfo.fields) if binfo is not None and binfo.fields else {}
+    base_len = binfo.length if binfo is not None else 0
+    for i, prop in enumerate(layout_fields):
+        if not isinstance(prop, CField):
             raise TypeError(
-                "'_fields_' must be a sequence of (name, C type) pairs")
-        bits = item[2] if len(item) > 2 else None
-        if not isinstance(fname, str):
-            raise TypeError(
-                "first item in _fields_ tuple (index %d) must be a string"
-                % (i,))
-        if not isinstance(ftype, _CDataMeta) or _info(ftype) is None:
-            raise TypeError(
-                "second item in _fields_ tuple (index %d) must be a C type"
-                % (i,))
-        finfo = _info(ftype)
+                "fields must be of type CField, got %s"
+                % (type(prop).__name__,))
+        if prop.index != i:
+            raise ValueError(
+                "field %r index mismatch (expected %d, got %d)"
+                % (prop.name, i, prop.index))
+        finfo = _info(prop.type)
         finfo.final = True  # using a type as a field finalizes it (test_3)
-        fsize = finfo.size
-        falign = finfo.align
-        if pack:
-            falign = min(falign, pack)
+        fields[prop.name] = prop
+        type.__setattr__(cls, prop.name, prop)
 
-        if bits is not None:
-            if finfo.code not in _INT_CODES:
-                raise TypeError(
-                    "bit fields not allowed for type %s" % (ftype.__name__,))
-            if isinstance(bits, bool) or not isinstance(bits, int) or \
-                    not 0 < bits <= fsize * 8:
-                raise ValueError(
-                    "number of bits invalid for bit field %r" % (fname,))
-            if union:
-                foffset = 0
-                bit_off = 0
-                max_size = max(max_size, fsize)
-            elif (bit_state is not None
-                    and bit_state[1] == fsize
-                    and bit_state[2] + bits <= fsize * 8):
-                foffset = bit_state[0]
-                bit_off = bit_state[2]
-                bit_state = (foffset, fsize, bit_off + bits)
-            else:
-                offset = _round_up(offset, falign)
-                foffset = offset
-                offset += fsize
-                bit_off = 0
-                bit_state = (foffset, fsize, bits)
-            total_align = max(total_align, falign)
-            fld = _make_cfield(fname, ftype, foffset, fsize, index,
-                               bits, bit_off)
-            layout[fname] = fld
-            type.__setattr__(cls, fname, fld)
-            index += 1
-            continue
-
-        bit_state = None
-        if union:
-            foffset = 0
-            max_size = max(max_size, fsize)
-        else:
-            offset = _round_up(offset, falign)
-            foffset = offset
-            offset += fsize
-        total_align = max(total_align, falign)
-        fld = _make_cfield(fname, ftype, foffset, fsize, index)
-        layout[fname] = fld
-        type.__setattr__(cls, fname, fld)
-        index += 1
-
-    if union:
-        total = _round_up(max_size, total_align)
-    else:
-        total = _round_up(offset, total_align)
-    if total > _sys.maxsize:
+    if total_size > _sys.maxsize:
         raise OverflowError("structure or union is too large")
 
-    info.fields = layout
-    info.size = total
+    # We did check that this flag was NOT set above; it must not have been
+    # set until now (a field referenced the class being laid out).
+    if info.final:
+        raise AttributeError("Structure or union cannot contain itself")
+
+    info.format = format_spec
+    info.fields = fields
+    info.size = total_size
     info.align = total_align
-    info.length = index
+    info.length = base_len + len(layout_fields)
     info.final = True
-    info.format = _pep_struct_format(info, union)
-    type.__setattr__(cls, "_fields_", fields)
     _make_anon_fields(cls, info)
+    type.__setattr__(cls, "_fields_", value)
 
 
-def _pep_struct_format(info, union):
-    """PEP 3118 "T{...}" format built from the final layout (CPython
-    stgdict.c). Unions and bitfields aren't expressible — fall back to
-    the unstructured "B" byte view."""
-    if union:
-        return "B"
-    parts = []
-    pos = 0
-    for name, fld in info.fields.items():
-        if fld.bit_size is not None:
-            return "B"
-        if fld.offset > pos:
-            n = fld.offset - pos
-            parts.append("x" if n == 1 else "%dx" % n)
-        finfo = _info(fld.type)
-        parts.append((finfo.format if finfo is not None else None) or "B")
-        parts.append(":%s:" % name)
-        pos = fld.offset + fld.size
-    if info.size > pos:
-        n = info.size - pos
-        parts.append("x" if n == 1 else "%dx" % n)
-    return "T{" + "".join(parts) + "}"
-
-
-def _round_up(n, align):
-    if align <= 1:
-        return n
-    rem = n % align
-    return n if rem == 0 else n + (align - rem)
+def _make_fields(cls, info, descr, index, offset):
+    """CPython MakeFields: re-home every `_fields_` descriptor of the
+    anonymous member `descr` onto `cls`, offsets and indices adjusted."""
+    fieldlist = descr.type._fields_
+    try:
+        fieldlist = list(fieldlist)
+    except TypeError:
+        raise TypeError("_fields_ must be a sequence")
+    for pair in fieldlist:
+        fname = pair[0]
+        fdescr = getattr(descr.type, fname)
+        if type(fdescr) is not CField:
+            raise TypeError("unexpected type")
+        if fdescr.is_anonymous:
+            _make_fields(cls, info, fdescr, index + fdescr.index,
+                         offset + fdescr.byte_offset)
+            continue
+        new_descr = CField(
+            name=fdescr.name,
+            type=fdescr.type,
+            byte_size=fdescr.byte_size,
+            byte_offset=fdescr.byte_offset + offset,
+            index=fdescr.index + index,
+            _internal_use=True,
+            bit_size=fdescr._bitfield_size if fdescr.is_bitfield else None,
+            bit_offset=fdescr._bit_offset if fdescr.is_bitfield else None,
+        )
+        type.__setattr__(cls, fname, new_descr)
 
 
 def _make_anon_fields(cls, info):
+    """CPython MakeAnonFields."""
     anon = getattr(cls, "_anonymous_", None)
     if anon is None:
         return
-    if not isinstance(anon, (list, tuple)):
+    try:
+        anon_names = list(anon)
+    except TypeError:
         raise TypeError("_anonymous_ must be a sequence")
-    for name in anon:
-        outer = info.fields.get(name)
-        if outer is None:
+    for fname in anon_names:
+        descr = getattr(cls, fname)
+        if type(descr) is not CField:
             raise AttributeError(
                 "'%s' is specified in _anonymous_ but not in _fields_"
-                % (name,))
-        inner_info = _info(outer.type)
-        if inner_info is None or inner_info.fields is None:
-            raise TypeError(
-                "'%s' is specified in _anonymous_ but is not a structure "
-                "or union" % (name,))
-        for iname, ifld in inner_info.fields.items():
-            promoted = _make_cfield(
-                iname, ifld.type, outer.offset + ifld.offset, ifld.size,
-                outer.index, ifld.bit_size, ifld.bit_offset)
-            info.fields[iname] = promoted
-            type.__setattr__(cls, iname, promoted)
+                % (fname,))
+        object.__setattr__(descr, "_anonymous", True)
+        _make_fields(cls, info, descr, descr.index, descr.byte_offset)
 
 
 # ---------------------------------------------------------------------------
@@ -1452,6 +1602,12 @@ def _cdata_set(dst, ftype, offset, index, value):
     if value is None and issubclass(ftype, _Pointer):
         _write_at(dst, offset, (0).to_bytes(_PTR, _BO))
         return
+    if finfo.code is not None and not isinstance(value, _CData):
+        # A plain Python value assigned to a simple-type slot (including
+        # subclasses of the simple types) goes through the type's setfunc.
+        keep, shadow = _simple_set(finfo.code, dst, value, offset, finfo.swapped)
+        _keep_ref(dst, index, keep, shadow)
+        return
     if isinstance(value, ftype):
         _write_at(dst, offset, value._read(0, finfo.size))
         _keep_ref(dst, index, _get_keeped(value))
@@ -1470,11 +1626,21 @@ def _cdata_set(dst, ftype, offset, index, value):
         _write_at(dst, offset, tmp._read(0, finfo.size))
         _keep_ref(dst, index, tmp)
         return
-    if isinstance(value, (list, tuple)) and not issubclass(ftype, _Pointer):
-        tmp = ftype(*value)
+    if isinstance(value, tuple) and not issubclass(ftype, _Pointer):
+        # _PyCData_set: a tuple is passed to the type; a failure there is
+        # re-raised as RuntimeError via _ctypes_extend_error.
+        try:
+            tmp = ftype(*value)
+        except Exception as exc:
+            raise RuntimeError(
+                "(%s) %s: %s" % (ftype.__name__, type(exc).__name__, exc))
         _write_at(dst, offset, tmp._read(0, finfo.size))
         _keep_ref(dst, index, _get_keeped(tmp))
         return
+    if not isinstance(value, _CData):
+        raise TypeError(
+            "expected %s instance, got %s"
+            % (ftype.__name__, type(value).__name__))
     raise TypeError(
         "incompatible types, %s instance instead of %s instance"
         % (type(value).__name__, ftype.__name__))
@@ -1497,6 +1663,11 @@ class _CData(metaclass=type):
 
     def __new__(cls, *args, **kw):
         return _alloc_instance(cls)
+
+    def __hash__(self):
+        # PyCData_nohash: every ctypes instance is unhashable, and none of
+        # them define value-based equality.
+        raise TypeError("unhashable type")
 
     def __init__(self, *args, **kw):
         pass
@@ -1540,16 +1711,13 @@ class _CData(metaclass=type):
         # Stamp the PEP 3118 metadata (CPython PyCData_NewGetBuffer):
         # arrays export their dims as `shape` with the element's format;
         # everything else is a 0-dim scalar of its own format.
-        dims = []
+        fmt, _ndim, dims = buffer_info(type(self))
         t = type(self)
         while isinstance(t, PyCArrayType):
-            ti = _info_req(t)
-            dims.append(ti.length)
-            t = ti.proto
+            t = _info_req(t).proto
         ti = _info(t)
-        fmt = (ti.format if ti is not None else None) or "B"
         itemsize = ti.size if ti is not None else 1
-        _nat.configure_view(mv, fmt, itemsize,
+        _nat.configure_view(mv, fmt or "B", itemsize,
                             tuple(dims) if dims else None)
         return mv
 
@@ -1630,19 +1798,40 @@ class _SimpleCData(_CData, metaclass=PyCSimpleType):
     def __bool__(self):
         return any(self._read(0, self._b_size))
 
-    def __eq__(self, other):
-        if isinstance(other, _SimpleCData):
-            return self.value == other.value
-        return self.value == other
-
-    def __ne__(self, other):
-        return not self.__eq__(other)
-
-    def __hash__(self):
-        return hash(self.value)
-
 
 # -- Structure / Union -------------------------------------------------------
+
+
+def _init_pos_args(self, tp, args, kw, index):
+    """CPython _init_pos_args: assign positional initializers to the
+    fields of `tp`, base classes first; returns the next field index."""
+    base = tp.__mro__[1] if len(tp.__mro__) > 1 else None
+    if base is not None and _info(base) is not None:
+        index = _init_pos_args(self, base, args, kw, index)
+    fields = tp.__dict__.get("_fields_")
+    if fields is None:
+        return index
+    fields = list(fields)
+    info = _info_req(tp)
+    i = index
+    while i < info.length and i < len(args):
+        name = fields[i - index][0]
+        if kw and name in kw:
+            raise TypeError("duplicate values for field %r" % (name,))
+        setattr(self, name, args[i])
+        i += 1
+    return info.length
+
+
+def _struct_union_init(self, args, kw):
+    """CPython Struct_init."""
+    _info_req(type(self))
+    if args:
+        res = _init_pos_args(self, type(self), args, kw, 0)
+        if res < len(args):
+            raise TypeError("too many initializers")
+    for key, val in kw.items():
+        setattr(self, key, val)
 
 
 class Structure(_CData, metaclass=PyCStructType):
@@ -1650,15 +1839,7 @@ class Structure(_CData, metaclass=PyCStructType):
     _b_root_ = True
 
     def __init__(self, *args, **kw):
-        info = _info_req(type(self))
-        if args:
-            names = list(info.fields.keys()) if info.fields else []
-            if len(args) > len(names):
-                raise TypeError("too many initializers")
-            for i, val in enumerate(args):
-                setattr(self, names[i], val)
-        for key, val in kw.items():
-            setattr(self, key, val)
+        _struct_union_init(self, args, kw)
 
 
 class Union(_CData, metaclass=UnionType):
@@ -1666,15 +1847,7 @@ class Union(_CData, metaclass=UnionType):
     _b_root_ = True
 
     def __init__(self, *args, **kw):
-        info = _info_req(type(self))
-        if args:
-            names = list(info.fields.keys()) if info.fields else []
-            if len(args) > len(names):
-                raise TypeError("too many initializers")
-            for i, val in enumerate(args):
-                setattr(self, names[i], val)
-        for key, val in kw.items():
-            setattr(self, key, val)
+        _struct_union_init(self, args, kw)
 
 
 # -- Array -------------------------------------------------------------------
@@ -1862,12 +2035,18 @@ class Array(_CData, metaclass=PyCArrayType):
 
 # -- Pointer -----------------------------------------------------------------
 
-_pointer_type_cache = {}
-
 
 class _Pointer(_CData, metaclass=PyCPointerType):
     __slots__ = ()
     _b_root_ = True
+
+    def __new__(cls, *args, **kw):
+        # Pointer_new: an incomplete pointer type (no `_type_`, e.g. a
+        # subclass of POINTER(T) or POINTER("name")) cannot be instantiated.
+        info = _info(cls)
+        if info is None or info.proto is None:
+            raise TypeError("Cannot create instance: has no _type_")
+        return _CData.__new__(cls, *args, **kw)
 
     def __init__(self, *args):
         if len(args) > 1:
@@ -1959,10 +2138,9 @@ class _Pointer(_CData, metaclass=PyCPointerType):
         if base == 0:
             raise ValueError("NULL pointer access")
         if isinstance(index, slice):
-            rng = self._item_range(index)
-            for i, v in zip(rng, value):
-                self[i] = v
-            return
+            # Pointers have sq_ass_item only (no mp_ass_subscript): slice
+            # assignment falls through to the sequence protocol's check.
+            raise TypeError("sequence index must be integer, not 'slice'")
         index = _index(index)
         dst = tgt.from_address(base + index * esize)
         if einfo.code is not None and _is_direct_simple(tgt):
@@ -1981,44 +2159,11 @@ class _Pointer(_CData, metaclass=PyCPointerType):
         return self._target_addr() != 0
 
 
-def POINTER(cls):
-    try:
-        return _pointer_type_cache[cls]
-    except (KeyError, TypeError):
-        pass
-    if isinstance(cls, str):
-        # Incomplete forward reference: `POINTER("cell")`. Cached under the
-        # id() of the created type so ctypes.SetPointerType can find it.
-        ptr = PyCPointerType("LP_%s" % cls, (_Pointer,), {})
-        _pointer_type_cache[id(ptr)] = ptr
-        return ptr
-    if cls is None:
-        ptr = PyCPointerType("LP_None", (_Pointer,), {})
-        _pointer_type_cache[cls] = ptr
-        return ptr
-    if not isinstance(cls, type):
-        raise TypeError("must be a ctypes type")
-    ptr = PyCPointerType("LP_%s" % cls.__name__, (_Pointer,),
-                         {"_type_": cls})
-    _pointer_type_cache[cls] = ptr
-    return ptr
-
-
-def pointer(obj):
-    if not isinstance(obj, _CData):
-        raise TypeError(
-            "_type_ must have storage info")
-    ptr_type = POINTER(type(obj))
-    p = ptr_type()
-    p.contents = obj
-    return p
-
-
 # -- CFuncPtr ----------------------------------------------------------------
 
 
 class CFuncPtr(_CData, metaclass=PyCFuncPtrType):
-    __slots__ = ("_handle_addr", "_callable", "_com_name",
+    __slots__ = ("_handle_addr", "_callable", "_com_name", "_paramflags",
                  "_i_restype", "_i_argtypes", "_i_errcheck", "_b_thunk")
     _b_root_ = True
     _argtypes_ = None
@@ -2061,12 +2206,20 @@ class CFuncPtr(_CData, metaclass=PyCFuncPtrType):
         if value is None:
             self._i_argtypes = None
             return
-        value = tuple(value)
+        try:
+            value = tuple(value)
+        except TypeError:
+            raise TypeError("_argtypes_ must be a sequence of types")
+        if len(value) > CTYPES_MAX_ARGCOUNT:
+            raise ArgumentError(
+                "_argtypes_ has too many arguments (%d), maximum is %d"
+                % (len(value), CTYPES_MAX_ARGCOUNT))
         for i, at in enumerate(value):
             if not hasattr(at, "from_param"):
                 raise TypeError(
                     "item %d in _argtypes_ has no from_param method"
                     % (i + 1,))
+        _validate_paramflags(getattr(self, "_paramflags", None), value)
         self._i_argtypes = value
 
     @argtypes.deleter
@@ -2100,6 +2253,7 @@ class CFuncPtr(_CData, metaclass=PyCFuncPtrType):
         object.__setattr__(self, "_handle_addr", 0)
         object.__setattr__(self, "_callable", None)
         object.__setattr__(self, "_com_name", None)
+        object.__setattr__(self, "_paramflags", None)
         if not args:
             return
         if len(args) > 1 and not isinstance(args[0], tuple):
@@ -2109,15 +2263,38 @@ class CFuncPtr(_CData, metaclass=PyCFuncPtrType):
         if isinstance(arg, int):
             self._set_address(arg)
         elif isinstance(arg, tuple):
+            # PyCFuncPtr_FromDll: (name_or_ordinal, dll)[, paramflags]
+            if len(args) > 2:
+                raise TypeError(
+                    "function takes at most 2 arguments (%d given)"
+                    % (len(args),))
+            paramflags = args[1] if len(args) > 1 else None
+            if len(arg) != 2:
+                raise TypeError("illegal func_spec argument")
             name_or_ord, dll = arg
             addr = _resolve_dll_symbol(dll, name_or_ord)
+            _validate_paramflags(paramflags, type(self)._argtypes_)
             self._set_address(addr)
+            object.__setattr__(self, "_paramflags", paramflags)
             if not isinstance(name_or_ord, int):
                 object.__setattr__(self, "_com_name", name_or_ord)
         elif callable(arg):
+            # _ctypes_alloc_callback: only result types with a setfunc
+            # (the fundamental simple types) may be returned by a callback.
+            restype = type(self)._restype_
+            if restype is not None:
+                rinfo = _info(restype) if isinstance(restype, type) else None
+                if rinfo is None or rinfo.code is None:
+                    raise TypeError(
+                        "invalid result type for callback function")
+            # PyCFuncPtr_new: the thunk owns the callable and the native
+            # closure; it is kept alive through `_objects['0']`, so a
+            # struct field holding this function pointer keeps the thunk
+            # (and therefore the callback) alive along with it.
+            thunk = _make_closure(type(self), arg)
             object.__setattr__(self, "_callable", arg)
-            closure_addr = _make_closure(self, arg)
-            self._set_address(closure_addr)
+            _keep_ref(self, 0, thunk)
+            self._set_address(thunk._closure)
         else:
             raise TypeError(
                 "argument must be callable or integer function address"
@@ -2144,13 +2321,9 @@ class CFuncPtr(_CData, metaclass=PyCFuncPtrType):
     def __bool__(self):
         return self._handle() != 0 or getattr(self, "_callable", None) is not None
 
-    def __call__(self, *args):
+    def __call__(self, *args, **kwds):
         handle = self._handle()
         argtypes = self.argtypes
-        if len(args) > CTYPES_MAX_ARGCOUNT:
-            raise ArgumentError(
-                "too many arguments (%d), maximum is %d"
-                % (len(args), CTYPES_MAX_ARGCOUNT))
         thunk = _INTERNAL_THUNKS.get(handle)
         if thunk is not None:
             # CPython's internal helpers (cast, string_at, memmove...) are
@@ -2161,13 +2334,160 @@ class CFuncPtr(_CData, metaclass=PyCFuncPtrType):
         _callable = getattr(self, "_callable", None)
         if _callable is not None and handle == 0:
             return _callable(*args)
+        paramflags = getattr(self, "_paramflags", None)
+        callargs, outmask, inoutmask, numretvals = _build_callargs(
+            paramflags, argtypes, args, kwds)
+        if len(callargs) > CTYPES_MAX_ARGCOUNT:
+            raise ArgumentError(
+                "too many arguments (%d), maximum is %d"
+                % (len(callargs), CTYPES_MAX_ARGCOUNT))
         restype = self.restype
         flags = type(self)._flags_
-        result = _ffi_invoke(handle, restype, argtypes, flags, args)
+        if argtypes:
+            required, actual = len(argtypes), len(callargs)
+            if (flags & FUNCFLAG_CDECL) == FUNCFLAG_CDECL:
+                if required > actual:
+                    raise TypeError(
+                        "this function takes at least %d argument%s (%d given)"
+                        % (required, "" if required == 1 else "s", actual))
+            elif required != actual:
+                raise TypeError(
+                    "this function takes %d argument%s (%d given)"
+                    % (required, "" if required == 1 else "s", actual))
+        result = _ffi_invoke(handle, restype, argtypes, flags, callargs)
         errcheck = self.errcheck
         if errcheck is not None:
-            result = errcheck(result, self, args)
+            result = errcheck(result, self, callargs)
+        return _build_result(result, callargs, outmask, inoutmask, numretvals)
+
+
+def _check_outarg_type(tp, index):
+    """CPython _check_outarg_type: an 'out' parameter must be a pointer,
+    an array, or one of the simple pointer types (c_void_p & friends)."""
+    if isinstance(tp, (PyCPointerType, PyCArrayType)):
+        return
+    info = _info(tp) if isinstance(tp, type) else None
+    if info is not None and info.code in ("P", "z", "Z"):
+        return
+    raise TypeError(
+        "'out' parameter %d must be a pointer type, not %s"
+        % (index, tp.__name__ if isinstance(tp, type)
+           else type(tp).__name__))
+
+
+def _validate_paramflags(paramflags, argtypes):
+    """CPython _validate_paramflags."""
+    if paramflags is None or argtypes is None:
+        return
+    if not isinstance(paramflags, tuple):
+        raise TypeError("paramflags must be a tuple or None")
+    if len(paramflags) != len(argtypes):
+        raise ValueError(
+            "paramflags must have the same length as argtypes")
+    for i, item in enumerate(paramflags):
+        ok = isinstance(item, tuple) and 1 <= len(item) <= 3 \
+            and isinstance(item[0], int) and not isinstance(item[0], bool) \
+            and (len(item) < 2 or item[1] is None or isinstance(item[1], str))
+        if not ok:
+            raise TypeError(
+                "paramflags must be a sequence of "
+                "(int [,string [,value]]) tuples")
+        flag = item[0] & (PARAMFLAG_FIN | PARAMFLAG_FOUT | PARAMFLAG_FLCID)
+        if flag in (0, PARAMFLAG_FIN, PARAMFLAG_FIN | PARAMFLAG_FLCID,
+                    PARAMFLAG_FIN | PARAMFLAG_FOUT):
+            continue
+        if flag == PARAMFLAG_FOUT:
+            _check_outarg_type(argtypes[i], i + 1)
+            continue
+        raise TypeError("paramflag value %d not supported" % (item[0],))
+
+
+_NO_DEFAULT = object()
+
+
+def _get_arg(state, name, defval, inargs, kwds):
+    """CPython _get_arg: `state` is a one-element list holding the
+    running inargs index."""
+    if state[0] < len(inargs):
+        v = inargs[state[0]]
+        state[0] += 1
+        return v
+    if kwds and name is not None and name in kwds:
+        state[0] += 1
+        return kwds[name]
+    if defval is not _NO_DEFAULT:
+        return defval
+    if name is not None:
+        raise TypeError("required argument '%s' missing" % (name,))
+    raise TypeError("not enough arguments")
+
+
+def _build_callargs(paramflags, argtypes, inargs, kwds):
+    """CPython _build_callargs: returns (callargs, outmask, inoutmask,
+    numretvals)."""
+    if not argtypes or paramflags is None:
+        return tuple(inargs), 0, 0, 0
+    n = len(argtypes)
+    callargs = [None] * n
+    outmask = inoutmask = 0
+    numretvals = 0
+    state = [0]
+    for i in range(n):
+        item = paramflags[i]
+        flag = item[0] & 0xFFFFFFFF
+        name = item[1] if len(item) > 1 else None
+        defval = item[2] if len(item) > 2 else _NO_DEFAULT
+        kind = flag & (PARAMFLAG_FIN | PARAMFLAG_FOUT | PARAMFLAG_FLCID)
+        if kind == PARAMFLAG_FIN | PARAMFLAG_FLCID:
+            callargs[i] = 0 if defval is _NO_DEFAULT else defval
+        elif kind in (0, PARAMFLAG_FIN, PARAMFLAG_FIN | PARAMFLAG_FOUT):
+            if kind == PARAMFLAG_FIN | PARAMFLAG_FOUT:
+                inoutmask |= 1 << i
+                numretvals += 1
+            callargs[i] = _get_arg(state, name, defval, inargs, kwds)
+        elif kind == PARAMFLAG_FOUT:
+            if defval is not _NO_DEFAULT:
+                callargs[i] = defval
+            else:
+                tp = argtypes[i]
+                info = _info(tp)
+                if info is None:
+                    raise RuntimeError("NULL stginfo unexpected")
+                if isinstance(info.proto, str):
+                    raise TypeError(
+                        "%s 'out' parameter must be passed as default value"
+                        % (tp.__name__,))
+                if isinstance(tp, PyCArrayType):
+                    callargs[i] = tp()
+                else:
+                    callargs[i] = info.proto()
+            outmask |= 1 << i
+            numretvals += 1
+        else:
+            raise ValueError("paramflag %d not yet implemented" % (flag,))
+    actual = len(inargs) + (len(kwds) if kwds else 0)
+    if actual != state[0]:
+        raise TypeError("call takes exactly %d arguments (%d given)"
+                        % (state[0], actual))
+    return tuple(callargs), outmask, inoutmask, numretvals
+
+
+def _build_result(result, callargs, outmask, inoutmask, numretvals):
+    """CPython _build_result."""
+    if numretvals == 0:
         return result
+    out = []
+    for i in range(32):
+        bit = 1 << i
+        if bit & inoutmask:
+            out.append(callargs[i])
+        elif bit & outmask:
+            out.append(callargs[i].__ctypes_from_outparam__())
+        if len(out) == numretvals:
+            break
+    if numretvals == 1:
+        return out[0]
+    return tuple(out)
 
 
 # ---------------------------------------------------------------------------
@@ -2194,11 +2514,25 @@ class _CArgObject:
         raise TypeError("cannot convert to an address")
 
     def __repr__(self):
-        try:
-            shown = self._value if self._value is not None else self._obj
-            return "<cparam '%s' (%r)>" % (self.tag, shown)
-        except Exception:
-            return "<cparam '%s'>" % (self.tag,)
+        # callproc.c PyCArg_repr.
+        tag = self.tag
+        if tag in "bBhHiIlLqQ":
+            return "<cparam '%s' (%d)>" % (tag, self._value)
+        if tag in "df":
+            return "<cparam '%s' (%r)>" % (tag, float(self._value))
+        if tag == "c":
+            v = self._value
+            ch = v[0] if isinstance(v, (bytes, bytearray)) else int(v) & 0xFF
+            if 32 <= ch < 127 and ch not in (0x27, 0x5c):
+                return "<cparam 'c' ('%s')>" % (chr(ch),)
+            return "<cparam 'c' ('\\x%02x')>" % (ch,)
+        if tag in "zZP":
+            try:
+                addr = self._address()
+            except TypeError:
+                addr = 0
+            return "<cparam '%s' (0x%016x)>" % (tag, addr)
+        return "<cparam '%s' at 0x%012x>" % (tag, id(self))
 
 
 def _new_parg(tag, obj, value, offset=0):
@@ -2216,6 +2550,34 @@ def byref(obj, offset=0):
         raise TypeError("byref() argument must be a ctypes instance, not '%s'"
                         % type(obj).__name__)
     return _new_parg("P", obj, None, offset)
+
+
+def _shape_prefix(shape):
+    """"(2,3)" for an array shape, "" for scalars
+    (_ctypes_alloc_format_string_with_shape)."""
+    if not shape:
+        return ""
+    return "(" + ",".join(str(d) for d in shape) + ")"
+
+
+def buffer_info(arg):
+    """Return buffer interface information (format, ndim, shape) for a
+    ctypes type or instance (callproc.c buffer_info)."""
+    if isinstance(arg, _CDataMeta):
+        info = _info(arg)
+    elif isinstance(arg, _CData):
+        info = _info(type(arg))
+    else:
+        info = None
+    if info is None:
+        raise TypeError("not a ctypes type or object")
+    dims = []
+    t = arg if isinstance(arg, _CDataMeta) else type(arg)
+    while isinstance(t, PyCArrayType):
+        ti = _info_req(t)
+        dims.append(ti.length)
+        t = ti.proto
+    return (info.format, len(dims), tuple(dims))
 
 
 def sizeof(type_or_obj):
@@ -2351,6 +2713,20 @@ def _thunk_wstring_at(ptr, size=-1):
     return _nat.wstring_at(_parg_addr(ptr), size)
 
 
+def _thunk_memoryview_at(ptr, size, readonly=False):
+    # 3.14 `memoryview_at(ptr, size, readonly)`: a memoryview over raw
+    # memory (`PyMemoryView_FromMemory`); the caller owns the region.
+    # The declared `c_ssize_t` argtype wraps like CPython's setfunc
+    # (PyLong_AsUnsignedLongLongMask): sys.maxsize + 1 arrives negative.
+    bits = 8 * _PTR
+    size = ((_parg_int(size) + (1 << (bits - 1))) % (1 << bits)) - (1 << (bits - 1))
+    if size < 0:
+        raise ValueError("memoryview_at: negative size")
+    if size >= _ABSURD_SIZE:
+        raise MemoryError
+    return _nat.memoryview_at(_parg_addr(ptr), size, bool(_parg_int(readonly)))
+
+
 def _thunk_cast(ptr, obj, typ):
     """CPython ``cast(obj, typ)`` (Modules/_ctypes/callproc.c).
 
@@ -2392,6 +2768,7 @@ _memset_addr = _register_thunk(_thunk_memset)
 _string_at_addr = _register_thunk(_thunk_string_at)
 _wstring_at_addr = _register_thunk(_thunk_wstring_at)
 _cast_addr = _register_thunk(_thunk_cast)
+_memoryview_at_addr = _register_thunk(_thunk_memoryview_at)
 
 
 # ---------------------------------------------------------------------------
@@ -2408,21 +2785,68 @@ def _type_code_for_ffi(t):
         if issubclass(t, _SimpleCData):
             code = _info_req(t).code
             return "h" if code == "v" else code
-        if issubclass(t, (_Pointer, Array, Structure, Union, CFuncPtr)):
+        if issubclass(t, (Structure, Union)):
+            # By value: the bridge gets the aggregate's shape and applies
+            # the platform classification (libffi's FFI_TYPE_STRUCT).
+            return _agg_descr(t)
+        if issubclass(t, (_Pointer, Array, CFuncPtr)):
             return "P"
     if callable(t):
         return "i"  # `restype` as a callable: raw int result, then call it
     raise TypeError("unsupported ctypes type in FFI signature: %r" % (t,))
 
 
-def _arg_to_ffi(value):
+def _agg_leaves(tp, base, out):
+    """Flatten `tp` into `(offset, code)` scalar leaves for the aggregate
+    descriptor (arrays and nested aggregates expanded; bitfields report
+    their storage unit; pointer-ish members are `P`)."""
+    info = _info_req(tp)
+    if issubclass(tp, _SimpleCData):
+        code = info.code
+        if code == "v":
+            code = "h"
+        elif code in ("z", "Z", "O"):
+            code = "P"
+        out.append((base, code))
+    elif issubclass(tp, (_Pointer, CFuncPtr)):
+        out.append((base, "P"))
+    elif issubclass(tp, Array):
+        elem = info.proto
+        esize = _info_req(elem).size
+        for i in range(info.length):
+            _agg_leaves(elem, base + i * esize, out)
+    else:
+        for fld in (info.fields or {}).values():
+            _agg_leaves(fld.type, base + fld.byte_offset, out)
+
+
+def _agg_descr(tp):
+    """`(size, [(offset, code), ...])` for a Structure/Union type, cached
+    once the layout is final."""
+    info = _info_req(tp)
+    descr = info.ffi_descr
+    if descr is None:
+        leaves = []
+        _agg_leaves(tp, 0, leaves)
+        descr = (info.size, tuple(leaves))
+        if info.final or info.fields:
+            info.ffi_descr = descr
+    return descr
+
+
+def _arg_to_ffi(value, index=1):
     """Marshal an argument with no declared argtype (CPython's
-    ConvParam defaults)."""
+    ConvParam defaults). `index` is the 1-based argument position used
+    in the error message."""
     if isinstance(value, _CArgObject):
         if value.tag in ("P", "z", "Z"):
             return ("P", value._address())
         return (value.tag, value._value)
-    if isinstance(value, (Array, Structure, Union)):
+    if isinstance(value, (Structure, Union)):
+        # ConvParam: a CDataObject is passed by value with its own ffi type.
+        info = _info_req(type(value))
+        return (_agg_descr(type(value)), value._read(0, info.size))
+    if isinstance(value, Array):
         return ("P", addressof(value))
     if isinstance(value, (_Pointer, CFuncPtr)):
         return ("P", int.from_bytes(value._read(0, _PTR), _BO))
@@ -2443,11 +2867,10 @@ def _arg_to_ffi(value):
         return ("z", value)
     if isinstance(value, str):
         return ("Z", value)
-    param = getattr(value, "_as_parameter_", None)
-    if param is not None:
-        return _arg_to_ffi(param)
-    raise TypeError("cannot pass %r to a foreign function"
-                    % (type(value).__name__,))
+    param = getattr(value, "_as_parameter_", _MISSING)
+    if param is not _MISSING:
+        return _arg_to_ffi(param, index)
+    raise TypeError("Don't know how to convert parameter %d" % (index,))
 
 
 def _convert_args(argtypes, args):
@@ -2479,11 +2902,18 @@ def _ffi_invoke(addr, restype, argtypes, flags, args):
     payloads = []
     n_declared = len(argtypes) if argtypes else 0
     for i, val in enumerate(conv):
-        if i < n_declared:
+        if i < n_declared and isinstance(argtypes[i], _CDataMeta):
             code = _type_code_for_ffi(argtypes[i])
             payload = _coerce_payload(code, val)
         else:
-            code, payload = _arg_to_ffi(val)
+            # Variadic tail, or an argtype that is merely an object with a
+            # `from_param` method (test_parameters.test_noctypes_argtype):
+            # the converted value alone decides the FFI type (ConvParam).
+            try:
+                code, payload = _arg_to_ffi(val, i + 1)
+            except (TypeError, ValueError) as exc:
+                raise ArgumentError(
+                    "argument %d: %s: %s" % (i + 1, type(exc).__name__, exc))
         codes.append(code)
         payloads.append(payload)
     rcode = _type_code_for_ffi(restype)
@@ -2506,6 +2936,15 @@ def _ffi_invoke(addr, restype, argtypes, flags, args):
 
 
 def _coerce_payload(code, value):
+    if isinstance(code, tuple):
+        # By-value aggregate: the instance's raw bytes (from_param handed
+        # back the instance itself, or a byref-style cparam wrapping it).
+        if isinstance(value, _CArgObject):
+            value = value._obj
+        if not isinstance(value, (Structure, Union)):
+            raise TypeError("expected a Structure/Union instance, got %s"
+                            % (type(value).__name__,))
+        return value._read(0, _info_req(type(value)).size)
     if code == "O":
         # `py_object.from_param` wraps the live object in a cparam
         # (RFC 0060): unwrap it so the callee receives the object
@@ -2518,7 +2957,11 @@ def _coerce_payload(code, value):
     if isinstance(value, _CArgObject):
         if code in ("P", "z", "Z"):
             return value._address()
-        return value._value
+        # Unwrap the cparam and normalise its payload like a bare value
+        # (a `c_char` cparam carries the one-byte bytes object).
+        value = value._value
+        if isinstance(value, _CData):
+            return value
     if code in ("P", "z", "Z"):
         if isinstance(value, _CData):
             # Aggregates pass their own address; pointer-like scalars pass
@@ -2532,6 +2975,12 @@ def _coerce_payload(code, value):
             return value
         if code == "Z" and isinstance(value, str):
             return value
+        return int(value)
+    if code == "u":
+        if isinstance(value, _SimpleCData):
+            value = value.value
+        if isinstance(value, str):
+            return ord(value)
         return int(value)
     if code in _INT_CODES or code in ("c", "?"):
         if isinstance(value, _SimpleCData):
@@ -2555,6 +3004,13 @@ def _wrap_result(restype, raw):
             # py_object restype: the native bridge already converted the
             # returned PyObject* into the live object.
             return raw
+        # The bridge returns the register image of a wchar_t / char as an
+        # int; GetResult memcpys it into the result buffer and the getfunc
+        # produces the one-character str / bytes.
+        if info.code == "u" and isinstance(raw, int):
+            raw = chr(raw)
+        elif info.code == "c" and isinstance(raw, int):
+            raw = bytes([raw & 0xFF])
         if _is_direct_simple(restype):
             obj = restype()
             obj.value = raw
@@ -2566,6 +3022,11 @@ def _wrap_result(restype, raw):
         p = restype()
         p._write(0, (int(raw) & ((1 << (8 * _PTR)) - 1)).to_bytes(_PTR, _BO))
         return p
+    if isinstance(restype, _CDataMeta) and issubclass(restype, (Structure, Union)):
+        # GetResult: a fresh instance holding the returned bytes.
+        inst = _alloc_instance(restype)
+        _write_at(inst, 0, bytes(raw))
+        return inst
     if isinstance(restype, _CDataMeta) and issubclass(restype, CFuncPtr):
         return restype(int(raw))
     if not isinstance(restype, _CDataMeta) and callable(restype):
@@ -2599,9 +3060,12 @@ def _from_closure_arg(argtype, raw):
             return bool(raw)
         return raw
     if issubclass(argtype, (Structure, Union)):
-        # By-reference aggregates: the trampoline delivers the address.
+        # By-value aggregate: the trampoline delivers the raw bytes it
+        # reassembled from registers / stack / hidden pointer.
         inst = _alloc_instance(argtype)
-        _write_at(inst, 0, _nat.read_mem(int(raw), _info_req(argtype).size))
+        if isinstance(raw, int):
+            raw = _nat.read_mem(raw, _info_req(argtype).size)
+        _write_at(inst, 0, bytes(raw))
         return inst
     return raw
 
@@ -2616,6 +3080,9 @@ def _to_closure_result(restype, result):
         info = _info_req(restype)
         if isinstance(result, _SimpleCData):
             result = result.value
+        if info.code == "O":
+            # py_object: the trampoline mints the owned PyObject* itself.
+            return result
         _simple_set(info.code, tmp, result, 0, False)
         raw = _simple_get(info.code, tmp, 0, False)
         if info.code in ("z", "Z", "P"):
@@ -2634,21 +3101,51 @@ def _to_closure_result(restype, result):
     return result
 
 
-def _make_closure(funcptr, callable_):
+class CThunkObject:
+    """CPython `_ctypes.CThunkObject`: owns a callback's Python callable
+    and its native closure. Freed with the thunk (test_issue_7959)."""
+
+    __slots__ = ("_callable", "_closure", "__weakref__")
+    __module__ = "_ctypes"
+
+    def __init__(self, *args, **kwargs):
+        raise TypeError("cannot create 'CThunkObject' instances")
+
+    def __del__(self):
+        closure = self._closure
+        if closure:
+            object.__setattr__(self, "_closure", 0)
+            _nat.free_closure(closure)
+
+
+def _make_closure(functype, callable_):
     # A real C-callable closure is created by the native bridge. The native
     # trampoline can only marshal primitives, so wrap the user callable so it
     # (a) rebuilds each declared argtype from the raw primitive before the
     # call and (b) reduces the return value back to a primitive afterwards.
     # Exceptions are routed to sys.unraisablehook with CPython's exact
     # message shapes (Modules/_ctypes/callbacks.c).
-    functype = type(funcptr)
+    #
+    # The trampoline's environment is a GC-invisible strong reference, so
+    # it must not hold the user callable directly: it reaches it through
+    # a weakref to the thunk (which owns the callable), so a callback that
+    # is only reachable through a cycle with its own CFuncPtr is
+    # collectable.
     argtypes = tuple(functype._argtypes_ or ())
     restype = functype._restype_
     argcodes = [_type_code_for_ffi(t) for t in argtypes]
     rcode = _type_code_for_ffi(restype) if restype is not None else None
+    thunk = object.__new__(CThunkObject)
+    object.__setattr__(thunk, "_callable", callable_)
+    object.__setattr__(thunk, "_closure", 0)
+    owner = _weakref.ref(thunk)
 
     def _closure_entry(*raw):
+        th = owner()
+        callable_ = th._callable if th is not None else None
         try:
+            if callable_ is None:
+                raise RuntimeError("ctypes callback function object is dead")
             conv = [_from_closure_arg(at, val)
                     for at, val in zip(argtypes, raw)]
             if len(raw) > len(argtypes):
@@ -2657,7 +3154,7 @@ def _make_closure(funcptr, callable_):
         except BaseException as exc:
             _nat.unraisable(
                 exc,
-                "Exception ignored on calling ctypes callback function %r"
+                "Exception ignored while calling ctypes callback function %r"
                 % (callable_,))
             return 0
         try:
@@ -2665,11 +3162,13 @@ def _make_closure(funcptr, callable_):
         except BaseException as exc:
             _nat.unraisable(
                 exc,
-                "Exception ignored on converting result of ctypes callback "
-                "function %r" % (callable_,))
+                "Exception ignored while converting result of ctypes "
+                "callback function %r" % (callable_,))
             return 0
 
     try:
-        return _nat.create_closure(_closure_entry, rcode, argcodes)
+        closure = _nat.create_closure(_closure_entry, rcode, argcodes)
     except NotImplementedError:
-        return 0
+        closure = 0
+    object.__setattr__(thunk, "_closure", closure)
+    return thunk

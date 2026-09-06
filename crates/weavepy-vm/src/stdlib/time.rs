@@ -457,7 +457,13 @@ fn time_sleep(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Int(i)) => *i as f64,
         Some(Object::Float(f)) => *f,
         Some(Object::Bool(b)) => f64::from(*b),
-        _ => return Err(type_error("sleep expects a number")),
+        Some(other) => {
+            return Err(type_error(format!(
+                "'{}' object cannot be interpreted as an integer or float",
+                other.type_name()
+            )))
+        }
+        None => return Err(type_error("sleep() takes exactly one argument (0 given)")),
     };
     // PEP 578: audits the *original* argument object, before the
     // negative-value check (test_audit expects a `time.sleep -1` event).

@@ -19,7 +19,6 @@
 //! in the built-in type dicts / the slot-wrapper cache), so their `Rc`
 //! addresses are stable keys.
 
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
@@ -50,9 +49,15 @@ pub struct DescrMeta {
     pub doc: Option<&'static str>,
 }
 
-thread_local! {
-    static DESCR_META: RefCell<HashMap<usize, DescrMeta>> = RefCell::new(HashMap::new());
-}
+/// PROCESS-GLOBAL (not thread-local): the built-in type dicts these
+/// descriptors live in are shared by every OS thread and every
+/// sub-interpreter, so the kind tag must be too. With a thread-local table
+/// a worker thread saw `type(str.lower)` as `builtin_function_or_method`
+/// and `type(FunctionType.__code__)` as `property`, which broke
+/// `inspect.getattr_static` (and so `import traceback`, via `_colorize`'s
+/// dataclasses) in any sub-interpreter created off the main thread.
+static DESCR_META: LazyLock<parking_lot::RwLock<HashMap<usize, DescrMeta>>> =
+    LazyLock::new(|| parking_lot::RwLock::new(HashMap::new()));
 
 /// `__module__` attribution for native builtin functions that do *not*
 /// live in `builtins` (e.g. the `_operator` accelerator, every `os.*` /
@@ -251,47 +256,43 @@ pub fn register(
     // Use the bare type name (a field read) — `qualified_display_name()`
     // would re-borrow `objclass.dict`, which a caller may hold open.
     let qualname = format!("{}.{}", objclass.name, name);
-    DESCR_META.with(|m| {
-        m.borrow_mut().insert(
-            k,
-            DescrMeta {
-                kind,
-                objclass,
-                qualname,
-                name: name.to_owned(),
-                doc,
-            },
-        );
-    });
+    DESCR_META.write().insert(
+        k,
+        DescrMeta {
+            kind,
+            objclass,
+            qualname,
+            name: name.to_owned(),
+            doc,
+        },
+    );
 }
 
 /// The recorded metadata for `obj`, if it was tagged.
 pub fn lookup(obj: &Object) -> Option<DescrMeta> {
     let k = key(obj)?;
-    DESCR_META.with(|m| m.borrow().get(&k).cloned())
+    DESCR_META.read().get(&k).cloned()
 }
 
-thread_local! {
-    /// Per-object `__text_signature__` overrides — Argument-Clinic
-    /// strings attached to descriptors minted at runtime (the
-    /// `_weave_descr.method_descriptor` shim helper), where the static
-    /// name-keyed table in `builtin_text_signature` can't reach.
-    static TEXT_SIGNATURE: RefCell<HashMap<usize, &'static str>> = RefCell::new(HashMap::new());
-}
+/// Per-object `__text_signature__` overrides — Argument-Clinic
+/// strings attached to descriptors minted at runtime (the
+/// `_weave_descr.method_descriptor` shim helper), where the static
+/// name-keyed table in `builtin_text_signature` can't reach.
+/// PROCESS-GLOBAL for the same reason as [`DESCR_META`].
+static TEXT_SIGNATURE: LazyLock<parking_lot::RwLock<HashMap<usize, &'static str>>> =
+    LazyLock::new(|| parking_lot::RwLock::new(HashMap::new()));
 
 /// Attach an Argument-Clinic `__text_signature__` string to `obj`.
 pub fn register_text_signature(obj: &Object, sig: &'static str) {
     if let Some(k) = key(obj) {
-        TEXT_SIGNATURE.with(|m| {
-            m.borrow_mut().insert(k, sig);
-        });
+        TEXT_SIGNATURE.write().insert(k, sig);
     }
 }
 
 /// The `__text_signature__` recorded for `obj`, if any.
 pub fn text_signature_of(obj: &Object) -> Option<&'static str> {
     let k = key(obj)?;
-    TEXT_SIGNATURE.with(|m| m.borrow().get(&k).copied())
+    TEXT_SIGNATURE.read().get(&k).copied()
 }
 
 // ------------------------------------------------------------------

@@ -34,8 +34,13 @@ __all__ = [
     "ParamSpecKwargs",
     "TypeAliasType",
     "Generic",
+    "Union",
     "NoDefault",
 ]
+
+# 3.14: `typing.Union` and `types.UnionType` are the same class, the VM's
+# native union type (`type(int | str)`); the C module re-exports it.
+Union = type(int | str)
 
 
 def _idfunc(*args):
@@ -123,10 +128,10 @@ def _type_check(arg, msg):
 
 
 def _make_union(self, other):
-    # C `make_union` — the nb_or slot for TypeVar/ParamSpec. Produces a
-    # typing.Union (not types.UnionType) to preserve string-forward-ref
-    # support.
-    return _call_typing_func("_make_union", self, other)
+    # C `make_union` — the nb_or slot for TypeVar/ParamSpec: 3.14 builds
+    # the union through `_Py_union_from_tuple`, i.e. `Union[self, other]`
+    # (string operands become ForwardRefs via typing._type_check).
+    return Union[self, other]
 
 
 _ANNOTATE_FORMAT_STRING = 4

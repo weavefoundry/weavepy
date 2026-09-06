@@ -7,37 +7,37 @@
 //! weavepy-0.0.0+gabc1234-aarch64-apple-darwin/
 //! ├── bin/
 //! │   ├── weavepy                  # the release binary
-//! │   ├── python3.13 -> weavepy    # POSIX symlinks
+//! │   ├── python3.14 -> weavepy    # POSIX symlinks
 //! │   ├── python3    -> weavepy
 //! │   ├── python     -> weavepy
 //! │   └── python3-config           # RFC 0075 WS5 (relocatable sh)
 //! ├── lib/
-//! │   ├── weavepy3.13/             # full stdlib tree + .weavepy-complete
-//! │   │   └── site-packages/       #   marker + config-3.13*/Makefile
-//! │   ├── python3.13 -> weavepy3.13
-//! │   ├── libpython3.13.dylib      # RFC 0075 WS5 (the weavepy-pylib
+//! │   ├── weavepy3.14/             # full stdlib tree + .weavepy-complete
+//! │   │   └── site-packages/       #   marker + config-3.14*/Makefile
+//! │   ├── python3.14 -> weavepy3.14
+//! │   ├── libpython3.14.dylib      # RFC 0075 WS5 (the weavepy-pylib
 //! │   │                            #   cdylib; .so.1.0 + .so on Linux)
 //! │   └── pkgconfig/
-//! │       ├── python-3.13.pc       # + python-3.13-embed.pc and the
+//! │       ├── python-3.14.pc       # + python-3.14-embed.pc and the
 //! │       └── ...                  #   python3{,-embed}.pc symlinks
 //! ├── include/
-//! │   └── python3.13/              # RFC 0062 WS2 header set (Python.h,
+//! │   └── python3.14/              # RFC 0062 WS2 header set (Python.h,
 //! │       └── ...                  #   pyconfig.h, cpython/, internal/)
 //! ├── README.md
 //! └── LICENSE-{APACHE,MIT}
 //! ```
 //!
 //! On Windows the artifact takes CPython's NT shape instead (RFC 0063
-//! WS6): `weavepy.exe` plus `python.exe`/`python3.exe`/`python3.13.exe`
+//! WS6): `weavepy.exe` plus `python.exe`/`python3.exe`/`python3.14.exe`
 //! sit at the *prefix root* as real file copies — no `bin/`, no symlinks
 //! anywhere in the artifact — and the default format is `zip` (written
-//! by bsdtar's `tar -a`). The exes are thin shims over `python313.dll`,
+//! by bsdtar's `tar -a`). The exes are thin shims over `python314.dll`,
 //! which also sits at the prefix root (RFC 0064 WS1), with its MSVC
-//! import library at `{prefix}\libs\python313.lib` (WS3 — setuptools'
+//! import library at `{prefix}\libs\python314.lib` (WS3 — setuptools'
 //! `library_dirs` convention). Headers live at `{prefix}\Include`
 //! (CPython's NT shape, where sysconfig's `nt` scheme points); `lib/`
 //! is unchanged and the RFC 0053 landmark walk finds
-//! `{prefix}/lib/weavepy3.13` from the exe's own directory, so nothing
+//! `{prefix}/lib/weavepy3.14` from the exe's own directory, so nothing
 //! else moves.
 //!
 //! Rather than reimplementing the stdlib writer, `build` runs the packaged
@@ -56,7 +56,7 @@
 //! materialize fallback shows up as a check failure instead of silently
 //! rescuing a broken artifact). The legs:
 //!
-//! 1. `version`  — `python3 -V` exits 0 and reports 3.13.
+//! 1. `version`  — `python3 -V` exits 0 and reports 3.14.
 //! 2. `identity` — `sys.prefix`/`base_prefix`/`executable`/`_stdlib_dir`
 //!    all resolve inside the artifact; `sysconfig`'s include dir exists
 //!    and carries `Python.h` + `pyconfig.h`, and matches `INCLUDEPY`.
@@ -68,11 +68,11 @@
 //! 5. `pip`      — offline `pip install` in the venv (needs `--wheels`).
 //! 6. `cext`     — compile + import a minimal C extension against the
 //!    shipped headers: unix via the `sysconfig` compiler vars (needs cc),
-//!    Windows via MSVC `cl /LD` against `libs\python313.lib` (RFC 0064
+//!    Windows via MSVC `cl /LD` against `libs\python314.lib` (RFC 0064
 //!    WS3; SKIP when no toolchain is installed).
 //! 7. `embed`    — RFC 0075 WS5: compile a C program against the shipped
 //!    headers with `bin/python3-config --cflags/--ldflags --embed`, link
-//!    it to `libpython3.13`, and run it: two full
+//!    it to `libpython3.14`, and run it: two full
 //!    `Py_InitializeFromConfig` → `PyRun_SimpleString` → `Py_FinalizeEx`
 //!    cycles plus a `Py_AtExit` callback, under the same scrubbed
 //!    environment — the embedded runtime must self-locate the stdlib
@@ -258,7 +258,7 @@ fn resolve_weavepy(workspace: &Path, explicit: Option<&Path>) -> Result<PathBuf>
 /// The POSIX runtime shared library (RFC 0075 WS5), which must sit
 /// next to the exe being packaged (cargo writes both into
 /// `target/<profile>/`). The artifact ships it renamed to CPython's
-/// conventional `libpython3.13.*` spelling — `weavepy-pylib`'s
+/// conventional `libpython3.14.*` spelling — `weavepy-pylib`'s
 /// build.rs already stamped that install name/soname — so embedders
 /// built with the shipped `python3-config` link and run against it.
 #[cfg(unix)]
@@ -267,9 +267,9 @@ fn resolve_posix_runtime(weavepy: &Path) -> Result<PathBuf> {
         .parent()
         .context("weavepy binary path has no parent directory")?;
     let file = if cfg!(target_os = "macos") {
-        "libpython313.dylib"
+        "libpython314.dylib"
     } else {
-        "libpython313.so"
+        "libpython314.so"
     };
     let lib = dir.join(file);
     if !lib.is_file() {
@@ -287,18 +287,18 @@ fn resolve_posix_runtime(weavepy: &Path) -> Result<PathBuf> {
 /// `target/<profile>/` — RFC 0064 WS1/WS3). The exe is a thin shim
 /// over the DLL, so a Windows artifact without it would not even
 /// start; the import library is what `pip install` of a C sdist
-/// links (`{prefix}\libs\python313.lib`, setuptools' convention).
+/// links (`{prefix}\libs\python314.lib`, setuptools' convention).
 #[cfg(windows)]
 fn resolve_windows_runtime(weavepy: &Path) -> Result<(PathBuf, PathBuf)> {
     let dir = weavepy
         .parent()
         .context("weavepy binary path has no parent directory")?;
-    let dll = dir.join("python313.dll");
-    // rustc names the cdylib's import library `python313.dll.lib`.
-    let implib = dir.join("python313.dll.lib");
+    let dll = dir.join("python314.dll");
+    // rustc names the cdylib's import library `python314.dll.lib`.
+    let implib = dir.join("python314.dll.lib");
     if !dll.is_file() || !implib.is_file() {
         bail!(
-            "python313.dll / python313.dll.lib not found next to {} — the Windows exe is a \
+            "python314.dll / python314.dll.lib not found next to {} — the Windows exe is a \
              shim over the runtime DLL (RFC 0064); build both with \
              `cargo build --release -p weavepy-cli -p weavepy-pylib`",
             weavepy.display()
@@ -424,31 +424,31 @@ fn build_artifact(workspace: &Path, weavepy: &Path, out: &Path, format: Format) 
         // `bin/`), all as real file copies — NTFS symlinks need
         // privileges, so nothing in the artifact may depend on them.
         // The landmark walk starts at the exe's own directory, so
-        // `{prefix}/lib/weavepy3.13` is found on the first probe.
-        for name in ["weavepy", "python", "python3", "python3.13"] {
+        // `{prefix}/lib/weavepy3.14` is found on the first probe.
+        for name in ["weavepy", "python", "python3", "python3.14"] {
             let dest = staging.join(exe_name(name));
             std::fs::copy(weavepy, &dest).with_context(|| {
                 format!("failed to copy {} to {}", weavepy.display(), dest.display())
             })?;
         }
-        // RFC 0064 WS3 — the binary ABI. `python313.dll` sits beside
+        // RFC 0064 WS3 — the binary ABI. `python314.dll` sits beside
         // the exes at the prefix root (the shim's first probe and
         // where a `.pyd`'s PE import resolves from), and the MSVC
-        // import library ships as `libs\python313.lib` — the exact
+        // import library ships as `libs\python314.lib` — the exact
         // path setuptools' `library_dirs` convention
         // (`{sys.base_exec_prefix}\libs`) and pyconfig.h's autolink
         // pragma expect.
         #[cfg(windows)]
         {
             let (dll, implib) = resolve_windows_runtime(weavepy)?;
-            let dll_dest = staging.join("python313.dll");
+            let dll_dest = staging.join("python314.dll");
             std::fs::copy(&dll, &dll_dest).with_context(|| {
                 format!("failed to copy {} to {}", dll.display(), dll_dest.display())
             })?;
             let libs_dir = staging.join("libs");
             std::fs::create_dir_all(&libs_dir)
                 .with_context(|| format!("failed to create {}", libs_dir.display()))?;
-            let implib_dest = libs_dir.join("python313.lib");
+            let implib_dest = libs_dir.join("python314.lib");
             std::fs::copy(&implib, &implib_dest).with_context(|| {
                 format!(
                     "failed to copy {} to {}",
@@ -472,7 +472,7 @@ fn build_artifact(workspace: &Path, weavepy: &Path, out: &Path, format: Format) 
             std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
                 .with_context(|| format!("failed to chmod {}", dest.display()))?;
         }
-        for shim in ["python3", "python", "python3.13"] {
+        for shim in ["python3", "python", "python3.14"] {
             #[cfg(unix)]
             {
                 std::os::unix::fs::symlink("weavepy", bin_dir.join(shim))
@@ -528,13 +528,13 @@ fn build_artifact(workspace: &Path, weavepy: &Path, out: &Path, format: Format) 
 
 /// RFC 0075 WS5 — assemble the POSIX embedding kit into `staging`:
 ///
-/// * `lib/libpython3.13.dylib` (macOS) or `lib/libpython3.13.so.1.0`
-///   plus the `libpython3.13.so` linker-name symlink (ELF) — the
+/// * `lib/libpython3.14.dylib` (macOS) or `lib/libpython3.14.so.1.0`
+///   plus the `libpython3.14.so` linker-name symlink (ELF) — the
 ///   `weavepy-pylib` cdylib, renamed to the identity its install
 ///   name/soname already carries (stamped by that crate's build.rs).
 /// * `bin/python3-config` — CPython's sh flavour, relocatable: the
 ///   prefix is computed from the script's own location at run time.
-/// * `lib/pkgconfig/python-3.13{,-embed}.pc` + `python3{,-embed}.pc`
+/// * `lib/pkgconfig/python-3.14{,-embed}.pc` + `python3{,-embed}.pc`
 ///   symlinks, relocatable through `${pcfiledir}`.
 #[cfg(unix)]
 fn write_embed_kit(weavepy: &Path, staging: &Path, ext_suffix: &str) -> Result<()> {
@@ -545,9 +545,9 @@ fn write_embed_kit(weavepy: &Path, staging: &Path, ext_suffix: &str) -> Result<(
     std::fs::create_dir_all(&lib_dir)
         .with_context(|| format!("failed to create {}", lib_dir.display()))?;
     let shipped_name = if cfg!(target_os = "macos") {
-        "libpython3.13.dylib"
+        "libpython3.14.dylib"
     } else {
-        "libpython3.13.so.1.0"
+        "libpython3.14.so.1.0"
     };
     let lib_dest = lib_dir.join(shipped_name);
     std::fs::copy(&runtime, &lib_dest).with_context(|| {
@@ -560,10 +560,10 @@ fn write_embed_kit(weavepy: &Path, staging: &Path, ext_suffix: &str) -> Result<(
     std::fs::set_permissions(&lib_dest, std::fs::Permissions::from_mode(0o755))
         .with_context(|| format!("failed to chmod {}", lib_dest.display()))?;
     if !cfg!(target_os = "macos") {
-        // The ELF linker name (`-lpython3.13` resolves this); the
+        // The ELF linker name (`-lpython3.14` resolves this); the
         // soname inside the file points loaders at the `.so.1.0`.
-        std::os::unix::fs::symlink(shipped_name, lib_dir.join("libpython3.13.so"))
-            .context("failed to symlink lib/libpython3.13.so")?;
+        std::os::unix::fs::symlink(shipped_name, lib_dir.join("libpython3.14.so"))
+            .context("failed to symlink lib/libpython3.14.so")?;
     }
 
     let config_path = staging.join("bin").join("python3-config");
@@ -573,20 +573,20 @@ fn write_embed_kit(weavepy: &Path, staging: &Path, ext_suffix: &str) -> Result<(
         .with_context(|| format!("failed to chmod {}", config_path.display()))?;
     std::os::unix::fs::symlink(
         "python3-config",
-        staging.join("bin").join("python3.13-config"),
+        staging.join("bin").join("python3.14-config"),
     )
-    .context("failed to symlink bin/python3.13-config")?;
+    .context("failed to symlink bin/python3.14-config")?;
 
     let pc_dir = lib_dir.join("pkgconfig");
     std::fs::create_dir_all(&pc_dir)
         .with_context(|| format!("failed to create {}", pc_dir.display()))?;
-    std::fs::write(pc_dir.join("python-3.13.pc"), pkgconfig_pc(false))
-        .context("failed to write python-3.13.pc")?;
-    std::fs::write(pc_dir.join("python-3.13-embed.pc"), pkgconfig_pc(true))
-        .context("failed to write python-3.13-embed.pc")?;
-    std::os::unix::fs::symlink("python-3.13.pc", pc_dir.join("python3.pc"))
+    std::fs::write(pc_dir.join("python-3.14.pc"), pkgconfig_pc(false))
+        .context("failed to write python-3.14.pc")?;
+    std::fs::write(pc_dir.join("python-3.14-embed.pc"), pkgconfig_pc(true))
+        .context("failed to write python-3.14-embed.pc")?;
+    std::os::unix::fs::symlink("python-3.14.pc", pc_dir.join("python3.pc"))
         .context("failed to symlink python3.pc")?;
-    std::os::unix::fs::symlink("python-3.13-embed.pc", pc_dir.join("python3-embed.pc"))
+    std::os::unix::fs::symlink("python-3.14-embed.pc", pc_dir.join("python3-embed.pc"))
         .context("failed to symlink python3-embed.pc")?;
     Ok(())
 }
@@ -620,7 +620,7 @@ bindir=$(cd "$(dirname -- "$0")" && pwd -P)
 prefix=$(dirname -- "$bindir")
 exec_prefix="$prefix"
 
-VERSION="3.13"
+VERSION="3.14"
 ABIFLAGS=""
 EXT_SUFFIX="{ext_suffix}"
 includedir="$prefix/include"
@@ -690,8 +690,8 @@ done
     )
 }
 
-/// A relocatable pkg-config file (`python-3.13.pc` /
-/// `python-3.13-embed.pc`): `${pcfiledir}` is the directory holding
+/// A relocatable pkg-config file (`python-3.14.pc` /
+/// `python-3.14-embed.pc`): `${pcfiledir}` is the directory holding
 /// the `.pc` file itself (`{prefix}/lib/pkgconfig`), so the prefix
 /// travels with the artifact. The embed flavour links the runtime;
 /// the plain flavour (extension builds) does not, per PEP 587-era
@@ -699,7 +699,7 @@ done
 #[cfg(unix)]
 fn pkgconfig_pc(embed: bool) -> String {
     let (name, libs) = if embed {
-        ("Python (embed)", "-L${libdir} -lpython3.13")
+        ("Python (embed)", "-L${libdir} -lpython3.14")
     } else {
         ("Python", "")
     };
@@ -711,12 +711,12 @@ fn pkgconfig_pc(embed: bool) -> String {
          includedir=${{prefix}}/include\n\
          \n\
          Name: {name}\n\
-         Description: Embed WeavePy (CPython 3.13-compatible) into an application\n\
+         Description: Embed WeavePy (CPython 3.14-compatible) into an application\n\
          Requires:\n\
-         Version: 3.13\n\
+         Version: 3.14\n\
          Libs.private: -lm\n\
          Libs: {libs}\n\
-         Cflags: -I${{includedir}}/python3.13\n"
+         Cflags: -I${{includedir}}/python3.14\n"
     )
 }
 
@@ -787,7 +787,7 @@ fn artifact_readme(name: &str) -> String {
         format!(
             "# {name}\n\
              \n\
-             A relocatable build of WeavePy, a Python 3.13-compatible interpreter.\n\
+             A relocatable build of WeavePy, a Python 3.14-compatible interpreter.\n\
              \n\
              ## Usage\n\
              \n\
@@ -797,7 +797,7 @@ fn artifact_readme(name: &str) -> String {
              .\\python3.exe\n\
              ```\n\
              \n\
-             The exes are thin shims over `python313.dll` at the artifact root —\n\
+             The exes are thin shims over `python314.dll` at the artifact root —\n\
              the runtime itself, and what C extensions link against (the CPython\n\
              Windows convention; POSIX artifacts use `bin/` symlinks instead).\n\
              The layout is self-locating — no environment variables are required.\n\
@@ -813,8 +813,8 @@ fn artifact_readme(name: &str) -> String {
              ```\n\
              \n\
              Building C extensions from source needs MSVC (Visual Studio Build\n\
-             Tools): the CPython 3.13 header set ships under `Include\\` and the\n\
-             import library under `libs\\python313.lib`, the paths setuptools\n\
+             Tools): the CPython 3.14 header set ships under `Include\\` and the\n\
+             import library under `libs\\python314.lib`, the paths setuptools\n\
              uses by convention.\n\
              \n\
              ## License\n\
@@ -825,7 +825,7 @@ fn artifact_readme(name: &str) -> String {
         format!(
             "# {name}\n\
              \n\
-             A relocatable build of WeavePy, a Python 3.13-compatible interpreter.\n\
+             A relocatable build of WeavePy, a Python 3.14-compatible interpreter.\n\
              \n\
              ## Usage\n\
              \n\
@@ -842,7 +842,7 @@ fn artifact_readme(name: &str) -> String {
              ```\n\
              \n\
              `bin/weavepy` is the real binary; `python`, `python3`, and\n\
-             `python3.13` are symlinks to it (Windows artifacts instead place\n\
+             `python3.14` are symlinks to it (Windows artifacts instead place\n\
              `python.exe` and friends at the archive root). The layout is\n\
              self-locating — no environment variables are required.\n\
              \n\
@@ -856,14 +856,14 @@ fn artifact_readme(name: &str) -> String {
              .venv/bin/python -m pip install <package>\n\
              ```\n\
              \n\
-             The CPython 3.13 C header set ships under `include/python3.13`\n\
+             The CPython 3.14 C header set ships under `include/python3.14`\n\
              (what `sysconfig.get_paths()[\"include\"]` reports), so building\n\
              C extensions from source — `pip install --no-binary` of sdists —\n\
              works with a C compiler on PATH.\n\
              \n\
              ## Embedding\n\
              \n\
-             The runtime also ships as a shared library (`lib/libpython3.13.*`)\n\
+             The runtime also ships as a shared library (`lib/libpython3.14.*`)\n\
              with `bin/python3-config` and pkg-config files, so applications\n\
              that embed CPython can link WeavePy the same way:\n\
              \n\
@@ -1191,7 +1191,7 @@ fn leg_version(python3: &Path, env: &[(OsString, OsString)]) -> Leg {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout).trim().to_owned();
             let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
-            if out.status.success() && (stdout.contains("3.13") || stderr.contains("3.13")) {
+            if out.status.success() && (stdout.contains("3.14") || stderr.contains("3.14")) {
                 Leg {
                     name: "version",
                     status: LegStatus::Pass,
@@ -1202,7 +1202,7 @@ fn leg_version(python3: &Path, env: &[(OsString, OsString)]) -> Leg {
                     name: "version",
                     status: LegStatus::Fail,
                     detail: format!(
-                        "`python3 -V` exited {} without reporting 3.13\nstdout: {stdout}\nstderr: {stderr}",
+                        "`python3 -V` exited {} without reporting 3.14\nstdout: {stdout}\nstderr: {stderr}",
                         out.status
                     ),
                 }
@@ -1558,7 +1558,7 @@ fn leg_embed(prefix: &Path, scratch: &Path, env: &[(OsString, OsString)]) -> Leg
                 Leg {
                     name: "embed",
                     status: LegStatus::Pass,
-                    detail: "two init→run→finalize cycles through libpython3.13".to_owned(),
+                    detail: "two init→run→finalize cycles through libpython3.14".to_owned(),
                 }
             } else {
                 fail(format!(
@@ -1728,7 +1728,7 @@ assert exe_dir == want_exe_dir, (
     f"sys.executable={sys.executable!r} not in {want_exe_dir!r}"
 )
 stdlib = os.path.realpath(sys._stdlib_dir)
-want_stdlib = os.path.join(expect, "lib", "weavepy3.13")
+want_stdlib = os.path.join(expect, "lib", "weavepy3.14")
 assert stdlib == want_stdlib, f"sys._stdlib_dir={sys._stdlib_dir!r} != {want_stdlib!r}"
 inc = sysconfig.get_paths()["include"]
 assert os.path.isdir(inc), f"sysconfig include dir missing: {inc!r}"
@@ -1855,7 +1855,7 @@ print("cext ok:", mod_path)
 
 /// The Windows twin of [`CEXT_SCRIPT`] (RFC 0064 WS3): same inline
 /// module, but built with MSVC `cl /LD` against the shipped
-/// `Include\` headers and linked against `libs\python313.lib` (found
+/// `Include\` headers and linked against `libs\python314.lib` (found
 /// via the pyconfig.h autolink pragma + `/LIBPATH`, exactly what
 /// setuptools does). MSVC is discovered the way setuptools' msvc
 /// module does it — `cl` already on PATH, else vswhere →
@@ -1870,8 +1870,8 @@ libs = os.path.join(sys.base_exec_prefix, "libs")
 assert includepy and os.path.isfile(os.path.join(includepy, "Python.h")), (
     f"no Python.h under INCLUDEPY={includepy!r}"
 )
-assert os.path.isfile(os.path.join(libs, "python313.lib")), (
-    f"no python313.lib under {libs!r}"
+assert os.path.isfile(os.path.join(libs, "python314.lib")), (
+    f"no python314.lib under {libs!r}"
 )
 
 

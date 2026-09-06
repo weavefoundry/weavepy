@@ -24,7 +24,8 @@
 //!   test_fork1.test_threaded_import_lock_fork).
 //! - `extension_suffixes()` — same list as
 //!   `importlib.machinery.EXTENSION_SUFFIXES`.
-//! - `get_magic()` — `MAGIC_NUMBER` bytes (4 bytes).
+//! - `get_magic()` — `MAGIC_NUMBER` bytes (4 bytes); `pyc_magic_number_token`
+//!   — the same value as 3.14's 32-bit little-endian int.
 //! - `source_hash(source_bytes)` — siphash13-derived 8-byte
 //!   digest (matches `importlib.util.source_hash`).
 
@@ -336,6 +337,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         d.insert(
             DictKey(Object::from_static("get_magic")),
             builtin("get_magic", imp_get_magic),
+        );
+        d.insert(
+            DictKey(Object::from_static("pyc_magic_number_token")),
+            pyc_magic_number_token(),
         );
         d.insert(
             DictKey(Object::from_static("source_hash")),
@@ -866,12 +871,19 @@ fn imp_extension_suffixes(_args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn imp_get_magic(_args: &[Object]) -> Result<Object, RuntimeError> {
-    // CPython 3.13's bytecode magic (`importlib.util.MAGIC_NUMBER`,
-    // RFC 0033). WeavePy keeps a distinct *cache tag*
-    // (`weavepy-313`) so its `.pyc` files never collide with
-    // CPython's `cpython-313` artifacts, which lets us adopt the
+    // CPython's bytecode magic (`importlib.util.MAGIC_NUMBER`, RFC
+    // 0033; 3.14's 3627 since RFC 0077 WS9). WeavePy keeps a distinct
+    // *cache tag* (`weavepy-314`) so its `.pyc` files never collide
+    // with CPython's `cpython-314` artifacts, which lets us adopt the
     // real magic number for tool interop without ambiguity.
-    Ok(Object::Bytes(Rc::from(b"\xf3\x0d\x0d\x0a".as_slice())))
+    Ok(Object::Bytes(Rc::from(crate::pycache::MAGIC.as_slice())))
+}
+
+/// `_imp.pyc_magic_number_token`: 3.14 moved the magic constant into
+/// C; `importlib._bootstrap_external` derives `MAGIC_NUMBER` from this
+/// 32-bit little-endian token (`3627 | b"\r\n" << 16`).
+fn pyc_magic_number_token() -> Object {
+    Object::Int(i64::from(u32::from_le_bytes(*crate::pycache::MAGIC)))
 }
 
 /// `_imp.source_hash(key, source)` — deterministic 8-byte hash

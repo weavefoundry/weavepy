@@ -208,8 +208,7 @@ fn fold_stmt(stmt: &mut Stmt, pep563: bool) {
         StmtKind::Match { subject, cases } => {
             fold_expr(subject, true);
             for case in cases {
-                // Patterns keep their literal shapes (codegen folds
-                // pattern literals itself); guard and body fold.
+                fold_pattern(&mut case.pattern);
                 if let Some(g) = &mut case.guard {
                     fold_expr(g, true);
                 }
@@ -235,6 +234,76 @@ fn fold_stmt(stmt: &mut Stmt, pep563: bool) {
         | StmtKind::Pass
         | StmtKind::Break
         | StmtKind::Continue => {}
+    }
+}
+
+/// `astfold_pattern`: the one AST-level constant fold 3.14 kept is the
+/// formation of negative and complex literals in `MatchValue` values
+/// and `MatchMapping` keys (`case -0.0:`, `case 1 - 2j:`), so those
+/// land in `co_consts` as single constants in pattern order.
+fn fold_pattern(pat: &mut weavepy_parser::ast::Pattern) {
+    use weavepy_parser::ast::PatternKind;
+    match &mut pat.kind {
+        PatternKind::Value(e) => fold_const_match_pattern(e),
+        PatternKind::Singleton(_) | PatternKind::Capture(_) | PatternKind::Star(_) => {}
+        PatternKind::Sequence(items) | PatternKind::Or(items) => {
+            for p in items {
+                fold_pattern(p);
+            }
+        }
+        PatternKind::Mapping { keys, patterns, .. } => {
+            for k in keys {
+                fold_const_match_pattern(k);
+            }
+            for p in patterns {
+                fold_pattern(p);
+            }
+        }
+        PatternKind::Class {
+            cls,
+            positionals,
+            keywords,
+        } => {
+            fold_expr(cls, true);
+            for p in positionals {
+                fold_pattern(p);
+            }
+            for (_, p) in keywords {
+                fold_pattern(p);
+            }
+        }
+        PatternKind::As { pattern, .. } => fold_pattern(pattern),
+    }
+}
+
+/// `fold_const_match_patterns`: `-<const>` and `<const> +/- <const>`.
+fn fold_const_match_pattern(e: &mut Expr) {
+    let folded = match &mut e.kind {
+        ExprKind::UnaryOp {
+            op: UnaryOp::USub,
+            operand,
+        } => match &operand.kind {
+            ExprKind::Constant(c) => eval_unaryop_const(UnaryOp::USub, c),
+            _ => None,
+        },
+        ExprKind::BinOp {
+            left,
+            op: op @ (BinOp::Add | BinOp::Sub),
+            right,
+        } => match &right.kind {
+            ExprKind::Constant(rc) => {
+                fold_const_match_pattern(left);
+                match &left.kind {
+                    ExprKind::Constant(lc) => eval_binop_const(lc, *op, rc),
+                    _ => None,
+                }
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(c) = folded {
+        e.kind = ExprKind::Constant(c);
     }
 }
 
@@ -803,21 +872,40 @@ fn eval_binop(lv: &Constant, op: BinOp, rv: &Constant) -> Option<Constant> {
     }
 }
 
+/// Which operands of a complex operation are complex (3.14's mixed-mode
+/// arithmetic, gh-69639: a real operand touches only the real part, so
+/// `1 - 0j` folds to `(1-0j)` and `(1+2j) - 1` to `2j`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ComplexSides {
+    Both,
+    LeftOnly,
+    RightOnly,
+}
+
+fn complex_sides(lv: &Constant, rv: &Constant) -> ComplexSides {
+    match (is_complex_kind(lv), is_complex_kind(rv)) {
+        (true, false) => ComplexSides::LeftOnly,
+        (false, true) => ComplexSides::RightOnly,
+        _ => ComplexSides::Both,
+    }
+}
+
 /// Numeric-only op with per-domain implementations (int exact, float
-/// IEEE, complex componentwise). Mixed operands promote upward.
+/// IEEE, complex following `complexobject.c`). Mixed operands promote
+/// upward.
 fn eval_numeric(
     lv: &Constant,
     rv: &Constant,
     int_op: impl Fn(BigInt, BigInt) -> BigInt,
     float_op: impl Fn(f64, f64) -> Option<f64>,
-    complex_op: impl Fn((f64, f64), (f64, f64)) -> Option<(f64, f64)>,
+    complex_op: impl Fn((f64, f64), (f64, f64), ComplexSides) -> Option<(f64, f64)>,
 ) -> Option<Constant> {
     if !is_numeric(lv) || !is_numeric(rv) {
         return None;
     }
     if is_complex_kind(lv) || is_complex_kind(rv) {
         let (a, b) = (complex_of(lv)?, complex_of(rv)?);
-        return complex_op(a, b).map(|(r, i)| Constant::Complex(r, i));
+        return complex_op(a, b, complex_sides(lv, rv)).map(|(r, i)| Constant::Complex(r, i));
     }
     if is_float_kind(lv) || is_float_kind(rv) {
         let (a, b) = (float_of(lv)?, float_of(rv)?);
@@ -826,8 +914,12 @@ fn eval_numeric(
     Some(int_const(int_op(int_of(lv)?, int_of(rv)?)))
 }
 
-fn c_sub(a: (f64, f64), b: (f64, f64)) -> Option<(f64, f64)> {
-    Some((a.0 - b.0, a.1 - b.1))
+fn c_sub(a: (f64, f64), b: (f64, f64), sides: ComplexSides) -> Option<(f64, f64)> {
+    Some(match sides {
+        ComplexSides::Both => (a.0 - b.0, a.1 - b.1),
+        ComplexSides::LeftOnly => (a.0 - b.0, a.1),
+        ComplexSides::RightOnly => (a.0 - b.0, -b.1),
+    })
 }
 
 fn eval_add(lv: &Constant, rv: &Constant) -> Option<Constant> {
@@ -837,7 +929,13 @@ fn eval_add(lv: &Constant, rv: &Constant) -> Option<Constant> {
             rv,
             |a, b| a + b,
             |a, b| Some(a + b),
-            |a, b| Some((a.0 + b.0, a.1 + b.1)),
+            |a, b, sides| {
+                Some(match sides {
+                    ComplexSides::Both => (a.0 + b.0, a.1 + b.1),
+                    ComplexSides::LeftOnly => (a.0 + b.0, a.1),
+                    ComplexSides::RightOnly => (b.0 + a.0, b.1),
+                })
+            },
         );
     }
     if let (Some(a), Some(b)) = (str_points(lv), str_points(rv)) {
@@ -874,7 +972,13 @@ fn eval_mult(lv: &Constant, rv: &Constant) -> Option<Constant> {
             rv,
             |a, b| a * b,
             |a, b| Some(a * b),
-            |a, b| Some(c_mul(a, b)),
+            |a, b, sides| {
+                Some(match sides {
+                    ComplexSides::Both => c_mul(a, b),
+                    ComplexSides::LeftOnly => (a.0 * b.0, a.1 * b.0),
+                    ComplexSides::RightOnly => (b.0 * a.0, b.1 * a.0),
+                })
+            },
         );
     }
     // int * str/bytes/tuple with the ast_opt size caps.
@@ -924,8 +1028,45 @@ fn eval_mult(lv: &Constant, rv: &Constant) -> Option<Constant> {
     }
 }
 
-fn c_mul(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
-    (a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0)
+/// `_Py_c_prod`, including C11 Annex G.5.1's recovery of infinities
+/// that computed as `nan+nanj`.
+fn c_mul(z: (f64, f64), w: (f64, f64)) -> (f64, f64) {
+    let (a, b, c, d) = (z.0, z.1, w.0, w.1);
+    let (ac, bd, ad, bc) = (a * c, b * d, a * d, b * c);
+    let (mut re, mut im) = (ac - bd, ad + bc);
+    if re.is_nan() && im.is_nan() {
+        let (mut a, mut b, mut c, mut d) = (a, b, c, d);
+        let box_inf = |x: f64| (if x.is_infinite() { 1.0f64 } else { 0.0 }).copysign(x);
+        let zero_nan = |x: f64| if x.is_nan() { 0.0f64.copysign(x) } else { x };
+        let mut recalc = false;
+        if a.is_infinite() || b.is_infinite() {
+            a = box_inf(a);
+            b = box_inf(b);
+            c = zero_nan(c);
+            d = zero_nan(d);
+            recalc = true;
+        }
+        if c.is_infinite() || d.is_infinite() {
+            c = box_inf(c);
+            d = box_inf(d);
+            a = zero_nan(a);
+            b = zero_nan(b);
+            recalc = true;
+        }
+        if !recalc && (ac.is_infinite() || bd.is_infinite() || ad.is_infinite() || bc.is_infinite())
+        {
+            a = zero_nan(a);
+            b = zero_nan(b);
+            c = zero_nan(c);
+            d = zero_nan(d);
+            recalc = true;
+        }
+        if recalc {
+            re = f64::INFINITY * (a * c - b * d);
+            im = f64::INFINITY * (a * d + b * c);
+        }
+    }
+    (re, im)
 }
 
 /// CPython's `_Py_c_quot` (Smith's scaled algorithm) — bit-exact with
@@ -955,6 +1096,67 @@ fn c_quot(a: (f64, f64), b: (f64, f64)) -> Option<(f64, f64)> {
     } else {
         Some((f64::NAN, f64::NAN))
     }
+    .map(|(mut re, mut im): (f64, f64)| {
+        // C11 Annex G.5.2: recover infinities and zeros from `nan+nanj`.
+        if re.is_nan() && im.is_nan() {
+            if (areal.is_infinite() || aimag.is_infinite())
+                && breal.is_finite()
+                && bimag.is_finite()
+            {
+                let x = (if areal.is_infinite() { 1.0f64 } else { 0.0 }).copysign(areal);
+                let y = (if aimag.is_infinite() { 1.0f64 } else { 0.0 }).copysign(aimag);
+                re = f64::INFINITY * (x * breal + y * bimag);
+                im = f64::INFINITY * (y * breal - x * bimag);
+            } else if (abs_breal.is_infinite() || abs_bimag.is_infinite())
+                && areal.is_finite()
+                && aimag.is_finite()
+            {
+                let x = (if breal.is_infinite() { 1.0f64 } else { 0.0 }).copysign(breal);
+                let y = (if bimag.is_infinite() { 1.0f64 } else { 0.0 }).copysign(bimag);
+                re = 0.0 * (areal * x + aimag * y);
+                im = 0.0 * (aimag * x - areal * y);
+            }
+        }
+        (re, im)
+    })
+}
+
+/// `_Py_cr_quot`: a complex over a real divides both parts.
+fn cr_quot(a: (f64, f64), b: f64) -> Option<(f64, f64)> {
+    (b != 0.0).then(|| (a.0 / b, a.1 / b))
+}
+
+/// `_Py_rc_quot`: a real over a complex (Smith's algorithm with a zero
+/// imaginary numerator, keeping zero signs exact).
+fn rc_quot(a: f64, b: (f64, f64)) -> Option<(f64, f64)> {
+    let (breal, bimag) = b;
+    let abs_breal = breal.abs();
+    let abs_bimag = bimag.abs();
+    let (mut re, mut im) = if abs_breal >= abs_bimag {
+        if abs_breal == 0.0 {
+            return None;
+        }
+        let ratio = bimag / breal;
+        let denom = breal + bimag * ratio;
+        (a / denom, (-a * ratio) / denom)
+    } else if abs_bimag >= abs_breal {
+        let ratio = breal / bimag;
+        let denom = breal * ratio + bimag;
+        ((a * ratio) / denom, (-a) / denom)
+    } else {
+        (f64::NAN, f64::NAN)
+    };
+    if re.is_nan()
+        && im.is_nan()
+        && a.is_finite()
+        && (abs_breal.is_infinite() || abs_bimag.is_infinite())
+    {
+        let x = (if breal.is_infinite() { 1.0f64 } else { 0.0 }).copysign(breal);
+        let y = (if bimag.is_infinite() { 1.0f64 } else { 0.0 }).copysign(bimag);
+        re = 0.0 * (a * x);
+        im = 0.0 * (-a * y);
+    }
+    Some((re, im))
 }
 
 fn eval_div(lv: &Constant, rv: &Constant) -> Option<Constant> {
@@ -962,7 +1164,13 @@ fn eval_div(lv: &Constant, rv: &Constant) -> Option<Constant> {
         return None;
     }
     if is_complex_kind(lv) || is_complex_kind(rv) {
-        return c_quot(complex_of(lv)?, complex_of(rv)?).map(|(r, i)| Constant::Complex(r, i));
+        let (a, b) = (complex_of(lv)?, complex_of(rv)?);
+        return match complex_sides(lv, rv) {
+            ComplexSides::Both => c_quot(a, b),
+            ComplexSides::LeftOnly => cr_quot(a, b.0),
+            ComplexSides::RightOnly => rc_quot(a.0, b),
+        }
+        .map(|(r, i)| Constant::Complex(r, i));
     }
     if is_float_kind(lv) || is_float_kind(rv) {
         let (a, b) = (float_of(lv)?, float_of(rv)?);
@@ -1109,8 +1317,70 @@ fn eval_pow(lv: &Constant, rv: &Constant) -> Option<Constant> {
         }
         return Some(Constant::Float(a.powf(b)));
     }
-    // complex pow uses CPython's c_powi/c_pow rounding; leave to the VM.
+    if (is_complex_kind(lv) || is_complex_kind(rv)) && is_numeric(lv) && is_numeric(rv) {
+        let (a, b) = (complex_of(lv)?, complex_of(rv)?);
+        // `complex_pow`: a small integral exponent takes the exact
+        // repeated-squaring path (`c_powi`), anything else the polar
+        // form (`_Py_c_pow`). An infinite component in the result is
+        // `_Py_ADJUST_ERANGE2`'s OverflowError; a NaN never sets errno
+        // but is left to the VM regardless (no folded NaN constants).
+        let p = if b.1 == 0.0 && b.0 == b.0.floor() && b.0.abs() <= 100.0 {
+            c_powi(a, b.0 as i64)?
+        } else {
+            c_pow(a, b)?
+        };
+        if !p.0.is_finite() || !p.1.is_finite() {
+            return None;
+        }
+        return Some(Constant::Complex(p.0, p.1));
+    }
     None
+}
+
+/// `c_powu` / `c_powi`: binary exponentiation by `_Py_c_prod`, the
+/// negative exponent as `1 / x**-n` (`None` on a zero divisor).
+fn c_powi(x: (f64, f64), n: i64) -> Option<(f64, f64)> {
+    let powu = |x: (f64, f64), n: i64| -> (f64, f64) {
+        let mut r = (1.0, 0.0);
+        let mut p = x;
+        let mut mask: i64 = 1;
+        while mask > 0 && n >= mask {
+            if n & mask != 0 {
+                r = c_mul(r, p);
+            }
+            mask <<= 1;
+            p = c_mul(p, p);
+        }
+        r
+    };
+    if n > 0 {
+        Some(powu(x, n))
+    } else {
+        c_quot((1.0, 0.0), powu(x, -n))
+    }
+}
+
+/// `_Py_c_pow`: the general polar-form power; `None` where CPython
+/// sets EDOM (zero to a negative or complex power).
+fn c_pow(a: (f64, f64), b: (f64, f64)) -> Option<(f64, f64)> {
+    if b.0 == 0.0 && b.1 == 0.0 {
+        return Some((1.0, 0.0));
+    }
+    if a.0 == 0.0 && a.1 == 0.0 {
+        if b.1 != 0.0 || b.0 < 0.0 {
+            return None;
+        }
+        return Some((0.0, 0.0));
+    }
+    let vabs = a.0.hypot(a.1);
+    let mut len = vabs.powf(b.0);
+    let at = a.1.atan2(a.0);
+    let mut phase = at * b.0;
+    if b.1 != 0.0 {
+        len *= (-at * b.1).exp();
+        phase += b.1 * vabs.ln();
+    }
+    Some((len * phase.cos(), len * phase.sin()))
 }
 
 // ---------- Python-equality dedup for frozenset folds ----------

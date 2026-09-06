@@ -48,7 +48,7 @@ tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 # RFC 0064 WS1 — the Windows `weavepy.exe` is a thin shim that
-# locates and loads `python313.dll` (built from `weavepy-pylib`) at
+# locates and loads `python314.dll` (built from `weavepy-pylib`) at
 # startup; the shim's only platform dependency is the loader API.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }

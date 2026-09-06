@@ -348,7 +348,10 @@ fn element_size(code: char, endian: Endian) -> Result<usize, RuntimeError> {
             Endian::Native => std::mem::size_of::<libc::c_long>(),
             _ => 4,
         },
-        'q' | 'Q' | 'd' => 8,
+        // 3.14: `F` is a C `float complex` (two binary32), `D` a
+        // `double complex` (two binary64), in every mode.
+        'q' | 'Q' | 'd' | 'F' => 8,
+        'D' => 16,
         'n' | 'N' => match endian {
             Endian::Native => std::mem::size_of::<isize>(),
             // In standard / explicit-endian modes `n`/`N` simply aren't
@@ -368,9 +371,9 @@ fn native_align(code: char) -> usize {
     match code {
         'x' | 'b' | 'B' | 'c' | 's' | 'p' | '?' => 1,
         'h' | 'H' | 'e' => 2,
-        'i' | 'I' | 'f' => 4,
+        'i' | 'I' | 'f' | 'F' => 4,
         'l' | 'L' => std::mem::align_of::<libc::c_long>(),
-        'q' | 'Q' | 'd' => 8,
+        'q' | 'Q' | 'd' | 'D' => 8,
         'n' | 'N' => std::mem::size_of::<isize>(),
         'P' => std::mem::size_of::<usize>(),
         _ => 1,
@@ -505,6 +508,38 @@ fn encode_one(
             out.extend_from_slice(&buf);
             Ok(())
         }
+        'F' => {
+            // `np_float_complex`: real then imaginary, each packed like
+            // `f` (so a component above FLT_MAX is the same OverflowError).
+            let (re, im) = require_complex(value)?;
+            let mut buf = [0u8; 4];
+            for part in [re, im] {
+                let f32v = part as f32;
+                if part.is_finite() && f32v.is_infinite() {
+                    return Err(overflow_error("float too large to pack with f format"));
+                }
+                match endian {
+                    Endian::Native => NativeEndian::write_f32(&mut buf, f32v),
+                    Endian::Standard | Endian::Little => LittleEndian::write_f32(&mut buf, f32v),
+                    Endian::Big => BigEndian::write_f32(&mut buf, f32v),
+                }
+                out.extend_from_slice(&buf);
+            }
+            Ok(())
+        }
+        'D' => {
+            let (re, im) = require_complex(value)?;
+            let mut buf = [0u8; 8];
+            for part in [re, im] {
+                match endian {
+                    Endian::Native => NativeEndian::write_f64(&mut buf, part),
+                    Endian::Standard | Endian::Little => LittleEndian::write_f64(&mut buf, part),
+                    Endian::Big => BigEndian::write_f64(&mut buf, part),
+                }
+                out.extend_from_slice(&buf);
+            }
+            Ok(())
+        }
         'e' => {
             // Half-precision IEEE 754, converted from the double with
             // round-half-to-even (CPython `_PyFloat_Pack2`), not via an
@@ -592,6 +627,14 @@ fn decode_one(code: char, endian: Endian, buf: &[u8]) -> Result<(Object, usize),
             &buf[..4],
         )))),
         'd' => Object::Float(crate::object::tag_unpacked_nan(read_f64(endian, &buf[..8]))),
+        'F' => Object::Complex(Rc::new(crate::object::PyComplex::new(
+            f64::from(read_f32(endian, &buf[..4])),
+            f64::from(read_f32(endian, &buf[4..8])),
+        ))),
+        'D' => Object::Complex(Rc::new(crate::object::PyComplex::new(
+            read_f64(endian, &buf[..8]),
+            read_f64(endian, &buf[8..16]),
+        ))),
         'e' => Object::Float(crate::object::tag_unpacked_nan(f64::from(half_to_f32(
             read_u16(endian, &buf[..2]),
         )))),
@@ -817,6 +860,22 @@ fn require_int(v: &Object) -> Result<i128, RuntimeError> {
 /// `__float__`/`nb_float` (then `__index__`), so a numpy float scalar
 /// (`np.float64`) or any real-number-like object packs correctly instead
 /// of being rejected as "not a float".
+/// `PyComplex_AsCComplex` for the `F`/`D` codes: a complex passes
+/// through, a real coerces with a zero imaginary part (the frozen
+/// wrapper has already run `__complex__`/`__float__`/`__index__`).
+fn require_complex(v: &Object) -> Result<(f64, f64), RuntimeError> {
+    if let Object::Complex(c) = v {
+        return Ok((
+            crate::object::untag_nan(c.real),
+            crate::object::untag_nan(c.imag),
+        ));
+    }
+    match crate::builtins::coerce_f64_opt(v)? {
+        Some(f) => Ok((crate::object::untag_nan(f), 0.0)),
+        None => Err(struct_error("required argument is not a complex")),
+    }
+}
+
 fn require_float(v: &Object) -> Result<f64, RuntimeError> {
     match crate::builtins::coerce_f64_opt(v)? {
         Some(f) => Ok(f),

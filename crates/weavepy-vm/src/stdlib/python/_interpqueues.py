@@ -1,4 +1,4 @@
-"""CPython 3.13's `_interpqueues` — cross-interpreter queues.
+"""CPython 3.14's `_interpqueues` — cross-interpreter queues.
 
 CPython implements this as the C extension
 `Modules/_interpqueuesmodule.c` over a process-global queue registry.
@@ -7,7 +7,14 @@ WeavePy's registry lives in the native `_xxsubinterpreters` module
 frozen shim only adapts calling conventions and retypes backend
 errors into the `_interpqueues` exception hierarchy.
 
-`test.support.interpreters.queues` is the sole stdlib consumer.
+`concurrent.interpreters._queues` (PEP 734) is the sole stdlib consumer.
+
+3.14 replaced the 3.13 `fmt` slot (`_SHARED_ONLY` / `_PICKLED`, chosen
+by the *wrapper*) with a per-queue / per-put `fallback`
+(`_PyXIDATA_XIDATA_ONLY` = 0 / `_PyXIDATA_FULL_FALLBACK` = 1) resolved
+*here*: items cross as cross-interpreter data (`_weave_xidata`), and
+`get()` returns `(obj, unboundop)`. The backend's `fmt` slot now only
+stores a queue's default fallback.
 """
 
 import _xxsubinterpreters as _backend
@@ -64,9 +71,35 @@ def _map_error(exc):
     return QueueError(text)
 
 
-def create(maxsize, fmt, unboundop):
+# Modules/_interpreters_common.h
+_UNBOUND_REMOVE = 1
+_UNBOUND_ERROR = 2
+_UNBOUND_REPLACE = 3
+_XIDATA_ONLY = 0
+_FULL_FALLBACK = 1
+
+
+def _resolve_unboundop(arg, default):
+    if arg < 0:
+        return default
+    if arg in (_UNBOUND_REMOVE, _UNBOUND_ERROR, _UNBOUND_REPLACE):
+        return arg
+    raise ValueError(f'unsupported unboundop {arg}')
+
+
+def _resolve_fallback(arg, default):
+    if arg < 0:
+        return default
+    if arg in (_XIDATA_ONLY, _FULL_FALLBACK):
+        return arg
+    raise ValueError(f'unsupported fallback {arg}')
+
+
+def create(maxsize, unboundop=-1, fallback=-1):
+    unboundop = _resolve_unboundop(unboundop, _UNBOUND_REPLACE)
+    fallback = _resolve_fallback(fallback, _FULL_FALLBACK)
     try:
-        return _backend.queue_create(maxsize, fmt, unboundop)
+        return _backend.queue_create(maxsize, fallback, unboundop)
     except (RuntimeError, ValueError) as exc:
         raise _map_error(exc) from None
 
@@ -80,16 +113,18 @@ def destroy(qid):
 
 def list_all():
     try:
-        return [tuple(entry) for entry in _backend.queue_list_all()]
+        entries = _backend.queue_list_all()
     except (RuntimeError, ValueError) as exc:
         raise _map_error(exc) from None
+    return [(qid, unboundop, fallback) for qid, fallback, unboundop in entries]
 
 
 def get_queue_defaults(qid):
     try:
-        return tuple(_backend.queue_get_defaults(int(qid)))
+        fallback, unboundop = _backend.queue_get_defaults(int(qid))
     except (RuntimeError, ValueError) as exc:
         raise _map_error(exc) from None
+    return (unboundop, fallback)
 
 
 def bind(qid):
@@ -127,25 +162,28 @@ def get_count(qid):
         raise _map_error(exc) from None
 
 
-def put(qid, obj, fmt, unboundop):
+def put(qid, obj, unboundop=-1, fallback=-1):
+    qid = int(qid)
+    if unboundop < 0 or fallback < 0:
+        default_unboundop, default_fallback = get_queue_defaults(qid)
+    else:
+        default_unboundop = default_fallback = None
+    unboundop = _resolve_unboundop(unboundop, default_unboundop)
+    fallback = _resolve_fallback(fallback, default_fallback)
+    import _weave_xidata
+    payload = _weave_xidata.get_xidata(obj, fallback)
     try:
-        _backend.queue_put(int(qid), obj, fmt, unboundop)
-    except TypeError as exc:
-        if 'not shareable' in str(exc):
-            # `_interpreters.NotShareableError` derives from ValueError
-            # (test_interpreters test_queues asserts
-            # `interpreters.NotShareableError` from `queue.put`).
-            import _interpreters
-            raise _interpreters.NotShareableError(str(exc)) from None
-        raise
+        _backend.queue_put(qid, payload, 0, unboundop)
     except (RuntimeError, ValueError) as exc:
-        if 'not shareable' in str(exc):
-            raise
         raise _map_error(exc) from None
 
 
 def get(qid):
     try:
-        return tuple(_backend.queue_get(int(qid)))
+        obj, _fmt, unboundop = _backend.queue_get(int(qid))
     except (RuntimeError, ValueError) as exc:
         raise _map_error(exc) from None
+    if unboundop is not None:
+        return (None, unboundop)
+    import _weave_xidata
+    return (_weave_xidata.from_xidata(obj), None)

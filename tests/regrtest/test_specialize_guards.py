@@ -103,12 +103,12 @@ try:
     7 // 0
     raise SystemExit("expected ZeroDivisionError")
 except ZeroDivisionError as e:
-    assert str(e) == "integer division or modulo by zero", e
+    assert str(e) == "division by zero", e
 try:
     7.0 / 0.0
     raise SystemExit("expected ZeroDivisionError")
 except ZeroDivisionError as e:
-    assert str(e) == "float division by zero", e
+    assert str(e) == "division by zero", e
 try:
     0 ** -1
     raise SystemExit("expected ZeroDivisionError")

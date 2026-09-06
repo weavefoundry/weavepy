@@ -76,6 +76,7 @@ CHANNEL_BINDING_TYPES = []
 HAS_NEVER_CHECK_COMMON_NAME = True
 HAS_PSK = False                      # external PSK key exchange not exposed
 HAS_PSK_TLS13 = False
+HAS_PHA = False                      # TLS 1.3 post-handshake auth not exposed
 
 OPENSSL_VERSION = _ssl.OPENSSL_VERSION
 OPENSSL_VERSION_NUMBER = _ssl.OPENSSL_VERSION_NUMBER

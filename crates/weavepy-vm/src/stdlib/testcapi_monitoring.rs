@@ -232,8 +232,16 @@ pub fn install(d: &mut DictData) {
     b(d, "fire_event_jump", |a| {
         fire(t::EVENT_JUMP, FireKind::Value, a)
     });
+    // `PyMonitoring_FireBranchEvent` fires BRANCH_RIGHT in 3.14; the
+    // split halves have their own entry points.
     b(d, "fire_event_branch", |a| {
-        fire(t::EVENT_BRANCH, FireKind::Value, a)
+        fire(t::EVENT_BRANCH_RIGHT, FireKind::Value, a)
+    });
+    b(d, "fire_event_branch_right", |a| {
+        fire(t::EVENT_BRANCH_RIGHT, FireKind::Value, a)
+    });
+    b(d, "fire_event_branch_left", |a| {
+        fire(t::EVENT_BRANCH_LEFT, FireKind::Value, a)
     });
     b(d, "fire_event_py_throw", |a| {
         fire(t::EVENT_PY_THROW, FireKind::Exception, a)

@@ -14,25 +14,10 @@ from _pydatetime import *          # noqa: F401,F403
 from _pydatetime import __doc__    # noqa: F401
 
 
-class PyCapsule:
-    """Stand-in for CPython's opaque `PyCapsule` (the type behind
-    `types.CapsuleType`). Not instantiable, like the real one."""
+from _weave_capsule import new_capsule as _new_capsule
 
-    __module__ = 'builtins'
-
-    _capsule_name = "datetime.datetime_CAPI"
-
-    def __new__(cls, *args, **kwargs):
-        raise TypeError("cannot create 'PyCapsule' instances")
-
-    def __repr__(self):
-        return '<capsule object "%s" at %#x>' % (self._capsule_name, id(self))
-
-
-datetime_CAPI = object.__new__(PyCapsule)
-# Reachable as type(datetime_CAPI); keeping the name out of the module dict
-# mirrors the C module's surface (only the capsule itself is exposed).
-del PyCapsule
+datetime_CAPI = _new_capsule("datetime.datetime_CAPI")
+del _new_capsule
 
 # The C module's classmethods are Argument Clinic `classmethod_descriptor`s
 # publishing `__text_signature__`/`__objclass__` — pydoc's summary line for

@@ -2379,6 +2379,8 @@ fn install_method_tables(bt: &BuiltinTypes) {
     install_named_methods(
         &bt.bytearray_,
         "bytearray",
-        &["append", "extend", "clear", "pop", "reverse", "insert"],
+        &[
+            "append", "extend", "clear", "pop", "reverse", "insert", "resize",
+        ],
     );
 }

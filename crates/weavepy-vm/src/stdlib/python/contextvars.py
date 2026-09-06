@@ -28,7 +28,19 @@ import _thread
 from types import GenericAlias as _GenericAlias
 
 
-_MISSING = object()
+class _TokenMissing:
+    """`Token.MISSING` (CPython's `_token_missing` singleton)."""
+
+    __slots__ = ()
+
+    def __repr__(self):
+        return '<Token.MISSING>'
+
+    def __reduce__(self):
+        return '_MISSING'
+
+
+_MISSING = _TokenMissing()
 
 # Py_ReprEnter stand-in for ContextVar.__repr__: a var whose *default*
 # reprs back to the var (e.g. a list containing it) renders as `...`
@@ -288,3 +300,7 @@ def _exit_context(ctx):
         _STATES.pop(ident, None)
     else:
         _STATES[ident] = prev
+
+
+import _collections_abc  # noqa: E402  (3.14: Context is a virtual Mapping)
+_collections_abc.Mapping.register(Context)

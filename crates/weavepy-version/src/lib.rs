@@ -15,38 +15,38 @@
 /// `sys.version_info.major`.
 pub const MAJOR: u32 = 3;
 /// `sys.version_info.minor`.
-pub const MINOR: u32 = 13;
+pub const MINOR: u32 = 14;
 /// `sys.version_info.micro`. Tracks the vendored `Lib/` the regrtest
 /// baseline was measured against.
-pub const MICRO: u32 = 0;
+pub const MICRO: u32 = 7;
 
-/// `"3.13"`: `sys.winver`, `python3.13-config`, `libpython3.13`, the
-/// `python-3.13.pc` files, `include/python3.13/`.
-pub const SHORT: &str = "3.13";
-/// `"313"`: `py_version_nodot`, `python313.dll`, `libpython313.dylib`.
-pub const NODOT: &str = "313";
-/// `"3.13.0"`: `platform.python_version()`, `Py_GetVersion()`.
-pub const FULL: &str = "3.13.0";
+/// `"3.14"`: `sys.winver`, `python3.14-config`, `libpython3.14`, the
+/// `python-3.14.pc` files, `include/python3.14/`.
+pub const SHORT: &str = "3.14";
+/// `"314"`: `py_version_nodot`, `python314.dll`, `libpython314.dylib`.
+pub const NODOT: &str = "314";
+/// `"3.14.7"`: `platform.python_version()`, `Py_GetVersion()`.
+pub const FULL: &str = "3.14.7";
 
 /// `PY_VERSION_HEX` for a final release (`serial 0`, level `f`).
 pub const HEX: u32 = (MAJOR << 24) | (MINOR << 16) | (MICRO << 8) | 0xF0;
 
 /// The bundled stdlib's directory under `lib/` (deliberately not
-/// `python3.13`, so a WeavePy tree and a CPython install never shadow
+/// `python3.14`, so a WeavePy tree and a CPython install never shadow
 /// each other).
-pub const LIB_DIR_NAME: &str = "weavepy3.13";
+pub const LIB_DIR_NAME: &str = "weavepy3.14";
 /// `sys.implementation.cache_tag` prefix; `pycache.rs` appends the
 /// bytecode-format generation.
-pub const CACHE_TAG_PREFIX: &str = "weavepy-313";
+pub const CACHE_TAG_PREFIX: &str = "weavepy-314";
 /// `sysconfig.get_config_var("SOABI")` prefix and the C-extension
-/// filename tag (`foo.cpython-313-darwin.so`).
-pub const SOABI_PREFIX: &str = "cpython-313";
-/// The wheel/ABI tag (`cp313`) and Windows extension tag (`.cp313-win_amd64.pyd`).
-pub const CP_TAG: &str = "cp313";
-/// The C-API library stem: `python313.dll`, `libpython313.dylib`.
-pub const PYLIB_STEM: &str = "python313";
+/// filename tag (`foo.cpython-314-darwin.so`).
+pub const SOABI_PREFIX: &str = "cpython-314";
+/// The wheel/ABI tag (`cp314`) and Windows extension tag (`.cp314-win_amd64.pyd`).
+pub const CP_TAG: &str = "cp314";
+/// The C-API library stem: `python314.dll`, `libpython314.dylib`.
+pub const PYLIB_STEM: &str = "python314";
 /// The vendored `Include/` tree under `crates/weavepy-capi/include/`.
-pub const HEADER_TREE: &str = "cpython313";
+pub const HEADER_TREE: &str = "cpython314";
 
 /// Concatenate string parts into a fixed byte buffer at compile time.
 /// The building block for [`vconcat!`]; not meant to be called directly.
@@ -69,7 +69,7 @@ pub const fn concat_into<const N: usize, const M: usize>(parts: [&str; M]) -> [u
 }
 
 /// Build a `&'static str` from string constants at compile time, so a
-/// platform suffix like `".cpython-313-darwin.so"` can be spelled as
+/// platform suffix like `".cpython-314-darwin.so"` can be spelled as
 /// `vconcat!(".", weavepy_version::SOABI_PREFIX, "-darwin.so")` and
 /// follow [`NODOT`] without a runtime allocation.
 #[macro_export]
@@ -90,8 +90,8 @@ mod tests {
     #[test]
     fn vconcat_builds_static_strs() {
         const S: &str = vconcat!(".", SOABI_PREFIX, "-darwin.so");
-        assert_eq!(S, ".cpython-313-darwin.so");
-        assert_eq!(vconcat!(PYLIB_STEM, ".dll"), "python313.dll");
+        assert_eq!(S, ".cpython-314-darwin.so");
+        assert_eq!(vconcat!(PYLIB_STEM, ".dll"), "python314.dll");
     }
 
     #[test]
@@ -105,6 +105,6 @@ mod tests {
         assert_eq!(CP_TAG, format!("cp{NODOT}"));
         assert_eq!(PYLIB_STEM, format!("python{NODOT}"));
         assert_eq!(HEADER_TREE, format!("cpython{NODOT}"));
-        assert_eq!(HEX, 0x030d_00f0);
+        assert_eq!(HEX, 0x030e_07f0);
     }
 }

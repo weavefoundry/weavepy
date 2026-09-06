@@ -7,7 +7,7 @@ txt files: ['a.txt', 'b.txt']
 --- fnmatch ---
 a.txt vs *.txt: True
 a.md vs *.txt: False
-translate: (?s:.*\.py)\Z ...
+translate: (?s:.*\.py)\z ...
 --- shutil ---
 copied content: hello
 dir gone: True

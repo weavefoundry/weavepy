@@ -186,8 +186,10 @@ def _get_module_details(mod_name, error=ImportError):
     Locates the module via ``importlib.util.find_spec`` (no execution of the
     target) and recovers its code object. A package redirects to its
     ``__main__`` submodule (``python -m pkg`` semantics)."""
+    # name= is only accepted by ImportError and its subclasses.
+    kwargs = {"name": mod_name} if issubclass(error, ImportError) else {}
     if mod_name.startswith("."):
-        raise error("Relative module names not supported")
+        raise error("Relative module names not supported", **kwargs)
     import importlib.util
     pkg_name = mod_name.rpartition(".")[0]
     if pkg_name:
@@ -215,22 +217,23 @@ def _get_module_details(mod_name, error=ImportError):
         if mod_name.endswith(".py"):
             msg += (". Try using '{}' instead of '{}' as the module name."
                     .format(mod_name[:-3], mod_name))
-        raise error(msg.format(mod_name, type(ex).__name__, ex)) from ex
+        raise error(msg.format(mod_name, type(ex).__name__, ex),
+                    **kwargs) from ex
     if spec is None:
-        raise error("No module named %s" % mod_name)
+        raise error("No module named %s" % mod_name, **kwargs)
     if spec.submodule_search_locations is not None:
         if mod_name == "__main__" or mod_name.endswith(".__main__"):
-            raise error("Cannot use package as __main__ module")
+            raise error("Cannot use package as __main__ module", **kwargs)
         try:
             return _get_module_details(mod_name + ".__main__", error)
         except error as e:
             if mod_name not in sys.modules:
                 raise
             raise error("%s; %r is a package and cannot be directly executed"
-                        % (e, mod_name))
+                        % (e, mod_name), **kwargs)
     code = _code_from_spec(mod_name, spec)
     if code is None:
-        raise error("No code object available for %s" % mod_name)
+        raise error("No code object available for %s" % mod_name, **kwargs)
     return mod_name, spec, code
 
 
@@ -243,6 +246,7 @@ def _get_main_module_details(error=ImportError):
     # also moves the standard __main__ out of the way so its preexisting
     # __loader__/__spec__ doesn't shadow the new module being located.
     main_name = "__main__"
+    kwargs = {"name": main_name} if issubclass(error, ImportError) else {}
     saved_main = sys.modules.get(main_name)
     if main_name in sys.modules:
         del sys.modules[main_name]
@@ -251,7 +255,8 @@ def _get_main_module_details(error=ImportError):
     except ImportError as exc:
         if main_name in str(exc):
             path0 = sys.path[0] if sys.path else None
-            raise error("can't find %r module in %r" % (main_name, path0)) from exc
+            raise error("can't find %r module in %r" % (main_name, path0),
+                        **kwargs) from exc
         raise
     finally:
         if saved_main is not None:

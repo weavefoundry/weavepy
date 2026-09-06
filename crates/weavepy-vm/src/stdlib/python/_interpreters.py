@@ -270,9 +270,17 @@ def _finalize_threads(interp_id):
                     _weave_fn()
                 except Exception:
                     pass
+            # Only threads *started by this interpreter* (CPython joins
+            # `interp->threads.handles`). `_MainThread` carries the
+            # runtime's main-thread ident even when the interpreter runs
+            # on a worker thread (InterpreterPoolExecutor), so joining it
+            # would wait on a thread that never finishes.
             for _weave_t in _weave_threading.enumerate():
                 if (_weave_t is not _weave_threading.current_thread()
-                        and not _weave_t.daemon):
+                        and not _weave_t.daemon
+                        and not isinstance(
+                            _weave_t, (_weave_threading._MainThread,
+                                       _weave_threading._DummyThread))):
                     _weave_t.join()
         """
     try:
@@ -282,8 +290,17 @@ def _finalize_threads(interp_id):
 
 
 def list_all(*, require_ready=False):
-    ids = [0] + list(_xx.list_all())
-    return [(i, whence(i)) for i in ids]
+    # CPython snapshots ids and whence together under the runtime lock.
+    # Here an `Interpreter.__del__` (a GC pass between the id snapshot
+    # and the `whence` lookups) can destroy one in between, so an id that
+    # vanished is simply omitted rather than raising.
+    out = [(0, WHENCE_RUNTIME)]
+    for i in _xx.list_all():
+        try:
+            out.append((i, _xx.whence(i)))
+        except (InterpreterNotFoundError, ValueError, RuntimeError):
+            continue
+    return out
 
 
 def get_current():
@@ -407,16 +424,57 @@ def capture_exception(exc=None):
 _UNSET = object()
 
 
-def _validate_shared(shared):
+def _validate_shared(shared, fname):
     """CPython's `_interpreters` argument contract for `shared`: it must
-    be a dict (gh-126654), and str keys must be encodable — a lone
-    surrogate raises UnicodeEncodeError before anything runs
-    (gh-127196, CommonTests.test_invalid_shared_encoding)."""
+    be a dict (gh-126654, the `O!` clinic message), and str keys must be
+    encodable — a lone surrogate raises UnicodeEncodeError before
+    anything runs (gh-127196, CommonTests.test_invalid_shared_encoding)."""
     if not isinstance(shared, dict):
-        raise TypeError("expected 'shared' to be a dict")
+        raise TypeError(
+            f"_interpreters.{fname}() argument 3 must be dict, not "
+            + ("None" if shared is None else type(shared).__name__)
+        )
     for key in shared:
         if isinstance(key, str):
             key.encode("utf-8")
+
+
+def _script_code(obj, fname):
+    """3.14 `_PyCode_GetScriptXIData`: the script is compiled (or its
+    code object checked) in the *calling* interpreter, so a SyntaxError,
+    or a ValueError for a closure / code with args / code that returns
+    a value, is raised here rather than captured as excinfo
+    (test__interpreters RunFailedTests.test_invalid_syntax,
+    RunFuncTests.test_closure / test_return_value)."""
+    import types
+
+    if isinstance(obj, types.CodeType):
+        code = obj
+    elif isinstance(obj, types.FunctionType):
+        code = obj.__code__
+    else:
+        if isinstance(obj, (bytes, bytearray)):
+            code = compile(bytes(obj), "<script>", "exec")
+        else:
+            code = compile(obj, "<script>", "exec")
+    # `verify_script`: no closure/free vars (globals are fine, they
+    # resolve against the target's __main__), no args, returns only None.
+    if code.co_freevars:
+        raise ValueError("closures not supported")
+    import inspect
+
+    if (
+        code.co_argcount
+        or code.co_posonlyargcount
+        or code.co_kwonlyargcount
+        or code.co_flags & (inspect.CO_VARARGS | inspect.CO_VARKEYWORDS)
+    ):
+        raise ValueError("code with args not supported")
+    import _weave_codeinfo
+
+    if not _weave_codeinfo.code_returns_only_none(code):
+        raise ValueError("code that returns a value is not a script")
+    return code
 
 
 def _retype_running(interp_id, exc):
@@ -428,9 +486,9 @@ def _retype_running(interp_id, exc):
 
 
 def exec(interp_id, code, shared=_UNSET, *, restrict=False):
-    interp_id = _require(interp_id, restrict)
     if shared is not _UNSET:
-        _validate_shared(shared)
+        _validate_shared(shared, "exec")
+    interp_id = _require(interp_id, restrict)
     import types
 
     if isinstance(code, str):
@@ -445,79 +503,7 @@ def exec(interp_id, code, shared=_UNSET, *, restrict=False):
         raise TypeError(
             f"expected a str, function, or code object, got {type(code).__name__}"
         )
-    if shared is not _UNSET and shared:
-        _xx.set_main_attrs(interp_id, dict(shared))
-    try:
-        _xx.run_string(interp_id, code)
-    except RuntimeError as e:
-        _retype_running(interp_id, e)
-        return _capture_excinfo(e)
-    except BaseException as e:
-        return _capture_excinfo(e)
-    return None
-
-
-def run_string(interp_id, script, shared=_UNSET, *, restrict=False):
-    interp_id = _require(interp_id, restrict)
-    if shared is not _UNSET:
-        _validate_shared(shared)
-    # `run_string` is stricter than `exec`: str only (RunStringTests
-    # test_bad_script / test_bytes_for_script expect TypeError raised,
-    # not captured).
-    if not isinstance(script, str):
-        raise TypeError(f"expected str, got {type(script).__name__}")
-    if type(script) is not str:
-        script = str.__str__(script)
-    if shared is not _UNSET and shared:
-        _xx.set_main_attrs(interp_id, dict(shared))
-    try:
-        _xx.run_string(interp_id, script)
-    except RuntimeError as e:
-        _retype_running(interp_id, e)
-        return _capture_excinfo(e)
-    except BaseException as e:
-        return _capture_excinfo(e)
-    return None
-
-
-def _stateless_code(func, fname):
-    """Validate CPython's `convert_code_arg` contract: `run_func` only
-    takes plain stateless functions (or their code objects) — no
-    parameters of any kind, no closure (test__interpreters
-    RunFuncTests.test_args / test_closure expect ValueError)."""
-    import types
-
-    if isinstance(func, types.CodeType):
-        code = func
-    elif isinstance(func, types.FunctionType):
-        if func.__closure__:
-            raise ValueError(f"{fname}(): closures not supported")
-        code = func.__code__
-    else:
-        raise TypeError(
-            f"{fname}(): expected a function or code object, got {func!r}"
-        )
-    import inspect
-
-    if (
-        code.co_argcount
-        or code.co_posonlyargcount
-        or code.co_kwonlyargcount
-        or code.co_flags & (inspect.CO_VARARGS | inspect.CO_VARKEYWORDS)
-    ):
-        raise ValueError(f"{fname}(): functions with arguments not supported")
-    if code.co_freevars:
-        raise ValueError(f"{fname}(): closures not supported")
-    if code.co_cellvars:
-        raise ValueError(f"{fname}(): functions with cell variables not supported")
-    return code
-
-
-def run_func(interp_id, func, shared=_UNSET, *, restrict=False):
-    interp_id = _require(interp_id, restrict)
-    if shared is not _UNSET:
-        _validate_shared(shared)
-    code = _stateless_code(func, "run_func")
+    code = _script_code(code, "exec")
     if shared is not _UNSET and shared:
         _xx.set_main_attrs(interp_id, dict(shared))
     try:
@@ -530,12 +516,104 @@ def run_func(interp_id, func, shared=_UNSET, *, restrict=False):
     return None
 
 
-def call(interp_id, callable, args=None, kwargs=None, *, restrict=False):
-    if args or kwargs:
-        raise NotImplementedError(
-            "arguments not supported by the in-process _interpreters port"
+def run_string(interp_id, script, shared=_UNSET, *, restrict=False):
+    if shared is not _UNSET:
+        _validate_shared(shared, "run_string")
+    interp_id = _require(interp_id, restrict)
+    # `run_string` is stricter than `exec`: str only (RunStringTests
+    # test_bad_script / test_bytes_for_script expect TypeError raised,
+    # not captured).
+    if not isinstance(script, str):
+        raise TypeError(f"expected str, got {type(script).__name__}")
+    if type(script) is not str:
+        script = str.__str__(script)
+    code = _script_code(script, "run_string")
+    if shared is not _UNSET and shared:
+        _xx.set_main_attrs(interp_id, dict(shared))
+    try:
+        _xx.run_func(interp_id, code)
+    except RuntimeError as e:
+        _retype_running(interp_id, e)
+        return _capture_excinfo(e)
+    except BaseException as e:
+        return _capture_excinfo(e)
+    return None
+
+
+def run_func(interp_id, func, shared=_UNSET, *, restrict=False):
+    if shared is not _UNSET:
+        _validate_shared(shared, "run_func")
+    interp_id = _require(interp_id, restrict)
+    import types
+
+    if not isinstance(func, (types.FunctionType, types.CodeType)):
+        raise TypeError(
+            "_interpreters.run_func() argument 2 must be a function, not "
+            + type(func).__name__
         )
-    return run_func(interp_id, callable, restrict=restrict)
+    code = _script_code(func, "run_func")
+    if shared is not _UNSET and shared:
+        _xx.set_main_attrs(interp_id, dict(shared))
+    try:
+        _xx.run_func(interp_id, code)
+    except RuntimeError as e:
+        _retype_running(interp_id, e)
+        return _capture_excinfo(e)
+    except BaseException as e:
+        return _capture_excinfo(e)
+    return None
+
+
+callable_ = callable
+
+
+def call(interp_id, callable, args=None, kwargs=None, *,
+         preserve_exc=False, restrict=False):
+    """3.14 `_interpreters.call()`: returns ``(result, excinfo)``.
+
+    The callable, args, kwargs, and result cross as CPython's XIData
+    does (`_weave_xidata`): shareable objects as themselves, stateless
+    functions as marshalled code rebuilt over the target's `__main__`,
+    everything else by pickle (so a module-level function is re-resolved
+    in the target and a `concurrent.interpreters.Queue` reconstructs from
+    its id). The target side lives in `_weave_xicall`; see there for the
+    protocol.
+    """
+    interp_id = _require(interp_id, restrict)
+    if not callable_(callable):
+        raise TypeError(f'expected a callable, got {callable!r}')
+    args = tuple(args) if args else ()
+    kwargs = dict(kwargs) if kwargs else {}
+    import _weave_xidata as _xid
+
+    payload = (
+        _xid.get_xidata(callable),
+        _xid.get_xidata(args) if args else None,
+        _xid.get_xidata(kwargs) if kwargs else None,
+    )
+    qid = _xx.queue_create(0, 0, 0)
+    try:
+        _xx.queue_put(qid, payload, 0, 0)
+        try:
+            _xx.run_string(interp_id, f"__import__('_weave_xicall').run({qid})")
+        except RuntimeError as e:
+            _retype_running(interp_id, e)
+            return None, _capture_excinfo(e)
+        except BaseException as e:
+            return None, _capture_excinfo(e)
+        try:
+            item = _xx.queue_get(qid)
+        except RuntimeError:
+            return None, None
+        kind, payload = item[0]
+        if kind != 'ok':
+            raise NotShareableError(payload)
+        return _xid.from_xidata(payload), None
+    finally:
+        try:
+            _xx.queue_destroy(qid)
+        except Exception:
+            pass
 
 
 def set___main___attrs(interp_id, updates, *, restrict=False):

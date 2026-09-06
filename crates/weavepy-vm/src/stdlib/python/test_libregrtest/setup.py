@@ -13,7 +13,7 @@ from _colorize import can_colorize  # type: ignore[import-not-found]
 from .filter import set_match_tests
 from .runtests import RunTests
 from .utils import (
-    setup_unraisable_hook, setup_threading_excepthook, fix_umask,
+    setup_unraisable_hook, setup_threading_excepthook,
     adjust_rlimit_nofile)
 
 
@@ -28,8 +28,6 @@ def setup_test_dir(testdir: str | None) -> None:
 
 
 def setup_process() -> None:
-    fix_umask()
-
     assert sys.__stderr__ is not None, "sys.__stderr__ is None"
     try:
         stderr_fd = sys.__stderr__.fileno()
@@ -51,6 +49,14 @@ def setup_process() -> None:
             signals.append(signal.SIGUSR1)
         for signum in signals:
             faulthandler.register(signum, chain=True, file=stderr_fd)
+
+    # Restore the default SIGINT handler if there is no Python-level
+    # handler.  Python inherits the SIG_IGN disposition when the test
+    # suite runs as a shell background job; then asyncio.Runner does not
+    # install its own handler and _thread.interrupt_main() is a no-op,
+    # which makes some tests in test_asyncio and test_threading hang.
+    if signal.getsignal(signal.SIGINT) in (signal.SIG_IGN, signal.SIG_DFL):
+        signal.signal(signal.SIGINT, signal.default_int_handler)
 
     adjust_rlimit_nofile()
 

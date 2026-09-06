@@ -859,7 +859,7 @@ class SysLogHandler(logging.Handler):
     }
 
     def __init__(self, address=('localhost', SYSLOG_UDP_PORT),
-                 facility=LOG_USER, socktype=None):
+                 facility=LOG_USER, socktype=None, timeout=None):
         """
         Initialize a handler.
 
@@ -876,6 +876,7 @@ class SysLogHandler(logging.Handler):
         self.address = address
         self.facility = facility
         self.socktype = socktype
+        self.timeout = timeout
         self.socket = None
         self.createSocket()
 
@@ -937,6 +938,8 @@ class SysLogHandler(logging.Handler):
                 err = sock = None
                 try:
                     sock = socket.socket(af, socktype, proto)
+                    if self.timeout:
+                        sock.settimeout(self.timeout)
                     if socktype == socket.SOCK_STREAM:
                         sock.connect(sa)
                     break
@@ -1532,6 +1535,19 @@ class QueueListener(object):
         self.handlers = handlers
         self._thread = None
         self.respect_handler_level = respect_handler_level
+
+    def __enter__(self):
+        """
+        For use as a context manager. Starts the listener.
+        """
+        self.start()
+        return self
+
+    def __exit__(self, *args):
+        """
+        For use as a context manager. Stops the listener.
+        """
+        self.stop()
 
     def dequeue(self, block):
         """

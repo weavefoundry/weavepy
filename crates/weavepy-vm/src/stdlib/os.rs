@@ -373,6 +373,21 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("read")),
             builtin("read", os_read),
         );
+        // 3.14 (gh-129205): `os.readinto(fd, buffer)`.
+        d.insert(
+            DictKey(Object::from_static("readinto")),
+            builtin("readinto", os_readinto),
+        );
+        // 3.14 (gh-120057): `os._create_environ()` re-snapshots the live
+        // process environment; `os.reload_environ()` is layered on it by
+        // `_weave_envinit`.
+        d.insert(
+            DictKey(Object::from_static("_create_environ")),
+            builtin("_create_environ", |args| {
+                require_no_args(args, "_create_environ")?;
+                Ok(initial_environ())
+            }),
+        );
         d.insert(
             DictKey(Object::from_static("write")),
             builtin("write", os_write),
@@ -4983,6 +4998,72 @@ fn os_read(args: &[Object]) -> Result<Object, RuntimeError> {
         let _ = (fd, n);
         Err(crate::error::not_implemented_error(
             "os.read() is only implemented on POSIX in WeavePy",
+        ))
+    }
+}
+
+/// `os.readinto(fd, buffer)` (3.14): one `read(2)` straight into a
+/// writable buffer, returning the byte count (0 at EOF). Mirrors `os_read`'s
+/// GIL release and PEP 475 retry.
+fn os_readinto(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() != 2 {
+        return Err(type_error(format!(
+            "readinto() takes exactly 2 arguments ({} given)",
+            args.len()
+        )));
+    }
+    let fd = match crate::builtins::try_coerce_index_i64(&args[0]) {
+        Some(Ok(v)) => i32::try_from(v).map_err(|_| {
+            crate::error::overflow_error("Python int too large to convert to C int")
+        })?,
+        Some(Err(e)) => return Err(e),
+        None => {
+            return Err(type_error(format!(
+                "'{}' object cannot be interpreted as an integer",
+                args[0].type_name()
+            )))
+        }
+    };
+    let (dst, start, cap) = crate::stdlib::io::writable_buffer_dst(args.get(1), "readinto")?;
+    #[cfg(unix)]
+    {
+        let mut tmp = vec![0u8; cap];
+        let ptr = tmp.as_mut_ptr();
+        loop {
+            let r = crate::gil::allow_threads_then(|| unsafe { libc::read(fd, ptr.cast(), cap) });
+            if r < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    service_pending_signals()?;
+                    continue;
+                }
+                return Err(crate::error::io_error_to_py(&err));
+            }
+            let n = r as usize;
+            dst.borrow_mut()[start..start + n].copy_from_slice(&tmp[..n]);
+            return Ok(Object::Int(n as i64));
+        }
+    }
+    #[cfg(windows)]
+    {
+        let mut tmp = vec![0u8; cap];
+        let want = u32::try_from(cap.min(i32::MAX as usize)).expect("clamped to i32::MAX");
+        let ptr = tmp.as_mut_ptr();
+        let r = crate::gil::allow_threads_then(|| unsafe {
+            crate::stdlib::nt_support::crt::_read(fd, ptr.cast(), want)
+        });
+        if r < 0 {
+            return Err(crate::stdlib::nt_support::last_crt_error_to_py(None));
+        }
+        let n = r as usize;
+        dst.borrow_mut()[start..start + n].copy_from_slice(&tmp[..n]);
+        Ok(Object::Int(n as i64))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (fd, dst, start, cap);
+        Err(crate::error::not_implemented_error(
+            "os.readinto() is only implemented on POSIX in WeavePy",
         ))
     }
 }

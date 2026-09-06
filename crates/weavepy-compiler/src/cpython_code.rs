@@ -1055,7 +1055,7 @@ pub fn encode(code: &CodeObject) -> CpythonCode {
         co_code,
         localsplusnames,
         localspluskinds,
-        stacksize: compute_stacksize(code),
+        stacksize: code.stacksize.unwrap_or_else(|| compute_stacksize(code)),
         firstlineno,
         positions,
         inst_offsets,
@@ -1273,17 +1273,14 @@ fn push_loc_svarint(out: &mut Vec<u8>, val: i32, first_mask: u8) {
     push_loc_varint(out, zig, first_mask);
 }
 
-/// Encode the PEP 626/657 location table. Instructions with tracked
-/// column spans use the "long" entry form (`code = 14`), preserving
-/// PEP 657 fine-grained positions across the marshal round-trip
-/// (traceback caret underlines from `.pyc`-loaded modules — doctest's
-/// error-report tests compare them textually). Instructions without
-/// columns keep the "no-column" form (`code = 13`).
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
-/// PEP 626 / PEP 657 location table (`write_location_info_entry`):
-/// one entry per instruction (all of its code units share the
-/// location), split into chunks of at most 8 units.
+/// Encode the PEP 626/657 location table exactly as CPython's
+/// `assemble_location_info` does: runs of consecutive instructions with
+/// the same four-field location merge into one entry (chunked at 8 code
+/// units), and each entry takes the most compact form that fits —
+/// the "short" form (codes 0-9, same line, `column < 80`, span < 16),
+/// the "one line" form (codes 10-12, line delta 0-2, columns < 128),
+/// the "no column" form (13), the "long" form (14), or "none" (15).
+/// Byte-identical tables are what make `marshal.dumps(code)` match.
 fn encode_linetable(
     code: &CodeObject,
     ext: &[usize],
@@ -1291,54 +1288,112 @@ fn encode_linetable(
     zero_width: &[bool],
     firstlineno: u32,
 ) -> Vec<u8> {
-    const CODE_NO_COLUMNS: u8 = 13;
-    const CODE_LONG: u8 = 14;
-    const CODE_NO_LOCATION: u8 = 15;
-    let mut out = Vec::new();
-    let mut prev_line = firstlineno as i32;
+    let mut enc = LocationEncoder {
+        out: Vec::new(),
+        lineno: firstlineno as i32,
+    };
+    // `loc = NO_LOCATION; size = 0` — the leading empty run emits nothing.
+    let mut run: Option<Position> = None;
+    let mut size = 0usize;
     for i in 0..code.instructions.len() {
         if zero_width[i] {
             continue;
         }
-        let units = ext[i] + 1 + cache_entries(mapped[i].cp_op);
         let pos = position_at(code, i, firstlineno);
-        let mut remaining = units;
-        if pos.lineno < 0 {
-            // NO_LOCATION: the entry form carries no line delta and
-            // doesn't advance the running line.
-            while remaining > 0 {
-                let chunk = remaining.min(8);
-                out.push(0x80 | (CODE_NO_LOCATION << 3) | ((chunk - 1) as u8));
-                remaining -= chunk;
+        if run != Some(pos) {
+            if let Some(loc) = run {
+                enc.emit_location(loc, size);
             }
-            continue;
+            run = Some(pos);
+            size = 0;
         }
-        let line = pos.lineno;
-        let end_line_delta = (pos.end_lineno - line).max(0) as u32;
-        let mut delta = line - prev_line;
-        while remaining > 0 {
-            let chunk = remaining.min(8);
-            match (pos.col, pos.end_col) {
-                (Some(col), Some(end_col)) => {
-                    out.push(0x80 | (CODE_LONG << 3) | ((chunk - 1) as u8));
-                    push_loc_svarint(&mut out, delta, 0);
-                    push_loc_varint(&mut out, end_line_delta, 0);
-                    // Columns are stored +1 so `0` means "None" (locations.md).
-                    push_loc_varint(&mut out, col + 1, 0);
-                    push_loc_varint(&mut out, end_col + 1, 0);
-                }
-                _ => {
-                    out.push(0x80 | (CODE_NO_COLUMNS << 3) | ((chunk - 1) as u8));
-                    push_loc_svarint(&mut out, delta, 0);
-                }
-            }
-            // Subsequent chunks of the same instruction repeat the line.
-            delta = 0;
-            remaining -= chunk;
-        }
-        prev_line = line;
+        size += ext[i] + 1 + cache_entries(mapped[i].cp_op);
     }
-    out
+    if let Some(loc) = run {
+        enc.emit_location(loc, size);
+    }
+    enc.out
+}
+
+/// The running state of `assemble.c`'s location writer (`a_linetable`
+/// plus `a_lineno`).
+struct LocationEncoder {
+    out: Vec<u8>,
+    lineno: i32,
+}
+
+impl LocationEncoder {
+    const CODE_SHORT0: u8 = 0;
+    const CODE_ONE_LINE0: u8 = 10;
+    const CODE_NO_COLUMNS: u8 = 13;
+    const CODE_LONG: u8 = 14;
+    const CODE_NONE: u8 = 15;
+
+    /// `assemble_emit_location`: split `isize` units into entries of at
+    /// most 8.
+    fn emit_location(&mut self, loc: Position, mut isize: usize) {
+        if isize == 0 {
+            return;
+        }
+        while isize > 8 {
+            self.emit_entry(loc, 8);
+            isize -= 8;
+        }
+        self.emit_entry(loc, isize);
+    }
+
+    fn first_byte(&mut self, code: u8, length: usize) {
+        debug_assert!((1..=8).contains(&length));
+        self.out.push(0x80 | (code << 3) | ((length - 1) as u8));
+    }
+
+    /// `write_location_info_entry`.
+    fn emit_entry(&mut self, loc: Position, isize: usize) {
+        if loc.lineno < 0 {
+            self.first_byte(Self::CODE_NONE, isize);
+            return;
+        }
+        let line_delta = loc.lineno - self.lineno;
+        let column = loc.col.map_or(-1, |c| c as i32);
+        let end_column = loc.end_col.map_or(-1, |c| c as i32);
+        if column < 0 || end_column < 0 {
+            if loc.end_lineno == loc.lineno || loc.end_lineno == -1 {
+                self.first_byte(Self::CODE_NO_COLUMNS, isize);
+                push_loc_svarint(&mut self.out, line_delta, 0);
+                self.lineno = loc.lineno;
+                return;
+            }
+        } else if loc.end_lineno == loc.lineno {
+            if line_delta == 0 && column < 80 && end_column - column < 16 && end_column >= column
+            {
+                // Short form: the running line is unchanged (delta 0).
+                let column_low_bits = (column & 7) as u8;
+                let column_group = (column >> 3) as u8;
+                self.first_byte(Self::CODE_SHORT0 + column_group, isize);
+                self.out
+                    .push((column_low_bits << 4) | ((end_column - column) as u8));
+                return;
+            }
+            if (0..3).contains(&line_delta) && column < 128 && end_column < 128 {
+                self.first_byte(Self::CODE_ONE_LINE0 + line_delta as u8, isize);
+                self.out.push(column as u8);
+                self.out.push(end_column as u8);
+                self.lineno = loc.lineno;
+                return;
+            }
+        }
+        // Long form. Columns are stored +1 so `0` means "None".
+        self.first_byte(Self::CODE_LONG, isize);
+        push_loc_svarint(&mut self.out, line_delta, 0);
+        push_loc_varint(
+            &mut self.out,
+            (loc.end_lineno - loc.lineno).max(0) as u32,
+            0,
+        );
+        push_loc_varint(&mut self.out, (column + 1) as u32, 0);
+        push_loc_varint(&mut self.out, (end_column + 1) as u32, 0);
+        self.lineno = loc.lineno;
+    }
 }
 
 // ---------- exception table ----------
@@ -2114,9 +2169,48 @@ fn decode_instructions(
     let mut shadow: Vec<SlotKind> = Vec::new();
     let mut out = Vec::with_capacity(total);
     let mut marks: Vec<u8> = Vec::with_capacity(total);
+    // Shared `LOCAL|CELL` slots currently holding an inlined
+    // comprehension's plain local rather than the enclosing scope's
+    // cell. CPython folds a comprehension target onto the same slot as
+    // a same-named cell of the enclosing scope
+    // (`compute_localsplus_info` skips cells already covered by
+    // locals), so between `LOAD_FAST_AND_CLEAR s` (the save) and the
+    // `SWAP; STORE_FAST s` restore, `LOAD_FAST s` reads the
+    // comprehension's value, not the cell object. Outside that region
+    // a `LOAD_FAST` on the slot is closure building (`LoadClosure`).
+    // A comprehension whose own target is a cell announces itself with
+    // `MAKE_CELL s` right after the save and keeps closure semantics.
+    // Nested comprehensions re-binding the same name push the slot
+    // again, so each restore pops one entry.
+    let mut plain_shared: Vec<u32> = Vec::new();
+    let shared_local = |slot: u32| slot < slots.nlocals && slots.is_cellish(slot);
+    let end_region = |plain_shared: &mut Vec<u32>, slot: u32| {
+        if let Some(p) = plain_shared.iter().rposition(|&s| s == slot) {
+            plain_shared.remove(p);
+        }
+    };
     for (idx, r) in raws.iter().enumerate() {
         if leaders.contains(&r.start_unit) {
             shadow.clear();
+        }
+        let after_swap = idx > 0 && raws[idx - 1].cp_op == op::SWAP;
+        match r.cp_op {
+            op::LOAD_FAST_AND_CLEAR
+                if shared_local(r.arg)
+                    && !raws
+                        .get(idx + 1)
+                        .is_some_and(|n| n.cp_op == op::MAKE_CELL && n.arg == r.arg) =>
+            {
+                plain_shared.push(r.arg);
+            }
+            op::STORE_FAST if after_swap => end_region(&mut plain_shared, r.arg),
+            op::STORE_FAST_STORE_FAST | op::STORE_FAST_LOAD_FAST if after_swap => {
+                end_region(&mut plain_shared, r.arg >> 4);
+                if r.cp_op == op::STORE_FAST_STORE_FAST {
+                    end_region(&mut plain_shared, r.arg & 0x0F);
+                }
+            }
+            _ => {}
         }
         // Fused wire forms first: they expand to two marked
         // instructions and drive the shadow stack directly.
@@ -2291,7 +2385,14 @@ fn decode_instructions(
             out.push(Instruction::new(OpCode::CallKw, call_kw_internal_arg));
             continue;
         }
-        let op = map_from_cpython(r.cp_op, r.arg, slots)?;
+        let op = match r.cp_op {
+            op::LOAD_FAST | op::LOAD_FAST_BORROW | op::LOAD_FAST_CHECK
+                if plain_shared.contains(&r.arg) =>
+            {
+                (OpCode::LoadFast, r.arg)
+            }
+            _ => map_from_cpython(r.cp_op, r.arg, slots)?,
+        };
         let self_idx = instr_of_raw(idx);
         let arg = if is_rel_jump(r.cp_op) {
             let next_unit = r.start_unit + r.size;
@@ -2523,9 +2624,15 @@ fn decode_linetable(
                 (d, span)
             }
             10..=12 => {
+                // One-line forms carry the columns as *raw bytes*
+                // (`write_location_byte`, both < 128), not varints: a
+                // column of 64..=127 has bit 6 set and must not be read
+                // as a continuation (CPython `advance_with_locations`).
                 let d = i32::from(code) - 10;
-                let col = read_loc_varint(table, &mut pos);
-                let end_col = read_loc_varint(table, &mut pos);
+                let col = u32::from(table.get(pos).copied().unwrap_or(0) & 0x7F);
+                pos += 1;
+                let end_col = u32::from(table.get(pos).copied().unwrap_or(0) & 0x7F);
+                pos += 1;
                 let span = crate::ColSpan {
                     end_lineno: (line + d).max(0) as u32,
                     col: col as i32,
@@ -3162,6 +3269,56 @@ def body():
         }
     }
     walk(&code, "<module>".to_owned());
+}
+
+/// An inlined comprehension target that shares its `LOCAL|CELL` slot
+/// with a same-named cell of the enclosing scope: `LOAD_FAST x` inside
+/// the comprehension is the plain local, while the same wire opcode
+/// after the restore is closure building (test_grammar
+/// `test_comprehension_specials` after a `.pyc` round-trip).
+#[test]
+fn decode_shared_slot_comprehension_local() {
+    use weavepy_parser::parse_module;
+    let src = r"
+def f():
+    x = 10; t = False; g = ((i,j) for i in range(x) if t for j in range(x))
+    x = 5; t = True
+    return [x for x in range(10) if x % 2 if x % 3], len(list(g)), (lambda: x)
+";
+    let module = parse_module(src).expect("parse");
+    let code = crate::compile_module(&module).expect("compile");
+    let f = code
+        .constants
+        .iter()
+        .find_map(|c| match c {
+            crate::Constant::Code(c) if c.name == "f" => Some(c.clone()),
+            _ => None,
+        })
+        .expect("f");
+    let cp = crate::cpython_code::encode(&f);
+    assert_eq!(cp.localsplusnames, ["g", "x", "t"]);
+    assert_eq!(
+        cp.localspluskinds,
+        [CO_FAST_LOCAL, CO_FAST_LOCAL | CO_FAST_CELL, CO_FAST_CELL]
+    );
+    let dc = crate::cpython_code::decode_full(
+        &cp.co_code,
+        &cp.co_linetable,
+        &cp.co_exceptiontable,
+        &cp.localsplusnames,
+        &cp.localspluskinds,
+        cp.firstlineno,
+        &f.constants,
+    )
+    .expect("decode");
+    for (i, (a, b)) in f.instructions.iter().zip(dc.instructions.iter()).enumerate() {
+        assert_eq!(a, b, "instruction {i} diverges");
+    }
+    assert_eq!(f.instructions.len(), dc.instructions.len());
+    // Both readings survive: the comprehension's plain loads and the
+    // lambda's closure load of the outer cell.
+    assert!(dc.instructions.contains(&Instruction::new(OpCode::LoadFast, 1)));
+    assert!(dc.instructions.contains(&Instruction::new(OpCode::LoadClosure, 0)));
 }
 
 /// `stack_effects` (WeavePy VM view, drives `co_stacksize`) and

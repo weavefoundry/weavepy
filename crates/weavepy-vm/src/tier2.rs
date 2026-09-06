@@ -3891,14 +3891,14 @@ extern "C" fn wpjit_math_cos(x: f64) -> f64 {
 /// interpreter re-executes and raises the exact `ZeroDivisionError`),
 /// so the error arm is unreachable-defensive.
 extern "C" fn wpjit_float_floordiv(a: f64, b: f64) -> f64 {
-    crate::py_float_divmod(a, b, "float floor division").map_or(f64::NAN, |(div, _)| div)
+    crate::py_float_divmod(a, b, "division by zero").map_or(f64::NAN, |(div, _)| div)
 }
 
 /// Python-semantics `float` modulo (RFC 0069 WS2): the remainder takes
 /// the divisor's sign. Zero divisors deopt before the call, as with
 /// [`wpjit_float_floordiv`].
 extern "C" fn wpjit_float_mod(a: f64, b: f64) -> f64 {
-    crate::py_float_divmod(a, b, "float modulo").map_or(f64::NAN, |(_, m)| m)
+    crate::py_float_divmod(a, b, "division by zero").map_or(f64::NAN, |(_, m)| m)
 }
 
 /// The `wpjit_list_get` helper (RFC 0061 WS5): read one element of a

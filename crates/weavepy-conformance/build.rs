@@ -5,8 +5,8 @@
 //! exporter (`ndarray` with the full `PyBUF_*` flag matrix including
 //! suboffsets, `staticarray`). The fixture lives in
 //! `tests/capi_ext/_testbuffer.c` (vendored verbatim) and is compiled
-//! against the *stock* CPython 3.13 headers vendored under
-//! `crates/weavepy-capi/include/cpython313/`, exactly like
+//! against the *stock* CPython 3.14 headers vendored under
+//! `crates/weavepy-capi/include/cpython314/`, exactly like
 //! `weavepy-capi/build.rs` builds its binary-ABI proof fixtures. The
 //! resulting dylib path is exported as
 //! `WEAVEPY_REGRTEST_TESTBUFFER_EXTENSION`; the regrtest bootstrap
@@ -20,11 +20,11 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The stock CPython 3.13 include directories (staged `pyconfig.h` +
+/// The stock CPython 3.14 include directories (staged `pyconfig.h` +
 /// the vendored tree), mirroring `weavepy-capi/build.rs`'s
 /// `stock_python_include`.
 fn stock_python_include(capi_dir: &Path, out_dir: &Path) -> Option<Vec<PathBuf>> {
-    let tree = capi_dir.join("include").join("cpython313");
+    let tree = capi_dir.join("include").join(weavepy_version::HEADER_TREE);
     if !tree.join("Python.h").is_file() {
         return None;
     }
@@ -62,12 +62,12 @@ fn main() {
 
     let Some(include_dirs) = stock_python_include(&capi_dir, &out_dir) else {
         println!(
-            "cargo:warning=stock CPython 3.13 headers not found; \
+            "cargo:warning=stock CPython 3.14 headers not found; \
              regrtest runs without the compiled C-API fixtures"
         );
         return;
     };
-    let internal_include = capi_dir.join("include").join("cpython313").join("internal");
+    let internal_include = capi_dir.join("include").join(weavepy_version::HEADER_TREE).join("internal");
 
     let suffix = if target_os == "windows" { "dll" } else { "so" };
     let cc = env::var("CC").unwrap_or_else(|_| "cc".to_owned());

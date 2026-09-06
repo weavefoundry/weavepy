@@ -820,8 +820,8 @@ reason = "measured (RFC 0054 sweep): now passes end-to-end (~8s; 3 skips). The p
 
 [tests."cpython/Lib/test/test_marshal.py"]
 status = "divergence"
-divergence_tests = ["test.test_marshal.InstancingTestCase.testInt", "test.test_marshal.InstancingTestCase.testFloat"]
-reason = "measured (RFC 0060 WS9): 66 run, 2F (14 skips) — version arg, buffer inputs, code round-trips, interning, and the unmarshallable-object taxonomy (incl. inside co_consts, gh-106287) all conform. The two residuals are InstancingTestCase.testInt/testFloat: they assert version-2 loads create *more* instances (n2 > n0 by id()), unsatisfiable while WeavePy's unboxed int/float model derives id() from the value — a principled object-model residual, not a marshal gap."
+divergence_tests = ["test.test_marshal.InstancingTestCase.testInt", "test.test_marshal.InstancingTestCase.testFloat", "test.test_marshal.BugsTestCase.test_reference_loop_tuple", "test.test_marshal.BugsTestCase.test_loads_abnormal_reference_loops"]
+reason = "measured (RFC 0077 Phase II, 3.14 suite): 75 run, 2F/2E (14 skips) — version arg (now 5, with TYPE_SLICE), buffer inputs, code round-trips, interning, the unmarshallable-object taxonomy (incl. inside co_consts, gh-106287) and the 3.14 w_complete recursion guard ('cannot marshal recursion slice/code objects') all conform. Residuals: InstancingTestCase.testInt/testFloat assert version-2 loads create *more* instances (n2 > n0 by id()), unsatisfiable while WeavePy's unboxed int/float model derives id() from the value; BugsTestCase.test_reference_loop_tuple/test_loads_abnormal_reference_loops need a tuple whose items are filled *after* it is registered in the ref table (CPython's PyTuple_New + SET_ITEM), impossible with WeavePy's immutable Rc<[Object]> tuple — both are object-model residuals, not marshal gaps."
 
 [tests."cpython/Lib/test/test_math.py"]
 status = "pass"
@@ -1359,6 +1359,10 @@ reason = "measured (RFC 0057 full-suite sweep): passes end-to-end after the obje
 [tests."cpython/Lib/test/test_tty.py"]
 status = "pass"
 reason = "measured (RFC 0055 WS6): frozen CPython tty.py over the native termios builtin — setraw/setcbreak mode surgery verified against tcgetattr round-trips."
+
+[tests."cpython/Lib/test/test_tstring.py"]
+status = "pass"
+reason = "measured (RFC 0077 Phase II): 12 run, OK. PEP 750 t-strings on by default (-X lang=3.13 opts out); string.templatelib Template/Interpolation carry the CPython tp_name ('string.templatelib.Template') so concatenation TypeErrors match, and every replacement-field diagnostic names the kind ('t-string: expecting ...') through the lexer/parser error path."
 
 [tests."cpython/Lib/test/test_tuple.py"]
 status = "pass"

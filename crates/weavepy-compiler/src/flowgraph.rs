@@ -786,7 +786,6 @@ fn build(co: &mut CodeObject, input: &BuildInput<'_>) -> Cfg {
             skip[i - 1] = true;
         }
     }
-    let wrap_hid = wrap_entry.map(|e| handler_ids[e]);
     if let Some(e) = wrap_entry {
         // The wrapping `SETUP_CLEANUP` heads the entry block, before
         // RESUME; it never carries a handler.
@@ -898,8 +897,15 @@ fn build(co: &mut CodeObject, input: &BuildInput<'_>) -> Cfg {
             _ => (ins.op, ins.arg, None),
         };
         if ins.op == OpCode::YieldValue {
-            // `last_yield_except_depth == 1`: only the wrap is active.
-            last_yield_depth1 = wrap && except == wrap_hid;
+            // `last_yield_except_depth == 1`: exactly one handler is
+            // active at the yield — the PEP 479 wrap alone in a
+            // generator function, or (a generator lambda has no wrap)
+            // the `yield from` send-dance's own `CLEANUP_THROW` handler.
+            let depth = table
+                .iter()
+                .filter(|h| (h.start as usize) <= i && i < h.end as usize)
+                .count();
+            last_yield_depth1 = depth == 1;
         }
         let blk = &mut cfg.blocks[b];
         let off = blk.next_instr();
@@ -2580,14 +2586,16 @@ impl Cfg {
             for i in 0..self.blocks[b].used {
                 let instr = self.blocks[b].slots[i];
                 let new_depth = depth + self.net_effect(b, i, false);
-                maxdepth = maxdepth.max(new_depth);
+                // 3.14 folds the depth *before* each instruction into
+                // the maximum; what an instruction pushes is seen as
+                // its successor's entry depth.
+                maxdepth = maxdepth.max(depth);
                 // `HAS_TARGET`: only jumps and block pushes have a
                 // control edge (`PUSH_EXC_INFO` carries a VM tag, and a
                 // NOP'd jump keeps its stale target).
                 if let Some(target) = instr.target.filter(|_| has_target(instr.op)) {
                     if instr.op != OpCode::EndAsyncFor {
                         let target_depth = depth + self.net_effect(b, i, true);
-                        maxdepth = maxdepth.max(target_depth);
                         self.stackdepth_push(target, target_depth, &mut sp);
                     }
                 }
@@ -3130,7 +3138,12 @@ pub(crate) fn optimize(co: &mut CodeObject, input: &BuildInput<'_>) {
         "convert_pseudo_conditional_jumps",
         cfg.convert_pseudo_conditional_jumps()
     );
-    pass!("calculate_stackdepth", cfg.calculate_stackdepth());
+    let stacksize = cfg.calculate_stackdepth();
+    if dump {
+        cfg.dump(&format!("{} (after calculate_stackdepth)", co.qualname));
+    }
+    // `_PyCode_Validate`: a zero stack size is bumped to one.
+    co.stacksize = u32::try_from(stacksize.max(1)).ok();
     pass!(
         "insert_prefix_instructions",
         cfg.insert_prefix_instructions(co)

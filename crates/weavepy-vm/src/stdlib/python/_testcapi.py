@@ -103,6 +103,10 @@ FLT_MAX = 3.4028234663852886e38
 FLT_MIN = 1.1754943508222875e-38
 DBL_MAX = sys.float_info.max
 DBL_MIN = sys.float_info.min
+# 3.14 (Modules/_testcapi/float.c): whether the platform's NaN encoding
+# uses the quiet bit inverted (legacy MIPS / HPPA). Every target we build
+# for follows IEEE 754-2008, so the answer is False.
+nan_msb_is_signaling = False
 
 
 def exception_print(exc):
@@ -158,6 +162,94 @@ def remove_mem_hooks():
     import _testinternalcapi
 
     _testinternalcapi.remove_mem_hooks()
+
+
+def _config_snapshot():
+    # PEP 741 `PyConfig_Get()` view: the runtime-config dict
+    # `_testinternalcapi.get_config()` already publishes, widened with
+    # the `sys.flags` / `sys` mirrors of the remaining public options
+    # (`test.support.has_no_debug_ranges` reads `code_debug_ranges`;
+    # test_regrtest probes `buffered_stdio`, `warnoptions`,
+    # `bytes_warning`, `use_environment`).
+    import sys
+    import _testinternalcapi
+
+    cfg = dict(_testinternalcapi.get_config())
+    flags = sys.flags
+    # `-u` gives `sys.stdout` a write-through text layer.
+    unbuffered = bool(getattr(sys.stdout, "write_through", False))
+    cfg.update({
+        "argv": list(sys.argv),
+        "orig_argv": list(getattr(sys, "orig_argv", sys.argv)),
+        "base_exec_prefix": sys.base_exec_prefix,
+        "base_executable": getattr(sys, "_base_executable", sys.executable),
+        "base_prefix": sys.base_prefix,
+        "buffered_stdio": 0 if unbuffered else 1,
+        "bytes_warning": flags.bytes_warning,
+        "dev_mode": bool(flags.dev_mode),
+        "exec_prefix": sys.exec_prefix,
+        "executable": sys.executable,
+        "faulthandler": int(_faulthandler_enabled()),
+        "hash_seed": 0,
+        "ignore_environment": flags.ignore_environment,
+        "import_time": 0,
+        "inspect": flags.inspect,
+        "install_signal_handlers": 1,
+        "interactive": flags.interactive,
+        "isolated": flags.isolated,
+        "module_search_paths": list(sys.path),
+        "optimization_level": flags.optimize,
+        "platlibdir": sys.platlibdir,
+        "prefix": sys.prefix,
+        "pycache_prefix": sys.pycache_prefix,
+        "quiet": flags.quiet,
+        "safe_path": flags.safe_path,
+        "site_import": int(not flags.no_site),
+        "stdlib_dir": getattr(sys, "_stdlib_dir", None),
+        "use_environment": int(not flags.ignore_environment),
+        "user_site_directory": int(not flags.no_user_site),
+        "verbose": flags.verbose,
+        "warn_default_encoding": flags.warn_default_encoding,
+        "warnoptions": list(sys.warnoptions),
+        "write_bytecode": int(not flags.dont_write_bytecode),
+        "xoptions": dict(sys._xoptions),
+    })
+    return cfg
+
+
+def _faulthandler_enabled():
+    try:
+        import faulthandler
+    except ImportError:
+        return False
+    return faulthandler.is_enabled()
+
+
+def config_get(name):
+    """PyConfig_Get(name): the current value of a runtime configuration
+    option (PEP 741)."""
+    if not isinstance(name, str):
+        raise TypeError(
+            "config_get() argument must be str, not %s" % type(name).__name__
+        )
+    cfg = _config_snapshot()
+    try:
+        return cfg[name]
+    except KeyError:
+        raise ValueError("unknown config option name: %s" % name) from None
+
+
+def config_getint(name):
+    value = config_get(name)
+    if isinstance(value, bool):
+        return int(value)
+    if not isinstance(value, int):
+        raise TypeError("config option %s is not an int" % name)
+    return value
+
+
+def config_names():
+    return frozenset(_config_snapshot())
 
 
 def crash_no_current_thread():
@@ -834,6 +926,8 @@ from _testinternalcapi import (  # noqa: F401
     fire_event_line,
     fire_event_jump,
     fire_event_branch,
+    fire_event_branch_left,
+    fire_event_branch_right,
     fire_event_py_throw,
     fire_event_raise,
     fire_event_c_raise,
@@ -1385,6 +1479,24 @@ class _StructMembersNew(_StructMembers):
 
 
 _test_structmembersType_NewAPI = _StructMembersNew
+
+
+def code_offset_to_line(*args):
+    """`PyCode_Addr2Line(code, offset)` (test_code.test_co_branches)."""
+    if len(args) != 2:
+        raise TypeError("code_offset_to_line takes 2 arguments")
+    code, offset = args
+    offset = int(offset)
+    import types as _types
+
+    if not isinstance(code, _types.CodeType):
+        raise TypeError("first arg must be a code object")
+    if offset < 0:
+        return code.co_firstlineno
+    for start, end, line in code.co_lines():
+        if start <= offset < end:
+            return -1 if line is None else line
+    return -1
 
 
 # RFC 0068 WS3 — per-family C-API fixture shims (test_capi per-leg

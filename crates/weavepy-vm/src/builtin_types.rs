@@ -552,17 +552,29 @@ impl BuiltinTypes {
         // `isinstance(typ, GenericAlias)` and
         // `__class_getitem__ = classmethod(GenericAlias)`.
         let generic_alias_ = mk("GenericAlias", vec![object_.clone()]);
-        let union_type_ = mk("UnionType", vec![object_.clone()]);
-        for ty in [&generic_alias_, &union_type_] {
-            // Not in `as_globals` (they live in `types`, not `builtins`),
-            // so the bulk metaclass pass below won't reach them.
+        // 3.14: `types.UnionType` *is* `typing.Union` — one class, named
+        // `Union` in module `typing`, subscriptable (`Union[int, str]`)
+        // and the class of every `X | Y` union.
+        let union_type_ = mk("Union", vec![object_.clone()]);
+        for (ty, module) in [(&generic_alias_, "types"), (&union_type_, "typing")] {
+            // Not in `as_globals` (they live in `types`/`typing`, not
+            // `builtins`), so the bulk metaclass pass below won't reach them.
             ty.set_metaclass(type_.clone());
             let mut d = ty.dict.borrow_mut();
             d.insert(
                 crate::object::DictKey(Object::from_static("__module__")),
-                Object::from_static("types"),
+                Object::from_static(module),
             );
         }
+        union_type_.dict.borrow_mut().insert(
+            crate::object::DictKey(Object::from_static("__class_getitem__")),
+            Object::Builtin(Rc::new(crate::object::BuiltinFn {
+                name: "__class_getitem__",
+                binds_instance: false,
+                call: Box::new(crate::union_class_getitem),
+                call_kw: None,
+            })),
+        );
         // (Their C tp_doc strings live in `builtin_type_doc` — the
         // `type.__doc__` getset path; test_pydoc test_union_type.)
         // CPython's `ga_new`: `GenericAlias(origin, args)` — also reached
@@ -910,6 +922,9 @@ impl BuiltinTypes {
                 "end_lineno",
                 "end_offset",
                 "print_file_and_line",
+                // 3.14: `(last_stmt_lineno, last_stmt_col, source)` set
+                // by the parser; `traceback._find_keyword_typos` reads it.
+                "_metadata",
             ],
         );
         install_field_defaults(
@@ -4054,13 +4069,6 @@ fn install_unicode_error_dunders(ty: &Rc<TypeObject>, kind: UnicodeErrorKind) {
                 _ => 0,
             }
         };
-        // `encoding` / `reason` render via str() whatever their type —
-        // attributes are reassignable after construction (issue 7309).
-        let encoding = get("encoding").map(|o| o.to_str()).unwrap_or_default();
-        let reason = get("reason").map(|o| o.to_str()).unwrap_or_default();
-        let start = get("start").as_ref().map(as_i).unwrap_or(0);
-        let end = get("end").as_ref().map(as_i).unwrap_or(0);
-
         // CPython: a half-built instance (`__new__` without `__init__`)
         // falls back to `BaseException.__str__` — "" for empty args,
         // str(arg) for one, repr(args) otherwise.
@@ -4075,7 +4083,60 @@ fn install_unicode_error_dunders(ty: &Rc<TypeObject>, kind: UnicodeErrorKind) {
                 _ => Object::from_static(""),
             });
         }
-        let obj = get("object").unwrap_or(Object::None);
+        // `encoding` / `reason` render via str() whatever their type —
+        // attributes are reassignable after construction (issue 7309) —
+        // through the full `__str__` protocol, which may run Python code.
+        let py_str = |o: Object| -> Result<String, RuntimeError> {
+            match &o {
+                Object::Str(_) | Object::None | Object::Int(_) | Object::Bool(_) => Ok(o.to_str()),
+                _ => match crate::vm_singletons::current_interpreter_ptr() {
+                    // SAFETY: published by an enclosing VM frame still
+                    // live on this thread; the GIL keeps the access
+                    // exclusive.
+                    Some(ptr) => unsafe { &mut *ptr }.str_object(&o),
+                    None => Ok(o.to_str()),
+                },
+            }
+        };
+        let reason = py_str(get("reason").unwrap_or(Object::None))?;
+        let encoding = match kind {
+            UnicodeErrorKind::Translate => String::new(),
+            _ => py_str(get("encoding").unwrap_or(Object::None))?,
+        };
+        // Those str() calls may have mutated `object`
+        // (`check_unicode_error_attribute`, gh-128974).
+        let obj = match get("object") {
+            None => {
+                return Err(crate::error::type_error(
+                    "UnicodeError 'object' attribute is not set".to_owned(),
+                ));
+            }
+            Some(o) => {
+                let subclass_of = |o: &Object, base: &str| {
+                    matches!(o, Object::Instance(i)
+                        if i.cls().mro.borrow().iter().any(|t| t.name == base))
+                };
+                let ok = match kind {
+                    UnicodeErrorKind::Decode => {
+                        matches!(o, Object::Bytes(_)) || subclass_of(&o, "bytes")
+                    }
+                    _ => matches!(o, Object::Str(_) | Object::WStr(_)) || subclass_of(&o, "str"),
+                };
+                if !ok {
+                    return Err(crate::error::type_error(format!(
+                        "UnicodeError 'object' attribute must be a {}",
+                        if kind == UnicodeErrorKind::Decode {
+                            "bytes"
+                        } else {
+                            "string"
+                        }
+                    )));
+                }
+                o
+            }
+        };
+        let start = get("start").as_ref().map(as_i).unwrap_or(0);
+        let end = get("end").as_ref().map(as_i).unwrap_or(0);
 
         // Escape a single offending scalar exactly as CPython does.
         let escape = |c: u32| -> String {
@@ -4241,9 +4302,10 @@ fn install_syntax_error_dunders(syntax_error: &Rc<TypeObject>) {
                     items.len()
                 )));
             }
-            if items.len() > 6 {
+            // 3.14 accepts a seventh `_metadata` item.
+            if items.len() > 7 {
                 return Err(crate::error::type_error(format!(
-                    "function takes at most 6 arguments ({} given)",
+                    "function takes at most 7 arguments ({} given)",
                     items.len()
                 )));
             }
@@ -4257,9 +4319,12 @@ fn install_syntax_error_dunders(syntax_error: &Rc<TypeObject>) {
             inst_rc.slot_set("lineno", pick(1));
             inst_rc.slot_set("offset", pick(2));
             inst_rc.slot_set("text", pick(3));
-            if items.len() == 6 {
+            if items.len() >= 6 {
                 inst_rc.slot_set("end_lineno", pick(4));
                 inst_rc.slot_set("end_offset", pick(5));
+            }
+            if items.len() == 7 {
+                inst_rc.slot_set("_metadata", pick(6));
             }
         }
         Ok(Object::None)
@@ -5945,6 +6010,12 @@ fn install_numeric_class_methods(bt: &BuiltinTypes) {
         crate::builtins::b_bytearray_fromhex_cls,
     );
     install(&bt.float_, "fromhex", crate::builtins::b_float_fromhex_cls);
+    // 3.14: `complex.from_number(number)`.
+    install(
+        &bt.complex_,
+        "from_number",
+        crate::builtins::b_complex_from_number_cls,
+    );
     // `float.__getformat__` — CPython keeps this (undocumented) classmethod
     // for `test.support` (`HAVE_IEEE_754`) and struct/float tests. Rust f64
     // is IEEE 754 binary64 on every supported target, so the answer is

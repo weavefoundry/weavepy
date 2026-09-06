@@ -24,7 +24,31 @@ def convert(obj, /, conversion):
         return repr(obj)
     if conversion == 'a':
         return ascii(obj)
-    raise ValueError(f'invalid conversion specifier: {conversion!r}')
+    raise ValueError(f'invalid conversion specifier: {conversion}')
+
+
+def _template_unpickle(*args):
+    import itertools
+
+    if len(args) != 2:
+        raise ValueError('Template expects tuple of length 2 to unpickle')
+
+    strings, interpolations = args
+    parts = []
+    for string, interpolation in itertools.zip_longest(strings, interpolations):
+        if string is not None:
+            parts.append(string)
+        if interpolation is not None:
+            parts.append(interpolation)
+    return Template(*parts)
+
+
+def _reject_subclass(cls, base):
+    # CPython's Template/Interpolation/TemplateIter are not
+    # `Py_TPFLAGS_BASETYPE` (test_templatelib.test_final_types).
+    if cls is not base:
+        raise TypeError(
+            f"type '{base.__name__}' is not an acceptable base type")
 
 
 class Interpolation:
@@ -38,6 +62,13 @@ class Interpolation:
 
     __slots__ = ('_value', '_expression', '_conversion', '_format_spec')
     __match_args__ = ('value', 'expression', 'conversion', 'format_spec')
+
+    def __init_subclass__(cls, **kwargs):
+        _reject_subclass(cls, Interpolation)
+
+    def __reduce__(self):
+        return (type(self), (self._value, self._expression,
+                             self._conversion, self._format_spec))
 
     def __new__(cls, value, expression='', conversion=None, format_spec=''):
         if not isinstance(expression, str):
@@ -101,6 +132,12 @@ class Template:
 
     __slots__ = ('_strings', '_interpolations')
 
+    def __init_subclass__(cls, **kwargs):
+        _reject_subclass(cls, Template)
+
+    def __reduce__(self):
+        return (_template_unpickle, (self._strings, self._interpolations))
+
     def __new__(cls, *args):
         strings = []
         interpolations = []
@@ -162,9 +199,30 @@ class Template:
             # strings and re-inserts any needed empty separators.
             return Template(*tuple(self), *tuple(other))
         # Template + str is deliberately unsupported (ambiguous: static
-        # text or interpolation?) — see PEP 750.
-        return NotImplemented
+        # text or interpolation?) — see PEP 750. CPython's `template_concat`
+        # is an `sq_concat` slot: a right operand with its own `__radd__`
+        # (an `nb_add` slot) is tried first, anything else gets the
+        # sequence-concat wording.
+        if hasattr(type(other), '__radd__'):
+            return NotImplemented
+        raise TypeError(
+            'can only concatenate string.templatelib.Template (not '
+            f'"{_tp_name(type(other))}") to string.templatelib.Template')
 
     def __repr__(self):
         return (f'{type(self).__name__}(strings={self._strings!r}, '
                 f'interpolations={self._interpolations!r})')
+
+
+def _tp_name(cls):
+    """`Py_TYPE(o)->tp_name`: dotted for the module's static types."""
+    if cls is Template or cls is Interpolation:
+        return f'string.templatelib.{cls.__name__}'
+    return cls.__name__
+
+
+# CPython's `Template`/`Interpolation` are static C types whose `tp_name`
+# carries the module prefix, and `tp_name`-based error text prints it
+# ('can only concatenate str (not "string.templatelib.Template") to str').
+__weavepy_set_tp_name__(Template, "string.templatelib.Template")
+__weavepy_set_tp_name__(Interpolation, "string.templatelib.Interpolation")

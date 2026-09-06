@@ -310,7 +310,7 @@ fn standard_key(encoding: &str) -> &'static str {
 
 /// Faithful port of CPython's `_PyUnicode_DecodeUnicodeEscapeInternal2`.
 /// Returns `(text, consumed, first_invalid_escape_warning)` — the warning
-/// message (e.g. ``invalid escape sequence '\z'``) that the caller emits as
+/// message (e.g. ``"\z" is an invalid escape sequence. ...``) that the caller emits as
 /// a `DeprecationWarning`, or `None`.
 pub fn unicode_escape_decode(
     data: &[u8],
@@ -371,7 +371,10 @@ pub fn unicode_escape_decode(
                     }
                 }
                 if ch > 0o377 && warn.is_none() {
-                    warn = Some(format!("invalid octal escape sequence '\\{ch:o}'"));
+                    warn = Some(format!(
+                        "\"\\{ch:o}\" is an invalid octal escape sequence. \
+                         Such sequences will not work in the future. "
+                    ));
                 }
                 out.push(ch);
             }
@@ -451,7 +454,11 @@ pub fn unicode_escape_decode(
             }
             _ => {
                 if warn.is_none() {
-                    warn = Some(format!("invalid escape sequence '\\{}'", c as char));
+                    warn = Some(format!(
+                        "\"\\{}\" is an invalid escape sequence. \
+                         Such sequences will not work in the future. ",
+                        c as char
+                    ));
                 }
                 out.push(u32::from(b'\\'));
                 out.push(u32::from(c));
@@ -1151,6 +1158,13 @@ impl EncCtx {
                 Ok((Replacement::Ascii(s), end))
             }
             Handler::NameReplace => {
+                // PyCodec_NameReplaceErrors reaches the name database via
+                // `_PyUnicode_GetNameCAPI` (an import of `unicodedata`).
+                if !crate::stdlib::unicodedata_mod::ensure_unicodedata_loaded() {
+                    return Err(crate::error::import_error(
+                        "PyCapsule_Import could not import module \"unicodedata\"",
+                    ));
+                }
                 let mut s = String::new();
                 for &cp in &self.input[start..end] {
                     match char::from_u32(cp).and_then(crate::stdlib::unicodedata_mod::char_name) {

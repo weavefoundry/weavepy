@@ -60,8 +60,25 @@ fn print_or_clear(e: RuntimeError, callable: &Object) {
     }
     if let Ok(ip) = interp() {
         let ctx = callable.repr();
-        ip.write_unraisable_msg(&e, callable, &ctx, None);
+        // PyErr_FormatUnraisable("Exception ignored on sqlite3 callback %R")
+        let err_msg = format!("Exception ignored on sqlite3 callback {ctx}");
+        ip.write_unraisable_msg(&e, callable, &ctx, Some(&err_msg));
     }
+}
+
+/// connection.c `check_num_params`: the argument count passed to
+/// `create_function` / `create_aggregate` / `create_window_function` must
+/// lie in `-1..=SQLITE_LIMIT_FUNCTION_ARG`.
+fn check_num_params(db: *mut ffi::sqlite3, n: i64, name: &str) -> Result<(), RuntimeError> {
+    // SAFETY: live db handle; a negative new value only queries the limit.
+    let limit = i64::from(unsafe { ffi::sqlite3_limit(db, ffi::SQLITE_LIMIT_FUNCTION_ARG, -1) });
+    if n < -1 || n > limit {
+        return Err(raise(
+            programming_error_class(),
+            format!("'{name}' must be between -1 and {limit}, not {n}"),
+        ));
+    }
+    Ok(())
 }
 
 /// Does the error match the named builtin exception class?
@@ -263,6 +280,7 @@ pub(crate) fn conn_create_function(
         .unwrap_or(false);
 
     let db = state.borrow().db_ptr();
+    check_num_params(db, narg, "narg")?;
     let c_name =
         std::ffi::CString::new(name.clone()).map_err(|_| value_error("embedded null byte"))?;
     let mut flags = ffi::SQLITE_UTF8;
@@ -495,6 +513,7 @@ pub(crate) fn conn_create_aggregate(
         .ok_or_else(|| type_error("create_aggregate() missing 'aggregate_class'"))?;
 
     let db = state.borrow().db_ptr();
+    check_num_params(db, n_arg, "n_arg")?;
     let c_name =
         std::ffi::CString::new(name.clone()).map_err(|_| value_error("embedded null byte"))?;
     if matches!(aggregate_class, Object::None) {
@@ -570,6 +589,7 @@ pub(crate) fn conn_create_window_function(
         .ok_or_else(|| type_error("create_window_function() missing 'aggregate_class'"))?;
 
     let db = state.borrow().db_ptr();
+    check_num_params(db, num_params, "num_params")?;
     let c_name =
         std::ffi::CString::new(name.clone()).map_err(|_| value_error("embedded null byte"))?;
     if matches!(aggregate_class, Object::None) {

@@ -571,22 +571,27 @@ pub(crate) fn create_registered(cfg: SubinterpConfig, whence: i64) -> Result<u64
     // `pending_identify` probes to this interpreter (and to worker
     // threads it spawns, which snapshot the id).
     interp.set_interp_id(id);
-    // A fresh interpreter's `__main__` carries exactly CPython's
+    // A fresh interpreter's `__main__` carries exactly CPython 3.14's
     // `add_main_module` shape: __name__/__doc__/__package__(None)/
-    // __loader__/__spec__/__annotations__/__builtins__ and nothing else
-    // (test__interpreters RunStringTests.test_execution_namespace_is_main
-    // snapshots `vars()` and compares exhaustively — no __file__).
+    // __loader__(BuiltinImporter)/__spec__(None)/__builtins__ and nothing
+    // else — no __file__, and no __annotations__ (PEP 649 made module
+    // annotations lazy). test__interpreters
+    // RunStringTests.test_execution_namespace_is_main and
+    // test_interpreters TestInterpreterCall.test_globals_from_builtins
+    // snapshot `vars()`/`dir()` and compare exhaustively. `__loader__` is
+    // the interpreter's *own* `_frozen_importlib.BuiltinImporter`, which
+    // needs that interpreter to run; `exec_registered` seeds it on the
+    // first execution.
     let globals = interp.build_module_globals_for("__main__", None, None);
     {
         let mut g = globals.borrow_mut();
         g.insert(DictKey(Object::from_static("__package__")), Object::None);
-        g.insert(
-            DictKey(Object::from_static("__annotations__")),
-            Object::Dict(Rc::new(RefCell::new(DictData::default()))),
-        );
-        g.insert(DictKey(Object::from_static("__loader__")), Object::None);
         g.insert(DictKey(Object::from_static("__spec__")), Object::None);
     }
+    // `sys.modules['__main__']` exists from the start in every CPython
+    // interpreter (`add_main_module`); `_interpreters.call(globals)` /
+    // `call(dir)` resolve the running `__main__` through it.
+    interp.install_main_module(&globals);
     reg.interps.insert(
         id,
         InterpreterEntry {
@@ -663,6 +668,7 @@ pub(crate) fn exec_registered(
 ) -> Result<i32, RuntimeError> {
     let (mut interp, globals) = take_interp(id, mark_running_main)?;
     push_current_id(id);
+    seed_main_loader(&mut interp, &globals);
     let result = (|| -> Result<(), RuntimeError> {
         let module = weavepy_parser::parse_module(source)
             .map_err(|e| crate::parse_error_to_syntax_error(&e, source, "<string>"))?;
@@ -685,6 +691,27 @@ pub(crate) fn exec_registered(
     pop_current_id();
     put_back_interp(id, interp);
     outcome
+}
+
+/// CPython's `add_main_module`: `__main__.__loader__` is the
+/// interpreter's own `_frozen_importlib.BuiltinImporter`. Resolved on
+/// the interpreter's first execution (see `create`), once.
+fn seed_main_loader(interp: &mut crate::Interpreter, globals: &Rc<RefCell<DictData>>) {
+    let key = DictKey(Object::from_static("__loader__"));
+    if globals.borrow().get(&key).is_some() {
+        return;
+    }
+    let loader = match interp.import_path_internal("_frozen_importlib") {
+        Ok(Object::Module(m)) => m
+            .dict
+            .borrow()
+            .get(&DictKey(Object::from_static("BuiltinImporter")))
+            .cloned(),
+        _ => None,
+    };
+    globals
+        .borrow_mut()
+        .insert(key, loader.unwrap_or(Object::None));
 }
 
 /// Destroy a registered interpreter (shared by `_xxsubinterpreters.destroy`
@@ -733,6 +760,17 @@ pub(crate) fn destroy_registered(id: u64) -> Result<(), RuntimeError> {
         queues_drop_interpreter(&mut reg, child);
     }
     Ok(())
+}
+
+/// Ids of every live sub-interpreter (ascending). Used by the main
+/// interpreter's shutdown to sweep what `Interpreter.close()` didn't.
+pub(crate) fn live_sub_ids() -> Vec<u64> {
+    let Ok(reg) = registry().lock() else {
+        return Vec::new();
+    };
+    let mut ids: Vec<u64> = reg.interps.keys().copied().collect();
+    ids.sort_unstable();
+    ids
 }
 
 /// Whether the interpreter id is registered (used by the
@@ -868,6 +906,7 @@ fn i_run_string(args: &[Object]) -> Result<Object, RuntimeError> {
     // id sees it as "running" (the entry itself stays registered).
     let (mut interp, globals) = take_interp(id, true)?;
     push_current_id(id);
+    seed_main_loader(&mut interp, &globals);
     let result = (|| -> Result<(), RuntimeError> {
         // A bad script surfaces as a real `SyntaxError` in the excinfo
         // snapshot `_interpreters.run_string` hands back (CPython runs
@@ -945,6 +984,7 @@ fn i_run_func(args: &[Object]) -> Result<Object, RuntimeError> {
     };
     let (mut interp, globals) = take_interp(id, true)?;
     push_current_id(id);
+    seed_main_loader(&mut interp, &globals);
     let result = match code {
         Some(code) => interp.exec_module_in(&code, globals).map(|_| Object::None),
         None => {

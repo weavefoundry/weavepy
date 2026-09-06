@@ -324,7 +324,41 @@ fn run_source_with_options_impl(
     let (module_res, escape_warnings) = parser::parse_module_with_warnings(source_ref);
     let module = match module_res {
         Ok(m) => m,
-        Err(e) => return (None, Err(e.into())),
+        Err(e) => {
+            // CPython parses the main module inside the initialized
+            // interpreter and reports a SyntaxError through
+            // `sys.excepthook` / `traceback` — which is where the 3.14
+            // keyword-typo hints ("Did you mean 'if'?") come from. Bring
+            // an interpreter up (site included, as at CPython init) and
+            // let it rebuild and print the exception.
+            if opts.print_uncaught {
+                let mut interpreter = vm::Interpreter::default();
+                interpreter.apply_run_options(&opts.flags);
+                for p in &opts.extra_path {
+                    interpreter.append_path(p.clone());
+                }
+                let argv: Vec<String> = if opts.argv.is_empty() {
+                    vec![opts.filename.clone()]
+                } else {
+                    opts.argv.clone()
+                };
+                interpreter.set_argv(argv);
+                if !opts.flags.no_site {
+                    let _ = interpreter.run_site();
+                }
+                if let Some(exc) = interpreter.main_module_syntax_error(source_ref, &opts.filename)
+                {
+                    if interpreter.print_uncaught_exception(&exc) {
+                        let _ = interpreter.flush_streams();
+                        return (
+                            None,
+                            Err(Error::RuntimePrinted(vm::RuntimeError::PyException(exc))),
+                        );
+                    }
+                }
+            }
+            return (None, Err(e.into()));
+        }
     };
     // `-O`/`-OO` applies to the main module too (assert/docstring
     // stripping, `__debug__` folding) — RFC 0052.

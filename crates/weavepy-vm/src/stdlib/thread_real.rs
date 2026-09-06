@@ -339,9 +339,7 @@ fn resolve_acquire_args(
         // Beyond `TIMEOUT_MAX` the nanosecond deadline overflows; CPython
         // raises OverflowError.
         if tv.is_nan() || tv > TIMEOUT_MAX_SECS {
-            return Err(overflow_error(
-                "timestamp too large to convert to C _PyTime_t",
-            ));
+            return Err(overflow_error("timestamp out of range for C PyTime_t"));
         }
     }
     Ok((blocking, timeout_obj))

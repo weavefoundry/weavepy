@@ -326,6 +326,13 @@ pub struct CodeObject {
     /// surface reports these bytes verbatim instead of re-encoding the
     /// instruction stream, so constructor/replace round-trips are exact.
     pub wire: Option<Box<WireOverrides>>,
+    /// `co_stacksize` as CPython's `calculate_stackdepth` computed it
+    /// over the control-flow graph (or as it arrived in a marshal
+    /// stream). The graph sees handler blocks a `SETUP_*` still targets
+    /// after their protected range emptied out (an `except* E as e:
+    /// pass` body), which the assembled exception table no longer
+    /// mentions; recomputing from the flat stream would miss them.
+    pub stacksize: Option<u32>,
     /// Sorted indices of `JumpBackward` instructions that encode as
     /// `JUMP_BACKWARD_NO_INTERRUPT` on the CPython wire (RFC 0068).
     /// CPython emits JUMP_NO_INTERRUPT for every synthetic scope-exit
@@ -345,6 +352,20 @@ pub struct CodeObject {
     /// `CO_FAST_HIDDEN` in `co_localspluskinds` and stay out of
     /// `locals()`.
     pub hidden_locals: Vec<String>,
+    /// Identifiers of the source that reach `co_consts` as strings
+    /// rather than names: keyword-argument names (the `CALL_KW` names
+    /// tuple, the `**`-call dict keys) and class-pattern attribute
+    /// names. CPython's parser interns every identifier, so these
+    /// constants are interned objects whatever their characters; the
+    /// marshal writer's `FLAG_REF` model needs to know (non-ASCII
+    /// identifiers are not interned by `intern_string_constants`).
+    pub const_identifiers: Vec<String>,
+    /// A compiler-generated `__annotate__` scope (PEP 649):
+    /// `codegen_leave_annotations_scope` rebuilt its
+    /// `co_localsplusnames` (`.format` -> `format`) as a fresh tuple
+    /// outside the constant cache, so the marshal writer never shares
+    /// it. A user function named `__annotate__` is not one.
+    pub annotate_scope: bool,
 }
 
 /// Raw CPython-3.13 wire fields pinned on a [`CodeObject`] by the
@@ -695,9 +716,15 @@ impl PartialEq for Constant {
             (C::Bool(a), C::Bool(b)) => a == b,
             (C::Int(a), C::Int(b)) => a == b,
             (C::BigInt(a), C::BigInt(b)) => a == b,
-            (C::Float(a), C::Float(b)) => a.to_bits() == b.to_bits(),
+            // `_PyCode_ConstantKey` keys a float by the object itself
+            // (plus a negative-zero marker), and `nan == nan` is false
+            // for distinct objects: every folded NaN gets its own slot.
+            (C::Float(a), C::Float(b)) => !a.is_nan() && a.to_bits() == b.to_bits(),
             (C::Complex(ar, ai), C::Complex(br, bi)) => {
-                ar.to_bits() == br.to_bits() && ai.to_bits() == bi.to_bits()
+                !ar.is_nan()
+                    && !ai.is_nan()
+                    && ar.to_bits() == br.to_bits()
+                    && ai.to_bits() == bi.to_bits()
             }
             (C::Str(a), C::Str(b)) => a == b,
             (C::WStr(a), C::WStr(b)) => a == b,
@@ -799,22 +826,18 @@ pub mod flags {
         | PYCF_ALLOW_INCOMPLETE_INPUT
         | PYCF_OPTIMIZED_AST;
 
-    /// Map a `__future__` feature name to its `CO_FUTURE_*` bit.
-    /// Returns 0 for features that predate the flag scheme entirely
-    /// (there are none — every known feature has a bit).
+    /// Map a `__future__` feature name to the `CO_FUTURE_*` bit the
+    /// compiler records on the module code object. `future.c`'s
+    /// `future_check_features` only sets a bit for the two features
+    /// that still change compilation (`barry_as_FLUFL`, `annotations`);
+    /// the mandatory ones are accepted and recorded as 0, so
+    /// `from __future__ import generator_stop` leaves `co_flags` clean.
     pub fn future_feature_bit(name: &str) -> Option<u32> {
         Some(match name {
-            "division" => CO_FUTURE_DIVISION,
-            "absolute_import" => CO_FUTURE_ABSOLUTE_IMPORT,
-            "with_statement" => CO_FUTURE_WITH_STATEMENT,
-            "print_function" => CO_FUTURE_PRINT_FUNCTION,
-            "unicode_literals" => CO_FUTURE_UNICODE_LITERALS,
             "barry_as_FLUFL" => CO_FUTURE_BARRY_AS_BDFL,
-            "generator_stop" => CO_FUTURE_GENERATOR_STOP,
             "annotations" => CO_FUTURE_ANNOTATIONS,
-            // `nested_scopes` / `generators` are always-on features with
-            // no live bit in 3.x.
-            "nested_scopes" | "generators" => 0,
+            "nested_scopes" | "generators" | "division" | "absolute_import"
+            | "with_statement" | "print_function" | "unicode_literals" | "generator_stop" => 0,
             _ => return None,
         })
     }
@@ -1400,7 +1423,19 @@ fn eval_mode_invalid_stmt(module: &Module) -> Option<&Stmt> {
 #[derive(Debug, Default)]
 struct LineIndex {
     line_starts: Vec<u32>,
+    /// Sorted byte offsets of [`NO_COLUMN_MARKER`] bytes: positions that
+    /// carry a line but no column (`col_offset == -1` on an AST node
+    /// compiled via `compile(tree)`).
+    no_column: Vec<u32>,
 }
+
+/// Marker byte the AST-to-source position synthesiser places at the end
+/// of every synthetic line. A span endpoint landing on it means "line
+/// known, column unknown": the instruction's location is encoded with
+/// `CODE_NO_COLUMNS` and `co_positions()` reports `None` columns, as
+/// CPython does for `col_offset = -1`. The byte is a tokenizer error in
+/// real source, so it never collides with a genuine span endpoint.
+pub const NO_COLUMN_MARKER: char = '\x01';
 
 impl LineIndex {
     fn new(source: &str) -> Self {
@@ -1408,14 +1443,23 @@ impl LineIndex {
         // tokenizer's universal-newline handling.
         let bytes = source.as_bytes();
         let mut starts = vec![0u32];
+        let mut no_column = Vec::new();
         for (i, &b) in bytes.iter().enumerate() {
             if b == b'\n' || (b == b'\r' && bytes.get(i + 1) != Some(&b'\n')) {
                 starts.push((i + 1) as u32);
+            } else if b == NO_COLUMN_MARKER as u8 {
+                no_column.push(i as u32);
             }
         }
         Self {
             line_starts: starts,
+            no_column,
         }
+    }
+
+    /// Whether `byte` is a "no column" position (see [`NO_COLUMN_MARKER`]).
+    fn is_no_column(&self, byte: u32) -> bool {
+        !self.no_column.is_empty() && self.no_column.binary_search(&byte).is_ok()
     }
 
     fn line_for(&self, byte: u32) -> u32 {
@@ -1503,6 +1547,12 @@ struct Compiler {
     /// `__qualname__` (CPython's `compiler_set_qualname` GLOBAL_EXPLICIT
     /// rule), which is what makes `global P; class P: ...` pickleable.
     explicit_globals: HashSet<String>,
+    /// Function scopes: iteration variables an inlined comprehension
+    /// turns into a cell while this scope only *reads* the name. The
+    /// cell exists for the comprehension's duration (`cellvars` carries
+    /// it), but the scope's own reads stay global-implicit, as
+    /// `inline_comprehension` leaves an existing symbol's scope alone.
+    comp_cell_only: HashSet<String>,
     /// Class scopes only: names whose class-level binding is an explicit
     /// `global`, but where an *enclosing function* binds the same name.
     /// PEP 227 makes class scopes invisible to nested scopes, so a
@@ -1942,6 +1992,7 @@ impl Compiler {
             comp_kind: None,
             bindings: IndexMap::new(),
             explicit_globals: HashSet::new(),
+            comp_cell_only: HashSet::new(),
             class_transparent_frees: HashSet::new(),
             free_order: Vec::new(),
             loop_stack: Vec::new(),
@@ -2037,6 +2088,19 @@ impl Compiler {
     ///   qualname when the parent is a class body (so a method reads
     ///   `C.method`). The child name is then dotted onto that base.
     fn compute_child_qualname(&self, name: &str) -> String {
+        self.child_qualname_impl(name, true)
+    }
+
+    /// [`Self::compute_child_qualname`] for a child that is itself an
+    /// annotation scope (a `type` alias value thunk): CPython applies
+    /// the `GLOBAL_EXPLICIT` reset only to function and class units, so
+    /// `global T; type T = ...` inside a function still yields
+    /// `f.<locals>.T`.
+    fn compute_annotation_child_qualname(&self, name: &str) -> String {
+        self.child_qualname_impl(name, false)
+    }
+
+    fn child_qualname_impl(&self, name: &str, force_global: bool) -> String {
         // Annotation scopes are transparent for qualnames: the generic
         // def/class defined inside `<generic parameters of X>` gets the
         // qualname it would have had in the enclosing scope, and a
@@ -2053,7 +2117,7 @@ impl Compiler {
         }
         // CPython's GLOBAL_EXPLICIT rule: `global P` in the enclosing scope
         // resets the nested def/class qualname to the bare name.
-        if self.explicit_globals.contains(name) {
+        if force_global && self.explicit_globals.contains(name) {
             return name.to_owned();
         }
         let mut base = self.co.qualname.clone();
@@ -2448,10 +2512,20 @@ impl Compiler {
         }
         let (_start_line, start_col) = self.line_index.pos_for(start);
         let (end_line, end_col) = self.line_index.pos_for(end);
+        let col = if self.line_index.is_no_column(start) {
+            -1
+        } else {
+            start_col as i32
+        };
+        let end_col = if self.line_index.is_no_column(end) {
+            -1
+        } else {
+            end_col as i32
+        };
         ColSpan {
             end_lineno: end_line,
-            col: start_col as i32,
-            end_col: end_col as i32,
+            col,
+            end_col,
         }
     }
 
@@ -2948,6 +3022,7 @@ impl Compiler {
                 continue;
             }
             match self.bindings.get(name) {
+                None if self.comp_cell_only.contains(name) => {}
                 Some(Binding::Local) | None => {
                     self.bindings.insert(name.clone(), Binding::Cell);
                 }
@@ -3079,6 +3154,23 @@ impl Compiler {
             for s in body {
                 self.collect_comp_cells_stmt(s, &mut comp_cells);
             }
+            // `inline_comprehension` copies a comprehension cell into
+            // this scope only when the scope has no entry for the name;
+            // a plain use here keeps its global-implicit resolution
+            // (`return b` next to `[(lambda: b) for b in xs]` is a
+            // LOAD_GLOBAL, test_listcomps
+            // `test_global_outside_cellvar_inside_plus_freevar`).
+            let mut used = HashSet::new();
+            for s in body {
+                for_each_scope_expr(s, &mut |e| {
+                    self.collect_uses_through_inlined(e, &mut Vec::new(), &mut used)
+                });
+            }
+            for name in &comp_cells {
+                if used.contains(name) && !self.bindings.contains_key(name) {
+                    self.comp_cell_only.insert(name.clone());
+                }
+            }
             self.register_comp_cells(comp_cells);
         }
     }
@@ -3140,7 +3232,13 @@ impl Compiler {
                 if self.eval_mode {
                     self.emit(OpCode::ReturnValue, 0);
                 } else if self.interactive {
-                    self.emit(OpCode::PrintExpr, 0);
+                    // 3.14 `codegen_stmt_expr`: `CALL_INTRINSIC_1
+                    // INTRINSIC_PRINT; POP_TOP` (both on the value's
+                    // location), so `dis` of a `'single'` compile matches
+                    // CPython byte for byte (test_peepholer
+                    // test_constant_folding_remove_nop_location).
+                    self.emit(OpCode::CallIntrinsic1, intrinsic::PRINT);
+                    self.emit(OpCode::PopTop, 0);
                 } else {
                     // CPython emits the statement's POP_TOP with NO_LOCATION
                     // and lets flowgraph line propagation fill it in when it
@@ -3186,6 +3284,29 @@ impl Compiler {
                 // Under `-O`/`-OO` (optimize >= 1) assertions compile
                 // to nothing, exactly like CPython's compiler_assert.
                 if self.params.optimize >= 1 {
+                    // The symtable pass still sees the dropped test: an
+                    // `await` / async comprehension outside an async
+                    // scope is a SyntaxError even when optimized away
+                    // (gh-121637, test_builtin.test_compile_top_level_await).
+                    if !self.in_async_context()
+                        && !self.allows_top_level_await()
+                        && body_has_top_level_await(std::slice::from_ref(stmt))
+                    {
+                        let direct_await = expr_contains_await(test)
+                            || msg.as_ref().is_some_and(|m| expr_contains_await(m));
+                        return Err(CompileError::spanned(
+                            if direct_await {
+                                if self.kind == CodeKind::Function {
+                                    "'await' outside async function"
+                                } else {
+                                    "'await' outside function"
+                                }
+                            } else {
+                                "asynchronous comprehension outside of an asynchronous function"
+                            },
+                            test.span,
+                        ));
+                    }
                     return Ok(());
                 }
                 let stmt_span = stmt.span;
@@ -3861,7 +3982,7 @@ impl Compiler {
             self.emit(OpCode::LoadConst, level_idx);
             let none_idx = self.co.intern_constant(Constant::None);
             self.emit(OpCode::LoadConst, none_idx);
-            let name_idx = self.co.intern_name(&alias.name);
+            let name_idx = self.co.intern_name(&self.import_name_mangled(&alias.name));
             self.emit(OpCode::ImportName, name_idx);
             match &alias.asname {
                 None => {
@@ -3888,7 +4009,7 @@ impl Compiler {
                         self.emit_store_name(asname);
                     } else {
                         for (i, part) in attrs.iter().enumerate() {
-                            let idx = self.co.intern_name(part);
+                            let idx = self.co.intern_name(&self.import_name_mangled(part));
                             self.emit(OpCode::ImportFrom, idx);
                             if i + 1 < attrs.len() {
                                 self.emit(OpCode::Swap, 2);
@@ -3932,7 +4053,7 @@ impl Compiler {
         let from_idx = self.co.intern_constant(Constant::Tuple(from_tuple));
         self.emit(OpCode::LoadConst, from_idx);
         let module_name = module.unwrap_or("");
-        let name_idx = self.co.intern_name(module_name);
+        let name_idx = self.co.intern_name(&self.import_name_mangled(module_name));
         self.emit(OpCode::ImportName, name_idx);
 
         // `from m import *` is its own opcode and binds every public name.
@@ -3946,13 +4067,24 @@ impl Compiler {
         }
 
         for alias in names {
-            let from_idx = self.co.intern_name(&alias.name);
+            let from_idx = self.co.intern_name(&self.import_name_mangled(&alias.name));
             self.emit(OpCode::ImportFrom, from_idx);
             let target = alias.asname.as_deref().unwrap_or(&alias.name);
             self.emit_store_name(target);
         }
         self.emit(OpCode::PopTop, 0);
         Ok(())
+    }
+
+    /// CPython emits `IMPORT_NAME` / `IMPORT_FROM` through `ADDOP_NAME`,
+    /// which runs `_Py_Mangle`: inside a class, `import __m` looks up
+    /// the module `_C__m` (a dotted path is left alone, and the
+    /// `fromlist` constant keeps the written spelling). Faithfully odd.
+    fn import_name_mangled(&self, name: &str) -> String {
+        match &self.private {
+            Some(class_name) => crate::mangle::mangle_ident(class_name, name),
+            None => name.to_owned(),
+        }
     }
 
     // ---------- structural pattern matching (RFC 0009) ----------
@@ -4438,7 +4570,10 @@ impl Compiler {
         self.set_span(pat.span);
         let kw_names: Vec<Constant> = keywords
             .iter()
-            .map(|(n, _)| Constant::Str(n.clone()))
+            .map(|(n, _)| {
+                self.note_identifier_const(n);
+                Constant::Str(n.clone())
+            })
             .collect();
         let kw_idx = self.co.intern_constant(Constant::Tuple(kw_names));
         self.emit(OpCode::LoadConst, kw_idx);
@@ -4461,6 +4596,10 @@ impl Compiler {
                 &keywords[i - nargs].1
             };
             if matches!(pattern.kind, PatternKind::Capture(None)) {
+                // `ADDOP(c, LOC(p), POP_TOP)`: the wildcard's pop is
+                // attributed to the class pattern, not the `_`.
+                self.set_line_from(pat.span.start.0);
+                self.set_span(pat.span);
                 self.emit(OpCode::PopTop, 0);
                 continue;
             }
@@ -5075,7 +5214,7 @@ impl Compiler {
         let mut flags = 0x01;
         if !code.freevars.is_empty() {
             for free in &code.freevars {
-                let idx = self.cell_or_free_index(free);
+                let idx = self.closure_index(free);
                 self.emit(OpCode::LoadClosure, idx);
             }
             self.emit(OpCode::BuildTuple, code.freevars.len() as u32);
@@ -5214,7 +5353,7 @@ impl Compiler {
         let mut flags = 0x01;
         if !code.freevars.is_empty() {
             for free in &code.freevars {
-                let idx = self.cell_or_free_index(free);
+                let idx = self.closure_index(free);
                 self.emit(OpCode::LoadClosure, idx);
             }
             self.emit(OpCode::BuildTuple, code.freevars.len() as u32);
@@ -5402,8 +5541,11 @@ impl Compiler {
         // the class block (methods, lambdas in the class body). A
         // generic method's parent is the hidden
         // `<generic parameters of X>` scope (a `TypeParametersBlock`),
-        // so it is not a method.
-        inner.co.is_method = self.co.is_class_body;
+        // so it is not a method. Nor is a lambda inside a comprehension
+        // inlined into the class body: the symtable builds the
+        // comprehension as its own function block first, so `st_cur`
+        // is that block, not the class.
+        inner.co.is_method = self.co.is_class_body && self.inline_comp == 0;
         inner.co.is_nested = self.child_is_nested();
         // PEP 695 lazy scope: the child consults `__classdict__` for
         // free/global loads; give it the cell as a free variable so
@@ -5592,7 +5734,7 @@ impl Compiler {
         flags |= self.compile_function_annotations(args, returns)?;
         if !inner_freevars.is_empty() {
             for free in &inner_freevars {
-                let idx = self.cell_or_free_index(free);
+                let idx = self.closure_index(free);
                 self.emit(OpCode::LoadClosure, idx);
             }
             self.emit(OpCode::BuildTuple, inner_freevars.len() as u32);
@@ -5676,7 +5818,7 @@ impl Compiler {
                 .insert("__classdict__".to_owned(), Binding::Free);
             inner.free_order.push("__classdict__".to_owned());
         }
-        inner.co.qualname = self.compute_child_qualname(name);
+        inner.co.qualname = self.compute_annotation_child_qualname(name);
         // A lambda or comprehension inside the annotation scope is
         // named from *this* scope (`compiler_set_qualname` looks
         // through the annotation parent).
@@ -5724,6 +5866,7 @@ impl Compiler {
         // `co->co_localsplusnames = ("format", *co->co_localsplusnames[1:])`
         if is_annotate {
             code.varnames[0] = "format".to_owned();
+            code.annotate_scope = true;
         }
         Ok(code)
     }
@@ -5736,7 +5879,7 @@ impl Compiler {
         let mut flags = 0;
         if !code.freevars.is_empty() {
             for free in &code.freevars {
-                let idx = self.cell_or_free_index(free);
+                let idx = self.closure_index(free);
                 self.emit(OpCode::LoadClosure, idx);
             }
             self.emit(OpCode::BuildTuple, code.freevars.len() as u32);
@@ -6089,6 +6232,7 @@ impl Compiler {
                         .arg
                         .clone()
                         .expect("kw splat handled by CallEx path above");
+                    self.note_identifier_const(&n);
                     names.push(Constant::Str(n));
                     self.compile_expr(&k.value)?;
                 }
@@ -6170,12 +6314,12 @@ impl Compiler {
         // `type.__new__` can reject a non-cell (test_slots_special2). We
         // reuse the same free-variable analysis the body relies on, so the
         // signal can't be a false negative relative to what super() needs.
-        let needs_class_closure = {
-            // Inlined comprehensions are transparent here: a
-            // `super()` written directly in one resolves `__class__`
-            // as an implicit global (`inline_comprehension` drops the
-            // comprehension's own `__class__` from the class's free
-            // set), so only a real nested scope claims the cell.
+        // Inlined comprehensions are transparent here: a `super()`
+        // written directly in one resolves `__class__` as an implicit
+        // global (`inline_comprehension` drops the comprehension's own
+        // `__class__` from the class's free set), so only a real nested
+        // scope claims a cell.
+        let needed = {
             let scan = FreeScan {
                 inline_comps: true,
                 async_ok: false,
@@ -6186,6 +6330,9 @@ impl Compiler {
             for s in body {
                 collect_inner_free(s, &self.bindings, &mut needed, &scan);
             }
+            needed
+        };
+        let needs_class_closure = {
             // A method's `super` read surfaces as `__class__` (the
             // `FunctionDef` arm of `collect_inner_free`); a nested
             // class's methods are satisfied by *its* cell and never
@@ -6214,9 +6361,13 @@ impl Compiler {
         // over a `__classdict__` cell that the VM seeds with the live
         // namespace mapping before the body runs.
         let future_annotations = self.params.future_annotations;
+        // A nested function scope that reads `__classdict__` outright
+        // (`lambda: __classdict__`) is satisfied by this class's cell
+        // too (`drop_class_free` sets `ste_needs_classdict`).
         let needs_classdict = body
             .iter()
-            .any(|s| stmt_needs_classdict(s, future_annotations));
+            .any(|s| stmt_needs_classdict(s, future_annotations))
+            || needed.contains("__classdict__");
         if needs_classdict {
             inner.co.cellvars.push("__classdict__".to_owned());
             inner
@@ -6280,7 +6431,7 @@ impl Compiler {
         // function provides one (test_super
         // test_various___class___pathologies). Only reserve the freevar
         // when the enclosing scope can actually supply the cell.
-        if class_body_reads_dunder_class(body)
+        if class_body_reads_dunder(body, "__class__")
             && !matches!(inner.bindings.get("__class__"), Some(Binding::Free))
             && matches!(
                 self.bindings.get("__class__"),
@@ -6585,12 +6736,12 @@ impl Compiler {
         // `__classdictcell__` first (CPython `type_new_set_classdictcell`
         // pops it and re-points the cell at the type's dict).
         if needs_classdict {
-            let idx = inner.cell_or_free_index("__classdict__");
+            let idx = inner.closure_index("__classdict__");
             inner.emit(OpCode::LoadClosure, idx);
             inner.emit_store_name("__classdictcell__");
         }
         if needs_class_closure {
-            let class_cell_idx = inner.cell_or_free_index("__class__");
+            let class_cell_idx = inner.closure_index("__class__");
             inner.emit(OpCode::LoadClosure, class_cell_idx);
             inner.emit(OpCode::CopyTop, 1);
             inner.emit_store_name("__classcell__");
@@ -6612,7 +6763,7 @@ impl Compiler {
         let mut flags = 0u32;
         if !inner_freevars.is_empty() {
             for free in &inner_freevars {
-                let idx = self.cell_or_free_index(free);
+                let idx = self.closure_index(free);
                 self.emit(OpCode::LoadClosure, idx);
             }
             self.emit(OpCode::BuildTuple, inner_freevars.len() as u32);
@@ -7168,16 +7319,22 @@ impl Compiler {
             self.finally_stack.pop();
         }
         let mut normal_skip = None;
+        let is_star_try = handlers.iter().any(|h| h.is_star);
         if has_handlers {
             // `POP_BLOCK` closes the body's coverage; the else clause
             // runs only on normal body completion, inline right after
-            // the body and *outside* the handled range (CPython
-            // compiles it before the handlers): an exception raised in
+            // the body and *outside* the handled range (CPython's
+            // `codegen_try_except` compiles it before the handlers;
+            // `codegen_try_star_except` places it after them, which
+            // only changes name/constant numbering once the cold
+            // handler blocks move to the end): an exception raised in
             // `else` does not reach this statement's own `except`
             // clauses — only an enclosing `finally`.
             self.emit_pop_block_no_line();
-            for s in orelse {
-                self.compile_stmt(s)?;
+            if !is_star_try {
+                for s in orelse {
+                    self.compile_stmt(s)?;
+                }
             }
             // Normal-exit hop over the handler region: CPython's
             // NO_LOCATION JUMP_NO_INTERRUPT to `end` (backward — and
@@ -7199,7 +7356,7 @@ impl Compiler {
         } else {
             handlers_start
         };
-        let is_star_try = handlers.iter().any(|h| h.is_star);
+        let mut star_exit = None;
         if has_handlers && is_star_try {
             // PEP 654 / RFC 0018: `except*` lowering, mirroring
             // CPython's `compiler_try_star_except`:
@@ -7234,17 +7391,10 @@ impl Compiler {
             // timing) and the wire shape matches CPython's exactly
             // (test_dis, test_monitoring branch/jump offsets).
             let n_handlers = handlers.len();
-            // Jumps into the PREP_RERAISE_STAR epilogue (each exit path
-            // of the *last* clause inlines its own `LIST_APPEND 1` +
-            // jump, as CPython's flowgraph small-block inlining does).
+            // Jumps into the PREP_RERAISE_STAR epilogue (the last
+            // clause's `except_with_error` block).
             let mut reraise_star_jumps: Vec<u32> = Vec::new();
-            // Jumps to the next clause's match sequence.
-            let mut next_clause_jumps: Vec<u32> = Vec::new();
             for (i, h) in handlers.iter().enumerate() {
-                let clause_start = self.next_offset();
-                for site in next_clause_jumps.drain(..) {
-                    self.patch_jump(site, clause_start);
-                }
                 // The whole match sequence carries the clause's own
                 // location (CPython locates BUILD_LIST/COPY/CHECK_EG_MATCH
                 // on the `except*` clause), so entering the handler fires
@@ -7320,102 +7470,33 @@ impl Compiler {
                 }
                 let clause_body_end = self.next_offset();
                 self.emit_pop_block_no_line();
-                // Fallthrough exit: the unbind (`e = None; del e`) and
-                // the inlined `LIST_APPEND 1` + hop carry the clause
-                // body's last line — CPython emits them NO_LOCATION and
-                // its flowgraph's `propagate_line_numbers` copies the
-                // preceding location, so no fresh `'line'` event fires
-                // on normal clause exit (and the JUMP event reports the
-                // body line: test_monitoring test_except_star). The
-                // propagated location must be computed the way CPython
-                // does: nothing flows into a jump target (a clause body
-                // ending in a nested `try` exits by *jumping* here, so
-                // the tail stays location-free — the nested
-                // test_sys_settrace test_try_except_star_nested shape),
-                // and the walk back stops at block boundaries.
-                let (pin_line, pin_col) = {
-                    let tgt = clause_body_end;
-                    let is_jump_target = |k: u32| -> bool {
-                        self.co.instructions.iter().enumerate().any(|(j, ins)| {
-                            let from = j as u32 + 1;
-                            match ins.op {
-                                OpCode::JumpForward
-                                | OpCode::PopJumpIfFalse
-                                | OpCode::PopJumpIfTrue
-                                | OpCode::PopJumpIfNone
-                                | OpCode::PopJumpIfNotNone
-                                | OpCode::ForIter
-                                | OpCode::Send => from + ins.arg == k,
-                                OpCode::JumpBackward => from.saturating_sub(ins.arg) == k,
-                                _ => false,
-                            }
-                        })
-                    };
-                    let mut line = 0u32;
-                    let mut col = ColSpan::default();
-                    if !is_jump_target(tgt) {
-                        let mut k = clause_body_end;
-                        while k > clause_body_start {
-                            let k1 = (k - 1) as usize;
-                            if matches!(
-                                self.co.instructions[k1].op,
-                                OpCode::JumpForward
-                                    | OpCode::JumpBackward
-                                    | OpCode::ReturnValue
-                                    | OpCode::RaiseVarargs
-                                    | OpCode::Reraise
-                            ) {
-                                break;
-                            }
-                            if self.co.linetable[k1] != 0
-                                && self.co.linetable[k1] != NEXT_LOCATION_LINE
-                            {
-                                line = self.co.linetable[k1];
-                                col = self.co.coltable[k1];
-                                break;
-                            }
-                            if is_jump_target(k1 as u32) {
-                                break;
-                            }
-                            k -= 1;
-                        }
-                    }
-                    (line, col)
-                };
+                // CPython `codegen_try_star_except` shape: every clause
+                // exit is NO_LOCATION and routes through small label
+                // blocks (`except`: NOP + hop to `except_with_error`;
+                // `except_with_error`: the last clause's `LIST_APPEND 1`
+                // + hop to `reraise_star`). The flowgraph inlines those
+                // no-lineno blocks and propagates locations exactly as
+                // CPython's does, and it leaves the same emptied
+                // unreachable blocks behind in the chain, which is what
+                // `optimize_load_fast`'s traversal (and so the
+                // LOAD_FAST_BORROW choice after the statement) depends on.
                 {
-                    let saved_line = self.current_line;
-                    let saved_span = self.current_span;
                     let saved_pin = self.line_pinned;
-                    let saved_col = self.pinned_colspan;
-                    self.line_pinned = Some(pin_line);
-                    self.pinned_colspan = pin_col;
+                    self.line_pinned = Some(0);
                     if let Some(stmts) = &unbind_stmts {
                         for s in stmts {
                             self.compile_stmt(s)?;
                         }
                     }
-                    if i == n_handlers - 1 {
-                        // [prev, orig, res, rest] → [prev, orig, res]
-                        self.emit(OpCode::ListAppend, 1);
-                        let j = self.emit(OpCode::JumpForward, 0);
-                        self.no_interrupt_jumps.insert(j);
-                        reraise_star_jumps.push(j);
-                    } else {
-                        let j = self.emit(OpCode::JumpForward, 0);
-                        self.no_interrupt_jumps.insert(j);
-                        next_clause_jumps.push(j);
-                    }
                     self.line_pinned = saved_pin;
-                    self.pinned_colspan = saved_col;
-                    self.current_line = saved_line;
-                    self.current_span = saved_span;
                 }
-                // Collector: an exception raised by the clause body
+                let to_except = self.emit_no_line(OpCode::JumpForward, 0);
+                self.no_interrupt_jumps.insert(to_except);
+                // cleanup_end: an exception raised by the clause body
                 // lands here with `[prev, orig, res, rest, lasti, exc]`
                 // (lasti-flagged entry; the raise chained `__context__`
                 // to the matched group already). Unbind, add it to the
-                // res list, drop the lasti, and run the next clause —
-                // all NO_LOCATION (CPython's cleanup_end block).
+                // res list, drop the lasti, hop to `except_with_error`.
                 let collector = self.next_offset();
                 self.co.exception_table.push(ExcHandler {
                     start: clause_body_start,
@@ -7436,17 +7517,16 @@ impl Compiler {
                 // [prev, orig, res, rest, lasti]
                 self.emit_no_line(OpCode::PopTop, 0);
                 // [prev, orig, res, rest]
-                if i == n_handlers - 1 {
-                    self.emit_no_line(OpCode::ListAppend, 1);
-                    let j = self.emit_no_line(OpCode::JumpForward, 0);
-                    self.no_interrupt_jumps.insert(j);
-                    reraise_star_jumps.push(j);
-                } else {
-                    let j = self.emit_no_line(OpCode::JumpForward, 0);
-                    self.no_interrupt_jumps.insert(j);
-                    next_clause_jumps.push(j);
-                }
-                // No-match path: discard the copied None. Carries the
+                let err_from_collector = self.emit_no_line(OpCode::JumpForward, 0);
+                self.no_interrupt_jumps.insert(err_from_collector);
+                // except (`next_except`): a NOP "to hold a propagated
+                // location info", then the hop.
+                let except_label = self.next_offset();
+                self.patch_jump(to_except, except_label);
+                self.emit_no_line(OpCode::Nop, 0);
+                let err_from_except = self.emit_no_line(OpCode::JumpForward, 0);
+                self.no_interrupt_jumps.insert(err_from_except);
+                // no_match: discard the copied None. Carries the
                 // clause's location (CPython) — already traced when the
                 // match check ran, so no fresh `'line'` event fires.
                 let no_match_target = self.next_offset();
@@ -7454,11 +7534,18 @@ impl Compiler {
                 self.set_span(h.span);
                 self.set_line_from(h.span.start.0);
                 self.emit(OpCode::PopTop, 0);
-                // [prev, orig, res, rest]; the last clause appends the
-                // unhandled remainder and falls into the epilogue, the
-                // others fall into the next clause's match sequence.
+                // except_with_error: [prev, orig, res, rest]; the last
+                // clause appends the unhandled remainder and hops to the
+                // epilogue, the others fall into the next clause's match
+                // sequence.
+                let except_with_error = self.next_offset();
+                self.patch_jump(err_from_collector, except_with_error);
+                self.patch_jump(err_from_except, except_with_error);
                 if i == n_handlers - 1 {
-                    self.emit(OpCode::ListAppend, 1);
+                    self.emit_no_line(OpCode::ListAppend, 1);
+                    let j = self.emit_no_line(OpCode::JumpForward, 0);
+                    self.no_interrupt_jumps.insert(j);
+                    reraise_star_jumps.push(j);
                 }
             }
             // PREP_RERAISE_STAR epilogue — entirely NO_LOCATION in
@@ -7513,10 +7600,11 @@ impl Compiler {
                 depth: HANDLER_DEPTH_ANCHOR_FLAG | region_start,
                 push_lasti: true,
             });
-            let end = self.next_offset();
-            self.patch_jump(exit, end);
+            // The "nothing to re-raise" hop lands past the `else`
+            // clause, which follows the handler region (see below).
+            star_exit = Some(exit);
             // Record the handler-body end on PUSH_EXC_INFO (see below).
-            self.co.instructions[push_exc_site as usize].arg = end;
+            self.co.instructions[push_exc_site as usize].arg = self.next_offset();
         } else if has_handlers {
             self.push_body_exc_entries(
                 body_start,
@@ -7759,10 +7847,20 @@ impl Compiler {
             // Record the handler-body end on PUSH_EXC_INFO (see above).
             self.co.instructions[push_exc_site as usize].arg = end;
         }
-        // Patch the normal-exit hop past the handler region.
+        // Patch the normal-exit hop past the handler region (for
+        // `except*`, onto the `else` clause that follows it).
         if let Some(j) = normal_skip {
             let end = self.next_offset();
             self.patch_jump(j, end);
+        }
+        if has_handlers && is_star_try {
+            for s in orelse {
+                self.compile_stmt(s)?;
+            }
+            if let Some(exit) = star_exit {
+                let end = self.next_offset();
+                self.patch_jump(exit, end);
+            }
         }
         let wrap_end = self.next_offset();
 
@@ -8061,6 +8159,25 @@ impl Compiler {
         // unwinder.
         self.co.instructions[push_exc_site as usize].arg = end;
         Ok(())
+    }
+
+    /// The `LOAD_CLOSURE` operand for `name`, CPython's `get_ref_type`
+    /// plus lookup: in a class body `__class__`, `__classdict__`, and
+    /// `__conditional_annotations__` always resolve to the implicit
+    /// *cell*, even when the body also declares the name `nonlocal`
+    /// (which gives it a free slot too; `STORE_DEREF` uses that one).
+    fn closure_index(&mut self, name: &str) -> u32 {
+        if self.co.is_class_body
+            && matches!(
+                name,
+                "__class__" | "__classdict__" | "__conditional_annotations__"
+            )
+        {
+            if let Some(i) = self.co.cellvars.iter().position(|n| n == name) {
+                return i as u32;
+            }
+        }
+        self.cell_or_free_index(name)
     }
 
     fn cell_or_free_index(&mut self, name: &str) -> u32 {
@@ -8543,6 +8660,14 @@ impl Compiler {
     /// `codegen_subkwargs`: a run of named keywords as one dict —
     /// `BUILD_MAP n` under the guideline, else a `NO_LOCATION`
     /// `BUILD_MAP 0` fed by `MAP_ADD 1`s.
+    /// Record an identifier that reaches `co_consts` as a string (see
+    /// [`CodeObject::const_identifiers`]).
+    fn note_identifier_const(&mut self, name: &str) {
+        if !self.co.const_identifiers.iter().any(|n| n == name) {
+            self.co.const_identifiers.push(name.to_owned());
+        }
+    }
+
     fn compile_subkwargs(
         &mut self,
         keywords: &[weavepy_parser::ast::Keyword],
@@ -8555,6 +8680,7 @@ impl Compiler {
         }
         for kw in keywords {
             let name = kw.arg.clone().expect("named keyword run");
+            self.note_identifier_const(&name);
             let idx = self.co.intern_constant(Constant::Str(name));
             self.emit(OpCode::LoadConst, idx);
             self.compile_expr(&kw.value)?;
@@ -8837,7 +8963,12 @@ impl Compiler {
             && name == "__class__"
             && !matches!(binding, Some(Binding::Global | Binding::ClassPassthrough))
         {
-            if let Some(pos) = self.free_order.iter().position(|n| n == "__class__") {
+            // `inline_comprehension`: `__class__` free in a comprehension
+            // inlined into a class body is demoted to `GLOBAL_IMPLICIT`.
+            if self.inline_comp > 0 {
+                let idx = self.co.intern_name(name);
+                self.emit(OpCode::LoadGlobal, idx);
+            } else if let Some(pos) = self.free_order.iter().position(|n| n == "__class__") {
                 let idx = (self.co.cellvars.len() + pos) as u32;
                 self.emit(OpCode::LoadLocals, 0);
                 self.emit(OpCode::LoadClassdictOrDeref, idx);
@@ -8855,6 +8986,13 @@ impl Compiler {
         // name a plain deref, and a class attribute the class also
         // forwards from an enclosing function reaches that cell.
         if self.kind == CodeKind::Class && self.inline_comp > 0 {
+            // `inline_comprehension`: the implicit class-scope names,
+            // free in the comprehension, are demoted to `GLOBAL_IMPLICIT`.
+            if CLASS_DUNDERS.contains(&name) {
+                let idx = self.co.intern_name(name);
+                self.emit(OpCode::LoadGlobal, idx);
+                return;
+            }
             match binding {
                 Some(Binding::Local) => {
                     let idx = self.var_index_or_add(name);
@@ -8865,6 +9003,17 @@ impl Compiler {
                     self.emit(OpCode::LoadDeref, idx);
                 }
                 Some(Binding::ClassPassthrough) if self.free_order.iter().any(|n| n == name) => {
+                    let idx = self.cell_or_free_index(name);
+                    self.emit(OpCode::LoadDeref, idx);
+                }
+                // `global y` in the class body doesn't reach the
+                // comprehension's own scope: it still closes over the
+                // enclosing function's `y`, which the class forwards
+                // (test_listcomps `test_in_class_scope_with_global`).
+                Some(Binding::Global) if self.class_transparent_frees.contains(name) => {
+                    if !self.free_order.iter().any(|n| n == name) {
+                        self.free_order.push(name.to_owned());
+                    }
                     let idx = self.cell_or_free_index(name);
                     self.emit(OpCode::LoadDeref, idx);
                 }
@@ -9217,6 +9366,7 @@ impl Compiler {
                     let mut names: Vec<Constant> = Vec::with_capacity(keywords.len());
                     for k in keywords {
                         let n = k.arg.clone().expect("checked above");
+                        self.note_identifier_const(&n);
                         names.push(Constant::Str(n));
                         self.compile_expr(&k.value)?;
                     }
@@ -9840,6 +9990,23 @@ impl Compiler {
         if parts.len() == 1 {
             return self.compile_expr(&parts[0]);
         }
+        if parts.len() > STACK_USE_GUIDELINE {
+            // CPython `codegen_joined_str`: a wide f-string is lowered to
+            // `''.join([p0, p1, ...])` so the operand stack stays shallow.
+            // Every synthesized instruction carries the f-string's own
+            // location.
+            let empty = self.co.intern_constant(Constant::Str(String::new()));
+            self.emit(OpCode::LoadConst, empty);
+            let join = self.co.intern_name("join");
+            self.emit(OpCode::LoadMethodAttr, join);
+            self.emit(OpCode::BuildList, 0);
+            for p in parts {
+                self.compile_expr(p)?;
+                self.emit(OpCode::ListAppend, 1);
+            }
+            self.emit(OpCode::Call, 1);
+            return Ok(());
+        }
         for p in parts {
             self.compile_expr(p)?;
         }
@@ -10280,19 +10447,146 @@ impl Compiler {
                 out.push(entry);
             }
         }
+        // `inline_comprehension` only copies a child's symbol when the
+        // parent has *no* entry for the name — a plain use counts, so
+        // `[x for [x for x in r][0] in l]` keeps the outer `x` as the
+        // enclosing scope's variable rather than a hidden local
+        // (test_listcomps `test_nested_2`).
+        let mut used = HashSet::new();
         for (gi, g) in generators.iter().enumerate() {
-            self.collect_nested_comp_symbols(&g.target, out);
+            Self::collect_names_shallow(&g.target, &mut used);
             if gi > 0 {
-                self.collect_nested_comp_symbols(&g.iter, out);
+                Self::collect_names_shallow(&g.iter, &mut used);
             }
             for cond in &g.ifs {
-                self.collect_nested_comp_symbols(cond, out);
+                Self::collect_names_shallow(cond, &mut used);
             }
         }
         if let Some(v) = value {
-            self.collect_nested_comp_symbols(v, out);
+            Self::collect_names_shallow(v, &mut used);
         }
-        self.collect_nested_comp_symbols(elt, out);
+        Self::collect_names_shallow(elt, &mut used);
+        let mut nested: Vec<(String, CompSym)> = out.clone();
+        for (gi, g) in generators.iter().enumerate() {
+            self.collect_nested_comp_symbols(&g.target, &mut nested);
+            if gi > 0 {
+                self.collect_nested_comp_symbols(&g.iter, &mut nested);
+            }
+            for cond in &g.ifs {
+                self.collect_nested_comp_symbols(cond, &mut nested);
+            }
+        }
+        if let Some(v) = value {
+            self.collect_nested_comp_symbols(v, &mut nested);
+        }
+        self.collect_nested_comp_symbols(elt, &mut nested);
+        for entry in nested.into_iter().skip(out.len()) {
+            if !used.contains(&entry.0) {
+                out.push(entry);
+            }
+        }
+    }
+
+    /// Names read in this scope or in an inlined comprehension nested
+    /// in it without being bound by that comprehension (or one between):
+    /// the USE-only symbols the scope ends up with after
+    /// `inline_comprehension` merged its children.
+    fn collect_uses_through_inlined(
+        &self,
+        expr: &Expr,
+        bound: &mut Vec<String>,
+        out: &mut HashSet<String>,
+    ) {
+        let (kind, elt, value, generators) = match &expr.kind {
+            ExprKind::Name(n) => {
+                if !bound.contains(n) {
+                    out.insert(n.clone());
+                }
+                return;
+            }
+            ExprKind::ListComp { elt, generators } => (CompKind::List, elt, None, generators),
+            ExprKind::SetComp { elt, generators } => (CompKind::Set, elt, None, generators),
+            ExprKind::DictComp {
+                key,
+                value,
+                generators,
+            } => (CompKind::Dict, key, Some(&**value), generators),
+            ExprKind::GeneratorExp { generators, .. } => {
+                self.collect_uses_through_inlined(&generators[0].iter, bound, out);
+                return;
+            }
+            ExprKind::Lambda { args, .. } | ExprKind::TypeParamFn { args, .. } => {
+                for d in &args.defaults {
+                    self.collect_uses_through_inlined(d, bound, out);
+                }
+                for d in args.kw_defaults.iter().flatten() {
+                    self.collect_uses_through_inlined(d, bound, out);
+                }
+                return;
+            }
+            _ => {
+                validate::for_each_child_expr(expr, &mut |c| {
+                    self.collect_uses_through_inlined(c, bound, out)
+                });
+                return;
+            }
+        };
+        self.collect_uses_through_inlined(&generators[0].iter, bound, out);
+        if !self.comp_inline_eligible(kind, elt, value, generators) {
+            return;
+        }
+        let depth = bound.len();
+        for g in generators {
+            let mut names = HashSet::new();
+            collect_target_names(&g.target, &mut names);
+            bound.extend(names);
+        }
+        for (gi, g) in generators.iter().enumerate() {
+            self.collect_uses_through_inlined(&g.target, bound, out);
+            if gi > 0 {
+                self.collect_uses_through_inlined(&g.iter, bound, out);
+            }
+            for cond in &g.ifs {
+                self.collect_uses_through_inlined(cond, bound, out);
+            }
+        }
+        if let Some(v) = value {
+            self.collect_uses_through_inlined(v, bound, out);
+        }
+        self.collect_uses_through_inlined(elt, bound, out);
+        bound.truncate(depth);
+    }
+
+    /// Every name the current comprehension scope itself refers to
+    /// (its `ste_symbols` entries before children are inlined): not
+    /// those inside a nested comprehension's body or a lambda's body,
+    /// but including a nested comprehension's outermost iterable and a
+    /// lambda's defaults.
+    fn collect_names_shallow(expr: &Expr, out: &mut HashSet<String>) {
+        match &expr.kind {
+            ExprKind::Name(n) => {
+                out.insert(n.clone());
+            }
+            ExprKind::Lambda { args, .. } | ExprKind::TypeParamFn { args, .. } => {
+                for d in &args.defaults {
+                    Self::collect_names_shallow(d, out);
+                }
+                for d in args.kw_defaults.iter().flatten() {
+                    Self::collect_names_shallow(d, out);
+                }
+            }
+            ExprKind::ListComp { generators, .. }
+            | ExprKind::SetComp { generators, .. }
+            | ExprKind::DictComp { generators, .. }
+            | ExprKind::GeneratorExp { generators, .. } => {
+                if let Some(first) = generators.first() {
+                    Self::collect_names_shallow(&first.iter, out);
+                }
+            }
+            _ => {
+                validate::for_each_child_expr(expr, &mut |c| Self::collect_names_shallow(c, out));
+            }
+        }
     }
 
     /// Explicit-global walrus targets bound directly in the current
@@ -10692,8 +10986,9 @@ impl Compiler {
         inner.comp_kind = Some(kind);
         inner.private = self.private.clone();
         // A non-inlined comprehension (genexpr) directly in a class
-        // body is a function block under the class block: `CO_METHOD`.
-        inner.co.is_method = self.co.is_class_body;
+        // body is a function block under the class block: `CO_METHOD`
+        // (not when it sits inside an inlined comprehension's body).
+        inner.co.is_method = self.co.is_class_body && self.inline_comp == 0;
         inner.co.is_nested = self.child_is_nested();
         // PEP 3155: a comprehension scope gets a dotted qualname like any
         // other nested scope (`C.m.<locals>.<genexpr>`); CPython's
@@ -10706,9 +11001,10 @@ impl Compiler {
             inner.co.is_coroutine = true;
         }
         if is_async_comp && matches!(kind, CompKind::Generator) {
-            // `(x async for x in xs)` becomes an async generator.
+            // `(x async for x in xs)` becomes an async generator
+            // (`CO_ASYNC_GENERATOR` alone, like an `async def` with
+            // `yield`; CPython never adds `CO_GENERATOR` to it).
             inner.co.is_async_generator = true;
-            inner.co.is_generator = true;
         }
 
         let collector_op = match kind {
@@ -10940,17 +11236,15 @@ impl Compiler {
             // ForIter pops the iterator on exhaustion. Return None
             // so the generator finishes cleanly (the VM converts
             // this to `StopIteration`)
-            // (test_multiline_generator_expression). An *async* genexp
-            // stamps that return with the whole expression's span
-            // (test_multiline_async_generator_expression); a sync one
-            // inherits the loop-exit location.
-            if is_async_comp {
-                inner.current_span = whole_span;
-                inner.set_line_from(whole_span.0);
-            }
+            // (test_multiline_generator_expression). CPython's
+            // `codegen_wrap_in_stopiteration_handler` adds it at
+            // NO_LOCATION, so it inherits the loop-exit location: the
+            // iterator's for a `for` (END_FOR/POP_ITER), the whole
+            // expression's for an `async for` (END_ASYNC_FOR carries
+            // `LOC(e)`; test_multiline_async_generator_expression).
             let none_idx = inner.co.intern_constant(Constant::None);
-            inner.emit(OpCode::LoadConst, none_idx);
-            inner.emit(OpCode::ReturnValue, 0);
+            inner.emit_no_line(OpCode::LoadConst, none_idx);
+            inner.emit_no_line(OpCode::ReturnValue, 0);
         } else {
             // `codegen_comprehension`: the collection's `RETURN_VALUE`
             // sits at `LOC(e)`, the whole comprehension.
@@ -10975,7 +11269,7 @@ impl Compiler {
         let mut flags = 0u32;
         if !inner_freevars.is_empty() {
             for free in &inner_freevars {
-                let idx = self.cell_or_free_index(free);
+                let idx = self.closure_index(free);
                 self.emit(OpCode::LoadClosure, idx);
             }
             self.emit(OpCode::BuildTuple, inner_freevars.len() as u32);
@@ -12497,6 +12791,13 @@ fn collect_inner_free_impl(
                     from_body.insert(r);
                 }
             }
+            // `nonlocal x` in a class body reaches up like it does in a
+            // function (`class C: nonlocal __firstlineno__` makes the
+            // enclosing function's `__firstlineno__` a cell even though
+            // the body never reads it).
+            for n in &class_nonlocals {
+                from_body.insert(n.clone());
+            }
             // The nested scopes are analyzed as *the class body* sees
             // them, not as this scope does: an inlined comprehension in
             // a class body still resolves its reads past the class
@@ -12527,8 +12828,11 @@ fn collect_inner_free_impl(
             // (symtable `drop_class_free`); it never reaches an enclosing
             // function — `class KeyedRef` inside `_WeakValueDictionary.
             // __init__` must not make `__init__` close over a `__class__`
-            // the outer class would then have to own.
-            from_body.remove("__class__");
+            // the outer class would then have to own. The same holds for
+            // the other implicit cells `drop_class_free` handles.
+            for dunder in CLASS_DUNDERS {
+                from_body.remove(dunder);
+            }
             out.extend(from_body);
         }
         StmtKind::If { test, body, orelse } | StmtKind::While { test, body, orelse } => {
@@ -12635,7 +12939,19 @@ fn collect_inner_free_impl(
                 && matches!(target.kind, ExprKind::Name(_))
                 && !pep563_active()
             {
-                collect_reads_expr(annotation, out);
+                // `analyze_name`: a name the class body itself binds
+                // (and doesn't declare `nonlocal`) resolves through
+                // `__classdict__` in a class-visible annotation scope
+                // (GLOBAL_IMPLICIT), never as a free variable of the
+                // enclosing function (`class D: C: C = field()` inside
+                // a `def` where `C` is a local).
+                let mut reads = HashSet::new();
+                collect_reads_expr(annotation, &mut reads);
+                for r in reads {
+                    if !scan.class_binds.as_ref().is_some_and(|b| b.contains(&r)) {
+                        out.insert(r);
+                    }
+                }
             }
         }
         StmtKind::Assert { test, msg } => {
@@ -14775,8 +15091,382 @@ fn collect_global_decls_deep(stmt: &Stmt, out: &mut HashSet<String>) {
 /// the nested bodies do not. Lambda bodies are included (they evaluate
 /// lazily but CPython resolves their `__class__` through the implicit
 /// cell, so the over-approximation only adds an unused freevar).
-fn class_body_reads_dunder_class(body: &[Stmt]) -> bool {
-    fn stmt_reads(stmt: &Stmt, out: &mut HashSet<String>) {
+/// Does `body` (a class body) read `__class__` at class level, either
+/// directly or inside a nested class's own body? Class scopes are
+/// transparent to free-variable resolution, so such a read reaches the
+/// enclosing function, whereas a method's read stops at its class.
+fn class_level_reads_dunder(body: &[Stmt], name: &str) -> bool {
+    fn nested(stmts: &[Stmt], name: &str) -> bool {
+        stmts.iter().any(|s| match &s.kind {
+            StmtKind::ClassDef { body, .. } => class_level_reads_dunder(body, name),
+            StmtKind::If { body, orelse, .. }
+            | StmtKind::While { body, orelse, .. }
+            | StmtKind::For { body, orelse, .. }
+            | StmtKind::AsyncFor { body, orelse, .. } => nested(body, name) || nested(orelse, name),
+            StmtKind::With { body, .. } | StmtKind::AsyncWith { body, .. } => nested(body, name),
+            StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            } => {
+                nested(body, name)
+                    || handlers.iter().any(|h| nested(&h.body, name))
+                    || nested(orelse, name)
+                    || nested(finalbody, name)
+            }
+            StmtKind::Match { cases, .. } => cases.iter().any(|c| nested(&c.body, name)),
+            _ => false,
+        })
+    }
+    class_body_reads_dunder(body, name) || nested(body, name)
+}
+
+/// The reads of a (mangled) class body that look past the class
+/// namespace into the enclosing scope: every read at class level of a
+/// name the body doesn't bind, plus the free names of the scopes nested
+/// in it (method, lambda and comprehension bodies skip the class
+/// namespace; `class B: c = 1; def m(self): return c` reaches an
+/// enclosing function's `c`, while `class B: c: str` or `class B: x = 1;
+/// y = x` alone never does).
+fn class_body_propagating_reads(body: &[Stmt], out: &mut HashSet<String>) {
+    let mut inner = HashSet::new();
+    for s in body {
+        collect_reads_stmt_in(s, &mut inner, false);
+    }
+    // A method's `__class__` / `__classdict__` /
+    // `__conditional_annotations__` read is satisfied by *this*
+    // class's implicit cell (symtable `drop_class_free`) and
+    // never reaches the enclosing scope; only a read at
+    // class-body level itself looks past the class.
+    for dunder in CLASS_DUNDERS {
+        if !class_level_reads_dunder(body, dunder) {
+            inner.remove(dunder);
+        }
+    }
+    // A name the class body binds (`DEF_BOUND`, not `nonlocal`) or
+    // declares `global` resolves in the class namespace or the module
+    // when read at class level, and through `__classdict__` in a
+    // class-visible annotation scope; only a nested scope's free read
+    // of it looks past the class.
+    let mut class_bound = HashSet::new();
+    let mut class_globals = HashSet::new();
+    let mut class_nonlocals = HashSet::new();
+    for s in body {
+        collect_assigned(s, &mut class_bound);
+        collect_decls(
+            s,
+            &mut class_globals,
+            &mut class_nonlocals,
+            &mut HashSet::new(),
+        );
+    }
+    let shadowed: Vec<String> = inner
+        .iter()
+        .filter(|n| {
+            class_globals.contains(*n) || (class_bound.contains(*n) && !class_nonlocals.contains(*n))
+        })
+        .cloned()
+        .collect();
+    if !shadowed.is_empty() {
+        let mut nested = HashSet::new();
+        class_nested_scope_reads(body, &mut nested);
+        for n in shadowed {
+            if !nested.contains(&n) {
+                inner.remove(&n);
+            }
+        }
+    }
+    out.extend(inner);
+}
+
+/// The free names of the scopes nested in a class body (the reads that
+/// skip the class namespace), leaving out everything evaluated at class
+/// level: decorators, defaults, bases, a comprehension's outermost
+/// iterable.
+fn class_nested_scope_reads(body: &[Stmt], out: &mut HashSet<String>) {
+    fn expr_nested(e: &Expr, out: &mut HashSet<String>) {
+        match &e.kind {
+            ExprKind::Lambda { args, body } | ExprKind::TypeParamFn { args, body } => {
+                for d in args.defaults.iter().chain(args.kw_defaults.iter().flatten()) {
+                    expr_nested(d, out);
+                }
+                let mut inner = HashSet::new();
+                collect_reads_expr(body, &mut inner);
+                for a in args
+                    .posonlyargs
+                    .iter()
+                    .chain(&args.args)
+                    .chain(&args.kwonlyargs)
+                    .chain(&args.vararg)
+                    .chain(&args.kwarg)
+                {
+                    inner.remove(&a.name);
+                }
+                out.extend(inner);
+            }
+            ExprKind::ListComp { elt, generators }
+            | ExprKind::SetComp { elt, generators }
+            | ExprKind::GeneratorExp { elt, generators } => {
+                comp_nested(elt, None, generators, out);
+            }
+            ExprKind::DictComp {
+                key,
+                value,
+                generators,
+            } => comp_nested(key, Some(value), generators, out),
+            _ => {
+                for c in weavepy_parser::expr_children(e) {
+                    expr_nested(c, out);
+                }
+            }
+        }
+    }
+    fn comp_nested(
+        elt: &Expr,
+        value: Option<&Expr>,
+        generators: &[Comprehension],
+        out: &mut HashSet<String>,
+    ) {
+        if let Some(first) = generators.first() {
+            expr_nested(&first.iter, out);
+        }
+        let mut inner = HashSet::new();
+        for (gi, g) in generators.iter().enumerate() {
+            if gi > 0 {
+                collect_reads_expr(&g.iter, &mut inner);
+            }
+            collect_reads_assign_target(&g.target, &mut inner);
+            for i in &g.ifs {
+                collect_reads_expr(i, &mut inner);
+            }
+        }
+        if let Some(v) = value {
+            collect_reads_expr(v, &mut inner);
+        }
+        collect_reads_expr(elt, &mut inner);
+        let mut bound = HashSet::new();
+        for g in generators {
+            collect_target_names(&g.target, &mut bound);
+        }
+        for b in &bound {
+            inner.remove(b);
+        }
+        out.extend(inner);
+    }
+    fn stmts_nested(stmts: &[Stmt], out: &mut HashSet<String>) {
+        for s in stmts {
+            stmt_nested(s, out);
+        }
+    }
+    fn stmt_nested(stmt: &Stmt, out: &mut HashSet<String>) {
+        match &stmt.kind {
+            StmtKind::FunctionDef {
+                args,
+                body,
+                decorator_list,
+                ..
+            }
+            | StmtKind::AsyncFunctionDef {
+                args,
+                body,
+                decorator_list,
+                ..
+            } => {
+                for d in decorator_list
+                    .iter()
+                    .chain(&args.defaults)
+                    .chain(args.kw_defaults.iter().flatten())
+                {
+                    expr_nested(d, out);
+                }
+                out.extend(function_free_names(args, body));
+            }
+            StmtKind::ClassDef {
+                name,
+                bases,
+                keywords,
+                body,
+                decorator_list,
+                ..
+            } => {
+                for e in decorator_list
+                    .iter()
+                    .chain(bases)
+                    .chain(keywords.iter().map(|k| &k.value))
+                {
+                    expr_nested(e, out);
+                }
+                let mangled_body;
+                let body: &[Stmt] = if name.trim_start_matches('_').is_empty() {
+                    body
+                } else {
+                    let mut b = body.clone();
+                    crate::mangle::mangle_class_body(name, &mut b);
+                    mangled_body = b;
+                    &mangled_body
+                };
+                let mut through = HashSet::new();
+                class_body_propagating_reads(body, &mut through);
+                for dunder in CLASS_DUNDERS {
+                    through.remove(dunder);
+                }
+                out.extend(through);
+            }
+            StmtKind::If { test, body, orelse } | StmtKind::While { test, body, orelse } => {
+                expr_nested(test, out);
+                stmts_nested(body, out);
+                stmts_nested(orelse, out);
+            }
+            StmtKind::For {
+                target,
+                iter,
+                body,
+                orelse,
+            }
+            | StmtKind::AsyncFor {
+                target,
+                iter,
+                body,
+                orelse,
+            } => {
+                expr_nested(target, out);
+                expr_nested(iter, out);
+                stmts_nested(body, out);
+                stmts_nested(orelse, out);
+            }
+            StmtKind::With { items, body } | StmtKind::AsyncWith { items, body } => {
+                for it in items {
+                    expr_nested(&it.context_expr, out);
+                    if let Some(v) = &it.optional_vars {
+                        expr_nested(v, out);
+                    }
+                }
+                stmts_nested(body, out);
+            }
+            StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            } => {
+                stmts_nested(body, out);
+                for h in handlers {
+                    if let Some(t) = &h.type_ {
+                        expr_nested(t, out);
+                    }
+                    stmts_nested(&h.body, out);
+                }
+                stmts_nested(orelse, out);
+                stmts_nested(finalbody, out);
+            }
+            StmtKind::Match { subject, cases } => {
+                expr_nested(subject, out);
+                for c in cases {
+                    if let Some(g) = &c.guard {
+                        expr_nested(g, out);
+                    }
+                    stmts_nested(&c.body, out);
+                }
+            }
+            StmtKind::Expr(e) | StmtKind::Return(Some(e)) => expr_nested(e, out),
+            StmtKind::Assign { targets, value } => {
+                for t in targets {
+                    expr_nested(t, out);
+                }
+                expr_nested(value, out);
+            }
+            StmtKind::AugAssign { target, value, .. } => {
+                expr_nested(target, out);
+                expr_nested(value, out);
+            }
+            StmtKind::AnnAssign {
+                target,
+                annotation,
+                value,
+                ..
+            } => {
+                expr_nested(target, out);
+                if !pep563_active() {
+                    expr_nested(annotation, out);
+                }
+                if let Some(v) = value {
+                    expr_nested(v, out);
+                }
+            }
+            StmtKind::Delete(targets) => {
+                for t in targets {
+                    expr_nested(t, out);
+                }
+            }
+            StmtKind::Assert { test, msg } => {
+                expr_nested(test, out);
+                if let Some(m) = msg {
+                    expr_nested(m, out);
+                }
+            }
+            StmtKind::Raise { exc, cause } => {
+                for e in exc.iter().chain(cause.iter()) {
+                    expr_nested(e, out);
+                }
+            }
+            StmtKind::TypeAlias { .. } => {
+                // The alias value and bounds are annotation scopes.
+                collect_reads_stmt(stmt, out);
+            }
+            _ => {}
+        }
+    }
+    stmts_nested(body, out);
+}
+
+/// The free names of a `def`: its body's reads minus its parameters,
+/// assigned locals and `global` names, plus its `nonlocal` names (which
+/// reach up even when only written). Decorators, defaults and
+/// annotations are the enclosing scope's business.
+fn function_free_names(args: &AstArguments, body: &[Stmt]) -> HashSet<String> {
+    let mut nested_reads = HashSet::new();
+    for s in body {
+        collect_reads_stmt_in(s, &mut nested_reads, true);
+    }
+    let mut nested_locals: HashSet<String> = HashSet::new();
+    for a in args
+        .posonlyargs
+        .iter()
+        .chain(&args.args)
+        .chain(&args.kwonlyargs)
+        .chain(&args.vararg)
+        .chain(&args.kwarg)
+    {
+        nested_locals.insert(a.name.clone());
+    }
+    let mut nested_globals = HashSet::new();
+    let mut nested_nonlocals = HashSet::new();
+    let mut nested_assigned = HashSet::new();
+    for s in body {
+        collect_decls(
+            s,
+            &mut nested_globals,
+            &mut nested_nonlocals,
+            &mut nested_assigned,
+        );
+    }
+    nested_locals.extend(nested_assigned);
+    let mut out: HashSet<String> = nested_nonlocals;
+    for r in nested_reads {
+        if !nested_locals.contains(&r) && !nested_globals.contains(&r) {
+            out.insert(r);
+        }
+    }
+    out
+}
+
+/// The implicit class-scope names the symtable special-cases
+/// (`drop_class_free`, `inline_comprehension`).
+const CLASS_DUNDERS: [&str; 3] = ["__class__", "__classdict__", "__conditional_annotations__"];
+
+fn class_body_reads_dunder(body: &[Stmt], name: &str) -> bool {
+    fn stmt_reads(stmt: &Stmt, out: &mut HashSet<String>, name: &str) {
         match &stmt.kind {
             StmtKind::FunctionDef {
                 args,
@@ -14846,13 +15536,13 @@ fn class_body_reads_dunder_class(body: &[Stmt]) -> bool {
             } => {
                 collect_reads_expr(iter, out);
                 for s in body.iter().chain(orelse) {
-                    stmt_reads(s, out);
+                    stmt_reads(s, out, name);
                 }
             }
             StmtKind::If { test, body, orelse } | StmtKind::While { test, body, orelse } => {
                 collect_reads_expr(test, out);
                 for s in body.iter().chain(orelse) {
-                    stmt_reads(s, out);
+                    stmt_reads(s, out, name);
                 }
             }
             StmtKind::With { items, body } | StmtKind::AsyncWith { items, body } => {
@@ -14860,7 +15550,7 @@ fn class_body_reads_dunder_class(body: &[Stmt]) -> bool {
                     collect_reads_expr(&it.context_expr, out);
                 }
                 for s in body {
-                    stmt_reads(s, out);
+                    stmt_reads(s, out, name);
                 }
             }
             StmtKind::Try {
@@ -14870,14 +15560,14 @@ fn class_body_reads_dunder_class(body: &[Stmt]) -> bool {
                 finalbody,
             } => {
                 for s in body.iter().chain(orelse).chain(finalbody) {
-                    stmt_reads(s, out);
+                    stmt_reads(s, out, name);
                 }
                 for h in handlers {
                     if let Some(t) = &h.type_ {
                         collect_reads_expr(t, out);
                     }
                     for s in &h.body {
-                        stmt_reads(s, out);
+                        stmt_reads(s, out, name);
                     }
                 }
             }
@@ -14885,23 +15575,93 @@ fn class_body_reads_dunder_class(body: &[Stmt]) -> bool {
                 collect_reads_expr(subject, out);
                 for case in cases {
                     for s in &case.body {
-                        stmt_reads(s, out);
+                        stmt_reads(s, out, name);
                     }
                 }
             }
-            // Everything else has no nested scope to exclude — reuse the
-            // full expression-read collector.
-            other_stmt => {
-                let _ = other_stmt;
-                collect_reads_stmt(stmt, out);
+            // Everything else: only reads made *at class level* count.
+            // A read inside a nested function scope (lambda body,
+            // comprehension body) is bound by this class's own
+            // implicit cell (`drop_class_free`) or, for a class-level
+            // inlined comprehension, demoted to a global lookup
+            // (`inline_comprehension`); neither reaches the enclosing
+            // function.
+            _ => {
+                if stmt_reads_dunder_at_class_level(stmt, name) {
+                    out.insert(name.to_owned());
+                }
             }
         }
     }
     let mut reads = HashSet::new();
     for s in body {
-        stmt_reads(s, &mut reads);
+        stmt_reads(s, &mut reads, name);
     }
-    reads.contains("__class__")
+    reads.contains(name)
+}
+
+/// Does `stmt` (a simple statement in a class body) read `name`
+/// directly in the class scope? Sub-expressions that open a function
+/// scope are skipped except for the parts evaluated in the enclosing
+/// scope (lambda defaults, a comprehension's outermost iterable).
+fn stmt_reads_dunder_at_class_level(stmt: &Stmt, name: &str) -> bool {
+    let mut all = HashSet::new();
+    collect_reads_stmt(stmt, &mut all);
+    if !all.contains(name) {
+        return false;
+    }
+    // Re-walk the statement's expressions with nested scopes hollowed
+    // out. Statement kinds not enumerated here keep the conservative
+    // answer.
+    let exprs: Vec<&Expr> = match &stmt.kind {
+        StmtKind::Expr(e) | StmtKind::Return(Some(e)) => vec![e],
+        StmtKind::Assign { targets, value } => {
+            targets.iter().chain(std::iter::once(value)).collect()
+        }
+        StmtKind::AugAssign { target, value, .. } => vec![target, value],
+        StmtKind::AnnAssign {
+            target,
+            annotation,
+            value,
+            ..
+        } => {
+            let mut v = vec![target];
+            if !pep563_active() {
+                v.push(annotation);
+            }
+            v.extend(value.as_ref());
+            v
+        }
+        StmtKind::Delete(targets) => targets.iter().collect(),
+        StmtKind::Assert { test, msg } => {
+            std::iter::once(test).chain(msg.as_ref()).collect()
+        }
+        StmtKind::Raise { exc, cause } => exc.iter().chain(cause.iter()).collect(),
+        _ => return true,
+    };
+    exprs
+        .into_iter()
+        .any(|e| expr_reads_dunder_at_class_level(e, name))
+}
+
+fn expr_reads_dunder_at_class_level(e: &Expr, name: &str) -> bool {
+    match &e.kind {
+        ExprKind::Name(n) => n == name,
+        ExprKind::Lambda { args, .. } | ExprKind::TypeParamFn { args, .. } => args
+            .defaults
+            .iter()
+            .chain(args.kw_defaults.iter().flatten())
+            .any(|d| expr_reads_dunder_at_class_level(d, name)),
+        ExprKind::ListComp { generators, .. }
+        | ExprKind::SetComp { generators, .. }
+        | ExprKind::GeneratorExp { generators, .. }
+        | ExprKind::DictComp { generators, .. } => generators
+            .first()
+            .is_some_and(|g| expr_reads_dunder_at_class_level(&g.iter, name)),
+        _ => weavepy_parser::expr_children(e)
+            .into_iter()
+            .any(|c| expr_reads_dunder_at_class_level(c, name)),
+    }
 }
 
 fn collect_decls(
@@ -15204,6 +15964,11 @@ fn bind_pattern_name(
     stores: &mut Vec<String>,
     span: weavepy_lexer::Span,
 ) -> Result<(), CompileError> {
+    // CPython `forbidden_name` (codegen `pattern_helper_store_name`):
+    // located at the binding pattern node.
+    if name == "__debug__" {
+        return Err(CompileError::spanned("cannot assign to __debug__", span));
+    }
     if stores.iter().any(|s| s == name) {
         return Err(CompileError::spanned(
             format!("multiple assignments to name '{name}' in pattern"),
@@ -15426,7 +16191,12 @@ fn validate_case_pattern(
             keywords,
             ..
         } => {
-            for (i, (name, _)) in keywords.iter().enumerate() {
+            for (i, (name, p)) in keywords.iter().enumerate() {
+                // CPython `validate_kwd_attrs`: `forbidden_name` is
+                // checked at the keyword's *pattern* location.
+                if name == "__debug__" {
+                    return Err(CompileError::spanned("cannot assign to __debug__", p.span));
+                }
                 if keywords[..i].iter().any(|(m, _)| m == name) {
                     return Err(CompileError::spanned(
                         format!("attribute name repeated in class pattern: {name}"),
@@ -15654,41 +16424,7 @@ fn collect_reads_stmt_in_impl(stmt: &Stmt, out: &mut HashSet<String>, fn_scope: 
             // cell-promoting an enclosing `def f` (test_dis's `outer`
             // fodder). `global` names read the module (never a promotion
             // source); `nonlocal` names reach up even when only written.
-            let mut nested_reads = HashSet::new();
-            for s in body {
-                collect_reads_stmt_in(s, &mut nested_reads, true);
-            }
-            let mut nested_locals: HashSet<String> = HashSet::new();
-            for a in args
-                .posonlyargs
-                .iter()
-                .chain(&args.args)
-                .chain(&args.kwonlyargs)
-                .chain(&args.vararg)
-                .chain(&args.kwarg)
-            {
-                nested_locals.insert(a.name.clone());
-            }
-            let mut nested_globals = HashSet::new();
-            let mut nested_nonlocals = HashSet::new();
-            let mut nested_assigned = HashSet::new();
-            for s in body {
-                collect_decls(
-                    s,
-                    &mut nested_globals,
-                    &mut nested_nonlocals,
-                    &mut nested_assigned,
-                );
-            }
-            nested_locals.extend(nested_assigned);
-            for n in &nested_nonlocals {
-                out.insert(n.clone());
-            }
-            for r in nested_reads {
-                if !nested_locals.contains(&r) && !nested_globals.contains(&r) {
-                    out.insert(r);
-                }
-            }
+            out.extend(function_free_names(args, body));
         }
         // The alias value and its parameters' bounds/defaults are
         // annotation scopes nested here; their free names surface as
@@ -15739,9 +16475,7 @@ fn collect_reads_stmt_in_impl(stmt: &Stmt, out: &mut HashSet<String>, fn_scope: 
                 mangled_body = b;
                 &mangled_body
             };
-            for s in body {
-                collect_reads_stmt_in(s, out, false);
-            }
+            class_body_propagating_reads(body, out);
         }
         StmtKind::Try {
             body,

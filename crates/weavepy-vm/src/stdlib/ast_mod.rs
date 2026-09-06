@@ -370,13 +370,15 @@ fn singleton(ty: &str) -> Object {
     node_noloc(ty, vec![])
 }
 
+/// An ASDL `identifier`: pegen's `_PyPegen_new_identifier` interns it,
+/// so `ast.parse('x').body[0].value.id is 'x'` (test_ast CopyTests).
 fn ident(s: &str) -> Object {
-    Object::from_str(s)
+    crate::stdlib::sys::intern_name(s)
 }
 
 fn opt_ident(s: Option<&str>) -> Object {
     match s {
-        Some(v) => Object::from_str(v),
+        Some(v) => ident(v),
         None => Object::None,
     }
 }
@@ -1235,10 +1237,7 @@ impl Builder<'_> {
             ),
             P::As { pattern, name } => node(
                 "MatchAs",
-                vec![
-                    ("pattern", self.pattern(pattern)),
-                    ("name", Object::from_str(name.clone())),
-                ],
+                vec![("pattern", self.pattern(pattern)), ("name", ident(name))],
                 sp,
                 self.lm,
             ),

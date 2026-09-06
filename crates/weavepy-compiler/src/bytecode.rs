@@ -46,6 +46,10 @@ pub const COMMON_CONSTANT_ANY: u32 = 4;
 /// `Include/internal/pycore_intrinsics.h`; the same numbers travel on
 /// the wire as the `CALL_INTRINSIC_1` / `CALL_INTRINSIC_2` oparg).
 pub mod intrinsic {
+    /// `INTRINSIC_PRINT(value)`: interactive-mode expression echo through
+    /// `sys.displayhook`; returns `None` (the codegen follows it with a
+    /// `POP_TOP`).
+    pub const PRINT: u32 = 1;
     /// `INTRINSIC_TYPEVAR(name)`: a `TypeVar` with no bound.
     pub const TYPEVAR: u32 = 7;
     /// `INTRINSIC_PARAMSPEC(name)`.

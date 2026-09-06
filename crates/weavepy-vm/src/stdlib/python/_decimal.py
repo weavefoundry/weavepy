@@ -64,10 +64,10 @@ __all__ = [
     'ROUND_FLOOR', 'ROUND_UP', 'ROUND_HALF_DOWN', 'ROUND_05UP',
 
     # Functions for manipulating contexts
-    'setcontext', 'getcontext', 'localcontext',
+    'setcontext', 'getcontext', 'localcontext', 'IEEEContext',
 
     # Limits for the C version for compatibility
-    'MAX_PREC',  'MAX_EMAX', 'MIN_EMIN', 'MIN_ETINY',
+    'MAX_PREC',  'MAX_EMAX', 'MIN_EMIN', 'MIN_ETINY', 'IEEE_CONTEXT_MAX_BITS',
 
     # C version: compile time choice that enables the thread local context (deprecated, now always true)
     'HAVE_THREADS',
@@ -85,6 +85,7 @@ __libmpdec_version__ = "2.4.2" # compatible libmpdec version
 import math as _math
 import numbers as _numbers
 import sys
+import _weakref
 
 try:
     from collections import namedtuple as _namedtuple
@@ -114,10 +115,12 @@ if sys.maxsize == 2**63-1:
     MAX_PREC = 999999999999999999
     MAX_EMAX = 999999999999999999
     MIN_EMIN = -999999999999999999
+    IEEE_CONTEXT_MAX_BITS = 512
 else:
     MAX_PREC = 425000000
     MAX_EMAX = 425000000
     MIN_EMIN = -425000000
+    IEEE_CONTEXT_MAX_BITS = 256
 
 MIN_ETINY = MIN_EMIN - (MAX_PREC-1)
 
@@ -391,11 +394,17 @@ class SignalDict(SignalDictMixin, dict):
     deleting a signal raises ValueError, and instances constructed
     directly (rather than by a Context) are unusable -- every operation
     on such an empty mapping raises `ValueError("invalid signal dict")`,
-    mirroring gh-106263.
+    mirroring gh-106263. A mapping that outlives its Context is likewise
+    invalid (gh-146011: the C `context_clear` nulls the flag pointer the
+    dict borrows), tracked here through a weak reference to the owner.
     """
 
+    # Weak reference to the owning Context; set by `Context._set_signal_dict`.
+    _owner = None
+
     def _check_valid(self):
-        if not dict.__len__(self):
+        owner = self._owner
+        if owner is None or owner() is None or not dict.__len__(self):
             raise ValueError("invalid signal dict")
 
     def __len__(self):
@@ -478,6 +487,26 @@ def setcontext(context):
     _current_context_var.set(context)
 
 del contextvars        # Don't contaminate the namespace
+
+def IEEEContext(bits, /):
+    """
+    Return a context object initialized to the proper values for one of the
+    IEEE interchange formats.  The argument must be a multiple of 32 and less
+    than IEEE_CONTEXT_MAX_BITS.
+    """
+    if bits <= 0 or bits > IEEE_CONTEXT_MAX_BITS or bits % 32:
+        raise ValueError("argument must be a multiple of 32, "
+                         f"with a maximum of {IEEE_CONTEXT_MAX_BITS}")
+
+    ctx = Context()
+    ctx.prec = 9 * (bits//32) - 2
+    ctx.Emax = 3 * (1 << (bits//16 + 3))
+    ctx.Emin = 1 - ctx.Emax
+    ctx.rounding = ROUND_HALF_EVEN
+    ctx.clamp = 1
+    ctx.traps = dict.fromkeys(_signals, False)
+
+    return ctx
 
 def localcontext(ctx=None, **kwargs):
     """Return a context manager for a copy of the supplied context
@@ -766,6 +795,21 @@ class Decimal(object):
             return self
 
         raise TypeError("Cannot convert %r to Decimal" % value)
+
+    @classmethod
+    def from_number(cls, number, /):
+        """Converts a real number to a decimal number, exactly.
+
+        >>> Decimal.from_number(314)              # int
+        Decimal('314')
+        >>> Decimal.from_number(0.1)              # float
+        Decimal('0.1000000000000000055511151231257827021181583404541015625')
+        >>> Decimal.from_number(Decimal('3.14'))  # another decimal instance
+        Decimal('3.14')
+        """
+        if isinstance(number, (int, Decimal, float)):
+            return cls(number)
+        raise TypeError("Cannot convert %r to Decimal" % number)
 
     @classmethod
     def from_float(cls, f):
@@ -4138,6 +4182,11 @@ class Context(object):
                 raise KeyError("%s is not a valid signal dict" % d)
         if type(d) is not SignalDict:
             d = SignalDict(d)
+        # A mapping handed over from another context (`_shallow_copy`
+        # shares flags/traps on purpose so `_fix` signals propagate) keeps
+        # its original owner; the copy dies first.
+        if d._owner is None:
+            d._owner = _weakref.ref(self)
         return object.__setattr__(self, name, d)
 
     def __setattr__(self, /, name, value):
@@ -6329,7 +6378,7 @@ _parser = re.compile(r"""        # A numeric string consists of:
         (?P<diag>\d*)            # with (possibly empty) diagnostic info.
     )
 #    \s*
-    \Z
+    \z
 """, re.VERBOSE | re.IGNORECASE).match
 
 _all_zeros = re.compile('0*$').match
@@ -6353,11 +6402,15 @@ _parse_format_specifier_regex = re.compile(r"""\A
 (?P<no_neg_0>z)?
 (?P<alt>\#)?
 (?P<zeropad>0)?
-(?P<minimumwidth>(?!0)\d+)?
+(?P<minimumwidth>\d+)?
 (?P<thousands_sep>[,_])?
-(?:\.(?P<precision>0|(?!0)\d+))?
+(?:\.
+    (?=[\d,_])  # lookahead for digit or separator
+    (?P<precision>\d+)?
+    (?P<frac_separators>[,_])?
+)?
 (?P<type>[eEfFgGn%])?
-\Z
+\z
 """, re.VERBOSE|re.DOTALL)
 
 del re
@@ -6455,6 +6508,9 @@ def _parse_format_specifier(format_spec, _localeconv=None):
             format_dict['thousands_sep'] = ''
         format_dict['grouping'] = [3, 0]
         format_dict['decimal_point'] = '.'
+
+    if format_dict['frac_separators'] is None:
+        format_dict['frac_separators'] = ''
 
     return format_dict
 
@@ -6574,6 +6630,11 @@ def _format_number(is_negative, intpart, fracpart, exp, spec):
     """
 
     sign = _format_sign(is_negative, spec)
+
+    frac_sep = spec['frac_separators']
+    if fracpart and frac_sep:
+        fracpart = frac_sep.join(fracpart[pos:pos + 3]
+                                 for pos in range(0, len(fracpart), 3))
 
     if fracpart or spec['alt']:
         fracpart = spec['decimal_point'] + fracpart

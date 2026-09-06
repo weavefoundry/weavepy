@@ -54,7 +54,7 @@ impl Span {
 
 /// A deferred compile-time diagnostic discovered while scanning a string
 /// or bytes literal: CPython's invalid-escape and oversized-octal-escape
-/// `SyntaxWarning`s (e.g. `invalid escape sequence '\z'`).
+/// `SyntaxWarning`s (e.g. `"\z" is an invalid escape sequence. ...`).
 ///
 /// The tokenizer detects these (matching CPython, which warns from the
 /// tokenizer/parser) but cannot emit them — that needs the runtime

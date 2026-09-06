@@ -27,5 +27,8 @@ walkdir    = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc       = { workspace = true }
 
+[build-dependencies]
+weavepy-version = { workspace = true }
+
 [lints]
 workspace = true

@@ -218,26 +218,59 @@ class _MapIter:
     and exceptions from ``func`` surface mid-stream, as in CPython.
     """
 
-    __slots__ = ("_func", "_iters")
+    __slots__ = ("_func", "_iters", "_strict")
 
     def __new__(cls, func, *iterables, **kwargs):
+        # 3.14: `map(..., strict=True)` (gh-119793) mirrors zip's strict
+        # mode; any other keyword follows the bpo-43413 subclass rule.
+        strict = kwargs.pop("strict", False)
         _reject_subclass_kwargs(cls, _MapIter, "map", kwargs)
+        if not iterables:
+            raise TypeError("map() must have at least two arguments.")
         self = object.__new__(cls)
         self._func = func
         self._iters = tuple(_hold_iter(it) for it in iterables)
+        self._strict = bool(strict)
         return self
 
     def __iter__(self):
         return self
 
     def __next__(self):
+        iters = self._iters
         args = []
-        for it in self._iters:
-            args.append(next(it))
+        for i, it in enumerate(iters):
+            try:
+                args.append(next(it))
+            except StopIteration:
+                if not self._strict:
+                    raise
+                if i > 0:
+                    raise ValueError(
+                        f"map() argument {i+1} is shorter than {_zip_arg_range(i)}"
+                    ) from None
+                # First iterator exhausted: with strict the rest must be
+                # exhausted too (a non-StopIteration error propagates).
+                for j, jt in enumerate(iters[1:], 1):
+                    try:
+                        next(jt)
+                    except StopIteration:
+                        continue
+                    raise ValueError(
+                        f"map() argument {j+1} is longer than {_zip_arg_range(j)}"
+                    ) from None
+                raise
         return self._func(*args)
 
     def __reduce__(self):
-        return (map, (self._func,) + self._iters)
+        # CPython's `map_reduce`/`map_setstate`: strict rides in the
+        # state slot (test_builtin test_map_pickle_strict_fail).
+        if self._strict:
+            return (type(self), (self._func,) + self._iters, True)
+        return (type(self), (self._func,) + self._iters)
+
+    def __setstate__(self, state):
+        self._strict = bool(state)
 
 
 class _EnumerateIter:

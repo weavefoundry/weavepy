@@ -1,8 +1,8 @@
-"""``_weave_codegen`` — CPython 3.13's compiler codegen stage.
+"""``_weave_codegen`` — CPython 3.14's compiler codegen stage.
 
-A Python port of ``Python/compile.c``'s AST → pseudo-instruction
-lowering (v3.13), backing ``_testinternalcapi.compiler_codegen`` (RFC
-0068 WS1). The graded contract is ``Lib/test/test_compiler_codegen``:
+A Python port of ``Python/codegen.c``'s AST → pseudo-instruction
+lowering (v3.14; RFC 0077 moved it up from the 3.13 ``compile.c``
+port), backing ``_testinternalcapi.compiler_codegen`` (RFC 0068 WS1). The graded contract is ``Lib/test/test_compiler_codegen``:
 an ``ast`` tree goes in, the *unoptimized* instruction sequence (with
 labels, pseudo ops, and ``add_return_at_end``) plus the unit metadata
 dict come out, with nested scopes saved via ``add_nested`` exactly as
@@ -13,6 +13,15 @@ The port covers the statement/expression core of the language
 displays, f-strings). Constructs outside that core — ``match``,
 ``try``, ``with``, comprehensions, async — raise ``SystemError`` with
 a clear message rather than emitting unfaithful code.
+
+3.14 deltas mirrored here: ``ANNOTATIONS_PLACEHOLDER`` after the
+module ``RESUME`` (PEP 649 deferred annotations), ``POP_ITER`` closing
+a ``for`` loop, ``BINARY_OP NB_SUBSCR`` for subscripts (the
+``BINARY_SUBSCR`` opcode is gone), ``LOAD_COMMON_CONSTANT`` for
+``AssertionError``, and ``BUILD_MAP`` everywhere ``BUILD_CONST_KEY_MAP``
+used to be emitted (that opcode is gone too). Function annotations
+are still lowered eagerly to a dict; the 3.14 ``__annotate__`` scope
+is not modelled.
 """
 
 import opcode as _opcode
@@ -41,7 +50,6 @@ UNARY_NOT = _op("UNARY_NOT")
 UNARY_INVERT = _op("UNARY_INVERT")
 UNARY_NEGATIVE = _op("UNARY_NEGATIVE")
 BINARY_OP = _op("BINARY_OP")
-BINARY_SUBSCR = _op("BINARY_SUBSCR")
 BINARY_SLICE = _op("BINARY_SLICE")
 STORE_SUBSCR = _op("STORE_SUBSCR")
 STORE_SLICE = _op("STORE_SLICE")
@@ -52,7 +60,6 @@ BUILD_LIST = _op("BUILD_LIST")
 BUILD_SET = _op("BUILD_SET")
 BUILD_MAP = _op("BUILD_MAP")
 BUILD_STRING = _op("BUILD_STRING")
-BUILD_CONST_KEY_MAP = _op("BUILD_CONST_KEY_MAP")
 LIST_APPEND = _op("LIST_APPEND")
 LIST_EXTEND = _op("LIST_EXTEND")
 SET_ADD = _op("SET_ADD")
@@ -81,7 +88,6 @@ LOAD_CLOSURE = _op("LOAD_CLOSURE")
 LOAD_ATTR = _op("LOAD_ATTR")
 STORE_ATTR = _op("STORE_ATTR")
 DELETE_ATTR = _op("DELETE_ATTR")
-LOAD_METHOD = _op("LOAD_METHOD")
 IMPORT_NAME = _op("IMPORT_NAME")
 IMPORT_FROM = _op("IMPORT_FROM")
 CALL = _op("CALL")
@@ -109,7 +115,9 @@ JUMP_BACKWARD_NO_INTERRUPT = _op("JUMP_BACKWARD_NO_INTERRUPT")
 CLEANUP_THROW = _op("CLEANUP_THROW")
 SETUP_CLEANUP = _op("SETUP_CLEANUP")
 RERAISE = _op("RERAISE")
-LOAD_ASSERTION_ERROR = _op("LOAD_ASSERTION_ERROR")
+LOAD_COMMON_CONSTANT = _op("LOAD_COMMON_CONSTANT")
+ANNOTATIONS_PLACEHOLDER = _op("ANNOTATIONS_PLACEHOLDER")
+POP_ITER = _op("POP_ITER")
 SETUP_ANNOTATIONS = _op("SETUP_ANNOTATIONS")
 CONVERT_VALUE = _op("CONVERT_VALUE")
 FORMAT_SIMPLE = _op("FORMAT_SIMPLE")
@@ -117,6 +125,15 @@ FORMAT_WITH_SPEC = _op("FORMAT_WITH_SPEC")
 RETURN_GENERATOR = _op("RETURN_GENERATOR")
 LOAD_BUILD_CLASS = _op("LOAD_BUILD_CLASS")
 STORE_FAST_MAYBE_NULL = _op("STORE_FAST_MAYBE_NULL")
+
+# `Include/internal/pycore_code.h` (3.14): `BINARY_OP` oparg for `a[b]`.
+NB_SUBSCR = 26
+# `Include/opcode_ids.h` / `pycore_opcode_utils.h`: `LOAD_COMMON_CONSTANT` opargs.
+CONSTANT_ASSERTIONERROR = 0
+CONSTANT_NOTIMPLEMENTEDERROR = 1
+CONSTANT_BUILTIN_TUPLE = 2
+CONSTANT_BUILTIN_ALL = 3
+CONSTANT_BUILTIN_ANY = 4
 
 RESUME_AT_FUNC_START = 0
 RESUME_AFTER_YIELD = 1
@@ -486,13 +503,11 @@ class _ConstMap:
         return idx
 
     def as_metadata(self):
-        out = {}
-        for i, value in enumerate(self.by_index):
-            try:
-                out[value] = i
-            except TypeError:
-                out[repr(value)] = i
-        return out
+        # 3.14 `_PyCompile_CodeGen`: `consts_dict_keys_inorder(u_consts)`, a
+        # list aligned with LOAD_CONST opargs (so `optimize_cfg` can take
+        # it as-is), taken *after* `AddReturnAtEnd` so the implicit
+        # `return None` constant is present.
+        return list(self.by_index)
 
 
 class _NameMap:
@@ -594,6 +609,11 @@ class Compiler:
         if scope_kind == "module":
             loc = (0, firstlineno, 0, 0)
         unit.addop(RESUME, RESUME_AT_FUNC_START, loc)
+        # 3.14 (`codegen_enter_scope`): the module body opens with the
+        # placeholder that `codegen_process_deferred_annotations` later
+        # replaces with the `__annotate__` setup (or a NOP).
+        if scope_kind == "module":
+            unit.addop(ANNOTATIONS_PLACEHOLDER, 0, loc)
 
     def _make_qualname(self, name):
         if len(self.units) == 0:
@@ -881,7 +901,7 @@ class Compiler:
         self.u.addop(JUMP, start, NO_LOCATION)
         self.u.use_label(cleanup)
         self.u.addop(END_FOR, 0, NO_LOCATION)
-        self.u.addop(POP_TOP, 0, NO_LOCATION)
+        self.u.addop(POP_ITER, 0, NO_LOCATION)
         self.u.fblocks.pop()
         for st in s.orelse or []:
             self.stmt(st)
@@ -895,7 +915,7 @@ class Compiler:
         loc = _loc(s)
         end = self.u.new_label()
         self.jump_if(loc, s.test, end, True)
-        self.u.addop(LOAD_ASSERTION_ERROR, 0, loc)
+        self.u.addop(LOAD_COMMON_CONSTANT, CONSTANT_ASSERTIONERROR, loc)
         if s.msg:
             self.expr(s.msg)
             self.u.addop(CALL, 0, loc)
@@ -949,7 +969,7 @@ class Compiler:
             self.expr(e.slice)
             self.u.addop(COPY, 2, loc)
             self.u.addop(COPY, 2, loc)
-            self.u.addop(BINARY_SUBSCR, 0, loc)
+            self.u.addop(BINARY_OP, NB_SUBSCR, loc)
         elif kind == "Name":
             self.nameop(loc, e.id, "Load")
         else:
@@ -1016,11 +1036,13 @@ class Compiler:
                 if d is not None
             ]
             if defaults:
-                for _name, d in defaults:
+                # 3.14 (`codegen_kwonlydefaults`): key/value pairs then
+                # BUILD_MAP. (Class bodies are unsupported here, so the
+                # `_PyCompile_MaybeMangle` step is the identity.)
+                for name, d in defaults:
+                    self.u.addop(LOAD_CONST, self.u.add_const(name), loc)
                     self.expr(d)
-                keys = tuple(name for name, _d in defaults)
-                self.u.addop(LOAD_CONST, self.u.add_const(keys), loc)
-                self.u.addop(BUILD_CONST_KEY_MAP, len(defaults), loc)
+                self.u.addop(BUILD_MAP, len(defaults), loc)
                 funcflags |= MAKE_FUNCTION_KWDEFAULTS
         return funcflags
 
@@ -1115,10 +1137,10 @@ class Compiler:
         if not pairs:
             return 0
         for name, ann in pairs:
+            self.u.addop(LOAD_CONST, self.u.add_const(name), loc)
             self.expr(ann)
             names.append(name)
-        self.u.addop(LOAD_CONST, self.u.add_const(tuple(names)), loc)
-        self.u.addop(BUILD_CONST_KEY_MAP, len(names), loc)
+        self.u.addop(BUILD_MAP, len(names), loc)
         return 1
 
     def classdef(self, s):
@@ -1361,13 +1383,6 @@ class Compiler:
     def subkwargs(self, loc, keywords, begin, end):
         n = end - begin
         big = n * 2 > STACK_USE_GUIDELINE
-        if n > 1 and not big:
-            for kw in keywords[begin:end]:
-                self.expr(kw.value)
-            keys = tuple(kw.arg for kw in keywords[begin:end])
-            self.u.addop(LOAD_CONST, self.u.add_const(keys), loc)
-            self.u.addop(BUILD_CONST_KEY_MAP, n, loc)
-            return
         if big:
             self.u.addop(BUILD_MAP, 0, NO_LOCATION)
         for kw in keywords[begin:end]:
@@ -1494,13 +1509,6 @@ class Compiler:
         loc = _loc(e)
         n = end - begin
         big = n * 2 > STACK_USE_GUIDELINE
-        if n > 1 and not big and all(_is_const(e.keys[i]) for i in range(begin, end)):
-            for i in range(begin, end):
-                self.expr(e.values[i])
-            keys = tuple(e.keys[i].value for i in range(begin, end))
-            self.u.addop(LOAD_CONST, self.u.add_const(keys), loc)
-            self.u.addop(BUILD_CONST_KEY_MAP, n, loc)
-            return
         if big:
             self.u.addop(BUILD_MAP, 0, loc)
         for i in range(begin, end):
@@ -1526,10 +1534,10 @@ class Compiler:
                 self.u.addop(STORE_SLICE, 0, loc)
         else:
             self.expr(e.slice)
-            op = {"Load": BINARY_SUBSCR, "Store": STORE_SUBSCR, "Del": DELETE_SUBSCR}[
-                ctx
-            ]
-            self.u.addop(op, 0, loc)
+            if ctx == "Load":
+                self.u.addop(BINARY_OP, NB_SUBSCR, loc)
+            else:
+                self.u.addop({"Store": STORE_SUBSCR, "Del": DELETE_SUBSCR}[ctx], 0, loc)
 
     def slice_(self, s):
         n = 2

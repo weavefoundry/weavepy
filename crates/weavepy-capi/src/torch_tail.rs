@@ -413,7 +413,7 @@ static STRUCTSEQ_NFIELDS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None
 
 /// `PyStructSequence_InitType(type, desc)` — initialise the extension's
 /// *static* `PyTypeObject` as a named-tuple-like type: tuple-shaped
-/// variable layout (`ob_item` right after `PyVarObject`), one readonly
+/// variable layout (`ob_item` after the var head and `ob_hash`), one readonly
 /// `T_OBJECT_EX` member per named field, then the ordinary
 /// [`crate::types::PyType_Ready`] bridge (which harvests `tp_members`
 /// into VM-visible descriptors). torch mints every
@@ -437,7 +437,9 @@ pub unsafe extern "C" fn PyStructSequence_InitType2(
         return -1;
     }
     crate::interp::ensure_initialised();
-    let item_base = std::mem::size_of::<crate::layout::PyVarObject>();
+    // A struct sequence is a `PyTupleObject`: fields sit in the inline
+    // `ob_item` array, which 3.14 places after the `ob_hash` cache.
+    let item_base = crate::layout::TUPLE_HEAD_BYTES;
     let ptr_size = std::mem::size_of::<usize>();
 
     // Named members from the desc's NULL-terminated field array. Unnamed
@@ -507,15 +509,15 @@ pub unsafe extern "C" fn PyStructSequence_SetItem(
     i: PySsizeT,
     v: *mut PyObject,
 ) {
-    let base = unsafe { (op as *mut u8).add(std::mem::size_of::<crate::layout::PyVarObject>()) }
-        as *mut *mut PyObject;
+    let base =
+        unsafe { (op as *mut u8).add(crate::layout::TUPLE_HEAD_BYTES) } as *mut *mut PyObject;
     unsafe { *base.offset(i) = v };
 }
 
 /// `PyStructSequence_GetItem(op, i)` — read a field (borrowed).
 #[no_mangle]
 pub unsafe extern "C" fn PyStructSequence_GetItem(op: *mut PyObject, i: PySsizeT) -> *mut PyObject {
-    let base = unsafe { (op as *const u8).add(std::mem::size_of::<crate::layout::PyVarObject>()) }
-        as *const *mut PyObject;
+    let base =
+        unsafe { (op as *const u8).add(crate::layout::TUPLE_HEAD_BYTES) } as *const *mut PyObject;
     unsafe { *base.offset(i) }
 }

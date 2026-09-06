@@ -380,7 +380,7 @@ pub fn set_program_name_override(name: Option<PathBuf>) {
 /// and `pyvenv.cfg` is never found (macOS returns the exec'd path and
 /// dodges this). Falls back to `current_exe()` when argv[0] is absent
 /// or doesn't name a real file (misleading custom argv0).
-pub(crate) fn program_exe() -> Option<PathBuf> {
+pub fn program_exe() -> Option<PathBuf> {
     if let Some(name) = PROGRAM_NAME_OVERRIDE.lock().unwrap().clone() {
         // getpath's program_full_path: relative-with-separator paths
         // are cwd-anchored; bare names are PATH-searched, and an

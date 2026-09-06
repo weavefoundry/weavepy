@@ -83,6 +83,17 @@ fn partial_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
     let slf = args.first().ok_or_else(|| {
         type_error("descriptor '__call__' of 'functools.partial' object needs an argument")
     })?;
+    // 3.14 `functools.Placeholder`: a partial with placeholders merges
+    // call-site positionals into the stored tuple. That path stays in
+    // the frozen `functools.py` (`_partial_call_py`); the native fast
+    // path covers the common placeholder-free case.
+    if let Ok(phcount) = interp.load_attr_public(slf, "_phcount") {
+        if !matches!(phcount, Object::Int(0)) {
+            let py_call = interp.load_attr_public(slf, "_partial_call_py")?;
+            let globals = interp.builtins_dict();
+            return interp.call(&py_call, &args[1..], kwargs, &globals);
+        }
+    }
     let func = interp.load_attr_public(slf, "func")?;
     let stored_args = interp.load_attr_public(slf, "args")?;
     let stored_kw = interp.load_attr_public(slf, "keywords")?;

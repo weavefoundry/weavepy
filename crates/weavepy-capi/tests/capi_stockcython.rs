@@ -181,7 +181,7 @@ fn stockcython_module_loads_with_types() {
         }
     }
     match lookup(&module, "ABI") {
-        Some(Object::Str(s)) => assert_eq!(&*s, "cp313"),
+        Some(Object::Str(s)) => assert_eq!(&*s, "cp314"),
         other => panic!("ABI wrong: {other:?}"),
     }
 }

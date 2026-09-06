@@ -1,11 +1,14 @@
 //! The `_warnings` module — a faithful port of CPython's
 //! `Modules/_warnings.c` (RFC 0056 WS4).
 //!
-//! The verbatim `Lib/warnings.py` does `from _warnings import (filters,
-//! _defaultaction, _onceregistry, warn, warn_explicit, _filters_mutated)`
-//! and, when that succeeds, the C module owns the filter state and the
-//! whole warn pipeline; the Python file only supplies display hooks and
-//! the `catch_warnings` bookkeeping. Like CPython, this module keeps a
+//! The verbatim `Lib/warnings.py` (3.14) does `from _warnings import
+//! (_acquire_lock, _defaultaction, _filters_mutated_lock_held,
+//! _onceregistry, _release_lock, _warnings_context, filters, warn,
+//! warn_explicit)` and, when that succeeds, the C module owns the filter
+//! state, the recursive warnings lock, the `_warnings_context`
+//! ContextVar and the whole warn pipeline; `_py_warnings.py` only
+//! supplies display hooks and the `catch_warnings` bookkeeping. Like
+//! CPython, this module keeps a
 //! *last-known* internal state (filters list, once-registry, default
 //! action, filters version) and re-reads the live `warnings` module
 //! attributes on every use, so `del warnings.filters` degrades exactly
@@ -43,14 +46,62 @@ struct WarnState {
     once_registry: Object,
     /// Last-known default action str (`WarningsState.default_action`).
     default_action: Object,
-    /// Bumped by `_filters_mutated`; registries carry a `"version"` entry
-    /// and are cleared when it goes stale.
+    /// Bumped by `_filters_mutated_lock_held`; registries carry a
+    /// `"version"` entry and are cleared when it goes stale.
     filters_version: i64,
+    /// `WarningsState.context` — the `_warnings_context` ContextVar
+    /// (3.14, PEP 787-adjacent context-aware warnings). Holds a
+    /// `warnings._WarningsContext` (with a `_filters` list) when
+    /// `sys.flags.context_aware_warnings` machinery is in use; consulted
+    /// ahead of the global `filters` by `get_filter`. `None` when the
+    /// module was built without a running interpreter.
+    context: Object,
 }
 
 // SAFETY of the static: `Object` is `Send + Sync` (`sync::Rc` is `Arc`,
 // `RefCell` is the GIL-guarded cell), and every touch happens under the GIL.
 static STATE: Mutex<Option<WarnState>> = Mutex::new(None);
+
+/// `WarningsState.lock` — the recursive mutex `_acquire_lock` /
+/// `_release_lock` expose to `warnings.py` (its `_Lock` context manager)
+/// and that `warn_explicit` takes around the filter/registry section.
+static LOCK: std::sync::LazyLock<crate::sync::RealRLock> =
+    std::sync::LazyLock::new(crate::sync::RealRLock::new);
+
+fn warnings_lock() {
+    let me = crate::gil::current_thread_id();
+    if !LOCK.try_acquire(me) {
+        crate::gil::allow_threads_then(|| LOCK.acquire(me));
+    }
+}
+
+fn warnings_unlock() -> Result<(), RuntimeError> {
+    let me = crate::gil::current_thread_id();
+    LOCK.release(me)
+        .map(|_| ())
+        .map_err(|_| runtime_error("cannot release un-acquired lock"))
+}
+
+fn warnings_lock_held() -> bool {
+    LOCK.is_owned_by(crate::gil::current_thread_id())
+}
+
+/// `PyContextVar_New("_warnings_context", NULL)` — built through the
+/// (pure-Python) `_contextvars` module, so it is the very `ContextVar`
+/// type `_py_warnings` hands out.
+fn new_context_var() -> Option<Object> {
+    let ip = interp().ok()?;
+    let module = ip.import_path("_contextvars").ok()?;
+    let cls = ip.load_attr_public(&module, "ContextVar").ok()?;
+    let globals = ip.builtins_dict();
+    ip.call_object_with_globals(
+        &cls,
+        &[Object::from_static("_warnings_context")],
+        &[],
+        &globals,
+    )
+    .ok()
+}
 
 /// The five default filters of a regular (non-debug, non-dev) build —
 /// `init_filters` in `_warnings.c`. The module filter for the
@@ -94,6 +145,7 @@ fn with_state<R>(f: impl FnOnce(&mut WarnState) -> R) -> R {
         once_registry: Object::Dict(Rc::new(RefCell::new(DictData::default()))),
         default_action: Object::from_static("default"),
         filters_version: 0,
+        context: Object::None,
     });
     f(st)
 }
@@ -117,11 +169,19 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                  It is a helper module to speed up interpreter start-up.",
             ),
         );
-        let (filters, onceregistry, defaultaction) = with_state(|st| {
+        // The ContextVar is created once per process (like the rest of
+        // the state) and re-exposed by every (re-)import.
+        if with_state(|st| matches!(st.context, Object::None)) {
+            if let Some(var) = new_context_var() {
+                with_state(|st| st.context = var);
+            }
+        }
+        let (filters, onceregistry, defaultaction, context) = with_state(|st| {
             (
                 st.filters.clone(),
                 st.once_registry.clone(),
                 st.default_action.clone(),
+                st.context.clone(),
             )
         });
         d.insert(DictKey(Object::from_static("filters")), filters);
@@ -130,6 +190,51 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("_defaultaction")),
             defaultaction,
         );
+        if !matches!(context, Object::None) {
+            d.insert(DictKey(Object::from_static("_warnings_context")), context);
+        } else {
+            // Built before the first frame existed (interpreter start-up
+            // imports `_warnings` eagerly), so the pure-Python
+            // `ContextVar` could not be constructed yet. PEP 562 module
+            // `__getattr__` materialises it on first access — from a
+            // running frame — so `from _warnings import _warnings_context`
+            // in `warnings.py` never falls back to the Python
+            // implementation half-way through its import list.
+            d.insert(
+                DictKey(Object::from_static("__getattr__")),
+                builtin_kw("__getattr__", |args, _| {
+                    let name = args.first().map(Object::to_str).unwrap_or_default();
+                    if name == "_warnings_context" {
+                        if with_state(|st| matches!(st.context, Object::None)) {
+                            if let Some(var) = new_context_var() {
+                                with_state(|st| st.context = var);
+                            }
+                        }
+                        let ctx = with_state(|st| st.context.clone());
+                        if !matches!(ctx, Object::None) {
+                            if let Ok(ip) = interp() {
+                                let module = ip
+                                    .module_cache()
+                                    .modules
+                                    .borrow()
+                                    .get(&StrKey("_warnings"))
+                                    .cloned();
+                                if let Some(Object::Module(m)) = module {
+                                    m.dict.borrow_mut().insert(
+                                        DictKey(Object::from_static("_warnings_context")),
+                                        ctx.clone(),
+                                    );
+                                }
+                            }
+                            return Ok(ctx);
+                        }
+                    }
+                    Err(crate::error::attribute_error(format!(
+                        "module '_warnings' has no attribute '{name}'"
+                    )))
+                }),
+            );
+        }
         d.insert(
             DictKey(Object::from_static("warn")),
             builtin_kw("warn", w_warn),
@@ -138,10 +243,28 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("warn_explicit")),
             builtin_kw("warn_explicit", w_warn_explicit),
         );
+        // 3.14: the version bump requires the caller to hold the lock.
         d.insert(
-            DictKey(Object::from_static("_filters_mutated")),
-            builtin_kw("_filters_mutated", |_, _| {
+            DictKey(Object::from_static("_filters_mutated_lock_held")),
+            builtin_kw("_filters_mutated_lock_held", |_, _| {
+                if !warnings_lock_held() {
+                    return Err(runtime_error("warnings lock is not held"));
+                }
                 with_state(|st| st.filters_version += 1);
+                Ok(Object::None)
+            }),
+        );
+        d.insert(
+            DictKey(Object::from_static("_acquire_lock")),
+            builtin_kw("_acquire_lock", |_, _| {
+                warnings_lock();
+                Ok(Object::None)
+            }),
+        );
+        d.insert(
+            DictKey(Object::from_static("_release_lock")),
+            builtin_kw("_release_lock", |_, _| {
+                warnings_unlock()?;
                 Ok(Object::None)
             }),
         );
@@ -245,13 +368,76 @@ fn get_filter(
     lineno: i64,
     module: &Object,
 ) -> Result<(Object, Object), RuntimeError> {
-    if let Some(live) = get_warnings_attr("filters", false) {
-        with_state(|st| st.filters = live);
+    // 3.14: a `_warnings_context` value (set by `catch_warnings` under
+    // context-aware warnings) supplies its own `_filters` list, searched
+    // *instead of* the global one.
+    match get_warnings_context_filters()? {
+        Some(context_filters) => {
+            if let Some(hit) = filter_search(
+                category,
+                text,
+                lineno,
+                module,
+                "_warnings_context _filters",
+                &context_filters,
+            )? {
+                return Ok(hit);
+            }
+        }
+        None => {
+            if let Some(live) = get_warnings_attr("filters", false) {
+                with_state(|st| st.filters = live);
+            }
+            let filters = with_state(|st| st.filters.clone());
+            let Object::List(list) = &filters else {
+                return Err(value_error("_warnings.filters must be a list"));
+            };
+            if let Some(hit) = filter_search(category, text, lineno, module, "filters", list)? {
+                return Ok(hit);
+            }
+        }
     }
-    let filters = with_state(|st| st.filters.clone());
-    let Object::List(list) = &filters else {
-        return Err(value_error("_warnings.filters must be a list"));
-    };
+    // No filter matched: the default action, refreshed from the live
+    // `warnings.defaultaction` when present.
+    if let Some(live) = get_warnings_attr("defaultaction", false) {
+        with_state(|st| st.default_action = live);
+    }
+    Ok((with_state(|st| st.default_action.clone()), Object::None))
+}
+
+/// `get_warnings_context_filters`: the `_filters` list of the current
+/// `_warnings_context` value, or `None` when the ContextVar is unset.
+fn get_warnings_context_filters() -> Result<Option<Rc<RefCell<Vec<Object>>>>, RuntimeError> {
+    let var = with_state(|st| st.context.clone());
+    if matches!(var, Object::None) {
+        return Ok(None);
+    }
+    let ip = interp()?;
+    let get = ip.load_attr_public(&var, "get")?;
+    let globals = ip.builtins_dict();
+    let ctx = ip.call_object_with_globals(&get, &[Object::None], &[], &globals)?;
+    if matches!(ctx, Object::None) {
+        return Ok(None);
+    }
+    let filters = ip.load_attr_public(&ctx, "_filters")?;
+    match filters {
+        Object::List(l) => Ok(Some(l)),
+        _ => Err(value_error(
+            "_filters of warnings._warnings_context must be a list",
+        )),
+    }
+}
+
+/// `filter_search`: scan one filters list for the first matching
+/// 5-tuple, returning the action plus the matched item.
+fn filter_search(
+    category: &Rc<TypeObject>,
+    text: &Object,
+    lineno: i64,
+    module: &Object,
+    list_name: &str,
+    list: &Rc<RefCell<Vec<Object>>>,
+) -> Result<Option<(Object, Object)>, RuntimeError> {
     let mut i = 0usize;
     loop {
         // Re-borrow per iteration: a Python `.match()` call below can
@@ -262,12 +448,12 @@ fn get_filter(
         };
         let Object::Tuple(t) = &item else {
             return Err(value_error(format!(
-                "_warnings.filters item {i} isn't a 5-tuple"
+                "warnings.{list_name} item {i} isn't a 5-tuple"
             )));
         };
         if t.len() != 5 {
             return Err(value_error(format!(
-                "_warnings.filters item {i} isn't a 5-tuple"
+                "warnings.{list_name} item {i} isn't a 5-tuple"
             )));
         }
         let action = t[0].clone();
@@ -284,16 +470,11 @@ fn get_filter(
             .as_i64()
             .ok_or_else(|| type_error("filter lineno must be an int"))?;
         if good_msg && is_subclass && good_mod && (ln == 0 || lineno == ln) {
-            return Ok((action, item));
+            return Ok(Some((action, item)));
         }
         i += 1;
     }
-    // No filter matched: the default action, refreshed from the live
-    // `warnings.defaultaction` when present.
-    if let Some(live) = get_warnings_attr("defaultaction", false) {
-        with_state(|st| st.default_action = live);
-    }
-    Ok((with_state(|st| st.default_action.clone()), Object::None))
+    Ok(None)
 }
 
 /// `get_once_registry`: the live `warnings.onceregistry` (validated as a
@@ -490,6 +671,28 @@ fn is_warning_instance(obj: &Object) -> Option<Rc<TypeObject>> {
 /// registry, pick a filter action, record, raise or show.
 #[allow(clippy::too_many_arguments)]
 fn warn_explicit_core(
+    category: Object,
+    message: Object,
+    filename: &Object,
+    lineno: i64,
+    module: Option<Object>,
+    registry: Object,
+    sourceline: Option<&str>,
+    source: Object,
+) -> Result<Object, RuntimeError> {
+    // 3.14 (`do_warn` / `warnings_warn_explicit_impl`): the whole
+    // pipeline runs under the recursive warnings lock, so Python-level
+    // `with _lock:` sections (filter mutation) serialise against it.
+    warnings_lock();
+    let r = warn_explicit_locked(
+        category, message, filename, lineno, module, registry, sourceline, source,
+    );
+    warnings_unlock()?;
+    r
+}
+
+#[allow(clippy::too_many_arguments)]
+fn warn_explicit_locked(
     category: Object,
     message: Object,
     filename: &Object,

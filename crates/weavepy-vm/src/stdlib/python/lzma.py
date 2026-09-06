@@ -4,8 +4,8 @@ This module provides a class for reading and writing compressed files,
 classes for incremental (de)compression, and convenience functions for
 one-shot (de)compression.
 
-These classes and functions support the XZ and legacy LZMA container
-formats, as well as raw filter chains (FORMAT_RAW).
+These classes and functions support both the XZ and legacy LZMA
+container formats, as well as raw compressed data streams.
 """
 
 __all__ = [
@@ -24,17 +24,18 @@ __all__ = [
 import builtins
 import io
 import os
+from compression._common import _streams
+# WeavePy divergence: the native `_lzma` exposes the core surface; the
+# liblzma constants this build does not act on are defined below so that
+# callers referencing them (and ``__all__``) keep working.
 from _lzma import (
     LZMACompressor, LZMADecompressor, LZMAError, is_check_supported,
-    _encode_filter_properties, _decode_filter_properties,
+    _encode_filter_properties, _decode_filter_properties,  # noqa: F401
     FORMAT_AUTO, FORMAT_XZ, FORMAT_ALONE, FORMAT_RAW,
     CHECK_NONE, CHECK_CRC32, CHECK_CRC64, CHECK_SHA256,
     PRESET_DEFAULT, PRESET_EXTREME,
 )
-import _compression
 
-# Constants that liblzma exposes but this build does not act on. They are
-# defined here so that callers referencing them (and ``__all__``) keep working.
 CHECK_ID_MAX = 15
 CHECK_UNKNOWN = 16
 
@@ -64,7 +65,7 @@ _MODE_READ     = 1
 _MODE_WRITE    = 3
 
 
-class LZMAFile(_compression.BaseStream):
+class LZMAFile(_streams.BaseStream):
 
     """A file object providing transparent LZMA (de)compression.
 
@@ -106,7 +107,11 @@ class LZMAFile(_compression.BaseStream):
         When opening a file for writing, the settings used by the
         compressor can be specified either as a preset compression
         level (with the *preset* argument), or in detail as a custom
-        filter chain (with the *filters* argument).
+        filter chain (with the *filters* argument). For FORMAT_XZ and
+        FORMAT_ALONE, the default is to use the PRESET_DEFAULT preset
+        level. For FORMAT_RAW, the caller must always specify a filter
+        chain; the raw compressor does not support preset compression
+        levels.
 
         preset (if provided) should be an integer in the range 0-9,
         optionally OR-ed with the constant PRESET_EXTREME.
@@ -152,7 +157,7 @@ class LZMAFile(_compression.BaseStream):
             raise TypeError("filename must be a str, bytes, file or PathLike object")
 
         if self._mode == _MODE_READ:
-            raw = _compression.DecompressReader(self._fp, LZMADecompressor,
+            raw = _streams.DecompressReader(self._fp, LZMADecompressor,
                 trailing_error=LZMAError, format=format, filters=filters)
             self._buffer = io.BufferedReader(raw)
 

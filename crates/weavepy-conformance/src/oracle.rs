@@ -73,7 +73,7 @@ pub fn ensure_available(python: &str) -> Result<String> {
         .output()
         .with_context(|| {
             format!(
-                "failed to launch `{python}`. install Python 3.13+ or set ${}",
+                "failed to launch `{python}`. install Python 3.14+ or set ${}",
                 crate::PYTHON_ENV_VAR
             )
         })?;

@@ -3,7 +3,7 @@
 //! `PyStatus`, `PyWideStringList`, `PyPreConfig`, and `PyConfig` are
 //! ABI-visible: embedders allocate them on their own stack and poke
 //! fields directly, so the `#[repr(C)]` layouts here must match the
-//! vendored stock header (`include/cpython313/cpython/initconfig.h`)
+//! vendored stock header (`include/cpython314/cpython/initconfig.h`)
 //! field-for-field. A layout assertion in this module's tests keeps
 //! the twin honest.
 //!
@@ -493,10 +493,11 @@ pub unsafe extern "C" fn Py_PreInitializeFromBytesArgs(
 // ---------------------------------------------------------------------------
 
 /// Field-for-field with the vendored `initconfig.h` `PyConfig` for a
-/// non-debug, GIL-enabled 3.13 build (i.e. exactly the build every
-/// cp313 wheel targets). `Py_GIL_DISABLED` / `Py_STATS` / `Py_DEBUG`
+/// non-debug, GIL-enabled 3.14 build (i.e. exactly the build every
+/// cp314 wheel targets). `Py_GIL_DISABLED` / `Py_STATS` / `Py_DEBUG`
 /// conditional fields are absent by construction; `MS_WINDOWS` fields
-/// follow `cfg(windows)`.
+/// follow `cfg(windows)` and the `__APPLE__` one `cfg(target_vendor =
+/// "apple")`.
 #[repr(C)]
 pub struct PyConfig {
     pub _config_init: c_int,
@@ -509,6 +510,8 @@ pub struct PyConfig {
     pub faulthandler: c_int,
     pub tracemalloc: c_int,
     pub perf_profiling: c_int,
+    /// 3.14: `-X disable-remote-debug` / `PYTHON_DISABLE_REMOTE_DEBUG`.
+    pub remote_debug: c_int,
     pub import_time: c_int,
     pub code_debug_ranges: c_int,
     pub show_ref_count: c_int,
@@ -544,6 +547,14 @@ pub struct PyConfig {
     pub use_frozen_modules: c_int,
     pub safe_path: c_int,
     pub int_max_str_digits: c_int,
+    /// 3.14: `-X thread_inherit_context` (default 0 on a GIL build).
+    pub thread_inherit_context: c_int,
+    /// 3.14: `-X context_aware_warnings` (default 0 on a GIL build).
+    pub context_aware_warnings: c_int,
+    /// 3.14, `__APPLE__` only: route stdout/stderr to the system log
+    /// (default 0 on macOS, 1 on iOS).
+    #[cfg(target_vendor = "apple")]
+    pub use_system_logger: c_int,
     pub cpu_count: c_int,
     // --- Path configuration inputs ------------
     pub pathconfig_warnings: c_int,
@@ -593,6 +604,7 @@ unsafe fn config_defaults(c: &mut PyConfig) {
     c.faulthandler = -1;
     c.tracemalloc = -1;
     c.perf_profiling = -1;
+    c.remote_debug = -1;
     c.module_search_paths_set = 0;
     c.parse_argv = 0;
     c.site_import = -1;
@@ -616,6 +628,12 @@ unsafe fn config_defaults(c: &mut PyConfig) {
     c._is_python_build = 0;
     c.int_max_str_digits = -1;
     c.cpu_count = -1;
+    c.thread_inherit_context = 0;
+    c.context_aware_warnings = 0;
+    #[cfg(target_vendor = "apple")]
+    {
+        c.use_system_logger = 0;
+    }
 }
 
 #[no_mangle]
@@ -1392,7 +1410,7 @@ mod tests {
     /// The struct sizes/offsets are ABI: an embedder's stack-allocated
     /// `PyConfig` is written through these offsets by both sides. The
     /// expected values are measured from the vendored stock header
-    /// (`cc -I include/cpython313` + `sizeof`/`offsetof`, LP64 POSIX).
+    /// (`cc -I include/cpython314` + `sizeof`/`offsetof`, LP64 POSIX).
     #[test]
     fn config_struct_layout_matches_stock_header() {
         #[cfg(all(unix, target_pointer_width = "64"))]
@@ -1400,11 +1418,17 @@ mod tests {
             assert_eq!(std::mem::size_of::<PyWideStringList>(), 16);
             assert_eq!(std::mem::size_of::<PyStatus>(), 32);
             assert_eq!(std::mem::size_of::<PyPreConfig>(), 40);
-            assert_eq!(std::mem::size_of::<PyConfig>(), 448);
+            assert_eq!(std::mem::size_of::<PyConfig>(), 456);
+            assert_eq!(std::mem::offset_of!(PyConfig, remote_debug), 44);
             assert_eq!(std::mem::offset_of!(PyConfig, argv), 128);
-            assert_eq!(std::mem::offset_of!(PyConfig, program_name), 280);
-            assert_eq!(std::mem::offset_of!(PyConfig, run_command), 400);
-            assert_eq!(std::mem::offset_of!(PyConfig, _init_main), 436);
+            assert_eq!(std::mem::offset_of!(PyConfig, thread_inherit_context), 268);
+            #[cfg(target_vendor = "apple")]
+            assert_eq!(std::mem::offset_of!(PyConfig, cpu_count), 280);
+            #[cfg(not(target_vendor = "apple"))]
+            assert_eq!(std::mem::offset_of!(PyConfig, cpu_count), 276);
+            assert_eq!(std::mem::offset_of!(PyConfig, program_name), 288);
+            assert_eq!(std::mem::offset_of!(PyConfig, run_command), 408);
+            assert_eq!(std::mem::offset_of!(PyConfig, _init_main), 444);
         }
     }
 

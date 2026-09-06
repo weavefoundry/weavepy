@@ -273,17 +273,19 @@ class Morsel(dict):
         "httponly" : "HttpOnly",
         "version"  : "Version",
         "samesite" : "SameSite",
+        "partitioned": "Partitioned",
     }
 
-    _flags = {'secure', 'httponly'}
+    _reserved_defaults = dict.fromkeys(_reserved, "")
+
+    _flags = {'secure', 'httponly', 'partitioned'}
 
     def __init__(self):
         # Set defaults
         self._key = self._value = self._coded_value = None
 
         # Set default attributes
-        for key in self._reserved:
-            dict.__setitem__(self, key, "")
+        dict.update(self, self._reserved_defaults)
 
     @property
     def key(self):
@@ -389,17 +391,21 @@ class Morsel(dict):
         return '<%s: %s>' % (self.__class__.__name__, self.OutputString())
 
     def js_output(self, attrs=None):
+        import urllib.parse
         # Print javascript
         output_string = self.OutputString(attrs)
         if _has_control_character(output_string):
             raise CookieError("Control characters are not allowed in cookies")
+        # Base64-encode value to avoid template
+        # injection in cookie values.
+        output_encoded = urllib.parse.quote(output_string, safe='', encoding='utf-8')
         return """
         <script type="text/javascript">
         <!-- begin hiding
-        document.cookie = \"%s\";
+        document.cookie = decodeURIComponent(\"%s\");
         // end hiding -->
         </script>
-        """ % (output_string.replace('"', r'\"'))
+        """ % (output_encoded,)
 
     def OutputString(self, attrs=None):
         # Build up our result

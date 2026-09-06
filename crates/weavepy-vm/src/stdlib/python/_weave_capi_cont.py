@@ -310,9 +310,11 @@ def dict_mergefromseq2(mapping, seq2, override):
             try:
                 fast = list(item)
             except TypeError:
-                raise TypeError(
-                    "cannot convert dictionary update sequence element #%d "
-                    "to a sequence" % i) from None
+                exc = TypeError("object is not iterable")
+                exc.add_note(
+                    "Cannot convert dictionary update sequence element #%d "
+                    "to a sequence" % i)
+                raise exc from None
         n = len(fast)
         if n != 2:
             raise ValueError(

@@ -205,13 +205,14 @@ fn errno() -> i32 {
 /// `fork_exec(args, executable_list, close_fds, fds_to_keep, cwd,
 /// env_list, p2cread, p2cwrite, c2pread, c2pwrite, errread, errwrite,
 /// errpipe_read, errpipe_write, restore_signals, call_setsid,
-/// pgid_to_set, gid, extra_groups, uid, child_umask, preexec_fn,
-/// allow_vfork)` — CPython 3.13's `_posixsubprocess.fork_exec`.
+/// pgid_to_set, gid, extra_groups, uid, child_umask, preexec_fn)` —
+/// CPython 3.14's `_posixsubprocess.fork_exec` (3.13's trailing
+/// `allow_vfork` is gone: 3.14 dropped the vfork path).
 #[cfg(unix)]
 fn fork_exec(args: &[Object]) -> Result<Object, RuntimeError> {
-    if args.len() < 23 {
+    if args.len() != 22 {
         return Err(type_error(format!(
-            "fork_exec expected 23 arguments, got {}",
+            "fork_exec() takes exactly 22 arguments ({} given)",
             args.len()
         )));
     }

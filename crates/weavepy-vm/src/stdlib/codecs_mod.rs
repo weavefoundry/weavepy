@@ -43,6 +43,19 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         register(&mut d, "encode", b_encode);
         register(&mut d, "decode", b_decode);
         register(&mut d, "lookup", b_lookup);
+        // The error-handler registry lives in the frozen `codecs.py`; these
+        // forward to it so `from _codecs import register_error,
+        // lookup_error, _unregister_error` works before `codecs` is imported
+        // (test_codeccallbacks imports `_codecs._unregister_error`, 3.14).
+        register(&mut d, "register_error", |args| {
+            forward_to_codecs("register_error", args)
+        });
+        register(&mut d, "lookup_error", |args| {
+            forward_to_codecs("lookup_error", args)
+        });
+        register(&mut d, "_unregister_error", |args| {
+            forward_to_codecs("_unregister_error", args)
+        });
         register(&mut d, "utf_8_encode", b_utf8_encode);
         register(&mut d, "utf_8_decode", b_utf8_decode);
         register(&mut d, "utf_7_encode", b_utf7_encode);
@@ -365,6 +378,16 @@ pub fn b_decode(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = decode_bytes_obj(&bytes, &encoding, &errors)?;
     let len = bytes.len() as i64;
     Ok(Object::new_tuple(vec![s, Object::Int(len)]))
+}
+
+/// Call `codecs.<name>(*args)` on the frozen `codecs` module through the
+/// live interpreter (the error-handler registry is Python-side).
+fn forward_to_codecs(name: &str, args: &[Object]) -> Result<Object, RuntimeError> {
+    with_interp(|interp| {
+        let codecs = interp.import_path_internal("codecs")?;
+        let f = interp.load_attr_public(&codecs, name)?;
+        interp.call_object(f, args, &[])
+    })
 }
 
 fn b_lookup(args: &[Object]) -> Result<Object, RuntimeError> {

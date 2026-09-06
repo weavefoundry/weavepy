@@ -98,7 +98,7 @@ fn stockabi_module_loads_with_constants() {
         other => panic!("ANSWER wrong: {other:?}"),
     }
     match lookup(&module, "ABI") {
-        Some(Object::Str(s)) => assert_eq!(&*s, "cp313"),
+        Some(Object::Str(s)) => assert_eq!(&*s, "cp314"),
         other => panic!("ABI wrong: {other:?}"),
     }
 }

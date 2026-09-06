@@ -971,6 +971,8 @@ pub(crate) unsafe fn pack_tuple_subclass_body(body: *mut PyObject) {
     let vo = body as *mut layout::PyVarObject;
     unsafe { (*vo).ob_size = n as PySsizeT };
     let to = body as *mut layout::PyTupleObject;
+    // 3.14: the cached hash starts out unset.
+    unsafe { (*to).ob_hash = -1 };
     let base = ptr::addr_of_mut!((*to).ob_item) as *mut *mut PyObject;
     for (i, elem) in items.iter().enumerate() {
         let ep = match elem {
@@ -4299,8 +4301,9 @@ impl BodyPlan {
             }
             Object::Tuple(t) => BodyPlan {
                 kind: BodyKind::Tuple,
-                // varhead(24) + n pointers.
-                body_size: round_up(24 + t.len() * 8, 8).max(24),
+                // varhead(24) + `ob_hash`(8) + n pointers (3.14 layout).
+                body_size: round_up(layout::TUPLE_HEAD_BYTES + t.len() * 8, 8)
+                    .max(layout::TUPLE_HEAD_BYTES),
             },
             Object::List(_) => BodyPlan {
                 kind: BodyKind::List,
@@ -4414,6 +4417,8 @@ unsafe fn fill_body(
                 let vo = body as *mut layout::PyVarObject;
                 unsafe { (*vo).ob_size = t.len() as PySsizeT };
                 let to = body as *mut layout::PyTupleObject;
+                // 3.14: the cached hash starts out unset.
+                unsafe { (*to).ob_hash = -1 };
                 let base = ptr::addr_of_mut!((*to).ob_item) as *mut *mut PyObject;
                 for (i, elem) in t.iter().enumerate() {
                     // RFC 0046 (wave 4): the inline `ob_item` array is the
@@ -5059,8 +5064,10 @@ mod tests {
         unsafe {
             // ob_size at +16.
             assert_eq!(read_at::<isize>(p, 16), 2);
-            // ob_item[0] at +24 is a float mirror with ob_fval 1.0.
-            let e0 = read_at::<*mut PyObject>(p, 24);
+            // ob_hash at +24 is unset (3.14 layout).
+            assert_eq!(read_at::<isize>(p, 24), -1);
+            // ob_item[0] at +32 is a float mirror with ob_fval 1.0.
+            let e0 = read_at::<*mut PyObject>(p, 32);
             assert_eq!(read_at::<f64>(e0, 16), 1.0);
             free_mirror(p);
         }

@@ -1,17 +1,29 @@
-"""``_weave_flowgraph`` — CPython 3.13's compiler flowgraph stage.
+"""``_weave_flowgraph`` — CPython 3.14's compiler flowgraph stage.
 
-A faithful Python port of ``Python/flowgraph.c`` (v3.13) over the
+A faithful Python port of ``Python/flowgraph.c`` (v3.14.7) over the
 CPython opcode space, backing ``_testinternalcapi.optimize_cfg`` (RFC
-0068 WS1). The graded contract is ``Lib/test/test_peepholer``'s
-``DirectCfgOptimizerTests`` and ``test_compile``'s CFG legs: a
+0068 WS1; RFC 0077 moved the port up from 3.13). The graded contract is
+``Lib/test/test_peepholer``'s ``DirectCfgOptimizerTests`` /
+``OptimizeLoadFastTestCase`` and ``test_compile``'s CFG legs: a
 pseudo-instruction sequence goes in, the optimized sequence comes out,
 with CPython's exact NOP/jump/const shapes.
 
 Every function mirrors its C namesake; the pass order in
-``optimize_code_unit`` is ``_PyCfg_OptimizeCodeUnit``'s.
+``optimize_code_unit`` is ``_PyCfg_OptimizeCodeUnit``'s, and
+``optimize_cfg_rows`` is ``_PyCompile_OptimizeCfg`` (which additionally
+runs ``calculate_stackdepth`` and ``optimize_load_fast``).
+
+3.14 deltas: constant folding of binary/unary ops and of list/set/tuple
+displays lives here now (the AST optimizer only folds a handful of
+shapes); ``LOAD_SMALL_INT`` replaces ``LOAD_CONST`` of 0..255;
+``RETURN_CONST`` is gone; ``JUMP_IF_TRUE`` / ``JUMP_IF_FALSE`` pseudo
+jumps are threaded; ``LOAD_FAST`` strength-reduces to
+``LOAD_FAST_BORROW`` when the borrowed reference provably dies before
+its local does.
 """
 
 import opcode as _opcode
+import _opcode as _opcode_tables
 
 _OPMAP = _opcode.opmap
 
@@ -25,8 +37,8 @@ POP_TOP = _op("POP_TOP")
 COPY = _op("COPY")
 SWAP = _op("SWAP")
 LOAD_CONST = _op("LOAD_CONST")
+LOAD_SMALL_INT = _op("LOAD_SMALL_INT")
 RETURN_VALUE = _op("RETURN_VALUE")
-RETURN_CONST = _op("RETURN_CONST")
 RAISE_VARARGS = _op("RAISE_VARARGS")
 RERAISE = _op("RERAISE")
 JUMP = _op("JUMP")
@@ -34,24 +46,44 @@ JUMP_NO_INTERRUPT = _op("JUMP_NO_INTERRUPT")
 JUMP_FORWARD = _op("JUMP_FORWARD")
 JUMP_BACKWARD = _op("JUMP_BACKWARD")
 JUMP_BACKWARD_NO_INTERRUPT = _op("JUMP_BACKWARD_NO_INTERRUPT")
+JUMP_IF_FALSE = _op("JUMP_IF_FALSE")
+JUMP_IF_TRUE = _op("JUMP_IF_TRUE")
 POP_JUMP_IF_FALSE = _op("POP_JUMP_IF_FALSE")
 POP_JUMP_IF_TRUE = _op("POP_JUMP_IF_TRUE")
 POP_JUMP_IF_NONE = _op("POP_JUMP_IF_NONE")
 POP_JUMP_IF_NOT_NONE = _op("POP_JUMP_IF_NOT_NONE")
 FOR_ITER = _op("FOR_ITER")
+SEND = _op("SEND")
+END_ASYNC_FOR = _op("END_ASYNC_FOR")
 STORE_FAST = _op("STORE_FAST")
 STORE_FAST_MAYBE_NULL = _op("STORE_FAST_MAYBE_NULL")
 LOAD_FAST = _op("LOAD_FAST")
 LOAD_FAST_CHECK = _op("LOAD_FAST_CHECK")
 LOAD_FAST_AND_CLEAR = _op("LOAD_FAST_AND_CLEAR")
+LOAD_FAST_BORROW = _op("LOAD_FAST_BORROW")
+LOAD_FAST_BORROW_LOAD_FAST_BORROW = _op("LOAD_FAST_BORROW_LOAD_FAST_BORROW")
 DELETE_FAST = _op("DELETE_FAST")
 BUILD_TUPLE = _op("BUILD_TUPLE")
+BUILD_LIST = _op("BUILD_LIST")
+BUILD_SET = _op("BUILD_SET")
+LIST_APPEND = _op("LIST_APPEND")
+LIST_EXTEND = _op("LIST_EXTEND")
+SET_ADD = _op("SET_ADD")
+SET_UPDATE = _op("SET_UPDATE")
+MAP_ADD = _op("MAP_ADD")
+DICT_MERGE = _op("DICT_MERGE")
+DICT_UPDATE = _op("DICT_UPDATE")
 UNPACK_SEQUENCE = _op("UNPACK_SEQUENCE")
 IS_OP = _op("IS_OP")
 CONTAINS_OP = _op("CONTAINS_OP")
 COMPARE_OP = _op("COMPARE_OP")
 TO_BOOL = _op("TO_BOOL")
 UNARY_NOT = _op("UNARY_NOT")
+UNARY_INVERT = _op("UNARY_INVERT")
+UNARY_NEGATIVE = _op("UNARY_NEGATIVE")
+BINARY_OP = _op("BINARY_OP")
+CALL_INTRINSIC_1 = _op("CALL_INTRINSIC_1")
+GET_ITER = _op("GET_ITER")
 LOAD_GLOBAL = _op("LOAD_GLOBAL")
 PUSH_NULL = _op("PUSH_NULL")
 SETUP_FINALLY = _op("SETUP_FINALLY")
@@ -67,22 +99,68 @@ STORE_FAST_STORE_FAST = _op("STORE_FAST_STORE_FAST")
 CALL = _op("CALL")
 CALL_KW = _op("CALL_KW")
 CALL_FUNCTION_EX = _op("CALL_FUNCTION_EX")
+ANNOTATIONS_PLACEHOLDER = _op("ANNOTATIONS_PLACEHOLDER")
+FORMAT_SIMPLE = _op("FORMAT_SIMPLE")
+GET_ANEXT = _op("GET_ANEXT")
+GET_LEN = _op("GET_LEN")
+GET_YIELD_FROM_ITER = _op("GET_YIELD_FROM_ITER")
+IMPORT_FROM = _op("IMPORT_FROM")
+MATCH_KEYS = _op("MATCH_KEYS")
+MATCH_MAPPING = _op("MATCH_MAPPING")
+MATCH_SEQUENCE = _op("MATCH_SEQUENCE")
+WITH_EXCEPT_START = _op("WITH_EXCEPT_START")
+END_SEND = _op("END_SEND")
+SET_FUNCTION_ATTRIBUTE = _op("SET_FUNCTION_ATTRIBUTE")
+CHECK_EXC_MATCH = _op("CHECK_EXC_MATCH")
+LOAD_ATTR = _op("LOAD_ATTR")
+LOAD_SUPER_ATTR = _op("LOAD_SUPER_ATTR")
+LOAD_SPECIAL = _op("LOAD_SPECIAL")
+PUSH_EXC_INFO = _op("PUSH_EXC_INFO")
 
 RESUME_AT_FUNC_START = 0
 RESUME_OPARG_DEPTH1_MASK = 0x2
+
+# `Include/internal/pycore_intrinsics.h`
+INTRINSIC_UNARY_POSITIVE = 5
+INTRINSIC_LIST_TO_TUPLE = 6
+
+# `Include/opcode_ids.h` / `pycore_code.h`: BINARY_OP opargs.
+NB_ADD = 0
+NB_AND = 1
+NB_FLOOR_DIVIDE = 2
+NB_LSHIFT = 3
+NB_MATRIX_MULTIPLY = 4
+NB_MULTIPLY = 5
+NB_REMAINDER = 6
+NB_OR = 7
+NB_POWER = 8
+NB_RSHIFT = 9
+NB_SUBTRACT = 10
+NB_TRUE_DIVIDE = 11
+NB_XOR = 12
+NB_INPLACE_ADD = 13
+NB_INPLACE_XOR = 25
+NB_SUBSCR = 26
+NB_OPARG_LAST = NB_SUBSCR
+
+# `Include/internal/pycore_compile.h`
+STACK_USE_GUIDELINE = 30
+MIN_CONST_SEQUENCE_SIZE = 3
 
 _HAS_ARG = frozenset(_opcode.hasarg)
 _BLOCK_PUSH = frozenset(_opcode.hasexc)  # SETUP_FINALLY/SETUP_CLEANUP/SETUP_WITH
 _JUMP_OPS = frozenset(_opcode.hasjrel) | frozenset(_opcode.hasjabs)
 HAS_TARGET_OPS = _JUMP_OPS | _BLOCK_PUSH
-_SCOPE_EXIT = frozenset((RETURN_VALUE, RETURN_CONST, RAISE_VARARGS, RERAISE))
+_SCOPE_EXIT = frozenset((RETURN_VALUE, RAISE_VARARGS, RERAISE))
 _UNCOND_JUMP = frozenset(
     (JUMP, JUMP_NO_INTERRUPT, JUMP_FORWARD, JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT)
 )
 _TERMINATOR = _JUMP_OPS | _SCOPE_EXIT
-# Compiler-visible instructions with HAS_EVAL_BREAK_FLAG (3.13
+# Compiler-visible instructions with HAS_EVAL_BREAK_FLAG (3.14
 # pycore_opcode_metadata.h; specialized forms never reach the CFG).
-_EVAL_BREAK = frozenset((RESUME, CALL, CALL_KW, CALL_FUNCTION_EX, JUMP_BACKWARD, JUMP))
+_EVAL_BREAK = frozenset(
+    (RESUME, CALL, CALL_KW, CALL_FUNCTION_EX, JUMP_BACKWARD, JUMP)
+)
 _HAS_CONST = frozenset(_opcode.hasconst)
 
 NO_LOCATION = (-1, -1, -1, -1)
@@ -107,6 +185,9 @@ class Instr:
     def set_op1(self, opcode, oparg):
         self.opcode = opcode
         self.oparg = oparg
+
+    def set_loc(self, loc):
+        self.loc = loc
 
 
 def is_block_push(instr):
@@ -217,8 +298,12 @@ class CfgBuilder:
 
 
 def sequence_to_cfg(rows):
-    """``instr_sequence_to_cfg``: rows are (opcode, oparg, loc) with jump
-    opargs already resolved to instruction indices."""
+    """``_PyCfg_FromInstructionSequence``: rows are (opcode, oparg, loc)
+    with jump opargs already resolved to instruction indices. The
+    ``ANNOTATIONS_PLACEHOLDER`` pseudo-instruction is dropped here (this
+    entry point carries no deferred-annotations code), shifting every
+    later label and jump target by one, exactly as the C loop's
+    ``offset`` bookkeeping does."""
     is_target = [False] * len(rows)
     for opcode, oparg, _loc in rows:
         if opcode in HAS_TARGET_OPS:
@@ -226,9 +311,15 @@ def sequence_to_cfg(rows):
                 raise ValueError("target out of range")
             is_target[oparg] = True
     g = CfgBuilder()
+    offset = 0
     for i, (opcode, oparg, loc) in enumerate(rows):
+        if opcode == ANNOTATIONS_PLACEHOLDER:
+            offset -= 1
+            continue
         if is_target[i]:
-            g.use_label(i)
+            g.use_label(i + offset)
+        if opcode in HAS_TARGET_OPS:
+            oparg += offset
         g.addop(opcode, oparg, loc)
     return g
 
@@ -315,6 +406,102 @@ def check_cfg(g):
         for i, instr in enumerate(b.instrs):
             if instr.opcode in _TERMINATOR and i != len(b.instrs) - 1:
                 raise SystemError("malformed control flow graph.")
+
+
+# ---- stack effects ---------------------------------------------------------
+
+_POPPED = _opcode_tables._POPPED
+_PUSHED = _opcode_tables._PUSHED
+_DEOPT = _opcode_tables._DEOPT
+_MAX_REAL_OPCODE = _opcode_tables._MAX_REAL_OPCODE
+
+
+def num_popped(opcode, oparg):
+    """``_PyOpcode_num_popped``; ``-1`` for an unknown opcode."""
+    fn = _POPPED.get(opcode)
+    return -1 if fn is None else fn(oparg)
+
+
+def num_pushed(opcode, oparg):
+    """``_PyOpcode_num_pushed``; ``-1`` for an unknown opcode."""
+    fn = _PUSHED.get(opcode)
+    return -1 if fn is None else fn(oparg)
+
+
+def get_stack_effects(opcode, oparg, jump):
+    """``get_stack_effects``: the net effect, or ``None`` when the opcode
+    has no entry (specialized forms, out-of-range numbers)."""
+    if opcode < 0:
+        return None
+    if opcode <= _MAX_REAL_OPCODE and _DEOPT.get(opcode, opcode) != opcode:
+        return None
+    popped = num_popped(opcode, oparg)
+    pushed = num_pushed(opcode, oparg)
+    if popped < 0 or pushed < 0:
+        return None
+    if opcode in _BLOCK_PUSH and not jump:
+        return 0
+    return pushed - popped
+
+
+def opcode_stack_effect(opcode, oparg):
+    """``PyCompile_OpcodeStackEffect`` (``jump = -1``, the maximal case);
+    ``None`` stands in for ``PY_INVALID_STACK_EFFECT``."""
+    return get_stack_effects(opcode, oparg, -1)
+
+
+_INT_MIN = -(2**31)
+
+
+def _stackdepth_push(stack, b, depth):
+    if not (b.startdepth < 0 or b.startdepth == depth):
+        raise ValueError("Invalid CFG, inconsistent stackdepth")
+    if b.startdepth < depth and b.startdepth < 100:
+        b.startdepth = depth
+        stack.append(b)
+
+
+def calculate_stackdepth(g):
+    """``calculate_stackdepth``: find the flow path needing the largest
+    stack (cycles are assumed to have no net effect), recording every
+    block's entry depth in ``startdepth`` on the way."""
+    for b in g.iter_blocks():
+        b.startdepth = _INT_MIN
+    stack = []
+    maxdepth = 0
+    _stackdepth_push(stack, g.entry, 0)
+    while stack:
+        b = stack.pop()
+        depth = b.startdepth
+        nxt = b.next
+        for instr in b.instrs:
+            effect = get_stack_effects(instr.opcode, instr.oparg, 0)
+            if effect is None:
+                raise SystemError(
+                    "Invalid stack effect for opcode=%d, arg=%d"
+                    % (instr.opcode, instr.oparg)
+                )
+            new_depth = depth + effect
+            if new_depth < 0:
+                raise ValueError("Invalid CFG, stack underflow")
+            maxdepth = max(maxdepth, depth)
+            if instr.opcode in HAS_TARGET_OPS and instr.opcode != END_ASYNC_FOR:
+                effect = get_stack_effects(instr.opcode, instr.oparg, 1)
+                if effect is None:
+                    raise SystemError(
+                        "Invalid stack effect for opcode=%d, arg=%d"
+                        % (instr.opcode, instr.oparg)
+                    )
+                target_depth = depth + effect
+                maxdepth = max(maxdepth, depth)
+                _stackdepth_push(stack, instr.target, target_depth)
+            depth = new_depth
+            if instr.opcode in _UNCOND_JUMP or instr.opcode in _SCOPE_EXIT:
+                nxt = None
+                break
+        if nxt is not None:
+            _stackdepth_push(stack, nxt, depth)
+    return maxdepth
 
 
 def next_nonempty_block(b):
@@ -447,7 +634,7 @@ def remove_redundant_nops_and_pairs(g):
                 prev_oparg = prev_instr.oparg if prev_instr else 0
                 is_redundant_pair = False
                 if instr.opcode == POP_TOP:
-                    if prev_opcode == LOAD_CONST:
+                    if prev_opcode in (LOAD_CONST, LOAD_SMALL_INT):
                         is_redundant_pair = True
                     elif prev_opcode == COPY and prev_oparg == 1:
                         is_redundant_pair = True
@@ -552,16 +739,28 @@ def resolve_line_numbers(g, firstlineno):
 # ---- constant folding / peephole ------------------------------------------
 
 
+def loads_const(opcode):
+    return opcode in _HAS_CONST or opcode == LOAD_SMALL_INT
+
+
 def get_const_value(opcode, oparg, consts):
-    assert opcode in _HAS_CONST
+    assert loads_const(opcode)
     if opcode == LOAD_CONST:
+        n = len(consts)
+        if oparg < 0 or oparg >= n:
+            raise ValueError(
+                "LOAD_CONST index %d is out of range for consts (len=%d)" % (oparg, n)
+            )
         return consts[oparg]
+    if opcode == LOAD_SMALL_INT:
+        return int(oparg)
     raise SystemError("Internal error: failed to get value of a constant")
 
 
 class _ConstKey:
-    """CPython's const-cache key: value plus type (and recursively for
-    containers), so 0 / 0.0 / False stay distinct constants."""
+    """CPython's const-cache key (``_PyCompile_ConstCacheMergeOne``): value
+    plus type (and recursively for containers), so 0 / 0.0 / False stay
+    distinct constants."""
 
     __slots__ = ("key",)
 
@@ -609,34 +808,364 @@ class _ConstKey:
         return isinstance(other, _ConstKey) and self.key == other.key
 
 
-def add_const(newconst, consts, const_cache):
+class ConstsIndex:
+    """The 3.14 ``consts_index`` hashtable: object identity -> index into
+    ``consts``, seeded from the incoming list (first occurrence wins)."""
+
+    __slots__ = ("by_id", "keep")
+
+    def __init__(self, consts):
+        self.by_id = {}
+        self.keep = []  # pin ids: the objects live in ``consts`` anyway
+        for i, item in enumerate(consts):
+            self.by_id.setdefault(id(item), i)
+
+    def get(self, obj):
+        return self.by_id.get(id(obj))
+
+    def set(self, obj, index):
+        self.by_id[id(obj)] = index
+        self.keep.append(obj)
+
+
+def add_const(newconst, consts, const_cache, consts_index):
+    """``add_const``: merge through the const cache, then look the object
+    up by identity; append when new. Returns the index."""
     key = _ConstKey(newconst)
     cached = const_cache.get(key)
     if cached is not None:
         newconst = cached
     else:
         const_cache[key] = newconst
-    for index, c in enumerate(consts):
-        if c is newconst:
-            return index
+    index = consts_index.get(newconst)
+    if index is not None:
+        return index
+    index = len(consts)
+    if index >= 2**31 - 2:
+        raise OverflowError("too many constants")
     consts.append(newconst)
-    return len(consts) - 1
+    consts_index.set(newconst, index)
+    return index
 
 
-def fold_tuple_on_constants(const_cache, instrs, start, n, consts):
-    """instrs[start:start+n] are candidate LOAD_CONSTs; instrs[start+n]
-    is BUILD_TUPLE(n)."""
-    for i in range(start, start + n):
-        if instrs[i].opcode not in _HAS_CONST:
-            return
-    newconst = tuple(
-        get_const_value(instrs[i].opcode, instrs[i].oparg, consts)
-        for i in range(start, start + n)
+def get_const_loading_instrs(bb, start, size):
+    """Walk ``bb.instrs`` backwards from ``start`` skipping NOPs and collect
+    ``size`` consecutive constant loads (oldest first). Returns the list, or
+    ``None`` when the run is not all constants."""
+    assert start < len(bb.instrs)
+    assert 0 <= size <= STACK_USE_GUIDELINE
+    out = [None] * size
+    while start >= 0 and size > 0:
+        instr = bb.instrs[start]
+        start -= 1
+        if instr.opcode == NOP:
+            continue
+        if not loads_const(instr.opcode):
+            return None
+        size -= 1
+        out[size] = instr
+    return out if size == 0 else None
+
+
+def nop_out(instrs):
+    """Turn every instruction in ``instrs`` into a location-less NOP."""
+    for instr in instrs:
+        assert instr.opcode != NOP
+        instr.set_op0(NOP)
+        instr.set_loc(NO_LOCATION)
+
+
+def maybe_instr_make_load_smallint(instr, newconst):
+    """Rewrite ``instr`` to ``LOAD_SMALL_INT`` when ``newconst`` is an exact
+    int in 0..255. Returns True when it did."""
+    if type(newconst) is int and 0 <= newconst <= 255:
+        instr.set_op1(LOAD_SMALL_INT, newconst)
+        return True
+    return False
+
+
+def instr_make_load_const(instr, newconst, consts, const_cache, consts_index):
+    if maybe_instr_make_load_smallint(instr, newconst):
+        return
+    oparg = add_const(newconst, consts, const_cache, consts_index)
+    instr.set_op1(LOAD_CONST, oparg)
+
+
+def fold_tuple_of_constants(bb, i, consts, const_cache, consts_index):
+    """``LOAD_CONST c1 .. LOAD_CONST cN BUILD_TUPLE N`` -> ``LOAD_CONST
+    (c1, .., cN)``."""
+    instr = bb.instrs[i]
+    assert instr.opcode == BUILD_TUPLE
+    seq_size = instr.oparg
+    if seq_size > STACK_USE_GUIDELINE:
+        return
+    const_instrs = get_const_loading_instrs(bb, i - 1, seq_size)
+    if const_instrs is None:
+        return
+    const_tuple = tuple(
+        get_const_value(inst.opcode, inst.oparg, consts) for inst in const_instrs
     )
-    index = add_const(newconst, consts, const_cache)
-    for i in range(start, start + n):
-        instrs[i].set_op0(NOP)
-    instrs[start + n].set_op1(LOAD_CONST, index)
+    nop_out(const_instrs)
+    instr_make_load_const(instr, const_tuple, consts, const_cache, consts_index)
+
+
+def fold_constant_intrinsic_list_to_tuple(bb, i, consts, const_cache, consts_index):
+    """``BUILD_LIST 0 (LOAD_CONST c LIST_APPEND 1)* CALL_INTRINSIC_1
+    INTRINSIC_LIST_TO_TUPLE`` -> ``LOAD_CONST (c1, .., cN)``."""
+    intrinsic = bb.instrs[i]
+    assert intrinsic.opcode == CALL_INTRINSIC_1
+    assert intrinsic.oparg == INTRINSIC_LIST_TO_TUPLE
+    consts_found = 0
+    expect_append = True
+    pos = i - 1
+    while pos >= 0:
+        instr = bb.instrs[pos]
+        opcode = instr.opcode
+        oparg = instr.oparg
+        if opcode == NOP:
+            pos -= 1
+            continue
+        if opcode == BUILD_LIST and oparg == 0:
+            if not expect_append:
+                # Not a sequence start.
+                return
+            # Sequence start, we are done.
+            items = [None] * consts_found
+            for newpos in range(i - 1, pos - 1, -1):
+                instr = bb.instrs[newpos]
+                if instr.opcode == NOP:
+                    continue
+                if loads_const(instr.opcode):
+                    assert consts_found > 0
+                    consts_found -= 1
+                    items[consts_found] = get_const_value(
+                        instr.opcode, instr.oparg, consts
+                    )
+                nop_out([instr])
+            assert consts_found == 0
+            instr_make_load_const(
+                intrinsic, tuple(items), consts, const_cache, consts_index
+            )
+            return
+        if expect_append:
+            if opcode != LIST_APPEND or oparg != 1:
+                return
+        else:
+            if not loads_const(opcode):
+                return
+            consts_found += 1
+        expect_append = not expect_append
+        pos -= 1
+    # Did not find sequence start.
+
+
+def optimize_lists_and_sets(bb, i, nextop, consts, const_cache, consts_index):
+    """Optimize list and set displays:
+
+    1. ``for`` loops, comprehensions and ``in`` / ``not in`` tests: a
+       literal list or set of constants becomes a constant tuple or
+       frozenset; a list of non-constants becomes a tuple.
+    2. Constant displays of at least ``MIN_CONST_SEQUENCE_SIZE`` items:
+       ``LOAD_CONST c1 .. LOAD_CONST cN BUILD_LIST N`` becomes
+       ``BUILD_LIST 0, LOAD_CONST (c1, .., cN), LIST_EXTEND 1`` (and
+       ``BUILD_SET`` / ``SET_UPDATE`` respectively).
+    """
+    instr = bb.instrs[i]
+    assert instr.opcode in (BUILD_LIST, BUILD_SET)
+    contains_or_iter = nextop in (GET_ITER, CONTAINS_OP)
+    seq_size = instr.oparg
+    if seq_size > STACK_USE_GUIDELINE or (
+        seq_size < MIN_CONST_SEQUENCE_SIZE and not contains_or_iter
+    ):
+        return
+    const_instrs = get_const_loading_instrs(bb, i - 1, seq_size)
+    if const_instrs is None:
+        # Not a const sequence.
+        if contains_or_iter and instr.opcode == BUILD_LIST:
+            # Iterate over a tuple instead of a list.
+            instr.set_op1(BUILD_TUPLE, instr.oparg)
+        return
+    const_result = tuple(
+        get_const_value(inst.opcode, inst.oparg, consts) for inst in const_instrs
+    )
+    if instr.opcode == BUILD_SET:
+        const_result = frozenset(const_result)
+    index = add_const(const_result, consts, const_cache, consts_index)
+    nop_out(const_instrs)
+    if contains_or_iter:
+        instr.set_op1(LOAD_CONST, index)
+    else:
+        assert i >= 2
+        bb.instrs[i - 2].set_loc(instr.loc)
+        bb.instrs[i - 2].set_op1(instr.opcode, 0)
+        bb.instrs[i - 1].set_op1(LOAD_CONST, index)
+        bb.instrs[i].set_op1(LIST_EXTEND if instr.opcode == BUILD_LIST else SET_UPDATE, 1)
+
+
+# Guards against creating constants that are slow to hash or huge.
+MAX_INT_SIZE = 128  # bits
+MAX_COLLECTION_SIZE = 256  # items
+MAX_STR_SIZE = 4096  # characters
+MAX_TOTAL_ITEMS = 1024  # including nested collections
+
+
+def const_folding_check_complexity(obj, limit):
+    if isinstance(obj, tuple):
+        limit -= len(obj)
+        for item in obj:
+            if limit < 0:
+                break
+            limit = const_folding_check_complexity(item, limit)
+            if limit < 0:
+                return limit
+    return limit
+
+
+class _NoFold(Exception):
+    """Stands in for the C helpers returning NULL without an exception set."""
+
+
+def _is_int(v):
+    return isinstance(v, int)
+
+
+def const_folding_safe_multiply(v, w):
+    if _is_int(v) and _is_int(w) and v != 0 and w != 0:
+        if abs(v).bit_length() + abs(w).bit_length() > MAX_INT_SIZE:
+            raise _NoFold
+    elif _is_int(v) and isinstance(w, tuple):
+        size = len(w)
+        if size:
+            n = v
+            if n < 0 or n > MAX_COLLECTION_SIZE // size:
+                raise _NoFold
+            if n and const_folding_check_complexity(w, MAX_TOTAL_ITEMS // n) < 0:
+                raise _NoFold
+    elif _is_int(v) and isinstance(w, (str, bytes)):
+        size = len(w)
+        if size:
+            n = v
+            if n < 0 or n > MAX_STR_SIZE // size:
+                raise _NoFold
+    elif _is_int(w) and isinstance(v, (tuple, str, bytes)):
+        return const_folding_safe_multiply(w, v)
+    return v * w
+
+
+def const_folding_safe_power(v, w):
+    if _is_int(v) and _is_int(w) and v != 0 and w > 0:
+        vbits = abs(v).bit_length()
+        if w >= 2**64:
+            raise _NoFold
+        if vbits > MAX_INT_SIZE // w:
+            raise _NoFold
+    return pow(v, w)
+
+
+def const_folding_safe_lshift(v, w):
+    if _is_int(v) and _is_int(w) and v != 0 and w != 0:
+        vbits = abs(v).bit_length()
+        if w < 0 or w >= 2**64:
+            raise _NoFold
+        if w > MAX_INT_SIZE or vbits > MAX_INT_SIZE - w:
+            raise _NoFold
+    return v << w
+
+
+def const_folding_safe_mod(v, w):
+    if isinstance(v, (str, bytes)):
+        raise _NoFold
+    return v % w
+
+
+def eval_const_binop(left, op, right):
+    """``eval_const_binop``: the folded value, or raise (any exception
+    means "don't fold")."""
+    assert 0 <= op <= NB_OPARG_LAST
+    if op == NB_ADD:
+        return left + right
+    if op == NB_SUBTRACT:
+        return left - right
+    if op == NB_MULTIPLY:
+        return const_folding_safe_multiply(left, right)
+    if op == NB_TRUE_DIVIDE:
+        return left / right
+    if op == NB_FLOOR_DIVIDE:
+        return left // right
+    if op == NB_REMAINDER:
+        return const_folding_safe_mod(left, right)
+    if op == NB_POWER:
+        return const_folding_safe_power(left, right)
+    if op == NB_LSHIFT:
+        return const_folding_safe_lshift(left, right)
+    if op == NB_RSHIFT:
+        return left >> right
+    if op == NB_OR:
+        return left | right
+    if op == NB_XOR:
+        return left ^ right
+    if op == NB_AND:
+        return left & right
+    if op == NB_SUBSCR:
+        return left[right]
+    # NB_MATRIX_MULTIPLY: no builtin constants implement it; the in-place
+    # variants never reach the folder from codegen.
+    raise _NoFold
+
+
+def fold_const_binop(bb, i, consts, const_cache, consts_index):
+    binop = bb.instrs[i]
+    assert binop.opcode == BINARY_OP
+    operands = get_const_loading_instrs(bb, i - 1, 2)
+    if operands is None:
+        return
+    lhs_instr, rhs_instr = operands
+    lhs = get_const_value(lhs_instr.opcode, lhs_instr.oparg, consts)
+    rhs = get_const_value(rhs_instr.opcode, rhs_instr.oparg, consts)
+    try:
+        newconst = eval_const_binop(lhs, binop.oparg, rhs)
+    except KeyboardInterrupt:
+        raise
+    except Exception:
+        return
+    nop_out(operands)
+    instr_make_load_const(binop, newconst, consts, const_cache, consts_index)
+
+
+def eval_const_unaryop(operand, opcode, oparg):
+    assert (
+        opcode in (UNARY_NEGATIVE, UNARY_INVERT, UNARY_NOT)
+        or (opcode == CALL_INTRINSIC_1 and oparg == INTRINSIC_UNARY_POSITIVE)
+    )
+    if opcode == UNARY_NEGATIVE:
+        return -operand
+    if opcode == UNARY_INVERT:
+        # XXX: This should be removed once the ~bool deprecation expires.
+        if isinstance(operand, bool):
+            raise _NoFold
+        return ~operand
+    if opcode == UNARY_NOT:
+        return not operand
+    return +operand
+
+
+def fold_const_unaryop(bb, i, consts, const_cache, consts_index):
+    unaryop = bb.instrs[i]
+    operands = get_const_loading_instrs(bb, i - 1, 1)
+    if operands is None:
+        return
+    (operand_instr,) = operands
+    operand = get_const_value(operand_instr.opcode, operand_instr.oparg, consts)
+    try:
+        newconst = eval_const_unaryop(operand, unaryop.opcode, unaryop.oparg)
+    except KeyboardInterrupt:
+        raise
+    except Exception:
+        return
+    if unaryop.opcode == UNARY_NOT:
+        assert isinstance(newconst, bool)
+    nop_out(operands)
+    instr_make_load_const(unaryop, newconst, consts, const_cache, consts_index)
 
 
 def swaptimize(block, ix):
@@ -746,33 +1275,49 @@ def apply_static_swaps(block, i):
         i -= 1
 
 
-def basicblock_optimize_load_const(const_cache, bb, consts):
+def basicblock_optimize_load_const(const_cache, bb, consts, consts_index):
     opcode = 0
     oparg = 0
     i = 0
     while i < len(bb.instrs):
         inst = bb.instrs[i]
+        if inst.opcode == LOAD_CONST:
+            constant = get_const_value(inst.opcode, inst.oparg, consts)
+            maybe_instr_make_load_smallint(inst, constant)
         is_copy_of_load_const = (
             opcode == LOAD_CONST and inst.opcode == COPY and inst.oparg == 1
         )
         if not is_copy_of_load_const:
             opcode = inst.opcode
             oparg = inst.oparg
-        if opcode != LOAD_CONST:
+        if opcode != LOAD_CONST and opcode != LOAD_SMALL_INT:
             i += 1
             continue
         nextop = bb.instrs[i + 1].opcode if i + 1 < len(bb.instrs) else 0
-        if nextop in (POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE):
+        if nextop in (POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, JUMP_IF_FALSE, JUMP_IF_TRUE):
+            # Remove LOAD_CONST const; conditional jump.
             cnt = get_const_value(opcode, oparg, consts)
             is_true = bool(cnt)
-            inst.set_op0(NOP)
-            jump_if_true = nextop == POP_JUMP_IF_TRUE
+            if opcode_stack_effect(nextop, 0) == -1:
+                # POP_JUMP_IF_FALSE or POP_JUMP_IF_TRUE
+                inst.set_op0(NOP)
+            jump_if_true = nextop in (POP_JUMP_IF_TRUE, JUMP_IF_TRUE)
             if is_true == jump_if_true:
                 bb.instrs[i + 1].opcode = JUMP
             else:
                 bb.instrs[i + 1].set_op0(NOP)
                 bb.instrs[i + 1].target = None
         elif nextop == IS_OP:
+            # Fold to POP_JUMP_IF_NONE:
+            # - LOAD_CONST(None) IS_OP(0) POP_JUMP_IF_TRUE
+            # - LOAD_CONST(None) IS_OP(1) POP_JUMP_IF_FALSE
+            # - LOAD_CONST(None) IS_OP(0) TO_BOOL POP_JUMP_IF_TRUE
+            # - LOAD_CONST(None) IS_OP(1) TO_BOOL POP_JUMP_IF_FALSE
+            # Fold to POP_JUMP_IF_NOT_NONE:
+            # - LOAD_CONST(None) IS_OP(0) POP_JUMP_IF_FALSE
+            # - LOAD_CONST(None) IS_OP(1) POP_JUMP_IF_TRUE
+            # - LOAD_CONST(None) IS_OP(0) TO_BOOL POP_JUMP_IF_FALSE
+            # - LOAD_CONST(None) IS_OP(1) TO_BOOL POP_JUMP_IF_TRUE
             cnt = get_const_value(opcode, oparg, consts)
             if cnt is not None:
                 i += 1
@@ -782,6 +1327,7 @@ def basicblock_optimize_load_const(const_cache, bb, consts):
                 continue
             is_instr = bb.instrs[i + 1]
             jump_instr = bb.instrs[i + 2]
+            # Get rid of TO_BOOL regardless:
             if jump_instr.opcode == TO_BOOL:
                 jump_instr.set_op0(NOP)
                 if len(bb.instrs) <= i + 3:
@@ -797,22 +1343,18 @@ def basicblock_optimize_load_const(const_cache, bb, consts):
             inst.set_op0(NOP)
             is_instr.set_op0(NOP)
             jump_instr.opcode = POP_JUMP_IF_NOT_NONE if invert else POP_JUMP_IF_NONE
-        elif nextop == RETURN_VALUE:
-            inst.set_op0(NOP)
-            i += 1
-            bb.instrs[i].set_op1(RETURN_CONST, oparg)
         elif nextop == TO_BOOL:
             cnt = get_const_value(opcode, oparg, consts)
             is_true = bool(cnt)
-            index = add_const(bool(is_true), consts, const_cache)
+            index = add_const(is_true, consts, const_cache, consts_index)
             inst.set_op0(NOP)
             bb.instrs[i + 1].set_op1(LOAD_CONST, index)
         i += 1
 
 
-def optimize_load_const(const_cache, g, consts):
+def optimize_load_const(const_cache, g, consts, consts_index):
     for b in g.iter_blocks():
-        basicblock_optimize_load_const(const_cache, b, consts)
+        basicblock_optimize_load_const(const_cache, b, consts, consts_index)
 
 
 def jump_thread(bb, inst, target, opcode):
@@ -820,6 +1362,8 @@ def jump_thread(bb, inst, target, opcode):
     assert is_jump(inst)
     assert is_jump(target)
     assert inst is bb.last_instr()
+    # bpo-45773: if inst.target is target.target nothing changes (and we
+    # would loop forever).
     if inst.target is not target.target:
         new_target = target.target
         new_loc = target.loc
@@ -831,7 +1375,7 @@ def jump_thread(bb, inst, target, opcode):
     return False
 
 
-def optimize_basic_block(const_cache, bb, consts):
+def optimize_basic_block(const_cache, bb, consts, consts_index):
     i = 0
     while i < len(bb.instrs):
         inst = bb.instrs[i]
@@ -844,6 +1388,10 @@ def optimize_basic_block(const_cache, bb, consts):
             target = Instr(NOP, 0, NO_LOCATION)
         nextop = bb.instrs[i + 1].opcode if i + 1 < len(bb.instrs) else 0
         if opcode == BUILD_TUPLE:
+            # Try to fold tuples of constants.
+            # Skip over BUILD_TUPLE(1) UNPACK_SEQUENCE(1).
+            # Replace BUILD_TUPLE(2) UNPACK_SEQUENCE(2) with SWAP(2).
+            # Replace BUILD_TUPLE(3) UNPACK_SEQUENCE(3) with SWAP(3).
             if nextop == UNPACK_SEQUENCE and oparg == bb.instrs[i + 1].oparg:
                 if oparg == 1:
                     inst.set_op0(NOP)
@@ -855,8 +1403,9 @@ def optimize_basic_block(const_cache, bb, consts):
                     bb.instrs[i + 1].opcode = SWAP
                     i += 1
                     continue
-            if i >= oparg:
-                fold_tuple_on_constants(const_cache, bb.instrs, i - oparg, oparg, consts)
+            fold_tuple_of_constants(bb, i, consts, const_cache, consts_index)
+        elif opcode in (BUILD_LIST, BUILD_SET):
+            optimize_lists_and_sets(bb, i, nextop, consts, const_cache, consts_index)
         elif opcode in (POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_NONE):
             if target.opcode == JUMP:
                 i -= jump_thread(bb, inst, target, opcode)
@@ -866,6 +1415,26 @@ def optimize_basic_block(const_cache, bb, consts):
         elif opcode == POP_JUMP_IF_TRUE:
             if target.opcode == JUMP:
                 i -= jump_thread(bb, inst, target, POP_JUMP_IF_TRUE)
+        elif opcode == JUMP_IF_FALSE:
+            if target.opcode in (JUMP, JUMP_IF_FALSE):
+                i -= jump_thread(bb, inst, target, JUMP_IF_FALSE)
+                i += 1
+                continue
+            if target.opcode == JUMP_IF_TRUE:
+                # No need to check for loops here, a block's next cannot
+                # point to itself.
+                assert inst.target is not inst.target.next
+                inst.target = inst.target.next
+                continue
+        elif opcode == JUMP_IF_TRUE:
+            if target.opcode in (JUMP, JUMP_IF_TRUE):
+                i -= jump_thread(bb, inst, target, JUMP_IF_TRUE)
+                i += 1
+                continue
+            if target.opcode == JUMP_IF_FALSE:
+                assert inst.target is not inst.target.next
+                inst.target = inst.target.next
+                continue
         elif opcode in (JUMP, JUMP_NO_INTERRUPT):
             if target.opcode == JUMP:
                 i -= jump_thread(bb, inst, target, JUMP)
@@ -875,6 +1444,10 @@ def optimize_basic_block(const_cache, bb, consts):
                 i -= jump_thread(bb, inst, target, opcode)
                 i += 1
                 continue
+        elif opcode == FOR_ITER:
+            # Threading FOR_ITER through a JUMP is disabled upstream: the
+            # jump could be backward and FOR_ITER only jumps forward.
+            pass
         elif opcode == STORE_FAST:
             if (
                 nextop == STORE_FAST
@@ -902,22 +1475,43 @@ def optimize_basic_block(const_cache, bb, consts):
                 bb.instrs[i + 1].set_op1(opcode, oparg)
                 i += 1
                 continue
+            if nextop == UNARY_NOT:
+                inst.set_op0(NOP)
+                inverted = oparg ^ 1
+                assert inverted in (0, 1)
+                bb.instrs[i + 1].set_op1(opcode, inverted)
+                i += 1
+                continue
         elif opcode == TO_BOOL:
             if nextop == TO_BOOL:
                 inst.set_op0(NOP)
                 i += 1
                 continue
-        elif opcode == UNARY_NOT:
-            if nextop == TO_BOOL:
-                inst.set_op0(NOP)
-                bb.instrs[i + 1].set_op0(UNARY_NOT)
-                i += 1
-                continue
-            if nextop == UNARY_NOT:
-                inst.set_op0(NOP)
-                bb.instrs[i + 1].set_op0(NOP)
-                i += 1
-                continue
+        elif opcode in (UNARY_NOT, UNARY_INVERT, UNARY_NEGATIVE):
+            if opcode == UNARY_NOT:
+                if nextop == TO_BOOL:
+                    inst.set_op0(NOP)
+                    bb.instrs[i + 1].set_op0(UNARY_NOT)
+                    i += 1
+                    continue
+                if nextop == UNARY_NOT:
+                    inst.set_op0(NOP)
+                    bb.instrs[i + 1].set_op0(NOP)
+                    i += 1
+                    continue
+            fold_const_unaryop(bb, i, consts, const_cache, consts_index)
+        elif opcode == CALL_INTRINSIC_1:
+            if oparg == INTRINSIC_LIST_TO_TUPLE:
+                if nextop == GET_ITER:
+                    inst.set_op0(NOP)
+                else:
+                    fold_constant_intrinsic_list_to_tuple(
+                        bb, i, consts, const_cache, consts_index
+                    )
+            elif oparg == INTRINSIC_UNARY_POSITIVE:
+                fold_const_unaryop(bb, i, consts, const_cache, consts_index)
+        elif opcode == BINARY_OP:
+            fold_const_binop(bb, i, consts, const_cache, consts_index)
         i += 1
 
     i = 0
@@ -928,14 +1522,14 @@ def optimize_basic_block(const_cache, bb, consts):
         i += 1
 
 
-def optimize_cfg(g, consts, const_cache, firstlineno):
+def optimize_cfg(g, consts, const_cache, consts_index, firstlineno):
     check_cfg(g)
     inline_small_or_no_lineno_blocks(g)
     remove_unreachable(g)
     resolve_line_numbers(g, firstlineno)
-    optimize_load_const(const_cache, g, consts)
+    optimize_load_const(const_cache, g, consts, consts_index)
     for b in g.iter_blocks():
-        optimize_basic_block(const_cache, b, consts)
+        optimize_basic_block(const_cache, b, consts, consts_index)
     remove_redundant_nops_and_pairs(g)
     remove_unreachable(g)
     remove_redundant_nops_and_jumps(g)
@@ -1159,12 +1753,206 @@ def push_cold_blocks_to_end(g):
         remove_redundant_nops_and_jumps(g)
 
 
+# ---- LOAD_FAST -> LOAD_FAST_BORROW -------------------------------------------
+
+NOT_LOCAL = -1
+DUMMY_INSTR = -1
+
+# LoadFastInstrFlag
+SUPPORT_KILLED = 1  # the loaded reference is still on the stack when the local is killed
+STORED_AS_LOCAL = 2  # the loaded reference is stored into a local
+REF_UNCONSUMED = 4  # the loaded reference is still on the stack at the end of the block
+
+
+def _kill_local(instr_flags, refs, local):
+    for r_instr, r_local in refs:
+        if r_local == local:
+            assert r_instr >= 0
+            instr_flags[r_instr] |= SUPPORT_KILLED
+
+
+def _store_local(instr_flags, refs, local, r):
+    _kill_local(instr_flags, refs, local)
+    if r[0] != DUMMY_INSTR:
+        instr_flags[r[0]] |= STORED_AS_LOCAL
+
+
+def _load_fast_push_block(stack, target, start_depth):
+    # The C asserts `target->b_startdepth == start_depth`; release builds
+    # (and this port) just follow the graph.
+    if not target.visited:
+        target.visited = 1
+        stack.append(target)
+
+
+# Opcodes that consume no inputs.
+_LF_CONSUME_NONE = frozenset(
+    (
+        FORMAT_SIMPLE,
+        GET_ANEXT,
+        GET_LEN,
+        GET_YIELD_FROM_ITER,
+        IMPORT_FROM,
+        MATCH_KEYS,
+        MATCH_MAPPING,
+        MATCH_SEQUENCE,
+        WITH_EXCEPT_START,
+    )
+)
+# Opcodes that consume some inputs and push no new values.
+_LF_PUSH_NONE = frozenset(
+    (DICT_MERGE, DICT_UPDATE, LIST_APPEND, LIST_EXTEND, MAP_ADD, RERAISE, SET_ADD, SET_UPDATE)
+)
+
+
+def optimize_load_fast(g):
+    """Strength-reduce ``LOAD_FAST{_LOAD_FAST}`` into the ``_BORROW``
+    variants where the frame's reference provably outlives the borrowed
+    one: abstract interpretation over a stack of ``(producing instr,
+    local)`` refs, per basic block (see the 3.14 ``flowgraph.c`` comment
+    for the lifetime argument)."""
+    for b in g.iter_blocks():
+        b.visited = 0
+    entry = g.entry
+    stack = [entry]
+    entry.startdepth = 0
+    entry.visited = 1
+    while stack:
+        block = stack.pop()
+        assert block.startdepth > -1
+        n = len(block.instrs)
+        instr_flags = [0] * n
+        # We don't track references on the stack across basic blocks, but
+        # the bytecode will expect their presence: add dummies.
+        refs = [(DUMMY_INSTR, NOT_LOCAL)] * block.startdepth
+        for i in range(n):
+            instr = block.instrs[i]
+            opcode = instr.opcode
+            oparg = instr.oparg
+            # Opcodes that load and store locals.
+            if opcode == DELETE_FAST:
+                _kill_local(instr_flags, refs, oparg)
+            elif opcode == LOAD_FAST:
+                refs.append((i, oparg))
+            elif opcode == LOAD_FAST_AND_CLEAR:
+                _kill_local(instr_flags, refs, oparg)
+                refs.append((i, oparg))
+            elif opcode == LOAD_FAST_LOAD_FAST:
+                refs.append((i, oparg >> 4))
+                refs.append((i, oparg & 15))
+            elif opcode == STORE_FAST:
+                r = refs.pop()
+                _store_local(instr_flags, refs, oparg, r)
+            elif opcode == STORE_FAST_LOAD_FAST:
+                r = refs.pop()
+                _store_local(instr_flags, refs, oparg >> 4, r)
+                refs.append((i, oparg & 15))
+            elif opcode == STORE_FAST_STORE_FAST:
+                r = refs.pop()
+                _store_local(instr_flags, refs, oparg >> 4, r)
+                r = refs.pop()
+                _store_local(instr_flags, refs, oparg & 15, r)
+            # Opcodes that shuffle values on the stack.
+            elif opcode == COPY:
+                assert oparg > 0
+                refs.append(refs[len(refs) - oparg])
+            elif opcode == SWAP:
+                assert oparg >= 2
+                idx = len(refs) - oparg
+                refs[idx], refs[-1] = refs[-1], refs[idx]
+            # Opcodes that do not consume all of their inputs are handled
+            # case by case; there is no generic way to know how many inputs
+            # stay on the stack.
+            elif opcode in _LF_CONSUME_NONE:
+                net_pushed = num_pushed(opcode, oparg) - num_popped(opcode, oparg)
+                assert net_pushed >= 0
+                # Upstream shadows the instruction index with the loop
+                # counter here (`for (int i = 0; ...) PUSH_REF(i, ...)`);
+                # mirror that so the same instructions get flagged.
+                for k in range(net_pushed):
+                    refs.append((k, NOT_LOCAL))
+            elif opcode in _LF_PUSH_NONE:
+                net_popped = num_popped(opcode, oparg) - num_pushed(opcode, oparg)
+                assert net_popped > 0
+                del refs[len(refs) - net_popped:]
+            elif opcode in (END_SEND, SET_FUNCTION_ATTRIBUTE):
+                tos = refs.pop()
+                refs.pop()
+                refs.append(tos)
+            # Opcodes that consume some inputs and push new values.
+            elif opcode == CHECK_EXC_MATCH:
+                refs.pop()
+                refs.append((i, NOT_LOCAL))
+            elif opcode == FOR_ITER:
+                _load_fast_push_block(stack, instr.target, len(refs) + 1)
+                refs.append((i, NOT_LOCAL))
+            elif opcode in (LOAD_ATTR, LOAD_SUPER_ATTR):
+                self_ref = refs.pop()
+                if opcode == LOAD_SUPER_ATTR:
+                    refs.pop()
+                    refs.pop()
+                refs.append((i, NOT_LOCAL))
+                if oparg & 1:
+                    # A method call; conservatively assume that self is
+                    # pushed back onto the stack.
+                    refs.append(self_ref)
+            elif opcode in (LOAD_SPECIAL, PUSH_EXC_INFO):
+                tos = refs.pop()
+                refs.append((i, NOT_LOCAL))
+                refs.append(tos)
+            elif opcode == SEND:
+                _load_fast_push_block(stack, instr.target, len(refs))
+                refs.pop()
+                refs.append((i, NOT_LOCAL))
+            # Opcodes that consume all of their inputs.
+            else:
+                popped = num_popped(opcode, oparg)
+                pushed = num_pushed(opcode, oparg)
+                if opcode in HAS_TARGET_OPS:
+                    _load_fast_push_block(
+                        stack, instr.target, len(refs) - popped + pushed
+                    )
+                if opcode not in _BLOCK_PUSH:
+                    # Block push opcodes only affect the stack when jumping
+                    # to the target.
+                    for _k in range(popped):
+                        refs.pop()
+                    for _k in range(pushed):
+                        refs.append((i, NOT_LOCAL))
+
+        # Push the fallthrough block.
+        term = block.last_instr()
+        if (
+            term is not None
+            and block.next is not None
+            and not (term.opcode in _UNCOND_JUMP or term.opcode in _SCOPE_EXIT)
+        ):
+            assert block.has_fallthrough()
+            _load_fast_push_block(stack, block.next, len(refs))
+
+        # Mark instructions whose values are still on the stack at the end
+        # of the block.
+        for r_instr, _r_local in refs:
+            if r_instr != -1:
+                instr_flags[r_instr] |= REF_UNCONSUMED
+
+        # Optimize instructions.
+        for i in range(n):
+            if not instr_flags[i]:
+                instr = block.instrs[i]
+                if instr.opcode == LOAD_FAST:
+                    instr.opcode = LOAD_FAST_BORROW
+                elif instr.opcode == LOAD_FAST_LOAD_FAST:
+                    instr.opcode = LOAD_FAST_BORROW_LOAD_FAST_BORROW
+
+
 def optimize_code_unit(g, consts, const_cache, nlocals, nparams, firstlineno):
     """``_PyCfg_OptimizeCodeUnit``: the full pass pipeline."""
     translate_jump_labels_to_targets(g)
     mark_except_handlers(g)
     label_exception_targets(g)
-    optimize_cfg(g, consts, const_cache, firstlineno)
+    consts_index = ConstsIndex(consts)
+    optimize_cfg(g, consts, const_cache, consts_index, firstlineno)
     remove_unused_consts(g, consts)
     add_checks_for_loads_of_uninitialized_variables(g, nlocals, nparams)
     insert_superinstructions(g)
@@ -1201,4 +1989,6 @@ def optimize_cfg_rows(rows, consts, nlocals):
     g = sequence_to_cfg(rows)
     const_cache = {}
     optimize_code_unit(g, consts, const_cache, nlocals, nparams=0, firstlineno=1)
+    calculate_stackdepth(g)
+    optimize_load_fast(g)
     return cfg_to_rows(g)

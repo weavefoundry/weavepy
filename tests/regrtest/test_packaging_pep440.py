@@ -119,15 +119,15 @@ def test_canonicalize_name():
 
 def test_wheel_filename():
     name, version, build, tags = parse_wheel_filename(
-        'numpy-2.0.0-cp313-cp313-manylinux_2_17_x86_64.whl'
+        'numpy-2.0.0-cp314-cp314-manylinux_2_17_x86_64.whl'
     )
     assert_eq(name, 'numpy')
     assert_eq(version, '2.0.0')
     assert_eq(build, None)
-    assert_true(any(t.python == 'cp313' for t in tags))
+    assert_true(any(t.python == 'cp314' for t in tags))
     # Tag-based compatibility & scoring.
     assert_true(wheel_is_compatible('foo-1.0-py3-none-any.whl'))
-    assert_true(wheel_score('numpy-2.0.0-cp313-cp313-macosx_11_0_arm64.whl') > 0)
+    assert_true(wheel_score('numpy-2.0.0-cp314-cp314-macosx_11_0_arm64.whl') > 0)
 
 
 def test_wheel_matrix_wave5():
@@ -155,9 +155,9 @@ def test_wheel_provenance_wave5():
     assert_true(('weavepy', 'none', 'any') in accept, 'weavepy-none-any accepted')
     assert_true(wheel_is_compatible('foo-1.0-weavepy-none-any.whl'),
                 'weavepy provenance wheel compatible')
-    # A provenance wheel outranks the stock cp313 wheel it shadows.
-    prov = wheel_score('numpy-2.0.0-weavepy-cp313-manylinux_2_17_x86_64.whl')
-    stock = wheel_score('numpy-2.0.0-cp313-cp313-manylinux_2_17_x86_64.whl')
+    # A provenance wheel outranks the stock cp314 wheel it shadows.
+    prov = wheel_score('numpy-2.0.0-weavepy-cp314-manylinux_2_17_x86_64.whl')
+    stock = wheel_score('numpy-2.0.0-cp314-cp314-manylinux_2_17_x86_64.whl')
     assert_true(prov > stock, 'provenance outranks stock ({} vs {})'.format(prov, stock))
 
 

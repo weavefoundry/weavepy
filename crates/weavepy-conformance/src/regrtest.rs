@@ -275,7 +275,8 @@ pub struct RegrtestFile {
 ///
 /// Returns the bundled tests in `tests/regrtest/` plus, when present,
 /// the CPython `Lib/test/` files. CPython tests come from one of:
-/// `vendor/cpython/Lib/test/`, `vendor/cpython-tests/`, or — when the
+/// `vendor/cpython314/Lib/test/`, `vendor/cpython/Lib/test/`,
+/// `vendor/cpython-tests/`, or — when the
 /// caller passes [`DiscoveryOptions::cpython_dir`] — an explicit
 /// directory. Only the files mentioned in `expectations.toml` (or the
 /// curated [`CPYTHON_REGRTEST_INCLUDE`] list) are scheduled, unless
@@ -299,9 +300,20 @@ pub fn discover_with(
         collect_bundled(&bundled, &mut out);
     }
 
+    // RFC 0077 WS14: the 3.14 tree (`vendor/cpython314/`) is the oracle;
+    // the 3.13 checkout (`vendor/cpython/`) remains a fallback for the
+    // `weavepy-3.13` maintenance line.
     let cpython_test = opts
         .cpython_dir
         .clone()
+        .or_else(|| {
+            let candidate = workspace_root
+                .join("vendor")
+                .join("cpython314")
+                .join("Lib")
+                .join("test");
+            candidate.is_dir().then_some(candidate)
+        })
         .or_else(|| {
             let candidate = workspace_root
                 .join("vendor")
@@ -1025,6 +1037,17 @@ fn capi_fixtures_dir() -> Option<String> {
     use std::hash::{Hash, Hasher};
     let mut h = std::hash::DefaultHasher::new();
     built_list.hash(&mut h);
+    // A rebuilt fixture (same `OUT_DIR` path, new bytes) must land in a
+    // fresh stage, or every worker keeps loading the previous build:
+    // fold each dylib's size and mtime into the key.
+    for p in &built {
+        if let Ok(meta) = std::fs::metadata(p) {
+            meta.len().hash(&mut h);
+            if let Ok(modified) = meta.modified() {
+                modified.hash(&mut h);
+            }
+        }
+    }
     let shim = std::env::temp_dir().join(format!("weavepy-capi-fixtures-{:016x}", h.finish()));
     if !built
         .iter()

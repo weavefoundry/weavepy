@@ -183,18 +183,32 @@ const _: () = {
 // Sequence containers.
 // ---------------------------------------------------------------------------
 
-/// `PyTupleObject { PyObject_VAR_HEAD; PyObject *ob_item[1]; }`.
+/// `PyTupleObject { PyObject_VAR_HEAD; Py_hash_t ob_hash; PyObject *ob_item[1]; }`.
+///
+/// 3.14 (gh-131525) caches the tuple hash in `ob_hash` ahead of the
+/// inline item array, so `PyTuple_GET_ITEM` / `PyTuple_SET_ITEM` (inline
+/// functions in `cpython/tupleobject.h`) read `ob_item` at offset 32.
+/// The cache is `-1` (unset) in every mirror WeavePy publishes; hashing
+/// goes through `PyObject_Hash`, which the C-API services from the
+/// native object, so the slot is never consulted by us.
 #[repr(C)]
 #[derive(Debug)]
 pub struct PyTupleObject {
     pub ob_base: PyVarObject,
+    pub ob_hash: PyHashT,
     pub ob_item: [*mut PyObject; 1],
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<PyTupleObject>() == 32);
-    assert!(std::mem::offset_of!(PyTupleObject, ob_item) == 24);
+    assert!(std::mem::size_of::<PyTupleObject>() == 40);
+    assert!(std::mem::offset_of!(PyTupleObject, ob_hash) == 24);
+    assert!(std::mem::offset_of!(PyTupleObject, ob_item) == 32);
 };
+
+/// Bytes ahead of a tuple's inline `ob_item` array (`PyVarObject` plus
+/// `ob_hash`): the `tp_basicsize` of `tuple` and of every struct
+/// sequence, and the size of a zero-length tuple body.
+pub const TUPLE_HEAD_BYTES: usize = std::mem::offset_of!(PyTupleObject, ob_item);
 
 /// `PyListObject { PyObject_VAR_HEAD; PyObject **ob_item; Py_ssize_t allocated; }`.
 #[repr(C)]
@@ -844,8 +858,10 @@ const _: () = assert!(std::mem::size_of::<c_int>() == 4);
 // `PyConfig_Clear`. Any size/offset drift means we zero/free the wrong
 // bytes of the caller's frame (Pillow's `getfont` does init → PyArg →
 // Clear around every truetype load). Offsets measured from the vendored
-// `include/cpython313/cpython/initconfig.h` on LP64 (macOS arm64 probe,
-// identical on x86-64 Linux — no conditional fields differ off-Windows).
+// `include/cpython314/cpython/initconfig.h` on LP64 (macOS arm64 probe,
+// identical on x86-64 Linux — the only conditional field off-Windows is
+// 3.14's `__APPLE__`-only `use_system_logger`, `cfg`-gated in the Rust
+// struct and absorbed by padding before `program_name`).
 #[cfg(not(windows))]
 const _: () = {
     use crate::initconfig::{PyConfig, PyPreConfig};
@@ -853,8 +869,9 @@ const _: () = {
     assert!(std::mem::offset_of!(PyPreConfig, utf8_mode) == 28);
     assert!(std::mem::offset_of!(PyPreConfig, allocator) == 36);
 
-    assert!(std::mem::size_of::<PyConfig>() == 448);
+    assert!(std::mem::size_of::<PyConfig>() == 456);
     assert!(std::mem::offset_of!(PyConfig, hash_seed) == 24);
+    assert!(std::mem::offset_of!(PyConfig, remote_debug) == 44);
     assert!(std::mem::offset_of!(PyConfig, dump_refs_file) == 64);
     assert!(std::mem::offset_of!(PyConfig, filesystem_encoding) == 80);
     assert!(std::mem::offset_of!(PyConfig, orig_argv) == 112);
@@ -862,11 +879,20 @@ const _: () = {
     assert!(std::mem::offset_of!(PyConfig, warnoptions) == 160);
     assert!(std::mem::offset_of!(PyConfig, stdio_encoding) == 232);
     assert!(std::mem::offset_of!(PyConfig, check_hash_pycs_mode) == 248);
-    assert!(std::mem::offset_of!(PyConfig, program_name) == 280);
-    assert!(std::mem::offset_of!(PyConfig, module_search_paths) == 320);
-    assert!(std::mem::offset_of!(PyConfig, executable) == 344);
-    assert!(std::mem::offset_of!(PyConfig, run_command) == 400);
-    assert!(std::mem::offset_of!(PyConfig, run_filename) == 416);
-    assert!(std::mem::offset_of!(PyConfig, sys_path_0) == 424);
-    assert!(std::mem::offset_of!(PyConfig, _is_python_build) == 440);
+    assert!(std::mem::offset_of!(PyConfig, thread_inherit_context) == 268);
+    assert!(std::mem::offset_of!(PyConfig, context_aware_warnings) == 272);
+    // `use_system_logger` (Apple only) sits between the two context knobs
+    // and `cpu_count`; the pointer alignment of `program_name` absorbs the
+    // 4 bytes elsewhere, so every later offset and the total size agree.
+    assert!(
+        std::mem::offset_of!(PyConfig, cpu_count)
+            == if cfg!(target_vendor = "apple") { 280 } else { 276 }
+    );
+    assert!(std::mem::offset_of!(PyConfig, program_name) == 288);
+    assert!(std::mem::offset_of!(PyConfig, module_search_paths) == 328);
+    assert!(std::mem::offset_of!(PyConfig, executable) == 352);
+    assert!(std::mem::offset_of!(PyConfig, run_command) == 408);
+    assert!(std::mem::offset_of!(PyConfig, run_filename) == 424);
+    assert!(std::mem::offset_of!(PyConfig, sys_path_0) == 432);
+    assert!(std::mem::offset_of!(PyConfig, _is_python_build) == 448);
 };

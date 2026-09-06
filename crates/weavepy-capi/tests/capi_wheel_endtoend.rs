@@ -51,7 +51,7 @@ fn build_wheel(out_dir: &Path, ext_path: &Path) -> PathBuf {
     // The wheel format is a regular zip; we hand-roll a minimal one
     // here so the test doesn't depend on the host `zip` binary or
     // an extra crate.
-    let wheel_path = out_dir.join("numpylike-1.0.0-cp313-cp313-any.whl");
+    let wheel_path = out_dir.join("numpylike-1.0.0-cp314-cp314-any.whl");
     let mut wheel = zip_minimal::Writer::new(File::create(&wheel_path).unwrap());
 
     let so_name = if cfg!(target_os = "windows") {
@@ -73,7 +73,7 @@ fn build_wheel(out_dir: &Path, ext_path: &Path) -> PathBuf {
     );
     wheel.add_file(
         "numpylike-1.0.0.dist-info/WHEEL",
-        b"Wheel-Version: 1.0\nGenerator: weavepy-test/0.1\nRoot-Is-Purelib: false\nTag: cp313-cp313-any\n",
+        b"Wheel-Version: 1.0\nGenerator: weavepy-test/0.1\nRoot-Is-Purelib: false\nTag: cp314-cp314-any\n",
     );
     wheel.add_file("numpylike-1.0.0.dist-info/RECORD", b"");
 
@@ -96,7 +96,7 @@ fn wheel_install_and_import_round_trip() {
     //   <tmp>/
     //     bin/
     //     lib/python3.13/site-packages/
-    //     wheels/numpylike-1.0.0-cp313-cp313-any.whl
+    //     wheels/numpylike-1.0.0-cp314-cp314-any.whl
     let tmp = tempfile::tempdir().expect("mktemp");
     let prefix = tmp.path();
     let site_packages = prefix.join("lib/python3.13/site-packages");

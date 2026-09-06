@@ -1,7 +1,7 @@
 //! Build helper: embed the vendored CPython 3.13 header tree
 //! (RFC 0062 WS2).
 //!
-//! The headers live in `crates/weavepy-capi/include/cpython313/` (the
+//! The headers live in `crates/weavepy-capi/include/cpython314/` (the
 //! stock CPython `Include/` install tree, PSF-licensed; see the
 //! `LICENSE.txt` alongside them) plus the per-OS generated
 //! `pyconfig.h` variants under `crates/weavepy-capi/include/pyconfig/`.

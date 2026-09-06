@@ -803,6 +803,17 @@ fn iseq_call(
     args: &[Object],
     kwargs: &[(String, Object)],
 ) -> Result<Object, RuntimeError> {
+    frozen_call("_weave_iseq", name, args, kwargs)
+}
+
+/// Call `name` in the frozen helper module `module` with the caller's
+/// positional and keyword arguments.
+fn frozen_call(
+    module: &'static str,
+    name: &'static str,
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
     let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
         RuntimeError::Internal("_testinternalcapi: no running interpreter".to_owned())
     })?;
@@ -815,12 +826,8 @@ fn iseq_call(
         .get(&DictKey(Object::from_static("__import__")))
         .cloned()
         .ok_or_else(|| RuntimeError::Internal("_testinternalcapi: no __import__".to_owned()))?;
-    let module = vm.call_object_with_globals(
-        &import_fn,
-        &[Object::from_static("_weave_iseq")],
-        &[],
-        &builtins,
-    )?;
+    let module =
+        vm.call_object_with_globals(&import_fn, &[Object::from_static(module)], &[], &builtins)?;
     let f = vm.load_attr_public(&module, name)?;
     vm.call_object_with_globals(&f, args, kwargs, &builtins)
 }
@@ -1556,7 +1563,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 name: "destroy_interpreter",
                 binds_instance: false,
                 call: Box::new(destroy_interpreter_fixture),
-                call_kw: None,
+                // 3.14: `destroy_interpreter(id, *, basic=False)` — the
+                // `basic` flavor takes the bare `Py_EndInterpreter` path,
+                // which for us is the same teardown.
+                call_kw: Some(Box::new(|args, _kwargs| destroy_interpreter_fixture(args))),
             })),
         );
         d.insert(
@@ -1910,6 +1920,58 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 call: Box::new(|args| iseq_call("compiler_codegen", args, &[])),
                 call_kw: None,
             })),
+        );
+        // RFC 0077 WS14 — 3.14's code-object introspection surface
+        // (test_code's VarCountsTests / StatelessCodeTest / LocalKinds),
+        // ported in the frozen `_weave_codeinfo`.
+        for name in [
+            "get_code_var_counts",
+            "verify_stateless_code",
+            "get_co_localskinds",
+            "code_returns_only_none",
+        ] {
+            d.insert(
+                DictKey(Object::from_static(name)),
+                Object::Builtin(Rc::new(BuiltinFn {
+                    name,
+                    binds_instance: false,
+                    call: Box::new(move |args| frozen_call("_weave_codeinfo", name, args, &[])),
+                    call_kw: Some(Box::new(move |args, kwargs| {
+                        frozen_call("_weave_codeinfo", name, args, kwargs)
+                    })),
+                })),
+            );
+        }
+        // 3.14 moved `type_assign_specific_version_unsafe` from `_testcapi`
+        // to `_testinternalcapi`; the frozen `_testcapi` shim still hosts
+        // the tag bookkeeping, so delegate there.
+        d.insert(
+            DictKey(Object::from_static("type_assign_specific_version_unsafe")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "type_assign_specific_version_unsafe",
+                binds_instance: false,
+                call: Box::new(|args| {
+                    frozen_call(
+                        "_testcapi",
+                        "type_assign_specific_version_unsafe",
+                        args,
+                        &[],
+                    )
+                }),
+                call_kw: None,
+            })),
+        );
+        // Specializer warm-up constants (`ADAPTIVE_WARMUP_DELAY` /
+        // `ADAPTIVE_COOLDOWN_VALUE` in pycore_code.h); test_call,
+        // test_dis, and test_monitoring loop this many times to reach
+        // the specialized shape.
+        d.insert(
+            DictKey(Object::from_static("SPECIALIZATION_THRESHOLD")),
+            Object::Int(2),
+        );
+        d.insert(
+            DictKey(Object::from_static("SPECIALIZATION_COOLDOWN")),
+            Object::Int(53),
         );
         d.insert(
             DictKey(Object::from_static("get_recursion_depth")),
@@ -2347,7 +2409,7 @@ fn pytime_ns_from_double(value: f64, round: i32) -> Result<i64, RuntimeError> {
     let d = pytime_round_f64(value * SEC_TO_NS as f64, round);
     if !((i64::MIN as f64) <= d && d < -(i64::MIN as f64)) {
         return Err(crate::error::overflow_error(
-            "timestamp too large to convert to C PyTime_t",
+            "timestamp out of range for C PyTime_t",
         ));
     }
     Ok(d as i64)
@@ -2361,7 +2423,7 @@ fn pytime_from_seconds_object(args: &[Object]) -> Result<Object, RuntimeError> {
         other => {
             let secs = pytime_t_arg(other)?;
             let ns = secs.checked_mul(SEC_TO_NS).ok_or_else(|| {
-                crate::error::overflow_error("timestamp too large to convert to C PyTime_t")
+                crate::error::overflow_error("timestamp out of range for C PyTime_t")
             })?;
             Ok(Object::Int(ns))
         }

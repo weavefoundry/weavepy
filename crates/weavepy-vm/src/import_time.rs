@@ -21,9 +21,11 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
 
-/// `0` off, `1` on. Set once at startup from the CLI (`-X importtime`)
-/// or the environment (`PYTHONPROFILEIMPORTTIME`), read on every fresh
-/// load with one relaxed byte load.
+/// `0` off, `1` on, `2` on plus a `cached | cached` line for every
+/// `sys.modules` hit (3.14 `-X importtime=2`). Set once at startup from
+/// the CLI (`-X importtime`) or the environment
+/// (`PYTHONPROFILEIMPORTTIME`), read on every load with one relaxed byte
+/// load.
 static ENABLED: AtomicU8 = AtomicU8::new(0);
 
 /// Whether the header line has been printed yet (process-wide).
@@ -40,10 +42,36 @@ pub fn set_enabled(on: bool) {
     ENABLED.store(u8::from(on), Ordering::Relaxed);
 }
 
+/// Set the import-time level (`0`, `1`, or `2`).
+pub fn set_level(level: u8) {
+    ENABLED.store(level, Ordering::Relaxed);
+}
+
 /// Whether import timing is on.
 #[inline]
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed) != 0
+}
+
+/// Whether cached (`sys.modules`) hits are reported too (level 2).
+#[inline]
+pub fn reports_cached() -> bool {
+    ENABLED.load(Ordering::Relaxed) >= 2
+}
+
+fn print_header() {
+    if HEADER_DONE.swap(1, Ordering::Relaxed) == 0 {
+        eprintln!("import time: self [us] | cumulative | imported package");
+    }
+}
+
+/// Report a `sys.modules` hit at level 2. CPython (`import_ensure_
+/// initialized`) prints `"import time: cached    | cached     | %*s"`
+/// with the name in a field two columns per nesting level wide.
+pub fn cached(name: &str) {
+    print_header();
+    let width = STACK.with(|s| s.borrow().len()) * 2;
+    eprintln!("import time: cached    | cached     | {name:>width$}");
 }
 
 /// Begin timing a fresh load. Must be paired with [`finish`].
@@ -66,14 +94,12 @@ pub fn finish(name: &str) {
         }
         stack.len()
     });
-    if HEADER_DONE.swap(1, Ordering::Relaxed) == 0 {
-        eprintln!("import time: self [us] | cumulative | imported package");
-    }
+    print_header();
     // CPython: `"import time: %9ld | %10ld | %*s%s\n"` with the name
-    // indented by one space per nesting level.
+    // indented by two spaces per nesting level.
     eprintln!(
         "import time: {self_us:>9} | {cumulative:>10} | {:width$}{name}",
         "",
-        width = depth
+        width = depth * 2
     );
 }

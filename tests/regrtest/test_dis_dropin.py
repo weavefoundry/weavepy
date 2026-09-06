@@ -27,7 +27,10 @@ for attr in ("opname", "opcode", "arg", "argval", "offset"):
 assert all(isinstance(i.opname, str) for i in instrs)
 assert all(isinstance(i.opcode, int) for i in instrs)
 opnames = {i.opname for i in instrs}
-assert "LOAD_FAST" in opnames, opnames
+# CPython 3.14 presents a local load as `LOAD_FAST_BORROW` (or the
+# `LOAD_FAST_BORROW_LOAD_FAST_BORROW` superinstruction) when the value
+# is consumed without escaping; any of the family counts.
+assert any(name.startswith("LOAD_FAST") for name in opnames), opnames
 assert any(name.startswith("RETURN") for name in opnames), opnames
 
 # Offsets are monotonically increasing code-unit positions.
@@ -39,7 +42,7 @@ assert offsets[0] == 0
 bc = dis.Bytecode(fn)
 text = bc.dis()
 assert isinstance(text, str), type(text)
-assert "LOAD_FAST" in text, text
+assert "LOAD_FAST" in text, text  # also matches the BORROW forms
 assert len(list(bc)) == len(instrs)
 
 # ---------- dis.dis(obj, file=...) writes to the given file ----------

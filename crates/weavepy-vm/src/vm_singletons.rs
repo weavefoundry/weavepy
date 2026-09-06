@@ -982,6 +982,22 @@ pub fn cext_call_active() -> bool {
 /// `sys.is_finalizing()` reads it.
 static FINALIZING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// `True` once shutdown reached CPython's `finalize_modules` stage:
+/// `sys.modules` emptied and `sys.meta_path` set to None, so a
+/// Python-level `import` fails even for a loaded module. The earlier
+/// stage — the collection of cyclic garbage after daemon threads are
+/// stopped — still imports normally, so this is set only once the
+/// sweep over module-global objects begins.
+static MODULES_TORN_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_modules_torn_down(value: bool) {
+    MODULES_TORN_DOWN.store(value, std::sync::atomic::Ordering::Release);
+}
+
+pub fn modules_torn_down() -> bool {
+    MODULES_TORN_DOWN.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// CPython clears the `sys` module dict *after* the std streams are
 /// finalized, so a `__del__` raising during that final sweep has nowhere
 /// to report (`test_sys.test_sys_ignores_cleaning_up_user_data`). The

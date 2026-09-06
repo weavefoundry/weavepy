@@ -180,6 +180,11 @@ pub struct ForeignHooks {
     /// the pending C exception. Backs ctypes' `py_object` restype
     /// (`pythonapi.PyBytes_FromFormat(...)` in `test_bytes.test_from_format`).
     pub steal_object: fn(usize) -> Result<Object, RuntimeError>,
+    /// Convert a *borrowed* `PyObject*` into a VM object without touching
+    /// its reference count — the ctypes `py_object` *callback argument*
+    /// direction (callbacks.c `getfunc` on a `PyObject*` the C caller
+    /// still owns). NULL raises `ValueError("PyObject is NULL")`.
+    pub borrow_object: fn(usize) -> Result<Object, RuntimeError>,
     /// Marshal a VM object to a *new owned* `PyObject*` reference — the
     /// ctypes `py_object` argument direction. Pair every call with a
     /// [`Self::release_object_ptr`] once the C call has returned.
@@ -253,6 +258,12 @@ pub fn wrap(ptr: usize, type_name: Rc<str>, tp_name: Rc<str>) -> Rc<PyForeignSou
 /// pending C exception.
 pub fn steal_object(ptr: usize) -> Result<Object, RuntimeError> {
     (hooks()?.steal_object)(ptr)
+}
+
+/// Convert a *borrowed* `PyObject*` (ctypes `py_object` callback argument)
+/// into a VM object; the reference stays with the C caller.
+pub fn borrow_object(ptr: usize) -> Result<Object, RuntimeError> {
+    (hooks()?.borrow_object)(ptr)
 }
 
 /// Mint a new owned `PyObject*` for `obj` (ctypes `py_object` argument).

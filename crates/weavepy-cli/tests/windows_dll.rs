@@ -1,6 +1,6 @@
-//! The `python313.dll` contract, end to end (RFC 0064 WS5).
+//! The `python314.dll` contract, end to end (RFC 0064 WS5).
 //!
-//! On Windows `weavepy.exe` is a thin shim over `python313.dll` — the
+//! On Windows `weavepy.exe` is a thin shim over `python314.dll` — the
 //! runtime, and the import target every `.pyd`'s PE header names. This
 //! battery is the smoke half of the POSIX `force_link_completeness`
 //! contract, adapted to the PE world:
@@ -29,16 +29,16 @@ fn exe_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_weavepy"))
 }
 
-/// `python313.dll` sits next to the exe (both land in
+/// `python314.dll` sits next to the exe (both land in
 /// `target/<profile>/`).
 fn dll_path() -> PathBuf {
     let dll = exe_path()
         .parent()
         .expect("exe path has a parent")
-        .join("python313.dll");
+        .join("python314.dll");
     assert!(
         dll.is_file(),
-        "python313.dll not found at {} — build it with \
+        "python314.dll not found at {} — build it with \
          `cargo build -p weavepy-pylib` (same profile as this test)",
         dll.display()
     );
@@ -132,7 +132,7 @@ fn dll_loads_and_exports_resolve() {
     }
     assert!(
         missing.is_empty(),
-        "python313.dll is missing exports: {missing:?} — if these are \
+        "python314.dll is missing exports: {missing:?} — if these are \
          varargs.c symbols, check the /EXPORT list in weavepy-pylib/build.rs"
     );
 }

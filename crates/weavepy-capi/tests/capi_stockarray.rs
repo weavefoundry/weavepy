@@ -208,7 +208,7 @@ fn stockarray_module_loads_with_type_and_capsule() {
         "missing _ARRAY_API capsule"
     );
     match lookup(&module, "ABI") {
-        Some(Object::Str(s)) => assert_eq!(&*s, "cp313"),
+        Some(Object::Str(s)) => assert_eq!(&*s, "cp314"),
         other => panic!("unexpected ABI marker: {other:?}"),
     }
 }

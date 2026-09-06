@@ -3156,6 +3156,19 @@ thread_local! {
 /// Park `err` as the pending key-comparison error (first one wins, matching
 /// CPython aborting on the first failed compare). Called from the reentrant
 /// `__hash__`/`__eq__` bridges when the callback raises.
+/// `indexmap` skips hashing when probing a table of 0 or 1 entries (it
+/// compares the lone entry directly). CPython always calls `__hash__`
+/// first, so a raising `__hash__` must still surface for `x in {'a'}`
+/// (test_set.test_unhashable_element's `HashError`). Only a user
+/// instance with a Python `__hash__` is affected; the call runs inside a
+/// `key_cmp_scope`, so a raised exception is stashed and re-raised there.
+#[inline]
+pub(crate) fn force_hash_for_tiny_table(len: usize, key: &Object) {
+    if len <= 1 && dict_key_is_reentrant(key) {
+        let _ = py_hash_value(key);
+    }
+}
+
 pub(crate) fn stash_key_cmp_error(err: RuntimeError) {
     KEY_CMP_ERROR.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -3778,6 +3791,15 @@ pub struct BoundMethod {
     /// wrapped `partial` with the class prepended rather than re-invoking
     /// `partial.__get__`.
     pub redispatch_descriptor: bool,
+    /// A genuine CPython `PyMethod_Type` object over a *builtin*
+    /// callable: `classmethod(repr).__get__(None, C)`,
+    /// `types.MethodType(len, obj)`. Attribute lookup on a builtin
+    /// type's method (`[].append`, `object().__repr__`) instead yields a
+    /// C-level bound object (`builtin_function_or_method` /
+    /// `method-wrapper`), which CPython's instrumentation never expands
+    /// (`_MAYBE_EXPAND_METHOD` checks `PyMethod_Type`). Irrelevant when
+    /// `function` is a Python function (always `method`).
+    pub py_method: bool,
 }
 
 impl BoundMethod {
@@ -3788,6 +3810,33 @@ impl BoundMethod {
             receiver,
             function,
             redispatch_descriptor: false,
+            py_method: false,
+        }
+    }
+
+    /// A `PyMethod_Type` object built by `classmethod.__get__` /
+    /// `types.MethodType`, so a builtin `function` still reports as
+    /// `method` and expands under instrumentation (see [`Self::py_method`]).
+    pub fn py_method(receiver: Object, function: Object) -> Self {
+        BoundMethod {
+            receiver,
+            function,
+            redispatch_descriptor: false,
+            py_method: true,
+        }
+    }
+
+    /// Would CPython represent this as a `PyMethod_Type` object? Always
+    /// for a Python function; for a builtin only when built by
+    /// `classmethod.__get__` / `types.MethodType` over a *non-native*
+    /// callable (a C `classmethod_descriptor` such as `int.from_bytes`
+    /// binds to a `builtin_function_or_method`).
+    pub fn is_pymethod_type(&self) -> bool {
+        match &self.function {
+            Object::Builtin(_) => {
+                self.py_method && crate::descr_registry::lookup(&self.function).is_none()
+            }
+            _ => true,
         }
     }
 
@@ -3800,6 +3849,7 @@ impl BoundMethod {
             receiver,
             function,
             redispatch_descriptor: true,
+            py_method: false,
         }
     }
 }
@@ -7217,6 +7267,13 @@ pub enum PyIterator {
         /// `__del__`) must be pinned here for the iterator's lifetime
         /// (test_dict test_free_after_iterating).
         owner: Option<Object>,
+        /// `reversed(d)` / `reversed(d.items())` …: `index` then counts
+        /// *down* (it holds the number of entries still to yield). The
+        /// watch is taken eagerly so a `clear()` + refill before the
+        /// first step exhausts the cursor silently, like CPython's
+        /// `di_pos >= dk_nentries` bail-out
+        /// (test_dict.test_reversed_dict_after_clear_and_restore).
+        reverse: bool,
     },
     Bytes {
         data: Rc<[u8]>,
@@ -7406,16 +7463,30 @@ impl PyIterator {
                 index,
                 dict,
                 owner,
+                reverse,
                 ..
             } => {
                 let d = dict.as_ref()?;
-                let entry = d
-                    .borrow()
-                    .get_index(*index)
-                    .map(|(k, v)| (k.0.clone(), v.clone()));
+                let entry = if *reverse {
+                    if *index == 0 {
+                        None
+                    } else {
+                        d.borrow()
+                            .get_index(*index - 1)
+                            .map(|(k, v)| (k.0.clone(), v.clone()))
+                    }
+                } else {
+                    d.borrow()
+                        .get_index(*index)
+                        .map(|(k, v)| (k.0.clone(), v.clone()))
+                };
                 match entry {
                     Some((k, v)) => {
-                        *index += 1;
+                        if *reverse {
+                            *index -= 1;
+                        } else {
+                            *index += 1;
+                        }
                         Some(match kind {
                             DictViewKind::Keys => k,
                             DictViewKind::Values => v,
@@ -7672,6 +7743,7 @@ impl PyIterator {
             len,
             watch,
             index,
+            reverse,
             ..
         } = self
         {
@@ -7682,7 +7754,7 @@ impl PyIterator {
                 // Sticky (`di_used = -1`): further `next()` calls keep
                 // raising and `__length_hint__` reports 0.
                 *len = usize::MAX;
-                *index = usize::MAX;
+                *index = if *reverse { 0 } else { usize::MAX };
                 return Err(runtime_error("dictionary changed size during iteration"));
             }
             // Same size but keys churned (`del d[k]; d[k] = v` between
@@ -7692,6 +7764,13 @@ impl PyIterator {
             // bump it, so `d[k] = new` over an existing key stays legal).
             match watch {
                 Some(w) if w.changed() => {
+                    if *reverse {
+                        // `dictreviter_iter_lock_held`: a rebuilt entry
+                        // array leaves `di_pos` past `dk_nentries`, which
+                        // is a silent StopIteration, not an error.
+                        *index = 0;
+                        return Ok(None);
+                    }
                     return Err(runtime_error("dictionary keys changed during iteration"));
                 }
                 None => *watch = Some(DictWatch::new(d)),
@@ -7738,10 +7817,18 @@ impl PyIterator {
             }
             PyIterator::Tuple { items, index } => Some(items.len().saturating_sub(*index)),
             PyIterator::Str { s, index } => Some(s[(*index).min(s.len())..].chars().count()),
-            PyIterator::DictKeys { dict, index, .. } => Some(
-                dict.as_ref()
-                    .map_or(0, |d| d.borrow().len().saturating_sub(*index)),
-            ),
+            PyIterator::DictKeys {
+                dict,
+                index,
+                reverse,
+                ..
+            } => Some(dict.as_ref().map_or(0, |d| {
+                if *reverse {
+                    (*index).min(d.borrow().len())
+                } else {
+                    d.borrow().len().saturating_sub(*index)
+                }
+            })),
             PyIterator::Bytes { data, index } => Some(data.len().saturating_sub(*index)),
             PyIterator::ByteArray { data, index } => {
                 Some(data.borrow().len().saturating_sub(*index))
@@ -7839,12 +7926,20 @@ impl PyIterator {
                     .collect()
             }
             PyIterator::DictKeys {
-                kind, index, dict, ..
+                kind,
+                index,
+                dict,
+                reverse,
+                ..
             } => match dict {
                 Some(d) => {
                     let d = d.borrow();
-                    let start = (*index).min(d.len());
-                    (start..d.len())
+                    let range: Box<dyn Iterator<Item = usize>> = if *reverse {
+                        Box::new((0..(*index).min(d.len())).rev())
+                    } else {
+                        Box::new((*index).min(d.len())..d.len())
+                    };
+                    range
                         .filter_map(|i| d.get_index(i))
                         .map(|(k, v)| match kind {
                             DictViewKind::Keys => k.0.clone(),
@@ -8602,7 +8697,7 @@ impl Object {
             Object::Dict(d) => {
                 // `unhashable in {…}` raises TypeError, exactly like a
                 // direct `d[unhashable]` lookup (CPython `PyDict_Contains`).
-                crate::builtins::ensure_hashable(item)?;
+                crate::builtins::ensure_dict_key(item)?;
                 if dict_key_is_reentrant(item) {
                     // A key with user `__eq__` compares through Python (which
                     // may raise, or mutate `d` mid-probe — gh-140551).
@@ -8629,11 +8724,17 @@ impl Object {
                 let key = crate::builtins::set_membership_key(item)?;
                 // A custom `__eq__` raising during a hash collision aborts the
                 // lookup in CPython (test_badcmp `s.__contains__(BadCmp())`).
-                key_cmp_scope(|| s.borrow().contains(&key))
+                key_cmp_scope(|| {
+                    force_hash_for_tiny_table(s.borrow().len(), &key.0);
+                    s.borrow().contains(&key)
+                })
             }
             Object::FrozenSet(s) => {
                 let key = crate::builtins::set_membership_key(item)?;
-                key_cmp_scope(|| s.contains(&key))
+                key_cmp_scope(|| {
+                    force_hash_for_tiny_table(s.len(), &key.0);
+                    s.contains(&key)
+                })
             }
             Object::Bytes(haystack) => bytes_membership(haystack, item),
             Object::ByteArray(haystack) => {
@@ -8838,6 +8939,7 @@ impl Object {
                     dict: Some(d.clone()),
                     len,
                     watch: None,
+                    reverse: false,
                     owner: None,
                 })
             }
@@ -8902,6 +9004,7 @@ impl Object {
                     dict: Some(v.dict.clone()),
                     len,
                     watch: None,
+                    reverse: false,
                     owner: v.owner.clone(),
                 })
             }
@@ -8913,6 +9016,7 @@ impl Object {
                     dict: Some(d.clone()),
                     len,
                     watch: None,
+                    reverse: false,
                     owner: None,
                 })
             }
@@ -9049,6 +9153,20 @@ impl Object {
 
     /// Like [`type_name`], but returns the user-class name for
     /// `Object::Instance` instead of the static placeholder.
+    /// CPython's `%T` format unit: `type(obj).__module__.__qualname__`
+    /// with the `builtins` prefix dropped (`test.test_str.PseudoFloat`,
+    /// `float`). Built-in and bridged types fall back to
+    /// [`Self::type_name_owned`].
+    pub fn type_name_fq(&self) -> String {
+        if let Object::Instance(inst) = self {
+            let cls = inst.cls();
+            if cls.c_tp_name.get().is_none() {
+                return cls.qualified_display_name();
+            }
+        }
+        self.type_name_owned()
+    }
+
     pub fn type_name_owned(&self) -> String {
         match self {
             // A bridged extension class renders its C `tp_name`
@@ -11140,7 +11258,7 @@ fn bytes_membership(haystack: &[u8], item: &Object) -> Result<bool, RuntimeError
 /// except those in the "Other" (Cc, Cf, Cs, Co, Cn) and "Separator"
 /// (Zl, Zp, Zs) general categories, with U+0020 (space) treated as
 /// printable. Used by `repr(str)` (and `str.isprintable`).
-/// `Py_UNICODE_ISPRINTABLE`, from the generated UCD 15.1.0 tables (the
+/// `Py_UNICODE_ISPRINTABLE`, from the generated UCD 16.0.0 tables (the
 /// `unicode_properties` crate tracks a newer UCD and drifts on newly
 /// assigned code points).
 pub(crate) fn char_is_printable(c: char) -> bool {

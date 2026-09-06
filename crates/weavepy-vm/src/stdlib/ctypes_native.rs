@@ -283,6 +283,60 @@ fn b_string_at(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::new_bytes(bytes))
 }
 
+/// A raw, caller-owned memory window for `ctypes.memoryview_at` (3.14).
+/// The memory is not owned: like CPython's `PyMemoryView_FromMemory`, the
+/// caller guarantees the region outlives the view.
+#[derive(Debug)]
+struct RawRegion {
+    ptr: usize,
+    len: usize,
+    readonly: bool,
+}
+
+// SAFETY: the region is foreign memory the caller vouches for; the GIL
+// serialises every access through the view.
+impl crate::object::SharedMemBuffer for RawRegion {
+    fn byte_len(&self) -> usize {
+        self.len
+    }
+    fn data_ptr(&self) -> *mut u8 {
+        self.ptr as *mut u8
+    }
+    fn is_readonly(&self) -> bool {
+        self.readonly
+    }
+}
+
+/// `memoryview_at(addr, size, readonly) -> memoryview` — CPython 3.14's
+/// `_memoryview_at_addr` thunk target (`PyMemoryView_FromMemory`).
+fn b_memoryview_at(args: &[Object]) -> Result<Object, RuntimeError> {
+    let addr = arg_usize(args, 0)?;
+    let size = match arg(args, 1)? {
+        Object::Int(n) => *n,
+        other => {
+            return Err(type_error(format!(
+                "memoryview_at: size must be int (got '{}')",
+                other.type_name()
+            )))
+        }
+    };
+    if size < 0 {
+        return Err(value_error("memoryview_at: negative size"));
+    }
+    let readonly = args.get(2).is_some_and(|v| v.is_truthy());
+    if addr == 0 && size != 0 {
+        return Err(value_error("memoryview_at: NULL pointer access"));
+    }
+    let region: Rc<dyn crate::object::SharedMemBuffer> = Rc::new(RawRegion {
+        ptr: addr,
+        len: size as usize,
+        readonly,
+    });
+    Ok(Object::MemoryView(Rc::new(
+        crate::object::PyMemoryView::from_shared(region),
+    )))
+}
+
 /// `wstring_at(addr, size=-1) -> str`. `wchar_t` is 4 bytes on POSIX.
 fn b_wstring_at(args: &[Object]) -> Result<Object, RuntimeError> {
     let addr = arg_usize(args, 0)?;
@@ -715,6 +769,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         register(&mut d, "memset", b_memset);
         register(&mut d, "string_at", b_string_at);
         register(&mut d, "wstring_at", b_wstring_at);
+        register(&mut d, "memoryview_at", b_memoryview_at);
         register(&mut d, "dlopen", b_dlopen);
         register(&mut d, "dlsym", b_dlsym);
         register(&mut d, "dlclose", b_dlclose);

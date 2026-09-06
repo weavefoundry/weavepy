@@ -71,16 +71,23 @@ for _p in _sys.path:
 # (test_weakref FinalizeTestCase.test_atexit).
 try:
     _exe_dir = _os.path.dirname(_os.path.abspath(_sys.executable))
-    for _cand in (
-        _os.path.join(_exe_dir, "..", "..", "vendor", "cpython", "Lib", "test"),
-        _os.path.join(_exe_dir, "..", "vendor", "cpython", "Lib", "test"),
-    ):
-        _cand = _os.path.normpath(_cand)
-        if (
-            _os.path.isfile(_os.path.join(_cand, "__init__.py"))
-            and _cand not in __path__
+    # The 3.14 tree (`vendor/cpython314`, RFC 0077) is the suite this
+    # interpreter identifies with; the 3.13 tree is only a fallback for
+    # checkouts that never fetched it. Grafting both would let a 3.13
+    # sibling module shadow its 3.14 counterpart.
+    for _root in (("vendor", "cpython314"), ("vendor", "cpython")):
+        _found = False
+        for _cand in (
+            _os.path.join(_exe_dir, "..", "..", *_root, "Lib", "test"),
+            _os.path.join(_exe_dir, "..", *_root, "Lib", "test"),
         ):
-            __path__.append(_cand)
+            _cand = _os.path.normpath(_cand)
+            if _os.path.isfile(_os.path.join(_cand, "__init__.py")):
+                _found = True
+                if _cand not in __path__:
+                    __path__.append(_cand)
+        if _found:
+            break
 except (TypeError, ValueError, OSError):
     pass
 # When a full CPython regression suite is among the grafted directories,
@@ -98,7 +105,7 @@ for _d in list(__path__):
     except (TypeError, ValueError):
         pass
 del _os, _sys
-for _n in ("_p", "_norm", "_child", "_d", "_up", "_init", "_exe_dir", "_cand"):
+for _n in ("_p", "_norm", "_child", "_d", "_up", "_init", "_exe_dir", "_cand", "_root", "_found"):
     try:
         del globals()[_n]
     except KeyError:

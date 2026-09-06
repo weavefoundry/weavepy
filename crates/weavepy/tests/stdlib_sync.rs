@@ -21,7 +21,12 @@ fn repo_root() -> PathBuf {
 #[test]
 fn bundled_stdlib_verbatim_set_has_not_drifted() {
     let root = repo_root();
-    let tree = root.join("vendor/cpython/Lib");
+    // The bundle tracks CPython 3.14 (RFC 0077 Phase II); the 3.13
+    // checkout is only consulted when no 3.14 tree is vendored.
+    let mut tree = root.join("vendor/cpython314/Lib");
+    if !tree.join("os.py").exists() {
+        tree = root.join("vendor/cpython/Lib");
+    }
     if !tree.join("os.py").exists() {
         eprintln!(
             "skipping: vendored CPython Lib/ not present at {}",

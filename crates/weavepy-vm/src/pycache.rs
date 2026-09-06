@@ -40,25 +40,27 @@ use weavepy_compiler::CodeObject;
 use crate::object::{DictData, Object};
 use crate::stdlib::marshal_mod;
 
-/// Bytecode magic. RFC 0033 adopts CPython 3.13's value
-/// (`b"\xf3\x0d\x0d\x0a"`, surfaced via `importlib.util.MAGIC_NUMBER`
-/// and `_imp.get_magic()`). Collisions with CPython's own `.pyc`
-/// files are avoided by the distinct [`CACHE_TAG`] in the filename,
-/// so adopting the real magic costs nothing and buys tool interop.
-pub const MAGIC: &[u8; 4] = b"\xf3\x0d\x0d\x0a";
+/// Bytecode magic. RFC 0033 adopts CPython's value (3.14's 3627,
+/// `b"\x2b\x0e\x0d\x0a"`, surfaced via `importlib.util.MAGIC_NUMBER`
+/// and `_imp.get_magic()`; RFC 0077 WS9 moved it from 3.13's 3571).
+/// Collisions with CPython's own `.pyc` files are avoided by the
+/// distinct [`CACHE_TAG`] in the filename, so adopting the real magic
+/// costs nothing and buys tool interop. The single source is the
+/// compiler's `MAGIC_NUMBER` so `marshal` and the cache can't drift.
+pub const MAGIC: &[u8; 4] = &weavepy_compiler::cpython_code::MAGIC_NUMBER;
 
 /// Cache tag — appears in `__pycache__/<name>.<tag>.pyc` and on
-/// `sys.implementation.cache_tag`. Mirrors CPython's `cpython-313`
+/// `sys.implementation.cache_tag`. Mirrors CPython's `cpython-314`
 /// shape: `<impl>-<major><minor>` with **no dot** in the tag itself
 /// (PEP 3147's `<name>.<tag>.pyc` parsing — e.g. `source_from_cache`,
 /// which `runpy`/`make_legacy_pyc` rely on — keys off the first dot, so
-/// a dotted tag like `weavepy-3.13` would corrupt the recovered source
-/// name). Distinct from CPython's `cpython-313` so the artifacts never
+/// a dotted tag like `weavepy-3.14` would corrupt the recovered source
+/// name). Distinct from CPython's `cpython-314` so the artifacts never
 /// collide.
 ///
 /// The trailing `-<rev>` is WeavePy's **bytecode-format revision**, our
 /// only lever for invalidating stale `.pyc` on a compiler change: we pin
-/// [`MAGIC`] to CPython 3.13's value (so `importlib.util.MAGIC_NUMBER` /
+/// [`MAGIC`] to CPython's value (so `importlib.util.MAGIC_NUMBER` /
 /// `_imp.get_magic()` match for `test_importlib.test_magic_number` and
 /// external-tool interop), which means we *cannot* bump the magic the way
 /// CPython does. Bumping the tag changes the `.pyc` *filename*, so both
@@ -208,7 +210,15 @@ pub const MAGIC: &[u8; 4] = b"\xf3\x0d\x0d\x0a";
 ///   binders, `INTRINSIC_SUBSCRIPT_GENERIC`, `INTRINSIC_TYPEALIAS`,
 ///   `INTRINSIC_SET_FUNCTION_TYPE_PARAMS`) instead of calls to the
 ///   `__weavepy_typevar__` builtin family, which no longer exists.
-pub const CACHE_TAG: &str = weavepy_version::vconcat!(weavepy_version::CACHE_TAG_PREFIX, "-51");
+/// - rev `52`: RFC 0077 Phase II (the 3.14 switch): the prefix becomes
+///   `weavepy-314`, [`MAGIC`] becomes 3627, and the bundled stdlib is
+///   CPython 3.14.7's, so every 3.13-era artifact is retired at once.
+/// - rev `53`: RFC 0077 Phase II marshal-parity work changed folded
+///   constants (3.14 mixed-mode complex arithmetic in the AST folder,
+///   `patma` fold shapes, complex `**` by `_Py_c_prod`), the linetable
+///   decoder, and `co_localsplusnames` for annotation scopes; rev-52
+///   artifacts written mid-wave carry the old constant values.
+pub const CACHE_TAG: &str = weavepy_version::vconcat!(weavepy_version::CACHE_TAG_PREFIX, "-53");
 
 const HEADER_LEN: usize = 16;
 

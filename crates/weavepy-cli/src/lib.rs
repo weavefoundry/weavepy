@@ -1,6 +1,6 @@
 //! The `weavepy` command-line interpreter driver.
 //!
-//! Argv-compatible with `python(1)` 3.13: every flag in the CPython
+//! Argv-compatible with `python(1)` 3.14: every flag in the CPython
 //! manpage is parsed and honoured (those we can't yet act on are
 //! accepted and forwarded onto `sys.flags` / `sys._xoptions` so user
 //! code that introspects them sees realistic values). Modes:
@@ -17,9 +17,9 @@
 //! returning the process exit code. It has two consumers — the
 //! `weavepy` bin target (`src/main.rs`), which calls it directly on
 //! POSIX (the fully-static binary, unchanged), and `weavepy-pylib`,
-//! the `python313` cdylib, which exports it as `weavepy_main` /
+//! the `python314` cdylib, which exports it as `weavepy_main` /
 //! `Py_Main` / `Py_BytesMain` so the Windows exe can be a thin shim
-//! over `python313.dll` (the same split CPython ships on NT).
+//! over `python314.dll` (the same split CPython ships on NT).
 
 mod regrtest_cmd;
 mod repl;
@@ -126,7 +126,7 @@ fn child_flags_from_opts(exe: &str, opt_args: &[String]) -> InterpreterFlags {
     }
 }
 
-/// CPython 3.13's `python(1)` flag set.
+/// CPython 3.14's `python(1)` flag set.
 ///
 /// Defaults match invoking `python` with no flags. Most of the
 /// surface is "accept and propagate" — `sys.flags`, `sys._xoptions`,
@@ -317,6 +317,9 @@ The following implementation-specific options are available:
 -X no_debug_ranges     : disable PEP 657 ranges (no-op today).
 -X pycache_prefix=PATH : redirect __pycache__ to PATH.
 -X int_max_str_digits  : set sys.int_info.str_digits_check_threshold.
+-X thread_inherit_context=[0|1] : threads inherit the caller's context (3.14).
+-X context_aware_warnings=[0|1] : warnings.catch_warnings uses a context variable (3.14).
+-X lang=3.13           : pin the 3.13 grammar (no t-strings, PEP 758 off).
 ";
 
 // Opt-in native crash diagnostics (`WEAVEPY_SEGV_BT`): macOS-only, because
@@ -448,7 +451,7 @@ extern "C" fn weavepy_segv_backtrace(sig: i32, info: *const u8, ctx: *mut std::f
 
 /// Run the WeavePy CLI against this process's real argv and
 /// environment, returning the exit code. This is the entire `weavepy`
-/// binary: the bin target's `main` (POSIX) and the `python313` DLL's
+/// binary: the bin target's `main` (POSIX) and the `python314` DLL's
 /// `weavepy_main` export (Windows) are both one-line calls into here.
 pub fn cli_main() -> i32 {
     #[cfg(target_os = "macos")]
@@ -737,7 +740,9 @@ fn real_main() -> Result<i32> {
     // Stuff `mode` back into the parsed Cli so the rest of real_main
     // sees a consistent view.
     match &mode {
-        Some(("c", cmd)) => cli.command = Some(decode_command_arg(cmd)),
+        // 3.14 (gh-103998): the command is dedented like
+        // `textwrap.dedent` before it is compiled.
+        Some(("c", cmd)) => cli.command = Some(dedent_command(&decode_command_arg(cmd))),
         Some(("m", m)) => cli.module = Some(m.clone()),
         // A script path may carry PEP 383-escaped bytes (PUA-bridged by
         // `os_args_bridged`); recover the OS-level bytes so the file
@@ -777,6 +782,33 @@ fn real_main() -> Result<i32> {
     };
 
     let mut flags = build_flags(&cli, &env);
+
+    // `PYTHONMALLOCSTATS`: allocator report on stderr at exit.
+    if !(cli.isolated || cli.ignore_env)
+        && env::var_os("PYTHONMALLOCSTATS").is_some_and(|v| !v.is_empty())
+    {
+        weavepy::vm::malloc_stats::install_exit_report();
+    }
+
+    // getpath honours `PYTHONHOME` unconditionally: a home without a
+    // stdlib leaves `import encodings` nothing to find, and CPython dies
+    // in `init_fs_encoding` after dumping the path configuration
+    // (gh-151253; test_cmd_line.test_dump_path_config). WeavePy's tree
+    // resolver would otherwise fall through to its cache and silently
+    // ignore the misconfiguration.
+    if !(cli.isolated || cli.ignore_env) {
+        if let Some(home) = env::var_os("PYTHONHOME").filter(|h| !h.is_empty()) {
+            let home = home.to_string_lossy().into_owned();
+            let sep = if cfg!(windows) { ';' } else { ':' };
+            let prefix = home.split_once(sep).map_or(home.as_str(), |(p, _)| p);
+            if !prefix.is_empty()
+                && !weavepy::vm::stdlib_tree::is_home_prefix(Path::new(prefix))
+                && env::var_os("WEAVEPYHOME").is_none()
+            {
+                dump_path_config_and_die(&cli, &env, &home, prefix);
+            }
+        }
+    }
 
     // Compose pythonpath from env (when honoured) plus -X variants.
     let mut extra_path: Vec<PathBuf> = env
@@ -993,10 +1025,38 @@ fn build_flags(cli: &Cli, env: &EnvOverrides) -> InterpreterFlags {
     }
     // `-X importtime` / `PYTHONPROFILEIMPORTTIME` (RFC 0077 WS7): per-load
     // timing lines on stderr, printed by the import walk itself.
-    if xoption_value(&cli.xoptions, "importtime").is_some()
-        || std::env::var_os("PYTHONPROFILEIMPORTTIME").is_some_and(|v| !v.is_empty())
+    // 3.14 (`config_init_import_time`): the value is 1 (default) or 2
+    // (also report cached hits); anything else is a fatal config error.
+    // The env var is read first so `-X importtime` can override it.
     {
-        weavepy::vm::import_time::set_enabled(true);
+        let mut level: u8 = 0;
+        if let Some(env) = std::env::var_os("PYTHONPROFILEIMPORTTIME")
+            .filter(|v| !v.is_empty())
+        {
+            let env = env.to_string_lossy();
+            level = match env.trim().parse::<i64>() {
+                Ok(n) if (0..=2).contains(&n) => n as u8,
+                Ok(_) => config_fatal_error(
+                    "config_init_import_time",
+                    "PYTHONPROFILEIMPORTTIME: numeric values other than 1 and 2 are reserved for future use.",
+                ),
+                Err(_) => 1,
+            };
+        }
+        if let Some(x) = xoption_value(&cli.xoptions, "importtime") {
+            level = match x {
+                None | Some("") => 1,
+                Some(v) => match v.parse::<i64>() {
+                    Ok(n) if (0..=2).contains(&n) => n as u8,
+                    Ok(_) => config_fatal_error(
+                        "config_init_import_time",
+                        "-X importtime: values other than 1 and 2 are reserved for future use.",
+                    ),
+                    Err(_) => 1,
+                },
+            };
+        }
+        weavepy::vm::import_time::set_level(level);
     }
     // `-X pycache_prefix[=PATH]` beats `PYTHONPYCACHEPREFIX` even when
     // given bare / with an empty value (which unsets the env prefix).
@@ -1311,6 +1371,126 @@ fn decode_command_arg(cmd: &str) -> String {
     }
 }
 
+/// `_Py_DumpPathConfig` followed by the `init_fs_encoding` fatal error
+/// CPython emits when `PYTHONHOME` names a directory with no stdlib.
+fn dump_path_config_and_die(cli: &Cli, env: &EnvOverrides, home: &str, prefix: &str) -> ! {
+    use std::fmt::Write as _;
+    let (maj, min, _) = weavepy_vm::stdlib::sys::PY_VERSION;
+    let quoted = |s: &str| format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"));
+    let program = env::args_os()
+        .next()
+        .map(|a| a.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let stdlib = format!("{prefix}/lib/python{maj}.{min}");
+    let mut out = String::new();
+    let _ = writeln!(out, "Could not find platform independent libraries <prefix>");
+    let _ = writeln!(out, "Python path configuration:");
+    let _ = writeln!(out, "  PYTHONHOME = {}", quoted(home));
+    let _ = writeln!(
+        out,
+        "  PYTHONPATH = {}",
+        if env.pythonpath.is_empty() {
+            "(not set)".to_owned()
+        } else {
+            quoted(&env.pythonpath.join(if cfg!(windows) { ";" } else { ":" }))
+        }
+    );
+    let _ = writeln!(out, "  program name = {}", quoted(&program));
+    let _ = writeln!(out, "  isolated = {}", u8::from(cli.isolated));
+    let _ = writeln!(out, "  environment = {}", u8::from(!(cli.isolated || cli.ignore_env)));
+    let _ = writeln!(
+        out,
+        "  user site = {}",
+        u8::from(!(cli.no_user_site || cli.isolated))
+    );
+    let _ = writeln!(out, "  safe_path = {}", u8::from(cli.safe_path || cli.isolated));
+    let _ = writeln!(out, "  import site = {}", u8::from(!cli.no_site));
+    let _ = writeln!(out, "  is in build tree = 0");
+    let _ = writeln!(out, "  stdlib dir = {}", quoted(&stdlib));
+    let _ = writeln!(out, "  sys.path[0] = (not set)");
+    let exe = weavepy::vm::stdlib_tree::program_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let _ = writeln!(out, "  sys._base_executable = {}", quoted(&exe));
+    let _ = writeln!(out, "  sys.base_prefix = {}", quoted(prefix));
+    let _ = writeln!(out, "  sys.base_exec_prefix = {}", quoted(prefix));
+    let _ = writeln!(out, "  sys.platlibdir = 'lib'");
+    let _ = writeln!(out, "  sys.executable = {}", quoted(&exe));
+    let _ = writeln!(out, "  sys.prefix = {}", quoted(prefix));
+    let _ = writeln!(out, "  sys.exec_prefix = {}", quoted(prefix));
+    let _ = writeln!(out, "  sys.path = [");
+    for p in &env.pythonpath {
+        let _ = writeln!(out, "    {},", quoted(p));
+    }
+    let _ = writeln!(out, "    {},", quoted(&format!("{stdlib}/lib-dynload")));
+    let _ = writeln!(out, "    {},", quoted(&stdlib));
+    let _ = writeln!(out, "  ]");
+    let _ = writeln!(
+        out,
+        "Fatal Python error: init_fs_encoding: failed to get the Python codec of the filesystem encoding"
+    );
+    let _ = writeln!(out, "Python runtime state: core initialized");
+    let _ = writeln!(out, "ModuleNotFoundError: No module named 'encodings'");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Current thread 0x{:016x} (most recent call first):", 0);
+    let _ = writeln!(out, "  <no Python frame>");
+    eprint!("{out}");
+    std::process::exit(1);
+}
+
+/// `_PyUnicode_Dedent`: strip the longest common leading whitespace
+/// (spaces and tabs only) from every line; whitespace-only lines collapse
+/// to a bare newline. Matches `textwrap.dedent`, which is what CPython's
+/// `pymain_run_command` applies to `-c` text since 3.14.
+fn dedent_command(src: &str) -> String {
+    let mut common: Option<&str> = None;
+    for line in src.split('\n') {
+        let indent_len = line.len() - line.trim_start_matches([' ', '\t']).len();
+        if indent_len == line.len() {
+            // Whitespace-only lines never contribute.
+            continue;
+        }
+        let indent = &line[..indent_len];
+        common = Some(match common {
+            None => indent,
+            Some(prev) => {
+                let shared = prev
+                    .bytes()
+                    .zip(indent.bytes())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                &prev[..shared]
+            }
+        });
+        if common.is_some_and(str::is_empty) {
+            return src.to_owned();
+        }
+    }
+    let Some(common) = common.filter(|c| !c.is_empty()) else {
+        return src.to_owned();
+    };
+    let n = common.len();
+    let mut out = String::with_capacity(src.len());
+    let mut lines = src.split('\n').peekable();
+    while let Some(line) = lines.next() {
+        let is_last = lines.peek().is_none();
+        let all_ws = line.bytes().all(|b| b == b' ' || b == b'\t');
+        if all_ws && !is_last {
+            // Whitespace-only interior lines become bare newlines.
+        } else if all_ws {
+            // A trailing whitespace-only fragment (after the final '\n')
+            // keeps whatever survives the dedent, like textwrap.dedent.
+            out.push_str(line.get(n..).unwrap_or(""));
+        } else {
+            out.push_str(&line[n..]);
+        }
+        if !is_last {
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// Rebuild a filesystem path from a (possibly PUA-bridged) argv string,
 /// recovering the original OS bytes for PEP 383-escaped names.
 fn bridged_arg_to_pathbuf(arg: &str) -> PathBuf {
@@ -1411,11 +1591,80 @@ fn decode_script_source(bytes: &[u8], filename: &str) -> String {
                 eprintln!("SyntaxError: {msg}");
                 std::process::exit(1);
             }
-            eprintln!("  File \"{filename}\", line 1");
-            eprintln!("SyntaxError: {msg}");
+            eprint!("{}", format_decode_syntax_error(&err, filename, &msg));
             std::process::exit(1);
         }
     }
+}
+
+/// Render a source-decoding `SyntaxError` the way `traceback` prints
+/// one (`_format_syntax_error`): the `File "…", line N` header when
+/// there's a line number, the offending line with a caret range when
+/// there's text, then `SyntaxError: <msg>`.
+fn format_decode_syntax_error(err: &weavepy::vm::RuntimeError, filename: &str, msg: &str) -> String {
+    use std::fmt::Write as _;
+    use weavepy::vm::object::Object;
+    let mut out = String::new();
+    let inst = match err {
+        weavepy::vm::RuntimeError::PyException(pe) => match &pe.instance {
+            Object::Instance(inst) => Some(inst.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let attr = |name: &str| -> Option<Object> {
+        inst.as_ref().and_then(|i| i.slot_get(name)).filter(|o| !matches!(o, Object::None))
+    };
+    let int = |name: &str| attr(name).and_then(|o| o.as_i64());
+    match int("lineno") {
+        Some(lineno) => {
+            let _ = writeln!(out, "  File \"{filename}\", line {lineno}");
+        }
+        None => {
+            let _ = writeln!(out, "  File \"{filename}\", line 1");
+        }
+    }
+    if let Some(Object::Str(text)) = attr("text") {
+        let rtext = text.to_string();
+        let rtext = rtext.trim_end_matches('\n');
+        let ltext = rtext.trim_start_matches([' ', '\n', '\x0c']);
+        let spaces = rtext.chars().count() - ltext.chars().count();
+        let _ = writeln!(out, "    {ltext}");
+        if let Some(offset) = int("offset") {
+            let len = rtext.chars().count() as i64;
+            let mut end_offset = match int("end_offset") {
+                Some(e) if e != 0 && int("end_lineno") == int("lineno") => e,
+                Some(_) if int("end_lineno") != int("lineno") => len + 1,
+                _ => offset,
+            };
+            let mut offset = offset;
+            if offset > len {
+                offset = len + 1;
+            }
+            if end_offset > len {
+                end_offset = len + 1;
+            }
+            if offset >= end_offset || end_offset < 0 {
+                end_offset = offset + 1;
+            }
+            let colno = offset - 1 - spaces as i64;
+            let end_colno = end_offset - 1 - spaces as i64;
+            if colno >= 0 {
+                let caretspace: String = ltext
+                    .chars()
+                    .take(colno as usize)
+                    .map(|c| if c.is_whitespace() { c } else { ' ' })
+                    .collect();
+                let _ = writeln!(
+                    out,
+                    "    {caretspace}{}",
+                    "^".repeat((end_colno - colno).max(0) as usize)
+                );
+            }
+        }
+    }
+    let _ = writeln!(out, "SyntaxError: {msg}");
+    out
 }
 
 fn run_path(
@@ -1499,14 +1748,11 @@ fn errno_message(errno: i32) -> String {
     }
 }
 
-/// CPython's `__pycache__`/legacy-`.pyc` magic (kept in sync with
-/// `crates/weavepy-vm/src/pycache.rs` and `importlib.machinery.MAGIC_NUMBER`).
-const PYC_MAGIC: [u8; 4] = [0xf3, 0x0d, 0x0d, 0x0a];
-
-/// Whether `bytes` begins with the WeavePy bytecode magic + the 16-byte
-/// `.pyc` header CPython writes (4 magic, 4 bit-field, 8 mtime/size or hash).
+/// Whether `bytes` begins with the bytecode magic (`pycache::MAGIC`, the
+/// same value `importlib.util.MAGIC_NUMBER` reports) + the 16-byte `.pyc`
+/// header CPython writes (4 magic, 4 bit-field, 8 mtime/size or hash).
 fn is_pyc_bytes(bytes: &[u8]) -> bool {
-    bytes.len() >= 16 && bytes[..4] == PYC_MAGIC
+    bytes.len() >= 16 && &bytes[..4] == weavepy::vm::pycache::MAGIC
 }
 
 /// Whether `bytes` begins with a zip signature (local-file/empty/spanned).

@@ -244,11 +244,17 @@ pub struct MonitoringTools {
     /// `(code id, instruction offset, tool, event index)`. Cleared by
     /// `sys.monitoring.restart_events`.
     pub disabled: std::collections::HashSet<(u64, u32, u8, u8)>,
+    /// Tools whose BRANCH_LEFT/RIGHT callbacks were installed through
+    /// the deprecated composite `BRANCH` event: a `DISABLE` from one
+    /// half then also disables the other half at the same branch
+    /// (CPython's `_PyLegacyBranchEventHandler`).
+    pub legacy_branch: [bool; 6],
 }
 
 impl MonitoringTools {
     pub fn new() -> Self {
         Self {
+            legacy_branch: [false; 6],
             tools: [None, None, None, None, None, None],
             callbacks: [
                 [const { None }; 32],
@@ -554,25 +560,88 @@ impl Drop for TracingReenabled {
 
 // ---------- PEP 669 event indices ----------
 //
-// These match the bit positions used in `crate::stdlib::sys_monitoring::build_events_namespace`.
-
-pub const EVENT_BRANCH: usize = 0;
-pub const EVENT_CALL: usize = 1;
-pub const EVENT_C_RAISE: usize = 2;
-pub const EVENT_C_RETURN: usize = 3;
-pub const EVENT_EXCEPTION_HANDLED: usize = 4;
-pub const EVENT_INSTRUCTION: usize = 5;
-pub const EVENT_JUMP: usize = 6;
-pub const EVENT_LINE: usize = 7;
-pub const EVENT_PY_RESUME: usize = 8;
-pub const EVENT_PY_RETURN: usize = 9;
-pub const EVENT_PY_START: usize = 10;
-pub const EVENT_PY_THROW: usize = 11;
-pub const EVENT_PY_UNWIND: usize = 12;
-pub const EVENT_PY_YIELD: usize = 13;
-pub const EVENT_RAISE: usize = 14;
+// These are CPython 3.14's `PY_MONITORING_EVENT_*` numbers
+// (`Include/cpython/monitoring.h`), so `sys.monitoring.events.X` values
+// and raw event-set integers (`set_events(tool, 15)`) agree with CPython.
+//
+// Local events (may be set per code object, callbacks may DISABLE):
+pub const EVENT_PY_START: usize = 0;
+pub const EVENT_PY_RESUME: usize = 1;
+pub const EVENT_PY_RETURN: usize = 2;
+pub const EVENT_PY_YIELD: usize = 3;
+pub const EVENT_CALL: usize = 4;
+pub const EVENT_LINE: usize = 5;
+pub const EVENT_INSTRUCTION: usize = 6;
+pub const EVENT_JUMP: usize = 7;
+/// 3.14 split `BRANCH` into the not-taken (`BRANCH_LEFT`) and taken
+/// (`BRANCH_RIGHT`) halves; `EVENT_BRANCH` remains as the deprecated
+/// composite (setting it sets both halves, registering a callback for
+/// it registers the callback for both).
+pub const EVENT_BRANCH_LEFT: usize = 8;
+pub const EVENT_BRANCH_RIGHT: usize = 9;
+pub const EVENT_STOP_ITERATION: usize = 10;
+// Other events, mainly exceptions (global-only):
+pub const EVENT_RAISE: usize = 11;
+pub const EVENT_EXCEPTION_HANDLED: usize = 12;
+pub const EVENT_PY_UNWIND: usize = 13;
+pub const EVENT_PY_THROW: usize = 14;
 pub const EVENT_RERAISE: usize = 15;
-pub const EVENT_STOP_ITERATION: usize = 16;
+// Ancillary events:
+pub const EVENT_C_RETURN: usize = 16;
+pub const EVENT_C_RAISE: usize = 17;
+pub const EVENT_BRANCH: usize = 18;
+/// Number of event indices (`_PY_MONITORING_EVENTS`).
+pub const NUM_EVENTS: usize = 19;
+
+thread_local! {
+    /// `tstate->what_event`: the PEP 669 event whose callbacks are
+    /// currently being dispatched on this thread (`-1` when none).
+    /// `frame.f_lineno = n` consults it — CPython allows the jump from
+    /// LINE/PY_RESUME/JUMP/BRANCH_*/PY_YIELD callbacks and words its
+    /// refusal by the event kind (test_monitoring
+    /// `test_callback_set_frame_lineno`).
+    static WHAT_EVENT: std::cell::Cell<i32> = const { std::cell::Cell::new(-1) };
+}
+
+/// The event being dispatched on this thread, if any.
+pub fn what_event() -> Option<usize> {
+    let e = WHAT_EVENT.with(std::cell::Cell::get);
+    usize::try_from(e).ok()
+}
+
+/// Scoped `tstate->what_event = idx` (restores the previous value on
+/// drop, so a callback that itself triggers events unwinds correctly).
+#[derive(Debug)]
+pub struct WhatEventGuard {
+    prev: i32,
+}
+
+impl WhatEventGuard {
+    pub fn new(event_idx: usize) -> Self {
+        let prev = WHAT_EVENT.with(|c| c.replace(event_idx as i32));
+        Self { prev }
+    }
+}
+
+impl Drop for WhatEventGuard {
+    fn drop(&mut self) {
+        let prev = self.prev;
+        WHAT_EVENT.with(|c| c.set(prev));
+    }
+}
+
+/// Expand the deprecated composite `BRANCH` bit into `BRANCH_LEFT |
+/// BRANCH_RIGHT` (CPython `monitoring_set_events_impl`).
+#[inline]
+pub const fn expand_branch_mask(mask: u32) -> u32 {
+    if mask & event_mask(EVENT_BRANCH) != 0 {
+        (mask & !event_mask(EVENT_BRANCH))
+            | event_mask(EVENT_BRANCH_LEFT)
+            | event_mask(EVENT_BRANCH_RIGHT)
+    } else {
+        mask
+    }
+}
 
 /// Bit mask for the given event index.
 #[inline]
@@ -593,11 +662,13 @@ pub const LOCAL_EVENTS_MASK: u32 = event_mask(EVENT_PY_START)
     | event_mask(EVENT_INSTRUCTION)
     | event_mask(EVENT_JUMP)
     | event_mask(EVENT_BRANCH)
+    | event_mask(EVENT_BRANCH_LEFT)
+    | event_mask(EVENT_BRANCH_RIGHT)
     | event_mask(EVENT_STOP_ITERATION);
 
 /// Every settable event bit. `C_RETURN`/`C_RAISE` are in the word but
 /// `set_events` rejects them (they fire whenever `CALL` is set).
-pub const ALL_EVENTS_MASK: u32 = (1u32 << 17) - 1;
+pub const ALL_EVENTS_MASK: u32 = (1u32 << NUM_EVENTS) - 1;
 
 /// Human-readable PEP 669 event name (for `DISABLE` error messages).
 pub fn monitoring_event_name(event_idx: usize) -> &'static str {
@@ -619,6 +690,8 @@ pub fn monitoring_event_name(event_idx: usize) -> &'static str {
         EVENT_RAISE => "RAISE",
         EVENT_RERAISE => "RERAISE",
         EVENT_STOP_ITERATION => "STOP_ITERATION",
+        EVENT_BRANCH_LEFT => "BRANCH_LEFT",
+        EVENT_BRANCH_RIGHT => "BRANCH_RIGHT",
         _ => "?",
     }
 }

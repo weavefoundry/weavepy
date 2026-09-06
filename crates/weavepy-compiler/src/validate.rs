@@ -188,8 +188,12 @@ impl Validator<'_> {
     /// analysis, but yield/await/named expressions inside it are
     /// compile-time errors (CPython symtable).
     fn visit_annotation(&mut self, ann: &Expr) -> Result<(), CompileError> {
+        // 3.14 (PEP 649): every annotation is its own annotation scope,
+        // so the yield/await/walrus prohibition applies whether or not
+        // PEP 563 is active (symtable `symtable_raise_if_annotation_block`).
+        check_annotation_expr(ann)?;
         if self.future_annotations {
-            check_annotation_expr(ann)
+            Ok(())
         } else {
             self.visit_expr(ann)
         }
@@ -302,15 +306,34 @@ impl Validator<'_> {
     /// Push the implicit PEP 695 scope holding a generic statement's
     /// type parameters (the caller pops it). Returns whether a scope
     /// was pushed.
-    fn push_type_params_scope(&mut self, type_params: &[weavepy_parser::ast::TypeParam]) -> bool {
+    /// CPython `forbidden_name` for PEP 695 type parameters: a parameter
+    /// named `__debug__` is "cannot assign to __debug__" at the parameter
+    /// node (including its `*`/`**` marker).
+    fn check_type_params_forbidden(
+        type_params: &[weavepy_parser::ast::TypeParam],
+    ) -> Result<(), CompileError> {
+        if let Some(tp) = type_params.iter().find(|tp| tp.name == "__debug__") {
+            return Err(CompileError::spanned(
+                "cannot assign to __debug__".to_owned(),
+                tp.span,
+            ));
+        }
+        Ok(())
+    }
+
+    fn push_type_params_scope(
+        &mut self,
+        type_params: &[weavepy_parser::ast::TypeParam],
+    ) -> Result<bool, CompileError> {
+        Self::check_type_params_forbidden(type_params)?;
         if type_params.is_empty() {
-            return false;
+            return Ok(false);
         }
         self.scopes.push(Scope {
             bound: type_params.iter().map(|tp| tp.name.clone()).collect(),
             ..Scope::new(ScopeKind::TypeParams)
         });
-        true
+        Ok(true)
     }
 
     fn visit_stmt(&mut self, stmt: &Stmt) -> Result<(), CompileError> {
@@ -334,7 +357,7 @@ impl Validator<'_> {
                 // The def's name binds in the enclosing scope.
                 let name = name.clone();
                 self.mark_assigned(&name);
-                let pushed = self.push_type_params_scope(type_params);
+                let pushed = self.push_type_params_scope(type_params)?;
                 let result = self.visit_function(args, body, decorator_list, returns.as_deref());
                 if pushed {
                     self.scopes.pop();
@@ -355,7 +378,7 @@ impl Validator<'_> {
                 for d in decorator_list {
                     self.visit_expr(d)?;
                 }
-                let pushed = self.push_type_params_scope(type_params);
+                let pushed = self.push_type_params_scope(type_params)?;
                 let result = (|| -> Result<(), CompileError> {
                     for b in bases {
                         self.visit_expr(b)?;
@@ -681,6 +704,22 @@ impl Validator<'_> {
                 }
             }
             StmtKind::Expr(e) => self.visit_expr(e)?,
+            StmtKind::TypeAlias {
+                name,
+                name_span,
+                type_params,
+                ..
+            } => {
+                // CPython `forbidden_name` at the alias name / type
+                // parameter node (`type __debug__ = int`, `type X[__debug__]`).
+                if name == "__debug__" {
+                    return Err(CompileError::spanned(
+                        "cannot assign to __debug__".to_owned(),
+                        *name_span,
+                    ));
+                }
+                Self::check_type_params_forbidden(type_params)?;
+            }
             _ => {}
         }
         // `from __future__ import …` feature names are checked wherever
@@ -1016,10 +1055,10 @@ impl Validator<'_> {
     }
 }
 
-/// PEP 563: yield / await / named expressions may not appear anywhere
-/// inside an annotation once `from __future__ import annotations` is
-/// active (CPython symtable's `_check_no_deferred_annotation` rules).
-/// Lambdas open a new scope, so their bodies are exempt.
+/// Yield / await / named expressions may not appear anywhere inside an
+/// annotation (CPython symtable's annotation-block rules; since 3.14
+/// every annotation is an annotation scope, so this holds with or
+/// without PEP 563). Lambdas open a new scope, so their bodies are exempt.
 fn check_annotation_expr(expr: &Expr) -> Result<(), CompileError> {
     match &expr.kind {
         ExprKind::Yield(_) | ExprKind::YieldFrom(_) => {
@@ -1034,10 +1073,10 @@ fn check_annotation_expr(expr: &Expr) -> Result<(), CompileError> {
                 expr.span,
             ));
         }
-        ExprKind::NamedExpr { target, .. } => {
+        ExprKind::NamedExpr { .. } => {
             return Err(CompileError::spanned(
                 "named expression cannot be used within an annotation",
-                target.span,
+                expr.span,
             ));
         }
         ExprKind::Lambda { args, .. } => {

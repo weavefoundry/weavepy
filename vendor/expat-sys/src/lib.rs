@@ -172,6 +172,17 @@ extern "C" {
     pub fn XML_GetSpecifiedAttributeCount(parser: XML_Parser) -> c_int;
     pub fn XML_UseForeignDTD(parser: XML_Parser, useDTD: XML_Bool) -> c_int;
     pub fn XML_SetReparseDeferralEnabled(parser: XML_Parser, enabled: XML_Bool) -> XML_Bool;
+    // Billion-laughs protection (Expat >= 2.4.0; needs XML_DTD / XML_GE,
+    // both on in our expat_config.h). Both return XML_FALSE for a non-root
+    // parser (and the amplification setter also for NaN / < 1.0).
+    pub fn XML_SetBillionLaughsAttackProtectionMaximumAmplification(
+        parser: XML_Parser,
+        maximumAmplificationFactor: f32,
+    ) -> XML_Bool;
+    pub fn XML_SetBillionLaughsAttackProtectionActivationThreshold(
+        parser: XML_Parser,
+        activationThresholdBytes: std::os::raw::c_ulonglong,
+    ) -> XML_Bool;
 
     pub fn XML_GetErrorCode(parser: XML_Parser) -> c_int;
     pub fn XML_ErrorString(code: c_int) -> *const XML_LChar;

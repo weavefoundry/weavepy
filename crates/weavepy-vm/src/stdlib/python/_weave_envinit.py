@@ -174,6 +174,21 @@ def _install():
     if supports_bytes_environ:
         _os.getenvb = getenvb
 
+    # 3.14 (gh-120057): `os.reload_environ()` re-reads the process
+    # environment into the shared store (in place, so `environb` follows).
+    _create_environ = getattr(_os, "_create_environ", None)
+    if _create_environ is not None:
+        def reload_environ():
+            fresh = {}
+            for k, v in _create_environ().items():
+                bk = k if isinstance(k, bytes) else k.encode(encoding, "surrogateescape")
+                bv = v if isinstance(v, bytes) else v.encode(encoding, "surrogateescape")
+                fresh[bk] = bv
+            data.clear()
+            data.update(fresh)
+
+        _os.reload_environ = reload_environ
+
 
 # ---------------------------------------------------------------------------
 # os.py-level helpers that CPython layers on top of the POSIX builtin.

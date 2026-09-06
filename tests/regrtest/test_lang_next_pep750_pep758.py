@@ -1,11 +1,11 @@
-"""`-X lang=next` 3.14 language preview (RFC 0076 WS15).
+"""PEP 750 / PEP 758 (RFC 0076 WS15, RFC 0077 WS11).
 
 Covers PEP 750 t-strings (literal syntax, Template/Interpolation
 runtime semantics, `string.templatelib`) and PEP 758 unparenthesized
-`except`/`except*` lists. The literal syntax is only legal under the
-`-X lang=next` gate, so syntax-level cases run in a subprocess with the
-flag; the `string.templatelib` module itself is importable without the
-gate (as on CPython 3.14) and is exercised in-process.
+`except`/`except*` lists. Since RFC 0077 WS11 the 3.14 grammar is on by
+default: `-X lang=next` is accepted as a no-op and `-X lang=3.13` pins
+the previous grammar, so syntax-level cases run in a subprocess (with
+and without the opt-out); `string.templatelib` is exercised in-process.
 """
 
 import subprocess
@@ -17,10 +17,11 @@ from string.templatelib import Interpolation, Template, convert
 
 
 def run_gated(code, *, gate=True):
-    """Run *code* in a fresh interpreter, optionally with -X lang=next."""
+    """Run *code* in a fresh interpreter: with the (no-op) `-X lang=next`,
+    or pinned to the 3.13 grammar via `-X lang=3.13` when *gate* is
+    False."""
     argv = [sys.executable]
-    if gate:
-        argv += ["-X", "lang=next"]
+    argv += ["-X", "lang=next" if gate else "lang=3.13"]
     argv += ["-c", textwrap.dedent(code)]
     return subprocess.run(argv, capture_output=True, text=True)
 
@@ -210,10 +211,17 @@ class TStringSyntaxTests(unittest.TestCase):
                     raise AssertionError(f'{src!r} should not compile')
         """)
 
-    def test_rejected_without_gate(self):
+    def test_rejected_under_313_grammar(self):
         proc = run_gated("t'{1}'", gate=False)
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("SyntaxError", proc.stderr)
+
+    def test_default_grammar_accepts(self):
+        proc = subprocess.run(
+            [sys.executable, "-c", "print(type(t'{1}').__name__)"],
+            capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "Template")
 
 
 class Pep758Tests(unittest.TestCase):
@@ -275,12 +283,19 @@ class Pep758Tests(unittest.TestCase):
             exec(compile(src, '<t>', 'exec'))
         """)
 
-    def test_rejected_without_gate(self):
+    def test_rejected_under_313_grammar(self):
         proc = run_gated(
             "compile('try:\\n pass\\nexcept A, B:\\n pass\\n', '<t>', 'exec')",
             gate=False)
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("must be parenthesized", proc.stderr)
+
+    def test_default_grammar_accepts(self):
+        proc = subprocess.run(
+            [sys.executable, "-c",
+             "compile('try:\\n pass\\nexcept A, B:\\n pass\\n', '<t>', 'exec')"],
+            capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
 
 
 class XOptionSurfaceTests(unittest.TestCase):

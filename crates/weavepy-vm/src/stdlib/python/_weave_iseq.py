@@ -158,7 +158,7 @@ def optimize_cfg(seq, consts, nlocals):
     if not isinstance(seq, InstructionSequence):
         raise ValueError("expected an instruction sequence")
     if not isinstance(consts, list):
-        raise TypeError("expected a list of constants")
+        raise TypeError("consts must be a list")
     seq._apply_label_map()
     rows = [
         (op, arg, (line, end_line, col, end_col))
@@ -185,9 +185,13 @@ def compiler_codegen(ast_obj, filename, optimize, compile_mode=0):
 
 
 def _index_map(mapping):
-    """Invert a bytecode_helper-style ``{value: index}`` dict to a tuple."""
+    """Invert a bytecode_helper-style ``{value: index}`` dict to a tuple.
+    A list (the shape ``compiler_codegen`` reports for ``consts`` in 3.14)
+    is already in index order."""
     if not mapping:
         return ()
+    if isinstance(mapping, (list, tuple)):
+        return tuple(mapping)
     out = [None] * (max(mapping.values()) + 1)
     for value, index in mapping.items():
         out[index] = value

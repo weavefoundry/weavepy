@@ -23,37 +23,56 @@ pub enum LexError {
     // PEP 701 f-string diagnostics. CPython distinguishes an unterminated
     // f-string *literal* from an unterminated *replacement field* and uses
     // f-string-specific wording, which several `test_fstring` negative
-    // cases assert on verbatim.
-    #[error("unterminated f-string literal")]
-    UnterminatedFstring { pos: u32 },
-    #[error("unterminated triple-quoted f-string literal")]
-    UnterminatedTripleFstring { pos: u32 },
-    #[error("f-string: expecting '}}'")]
+    // cases assert on verbatim. `kind` is the literal's prefix letter
+    // (`f` or `t`), `detected_line` the line the tokenizer was on when
+    // it gave up (CPython's `tok->lineno`).
+    #[error("unterminated {kind}-string literal (detected at line {detected_line})")]
+    UnterminatedFstring {
+        pos: u32,
+        kind: char,
+        detected_line: u32,
+    },
+    #[error("unterminated triple-quoted {kind}-string literal (detected at line {detected_line})")]
+    UnterminatedTripleFstring {
+        pos: u32,
+        kind: char,
+        detected_line: u32,
+    },
+    #[error("{kind}-string: expecting '}}'")]
     FstringExpectingBrace {
         pos: u32,
+        /// `'f'` or `'t'`: the innermost enclosing string's kind.
+        kind: char,
         /// Byte offset just past the unterminated field's `{`, so the
         /// parser can attempt a partial parse of the field expression
         /// (CPython's pegen surfaces *inner* errors over the missing
         /// brace).
         field_start: u32,
     },
-    #[error("f-string: expecting '}}', or format specs")]
+    #[error("{kind}-string: expecting '}}', or format specs")]
     FstringExpectingBraceOrSpec {
         pos: u32,
+        kind: char,
         /// Byte offset just past the unterminated field's `{` (see
         /// [`LexError::FstringExpectingBrace::field_start`]).
         field_start: u32,
     },
     /// A format spec opened a replacement field at nesting depth > 2
     /// (CPython's tokenizer allows only two levels of spec nesting).
-    #[error("f-string: expressions nested too deeply")]
-    FstringNestedTooDeeply { pos: u32 },
+    #[error("{kind}-string: expressions nested too deeply")]
+    FstringNestedTooDeeply { pos: u32, kind: char },
     /// More than 150 lexically nested f-strings (CPython's
     /// `MAXFSTRINGLEVEL`). `field_start` is the outermost replacement
     /// field's start so the parser can prefer an error pegen would have
     /// reported from the tokens already seen.
-    #[error("too many nested f-strings")]
-    FstringTooManyNested { pos: u32, field_start: u32 },
+    #[error("too many nested f-strings or t-strings")]
+    FstringTooManyNested {
+        pos: u32,
+        field_start: u32,
+        /// Kind (`'f'`/`'t'`) of the outermost string, whose field
+        /// `field_start` opens.
+        kind: char,
+    },
     /// `\N` not followed by a complete `{NAME}` group in an f-string
     /// literal part. CPython detects this in the tokenizer (names are
     /// parsed differently inside f-strings), so it wins over an
@@ -68,13 +87,17 @@ pub enum LexError {
     },
     #[error("closing parenthesis '{close}' does not match opening parenthesis '{open}'")]
     FstringParenMismatch { close: char, open: char, pos: u32 },
-    #[error("f-string: unmatched '{close}'")]
-    FstringUnmatchedParen { close: char, pos: u32 },
+    #[error("{kind}-string: unmatched '{close}'")]
+    FstringUnmatchedParen { close: char, pos: u32, kind: char },
     #[error("'{open}' was never closed")]
     BracketNeverClosed { open: char, pos: u32 },
     /// A closer with no bracket open at all (`)1 + 2`).
     #[error("unmatched '{close}'")]
     UnmatchedClose { close: char, pos: u32 },
+    /// More than `MAXLEVEL` (200) brackets open at once
+    /// (`Parser/lexer/state.h`), anchored at the offending opener.
+    #[error("too many nested parentheses")]
+    TooManyNestedParens { pos: u32 },
     /// A closer that doesn't pair with the innermost opener. CPython
     /// appends " on line N" when the opener sits on an earlier line.
     #[error("closing parenthesis '{close}' does not match opening parenthesis '{open}'{suffix}", suffix = open_line.map(|l| format!(" on line {l}")).unwrap_or_default())]
@@ -85,8 +108,8 @@ pub enum LexError {
         open_line: Option<u32>,
         pos: u32,
     },
-    #[error("f-string: newlines are not allowed in format specifiers for single quoted f-strings")]
-    FstringNewlineInSpec { pos: u32 },
+    #[error("{kind}-string: newlines are not allowed in format specifiers for single quoted {kind}-strings")]
+    FstringNewlineInSpec { pos: u32, kind: char },
     // CPython renders this as `invalid character '€' (U+20AC)` — the
     // glyph in quotes followed by the code point. The byte position is
     // carried separately (see [`LexError::byte_offset`]) and surfaces as
@@ -125,6 +148,18 @@ pub enum LexError {
     InvalidNumber { pos: u32, message: String },
     #[error("invalid string prefix {prefix:?} at byte {pos}")]
     InvalidStringPrefix { pos: u32, prefix: String },
+    /// A quote-adjacent run of prefix letters (each of `b`/`r`/`u`/`f`/`t`
+    /// at most once) combining two markers CPython's tokenizer rejects
+    /// (`ub`, `ur`, `uf`, `ut`, `bf`, `bt`, `ft`, in any order/case).
+    /// 3.14 `maybe_raise_syntax_error_for_string_prefixes`; the error
+    /// spans the prefix letters (`pos..end`).
+    #[error("'{first}' and '{second}' prefixes are incompatible")]
+    IncompatibleStringPrefixes {
+        pos: u32,
+        end: u32,
+        first: char,
+        second: char,
+    },
     #[error("unexpected character after line continuation character")]
     StrayBackslash { pos: u32 },
     #[error("unexpected EOF at byte {pos}: {message}")]
@@ -140,19 +175,20 @@ impl LexError {
             | LexError::UnterminatedStringEscapedQuote { pos, .. }
             | LexError::UnterminatedTripleString { pos, .. }
             | LexError::UnexpectedEofParsing { pos, .. }
-            | LexError::UnterminatedFstring { pos }
-            | LexError::UnterminatedTripleFstring { pos }
+            | LexError::UnterminatedFstring { pos, .. }
+            | LexError::UnterminatedTripleFstring { pos, .. }
             | LexError::FstringExpectingBrace { pos, .. }
             | LexError::FstringExpectingBraceOrSpec { pos, .. }
-            | LexError::FstringNestedTooDeeply { pos }
+            | LexError::FstringNestedTooDeeply { pos, .. }
             | LexError::FstringTooManyNested { pos, .. }
             | LexError::FstringMalformedNamedEscape { pos, .. }
             | LexError::FstringParenMismatch { pos, .. }
             | LexError::FstringUnmatchedParen { pos, .. }
             | LexError::BracketNeverClosed { pos, .. }
             | LexError::UnmatchedClose { pos, .. }
+            | LexError::TooManyNestedParens { pos }
             | LexError::MismatchedClose { pos, .. }
-            | LexError::FstringNewlineInSpec { pos }
+            | LexError::FstringNewlineInSpec { pos, .. }
             | LexError::InvalidChar { pos, .. }
             | LexError::InvalidNonPrintable { pos, .. }
             | LexError::InvalidToken { pos }
@@ -162,8 +198,19 @@ impl LexError {
             | LexError::UnexpectedIndent { pos }
             | LexError::InvalidNumber { pos, .. }
             | LexError::InvalidStringPrefix { pos, .. }
+            | LexError::IncompatibleStringPrefixes { pos, .. }
             | LexError::StrayBackslash { pos }
             | LexError::UnexpectedEof { pos, .. } => *pos,
+        }
+    }
+
+    /// Byte offset one past the end of the offending region, for the
+    /// errors CPython's tokenizer raises with a known range; the
+    /// detection offset otherwise (a point span).
+    pub fn byte_end_offset(&self) -> u32 {
+        match self {
+            LexError::IncompatibleStringPrefixes { end, .. } => *end,
+            _ => self.byte_offset(),
         }
     }
 }

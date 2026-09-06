@@ -45,6 +45,7 @@ pub mod hot_gates;
 pub mod import;
 pub mod import_time;
 pub mod linejump;
+pub mod malloc_stats;
 pub mod object;
 pub mod proc_init;
 pub mod py_errno;
@@ -348,6 +349,22 @@ fn generator_frame_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
             if let Ok(v) = c.try_borrow() {
                 visit(&v);
             }
+        }
+        // `f_globals` is a real edge (CPython's `frame_traverse` visits
+        // it): a generator parked in an `exec()` namespace that also names
+        // the generator is a dict -> generator -> frame -> dict cycle, and
+        // the collector must see the back-edge to reclaim (and close) it
+        // (test_generators.test_generator_resurrect).
+        visit(&Object::Dict(frame.globals.clone()));
+        // The frame-stack shell and the Python-visible snapshot each hold
+        // their own strong handle on the same globals dict; the collector
+        // seeds reachability from refcounts, so every handle must be
+        // accounted for or the dict looks externally referenced.
+        if let Some(shell) = &frame.shell_cache {
+            visit(&Object::Dict(shell.globals.clone()));
+        }
+        if let Some(py) = &frame.py_frame {
+            visit(&Object::Dict(py.globals.clone()));
         }
         // The cached Python-visible frame snapshot shares the locals
         // storage visited above (no separate mirror copies), but its
@@ -1067,6 +1084,7 @@ impl Default for Interpreter {
         // flag is process-global, and in-process harnesses run many
         // interpreters back to back.
         crate::vm_singletons::set_finalizing(false);
+        crate::vm_singletons::set_modules_torn_down(false);
         interp
     }
 }
@@ -1089,7 +1107,7 @@ impl Interpreter {
     /// Python-level `sys.stdout`/`sys.stderr` `flush()` (handles a
     /// reassigned, user-buffered stream), then flush the host sink.
     /// Returns `false` when flushing `sys.stdout` failed — CPython's
-    /// `Py_FinalizeEx` reports that with "Exception ignored on flushing
+    /// `Py_FinalizeEx` reports that with "Exception ignored while flushing
     /// sys.stdout" on stderr and the process exits with status 120
     /// (`test_cmd_line.test_stdout_flush_at_shutdown`).
     pub fn flush_streams(&mut self) -> bool {
@@ -1112,7 +1130,7 @@ impl Interpreter {
                     {
                         if name == "stdout" {
                             eprintln!(
-                                "Exception ignored on flushing sys.stdout:\n{}: {}",
+                                "Exception ignored while flushing sys.stdout:\n{}: {}",
                                 exc.type_name(),
                                 exc.message()
                             );
@@ -1513,6 +1531,25 @@ impl Interpreter {
                 // Mirror into the Rust-side cache the native `io.open` /
                 // `io.text_encoding` text paths consult (PEP 597).
                 crate::vm_singletons::set_warn_default_encoding(warn_default_encoding);
+                // 3.14's two context flags (`-X thread_inherit_context` /
+                // `-X context_aware_warnings`, plus their `PYTHON_*` env
+                // twins). GIL builds default both off; `threading.Thread`
+                // and `_py_warnings` read them off `sys.flags`.
+                for (name, env) in [
+                    ("thread_inherit_context", "PYTHON_THREAD_INHERIT_CONTEXT"),
+                    ("context_aware_warnings", "PYTHON_CONTEXT_AWARE_WARNINGS"),
+                ] {
+                    let from_x = flags.xoptions.iter().rev().find_map(|x| {
+                        let (k, v) = x.split_once('=').unwrap_or((x.as_str(), "1"));
+                        (k == name).then(|| i64::from(v != "0"))
+                    });
+                    let from_env = (!flags.ignore_environment)
+                        .then(|| std::env::var(env).ok())
+                        .flatten()
+                        .filter(|v| !v.is_empty())
+                        .map(|v| i64::from(v != "0"));
+                    set(&mut fld, name, from_x.or(from_env).unwrap_or(0));
+                }
             }
             d.insert(
                 crate::object::DictKey(Object::from_static("dont_write_bytecode")),
@@ -1609,7 +1646,19 @@ impl Interpreter {
         // ignored: …") before any user code runs. Best-effort, like
         // CPython's `_PyWarnings_Init` failure handling.
         if !flags.warning_filters.is_empty() {
+            // The `_warnings` builtin constructs its `_warnings_context`
+            // ContextVar through the interpreter (a Python `contextvars`
+            // object), so the pointer must be published for this import
+            // like it is for the codec lookup above.
+            let guard = if crate::vm_singletons::current_interpreter_ptr().is_none() {
+                Some(crate::vm_singletons::publish_interpreter_ptr(
+                    std::ptr::from_mut::<Self>(self),
+                ))
+            } else {
+                None
+            };
             let _ = self.import_path("warnings");
+            drop(guard);
         }
     }
 
@@ -2840,47 +2889,67 @@ impl Interpreter {
             return;
         }
         let _ = retval;
-        for i in 0..nlocals {
-            // Cheap pre-filter: a local holding the *last* program reference
-            // has `strong_count == locals-slot (1) + GC handle (<=1)`, plus
-            // any weakref slots' strong clones (which the cascade discounts,
-            // so an object reachable *only* through `weakref.ref(obj)` is
-            // still dead). Anything larger means the value escaped (it was
-            // returned, stored on an instance, captured by a closure, …), so
-            // leave it alone without paying for the full refcount/weakref
-            // test or a cascade. Keeps the hot return path of scalar-only
-            // frames free.
-            //
-            // A *closure function* local is reaped here too: it is GC-tracked
-            // (`MakeFunction`), so merely dropping the frame's `Rc` leaves it
-            // pinned by its own GC handle — and still holding its captured
-            // cells — until the next cyclic collection. Routing a
-            // uniquely-held (non-escaped) function through the cascade
-            // untracks and frees it now, releasing its share of this frame's
-            // cells so the cellvar sweep below can reclaim a captured-but-
-            // unescaped finalizable (`test_tempfile.test_writelines_rollover`).
-            //
-            // The locals borrow is released before the cascade runs: the
-            // cascade can execute arbitrary `__del__` code, which may
-            // re-enter this very frame's shared locals storage (e.g. via a
-            // traceback's `f_locals`).
-            let v = {
-                let mut locals = frame.locals.borrow_mut();
+        // Pass 1: move every candidate local out of its slot. A *closure
+        // function* local is a candidate too: it is GC-tracked
+        // (`MakeFunction`), so merely dropping the frame's `Rc` leaves it
+        // pinned by its own GC handle — and still holding its captured
+        // cells — until the next cyclic collection. Routing a
+        // uniquely-held (non-escaped) function through the cascade
+        // untracks and frees it now, releasing its share of this frame's
+        // cells so the cellvar sweep below can reclaim a captured-but-
+        // unescaped finalizable (`test_tempfile.test_writelines_rollover`).
+        //
+        // Two slots naming the *same* object (`x = C(); for y in [x]: …`,
+        // or test_interpreters' `second = create(); for interp in
+        // list_all(): …`) each see the other's reference and would both
+        // fail the escaped-value pre-filter below, so the object would
+        // fall to the plain `Rc` drop — whose `Drop` net queues `__del__`
+        // *after* the weakrefs have been cleared (CPython's
+        // `subtype_dealloc` finalizes first). Dedupe by identity here so
+        // the frame contributes exactly one reference per object.
+        //
+        // The locals borrow is released before any cascade runs: the
+        // cascade can execute arbitrary `__del__` code, which may
+        // re-enter this very frame's shared locals storage (e.g. via a
+        // traceback's `f_locals`).
+        let mut candidates: Vec<Object> = Vec::new();
+        {
+            let mut locals = frame.locals.borrow_mut();
+            for i in 0..nlocals {
                 let needs = Self::local_needs_prompt_reap(&locals[i])
                     || matches!(locals[i], Object::Function(_));
-                if needs && Self::looks_reapable_temporary(&locals[i]) {
-                    Some(std::mem::replace(&mut locals[i], Object::Unbound))
-                } else {
+                if !needs {
                     // RFC 0077 (WS2): `RETURN_VALUE` is exempt from the
                     // eval loop's coarse stack-shrink mark; the frame's
                     // slots are the references it actually releases, so
                     // grade each one here (no-op for scalar locals).
                     gc_trace::note_dropped(&locals[i]);
-                    None
+                    continue;
                 }
-            };
-            if let Some(v) = v {
+                let v = std::mem::replace(&mut locals[i], Object::Unbound);
+                if candidates.iter().any(|c| c.is_same(&v)) {
+                    // Duplicate slot: releasing this clone is the frame
+                    // letting go of its second reference.
+                    drop(v);
+                } else {
+                    candidates.push(v);
+                }
+            }
+        }
+        // Pass 2: cheap pre-filter, then cascade. A candidate holding the
+        // *last* program reference has `strong_count == our clone (1) + GC
+        // handle (<=1)`, plus any weakref slots' strong clones (which the
+        // cascade discounts, so an object reachable *only* through
+        // `weakref.ref(obj)` is still dead). Anything larger means the
+        // value escaped (it was returned, stored on an instance, captured
+        // by a closure, …), so leave it alone without paying for the full
+        // refcount/weakref test or a cascade. Keeps the hot return path of
+        // scalar-only frames free.
+        for v in candidates {
+            if Self::looks_reapable_temporary(&v) {
                 self.prompt_reap_dropped(v);
+            } else {
+                gc_trace::note_dropped(&v);
             }
         }
         // A value captured by a nested closure does not live in a fast local
@@ -2933,26 +3002,29 @@ impl Interpreter {
     /// [`Self::reap_frame_locals_on_exit`] for the suspended-frame world.
     fn reap_dead_frame(&mut self, frame: &mut Frame) {
         let mut reap: Vec<Object> = Vec::new();
-        {
-            let mut locals = frame.locals.borrow_mut();
-            for slot in locals.iter_mut() {
-                if Self::local_needs_prompt_reap(slot)
-                    || crate::weakref_registry::count_for(crate::weakref_registry::id_of(slot)) > 0
-                {
-                    reap.push(std::mem::replace(slot, Object::Unbound));
-                } else {
-                    gc_trace::note_dropped(slot);
-                }
-            }
-        }
-        for slot in &mut frame.stack {
+        // Same-object slots collapse to one entry (see
+        // `reap_frame_locals_on_exit`): the deadness test must see the
+        // frame as a single reference.
+        let take = |slot: &mut Object, reap: &mut Vec<Object>| {
             if Self::local_needs_prompt_reap(slot)
                 || crate::weakref_registry::count_for(crate::weakref_registry::id_of(slot)) > 0
             {
-                reap.push(std::mem::replace(slot, Object::Unbound));
+                let v = std::mem::replace(slot, Object::Unbound);
+                if !reap.iter().any(|c| c.is_same(&v)) {
+                    reap.push(v);
+                }
             } else {
                 gc_trace::note_dropped(slot);
             }
+        };
+        {
+            let mut locals = frame.locals.borrow_mut();
+            for slot in locals.iter_mut() {
+                take(slot, &mut reap);
+            }
+        }
+        for slot in &mut frame.stack {
+            take(slot, &mut reap);
         }
         for v in reap {
             self.prompt_reap_dropped(v);
@@ -3657,8 +3729,7 @@ impl Interpreter {
             for (cb, wr) in callbacks {
                 let globals = self.builtins.clone();
                 if let Err(err) = self.call(&cb, std::slice::from_ref(&wr), &[], &globals) {
-                    let context_repr = wr.repr();
-                    self.write_unraisable(&err, &wr, &context_repr);
+                    self.write_unraisable_fmt(&err, "calling weakref callback", &cb);
                 }
             }
         }
@@ -3794,6 +3865,22 @@ impl Interpreter {
         // special-casing) so the explicit `atexit._run_exitfuncs()` path
         // and real shutdown behave identically.
         crate::stdlib::atexit_mod::run_exit_handlers(self);
+        // (3) `finalize_subinterpreters()` — any sub-interpreter still
+        // alive here draws a RuntimeWarning ("remaining subinterpreters;
+        // close them with Interpreter.close()", GH-135729) and is torn
+        // down. Only the main interpreter (which owns the registry) does
+        // this; a sub-interpreter finalizing itself has nothing to sweep.
+        if !crate::stdlib::interpreters_mod::in_subinterpreter() {
+            let remaining = crate::stdlib::interpreters_mod::live_sub_ids();
+            if !remaining.is_empty() {
+                let _ = self.emit_runtime_warning(
+                    "remaining subinterpreters; close them with Interpreter.close()".to_owned(),
+                );
+                for id in remaining {
+                    let _ = crate::stdlib::interpreters_mod::destroy_registered(id);
+                }
+            }
+        }
     }
 
     /// Run finalizers (`__del__`) for every object still alive at
@@ -3814,7 +3901,13 @@ impl Interpreter {
         // working. `__del__`-time code observes this through failing
         // `import` and `sys.is_finalizing()`.
         crate::vm_singletons::set_finalizing(true);
+        // Cyclic garbage first — CPython's `_PyGC_CollectNoFail` after
+        // the daemon threads are stopped, with the import system intact.
         self.run_pending_finalizers();
+        // Everything from here is `finalize_modules`: module globals are
+        // torn down with `sys.modules` already emptied, so a `__del__`
+        // running now can't `import` (see `OpCode::ImportName`).
+        crate::vm_singletons::set_modules_torn_down(true);
         // Objects hung on the `sys` module (`sys.x = C()`) are torn down
         // *last* in CPython's `finalize_modules` — after the std streams
         // are gone — so their `__del__` errors report nowhere
@@ -3918,19 +4011,13 @@ impl Interpreter {
             let globals = self.builtins.clone();
             match self.call(&hook, &[obj.clone()], &[], &globals) {
                 Ok(_) => warned = true,
-                Err(err) => {
-                    let outer = Rc::new(RefCell::new(DictData::default()));
-                    let context_repr = self.repr_of(obj, &outer).unwrap_or_else(|_| obj.repr());
-                    self.write_unraisable(&err, obj, &context_repr);
-                }
+                Err(err) => self.write_unraisable_fmt(&err, "finalizing coroutine", obj),
             }
         }
         if !warned {
             let message = format!("coroutine '{qualname}' was never awaited");
             if let Err(err) = self.emit_runtime_warning(message) {
-                let outer = Rc::new(RefCell::new(DictData::default()));
-                let context_repr = self.repr_of(obj, &outer).unwrap_or_else(|_| obj.repr());
-                self.write_unraisable(&err, obj, &context_repr);
+                self.write_unraisable_fmt(&err, "finalizing coroutine", obj);
             }
         }
     }
@@ -3965,9 +4052,7 @@ impl Interpreter {
             if !matches!(finalizer, Object::None) && !g.is_finished() {
                 let globals = self.builtins.clone();
                 if let Err(err) = self.call(&finalizer, &[obj.clone()], &[], &globals) {
-                    let outer = Rc::new(RefCell::new(DictData::default()));
-                    let context_repr = self.repr_of(obj, &outer).unwrap_or_else(|_| obj.repr());
-                    self.write_unraisable(&err, obj, &context_repr);
+                    self.write_unraisable_fmt(&err, "finalizing generator", obj);
                 }
                 return;
             }
@@ -3981,9 +4066,7 @@ impl Interpreter {
             Object::Generator(_) | Object::Coroutine(_) | Object::AsyncGenerator(_)
         ) {
             if let Err(err) = self.gen_method_close(obj) {
-                let outer = Rc::new(RefCell::new(DictData::default()));
-                let context_repr = self.repr_of(obj, &outer).unwrap_or_else(|_| obj.repr());
-                self.write_unraisable(&err, obj, &context_repr);
+                self.write_unraisable_fmt(&err, "closing generator", obj);
             }
             return;
         }
@@ -3997,19 +4080,15 @@ impl Interpreter {
         let Some(del) = inst.cls().lookup("__del__") else {
             return;
         };
-        let class_name = inst.cls().name.clone();
         let bound = Object::BoundMethod(Rc::new(BoundMethod::new(obj.clone(), del.clone())));
         let kwargs: Vec<(String, Object)> = Vec::new();
         let outer = Rc::new(RefCell::new(DictData::default()));
         if let Err(err) = self.call(&bound, &[], &kwargs, &outer) {
-            // CPython's `slot_tp_finalize` reports the *looked-up*
-            // `__del__` (the plain function) as the hook's `object`
-            // (`cm.unraisable.object == C.__del__` holds); the printed
-            // context still mirrors the bound-method repr so the
-            // default hook emits `… <bound method C.__del__ of …>`.
-            let receiver_repr = self.repr_of(obj, &outer).unwrap_or_else(|_| obj.repr());
-            let context_repr = format!("<bound method {class_name}.__del__ of {receiver_repr}>");
-            self.write_unraisable(&err, &del, &context_repr);
+            // CPython's `slot_tp_finalize` (3.13+) reports
+            // `Exception ignored while calling deallocator <function
+            // C.__del__ …>` -- the looked-up plain function's repr, with
+            // a `None` hook object (test_generators' Leaker doctest).
+            self.write_unraisable_fmt(&err, "calling deallocator", &del);
         }
     }
 
@@ -4022,6 +4101,17 @@ impl Interpreter {
     /// stderr and swallows the error so it can't change the exit status.
     fn write_unraisable(&mut self, err: &RuntimeError, object: &Object, context_repr: &str) {
         self.write_unraisable_msg(err, object, context_repr, None);
+    }
+
+    /// CPython 3.13+'s `PyErr_FormatUnraisable("Exception ignored while
+    /// <verb> %R", obj)`: the message embeds the object's repr and the
+    /// hook's `object` is `None` (`cm.unraisable.err_msg` is what the
+    /// 3.14 tests assert on).
+    fn write_unraisable_fmt(&mut self, err: &RuntimeError, verb: &str, obj: &Object) {
+        let outer = Rc::new(RefCell::new(DictData::default()));
+        let repr = self.repr_of(obj, &outer).unwrap_or_else(|_| obj.repr());
+        let msg = format!("Exception ignored while {verb} {repr}");
+        self.write_unraisable_msg(err, &Object::None, &msg, Some(&msg));
     }
 
     /// Like [`Self::write_unraisable`] but with an explicit `err_msg`
@@ -4484,6 +4574,18 @@ impl Interpreter {
         package: Option<&str>,
     ) -> Rc<RefCell<DictData>> {
         self.build_module_globals(name, file, package)
+    }
+
+    /// Register `globals` as this interpreter's `__main__` module in
+    /// `sys.modules` (a sub-interpreter's `add_main_module`; the main
+    /// interpreter does this inside `run_module_as`).
+    pub fn install_main_module(&mut self, globals: &Rc<RefCell<DictData>>) {
+        let module = Rc::new(PyModule {
+            name: "__main__".to_owned(),
+            filename: None,
+            dict: globals.clone(),
+        });
+        self.cache.insert("__main__", Object::Module(module));
     }
 
     /// Populate a fresh module-globals dict with builtins, builtin
@@ -4978,6 +5080,30 @@ impl Interpreter {
             } else {
                 crate::trace::EVENT_PY_START
             };
+            // CPython fires `call`/PY_START from the `RESUME` instruction,
+            // *after* the frame prologue (`MAKE_CELL`, `COPY_FREE_VARS`,
+            // a generator's `RETURN_GENERATOR; POP_TOP`) has run, so the
+            // event sees `f_lasti` at the RESUME and `f_lineno` as its
+            // line (a closure's `COPY_FREE_VARS` carries no location:
+            // test_sys_settrace expects `(0, 'call')`, not `None`).
+            if !is_gen_resume || gen_first_resume {
+                let mut pc = frame.pc as usize;
+                while let Some(ins) = frame.code.instructions.get(pc) {
+                    match ins.op {
+                        OpCode::MakeCell
+                        | OpCode::CopyFreeVars
+                        | OpCode::ReturnGenerator
+                        | OpCode::PopTop => pc += 1,
+                        _ => break,
+                    }
+                }
+                if matches!(
+                    frame.code.instructions.get(pc).map(|i| i.op),
+                    Some(OpCode::Resume)
+                ) {
+                    py_frame.lasti.set(pc as u32);
+                }
+            }
             self.fire_call_event(&py_frame, mon_event, Object::None)?;
             // On a resume, line tracing must continue from the line
             // where the frame suspended — CPython reports the `call`
@@ -5666,18 +5792,70 @@ impl Interpreter {
                     // instruction resolves, with `(code, source_offset,
                     // dest_offset)`. `frame.pc` already points at the
                     // resolved destination (fall-through or target).
-                    let bj_mask = crate::trace::event_mask(crate::trace::EVENT_BRANCH)
+                    let bj_mask = crate::trace::event_mask(crate::trace::EVENT_BRANCH_LEFT)
+                        | crate::trace::event_mask(crate::trace::EVENT_BRANCH_RIGHT)
                         | crate::trace::event_mask(crate::trace::EVENT_JUMP);
                     if instruction_ran && obs.mon_mask & bj_mask != 0 && !is_gen_bootstrap {
                         let op = frame.code.instructions.get(cur_pc).map(|i| i.op);
+                        // 3.14 split BRANCH: the taken side of a
+                        // conditional jump and loop exhaustion fire
+                        // BRANCH_RIGHT; the fall-through (at NOT_TAKEN)
+                        // and a continuing FOR_ITER fire BRANCH_LEFT.
+                        let taken = frame.pc as usize != cur_pc + 1;
+                        // The 3.14 `async for` pseudo-branch: the source
+                        // is the `END_SEND` the loop body falls out of.
+                        // `END_SEND; NOT_TAKEN` (one more item) is
+                        // BRANCH_LEFT from it; `END_ASYNC_FOR oparg`
+                        // (StopAsyncIteration caught) is BRANCH_RIGHT
+                        // from `next_instr - oparg`, that same END_SEND
+                        // (`_MONITOR_END_ASYNC_FOR`).
+                        let mut src_pc = cur_pc;
                         let ev = match op {
+                            Some(OpCode::EndSend)
+                                if matches!(
+                                    frame.code.instructions.get(cur_pc + 1).map(|i| i.op),
+                                    Some(OpCode::NotTaken)
+                                ) =>
+                            {
+                                Some(crate::trace::EVENT_BRANCH_LEFT)
+                            }
+                            Some(OpCode::EndAsyncFor) => {
+                                // The internal arg carries nothing (the
+                                // wire oparg is resolved at encode time
+                                // from the END_SEND position), so recover
+                                // the END_SEND the same way: the first
+                                // SEND inside the exception range this
+                                // instruction handles, at its target.
+                                let code = &frame.code;
+                                let n = code.instructions.len();
+                                let send = code
+                                    .exception_table
+                                    .iter()
+                                    .filter(|h| h.handler as usize == cur_pc)
+                                    .find_map(|h| {
+                                        (h.start as usize..(h.end as usize).min(n))
+                                            .find(|&k| code.instructions[k].op == OpCode::Send)
+                                    });
+                                if let Some(send) = send {
+                                    src_pc = send + 1 + code.instructions[send].arg as usize;
+                                }
+                                Some(crate::trace::EVENT_BRANCH_RIGHT)
+                            }
                             Some(
                                 OpCode::PopJumpIfFalse
                                 | OpCode::PopJumpIfTrue
                                 | OpCode::PopJumpIfNone
-                                | OpCode::PopJumpIfNotNone
-                                | OpCode::ForIter,
-                            ) => Some(crate::trace::EVENT_BRANCH),
+                                | OpCode::PopJumpIfNotNone,
+                            ) => Some(if taken {
+                                crate::trace::EVENT_BRANCH_RIGHT
+                            } else {
+                                crate::trace::EVENT_BRANCH_LEFT
+                            }),
+                            Some(OpCode::ForIter) => Some(if taken {
+                                crate::trace::EVENT_BRANCH_RIGHT
+                            } else {
+                                crate::trace::EVENT_BRANCH_LEFT
+                            }),
                             // CPython instruments every wire JUMP_FORWARD
                             // (RFC 0068 WS1 gives exact wire parity, so
                             // WeavePy's forward jumps map 1:1) but has no
@@ -5695,10 +5873,9 @@ impl Interpreter {
                         };
                         if let Some(ev) = ev {
                             let mut dest = frame.pc as usize;
-                            // FOR_ITER exhaustion: CPython reports the
-                            // instruction *past* END_FOR/POP_TOP as the
-                            // branch destination (the exhaust path jumps
-                            // over them).
+                            // FOR_ITER exhaustion: CPython's POP_ITER
+                            // reports the instruction *past* itself
+                            // (END_FOR; POP_ITER) as the destination.
                             if matches!(op, Some(OpCode::ForIter))
                                 && matches!(
                                     frame.code.instructions.get(dest).map(|i| i.op),
@@ -5706,13 +5883,42 @@ impl Interpreter {
                                 )
                             {
                                 dest += 1;
+                                if matches!(
+                                    frame.code.instructions.get(dest).map(|i| i.op),
+                                    Some(OpCode::PopIter | OpCode::PopTop)
+                                ) {
+                                    dest += 1;
+                                }
+                            }
+                            // Fall-through of a conditional jump: the
+                            // NOT_TAKEN unit reports the instruction
+                            // after itself.
+                            if ev == crate::trace::EVENT_BRANCH_LEFT
+                                && matches!(
+                                    frame.code.instructions.get(dest).map(|i| i.op),
+                                    Some(OpCode::NotTaken)
+                                )
+                            {
+                                dest += 1;
                             }
                             self.fire_branch_jump_event(
                                 &frame.code,
                                 ev,
-                                cur_pc as u32,
+                                src_pc as u32,
                                 dest as u32,
                             )?;
+                            // A BRANCH/JUMP callback may set `f_lineno`
+                            // (CPython `_Py_call_instrumentation_jump`:
+                            // "the callback has caused a jump" — execution
+                            // resumes at the new `instr_ptr` instead of
+                            // the resolved destination).
+                            if let Some(py_frame) = py_frame_slot.as_ref() {
+                                if py_frame.pending_jump.get().is_some() {
+                                    let py_frame = py_frame.clone();
+                                    self.apply_pending_jump(frame, &py_frame);
+                                    prev_pc = Some(frame.pc as usize);
+                                }
+                            }
                         }
                     }
                 }
@@ -5728,10 +5934,16 @@ impl Interpreter {
                         let py_frame = self.ensure_top_py_frame(&mut py_frame_slot);
                         self.fire_yield_event(&py_frame, &v)?;
                         // A jump set from the yield's 'return' trace event
-                        // (CPython allows these) lands on the suspended
-                        // frame, taking effect if/when it resumes.
+                        // *abandons the yield*: CPython's
+                        // `INSTRUMENTED_YIELD_VALUE` sees `frame->instr_ptr
+                        // != this_instr` after the callback and dispatches
+                        // to the new location instead of suspending
+                        // (test_sys_settrace `test_jump_from_yield`: the
+                        // body runs again inside the same `next()`).
                         if py_frame.pending_jump.get().is_some() {
                             self.apply_pending_jump(frame, &py_frame);
+                            prev_pc = None;
+                            continue;
                         }
                     }
                     break Ok(FrameOutcome::Yielded(v));
@@ -6260,7 +6472,33 @@ impl Interpreter {
     /// returns.
     fn frame_set_lineno(&mut self, fr: &Rc<PyFrame>, new_lineno: i64) -> Result<(), RuntimeError> {
         use crate::linejump::TraceEvent;
-        let event = fr.trace_event.get();
+        let mut event = fr.trace_event.get();
+        if event == TraceEvent::None {
+            // Not inside a `sys.settrace` callback: a `sys.monitoring`
+            // callback may still be running (`tstate->what_event`).
+            // CPython's `frame_setlineno` switch on the event kind.
+            use crate::trace as t;
+            match t::what_event() {
+                None => return Err(value_error("f_lineno can only be set in a trace function")),
+                Some(t::EVENT_PY_YIELD) => event = TraceEvent::Yield,
+                Some(
+                    t::EVENT_PY_RESUME
+                    | t::EVENT_JUMP
+                    | t::EVENT_BRANCH_LEFT
+                    | t::EVENT_BRANCH_RIGHT
+                    | t::EVENT_LINE,
+                ) => event = TraceEvent::Line,
+                Some(t::EVENT_PY_START) => {
+                    return Err(value_error(
+                        "can't jump from the 'call' trace event of a new frame",
+                    ))
+                }
+                Some(t::EVENT_CALL | t::EVENT_C_RETURN) => {
+                    return Err(value_error("can't jump during a call"))
+                }
+                Some(_) => return Err(value_error("can only jump from a 'line' trace event")),
+            }
+        }
         match event {
             TraceEvent::Line | TraceEvent::Yield => {}
             TraceEvent::None => {
@@ -6899,10 +7137,24 @@ impl Interpreter {
         Ok(())
     }
 
+    /// The frame's `f_trace` as the legacy `sys.settrace` machinery sees
+    /// it: `None` unless a thread trace function is installed. CPython's
+    /// `call_trace_func` bails when `tstate->c_tracefunc` is NULL, so a
+    /// debugger on the `sys.monitoring` backend (3.14 `pdb -m` /
+    /// `breakpoint()`) can park its `trace_dispatch` in `frame.f_trace`
+    /// for its own callbacks to call without the VM also invoking it and
+    /// double-dispatching every line/return (test_pdb `test_issue13183`).
+    fn legacy_frame_trace(py_frame: &Rc<PyFrame>) -> Object {
+        if crate::trace::trace_hook().is_none() {
+            return Object::None;
+        }
+        py_frame.trace.borrow().clone()
+    }
+
     /// Fire the `'line'` event when the source line changes.
     fn fire_line_event(&mut self, py_frame: &Rc<PyFrame>) -> Result<(), RuntimeError> {
         let _event = TraceEventGuard::new(py_frame, crate::linejump::TraceEvent::Line);
-        let frame_trace = py_frame.trace.borrow().clone();
+        let frame_trace = Self::legacy_frame_trace(py_frame);
         if !matches!(frame_trace, Object::None) {
             let result = self.invoke_observe_hook(
                 &frame_trace,
@@ -6931,7 +7183,7 @@ impl Interpreter {
     /// trace; `sys.monitoring` observes INSTRUCTION.
     fn fire_opcode_event(&mut self, py_frame: &Rc<PyFrame>) -> Result<(), RuntimeError> {
         let _event = TraceEventGuard::new(py_frame, crate::linejump::TraceEvent::Opcode);
-        let frame_trace = py_frame.trace.borrow().clone();
+        let frame_trace = Self::legacy_frame_trace(py_frame);
         if !matches!(frame_trace, Object::None) {
             let result = self.invoke_observe_hook(
                 &frame_trace,
@@ -6956,7 +7208,7 @@ impl Interpreter {
         value: &Object,
     ) -> Result<(), RuntimeError> {
         let _event = TraceEventGuard::new(py_frame, crate::linejump::TraceEvent::Return);
-        let frame_trace = py_frame.trace.borrow().clone();
+        let frame_trace = Self::legacy_frame_trace(py_frame);
         if !matches!(frame_trace, Object::None) {
             let _ = self.invoke_observe_hook(
                 &frame_trace,
@@ -6988,7 +7240,7 @@ impl Interpreter {
         value: &Object,
     ) -> Result<(), RuntimeError> {
         let _event = TraceEventGuard::new(py_frame, crate::linejump::TraceEvent::Yield);
-        let frame_trace = py_frame.trace.borrow().clone();
+        let frame_trace = Self::legacy_frame_trace(py_frame);
         if !matches!(frame_trace, Object::None) {
             // CPython's `sys_trace_return` subscribes to PY_YIELD too: the
             // `'return'` event a yield fires carries the *yielded value* —
@@ -7038,42 +7290,43 @@ impl Interpreter {
         synthesize_head: bool,
     ) -> Result<(), RuntimeError> {
         let _event = TraceEventGuard::new(py_frame, crate::linejump::TraceEvent::Exception);
-        let frame_trace = py_frame.trace.borrow().clone();
+        let frame_trace = Self::legacy_frame_trace(py_frame);
+        // CPython's ceval runs `PyTraceBack_Here` *before* `call_exc_trace`
+        // / `_PyEval_MonitorRaise` — the event's traceback already has the
+        // current frame at its head. WeavePy appends this frame's entry
+        // later (`handle_exception`), so build the event's view
+        // non-destructively: a fresh head for this frame chained onto the
+        // instance's traceback-so-far. pdb needs the real chain —
+        // `bdb.get_stack` walks `tb_next` to show frames *below* the
+        // current one after an exception (`bt`/`down` in test_pdb's
+        // test_post_mortem), and a `None` traceback makes pdb print the
+        // `Internal StopIteration` prefix meant only for synthetic
+        // generator-exhaustion events.
+        let inherited_tb = match &exc.instance {
+            Object::Instance(inst) => match inst.slot_get("__traceback__") {
+                Some(Object::Traceback(tb)) => Some(tb),
+                _ => None,
+            },
+            _ => None,
+        };
+        let tb_arg = if synthesize_head {
+            Object::Traceback(Rc::new(PyTraceback {
+                lineno: py_frame.last_line.get().unwrap_or(1),
+                lasti: py_frame.lasti.get(),
+                frame: py_frame.clone(),
+                raw_lasti: None,
+                next: RefCell::new(inherited_tb.clone()),
+            }))
+        } else {
+            inherited_tb.clone().map_or(Object::None, Object::Traceback)
+        };
         if !matches!(frame_trace, Object::None) {
-            // CPython passes a 3-tuple (type, value, traceback), and its
-            // ceval runs `PyTraceBack_Here` *before* `call_exc_trace` — the
-            // tuple's traceback already has the current frame at its head.
-            // WeavePy appends this frame's entry later (`handle_exception`),
-            // so build the event's view non-destructively: a fresh head for
-            // this frame chained onto the instance's traceback-so-far. pdb
-            // needs the real chain — `bdb.get_stack` walks `tb_next` to show
-            // frames *below* the current one after an exception (`bt`/`down`
-            // in test_pdb's test_post_mortem), and a `None` traceback makes
-            // pdb print the `Internal StopIteration` prefix meant only for
-            // synthetic generator-exhaustion events.
+            // CPython passes a 3-tuple (type, value, traceback).
             let exc_type = match &exc.instance {
                 Object::Instance(inst) => Object::Type(inst.cls()),
                 _ => Object::None,
             };
-            let inherited_tb = match &exc.instance {
-                Object::Instance(inst) => match inst.slot_get("__traceback__") {
-                    Some(Object::Traceback(tb)) => Some(tb),
-                    _ => None,
-                },
-                _ => None,
-            };
-            let tb_arg = if synthesize_head {
-                Object::Traceback(Rc::new(PyTraceback {
-                    lineno: py_frame.last_line.get().unwrap_or(1),
-                    lasti: py_frame.lasti.get(),
-                    frame: py_frame.clone(),
-                    raw_lasti: None,
-                    next: RefCell::new(inherited_tb),
-                }))
-            } else {
-                inherited_tb.map_or(Object::None, Object::Traceback)
-            };
-            let arg = Object::new_tuple(vec![exc_type, exc.instance.clone(), tb_arg]);
+            let arg = Object::new_tuple(vec![exc_type, exc.instance.clone(), tb_arg.clone()]);
             let _ = self.invoke_observe_hook(
                 &frame_trace,
                 py_frame,
@@ -7082,7 +7335,32 @@ impl Interpreter {
                 crate::trace::HookKind::Trace,
             )?;
         }
-        self.fire_monitoring_event(py_frame, crate::trace::EVENT_RAISE, exc.instance.clone())?;
+        // The RAISE callback gets the exception itself; bdb's monitoring
+        // backend reads `exc.__traceback__` right away (and pdb prints
+        // `Internal StopIteration` for a `None` one), so expose the same
+        // head-synthesized view for the callback's duration, then restore
+        // the traceback-so-far for `handle_exception` to extend.
+        let swap_tb = synthesize_head
+            && matches!(&exc.instance, Object::Instance(_))
+            && crate::trace::monitoring_union_mask_cached()
+                & crate::trace::event_mask(crate::trace::EVENT_RAISE)
+                != 0;
+        if swap_tb {
+            if let Object::Instance(inst) = &exc.instance {
+                inst.slot_set("__traceback__", tb_arg);
+            }
+        }
+        let r =
+            self.fire_monitoring_event(py_frame, crate::trace::EVENT_RAISE, exc.instance.clone());
+        if swap_tb {
+            if let Object::Instance(inst) = &exc.instance {
+                inst.slot_set(
+                    "__traceback__",
+                    inherited_tb.map_or(Object::None, Object::Traceback),
+                );
+            }
+        }
+        r?;
         Ok(())
     }
 
@@ -7120,7 +7398,7 @@ impl Interpreter {
         exc: Object,
     ) -> Result<(), RuntimeError> {
         let _event = TraceEventGuard::new(py_frame, crate::linejump::TraceEvent::Return);
-        let frame_trace = py_frame.trace.borrow().clone();
+        let frame_trace = Self::legacy_frame_trace(py_frame);
         if !matches!(frame_trace, Object::None) {
             let _ = self.invoke_observe_hook(
                 &frame_trace,
@@ -7188,6 +7466,14 @@ impl Interpreter {
         pc: u32,
         args: &[Object],
     ) -> Result<(), RuntimeError> {
+        // The frozen Python stand-ins for CPython C code are as invisible
+        // to `sys.monitoring` as to `sys.settrace` (see
+        // `invoke_observe_hook`): C code fires no PY_START/LINE/... events,
+        // and pdb's `sys.monitoring` backend must not step into
+        // `_seqtools.map.__new__` (test_pdb_skip_modules).
+        if code_hidden_from_trace(&code.filename) {
+            return Ok(());
+        }
         let code_id = Rc::as_ptr(code) as u64;
         let mask_bit = crate::trace::event_mask(mask_idx);
         let hooks: Vec<(u8, Object)> = crate::trace::with_monitoring(|m| {
@@ -7215,6 +7501,7 @@ impl Interpreter {
         };
         let (disable, _missing) = crate::trace::monitoring_sentinels();
         let outer = self.builtins.clone();
+        let _what = crate::trace::WhatEventGuard::new(event_idx);
         for (tool, cb) in hooks {
             let r = self.call(&cb, args, &[], &outer)?;
             if r.is_same(&disable) {
@@ -7232,6 +7519,21 @@ impl Interpreter {
                 }
                 crate::trace::with_monitoring(|m| {
                     m.disabled.insert((code_id, pc, tool, event_idx as u8));
+                    // A legacy `BRANCH` callback disables both halves.
+                    if m.legacy_branch[tool as usize] {
+                        let other = match event_idx {
+                            crate::trace::EVENT_BRANCH_LEFT => {
+                                Some(crate::trace::EVENT_BRANCH_RIGHT)
+                            }
+                            crate::trace::EVENT_BRANCH_RIGHT => {
+                                Some(crate::trace::EVENT_BRANCH_LEFT)
+                            }
+                            _ => None,
+                        };
+                        if let Some(other) = other {
+                            m.disabled.insert((code_id, pc, tool, other as u8));
+                        }
+                    }
                 });
             }
         }
@@ -7312,15 +7614,61 @@ impl Interpreter {
         callable: &Object,
         args: &[Object],
     ) -> Result<(), RuntimeError> {
+        self.fire_monitoring_call_family_impl(event_idx, code, pc, callable, args, true)
+    }
+
+    /// `CALL_FUNCTION_EX`'s variant: CPython's
+    /// `INSTRUMENTED_CALL_FUNCTION_EX` has no `_MAYBE_EXPAND_METHOD`
+    /// step, so a bound method is reported as-is (and the legacy
+    /// `sys.setprofile` bridge, which only fires `c_call` for a
+    /// `PyCFunction` callable, stays silent for `classmethod(max)`;
+    /// test_sys_setprofile `test_method_with_c_function`).
+    fn fire_monitoring_call_family_unexpanded(
+        &mut self,
+        event_idx: usize,
+        code: &Rc<weavepy_compiler::CodeObject>,
+        pc: u32,
+        callable: &Object,
+        args: &[Object],
+    ) -> Result<(), RuntimeError> {
+        self.fire_monitoring_call_family_impl(event_idx, code, pc, callable, args, false)
+    }
+
+    fn fire_monitoring_call_family_impl(
+        &mut self,
+        event_idx: usize,
+        code: &Rc<weavepy_compiler::CodeObject>,
+        pc: u32,
+        callable: &Object,
+        args: &[Object],
+        expand_method: bool,
+    ) -> Result<(), RuntimeError> {
         let (_disable, missing) = crate::trace::monitoring_sentinels();
-        // Stack-truthful shape (CPython INSTRUMENTED_CALL): the callable
-        // is reported as-is — a bound-method callable is *not* unwrapped
-        // — and arg0 is the first operand (the receiver when a
+        // Stack shape after CPython 3.14's `_MAYBE_EXPAND_METHOD`, which
+        // `INSTRUMENTED_CALL` runs *before* `_MONITOR_CALL`: a plain
+        // bound `method` in the callable slot (no self yet) is expanded
+        // into `(im_func, im_self)`, so the event reports the function
+        // with the receiver as arg0 (test_monitoring
+        // `TestLoadSuperAttr`: `super().method(x)` without
+        // `LOAD_SUPER_ATTR` still reports `('call', 'method', b)`).
+        // Otherwise arg0 is the first operand (the receiver when a
         // method-flagged load unbound the method into the self slot,
         // else the first positional), or MISSING. `LoadMethodAttr`
         // recreates CPython's unbound-method stack shape under active
         // CALL monitoring so the receiver lands in `args`.
-        let (func, arg0) = (callable.clone(), args.first().cloned().unwrap_or(missing));
+        // Only a `PyMethod_Type` object expands. A builtin bound by
+        // attribute lookup (`super().__repr__`, a `method-wrapper`;
+        // `[].append`) is a different C type that CPython calls as-is, so
+        // its CALL reports the object itself with arg0 = MISSING
+        // (test_monitoring `TestLoadSuperAttr.test_vs_other_type_call`).
+        let (func, arg0) = match callable {
+            Object::BoundMethod(bm)
+                if expand_method && !bm.redispatch_descriptor && bm.is_pymethod_type() =>
+            {
+                (bm.function.clone(), bm.receiver.clone())
+            }
+            _ => (callable.clone(), args.first().cloned().unwrap_or(missing)),
+        };
         let call_args = [
             Object::Code(code.clone()),
             Object::Int(i64::from(code.cpython_lasti(pc))),
@@ -7583,6 +7931,32 @@ impl Interpreter {
             if let Some(ci) = Self::shared_cell_index(&frame.code, slot) {
                 if !Rc::ptr_eq(&frame.cells[ci], c) {
                     Rc::make_mut(&mut frame.cells)[ci] = c.clone();
+                }
+                // A comprehension that used the shared slot as a plain
+                // local left its last value there; in CPython the slot
+                // now holds the cell again, so the name reads through
+                // the cell (`locals()` after `[x + 1 for x in lst]`,
+                // test_listcomps `test_shadow_with_free_and_local`).
+                let stale = if Self::locals_fast_off() {
+                    let mut locals = frame.locals.borrow_mut();
+                    if slot < locals.len() {
+                        Some(std::mem::replace(&mut locals[slot], Object::Unbound))
+                    } else {
+                        None
+                    }
+                } else {
+                    // SAFETY: as for the plain store below.
+                    unsafe {
+                        let locals = &mut *frame.locals.as_ptr();
+                        if slot < locals.len() {
+                            Some(std::mem::replace(&mut locals[slot], Object::Unbound))
+                        } else {
+                            None
+                        }
+                    }
+                };
+                if let Some(stale) = stale {
+                    gc_trace::note_dropped(&stale);
                 }
                 return Ok(());
             }
@@ -9553,6 +9927,36 @@ impl Interpreter {
                                 return Ok(StepOutcome::Continue);
                             }
                         }
+                        // The method-level analogue: a bound Python
+                        // function carrying a `__weave_raw_call__`
+                        // attribute (`ast.AST.__replace__`, standing in
+                        // for a METH_VARARGS|METH_KEYWORDS C method) is
+                        // invoked as `raw(self, args, kwargs)` with the
+                        // dict intact.
+                        if let Object::BoundMethod(bm) = &callable {
+                            let raw = match &bm.function {
+                                Object::Function(f) => f
+                                    .attrs
+                                    .borrow()
+                                    .borrow()
+                                    .get(&crate::object::StrKey("__weave_raw_call__"))
+                                    .cloned(),
+                                _ => None,
+                            };
+                            if let Some(raw) = raw {
+                                let call_args = vec![
+                                    bm.receiver.clone(),
+                                    Object::Tuple(pos_args.clone().into()),
+                                    Object::Dict(d.clone()),
+                                ];
+                                let r =
+                                    self.call_c_profiled(&raw, &call_args, &[], &frame.globals)?;
+                                frame.push(r);
+                                self.reap_call_receiver(callable);
+                                self.reap_call_args(&mut pos_args);
+                                return Ok(StepOutcome::Continue);
+                            }
+                        }
                     }
                 }
                 // Drop the raw-kwargs routing clone *before* the call and the
@@ -9619,7 +10023,7 @@ impl Interpreter {
                         & crate::trace::event_mask(crate::trace::EVENT_CALL)
                         != 0;
                 if mon_call {
-                    self.fire_monitoring_call_family(
+                    self.fire_monitoring_call_family_unexpanded(
                         crate::trace::EVENT_CALL,
                         &frame.code.clone(),
                         cache_pc,
@@ -9641,7 +10045,21 @@ impl Interpreter {
                         *self.pending_raw_kwargs.borrow_mut() = Some(d.clone());
                     }
                 }
-                let result = self.call_c_profiled(&callable, &pos_args, &kw_pairs, &frame.globals);
+                // CPython's `INSTRUMENTED_CALL_FUNCTION_EX` doesn't unpack a
+                // `PyMethod_Type` callable, so the legacy profiler sees a
+                // `method` (not a `PyCFunction`) and fires no `c_call` /
+                // `c_return` for `classmethod(max)` called with `*args`
+                // (test_sys_setprofile `test_method_with_c_function`).
+                let py_method_over_builtin = matches!(
+                    &callable,
+                    Object::BoundMethod(bm) if bm.is_pymethod_type()
+                        && matches!(bm.function, Object::Builtin(_))
+                );
+                let result = if py_method_over_builtin {
+                    self.call(&callable, &pos_args, &kw_pairs, &frame.globals)
+                } else {
+                    self.call_c_profiled(&callable, &pos_args, &kw_pairs, &frame.globals)
+                };
                 // A non-Python callee never consumed the raw-kwargs ride-along.
                 self.pending_raw_kwargs.borrow_mut().take();
                 if mon_call
@@ -9656,7 +10074,7 @@ impl Interpreter {
                     } else {
                         crate::trace::EVENT_C_RAISE
                     };
-                    self.fire_monitoring_call_family(
+                    self.fire_monitoring_call_family_unexpanded(
                         event,
                         &frame.code.clone(),
                         cache_pc,
@@ -9730,16 +10148,16 @@ impl Interpreter {
                     // adjusted for exhaustion. Continue dispatch.
                     return Ok(StepOutcome::Continue);
                 }
-                let mut it_obj = frame
+                let it_obj = frame
                     .stack
                     .last()
                     .cloned()
                     .ok_or_else(|| RuntimeError::Internal("FOR_ITER no iter".to_owned()))?;
                 // A suspended frame's `f_locals` write (PEP 667) can smuggle
-                // a non-iterator into the loop slot. CPython 3.13 tolerates
-                // this: iterate the object afresh and pin the new iterator
-                // in the slot (TypeError "'X' object is not iterable" for
-                // non-iterables, via iter()).
+                // a non-iterator into the loop slot. 3.14's FOR_ITER calls
+                // `tp_iternext` unconditionally, so anything without one
+                // raises `TypeError: 'X' object is not an iterator`
+                // (test_generators.ModifyUnderlyingIterableTest).
                 if !matches!(
                     &it_obj,
                     Object::Iter(_)
@@ -9749,11 +10167,10 @@ impl Interpreter {
                         | Object::Foreign(_)
                         | Object::File(_)
                 ) {
-                    let fresh = self.make_iter(&it_obj, &frame.globals)?;
-                    if let Some(slot) = frame.stack.last_mut() {
-                        *slot = fresh.clone();
-                    }
-                    it_obj = fresh;
+                    return Err(type_error(format!(
+                        "'{}' object is not an iterator",
+                        it_obj.type_name_owned()
+                    )));
                 }
                 // CPython frees a *temporary* iterable's elements by refcount
                 // the instant the exhausted FOR_ITER pops the iterator (the
@@ -9824,9 +10241,10 @@ impl Interpreter {
                                 Err(e) => return Err(e),
                             },
                             None => {
-                                return Err(type_error(
-                                    "iter() returned non-iterator without __next__",
-                                ));
+                                return Err(type_error(format!(
+                                    "'{}' object is not an iterator",
+                                    it_obj.type_name_owned()
+                                )));
                             }
                         }
                     }
@@ -9911,7 +10329,7 @@ impl Interpreter {
                 // Set insertion hashes each element; unhashable elements
                 // raise (`{ {} }` is a set holding a dict).
                 for it in &items {
-                    builtins::ensure_hashable(it)?;
+                    builtins::ensure_set_element(it)?;
                 }
                 let obj = Object::new_set_from(items);
                 self.record_alloc(&obj);
@@ -10054,7 +10472,7 @@ impl Interpreter {
                         RuntimeError::Internal("SET_ADD depth out of range".to_owned())
                     })?;
                 if let Object::Set(s) = s {
-                    builtins::ensure_hashable(&v)?;
+                    builtins::ensure_set_element(&v)?;
                     s.borrow_mut().insert(DictKey(v));
                 }
             }
@@ -10076,7 +10494,7 @@ impl Interpreter {
                 let globals = frame.globals.clone();
                 let items = self.collect_iterable(&v, &globals)?;
                 for item in items {
-                    builtins::ensure_hashable(&item)?;
+                    builtins::ensure_set_element(&item)?;
                     s.borrow_mut().insert(DictKey(item));
                 }
             }
@@ -11171,6 +11589,33 @@ impl Interpreter {
                     }
                 };
                 let name = self.name_at(&frame.code, ins.arg)?;
+                // Module teardown (`finalize_modules`) has emptied
+                // `sys.modules` and set `sys.meta_path` to None, so a
+                // Python-level `import` in a `__del__` running at exit
+                // fails even for modules that were loaded — an `import
+                // ast` in `traceback`'s caret-anchor helper then falls
+                // back to whole-range carets (test_traceback
+                // `test_print_traceback_at_exit`). VM-internal loads
+                // aren't affected.
+                if self.internal_import_depth == 0
+                    && crate::vm_singletons::modules_torn_down()
+                    && !name.is_empty()
+                {
+                    // `_py_warnings` stands in for CPython's C `_warnings`,
+                    // whose `warn()` doesn't import anything, so a
+                    // `warnings.warn` from a `__del__` at this stage still
+                    // works (test_warnings `FinalizationTest`).
+                    let importer = frame
+                        .globals
+                        .borrow()
+                        .get(&crate::object::StrKey("__name__"))
+                        .map(|n| n.to_str());
+                    if importer.as_deref() != Some("_py_warnings") {
+                        return Err(import_error(
+                            "sys.meta_path is None, Python is likely shutting down".to_owned(),
+                        ));
+                    }
+                }
                 // CPython `IMPORT_NAME` resolves `__import__` from the
                 // builtins and calls any override with `(name, globals,
                 // locals, fromlist, level)`; only the original C builtin
@@ -13118,6 +13563,18 @@ impl Interpreter {
                 }
                 if name == "__dict__" {
                     return Ok(Object::Dict(d.clone()));
+                }
+                // 3.14 `typing.Union` instance surface: `__origin__` is the
+                // `Union` class itself (`typing.get_origin(int | str)`), and
+                // the union reports the class's `__name__`/`__qualname__`.
+                if is_pep604_union(obj).is_some() {
+                    match name {
+                        "__origin__" => {
+                            return Ok(Object::Type(builtin_types().union_type_.clone()));
+                        }
+                        "__name__" | "__qualname__" => return Ok(Object::from_static("Union")),
+                        _ => {}
+                    }
                 }
                 // CPython `ga_getattro`: a GenericAlias proxies attribute
                 // reads to its `__origin__` (so `dict[int, None].fromkeys`
@@ -15376,7 +15833,7 @@ impl Interpreter {
                 )
             }
             Object::StaticMethod(inner) => Ok(inner.func()),
-            Object::ClassMethod(inner) => Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
+            Object::ClassMethod(inner) => Ok(Object::BoundMethod(Rc::new(BoundMethod::py_method(
                 owner.clone(),
                 inner.func(),
             )))),
@@ -15510,7 +15967,7 @@ impl Interpreter {
             Object::Function(_) | Object::Builtin(_) => {
                 Object::BoundMethod(Rc::new(BoundMethod::new(receiver.clone(), attr)))
             }
-            Object::ClassMethod(inner) => Object::BoundMethod(Rc::new(BoundMethod::new(
+            Object::ClassMethod(inner) => Object::BoundMethod(Rc::new(BoundMethod::py_method(
                 match receiver {
                     Object::Instance(inst) => Object::Type(inst.cls()),
                     other => other.clone(),
@@ -16572,6 +17029,7 @@ impl Interpreter {
     fn do_complex_call(
         &mut self,
         args: &[Object],
+        two_arg_form: bool,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
         // Coerce each argument to a value `b_complex` understands. The real
@@ -16581,9 +17039,135 @@ impl Interpreter {
         // hook is `__complex__`, e.g. `complex(0, WithComplex(..))`).
         let mut coerced = Vec::with_capacity(args.len());
         for (idx, a) in args.iter().enumerate() {
-            coerced.push(self.coerce_complex_arg(a, idx == 0, globals)?);
+            let nargs = if two_arg_form { 2 } else { 1 };
+            coerced.push(self.coerce_complex_arg(a, idx == 0, nargs, globals)?);
+        }
+        // 3.14 (`complex_new_impl`, the two-argument form only): a complex
+        // where a *real* is expected still works, but is deprecated. The
+        // 'real' slot warns when the argument is (or `__complex__`-converts
+        // to) a complex and its type offers neither `__float__` nor
+        // `__index__`; the 'imag' slot warns for any complex.
+        if two_arg_form {
+            let is_complex_typed = |o: &Object| match o {
+                Object::Complex(_) => true,
+                Object::Instance(inst) => {
+                    matches!(inst.native.get(), Some(Object::Complex(_)))
+                }
+                _ => false,
+            };
+            let real_converted_complex = matches!(coerced[0], Object::Complex(_));
+            if real_converted_complex {
+                let has_real_hook = matches!(args[0], Object::Instance(_))
+                    && (instance_method(&args[0], "__float__").is_some()
+                        || instance_method(&args[0], "__index__").is_some());
+                if !has_real_hook {
+                    self.emit_deprecation_warning(format!(
+                        "complex() argument 'real' must be a real number, not {}",
+                        args[0].type_name_fq()
+                    ))?;
+                }
+            }
+            if args.get(1).is_some_and(is_complex_typed) {
+                self.emit_deprecation_warning(format!(
+                    "complex() argument 'imag' must be a real number, not {}",
+                    args[1].type_name_fq()
+                ))?;
+            }
+            // `complex(real="1")`: the keyword form never parses strings.
+            if matches!(args[0], Object::Str(_) | Object::WStr(_)) {
+                return Err(type_error(format!(
+                    "complex() argument 'real' must be a real number, not {}",
+                    args[0].type_name_fq()
+                )));
+            }
         }
         crate::builtins::b_complex(&coerced)
+    }
+
+    /// `complex.from_number(number)` (3.14): `PyComplex_AsCComplex` on a
+    /// number — never a string — wrapped in `cls`. An exact `complex`
+    /// passes through identically for the base type.
+    pub fn complex_from_number(
+        &mut self,
+        cls: Option<&Object>,
+        number: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        let bt = crate::builtin_types::builtin_types();
+        let is_base = match cls {
+            Some(Object::Type(t)) => Rc::ptr_eq(t, &bt.complex_),
+            _ => true,
+        };
+        let not_real = || {
+            type_error(format!(
+                "must be real number, not {}",
+                number.type_name_owned()
+            ))
+        };
+        let value = match number {
+            Object::Complex(_) if is_base => return Ok(number.clone()),
+            Object::Complex(c) => Object::Complex(c.clone()),
+            Object::Float(f) => Object::Complex(Rc::new(crate::object::PyComplex::new(*f, 0.0))),
+            Object::Int(_) | Object::Long(_) | Object::Bool(_) => {
+                if long_overflows_f64(number) {
+                    return Err(overflow_error("int too large to convert to float"));
+                }
+                Object::Complex(Rc::new(crate::object::PyComplex::new(
+                    number.as_f64().expect("int-like"),
+                    0.0,
+                )))
+            }
+            Object::Str(_) | Object::Bytes(_) | Object::ByteArray(_) => return Err(not_real()),
+            Object::Instance(inst) => {
+                // A str subclass is still not a number here.
+                let is_str = crate::builtins::class_of(number)
+                    .mro
+                    .borrow()
+                    .iter()
+                    .any(|t| Rc::ptr_eq(t, &bt.str_));
+                if is_str {
+                    return Err(not_real());
+                }
+                let has_hook = matches!(inst.native.get(), Some(Object::Complex(_)))
+                    || instance_method(number, "__complex__").is_some()
+                    || instance_method(number, "__float__").is_some()
+                    || instance_method(number, "__index__").is_some()
+                    || matches!(
+                        inst.native.get(),
+                        Some(Object::Float(_) | Object::Int(_) | Object::Long(_) | Object::Bool(_))
+                    );
+                if !has_hook {
+                    return Err(not_real());
+                }
+                match self.coerce_complex_arg(number, true, 1, globals)? {
+                    c @ Object::Complex(_) => c,
+                    Object::Float(f) => {
+                        Object::Complex(Rc::new(crate::object::PyComplex::new(f, 0.0)))
+                    }
+                    other @ (Object::Int(_) | Object::Long(_) | Object::Bool(_)) => {
+                        if long_overflows_f64(&other) {
+                            return Err(overflow_error("int too large to convert to float"));
+                        }
+                        Object::Complex(Rc::new(crate::object::PyComplex::new(
+                            other.as_f64().expect("int-like"),
+                            0.0,
+                        )))
+                    }
+                    _ => return Err(not_real()),
+                }
+            }
+            _ => match crate::builtins::coerce_f64_opt(number)? {
+                Some(f) => Object::Complex(Rc::new(crate::object::PyComplex::new(f, 0.0))),
+                None => return Err(not_real()),
+            },
+        };
+        if is_base {
+            return Ok(value);
+        }
+        let Some(Object::Type(t)) = cls else {
+            return Ok(value);
+        };
+        self.call_object(Object::Type(t.clone()), &[value], &[])
     }
 
     /// Reduce one `complex()` argument to a `complex`/`float`/`int`/`str`
@@ -16594,8 +17178,29 @@ impl Interpreter {
         &mut self,
         a: &Object,
         allow_complex: bool,
+        nargs: usize,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
+        // 3.14 `complex_new_impl` wording (`%T`, so no quotes): the one-arg
+        // form says "argument", the two-arg form names the slot.
+        let not_a_number = |a: &Object| {
+            type_error(if nargs == 1 {
+                format!(
+                    "complex() argument must be a string or a number, not {}",
+                    a.type_name_fq()
+                )
+            } else if allow_complex {
+                format!(
+                    "complex() argument 'real' must be a real number, not {}",
+                    a.type_name_fq()
+                )
+            } else {
+                format!(
+                    "complex() argument 'imag' must be a real number, not {}",
+                    a.type_name_fq()
+                )
+            })
+        };
         // CPython's `complex_new` checks `PyUnicode_Check(r)` — subclasses
         // included — *before* any numeric hook, so a `str` subclass parses
         // as a string. numpy's U→complex cast loop hands `np.str_('1+2j')`
@@ -16664,17 +17269,7 @@ impl Interpreter {
             if let Some(native) = a.native_value() {
                 return Ok(native);
             }
-            return Err(type_error(if allow_complex {
-                format!(
-                    "complex() first argument must be a string or a number, not '{}'",
-                    a.type_name_owned()
-                )
-            } else {
-                format!(
-                    "complex() second argument must be a number, not '{}'",
-                    a.type_name_owned()
-                )
-            }));
+            return Err(not_a_number(a));
         }
         if let Object::Foreign(s) = a {
             // A foreign extension scalar (numpy `complex64`/`complex128`/
@@ -16725,17 +17320,7 @@ impl Interpreter {
                     return Ok(Object::Float(f));
                 }
             }
-            return Err(type_error(if allow_complex {
-                format!(
-                    "complex() first argument must be a string or a number, not '{}'",
-                    a.type_name_owned()
-                )
-            } else {
-                format!(
-                    "complex() second argument must be a number, not '{}'",
-                    a.type_name_owned()
-                )
-            }));
+            return Err(not_a_number(a));
         }
         Ok(a.native_value().unwrap_or_else(|| a.clone()))
     }
@@ -16990,14 +17575,34 @@ impl Interpreter {
                     args[2].type_name()
                 )))
             };
-            if let Some(method) = instance_method(&args[0], "__pow__") {
+            let not_impl = crate::vm_singletons::not_implemented();
+            let same_type_operands = matches!((&args[0], &args[1]),
+                (Object::Instance(a), Object::Instance(b))
+                    if Rc::ptr_eq(&a.cls(), &b.cls()));
+            let base_pow = instance_method(&args[0], "__pow__");
+            if let Some(method) = &base_pow {
+                let r = self.call(method, &args[1..3], &[], globals)?;
+                if !r.is_same(&not_impl) {
+                    return Ok(r);
+                }
+            }
+            // 3.14 (gh-130104): `ternary_op` offers the operation to the
+            // exponent's type too, which for a Python class means
+            // `exp.__rpow__(base, mod)` (`pow(10, Decimal(2), 7)`), unless
+            // both operands share the type (SLOT1BINFULL's `do_other`).
+            if !same_type_operands {
+                if let Some(method) = instance_method(&args[1], "__rpow__") {
+                    let r =
+                        self.call(&method, &[args[0].clone(), args[2].clone()], &[], globals)?;
+                    if !r.is_same(&not_impl) {
+                        return Ok(r);
+                    }
+                }
+            }
+            if base_pow.is_some() {
                 // CPython's `ternary_op` turns a NotImplemented result into
                 // TypeError (e.g. `pow(Decimal(1), 2, "3")`).
-                let r = self.call(&method, &args[1..3], &[], globals)?;
-                if r.is_same(&crate::vm_singletons::not_implemented()) {
-                    return ternary_unsupported();
-                }
-                return Ok(r);
+                return ternary_unsupported();
             }
             // CPython's `ternary_op` also offers the operation to the 2nd and
             // 3rd operands via their `nb_power` slot (this is how the C
@@ -17061,14 +17666,14 @@ impl Interpreter {
             return self.obj_truthy(inner, globals);
         }
         if let Object::Instance(_) = v {
-            // Issue #35712: evaluating `NotImplemented` in a boolean context
-            // warns (eventually a TypeError) — test_builtin
-            // test_warning_notimplemented.
+            // Issue #35712 / gh-79893: evaluating `NotImplemented` in a
+            // boolean context is a TypeError since 3.14 (a
+            // DeprecationWarning in 3.9-3.13) -- test_builtin
+            // test_bool_notimplemented.
             if v.is_same(&crate::vm_singletons::not_implemented()) {
-                self.emit_deprecation_warning(
-                    "NotImplemented should not be used in a boolean context".to_owned(),
-                )?;
-                return Ok(true);
+                return Err(type_error(
+                    "NotImplemented should not be used in a boolean context",
+                ));
             }
             if let Some(method) = instance_method(v, "__bool__") {
                 let r = self.call(&method, &[], &[], globals)?;
@@ -17921,15 +18526,28 @@ impl Interpreter {
     fn do_map_call(
         &mut self,
         args: &[Object],
+        kwargs: &[(String, Object)],
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
+        // 3.14 `map(..., strict=True)` (gh-119793); any other keyword is
+        // rejected the way CPython's `|$p:map` format does.
+        for (k, _) in kwargs {
+            if k != "strict" {
+                return Err(type_error(format!(
+                    "map() got an unexpected keyword argument '{k}'"
+                )));
+            }
+        }
+        if args.len() < 2 {
+            return Err(type_error("map() must have at least two arguments."));
+        }
         // Always lazy, like CPython's `map` type: laziness is observable
         // in type identity (`map` reduces by its own constructor —
         // test_pickle's test_compat_pickle checks the emitted global is
         // `itertools.imap` under protocol < 3), in error timing (`func`
         // failures surface at `next()`, not construction), and in side
         // effect interleaving.
-        match self.make_seqtools_iter("_MapIter", args, &[], globals)? {
+        match self.make_seqtools_iter("_MapIter", args, kwargs, globals)? {
             Some(it) => Ok(it),
             None => Err(runtime_error("internal: _seqtools._MapIter unavailable")),
         }
@@ -18623,9 +19241,20 @@ impl Interpreter {
         // `_UnionGenericAlias.__hash__` computes, so `hash(int | str) ==
         // hash(typing.Union[int, str])` (test_types.UnionTests.test_hash).
         if let Some(members) = crate::is_pep604_union(obj) {
-            // Member hashability first: `hash(frozenset(...))` hashes each
-            // element, so a member whose metaclass sets `__hash__ = None`
-            // raises TypeError (test_types test_union_of_unhashable).
+            // 3.14 `union_hash`: args that were unhashable when the union
+            // was built make the union unhashable -- re-hash them so the
+            // original error surfaces (test_types test_union_of_unhashable),
+            // and refuse even if they since became hashable
+            // (test_unhashable_becomes_hashable).
+            if let Some(unhashable) = crate::union_unhashable_args(obj) {
+                for m in &unhashable {
+                    self.do_hash_call(m, globals)?;
+                }
+                return Err(type_error(format!(
+                    "union contains {} unhashable elements",
+                    unhashable.len()
+                )));
+            }
             for m in &members {
                 self.do_hash_call(m, globals)?;
             }
@@ -18745,6 +19374,27 @@ impl Interpreter {
                     return self.call(&target, &[], &[], globals);
                 }
                 _ => {}
+            }
+        }
+        // A class hashes through its *metaclass*'s `__hash__` when that
+        // is Python code (`class M(type): def __hash__(self): ...`), the
+        // way `PyObject_Hash` dispatches on `Py_TYPE(cls)->tp_hash`
+        // (test_types test_unhashable_becomes_hashable). `__hash__ = None`
+        // on the metaclass is caught by `ensure_hashable` inside
+        // `hash_object`.
+        if let Object::Type(t) = obj {
+            let meta = t.metaclass_or_type();
+            if !Rc::ptr_eq(&meta, &crate::builtin_types::builtin_types().type_) {
+                if let Some(method @ (Object::Function(_) | Object::BoundMethod(_))) =
+                    meta.lookup("__hash__")
+                {
+                    let bound = Object::BoundMethod(Rc::new(BoundMethod::new(obj.clone(), method)));
+                    let result = self.call(&bound, &[], &[], globals)?;
+                    return match &result {
+                        Object::Int(_) | Object::Bool(_) | Object::Long(_) => Ok(result),
+                        _ => Err(type_error("__hash__ method should return an integer")),
+                    };
+                }
             }
         }
         builtins::hash_object(obj)
@@ -19048,20 +19698,17 @@ impl Interpreter {
         })?;
         let mut idx: usize = 0;
         while let Some(pair) = self.iter_next(&it, globals)? {
-            let inner = self.make_iter(&pair, globals).map_err(|e| {
-                if is_type_error(&e) {
-                    type_error(format!(
-                        "cannot convert dictionary update sequence element #{idx} to a sequence"
-                    ))
-                } else {
-                    e
-                }
-            })?;
+            let inner = self
+                .make_iter(&pair, globals)
+                .map_err(|e| crate::builtins::dict_update_element_error(e, idx))?;
             // CPython materializes each element (PySequence_Fast) and
             // reports its real length when it isn't exactly 2.
             let mut kv: Vec<Object> = Vec::with_capacity(2);
             let mut n: usize = 0;
-            while let Some(x) = self.iter_next(&inner, globals)? {
+            while let Some(x) = self
+                .iter_next(&inner, globals)
+                .map_err(|e| crate::builtins::dict_update_element_note(e, idx))?
+            {
                 if kv.len() < 2 {
                     kv.push(x);
                 }
@@ -20421,7 +21068,7 @@ impl Interpreter {
                 3 => type_error(format!(
                     "'async for' received an invalid object from __anext__: {t}"
                 )),
-                _ => type_error(format!("object {t} can't be used in 'await' expression")),
+                _ => type_error(format!("'{t}' object can't be awaited")),
             }
         };
         match &value {
@@ -24425,12 +25072,12 @@ impl Interpreter {
                 let res = match kind {
                     BinOpKind::Div => {
                         if b == 0.0 {
-                            Err(zero_division_error("float division by zero"))
+                            Err(zero_division_error("division by zero"))
                         } else {
                             Ok(crate::object::fresh_float(a / b))
                         }
                     }
-                    BinOpKind::FloorDiv => py_float_divmod(a, b, "float floor division by zero")
+                    BinOpKind::FloorDiv => py_float_divmod(a, b, "division by zero")
                         .map(|(q, _)| crate::object::fresh_float(q)),
                     BinOpKind::Mod => py_float_mod(a, b).map(crate::object::fresh_float),
                     BinOpKind::Pow => float_pow(a, b),
@@ -24766,7 +25413,7 @@ impl Interpreter {
                 // `__eq__` / `__repr__` on the key can re-enter the VM.
                 let len = frame.stack.len();
                 frame.stack.truncate(len - 2);
-                crate::builtins::ensure_hashable(&key)?;
+                crate::builtins::ensure_dict_key(&key)?;
                 let found = crate::builtins::dict_lookup(&d, &key)?;
                 let r = found.ok_or_else(|| key_error_object(key.clone()))?;
                 frame.push(r);
@@ -24849,7 +25496,7 @@ impl Interpreter {
                 let len = frame.stack.len();
                 frame.stack.truncate(len - 2);
                 let value = frame.pop()?;
-                crate::builtins::ensure_hashable(&key)?;
+                crate::builtins::ensure_dict_key(&key)?;
                 let old = crate::builtins::dict_insert(&d, key, value)?;
                 if let Some(old) = old {
                     crate::vm_singletons::queue_container_removed(&old);
@@ -26233,6 +26880,14 @@ impl Interpreter {
                 ],
             )?;
         }
+        // `type_setattro` → `_PyObject_GenericSetAttrWithDict`: a *data*
+        // descriptor found on the metaclass (a `property` with a setter,
+        // an object defining `__set__`) intercepts the store before the
+        // class dict is touched (`Cls.__pointer_type__ = …` on a ctypes
+        // metaclass; test_ctypes.test_pointers).
+        if let Some(handled) = self.metaclass_descriptor_store(ty, name, Some(value.clone()))? {
+            return Ok(handled);
+        }
         // `cls.__bases__ = (…)` — CPython's `type_set_bases`: validate,
         // recompute the MRO of the class and all its subclasses (rolling back
         // on failure), and re-home the subclass registries.
@@ -26371,6 +27026,91 @@ impl Interpreter {
         Ok(())
     }
 
+    /// The metaclass half of `_PyObject_GenericSetAttrWithDict` for a
+    /// class target: when `name` resolves on the (user) metaclass to a
+    /// data descriptor, run its `__set__` (`value` = `Some`) or
+    /// `__delete__` (`value` = `None`) with the class as the instance.
+    /// Returns `Ok(None)` when no metaclass descriptor claims the name
+    /// and the caller should fall through to the class-dict store.
+    /// `type`'s own getsets (`__name__`, `__bases__`, …) are handled by
+    /// the callers' dedicated branches, so only a *non-default*
+    /// metaclass is consulted here.
+    fn metaclass_descriptor_store(
+        &mut self,
+        ty: &Rc<TypeObject>,
+        name: &str,
+        value: Option<Object>,
+    ) -> Result<Option<()>, RuntimeError> {
+        let Some(meta) = ty.metaclass.borrow().clone() else {
+            return Ok(None);
+        };
+        if meta.flags.is_builtin {
+            return Ok(None);
+        }
+        let Some((attr, owner)) = meta.lookup_with_owner(name) else {
+            return Ok(None);
+        };
+        // Descriptors inherited from `type` itself (`__module__`,
+        // `__doc__`, …) are the getsets the callers implement natively;
+        // routing them through here would recurse.
+        if owner.flags.is_builtin {
+            return Ok(None);
+        }
+        let target = Object::Type(ty.clone());
+        let g = self.builtins.clone();
+        match &attr {
+            Object::Property(prop) => match value {
+                Some(v) => {
+                    let setter = prop.fset();
+                    if matches!(setter, Object::None) {
+                        return Err(crate::builtins::property_unreachable_error(
+                            prop, &target, "setter",
+                        ));
+                    }
+                    self.call_descriptor_accessor(&setter, &[target, v], &[], &g)?;
+                }
+                None => {
+                    let deleter = prop.fdel();
+                    if matches!(deleter, Object::None) {
+                        return Err(crate::builtins::property_unreachable_error(
+                            prop, &target, "deleter",
+                        ));
+                    }
+                    self.call_descriptor_accessor(&deleter, &[target], &[], &g)?;
+                }
+            },
+            Object::Instance(descr) => {
+                let has_set = descr.cls().lookup("__set__");
+                let has_delete = descr.cls().lookup("__delete__");
+                if has_set.is_none() && has_delete.is_none() {
+                    return Ok(None);
+                }
+                match value {
+                    Some(v) => {
+                        // `slot_tp_descr_set`: a descriptor defining only
+                        // `__delete__` fails the `__set__` lookup.
+                        let Some(setter) = has_set else {
+                            return Err(attribute_error("__set__".to_owned()));
+                        };
+                        let bound =
+                            Object::BoundMethod(Rc::new(BoundMethod::new(attr.clone(), setter)));
+                        self.call(&bound, &[target, v], &[], &g)?;
+                    }
+                    None => {
+                        let Some(deleter) = has_delete else {
+                            return Err(attribute_error("__delete__".to_owned()));
+                        };
+                        let bound =
+                            Object::BoundMethod(Rc::new(BoundMethod::new(attr.clone(), deleter)));
+                        self.call(&bound, &[target], &[], &g)?;
+                    }
+                }
+            }
+            _ => return Ok(None),
+        }
+        Ok(Some(()))
+    }
+
     /// CPython `type_setattro`'s delete half: remove a name from the class's
     /// own dict. Rejects immutable types and the read-only layout getsets.
     pub(crate) fn del_type_attr_direct(
@@ -26383,6 +27123,9 @@ impl Interpreter {
                 "cannot delete '{name}' attribute of immutable type '{}'",
                 ty.qualified_display_name()
             )));
+        }
+        if let Some(handled) = self.metaclass_descriptor_store(ty, name, None)? {
+            return Ok(handled);
         }
         if matches!(name, "__dict__" | "__weakref__") {
             return Err(type_error(format!(
@@ -27646,6 +28389,23 @@ impl Interpreter {
         {
             return Err(attribute_error("cannot delete attribute".to_owned()));
         }
+        // UnicodeError's `T_OBJECT` members (`encoding`, `object`,
+        // `start`, `end`, `reason`): deleting one that is already unset
+        // just stores NULL again — no AttributeError, unlike a plain
+        // instance attribute (test_exceptions
+        // `test_unicode_error_evil_str_del_self_object` deletes
+        // `object` once per evil `__str__`).
+        if matches!(name, "encoding" | "object" | "start" | "end" | "reason")
+            && inst.slot_get(name).is_none()
+            && inst
+                .cls()
+                .mro
+                .borrow()
+                .iter()
+                .any(|t| t.name == "UnicodeError")
+        {
+            return Ok(());
+        }
         // BaseException getsets: the core exception attributes can be
         // reassigned but never deleted (CPython `BaseException_*`
         // setters reject NULL).
@@ -27984,7 +28744,7 @@ impl Interpreter {
                 Ok(Object::str_from_codepoints(vec![cps[idx]]))
             }
             (Object::Dict(d), key) => {
-                crate::builtins::ensure_hashable(key)?;
+                crate::builtins::ensure_dict_key(key)?;
                 // Drop the borrow before building the KeyError: rendering the
                 // missing key runs its Python `__repr__`, which may re-enter
                 // the VM and mutate this very dict (pandas' `test_replace_series`
@@ -28384,7 +29144,7 @@ impl Interpreter {
                 Ok(())
             }
             (Object::Dict(d), key) => {
-                crate::builtins::ensure_hashable(key)?;
+                crate::builtins::ensure_dict_key(key)?;
                 let old = crate::builtins::dict_insert(d, key.clone(), value)?;
                 if let Some(old) = old {
                     crate::vm_singletons::queue_container_removed(&old);
@@ -28791,7 +29551,7 @@ impl Interpreter {
                 Ok(())
             }
             (Object::Dict(d), key) => {
-                crate::builtins::ensure_hashable(key)?;
+                crate::builtins::ensure_dict_key(key)?;
                 let removed = crate::builtins::dict_remove(d, key)?;
                 let Some((k, v)) = removed else {
                     return Err(key_error_object(key.clone()));
@@ -28873,7 +29633,15 @@ impl Interpreter {
                             ".u.gen_throw" | ".u.cor_throw" => {
                                 self.gen_method_throw(&receiver, rest)
                             }
-                            ".u.gen_close" | ".u.cor_close" => self.gen_method_close(&receiver),
+                            ".u.gen_close" | ".u.cor_close" => {
+                                if !rest.is_empty() {
+                                    return Err(type_error(format!(
+                                        "close() takes no arguments ({} given)",
+                                        rest.len()
+                                    )));
+                                }
+                                self.gen_method_close(&receiver)
+                            }
                             ".u.gen_next" => self.gen_method_send(&receiver, Object::None),
                             ".u.gen_iter" => {
                                 if matches!(receiver, Object::Coroutine(_)) {
@@ -28998,7 +29766,7 @@ impl Interpreter {
                         && (args.len() == 1 || args.len() == 2)
                         && kwargs.is_empty()
                     {
-                        return self.do_complex_call(args, outer_globals);
+                        return self.do_complex_call(args, args.len() == 2, outer_globals);
                     }
                     if b.name == "pow"
                         && (args.len() == 2 || args.len() == 3)
@@ -29151,8 +29919,8 @@ impl Interpreter {
                         }
                         return invoke(args);
                     }
-                    if b.name == "map" && args.len() >= 2 {
-                        return self.do_map_call(args, outer_globals);
+                    if b.name == "map" && (args.len() >= 2 || !kwargs.is_empty()) {
+                        return self.do_map_call(args, kwargs, outer_globals);
                     }
                     if b.name == "filter" && args.len() == 2 {
                         return self.do_filter_call(args, outer_globals);
@@ -30094,6 +30862,12 @@ impl Interpreter {
                             return self.gen_method_throw(&bm.receiver, args);
                         }
                         ".gen_close" | ".cor_close" => {
+                            if !args.is_empty() {
+                                return Err(type_error(format!(
+                                    "close() takes no arguments ({} given)",
+                                    args.len()
+                                )));
+                            }
                             return self.gen_method_close(&bm.receiver);
                         }
                         ".gen_next" => {
@@ -30961,6 +31735,11 @@ impl Interpreter {
             if matches!(b, Object::Type(_)) {
                 resolved_bases.push(b.clone());
                 continue;
+            }
+            // `union_mro_entries`: `class C(int | str)` is a TypeError.
+            if is_pep604_union(b).is_some() {
+                let shown = self.repr_object(b)?;
+                return Err(type_error(format!("Cannot subclass {shown}")));
             }
             // PEP 585 generic alias base — `class PrettyDict(dict[_KT, _VT])`.
             // CPython's `GenericAlias.__mro_entries__` substitutes the origin
@@ -32955,7 +33734,7 @@ impl Interpreter {
                 // A `classmethod`-wrapped `__new__` binds `cls` like any
                 // attribute access would, and `type.__call__` still passes
                 // `cls` explicitly — the target sees it twice.
-                Object::ClassMethod(inner) => Object::BoundMethod(Rc::new(BoundMethod::new(
+                Object::ClassMethod(inner) => Object::BoundMethod(Rc::new(BoundMethod::py_method(
                     Object::Type(cls.clone()),
                     inner.func(),
                 ))),
@@ -33171,9 +33950,9 @@ impl Interpreter {
                     }
                     return Ok(make_generic_alias(args[0].clone(), args[1].clone()));
                 }
-                "UnionType" => {
+                "Union" => {
                     return Err(type_error(
-                        "cannot create 'types.UnionType' instances".to_owned(),
+                        "cannot create 'typing.Union' instances".to_owned(),
                     ));
                 }
                 // `weakref.ref(target, callback=None)` — the type object
@@ -33248,7 +34027,7 @@ impl Interpreter {
                             args.len()
                         )));
                     }
-                    return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
+                    return Ok(Object::BoundMethod(Rc::new(BoundMethod::py_method(
                         args[1].clone(),
                         args[0].clone(),
                     ))));
@@ -33421,7 +34200,11 @@ impl Interpreter {
             if cls.name == "complex" && (!args.is_empty() || !kwargs.is_empty()) {
                 let bound = bind_complex_args(args, kwargs)?;
                 let global_dummy = Rc::new(RefCell::new(DictData::default()));
-                return self.do_complex_call(&bound, &global_dummy);
+                // CPython's `actual_complex_new`: only a lone positional
+                // argument takes the string-or-number path; keywords (even
+                // `real=` alone) go through the clinic `real`/`imag` form.
+                let two_arg_form = args.len() == 2 || !kwargs.is_empty();
+                return self.do_complex_call(&bound, two_arg_form, &global_dummy);
             }
             // `bool(x)` must consult __bool__/__len__ for instances.
             if cls.name == "bool" && args.len() <= 1 && kwargs.is_empty() {
@@ -35450,6 +36233,12 @@ impl Interpreter {
     ) -> Result<Object, RuntimeError> {
         use weavepy_compiler::bytecode::intrinsic as intr;
         match id {
+            // `_PyIntrinsics_UnaryFunctions[INTRINSIC_PRINT]`: echo through
+            // `sys.displayhook`, yield `None` for the trailing `POP_TOP`.
+            intr::PRINT => {
+                self.do_print_expr(value, outer_globals)?;
+                Ok(Object::None)
+            }
             intr::TYPEVAR => self.do_typing_intrinsic("typevar", &[value], outer_globals),
             intr::PARAMSPEC => self.do_typing_intrinsic("paramspec", &[value], outer_globals),
             intr::TYPEVARTUPLE => self.do_typing_intrinsic("typevartuple", &[value], outer_globals),
@@ -35587,8 +36376,8 @@ impl Interpreter {
         flags: u32,
     ) -> Result<weavepy_parser::Module, RuntimeError> {
         let flufl = flags & weavepy_compiler::flags::CO_FUTURE_BARRY_AS_BDFL != 0;
-        let (parsed, mut warnings) =
-            weavepy_parser::parse_module_with_warnings_flags(source, flufl);
+        let (parsed, mut warnings, last_stmt) =
+            weavepy_parser::parse_module_with_warnings_flags_meta(source, flufl);
         // CPython's compiler emits these at code-gen; parse success is
         // the equivalent gate here (`PyCF_ONLY_AST` bypasses this path).
         if let Ok(m) = &parsed {
@@ -35599,7 +36388,169 @@ impl Interpreter {
         // `simplefilter('error')` the first escape escalates to a
         // SyntaxError that preempts the parse error — both match CPython.
         self.emit_escape_warnings(source, filename, &warnings)?;
-        parsed.map_err(|e| parse_error_to_syntax_error(&e, source, filename))
+        parsed.map_err(|e| {
+            let err = parse_error_to_syntax_error(&e, source, filename);
+            // 3.14 `_PyPegen_set_syntax_error_metadata`: `traceback`
+            // reads `(last_stmt_lineno, last_stmt_col, source)` to try
+            // keyword-typo suggestions ("Did you mean 'for'?").
+            attach_syntax_error_metadata(&err, last_stmt, source);
+            err
+        })
+    }
+
+    /// The `SyntaxError` the main module's source raises, as `compile()`
+    /// would build it — with `_metadata` for `traceback`'s keyword-typo
+    /// hints — so the CLI can report a failed pre-interpreter parse
+    /// through `sys.excepthook` like CPython's `pymain_run_python`
+    /// (`python -c "iff x:"` prints "Did you mean 'if'?"). `None` when
+    /// the source parses after all or fails without a Python exception.
+    pub fn main_module_syntax_error(
+        &mut self,
+        source: &str,
+        filename: &str,
+    ) -> Option<crate::error::PyException> {
+        let _interp_guard =
+            crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
+        let _handles = self.activate_thread_handles();
+        match self.parse_for_compile(
+            source,
+            filename,
+            0,
+            crate::stdlib::ast_convert::RootMode::Exec,
+        ) {
+            Err(RuntimeError::PyException(exc)) => Some(exc),
+            _ => None,
+        }
+    }
+
+    /// Parse textual `compile()` input for `root_mode`, honouring the
+    /// flags pegen consults: `PyCF_ALLOW_INCOMPLETE_INPUT` turns a
+    /// failure at end-of-source into `_IncompleteInputError`
+    /// (`_PyPegen_run_parser`), and in `single` mode the interactive
+    /// grammar's `statement_newline` shape plus `PyCF_DONT_IMPLY_DEDENT`
+    /// decide whether a newline-less compound statement is complete.
+    fn parse_for_compile(
+        &mut self,
+        source: &str,
+        filename: &str,
+        flags: u32,
+        root_mode: crate::stdlib::ast_convert::RootMode,
+    ) -> Result<weavepy_parser::Module, RuntimeError> {
+        use crate::stdlib::ast_convert::RootMode;
+        use weavepy_compiler::flags as cf;
+        let flufl = flags & cf::CO_FUTURE_BARRY_AS_BDFL != 0;
+        let allow_incomplete = flags & cf::PYCF_ALLOW_INCOMPLETE_INPUT != 0;
+        let parse = |src: &str| match root_mode {
+            RootMode::Eval => weavepy_parser::parse_eval_full(src, flufl),
+            RootMode::Single => {
+                let (r, w, m) = weavepy_parser::parse_module_full(src, flufl);
+                // `single` tokenizes the text as-is, like `eval`: a bare
+                // trailing `\` is E_LINECONT, not EOF.
+                (weavepy_parser::backslash_at_eof_fixup(src, r), w, m)
+            }
+            RootMode::Exec => weavepy_parser::parse_module_full(src, flufl),
+        };
+        let (mut parsed, mut warnings, mut meta) = parse(source);
+        if let Ok(m) = &parsed {
+            collect_compiler_syntax_warnings(m, &mut warnings);
+        }
+        self.emit_escape_warnings(source, filename, &warnings)?;
+        // CPython tokenizes lazily, so when the tokenizer runs off the
+        // end inside an open construct, pegen has already parsed every
+        // token before it. Our lexer runs ahead; replay pegen's order by
+        // parsing the tokens it did produce (`weavepy_lexer::tokenize_partial`).
+        let exec = matches!(root_mode, RootMode::Exec);
+        // Set once pegen's first pass is known to have failed *before*
+        // reaching EOF: `_is_end_of_source` is then false whatever
+        // diagnostic ends up winning.
+        let mut first_pass_short = false;
+        if let Err(e) = &parsed {
+            if let Some(kind) = lex_eof_kind(e, source) {
+                if let (Err((tokens, _)), _) = weavepy_lexer::tokenize_partial(source) {
+                    let eval = matches!(root_mode, RootMode::Eval);
+                    let (r2, m2) = weavepy_parser::parse_partial(source, tokens, flufl, eval);
+                    let real = |t: weavepy_parser::StopToken| (t.start as usize) < source.len();
+                    if let (Err(e2), Some(stop)) = (r2, m2.stop.filter(|s| real(*s))) {
+                        // The parser failed on a token the tokenizer had
+                        // produced. `tok->done` is E_EOF there only when
+                        // that token abuts the end of a source that gets
+                        // no appended newline (`single`/`eval`).
+                        if !exec && stop.end as usize >= source.len() {
+                            if allow_incomplete && !matches!(kind, LexEofKind::Backslash) {
+                                return Err(incomplete_input_at(
+                                    source, filename, stop.start, stop.end,
+                                ));
+                            }
+                            if matches!(kind, LexEofKind::Backslash) {
+                                parsed = Err(e2);
+                                meta = m2;
+                            }
+                        } else {
+                            first_pass_short = true;
+                            // Second pass and `_PyPegen_tokenize_full_source_to_check_for_errors`:
+                            // which diagnostic survives.
+                            let lex_wins = match kind {
+                                LexEofKind::Backslash => false,
+                                LexEofKind::Literal => true,
+                                LexEofKind::Bracket { open_line } => {
+                                    // The furthest token the error pass
+                                    // fetched (see `ParseMeta::furthest`).
+                                    match m2.furthest {
+                                        // The lookahead fetched EOF: the
+                                        // tokenizer raises the unclosed
+                                        // bracket itself.
+                                        Some(n) if !real(n) => true,
+                                        None => true,
+                                        // Tokenizing the rest of the
+                                        // source reports the opener only
+                                        // when the parser got past its
+                                        // line, and only if the tokenizer
+                                        // isn't already at EOF (`is_tok_ok`).
+                                        Some(n) => {
+                                            let tok_ok = exec || (n.end as usize) < source.len();
+                                            let n_line = source
+                                                [..(n.start as usize).min(source.len())]
+                                                .matches('\n')
+                                                .count()
+                                                as u32
+                                                + 1;
+                                            tok_ok && n_line > open_line
+                                        }
+                                    }
+                                }
+                            };
+                            if !lex_wins {
+                                parsed = Err(e2);
+                                meta = m2;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let module = match parsed {
+            Ok(m) => m,
+            Err(e) => {
+                if allow_incomplete
+                    && !first_pass_short
+                    && parse_error_is_incomplete_input(&e, &meta, source, root_mode)
+                {
+                    return Err(incomplete_input_error(
+                        Some(&e),
+                        source,
+                        filename,
+                        root_mode,
+                    ));
+                }
+                let err = parse_error_to_syntax_error(&e, source, filename);
+                attach_syntax_error_metadata(&err, meta.last_stmt, source);
+                return Err(err);
+            }
+        };
+        if matches!(root_mode, RootMode::Single) {
+            check_single_input(&module, source, filename, flags)?;
+        }
+        Ok(module)
     }
 
     /// [`Self::parse_source_emitting_warnings`], but with the `eval`
@@ -35673,8 +36624,13 @@ impl Interpreter {
                 if let RuntimeError::PyException(pe) = &e {
                     if let Object::Instance(inst) = &pe.instance {
                         if inst.cls().is_subclass_of(&syntax_warning_ty) {
+                            // The SyntaxError form drops the "will not work
+                            // in the future" sentence (string_parser.c).
+                            let msg = w
+                                .message
+                                .replace("Such sequences will not work in the future. ", "");
                             let err = crate::error::syntax_error_located(
-                                w.message.clone(),
+                                msg,
                                 Some(filename),
                                 Some(lineno),
                                 Some(offset),
@@ -36615,10 +37571,14 @@ impl Interpreter {
         // ---- AST-object source (RFC 0052: real tree lowering) ----
         if crate::stdlib::ast_convert::is_ast_object(&source_obj) {
             if only_ast {
-                // CPython validates and returns the tree (constant-folded
-                // when PyCF_OPTIMIZED_AST asks for it).
+                // 3.14 `compile()` runs `PyAST_obj2mod` + `_PyAST_Validate`
+                // over an AST source at every optimize level (gh-130139:
+                // `ast.parse(ast.Constant(42))` is a TypeError), then the
+                // AST preprocess pass — a syntax-only walk unless
+                // PyCF_OPTIMIZED_AST asks for the folds.
+                crate::stdlib::ast_convert::check_ast_root(&source_obj, root_mode)?;
+                self.validate_ast_object(&source_obj, outer_globals)?;
                 if optimized_ast {
-                    self.validate_ast_object(&source_obj, outer_globals)?;
                     return self.fold_ast_constants(&source_obj, optimize, outer_globals);
                 }
                 return Ok(source_obj);
@@ -36630,6 +37590,12 @@ impl Interpreter {
             let converted = crate::stdlib::ast_convert::convert_ast_root(&source_obj, root_mode)?;
             let src = converted.synthetic_source;
             let module = converted.module;
+            // CPython's codegen-time SyntaxWarnings (`is` with a literal,
+            // PEP 765 control flow in `finally`, ...) fire for AST input
+            // too; only the tokenizer's escape warnings are skipped.
+            let mut warnings = Vec::new();
+            collect_compiler_syntax_warnings(&module, &mut warnings);
+            self.emit_escape_warnings(&src, &filename, &warnings)?;
             let code = match root_mode {
                 crate::stdlib::ast_convert::RootMode::Exec => {
                     weavepy_compiler::compile_module_with_options(&module, &src, &filename, opts)
@@ -36684,9 +37650,21 @@ impl Interpreter {
         };
         check_compile_source_nulls(&source)?;
 
+        let parse_flags = opts.flags | explicit_flags;
+        let interactive_probe = explicit_flags & cf::PYCF_ALLOW_INCOMPLETE_INPUT != 0
+            || (explicit_flags & cf::PYCF_DONT_IMPLY_DEDENT != 0
+                && matches!(root_mode, crate::stdlib::ast_convert::RootMode::Single));
+
         // PyCF_ONLY_AST on text: parse and hand back a Python tree —
         // `ast.parse` in builtin form.
         if only_ast {
+            // `codeop.compile_command(..., flags=PyCF_ONLY_AST)` (used by
+            // `traceback`'s keyword-typo probe) needs the incomplete-input
+            // classification too; run the pegen-shaped parse first so
+            // `_IncompleteInputError` wins over the tree build.
+            if interactive_probe {
+                self.parse_for_compile(&source, &filename, parse_flags, root_mode)?;
+            }
             let type_comments = explicit_flags & cf::PYCF_TYPE_COMMENTS != 0;
             let tree =
                 self.build_ast_object(&source, &filename, &mode, type_comments, outer_globals)?;
@@ -36696,92 +37674,25 @@ impl Interpreter {
             return Ok(tree);
         }
 
-        match root_mode {
+        let module = self.parse_for_compile(&source, &filename, parse_flags, root_mode)?;
+        let code = match root_mode {
             crate::stdlib::ast_convert::RootMode::Exec => {
-                let module =
-                    self.parse_source_emitting_warnings_flags(&source, &filename, opts.flags)?;
-                let code = weavepy_compiler::compile_module_with_options(
-                    &module, &source, &filename, opts,
-                )
-                .map_err(|e| compile_error_to_syntax_error(&e, &source, &filename))?;
-                Ok(Object::Code(Rc::new(code)))
+                weavepy_compiler::compile_module_with_options(&module, &source, &filename, opts)
             }
             crate::stdlib::ast_convert::RootMode::Eval => {
-                let module =
-                    self.parse_eval_source_emitting_warnings_flags(&source, &filename, opts.flags)?;
-                let code =
-                    weavepy_compiler::compile_eval_with_options(&module, &source, &filename, opts)
-                        .map_err(|e| compile_error_to_syntax_error(&e, &source, &filename))?;
-                Ok(Object::Code(Rc::new(code)))
+                weavepy_compiler::compile_eval_with_options(&module, &source, &filename, opts)
             }
             // Interactive mode: top-level expression statements echo
             // through `sys.displayhook` (`PrintExpr`). Powers the REPL,
             // `code`/`codeop`, and `doctest`'s example execution.
             crate::stdlib::ast_convert::RootMode::Single => {
-                let module =
-                    self.parse_source_emitting_warnings_flags(&source, &filename, opts.flags)?;
-                // pegen's `interactive` start rule accepts exactly one
-                // `statement_newline` — a second statement is a
-                // SyntaxError located at the end of the *first* one.
-                // Semicolon-joined simple statements on one physical
-                // line are a single `simple_stmts`, hence allowed
-                // (`import ast; ast.parse(...)`).
-                let line_of = |off: usize| source[..off.min(source.len())].matches('\n').count();
-                if module.body.len() > 1
-                    && module.body.iter().any(|s| {
-                        line_of(s.span.start.0 as usize)
-                            != line_of(module.body[0].span.start.0 as usize)
-                    })
-                {
-                    let end = module.body[0].span.end.0 as usize;
-                    let lineno = source[..end.min(source.len())].matches('\n').count() as u32 + 1;
-                    return Err(crate::error::syntax_error_located(
-                        "multiple statements found while compiling a single statement",
-                        Some(&filename),
-                        Some(lineno),
-                        Some(1),
-                        source.lines().nth(lineno as usize - 1),
-                    ));
-                }
-                // Interactive grammar: a compound statement needs a
-                // NEWLINE terminator, so a *one-line* compound with no
-                // trailing newline — `compile('def f(): pass', …,
-                // 'single')` — is a SyntaxError ("invalid syntax",
-                // offset 0). Multi-line blocks are fine: their last
-                // body line already produced the NEWLINE token.
-                if let Some(stmt) = module.body.first() {
-                    use weavepy_parser::ast::StmtKind as SK;
-                    let compound = matches!(
-                        stmt.kind,
-                        SK::FunctionDef { .. }
-                            | SK::AsyncFunctionDef { .. }
-                            | SK::ClassDef { .. }
-                            | SK::If { .. }
-                            | SK::While { .. }
-                            | SK::For { .. }
-                            | SK::AsyncFor { .. }
-                            | SK::With { .. }
-                            | SK::AsyncWith { .. }
-                            | SK::Try { .. }
-                            | SK::Match { .. }
-                    );
-                    if compound && !source.contains('\n') {
-                        return Err(crate::error::syntax_error_located(
-                            "invalid syntax",
-                            Some(&filename),
-                            Some(1),
-                            Some(0),
-                            source.lines().next(),
-                        ));
-                    }
-                }
-                let code = weavepy_compiler::compile_interactive_with_options(
+                weavepy_compiler::compile_interactive_with_options(
                     &module, &source, &filename, opts,
                 )
-                .map_err(|e| compile_error_to_syntax_error(&e, &source, &filename))?;
-                Ok(Object::Code(Rc::new(code)))
             }
         }
+        .map_err(|e| compile_error_to_syntax_error(&e, &source, &filename))?;
+        Ok(Object::Code(Rc::new(code)))
     }
 
     /// `compile(src, f, mode, PyCF_ONLY_AST)`: parse `src` and build a
@@ -37371,7 +38282,14 @@ impl Interpreter {
             Some(h) if h != crate::gil::current_thread_id()
         );
         let leaf = match self.cache.get(&absolute) {
-            Some(m) if !matches!(m, Object::None) && !initializing_elsewhere => m,
+            Some(m) if !matches!(m, Object::None) && !initializing_elsewhere => {
+                // `-X importtime=2`: `import_ensure_initialized` reports
+                // the `sys.modules` hit.
+                if crate::import_time::reports_cached() {
+                    crate::import_time::cached(&absolute);
+                }
+                m
+            }
             _ => self.import_path(&absolute)?,
         };
 
@@ -37599,6 +38517,8 @@ impl Interpreter {
             let timed = !was_cached && crate::import_time::enabled();
             if timed {
                 crate::import_time::begin();
+            } else if was_cached && crate::import_time::reports_cached() {
+                crate::import_time::cached(&so_far);
             }
             let loaded = self.load_one(&so_far);
             if timed {
@@ -38073,13 +38993,13 @@ impl Interpreter {
             return Ok(cached);
         }
         // During interpreter shutdown only already-imported modules
-        // resolve; CPython's import system is torn down by then and
-        // raises with this exact wording (traceback's caret-anchor
-        // helper relies on `import ast` failing at `__del__` time).
+        // resolve; CPython's import system is torn down by then
+        // (`finalize_modules` empties `sys.modules` and `sys.meta_path`)
+        // and `_find_and_load` raises with this exact wording.
         if crate::vm_singletons::is_finalizing() {
-            return Err(import_error(format!(
-                "import of {full} halted; None in sys.modules"
-            )));
+            return Err(import_error(
+                "sys.meta_path is None, Python is likely shutting down".to_owned(),
+            ));
         }
         // Cache miss: claim the per-module find+load window (CPython's
         // `_ModuleLockManager` around `_find_and_load`). Two threads that
@@ -39353,6 +40273,9 @@ fn collect_compiler_syntax_warnings(
             ExprKind::GeneratorExp { .. } => Some("generator"),
             ExprKind::Lambda { .. } => Some("function"),
             ExprKind::JoinedStr(_) | ExprKind::FormattedValue { .. } => Some("str"),
+            ExprKind::TemplateStr(_) | ExprKind::Interpolation { .. } => {
+                Some("string.templatelib.Template")
+            }
             ExprKind::Constant(c) => Some(match c {
                 C::None => "NoneType",
                 C::Bool(_) => "bool",
@@ -39383,6 +40306,8 @@ fn collect_compiler_syntax_warnings(
                 | ExprKind::GeneratorExp { .. }
                 | ExprKind::JoinedStr(_)
                 | ExprKind::FormattedValue { .. }
+                | ExprKind::TemplateStr(_)
+                | ExprKind::Interpolation { .. }
         ) {
             if let Some(name) = infer_type_name(func) {
                 out.push(weavepy_parser::EscapeWarning {
@@ -39413,6 +40338,8 @@ fn collect_compiler_syntax_warnings(
             ExprKind::Set(_)
             | ExprKind::SetComp { .. }
             | ExprKind::GeneratorExp { .. }
+            | ExprKind::TemplateStr(_)
+            | ExprKind::Interpolation { .. }
             | ExprKind::Lambda { .. } => true,
             _ => false,
         };
@@ -39663,7 +40590,26 @@ fn collect_compiler_syntax_warnings(
         }
     }
 
-    fn visit_stmt(s: &Stmt, out: &mut Vec<weavepy_parser::EscapeWarning>) {
+    /// PEP 765 (CPython 3.14 `Python/ast_preprocess.c`,
+    /// `control_flow_in_finally_warning`): `return`, `break`, and
+    /// `continue` that leave a `finally` block draw a `SyntaxWarning`.
+    /// `finally_depth` counts enclosing `finally` bodies in the current
+    /// function; `loop_depth` counts loops opened *inside* the innermost
+    /// `finally`, so `break`/`continue` targeting one of those is fine.
+    #[derive(Default, Clone, Copy)]
+    struct FinallyCtx {
+        finally_depth: u32,
+        loop_depth: u32,
+    }
+
+    fn finally_warning(kw: &str, s: &Stmt, out: &mut Vec<weavepy_parser::EscapeWarning>) {
+        out.push(weavepy_parser::EscapeWarning {
+            offset: s.span.start.0,
+            message: format!("'{kw}' in a 'finally' block"),
+        });
+    }
+
+    fn visit_stmt(s: &Stmt, ctx: FinallyCtx, out: &mut Vec<weavepy_parser::EscapeWarning>) {
         match &s.kind {
             StmtKind::FunctionDef {
                 args,
@@ -39686,7 +40632,8 @@ fn collect_compiler_syntax_warnings(
                 if let Some(r) = returns {
                     visit_expr(r, out);
                 }
-                visit_body(body, out);
+                // A nested function starts a fresh control-flow scope.
+                visit_body(body, FinallyCtx::default(), out);
             }
             StmtKind::ClassDef {
                 bases,
@@ -39704,9 +40651,12 @@ fn collect_compiler_syntax_warnings(
                 for d in decorator_list {
                     visit_expr(d, out);
                 }
-                visit_body(body, out);
+                visit_body(body, FinallyCtx::default(), out);
             }
             StmtKind::Return(v) => {
+                if ctx.finally_depth > 0 {
+                    finally_warning("return", s, out);
+                }
                 if let Some(v) = v {
                     visit_expr(v, out);
                 }
@@ -39747,10 +40697,21 @@ fn collect_compiler_syntax_warnings(
                     visit_expr(v, out);
                 }
             }
-            StmtKind::If { test, body, orelse } | StmtKind::While { test, body, orelse } => {
+            StmtKind::If { test, body, orelse } => {
                 visit_expr(test, out);
-                visit_body(body, out);
-                visit_body(orelse, out);
+                visit_body(body, ctx, out);
+                visit_body(orelse, ctx, out);
+            }
+            StmtKind::While { test, body, orelse } => {
+                visit_expr(test, out);
+                let inner = FinallyCtx {
+                    loop_depth: ctx.loop_depth + 1,
+                    ..ctx
+                };
+                visit_body(body, inner, out);
+                // `else:` runs after the loop; a `break` there targets
+                // an outer loop.
+                visit_body(orelse, ctx, out);
             }
             StmtKind::For {
                 target,
@@ -39766,8 +40727,12 @@ fn collect_compiler_syntax_warnings(
             } => {
                 visit_target(target, out);
                 visit_expr(iter, out);
-                visit_body(body, out);
-                visit_body(orelse, out);
+                let inner = FinallyCtx {
+                    loop_depth: ctx.loop_depth + 1,
+                    ..ctx
+                };
+                visit_body(body, inner, out);
+                visit_body(orelse, ctx, out);
             }
             StmtKind::Try {
                 body,
@@ -39775,15 +40740,21 @@ fn collect_compiler_syntax_warnings(
                 orelse,
                 finalbody,
             } => {
-                visit_body(body, out);
+                visit_body(body, ctx, out);
                 for h in handlers {
                     if let Some(t) = &h.type_ {
                         visit_expr(t, out);
                     }
-                    visit_body(&h.body, out);
+                    visit_body(&h.body, ctx, out);
                 }
-                visit_body(orelse, out);
-                visit_body(finalbody, out);
+                visit_body(orelse, ctx, out);
+                // Entering a `finally` resets the loop count: a loop
+                // opened outside it cannot be exited without leaving it.
+                let inner = FinallyCtx {
+                    finally_depth: ctx.finally_depth + 1,
+                    loop_depth: 0,
+                };
+                visit_body(finalbody, inner, out);
             }
             StmtKind::Raise { exc, cause } => {
                 for e in [exc, cause].into_iter().flatten() {
@@ -39797,7 +40768,7 @@ fn collect_compiler_syntax_warnings(
                         visit_target(v, out);
                     }
                 }
-                visit_body(body, out);
+                visit_body(body, ctx, out);
             }
             StmtKind::Match { subject, cases } => {
                 visit_expr(subject, out);
@@ -39805,7 +40776,7 @@ fn collect_compiler_syntax_warnings(
                     if let Some(g) = &c.guard {
                         visit_expr(g, out);
                     }
-                    visit_body(&c.body, out);
+                    visit_body(&c.body, ctx, out);
                 }
             }
             StmtKind::Expr(e) => visit_expr(e, out),
@@ -39828,23 +40799,31 @@ fn collect_compiler_syntax_warnings(
                     visit_expr(m, out);
                 }
             }
+            StmtKind::Break => {
+                if ctx.finally_depth > 0 && ctx.loop_depth == 0 {
+                    finally_warning("break", s, out);
+                }
+            }
+            StmtKind::Continue => {
+                if ctx.finally_depth > 0 && ctx.loop_depth == 0 {
+                    finally_warning("continue", s, out);
+                }
+            }
             StmtKind::Import(_)
             | StmtKind::ImportFrom { .. }
             | StmtKind::Global(_)
             | StmtKind::Nonlocal(_)
-            | StmtKind::Pass
-            | StmtKind::Break
-            | StmtKind::Continue => {}
+            | StmtKind::Pass => {}
         }
     }
 
-    fn visit_body(body: &[Stmt], out: &mut Vec<weavepy_parser::EscapeWarning>) {
+    fn visit_body(body: &[Stmt], ctx: FinallyCtx, out: &mut Vec<weavepy_parser::EscapeWarning>) {
         for s in body {
-            visit_stmt(s, out);
+            visit_stmt(s, ctx, out);
         }
     }
 
-    visit_body(&module.body, out);
+    visit_body(&module.body, FinallyCtx::default(), out);
 }
 
 fn line_col_text(source: &str, byte: u32) -> (u32, u32, String) {
@@ -39872,7 +40851,7 @@ fn line_col_text(source: &str, byte: u32) -> (u32, u32, String) {
 }
 
 /// Route the parser's `\N{NAME}` escapes through the generated UCD
-/// 15.1.0 tables (RFC 0050 WS4), honouring a poisoned
+/// 16.0.0 tables (RFC 0050 WS4), honouring a poisoned
 /// `sys.modules['unicodedata']` the way CPython's tokenizer does (its
 /// escape decoder imports `unicodedata` through the live runtime).
 /// Idempotent; installed from `Interpreter::default` and from embedding
@@ -39880,12 +40859,8 @@ fn line_col_text(source: &str, byte: u32) -> (u32, u32, String) {
 pub fn install_parser_unicode_hook() {
     weavepy_parser::set_unicode_name_resolver(|name| {
         use weavepy_parser::UnicodeNameResolution as R;
-        if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
-            // SAFETY: published by an enclosing VM frame on this thread.
-            let interp = unsafe { &mut *ptr };
-            if matches!(interp.cache.get("unicodedata"), Some(Object::None)) {
-                return R::Unavailable;
-            }
+        if !crate::stdlib::unicodedata_mod::ensure_unicodedata_loaded() {
+            return R::Unavailable;
         }
         // Aliases resolve (CPython's `\N{NULL}`); named sequences do not.
         match crate::stdlib::ucd::lookup_with_aliases(name) {
@@ -40040,16 +41015,30 @@ fn decode_source_bytes_inner(
             raw.to_string()
         }
     }
-    let mut cookie = None;
-    let mut line_start = 0usize;
-    for _ in 0..2 {
-        let line_end = payload[line_start..]
+    // Byte range (exclusive of the newline) of line `n` (1-based).
+    let line_bounds = |n: usize| -> (usize, usize) {
+        let mut start = 0usize;
+        for _ in 1..n {
+            match payload[start..].iter().position(|&b| b == b'\n') {
+                Some(off) => start += off + 1,
+                None => return (payload.len(), payload.len()),
+            }
+        }
+        let end = payload[start..]
             .iter()
             .position(|&b| b == b'\n')
-            .map_or(payload.len(), |off| line_start + off);
+            .map_or(payload.len(), |off| start + off);
+        (start, end)
+    };
+    let mut cookie: Option<(String, usize)> = None;
+    // Did line 1 carry code (not blank / comment)? The tokenizer then
+    // stops looking for a cookie and validates line 1 on its own.
+    let mut line1_is_code = false;
+    for n in 1..=2 {
+        let (line_start, line_end) = line_bounds(n);
         let line = &payload[line_start..line_end];
         if let Some(c) = cookie_of_line(line) {
-            cookie = Some(c);
+            cookie = Some((c, n));
             break;
         }
         // A cookie on line 2 only counts when line 1 is blank or a
@@ -40059,73 +41048,180 @@ fn decode_source_bytes_inner(
             .iter()
             .find(|b| !matches!(b, b' ' | b'\t' | 0x0C | b'\r'))
             .is_none_or(|b| *b == b'#');
-        if !blank_or_comment || line_end >= payload.len() {
+        if !blank_or_comment {
+            line1_is_code = n == 1;
             break;
         }
-        line_start = line_end + 1;
+        if line_end >= payload.len() {
+            break;
+        }
     }
 
-    if let Some(enc) = cookie {
-        // With a BOM present, CPython only accepts cookies that
-        // *literally* start with "utf-8" — even "utf8" is rejected
-        // ("encoding problem: utf8 with BOM", lineno 0, offset -1).
-        if had_bom && !enc.to_ascii_lowercase().starts_with("utf-8") {
-            let e = crate::error::syntax_error_located(
-                format!("encoding problem: {enc} with BOM"),
-                Some(filename),
-                None,
-                None,
-                None,
-            );
-            if let RuntimeError::PyException(pe) = &e {
-                if let Object::Instance(inst) = &pe.instance {
-                    inst.slot_set("lineno", Object::Int(0));
-                    inst.slot_set("offset", Object::Int(-1));
+    // `_PyTokenizer_raise_init_error`: a failure while *setting up* the
+    // decoder (unknown codec, non-text codec, or a decode error over
+    // the input as a whole) becomes `SyntaxError(str(exc), (filename,
+    // 0, -1, None))`.
+    let init_error = |msg: String| -> RuntimeError {
+        let e = crate::error::syntax_error_located(msg, Some(filename), Some(0), None, None);
+        if let RuntimeError::PyException(pe) = &e {
+            if let Object::Instance(inst) = &pe.instance {
+                inst.slot_set("offset", Object::Int(-1));
+                if let Some(Object::Tuple(args)) = inst.slot_get("args") {
+                    if let Some(Object::Tuple(detail)) = args.get(1) {
+                        let mut d = detail.to_vec();
+                        d[2] = Object::Int(-1);
+                        inst.slot_set(
+                            "args",
+                            Object::new_tuple(vec![args[0].clone(), Object::new_tuple(d)]),
+                        );
+                    }
                 }
             }
-            return Err(e);
         }
-        // Decode under the *normalized* name (prefix-matched, so a
-        // BUFSIZ-long `iso-8859-1-xxx…` cookie is latin-1); error
-        // messages keep the raw spelling like CPython's tokenizer.
-        let norm = get_normal_name(&enc);
-        let decoded =
-            crate::stdlib::codecs_mod::decode_bytes(payload, &norm, "strict").or_else(|e| {
-                // Registry-backed codecs (the frozen CJK modules, custom
-                // `codecs.register` entries) need a live interpreter, but the
-                // CLI decodes the main script before one exists. Boot a
-                // scratch interpreter just for this decode — rare (only
-                // non-native cookie encodings) and CPython's tokenizer always
-                // has the full runtime available at this point anyway.
-                if crate::vm_singletons::current_interpreter_ptr().is_none() {
-                    let mut scratch = Interpreter::default();
-                    let guard =
-                        crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<
-                            Interpreter,
-                        >(
-                            &mut scratch
-                        ));
-                    let res = crate::stdlib::codecs_mod::decode_bytes(payload, &norm, "strict");
-                    drop(guard);
-                    res
-                } else {
-                    Err(e)
-                }
-            });
-        return decoded.map(translate_source_newlines).map_err(|e| {
-            // A string/bytes `compile()` source surfaces the codec's own
-            // message as the SyntaxError text ("'ascii' codec can't decode
-            // byte 0xe2 in position 16: ordinal not in range(128)" —
-            // test_source_encoding's test_error_from_string); the file
-            // tokenizer reports CPython's terser "encoding problem: NAME"
-            // (which is also the unknown-codec shape for both).
-            if !from_file {
-                if let Some(text) = unicode_decode_error_text(&e) {
-                    return crate::error::syntax_error(text);
-                }
+        e
+    };
+    // A located SyntaxError whose `text` is the source line (no
+    // trailing newline), with an explicit end column.
+    let located = |msg: String, lineno: usize, offset: i64, end_offset: i64, text: &str| {
+        let e = crate::error::syntax_error_located(
+            msg,
+            Some(filename),
+            Some(lineno as u32),
+            Some(offset.max(0) as u32),
+            Some(text),
+        );
+        if let RuntimeError::PyException(pe) = &e {
+            if let Object::Instance(inst) = &pe.instance {
+                inst.slot_set("end_lineno", Object::Int(lineno as i64));
+                inst.slot_set("end_offset", Object::Int(end_offset));
             }
-            crate::error::syntax_error(format!("encoding problem: {enc}"))
-        });
+        }
+        e
+    };
+
+    // Is the source declared UTF-8 (BOM and/or a `utf-8` cookie)? The
+    // tokenizer then keeps its raw reader and validates each line with
+    // the utf-8 codec instead of `ensure_utf8`'s PEP 263 diagnostic.
+    let mut declared_utf8 = had_bom;
+    if let Some((enc, cookie_line)) = cookie {
+        // Decode under the *normalized* name (prefix-matched, so a
+        // BUFSIZ-long `iso-8859-1-xxx…` cookie is latin-1); the
+        // messages use that normalized spelling, like the tokenizer.
+        let norm = get_normal_name(&enc);
+        let (cl_start, cl_end) = line_bounds(cookie_line);
+        if had_bom && norm != "utf-8" {
+            // `check_coding_spec`'s BOM/cookie mismatch spans the
+            // whole cookie line (`size` counts line 2's leading newline
+            // in the string path and the trailing one in the file path).
+            let size = if from_file || cookie_line == 2 {
+                cl_end - cl_start + 1
+            } else {
+                cl_end - cl_start
+            };
+            let text = decode_utf8_replace(&payload[cl_start..cl_end]);
+            return Err(located(
+                format!("encoding problem: {norm} with BOM"),
+                cookie_line,
+                0,
+                size as i64,
+                &text,
+            ));
+        }
+        if norm == "utf-8" {
+            declared_utf8 = true;
+        } else {
+            let decode =
+                |bytes: &[u8]| {
+                    crate::stdlib::codecs_mod::decode_bytes(bytes, &norm, "strict").or_else(|e| {
+                        // Registry-backed codecs (the frozen CJK modules,
+                        // custom `codecs.register` entries) need a live
+                        // interpreter, but the CLI decodes the main script
+                        // before one exists. Boot a scratch interpreter just
+                        // for this decode — rare (only non-native cookie
+                        // encodings) and CPython's tokenizer always has the
+                        // full runtime available at this point anyway.
+                        if crate::vm_singletons::current_interpreter_ptr().is_none() {
+                            let mut scratch = Interpreter::default();
+                            let guard = crate::vm_singletons::publish_interpreter_ptr(
+                                std::ptr::from_mut::<Interpreter>(&mut scratch),
+                            );
+                            let res =
+                                crate::stdlib::codecs_mod::decode_bytes(bytes, &norm, "strict");
+                            drop(guard);
+                            res
+                        } else {
+                            Err(e)
+                        }
+                    })
+                };
+            return match decode(payload) {
+                Ok(s) => Ok(translate_source_newlines(s)),
+                Err(e) => {
+                    let Some((start, _)) = unicode_decode_error_span(&e) else {
+                        // Unknown codec / not a text encoding: the
+                        // LookupError's text, init-error shaped.
+                        let mut msg = match &e {
+                            RuntimeError::PyException(pe) => pe.message(),
+                            other => other.to_string(),
+                        };
+                        // The file tokenizer goes through `io.open`,
+                        // whose non-text-codec message has no
+                        // `codecs.decode()` hint.
+                        if from_file {
+                            if let Some(i) = msg.find("; use codecs.decode()") {
+                                msg.truncate(i);
+                            }
+                        }
+                        return Err(init_error(msg));
+                    };
+                    if !from_file {
+                        // The string tokenizer decodes the whole buffer
+                        // up front: the codec's own message, init-error
+                        // shaped, with the position in the whole source.
+                        let msg = unicode_decode_error_text(&e).unwrap_or_else(|| "".into());
+                        return Err(init_error(msg));
+                    }
+                    // The file tokenizer found the cookie on line L
+                    // having read lines 1..=L raw. `fp_setreadl` then
+                    // re-opens the file one byte before the end of line L
+                    // and decodes the rest in one chunk (a failure there
+                    // is an init error, position relative to that
+                    // chunk); afterwards the raw lines 1..=L are checked
+                    // with the codec, and *that* failure is a tokenizer
+                    // `E_DECODE` — "(unicode error) …" anchored on line L.
+                    let after_cookie = (cl_end + 1).min(payload.len());
+                    if start >= after_cookie {
+                        let chunk_start = after_cookie.saturating_sub(1);
+                        let msg = match decode(&payload[chunk_start..]) {
+                            Err(e2) => unicode_decode_error_text(&e2),
+                            Ok(_) => None,
+                        }
+                        .or_else(|| unicode_decode_error_text(&e))
+                        .unwrap_or_default();
+                        return Err(init_error(msg));
+                    }
+                    let msg = match decode(&payload[..after_cookie]) {
+                        Err(e2) => unicode_decode_error_text(&e2),
+                        Ok(_) => None,
+                    }
+                    .or_else(|| unicode_decode_error_text(&e))
+                    .unwrap_or_default();
+                    let text = crate::stdlib::codecs_mod::decode_bytes(
+                        &payload[cl_start..cl_end],
+                        &norm,
+                        "replace",
+                    )
+                    .unwrap_or_else(|_| decode_utf8_replace(&payload[cl_start..cl_end]));
+                    Err(located(
+                        format!("(unicode error) {msg}"),
+                        cookie_line,
+                        0,
+                        -1,
+                        &text,
+                    ))
+                }
+            };
+        }
     }
 
     match std::str::from_utf8(payload) {
@@ -40134,19 +41230,6 @@ fn decode_source_bytes_inner(
             let bad_at = e.valid_up_to();
             let bad_byte = payload.get(bad_at).copied().unwrap_or(0);
             let line = payload[..bad_at].iter().filter(|&&b| b == b'\n').count() + 1;
-            if from_file {
-                // CPython's file tokenizer message (`python bad.py`).
-                return Err(crate::error::syntax_error(format!(
-                    "Non-UTF-8 code starting with '\\x{bad_byte:02x}' in file {filename} on \
-                     line {line}, but no encoding declared; see \
-                     https://peps.python.org/pep-0263/ for details"
-                )));
-            }
-            // `compile()` bytes source: CPython reports the failure as
-            // a "(unicode error)" SyntaxError. `position` is the bad
-            // byte's index within its contiguous run of non-ASCII
-            // bytes; `offset` is the character column where that run
-            // starts; `end_offset` is `offset + position + 1`.
             let line_start = payload[..bad_at]
                 .iter()
                 .rposition(|&b| b == b'\n')
@@ -40155,46 +41238,90 @@ fn decode_source_bytes_inner(
                 .iter()
                 .position(|&b| b == b'\n')
                 .map_or(payload.len(), |off| bad_at + off);
-            let mut run_start = bad_at;
-            while run_start > line_start && payload[run_start - 1] >= 0x80 {
-                run_start -= 1;
+            let text = decode_utf8_replace(&payload[line_start..line_end]);
+            if declared_utf8 && from_file {
+                // The file tokenizer validates each line it reads with
+                // the utf-8 codec (`PyUnicode_Decode`), failing as a
+                // tokenizer `E_DECODE`: "(unicode error) …" at column 0
+                // of the line being read. Lines 1 and 2 are buffered
+                // together and checked once the cookie search ends, so
+                // the position (and the line reported) is theirs jointly.
+                let (position, lineno) = if line > 2 || line1_is_code {
+                    (bad_at - line_start, line)
+                } else {
+                    let (_, l2_end) = line_bounds(2);
+                    let lineno = if l2_end >= payload.len() && line == 1 {
+                        1
+                    } else {
+                        2
+                    };
+                    (bad_at, lineno)
+                };
+                let reason = if e.error_len().is_none() {
+                    "unexpected end of data"
+                } else if matches!(bad_byte, 0xC2..=0xF4) {
+                    "invalid continuation byte"
+                } else {
+                    "invalid start byte"
+                };
+                let (ls, le) = line_bounds(lineno);
+                let text = decode_utf8_replace(&payload[ls..le]);
+                return Err(located(
+                    format!(
+                        "(unicode error) 'utf-8' codec can't decode byte 0x{bad_byte:02x} in \
+                         position {position}: {reason}"
+                    ),
+                    lineno,
+                    0,
+                    -1,
+                    &text,
+                ));
             }
-            let position = bad_at - run_start;
-            let reason = if e.error_len().is_none() {
-                "unexpected end of data"
-            } else if matches!(bad_byte, 0xC2..=0xF4) {
-                "invalid continuation byte"
+            // `_PyTokenizer_ensure_utf8`: the PEP 263 diagnostic, with the
+            // bad byte's character column (1-based) as both ends of the
+            // range; the tokenizer only knows the file name when reading
+            // a file.
+            let col = std::str::from_utf8(&payload[line_start..bad_at])
+                .map_or(0, |s| s.chars().count())
+                + 1;
+            let in_file = if from_file {
+                format!(" in file {filename}")
             } else {
-                "invalid start byte"
+                String::new()
             };
-            let text: String = decode_utf8_replace(&payload[line_start..line_end]);
-            // Bytes before the run are valid UTF-8, so the decoded
-            // text's byte offsets line up with the source's there.
-            let offset = text
-                .char_indices()
-                .take_while(|(i, _)| *i < run_start - line_start)
-                .count()
-                .max(1);
-            let text = format!("{text}\n");
-            let e = crate::error::syntax_error_located(
+            Err(located(
                 format!(
-                    "(unicode error) 'utf-8' codec can't decode byte 0x{bad_byte:02x} in \
-                     position {position}: {reason}"
+                    "Non-UTF-8 code starting with '\\x{bad_byte:02x}'{in_file} on line {line}, \
+                     but no encoding declared; see https://peps.python.org/pep-0263/ for details"
                 ),
-                Some(filename),
-                Some(line as u32),
-                Some(offset as u32),
-                Some(&text),
-            );
-            if let RuntimeError::PyException(pe) = &e {
-                if let Object::Instance(inst) = &pe.instance {
-                    inst.slot_set("end_lineno", Object::Int(line as i64));
-                    inst.slot_set("end_offset", Object::Int((offset + position + 1) as i64));
-                }
-            }
-            Err(e)
+                line,
+                col as i64,
+                col as i64,
+                &text,
+            ))
         }
     }
+}
+
+/// The `(start, end)` of a `UnicodeDecodeError`, or `None` for any other
+/// error (an unknown-codec `LookupError`, say).
+fn unicode_decode_error_span(e: &RuntimeError) -> Option<(usize, usize)> {
+    let RuntimeError::PyException(pe) = e else {
+        return None;
+    };
+    let Object::Instance(inst) = &pe.instance else {
+        return None;
+    };
+    crate::builtin_types::exc_attr(inst, "reason")?;
+    let start = match crate::builtin_types::exc_attr(inst, "start")? {
+        Object::Int(n) if n >= 0 => n as usize,
+        _ => return None,
+    };
+    let end = match crate::builtin_types::exc_attr(inst, "end")? {
+        Object::Int(n) if n >= 0 => n as usize,
+        _ => return None,
+    };
+    Some((start, end))
 }
 
 /// CPython's tokenizer `translate_newlines`: source text is normalized to
@@ -40290,6 +41417,325 @@ fn decode_utf8_replace(bytes: &[u8]) -> String {
     }
 }
 
+/// pegen's `_is_end_of_source`: after a failed parse, had the tokenizer
+/// already run off the end of the input (`tok->done` is `E_EOF`,
+/// `E_EOFS`, or `E_EOLS`)? That is what `PyCF_ALLOW_INCOMPLETE_INPUT`
+/// turns into `_IncompleteInputError`.
+///
+/// CPython's tokenizer is lazy, so this is about *which* token the parser
+/// choked on. In `exec` mode the source gets a newline appended, so the
+/// final NEWLINE is a real token and only tokens past it (DEDENT /
+/// ENDMARKER) sit at EOF; `single` and `eval` tokenize the text as-is,
+/// so the implicit final NEWLINE is EOF, and so is any token that abuts
+/// the end of the string (the lexer had to read EOF to terminate it).
+fn parse_error_is_incomplete_input(
+    err: &weavepy_parser::ParseError,
+    meta: &weavepy_parser::ParseMeta,
+    source: &str,
+    root_mode: crate::stdlib::ast_convert::RootMode,
+) -> bool {
+    use weavepy_lexer::LexError as L;
+    use weavepy_parser::{ParseError as P, StopKind};
+    let exec = matches!(root_mode, crate::stdlib::ast_convert::RootMode::Exec);
+    match err {
+        // EOF inside brackets (`E_EOF` with `tok->level > 0`) or inside a
+        // triple-quoted literal (`E_EOFS`): always end-of-source.
+        P::Lex(L::BracketNeverClosed { .. }) => true,
+        P::Lex(L::UnterminatedTripleString { .. } | L::UnterminatedTripleFstring { .. }) => true,
+        // A single-quoted literal is `E_EOLS` only when EOF (not a
+        // newline) cut it short; the f-string tokenizer never sets it.
+        P::Lex(
+            L::UnterminatedString { pos, .. } | L::UnterminatedStringEscapedQuote { pos, .. },
+        ) => string_literal_runs_to_eof(source, *pos as usize, exec),
+        P::Lex(L::UnterminatedFstring { .. }) => false,
+        // `\` continuation at EOF: `\`⏎EOF is E_EOF (incomplete); a bare
+        // trailing `\` is E_LINECONT unless exec mode appended the newline.
+        P::Lex(L::UnexpectedEofParsing { pos, .. }) => {
+            let pos = (*pos as usize).min(source.len());
+            exec || source[..pos].ends_with('\n') || source[pos..].starts_with('\n')
+        }
+        P::Lex(_) => false,
+        _ => {
+            let Some(stop) = meta.stop else {
+                return false;
+            };
+            let start = (stop.start as usize).min(source.len());
+            let tail_blank = source[start..].trim().is_empty();
+            match stop.kind {
+                StopKind::Endmarker => true,
+                StopKind::Dedent => tail_blank,
+                StopKind::Newline => !exec && stop.start == stop.end && tail_blank,
+                StopKind::Other => !exec && stop.end as usize >= source.len(),
+            }
+        }
+    }
+}
+
+/// Did the string literal opening at byte `pos` (prefix or quote) reach
+/// EOF rather than a newline? `exec` mode appends a newline, which only
+/// a trailing backslash can swallow.
+fn string_literal_runs_to_eof(source: &str, pos: usize, exec: bool) -> bool {
+    let bytes = source.as_bytes();
+    let mut i = pos.min(bytes.len());
+    while i < bytes.len() && bytes[i] != b'\'' && bytes[i] != b'"' {
+        i += 1;
+    }
+    i += 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                if i + 1 >= bytes.len() {
+                    // Backslash swallows even the appended newline.
+                    return true;
+                }
+                i += 2;
+            }
+            b'\n' => return false,
+            _ => i += 1,
+        }
+    }
+    // Reaching the end without a newline: exec mode appends one (which
+    // terminates the literal) unless the source already ended with a
+    // newline that an escape swallowed.
+    !exec || source.ends_with('\n')
+}
+
+/// How CPython's tokenizer reports running off the end of the input
+/// inside an open construct — the cases where pegen's parser has already
+/// consumed every earlier token before the tokenizer error surfaces.
+#[derive(Clone, Copy)]
+enum LexEofKind {
+    /// `E_EOF` with brackets open: no exception is set by the tokenizer;
+    /// "'(' was never closed" only overrides an earlier parse error when
+    /// the parser got past the opener's line
+    /// (`_PyPegen_tokenize_full_source_to_check_for_errors`).
+    Bracket { open_line: u32 },
+    /// An unterminated literal: the tokenizer raises immediately, so it
+    /// overrides any earlier parse error.
+    Literal,
+    /// `\` continuation at EOF (`E_EOF`, no brackets): never overrides.
+    Backslash,
+}
+
+fn lex_eof_kind(err: &weavepy_parser::ParseError, source: &str) -> Option<LexEofKind> {
+    use weavepy_lexer::LexError as L;
+    use weavepy_parser::ParseError as P;
+    match err {
+        P::Lex(L::BracketNeverClosed { pos, .. }) => Some(LexEofKind::Bracket {
+            open_line: source[..(*pos as usize).min(source.len())]
+                .matches('\n')
+                .count() as u32
+                + 1,
+        }),
+        P::Lex(
+            L::UnterminatedString { .. }
+            | L::UnterminatedStringEscapedQuote { .. }
+            | L::UnterminatedTripleString { .. }
+            | L::UnterminatedFstring { .. }
+            | L::UnterminatedTripleFstring { .. },
+        ) => Some(LexEofKind::Literal),
+        P::Lex(L::UnexpectedEofParsing { .. }) => Some(LexEofKind::Backslash),
+        _ => None,
+    }
+}
+
+/// `_IncompleteInputError("incomplete input")` anchored at a real token
+/// that abuts the end of the input (pegen's `_PyPegen_raise_error` on
+/// the last token fetched, with its full span).
+fn incomplete_input_at(source: &str, filename: &str, start: u32, end: u32) -> RuntimeError {
+    let (lineno, offset, text) = line_col_text(source, start);
+    let (end_lineno, end_offset, _) = line_col_text(source, end);
+    let e = crate::error::syntax_error_located_as(
+        "_IncompleteInputError",
+        "incomplete input",
+        Some(filename),
+        Some(lineno),
+        Some(offset),
+        Some(&text),
+    );
+    set_syntax_error_end(&e, end_lineno, i64::from(end_offset));
+    e
+}
+
+/// Build `_IncompleteInputError("incomplete input")` where pegen anchors
+/// it when the tokenizer itself hit EOF: an unterminated literal reports
+/// its opening quote (the tokenizer rewinds `tok->cur` there); otherwise
+/// the last token. With a trailing newline that is the NEWLINE at the
+/// end of the last non-empty line (1-based column past it); otherwise the
+/// EOF position, which the converted ENDMARKER reports 0-based in
+/// `single`/`eval` and the appended newline reports 1-based in `exec`.
+/// The end column is CPython's unset `-1`.
+fn incomplete_input_error(
+    err: Option<&weavepy_parser::ParseError>,
+    source: &str,
+    filename: &str,
+    root_mode: crate::stdlib::ast_convert::RootMode,
+) -> RuntimeError {
+    use weavepy_lexer::LexError as L;
+    use weavepy_parser::ParseError as P;
+    let exec = matches!(root_mode, crate::stdlib::ast_convert::RootMode::Exec);
+    let (lineno, offset, text) = match err {
+        Some(P::Lex(
+            L::UnterminatedString { pos, .. }
+            | L::UnterminatedStringEscapedQuote { pos, .. }
+            | L::UnterminatedTripleString { pos, .. }
+            | L::UnterminatedFstring { pos, .. }
+            | L::UnterminatedTripleFstring { pos, .. },
+        )) => {
+            let (lineno, offset, _) = line_col_text(source, *pos);
+            // The tokenizer's line buffer spans the whole (multi-line)
+            // literal: everything from the start of its line.
+            let line_start = source[..(*pos as usize).min(source.len())]
+                .rfind('\n')
+                .map_or(0, |i| i + 1);
+            (lineno, offset, source[line_start..].to_owned())
+        }
+        _ => {
+            let (body, plus, trailing_newline) = match source.strip_suffix('\n') {
+                Some(body) => (body.strip_suffix('\r').unwrap_or(body), 1, true),
+                None => (source, u32::from(exec), false),
+            };
+            let last_line = body.rsplit('\n').next().unwrap_or("");
+            let lineno = body.matches('\n').count() as u32 + 1;
+            let offset = last_line.chars().count() as u32 + plus;
+            // `.text` is the tokenizer's line buffer, newline-terminated
+            // when the source (or exec mode's appended newline) has one.
+            let mut text = last_line.to_owned();
+            if trailing_newline || exec {
+                text.push('\n');
+            }
+            (lineno, offset, text)
+        }
+    };
+    let e = crate::error::syntax_error_located_as(
+        "_IncompleteInputError",
+        "incomplete input",
+        Some(filename),
+        Some(lineno),
+        Some(offset),
+        Some(&text),
+    );
+    set_syntax_error_end(&e, lineno, -1);
+    e
+}
+
+/// Populate `end_lineno`/`end_offset` on a located `SyntaxError`.
+fn set_syntax_error_end(err: &RuntimeError, end_lineno: u32, end_offset: i64) {
+    if let RuntimeError::PyException(pe) = err {
+        if let Object::Instance(inst) = &pe.instance {
+            inst.slot_set("end_lineno", Object::Int(i64::from(end_lineno)));
+            inst.slot_set("end_offset", Object::Int(end_offset));
+        }
+    }
+}
+
+/// The interactive start rule's extra constraints on an otherwise
+/// well-formed parse (`interactive: statement_newline`), evaluated the
+/// way pegen's token stream would see them.
+///
+/// * More than one statement → "multiple statements found while
+///   compiling a single statement" (`bad_single_statement`).
+/// * A compound statement must be followed by a NEWLINE token. When the
+///   source lacks a trailing newline, `_PyPegen_fill_token` converts the
+///   ENDMARKER into that NEWLINE, and — unless `PyCF_DONT_IMPLY_DEDENT`
+///   is set — implies the pending DEDENTs, after which a second
+///   ENDMARKER becomes a second NEWLINE. So a newline-less block that is
+///   still indented at EOF parses (the implied DEDENTs supply the extra
+///   NEWLINE) unless dedents mustn't be implied, while a newline-less
+///   compound whose last line is at column 0 (`def f(): pass`) never
+///   gets its terminating NEWLINE.
+fn check_single_input(
+    module: &weavepy_parser::Module,
+    source: &str,
+    filename: &str,
+    flags: u32,
+) -> Result<(), RuntimeError> {
+    use weavepy_compiler::flags as cf;
+    let line_of = |off: usize| source[..off.min(source.len())].matches('\n').count();
+    if module.body.len() > 1
+        && module.body.iter().any(|s| {
+            line_of(s.span.start.0 as usize) != line_of(module.body[0].span.start.0 as usize)
+        })
+    {
+        let end = module.body[0].span.end.0 as usize;
+        let lineno = source[..end.min(source.len())].matches('\n').count() as u32 + 1;
+        return Err(crate::error::syntax_error_located(
+            "multiple statements found while compiling a single statement",
+            Some(filename),
+            Some(lineno),
+            Some(1),
+            source.lines().nth(lineno as usize - 1),
+        ));
+    }
+    let Some(stmt) = module.body.first() else {
+        return Ok(());
+    };
+    use weavepy_parser::ast::StmtKind as SK;
+    let compound = matches!(
+        stmt.kind,
+        SK::FunctionDef { .. }
+            | SK::AsyncFunctionDef { .. }
+            | SK::ClassDef { .. }
+            | SK::If { .. }
+            | SK::While { .. }
+            | SK::For { .. }
+            | SK::AsyncFor { .. }
+            | SK::With { .. }
+            | SK::AsyncWith { .. }
+            | SK::Try { .. }
+            | SK::Match { .. }
+    );
+    if !compound {
+        return Ok(());
+    }
+    // Tokenizer state at EOF: is the last logical line closed by a real
+    // NEWLINE, and how deep is the indent stack?
+    let Ok(tokens) = weavepy_lexer::tokenize(source) else {
+        return Ok(());
+    };
+    let len = source.len() as u32;
+    let mut real_newline = true;
+    let mut depth: i32 = 0;
+    for t in &tokens {
+        match t.kind {
+            weavepy_lexer::TokenKind::Newline => real_newline = t.span.start != t.span.end,
+            weavepy_lexer::TokenKind::Indent => depth += 1,
+            // DEDENTs synthesised at EOF don't count: CPython only pops
+            // the stack there if a fresh line (after a trailing newline)
+            // was read at column 0.
+            weavepy_lexer::TokenKind::Dedent if t.span.start.0 < len => depth -= 1,
+            _ => {}
+        }
+    }
+    let indent_at_eof = if source.ends_with('\n') { 0 } else { depth };
+    let dont_imply_dedent = flags & cf::PYCF_DONT_IMPLY_DEDENT != 0;
+    let unterminated = if indent_at_eof > 0 {
+        dont_imply_dedent
+    } else {
+        !real_newline
+    };
+    if !unterminated {
+        return Ok(());
+    }
+    let last_line = source.rsplit('\n').next().unwrap_or("");
+    let lineno = source.matches('\n').count() as u32 + 1;
+    if flags & cf::PYCF_ALLOW_INCOMPLETE_INPUT != 0 {
+        return Err(incomplete_input_error(
+            None,
+            source,
+            filename,
+            crate::stdlib::ast_convert::RootMode::Single,
+        ));
+    }
+    Err(crate::error::syntax_error_located(
+        "invalid syntax",
+        Some(filename),
+        Some(lineno),
+        Some(0),
+        Some(last_line),
+    ))
+}
+
 /// Map a [`weavepy_parser::ParseError`] to a CPython-shaped `SyntaxError`,
 /// computing the line/column/text from the error's byte offset. CPython
 /// raises `SyntaxError` (not `ValueError`/`ImportError`) from both
@@ -40332,19 +41778,66 @@ fn parse_error_to_syntax_error(
     // None makes traceback assume a multi-line error and underline to
     // end of line.
     let end_byte = err.byte_end_offset();
-    let (end_lineno, end_offset) = if end_byte > err.byte_offset() {
+    let start_byte = err.byte_offset() as usize;
+    // An error anchored at a NEWLINE/ENDMARKER token: CPython's tokenizer
+    // always ends the source with a newline and reports the token as one
+    // column wide on its own line (`if x⏎` → offset 5, end_offset 6).
+    let at_line_end = source[start_byte.min(source.len())..]
+        .chars()
+        .next()
+        .is_none_or(|c| c == '\n' || c == '\r');
+    let (end_lineno, end_offset) = if at_line_end {
+        (lineno, i64::from(offset) + 1)
+    } else if end_byte > err.byte_offset() {
         let (l, c, _) = line_col_text(source, end_byte);
-        (l, c)
+        (l, i64::from(c))
     } else {
-        (lineno, offset)
+        (lineno, i64::from(offset))
     };
-    if let RuntimeError::PyException(pe) = &e {
-        if let Object::Instance(inst) = &pe.instance {
-            inst.slot_set("end_lineno", Object::Int(i64::from(end_lineno)));
-            inst.slot_set("end_offset", Object::Int(i64::from(end_offset)));
-        }
-    }
+    // Tokenizer-stage diagnostics raised without a known end: pegen's
+    // `RAISE_ERROR_KNOWN_LOCATION(..., end_col_offset=-1)` publishes
+    // `end_offset` 0 (the `+1` adjustment) for the unclosed-bracket,
+    // stray-continuation and too-deep-indent errors, and
+    // `_PyPegen_raise_error`'s bare `-1` for the E_EOF and E_DEDENT ones.
+    let end_offset = if msg.contains("was never closed")
+        || msg == "unexpected character after line continuation character"
+        || msg == "too many levels of indentation"
+    {
+        0
+    } else if msg == "unexpected EOF while parsing"
+        || msg == "unindent does not match any outer indentation level"
+    {
+        -1
+    } else {
+        end_offset
+    };
+    set_syntax_error_end(&e, end_lineno, end_offset);
     e
+}
+
+/// Set `SyntaxError._metadata = (last_stmt_lineno, last_stmt_col, source)`
+/// on a parser-raised `SyntaxError` (CPython 3.14's
+/// `_PyPegen_set_syntax_error_metadata`). Non-SyntaxError results
+/// (`ValueError` for identifier constants) are left alone.
+fn attach_syntax_error_metadata(err: &RuntimeError, last_stmt: (u32, u32), source: &str) {
+    let RuntimeError::PyException(pe) = err else {
+        return;
+    };
+    let Object::Instance(inst) = &pe.instance else {
+        return;
+    };
+    let syntax_error_ty = &crate::builtin_types::builtin_types().syntax_error;
+    if !inst.cls().is_subclass_of(syntax_error_ty) {
+        return;
+    }
+    inst.slot_set(
+        "_metadata",
+        Object::new_tuple(vec![
+            Object::Int(i64::from(last_stmt.0)),
+            Object::Int(i64::from(last_stmt.1)),
+            Object::from_str(source.to_owned()),
+        ]),
+    );
 }
 
 /// Map a [`weavepy_compiler::CompileError`] to a CPython-shaped
@@ -41777,7 +43270,7 @@ pub(crate) fn builtin_type_doc(name: &str) -> Option<&'static str> {
             "Represent a PEP 585 generic type\n\n\
              E.g. for t = list[int], t.__origin__ is list and t.__args__ is (int,)."
         }
-        "UnionType" => "Represent a PEP 604 union type\n\nE.g. for int | str",
+        "Union" => "Represent a union type\n\nE.g. for int | str",
         _ => return None,
     })
 }
@@ -41966,6 +43459,12 @@ fn make_coroutine_wrapper(coro: &Object) -> Object {
     }
     fn cw_close(args: &[Object]) -> Result<Object, RuntimeError> {
         let coro = wrapped_coro(args)?;
+        if args.len() > 1 {
+            return Err(type_error(format!(
+                "coroutine_wrapper.close() takes no arguments ({} given)",
+                args.len() - 1
+            )));
+        }
         with_interp(|i| i.gen_method_close(&coro))
     }
     fn cw_iter(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -43447,16 +44946,11 @@ pub(crate) fn percent_format_with(
                         _ => item.clone(),
                     };
                     if !percent_is_real(&numeric) {
-                        // str mode names the conversion as written (`%i
-                        // format: …`, test_str.test_formatting); bytes mode
-                        // still reports `%i` as `%d` (test_bytes.test_mod).
-                        let kind_msg = if kind == 'i' && mode == PercentMode::Bytes {
-                            'd'
-                        } else {
-                            kind
-                        };
+                        // Both modes name the conversion as written (`%i
+                        // format: …`; 3.14 aligned bytes with str,
+                        // test_bytes.test_mod / test_str.test_formatting).
                         return Err(type_error(format!(
-                            "%{kind_msg} format: a real number is required, not {}",
+                            "%{kind} format: a real number is required, not {}",
                             item.type_name_owned()
                         )));
                     }
@@ -43538,10 +45032,22 @@ pub(crate) fn percent_format_with(
                         },
                         _ => match item.as_bytes_view() {
                             Some(b) if b.len() == 1 => b[0],
+                            Some(b) if matches!(&item, Object::Bytes(_) | Object::ByteArray(_)) => {
+                                // CPython's `byte_converter` names the
+                                // container and its length.
+                                return Err(type_error(format!(
+                                    "%c requires an integer in range(256) or a single byte, \
+                                     not a {} object of length {}",
+                                    item.type_name(),
+                                    b.len()
+                                )));
+                            }
                             _ => {
-                                return Err(type_error(
-                                    "%c requires an integer in range(256) or a single byte",
-                                ))
+                                // 3.14: `%T` names the offending type.
+                                return Err(type_error(format!(
+                                    "%c requires an integer in range(256) or a single byte, not {}",
+                                    item.type_name_fq()
+                                )));
                             }
                         },
                     };
@@ -43581,16 +45087,33 @@ pub(crate) fn percent_format_with(
                         }
                         Object::Str(_) | Object::WStr(_) => match int_item.str_codepoints() {
                             Some(cps) if cps.len() == 1 => cps[0],
-                            _ => return Err(type_error("%c requires int or char")),
+                            Some(cps) => {
+                                return Err(type_error(format!(
+                                    "%c requires an int or a unicode character, not a string of length {}",
+                                    cps.len()
+                                )))
+                            }
+                            None => {
+                                return Err(type_error(
+                                    "%c requires an int or a unicode character, not str",
+                                ))
+                            }
                         },
                         // An `int` subclass instance (bool-like enum members).
-                        Object::Instance(_) => {
+                        Object::Instance(_) if int_item.as_i64().is_some() => {
                             match int_item.as_i64().filter(|n| (0..=0x10_FFFF).contains(n)) {
                                 Some(n) => n as u32,
-                                None => return Err(type_error("%c requires int or char")),
+                                None => {
+                                    return Err(overflow_error("%c arg not in range(0x110000)"))
+                                }
                             }
                         }
-                        _ => return Err(type_error("%c requires int or char")),
+                        other => {
+                            return Err(type_error(format!(
+                                "%c requires an int or a unicode character, not {}",
+                                other.type_name_fq()
+                            )))
+                        }
                     };
                     // Apply width/alignment by routing through the string
                     // formatter (`%5c` right-justifies like `%5s`).
@@ -44180,14 +45703,23 @@ fn apply_format_spec_inner(
             apply_alignment(&s, &sp, numeric_default)
         }
         Some('c') => match value {
-            Object::Int(i) => {
-                let c = u32::try_from(*i)
-                    .ok()
-                    .and_then(char::from_u32)
+            Object::Int(_) | Object::Bool(_) | Object::Long(_) => {
+                let cp = value
+                    .as_i64()
+                    .filter(|n| (0..=0x10_FFFF).contains(n))
+                    .ok_or_else(|| overflow_error("%c arg not in range(0x110000)"))?;
+                let c = char::from_u32(cp as u32)
                     .ok_or_else(|| value_error("integer is not a valid unicode codepoint"))?;
                 apply_alignment(&c.to_string(), &parsed, false)
             }
-            _ => return Err(value_error("%c requires int or char")),
+            // `format(1.5, 'c')`: the float/complex formatter has no `c`
+            // (`Unknown format code 'c' for object of type 'float'`).
+            other => {
+                return Err(value_error(format!(
+                    "Unknown format code 'c' for object of type '{}'",
+                    other.type_name_owned()
+                )))
+            }
         },
         // `n` is locale-aware: integers group like `d`, floats like `g`.
         // WeavePy runs in the C locale, so grouping is empty and the output
@@ -45032,7 +46564,7 @@ fn object_needs_vm_iter(o: &Object) -> bool {
     )
 }
 
-fn is_type_error(e: &RuntimeError) -> bool {
+pub(crate) fn is_type_error(e: &RuntimeError) -> bool {
     if let RuntimeError::PyException(pe) = e {
         if let Object::Instance(inst) = &pe.instance {
             return inst
@@ -45496,7 +47028,7 @@ fn code_vm_ext(code: &CodeObject) -> Option<&CodeConstObjects> {
             objects: code
                 .constants
                 .iter()
-                .map(|c| constant_to_object(c.clone()))
+                .map(constant_to_object_interned)
                 .collect(),
             name_hashes: code
                 .names
@@ -45553,6 +47085,22 @@ fn code_name_key(code: &CodeObject, name_idx: u32) -> Option<crate::object::StrK
         None => crate::object::py_str_hash(s),
     };
     Some(crate::object::StrKeyHashed { s, hash })
+}
+
+/// `co_consts` materialization with `intern_string_constants` applied:
+/// name-like str constants come from the intern pool (so a `'x'` literal
+/// `is` the parser's interned identifier `'x'`, as in CPython), and tuple
+/// constants are walked for the same.
+fn constant_to_object_interned(c: &Constant) -> Object {
+    match c {
+        Constant::Str(s) if crate::stdlib::sys::cpython_interns_constant(s) => {
+            crate::stdlib::sys::intern_name(s)
+        }
+        Constant::Tuple(xs) => {
+            Object::new_tuple(xs.iter().map(constant_to_object_interned).collect())
+        }
+        other => constant_to_object(other.clone()),
+    }
 }
 
 fn constant_to_object(c: Constant) -> Object {
@@ -45755,10 +47303,17 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
     {
         return Err(overflow_error("int too large to convert to float"));
     }
-    // Complex absorbs (complex, anything-numeric).
+    // Complex absorbs (complex, anything-numeric). 3.14's mixed-mode
+    // rules (gh-69639) treat a real operand as a real number, not as a
+    // complex with a zero imaginary part.
     if matches!(a, O::Complex(_)) || matches!(b, O::Complex(_)) {
         if let (Some(ac), Some(bc)) = (a.as_complex(), b.as_complex()) {
-            return complex_arith(ac, bc, op);
+            let mode = match (matches!(a, O::Complex(_)), matches!(b, O::Complex(_))) {
+                (true, true) => ComplexMode::Both,
+                (true, false) => ComplexMode::LeftOnly,
+                (false, _) => ComplexMode::RightOnly,
+            };
+            return complex_arith(ac, bc, op, mode);
         }
     }
 
@@ -45783,7 +47338,7 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
         (O::Float(x), O::Float(y), B::Mult) => Ok(crate::object::fresh_float(x * y)),
         (O::Float(x), O::Float(y), B::Div) => {
             if *y == 0.0 {
-                Err(zero_division_error("float division by zero"))
+                Err(zero_division_error("division by zero"))
             } else {
                 Ok(crate::object::fresh_float(x / y))
             }
@@ -45791,7 +47346,7 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
         (O::Float(x), O::Float(y), B::Mod) => Ok(crate::object::fresh_float(py_float_mod(*x, *y)?)),
         (O::Float(x), O::Float(y), B::Pow) => float_pow(*x, *y),
         (O::Float(x), O::Float(y), B::FloorDiv) => Ok(crate::object::fresh_float(
-            py_float_divmod(*x, *y, "float floor division by zero")?.0,
+            py_float_divmod(*x, *y, "division by zero")?.0,
         )),
 
         (O::Int(x), O::Float(y), op) => binary_op(&O::Float(*x as f64), &O::Float(*y), op),
@@ -46359,6 +47914,19 @@ pub fn is_pep604_union(obj: &Object) -> Option<Vec<Object>> {
 /// test_union_parameter_substitution's `BadType`); a single surviving
 /// member is returned bare (`int | int is int`). Matches
 /// `Objects/unionobject.c::_Py_make_union`.
+/// The args recorded as unhashable when a PEP 604 union was built
+/// (CPython's `unionobject.unhashable_args`), or `None`.
+pub fn union_unhashable_args(obj: &Object) -> Option<Vec<Object>> {
+    let Object::SimpleNamespace(ns) = obj else {
+        return None;
+    };
+    let dict = ns.borrow();
+    match dict.get(&DictKey(Object::from_static("__weave_unhashable_args__")))? {
+        Object::Tuple(t) if !t.is_empty() => Some(t.to_vec()),
+        _ => None,
+    }
+}
+
 pub fn make_pep604_union(a: &Object, b: &Object) -> Result<Object, RuntimeError> {
     let mut args: Vec<Object> = Vec::new();
     let mut push = |x: &Object| {
@@ -46373,27 +47941,60 @@ pub fn make_pep604_union(a: &Object, b: &Object) -> Result<Object, RuntimeError>
     push(a);
     push(b);
 
-    // Equality dedup, preserving first-seen order. Identity short-cut
-    // first; TypeVar-shaped placeholders compare by identity only
-    // (CPython's TypeVar has no `__eq__`); everything else routes
-    // through the live interpreter's rich comparison so metaclass
-    // `__eq__` hooks fire (and their errors escape). Outside a running
+    // Dedup preserving first-seen order, the 3.14 `unionbuilder` way: a
+    // hashable arg is deduplicated through a set (so `__eq__` only runs
+    // on a hash collision), an unhashable one -- `hash()` raised, any
+    // exception class -- through list membership (rich `==`, errors
+    // escape). The unhashable args are remembered so `hash(union)` can
+    // refuse (`union contains N unhashable elements`). Outside a running
     // interpreter (bootstrap) identity is all we need.
     let mut unique: Vec<Object> = Vec::new();
+    let mut hashable: Vec<(i64, Object)> = Vec::new();
+    let mut unhashable: Vec<Object> = Vec::new();
+    let mut interp = crate::builtins::reentrant_interp().ok();
     'outer: for x in args {
-        for seen in &unique {
-            if seen.is_same(&x) {
+        let Some(interp) = interp.as_deref_mut() else {
+            if unique.iter().any(|seen| seen.is_same(&x)) {
                 continue 'outer;
             }
-            if is_typevar_like(seen) || is_typevar_like(&x) {
-                continue;
-            }
-            if let Ok(interp) = crate::builtins::reentrant_interp() {
-                let g = interp.builtins_dict();
-                let eq = interp.rich_compare_obj(seen, &x, CompareKind::Eq, &g)?;
-                if eq.is_truthy() {
-                    continue 'outer;
+            unique.push(x);
+            continue 'outer;
+        };
+        let g = interp.builtins_dict();
+        let hash = match interp.do_hash_call(&x, &g) {
+            Ok(Object::Int(h)) => Some(h),
+            Ok(Object::Bool(b)) => Some(i64::from(b)),
+            Ok(Object::Long(b)) => Some(crate::object::py_hash_long_bigint(&b)),
+            Ok(_) => Some(crate::object::identity_hash(&x)),
+            Err(_) => None,
+        };
+        match hash {
+            Some(h) => {
+                for (h2, seen) in &hashable {
+                    if *h2 != h {
+                        continue;
+                    }
+                    if seen.is_same(&x) {
+                        continue 'outer;
+                    }
+                    let eq = interp.rich_compare_obj(seen, &x, CompareKind::Eq, &g)?;
+                    if eq.is_truthy() {
+                        continue 'outer;
+                    }
                 }
+                hashable.push((h, x.clone()));
+            }
+            None => {
+                for seen in &unhashable {
+                    if seen.is_same(&x) {
+                        continue 'outer;
+                    }
+                    let eq = interp.rich_compare_obj(seen, &x, CompareKind::Eq, &g)?;
+                    if eq.is_truthy() {
+                        continue 'outer;
+                    }
+                }
+                unhashable.push(x.clone());
             }
         }
         unique.push(x);
@@ -46412,6 +48013,12 @@ pub fn make_pep604_union(a: &Object, b: &Object) -> Result<Object, RuntimeError>
         DictKey(Object::from_static("__args__")),
         Object::new_tuple(args.clone()),
     );
+    if !unhashable.is_empty() {
+        dict.insert(
+            DictKey(Object::from_static("__weave_unhashable_args__")),
+            Object::new_tuple(unhashable),
+        );
+    }
     // CPython `union_getitem`/`union_parameters`: a union carries the type
     // parameters found anywhere in its args (`(list[T] | float).
     // __parameters__ == (T,)`), which typing's `_collect_parameters`
@@ -46424,14 +48031,83 @@ pub fn make_pep604_union(a: &Object, b: &Object) -> Result<Object, RuntimeError>
         DictKey(Object::from_static("__parameters__")),
         Object::new_tuple(params),
     );
-    // Surface a `__class__` string so `repr` / type introspection
-    // sees something reasonable; we don't have a real
-    // `types.UnionType` runtime type yet but the str is cheap.
-    dict.insert(
-        DictKey(Object::from_static("__class__")),
-        Object::from_static("types.UnionType"),
-    );
+    // (`__origin__`/`__name__`/`__qualname__` are resolved by the
+    // attribute-load path — storing `__origin__` here would make the
+    // union look like a GenericAlias to `is_generic_alias`.)
     Ok(Object::SimpleNamespace(Rc::new(RefCell::new(dict))))
+}
+
+/// `typing.Union[...]` (3.14 `union_class_getitem` / `_Py_union_from_tuple`):
+/// every argument is run through the `Union[arg, ...]` type check
+/// (`None` becomes `NoneType`, strings become `ForwardRef`s via
+/// `typing._type_check`), nested unions flatten, duplicates collapse, a
+/// lone survivor is returned bare, and no arguments is an error.
+pub fn union_class_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
+    let item = args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| type_error("__class_getitem__() missing argument"))?;
+    let items: Vec<Object> = match &item {
+        Object::Tuple(t) => t.iter().cloned().collect(),
+        other => vec![other.clone()],
+    };
+    if items.is_empty() {
+        return Err(type_error("Cannot take a Union of no types."));
+    }
+    let mut acc: Option<Object> = None;
+    for raw in items {
+        let checked = union_type_check(&raw)?;
+        acc = Some(match acc {
+            None => checked,
+            Some(prev) => make_pep604_union(&prev, &checked)?,
+        });
+    }
+    let out = acc.expect("at least one argument");
+    // `Union[X]` is `X` — except a lone `None`, which is `NoneType`.
+    Ok(normalize_union_arg(out))
+}
+
+/// `unionobject.c::type_check` — `is_unionable` arguments pass through;
+/// anything else goes to `typing._type_check` (which turns strings into
+/// `ForwardRef`s and rejects the special forms that can't be union members).
+fn union_type_check(arg: &Object) -> Result<Object, RuntimeError> {
+    if matches!(arg, Object::None | Object::Type(_))
+        || is_generic_alias(arg)
+        || is_pep604_union(arg).is_some()
+        || is_typevar_like(arg)
+        || is_type_alias_type(arg)
+    {
+        return Ok(arg.clone());
+    }
+    let Ok(interp) = crate::builtins::reentrant_interp() else {
+        return Ok(arg.clone());
+    };
+    // `typing` may be mid-import (its own module body never subscripts
+    // `Union`, but a partially initialised module has no `_type_check`
+    // yet); in that case accept the argument as-is.
+    let globals = interp.builtins_dict();
+    let typing = interp.do_import("typing", &Object::None, 0, &globals)?;
+    let Ok(type_check) = interp.load_attr_public(&typing, "_type_check") else {
+        return Ok(arg.clone());
+    };
+    let msg = Object::from_static("Union[arg, ...]: each arg must be a type.");
+    interp.call_object_with_globals(&type_check, &[arg.clone(), msg], &[], &globals)
+}
+
+/// An instance of `typing.TypeAliasType` (the `type X = ...` statement's
+/// runtime object, defined in the frozen `_typing`).
+fn is_type_alias_type(obj: &Object) -> bool {
+    match obj {
+        Object::Instance(inst) => {
+            let cls = inst.cls();
+            cls.name == "TypeAliasType"
+                && matches!(
+                    cls.dict.borrow().get(&DictKey(Object::from_static("__module__"))),
+                    Some(Object::Str(m)) if &**m == "typing"
+                )
+        }
+        _ => false,
+    }
 }
 
 /// Normalise a single argument for inclusion in a PEP 604 union:
@@ -46486,7 +48162,7 @@ pub fn py_float_divmod(x: f64, y: f64, ctx: &'static str) -> Result<(f64, f64), 
 /// `0.1 % float('-inf') == -inf`. Mirrors CPython's `float_rem`.
 fn py_float_mod(x: f64, y: f64) -> Result<f64, RuntimeError> {
     if y == 0.0 {
-        return Err(zero_division_error("float modulo"));
+        return Err(zero_division_error("division by zero"));
     }
     let mut m = x % y;
     if m != 0.0 {
@@ -46510,9 +48186,7 @@ fn float_pow(x: f64, y: f64) -> Result<Object, RuntimeError> {
     // 0.0 to a finite negative power is a division by zero (C99 still treats
     // 0**-inf as +inf, so only finite negative exponents raise).
     if x == 0.0 && y < 0.0 && y.is_finite() {
-        return Err(zero_division_error(
-            "0.0 cannot be raised to a negative power",
-        ));
+        return Err(zero_division_error("zero to a negative power"));
     }
     if x < 0.0 && y.fract() != 0.0 && x.is_finite() && y.is_finite() {
         let magnitude = (-x).powf(y);
@@ -46704,7 +48378,7 @@ fn bignum_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
         }
         B::FloorDiv => {
             if y.is_zero() {
-                return Err(zero_division_error("integer division or modulo by zero"));
+                return Err(zero_division_error("division by zero"));
             }
             // num-bigint's div truncates toward zero; adjust for
             // floor semantics like CPython.
@@ -46714,7 +48388,7 @@ fn bignum_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
         }
         B::Mod => {
             if y.is_zero() {
-                return Err(zero_division_error("integer division or modulo by zero"));
+                return Err(zero_division_error("division by zero"));
             }
             use num_integer::Integer;
             let (_, r) = x.div_mod_floor(&y);
@@ -46817,7 +48491,7 @@ fn i64_op(x: i64, y: i64, op: BinOpKind) -> Result<Option<Object>, RuntimeError>
         }
         B::FloorDiv => {
             if y == 0 {
-                return Err(zero_division_error("integer division or modulo by zero"));
+                return Err(zero_division_error("division by zero"));
             }
             // Avoid overflow on i64::MIN / -1.
             if x == i64::MIN && y == -1 {
@@ -46835,7 +48509,7 @@ fn i64_op(x: i64, y: i64, op: BinOpKind) -> Result<Option<Object>, RuntimeError>
         }
         B::Mod => {
             if y == 0 {
-                return Err(zero_division_error("integer division or modulo by zero"));
+                return Err(zero_division_error("division by zero"));
             }
             // `i64::MIN % -1` overflows the remainder op (the value is 0);
             // defer to the bignum path, mirroring the FloorDiv guard above.
@@ -46857,9 +48531,7 @@ fn i64_op(x: i64, y: i64, op: BinOpKind) -> Result<Option<Object>, RuntimeError>
                 // through `float_pow`), which makes `0 ** -n` a division by
                 // zero rather than the IEEE `inf` that `powf` would yield.
                 if x == 0 {
-                    return Err(zero_division_error(
-                        "0.0 cannot be raised to a negative power",
-                    ));
+                    return Err(zero_division_error("zero to a negative power"));
                 }
                 return Ok(Some(Object::Float((x as f64).powf(y as f64))));
             }
@@ -47255,22 +48927,39 @@ fn complex_div(ar: f64, ai: f64, br: f64, bi: f64) -> Result<(f64, f64), Runtime
     // the denominator is exactly `0+0j` (first branch with `abs_br == 0`).
     let abs_br = br.abs();
     let abs_bi = bi.abs();
-    if abs_br >= abs_bi {
+    let (mut re, mut im) = if abs_br >= abs_bi {
         if abs_br == 0.0 {
-            return Err(zero_division_error("complex division by zero"));
+            return Err(zero_division_error("division by zero"));
         }
         let ratio = bi / br;
         let denom = br + bi * ratio;
-        Ok(((ar + ai * ratio) / denom, (ai - ar * ratio) / denom))
+        ((ar + ai * ratio) / denom, (ai - ar * ratio) / denom)
     } else if abs_bi >= abs_br {
         // `abs_bi >= abs_br` and not the first branch ⇒ `abs_bi != 0`.
         let ratio = br / bi;
         let denom = br * ratio + bi;
-        Ok(((ar * ratio + ai) / denom, (ai * ratio - ar) / denom))
+        ((ar * ratio + ai) / denom, (ai * ratio - ar) / denom)
     } else {
         // At least one of `br`/`bi` is NaN.
-        Ok((f64::NAN, f64::NAN))
+        (f64::NAN, f64::NAN)
+    };
+    // C11 Annex G.5.2 (`_Cdivd`): recover infinities and zeros that
+    // computed as `nan+nanj`.
+    if re.is_nan() && im.is_nan() {
+        if (ar.is_infinite() || ai.is_infinite()) && br.is_finite() && bi.is_finite() {
+            let x = (if ar.is_infinite() { 1.0f64 } else { 0.0 }).copysign(ar);
+            let y = (if ai.is_infinite() { 1.0f64 } else { 0.0 }).copysign(ai);
+            re = f64::INFINITY * (x * br + y * bi);
+            im = f64::INFINITY * (y * br - x * bi);
+        } else if (abs_br.is_infinite() || abs_bi.is_infinite()) && ar.is_finite() && ai.is_finite()
+        {
+            let x = (if br.is_infinite() { 1.0f64 } else { 0.0 }).copysign(br);
+            let y = (if bi.is_infinite() { 1.0f64 } else { 0.0 }).copysign(bi);
+            re = 0.0 * (ar * x + ai * y);
+            im = 0.0 * (ai * x - ar * y);
+        }
     }
+    Ok((re, im))
 }
 
 /// CPython `_Py_c_pow` — repeated multiplication for small integer
@@ -47283,32 +48972,29 @@ fn complex_pow(ar: f64, ai: f64, br: f64, bi: f64) -> Result<(f64, f64), Runtime
         return Ok((1.0, 0.0));
     }
     // `0 ** y`: zero for a positive real `y`, otherwise a zero-division
-    // (CPython sets `errno = EDOM` → "0.0 to a negative or complex power").
+    // (CPython sets `errno = EDOM` → "zero to a negative or complex power").
     if ar == 0.0 && ai == 0.0 {
         if bi != 0.0 || br < 0.0 {
-            return Err(zero_division_error("0.0 to a negative or complex power"));
+            return Err(zero_division_error("zero to a negative or complex power"));
         }
         return Ok((0.0, 0.0));
     }
     // Integer real exponent in (-100, 100), zero imaginary part: CPython
     // uses `c_powi`/`c_powu` (repeated squaring) so results are exact for
     // the common integer-power cases the test-suite checks.
-    if bi == 0.0 && br.fract() == 0.0 && br.abs() < 100.0 {
+    if bi == 0.0 && br.fract() == 0.0 && br.abs() <= 100.0 {
         let n = br as i64;
         let (mut pr, mut pi) = (1.0_f64, 0.0_f64);
         let (mut xr, mut xi) = (ar, ai);
         let mut k = n.unsigned_abs();
+        // Each step is `_Py_c_prod`, whose Annex G recovery keeps an
+        // overflowed square as `inf` rather than `nan` so the ERANGE
+        // check below fires (`pow(1e200+1j, 5)` → OverflowError).
         while k > 0 {
             if k & 1 == 1 {
-                let nr = pr * xr - pi * xi;
-                let ni = pr * xi + pi * xr;
-                pr = nr;
-                pi = ni;
+                (pr, pi) = complex_prod(pr, pi, xr, xi);
             }
-            let sr = xr * xr - xi * xi;
-            let si = 2.0 * xr * xi;
-            xr = sr;
-            xi = si;
+            (xr, xi) = complex_prod(xr, xi, xr, xi);
             k >>= 1;
         }
         if n < 0 {
@@ -47337,21 +49023,125 @@ fn complex_pow_finish(ar: f64, ai: f64, re: f64, im: f64) -> Result<(f64, f64), 
     Ok((re, im))
 }
 
+/// Which operands of a complex binary operation are `complex` objects
+/// (the other being a real number the operation absorbs). CPython 3.14's
+/// `COMPLEX_BINOP` picks `_Py_c_*`, `_Py_cr_*`, or `_Py_rc_*` on this.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ComplexMode {
+    Both,
+    LeftOnly,
+    RightOnly,
+}
+
+/// `_Py_c_prod` with C11 Annex G.5.1's recovery of infinities that
+/// computed as `nan+nanj`.
+fn complex_prod(a: f64, b: f64, c: f64, d: f64) -> (f64, f64) {
+    let (ac, bd, ad, bc) = (a * c, b * d, a * d, b * c);
+    let (mut re, mut im) = (ac - bd, ad + bc);
+    if re.is_nan() && im.is_nan() {
+        let (mut a, mut b, mut c, mut d) = (a, b, c, d);
+        let box_inf = |x: f64| (if x.is_infinite() { 1.0f64 } else { 0.0 }).copysign(x);
+        let zero_nan = |x: f64| if x.is_nan() { 0.0f64.copysign(x) } else { x };
+        let mut recalc = false;
+        if a.is_infinite() || b.is_infinite() {
+            a = box_inf(a);
+            b = box_inf(b);
+            c = zero_nan(c);
+            d = zero_nan(d);
+            recalc = true;
+        }
+        if c.is_infinite() || d.is_infinite() {
+            c = box_inf(c);
+            d = box_inf(d);
+            a = zero_nan(a);
+            b = zero_nan(b);
+            recalc = true;
+        }
+        if !recalc && (ac.is_infinite() || bd.is_infinite() || ad.is_infinite() || bc.is_infinite())
+        {
+            a = zero_nan(a);
+            b = zero_nan(b);
+            c = zero_nan(c);
+            d = zero_nan(d);
+            recalc = true;
+        }
+        if recalc {
+            re = f64::INFINITY * (a * c - b * d);
+            im = f64::INFINITY * (a * d + b * c);
+        }
+    }
+    (re, im)
+}
+
+/// `_Py_rc_quot`: a real numerator over a complex denominator (Smith's
+/// algorithm specialised to `a.imag == 0`, which keeps zero signs exact).
+fn complex_rc_quot(a: f64, br: f64, bi: f64) -> Result<(f64, f64), RuntimeError> {
+    let abs_br = br.abs();
+    let abs_bi = bi.abs();
+    let (mut re, mut im);
+    if abs_br >= abs_bi {
+        if abs_br == 0.0 {
+            return Err(zero_division_error("division by zero"));
+        }
+        let ratio = bi / br;
+        let denom = br + bi * ratio;
+        re = a / denom;
+        im = (-a * ratio) / denom;
+    } else if abs_bi >= abs_br {
+        let ratio = br / bi;
+        let denom = br * ratio + bi;
+        re = (a * ratio) / denom;
+        im = (-a) / denom;
+    } else {
+        re = f64::NAN;
+        im = f64::NAN;
+    }
+    if re.is_nan() && im.is_nan() && a.is_finite() && (abs_br.is_infinite() || abs_bi.is_infinite())
+    {
+        let x = (if br.is_infinite() { 1.0f64 } else { 0.0 }).copysign(br);
+        let y = (if bi.is_infinite() { 1.0f64 } else { 0.0 }).copysign(bi);
+        re = 0.0 * (a * x);
+        im = 0.0 * (-a * y);
+    }
+    Ok((re, im))
+}
+
 fn complex_arith(
     (ar, ai): (f64, f64),
     (br, bi): (f64, f64),
     op: BinOpKind,
+    mode: ComplexMode,
 ) -> Result<Object, RuntimeError> {
     use BinOpKind as B;
-    match op {
-        B::Add => Ok(Object::new_complex(ar + br, ai + bi)),
-        B::Sub => Ok(Object::new_complex(ar - br, ai - bi)),
-        B::Mult => Ok(Object::new_complex(ar * br - ai * bi, ar * bi + ai * br)),
-        B::Div => {
+    match (op, mode) {
+        // `_Py_cr_sum` / `_Py_rc_sum`: only the real part moves.
+        (B::Add, ComplexMode::LeftOnly) => Ok(Object::new_complex(ar + br, ai)),
+        (B::Add, ComplexMode::RightOnly) => Ok(Object::new_complex(br + ar, bi)),
+        (B::Add, ComplexMode::Both) => Ok(Object::new_complex(ar + br, ai + bi)),
+        (B::Sub, ComplexMode::LeftOnly) => Ok(Object::new_complex(ar - br, ai)),
+        (B::Sub, ComplexMode::RightOnly) => Ok(Object::new_complex(ar - br, -bi)),
+        (B::Sub, ComplexMode::Both) => Ok(Object::new_complex(ar - br, ai - bi)),
+        (B::Mult, ComplexMode::LeftOnly) => Ok(Object::new_complex(ar * br, ai * br)),
+        (B::Mult, ComplexMode::RightOnly) => Ok(Object::new_complex(br * ar, bi * ar)),
+        (B::Mult, ComplexMode::Both) => {
+            let (re, im) = complex_prod(ar, ai, br, bi);
+            Ok(Object::new_complex(re, im))
+        }
+        (B::Div, ComplexMode::LeftOnly) => {
+            if br == 0.0 {
+                return Err(zero_division_error("division by zero"));
+            }
+            Ok(Object::new_complex(ar / br, ai / br))
+        }
+        (B::Div, ComplexMode::RightOnly) => {
+            let (re, im) = complex_rc_quot(ar, br, bi)?;
+            Ok(Object::new_complex(re, im))
+        }
+        (B::Div, ComplexMode::Both) => {
             let (re, im) = complex_div(ar, ai, br, bi)?;
             Ok(Object::new_complex(re, im))
         }
-        B::Pow => {
+        (B::Pow, _) => {
             let (re, im) = complex_pow(ar, ai, br, bi)?;
             Ok(Object::new_complex(re, im))
         }
