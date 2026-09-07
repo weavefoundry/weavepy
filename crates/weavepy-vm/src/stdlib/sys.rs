@@ -599,7 +599,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
                 Object::from_static(weavepy_version::SHORT),
             );
             // CPython publishes the HMODULE of python3xx.dll here. Since
-            // RFC 0064 the runtime ships as a real `python313.dll` loaded
+            // RFC 0064 the runtime ships as a real `python314.dll` loaded
             // by the `weavepy.exe` shim, so the handle is the module's:
             // nonzero whenever this interpreter is running out of the DLL
             // (the shipped configuration), 0 in a statically-linked
@@ -2037,33 +2037,25 @@ const VERSION_INFO_FIELDS: &[&str] = &["major", "minor", "micro", "releaselevel"
 #[cfg(windows)]
 const WINDOWS_VERSION_VISIBLE: [&str; 5] = ["major", "minor", "build", "platform", "service_pack"];
 
-/// The `HMODULE` of `python313.dll` when this interpreter is running
-/// out of the runtime DLL (RFC 0064 WS1: the shipped exe is a shim
-/// that loads it), 0 when statically linked (embedder test harnesses).
-/// `GetModuleHandleW` peeks at the process's loaded-module list
-/// without loading anything and without taking a reference.
+/// The `HMODULE` of the runtime DLL (`python314.dll`, following
+/// `weavepy_version::PYLIB_STEM`) when this interpreter is running out
+/// of it (RFC 0064 WS1: the shipped exe is a shim that loads it), 0 when
+/// statically linked (embedder test harnesses). `GetModuleHandleW`
+/// peeks at the process's loaded-module list without loading anything
+/// and without taking a reference.
 #[cfg(windows)]
 fn python_dll_handle() -> i64 {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-    // "python313.dll" as static UTF-16, NUL-terminated.
-    const NAME: &[u16] = &[
-        b'p' as u16,
-        b'y' as u16,
-        b't' as u16,
-        b'h' as u16,
-        b'o' as u16,
-        b'n' as u16,
-        b'3' as u16,
-        b'1' as u16,
-        b'3' as u16,
-        b'.' as u16,
-        b'd' as u16,
-        b'l' as u16,
-        b'l' as u16,
-        0,
-    ];
-    // SAFETY: NAME is a valid NUL-terminated UTF-16 string.
-    let handle = unsafe { GetModuleHandleW(NAME.as_ptr()) };
+    // The DLL name as NUL-terminated UTF-16. Derived from the version
+    // crate so a CPython switch (3.13 -> 3.14 hardcoded "python313.dll"
+    // here and `sys.dllhandle` silently reported 0 under the shim) can't
+    // leave it behind.
+    const DLL_NAME: &str = weavepy_version::vconcat!(weavepy_version::PYLIB_STEM, ".dll");
+    let mut name: Vec<u16> = DLL_NAME.encode_utf16().collect();
+    name.push(0);
+    // SAFETY: `name` is a valid NUL-terminated UTF-16 string that
+    // outlives the call.
+    let handle = unsafe { GetModuleHandleW(name.as_ptr()) };
     handle as usize as i64
 }
 

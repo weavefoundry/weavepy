@@ -31,7 +31,7 @@ pub use weavepy_vm as vm;
 ///
 /// RFC 0075 moved the loader body into `weavepy-capi`
 /// ([`capi::loader::install_vm_extension_loader`]) so a pure-capi
-/// embedder — a C program linking `libpython313` — imports
+/// embedder — a C program linking `libpython314` — imports
 /// extensions without this umbrella crate in the picture. The
 /// umbrella keeps this entry point for its Rust consumers.
 pub fn install_capi_loader() {
