@@ -369,6 +369,8 @@ impl<'src> Scanner<'src> {
                 // right after the swallowed newline): CPython reports
                 // an EOF error rather than silently completing the
                 // statement — unless a bracket is open, which wins.
+                // Anchored one column past the backslash on *its* line
+                // (`compile('x = 1 \\\n')` reports line 1, offset 8).
                 if self.peek().is_none() {
                     if let Some(&(bracket, pos)) = self.open_brackets.last() {
                         return Err(LexError::BracketNeverClosed {
@@ -377,7 +379,7 @@ impl<'src> Scanner<'src> {
                         });
                     }
                     return Err(LexError::UnexpectedEofParsing {
-                        pos: self.pos as u32,
+                        pos: (bs_pos + 1) as u32,
                         line_had_tokens: self.last_was_content,
                     });
                 }
@@ -497,12 +499,35 @@ impl<'src> Scanner<'src> {
         // indent handling (the continuation is consumed by the main
         // loop as part of the logical line).
         if b == b'\\' {
+            // A continuation chain that runs off the end of the input
+            // is bpo-2180's "unexpected EOF while parsing", anchored one
+            // column past the last backslash (`compile('  \\')` reports
+            // offset 4; `'\\\n'` offset 2). It is *not* an indentation
+            // error, and unlike a chain that lands on a blank line it is
+            // not blank either.
+            let eof_after = |bs: usize| -> Option<u32> {
+                let mut q = bs + 1;
+                if self.src.get(q) == Some(&b'\r') {
+                    q += 1;
+                }
+                if self.src.get(q) == Some(&b'\n') {
+                    q += 1;
+                }
+                (q >= self.src.len()).then_some((bs + 1) as u32)
+            };
             let mut probe = self.pos;
             let blank_joined = loop {
                 if self.src.get(probe) != Some(&b'\\') {
                     break false;
                 }
-                let mut q = probe + 1;
+                if let Some(pos) = eof_after(probe) {
+                    return Err(LexError::UnexpectedEofParsing {
+                        pos,
+                        line_had_tokens: self.last_was_content,
+                    });
+                }
+                let bs = probe;
+                let mut q = bs + 1;
                 if self.src.get(q) == Some(&b'\r') {
                     q += 1;
                 }
@@ -514,8 +539,16 @@ impl<'src> Scanner<'src> {
                     probe += 1;
                 }
                 match self.src.get(probe) {
-                    None | Some(b'\n' | b'\r' | b'#') => break true,
+                    Some(b'\n' | b'\r' | b'#') => break true,
                     Some(b'\\') => continue,
+                    // Whitespace, then EOF: the joined line never got
+                    // its content.
+                    None => {
+                        return Err(LexError::UnexpectedEofParsing {
+                            pos: (bs + 1) as u32,
+                            line_had_tokens: self.last_was_content,
+                        });
+                    }
                     _ => break false,
                 }
             };
@@ -972,7 +1005,8 @@ impl<'src> Scanner<'src> {
                 kind: self.fstring_kinds.first().copied().unwrap_or('f'),
             });
         }
-        self.fstring_kinds.push(if prefix.template { 't' } else { 'f' });
+        self.fstring_kinds
+            .push(if prefix.template { 't' } else { 'f' });
         let r = self.scan_fstring_extent_inner(start, quote, triple, prefix, warned);
         self.fstring_kinds.pop();
         self.fstring_level -= 1;
@@ -1828,7 +1862,9 @@ fn incompatible_prefix_pair(prefix: &str) -> Option<(char, char)> {
         (b && t, ('b', 't')),
         (f && t, ('f', 't')),
     ];
-    pairs.into_iter().find_map(|(hit, pair)| hit.then_some(pair))
+    pairs
+        .into_iter()
+        .find_map(|(hit, pair)| hit.then_some(pair))
 }
 
 /// Decode one UTF-8 code point at the start of `bytes`. Returns the

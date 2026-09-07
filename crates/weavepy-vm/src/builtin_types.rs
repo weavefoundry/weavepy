@@ -494,6 +494,12 @@ impl BuiltinTypes {
                             return Ok(inst);
                         }
                     }
+                    // A plain namespace is a container like any other:
+                    // `ns.caught = args` with `args.thread` reaching back
+                    // through a closure cell is a cycle the collector must
+                    // see (test_interpreters' captured_thread_exception
+                    // left its Thread in `threading._dangling`).
+                    crate::gc_trace::track(ns.clone());
                     Ok(ns)
                 };
             let mut ns_dict = simple_namespace_.dict.borrow_mut();
@@ -6010,6 +6016,12 @@ fn install_numeric_class_methods(bt: &BuiltinTypes) {
         crate::builtins::b_bytearray_fromhex_cls,
     );
     install(&bt.float_, "fromhex", crate::builtins::b_float_fromhex_cls);
+    // 3.14: `float.from_number(number)` (gh-84978).
+    install(
+        &bt.float_,
+        "from_number",
+        crate::builtins::b_float_from_number_cls,
+    );
     // 3.14: `complex.from_number(number)`.
     install(
         &bt.complex_,

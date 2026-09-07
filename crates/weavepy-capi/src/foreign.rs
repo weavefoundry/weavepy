@@ -583,6 +583,7 @@ pub fn install() {
         release_object_ptr: fwd_release_object_ptr,
         descr_get: fwd_descr_get,
         handled_exception: fwd_handled_exception,
+        take_pending_error: crate::errors::take_pending_error_runtime,
     });
     weavepy_vm::types::TypeObject::install_metaclass_drift_hook(
         crate::types::metaclass_drift_probe,

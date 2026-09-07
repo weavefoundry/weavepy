@@ -2012,14 +2012,14 @@ impl MethodWrapper {
                 let doc = pinned("__doc__", &|| {
                     crate::builtins::code_docstring(&code).unwrap_or(Object::None)
                 });
-                let annotations = pinned("__annotations__", &|| {
-                    Object::Dict(Rc::new(RefCell::new(DictData::default())))
-                });
+                // 3.14 (PEP 749, gh-125017): `__annotations__` and
+                // `__annotate__` are no longer copied eagerly; they are
+                // getsets that lazily pull from the wrapped callable and
+                // cache the result in the wrapper's dict (see `load_attr`).
                 [
                     ("__module__", module),
                     ("__name__", name),
                     ("__qualname__", qualname),
-                    ("__annotations__", annotations),
                     ("__doc__", doc),
                 ]
                 .into_iter()
@@ -2090,6 +2090,13 @@ pub struct PyProperty {
     /// `property_copy`: a getter-derived doc is *not* carried over to
     /// the copy, so the new getter's own docstring wins.
     pub getter_doc: Cell<bool>,
+}
+
+impl Drop for PyProperty {
+    fn drop(&mut self) {
+        // See `BuiltinFn::drop`.
+        crate::descr_registry::forget(std::ptr::from_ref(self).cast::<()>() as usize);
+    }
 }
 
 impl PyProperty {
@@ -3884,6 +3891,14 @@ pub struct BuiltinFn {
     >,
 }
 
+impl Drop for BuiltinFn {
+    fn drop(&mut self) {
+        // The descriptor side tables key on this allocation's address;
+        // a reused address must not inherit its tags.
+        crate::descr_registry::forget(std::ptr::from_ref(self).cast::<()>() as usize);
+    }
+}
+
 impl BuiltinFn {
     /// Build a positional-only builtin (the common case).
     pub fn new<F>(name: &'static str, body: F) -> Self
@@ -4214,8 +4229,12 @@ impl fmt::Debug for AsyncGenAwait {
 /// (`io.StringIO`/`io.BytesIO`), or the interpreter's stdout/stderr
 /// sinks.
 /// Default Python-level buffer size for a buffered file stream
-/// (`io.DEFAULT_BUFFER_SIZE`).
-pub const DEFAULT_BUFFER_SIZE: usize = 8192;
+/// (`io.DEFAULT_BUFFER_SIZE`): 128 KiB since CPython 3.14 (gh-117151).
+pub const DEFAULT_BUFFER_SIZE: usize = 128 * 1024;
+
+/// `TextIOWrapper._CHUNK_SIZE`, which stayed at 8 KiB when
+/// `DEFAULT_BUFFER_SIZE` grew in 3.14.
+pub const TEXT_CHUNK_SIZE: usize = 8192;
 
 /// The CPython io-stack layer a [`PyFile`] presents to Python: its
 /// `type()` identity and which `io` ABC it answers `isinstance` for.
@@ -5338,7 +5357,7 @@ impl PyFile {
                 }
             }
         }
-        DEFAULT_BUFFER_SIZE
+        TEXT_CHUNK_SIZE
     }
 
     /// Decide — once, lazily, and cached — whether this text stream must use
@@ -8859,12 +8878,12 @@ impl Object {
             Object::Instance(inst) => match inst.native.get() {
                 Some(native) => native.contains(item),
                 None => Err(type_error(format!(
-                    "argument of type '{}' is not iterable",
+                    "argument of type '{}' is not a container or iterable",
                     self.type_name()
                 ))),
             },
             _ => Err(type_error(format!(
-                "argument of type '{}' is not iterable",
+                "argument of type '{}' is not a container or iterable",
                 self.type_name()
             ))),
         }
@@ -9778,6 +9797,47 @@ impl Object {
                             }
                             format!("[{}]", parts.join(", "))
                         }
+                        // CPython `_Py_typing_type_repr`: anything with a
+                        // `__qualname__` and a `__module__` renders as
+                        // `module.qualname` (bare `qualname` for builtins),
+                        // so `repr(Union[fun, int])` is
+                        // `"__main__.fun | int"` (test_typing
+                        // test_function_repr_union), and `list[len]` is
+                        // `"list[len]"`.
+                        Object::Function(f) => {
+                            let qual = f
+                                .slot("__qualname__")
+                                .as_ref()
+                                .map(Object::to_str)
+                                .unwrap_or_else(|| f.code().qualname.clone());
+                            let module = f
+                                .slot("__module__")
+                                .or_else(|| {
+                                    f.globals
+                                        .borrow()
+                                        .get(&DictKey(Object::from_static("__name__")))
+                                        .cloned()
+                                })
+                                .unwrap_or(Object::None);
+                            match module {
+                                Object::None => o.repr(),
+                                m => {
+                                    let m = m.to_str();
+                                    if m == "builtins" {
+                                        qual
+                                    } else {
+                                        format!("{m}.{qual}")
+                                    }
+                                }
+                            }
+                        }
+                        Object::Builtin(b) => {
+                            let qual = crate::builtin_display_name(b.name);
+                            match crate::descr_registry::module_of(o) {
+                                Some(m) if m != "builtins" => format!("{m}.{qual}"),
+                                _ => qual.to_owned(),
+                            }
+                        }
                         other => other.repr(),
                     }
                 }
@@ -10248,9 +10308,10 @@ pub(crate) fn i64_cmp_f64(a: i64, b: f64) -> Result<Ordering, RuntimeError> {
 //
 // Identity is restored by *tagging*: every seam where CPython would allocate
 // a fresh float object for a NaN (literal parse, `PyFloat_FromDouble`,
-// arithmetic producing NaN) stamps a unique counter into the low mantissa
-// bits. Bit 51 (quiet) stays set, bit 50 marks "WeavePy tag", bits 0..50
-// carry the counter, and the sign bit is preserved. `is_same` (bit
+// arithmetic producing NaN) stamps a unique counter into the mantissa.
+// Bit 51 (quiet) stays set, bit 50 marks "WeavePy tag", bits 29..50 carry
+// the counter, bits 0..29 hold a fixed magic (see `NAN_TAG_MAGIC`), and
+// the sign bit is preserved. `is_same` (bit
 // comparison) then separates distinct NaNs exactly like CPython pointer
 // identity, and `py_hash_double` hashes the bits — stable per object,
 // different across objects.
@@ -10260,15 +10321,33 @@ pub(crate) fn i64_cmp_f64(a: i64, b: f64) -> Result<Ordering, RuntimeError> {
 // it; `pandas.util.hash_pandas_object` hashes the raw buffer), pickle /
 // marshal payloads, and mirror float bodies (`ob_fval` is read by the
 // `PyFloat_AS_DOUBLE` macro). Those seams call [`untag_nan`], which strips
-// only the marker-bearing tags and leaves genuine (bit-50-clear) payloads —
-// e.g. from `struct.unpack` of exotic bytes — untouched, so byte-level
+// only marker-and-magic-bearing tags and leaves genuine payloads — e.g.
+// from `struct.unpack` of exotic bytes — untouched, so byte-level
 // round-trips stay faithful.
 
 /// Marker bit distinguishing WeavePy identity tags from genuine NaN
 /// payloads that entered through byte-level APIs.
 const NAN_TAG_MARKER: u64 = 1 << 50;
-/// Mask of the counter field within the tag (bits 0..50).
-const NAN_TAG_COUNTER_MASK: u64 = NAN_TAG_MARKER - 1;
+/// The tag's low field is a fixed magic, not counter bits. A NaN widened
+/// from a 2- or 4-byte encoding (`PyFloat_Unpack2/4`, `struct.unpack('e'
+/// / 'f')`) carries its payload in the top of the mantissa and has bits
+/// 0..29 clear, so requiring this nonzero magic there means no such
+/// payload can ever be mistaken for a tag and canonicalized on the way
+/// back out (test_capi.test_float's random-payload round trips at every
+/// size). An 8-byte payload collides only with probability 2^-29.
+const NAN_TAG_MAGIC_MASK: u64 = (1 << 29) - 1;
+const NAN_TAG_MAGIC: u64 = 0x0A5C_3D71;
+/// The identity counter lives in bits 29..50.
+const NAN_TAG_COUNTER_SHIFT: u32 = 29;
+const NAN_TAG_COUNTER_MASK: u64 = (1 << (50 - NAN_TAG_COUNTER_SHIFT)) - 1;
+
+/// Whether `v` carries a WeavePy identity tag (as opposed to a genuine
+/// payload that entered through a byte-level API).
+#[inline]
+fn is_tagged_nan(v: f64) -> bool {
+    let bits = v.to_bits();
+    v.is_nan() && bits & NAN_TAG_MARKER != 0 && bits & NAN_TAG_MAGIC_MASK == NAN_TAG_MAGIC
+}
 
 /// Stamp a fresh identity tag into a NaN, preserving its sign. Non-NaN
 /// values pass through unchanged. Each call yields a distinct bit pattern,
@@ -10288,7 +10367,12 @@ fn fresh_nan_bits(v: f64) -> f64 {
     let counter = NEXT_NAN_TAG.fetch_add(1, Ordering::Relaxed) & NAN_TAG_COUNTER_MASK;
     let sign = v.to_bits() & (1u64 << 63);
     // Exponent all-ones + quiet bit keeps it a quiet NaN on every platform.
-    f64::from_bits(sign | 0x7ff8_0000_0000_0000 | NAN_TAG_MARKER | counter)
+    f64::from_bits(
+        sign | 0x7ff8_0000_0000_0000
+            | NAN_TAG_MARKER
+            | (counter << NAN_TAG_COUNTER_SHIFT)
+            | NAN_TAG_MAGIC,
+    )
 }
 
 /// Construct an `Object::Float`, giving a NaN result a fresh identity —
@@ -10303,7 +10387,7 @@ pub fn fresh_float(v: f64) -> Object {
 /// non-NaN values pass through unchanged.
 #[inline]
 pub fn untag_nan(v: f64) -> f64 {
-    if v.is_nan() && v.to_bits() & NAN_TAG_MARKER != 0 {
+    if is_tagged_nan(v) {
         let sign = v.to_bits() & (1u64 << 63);
         return f64::from_bits(sign | 0x7ff8_0000_0000_0000);
     }

@@ -42,11 +42,11 @@ fn peak_rss_bytes() -> Option<u64> {
         }
         // macOS reports bytes, Linux/BSD kilobytes.
         let raw = usage.ru_maxrss as u64;
-        return Some(if cfg!(target_os = "macos") {
+        Some(if cfg!(target_os = "macos") {
             raw
         } else {
             raw * 1024
-        });
+        })
     }
     #[cfg(not(unix))]
     {

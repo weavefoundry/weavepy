@@ -857,7 +857,7 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
                         | crate::object::IoKind::BufferedRandom
                 ) =>
             {
-                Some(method("read1", file_read))
+                Some(method("read1", file_read1))
             }
             // Binary streams only — CPython text files genuinely lack the
             // attribute (it lives on RawIOBase/BufferedIOBase).
@@ -1712,9 +1712,15 @@ fn num_binop_method(
             .first()
             .cloned()
             .ok_or_else(|| type_error(format!("unbound method {nm}() needs an argument")))?;
-        let o = match args.get(1) {
-            Some(o) => o.clone(),
-            None => return Err(type_error(format!("{nm}() takes exactly one argument"))),
+        // CPython's `wrap_binaryfunc` -> `check_num_args(args, 1)`.
+        let o = match (args.get(1), args.len()) {
+            (Some(o), 2) => o.clone(),
+            _ => {
+                return Err(type_error(format!(
+                    "expected 1 argument, got {}",
+                    args.len().saturating_sub(1)
+                )))
+            }
         };
         if !num_accepts(kind, &o) {
             return Ok(crate::vm_singletons::not_implemented());
@@ -1731,9 +1737,15 @@ fn num_cmp_method(nm: &'static str, kind: NumSelf, which: CmpDun) -> BuiltinFn {
             .first()
             .cloned()
             .ok_or_else(|| type_error(format!("unbound method {nm}() needs an argument")))?;
-        let o = match args.get(1) {
-            Some(o) => o.clone(),
-            None => return Err(type_error(format!("{nm}() takes exactly one argument"))),
+        // CPython's `richcmp_*` wrappers -> `check_num_args(args, 1)`.
+        let o = match (args.get(1), args.len()) {
+            (Some(o), 2) => o.clone(),
+            _ => {
+                return Err(type_error(format!(
+                    "expected 1 argument, got {}",
+                    args.len().saturating_sub(1)
+                )))
+            }
         };
         let ordering = matches!(which, CmpDun::Lt | CmpDun::Le | CmpDun::Gt | CmpDun::Ge);
         // `complex` has no ordering: `<`/`<=`/`>`/`>=` always decline.
@@ -1813,9 +1825,16 @@ pub(crate) fn numeric_dunder(self_repr: &Object, name: &str) -> Option<BuiltinFn
                 .first()
                 .cloned()
                 .ok_or_else(|| type_error("unbound method __pow__() needs an argument"))?;
-            let o = match args.get(1) {
-                Some(o) => o.clone(),
-                None => return Err(type_error("__pow__() takes exactly one argument")),
+            // `wrap_ternaryfunc`: one or two arguments
+            // (test_descr.test_pow_wrapper_error_messages).
+            let o = match (args.get(1), args.len()) {
+                (Some(o), 2 | 3) => o.clone(),
+                _ => {
+                    return Err(type_error(format!(
+                        "expected 1 or 2 arguments, got {}",
+                        args.len().saturating_sub(1)
+                    )))
+                }
             };
             if !num_accepts(kind, &o) {
                 return Ok(crate::vm_singletons::not_implemented());
@@ -1825,7 +1844,28 @@ pub(crate) fn numeric_dunder(self_repr: &Object, name: &str) -> Option<BuiltinFn
                 _ => crate::binary_op(&s, &o, B::Pow),
             }
         }),
-        "__rpow__" => num_binop_method("__rpow__", kind, B::Pow, true),
+        "__rpow__" => method("__rpow__", move |args| {
+            let s = args
+                .first()
+                .cloned()
+                .ok_or_else(|| type_error("unbound method __rpow__() needs an argument"))?;
+            let o = match (args.get(1), args.len()) {
+                (Some(o), 2 | 3) => o.clone(),
+                _ => {
+                    return Err(type_error(format!(
+                        "expected 1 or 2 arguments, got {}",
+                        args.len().saturating_sub(1)
+                    )))
+                }
+            };
+            if !num_accepts(kind, &o) {
+                return Ok(crate::vm_singletons::not_implemented());
+            }
+            match args.get(2) {
+                Some(m) if !matches!(m, Object::None) => b_pow(&[o, s, m.clone()]),
+                _ => crate::binary_op(&o, &s, B::Pow),
+            }
+        }),
         // `floordiv`/`mod` are undefined on `complex`.
         "__floordiv__" if not_complex => num_binop_method("__floordiv__", kind, B::FloorDiv, false),
         "__rfloordiv__" if not_complex => {
@@ -2044,6 +2084,14 @@ pub fn builtin_classmethod(type_name: &str, attr: &str) -> Option<Object> {
         ("bytes", "fromhex") | ("bytearray", "fromhex") => Some(method("fromhex", bytes_fromhex)),
         ("int", "from_bytes") => Some(method_kw("from_bytes", int_from_bytes_method)),
         ("float", "fromhex") => Some(method("fromhex", float_fromhex)),
+        ("float", "from_number") => Some(method("from_number", |args| {
+            // Unbound access (`float.from_number`): splice the base type in.
+            let bt = crate::builtin_types::builtin_types();
+            let mut full = Vec::with_capacity(args.len() + 1);
+            full.push(Object::Type(bt.float_.clone()));
+            full.extend_from_slice(args);
+            b_float_from_number_cls(&full)
+        })),
         ("complex", "from_number") => Some(method("from_number", |args| {
             // Unbound access (`complex.from_number`): no class slot, so
             // splice the base type in.
@@ -2495,10 +2543,12 @@ fn str_slot_str(args: &[Object]) -> Result<Object, RuntimeError> {
     let o = args
         .first()
         .ok_or_else(|| type_error("__str__() takes exactly one argument (0 given)"))?;
+    // `WStr` is the surrogate-carrying `str` representation (RFC 0040):
+    // still a `str` for the receiver check (test_apple test_non_ascii).
     match o {
-        Object::Str(_) => Ok(o.clone()),
+        Object::Str(_) | Object::WStr(_) => Ok(o.clone()),
         _ => match o.native_value() {
-            Some(n @ Object::Str(_)) => Ok(n),
+            Some(n @ (Object::Str(_) | Object::WStr(_))) => Ok(n),
             _ => Err(type_error(format!(
                 "descriptor '__str__' requires a 'str' object but received a '{}'",
                 o.type_name()
@@ -3485,6 +3535,28 @@ pub(crate) fn call_annotate_value(annotate: Option<&Object>) -> Result<Object, R
 /// CPython `_PyModuleSpec_IsInitializing`: `__spec__._initializing` is
 /// truthy while the import system is still executing the module body.
 fn module_spec_is_initializing(dict: &Rc<RefCell<DictData>>) -> bool {
+    let ptr = crate::vm_singletons::current_interpreter_ptr();
+    let Some(ptr) = ptr else {
+        return false;
+    };
+    // SAFETY: the pointer was published by an enclosing VM frame still
+    // live on this thread; the GIL keeps the access exclusive.
+    let interp = unsafe { &mut *ptr };
+    // The native import path keeps the `spec._initializing` window in
+    // the module cache rather than on a (lazily synthesized) spec: a
+    // module whose body is still executing must not cache a partial
+    // `__annotations__` (test_type_annotations
+    // test_partially_executed_module — `b` reads `a.__annotations__`
+    // mid-body and `a` must still report the full set afterwards).
+    let name = match dict.borrow().get(&crate::object::StrKey("__name__")) {
+        Some(Object::Str(s)) => Some(s.to_string()),
+        _ => None,
+    };
+    if let Some(name) = name {
+        if interp.cache.is_initializing(&name) {
+            return true;
+        }
+    }
     let spec = dict
         .borrow()
         .get(&crate::object::StrKey("__spec__"))
@@ -3495,13 +3567,6 @@ fn module_spec_is_initializing(dict: &Rc<RefCell<DictData>>) -> bool {
     if matches!(spec, Object::None) {
         return false;
     }
-    let ptr = crate::vm_singletons::current_interpreter_ptr();
-    let Some(ptr) = ptr else {
-        return false;
-    };
-    // SAFETY: the pointer was published by an enclosing VM frame still
-    // live on this thread; the GIL keeps the access exclusive.
-    let interp = unsafe { &mut *ptr };
     match interp.load_attr_public(&spec, "_initializing") {
         Ok(v) => interp.op_truth(&v).unwrap_or(false),
         Err(_) => false,
@@ -3693,6 +3758,25 @@ fn property_dunder_delete(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
+/// The `__dict__` a surrogate-bearing attribute name is looked up in.
+/// Attribute names are `&str` throughout the VM (a lone surrogate folds
+/// to U+FFFD in `attr_name_of`), so `getattr(module, 'x\udbff')` after
+/// `globals()['x\udbff'] = v` (pickletester test_nonencodable_*) is
+/// served straight from the namespace dict with the `WStr` key.
+pub(crate) fn wstr_attr_dict(obj: &Object) -> Option<Rc<RefCell<crate::object::DictData>>> {
+    match obj {
+        Object::Module(m) => Some(m.dict.clone()),
+        Object::Instance(inst) => Some(inst.dict.clone()),
+        _ => None,
+    }
+}
+
+pub(crate) fn wstr_attr_get(obj: &Object, name: &Object) -> Option<Object> {
+    let d = wstr_attr_dict(obj)?;
+    let hit = d.borrow().get(&DictKey(name.clone())).cloned();
+    hit
+}
+
 fn b_getattr(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() < 2 {
         return Err(type_error("getattr() requires at least 2 arguments"));
@@ -3709,7 +3793,11 @@ fn b_getattr(args: &[Object]) -> Result<Object, RuntimeError> {
         }
     };
     let default = args.get(2).cloned();
-    match attr_get(&args[0], &name) {
+    let found = match &args[1] {
+        Object::WStr(_) => wstr_attr_get(&args[0], &args[1]),
+        _ => attr_get(&args[0], &name),
+    };
+    match found {
         Some(v) => Ok(v),
         None => match default {
             Some(d) => Ok(d),
@@ -3737,6 +3825,11 @@ fn b_setattr(args: &[Object]) -> Result<Object, RuntimeError> {
             )))
         }
     };
+    if let (Object::WStr(_), Some(d)) = (&args[1], wstr_attr_dict(&args[0])) {
+        d.borrow_mut()
+            .insert(DictKey(args[1].clone()), args[2].clone());
+        return Ok(Object::None);
+    }
     attr_set(&args[0], &name, args[2].clone())?;
     Ok(Object::None)
 }
@@ -3756,6 +3849,14 @@ fn b_delattr(args: &[Object]) -> Result<Object, RuntimeError> {
             )))
         }
     };
+    if let (Object::WStr(_), Some(d)) = (&args[1], wstr_attr_dict(&args[0])) {
+        if d.borrow_mut()
+            .shift_remove(&DictKey(args[1].clone()))
+            .is_some()
+        {
+            return Ok(Object::None);
+        }
+    }
     attr_delete(&args[0], &name)?;
     Ok(Object::None)
 }
@@ -3775,7 +3876,11 @@ fn b_hasattr(args: &[Object]) -> Result<Object, RuntimeError> {
             )))
         }
     };
-    Ok(Object::Bool(attr_get(&args[0], &name).is_some()))
+    let found = match &args[1] {
+        Object::WStr(_) => wstr_attr_get(&args[0], &args[1]),
+        _ => attr_get(&args[0], &name),
+    };
+    Ok(Object::Bool(found.is_some()))
 }
 
 fn b_vars(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -6293,6 +6398,55 @@ pub(crate) fn b_float_fromhex_cls(args: &[Object]) -> Result<Object, RuntimeErro
     float_fromhex_wrap(cls, x)
 }
 
+/// `float.from_number(number)` (3.14, gh-84978): `PyFloat_AsDouble` on a
+/// real number — never a `str`/bytes-like — wrapped in `cls`. An exact
+/// `float` passes through identically for the base type.
+pub(crate) fn b_float_from_number_cls(args: &[Object]) -> Result<Object, RuntimeError> {
+    let cls = args.first();
+    let Some(number) = args.get(1) else {
+        return Err(type_error(
+            "float.from_number() takes exactly one argument (0 given)",
+        ));
+    };
+    if args.len() > 2 {
+        return Err(type_error(format!(
+            "float.from_number() takes exactly one argument ({} given)",
+            args.len() - 1
+        )));
+    }
+    let bt = crate::builtin_types::builtin_types();
+    let is_base = match cls {
+        Some(Object::Type(t)) => crate::sync::Rc::ptr_eq(t, &bt.float_),
+        _ => true,
+    };
+    let not_real = || {
+        type_error(format!(
+            "must be real number, not {}",
+            number.type_name_owned()
+        ))
+    };
+    if is_base && matches!(number, Object::Float(_)) {
+        return Ok(number.clone());
+    }
+    if matches!(
+        number,
+        Object::Str(_)
+            | Object::WStr(_)
+            | Object::Bytes(_)
+            | Object::ByteArray(_)
+            | Object::MemoryView(_)
+            | Object::Complex(_)
+    ) {
+        return Err(not_real());
+    }
+    // `coerce_f64_opt` unwraps numeric subclasses and dispatches
+    // `__float__`/`__index__` (but not `__int__`), exactly like
+    // `PyFloat_AsDouble`. A `str` subclass unwraps to a `Str` payload and
+    // yields `None` here, so it lands on the TypeError too.
+    let x = coerce_f64_opt(number)?.ok_or_else(not_real)?;
+    float_fromhex_wrap(cls, x)
+}
+
 fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, RuntimeError> {
     // CPython's `_PyBytes_FromHex`: pairs of hex digits, with *ASCII*
     // whitespace permitted only between pairs. Error positions are
@@ -7294,10 +7448,12 @@ fn bytes_construct(
         return Ok(Vec::new());
     };
     // String sources require an encoding; non-string sources reject one.
-    let as_str: Option<Rc<str>> = match src {
-        Object::Str(s) => Some(s.clone()),
+    // A surrogate-bearing `WStr` is a str too: `bytes('\udbff', 'utf-8')`
+    // raises UnicodeEncodeError (pickletester test_nonencodable_*).
+    let as_str: Option<Object> = match src {
+        Object::Str(_) | Object::WStr(_) => Some(src.clone()),
         Object::Instance(inst) => match inst.native.get() {
-            Some(Object::Str(s)) => Some(s.clone()),
+            Some(s @ (Object::Str(_) | Object::WStr(_))) => Some(s.clone()),
             _ => None,
         },
         _ => None,
@@ -7306,7 +7462,7 @@ fn bytes_construct(
         let Some(enc) = encoding else {
             return Err(type_error("string argument without an encoding"));
         };
-        return crate::stdlib::codecs_mod::encode_str(
+        return crate::stdlib::codecs_mod::encode_obj(
             &s,
             &enc,
             errors.as_deref().unwrap_or("strict"),
@@ -7458,8 +7614,23 @@ fn open_path_arg(obj: &Object) -> Result<(String, bool, std::ffi::OsString), Run
         let os = std::ffi::OsString::from(&s);
         (s, false, os)
     }
+    // PEP 383: a surrogate-bearing str (a surrogateescape'd name, whether
+    // passed directly or returned by `__fspath__`) fsencodes to the raw
+    // bytes for the syscall while keeping the str flavour for messages.
+    fn from_wstr(cps: &[u32]) -> Result<(String, bool, std::ffi::OsString), RuntimeError> {
+        let bytes = crate::stdlib::codecs_mod::encode_codepoints(cps, "utf-8", "surrogateescape")?;
+        #[cfg(unix)]
+        let os = {
+            use std::os::unix::ffi::OsStrExt;
+            std::ffi::OsStr::from_bytes(&bytes).to_owned()
+        };
+        #[cfg(not(unix))]
+        let os = std::ffi::OsString::from(String::from_utf8_lossy(&bytes).into_owned());
+        Ok((String::from_utf8_lossy(&bytes).into_owned(), false, os))
+    }
     match obj {
         Object::Str(s) => Ok(from_str(s.to_string())),
+        Object::WStr(cps) => from_wstr(cps),
         Object::Bytes(b) => Ok(from_bytes(b)),
         Object::ByteArray(b) => Ok(from_bytes(&b.borrow())),
         Object::Instance(_) => {
@@ -7477,24 +7648,7 @@ fn open_path_arg(obj: &Object) -> Result<(String, bool, std::ffi::OsString), Run
             let resolved = interp.call_object(fspath, &[], &[])?;
             match resolved {
                 Object::Str(s) => Ok(from_str(s.to_string())),
-                // PEP 383: a surrogate-bearing str result (pathlib over a
-                // surrogateescape'd name) fsencodes to the raw bytes for
-                // the syscall while keeping the str flavour for messages.
-                Object::WStr(cps) => {
-                    let bytes = crate::stdlib::codecs_mod::encode_codepoints(
-                        &cps,
-                        "utf-8",
-                        "surrogateescape",
-                    )?;
-                    #[cfg(unix)]
-                    let os = {
-                        use std::os::unix::ffi::OsStrExt;
-                        std::ffi::OsStr::from_bytes(&bytes).to_owned()
-                    };
-                    #[cfg(not(unix))]
-                    let os = std::ffi::OsString::from(String::from_utf8_lossy(&bytes).into_owned());
-                    Ok((String::from_utf8_lossy(&bytes).into_owned(), false, os))
-                }
+                Object::WStr(cps) => from_wstr(&cps),
                 Object::Bytes(b) => Ok(from_bytes(&b)),
                 other => Err(type_error(format!(
                     "expected __fspath__() to return str or bytes, not {}",
@@ -7709,8 +7863,12 @@ pub(crate) fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
     if !mode.contains('r') && !writing {
         opts.read(true);
     }
-    let mut f = opts
-        .open(&os_path)
+    // `open(2)` can block (a FIFO with no peer yet, a slow device):
+    // CPython's `_io.FileIO` wraps it in `Py_BEGIN_ALLOW_THREADS`, and
+    // a reader thread parked in `open()` must not hold the GIL while
+    // the writer it waits for is a Python thread (test_logging
+    // test_should_not_rollover_named_pipe, gh-143237).
+    let mut f = crate::gil::allow_threads_then(|| opts.open(&os_path))
         .map_err(|e| crate::error::io_error_to_py_named(&e, Some(&path)))?;
     // CPython's `FileIO.__init__` explicitly `lseek`s to the end in append
     // mode "for consistent behaviour" — `open(fn, 'a').tell()` is the file
@@ -7853,7 +8011,9 @@ fn b_sorted(args: &[Object]) -> Result<Object, RuntimeError> {
     if let Some(e) = err {
         return Err(e);
     }
-    Ok(Object::new_list(buf))
+    let obj = Object::new_list(buf);
+    crate::gc_trace::track(obj.clone());
+    Ok(obj)
 }
 
 fn b_reversed(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -9214,6 +9374,18 @@ pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
                 for k in d.borrow().keys() {
                     if let Object::Str(s) = &k.0 {
                         names.insert(s.to_string());
+                    }
+                }
+                // A PEP 604 union (3.14 `types.UnionType`) exposes its
+                // getsets -- `__args__`, `__parameters__`, `__origin__`,
+                // `__name__`, `__qualname__` -- and none of the private
+                // bookkeeping the namespace carries (test_typing test_dir
+                // asserts `'__origin__' in dir(Union[str, int])`).
+                if crate::is_pep604_union(other).is_some() {
+                    names.remove("__is_pep604_union__");
+                    names.remove("__weave_unhashable_args__");
+                    for n in ["__origin__", "__name__", "__qualname__"] {
+                        names.insert(n.to_string());
                     }
                 }
                 // CPython `ga_dir`: a generic alias reports `dir(origin)`
@@ -15246,8 +15418,50 @@ pub(crate) fn file_read(args: &[Object]) -> Result<Object, RuntimeError> {
     } else {
         match f.read_bytes_opt(None)? {
             Some(data) => Ok(stream_text_object(&f, f.decode_text(data)?)),
-            None => Ok(Object::None),
+            // 3.14 (gh-57531): `TextIOWrapper.read()` over a non-blocking
+            // buffer that yields `None` raises instead of returning `None`
+            // (`test_io.test_read_non_blocking`).
+            None => Err(crate::error::blocking_io_error("Read returned None.")),
         }
+    }
+}
+
+/// `BufferedReader.read1([size])` — at most one raw read. With no size (or a
+/// negative one) CPython reads up to `buffer_size` bytes, so on a 5 MB file
+/// `read1()` returns exactly the buffer size (`test_file.testDefaultBufferSize`
+/// checks `max(min(st_blksize, 8 MiB), io.DEFAULT_BUFFER_SIZE)`). Non-binary
+/// and unbuffered streams keep the plain `read` behaviour.
+pub(crate) fn file_read1(args: &[Object]) -> Result<Object, RuntimeError> {
+    let f = file_self(args)?;
+    let buffered = f.binary
+        && !matches!(
+            f.io_kind.get(),
+            crate::object::IoKind::Raw | crate::object::IoKind::BytesIO
+        );
+    if !buffered {
+        return file_read(args);
+    }
+    file_check_open(&f)?;
+    if !f.readable() {
+        return Err(crate::stdlib::io::unsupported_op("read1"));
+    }
+    let n = match args.get(1) {
+        None | Some(Object::None) => f.buf_size.get(),
+        Some(o) => {
+            let i = match o {
+                Object::Int(i) => *i,
+                _ => coerce_index_i64(o).map_err(|_| type_error("read1() argument must be int"))?,
+            };
+            if i < 0 {
+                f.buf_size.get()
+            } else {
+                i as usize
+            }
+        }
+    };
+    match f.read_bytes_opt(Some(n))? {
+        Some(data) => Ok(Object::new_bytes(data)),
+        None => Ok(Object::None),
     }
 }
 
@@ -15877,6 +16091,16 @@ pub(crate) fn file_tell(args: &[Object]) -> Result<Object, RuntimeError> {
     if !f.binary && !f.telling.get() {
         return Err(crate::error::os_error(
             "telling position disabled by next() call",
+        ));
+    }
+    // `TextIOWrapper.tell()` checks seekability before asking the raw
+    // stream, so a text handle on a pipe/FIFO raises
+    // `io.UnsupportedOperation` (the binary layers surface the raw
+    // `lseek` ESPIPE instead) — logging's RotatingFileHandler relies on
+    // the distinction (gh-143237).
+    if !f.binary && !f.seekable() {
+        return Err(crate::stdlib::io::unsupported_op(
+            "underlying stream is not seekable",
         ));
     }
     // Incremental text cookie path (a custom decode=None codec): `tell()`

@@ -67,6 +67,30 @@ pub unsafe extern "C" fn Py_GetVersion() -> *const c_char {
     VERSION.as_ptr() as *const c_char
 }
 
+/// 3.14 `Py_PACK_FULL_VERSION` (pymacro.h, gh-127015): the exported
+/// function behind the `PY_VERSION_HEX` layout, each field masked to its
+/// width (test_capi.test_misc.TestVersions calls it through ctypes).
+#[no_mangle]
+pub extern "C" fn Py_PACK_FULL_VERSION(
+    x: c_int,
+    y: c_int,
+    z: c_int,
+    level: c_int,
+    serial: c_int,
+) -> u32 {
+    ((x as u32 & 0xff) << 24)
+        | ((y as u32 & 0xff) << 16)
+        | ((z as u32 & 0xff) << 8)
+        | ((level as u32 & 0xf) << 4)
+        | (serial as u32 & 0xf)
+}
+
+/// 3.14 `Py_PACK_VERSION(x, y)` == `Py_PACK_FULL_VERSION(x, y, 0, 0, 0)`.
+#[no_mangle]
+pub extern "C" fn Py_PACK_VERSION(x: c_int, y: c_int) -> u32 {
+    Py_PACK_FULL_VERSION(x, y, 0, 0, 0)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn Py_GetCompiler() -> *const c_char {
     COMPILER.as_ptr() as *const c_char

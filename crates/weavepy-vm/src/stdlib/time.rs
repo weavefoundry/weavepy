@@ -18,8 +18,18 @@ use crate::error::{type_error, RuntimeError};
 use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
 
-thread_local! {
-    static EPOCH: Instant = Instant::now();
+/// Process-wide origin of `time.monotonic()` / `time.perf_counter()`.
+/// One clock for every thread: a per-thread origin made readings from
+/// two threads disagree by however long the second thread's first call
+/// came after the first's (a `threading.Thread` started 200 ms in read
+/// ~0 where the main thread read ~0.2), which breaks every cross-thread
+/// deadline (`Condition.wait(timeout)` bookkeeping, `queue.Queue.get`,
+/// `concurrent.futures.wait`) and any elapsed-time comparison across
+/// threads. CPython reads one `mach_absolute_time()`/`CLOCK_MONOTONIC`.
+static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+fn monotonic_elapsed() -> Duration {
+    EPOCH.get_or_init(Instant::now).elapsed()
 }
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
@@ -387,12 +397,12 @@ fn time_get_clock_info(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn time_monotonic(_args: &[Object]) -> Result<Object, RuntimeError> {
-    let elapsed = EPOCH.with(|e| e.elapsed());
+    let elapsed = monotonic_elapsed();
     Ok(Object::Float(elapsed.as_secs_f64()))
 }
 
 fn time_monotonic_ns(_args: &[Object]) -> Result<Object, RuntimeError> {
-    let elapsed = EPOCH.with(|e| e.elapsed());
+    let elapsed = monotonic_elapsed();
     Ok(Object::Int(elapsed.as_nanos() as i64))
 }
 
@@ -419,7 +429,7 @@ fn process_time_ns_value() -> i64 {
     }
     #[cfg(not(unix))]
     {
-        EPOCH.with(|e| e.elapsed()).as_nanos() as i64
+        monotonic_elapsed().as_nanos() as i64
     }
 }
 
@@ -430,7 +440,7 @@ fn thread_time_ns_value() -> i64 {
     }
     #[cfg(not(unix))]
     {
-        EPOCH.with(|e| e.elapsed()).as_nanos() as i64
+        monotonic_elapsed().as_nanos() as i64
     }
 }
 

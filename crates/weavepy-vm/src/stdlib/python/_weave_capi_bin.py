@@ -245,6 +245,9 @@ def bytearray_concat(left, right):
 
 def bytearray_resize(obj, size):
     # PyByteArray_Resize(); resizes in place, returns 0.
+    if size < 0:
+        raise ValueError(
+            "Can only resize to positive sizes, got %d" % size)
     if size > _ALLOC_LIMIT:
         raise MemoryError
     cur = len(obj)

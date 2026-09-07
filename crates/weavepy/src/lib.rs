@@ -423,9 +423,16 @@ fn run_source_with_options_impl(
         let code_rc = vm::sync::Rc::new(code.clone());
         interpreter.register_source_with_linecache(&code_rc, source_ref, "<string>");
     }
-    let result = interpreter
-        .emit_escape_warnings(source_ref, &opts.filename, &escape_warnings)
-        .and_then(|()| interpreter.run_module_as(&code, "__main__", file_for_main));
+    // RFC 0077 WS11: `-X lang=next` is a no-op now that the 3.14 grammar
+    // is the default; say so once per process, before user code runs.
+    let lang_next_requested = opts.flags.xoptions.iter().any(|x| x == "lang=next");
+    let result = (if lang_next_requested {
+        interpreter.emit_lang_next_deprecation()
+    } else {
+        Ok(())
+    })
+    .and_then(|()| interpreter.emit_escape_warnings(source_ref, &opts.filename, &escape_warnings))
+    .and_then(|()| interpreter.run_module_as(&code, "__main__", file_for_main));
     // CPython prints the uncaught exception (via `sys.excepthook` /
     // the traceback module) *before* `Py_FinalizeEx` runs shutdown
     // finalizers — `__del__` output interleaves after the traceback.

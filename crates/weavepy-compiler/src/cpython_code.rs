@@ -1364,8 +1364,7 @@ impl LocationEncoder {
                 return;
             }
         } else if loc.end_lineno == loc.lineno {
-            if line_delta == 0 && column < 80 && end_column - column < 16 && end_column >= column
-            {
+            if line_delta == 0 && column < 80 && end_column - column < 16 && end_column >= column {
                 // Short form: the running line is unchanged (delta 0).
                 let column_low_bits = (column & 7) as u8;
                 let column_group = (column >> 3) as u8;
@@ -1439,8 +1438,8 @@ fn encode_exception_table(code: &CodeObject, starts: &[usize]) -> Vec<u8> {
         let target = starts.get(h.handler as usize).copied().unwrap_or(0) as u32;
         let k = (target, h.depth, h.push_lasti);
         for i in (h.start as usize)..(h.end as usize).min(n) {
-            for u in starts[i]..starts[i + 1] {
-                owner[u] = Some(k);
+            for slot in &mut owner[starts[i]..starts[i + 1]] {
+                *slot = Some(k);
             }
         }
     }
@@ -3311,14 +3310,23 @@ def f():
         &f.constants,
     )
     .expect("decode");
-    for (i, (a, b)) in f.instructions.iter().zip(dc.instructions.iter()).enumerate() {
+    for (i, (a, b)) in f
+        .instructions
+        .iter()
+        .zip(dc.instructions.iter())
+        .enumerate()
+    {
         assert_eq!(a, b, "instruction {i} diverges");
     }
     assert_eq!(f.instructions.len(), dc.instructions.len());
     // Both readings survive: the comprehension's plain loads and the
     // lambda's closure load of the outer cell.
-    assert!(dc.instructions.contains(&Instruction::new(OpCode::LoadFast, 1)));
-    assert!(dc.instructions.contains(&Instruction::new(OpCode::LoadClosure, 0)));
+    assert!(dc
+        .instructions
+        .contains(&Instruction::new(OpCode::LoadFast, 1)));
+    assert!(dc
+        .instructions
+        .contains(&Instruction::new(OpCode::LoadClosure, 0)));
 }
 
 /// `stack_effects` (WeavePy VM view, drives `co_stacksize`) and

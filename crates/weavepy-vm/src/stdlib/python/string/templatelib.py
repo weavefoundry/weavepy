@@ -9,6 +9,10 @@ literal-created and manually-created templates are indistinguishable.
 
 __all__ = ["Template", "Interpolation", "convert"]
 
+# 3.14: `Template[int]` / `Interpolation[int]` are `types.GenericAlias`
+# (the C types carry `__class_getitem__ = Py_GenericAlias`).
+from types import GenericAlias as _GenericAlias
+
 
 def convert(obj, /, conversion):
     """Apply formatted-string-literal conversion semantics to *obj*.
@@ -62,6 +66,8 @@ class Interpolation:
 
     __slots__ = ('_value', '_expression', '_conversion', '_format_spec')
     __match_args__ = ('value', 'expression', 'conversion', 'format_spec')
+
+    __class_getitem__ = classmethod(_GenericAlias)
 
     def __init_subclass__(cls, **kwargs):
         _reject_subclass(cls, Interpolation)
@@ -131,6 +137,8 @@ class Template:
     """
 
     __slots__ = ('_strings', '_interpolations')
+
+    __class_getitem__ = classmethod(_GenericAlias)
 
     def __init_subclass__(cls, **kwargs):
         _reject_subclass(cls, Template)

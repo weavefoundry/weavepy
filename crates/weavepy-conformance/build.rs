@@ -67,7 +67,10 @@ fn main() {
         );
         return;
     };
-    let internal_include = capi_dir.join("include").join(weavepy_version::HEADER_TREE).join("internal");
+    let internal_include = capi_dir
+        .join("include")
+        .join(weavepy_version::HEADER_TREE)
+        .join("internal");
 
     let suffix = if target_os == "windows" { "dll" } else { "so" };
     let cc = env::var("CC").unwrap_or_else(|_| "cc".to_owned());

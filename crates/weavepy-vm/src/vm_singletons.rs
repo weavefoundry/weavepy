@@ -276,6 +276,29 @@ pub fn publish_interpreter_seed(interp: &crate::Interpreter) {
     *seed_types_slot().lock() = Some(crate::builtin_types::builtin_types());
 }
 
+/// Run `f` (typically a `Interpreter::new()` for a *sub*-interpreter)
+/// without letting it replace the published seed. `Interpreter::default`
+/// unconditionally publishes itself as the seed, so without this a
+/// sub-interpreter would (a) become the fork source for the main
+/// interpreter's later `start_new_thread` fallback and (b) stay alive
+/// in the slot after `interpreters.destroy()` — every closed
+/// sub-interpreter's builtins dict, `_frozen_importlib`, and module
+/// graph would be pinned by the seed copy (~120 tracked objects per
+/// interpreter, growing `gc.collect()` linearly across
+/// `InterpreterPoolExecutor` runs).
+pub fn with_seed_preserved<T>(f: impl FnOnce() -> T) -> T {
+    let saved = seed_slot().lock().take();
+    let saved_types = seed_types_slot().lock().take();
+    let out = f();
+    if saved.is_some() {
+        *seed_slot().lock() = saved;
+    }
+    if saved_types.is_some() {
+        *seed_types_slot().lock() = saved_types;
+    }
+    out
+}
+
 /// Hand out a fresh worker [`crate::Interpreter`] cloned from the
 /// last-published seed. Returns `None` if no seed has been published
 /// yet (callers fall back to `Interpreter::new()`).

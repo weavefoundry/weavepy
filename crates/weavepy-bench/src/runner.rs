@@ -43,7 +43,7 @@ pub struct RunOpts {
     /// call runs on, and it had never been measured against a
     /// baseline. `--no-interp` opts out for quick local runs.
     pub include_interp: bool,
-    /// Explicit path to the host Python. When `None`, `python3.13`
+    /// Explicit path to the host Python. When `None`, `python3.14`
     /// is preferred and `python3` is the fallback.
     pub python_path: Option<String>,
     /// Explicit path to the `weavepy` binary under test. When
@@ -94,13 +94,13 @@ pub fn resolve_weavepy(opts: &RunOpts) -> io::Result<PathBuf> {
     )))
 }
 
-/// Locate the host CPython. Priority: explicit opt → `python3.13` →
+/// Locate the host CPython. Priority: explicit opt → `python3.14` →
 /// `python3`. A candidate qualifies if `-c pass` exits 0.
 pub fn resolve_python(opts: &RunOpts) -> io::Result<String> {
     if let Some(p) = &opts.python_path {
         return Ok(p.clone());
     }
-    for candidate in ["python3.13", "python3"] {
+    for candidate in ["python3.14", "python3"] {
         let ok = Command::new(candidate)
             .args(["-c", "pass"])
             .output()
@@ -111,7 +111,7 @@ pub fn resolve_python(opts: &RunOpts) -> io::Result<String> {
         }
     }
     Err(io::Error::other(
-        "no host CPython found (tried python3.13, python3); pass --python=PATH or --no-cpython",
+        "no host CPython found (tried python3.14, python3); pass --python=PATH or --no-cpython",
     ))
 }
 

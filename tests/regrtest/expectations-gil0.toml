@@ -12,6 +12,13 @@
 #
 # Statuses are measured on the release binary. `measured_os` mirrors
 # the main baseline's advisory-gate semantics (RFC 0063 WS7).
+#
+# Re-measured on the CPython 3.14.7 tree after the RFC 0077 Phase II
+# switch (`-j4`, macOS aarch64): 10 total, pass 10, unexpected 0. No
+# row changed status; the Phase II GIL hand-off change (a holder now
+# yields once a waiter has been *visible* for the switch interval, the
+# way CPython's `drop_gil` request works, rather than as soon as one
+# appears) is invisible to this lane, which runs with the GIL off.
 
 measured_os = ["macos"]
 timeout_seconds = 120

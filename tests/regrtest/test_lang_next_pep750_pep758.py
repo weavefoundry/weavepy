@@ -3,9 +3,10 @@
 Covers PEP 750 t-strings (literal syntax, Template/Interpolation
 runtime semantics, `string.templatelib`) and PEP 758 unparenthesized
 `except`/`except*` lists. Since RFC 0077 WS11 the 3.14 grammar is on by
-default: `-X lang=next` is accepted as a no-op and `-X lang=3.13` pins
-the previous grammar, so syntax-level cases run in a subprocess (with
-and without the opt-out); `string.templatelib` is exercised in-process.
+default: `-X lang=next` is accepted as a no-op (with a DeprecationWarning
+for this one wave) and `-X lang=3.13` pins the previous grammar, so
+syntax-level cases run in a subprocess (with and without the opt-out);
+`string.templatelib` is exercised in-process.
 """
 
 import subprocess
@@ -302,6 +303,31 @@ class XOptionSurfaceTests(unittest.TestCase):
     def test_sys_xoptions_carries_gate(self):
         proc = run_gated("import sys; print(sys._xoptions.get('lang'))")
         self.assertEqual(proc.stdout.strip(), "next")
+
+    def test_lang_next_warns_deprecated(self):
+        # RFC 0077 WS11: the flag is a no-op for one wave and says so
+        # through the ordinary warnings machinery (attributed to
+        # __main__, so the default filters show it).
+        proc = run_gated("print('ran')")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "ran")
+        self.assertIn("DeprecationWarning", proc.stderr)
+        self.assertIn("-X lang=next is deprecated", proc.stderr)
+
+    def test_lang_next_warning_honors_w_error(self):
+        proc = subprocess.run(
+            [sys.executable, "-W", "error", "-X", "lang=next", "-c", "print('ran')"],
+            capture_output=True, text=True)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("ran", proc.stdout)
+        self.assertIn("DeprecationWarning", proc.stderr)
+
+    def test_default_and_313_pin_are_silent(self):
+        for argv in ([sys.executable, "-c", "print('ran')"],
+                     [sys.executable, "-X", "lang=3.13", "-c", "print('ran')"]):
+            proc = subprocess.run(argv, capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertNotIn("DeprecationWarning", proc.stderr)
 
 
 if __name__ == "__main__":

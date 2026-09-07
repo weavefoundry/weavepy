@@ -1550,8 +1550,8 @@ fn leg_embed(prefix: &Path, scratch: &Path, env: &[(OsString, OsString)]) -> Leg
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
             let want = [
-                "embed ok round 0 (3, 13)",
-                "embed ok round 1 (3, 13)",
+                "embed ok round 0 (3, 14)",
+                "embed ok round 1 (3, 14)",
                 "embed smoke ok",
             ];
             if out.status.success() && want.iter().all(|w| stdout.contains(w)) {

@@ -3,7 +3,7 @@
  *
  * Unlike every other in-tree fixture (`_smalltest`, `_ndarray`,
  * `_numpylike`), this module is compiled against the **stock CPython
- * 3.13 headers** (`#include <Python.h>` resolved via the host's real
+ * 3.14 headers** (`#include <Python.h>` resolved via the host's real
  * include directory) with the *full* (non-limited) API. That means the
  * compiler inlines CPython's hot-path macros directly into this object
  * file:
@@ -210,7 +210,7 @@ static PyMethodDef sa_methods[] = {
 static struct PyModuleDef sa_module = {
     PyModuleDef_HEAD_INIT,
     "_stockabi",
-    "RFC 0043 wave-1 stock-CPython-3.13-ABI proof extension.",
+    "RFC 0043 wave-1 stock-CPython-3.14-ABI proof extension.",
     -1,
     sa_methods,
     NULL,
@@ -225,6 +225,6 @@ PyMODINIT_FUNC PyInit__stockabi(void) {
         return NULL;
     }
     PyModule_AddIntConstant(m, "ANSWER", 42);
-    PyModule_AddStringConstant(m, "ABI", "cp313");
+    PyModule_AddStringConstant(m, "ABI", "cp314");
     return m;
 }

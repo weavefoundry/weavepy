@@ -119,6 +119,7 @@ pub mod ssl_real;
 pub mod string_mod;
 pub mod warnings_mod;
 
+pub mod collections_native;
 pub mod gc_real;
 pub mod multiprocessing_mod;
 pub mod queue_native;
@@ -257,6 +258,10 @@ pub fn register_all(cache: &ModuleCache) {
     // bound form must be a `builtin_function_or_method` —
     // test_types.test_method_descriptor_crash).
     cache.register_builtin("_weave_queue", queue_native::build);
+    // Atomic `deque` end operations behind the `_collections` Python
+    // stand-in (CPython documents append/pop from either side as
+    // thread-safe; `SimpleQueue` and asyncio's ready queue rely on it).
+    cache.register_builtin("_weave_collections", collections_native::build);
     cache.register_builtin("gc", gc_real::build);
     cache.register_builtin("_multiprocessing", multiprocessing_mod::build);
     // RFC 0040 WS5 — native XML parser behind `xml.parsers.expat`; drives the
@@ -3527,6 +3532,100 @@ pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "_pyrepl.trace",
             source: include_str!("python/_pyrepl_trace.py"),
+            is_package: false,
+        },
+        // RFC 0077 — the rest of 3.14.7's `_pyrepl` package, verbatim, so
+        // `test_pyrepl` (`from _pyrepl import terminfo`, `unix_console`,
+        // `readline`, …) resolves against the staged stdlib. The
+        // interactive REPL itself stays Rust-native.
+        FrozenSource {
+            name: "_pyrepl.__main__",
+            source: include_str!("python/_pyrepl___main__.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl._module_completer",
+            source: include_str!("python/_pyrepl__module_completer.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl._threading_handler",
+            source: include_str!("python/_pyrepl__threading_handler.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.base_eventqueue",
+            source: include_str!("python/_pyrepl_base_eventqueue.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.commands",
+            source: include_str!("python/_pyrepl_commands.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.completing_reader",
+            source: include_str!("python/_pyrepl_completing_reader.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.fancy_termios",
+            source: include_str!("python/_pyrepl_fancy_termios.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.historical_reader",
+            source: include_str!("python/_pyrepl_historical_reader.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.input",
+            source: include_str!("python/_pyrepl_input.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.keymap",
+            source: include_str!("python/_pyrepl_keymap.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.reader",
+            source: include_str!("python/_pyrepl_reader.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.readline",
+            source: include_str!("python/_pyrepl_readline.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.simple_interact",
+            source: include_str!("python/_pyrepl_simple_interact.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.terminfo",
+            source: include_str!("python/_pyrepl_terminfo.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.unix_console",
+            source: include_str!("python/_pyrepl_unix_console.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.unix_eventqueue",
+            source: include_str!("python/_pyrepl_unix_eventqueue.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.windows_console",
+            source: include_str!("python/_pyrepl_windows_console.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl.windows_eventqueue",
+            source: include_str!("python/_pyrepl_windows_eventqueue.py"),
             is_package: false,
         },
         // RFC 0055 WS2 — verbatim CPython `venv` + `ensurepip`

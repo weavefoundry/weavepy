@@ -96,31 +96,45 @@ class Pickler(_Pickler):
 
     def save_reduce(self, func, args, state=None, listitems=None,
                     dictitems=None, state_setter=None, *, obj=None):
+        # Message wording follows 3.14's `Modules/_pickle.c:save_reduce`
+        # (pickletester test_bad_newobj_ex_args, test_bad_object_list_items,
+        # test_bad_object_dict_items, test_bad_state_setter).
         if getattr(func, "__name__", "") == "__newobj_ex__" and \
                 isinstance(args, tuple) and len(args) == 3:
             _, newargs, kwargs = args
             if not isinstance(newargs, tuple):
                 raise PicklingError(
-                    "second item from __newobj_ex__ args is not a tuple, "
+                    "second argument to __newobj_ex__() must be a tuple, "
                     "not %s" % type(newargs).__name__)
             if not isinstance(kwargs, dict):
                 raise PicklingError(
-                    "third item from __newobj_ex__ args is not a dict, "
+                    "third argument to __newobj_ex__() must be a dict, "
                     "not %s" % type(kwargs).__name__)
         if listitems is not None and not hasattr(type(listitems), "__next__"):
             raise PicklingError(
-                "fourth element of the tuple returned by __reduce__ "
+                "fourth item of the tuple returned by __reduce__ "
                 "must be an iterator, not %s" % type(listitems).__name__)
-        if dictitems is not None and not hasattr(type(dictitems), "__next__"):
-            raise PicklingError(
-                "fifth element of the tuple returned by __reduce__ "
-                "must be an iterator, not %s" % type(dictitems).__name__)
+        if dictitems is not None:
+            if not hasattr(type(dictitems), "__next__"):
+                raise PicklingError(
+                    "fifth item of the tuple returned by __reduce__ "
+                    "must be an iterator, not %s" % type(dictitems).__name__)
+            dictitems = self._checked_dict_items(dictitems)
         if state_setter is not None and not callable(state_setter):
             raise PicklingError(
-                "sixth element of the tuple returned by __reduce__ "
-                "must be a function, not %s" % type(state_setter).__name__)
+                "sixth item of the tuple returned by __reduce__ "
+                "must be callable, not %s" % type(state_setter).__name__)
         return _Pickler.save_reduce(self, func, args, state, listitems,
                                     dictitems, state_setter, obj=obj)
+
+    @staticmethod
+    def _checked_dict_items(items):
+        # `_pickle.c:batch_dict` rejects a non-2-tuple item with TypeError
+        # where the pure engine's `for k, v in items` raises ValueError.
+        for item in items:
+            if not isinstance(item, tuple) or len(item) != 2:
+                raise TypeError("dict items iterator must return 2-tuples")
+            yield item
 
 
 class _BoundBuiltinMethod:

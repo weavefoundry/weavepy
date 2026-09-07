@@ -69,12 +69,62 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         reg!("combinations_core", combinations_core);
         reg!("cwr_core", cwr_core);
         reg!("batched_core", batched_core);
+        reg!(
+            "_register_classmethod_descriptor",
+            register_classmethod_descriptor
+        );
     }
     Rc::new(PyModule {
         name: "_itertools".to_owned(),
         filename: None,
         dict,
     })
+}
+
+/// `_register_classmethod_descriptor(cls, name)` — post-splice hook for
+/// the frozen `itertools.py` (the `_operator._register_call_descriptors`
+/// pattern): after `chain.from_iterable = classmethod(_n.chain_from_iterable)`
+/// it tags the wrapped native as a descriptor *owned by* `cls`, which is
+/// what `type(chain.from_iterable)` keys on to present the bound
+/// attribute as `builtin_function_or_method` (a C `METH_CLASS` slot binds
+/// to one; a Python-level `classmethod(len).__get__` binds to `method`)
+/// and what gives it `__qualname__ == 'chain.from_iterable'`.
+/// torch._dynamo's `substitute_in_graph(itertools.chain.from_iterable)`
+/// gates its polyfill on exactly that type. Before RFC 0077 the native
+/// passed the check only by accident: the descriptor side table was never
+/// purged, so a fresh `BuiltinFn` at a recycled address inherited a dead
+/// builtin's registration. The table is now purged on drop
+/// (`descr_registry::forget`), and this hook records the fact honestly.
+fn register_classmethod_descriptor(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [cls_obj, name_obj] = args else {
+        return Err(type_error(
+            "_register_classmethod_descriptor expected 2 arguments (cls, name)",
+        ));
+    };
+    let Object::Type(cls) = cls_obj else {
+        return Err(type_error(
+            "_register_classmethod_descriptor: first argument must be a class",
+        ));
+    };
+    let Object::Str(name) = name_obj else {
+        return Err(type_error(
+            "_register_classmethod_descriptor: second argument must be a str",
+        ));
+    };
+    let entry = cls.dict.borrow().get(&DictKey(name_obj.clone())).cloned();
+    if let Some(Object::ClassMethod(w)) = entry {
+        let func = w.func();
+        if matches!(func, Object::Builtin(_)) {
+            crate::descr_registry::register(
+                &func,
+                crate::descr_registry::DescrKind::Method,
+                cls.clone(),
+                name.as_ref(),
+                None,
+            );
+        }
+    }
+    Ok(Object::None)
 }
 
 /// One `islice` index argument: `None` or an int in `0..=isize::MAX`.

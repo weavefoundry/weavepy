@@ -210,64 +210,17 @@ class deque:
             self._head = 0
         return self._data
 
-    def append(self, x):
-        # CPython's method descriptor rejects unbound calls with a
-        # foreign receiver (`deque.append(thing, x)` — gh-92063).
-        if not isinstance(self, deque):
-            raise TypeError(
-                "descriptor 'append' for 'collections.deque' objects "
-                "doesn't apply to a '%s' object" % type(self).__name__
-            )
-        self._state += 1
-        self._data.append(x)
-        if self._maxlen is not None and len(self._data) - self._head > self._maxlen:
-            self.popleft()
-
-    def appendleft(self, x):
-        # Fill the consumed prefix from the right; when there is none,
-        # open a block of slack proportional to the size so a run of
-        # `appendleft` calls is amortized O(1) like CPython's block
-        # deque (rather than `list.insert(0, x)`'s O(n) shift).
-        self._state += 1
-        data = self._data
-        h = self._head
-        if h == 0:
-            h = max(8, len(data) // 2)
-            data[0:0] = [None] * h
-        h -= 1
-        data[h] = x
-        self._head = h
-        if self._maxlen is not None and len(data) - h > self._maxlen:
-            data.pop()
-
-    def pop(self):
-        data = self._data
-        if len(data) <= self._head:
-            raise IndexError("pop from an empty deque")
-        self._state += 1
-        x = data.pop()
-        if len(data) == self._head and self._head:
-            del data[:]
-            self._head = 0
-        return x
-
-    def popleft(self):
-        data = self._data
-        h = self._head
-        if h >= len(data):
-            raise IndexError("pop from an empty deque")
-        self._state += 1
-        x = data[h]
-        data[h] = None
-        h += 1
-        if h >= len(data):
-            del data[:]
-            h = 0
-        elif h >= 32 and h * 2 >= len(data):
-            del data[:h]
-            h = 0
-        self._head = h
-        return x
+    # The four end operations are native builtins
+    # (`stdlib/collections_native.rs`): CPython documents them as
+    # thread-safe, and a Python method body is not atomic here (the GIL
+    # is handed off at checkpoints inside it; `-X gil=0` runs it
+    # concurrently). Each runs to completion under the backing list's
+    # cell borrow, so `SimpleQueue.get` racing `put`, or asyncio's
+    # `call_soon_threadsafe` racing the loop's `popleft`, can't tear the
+    # head index. The unbound form keeps gh-92063's foreign-receiver
+    # TypeError. Being builtins also makes `d.append` a
+    # `builtin_function_or_method`, like the C accelerator's.
+    from _weave_collections import append, appendleft, pop, popleft
 
     def extend(self, iterable):
         # `d.extend(d)` iterates a snapshot (CPython special-cases

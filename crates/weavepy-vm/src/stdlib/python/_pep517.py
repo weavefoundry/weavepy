@@ -14,7 +14,7 @@ Surface::
     metadata_for(src_dir)       -> METADATA text
 
 Compiled C/C++ extensions build through a *real* backend (RFC 0062
-WS2: the installed `{prefix}/include/python3.13/` header tree plus the
+WS2: the installed `{prefix}/include/python3.14/` header tree plus the
 compiler-truthful `sysconfig` vars make `setuptools.build_meta`
 compile them like on CPython). The in-tree fallback below remains
 pure-Python-only; when a tree declares extensions and no real backend

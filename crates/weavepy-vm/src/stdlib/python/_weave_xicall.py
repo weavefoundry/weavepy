@@ -12,9 +12,14 @@ rebuild, call, and ship the converted result back on the same queue.
 The result queue item is ``(kind, payload)``:
 
 ``('ok', payload)``    the return value as cross-interpreter data
-``('unshareable', s)`` the callable/args or the return value could not
-                       be converted; ``s`` is the error text and the
-                       caller raises ``NotShareableError``
+``('unshareable', (label, s))``
+                       the callable/args/kwargs or the return value could
+                       not be converted; ``s`` is the error text and
+                       ``label`` is ``'func'``/``'args'``/``'kwargs'`` for
+                       an input (CPython's ``wrap_notshareable`` raises
+                       ``NotShareableError('<label> not shareable')`` with
+                       the conversion error as ``__cause__``) or ``None``
+                       for the return value (raised as-is)
 
 A callable that raises simply propagates out of ``run`` -- the caller's
 ``run_string`` sees the exception and packages it as ``excinfo``, exactly
@@ -60,19 +65,24 @@ def _call_as_running_main(fn, args, kwargs):
 def run(qid):
     import _weave_xidata as _xid
     (fn, args, kwargs), _fmt, _unbound = _xx.queue_get(qid)
+    # Unpack each piece under its own label, like CPython's
+    # `_interp_call_unpack` (GH-125864: a pickle that loads badly must
+    # surface as `NotShareableError('args not shareable')` rather than
+    # leave the caller waiting on its result queue).
+    label = 'func'
     try:
         fn = _xid.from_xidata(fn)
+        label = 'args'
         args = _xid.from_xidata(args) if args is not None else ()
+        label = 'kwargs'
         kwargs = _xid.from_xidata(kwargs) if kwargs is not None else {}
     except BaseException as exc:  # noqa: BLE001 - any conversion failure
-        _xx.queue_put(qid, ('unshareable', f'{type(exc).__name__}: {exc}'),
-                      0, 0)
+        _xx.queue_put(qid, ('unshareable', (label, str(exc))), 0, 0)
         return
     res = _call_as_running_main(fn, args, kwargs)
     try:
         payload = _xid.get_xidata(res)
     except BaseException as exc:  # noqa: BLE001
-        _xx.queue_put(qid, ('unshareable', f'{type(exc).__name__}: {exc}'),
-                      0, 0)
+        _xx.queue_put(qid, ('unshareable', (None, str(exc))), 0, 0)
         return
     _xx.queue_put(qid, ('ok', payload), 0, 0)

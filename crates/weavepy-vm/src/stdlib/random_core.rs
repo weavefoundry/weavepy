@@ -335,36 +335,47 @@ fn random_getrandbits(args: &[Object]) -> Result<Object, RuntimeError> {
             args.len() - 1
         )));
     }
-    let k = match args.get(1) {
-        Some(Object::Bool(b)) => i64::from(*b),
-        Some(Object::Int(i)) => *i,
+    // 3.14 (gh-129889): `k` is a C `uint64_t` (`PyLong_AsUnsignedLongLong`
+    // semantics): a negative int of any size is ValueError "Cannot convert
+    // negative int", one past 2**64 is OverflowError, and a count too large
+    // to allocate is MemoryError (test_random.test_getrandbits).
+    let negative = || value_error("Cannot convert negative int");
+    let k: u64 = match args.get(1) {
+        Some(Object::Bool(b)) => u64::from(*b),
+        Some(Object::Int(i)) => u64::try_from(*i).map_err(|_| negative())?,
         Some(Object::Long(b)) => {
             use num_traits::ToPrimitive;
-            // Clinic 'i' conversion: an int beyond C int is an
-            // OverflowError (getrandbits(1 << 1000), test_random).
-            b.to_i64().ok_or_else(|| {
-                crate::error::overflow_error("Python int too large to convert to C int")
+            if b.sign() == Sign::Minus {
+                return Err(negative());
+            }
+            b.to_u64().ok_or_else(|| {
+                crate::error::overflow_error("Python int too large for C uint64_t")
             })?
         }
-        // Clinic 'i' accepts anything indexable — `getrandbits(MyIndex(100))`
-        // runs the user __index__ (test_random.test_getrandbits).
-        Some(other @ Object::Instance(_)) => crate::builtins::coerce_index_i64(other)?,
+        // Anything indexable — `getrandbits(MyIndex(100))` runs the user
+        // __index__ (test_random.test_getrandbits).
+        Some(other @ Object::Instance(_)) => {
+            u64::try_from(crate::builtins::coerce_index_i64(other)?).map_err(|_| negative())?
+        }
         _ => return Err(type_error("getrandbits() requires an integer argument")),
     };
-    if k < 0 {
-        return Err(value_error("number of bits must be non-negative"));
-    }
     if k == 0 {
         return Ok(Object::Int(0));
     }
-    let k = k as u64;
     if k <= 32 {
         let v = with_mt(&inst, |mt| mt.genrand_u32())? >> (32 - k as u32);
         return Ok(Object::Int(i64::from(v)));
     }
+    if (k - 1) / 32 + 1 > (isize::MAX as u64) / 4 {
+        return Err(crate::error::memory_error(""));
+    }
     let words = ((k - 1) / 32 + 1) as usize;
+    let mut buf: Vec<u32> = Vec::new();
+    if buf.try_reserve_exact(words).is_err() {
+        return Err(crate::error::memory_error(""));
+    }
     let digits = with_mt(&inst, |mt| {
-        let mut out = Vec::with_capacity(words);
+        let mut out = buf;
         let mut remaining = k;
         for _ in 0..words {
             let mut r = mt.genrand_u32();

@@ -559,7 +559,11 @@ pub(crate) fn create_registered(cfg: SubinterpConfig, whence: i64) -> Result<u64
         .map_err(|_| runtime_error("sub-interpreter registry poisoned"))?;
     let id = reg.next_id;
     reg.next_id += 1;
-    let mut interp = Box::new(crate::Interpreter::new());
+    // Keep the main interpreter's thread seed in place: a sub-interpreter
+    // must neither become the `start_new_thread` fork source nor outlive
+    // its `destroy()` through the seed slot.
+    let mut interp =
+        crate::vm_singletons::with_seed_preserved(|| Box::new(crate::Interpreter::new()));
     interp.set_subinterp_config(cfg.check_multi_interp_extensions, cfg.gil == "own");
     // CPython `interp->feature_flags` (Py_RTFLAGS_*): what `os.fork`,
     // `os.exec*`, and `_thread.daemon_threads_allowed` consult
@@ -701,6 +705,14 @@ fn seed_main_loader(interp: &mut crate::Interpreter, globals: &Rc<RefCell<DictDa
     if globals.borrow().get(&key).is_some() {
         return;
     }
+    // This runs `_frozen_importlib`'s body, whose `_setup` reaches
+    // `_imp.create_builtin` for `_thread`/`_warnings`/`_weakref`. Those
+    // builtins resolve "the interpreter" through the published pointer,
+    // which at this point is still the *parent's* (we are inside its
+    // `_interpreters.exec` call). Publish the sub-interpreter so it gets
+    // its own copies instead of adopting, and re-stamping the `__spec__`
+    // / `__loader__` of, the parent's modules.
+    let guard = crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut(interp));
     let loader = match interp.import_path_internal("_frozen_importlib") {
         Ok(Object::Module(m)) => m
             .dict
@@ -709,6 +721,7 @@ fn seed_main_loader(interp: &mut crate::Interpreter, globals: &Rc<RefCell<DictDa
             .cloned(),
         _ => None,
     };
+    drop(guard);
     globals
         .borrow_mut()
         .insert(key, loader.unwrap_or(Object::None));
@@ -736,7 +749,13 @@ pub(crate) fn destroy_registered(id: u64) -> Result<(), RuntimeError> {
         }
         Some(_) => {}
     }
-    reg.interps.remove(&id);
+    let mut dying: Vec<(u64, Box<crate::Interpreter>)> = Vec::new();
+    dying.extend(
+        reg.interps
+            .remove(&id)
+            .and_then(|e| e.interp)
+            .map(|i| (id, i)),
+    );
     // The dying interpreter lets go of its channel ends and any items
     // it sent become "unbound" (CPython `interp_destroy` →
     // `_channels_drop_interpreter`), and likewise for queued items.
@@ -755,9 +774,106 @@ pub(crate) fn destroy_registered(id: u64) -> Result<(), RuntimeError> {
         .map(|(k, _)| *k)
         .collect();
     for child in orphans {
-        reg.interps.remove(&child);
+        dying.extend(
+            reg.interps
+                .remove(&child)
+                .and_then(|e| e.interp)
+                .map(|i| (child, i)),
+        );
         channels_drop_interpreter(&mut reg, child);
         queues_drop_interpreter(&mut reg, child);
+    }
+    // The rest of `Py_EndInterpreter`, run with the registry lock
+    // released: the teardown drops arbitrary objects, and a
+    // `concurrent.interpreters.Interpreter.__del__` reached that way
+    // re-enters this registry. Order matters and mirrors CPython:
+    // `_PyAtExit_Call(interp)` runs the dying interpreter's own `atexit`
+    // callbacks (its `logging.shutdown`, `weakref.finalize._exitfunc`,
+    // ...) while its modules are intact; then `finalize_modules` unhooks
+    // `sys.modules`, the interpreter box is dropped (frame stacks,
+    // builtins, namespaces), and a collection reclaims the graph —
+    // finalizers run there before anything is cleared, so
+    // `Interpreter.__del__` still sees an intact `_interpreters` — and
+    // only then are modules that survived (rooted from Rust) blanked.
+    // Without any of this, every closed sub-interpreter left ~5.5k
+    // tracked objects behind and each later `gc.collect()` in the
+    // process paid for them.
+    drop(reg);
+    // The interpreter driving the teardown. `None` when the published
+    // pointer *is* one of the dying boxes (a C host that called
+    // `destroy` on the interpreter being destroyed): it is freed below,
+    // so nothing may dereference it afterwards.
+    let parent_ptr = crate::vm_singletons::current_interpreter_ptr().filter(|p| {
+        !dying
+            .iter()
+            .any(|(_, boxed)| std::ptr::eq(&raw const **boxed, *p))
+    });
+    let mut leftovers: Vec<(Vec<(DictKey, Object)>, Rc<RefCell<DictData>>)> = Vec::new();
+    for (dying_id, mut interp) in dying {
+        push_current_id(dying_id);
+        crate::stdlib::atexit_mod::run_exit_handlers(&mut interp);
+        pop_current_id();
+        let modules = interp.take_subinterp_modules();
+        let builtins = interp.builtins_dict();
+        drop(interp);
+        leftovers.push((modules, builtins));
+    }
+    // Keep only weak evidence of the module *namespaces* across the
+    // collection: a strong `Vec<Object>` would root the very graph we
+    // want reclaimed, and the module objects themselves usually die
+    // while their dicts live on through `function.__globals__`.
+    let weak: Vec<(Vec<(DictKey, crate::sync::Weak<RefCell<DictData>>)>, _)> = leftovers
+        .into_iter()
+        .map(|(mods, builtins)| {
+            (
+                mods.into_iter()
+                    .filter_map(|(k, v)| match v {
+                        Object::Module(m) => Some((k, Rc::downgrade(&m.dict))),
+                        _ => None,
+                    })
+                    .collect(),
+                builtins,
+            )
+        })
+        .collect();
+    // Cyclic garbage that carries a finalizer is *deferred* by a
+    // collection: the `__del__`s are queued for the next eval-loop safe
+    // point and the graph stays allocated until they have run (PEP 442).
+    // Nothing ticks between here and the blanking below, so drive the
+    // queue ourselves — through the destroying interpreter, as CPython's
+    // `_PyGC_CollectNoFail` does in `finalize_modules` — and collect
+    // again, so `Interpreter.__del__` (of an interpreter the dead one
+    // created or looked up) runs while its `_interpreters` global is
+    // still bound instead of against a blanked module
+    // (test_interpreters: "TypeError: 'NoneType' object is not callable"
+    // from `Interpreter.__del__` after every `close()`).
+    crate::gc_trace::collect_all();
+    if let Some(ptr) = parent_ptr {
+        // SAFETY: published by the enclosing VM frame on this thread and
+        // not one of the boxes dropped above; the GIL keeps the access
+        // exclusive.
+        let parent = unsafe { &mut *ptr };
+        for _ in 0..crate::gc_trace::MAX_COLLECT_PASSES {
+            if parent.run_pending_finalizers() == 0 {
+                break;
+            }
+            crate::gc_trace::collect_all();
+        }
+    }
+    // Namespaces the destroying (parent) interpreter shares with the dead
+    // one are off limits — a process-singleton native module gutted here
+    // would gut the caller.
+    let shared = match parent_ptr {
+        // SAFETY: as above.
+        Some(ptr) => unsafe { (*ptr).shared_namespace_dicts() },
+        None => std::collections::HashSet::new(),
+    };
+    for (mods, builtins) in weak {
+        let survivors: Vec<(DictKey, Rc<RefCell<DictData>>)> = mods
+            .into_iter()
+            .filter_map(|(k, w)| w.upgrade().map(|d| (k, d)))
+            .collect();
+        crate::Interpreter::clear_subinterp_module_dicts(survivors, &builtins, &shared);
     }
     Ok(())
 }

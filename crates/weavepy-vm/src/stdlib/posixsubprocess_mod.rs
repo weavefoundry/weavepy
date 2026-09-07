@@ -239,6 +239,14 @@ fn fork_exec(args: &[Object]) -> Result<Object, RuntimeError> {
     let child_umask = opt_int(Some(&args[20])).unwrap_or(-1);
     let preexec_fn = &args[21];
 
+    // `subprocess_fork_exec_impl`: PySys_Audit("_posixsubprocess.fork_exec",
+    // "OOO", executable_list, process_args, env_list-or-None)
+    // (audit-tests test_posixsubprocess).
+    crate::stdlib::sys::audit_event(
+        "_posixsubprocess.fork_exec",
+        &[exec_list.clone(), process_args.clone(), env_list.clone()],
+    )?;
+
     // ---- Parent: build all C data BEFORE forking (no alloc in child). ----
     let exec_items = match crate::stdlib::os::sequence_items(exec_list) {
         Some(items) => items,

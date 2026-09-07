@@ -30,7 +30,7 @@ struct ExtensionBuild<'a> {
     env_var: &'a str,
 }
 
-/// The stock CPython 3.13 include directories the binary-ABI proof
+/// The stock CPython 3.14 include directories the binary-ABI proof
 /// fixtures compile against.
 ///
 /// RFC 0062 WS2 vendored the stock `Include/` tree into
@@ -204,7 +204,7 @@ fn main() {
 
     // ----------------------------------------------------------------
     // 2b) RFC 0043 binary-ABI hermetic proofs: compile the proof
-    //     fixtures against the host's *stock* CPython 3.13 headers
+    //     fixtures against the host's *stock* CPython 3.14 headers
     //     (full, non-limited API → real inlined macros and the genuine
     //     416-byte `PyTypeObject`), NOT WeavePy's `include/Python.h`.
     //
@@ -220,7 +220,7 @@ fn main() {
     //         interchange protocols, and the `import_array()` array-C-API
     //         capsule pattern.
     //
-    //     Skipped (with a note) when CPython 3.13 dev headers aren't
+    //     Skipped (with a note) when CPython 3.14 dev headers aren't
     //     present, so a bare CI host still builds and the stock proofs
     //     self-skip.
     // ----------------------------------------------------------------
@@ -356,7 +356,7 @@ fn main() {
         }
         None => {
             println!(
-                "cargo:warning=stock CPython 3.13 headers not found; \
+                "cargo:warning=stock CPython 3.14 headers not found; \
                  skipping the _stockabi/_stocktype/_stockarray/_stockcython \
                  binary-ABI proof fixtures"
             );

@@ -4,7 +4,7 @@
 //! `crates/weavepy-capi/include/cpython314/`, PSF-licensed) plus the
 //! per-OS generated `pyconfig.h`, embedded so
 //! [`crate::stdlib_tree::materialize`] can write a real
-//! `{prefix}/include/python3.13/` — the surface `pip install` of a
+//! `{prefix}/include/python3.14/` — the surface `pip install` of a
 //! C-extension sdist compiles against. See the build script for the
 //! generation step.
 

@@ -794,6 +794,15 @@ impl GcState {
     /// already held (by `reap_dead_acyclic` itself or by `collect_impl`).
     fn reap_dead_acyclic_locked(&self) -> usize {
         let mut reclaimed = 0usize;
+        // A worklist of ids that *may* have just died. Freeing an object
+        // drops its fields, so the only way a tracked object can become
+        // dead during this pass is by being a (transitive) child of one we
+        // freed; seeding the worklist from those children makes a long
+        // acyclic chain (`UserList([UserList([...])])` 200k deep,
+        // `test_userlist.test_repr_deep`) O(n) instead of one full index
+        // rescan per link. The outer loop's full scan remains the fixpoint
+        // authority: it seeds the first batch and confirms the last.
+        let mut work: Vec<ObjectId> = Vec::new();
         loop {
             let dead: Vec<ObjectId> = {
                 let index = self.index.borrow();
@@ -810,30 +819,62 @@ impl GcState {
             if dead.is_empty() {
                 break;
             }
-            for id in dead {
+            work.extend(dead);
+            while let Some(id) = work.pop() {
                 // Re-validate under a fresh borrow: a free earlier in this
-                // batch may have already reclaimed `id` as a child, or
-                // (it cannot here, counts only fall) revived it.
-                let still_dead = match self.index.borrow().get(&id) {
-                    Some(h) => {
-                        strong_count_for(&h.object) <= 1
-                            && !has_finalizer(&h.object)
-                            && crate::weakref_registry::count_for(id) == 0
-                    }
-                    None => false,
-                };
-                if still_dead {
-                    if crate::hot_gates::env_flags::reap_trace() {
-                        if let Some(h) = self.index.borrow().get(&id) {
-                            eprintln!("[ACYCLIC-REAP] {}", h.object.type_name_owned());
-                        }
-                    }
-                    self.untrack_id(id);
-                    reclaimed += 1;
+                // batch may have already reclaimed `id` as a child, and a
+                // worklist candidate may simply still be alive (counts
+                // only fall here, so nothing is ever revived).
+                let handle = self.index.borrow().get(&id).cloned();
+                let Some(h) = handle else { continue };
+                let still_dead = strong_count_for(&h.object) <= 1
+                    && !has_finalizer(&h.object)
+                    && crate::weakref_registry::count_for(id) == 0;
+                if !still_dead {
+                    continue;
                 }
+                if crate::hot_gates::env_flags::reap_trace() {
+                    eprintln!("[ACYCLIC-REAP] {}", h.object.type_name_owned());
+                }
+                // Enqueue the tracked objects this one holds, looking
+                // through untracked intermediaries (a tuple or frozenset
+                // holding the next link) which die with their parent.
+                self.collect_child_candidates(&h.object, &mut work);
+                self.untrack_id(id);
+                // `h` was cloned out of the index above; drop that clone so
+                // the untrack's field drops actually happen now (and the
+                // children's counts fall before they are re-examined).
+                drop(h);
+                reclaimed += 1;
             }
         }
         reclaimed
+    }
+
+    /// Push the ids of the tracked objects directly held by `obj` onto
+    /// `work`, descending through *untracked* children (immutable
+    /// containers and iterators are not persistently tracked) so a tracked
+    /// grandchild behind a tuple is still found. Bounded by an explicit
+    /// stack and a visited set so deep or shared untracked webs neither
+    /// recurse on the C stack nor blow up the candidate list.
+    fn collect_child_candidates(&self, obj: &Object, work: &mut Vec<ObjectId>) {
+        let mut pending: Vec<Object> = Vec::new();
+        traverse_object(obj, &mut |child| pending.push(child.clone()));
+        let mut seen: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
+        while let Some(child) = pending.pop() {
+            let id = id_of(&child);
+            if !seen.insert(id) {
+                continue;
+            }
+            if self.index.borrow().contains_key(&id) {
+                work.push(id);
+            } else if strong_count_for(&child) <= 2 {
+                // Untracked and about to die with its parent (our `child`
+                // clone plus the parent's own slot are the only counts): its
+                // fields fall too, so look through it.
+                traverse_object(&child, &mut |grandchild| pending.push(grandchild.clone()));
+            }
+        }
     }
 
     /// True iff at least one finalizable object is currently tracked. A single
@@ -1730,6 +1771,30 @@ impl GcState {
                 grey.push(handle.clone());
             }
         }
+        if std::env::var_os("WP_ROOT_DBG").is_some() {
+            for h in &grey {
+                let d = match &h.object {
+                    Object::Module(m) => format!("module {}", m.name),
+                    Object::Function(f) => format!("function {}", f.name),
+                    Object::Type(t) => format!("class {}", t.name),
+                    Object::Instance(i) => format!("instance {}", i.cls().name),
+                    Object::Dict(d) => format!(
+                        "dict len={} first={:?}",
+                        d.borrow().len(),
+                        d.borrow().iter().next().map(|(k, _)| k.0.repr())
+                    ),
+                    Object::List(l) => format!("list len={}", l.borrow().len()),
+                    o => o.type_name_owned(),
+                };
+                eprintln!(
+                    "[root] id={} gc_refs={} sc={} {}",
+                    h.id,
+                    h.gc_refs.load(Ordering::Acquire),
+                    strong_count_for(&h.object),
+                    d
+                );
+            }
+        }
         while let Some(h) = grey.pop() {
             h.color.store(color::Black, Ordering::Release);
             traverse_object(&h.object, &mut |child| {
@@ -2043,7 +2108,17 @@ impl GcState {
                 garbage.push(h.object.clone());
             }
         } else {
+            // Instances whose `__dict__` is shared are deferred; once
+            // every other dead object has released its references, a
+            // dict held only by dead holders is down to one owner and
+            // the retry clears it (a live holder keeps it intact).
+            let mut shared_dict_holders: Vec<&Arc<TrackedHandle>> = Vec::new();
             for h in &dead {
+                if !clear_object_fields(&h.object) {
+                    shared_dict_holders.push(h);
+                }
+            }
+            for h in shared_dict_holders {
                 clear_object_fields(&h.object);
             }
         }
@@ -2529,6 +2604,16 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
             // namespace dict, which isn't a tracked candidate on its own —
             // the `by_id` lookup simply misses it, so visiting is harmless.
             visit(&Object::Dict(f.globals.clone()));
+            // `func_builtins` too. For the main interpreter this edge is
+            // moot (its builtins dict is rooted from Rust for the process
+            // lifetime), but a destroyed sub-interpreter's builtins dict
+            // is held *only* by that interpreter's functions: without the
+            // edge, every one of them counted as an external root, the
+            // dict stayed Black, and everything reachable from it —
+            // `__loader__` (its `_frozen_importlib.BuiltinImporter`), its
+            // `open`, its `__import__` — pinned the whole module graph of
+            // every closed interpreter for the life of the process.
+            visit(&Object::Dict(f.builtins.clone()));
             for d in &f.defaults {
                 visit(d);
             }
@@ -2668,7 +2753,16 @@ pub fn register_clear(matches: fn(&Object) -> bool, clear: fn(&Object)) {
 
 /// Drain a container's child references in place. Used during
 /// the GC's clear phase to break cycles.
-pub fn clear_object_fields(obj: &Object) {
+///
+/// Returns `false` when the clear was *deferred*: an instance whose
+/// `__dict__` is shared with another holder (`ref = obj.__dict__`,
+/// then `obj` dies) keeps that dict intact — CPython's `subtype_clear`
+/// only drops the instance's *reference* to the dict, and the dict
+/// lives on for whoever else holds it (test_mailbox
+/// `test_type_specific_attributes_removed_on_conversion` snapshots
+/// `cls(msg).__dict__` of a temporary). The caller may retry once the
+/// other dead holders have released their references.
+pub fn clear_object_fields(obj: &Object) -> bool {
     // `try_borrow_mut` throughout: clear targets are unreachable, but
     // collections can run from allocation sites and the drop path —
     // a momentarily-borrowed container is left for the next pass
@@ -2697,11 +2791,16 @@ pub fn clear_object_fields(obj: &Object) {
             // instance dict to find its side-table slot — so it must run while
             // that dict is still intact.
             run_external_clear(obj);
-            if let Ok(mut m) = i.dict.try_borrow_mut() {
-                m.clear();
-            }
             if let Ok(mut slots) = i.slots.try_borrow_mut() {
                 *slots = None;
+            }
+            if crate::sync::Rc::strong_count(&i.dict) > 1 {
+                // Shared `__dict__`: leave its contents to the other
+                // holder (see the doc comment).
+                return false;
+            }
+            if let Ok(mut m) = i.dict.try_borrow_mut() {
+                m.clear();
             }
         }
         Object::ByteArray(b) => {
@@ -2771,6 +2870,7 @@ pub fn clear_object_fields(obj: &Object) {
         }
         _ => {}
     }
+    true
 }
 
 /// Look up `__del__` on the object's type and queue the

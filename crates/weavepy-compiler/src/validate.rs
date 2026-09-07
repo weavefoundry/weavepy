@@ -1091,6 +1091,21 @@ fn check_annotation_expr(expr: &Expr) -> Result<(), CompileError> {
             }
             return Ok(());
         }
+        // The annotation scope is never a coroutine, so an async
+        // list/set/dict comprehension is rejected even inside an
+        // `async def` (test_type_annotations
+        // test_no_exotic_expressions_in_unevaluated_annotations). A
+        // generator expression is exempt: it becomes an async generator.
+        ExprKind::ListComp { generators, .. }
+        | ExprKind::SetComp { generators, .. }
+        | ExprKind::DictComp { generators, .. }
+            if generators.iter().any(|g| g.is_async) =>
+        {
+            return Err(CompileError::spanned(
+                "asynchronous comprehension outside of an asynchronous function",
+                expr.span,
+            ));
+        }
         _ => {}
     }
     let mut result = Ok(());

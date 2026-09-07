@@ -656,6 +656,10 @@ def _addr_of(x):
     pointer) — what ``memmove`` / ``string_at`` / ``cast`` accept."""
     if isinstance(x, (bytes, bytearray)):
         return _nat.addressof_buffer(x)
+    if isinstance(x, str):
+        # `c_void_p.from_param` takes a str as a `Z` (wchar_t*) argument
+        # (test_memfunctions.test_overflow passes `u"foo"` to wstring_at).
+        return _nat.intern_buffer(bytes(_wchar_buffer(x)))
     return _as_address(x)
 
 
@@ -2330,6 +2334,9 @@ class CFuncPtr(_CData, metaclass=PyCFuncPtrType):
             # real C functions reached through PYFUNCTYPE prototypes; their
             # implementations receive the raw Python objects. Skip argtype
             # conversion so e.g. cast()'s `py_object` args stay unwrapped.
+            # PyCFuncPtr_call audits every foreign call (audit-tests
+            # test_ctypes_call_function).
+            _sys.audit("ctypes.call_function", handle, args)
             return thunk(*args)
         _callable = getattr(self, "_callable", None)
         if _callable is not None and handle == 0:
@@ -2354,6 +2361,7 @@ class CFuncPtr(_CData, metaclass=PyCFuncPtrType):
                 raise TypeError(
                     "this function takes %d argument%s (%d given)"
                     % (required, "" if required == 1 else "s", actual))
+        _sys.audit("ctypes.call_function", handle, tuple(callargs))
         result = _ffi_invoke(handle, restype, argtypes, flags, callargs)
         errcheck = self.errcheck
         if errcheck is not None:
@@ -2701,16 +2709,21 @@ def _thunk_memset(dst, c, count):
 
 def _thunk_string_at(ptr, size=-1):
     size = _parg_int(size)
+    addr = _parg_addr(ptr)
+    # callproc.c `string_at`: PySys_Audit("ctypes.string_at", "nn", ptr, size).
+    _sys.audit("ctypes.string_at", addr, size)
     if size >= _ABSURD_SIZE:
         raise MemoryError
-    return _nat.string_at(_parg_addr(ptr), size)
+    return _nat.string_at(addr, size)
 
 
 def _thunk_wstring_at(ptr, size=-1):
     size = _parg_int(size)
+    addr = _parg_addr(ptr)
+    _sys.audit("ctypes.wstring_at", addr, size)
     if size >= _ABSURD_SIZE:
         raise MemoryError
-    return _nat.wstring_at(_parg_addr(ptr), size)
+    return _nat.wstring_at(addr, size)
 
 
 def _thunk_memoryview_at(ptr, size, readonly=False):
@@ -2761,6 +2774,36 @@ def _thunk_cast(ptr, obj, typ):
         shadow.append(0)
         _keep_ref(result, 0, obj, shadow)
     return result
+
+
+def call_function(func, arguments):
+    """CPython ``_ctypes.call_function(addr, args)`` (callproc.c): call the
+    C function at ``addr`` with the tuple ``args`` under default argument
+    conversion, returning its ``int`` result. Audits
+    ``ctypes.call_function`` like the C version (audit-tests
+    test_ctypes_call_function)."""
+    func = _index(func)
+    if not isinstance(arguments, tuple):
+        raise TypeError(
+            "call_function() argument 2 must be tuple, not %s"
+            % type(arguments).__name__)
+    _sys.audit("ctypes.call_function", func, arguments)
+    thunk = _INTERNAL_THUNKS.get(func)
+    if thunk is not None:
+        result = thunk(*arguments)
+        return result if isinstance(result, int) else 0
+    if func == 0:
+        raise ValueError("attempt to call NULL function pointer")
+    codes = []
+    payloads = []
+    for i, val in enumerate(arguments):
+        code, payload = _arg_to_ffi(val, i + 1)
+        codes.append(code)
+        payloads.append(payload)
+    return _nat.call_function(func, "i", codes, payloads, FUNCFLAG_CDECL, len(codes))
+
+
+call_cdeclfunction = call_function
 
 
 _memmove_addr = _register_thunk(_thunk_memmove)

@@ -532,6 +532,13 @@ fn accel_module(name: &'static str, ctors: &[(&'static str, Object)]) -> Rc<PyMo
         for (ctor_name, ctor) in ctors {
             d.insert(DictKey(Object::from_static(ctor_name)), ctor.clone());
         }
+        // 3.14 (gh-133711): the HACL* modules publish `HASHLIB_GIL_MINSIZE`
+        // (the buffer size above which `update()` releases the GIL) so
+        // test_hmac can size its large-update probes.
+        d.insert(
+            DictKey(Object::from_static("_GIL_MINSIZE")),
+            Object::Int(2048),
+        );
     }
     Rc::new(PyModule {
         name: name.to_owned(),

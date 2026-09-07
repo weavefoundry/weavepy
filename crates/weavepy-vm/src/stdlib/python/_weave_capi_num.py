@@ -45,6 +45,19 @@ __all__ = [
     "pylong_as_size_t",
     "pylong_asdouble",
     "pylong_asvoidptr",
+    # 3.14 additions (Modules/_testlimitedcapi/long.c and
+    # Modules/_testcapi/long.c)
+    "pylong_asint32",
+    "pylong_asuint32",
+    "pylong_asint64",
+    "pylong_asuint64",
+    "pylong_getsign",
+    "pylong_ispositive",
+    "pylong_isnegative",
+    "pylong_iszero",
+    "get_pylong_layout",
+    "pylong_export",
+    "pylongwriter_create",
     # Modules/_testcapi/immortal.c (also exercised by test_long's
     # test_bug_143050; the misc shim may override with its own copy —
     # it is star-imported after this module, so its version wins).
@@ -439,6 +452,115 @@ def pylong_asunsignedlonglongmask(arg):
     return _as_unsigned_mask(arg, 64)
 
 
+def _as_fixed_unsigned(arg, bits, what):
+    # PyLong_AsUInt32/AsUInt64: __index__ accepted; a negative value is a
+    # ValueError (not OverflowError), too large is OverflowError.
+    v = _index(arg)
+    if v < 0:
+        raise ValueError("can't convert negative int to unsigned")
+    if v > (1 << bits) - 1:
+        raise OverflowError("Python int too large to convert to C " + what)
+    return v
+
+
+def pylong_asint32(arg):
+    return _as_signed(arg, 32, "int32_t")
+
+
+def pylong_asuint32(arg):
+    return _as_fixed_unsigned(arg, 32, "uint32_t")
+
+
+def pylong_asint64(arg):
+    return _as_signed(arg, 64, "int64_t")
+
+
+def pylong_asuint64(arg):
+    return _as_fixed_unsigned(arg, 64, "uint64_t")
+
+
+def _sign_receiver(arg, func):
+    # PyLong_GetSign / IsPositive / IsNegative / IsZero: PyLong_Check
+    # gate, no __index__ (test_long expects TypeError for Index(123)).
+    if arg is None:
+        _null_err()
+    if not isinstance(arg, int):
+        raise TypeError(
+            "expected int, got %s" % type(arg).__name__
+        )
+    return int.__index__(arg)
+
+
+def pylong_getsign(arg):
+    v = _sign_receiver(arg, "PyLong_GetSign")
+    return (v > 0) - (v < 0)
+
+
+def pylong_ispositive(arg):
+    return int(_sign_receiver(arg, "PyLong_IsPositive") > 0)
+
+
+def pylong_isnegative(arg):
+    return int(_sign_receiver(arg, "PyLong_IsNegative") < 0)
+
+
+def pylong_iszero(arg):
+    return int(_sign_receiver(arg, "PyLong_IsZero") == 0)
+
+
+def get_pylong_layout():
+    # PyLong_GetNativeLayout(): the layout is what sys.int_info describes
+    # (least-significant digit first, native-endian digits).
+    info = _sys.int_info
+    return {
+        "bits_per_digit": info.bits_per_digit,
+        "digit_size": info.sizeof_digit,
+        "digits_order": -1,
+        "digit_endianness": -1 if _sys.byteorder == "little" else 1,
+    }
+
+
+def pylong_export(arg):
+    # PyLong_Export(): a value that fits int64_t is returned directly;
+    # otherwise (negative, digits) with digits in native layout order.
+    if arg is None:
+        _null_err()
+    if not isinstance(arg, int):
+        raise TypeError(
+            "expect int, got %s" % type(arg).__name__
+        )
+    v = int.__index__(arg)
+    if -(1 << 63) <= v <= (1 << 63) - 1:
+        return v
+    base = 1 << _sys.int_info.bits_per_digit
+    negative = v < 0
+    mag = -v if negative else v
+    digits = []
+    while mag:
+        mag, d = divmod(mag, base)
+        digits.append(d)
+    return (int(negative), digits)
+
+
+def pylongwriter_create(negative, digits):
+    # PyLongWriter_Create(): ndigits must be positive, each digit must
+    # fit the layout, and the result is normalised (small-int singletons
+    # included; `int(...)` of a small value yields the cached object).
+    digits = list(digits)
+    if len(digits) <= 0:
+        raise ValueError("ndigits must be positive")
+    bits = _sys.int_info.bits_per_digit
+    base = 1 << bits
+    value = 0
+    for d in reversed(digits):
+        if not 0 <= d < base:
+            raise ValueError("digit must fit in %d bits" % bits)
+        value = value * base + d
+    if negative:
+        value = -value
+    return value
+
+
 def pylong_as_ssize_t(arg):
     # PyLong_AsSsize_t: exact int only, signed range.
     v = _exact_int(arg)
@@ -512,21 +634,73 @@ def float_getmin():
 _PACK_FMTS = {2: "e", 4: "f", 8: "d"}
 
 
+def _double_bits(d):
+    return int.from_bytes(_struct.pack(">d", d), "big")
+
+
+def _bits_double(v):
+    return _struct.unpack(">d", v.to_bytes(8, "big"))[0]
+
+
+def _pack_nan(size, d):
+    # PyFloat_Pack2/4 on a NaN (3.14, gh-130317): the type bit and as
+    # much payload as fits survive, truncated from the top of the
+    # mantissa; a payload that truncates to nothing becomes a quiet NaN.
+    v = _double_bits(d)
+    sign = v >> 63
+    if size == 2:
+        bits = (v & 0xffc0000000000) >> 42
+        if not bits:
+            bits |= 1 << 9
+        return (sign << 15) | (0x1F << 10) | bits
+    # size 4: the hardware narrowing keeps the top 23 mantissa bits and
+    # quiets the NaN; CPython un-quiets it again when a payload is left.
+    mant = ((v >> 29) & 0x7FFFFF) | (1 << 22)
+    if not (v & (1 << 51)) and (mant & 0x3FFFFF):
+        mant &= ~(1 << 22)
+    return (sign << 31) | (0xFF << 23) | mant
+
+
 def float_pack(size, d, le):
     # PyFloat_Pack2/4/8; struct shares the rounding and the
-    # OverflowError-on-out-of-range behaviour.
+    # OverflowError-on-out-of-range behaviour for finite values, and
+    # the NaN encodings are reproduced bit for bit.
     d = _ga._as_double(d)
     fmt = _PACK_FMTS.get(size)
     if fmt is None:
         raise ValueError("size must 2, 4 or 8")
+    if d != d and size != 8:
+        return _pack_nan(size, d).to_bytes(size, "little" if le else "big")
     return _struct.pack(("<" if le else ">") + fmt, d)
+
+
+def _unpack_nan(size, i):
+    # PyFloat_Unpack2/4 on a NaN: widen the payload into the top of the
+    # double's mantissa, preserving the signalling bit.
+    if size == 2:
+        sign = i >> 15
+        bits = i & 0x3FF
+        v = (sign << 63) | (0x7FF << 52) | (bits << 42)
+    else:
+        sign = i >> 31
+        mant = i & 0x7FFFFF
+        v = (sign << 63) | (0x7FF << 52) | (mant << 29)
+    return _bits_double(v)
 
 
 def float_unpack(data, le):
     data = bytes(data)
-    fmt = _PACK_FMTS.get(len(data))
+    size = len(data)
+    fmt = _PACK_FMTS.get(size)
     if fmt is None:
         raise ValueError("data length must 2, 4 or 8 bytes")
+    if size != 8:
+        i = int.from_bytes(data, "little" if le else "big")
+        exp_all_ones = 0x1F if size == 2 else 0xFF
+        exp = (i >> (10 if size == 2 else 23)) & exp_all_ones
+        mant = i & ((1 << (10 if size == 2 else 23)) - 1)
+        if exp == exp_all_ones and mant:
+            return _unpack_nan(size, i)
     return _struct.unpack(("<" if le else ">") + fmt, data)[0]
 
 
@@ -625,6 +799,80 @@ def _py_c_quot(a, b):
         )
     # At least one of b.real or b.imag is a NaN.
     return (complex(_math.nan, _math.nan), 0)
+
+
+# 3.14 mixed-mode arithmetic (`_Py_cr_*` / `_Py_rc_*`): the real operand
+# touches only the component it applies to, so `-0j + -0.0` keeps its
+# `-0.0` imaginary part where promoting the real to `(-0.0+0j)` would
+# have turned it into `+0.0`. Exposed on `_testinternalcapi`.
+def _py_cr_sum(a, b):
+    a = _ga._as_complex(a)
+    b = _ga._as_double(b)
+    return (complex(a.real + b, a.imag), 0)
+
+
+def _py_cr_diff(a, b):
+    a = _ga._as_complex(a)
+    b = _ga._as_double(b)
+    return (complex(a.real - b, a.imag), 0)
+
+
+def _py_rc_diff(a, b):
+    a = _ga._as_double(a)
+    b = _ga._as_complex(b)
+    return (complex(a - b.real, -b.imag), 0)
+
+
+def _py_cr_prod(a, b):
+    a = _ga._as_complex(a)
+    b = _ga._as_double(b)
+    return (complex(a.real * b, a.imag * b), 0)
+
+
+def _py_cr_quot(a, b):
+    a = _ga._as_complex(a)
+    b = _ga._as_double(b)
+    if b:
+        return (complex(a.real / b, a.imag / b), 0)
+    return (complex(0.0, 0.0), _errno.EDOM)
+
+
+def _py_rc_quot(a, b):
+    # Port of _Py_rc_quot: Smith's algorithm with a real numerator, then
+    # the C11 Annex G infinity recovery for a finite `a` over an infinite
+    # `b` (`1.0 / (nan-infj)` is `0j`, not `nan+nanj`).
+    a = _ga._as_double(a)
+    b = _ga._as_complex(b)
+    abs_breal = -b.real if b.real < 0 else b.real
+    abs_bimag = -b.imag if b.imag < 0 else b.imag
+    err = 0
+    if abs_breal >= abs_bimag:
+        if abs_breal == 0.0:
+            err = _errno.EDOM
+            r_real = r_imag = 0.0
+        else:
+            ratio = b.imag / b.real
+            denom = b.real + b.imag * ratio
+            r_real = a / denom
+            r_imag = (-a * ratio) / denom
+    elif abs_bimag >= abs_breal:
+        ratio = b.real / b.imag
+        denom = b.real * ratio + b.imag
+        r_real = (a * ratio) / denom
+        r_imag = (-a) / denom
+    else:
+        r_real = r_imag = _math.nan
+    if (
+        _math.isnan(r_real)
+        and _math.isnan(r_imag)
+        and _math.isfinite(a)
+        and (_math.isinf(abs_breal) or _math.isinf(abs_bimag))
+    ):
+        x = _math.copysign(1.0 if _math.isinf(b.real) else 0.0, b.real)
+        y = _math.copysign(1.0 if _math.isinf(b.imag) else 0.0, b.imag)
+        r_real = 0.0 * (a * x)
+        r_imag = 0.0 * (-a * y)
+    return (complex(r_real, r_imag), err)
 
 
 def _pow_or_inf(x, y):

@@ -185,6 +185,11 @@ class _FilterIter:
 
     __slots__ = ("_func", "_it")
 
+    # Present CPython's identity: instances repr as `<filter object at …>`
+    # and pickle through `builtins.filter` (see `__reduce__`).
+    __module__ = "builtins"
+    __qualname__ = "filter"
+
     def __new__(cls, func, iterable, **kwargs):
         _reject_subclass_kwargs(cls, _FilterIter, "filter", kwargs)
         self = object.__new__(cls)
@@ -207,7 +212,16 @@ class _FilterIter:
                 return item
 
     def __reduce__(self):
-        return (filter, (self._func, self._it))
+        # CPython's `filter_reduce` returns `Py_TYPE(lz)`; for the exact
+        # type that is `builtins.filter` (the pickler resolves it by
+        # name, so it must be the very object bound in `builtins`).
+        cls = type(self)
+        if cls is _FilterIter:
+            cls = filter
+        return (cls, (self._func, self._it))
+
+
+_FilterIter.__name__ = "filter"
 
 
 class _MapIter:
@@ -219,6 +233,13 @@ class _MapIter:
     """
 
     __slots__ = ("_func", "_iters", "_strict")
+
+    # CPython identity (`<map object at …>`, `type(m).__module__ ==
+    # 'builtins'`); pickling goes through `builtins.map` so protocol < 3
+    # emits the `itertools.imap` compat global (pickletester
+    # test_compat_pickle).
+    __module__ = "builtins"
+    __qualname__ = "map"
 
     def __new__(cls, func, *iterables, **kwargs):
         # 3.14: `map(..., strict=True)` (gh-119793) mirrors zip's strict
@@ -264,13 +285,20 @@ class _MapIter:
 
     def __reduce__(self):
         # CPython's `map_reduce`/`map_setstate`: strict rides in the
-        # state slot (test_builtin test_map_pickle_strict_fail).
+        # state slot (test_builtin test_map_pickle_strict_fail). The
+        # exact type reduces to `builtins.map` itself (see `_FilterIter`).
+        cls = type(self)
+        if cls is _MapIter:
+            cls = map
         if self._strict:
-            return (type(self), (self._func,) + self._iters, True)
-        return (type(self), (self._func,) + self._iters)
+            return (cls, (self._func,) + self._iters, True)
+        return (cls, (self._func,) + self._iters)
 
     def __setstate__(self, state):
         self._strict = bool(state)
+
+
+_MapIter.__name__ = "map"
 
 
 class _EnumerateIter:

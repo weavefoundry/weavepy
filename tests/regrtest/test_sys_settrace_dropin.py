@@ -161,7 +161,12 @@ def test_tracemalloc_lifecycle():
 
 def test_sys_monitoring_constants():
     assert_eq(sys.monitoring.events.NO_EVENTS, 0)
-    assert_eq(sys.monitoring.events.LINE, 1 << 7)
+    # CPython 3.14 renumbered the event table when BRANCH_LEFT/BRANCH_RIGHT
+    # landed (gh-122548): LINE is bit 5, JUMP bit 7, BRANCH the bit-18 alias.
+    assert_eq(sys.monitoring.events.LINE, 1 << 5)
+    assert_eq(sys.monitoring.events.JUMP, 1 << 7)
+    assert_eq(sys.monitoring.events.BRANCH_LEFT, 1 << 8)
+    assert_eq(sys.monitoring.events.BRANCH_RIGHT, 1 << 9)
     assert_true(hasattr(sys.monitoring, 'use_tool_id'))
     sys.monitoring.use_tool_id(0, 'weavepy-test')
     assert_eq(sys.monitoring.get_tool(0), 'weavepy-test')

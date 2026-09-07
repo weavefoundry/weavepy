@@ -836,8 +836,8 @@ pub mod flags {
         Some(match name {
             "barry_as_FLUFL" => CO_FUTURE_BARRY_AS_BDFL,
             "annotations" => CO_FUTURE_ANNOTATIONS,
-            "nested_scopes" | "generators" | "division" | "absolute_import"
-            | "with_statement" | "print_function" | "unicode_literals" | "generator_stop" => 0,
+            "nested_scopes" | "generators" | "division" | "absolute_import" | "with_statement"
+            | "print_function" | "unicode_literals" | "generator_stop" => 0,
             _ => return None,
         })
     }
@@ -3293,7 +3293,7 @@ impl Compiler {
                         && body_has_top_level_await(std::slice::from_ref(stmt))
                     {
                         let direct_await = expr_contains_await(test)
-                            || msg.as_ref().is_some_and(|m| expr_contains_await(m));
+                            || msg.as_ref().is_some_and(expr_contains_await);
                         return Err(CompileError::spanned(
                             if direct_await {
                                 if self.kind == CodeKind::Function {
@@ -9335,9 +9335,18 @@ impl Compiler {
                     self.current_span = saved_span;
                     self.current_line = saved_line;
                 }
-                if has_starred
-                    || has_kw_splat
-                    || args.len() + keywords.len() * 2 > STACK_USE_GUIDELINE
+                // CPython 3.14 `maybe_optimize_method_call` emits
+                // CALL/CALL_KW itself and never routes through
+                // `codegen_call_helper`, so the method form never takes
+                // the ex_call route: its own operand guard
+                // (`argsl + kwdsl + (kwdsl != 0) < STACK_USE_GUIDELINE`)
+                // is the only size limit. A method-flagged LOAD_ATTR
+                // followed by CALL_FUNCTION_EX would leave the receiver
+                // in the self slot, which CALL_FUNCTION_EX asserts NULL.
+                if !method_form
+                    && (has_starred
+                        || has_kw_splat
+                        || args.len() + keywords.len() * 2 > STACK_USE_GUIDELINE)
                 {
                     // `codegen_call_helper_impl`'s `ex_call`: splats, `**`,
                     // or an operand count over the stack-use guideline
@@ -9429,7 +9438,9 @@ impl Compiler {
                 // `slice(1, 2, None)` from `co_consts`); otherwise the
                 // two bounds (defaulting to None) plus the optional step
                 // feed `BUILD_SLICE 2|3`.
-                if let Some(folded) = constant_slice(lower, upper, step) {
+                if let Some(folded) =
+                    constant_slice(lower.as_deref(), upper.as_deref(), step.as_deref())
+                {
                     let idx = self.co.intern_constant(folded);
                     self.emit(OpCode::LoadConst, idx);
                 } else {
@@ -11309,8 +11320,16 @@ impl Compiler {
         // final value (list/set/dict) ends up on the stack.
         if is_async_comp && !matches!(kind, CompKind::Generator) {
             if !self.in_async_context() {
-                return Err(CompileError::new(
+                // CPython anchors this symtable error at the comprehension
+                // expression itself (`lineno`/`offset` are never None;
+                // test_type_annotations test_no_exotic_expressions checks
+                // annotation-scope comprehensions).
+                return Err(CompileError::spanned(
                     "asynchronous comprehension outside of an asynchronous function",
+                    weavepy_lexer::Span {
+                        start: weavepy_lexer::BytePos(whole_span.0),
+                        end: weavepy_lexer::BytePos(whole_span.1),
+                    },
                 ));
             }
             self.compile_await_dance(0);
@@ -11909,6 +11928,7 @@ impl CompLoc {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compile_comp_body(
     inner: &mut Compiler,
     comp_loc: CompLoc,
@@ -15164,7 +15184,8 @@ fn class_body_propagating_reads(body: &[Stmt], out: &mut HashSet<String>) {
     let shadowed: Vec<String> = inner
         .iter()
         .filter(|n| {
-            class_globals.contains(*n) || (class_bound.contains(*n) && !class_nonlocals.contains(*n))
+            class_globals.contains(*n)
+                || (class_bound.contains(*n) && !class_nonlocals.contains(*n))
         })
         .cloned()
         .collect();
@@ -15188,7 +15209,11 @@ fn class_nested_scope_reads(body: &[Stmt], out: &mut HashSet<String>) {
     fn expr_nested(e: &Expr, out: &mut HashSet<String>) {
         match &e.kind {
             ExprKind::Lambda { args, body } | ExprKind::TypeParamFn { args, body } => {
-                for d in args.defaults.iter().chain(args.kw_defaults.iter().flatten()) {
+                for d in args
+                    .defaults
+                    .iter()
+                    .chain(args.kw_defaults.iter().flatten())
+                {
                     expr_nested(d, out);
                 }
                 let mut inner = HashSet::new();
@@ -15633,9 +15658,7 @@ fn stmt_reads_dunder_at_class_level(stmt: &Stmt, name: &str) -> bool {
             v
         }
         StmtKind::Delete(targets) => targets.iter().collect(),
-        StmtKind::Assert { test, msg } => {
-            std::iter::once(test).chain(msg.as_ref()).collect()
-        }
+        StmtKind::Assert { test, msg } => std::iter::once(test).chain(msg.as_ref()).collect(),
         StmtKind::Raise { exc, cause } => exc.iter().chain(cause.iter()).collect(),
         _ => return true,
     };
@@ -15983,11 +16006,11 @@ fn bind_pattern_name(
 /// expression is a (post-AST-optimizer) constant, so the slice object
 /// itself can live in `co_consts`.
 fn constant_slice(
-    lower: &Option<Box<Expr>>,
-    upper: &Option<Box<Expr>>,
-    step: &Option<Box<Expr>>,
+    lower: Option<&Expr>,
+    upper: Option<&Expr>,
+    step: Option<&Expr>,
 ) -> Option<Constant> {
-    let part = |x: &Option<Box<Expr>>| -> Option<Constant> {
+    let part = |x: Option<&Expr>| -> Option<Constant> {
         match x {
             None => Some(Constant::None),
             Some(e) => match &e.kind {
@@ -16009,7 +16032,8 @@ fn constant_slice(
 fn should_apply_two_element_slice_optimization(slice: &Expr) -> bool {
     match &slice.kind {
         ExprKind::Slice { lower, upper, step } => {
-            step.is_none() && constant_slice(lower, upper, step).is_none()
+            step.is_none()
+                && constant_slice(lower.as_deref(), upper.as_deref(), step.as_deref()).is_none()
         }
         _ => false,
     }

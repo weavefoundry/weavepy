@@ -96,18 +96,24 @@ def _as_mask(arg, mask):
 
 
 def _as_exact_mask(arg, mask):
-    # 'k'/'K': PyLong_Check required first — no __index__ fallback.
-    if not isinstance(arg, int):
+    # 'k'/'K' (3.14, gh-119329): `PyLong_AsUnsignedLongMask` with the
+    # `__index__` fallback, so an Index-like object converts and a
+    # strict-int-subclass `__index__` result warns; a float or an
+    # `__int__`-only object still reports "must be int".
+    if isinstance(arg, int):
+        return (arg + 0) & mask
+    if getattr(type(arg), "__index__", None) is None:
         raise _ConvertErr("int", arg)
-    return (arg + 0) & mask
+    return _py_index(arg) & mask
 
 
 def _as_double(arg):
     # PyFloat_AsDouble: exact/subclass float value wins outright (a
-    # subclass __float__ override is never consulted, and `* 1.0`
-    # preserves signed zeros where `float()` would re-dispatch).
+    # subclass __float__ override is never consulted; `float.__float__`
+    # reads the stored value bit-for-bit, preserving signed zeros and NaN
+    # payloads where arithmetic would re-tag the NaN).
     if isinstance(arg, float):
-        return arg * 1.0
+        return float.__float__(arg)
     t = type(arg)
     if isinstance(arg, int):
         return float(arg)  # int.__float__ (may raise OverflowError)
@@ -468,11 +474,17 @@ def _converttuple(arg, fmt, va, levels):
     failure returns an error-message string (with `levels` filled);
     hard exceptions propagate.
     """
-    # First pass: count top-level units of this group.
+    # First pass: count top-level units of this group. 3.14 also decides
+    # whether the group *must* be a tuple: a unit that borrows from the
+    # argument ('s'/'y'/'z' without '*', 'S'/'Y'/'U', plain 'O') makes a
+    # non-tuple sequence deprecated (a list is still converted, with a
+    # DeprecationWarning) and the length message say "tuple".
     n = 0
     depth = 0
     j = fmt.i
     s = fmt.s
+    istuple = isinstance(arg, tuple)
+    mustbetuple = istuple
     while True:
         ch = s[j] if j < len(s) else "\0"
         j += 1
@@ -486,28 +498,57 @@ def _converttuple(arg, fmt, va, levels):
             depth -= 1
         elif ch in (":", ";", "\0"):
             break
-        elif depth == 0 and ch.isalpha() and ch != "e":
-            n += 1
+        else:
+            nxt = s[j] if j < len(s) else "\0"
+            if depth == 0 and ch.isalpha():
+                n += 1
+            if ch == "e" and nxt in ("s", "t"):
+                j += 1
+                continue
+            if not mustbetuple:
+                if ch in ("y", "s", "z"):
+                    if nxt != "*":
+                        mustbetuple = True
+                elif ch in ("S", "Y", "U"):
+                    mustbetuple = True
+                elif ch == "O":
+                    if nxt != "&":
+                        mustbetuple = True
 
-    if not _is_sequence(arg) or isinstance(arg, bytes):
+    if istuple:
+        items = arg
+    elif not _is_sequence(arg) or isinstance(arg, (str, bytes, bytearray)):
         del levels[:]
-        return "must be %d-item sequence, not %s" % (
+        return "must be %d-item tuple, not %s" % (
             n,
             "None" if arg is None else type(arg).__name__,
         )
-    length = len(arg)
-    if length != n:
+    else:
+        if mustbetuple:
+            warnings.warn(
+                "argument must be %d-item tuple, not %s"
+                % (n, type(arg).__name__),
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        length = len(arg)
+        if length != n:
+            del levels[:]
+            return "must be %s of length %d, not %d" % (
+                "tuple" if mustbetuple else "sequence",
+                n,
+                length,
+            )
+        # PySequence_Tuple: a failing item fetch propagates as-is
+        # (test_getargs.test_tuple's CustomError).
+        items = tuple(arg)
+    if len(items) != n:
         del levels[:]
-        return "must be sequence of length %d, not %d" % (n, length)
+        return "must be tuple of length %d, not %d" % (n, len(items))
 
     out = []
     for i in range(n):
-        try:
-            item = arg[i]
-        except Exception:
-            del levels[:]
-            levels.append(i + 1)
-            return "is not retrievable"
+        item = items[i]
         sub_levels = []
         msg = _convertitem_inner(item, fmt, va, sub_levels, out)
         if msg is not None:

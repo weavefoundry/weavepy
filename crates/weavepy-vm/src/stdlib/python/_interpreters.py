@@ -607,7 +607,13 @@ def call(interp_id, callable, args=None, kwargs=None, *,
             return None, None
         kind, payload = item[0]
         if kind != 'ok':
-            raise NotShareableError(payload)
+            label, msg = payload
+            cause = NotShareableError(msg)
+            if label is None:
+                raise cause
+            # CPython's `wrap_notshareable`: the input that failed to
+            # convert names itself, and the conversion error is the cause.
+            raise NotShareableError(f'{label} not shareable') from cause
         return _xid.from_xidata(payload), None
     finally:
         try:

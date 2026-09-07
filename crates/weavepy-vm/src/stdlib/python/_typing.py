@@ -801,6 +801,13 @@ def _ga_make_substitution(args, new_arg_by_param, is_callable_origin):
             new_args.append(
                 tuple(_ga_make_substitution(old_arg, new_arg_by_param, is_callable_origin))
             )
+        elif isinstance(old_arg, list):
+            # 3.14 (gh-124445): a ParamSpec argument list `X[[T]]` keeps
+            # its list shape and is substituted element-wise
+            # (`X[[T]][str].__args__ == ([str],)`).
+            new_args.append(
+                list(_ga_make_substitution(old_arg, new_arg_by_param, is_callable_origin))
+            )
         else:
             new_args.append(new_arg)
     return new_args

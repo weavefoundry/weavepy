@@ -121,6 +121,10 @@ struct BzDecompState {
     eof: bool,
     needs_input: bool,
     unused_data: Vec<u8>,
+    /// 3.14 (gh-134189): set once `decompress()` raised a data error; the
+    /// stream is then unusable (`needs_input` is False and further calls
+    /// raise ValueError) instead of re-entering a corrupt libbz2 state.
+    errored: bool,
 }
 
 // SAFETY: WeavePy serialises all bytecode execution (and therefore every
@@ -443,6 +447,7 @@ fn decompressor_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Obj
                 eof: false,
                 needs_input: true,
                 unused_data: Vec::new(),
+                errored: false,
             })),
         );
     }
@@ -475,6 +480,11 @@ fn decompressor_decompress(
     };
     let state = decomp_state(id).ok_or_else(|| value_error("stale BZ2Decompressor"))?;
     let mut st = state.borrow_mut();
+    if st.errored {
+        return Err(value_error(
+            "Decompressor is unusable after a previous error",
+        ));
+    }
     if st.eof {
         return Err(eof_error("End of stream already reached"));
     }
@@ -485,7 +495,21 @@ fn decompressor_decompress(
     } else {
         Some(max_length as usize)
     };
-    let (out, consumed, eof) = bz_decompress_step(&mut st.d, &combined, limit)?;
+    let (out, consumed, eof) = match bz_decompress_step(&mut st.d, &combined, limit) {
+        Ok(r) => r,
+        Err(e) => {
+            // 3.14 (gh-134189): a data error poisons the decompressor.
+            st.errored = true;
+            st.needs_input = false;
+            if let Some(Object::Instance(inst)) = args.first() {
+                inst.dict.borrow_mut().insert(
+                    DictKey(Object::from_static("needs_input")),
+                    Object::Bool(false),
+                );
+            }
+            return Err(e);
+        }
+    };
     let leftover = combined[consumed..].to_vec();
     if eof {
         st.eof = true;

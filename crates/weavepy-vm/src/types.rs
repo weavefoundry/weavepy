@@ -338,6 +338,12 @@ pub struct TypeObject {
     /// Decimal` compiles to `PyType_CheckExact`, which demands
     /// `Py_TYPE(Decimal) == &PyType_Type` (pandas `_libs.missing`).
     pub immutable: Cell<bool>,
+    /// Set alongside [`Self::immutable`] when a *heap* type was frozen at
+    /// runtime (`PyType_Freeze`, RFC 0077 WS12) rather than standing in
+    /// for a static C type: the immutability errors then print the bare
+    /// `tp_name` (`'MyType'`) CPython prints for heap types instead of
+    /// the dotted static-type spelling.
+    pub frozen_heap_type: Cell<bool>,
     /// The extension's own static `PyTypeObject*` when this class bridges
     /// a *readied stock* C type, else 0 (RFC 0076 WS5). A C extension may
     /// re-seat such a type's metaclass with a raw `Py_SET_TYPE(&MyType,
@@ -519,11 +525,19 @@ impl TypeObject {
                         | "getset_descriptor"
                         | "wrapper_descriptor"
                         | "method-wrapper"
+                        | "Union"
                 )
             {
+                // `tp_name` spelling: `typing.Union` is the one heap-less
+                // builtin here whose C name carries its module
+                // (test_typing.UnionTests.test_cannot_subclass).
+                let shown = if b.name.as_str() == "Union" {
+                    "typing.Union"
+                } else {
+                    b.name.as_str()
+                };
                 return Err(type_error(format!(
-                    "type '{}' is not an acceptable base type",
-                    b.name
+                    "type '{shown}' is not an acceptable base type"
                 )));
             }
             // A user class whose MRO is still unset is mid-creation (its
@@ -667,6 +681,7 @@ impl TypeObject {
             c_tp_name: Cell::new(None),
             c_sq_item: Cell::new(false),
             immutable: Cell::new(false),
+            frozen_heap_type: Cell::new(false),
             c_ext_ptr: Cell::new(0),
         });
         let mro = compute_c3(&ty, &bases, name)?;
@@ -1333,6 +1348,17 @@ impl TypeObject {
     /// CPython `type_repr` name: `__module__.__qualname__`, with the
     /// module prefix omitted for `builtins` (so `<class 'int'>` but
     /// `<class 'collections.abc.Iterable'>` / `<class '__main__.Foo'>`).
+    /// The `tp_name` CPython prints in "immutable type" errors: the
+    /// dotted static-type spelling for built-ins and the frozen-stdlib
+    /// stand-ins, the bare class name for a heap type frozen at runtime.
+    pub fn immutable_type_display_name(&self) -> String {
+        if self.frozen_heap_type.get() {
+            self.name.clone()
+        } else {
+            self.qualified_display_name()
+        }
+    }
+
     pub fn qualified_display_name(&self) -> String {
         let dict = self.dict.borrow();
         // Only honour *string* entries — some built-in types carry a

@@ -433,6 +433,11 @@ pub enum TOp {
         elem: JitType,
         none_fill: bool,
         mixed: bool,
+        /// CPython 3.14's folded constant literal (`BUILD_LIST 0;
+        /// LOAD_CONST (..); LIST_EXTEND 1`): the elements were pushed
+        /// as constants and the deopt re-executes `BUILD_LIST 0`, so
+        /// the spill carries none of them.
+        konst: bool,
     },
     /// RFC 0073 WS1 — `BUILD_TUPLE k`: pops `n` elements (staged
     /// through the marshal buffer with per-element tags, exactly like
@@ -457,8 +462,15 @@ pub enum TOp {
     /// `None` marker, never a native value) and the pin, calls the
     /// registered `wpjit_list_slice` helper (CPython index clamping),
     /// and pushes the fresh pinned list on the same lane. Cap
-    /// pressure deopts at this pc.
-    ListSlice { start: bool, stop: bool },
+    /// pressure deopts at this pc. `konst` marks CPython 3.14's folded
+    /// shape (`LOAD_CONST slice(a, b, None)` + `BINARY_OP NB_SUBSCR`):
+    /// the bounds are constants the deopt spill must *not* materialize
+    /// (the interpreter re-executes the `LOAD_CONST` itself).
+    ListSlice {
+        start: bool,
+        stop: bool,
+        konst: bool,
+    },
     /// RFC 0074 WS1 — a `LOAD_GLOBAL` resolving to an arbitrary
     /// object (a builtin, a class, a `*args`/`**kwargs` function, a
     /// module-level container or string — anything the specialized
@@ -554,7 +566,12 @@ pub enum TOp {
     /// bounds (`stop` above `start`) and the pin, applies CPython's
     /// slice clamping through the interpreter's subscript core, and
     /// pushes the fresh `str` pin. Cap pressure deopts at this pc.
-    StrSlice { start: bool, stop: bool },
+    /// `konst` as on [`TOp::ListSlice`].
+    StrSlice {
+        start: bool,
+        stop: bool,
+        konst: bool,
+    },
 }
 
 /// One IR statement: a [`TOp`] tagged with its originating bytecode pc

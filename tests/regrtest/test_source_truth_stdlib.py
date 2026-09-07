@@ -84,7 +84,9 @@ import sysconfig
 paths = sysconfig.get_paths()
 assert os.path.isdir(paths["stdlib"]), paths["stdlib"]
 assert paths["stdlib"].startswith(sys.prefix)
-assert sysconfig.get_python_version() == "3.13"
+# Tracks the identity in `weavepy-version` (RFC 0077 WS13: 3.14).
+assert sysconfig.get_python_version() == "%d.%d" % sys.version_info[:2]
+assert sysconfig.get_python_version() == "3.14"
 
 import site
 

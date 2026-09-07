@@ -108,7 +108,7 @@ fn print_help() {
     eprintln!("COMMON FLAGS:");
     eprintln!("    --weavepy=PATH        weavepy binary under test (default: $WEAVEPY_BIN,");
     eprintln!("                          then a `weavepy` next to this executable).");
-    eprintln!("    --python=PATH         Host CPython (default: python3.13, then python3).");
+    eprintln!("    --python=PATH         Host CPython (default: python3.14, then python3).");
     eprintln!("    --no-cpython          Skip the host CPython column (absolute-only mode).");
     eprintln!("    --samples=N           Timing samples per fixture (default 5).");
     eprintln!("    --no-interp           Skip the WEAVEPY_JIT=0 column. RFC 0077 WS1: the");

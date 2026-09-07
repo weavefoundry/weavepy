@@ -446,6 +446,12 @@ fn fut_gc_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
         visit(cb);
         visit(ctx);
     }
+    // 3.14 `FutureObj_traverse` visits `fut_awaited_by`: the strong
+    // waiter references it holds close the `task -> coro frame -> future
+    // -> awaited_by -> task` loop (test_log_destroyed_pending_task).
+    for w in &s.awaited_by {
+        visit(w);
+    }
 }
 
 fn fut_gc_clear(obj: &Object) {
@@ -478,6 +484,7 @@ fn fut_gc_clear(obj: &Object) {
             dropped.push(cb);
             dropped.push(ctx);
         }
+        dropped.append(&mut s.awaited_by);
     }
     // The registry entry itself dies too — the instance dict (and with it
     // the handle) is cleared right after this hook runs.
@@ -523,6 +530,13 @@ fn current_tasks_dict() -> Rc<RefCell<DictData>> {
     static CELL: std::sync::OnceLock<Rc<RefCell<DictData>>> = std::sync::OnceLock::new();
     CELL.get_or_init(|| Rc::new(RefCell::new(DictData::default())))
         .clone()
+}
+
+/// `PyOS_AfterFork_Child` analogue for `_asyncio`: 3.14 keeps the running
+/// task per thread state, so a `fork(2)` child starts with no current task
+/// (`test_unix_events.TestFork.test_fork_not_share_current_task`).
+pub fn clear_current_tasks_after_fork_in_child() {
+    current_tasks_dict().borrow_mut().clear();
 }
 
 fn register_task_impl(interp: &mut Interp, task: &Object) -> Result<(), RuntimeError> {

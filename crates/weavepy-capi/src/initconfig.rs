@@ -918,6 +918,21 @@ unsafe fn parse_cmdline(c: &mut PyConfig) -> Result<(), PyStatus> {
             break;
         }
         match arg.as_str() {
+            // `pymain_usage` / `pymain_version`: print and *exit*, which
+            // `Py_InitializeFromInitConfig` surfaces as exit code 0
+            // (test_embed test_initconfig_exit).
+            "-h" | "-?" | "--help" => {
+                let prog = raw.first().cloned().unwrap_or_else(|| "python".to_owned());
+                println!(
+                    "usage: {prog} [option] ... [-c cmd | -m mod | file | -] [arg] ...\n\
+                     Try `python -h' for more information."
+                );
+                return Err(PyStatus::exit(0));
+            }
+            "-V" | "--version" => {
+                println!("Python {}", weavepy_version::FULL);
+                return Err(PyStatus::exit(0));
+            }
             "-i" => {
                 c.inspect = 1;
                 c.interactive = 1;

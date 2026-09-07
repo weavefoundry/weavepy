@@ -198,6 +198,16 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("getpid")),
             builtin("getpid", os_getpid),
         );
+        // 3.14 `posix._is_inputhook_installed()` (gh-121886): `_pyrepl`'s
+        // console polls it for `PyOS_InputHook`; WeavePy has no C input
+        // hook, so it is always `False`.
+        d.insert(
+            DictKey(Object::from_static("_is_inputhook_installed")),
+            builtin("_is_inputhook_installed", |args| {
+                require_no_args(args, "_is_inputhook_installed")?;
+                Ok(Object::Bool(false))
+            }),
+        );
         // RFC 0040 WS1 — `os.sysconf(name)` + `os.sysconf_names`. asyncio's
         // `selector_events` probes `SC_IOV_MAX` the moment it sees
         // `socket.sendmsg`, and `concurrent.futures.ProcessPoolExecutor.
@@ -226,6 +236,17 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("mkdir")),
             builtin_kw("mkdir", os_mkdir_kw),
         );
+        #[cfg(unix)]
+        {
+            d.insert(
+                DictKey(Object::from_static("mkfifo")),
+                builtin_kw("mkfifo", os_mkfifo),
+            );
+            d.insert(
+                DictKey(Object::from_static("mknod")),
+                builtin_kw("mknod", os_mknod),
+            );
+        }
         d.insert(
             DictKey(Object::from_static("makedirs")),
             builtin_kw("makedirs", os_makedirs_kw),
@@ -546,7 +567,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         );
         d.insert(
             DictKey(Object::from_static("link")),
-            builtin("link", os_link),
+            builtin_kw("link", os_link),
         );
         d.insert(
             DictKey(Object::from_static("chmod")),
@@ -829,7 +850,12 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         // all thread the keyword through to `*at(AT_SYMLINK_NOFOLLOW)`, so
         // advertise exactly those (CPython lists more, but we only claim what we
         // faithfully implement).
-        let follow_objs: Vec<Object> = ["stat", "chmod", "utime"]
+        // `link` joined for CPython 3.14 (`linkat(AT_SYMLINK_FOLLOW)`, POSIX).
+        #[cfg(unix)]
+        let follow_names: &[&str] = &["stat", "chmod", "utime", "link"];
+        #[cfg(not(unix))]
+        let follow_names: &[&str] = &["stat", "chmod", "utime"];
+        let follow_objs: Vec<Object> = follow_names
             .iter()
             .filter_map(|n| d.get(&DictKey(Object::from_static(n))).cloned())
             .collect();
@@ -847,8 +873,9 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         // which only the fd path can do without `ENAMETOOLONG`.
         #[cfg(unix)]
         {
+            // `mkfifo`/`mknod` go through `mkfifoat`/`mknodat` (3.14 os.mkfifo).
             let dir_fd_objs: Vec<Object> = [
-                "open", "stat", "lstat", "unlink", "remove", "rmdir", "mkdir",
+                "open", "stat", "lstat", "unlink", "remove", "rmdir", "mkdir", "mkfifo", "mknod",
             ]
             .iter()
             .filter_map(|n| d.get(&DictKey(Object::from_static(n))).cloned())
@@ -1647,6 +1674,69 @@ fn os_mkdir_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, R
     os_mkdir(args)
 }
 
+/// `os.mkfifo(path, mode=0o666, *, dir_fd=None)` — `mkfifoat(2)`
+/// (`test_asyncio.test_events.UnixPipeObjectSupportTests.test_read_fifo`,
+/// `test_posix.test_mkfifo`).
+#[cfg(unix)]
+fn os_mkfifo(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let p = path_arg_or_kw(args, 0, "path", kwargs, "mkfifo")?;
+    let mode = match args
+        .get(1)
+        .or_else(|| kwargs.iter().find(|(k, _)| k == "mode").map(|(_, v)| v))
+    {
+        Some(m) => mode_arg(m, "mkfifo")?,
+        None => 0o666,
+    };
+    let dfd = dir_fd_arg(kwargs)?.unwrap_or(libc::AT_FDCWD);
+    let cpath =
+        std::ffi::CString::new(p.as_bytes()).map_err(|_| value_error("embedded null byte"))?;
+    // SAFETY: `cpath` outlives the call; `dfd` is caller-supplied.
+    let rc = unsafe { libc::mkfifoat(dfd, cpath.as_ptr(), mode as libc::mode_t) };
+    if rc != 0 {
+        return Err(path_io_err(
+            &std::io::Error::last_os_error(),
+            args.first(),
+            &p,
+        ));
+    }
+    Ok(Object::None)
+}
+
+/// `os.mknod(path, mode=0o600, device=0, *, dir_fd=None)` — `mknodat(2)`
+/// (`test_posix.test_mknod`).
+#[cfg(unix)]
+fn os_mknod(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let p = path_arg_or_kw(args, 0, "path", kwargs, "mknod")?;
+    let mode = match args
+        .get(1)
+        .or_else(|| kwargs.iter().find(|(k, _)| k == "mode").map(|(_, v)| v))
+    {
+        Some(m) => mode_arg(m, "mknod")?,
+        None => 0o600,
+    };
+    let device = int_arg_or_kw(args, 2, "device", kwargs).unwrap_or(0);
+    let dfd = dir_fd_arg(kwargs)?.unwrap_or(libc::AT_FDCWD);
+    let cpath =
+        std::ffi::CString::new(p.as_bytes()).map_err(|_| value_error("embedded null byte"))?;
+    // SAFETY: `cpath` outlives the call; `dfd` is caller-supplied.
+    let rc = unsafe {
+        libc::mknodat(
+            dfd,
+            cpath.as_ptr(),
+            mode as libc::mode_t,
+            device as libc::dev_t,
+        )
+    };
+    if rc != 0 {
+        return Err(path_io_err(
+            &std::io::Error::last_os_error(),
+            args.first(),
+            &p,
+        ));
+    }
+    Ok(Object::None)
+}
+
 /// Extract a POSIX permission-bits argument (`int`, or an `int` subclass
 /// instance) from an `os.*` mode parameter.
 fn mode_arg(obj: &Object, func: &str) -> Result<u32, RuntimeError> {
@@ -2122,16 +2212,21 @@ fn os_open_stub(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
     // PEP 446: descriptors Python creates are non-inheritable —
     // CPython's `os.open` ORs in `O_CLOEXEC` (as did the previous
     // `OpenOptions`-based implementation here).
-    let fd = unsafe {
-        libc::open(
-            cpath.as_ptr(),
-            flags as libc::c_int | libc::O_CLOEXEC,
-            mode as libc::c_uint,
-        )
-    };
+    // `open(2)` may block (a FIFO awaiting its peer); CPython runs it
+    // under `Py_BEGIN_ALLOW_THREADS`, and so must we or a thread parked
+    // in `os.open` starves the Python thread it is waiting for.
+    let (fd, err) = crate::gil::allow_threads_then(|| {
+        let fd = unsafe {
+            libc::open(
+                cpath.as_ptr(),
+                flags as libc::c_int | libc::O_CLOEXEC,
+                mode as libc::c_uint,
+            )
+        };
+        (fd, std::io::Error::last_os_error())
+    });
     if fd < 0 {
-        let e = std::io::Error::last_os_error();
-        return Err(path_io_err(&e, path_obj.as_ref(), &p));
+        return Err(path_io_err(&err, path_obj.as_ref(), &p));
     }
     Ok(Object::Int(i64::from(fd)))
 }
@@ -5763,11 +5858,62 @@ fn os_symlink(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
     }
 }
 
-fn os_link(args: &[Object]) -> Result<Object, RuntimeError> {
-    let src = first_path(args, "link")?;
-    let dst = nth_path(args, 1, "link")?;
-    std::fs::hard_link(&src, &dst).map_err(|e| path_io_err2(&e, args.first(), &src, &dst))?;
-    Ok(Object::None)
+/// `os.link(src, dst, *, src_dir_fd=None, dst_dir_fd=None, follow_symlinks=True)`.
+/// On POSIX this goes through `linkat(2)` so that `follow_symlinks` and the
+/// two `dir_fd`s are honoured exactly like CPython 3.14's `os_link_impl`
+/// (`test_posix.test_link_follow_symlinks`): the default follows symlinks
+/// (Rust's `std::fs::hard_link` deliberately does *not* on macOS, which is
+/// why this can't simply delegate to it).
+fn os_link(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let src = path_arg_or_kw(args, 0, "src", kwargs, "link")?;
+    let dst = path_arg_or_kw(args, 1, "dst", kwargs, "link")?;
+    #[cfg(unix)]
+    {
+        let fd_kw = |name: &str| -> Result<libc::c_int, RuntimeError> {
+            let sub: Vec<(String, Object)> = kwargs
+                .iter()
+                .filter(|(k, _)| k == name)
+                .map(|(_, v)| ("dir_fd".to_owned(), v.clone()))
+                .collect();
+            Ok(dir_fd_arg(&sub)?.unwrap_or(libc::AT_FDCWD))
+        };
+        let src_fd = fd_kw("src_dir_fd")?;
+        let dst_fd = fd_kw("dst_dir_fd")?;
+        let flags = if dir_entry_follow(kwargs) {
+            libc::AT_SYMLINK_FOLLOW
+        } else {
+            0
+        };
+        let csrc = std::ffi::CString::new(src.as_bytes())
+            .map_err(|_| value_error("embedded null character in src"))?;
+        let cdst = std::ffi::CString::new(dst.as_bytes())
+            .map_err(|_| value_error("embedded null character in dst"))?;
+        // SAFETY: both C strings outlive the call; the fds are caller-supplied.
+        let rc = unsafe { libc::linkat(src_fd, csrc.as_ptr(), dst_fd, cdst.as_ptr(), flags) };
+        if rc != 0 {
+            return Err(path_io_err2(
+                &std::io::Error::last_os_error(),
+                args.first(),
+                &src,
+                &dst,
+            ));
+        }
+        Ok(Object::None)
+    }
+    #[cfg(not(unix))]
+    {
+        for name in ["src_dir_fd", "dst_dir_fd"] {
+            if let Some((_, v)) = kwargs.iter().find(|(k, _)| k == name) {
+                if !matches!(v, Object::None) {
+                    return Err(crate::error::not_implemented_error(format!(
+                        "link: {name} unavailable on this platform"
+                    )));
+                }
+            }
+        }
+        std::fs::hard_link(&src, &dst).map_err(|e| path_io_err2(&e, args.first(), &src, &dst))?;
+        Ok(Object::None)
+    }
 }
 
 /// `os.chmod(path, mode, *, dir_fd=None, follow_symlinks=True)`. `shutil`'s
@@ -6717,6 +6863,13 @@ fn path_like_type_singleton(name: &str) -> Rc<crate::types::TypeObject> {
     dict.insert(
         DictKey(Object::from_static("__slots__")),
         Object::Tuple(Rc::from(Vec::new())),
+    );
+    // `os.PathLike.__module__ == 'os'`: `typing._PROTO_ALLOWLIST` keys on
+    // `(base.__module__, base.__name__)` to let `class P(os.PathLike,
+    // Protocol)` through (test_typing test_builtin_protocol_allowlist).
+    dict.insert(
+        DictKey(Object::from_static("__module__")),
+        Object::from_static("os"),
     );
     let ty = TypeObject::new_with_flags(
         Box::leak(name.to_owned().into_boxed_str()),

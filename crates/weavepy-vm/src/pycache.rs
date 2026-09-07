@@ -284,7 +284,7 @@ pub fn try_load(source_path: &Path, optimize: u8) -> Option<CodeObject> {
             let mut code = (*c).clone();
             // The cache may have been written under a different spelling of
             // the same file (a symlinked `sys.path` entry — e.g. a vendored
-            // `Lib -> /opt/.../python3.13`). CPython re-imports record the
+            // `Lib -> /opt/.../python3.14`). CPython re-imports record the
             // *current* path in `co_filename` (each interpreter writes its
             // own pyc from the path it used); a stale spelling here would
             // diverge from the module's `__file__` and break consumers that

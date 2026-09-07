@@ -783,8 +783,8 @@ fn signal_signal(args: &[Object]) -> Result<Object, RuntimeError> {
         return Err(value_error("signal number out of range"));
     }
     // CPython only allows installing handlers from the main thread of
-    // the main interpreter.
-    if !crate::gil::is_main_thread() {
+    // the main interpreter (`_Py_ThreadCanHandleSignals`).
+    if !crate::gil::is_main_thread() || crate::stdlib::interpreters_mod::in_subinterpreter() {
         return Err(value_error(
             "signal only works in main thread of the main interpreter",
         ));
@@ -1113,6 +1113,12 @@ fn set_wakeup_fd(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object,
     // prior `warn_on_full_buffer=False` doesn't leak — test_signal
     // WakeupSocketSignalTests.test_warn_on_full_buffer).
     let mut warn_on_full_buffer = true;
+    // `signal_set_wakeup_fd_impl`: main thread of the main interpreter only.
+    if !crate::gil::is_main_thread() || crate::stdlib::interpreters_mod::in_subinterpreter() {
+        return Err(value_error(
+            "set_wakeup_fd only works in main thread of the main interpreter",
+        ));
+    }
     for (k, v) in kwargs {
         match k.as_str() {
             "warn_on_full_buffer" => {

@@ -204,7 +204,19 @@ fn print_or_exit(interp: &mut Interpreter, err: RuntimeError) {
 /// Route a `Simple`-family source through the active embed
 /// sub-interpreter, if `Py_NewInterpreter` made one current.
 fn run_in_embed_subinterp(id: i64, source: &str) -> Option<c_int> {
-    let module = crate::interp::with_interp_mut(|interp| interp.import_path("_xxsubinterpreters"))?;
+    // Drive `run_string` from the owned main interpreter (see
+    // `embed::call_xxsubinterpreters`): the host chain a sub-interpreter
+    // run records must bottom out at the main interpreter, not at
+    // whichever sub-interpreter happened to run last.
+    fn with_host<R>(f: impl FnOnce(&mut Interpreter) -> R) -> Option<R> {
+        match crate::embed::owned_interpreter() {
+            // SAFETY: live between `Py_Initialize*` and `Py_FinalizeEx`;
+            // the GIL keeps the access exclusive.
+            Some(p) => Some(f(unsafe { &mut *p })),
+            None => crate::interp::with_interp_mut(f),
+        }
+    }
+    let module = with_host(|interp| interp.import_path("_xxsubinterpreters"))?;
     let Ok(Object::Module(m)) = module else {
         return Some(-1);
     };
@@ -213,7 +225,7 @@ fn run_in_embed_subinterp(id: i64, source: &str) -> Option<c_int> {
         .borrow()
         .get(&DictKey(Object::from_static("run_string")))
         .cloned()?;
-    let result = crate::interp::with_interp_mut(|interp| {
+    let result = with_host(|interp| {
         interp.call_object(
             run_string,
             &[Object::Int(id), Object::from_str(source.to_owned())],

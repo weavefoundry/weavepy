@@ -373,9 +373,14 @@ def _partial_repr(self):
     cls = type(self)
     module = cls.__module__
     qualname = cls.__qualname__
-    args = [repr(self.func)]
-    args.extend(map(repr, self.args))
-    args.extend(f"{k}={v!r}" for k, v in self.keywords.items())
+    # WeavePy: this class *is* `functools.partial` (CPython's is the C
+    # type), whose repr snapshots func/args/keywords before rendering so a
+    # reentrant `__setstate__` from an argument's `__repr__` can't change
+    # what is printed (GH-144475, test_repr_safety_against_reentrant_mutation).
+    func, pargs, keywords = self.func, self.args, self.keywords
+    args = [repr(func)]
+    args.extend(map(repr, pargs))
+    args.extend(f"{k}={v!r}" for k, v in keywords.items())
     return f"{module}.{qualname}({', '.join(args)})"
 
 # Purely functional, no descriptor behaviour
@@ -565,6 +570,26 @@ def _unwrap_partialmethod(func):
 
 _CacheInfo = namedtuple("CacheInfo", ["hits", "misses", "maxsize", "currsize"])
 
+class _HashedSeq(list):
+    """ This class guarantees that hash() will be called no more than once
+        per element.  This is important because the lru_cache() will hash
+        the key multiple times on a cache miss.
+
+        WeavePy: CPython 3.14 dropped this wrapper because its tuples cache
+        their hash; a WeavePy tuple is a bare `Rc<[Object]>` with no hash
+        slot, so the wrapper stays to keep the "hash once per call"
+        guarantee (test_functools.test_lru_hash_only_once).
+    """
+
+    __slots__ = 'hashvalue'
+
+    def __init__(self, tup, hash=hash):
+        self[:] = tup
+        self.hashvalue = hash(tup)
+
+    def __hash__(self):
+        return self.hashvalue
+
 def _make_key(args, kwds, typed,
              kwd_mark = (object(),),
              fasttypes = {int, str},
@@ -594,7 +619,7 @@ def _make_key(args, kwds, typed,
             key += tuple(type(v) for v in kwds.values())
     elif len(key) == 1 and type(key[0]) in fasttypes:
         return key[0]
-    return key
+    return _HashedSeq(key)
 
 def lru_cache(maxsize=128, typed=False):
     """Least-recently-used cache decorator.

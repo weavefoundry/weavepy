@@ -10,7 +10,7 @@ standard while exploring a modern Rust-based runtime architecture built for
 aggressive optimization, native interoperability, and long-term performance
 work.
 
-> **Status: drop-in replacement for the documented CPython 3.13 surface,
+> **Status: drop-in replacement for the documented CPython 3.14 surface,
 > with a measured conformance baseline and a live C-extension entry point.**
 > The bundled regression suite at `tests/regrtest/` covers the seven
 > semantic groups exercised by `RFC 0027` (object model, iterators/
@@ -75,16 +75,18 @@ work.
 > (PEP 626), `co_exceptiontable`, `co_positions()` (PEP 657),
 > `co_stacksize`, `co_qualname`, `co_lines()`, `replace()`, …) backed by
 > a new `cpython_code` codec that re-encodes WeavePy's instruction stream
-> into CPython 3.13's 16-bit `_Py_CODEUNIT` form (`EXTENDED_ARG` + inline
-> `CACHE` entries). On top of that it lands the four introspection
+> into CPython's 16-bit `_Py_CODEUNIT` form (`EXTENDED_ARG` + inline
+> `CACHE` entries; the 3.14 opcode table and `LOAD_FAST_BORROW` marks
+> since `RFC 0077`). On top of that it lands the four introspection
 > modules every serious tool reaches for — `import ast`, `import dis`,
 > `import opcode`, `import symtable` — as frozen Python over thin Rust
 > cores (`_ast`, `_symtable`), a `marshal` that serialises code objects
-> byte-compatibly with CPython 3.13 (`TYPE_CODE` + `FLAG_REF` shared refs
+> byte-compatibly with CPython (`TYPE_CODE` + `FLAG_REF` shared refs
 > + exact 15-bit bigint digits), and real `.pyc` read/write under
-> `__pycache__` using CPython's `b"\xf3\r\r\n"` magic + PEP 552 header
-> (kept collision-safe by a distinct `weavepy-3.13` cache tag). Six
-> bundled regrtests cross-check the whole surface against CPython 3.13.
+> `__pycache__` using CPython's magic (`b"+\x0e\r\n"`, 3627, for 3.14)
+> + PEP 552 header (kept collision-safe by a distinct `weavepy-314`
+> cache tag). Six bundled regrtests cross-check the whole surface
+> against the CPython tree WeavePy tracks.
 >
 > `RFC 0054` lands the **async wave**: a native `_asyncio` C-accelerator
 > (the real `Future`/`Task` state machines, `current_task`/`all_tasks`,
@@ -402,7 +404,8 @@ cargo run -p weavepy-conformance -- ecosystem \
 
 See [`docs/CONFORMANCE.md`](docs/CONFORMANCE.md) for the model, the
 corpus layout, and the now-live CPython `regrtest`-style runner (RFC
-0034 built it; RFC 0036 wired a real CPython 3.13 checkout into the CLI).
+0034 built it; RFC 0036 wired a real CPython checkout into the CLI; RFC
+0077 pointed it at the 3.14.7 tree).
 
 ## Project goals
 

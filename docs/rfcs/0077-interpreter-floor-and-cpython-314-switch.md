@@ -1,6 +1,7 @@
 # RFC 0077: The floor-and-switch wave: performance wave 12 (the tier-1 interpreter floor) and the CPython 3.14 target switch
 
-- **Status**: Draft
+- **Status**: Accepted (landed 2026-09-06; the Pillar I 1.8x interp gate
+  is a recorded honest miss, the Pillar II gate is met; see Results)
 - **Authors**: WeavePy authors
 - **Created**: 2026-09-01
 - **Tracking issue**: TBD
@@ -818,6 +819,23 @@ Acceptance: `test_dis`, `test__opcode`, `test_opcodes`, `test_code`,
 marshal"` cross-checks a corpus of code objects byte-for-byte against
 WeavePy's `marshal.dumps` (the RFC 0033 fixture, re-pointed).
 
+**Landed (WS9).** Magic 3627 (`_imp.pyc_magic_number_token`
+`0x0a0d0e2b`), cache tag `weavepy-314-53` (rev 53 retires the mid-wave
+rev-52 artifacts whose folded constants predate the 3.14 AST folder),
+the regenerated opcode table and `_inline_cache_entries`, and the
+verbatim 3.14 `opcode`/`_opcode`/`dis`/`_opcode_metadata`. Every codegen
+delta above is in: `LOAD_SPECIAL` `with` shapes, `LOAD_COMMON_CONSTANT`,
+`BINARY_OP NB_SUBSCR`, `RETURN_CONST` retired, `LOAD_SMALL_INT`,
+`NOT_TAKEN`, `POP_ITER`, the `CALL_FUNCTION_EX` kwargs slot, and the
+`optimize_load_fast` liveness pass. The borrow is a wire-form mark
+(`CodeObject::wire_marks`) the VM executes as a plain clone, with one
+observable exception CPython 3.14 itself introduced: `sys.getrefcount`
+on a borrowed local reads one lower (gh-130704), so `sys.rs` discounts
+the argument clone when the caller's instruction before the `CALL` is a
+borrow-marked fast load of a slot still bound to the object
+(`test_capi.test_object.test_is_unique_temporary`). `test_marshal`
+keeps its two-subtest divergence row.
+
 #### WS10: PEP 649/749 deferred annotations
 
 The deepest item. Design, following `codegen.c`:
@@ -858,6 +876,19 @@ Acceptance: `test_annotationlib`, `test_type_annotations`,
 `test_type_params`, `test_grammar` pass on 3.14; the RFC 0057
 comprehension-scope canaries and `test_rfc0076_burn_regressions.py`
 (attrs' `compile()`-at-class-build `super()` shape) stay green.
+
+**Landed (WS10).** The compiler emits `__annotate__` thunks (closed
+over `__classdict__`, `__conditional_annotations__` for annotations
+under control flow, `NotImplementedError` for formats above 2) with
+`SET_FUNCTION_ATTRIBUTE 0x10` and `ANNOTATIONS_PLACEHOLDER`; the
+future-import path keeps stringized `__annotations__`. The runtime
+grew `function.__annotate__`, the lazy cached `__annotations__`
+properties on functions, classes, and modules (3.14 inheritance
+rules), and the fake-globals call convention `annotationlib`'s
+`FORWARDREF`/`STRING` formats need; `annotationlib`, `typing`,
+`dataclasses`, `inspect`, `functools`, `enum`, and `pydoc` are the
+verbatim 3.14 modules. The acceptance list above grades green in the
+Phase II sweep.
 
 #### WS11: the stdlib tail
 
@@ -912,6 +943,18 @@ comprehension-scope canaries and `test_rfc0076_burn_regressions.py`
   so the vendored `test_zstd` graduates from `skip` to a measured row.
 - **`compression`** and `_compression` follow 3.14 (`_compression.py`
   removed; `compression._common._streams` is the home).
+
+**Landed (WS11).** The verbatim 3.14 `asyncio` package (`asyncio.tools`,
+`asyncio.graph`, the awaited-by bookkeeping in `_asyncio`), PEP 734
+`concurrent.interpreters` over the extended `_interpreters` shims, the
+`warnings`/`_py_warnings` split with `sys.flags.context_aware_warnings`
+and `thread_inherit_context`, PEP 768's without-remote-debug posture,
+the PEP 750/758 default-on grammar (`-X lang=next` warns once with a
+`DeprecationWarning`; `-X lang=3.13` pins the old grammar), UCD 16.0.0,
+`_zstd` against 3.14's `test_zstd`, and the long tail (`heapq.*_max`,
+`complex.from_number`, `re` `\z`, `memoryview[int]`, `map(strict=)`,
+`pathlib.Path.copy/move`, float thousands separators in the fraction
+part) are all in place; each is a row in the Phase II sweep.
 
 #### WS12: the C-API delta and the header re-vendor
 
@@ -968,11 +1011,28 @@ unit test that pins every literal to the numbers. `sys.rs`
 (`PY_VERSION`, `winver`), `stdlib_tree.rs`, `pycache.rs`,
 `sysconfig_native.rs` (`EXT_SUFFIX`, `SOABI`), the extension loader's
 suffix table, `Py_Version`, `Py_GetVersion`, the CLI's DLL name, and
-both header-embedding `build.rs` now read from it. **Not yet
-consolidated:** `weavepy-pylib`'s cdylib name (a Cargo manifest
-field), `weavepy-dist`'s artifact names and embedded check scripts,
-and the `cpython313/` header directory name itself; these move with
-the flip.
+both header-embedding `build.rs` now read from it. The three items
+that could not read the crate (a Cargo manifest field, a directory
+name, the dist tree's embedded check scripts) moved with the flip:
+`weavepy-pylib`'s cdylib is `python314`, the header tree is
+`crates/weavepy-capi/include/cpython314/`, and `weavepy-dist` lays
+out `python3.14`, `libpython3.14.*`, `python3.14-config`, and
+`include/python3.14/`.
+
+**Landed (WS12, the delta).** The 3.14.7 `Include/` tree is vendored
+with `pyconfig/*.h` regenerated (`PY_VERSION_HEX 0x030e07f0`); the new
+symbol families above are exported with `force_link_table.rs` anchors
+(`PyUnicodeWriter_*`, the fixed-width `PyLong_*`, `PyIter_NextItem`,
+`PyDict_Pop`, `PyType_GetBaseByToken` with `Py_tp_token`, `Py_fopen`,
+`PyUnstable_Object_IsUniqueReferencedTemporary`, the `PyMonitoring_*`
+family, and the rest), `_PyArg_UnpackKeywords` takes the 3.14 `varpos`
+argument, and the PEP 741 `PyConfig_Get`/`PyConfig_Set` surface is in.
+`test_capi` grades on the 3.14 tree with one divergence row (the
+`PyConfig_Get` int-identity subtest; WeavePy's ints are unboxed), the
+`_testmultiphase`/`_testsinglephase` fixtures load per-interpreter
+under `test_interpreters`, and the ecosystem lane imports cp314 wheels
+(numpy, scipy, torch, polars, pydantic-core, cryptography, orjson)
+through the regular `ExtensionFileLoader` path.
 
 Acceptance: `test_capi` shares that the gap census attributed to
 3.14 surface growth pass or carry measured reasons; the
@@ -992,6 +1052,16 @@ wheel with a compiled extension (numpy) imports via the regular
 (identity spot-checks), `docs/CONFORMANCE.md`, `README.md` status
 paragraph, and the `weavepy-3.13` maintenance branch cut at the
 Phase I checkpoint commit (RFC 0076's release-branch model).
+
+**Landed (WS13).** `weavepy-version` reads `(3, 14, 7)`: `sys.version`
+`3.14.7 (WeavePy) [WeavePy]`, `sys.hexversion 0x030e07f0`,
+`sys.implementation.cache_tag weavepy-314-53`, `weavepy --version`
+`Python 3.14.7 (WeavePy 0.0.0)`, `EXT_SUFFIX .cpython-314-darwin.so`,
+`SOABI cpython-314-darwin`, `LDVERSION 3.14`, `python314.dll` in the CI
+matrix, `python3.14-config` in the dist tree, and
+`sysconfig.get_python_version() == "3.14"` pinned by
+`test_source_truth_stdlib.py`. `docs/CONFORMANCE.md` and the README
+status paragraph follow.
 
 #### WS14: re-measure and re-baseline
 
@@ -1202,4 +1272,132 @@ CPython 3.14 host as the reference:
 
 ### Phase II (3.14 sweep, ecosystem on cp314, bench re-run)
 
-TBD.
+Measured on the final Phase II tree, macOS-aarch64, CPython 3.14.7 as
+the host and oracle. The Pillar II gate is met on all four legs.
+
+- **3.14 sweep** (`--mode subprocess --jobs 6 --all-cpython`, check
+  mode, the 3.14.7 `Lib/test` tree): **574 labels, pass 570, fail 0,
+  error 0, skip 1, timeout 0, divergence 3, unexpected 0**, 11m42s
+  wall. Every 3.14 file is scheduled and graded; `fail + error` is 0
+  against the gate's <= 20 (from 287 in the RFC 0076 gap sweep). The
+  three `divergence` rows enumerate their ids: `test_capi` (the
+  subinterpreter `PyConfig_Get` int-identity leg, `assertIsNot(4300,
+  4300)`, unsatisfiable under unboxed ints), `test_embed` (41
+  enumerated legs via the `_testembed` twin; the lifecycle heart
+  passes), and `test_marshal` (two int/float instancing-by-`id()`
+  asserts and two tuple-reference-loop legs). The one `skip` is
+  CPython's own macOS `test_multiprocessing_fork` skip. The WS9 and
+  WS10 acceptance lists pass outright (`test_dis`, `test_compile`,
+  `test_peepholer`, `test_code`, `test_marshal` at its divergence,
+  `test_annotationlib`, `test_typing`, `test_type_annotations`,
+  `test_grammar`, `test_tstring`, `test_syntax`, `test_dataclasses`,
+  `test_functools`, `test_inspect`, `test_pydoc`).
+  `tests/regrtest/expectations.toml` is the rewritten 3.14 baseline:
+  no `fail`/`error`/`timeout` rows remain, and the header records the
+  protocol.
+- **Sweep-surfaced engine fixes**, each with a bundled canary (standing
+  policy): the compiler paired a method-flagged `LOAD_ATTR` with
+  `CALL_FUNCTION_EX` for wide calls (2 positionals plus 22 keywords
+  crossed the plain-call `STACK_USE_GUIDELINE`; CPython's
+  `maybe_optimize_method_call` never routes the method form through
+  the ex-call path), which the ecosystem lane hit as fastapi's
+  `APIRouter.api_route`, polars, and uvicorn raising `CallEx self slot
+  must be NULL` (`test_rfc0077_wide_method_call.py` pins the 3.14
+  `CALL`/`CALL_KW`/`CALL_FUNCTION_EX` thresholds for both forms);
+  `itertools.chain.from_iterable` was not in the descriptor registry,
+  so `type()` reported `method` instead of `builtin_function_or_method`
+  (torch's introspection); `time.monotonic()`/`perf_counter()` kept a
+  *per-thread* origin, so a later-started thread read a clock behind
+  the main thread's by its start delay, and the socket readiness wait
+  truncated a sub-millisecond remaining budget to `poll(.., 0)`, an
+  instant `TimeoutError` (CPython rounds up); both surfaced as
+  `test_httpservers`' 1 ms-handler leg failing 5 of 12 runs under
+  six-way contention on WeavePy and 0 of 12 on CPython, 18 of 18 after
+  the fix (`test_rfc0077_clock_and_socket_timeout.py`). The conformance
+  runner's `-c` bootstrap now gives `__main__` a `__file__` and a
+  `test.__main__` spec, without which `multiprocessing`'s spawn
+  preparation executed `test/__main__.py` in every worker (the timeout
+  cascade the first 3.14 sweep showed as `test_fcntl`,
+  `test_compileall`, `test_frame`, `test_asyncio.test_events`).
+  `_testinternalcapi.incref_decref_delayed` was added for
+  `test_capi`'s 3.14 GC legs. Two sweeps between the last two clean
+  runs each lost one or two concurrency suites to a 600 to 1200 s
+  timeout (`test_asyncio.test_events`, `test_concurrent_futures`,
+  `test_multiprocessing_spawn`), none reproducible in 3 solo runs plus
+  a six-suite concurrent run each; they coincided with the host at
+  1.0 GiB of free disk and 2.4 of 3 GiB of swap in use, and vanished
+  once 1.7 GiB was reclaimed, so they're recorded as a host-condition
+  artifact, not a regression.
+- **JIT on 3.14 bytecode**: the tier-2 analyzer learned the shapes the
+  3.14 compiler emits that the 3.13 one didn't, so the JIT fixtures
+  compile again instead of rejecting: `LOAD_CONST` of a folded `slice`
+  constant (`x[2:6]`, `s[1:]`), `POP_JUMP_IF_NONE` /
+  `POP_JUMP_IF_NOT_NONE` (fused `is None` branches), the constant
+  list literal `BUILD_LIST 0; LOAD_CONST (..); LIST_EXTEND 1`, and the
+  comprehension epilogue with the static-swap `STORE_FAST; STORE_FAST`
+  in place of `SWAP 2`. `weavepy-jit`'s and `weavepy-vm`'s JIT unit
+  tests are the pins.
+- **`--gil0` lane** (`expectations-gil0.toml`, `-j4`): 10 of 10, no
+  row changed status. On the unresolved question: 3.14's
+  `test_free_threading/` does **not** join the lane, because the
+  package gates on the `Py_GIL_DISABLED` *build* flag
+  (`sysconfig.get_config_var`), which the default build correctly
+  reports as 0 (abiflags `""`, cp314 wheels), so the sweep records it
+  as CPython's own `skipped: GIL enabled`. Force-loading the package
+  under `-X gil=0` with the flag patched, as a measurement only: 186
+  run, 156 pass, 4 skip, 13 fail, 8 error, in clusters (the twelve
+  `heapq` race legs, which need per-call locking in a native `_heapq`;
+  `cprofile`, `csv`, dict-watcher and `__dict__` races; `mmap`;
+  `sys.monitoring` under concurrent registration; `str` interning; the
+  tokenizer iterator). That's the RFC 0076 "JIT under free-threading /
+  `--gil0` full-sweep baseline" future-work item's worklist, unchanged
+  in kind.
+- **Identity**: `sys.version_info[:2] == (3, 14)`, `sys.version`
+  `3.14.7`; `pip debug --verbose` under WeavePy lists the `cp314`
+  tags (`cp314-cp314-macosx_*` first); the `weavepy-dist` artifact
+  ships `bin/python3.14-config`, whose `--ldflags --embed` names
+  `libpython3.14`, and its `check` matrix passes (version, identity,
+  stdlib, venv, cext, embed: two init/run/finalize cycles through
+  `libpython3.14`) after the checker's own stale `(3, 13)` want-strings
+  were flipped; the `_testembed` twin's lifecycle legs
+  pass inside `test_embed`. `-X lang=next` is accepted and changes
+  nothing (`-X lang=3.13` is the opt-out); `t"..."` evaluates to a
+  `string.templatelib.Template`, `except A, B:` parses, `from
+  __future__ import annotations` still stringizes, and `test_tstring`,
+  `test_grammar`, `test_syntax`, `test_annotationlib` pass.
+- **Ecosystem** (`--wheels target/ecosystem-wheels --selftests`,
+  offline, cp314 wheels, one run of 3h34m on the final binary): **48
+  of 48 probe rows pass, unexpected 0; selftests 8 pass / 2 fail**, all
+  at their RFC 0076 verdicts (attrs, click, jinja2, dateutil,
+  packaging, scipy at 85 min under load, pillow, and the markupsafe
+  sdist pass; numpy stays budget-bound at 2400 s and lxml stays at its
+  upstream-collection-artifact `fail`, both as the rows document).
+  `tests/ecosystem/expectations.toml` records the re-measure; no row
+  moved.
+- **Bench baseline** (`weavepy-bench run --samples=7
+  --update-baseline`, `baselines/bench-macos-aarch64.json`, v6 with
+  the `interp` column): suite geomean **2.75x** CPython (2.78x at the
+  Phase I checkpoint), **interp geomean 7.20x** (6.68x); `startup`
+  2.18x versus 2.20x, so the flip didn't move it. The three census
+  rows stay excluded from both geomeans (`deque_ops` 18x / 32x interp,
+  `datetime_ops` 381x / 353x, `pickle_bench` 358x / 329x). The same
+  caveat as the checkpoint recording applies, harder: the host was
+  shared with an interactive session and two storage-management
+  daemons at 50 to 80% CPU for the whole run (load average 8 to 15),
+  and absolute times ran 2 to 5x above solo timings (`fib` interp
+  501 ms in the run versus ~30 ms solo after startup; `deltablue` 3.5 s
+  versus 0.44 s), so per-row ratios wobble well past the gate's 10%
+  envelope run to run (`fib` interp 9.5x committed, 13.2x and 20.8x in
+  two recordings). The geomeans are consistent across the two
+  recordings (3.01x / 7.53x and 2.75x / 7.20x) and with the checkpoint;
+  the baseline should be re-recorded on a quiet host before it's used
+  as the ratchet. Standalone, the 3.14 bytecode did not change the
+  interpreter's dispatch coverage: `LOAD_FAST_BORROW` and
+  `LOAD_SMALL_INT` are presentation of the same internal `LoadFast` /
+  `LoadConst`, so `step_hot`'s subset is unchanged.
+- **Hygiene**: `cargo fmt`, `clippy --workspace --all-targets -D
+  warnings`, and `cargo test --workspace` are green: all 39 test
+  targets pass (run one target at a time on the low-disk host, 259
+  `weavepy-vm` unit tests, the 16 `weavepy-capi` fixture suites, the
+  JIT suites, `fixtures`, `stdlib_sync`, `m_test`, and the
+  conformance runner's own tests among them).

@@ -748,6 +748,20 @@ std::thread_local! {
     static GIL_HELD_SINCE: std::cell::Cell<Option<std::time::Instant>> =
         const { std::cell::Cell::new(None) };
 
+    /// When this holder first *noticed* a waiter at a checkpoint (RFC
+    /// 0077 Phase II). CPython's `take_gil` measures the switch interval
+    /// from the waiter's side: a waiter parks for `switchinterval`, and
+    /// only then raises `gil_drop_request`. Measuring from the holder's
+    /// acquisition instead let a long-running holder yield the moment a
+    /// waiter appeared — a `Future.result()` waiter woken by
+    /// `set_result` could slip in before the worker reached
+    /// `_idle_semaphore.release()` and `work_queue.get()`, spinning a
+    /// second thread (test_concurrent_futures' InterpreterPoolExecutor
+    /// `test_idle_thread_reuse`). Cleared when the waiter count drops to
+    /// zero and on every (re)acquire.
+    static WAITER_SEEN_SINCE: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+
     /// Depth of nested "no cooperative GIL hand-off" critical sections
     /// on this thread. While `> 0`, [`maybe_yield_gil`] refuses to drop
     /// the GIL at a periodic checkpoint.
@@ -794,6 +808,22 @@ fn no_yield_active() -> bool {
 #[inline]
 pub fn note_gil_acquired() {
     GIL_HELD_SINCE.with(|c| c.set(Some(std::time::Instant::now())));
+    WAITER_SEEN_SINCE.with(|c| c.set(None));
+}
+
+/// Whether a waiter has been waiting on this holder for at least the
+/// switch interval (CPython's waiter-side `gil_drop_request` timing).
+/// The first checkpoint that sees a waiter starts the clock and keeps
+/// the GIL; a later checkpoint past the interval reports due.
+#[inline]
+fn waiter_interval_elapsed() -> bool {
+    WAITER_SEEN_SINCE.with(|c| match c.get() {
+        Some(since) => since.elapsed() >= global_gil().breaker.switch_interval(),
+        None => {
+            c.set(Some(std::time::Instant::now()));
+            false
+        }
+    })
 }
 
 /// Whether this thread has held the GIL long enough (≥ the configured
@@ -874,6 +904,7 @@ fn maybe_yield_gil() {
     }
     let gil = global_gil();
     if gil.breaker.waiter_count() == 0 {
+        WAITER_SEEN_SINCE.with(|c| c.set(None));
         return;
     }
     // CPython hands the GIL off on a wall-clock interval, not an opcode
@@ -882,10 +913,11 @@ fn maybe_yield_gil() {
     // a short burst of bytecode between checkpoints — e.g. a finalizer's
     // `n_instances -= 1` or an unpickle's `__new__` increment — completes
     // without another thread slipping in mid-`LOAD`/`STORE` and clobbering a
-    // shared counter (the `test_release_task_refs` race). A thread that has
-    // held the GIL for less than the interval keeps running; the next
-    // checkpoint after the interval elapses performs the hand-off.
-    if !switch_interval_elapsed() {
+    // shared counter (the `test_release_task_refs` race). Both clocks must
+    // have run out: the holder has held for the interval *and* the waiter
+    // has waited for it (`WAITER_SEEN_SINCE`), which is what CPython's
+    // waiter-timed drop request amounts to.
+    if !switch_interval_elapsed() || !waiter_interval_elapsed() {
         return;
     }
     let popped: Vec<GilGuard> =

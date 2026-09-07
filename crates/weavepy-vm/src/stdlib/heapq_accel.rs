@@ -57,6 +57,15 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         reg!("heapify", heapify);
         reg!("heapreplace", heapreplace);
         reg!("heappushpop", heappushpop);
+        // 3.14 (gh-130725): the max-heap family is public C API
+        // (`heapq.heappush_max.__module__ == '_heapq'`, test_heapq
+        // test_c_functions). The underscored aliases stay for callers of
+        // the pre-3.14 private names.
+        reg!("heappush_max", heappush_max);
+        reg!("heappop_max", heappop_max);
+        reg!("heapify_max", heapify_max);
+        reg!("heapreplace_max", heapreplace_max);
+        reg!("heappushpop_max", heappushpop_max);
         reg!("_heapify_max", heapify_max);
         reg!("_heapreplace_max", heapreplace_max);
         reg!("_heappop_max", heappop_max);
@@ -240,7 +249,7 @@ fn heapreplace(args: &[Object]) -> Result<Object, RuntimeError> {
     heapreplace_impl(args, false)
 }
 
-fn heappushpop(args: &[Object]) -> Result<Object, RuntimeError> {
+fn heappushpop_impl(args: &[Object], max_heap: bool) -> Result<Object, RuntimeError> {
     let heap = heap_arg(args)?;
     let item = args
         .get(1)
@@ -254,9 +263,14 @@ fn heappushpop(args: &[Object]) -> Result<Object, RuntimeError> {
         let Some(top) = top else {
             return Ok(item);
         };
-        // Only replace when `heap[0] < item` (min-heap), else `item` is the
-        // smallest and is returned untouched.
-        if !interp.op_compare(&top, &item, CompareKind::Lt)? {
+        // Only replace when `heap[0] < item` (min-heap) / `item < heap[0]`
+        // (max-heap), else `item` is the extreme and is returned untouched.
+        let replace = if max_heap {
+            interp.op_compare(&item, &top, CompareKind::Lt)?
+        } else {
+            interp.op_compare(&top, &item, CompareKind::Lt)?
+        };
+        if !replace {
             return Ok(item);
         }
         // bpo-39421: the comparison above may have run arbitrary Python
@@ -270,9 +284,13 @@ fn heappushpop(args: &[Object]) -> Result<Object, RuntimeError> {
             }
             std::mem::replace(&mut h[0], item)
         };
-        siftup(interp, &heap, 0, false)?;
+        siftup(interp, &heap, 0, max_heap)?;
         Ok(returnitem)
     })
+}
+
+fn heappushpop(args: &[Object]) -> Result<Object, RuntimeError> {
+    heappushpop_impl(args, false)
 }
 
 fn heapify_impl(args: &[Object], max_heap: bool) -> Result<Object, RuntimeError> {
@@ -301,4 +319,12 @@ fn heapreplace_max(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn heappop_max(args: &[Object]) -> Result<Object, RuntimeError> {
     heappop_impl(args, true)
+}
+
+fn heappush_max(args: &[Object]) -> Result<Object, RuntimeError> {
+    heappush_impl(args, true)
+}
+
+fn heappushpop_max(args: &[Object]) -> Result<Object, RuntimeError> {
+    heappushpop_impl(args, true)
 }

@@ -994,6 +994,13 @@ impl RealRLock {
         self.state.lock().depth
     }
 
+    /// `(owner thread id or 0, recursion depth)` in one snapshot — what
+    /// 3.14's `RLock.__repr__` prints (`owner=… count=…`).
+    pub fn owner_and_depth(&self) -> (u64, usize) {
+        let state = self.state.lock();
+        (state.owner.unwrap_or(0), state.depth)
+    }
+
     /// Forcibly drop all ownership/recursion state, backing
     /// `_thread.RLock._at_fork_reinit()`. See [`RealLock::force_reset`] for the
     /// full rationale: `parking_lot` is not `fork`-safe, so we reinitialise the

@@ -63,6 +63,13 @@ LLONG_MIN = -(2**63)
 ULLONG_MAX = 2**64 - 1
 SHRT_MAX = 2**15 - 1
 SHRT_MIN = -(2**15)
+# Fixed-width limits (3.14 PyLong_As{,U}Int{32,64}).
+INT32_MAX = 2**31 - 1
+INT32_MIN = -(2**31)
+UINT32_MAX = 2**32 - 1
+INT64_MAX = 2**63 - 1
+INT64_MIN = -(2**63)
+UINT64_MAX = 2**64 - 1
 
 def PyTime_AsSecondsDouble(t):
     """`PyTime_AsSecondsDouble()` (Python/pytime.c): exact whole seconds
@@ -225,6 +232,225 @@ def _faulthandler_enabled():
     return faulthandler.is_enabled()
 
 
+# --- PEP 741: PyConfig_Get() / PyConfig_Set() ------------------------------
+#
+# The option table is CPython 3.14's `PYCONFIG_SPEC` (Python/initconfig.c):
+# name -> (kind, source). `kind` is the PyConfig member type; `source` is
+# where the live value comes from: ("sys", attr), ("flag", attr, negate),
+# or a callable. Options with a `sys`/`flag` source are the mutable ones;
+# everything else is read-only through `PyConfig_Set()`.
+
+_CFG_BOOL, _CFG_INT, _CFG_UINT, _CFG_ULONG = "bool", "int", "uint", "ulong"
+_CFG_STR, _CFG_STR_OPT, _CFG_LIST, _CFG_DICT = "str", "str?", "list", "dict"
+
+
+def _cfg_flag(attr, negate=False):
+    return ("flag", attr, negate)
+
+
+def _cfg_sys(attr):
+    return ("sys", attr)
+
+
+def _cfg_const(value):
+    return ("const", value)
+
+
+def _cfg_cpu_count():
+    import _testinternalcapi
+
+    return _testinternalcapi._cpu_count_override()
+
+
+def _cfg_stdio(which):
+    def get():
+        stream = getattr(sys, "__stdout__", None) or sys.stdout
+        if which == "encoding":
+            return getattr(stream, "encoding", None) or "utf-8"
+        return getattr(stream, "errors", None) or "strict"
+
+    return ("call", get)
+
+
+def _cfg_fs(which):
+    def get():
+        if which == "encoding":
+            return sys.getfilesystemencoding()
+        return sys.getfilesystemencodeerrors()
+
+    return ("call", get)
+
+
+def _cfg_buffered_stdio():
+    # `-u` gives `sys.stdout` a write-through text layer.
+    return not bool(getattr(sys.stdout, "write_through", False))
+
+
+def _cfg_use_hash_seed():
+    return not sys.flags.hash_randomization
+
+
+def _cfg_program_name():
+    import os as _os
+
+    argv0 = (getattr(sys, "orig_argv", None) or [sys.executable or "python"])[0]
+    return argv0 or (sys.executable or "python")
+
+
+def _cfg_home():
+    import os as _os
+
+    return _os.environ.get("PYTHONHOME") or None
+
+
+def _cfg_run_target(which):
+    def get():
+        argv = list(getattr(sys, "orig_argv", []))
+        i = 1
+        while i < len(argv):
+            a = argv[i]
+            if a in ("-c", "-m") and i + 1 < len(argv):
+                return argv[i + 1] if which == {"-c": "command", "-m": "module"}[a] else None
+            if a.startswith("-c") and len(a) > 2:
+                return a[2:] if which == "command" else None
+            if a.startswith("-m") and len(a) > 2:
+                return a[2:] if which == "module" else None
+            if a in ("-W", "-X") and i + 1 < len(argv):
+                i += 2
+                continue
+            if a == "-" or not a.startswith("-"):
+                return a if which == "filename" and a != "-" else None
+            i += 1
+        return None
+
+    return ("call", get)
+
+
+_CONFIG_SPEC = {
+    # PyPreConfig members (read-only).
+    "allocator": (_CFG_INT, _cfg_const(0)),
+    "coerce_c_locale": (_CFG_BOOL, _cfg_const(False)),
+    "coerce_c_locale_warn": (_CFG_BOOL, _cfg_const(False)),
+    "configure_locale": (_CFG_BOOL, _cfg_const(True)),
+    "dev_mode": (_CFG_BOOL, _cfg_flag("dev_mode")),
+    "isolated": (_CFG_BOOL, _cfg_flag("isolated")),
+    "parse_argv": (_CFG_BOOL, _cfg_const(False)),
+    "use_environment": (_CFG_BOOL, _cfg_flag("ignore_environment", True)),
+    "utf8_mode": (_CFG_BOOL, _cfg_flag("utf8_mode")),
+    # PyConfig members.
+    "argv": (_CFG_LIST, _cfg_sys("argv")),
+    "base_exec_prefix": (_CFG_STR_OPT, _cfg_sys("base_exec_prefix")),
+    "base_executable": (_CFG_STR_OPT, _cfg_sys("_base_executable")),
+    "base_prefix": (_CFG_STR_OPT, _cfg_sys("base_prefix")),
+    "buffered_stdio": (_CFG_BOOL, ("call", _cfg_buffered_stdio)),
+    "bytes_warning": (_CFG_UINT, _cfg_flag("bytes_warning")),
+    "check_hash_pycs_mode": (_CFG_STR, _cfg_const("default")),
+    "code_debug_ranges": (_CFG_BOOL, _cfg_const(True)),
+    "configure_c_stdio": (_CFG_BOOL, _cfg_const(True)),
+    "context_aware_warnings": (_CFG_INT, _cfg_flag("context_aware_warnings")),
+    "cpu_count": (_CFG_INT, ("call", _cfg_cpu_count)),
+    "dump_refs": (_CFG_BOOL, _cfg_const(False)),
+    "dump_refs_file": (_CFG_STR_OPT, _cfg_const(None)),
+    "exec_prefix": (_CFG_STR_OPT, _cfg_sys("exec_prefix")),
+    "executable": (_CFG_STR_OPT, _cfg_sys("executable")),
+    "faulthandler": (_CFG_BOOL, ("call", _faulthandler_enabled)),
+    "filesystem_encoding": (_CFG_STR, _cfg_fs("encoding")),
+    "filesystem_errors": (_CFG_STR, _cfg_fs("errors")),
+    "hash_seed": (_CFG_ULONG, _cfg_const(0)),
+    "home": (_CFG_STR_OPT, ("call", _cfg_home)),
+    "import_time": (_CFG_INT, _cfg_const(0)),
+    "inspect": (_CFG_BOOL, _cfg_flag("inspect")),
+    "install_signal_handlers": (_CFG_BOOL, _cfg_const(True)),
+    "int_max_str_digits": (_CFG_UINT, _cfg_flag("int_max_str_digits")),
+    "interactive": (_CFG_BOOL, _cfg_flag("interactive")),
+    "malloc_stats": (_CFG_BOOL, _cfg_const(False)),
+    "module_search_paths": (_CFG_LIST, _cfg_sys("path")),
+    "optimization_level": (_CFG_UINT, _cfg_flag("optimize")),
+    "orig_argv": (_CFG_LIST, _cfg_sys("orig_argv")),
+    "parser_debug": (_CFG_BOOL, _cfg_flag("debug")),
+    "pathconfig_warnings": (_CFG_BOOL, _cfg_const(True)),
+    "perf_profiling": (_CFG_INT, _cfg_const(0)),
+    "platlibdir": (_CFG_STR, _cfg_sys("platlibdir")),
+    "prefix": (_CFG_STR_OPT, _cfg_sys("prefix")),
+    "program_name": (_CFG_STR, ("call", _cfg_program_name)),
+    "pycache_prefix": (_CFG_STR_OPT, _cfg_sys("pycache_prefix")),
+    "quiet": (_CFG_BOOL, _cfg_flag("quiet")),
+    "remote_debug": (_CFG_INT, _cfg_const(0)),
+    "run_command": (_CFG_STR_OPT, _cfg_run_target("command")),
+    "run_filename": (_CFG_STR_OPT, _cfg_run_target("filename")),
+    "run_module": (_CFG_STR_OPT, _cfg_run_target("module")),
+    "safe_path": (_CFG_BOOL, _cfg_flag("safe_path")),
+    "show_ref_count": (_CFG_BOOL, _cfg_const(False)),
+    "site_import": (_CFG_BOOL, _cfg_flag("no_site", True)),
+    "skip_source_first_line": (_CFG_BOOL, _cfg_const(False)),
+    "stdio_encoding": (_CFG_STR, _cfg_stdio("encoding")),
+    "stdio_errors": (_CFG_STR, _cfg_stdio("errors")),
+    "stdlib_dir": (_CFG_STR_OPT, _cfg_sys("_stdlib_dir")),
+    "thread_inherit_context": (_CFG_INT, _cfg_flag("thread_inherit_context")),
+    "tracemalloc": (_CFG_INT, _cfg_const(0)),
+    "use_frozen_modules": (_CFG_BOOL, _cfg_const(True)),
+    "use_hash_seed": (_CFG_BOOL, ("call", _cfg_use_hash_seed)),
+    "user_site_directory": (_CFG_BOOL, _cfg_flag("no_user_site", True)),
+    "verbose": (_CFG_UINT, _cfg_flag("verbose")),
+    "warn_default_encoding": (_CFG_BOOL, _cfg_flag("warn_default_encoding")),
+    "warnoptions": (_CFG_LIST, _cfg_sys("warnoptions")),
+    "write_bytecode": (_CFG_BOOL, ("sysnot", "dont_write_bytecode")),
+    "xoptions": (_CFG_DICT, _cfg_sys("_xoptions")),
+}
+if sys.platform == "win32":
+    _CONFIG_SPEC["legacy_windows_stdio"] = (_CFG_BOOL, _cfg_const(False))
+    _CONFIG_SPEC["legacy_windows_fs_encoding"] = (_CFG_BOOL, _cfg_const(False))
+if sys.platform in ("darwin", "ios", "tvos", "watchos", "visionos"):
+    _CONFIG_SPEC["use_system_logger"] = (_CFG_BOOL, _cfg_const(False))
+
+# PyConfig_Set() on a `sys.flags`-backed option also refreshes the
+# matching `Py_*Flag` global (`_Py_SetConfigGlobals`); `get_configs()`
+# reports them under these names.
+_GLOBAL_FLAG_NAMES = {
+    "bytes_warning": ("Py_BytesWarningFlag", False),
+    "inspect": ("Py_InspectFlag", False),
+    "interactive": ("Py_InteractiveFlag", False),
+    "optimization_level": ("Py_OptimizeFlag", False),
+    "parser_debug": ("Py_DebugFlag", False),
+    "quiet": ("Py_QuietFlag", False),
+    "use_environment": ("Py_IgnoreEnvironmentFlag", True),
+    "verbose": ("Py_VerboseFlag", False),
+    "write_bytecode": ("Py_DontWriteBytecodeFlag", True),
+    "buffered_stdio": ("Py_UnbufferedStdioFlag", True),
+    "isolated": ("Py_IsolatedFlag", False),
+    "pathconfig_warnings": ("Py_FrozenFlag", True),
+    "site_import": ("Py_NoSiteFlag", True),
+    "user_site_directory": ("Py_NoUserSiteDirectory", True),
+    "utf8_mode": ("Py_UTF8Mode", False),
+}
+
+
+def _config_raw(name):
+    kind, source = _CONFIG_SPEC[name]
+    tag = source[0]
+    if tag == "const":
+        return source[1]
+    if tag == "call":
+        return source[1]()
+    if tag == "sys":
+        return getattr(sys, source[1])
+    if tag == "sysnot":
+        return not getattr(sys, source[1])
+    # ("flag", attr, negate)
+    value = getattr(sys.flags, source[1])
+    if source[2]:
+        value = not value
+    return value
+
+
+def _config_coerce(kind, value):
+    if kind == _CFG_BOOL:
+        return bool(value)
+    if kind in (_CFG_INT, _CFG_UINT, _CFG_ULONG):
+        return int(value)
+    return value
+
+
 def config_get(name):
     """PyConfig_Get(name): the current value of a runtime configuration
     option (PEP 741)."""
@@ -232,11 +458,16 @@ def config_get(name):
         raise TypeError(
             "config_get() argument must be str, not %s" % type(name).__name__
         )
-    cfg = _config_snapshot()
     try:
-        return cfg[name]
+        kind, source = _CONFIG_SPEC[name]
     except KeyError:
         raise ValueError("unknown config option name: %s" % name) from None
+    value = _config_raw(name)
+    if source[0] == "sys":
+        # `sys` attributes are handed back as-is (a swapped-in tuple stays
+        # a tuple), exactly as `config_get_sys_attr` does.
+        return value
+    return _config_coerce(kind, value)
 
 
 def config_getint(name):
@@ -249,7 +480,153 @@ def config_getint(name):
 
 
 def config_names():
-    return frozenset(_config_snapshot())
+    return frozenset(_CONFIG_SPEC)
+
+
+def _config_snapshot():
+    # Every option, as `PyConfig_Get()` reports it.
+    return {name: config_get(name) for name in _CONFIG_SPEC}
+
+
+def _check_sys_value(name, kind, value):
+    if kind == _CFG_STR:
+        if not isinstance(value, str):
+            raise TypeError("expected str, got %s" % type(value).__name__)
+    elif kind == _CFG_STR_OPT:
+        if value is not None and not isinstance(value, str):
+            raise TypeError("expected str or None, got %s" % type(value).__name__)
+    elif kind == _CFG_LIST:
+        if not isinstance(value, list) or not all(
+            isinstance(item, str) for item in value
+        ):
+            raise TypeError("expected list[str]")
+    elif kind == _CFG_DICT:
+        if not isinstance(value, dict) or not all(
+            isinstance(k, str) and isinstance(v, (str, bool))
+            for k, v in value.items()
+        ):
+            raise TypeError("expected dict[str, str | bool]")
+
+
+def _check_int_value(name, kind, value):
+    if isinstance(value, bool):
+        return int(value)
+    if not isinstance(value, int):
+        raise TypeError(
+            "config option %s: expected int, got %s" % (name, type(value).__name__)
+        )
+    if kind in (_CFG_UINT, _CFG_ULONG) and value < 0:
+        raise ValueError("config option %s: value must be >= 0" % name)
+    if kind == _CFG_BOOL and value < 0:
+        raise ValueError("config option %s: value must be 0 or 1" % name)
+    if name == "int_max_str_digits" and value != 0 and value < 4300:
+        raise ValueError(
+            "maxdigits must be >= %d or 0 for unlimited" % 4300
+        )
+    return value
+
+
+# The `PyConfig_MEMBER_PUBLIC` rows: the only ones `PyConfig_Set()` accepts.
+_CONFIG_PUBLIC = frozenset({
+    "argv", "base_exec_prefix", "base_executable", "base_prefix",
+    "bytes_warning", "cpu_count", "exec_prefix", "executable", "inspect",
+    "int_max_str_digits", "interactive", "module_search_paths",
+    "optimization_level", "parser_debug", "platlibdir", "prefix",
+    "pycache_prefix", "quiet", "stdlib_dir", "use_environment", "verbose",
+    "warnoptions", "write_bytecode", "xoptions",
+})
+
+# `Py_*Flag` globals written by `PyConfig_Set()` (the raw, un-normalized
+# int, before the sys.flags bool clamp), keyed by option name.
+_GLOBAL_OVERRIDES = {}
+
+
+def config_set(name, value):
+    """PyConfig_Set(name, value) (PEP 741)."""
+    import _testinternalcapi
+
+    if not isinstance(name, str):
+        raise TypeError(
+            "config_set() argument 1 must be str, not %s" % type(name).__name__
+        )
+    try:
+        kind, source = _CONFIG_SPEC[name]
+    except KeyError:
+        raise ValueError("unknown config option name: %s" % name) from None
+    if name not in _CONFIG_PUBLIC:
+        raise ValueError("cannot set read-only option %s" % name)
+    tag = source[0]
+    if tag == "sys":
+        _check_sys_value(name, kind, value)
+        setattr(sys, source[1], value)
+        return
+    if tag == "sysnot":
+        ivalue = _check_int_value(name, kind, value)
+        _GLOBAL_OVERRIDES[name] = ivalue
+        flag = int(bool(ivalue))
+        sys.dont_write_bytecode = int(not flag)
+        _testinternalcapi._replace_sys_flags(source[1], int(not flag))
+        return
+    if tag == "flag":
+        ivalue = _check_int_value(name, kind, value)
+        _GLOBAL_OVERRIDES[name] = ivalue
+        if kind == _CFG_BOOL:
+            ivalue = int(bool(ivalue))
+        stored = int(not ivalue) if source[2] else ivalue
+        if name == "int_max_str_digits":
+            sys.set_int_max_str_digits(ivalue)
+        if source[1] in ("dev_mode", "safe_path"):
+            stored = bool(stored)
+        _testinternalcapi._replace_sys_flags(source[1], stored)
+        return
+    if name == "cpu_count":
+        ivalue = _check_int_value(name, kind, value)
+        _testinternalcapi._set_cpu_count_override(ivalue)
+        return
+    raise ValueError("cannot set read-only option %s" % name)
+
+
+def _get_configs():
+    """`_testinternalcapi.get_configs()`: the pre/config/global dump."""
+    global_config = {}
+    for name, (gname, negate) in _GLOBAL_FLAG_NAMES.items():
+        value = _GLOBAL_OVERRIDES.get(name)
+        if value is None:
+            value = config_get(name)
+        if isinstance(value, bool):
+            value = int(value)
+        if negate:
+            value = int(not value)
+        global_config[gname] = value
+    global_config["Py_HashRandomizationFlag"] = int(sys.flags.hash_randomization)
+    if sys.platform == "win32":
+        global_config["Py_LegacyWindowsStdioFlag"] = 0
+        global_config["Py_LegacyWindowsFSEncodingFlag"] = 0
+    else:
+        global_config["Py_FileSystemDefaultEncodeErrors"] = (
+            sys.getfilesystemencodeerrors()
+        )
+        global_config["Py_HasFileSystemDefaultEncoding"] = 0
+    config = _config_snapshot()
+    pre_config = {
+        key: config[key]
+        for key in (
+            "allocator",
+            "coerce_c_locale",
+            "coerce_c_locale_warn",
+            "configure_locale",
+            "dev_mode",
+            "isolated",
+            "parse_argv",
+            "use_environment",
+            "utf8_mode",
+        )
+    }
+    return {
+        "global_config": global_config,
+        "pre_config": pre_config,
+        "config": config,
+    }
 
 
 def crash_no_current_thread():
@@ -1271,10 +1648,37 @@ class instancemethod:
 # PyRun_StringFlags / PyRun_FileExFlags fixtures (test_capi.test_run).
 
 
-def _run_checked(source, start, globals, locals):
+# Compiler flags (Include/cpython/compile.h) the fixtures accept.
+PyCF_ONLY_AST = 0x0400
+PyCF_IGNORE_COOKIE = 0x0800
+
+_START_MODES = {256: "single", 257: "exec", 258: "eval"}
+
+
+def _start_mode(start):
+    try:
+        return _START_MODES[start]
+    except KeyError:
+        # `_PyPegen_Parser_New` / `Py_CompileStringObject` on an unknown
+        # start token.
+        raise ValueError("invalid start rule") from None
+
+
+def _decode_source(source):
+    if isinstance(source, bytes):
+        # The C parser reports bad UTF-8 as a SyntaxError.
+        try:
+            return source.decode("utf-8")
+        except UnicodeDecodeError as e:
+            raise SyntaxError("(unicode error) %s" % e) from None
+    return source
+
+
+def _run_checked(source, start, globals, locals, filename="<string>"):
     # PyEval_EvalCode: globals must be a real dict (subclass ok) —
     # SystemError otherwise; locals may be any mapping — TypeError
     # otherwise.
+    mode = _start_mode(start)
     if not isinstance(globals, dict):
         raise SystemError("PyEval_EvalCodeEx: globals must be a dict")
     if locals is None:
@@ -1283,29 +1687,242 @@ def _run_checked(source, start, globals, locals):
         locals, (list, tuple)
     ):
         raise TypeError("locals must be a mapping")
-    mode = {256: "single", 257: "exec", 258: "eval"}.get(start, "exec")
-    if isinstance(source, bytes):
-        # The C parser reports bad UTF-8 as a SyntaxError.
-        try:
-            source = source.decode("utf-8")
-        except UnicodeDecodeError as e:
-            raise SyntaxError("(unicode error) %s" % e) from None
-    code = compile(source, "<string>", mode)
+    code = compile(_decode_source(source), filename, mode)
     result = eval(code, globals, locals)
     return result if mode == "eval" else None
+
+
+def run_string(source, start, globals=None, locals=None):
+    return _run_checked(source, start, globals, locals)
 
 
 def run_stringflags(source, start, globals=None, locals=None, flags=None):
     return _run_checked(source, start, globals, locals)
 
 
-def run_fileexflags(filename, start, globals=None, locals=None, closeit=0,
-                    flags=None):
+def _read_source_file(filename):
     import os as _os
 
-    with open(_os.fsdecode(filename), "rb") as fp:
-        source = fp.read()
-    return _run_checked(source, start, globals, locals)
+    # The C fixtures `fopen()` the bytes path; keep the surrogateescaped
+    # spelling for `co_filename` / `SyntaxError.filename`.
+    name = _os.fsdecode(filename)
+    with open(_os.fsencode(filename), "rb") as fp:
+        return fp.read(), name
+
+
+def run_file(filename, start, globals=None, locals=None):
+    source, name = _read_source_file(filename)
+    return _run_checked(source, start, globals, locals, name)
+
+
+def run_fileex(filename, start, globals=None, locals=None, closeit=0):
+    source, name = _read_source_file(filename)
+    return _run_checked(source, start, globals, locals, name)
+
+
+def run_fileflags(filename, start, globals=None, locals=None, flags=None):
+    source, name = _read_source_file(filename)
+    return _run_checked(source, start, globals, locals, name)
+
+
+def run_fileexflags(filename, start, globals=None, locals=None, closeit=0,
+                    flags=None):
+    source, name = _read_source_file(filename)
+    return _run_checked(source, start, globals, locals, name)
+
+
+def _err_print():
+    # `PyErr_Print()`: hand the pending exception to `sys.excepthook`.
+    import sys as _sys
+
+    exc = _sys.exception()
+    hook = getattr(_sys, "excepthook", None) or _sys.__excepthook__
+    hook(type(exc), exc, exc.__traceback__)
+
+
+def _main_dict():
+    import sys as _sys
+
+    return _sys.modules["__main__"].__dict__
+
+
+def _pyrun_simple_file(open_filename, filename, closeit=0, flags=None):
+    # `pyrun_simple_file` (Python/pythonrun.c): `__main__.__file__` is
+    # set for the run only when absent (and removed again afterwards),
+    # `__loader__` becomes a `SourceFileLoader` unless the name is
+    # `<stdin>`, and any exception is printed through the excepthook
+    # (return -1).
+    import os as _os
+    import sys as _sys
+
+    if isinstance(filename, bytes):
+        filename = _os.fsdecode(filename)
+    d = _main_dict()
+    set_file_name = "__file__" not in d
+    if set_file_name:
+        d["__file__"] = filename
+        d["__cached__"] = None
+    try:
+        if filename != "<stdin>":
+            from importlib.machinery import SourceFileLoader
+
+            d["__loader__"] = SourceFileLoader("__main__", filename)
+        try:
+            with open(_os.fsencode(open_filename), "rb") as fp:
+                source = fp.read()
+            code = compile(_decode_source(source), filename, "exec")
+            exec(code, d, d)
+        except BaseException:
+            _err_print()
+            return -1
+        _sys.stdout.flush()
+        return 0
+    finally:
+        if set_file_name:
+            d.pop("__file__", None)
+            d.pop("__cached__", None)
+
+
+def run_simplefile(open_filename, filename):
+    return _pyrun_simple_file(open_filename, filename)
+
+
+def run_simplefileex(open_filename, filename, closeit=0):
+    return _pyrun_simple_file(open_filename, filename, closeit)
+
+
+def run_simplefileexflags(open_filename, filename, closeit=0, flags=None):
+    return _pyrun_simple_file(open_filename, filename, closeit, flags)
+
+
+# `PyRun_AnyFile*` switches to the interactive loop only for a tty; the
+# fixtures always hand it a regular file.
+run_anyfile = run_simplefile
+run_anyfileex = run_simplefileex
+run_anyfileexflags = run_simplefileexflags
+
+
+def run_anyfileflags(open_filename, filename, flags=None):
+    return _pyrun_simple_file(open_filename, filename, 0, flags)
+
+
+def _interactive_statements(open_filename, filename):
+    # Split the file into top-level statements the way the interactive
+    # tokenizer feeds them to `PyRun_InteractiveOne`: one compile per
+    # statement, `single` mode, executed in `__main__`.
+    import ast as _ast
+    import os as _os
+
+    with open(_os.fsencode(open_filename), "rb") as fp:
+        source = _decode_source(fp.read())
+    tree = _ast.parse(source, filename, "exec")
+    for node in tree.body:
+        yield compile(_ast.Interactive(body=[node]), filename, "single")
+
+
+def _pyrun_interactive(open_filename, filename, loop, filename_is_object):
+    import os as _os
+    import sys as _sys
+
+    try:
+        if filename_is_object:
+            if not isinstance(filename, str):
+                raise TypeError(
+                    "filename must be str, not %s" % type(filename).__name__
+                )
+        elif isinstance(filename, bytes):
+            filename = _os.fsdecode(filename)
+        d = _main_dict()
+        # The REPL prompts go to stderr, as they do in CPython.
+        ps1 = getattr(_sys, "ps1", ">>> ")
+        stmts = _interactive_statements(open_filename, filename)
+        ran = False
+        while True:
+            _sys.stderr.write(str(ps1))
+            _sys.stderr.flush()
+            try:
+                code = next(stmts)
+            except StopIteration:
+                break
+            ran = True
+            exec(code, d, d)
+            if not loop:
+                break
+        if not ran and not loop:
+            # E_EOF on the very first statement.
+            return -1
+        return 0
+    except BaseException:
+        _err_print()
+        # `PyRun_InteractiveLoop` reports and keeps going until EOF;
+        # a single failed statement is all the fixture files hold, so
+        # the loop ends there with E_EOF.
+        return 0 if loop else -1
+
+
+def run_interactiveone(open_filename, filename):
+    return _pyrun_interactive(open_filename, filename, False, False)
+
+
+def run_interactiveoneflags(open_filename, filename, flags=None):
+    return _pyrun_interactive(open_filename, filename, False, False)
+
+
+def run_interactiveoneobject(open_filename, filename, flags=None):
+    return _pyrun_interactive(open_filename, filename, False, True)
+
+
+def run_interactiveloop(open_filename, filename):
+    return _pyrun_interactive(open_filename, filename, True, False)
+
+
+def run_interactiveloopflags(open_filename, filename, flags=None):
+    return _pyrun_interactive(open_filename, filename, True, False)
+
+
+def _pyrun_simple_string(source, flags=None):
+    d = _main_dict()
+    try:
+        exec(compile(_decode_source(source), "<string>", "exec"), d, d)
+    except BaseException:
+        _err_print()
+        return -1
+    return 0
+
+
+def run_simplestring(source):
+    return _pyrun_simple_string(source)
+
+
+def run_simplestringflags(source, flags=None):
+    return _pyrun_simple_string(source, flags)
+
+
+def _compile_string(source, filename, start, flags=0, optimize=-1):
+    import os as _os
+
+    mode = _start_mode(start)
+    if isinstance(filename, bytes):
+        filename = _os.fsdecode(filename)
+    flags = flags or 0
+    if isinstance(source, bytes) and flags & PyCF_IGNORE_COOKIE:
+        source = _decode_source(source)
+    return compile(source, filename, mode, flags & ~PyCF_IGNORE_COOKIE,
+                   optimize=optimize)
+
+
+def run_compilestringflags(source, filename, start, flags=0):
+    return _compile_string(source, filename, start, flags)
+
+
+def run_compilestringexflags(source, filename, start, flags=0, optimize=-1):
+    return _compile_string(source, filename, start, flags, optimize)
+
+
+def run_compilestringobject(source, filename, start, flags=0, optimize=-1):
+    if not isinstance(filename, str):
+        raise TypeError("filename must be str")
+    return _compile_string(source, filename, start, flags, optimize)
 
 
 # ---------------------------------------------------------------------------
@@ -1386,11 +2003,12 @@ class _StructMembers:
             ("T_FLOAT", 0.0),
             ("T_DOUBLE", 0.0),
             ("T_STRING_INPLACE", ""),
+            ("T_LONGLONG", 0),
+            ("T_ULONGLONG", 0),
+            ("T_CHAR", "\0"),
         ]
         if len(args) > len(defaults):
             raise TypeError("too many arguments")
-        object.__setattr__(self, "_T_LONGLONG", 0)
-        object.__setattr__(self, "_T_ULONGLONG", 0)
         for (name, default), value in zip(
             defaults, list(args) + [d for _, d in defaults[len(args) :]]
         ):
@@ -1400,8 +2018,28 @@ class _StructMembers:
                 object.__setattr__(self, "_" + name, float(value))
             elif name == "T_STRING_INPLACE":
                 object.__setattr__(self, "_" + name, str(value))
+            elif name == "T_CHAR":
+                # The C ctor parses it with "c": a length-1 bytes.
+                if isinstance(value, (bytes, bytearray)):
+                    value = bytes(value).decode("latin-1")
+                object.__setattr__(self, "_T_CHAR", str(value))
             else:
                 object.__setattr__(self, "_" + name, int(value))
+
+    @property
+    def T_CHAR(self):
+        return self._T_CHAR
+
+    @T_CHAR.setter
+    def T_CHAR(self, value):
+        # PyMember_SetOne Py_T_CHAR: PyUnicode_AsUTF8AndSize then len == 1.
+        if not isinstance(value, str) or len(value.encode("utf-8")) != 1:
+            raise TypeError("bad argument type for built-in operation")
+        object.__setattr__(self, "_T_CHAR", value)
+
+    @T_CHAR.deleter
+    def T_CHAR(self):
+        raise TypeError("can't delete numeric/char attribute")
 
     @property
     def T_BOOL(self):

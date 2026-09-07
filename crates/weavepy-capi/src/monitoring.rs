@@ -219,6 +219,28 @@ pub unsafe extern "C" fn _PyMonitoring_FireBranchEvent(
     0
 }
 
+/// `(state, codelike, offset, target_offset)` — the 3.14 split of the
+/// (now deprecated) branch event into its taken/not-taken halves.
+#[no_mangle]
+pub unsafe extern "C" fn _PyMonitoring_FireBranchLeftEvent(
+    state: *mut PyMonitoringState,
+    codelike: *mut PyObject,
+    offset: i32,
+    target_offset: *mut PyObject,
+) -> c_int {
+    unsafe { _PyMonitoring_FireBranchEvent(state, codelike, offset, target_offset) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn _PyMonitoring_FireBranchRightEvent(
+    state: *mut PyMonitoringState,
+    codelike: *mut PyObject,
+    offset: i32,
+    target_offset: *mut PyObject,
+) -> c_int {
+    unsafe { _PyMonitoring_FireBranchEvent(state, codelike, offset, target_offset) }
+}
+
 /// `(state, codelike, offset, value)` — `StopIteration`.
 #[no_mangle]
 pub unsafe extern "C" fn _PyMonitoring_FireStopIterationEvent(

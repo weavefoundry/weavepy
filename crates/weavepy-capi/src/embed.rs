@@ -123,7 +123,7 @@ fn flags_from(config: &EmbedConfig) -> InterpreterFlags {
 /// foreign embedder binary whose ancestors carry no landmark —
 /// computes the prefix from the *shared library's* location. The
 /// WS5 twin of that last step is a dladdr probe over this module's
-/// own address: `libpython3.13.{so,dylib}` ships inside the artifact
+/// own address: `libpython3.14.{so,dylib}` ships inside the artifact
 /// at `{prefix}/lib/`, so its on-disk path self-locates the stdlib
 /// for any embedder anywhere on the filesystem. The result is
 /// published through `WEAVEPYHOME`, the resolver's highest-priority
@@ -144,7 +144,7 @@ fn point_stdlib_home(config: &EmbedConfig) {
 }
 
 /// The installation prefix implied by the shared object this code
-/// lives in (`{prefix}/lib/libpython3.13.*` → `{prefix}`), walking
+/// lives in (`{prefix}/lib/libpython3.14.*` → `{prefix}`), walking
 /// ancestors so a statically linked embedder whose exe sits in
 /// `{prefix}/bin` resolves too. `None` when no ancestor carries a
 /// complete stdlib tree — the resolver then falls back to its own
@@ -214,7 +214,15 @@ pub fn initialize(config: Option<EmbedConfig>) -> PyStatus {
                 interp.append_path(std::path::PathBuf::from(p));
             }
         }
-        if let Some(pp) = &config.pythonpath_env {
+        // `config_read_env_vars`: an unset `pythonpath_env` is filled from
+        // `$PYTHONPATH` when the environment is consulted (test_embed
+        // test_init_run_main_module_exitcode finds `-m` targets that way).
+        let env_pythonpath = if config.pythonpath_env.is_none() && config.use_environment {
+            std::env::var("PYTHONPATH").ok().filter(|v| !v.is_empty())
+        } else {
+            None
+        };
+        if let Some(pp) = config.pythonpath_env.as_ref().or(env_pythonpath.as_ref()) {
             let sep = if cfg!(windows) { ';' } else { ':' };
             for p in pp.split(sep).filter(|p| !p.is_empty()) {
                 interp.append_path(std::path::PathBuf::from(p));
@@ -325,7 +333,11 @@ pub fn finalize() -> c_int {
             //    then the Python atexit callbacks. The VM bundles the
             //    two in its shutdown drain, matching CPython's order.
             interp.run_interpreter_shutdown();
-            // 2. The Py_AtExit C table (LIFO, post-Python-atexit).
+            // 2. The Py_AtExit C table (LIFO, post-Python-atexit),
+            //    preceded by the per-interpreter `PyUnstable_AtExit`
+            //    callbacks, which CPython runs at interpreter (not
+            //    runtime) finalization.
+            crate::abi314::run_unstable_atexit();
             run_c_atexit_table();
             // 3. Shutdown finalizers (module-global __del__ etc.).
             interp.run_shutdown_finalizers();
@@ -493,6 +505,37 @@ fn run_main_body(interp: &mut Interpreter, config: &EmbedConfig) -> c_int {
     // No command/module/filename: CPython falls back to stdin (REPL on
     // a tty). The embedding twin reads piped stdin; an interactive
     // embedder wanting the full REPL calls PyRun_InteractiveLoop.
+    //
+    // `pymain_run_stdin` runs `$PYTHONSTARTUP` first (`pymain_run_startup`)
+    // when the environment is consulted; a `SystemExit` raised there ends
+    // the run with its code (test_embed test_init_run_main_startup_exitcode).
+    if config.use_environment {
+        if let Some(startup) = std::env::var_os("PYTHONSTARTUP").filter(|v| !v.is_empty()) {
+            let path = std::path::PathBuf::from(&startup);
+            match std::fs::read_to_string(&path) {
+                Ok(src) => {
+                    let r = exec_in_main(interp, &src, Some(&path.to_string_lossy()));
+                    match &r {
+                        // SystemExit ends the run; any other error is
+                        // reported and the session goes on (CPython
+                        // `pymain_run_startup` -> `pymain_err_print`).
+                        Err(weavepy_vm::RuntimeError::PyException(exc))
+                            if exc.system_exit_code().is_some() =>
+                        {
+                            return conclude(interp, r);
+                        }
+                        Err(_) => {
+                            let _ = conclude(interp, r);
+                        }
+                        Ok(_) => {}
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Could not open PYTHONSTARTUP\n{}: {e}", path.display());
+                }
+            }
+        }
+    }
     use std::io::Read;
     let mut buf = String::new();
     if std::io::stdin().read_to_string(&mut buf).is_ok() && !buf.is_empty() {
@@ -631,6 +674,21 @@ unsafe fn call_xxsubinterpreters(method: &str, args: &[Object]) -> Option<Object
         .borrow()
         .get(&DictKey(Object::from_str(method.to_owned())))
         .cloned()?;
+    // Drive the registry from the *main* (owned) interpreter, never from
+    // whatever `LAST_INTERPRETER` was left pointing at: a `PyRun_*` routed
+    // into a sub-interpreter can leave that sub-interpreter as the "last
+    // seen" one, and `destroy` invoked *on* the interpreter being
+    // destroyed publishes a pointer that the teardown then frees
+    // (test_embed test_repeated_init_and_subinterpreters segfaulted at
+    // the first `Py_EndInterpreter`).
+    if let Some(main) = owned_interpreter() {
+        // SAFETY: `OWNED` is live between `Py_Initialize*` and
+        // `Py_FinalizeEx`, which is the only window this is reachable in
+        // (`is_initialized()` is checked by every caller); the GIL keeps
+        // the access exclusive.
+        let interp = unsafe { &mut *main };
+        return interp.call_object(func, args, &[]).ok();
+    }
     crate::interp::with_interp_mut(|interp| interp.call_object(func, args, &[]).ok())?
 }
 

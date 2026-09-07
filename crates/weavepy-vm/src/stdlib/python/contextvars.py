@@ -24,8 +24,11 @@ __all__ = ["ContextVar", "Context", "Token", "copy_context"]
 import _thread
 
 # `ContextVar[int]` yields a `types.GenericAlias` (CPython exposes this on
-# the C `ContextVar`). `types` only imports `sys`, so this is safe here.
-from types import GenericAlias as _GenericAlias
+# the C `ContextVar`). Spelled like `_collections_abc` does rather than
+# `from types import GenericAlias`: this module loads at startup (via
+# `_warnings`), and `types` must not be in `sys.modules` after
+# `python -I -c pass` (test_site.test_startup_imports).
+_GenericAlias = type(list[int])
 
 
 class _TokenMissing:
@@ -86,6 +89,15 @@ class Token:
     def __repr__(self):
         used = " used" if self._used else ""
         return f"<Token{used} var={self._var!r} at {id(self):#x}>"
+
+    # 3.14 (gh-129889): Token is a context manager; leaving the block
+    # resets the variable to the value it held before ``set()``.
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self._var.reset(self)
+        return None
 
 
 class ContextVar:
@@ -187,6 +199,8 @@ class Context:
         prev = _STATES.get(ident)
         self._entered = True
         _STATES[ident] = self
+        if _switch_hook is not None:
+            _switch_hook(self)
         try:
             return callable_(*args, **kwargs)
         finally:
@@ -195,6 +209,8 @@ class Context:
                 _STATES.pop(ident, None)
             else:
                 _STATES[ident] = prev
+            if _switch_hook is not None:
+                _switch_hook(prev)
 
     def copy(self):
         new = Context()
@@ -285,6 +301,8 @@ def _enter_context(ctx):
     _C_PREV[id(ctx)] = _STATES.get(ident)
     ctx._entered = True
     _STATES[ident] = ctx
+    if _switch_hook is not None:
+        _switch_hook(ctx)
 
 
 def _exit_context(ctx):
@@ -300,6 +318,35 @@ def _exit_context(ctx):
         _STATES.pop(ident, None)
     else:
         _STATES[ident] = prev
+    if _switch_hook is not None:
+        _switch_hook(prev)
+
+
+# --- context watchers (PyContext_AddWatcher, 3.14) -------------------------
+#
+# `Py_CONTEXT_SWITCHED` fires after every enter and exit with the context
+# that just became current (`None` when the stack unwinds to empty). The
+# hook is `None` unless `_testcapi`'s watcher fixture is installed, so the
+# steady-state cost is one global load per switch.
+
+_switch_hook = None
+
+
+def _set_switch_hook(hook):
+    global _switch_hook
+    _switch_hook = hook
+
+
+def _clear_context_stack():
+    # `clear_context_stack` in Modules/_testcapi/watchers.c: drop the
+    # thread's base context so the next switch reports `None` on exit.
+    ident = _thread.get_ident()
+    ctx = _STATES.get(ident)
+    if ctx is None:
+        return
+    if ctx._entered:
+        raise RuntimeError("must first exit all non-base contexts")
+    _STATES.pop(ident, None)
 
 
 import _collections_abc  # noqa: E402  (3.14: Context is a virtual Mapping)

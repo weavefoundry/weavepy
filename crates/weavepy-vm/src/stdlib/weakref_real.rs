@@ -1218,21 +1218,18 @@ fn make_ref_object_with_class(
     // test_callback_in_cycle_resurrection). Callback-less wrappers stay
     // untracked, as in CPython.
     //
-    // We narrow CPython's rule for throughput: a callback that is a
-    // builtin or a closure-free plain function can only route a cycle
-    // through its module globals, which stay alive until interpreter
-    // shutdown anyway — while `WeakValueDictionary`/`WeakSet` mint one
-    // closure-free `_remove` callback ref per entry, so tracking those
-    // would put the whole population (70k in test_weakref's threaded
-    // copy tests) on the collector's candidate list. Instances (a
-    // `weakref.finalize` object is its own callback), bound methods and
-    // closures — the shapes that can actually close a user-visible
-    // cycle — are tracked.
-    let callback_can_cycle = match &callback {
-        None | Some(Object::Builtin(_)) => false,
-        Some(Object::Function(f)) => !f.closure.is_empty(),
-        Some(_) => true,
-    };
+    // We narrow CPython's rule only for builtin callbacks, which hold no
+    // Python edges at all. A plain function callback — closure or not —
+    // routes a cycle through its `__globals__`, and that namespace is
+    // *not* guaranteed to live until shutdown: an `exec()` namespace, a
+    // `types.ModuleType` built at runtime, or every module of a closed
+    // sub-interpreter dies with its last reference, and an untracked
+    // wrapper's strong `__callback__` edge would count as an external
+    // root that pins `cb -> __globals__ -> ...` forever (logging's
+    // `_removeHandlerRef` refs alone kept a destroyed sub-interpreter's
+    // whole module graph alive). Instances (a `weakref.finalize` object
+    // is its own callback) and bound methods are tracked as well.
+    let callback_can_cycle = !matches!(&callback, None | Some(Object::Builtin(_)));
     if callback_can_cycle {
         crate::gc_trace::track(wrapper.clone());
     }

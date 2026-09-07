@@ -352,6 +352,16 @@ fn watchers_set_dispatch(args: &[Object]) -> Result<Object, RuntimeError> {
     let (Some(d), Some(t), Some(f)) = (args.first(), args.get(1), args.get(2)) else {
         return Err(system_error("_watchers_set_dispatch: expected 3 callables"));
     };
+    // The dispatchers are process-wide, and the fixture registers them
+    // at import. A sub-interpreter importing `_testcapi`
+    // (test_misc.SubinterpreterTest runs `_testcapi.config_set` in one)
+    // must not swap the main interpreter's dispatchers for its own
+    // function objects: once it is torn down those are dead and every
+    // later watcher event in the main interpreter would go nowhere
+    // (test_watchers ran after test_misc and saw `[]` for every event).
+    if crate::builtins::reentrant_interp().is_ok_and(|i| i.is_subinterpreter.get()) {
+        return Ok(Object::None);
+    }
     crate::capi_watchers::set_dispatchers(d.clone(), t.clone(), f.clone());
     Ok(Object::None)
 }
@@ -427,6 +437,143 @@ fn set_func_watchers_active(args: &[Object]) -> Result<Object, RuntimeError> {
     let active = args.first().is_some_and(|o| o.is_truthy());
     crate::capi_watchers::set_funcs_active(active);
     Ok(Object::None)
+}
+
+/// `_replace_sys_flags(name, value)`: the `PyConfig_Set()` (PEP 741)
+/// side effect on `sys.flags`. CPython rebuilds the struct sequence
+/// (`_PySys_UpdateConfig`), so the fixture's `sys.flags is not old_flags`
+/// check holds; every other field is carried over unchanged.
+fn replace_sys_flags_native(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Str(name), value] = args else {
+        return Err(system_error("_replace_sys_flags: expected (name, value)"));
+    };
+    let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() else {
+        return Err(system_error("_replace_sys_flags: no current interpreter"));
+    };
+    // SAFETY: the pointer was published by an enclosing VM frame still
+    // live on this thread; the GIL keeps the access exclusive.
+    let interp = unsafe { &*ptr };
+    let sys = interp
+        .cache
+        .modules
+        .borrow()
+        .get(&DictKey(Object::from_static("sys")))
+        .cloned();
+    let Some(Object::Module(sys)) = sys else {
+        return Err(system_error("_replace_sys_flags: sys is not loaded"));
+    };
+    let old = sys
+        .dict
+        .borrow()
+        .get(&DictKey(Object::from_static("flags")))
+        .cloned();
+    let Some(Object::Instance(old_inst)) = old else {
+        return Err(system_error(
+            "_replace_sys_flags: sys.flags is not a struct sequence",
+        ));
+    };
+    let name = name.to_string();
+    let known = crate::stdlib::sys::SYS_FLAGS_FIELDS
+        .iter()
+        .chain(crate::stdlib::sys::SYS_FLAGS_HIDDEN.iter())
+        .any(|f| *f == name);
+    if !known {
+        return Err(crate::error::value_error(format!(
+            "unknown sys.flags field: {name}"
+        )));
+    }
+    let lookup = |field: &str| -> Object {
+        if field == name {
+            return value.clone();
+        }
+        old_inst
+            .dict
+            .borrow()
+            .get(&crate::object::StrKey(field))
+            .cloned()
+            .unwrap_or(Object::Int(0))
+    };
+    let values: Vec<Object> = crate::stdlib::sys::SYS_FLAGS_FIELDS
+        .iter()
+        .map(|f| lookup(f))
+        .collect();
+    let hidden: Vec<(&'static str, Object)> = crate::stdlib::sys::SYS_FLAGS_HIDDEN
+        .iter()
+        .map(|f| (*f, lookup(f)))
+        .collect();
+    let fresh = crate::stdlib::os::struct_seq_instance(
+        old_inst.cls(),
+        crate::stdlib::sys::SYS_FLAGS_FIELDS,
+        values,
+    );
+    if let Object::Instance(inst) = &fresh {
+        let mut d = inst.dict.borrow_mut();
+        for (k, v) in hidden {
+            d.insert(DictKey(Object::from_static(k)), v);
+        }
+    }
+    sys.dict
+        .borrow_mut()
+        .insert(DictKey(Object::from_static("flags")), fresh);
+    Ok(Object::None)
+}
+
+/// `get_configs()`: the `{'global_config': {...}, ...}` dump test_config
+/// and test_embed read; assembled in the frozen `_testcapi` from the
+/// live `sys.flags` (the `Py_*Flag` globals mirror them).
+fn get_configs_native(args: &[Object]) -> Result<Object, RuntimeError> {
+    frozen_call("_testcapi", "_get_configs", args, &[])
+}
+
+/// `is_static_immortal(obj)` (`_Py_IsStaticImmortal`): the statically
+/// allocated singletons, small ints, and static types.
+fn is_static_immortal_native(args: &[Object]) -> Result<Object, RuntimeError> {
+    frozen_call("_testcapi", "_is_static_immortal", args, &[])
+}
+
+// 3.14 mixed-mode complex arithmetic (`_Py_cr_*` / `_Py_rc_*`,
+// Objects/complexobject.c; test_capi.test_complex). The frozen
+// `_weave_capi_num` fixture carries the exact per-component semantics.
+fn py_cr_sum_native(args: &[Object]) -> Result<Object, RuntimeError> {
+    frozen_call("_weave_capi_num", "_py_cr_sum", args, &[])
+}
+
+fn py_cr_diff_native(args: &[Object]) -> Result<Object, RuntimeError> {
+    frozen_call("_weave_capi_num", "_py_cr_diff", args, &[])
+}
+
+fn py_rc_diff_native(args: &[Object]) -> Result<Object, RuntimeError> {
+    frozen_call("_weave_capi_num", "_py_rc_diff", args, &[])
+}
+
+fn py_cr_prod_native(args: &[Object]) -> Result<Object, RuntimeError> {
+    frozen_call("_weave_capi_num", "_py_cr_prod", args, &[])
+}
+
+fn py_cr_quot_native(args: &[Object]) -> Result<Object, RuntimeError> {
+    frozen_call("_weave_capi_num", "_py_cr_quot", args, &[])
+}
+
+fn py_rc_quot_native(args: &[Object]) -> Result<Object, RuntimeError> {
+    frozen_call("_weave_capi_num", "_py_rc_quot", args, &[])
+}
+
+/// `_set_cpu_count_override(n)`: `PyConfig_Set("cpu_count", n)`; `n <= 0`
+/// restores the platform count (`-X cpu_count=default`).
+fn set_cpu_count_override_native(args: &[Object]) -> Result<Object, RuntimeError> {
+    let Some(Object::Int(n)) = args.first() else {
+        return Err(system_error("_set_cpu_count_override: expected an int"));
+    };
+    crate::vm_singletons::set_cpu_count_override((*n).max(0));
+    Ok(Object::None)
+}
+
+/// `_cpu_count_override()`: the live `cpu_count` config value (-1 when
+/// the platform count is in effect, as `PyConfig.cpu_count` reports).
+fn cpu_count_override_native(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::Int(
+        crate::vm_singletons::cpu_count_override().unwrap_or(-1),
+    ))
 }
 
 /// Unwrap the native set/frozenset payload behind `obj` — the object
@@ -911,6 +1058,175 @@ fn type_attr_version(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
+/// `_testinternalcapi.get_static_builtin_types()` (3.14,
+/// `test.support.iter_builtin_types`): the interpreter-created
+/// (`Py_TPFLAGS_STATIC_BUILTIN`) types. WeavePy's analogue is every
+/// `is_builtin` type reachable from the `builtins` namespace, in
+/// declaration order — `ExceptionGroup` is a heap type in CPython and is
+/// omitted the same way.
+fn get_static_builtin_types(args: &[Object]) -> Result<Object, RuntimeError> {
+    if !args.is_empty() {
+        return Err(crate::error::type_error(
+            "get_static_builtin_types() takes no arguments",
+        ));
+    }
+    let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
+        RuntimeError::Internal("_testinternalcapi: no running interpreter".to_owned())
+    })?;
+    // SAFETY: published by an enclosing VM frame still live on this
+    // thread; the GIL keeps the access exclusive.
+    let vm = unsafe { &mut *ptr };
+    let builtins = vm.builtins_dict();
+    let mut seen: Vec<*const crate::types::TypeObject> = Vec::new();
+    let mut out = Vec::new();
+    for value in builtins.borrow().values() {
+        let Object::Type(t) = value else { continue };
+        if !t.flags.is_builtin || t.name == "ExceptionGroup" {
+            continue;
+        }
+        let p = Rc::as_ptr(t);
+        if seen.contains(&p) {
+            continue;
+        }
+        seen.push(p);
+        out.push(value.clone());
+    }
+    Ok(Object::new_list(out))
+}
+
+/// `_testinternalcapi.get_tracked_heap_size()` (3.14, `gcstate->heap_size`):
+/// the number of GC-tracked objects alive right now — every generation plus
+/// the permanent (frozen) one. A fresh `[]` bumps it by exactly one and its
+/// `del` drops it back (`test_gc.test_heap_size`).
+fn get_tracked_heap_size(_args: &[Object]) -> Result<Object, RuntimeError> {
+    let total =
+        crate::gc_trace::with_state(|s| s.counts().iter().sum::<usize>() + s.freeze_count());
+    Ok(Object::Int(total as i64))
+}
+
+/// `_testinternalcapi.incref_decref_delayed(obj)` (3.14, gh-130519):
+/// `Py_INCREF` followed by `_PyObject_XDecRefDelayed`, the free-threaded
+/// build's QSBR-deferred release. The pair is refcount-neutral for the
+/// caller and the deferred drop runs the destructor from a later safe
+/// point; with the caller's reference still live here the delayed
+/// decref has nothing to finalize, so the observable behaviour (the
+/// object dies when the caller's last reference goes) is the same.
+fn incref_decref_delayed(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() != 1 {
+        return Err(crate::error::type_error(format!(
+            "incref_decref_delayed() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+    Ok(Object::None)
+}
+
+/// `_testinternalcapi.identify_type_slot_wrappers()` (3.14): the dunder
+/// names of CPython's `slotdefs` table (`Objects/typeobject.c`), with the
+/// same duplicates for slots that map to two C-level slots. `test.support`
+/// dedupes it into the list of attributes it probes for slot wrappers.
+fn identify_type_slot_wrappers(_args: &[Object]) -> Result<Object, RuntimeError> {
+    const NAMES: &[&str] = &[
+        "__getattribute__",
+        "__getattr__",
+        "__setattr__",
+        "__delattr__",
+        "__repr__",
+        "__hash__",
+        "__call__",
+        "__str__",
+        "__getattribute__",
+        "__getattr__",
+        "__setattr__",
+        "__delattr__",
+        "__lt__",
+        "__le__",
+        "__eq__",
+        "__ne__",
+        "__gt__",
+        "__ge__",
+        "__iter__",
+        "__next__",
+        "__get__",
+        "__set__",
+        "__delete__",
+        "__init__",
+        "__new__",
+        "__del__",
+        "__await__",
+        "__aiter__",
+        "__anext__",
+        "__add__",
+        "__radd__",
+        "__sub__",
+        "__rsub__",
+        "__mul__",
+        "__rmul__",
+        "__mod__",
+        "__rmod__",
+        "__divmod__",
+        "__rdivmod__",
+        "__pow__",
+        "__rpow__",
+        "__neg__",
+        "__pos__",
+        "__abs__",
+        "__bool__",
+        "__invert__",
+        "__lshift__",
+        "__rlshift__",
+        "__rshift__",
+        "__rrshift__",
+        "__and__",
+        "__rand__",
+        "__xor__",
+        "__rxor__",
+        "__or__",
+        "__ror__",
+        "__int__",
+        "__float__",
+        "__iadd__",
+        "__isub__",
+        "__imul__",
+        "__imod__",
+        "__ipow__",
+        "__ilshift__",
+        "__irshift__",
+        "__iand__",
+        "__ixor__",
+        "__ior__",
+        "__floordiv__",
+        "__rfloordiv__",
+        "__truediv__",
+        "__rtruediv__",
+        "__ifloordiv__",
+        "__itruediv__",
+        "__index__",
+        "__matmul__",
+        "__rmatmul__",
+        "__imatmul__",
+        "__len__",
+        "__getitem__",
+        "__setitem__",
+        "__delitem__",
+        "__len__",
+        "__add__",
+        "__mul__",
+        "__rmul__",
+        "__getitem__",
+        "__setitem__",
+        "__delitem__",
+        "__contains__",
+        "__iadd__",
+        "__imul__",
+        "__buffer__",
+        "__release_buffer__",
+    ];
+    Ok(Object::new_list(
+        NAMES.iter().map(|n| Object::from_static(n)).collect(),
+    ))
+}
+
 /// `_testcapi.fatal_error(message, release_gil=False)`: invoke
 /// `Py_FatalError` with the C-side function name CPython's helper reports
 /// (`_testcapi_fatal_error_impl`). Never returns — the process dumps a
@@ -1034,61 +1350,27 @@ fn run_in_subinterp_with_config(args: &[Object]) -> Result<Object, RuntimeError>
     run_code_in_fresh_subinterp(&code, cfg, 3)
 }
 
-/// `_testinternalcapi.get_crossinterp_data(obj)` — CPython runs the
-/// object through `_PyObject_GetCrossInterpreterData`: only PEP 684
-/// shareable values convert. The returned "data" here is the
-/// value-decoupled rebuild itself (fresh allocations for
-/// str/bytes/tuples, mirroring the XID buffer copy), which
-/// `restore_crossinterp_data` rebuilds again (test__interpreters
-/// ShareableTypeTests round-trips and type-checks the result).
-fn get_crossinterp_data(args: &[Object]) -> Result<Object, RuntimeError> {
-    let obj = args.first().cloned().unwrap_or(Object::None);
-    xid_convert(&obj)
+/// `_testinternalcapi.get_crossinterp_data(obj, mode=None)`: CPython
+/// runs the object through the `Python/crossinterp.c` codec the `mode`
+/// names ("xidata", "fallback", "pickle", "marshal", "code", "func",
+/// "script", "script-pure") and hands back a capsule around the
+/// `_PyXIData_t`. The codecs are ported in the frozen `_weave_xidata`
+/// (the same module PEP 734 `_interpreters.call`, queues, and channels
+/// convert through), so this entry just delegates: mode parsing, the
+/// `NotShareableError` wrapping with the right `__cause__`, and the
+/// opaque `XIData` handle all live there (test_crossinterp).
+fn get_crossinterp_data(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
+    frozen_call("_weave_xidata", "get_crossinterp_data", args, kwargs)
 }
 
-/// `_testinternalcapi.restore_crossinterp_data(xid)` — rebuild the
-/// object from its cross-interpreter representation.
+/// `_testinternalcapi.restore_crossinterp_data(xid)`: rebuild the
+/// object from the handle `get_crossinterp_data` returned
+/// (`_PyXIData_NewObject`), again in `_weave_xidata`.
 fn restore_crossinterp_data(args: &[Object]) -> Result<Object, RuntimeError> {
-    let obj = args
-        .first()
-        .ok_or_else(|| crate::error::type_error("restore_crossinterp_data: missing data"))?;
-    xid_convert(obj)
-}
-
-fn xid_convert(obj: &Object) -> Result<Object, RuntimeError> {
-    use num_traits::ToPrimitive;
-    Ok(match obj {
-        Object::None => Object::None,
-        Object::Bool(b) => Object::Bool(*b),
-        Object::Int(i) => Object::Int(*i),
-        // `_PyLong_AsSsize_t` bound: ints beyond C Py_ssize_t don't
-        // convert (ShareableTypeTests.test_non_shareable_int expects
-        // OverflowError for sys.maxsize + 1).
-        Object::Long(l) => match l.to_i64() {
-            Some(i) => Object::Int(i),
-            None => {
-                return Err(crate::error::overflow_error(
-                    "Python int too large to convert to C ssize_t",
-                ))
-            }
-        },
-        Object::Float(f) => Object::Float(*f),
-        Object::Str(s) => Object::from_str(s.to_string()),
-        Object::Bytes(b) => Object::Bytes(Rc::from(&b[..])),
-        Object::Tuple(items) => {
-            let mut out = Vec::with_capacity(items.len());
-            for it in items.iter() {
-                out.push(xid_convert(it)?);
-            }
-            Object::new_tuple(out)
-        }
-        other => {
-            return Err(crate::error::value_error(format!(
-                "{} does not support cross-interpreter data",
-                other.type_name()
-            )))
-        }
-    })
+    frozen_call("_weave_xidata", "restore_crossinterp_data", args, &[])
 }
 
 /// Raise `_interpreters.InterpreterError` (the class the graded tests
@@ -1592,8 +1874,8 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "get_crossinterp_data",
                 binds_instance: false,
-                call: Box::new(get_crossinterp_data),
-                call_kw: None,
+                call: Box::new(|args| get_crossinterp_data(args, &[])),
+                call_kw: Some(Box::new(get_crossinterp_data)),
             })),
         );
         d.insert(
@@ -1670,6 +1952,18 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             ("_unwatch_type", unwatch_type_native),
             ("_clear_type_watcher", clear_type_watcher_native),
             ("_set_func_watchers_active", set_func_watchers_active),
+            // PEP 741 `PyConfig_Set()` side effects (test_capi.test_config).
+            ("_replace_sys_flags", replace_sys_flags_native),
+            ("_set_cpu_count_override", set_cpu_count_override_native),
+            ("_cpu_count_override", cpu_count_override_native),
+            ("get_configs", get_configs_native),
+            ("is_static_immortal", is_static_immortal_native),
+            ("_py_cr_sum", py_cr_sum_native),
+            ("_py_cr_diff", py_cr_diff_native),
+            ("_py_rc_diff", py_rc_diff_native),
+            ("_py_cr_prod", py_cr_prod_native),
+            ("_py_cr_quot", py_cr_quot_native),
+            ("_py_rc_quot", py_rc_quot_native),
             // PyMem debug-hook fixtures (test_capi.test_mem); the
             // `pymem_*` names are re-exported by the frozen `_testcapi`.
             ("pymem_buffer_overflow", pymem_buffer_overflow),
@@ -1805,6 +2099,42 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 name: "_type_attr_version",
                 binds_instance: false,
                 call: Box::new(type_attr_version),
+                call_kw: None,
+            })),
+        );
+        d.insert(
+            DictKey(Object::from_static("get_static_builtin_types")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "get_static_builtin_types",
+                binds_instance: false,
+                call: Box::new(get_static_builtin_types),
+                call_kw: None,
+            })),
+        );
+        d.insert(
+            DictKey(Object::from_static("identify_type_slot_wrappers")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "identify_type_slot_wrappers",
+                binds_instance: false,
+                call: Box::new(identify_type_slot_wrappers),
+                call_kw: None,
+            })),
+        );
+        d.insert(
+            DictKey(Object::from_static("get_tracked_heap_size")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "get_tracked_heap_size",
+                binds_instance: false,
+                call: Box::new(get_tracked_heap_size),
+                call_kw: None,
+            })),
+        );
+        d.insert(
+            DictKey(Object::from_static("incref_decref_delayed")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "incref_decref_delayed",
+                binds_instance: false,
+                call: Box::new(incref_decref_delayed),
                 call_kw: None,
             })),
         );

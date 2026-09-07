@@ -40,7 +40,12 @@ pub struct ActiveContext {
 /// extension callbacks (dunder shims, class methods) can find a
 /// VM even after `body` returns.
 pub fn with_active<R>(ctx: ActiveContext, body: impl FnOnce() -> R) -> R {
-    if !ctx.interp.is_null() {
+    // In an embedding host (`Py_Initialize*`) the fallback pointer stays
+    // pinned to the owned main interpreter: a bridged call made while a
+    // `Py_NewInterpreter` sub-interpreter is current must not leave the
+    // cache pointing at an interpreter `Py_EndInterpreter` is about to
+    // drop (test_embed test_repeated_init_and_subinterpreters).
+    if !ctx.interp.is_null() && crate::embed::owned_interpreter().is_none() {
         LAST_INTERPRETER.store(ctx.interp, Ordering::SeqCst);
     }
     ACTIVE.with(|cell| {

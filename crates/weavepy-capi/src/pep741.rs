@@ -77,7 +77,7 @@ pub extern "C" fn PyInitConfig_Create() -> *mut PyInitConfig {
         configure_locale: 0,
         coerce_c_locale: 0,
         coerce_c_locale_warn: 0,
-        utf8_mode: 1,
+        utf8_mode: 0, // `PyPreConfig_InitIsolatedConfig`
         allocator: 0,
         gil: None,
         modules: Vec::new(),
@@ -696,8 +696,9 @@ pub unsafe extern "C" fn Py_InitializeFromInitConfig(config: *mut PyInitConfig) 
 
 unsafe fn store_status(c: &mut PyInitConfig, status: PyStatus) -> c_int {
     if status._type == _PyStatus_TYPE_EXIT {
+        // CPython's `initconfig_set_status`: "exit code %i".
         c.exitcode = Some(status.exitcode);
-        return c.set_error("Python exit");
+        return c.set_error(&format!("exit code {}", status.exitcode));
     }
     if status._type == _PyStatus_TYPE_ERROR {
         let msg = if status.err_msg.is_null() {

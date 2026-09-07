@@ -381,7 +381,9 @@ impl<'src> Parser<'src> {
     /// token.
     fn apply_poison(&mut self, result: Result<Module, ParseError>) -> Result<Module, ParseError> {
         let Err(err) = result else { return result };
-        let Some(fail) = self.poison else { return Err(err) };
+        let Some(fail) = self.poison else {
+            return Err(err);
+        };
         let stop = self.first_fail.unwrap_or(self.pos);
         if stop != fail || !matches!(err, ParseError::Unexpected { .. }) {
             return Err(err);
@@ -404,7 +406,8 @@ impl<'src> Parser<'src> {
             // after it — and, through a `','.x+` loop, each further
             // comma-separated element's follower.
             let mut i = pos;
-            let starts_expr = |i: usize| self.tokens.get(i).is_some_and(|t| stop_token(t).expr_start);
+            let starts_expr =
+                |i: usize| self.tokens.get(i).is_some_and(|t| stop_token(t).expr_start);
             // A memo-poisoned failure ran no `invalid_*` rule that would
             // have looked past the stop token.
             if !self.poisoned && starts_expr(i) {
@@ -478,13 +481,12 @@ impl<'src> Parser<'src> {
             // for is named (`expected ':'`, `expected '('`); a missing
             // NAME or other token is the bare generic error.
             let named = matches!(what, "`:`" | "`(`" | "'('");
-            let message = if named
-                && matches!(self.peek(), TokenKind::Newline | TokenKind::Endmarker)
-            {
-                format!("expected {}", what.replace('`', "'"))
-            } else {
-                "invalid syntax".to_owned()
-            };
+            let message =
+                if named && matches!(self.peek(), TokenKind::Newline | TokenKind::Endmarker) {
+                    format!("expected {}", what.replace('`', "'"))
+                } else {
+                    "invalid syntax".to_owned()
+                };
             Err(ParseError::Unexpected {
                 span: self.peek_token().span,
                 message,
@@ -1919,7 +1921,9 @@ impl<'src> Parser<'src> {
         }
         self.expect(&TokenKind::Colon, "`:`")?;
         let body = self.parse_block("class definition", class_tok.span)?;
-        let span_end = body.last().map_or(class_tok.span, |s| self.block_end(s.span));
+        let span_end = body
+            .last()
+            .map_or(class_tok.span, |s| self.block_end(s.span));
         let span = class_tok.span.merge(span_end);
         Ok(Stmt {
             kind: StmtKind::ClassDef {
@@ -2040,7 +2044,9 @@ impl<'src> Parser<'src> {
                 },
                 exc_tok.span,
             )?;
-            let span_end = handler_body.last().map_or(exc_tok.span, |s| self.block_end(s.span));
+            let span_end = handler_body
+                .last()
+                .map_or(exc_tok.span, |s| self.block_end(s.span));
             handlers.push(ExceptHandler {
                 type_,
                 name,
@@ -3043,7 +3049,9 @@ impl<'src> Parser<'src> {
         };
         self.expect(&TokenKind::Colon, "`:`")?;
         let body = self.parse_block("'case' statement", case_tok.span)?;
-        let span_end = body.last().map_or(case_tok.span, |s| self.block_end(s.span));
+        let span_end = body
+            .last()
+            .map_or(case_tok.span, |s| self.block_end(s.span));
         Ok(MatchCase {
             pattern,
             guard,
@@ -4523,7 +4531,9 @@ impl<'src> Parser<'src> {
                     let e = match self.parse_ternary() {
                         Ok(e) => e,
                         Err(_) if seen_keyword => {
-                            return Err(self.positional_after_keyword(positional_tok.span, seen_kw_unpack));
+                            return Err(
+                                self.positional_after_keyword(positional_tok.span, seen_kw_unpack)
+                            );
                         }
                         Err(e) => return Err(e),
                     };
@@ -4592,7 +4602,9 @@ impl<'src> Parser<'src> {
                             });
                         }
                     } else if seen_keyword {
-                        return Err(self.positional_after_keyword(positional_tok.span, seen_kw_unpack));
+                        return Err(
+                            self.positional_after_keyword(positional_tok.span, seen_kw_unpack)
+                        );
                     } else {
                         args.push(e);
                     }
@@ -5412,7 +5424,9 @@ impl<'src> Parser<'src> {
         let at_expr_entry = self.pos == self.expr_entry;
         let at_target_entry = self.pos == self.target_entry;
         self.bump();
-        if at_expr_entry && !first_prefix.interpolated() && !matches!(self.peek(), TokenKind::String)
+        if at_expr_entry
+            && !first_prefix.interpolated()
+            && !matches!(self.peek(), TokenKind::String)
         {
             let target_first =
                 at_target_entry && matches!(self.peek(), TokenKind::LPar | TokenKind::LSqb);
@@ -5649,6 +5663,7 @@ impl<'src> Parser<'src> {
     /// doubled-brace escapes: in a spec every `{` opens a nested
     /// replacement field (CPython rejects `f'{3:{{>10}'` with "expecting
     /// a valid expression after '{'").
+    #[allow(clippy::too_many_arguments)]
     fn parse_fstring_body_inner(
         &self,
         body: &str,
@@ -5933,6 +5948,7 @@ impl<'src> Parser<'src> {
     /// Parse one `expr[!conv][:spec]` field and return a
     /// `FormattedValue` (possibly preceded by a synthetic literal
     /// for `{x = }` debug form).
+    #[allow(clippy::too_many_arguments)]
     fn parse_fstring_field(
         &self,
         field: &str,
@@ -6251,7 +6267,9 @@ impl<'src> Parser<'src> {
                 // so `t"{ a }"` reports `' a'` and `t"{a = }"` reports `'a'`.
                 ExprKind::Interpolation {
                     value: Box::new(value),
-                    text: clean.trim_end_matches(|c: char| ws(c) || c == '=').to_owned(),
+                    text: clean
+                        .trim_end_matches(|c: char| ws(c) || c == '=')
+                        .to_owned(),
                     conversion,
                     format_spec,
                 }

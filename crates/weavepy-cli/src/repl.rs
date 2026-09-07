@@ -103,6 +103,7 @@ impl Repl {
         if !self.quiet {
             self.print_banner();
         }
+        self.warn_dumb_terminal();
         if let Some(p) = startup {
             self.run_startup(p);
         }
@@ -124,6 +125,24 @@ impl Repl {
             if !d.contains_key(&key) {
                 d.insert(key, Object::Str(Rc::from(value.as_str())));
             }
+        }
+    }
+
+    /// 3.14's `_pyrepl.main.interactive_console`: on a tty whose
+    /// terminfo lacks the capabilities pyrepl needs (`TERM=dumb`), it
+    /// warns once on stderr and falls back to the basic REPL, unless
+    /// `PYTHON_BASIC_REPL` asked for that explicitly. Our line editor is
+    /// native, but the fallback notice is part of the observable contract
+    /// (test_pyrepl `TestDumbTerminal`).
+    fn warn_dumb_terminal(&self) {
+        if !self.stdin_tty || std::env::var_os("PYTHON_BASIC_REPL").is_some() {
+            return;
+        }
+        if std::env::var("TERM").map(|t| t == "dumb").unwrap_or(false) {
+            let _ = writeln!(
+                io::stderr(),
+                "warning: can't use pyrepl: (5, \"terminal doesn't have the required clear capability\"); TERM=dumb"
+            );
         }
     }
 

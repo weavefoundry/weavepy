@@ -48,7 +48,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     let eb = b("encode_basestring", json_encode_basestring);
     let eba = b("encode_basestring_ascii", json_encode_basestring_ascii);
     let mk_scanner = b("make_scanner", json_make_scanner);
-    let mk_encoder = b("make_encoder", json_make_encoder);
+    let mk_encoder = bkw("make_encoder", json_make_encoder);
 
     // `__module__ == "_json"` for each public function — `test_json`'s
     // `TestCTest.test_cjson` and `test_speedups` assert exactly this.
@@ -1017,13 +1017,61 @@ fn obj_to_string(o: &Object) -> Option<String> {
         .map(|cps| cps.iter().filter_map(|&c| char::from_u32(c)).collect())
 }
 
-fn json_make_encoder(args: &[Object]) -> Result<Object, RuntimeError> {
-    if args.len() != 9 {
+/// Parameter names of `_json.make_encoder`, in clinic order — it is
+/// positional-or-keyword (test_speedups.test_current_indent_level builds
+/// one with keywords only).
+const MAKE_ENCODER_PARAMS: [&str; 9] = [
+    "markers",
+    "default",
+    "encoder",
+    "indent",
+    "key_separator",
+    "item_separator",
+    "sort_keys",
+    "skipkeys",
+    "allow_nan",
+];
+
+fn json_make_encoder(
+    positional: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
+    if positional.len() > 9 {
         return Err(type_error(format!(
-            "make_encoder() takes exactly 9 arguments ({} given)",
-            args.len()
+            "make_encoder() takes at most 9 arguments ({} given)",
+            positional.len()
         )));
     }
+    let mut bound: Vec<Option<Object>> = positional.iter().cloned().map(Some).collect();
+    bound.resize(9, None);
+    for (k, v) in kwargs {
+        let Some(idx) = MAKE_ENCODER_PARAMS.iter().position(|p| p == k) else {
+            return Err(type_error(format!(
+                "make_encoder() got an unexpected keyword argument '{k}'"
+            )));
+        };
+        if bound[idx].is_some() {
+            return Err(type_error(format!(
+                "argument for make_encoder() given by name ('{k}') and position ({})",
+                idx + 1
+            )));
+        }
+        bound[idx] = Some(v.clone());
+    }
+    let mut args: Vec<Object> = Vec::with_capacity(9);
+    for (i, slot) in bound.into_iter().enumerate() {
+        match slot {
+            Some(v) => args.push(v),
+            None => {
+                return Err(type_error(format!(
+                    "make_encoder() missing required argument '{}' (pos {})",
+                    MAKE_ENCODER_PARAMS[i],
+                    i + 1
+                )))
+            }
+        }
+    }
+    let args = &args[..];
     let markers = args[0].clone();
     match &markers {
         Object::None | Object::Dict(_) => {}
@@ -1078,10 +1126,29 @@ fn encoder_call(cfg: &EncoderCfg, args: &[Object]) -> Result<Object, RuntimeErro
         .first()
         .cloned()
         .ok_or_else(|| type_error("encoder missing 'obj' argument"))?;
+    // `_current_indent_level` is a required `Py_ssize_t` (clinic): a
+    // float or a missing argument is a TypeError, a negative level is
+    // clamped by the indentation arithmetic
+    // (test_speedups.test_current_indent_level).
     let level = match args.get(1) {
         Some(Object::Int(n)) => *n,
         Some(Object::Bool(bv)) => i64::from(*bv),
-        _ => 0,
+        Some(Object::Long(_)) => {
+            return Err(overflow_error(
+                "Python int too large to convert to C ssize_t",
+            ))
+        }
+        Some(other) => {
+            return Err(type_error(format!(
+                "'{}' object cannot be interpreted as an integer",
+                other.type_name_owned()
+            )))
+        }
+        None => {
+            return Err(type_error(
+                "_iterencode() missing required argument '_current_indent_level' (pos 2)",
+            ))
+        }
     };
     with_interp(|interp| {
         let mut out: Vec<Object> = Vec::new();
@@ -1096,7 +1163,21 @@ fn encoder_call(cfg: &EncoderCfg, args: &[Object]) -> Result<Object, RuntimeErro
             track,
             &mut cycle,
         )?;
-        Ok(Object::new_list(out))
+        // `_json.c` writes into one `PyUnicodeWriter` and returns
+        // `(result,)`: a single joined chunk, as a tuple.
+        let mut joined = String::new();
+        for chunk in &out {
+            match obj_to_string(chunk) {
+                Some(s) => joined.push_str(&s),
+                None => {
+                    return Err(type_error(format!(
+                        "encoder produced a non-str chunk: {}",
+                        chunk.type_name_owned()
+                    )))
+                }
+            }
+        }
+        Ok(Object::new_tuple(vec![Object::from_str(joined)]))
     })
 }
 
@@ -1150,7 +1231,13 @@ fn obj_id(o: &Object) -> usize {
         Object::Dict(r) => Rc::as_ptr(r).cast::<()>() as usize,
         Object::Tuple(r) => Rc::as_ptr(r).cast::<()>() as usize,
         Object::Instance(r) => Rc::as_ptr(r).cast::<()>() as usize,
-        _ => 0,
+        // Anything else routed through `default()` (a class, a module,
+        // `Ellipsis`, ...) needs a real identity too: the `markers` cycle
+        // check keys on it, and a shared placeholder made every second
+        // such object a false "Circular reference detected"
+        // (test_json.test_default.test_bad_default nests type → module →
+        // list → Ellipsis → NotImplemented through `default`).
+        _ => crate::weakref_registry::id_of(o) as usize,
     }
 }
 
@@ -1347,13 +1434,30 @@ fn encode_value_impl(
                 return Err(value_error("Circular reference detected"));
             }
             let o2 = interp.call_object(cfg.default.clone(), std::slice::from_ref(o), &[])?;
-            encode_value(interp, cfg, &o2, level, out, track, cycle)?;
+            // The note covers a failure while encoding `default()`'s
+            // result, not a failure of `default()` itself (`dumps(sys)`
+            // carries no notes; test_fail.test_not_serializable).
+            encode_value(interp, cfg, &o2, level, out, track, cycle).map_err(|e| {
+                serializing_note(e, || {
+                    format!("when serializing {} object", o.type_name_owned())
+                })
+            })?;
             if track {
                 cycle.remove(&id);
             }
         }
     }
     Ok(())
+}
+
+/// 3.14 (gh-122163): `_json.c`'s `_PyErr_FormatNote("when serializing …")`
+/// annotates an encoding failure with the container item or object it was
+/// raised under, so a deep failure reports its path via PEP 678 notes.
+fn serializing_note(err: RuntimeError, note: impl FnOnce() -> String) -> RuntimeError {
+    if let RuntimeError::PyException(exc) = &err {
+        exc.add_note(note());
+    }
+    err
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1415,7 +1519,11 @@ fn encode_list(
         } else {
             out.push(Object::from_str(separator.clone()));
         }
-        encode_value(interp, cfg, &value, level, out, track, cycle)?;
+        encode_value(interp, cfg, &value, level, out, track, cycle).map_err(|e| {
+            serializing_note(e, || {
+                format!("when serializing {} item {i}", container.type_name_owned())
+            })
+        })?;
         i += 1;
     }
     if let Some(ind) = &cfg.indent {
@@ -1493,7 +1601,16 @@ fn encode_dict(
         }
         out.push(call_encoder(interp, cfg, &key_str)?);
         out.push(Object::from_str(cfg.key_separator.clone()));
-        encode_value(interp, cfg, &v, level, out, track, cycle)?;
+        // The note names the *original* key (`dict item 1`, not `'1'`).
+        encode_value(interp, cfg, &v, level, out, track, cycle).map_err(|e| {
+            serializing_note(e, || {
+                format!(
+                    "when serializing {} item {}",
+                    container.type_name_owned(),
+                    k.repr()
+                )
+            })
+        })?;
     }
     if !first {
         if let Some(ind) = &cfg.indent {

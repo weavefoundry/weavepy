@@ -59,41 +59,101 @@ unsafe fn group_to_object(g: *const libc::group) -> Object {
     super::os::struct_seq_instance(struct_group_type(), &GROUP_FIELDS, values)
 }
 
+/// `grp.getgrgid(id)` — arity and `_Py_Gid_Converter` semantics
+/// (`test_grp.test_errors`): exactly one argument, `int` only (`-1` wraps
+/// to `(gid_t)-1`), and anything outside `gid_t` is an `OverflowError`.
 #[cfg(unix)]
 fn grp_getgrgid(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() > 1 {
+        return Err(type_error(format!(
+            "getgrgid() takes at most 1 argument ({} given)",
+            args.len()
+        )));
+    }
     let gid = match args.first() {
         Some(Object::Int(n)) => *n,
         Some(Object::Bool(b)) => i64::from(*b),
-        Some(Object::Long(_)) => -1,
+        Some(Object::Long(n)) => {
+            return Err(crate::error::overflow_error(
+                if n.sign() == num_bigint::Sign::Minus {
+                    "gid is less than minimum"
+                } else {
+                    "gid is greater than maximum"
+                },
+            ))
+        }
         Some(other) => {
             return Err(type_error(format!(
-                "getgrgid(): gid must be a number, not {}",
+                "gid should be integer, not {}",
                 other.type_name()
             )))
         }
-        None => return Err(type_error("getgrgid() takes exactly 1 argument (0 given)")),
+        None => {
+            return Err(type_error(
+                "getgrgid() missing required argument 'id' (pos 1)",
+            ))
+        }
     };
-    let g = unsafe { libc::getgrgid(gid as libc::gid_t) };
+    let raw = if gid == -1 {
+        libc::gid_t::MAX
+    } else {
+        libc::gid_t::try_from(gid).map_err(|_| {
+            crate::error::overflow_error(if gid < 0 {
+                "gid is less than minimum"
+            } else {
+                "gid is greater than maximum"
+            })
+        })?
+    };
+    let g = unsafe { libc::getgrgid(raw) };
     if g.is_null() {
         return Err(key_error(format!("getgrgid(): gid not found: {gid}")));
     }
     Ok(unsafe { group_to_object(g) })
 }
 
+/// Convert a `str` name argument to a C string the way CPython's
+/// `PyUnicode_FSConverter` does: a surrogate-bearing `str` goes through
+/// `utf-8`/`surrogateescape` (an unencodable one is a `UnicodeEncodeError`),
+/// and an embedded NUL is a `ValueError`.
 #[cfg(unix)]
-fn grp_getgrnam(args: &[Object]) -> Result<Object, RuntimeError> {
-    let name = match args.first() {
-        Some(Object::Str(s)) => s.to_string(),
+pub(super) fn name_arg_to_cstring(
+    args: &[Object],
+    func: &str,
+) -> Result<(String, std::ffi::CString), RuntimeError> {
+    if args.len() > 1 {
+        return Err(type_error(format!(
+            "{func}() takes at most 1 argument ({} given)",
+            args.len()
+        )));
+    }
+    let (name, bytes) = match args.first() {
+        Some(Object::Str(s)) => (s.to_string(), s.as_bytes().to_vec()),
+        Some(Object::WStr(cps)) => {
+            let bytes =
+                crate::stdlib::codecs_mod::encode_codepoints(cps, "utf-8", "surrogateescape")?;
+            (String::from_utf8_lossy(&bytes).into_owned(), bytes)
+        }
         Some(other) => {
             return Err(type_error(format!(
-                "getgrnam(): argument must be a str, not {}",
+                "{func}() argument 'name' must be str, not {}",
                 other.type_name()
             )))
         }
-        None => return Err(type_error("getgrnam() takes exactly 1 argument (0 given)")),
+        None => {
+            return Err(type_error(format!(
+                "{func}() missing required argument 'name' (pos 1)"
+            )))
+        }
     };
-    let cname = std::ffi::CString::new(name.as_str())
-        .map_err(|_| type_error("getgrnam(): embedded null character"))?;
+    let cname = std::ffi::CString::new(bytes)
+        .map_err(|_| crate::error::value_error("embedded null byte"))?;
+    Ok((name, cname))
+}
+
+#[cfg(unix)]
+fn grp_getgrnam(args: &[Object]) -> Result<Object, RuntimeError> {
+    let (name, cname) = name_arg_to_cstring(args, "getgrnam")?;
     let g = unsafe { libc::getgrnam(cname.as_ptr()) };
     if g.is_null() {
         return Err(key_error(format!("getgrnam(): name not found: '{name}'")));
@@ -102,7 +162,13 @@ fn grp_getgrnam(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 #[cfg(unix)]
-fn grp_getgrall(_args: &[Object]) -> Result<Object, RuntimeError> {
+fn grp_getgrall(args: &[Object]) -> Result<Object, RuntimeError> {
+    if !args.is_empty() {
+        return Err(type_error(format!(
+            "grp.getgrall() takes no arguments ({} given)",
+            args.len()
+        )));
+    }
     let mut entries = Vec::new();
     unsafe {
         libc::setgrent();

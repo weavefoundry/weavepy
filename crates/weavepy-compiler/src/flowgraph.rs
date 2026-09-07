@@ -639,6 +639,7 @@ fn build(co: &mut CodeObject, input: &BuildInput<'_>) -> Cfg {
     let mut owner: Vec<Option<usize>> = vec![None; n];
     for (idx, h) in table.iter().enumerate() {
         let span = h.end.saturating_sub(h.start);
+        #[allow(clippy::needless_range_loop)]
         for k in h.start as usize..(h.end as usize).min(n) {
             let replace = match owner[k] {
                 None => true,
@@ -1672,7 +1673,7 @@ impl Cfg {
     fn swaptimize(&mut self, bb: BlockId, ix: &mut usize) {
         let b = &mut self.blocks[bb];
         let base = *ix;
-        debug_assert!(b.slots[base].op == OpCode::Swap);
+        debug_assert_eq!(b.slots[base].op, OpCode::Swap);
         let mut depth = b.slots[base].arg as usize;
         let mut len = 0usize;
         let mut more = false;
@@ -1698,9 +1699,7 @@ impl Cfg {
         for k in 0..len {
             if b.slots[base + k].op == OpCode::Swap {
                 let oparg = b.slots[base + k].arg as usize;
-                let top = stack[0];
-                stack[0] = stack[oparg - 1];
-                stack[oparg - 1] = top;
+                stack.swap(0, oparg - 1);
             }
         }
         let mut current = len as i64 - 1;
@@ -1718,7 +1717,7 @@ impl Cfg {
                     current -= 1;
                 }
                 if stack[j] == VISITED {
-                    debug_assert!(j == i);
+                    debug_assert_eq!(j, i);
                     break;
                 }
                 let next_j = stack[j] as usize;
@@ -1773,7 +1772,7 @@ impl Cfg {
             };
             let mut k = j;
             let lineno = self.blocks[bb].slots[j].loc.line;
-            let mut count = swap.arg as i64 - 1;
+            let mut count = i64::from(swap.arg) - 1;
             while count > 0 {
                 match self.next_swappable_instruction(bb, k, lineno) {
                     Some(nk) => k = nk,
@@ -2678,9 +2677,7 @@ impl Cfg {
             // Values on the stack at entry are opaque.
             refs.clear();
             let depth = self.blocks[b].startdepth.max(0);
-            for _ in 0..depth {
-                refs.push(DUMMY);
-            }
+            refs.extend(std::iter::repeat_n(DUMMY, depth as usize));
             for i in 0..used {
                 let instr = self.blocks[b].slots[i];
                 let ii = i as i64;
@@ -2891,8 +2888,8 @@ impl Cfg {
                     flags[r.instr as usize] |= REF_UNCONSUMED;
                 }
             }
-            for i in 0..used {
-                if flags[i] != 0 {
+            for (i, &flag) in flags.iter().enumerate().take(used) {
+                if flag != 0 {
                     continue;
                 }
                 let instr = &mut self.blocks[b].slots[i];

@@ -128,7 +128,14 @@ pub fn parse(args: &[Object]) -> Result<Object, RuntimeError> {
             .map_err(|e| crate::parse_error_to_syntax_error(&e, &source, &filename))?;
         (m, Some(t))
     } else {
-        let m = weavepy_parser::parse_module(&source)
+        // Optional 5th arg: PEP 401 `CO_FUTURE_BARRY_AS_BDFL` carried in
+        // from `compile(..., PyCF_ONLY_AST | flags)`; `codeop.Compile`
+        // feeds recorded `__future__` flags back this way, so the REPL's
+        // `print("black" <> 'blue')` must parse (3.14 test_pyrepl
+        // test_future_barry_as_flufl).
+        let flufl = matches!(args.get(4), Some(Object::Bool(true)));
+        let m = weavepy_parser::parse_module_with_warnings_flags(&source, flufl)
+            .0
             .map_err(|e| crate::parse_error_to_syntax_error(&e, &source, &filename))?;
         (m, None)
     };

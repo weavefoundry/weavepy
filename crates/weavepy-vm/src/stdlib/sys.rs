@@ -296,17 +296,27 @@ pub fn build_with_state(
         // with real importer objects; until then they hold empty
         // collections so `importlib.util.find_spec("name")` doesn't
         // crash trying to walk a missing attribute.
+        // GC-tracked like every CPython list/dict: these hold the
+        // importer classes, path hooks, and `FileFinder`s of *this*
+        // interpreter, and an untracked container makes each of them
+        // look externally rooted — for a destroyed sub-interpreter that
+        // pinned its whole importlib graph (and everything reachable from
+        // it) for the life of the process.
+        let tracked = |o: Object| {
+            crate::gc_trace::track(o.clone());
+            o
+        };
         d.insert(
             DictKey(Object::from_static("meta_path")),
-            Object::new_list(Vec::new()),
+            tracked(Object::new_list(Vec::new())),
         );
         d.insert(
             DictKey(Object::from_static("path_hooks")),
-            Object::new_list(Vec::new()),
+            tracked(Object::new_list(Vec::new())),
         );
         d.insert(
             DictKey(Object::from_static("path_importer_cache")),
-            Object::new_dict(),
+            tracked(Object::new_dict()),
         );
         d.insert(DictKey(Object::from_static("pycache_prefix")), Object::None);
         d.insert(
@@ -702,7 +712,19 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
                 .map_or(Object::from_static(""), |p| {
                     Object::from_str(p.to_string_lossy().into_owned())
                 });
-            for name in ["prefix", "exec_prefix", "base_prefix", "base_exec_prefix"] {
+            // Inside a venv, getpath sets `prefix`/`exec_prefix` to the
+            // directory holding pyvenv.cfg while the `base_*` pair keeps
+            // the installation (3.14's `site.venv()` only checks this;
+            // it no longer assigns it — test_venv, test_sysconfig
+            // test_makefile_overwrites_config_vars).
+            let venv_prefix = venv_prefix_dir().map_or_else(
+                || prefix.clone(),
+                |p| Object::from_str(p.to_string_lossy().into_owned()),
+            );
+            for name in ["prefix", "exec_prefix"] {
+                d.insert(DictKey(Object::from_static(name)), venv_prefix.clone());
+            }
+            for name in ["base_prefix", "base_exec_prefix"] {
                 d.insert(DictKey(Object::from_static(name)), prefix.clone());
             }
         }
@@ -974,23 +996,49 @@ fn implementation_value() -> Object {
             Object::from_static(crate::stdlib::sysconfig_native::MULTIARCH),
         );
     }
+    // 3.14 / PEP 734: WeavePy ships a working `_interpreters` (multiple
+    // isolated interpreters with their own GIL), so this is `True` like a
+    // non-WASM CPython build (`test_sys.test_implementation`).
+    d.insert(
+        DictKey(Object::from_static("supports_isolated_interpreters")),
+        Object::Bool(true),
+    );
     Object::SimpleNamespace(Rc::new(RefCell::new(d)))
 }
 
 /// Contents of the governing `pyvenv.cfg` (next to the executable's
 /// directory or one level up), or `None` outside a virtual environment.
 fn venv_cfg_contents() -> Option<String> {
+    std::fs::read_to_string(venv_cfg_path()?).ok()
+}
+
+/// Path of the governing `pyvenv.cfg`, or `None` outside a venv.
+fn venv_cfg_path() -> Option<std::path::PathBuf> {
     // argv[0]-derived: the venv executable is a symlink whose identity
     // `current_exe()` destroys on Linux (see stdlib_tree::program_exe).
     let exe = crate::stdlib_tree::program_exe()?;
     let exe_dir = exe.parent()?;
-    let cfg = [
+    [
         exe_dir.join("pyvenv.cfg"),
         exe_dir.parent()?.join("pyvenv.cfg"),
     ]
     .into_iter()
-    .find(|p| p.is_file())?;
-    std::fs::read_to_string(cfg).ok()
+    .find(|p| p.is_file())
+}
+
+/// CPython getpath's `venv_prefix`: the directory holding `pyvenv.cfg`.
+/// Since 3.14 `site.venv()` no longer rewrites `sys.prefix` itself (it
+/// only warns when getpath disagrees), so the interpreter must report
+/// the venv directory as `sys.prefix`/`sys.exec_prefix` natively.
+/// `None` outside a venv (or under `PYTHONHOME`, which getpath honours
+/// first).
+fn venv_prefix_dir() -> Option<std::path::PathBuf> {
+    for var in ["WEAVEPYHOME", "PYTHONHOME"] {
+        if std::env::var_os(var).is_some_and(|v| !v.is_empty()) {
+            return None;
+        }
+    }
+    venv_cfg_path()?.parent().map(std::path::Path::to_path_buf)
 }
 
 /// Case-insensitive `key = value` lookup in pyvenv.cfg contents.
@@ -1113,6 +1161,10 @@ fn builtin_module_names_value() -> Object {
         "_xxsubinterpreters",
         "atexit",
         "binascii",
+        // `builtins` is native in CPython too; `_pyrepl._module_completer`
+        // completes top-level imports from this tuple
+        // (`test_pyrepl.test_builtin_completion_top_level`).
+        "builtins",
         "cmath",
         "errno",
         "faulthandler",
@@ -2702,14 +2754,62 @@ fn sys_getrefcount(args: &[Object]) -> Result<Object, RuntimeError> {
     // (test_nditer test_iter_refcount — RFC 0076 WS1).
     let extra_c = crate::gc_trace::extra_c_refs(obj);
     // The clone in our `args` slice plays the role of CPython's
-    // "+1 for the argument reference" — no extra increment needed.
+    // "+1 for the argument reference" — no extra increment needed...
+    // unless CPython wouldn't have taken one at all (a borrowed load).
+    let borrowed = borrowed_argument_discount(obj);
     let visible = strong
         .saturating_sub(registry)
         .saturating_sub(weak_clones)
         .saturating_sub(zombie_refs)
         .saturating_sub(pinned)
+        .saturating_sub(borrowed)
         .saturating_add(extra_c);
     Ok(Object::Int(visible.max(1) as i64))
+}
+
+/// CPython 3.14's `LOAD_FAST_BORROW` (gh-130704) pushes a *borrowed*
+/// reference: `sys.getrefcount(x)` on a local that the compiler's
+/// liveness pass proved safe to borrow reads 1 lower than 3.13 did,
+/// because the argument slot never took its own `Py_INCREF`. WeavePy
+/// executes every fast load as a plain clone (the borrow is a wire-form
+/// mark, `CodeObject::wire_marks`), so recover the CPython number by
+/// looking at the caller's instruction just before the `CALL`: when it
+/// is a borrow-marked fast load of a slot still bound to `obj`, the
+/// argument clone corresponds to a reference CPython never counted.
+fn borrowed_argument_discount(obj: &Object) -> usize {
+    use weavepy_compiler::bytecode::{wire, OpCode};
+    let Some(handles) = crate::vm_singletons::current_thread_handles() else {
+        return 0;
+    };
+    let shell = handles.frame_stack.borrow().last().cloned();
+    let Some(shell) = shell else {
+        return 0;
+    };
+    // `lasti` mirrors the pc of the executing `CALL`; the last argument
+    // was pushed by the instruction before it.
+    let call_pc = shell.lasti.load(std::sync::atomic::Ordering::Relaxed) as usize;
+    let Some(load_pc) = call_pc.checked_sub(1) else {
+        return 0;
+    };
+    let code = &shell.code;
+    let Some(ins) = code.instructions.get(load_pc) else {
+        return 0;
+    };
+    let is_borrow = code
+        .wire_marks
+        .get(load_pc)
+        .is_some_and(|m| m & wire::BORROW != 0);
+    if !is_borrow {
+        return 0;
+    }
+    let slot = match ins.op {
+        OpCode::LoadFast => ins.arg,
+        // Fused pair: the second (top-of-stack) load is the argument.
+        OpCode::LoadFastLoadFast => ins.arg & 15,
+        _ => return 0,
+    } as usize;
+    let locals = shell.locals.borrow();
+    usize::from(locals.get(slot).is_some_and(|v| v.is_same(obj)))
 }
 
 thread_local! {
@@ -2808,9 +2908,21 @@ fn sys_set_asyncgen_hooks(
     Ok(Object::None)
 }
 
+const ASYNCGEN_HOOKS_FIELDS: &[&str] = &["firstiter", "finalizer"];
+
 fn sys_get_asyncgen_hooks(_args: &[Object]) -> Result<Object, RuntimeError> {
+    // CPython returns the `sys.asyncgen_hooks` struct sequence
+    // (`AsyncGenHooksType`, a tuple subclass with named fields), not a
+    // bare tuple — test_embed's finalize_structseq leg checks
+    // `__bases__ == (tuple,)` on it (bpo-46417).
     let (firstiter, finalizer) = asyncgen_hooks();
-    Ok(Object::new_tuple(vec![firstiter, finalizer]))
+    let ty = crate::stdlib::os::struct_seq_type("asyncgen_hooks", "sys", ASYNCGEN_HOOKS_FIELDS);
+    disallow_instantiation(&ty, "sys.asyncgen_hooks");
+    Ok(crate::stdlib::os::struct_seq_instance(
+        ty,
+        ASYNCGEN_HOOKS_FIELDS,
+        vec![firstiter, finalizer],
+    ))
 }
 
 /// Default `sys.displayhook`: if the value is None do nothing,

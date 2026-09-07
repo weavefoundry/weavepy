@@ -1080,6 +1080,11 @@ fn libregrtest_bootstrap(file: &RegrtestFile) -> Option<String> {
         .replace('/', ".");
     let lib_dir = cpython_lib_dir(file)?;
     let path = file.path.display().to_string();
+    let main_file = Path::new(&lib_dir)
+        .join("test")
+        .join("__main__.py")
+        .display()
+        .to_string();
     // Compiled C-API fixtures (`_testbuffer`, RFC 0066 WS1): appended to
     // the tail of `sys.path` so they can never shadow the stdlib.
     // (Also on the default path via WEAVEPY_CPYTHON_LIB — the guard keeps
@@ -1119,6 +1124,21 @@ if {name:?}.split(".")[0] == "test_importlib":
 del _lib
 {fixtures}
 sys.argv = [{path:?}]
+# Under `python -m test` the `__main__` module is `Lib/test/__main__.py`:
+# it carries a `__file__` and a `__spec__` named `test.__main__`. This
+# `-c` bootstrap stands in for it, so give `__main__` both.
+# test_capi.test_run's PyRun_*File legs read and temporarily delete
+# `sys.modules['__main__'].__file__` around every subtest, and the spec
+# is what keeps `multiprocessing`'s spawn preparation on the
+# `init_main_from_name` route (which skips `*.__main__` modules) instead
+# of `init_main_from_path` — without it every spawned worker would
+# *execute* `test/__main__.py`, i.e. run the whole suite (RFC 0077
+# Phase II).
+import importlib.util as _ilu
+_main = sys.modules["__main__"]
+_main.__file__ = {main_file:?}
+_main.__spec__ = _ilu.spec_from_file_location("test.__main__", {main_file:?})
+del _ilu, _main
 import unittest
 # Run inside a fresh scratch working directory, like libregrtest's per-worker
 # `temp_cwd`. CPython's suite assumes a disposable cwd: `test.support.os_helper`

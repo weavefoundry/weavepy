@@ -1030,9 +1030,7 @@ fn build_flags(cli: &Cli, env: &EnvOverrides) -> InterpreterFlags {
     // The env var is read first so `-X importtime` can override it.
     {
         let mut level: u8 = 0;
-        if let Some(env) = std::env::var_os("PYTHONPROFILEIMPORTTIME")
-            .filter(|v| !v.is_empty())
-        {
+        if let Some(env) = std::env::var_os("PYTHONPROFILEIMPORTTIME").filter(|v| !v.is_empty()) {
             let env = env.to_string_lossy();
             level = match env.trim().parse::<i64>() {
                 Ok(n) if (0..=2).contains(&n) => n as u8,
@@ -1176,6 +1174,15 @@ fn build_flags(cli: &Cli, env: &EnvOverrides) -> InterpreterFlags {
         warning_filters: {
             let mut v = env.warning_filters.clone();
             v.extend(cli.warnings.iter().cloned());
+            // `config_init_warnoptions`: `-b` / `-bb` append a BytesWarning
+            // filter after the `-W` options so it takes precedence
+            // (test_regrtest.test_add_python_opts checks
+            // `['error', 'error::BytesWarning']` for `-W error -bb`).
+            match cli.bytes_warning {
+                0 => {}
+                1 => v.push("default::BytesWarning".to_owned()),
+                _ => v.push("error::BytesWarning".to_owned()),
+            }
             v
         },
         // `-R` re-enables randomization, trumping a fixed seed from
@@ -1383,7 +1390,10 @@ fn dump_path_config_and_die(cli: &Cli, env: &EnvOverrides, home: &str, prefix: &
         .unwrap_or_default();
     let stdlib = format!("{prefix}/lib/python{maj}.{min}");
     let mut out = String::new();
-    let _ = writeln!(out, "Could not find platform independent libraries <prefix>");
+    let _ = writeln!(
+        out,
+        "Could not find platform independent libraries <prefix>"
+    );
     let _ = writeln!(out, "Python path configuration:");
     let _ = writeln!(out, "  PYTHONHOME = {}", quoted(home));
     let _ = writeln!(
@@ -1397,13 +1407,21 @@ fn dump_path_config_and_die(cli: &Cli, env: &EnvOverrides, home: &str, prefix: &
     );
     let _ = writeln!(out, "  program name = {}", quoted(&program));
     let _ = writeln!(out, "  isolated = {}", u8::from(cli.isolated));
-    let _ = writeln!(out, "  environment = {}", u8::from(!(cli.isolated || cli.ignore_env)));
+    let _ = writeln!(
+        out,
+        "  environment = {}",
+        u8::from(!(cli.isolated || cli.ignore_env))
+    );
     let _ = writeln!(
         out,
         "  user site = {}",
         u8::from(!(cli.no_user_site || cli.isolated))
     );
-    let _ = writeln!(out, "  safe_path = {}", u8::from(cli.safe_path || cli.isolated));
+    let _ = writeln!(
+        out,
+        "  safe_path = {}",
+        u8::from(cli.safe_path || cli.isolated)
+    );
     let _ = writeln!(out, "  import site = {}", u8::from(!cli.no_site));
     let _ = writeln!(out, "  is in build tree = 0");
     let _ = writeln!(out, "  stdlib dir = {}", quoted(&stdlib));
@@ -1601,7 +1619,11 @@ fn decode_script_source(bytes: &[u8], filename: &str) -> String {
 /// one (`_format_syntax_error`): the `File "…", line N` header when
 /// there's a line number, the offending line with a caret range when
 /// there's text, then `SyntaxError: <msg>`.
-fn format_decode_syntax_error(err: &weavepy::vm::RuntimeError, filename: &str, msg: &str) -> String {
+fn format_decode_syntax_error(
+    err: &weavepy::vm::RuntimeError,
+    filename: &str,
+    msg: &str,
+) -> String {
     use std::fmt::Write as _;
     use weavepy::vm::object::Object;
     let mut out = String::new();
@@ -1613,7 +1635,9 @@ fn format_decode_syntax_error(err: &weavepy::vm::RuntimeError, filename: &str, m
         _ => None,
     };
     let attr = |name: &str| -> Option<Object> {
-        inst.as_ref().and_then(|i| i.slot_get(name)).filter(|o| !matches!(o, Object::None))
+        inst.as_ref()
+            .and_then(|i| i.slot_get(name))
+            .filter(|o| !matches!(o, Object::None))
     };
     let int = |name: &str| attr(name).and_then(|o| o.as_i64());
     match int("lineno") {
@@ -1694,6 +1718,14 @@ fn run_path(
     let bytes = match fs::read(path) {
         Ok(b) => b,
         Err(e) => {
+            // `python app.zip/pkg/sub`: CPython asks the path hooks first
+            // (`pymain_get_importer`), and `zipimporter` accepts a
+            // directory *inside* an archive, so the program is the
+            // zip's `pkg/sub/__main__` with `sys.path[0]` set to the
+            // full path (test_argparse.TestProgName.test_directory_in_zipfile).
+            if zip_ancestor(path).is_some() {
+                return run_main_module_from_path(path, extra, flags, extra_path);
+            }
             let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
             let program = env::args().next().unwrap_or_else(|| "weavepy".to_owned());
             let errno = e.raw_os_error().unwrap_or(2);
@@ -1762,6 +1794,30 @@ fn is_zip_bytes(bytes: &[u8]) -> bool {
         bytes.get(..4),
         Some([b'P', b'K', 0x03, 0x04] | [b'P', b'K', 0x05, 0x06] | [b'P', b'K', 0x07, 0x08])
     )
+}
+
+/// The nearest existing ancestor of `path` that is a zip archive, for a
+/// `archive.zip/dir/inside` program path (the shape `zipimporter`'s
+/// path hook resolves). `None` when no ancestor is a regular zip file.
+fn zip_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut cur = path.parent();
+    while let Some(p) = cur {
+        if p.as_os_str().is_empty() {
+            return None;
+        }
+        if p.is_file() {
+            let mut magic = [0u8; 4];
+            let ok = fs::File::open(p)
+                .and_then(|mut f| io::Read::read_exact(&mut f, &mut magic))
+                .is_ok();
+            return (ok && is_zip_bytes(&magic)).then(|| p.to_path_buf());
+        }
+        if p.exists() {
+            return None;
+        }
+        cur = p.parent();
+    }
+    None
 }
 
 /// Run a directory or zipfile's top-level `__main__` as the program, with

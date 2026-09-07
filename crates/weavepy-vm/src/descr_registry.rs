@@ -15,9 +15,15 @@
 //! WeavePy keeps representing these as `Object::Builtin` / `Object::Property`
 //! (so the call / binding / identity machinery is unchanged) and records the
 //! *kind* and metadata in a pointer-keyed side table populated once at
-//! interpreter start. The descriptors live for the process lifetime (they sit
-//! in the built-in type dicts / the slot-wrapper cache), so their `Rc`
-//! addresses are stable keys.
+//! interpreter start. Most descriptors live for the process lifetime (they
+//! sit in the built-in type dicts / the slot-wrapper cache), but not all:
+//! a closed sub-interpreter's native modules die with it, and the
+//! allocator then hands their addresses to fresh builtins. Every table
+//! here is therefore purged from `BuiltinFn`/`PyProperty`'s `Drop` via
+//! [`forget`] (a stale `BUILTIN_MODULE` row once made a new
+//! interpreter's `len` report `__module__ == '_codecs'`, and pickling it
+//! failed — test_interpreters TestInterpreterCall after a prior test's
+//! interpreter was torn down).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
@@ -56,8 +62,54 @@ pub struct DescrMeta {
 /// and `type(FunctionType.__code__)` as `property`, which broke
 /// `inspect.getattr_static` (and so `import traceback`, via `_colorize`'s
 /// dataclasses) in any sub-interpreter created off the main thread.
-static DESCR_META: LazyLock<parking_lot::RwLock<HashMap<usize, DescrMeta>>> =
+static DESCR_META: LazyLock<parking_lot::RwLock<HashMap<usize, StoredMeta>>> =
     LazyLock::new(|| parking_lot::RwLock::new(HashMap::new()));
+
+/// Every pointer key any table below has ever been given (and not yet
+/// forgotten). `Drop` consults this one set first, so the common case —
+/// a builtin no table knows — costs a single read-locked hash probe.
+static TAGGED: LazyLock<parking_lot::RwLock<HashSet<usize>>> =
+    LazyLock::new(|| parking_lot::RwLock::new(HashSet::new()));
+
+fn note_key(k: usize) {
+    TAGGED.write().insert(k);
+}
+
+/// Purge every registration keyed on `k` — the address of a `BuiltinFn`
+/// or `PyProperty` that is being dropped — so a later allocation at the
+/// same address starts untagged. Values holding `Object`s are moved out
+/// under the lock and dropped after it is released (their drops can
+/// re-enter here).
+pub(crate) fn forget(k: usize) {
+    if !TAGGED.write().remove(&k) {
+        return;
+    }
+    DESCR_META.write().remove(&k);
+    BUILTIN_MODULE.write().remove(&k);
+    NATIVE_DESCR_ACCESSOR.write().remove(&k);
+    SURFACE_ONLY.write().remove(&k);
+    DEFAULT_NEW.write().remove(&k);
+    TEXT_SIGNATURE.write().remove(&k);
+    LIVE_C_DOC.write().remove(&k);
+    let writable = BUILTIN_WRITABLE_MODULE.write().remove(&k);
+    drop(writable);
+}
+
+/// The stored form of [`DescrMeta`]. `objclass` is held *weakly*: the
+/// table is process-global and never pruned, and most owners are
+/// process-lifetime built-in types, but some registrations name classes
+/// that die — `operator_mod.py` tags `attrgetter.__call__` & co. on every
+/// import, so each closed sub-interpreter's `operator` classes were rooted
+/// here forever (and, through their methods' `__globals__`, the whole
+/// module graph of that interpreter). A dead owner means the descriptor's
+/// class is gone; [`lookup`] then reports the entry as unregistered.
+struct StoredMeta {
+    kind: DescrKind,
+    objclass: crate::sync::Weak<TypeObject>,
+    qualname: String,
+    name: String,
+    doc: Option<&'static str>,
+}
 
 /// `__module__` attribution for native builtin functions that do *not*
 /// live in `builtins` (e.g. the `_operator` accelerator, every `os.*` /
@@ -83,6 +135,7 @@ static BUILTIN_MODULE: LazyLock<parking_lot::RwLock<HashMap<usize, &'static str>
 /// `__module__` reports that instead of the default `"builtins"`.
 pub fn register_module(obj: &Object, module: &'static str) {
     let Some(k) = key(obj) else { return };
+    note_key(k);
     BUILTIN_MODULE.write().insert(k, module);
 }
 
@@ -151,6 +204,7 @@ static DEFAULT_NEW: LazyLock<parking_lot::RwLock<HashSet<usize>>> =
 pub fn mark_default_new(obj: &Object) {
     if let Object::Builtin(b) = obj {
         let k = Rc::as_ptr(b).cast::<()>() as usize;
+        note_key(k);
         DEFAULT_NEW.write().insert(k);
     }
 }
@@ -169,6 +223,7 @@ pub fn is_default_new(obj: &Object) -> bool {
 /// [`TypeObject::lookup`] will skip it during dispatch.
 pub fn mark_surface_only(obj: &Object) {
     if let Some(k) = key(obj) {
+        note_key(k);
         SURFACE_ONLY.write().insert(k);
     }
 }
@@ -186,6 +241,7 @@ pub fn is_surface_only(obj: &Object) -> bool {
 pub fn mark_native_descr_accessor(obj: &Object) {
     if let Object::Builtin(b) = obj {
         let k = Rc::as_ptr(b).cast::<()>() as usize;
+        note_key(k);
         NATIVE_DESCR_ACCESSOR.write().insert(k);
     }
 }
@@ -222,6 +278,7 @@ static BUILTIN_WRITABLE_MODULE: LazyLock<parking_lot::RwLock<HashMap<usize, Obje
 /// Returns `false` if `obj` is not a taggable representation.
 pub fn set_builtin_module(obj: &Object, value: Object) -> bool {
     let Some(k) = key(obj) else { return false };
+    note_key(k);
     BUILTIN_WRITABLE_MODULE.write().insert(k, value);
     true
 }
@@ -256,11 +313,12 @@ pub fn register(
     // Use the bare type name (a field read) — `qualified_display_name()`
     // would re-borrow `objclass.dict`, which a caller may hold open.
     let qualname = format!("{}.{}", objclass.name, name);
+    note_key(k);
     DESCR_META.write().insert(
         k,
-        DescrMeta {
+        StoredMeta {
             kind,
-            objclass,
+            objclass: Rc::downgrade(&objclass),
             qualname,
             name: name.to_owned(),
             doc,
@@ -268,10 +326,27 @@ pub fn register(
     );
 }
 
-/// The recorded metadata for `obj`, if it was tagged.
+/// The recorded metadata for `obj`, if it was tagged (and its owning
+/// class is still alive).
 pub fn lookup(obj: &Object) -> Option<DescrMeta> {
     let k = key(obj)?;
-    DESCR_META.read().get(&k).cloned()
+    let found = {
+        let table = DESCR_META.read();
+        let m = table.get(&k)?;
+        m.objclass.upgrade().map(|objclass| DescrMeta {
+            kind: m.kind,
+            objclass,
+            qualname: m.qualname.clone(),
+            name: m.name.clone(),
+            doc: m.doc,
+        })
+    };
+    if found.is_none() {
+        // Owner died: drop the stale entry so a reused pointer key can't
+        // inherit it.
+        DESCR_META.write().remove(&k);
+    }
+    found
 }
 
 /// Per-object `__text_signature__` overrides — Argument-Clinic
@@ -285,6 +360,7 @@ static TEXT_SIGNATURE: LazyLock<parking_lot::RwLock<HashMap<usize, &'static str>
 /// Attach an Argument-Clinic `__text_signature__` string to `obj`.
 pub fn register_text_signature(obj: &Object, sig: &'static str) {
     if let Some(k) = key(obj) {
+        note_key(k);
         TEXT_SIGNATURE.write().insert(k, sig);
     }
 }
@@ -326,6 +402,7 @@ static LIVE_C_DOC: LazyLock<parking_lot::RwLock<HashMap<usize, (usize, LiveDocRe
 /// Attach a live C-doc reader to `obj` (a bridged method descriptor).
 pub fn register_live_c_doc(obj: &Object, addr: usize, read: LiveDocReader) {
     if let Some(k) = key(obj) {
+        note_key(k);
         LIVE_C_DOC.write().insert(k, (addr, read));
     }
 }

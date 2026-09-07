@@ -1,6 +1,15 @@
 # PY314-GAP: the measured CPython 3.14 gap analysis
 
-**RFC 0076 WS13.** This document is the charter for the version-switch
+> **Closed by RFC 0077 Phase II (2026-09).** WeavePy now targets
+> CPython 3.14.7: `sys.version_info[:2] == (3, 14)`, the runtime stdlib
+> and `Lib/test` come from the 3.14.7 tree, and
+> `tests/regrtest/expectations.toml` is the measured 3.14 baseline (see
+> the RFC's Results section for the sweep numbers). Everything below is
+> the **historical** 3.13-to-3.14 delta as measured before the switch,
+> kept as the record of what the switch had to close. `docs/CONFORMANCE.md`
+> is the current conformance reference.
+
+**RFC 0076 WS13.** This document was the charter for the version-switch
 wave (RFC 0077, committed by the version policy RFC 0076 adopts): the
 enumerated delta between WeavePy's 3.13 surface and CPython 3.14,
 grounded in **one measured sweep** of 3.14's own test suite — not in

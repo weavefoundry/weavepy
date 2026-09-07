@@ -674,14 +674,11 @@ fn pointer_payload(
     owned: &mut Vec<usize>,
 ) -> Result<usize, RuntimeError> {
     if code == 'O' {
-        // Legacy escape hatch: an explicit integer payload is already a
-        // raw `PyObject*` address; anything else is the object itself.
-        // (`Object::None` must marshal to `Py_None`, not NULL.)
-        if let Object::Int(_) | Object::Long(_) = payload {
-            if let Some(addr) = payload.as_usize() {
-                return Ok(addr);
-            }
-        }
+        // The payload is the object itself, ints included: CPython's
+        // `py_object.from_param(123)` hands the callee the int object, so
+        // `pythonapi.PyOS_FSPath(123)` must reach `PyOS_FSPath` as a
+        // `PyObject*` (test_capi.test_file.test_py_fopen), not as the raw
+        // address 123. (`Object::None` marshals to `Py_None`, not NULL.)
         let ptr = crate::foreign::object_to_owned_ptr(payload)?;
         owned.push(ptr);
         return Ok(ptr);
@@ -1086,6 +1083,16 @@ pub(super) fn b_call_function(args: &[Object]) -> Result<Object, RuntimeError> {
     drop(agg_copies);
     for p in owned {
         crate::foreign::release_object_ptr(p);
+    }
+    // CPython `_call_function_pointer`: a PyDLL (`ctypes.pythonapi`) call
+    // raises whatever exception the callee left pending, whatever it
+    // returned. `py_object` results still go through `steal_object` so a
+    // NULL with nothing pending keeps its ValueError.
+    const FUNCFLAG_PYTHONAPI: i64 = 0x4;
+    if (flags & FUNCFLAG_PYTHONAPI) != 0 && !(ret_is_object && ret.gpr[0] == 0) {
+        if let Some(err) = crate::foreign::take_pending_error() {
+            return Err(err);
+        }
     }
     match ret_ty {
         RetTy::Scalar(_) if ret_is_object => crate::foreign::steal_object(ret.gpr[0] as usize),

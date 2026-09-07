@@ -163,6 +163,10 @@ def dict_getitem(mapping, key):
     if not isinstance(mapping, dict):
         return KeyError
     try:
+        # PyObject_Hash() first: the C code hashes the key itself, so an
+        # unhashable key reports the plain "unhashable type" message, not
+        # dict.get()'s 3.14 "cannot use ... as a dict key" wrapper.
+        hash(key)
         value = dict.get(mapping, key, _NULL)
     except BaseException as exc:
         _write_unraisable(

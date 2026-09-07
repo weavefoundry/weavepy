@@ -1,7 +1,7 @@
 /*
  * _stockdatetime — the RFC 0029 (wave 5) faithful-datetime ABI proof.
  *
- * Compiled against the host's **stock CPython 3.13 headers**, including
+ * Compiled against the host's **stock CPython 3.14 headers**, including
  * the real `datetime.h`. That means the compiler inlines CPython's
  * datetime accessor macros directly into this object file — exactly the
  * way Cython's `cimport datetime` does inside pandas' `tslibs`:

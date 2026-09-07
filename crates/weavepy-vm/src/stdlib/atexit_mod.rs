@@ -17,10 +17,16 @@ use weavepy_compiler::CompareKind;
 
 type Callback = (Object, Vec<Object>, Vec<(String, Object)>);
 
-thread_local! {
-    /// Registration-order slots; `None` = deleted (CPython's NULL holes).
-    static HANDLERS: RefCell<Vec<Option<Callback>>> = const { RefCell::new(Vec::new()) };
-}
+/// CPython `struct atexit_state`: registration-order slots where `None`
+/// is a deleted entry (the C array's NULL holes). One per *interpreter*
+/// (`interp->atexit`), not per thread and not process-wide: every thread
+/// of an interpreter shares the handle (`Interpreter::fork_for_thread`),
+/// a sub-interpreter gets a fresh one at `Interpreter::new()`, and its
+/// callbacks run when that interpreter ends. A thread-local here used to
+/// (a) lose registrations made from worker threads at shutdown and (b)
+/// root every closed sub-interpreter's `logging.shutdown` — and through
+/// its `__globals__` the whole module graph — in the parent's list.
+pub(crate) type Registry = Rc<RefCell<Vec<Option<Callback>>>>;
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     let dict = Rc::new(RefCell::new(DictData::default()));
@@ -88,10 +94,11 @@ fn a_register(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
         .cloned()
         .ok_or_else(|| type_error("register() takes at least 1 argument (0 given)"))?;
     let positional = args.get(1..).map(|s| s.to_vec()).unwrap_or_default();
-    HANDLERS.with(|h| {
-        h.borrow_mut()
-            .push(Some((func.clone(), positional, kwargs.to_vec())));
-    });
+    let interp = current_interp("atexit.register()")?;
+    interp
+        .atexit_handlers
+        .borrow_mut()
+        .push(Some((func.clone(), positional, kwargs.to_vec())));
     Ok(func)
 }
 
@@ -106,16 +113,17 @@ fn a_unregister(args: &[Object]) -> Result<Object, RuntimeError> {
     // null every match. The `__eq__` call may re-enter `unregister`/`_clear`
     // (gh-112127), so re-read length and slot state on every step and never
     // hold the registry borrow across the comparison.
+    let handlers = interp.atexit_handlers.clone();
     let mut i = 0usize;
     loop {
-        let stored = HANDLERS.with(|h| {
-            let v = h.borrow();
+        let stored = {
+            let v = handlers.borrow();
             if i >= v.len() {
                 None
             } else {
                 Some(v[i].as_ref().map(|(f, _, _)| f.clone()))
             }
-        });
+        };
         let stored = match stored {
             None => break, // past the end
             Some(None) => {
@@ -134,12 +142,10 @@ fn a_unregister(args: &[Object]) -> Result<Object, RuntimeError> {
                 .is_truthy()
         };
         if eq {
-            HANDLERS.with(|h| {
-                let mut v = h.borrow_mut();
-                if i < v.len() {
-                    v[i] = None;
-                }
-            });
+            let mut v = handlers.borrow_mut();
+            if i < v.len() {
+                v[i] = None;
+            }
         }
         i += 1;
     }
@@ -159,14 +165,20 @@ fn a_run_exitfuncs(_args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn a_clear(_args: &[Object]) -> Result<Object, RuntimeError> {
-    HANDLERS.with(|h| h.borrow_mut().clear());
+    let interp = current_interp("atexit._clear()")?;
+    interp.atexit_handlers.borrow_mut().clear();
     Ok(Object::None)
 }
 
 fn a_ncallbacks(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::Int(HANDLERS.with(|h| {
-        h.borrow().iter().filter(|s| s.is_some()).count() as i64
-    })))
+    let interp = current_interp("atexit._ncallbacks()")?;
+    let n = interp
+        .atexit_handlers
+        .borrow()
+        .iter()
+        .filter(|s| s.is_some())
+        .count();
+    Ok(Object::Int(n as i64))
 }
 
 /// CPython `atexit_callfuncs`: walk the slots from the highest index at
@@ -184,16 +196,17 @@ fn a_ncallbacks(_args: &[Object]) -> Result<Object, RuntimeError> {
 /// shutdown sequence (`_PyAtExit_Call`); the shared registry means a
 /// handler never runs twice.
 pub fn run_exit_handlers(interp: &mut crate::Interpreter) {
-    let start = HANDLERS.with(|h| h.borrow().len());
+    let handlers = interp.atexit_handlers.clone();
+    let start = handlers.borrow().len();
     for i in (0..start).rev() {
-        let cb = HANDLERS.with(|h| {
-            let v = h.borrow();
+        let cb = {
+            let v = handlers.borrow();
             if i < v.len() {
                 v[i].clone()
             } else {
                 None
             }
-        });
+        };
         let Some((func, args, kwargs)) = cb else {
             continue;
         };
@@ -203,5 +216,5 @@ pub fn run_exit_handlers(interp: &mut crate::Interpreter) {
             interp.write_unraisable_msg(&err, &Object::None, &func_repr, Some(&err_msg));
         }
     }
-    HANDLERS.with(|h| h.borrow_mut().clear());
+    handlers.borrow_mut().clear();
 }

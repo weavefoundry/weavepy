@@ -229,8 +229,67 @@ fn collect(args: &[Object]) -> Result<Object, RuntimeError> {
     // cache is the sole owner of, so `weakref`s on dead `__code__`
     // objects die like they do under CPython's collector.
     crate::tier2::gc_sweep();
+    // Likewise release `__missing__`-globals owners nothing can reach any
+    // more (`annotationlib`'s `_StringifierDict`s), so the classes their
+    // `ForwardRef`s name die in this pass like they do under CPython.
+    if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+        // SAFETY: published by an enclosing VM frame on this thread.
+        unsafe { (*ptr).prune_globals_missing_hooks() };
+    }
+    let before = debug_stats_begin(upto);
     let collected = gc_trace::collect_upto(upto);
+    debug_stats_end(before, collected);
     Ok(Object::Int(collected as i64))
+}
+
+/// Snapshot taken by [`debug_stats_begin`] for the matching footer.
+pub(crate) struct DebugStatsBefore {
+    start: std::time::Instant,
+    stats: [gc_trace::GcStats; N_GENERATIONS],
+}
+
+/// `gc.DEBUG_STATS` — CPython's `gc_collect_main` banner on stderr
+/// (`test_gc.test_gc_debug_stats` regex-matches every line). Returns
+/// `None` when the flag is clear. Shared by the module-level `collect`
+/// and the eval loop's `gc.collect()` interception (the path a Python
+/// `gc.collect()` call actually takes, so it can drain finalizers).
+pub(crate) fn debug_stats_begin(upto: usize) -> Option<DebugStatsBefore> {
+    let debug_stats = (gc_trace::with_state(|s| s.debug.load(Ordering::Acquire)) & 0x1) != 0;
+    if !debug_stats {
+        return None;
+    }
+    let (counts, frozen, stats) =
+        gc_trace::with_state(|s| (s.counts(), s.freeze_count(), *s.stats.borrow()));
+    let gen = upto.min(N_GENERATIONS - 1);
+    eprintln!("gc: collecting generation {gen}...");
+    eprintln!(
+        "gc: objects in each generation: {} {} {}",
+        counts[0], counts[1], counts[2]
+    );
+    eprintln!("gc: objects in permanent generation: {frozen}");
+    Some(DebugStatsBefore {
+        start: std::time::Instant::now(),
+        stats,
+    })
+}
+
+/// The `gc: done, ...` footer matching [`debug_stats_begin`].
+pub(crate) fn debug_stats_end(before: Option<DebugStatsBefore>, collected: usize) {
+    let Some(DebugStatsBefore { start, stats: prev }) = before else {
+        return;
+    };
+    let stats = gc_trace::with_state(|s| *s.stats.borrow());
+    let uncollectable: u64 = stats
+        .iter()
+        .zip(prev.iter())
+        .map(|(now, was)| now.uncollectable.saturating_sub(was.uncollectable))
+        .sum();
+    eprintln!(
+        "gc: done, {} unreachable, {} uncollectable, {:.4}s elapsed",
+        collected as u64 + uncollectable,
+        uncollectable,
+        start.elapsed().as_secs_f64()
+    );
 }
 
 fn get_count(_args: &[Object]) -> Result<Object, RuntimeError> {
@@ -337,6 +396,19 @@ fn referrer_edges(obj: &Object, visit: &mut dyn FnMut(&Object)) {
     match obj {
         Object::Function(f) => visit(&Object::Code(f.code.borrow().clone())),
         Object::Type(t) => visit(&Object::Dict(t.dict.clone())),
+        // 3.14 (gh-124392): a *running* generator/coroutine refers to
+        // the locals of its executing frame, which lives on the call
+        // stack rather than in the generator's state box.
+        Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g)
+            if matches!(
+                g.state.try_borrow().as_deref(),
+                Ok(crate::object::GeneratorState::Running)
+            ) =>
+        {
+            if let Ok(interp) = crate::builtins::reentrant_interp() {
+                interp.running_gen_frame_referents(g, visit);
+            }
+        }
         _ => {}
     }
 }
@@ -415,8 +487,23 @@ fn is_tracked(args: &[Object]) -> Result<Object, RuntimeError> {
     let target = args
         .first()
         .ok_or_else(|| type_error("is_tracked() requires 1 argument"))?;
-    let id = id_of(target);
-    Ok(Object::Bool(gc_trace::with_state(|s| s.is_tracked(id))))
+    Ok(Object::Bool(object_is_tracked(target)))
+}
+
+/// `gc.is_tracked()` semantics for one object. Tuples aren't
+/// registered with the tracer (they're immutable `Rc<[Object]>`
+/// slices whose referents the collector reaches through their owners),
+/// so they answer the way a CPython tuple does *after*
+/// `_PyTuple_MaybeUntrack` — which since 3.14 runs at creation time:
+/// tracked iff some element is itself a tracked container.
+fn object_is_tracked(target: &Object) -> bool {
+    match target {
+        Object::Tuple(items) => items.iter().any(object_is_tracked),
+        other => {
+            let id = id_of(other);
+            gc_trace::with_state(|s| s.is_tracked(id))
+        }
+    }
 }
 
 fn is_finalized(args: &[Object]) -> Result<Object, RuntimeError> {

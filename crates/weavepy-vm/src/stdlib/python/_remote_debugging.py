@@ -148,12 +148,22 @@ class RemoteUnwinder:
     The Python object is created and destroyed on each call. Attaching to
     another process's address space isn't available in this runtime, so
     construction fails the way CPython's does without attach permission.
+    The one process whose memory *is* readable is our own: `pid ==
+    os.getpid()` unwinds this interpreter's live frames through
+    `sys._current_frames()` (the C module needs no special permission for
+    the self case either; `test_external_inspection.test_self_trace`).
     """
 
     def __init__(self, pid, *, all_threads=False, only_active_thread=False, debug=False):
         if all_threads and only_active_thread:
             raise ValueError("all_threads and only_active_thread cannot both be true")
         pid = int(pid)
+        import os
+        if pid == os.getpid():
+            self._pid = pid
+            self._all_threads = bool(all_threads)
+            self._only_active_thread = bool(only_active_thread)
+            return
         if sys.platform == "darwin":
             raise PermissionError(
                 f"Cannot get task port for PID {pid} (kern_return_t: 5). This "
@@ -168,7 +178,40 @@ class RemoteUnwinder:
         raise RuntimeError("Remote debugging is not supported on this platform")
 
     def get_stack_trace(self):
-        raise RuntimeError("RemoteUnwinder is not attached to a process")
+        """Per-thread `ThreadInfo(native_thread_id, [FrameInfo, ...])`, most
+        recent frame first. Frames of this module (the unwinder itself) are
+        dropped, just as the C unwinder contributes no Python frames."""
+        import threading
+
+        frames_by_ident = sys._current_frames()
+        native_ids = {}
+        for t in threading.enumerate():
+            if t.ident is not None and t.native_id is not None:
+                native_ids[t.ident] = t.native_id
+        me = threading.get_ident()
+        native_ids[me] = threading.get_native_id()
+
+        if self._only_active_thread:
+            # The GIL holder is whoever is running this very call.
+            wanted = [me]
+        elif self._all_threads:
+            wanted = list(frames_by_ident)
+        else:
+            wanted = [threading.main_thread().ident]
+
+        result = []
+        for ident in wanted:
+            frame = frames_by_ident.get(ident)
+            if frame is None:
+                continue
+            frames = []
+            while frame is not None:
+                code = frame.f_code
+                if code.co_filename != __file__:
+                    frames.append(FrameInfo((code.co_filename, frame.f_lineno, code.co_qualname)))
+                frame = frame.f_back
+            result.append(ThreadInfo((native_ids.get(ident, ident), frames)))
+        return result
 
     def get_all_awaited_by(self):
         raise RuntimeError("RemoteUnwinder is not attached to a process")

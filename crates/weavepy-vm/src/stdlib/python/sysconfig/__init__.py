@@ -27,7 +27,7 @@ _ALWAYS_STR = {
 
 _INSTALL_SCHEMES = {
     # WeavePy stages the standard library under `lib/weavepy3.13` while
-    # keeping site-packages at CPython's `lib/python3.13/site-packages`
+    # keeping site-packages at CPython's `lib/python3.14/site-packages`
     # (pip and site.py agree on the latter). Only the stdlib/platstdlib
     # entries use the `{stdlib_impl_lower}` var ('weavepy'), so
     # `sysconfig.get_path('stdlib')` matches `os.path.dirname(os.__file__)`

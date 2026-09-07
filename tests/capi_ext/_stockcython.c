@@ -1,7 +1,7 @@
 /*
  * _stockcython — the RFC 0047 (binary-ABI, wave 5) hermetic proof.
  *
- * Compiled against the host's **stock CPython 3.13 headers** (full,
+ * Compiled against the host's **stock CPython 3.14 headers** (full,
  * non-limited API) like `_stockabi`/`_stocktype`/`_stockarray`, this
  * fixture stands in for a **Cython-generated** extension (the shape
  * pandas and the wider Cython ecosystem ship). It proves the two
@@ -417,7 +417,7 @@ static PyMethodDef cy_methods[] = {
 static struct PyModuleDef cy_module = {
     PyModuleDef_HEAD_INIT,
     "_stockcython",
-    "RFC 0047 wave-5 stock-CPython-3.13 Cython-surface proof.",
+    "RFC 0047 wave-5 stock-CPython-3.14 Cython-surface proof.",
     -1,
     cy_methods,
     NULL,
@@ -451,6 +451,6 @@ PyMODINIT_FUNC PyInit__stockcython(void) {
         Py_DECREF(m);
         return NULL;
     }
-    PyModule_AddStringConstant(m, "ABI", "cp313");
+    PyModule_AddStringConstant(m, "ABI", "cp314");
     return m;
 }

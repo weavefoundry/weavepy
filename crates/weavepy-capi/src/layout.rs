@@ -886,7 +886,11 @@ const _: () = {
     // 4 bytes elsewhere, so every later offset and the total size agree.
     assert!(
         std::mem::offset_of!(PyConfig, cpu_count)
-            == if cfg!(target_vendor = "apple") { 280 } else { 276 }
+            == if cfg!(target_vendor = "apple") {
+                280
+            } else {
+                276
+            }
     );
     assert!(std::mem::offset_of!(PyConfig, program_name) == 288);
     assert!(std::mem::offset_of!(PyConfig, module_search_paths) == 328);
