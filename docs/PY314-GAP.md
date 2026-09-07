@@ -290,4 +290,5 @@ Notes on individual labels:
    small, testable fix.
 6. **Identity flip**: `sys.version` 3.14, cp314 tags,
    `libpython3.14` naming, t-strings/PEP 758 default-on and
-   `-X lang=next` deleted, `weavepy-3.13` maintenance branch cut.
+   `-X lang=next` deleted. No maintenance branch for 3.13: WeavePy
+   fixes forward only.

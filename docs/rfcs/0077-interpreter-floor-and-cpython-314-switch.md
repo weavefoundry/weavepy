@@ -242,9 +242,10 @@ The commit is one; the work is two measured phases:
    recorded in the Results section as the *Phase I checkpoint* and
    are the wave's performance evidence; nothing after them may
    change them except the identity flip's effect on `startup`.
-2. **Phase II** lands WS8 to WS14. The 3.13 baseline retires to the
-   `weavepy-3.13` maintenance branch; `tests/regrtest/expectations.toml`
-   is rewritten from the 3.14 sweep.
+2. **Phase II** lands WS8 to WS14. The 3.13 baseline retires (the
+   Phase I checkpoint commit is the last one that reports 3.13; it
+   gets no branch); `tests/regrtest/expectations.toml` is rewritten
+   from the 3.14 sweep.
 
 A failure in Phase II is therefore attributable: if a label that
 passed at the Phase I checkpoint fails after the flip, it's a 3.14
@@ -1049,9 +1050,11 @@ wheel with a compiled extension (numpy) imports via the regular
 `_minipip`/`_packaging` derive `cp314` from `version_info` (no edit),
 `sys._git`/`sys.version` string, `weavepy --version` output, the
 `_testembed` twin's expected config dump, the dist `check` matrix
-(identity spot-checks), `docs/CONFORMANCE.md`, `README.md` status
-paragraph, and the `weavepy-3.13` maintenance branch cut at the
-Phase I checkpoint commit (RFC 0076's release-branch model).
+(identity spot-checks), `docs/CONFORMANCE.md`, and the `README.md`
+status paragraph. No maintenance branch is cut: WeavePy fixes
+forward only (RFC 0076's version policy, as amended by this
+landing), so the Phase I checkpoint commit is simply the last one in
+history that reports 3.13.
 
 **Landed (WS13).** `weavepy-version` reads `(3, 14, 7)`: `sys.version`
 `3.14.7 (WeavePy) [WeavePy]`, `sys.hexversion 0x030e07f0`,
@@ -1134,8 +1137,9 @@ status paragraph follow.
   `PyUnstable_*` probes). That is the point of the lane; a measured
   fail row with a named root cause is an acceptable landing for a
   row that was green on cp313 only if the cause is upstream-shaped.
-- **Maintenance branch cost.** `weavepy-3.13` receives cherry-picks
-  only; no CI lane is added for it this wave.
+- **No maintenance line.** Users on the 3.13 surface who need a fix
+  upgrade to the current release. Nothing is backported, and no
+  branch or CI lane exists for the old version.
 
 ## Alternatives
 
