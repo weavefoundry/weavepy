@@ -6,7 +6,8 @@
 //! family and the sign predicates, the `PyLong_Export`/`PyLongWriter`
 //! import-export layer (PEP 757), `Py_HashBuffer`, `PyBytes_Join`,
 //! `PyImport_ImportModuleAttr`, `PyType_GetBaseByToken`
-//! (`Py_tp_token`), `PyType_Freeze`, `PyUnicode_Equal`,
+//! (`Py_tp_token`), `PyType_Freeze`, `PyUnicode_Equal`, the exported
+//! `PyUnicode_KIND`/`PyUnicode_DATA` accessor functions,
 //! `Py_fopen`/`Py_fclose`, `PyConfig_Set`, the `PyUnstable_*`
 //! refcount hints, the `PyTime_*` clocks, `PySys_AuditTuple`, the
 //! remaining watcher registrars, and a handful of 3.12/3.13 audit
@@ -619,11 +620,12 @@ pub unsafe extern "C" fn PyUnstable_Long_CompactValue(op: *mut PyObject) -> PySs
 }
 
 /// `PyLong_AsPid(obj)` — `pid_t` is a 32-bit `int` on every supported
-/// platform; `__index__` accepted, range-checked as `int`.
+/// platform (`pyport.h` defines it as `int` on Windows, where libc has
+/// no `pid_t`); `__index__` accepted, range-checked as `int`.
 #[no_mangle]
-pub unsafe extern "C" fn PyLong_AsPid(obj: *mut PyObject) -> libc::pid_t {
+pub unsafe extern "C" fn PyLong_AsPid(obj: *mut PyObject) -> c_int {
     match unsafe { as_signed_fixed(obj, 32, "int") } {
-        Some(v) => v as libc::pid_t,
+        Some(v) => v as c_int,
         None => -1,
     }
 }
@@ -934,6 +936,47 @@ pub unsafe extern "C" fn PyUnicode_Equal(a: *mut PyObject, b: *mut PyObject) -> 
         return -1;
     };
     c_int::from(x == y)
+}
+
+/// `PyUnicode_KIND(op)` as an exported function.
+///
+/// 3.14 exports the PEP 393 accessors as real functions next to the
+/// header macros (`PyAPI_FUNC(int) PyUnicode_KIND` /
+/// `PyAPI_FUNC(void*) PyUnicode_DATA` in `cpython/unicodeobject.h`) so
+/// non-C consumers can call them; PyO3 0.26+ binds both as `extern`
+/// symbols, and a manylinux wheel linked `-z now` (pydantic-core's
+/// `_pydantic_core.so`) fails at `dlopen` with `undefined symbol:
+/// PyUnicode_DATA` when they're missing. Every `str` that crosses into C
+/// is minted with a faithful PEP 393 body (`mirror::fill_str`), so this
+/// is the macro's read of the `state` word, no VM round trip.
+#[no_mangle]
+pub unsafe extern "C" fn PyUnicode_KIND(op: *mut PyObject) -> c_int {
+    let ao = op as *const crate::layout::PyASCIIObject;
+    let state = unsafe { (*ao).state };
+    ((state >> crate::layout::ustate::KIND_SHIFT) & 0x7) as c_int
+}
+
+/// `PyUnicode_DATA(op)` as an exported function; see [`PyUnicode_KIND`].
+/// Compact bodies carry their data just past `PyASCIIObject` (ASCII) or
+/// `PyCompactUnicodeObject` (Latin-1/UCS-2/UCS-4); a non-compact body
+/// (the `unicode_subtype_new` form) points at it through `data.any`.
+#[no_mangle]
+pub unsafe extern "C" fn PyUnicode_DATA(op: *mut PyObject) -> *mut c_void {
+    use crate::layout::{ustate, PyASCIIObject, PyCompactUnicodeObject, PyUnicodeObject};
+    let ao = op as *const PyASCIIObject;
+    let state = unsafe { (*ao).state };
+    let compact = (state >> ustate::COMPACT_SHIFT) & 0x1 != 0;
+    if compact {
+        let ascii = (state >> ustate::ASCII_SHIFT) & 0x1 != 0;
+        let off = if ascii {
+            std::mem::size_of::<PyASCIIObject>()
+        } else {
+            std::mem::size_of::<PyCompactUnicodeObject>()
+        };
+        unsafe { (op as *mut u8).add(off) as *mut c_void }
+    } else {
+        unsafe { (*(op as *const PyUnicodeObject)).data }
+    }
 }
 
 // ---------------------------------------------------------------------------

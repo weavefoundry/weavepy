@@ -4871,9 +4871,7 @@ impl Compiler {
                 // are parameters now) and no decorators.
                 let mut inner_args = args.clone();
                 inner_args.defaults.clear();
-                for d in &mut inner_args.kw_defaults {
-                    *d = None;
-                }
+                inner_args.kw_defaults.fill(None);
                 let inner_stmt = Stmt {
                     kind: if is_async {
                         StmtKind::AsyncFunctionDef {

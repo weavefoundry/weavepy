@@ -1846,6 +1846,7 @@ enum AtForkPhase {
 /// `logging._afterFork` left in a global list rooted, through their
 /// `__globals__`, that interpreter's entire module graph for the life
 /// of the process.
+#[cfg(unix)]
 #[derive(Default)]
 pub(crate) struct AtForkHandlers {
     before: Vec<Object>,
@@ -1853,6 +1854,7 @@ pub(crate) struct AtForkHandlers {
     after_in_child: Vec<Object>,
 }
 
+#[cfg(unix)]
 pub(crate) type AtForkRegistry = Rc<RefCell<AtForkHandlers>>;
 
 /// `os.register_at_fork(*, before=None, after_in_parent=None,

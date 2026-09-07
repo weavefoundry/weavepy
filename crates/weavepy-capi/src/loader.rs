@@ -473,8 +473,11 @@ pub fn load_extension_module(
 
 /// Load the shared library with the platform's CPython semantics.
 ///
-/// POSIX: plain dlopen (`RTLD_NOW | RTLD_LOCAL`, libloading's
-/// default, matching CPython's `dlopenflags` default).
+/// POSIX: plain dlopen with libloading's default `RTLD_LAZY | RTLD_LOCAL`.
+/// CPython's `dlopenflags` default is `RTLD_NOW`; the lazy binding here
+/// means a missing function symbol surfaces at first call rather than
+/// at import, except for a library linked `-z now` (`DF_BIND_NOW`, the
+/// maturin/PyO3 default), which the loader resolves eagerly regardless.
 #[cfg(not(windows))]
 fn open_extension_library(path: &Path, _leaf: &str) -> Result<Library, LoadError> {
     unsafe { Library::new(path) }.map_err(|e| LoadError::Dlopen(format!("{path:?}: {e}")))

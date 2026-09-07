@@ -731,6 +731,8 @@ static FORCE_LINK: &[FnPtr] = &[
     addr!(crate::abi314::PyImport_ImportModuleAttr),
     addr!(crate::abi314::PyImport_ImportModuleAttrString),
     addr!(crate::abi314::PyUnicode_Equal),
+    addr!(crate::abi314::PyUnicode_KIND),
+    addr!(crate::abi314::PyUnicode_DATA),
     addr!(crate::abi314::PyType_GetBaseByToken),
     addr!(crate::abi314::PyType_Freeze),
     addr!(crate::abi314::PyType_GetFullyQualifiedName),
