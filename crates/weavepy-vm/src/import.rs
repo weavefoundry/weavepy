@@ -19,22 +19,13 @@ use crate::sync::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::object::{DictData, DictKey, Object, PyModule};
+use crate::object::{DictData, DictKey, Object, PyModule, StrKey};
 
 /// Build a fresh built-in module given the live cache (so factories
 /// can read `sys.argv` / `sys.path` at construction time).
 pub type BuiltinModuleFactory = fn(&ModuleCache) -> Rc<PyModule>;
 
-/// A frozen-Python module: source compiled at runtime and executed
-/// inside the interpreter exactly like a real `.py` file, but without
-/// touching the filesystem. Used to ship pure-Python stdlib modules
-/// inside the binary.
-#[derive(Clone, Copy, Debug)]
-pub struct FrozenSource {
-    pub name: &'static str,
-    pub source: &'static str,
-    pub is_package: bool,
-}
+pub use crate::stdlib::frozen_sources::FrozenSource;
 
 /// Shared runtime state for the import machinery.
 ///
@@ -141,8 +132,7 @@ impl ModuleCache {
 
     /// Cache hit lookup. Returns `None` if not yet loaded.
     pub fn get(&self, full_name: &str) -> Option<Object> {
-        let key = DictKey(Object::from_str(full_name));
-        self.modules.borrow().get(&key).cloned()
+        self.modules.borrow().get(&StrKey(full_name)).cloned()
     }
 
     /// Install a loaded module in the cache. CPython treats
@@ -162,9 +152,7 @@ impl ModuleCache {
     }
 
     pub fn remove(&self, full_name: &str) {
-        self.modules
-            .borrow_mut()
-            .shift_remove(&DictKey(Object::from_str(full_name)));
+        self.modules.borrow_mut().shift_remove(&StrKey(full_name));
     }
 
     /// Mark/unmark `full_name`'s body as executing (the

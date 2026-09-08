@@ -2,7 +2,7 @@
 """Classify and re-vendor the bundled stdlib against CPython `Lib/` trees.
 
 RFC 0077 (WS8). The bundled stdlib is the `FrozenSource` table in
-`crates/weavepy-vm/src/stdlib/mod.rs`: 580-odd `include_str!` entries
+`crates/weavepy-vm/src/stdlib/frozen_sources.rs`: 580-odd `include_str!` entries
 over `crates/weavepy-vm/src/stdlib/python/`, some under renamed files
 (`random_mod.py` is `random`, `os_source.py` is `os`, ...). This tool
 reads that table so the module-name -> bundled-file mapping is never
@@ -52,7 +52,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-MOD_RS = REPO / "crates" / "weavepy-vm" / "src" / "stdlib" / "mod.rs"
+MOD_RS = REPO / "crates" / "weavepy-vm" / "src" / "stdlib" / "frozen_sources.rs"
 BUNDLED = REPO / "crates" / "weavepy-vm" / "src" / "stdlib" / "python"
 
 STANZA = re.compile(

@@ -1,0 +1,13 @@
+{
+  "date_utc": "2026-09-08",
+  "baseline_commit": "2c6348a",
+  "platform": "darwin-arm64",
+  "rustc": "1.98.1 (48a229cea 2026-09-01)",
+  "cpython": "3.14.7",
+  "build_command": "cargo build --release -p weavepy-cli --bin weavepy",
+  "cache_build_id": "c7d92875f7fdf095",
+  "binary_sha256": {
+    "base": "bad6f91556b48934050b97c335a35da2aa9ce5cd7d77d7d19b3164f74a230945",
+    "new": "70cbfdda4bbdbdb65f410ba47a1ff97321334a5bbc83258238656352e2a12e6e"
+  }
+}

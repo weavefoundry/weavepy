@@ -1,0 +1,95 @@
+{
+  "vm_unit_tests": 259,
+  "benchmark_reporting_tests": 4,
+  "integration_harnesses": [
+    "all_run_fixtures_match",
+    "bundled_stdlib_verbatim_set_has_not_drifted"
+  ],
+  "verbatim_stdlib_files": 467,
+  "new_regression": "tests/regrtest/test_frame_recycling.py",
+  "new_regression_modes": [
+    "CPython 3.14.7",
+    "WeavePy JIT",
+    "WeavePy interpreter",
+    "WeavePy gil=0"
+  ],
+  "checks": [
+    "cargo fmt --all --check",
+    "cargo clippy -p weavepy-vm --lib --all-features -- -D warnings",
+    "cargo check -p weavepy-vm --no-default-features"
+  ],
+  "final_release_cpython_suites": [
+    {
+      "suite": "test_builtin",
+      "status": "pass",
+      "duration_ms": 873,
+      "reported_tests": 147
+    },
+    {
+      "suite": "test_frame",
+      "status": "pass",
+      "duration_ms": 11925,
+      "reported_tests": 59
+    },
+    {
+      "suite": "test_gc",
+      "status": "pass",
+      "duration_ms": 3724,
+      "reported_tests": 57
+    },
+    {
+      "suite": "test_generators",
+      "status": "pass",
+      "duration_ms": 6232,
+      "reported_tests": 59
+    },
+    {
+      "suite": "test_import",
+      "status": "pass",
+      "duration_ms": 5891,
+      "reported_tests": 119
+    },
+    {
+      "suite": "test_inspect",
+      "status": "pass",
+      "duration_ms": 2341,
+      "reported_tests": 362
+    },
+    {
+      "suite": "test_monitoring",
+      "status": "pass",
+      "duration_ms": 381,
+      "reported_tests": 88
+    },
+    {
+      "suite": "test_sys_setprofile",
+      "status": "pass",
+      "duration_ms": 274,
+      "reported_tests": 29
+    },
+    {
+      "suite": "test_sys_settrace",
+      "status": "pass",
+      "duration_ms": 3184,
+      "reported_tests": 448
+    },
+    {
+      "suite": "test_threading",
+      "status": "pass",
+      "duration_ms": 133488,
+      "reported_tests": 228
+    },
+    {
+      "suite": "test_traceback",
+      "status": "pass",
+      "duration_ms": 8648,
+      "reported_tests": 370
+    },
+    {
+      "suite": "test_weakref",
+      "status": "pass",
+      "duration_ms": 11512,
+      "reported_tests": 137
+    }
+  ]
+}

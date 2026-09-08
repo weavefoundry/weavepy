@@ -228,6 +228,7 @@ fn collect(args: &[Object]) -> Result<Object, RuntimeError> {
     // RFC 0068 — release JIT-pinned code objects this thread's tier
     // cache is the sole owner of, so `weakref`s on dead `__code__`
     // objects die like they do under CPython's collector.
+    #[cfg(feature = "jit")]
     crate::tier2::gc_sweep();
     // Likewise release `__missing__`-globals owners nothing can reach any
     // more (`annotationlib`'s `_StringifierDict`s), so the classes their

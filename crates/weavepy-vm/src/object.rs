@@ -919,11 +919,11 @@ impl PyFrame {
 ///   walk (see the `f_back` attribute handler).
 #[derive(Debug)]
 pub struct FrameShell {
-    pub code: Rc<CodeObject>,
-    pub locals: Rc<RefCell<Vec<Object>>>,
-    pub cells: Rc<Vec<Rc<RefCell<Object>>>>,
-    pub globals: Rc<RefCell<DictData>>,
-    pub builtins: Rc<RefCell<DictData>>,
+    pub code: FrameSlot<Rc<CodeObject>>,
+    pub locals: FrameSlot<Rc<RefCell<Vec<Object>>>>,
+    pub cells: FrameSlot<Rc<Vec<Rc<RefCell<Object>>>>>,
+    pub globals: FrameSlot<Rc<RefCell<DictData>>>,
+    pub builtins: FrameSlot<Rc<RefCell<DictData>>>,
     /// Mapping-object `__builtins__` (see `Frame::builtins_obj`) — a
     /// sandboxed exec/eval frame resolves builtin names by item access
     /// on this object; `_PyEval_GetBuiltin`-style helpers (e.g.
@@ -948,20 +948,45 @@ pub struct FrameShell {
     pub materialized: RefCell<Option<Rc<PyFrame>>>,
 }
 
+/// Owned metadata in a live frame shell. Recycled shells leave these slots
+/// empty so recycling doesn't clone and later drop shared placeholders.
+/// Only a live shell may be read; the pool is private to the interpreter.
+#[derive(Debug)]
+pub struct FrameSlot<T>(Option<T>);
+
+impl<T> FrameSlot<T> {
+    pub(crate) fn new(value: T) -> Self {
+        Self(Some(value))
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl<T> std::ops::Deref for FrameSlot<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.0.as_ref().expect("live frame shell metadata")
+    }
+}
+
 impl FrameShell {
     /// Wrap an already-materialised frame (generator resume, event
     /// dispatch around throw/unwind) in a shell for the spine.
     pub fn from_py_frame(py: &Rc<PyFrame>) -> Self {
         FrameShell {
-            code: py.code.clone(),
-            locals: py
-                .locals_mirror
-                .borrow()
-                .clone()
-                .unwrap_or_else(|| Rc::new(RefCell::new(Vec::new()))),
-            cells: py.cells.clone(),
-            globals: py.globals.clone(),
-            builtins: py.builtins.clone(),
+            code: FrameSlot::new(py.code.clone()),
+            locals: FrameSlot::new(
+                py.locals_mirror
+                    .borrow()
+                    .clone()
+                    .unwrap_or_else(|| Rc::new(RefCell::new(Vec::new()))),
+            ),
+            cells: FrameSlot::new(py.cells.clone()),
+            globals: FrameSlot::new(py.globals.clone()),
+            builtins: FrameSlot::new(py.builtins.clone()),
             builtins_obj: None,
             class_namespace: py.class_namespace.clone(),
             class_namespace_obj: py.class_namespace_obj.clone(),

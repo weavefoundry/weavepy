@@ -1,0 +1,63 @@
+{
+  "work": 1000000,
+  "threads": 8,
+  "samples": 3,
+  "rows": {
+    "base_gil1": [
+      {
+        "serial_ns": 32276375,
+        "parallel_ns": 34686792
+      },
+      {
+        "serial_ns": 32302542,
+        "parallel_ns": 34829000
+      },
+      {
+        "serial_ns": 32400750,
+        "parallel_ns": 34793000
+      }
+    ],
+    "new_gil1": [
+      {
+        "serial_ns": 32292542,
+        "parallel_ns": 34685833
+      },
+      {
+        "serial_ns": 32252709,
+        "parallel_ns": 35017917
+      },
+      {
+        "serial_ns": 32363084,
+        "parallel_ns": 34841250
+      }
+    ],
+    "base_gil0": [
+      {
+        "serial_ns": 1203526208,
+        "parallel_ns": 237255958
+      },
+      {
+        "serial_ns": 1260533667,
+        "parallel_ns": 246274666
+      },
+      {
+        "serial_ns": 1208423375,
+        "parallel_ns": 258206750
+      }
+    ],
+    "new_gil0": [
+      {
+        "serial_ns": 1174327458,
+        "parallel_ns": 218055125
+      },
+      {
+        "serial_ns": 1169401750,
+        "parallel_ns": 234447958
+      },
+      {
+        "serial_ns": 1177482917,
+        "parallel_ns": 225646208
+      }
+    ]
+  }
+}
